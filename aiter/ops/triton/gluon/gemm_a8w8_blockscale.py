@@ -18,6 +18,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd.cdna4 import async_copy
 
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -174,19 +175,19 @@ def _gemm_a8w8_blockscale_kernel(
         offs_a_scale = offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
 
         if EVEN_K:
-            async_copy.buffer_load_to_shared(smem_a,
+            a = gl.amd.cdna4.buffer_load(
                 ptr=a_ptr,
                 offsets=offs_a,
                 mask=offs_am[:, None] < M,
-                cache_modifier=cache_modifier,
+                cache=cache_modifier,
             )
         else:
-            async_copy.buffer_load_to_shared(smem_a,
+            a = gl.amd.cdna4.buffer_load(
                 ptr=a_ptr,
                 offsets=offs_a,
                 mask=(offs_ak[None, :] < K - (pid_k * num_k_iter * BLOCK_SIZE_K))
                 & (offs_am[:, None] < M),
-                cache_modifier=cache_modifier,
+                cache=cache_modifier,
             )
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
@@ -219,6 +220,7 @@ def _gemm_a8w8_blockscale_kernel(
             cache=cache_modifier,
         )
         smem_scale_a.store(a_scale)
+        smem_a.store(a)
 
         acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
         acc = gl.zeros(
