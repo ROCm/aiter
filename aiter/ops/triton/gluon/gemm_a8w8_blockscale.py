@@ -103,13 +103,13 @@ def _gemm_a8w8_blockscale_kernel(
     blocked_mk: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 16],  # 16 * 128
         threads_per_warp=[8, 8],
-        warps_per_cta=[4, 1],
+        warps_per_cta=[2, 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[16, 1],  # 16 * 128
         threads_per_warp=[8, 8],
-        warps_per_cta=[1, 4],
+        warps_per_cta=[1, 2],
         order=[0, 1],
     )
 
@@ -126,7 +126,7 @@ def _gemm_a8w8_blockscale_kernel(
         vec=16, per_phase=2, max_phase=8, order=[0]
     )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[2, 2]
+        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 2]
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=16
