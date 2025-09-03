@@ -318,6 +318,7 @@ def test_mha_with_pe(
     device: str = "cuda"
     dtype: torch.dtype = torch.float16
     # |_ bfloat16 dtype didn't change anything
+    # |_ float32 dtype reduces greatest absolute difference to 1.078116774559021.
     DROPOUT: float = 0
     dropout_mask: torch.Tensor | None = None
     RETURN_LSE: bool = DUMP_TENSORS
