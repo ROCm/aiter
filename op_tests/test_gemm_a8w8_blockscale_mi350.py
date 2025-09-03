@@ -88,7 +88,7 @@ def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 @perftest()
 def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     # return aiter.flatmm_a8w8_blockscale_ASM(x, weight, x_scale, w_scale, dtype)
-    return aiter.mi350_a8w8_blockscale_ASM(x, weight, x_scale, w_scale, dtype)
+    return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
 
 
 @benchmark()

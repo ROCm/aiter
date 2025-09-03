@@ -385,8 +385,12 @@ def gemm_a8w8_blockscale(
     k = XQ.shape[1]
     get_CKGEMM_config(m, n, k, "a8w8_blockscale_tuned_gemm.csv")
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+    from aiter.jit.utils.chip_info import get_gfx
 
+    if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
+        return mi350_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
+    else:
+        return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
 
 def flatmm_a8w8_blockscale_ASM(
     XQ: Tensor,
@@ -410,6 +414,7 @@ def mi350_a8w8_blockscale_ASM(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
+    Y: Tensor,
     dtype=dtypes.bf16,
 ):
     assert dtype in [
@@ -417,8 +422,6 @@ def mi350_a8w8_blockscale_ASM(
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     m = XQ.shape[0]
     n = WQ.shape[0]
-    # k = XQ.shape[-1]
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return mi350_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
 
