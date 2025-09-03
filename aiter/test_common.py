@@ -81,10 +81,10 @@ def perftest(
             ) as prof:
                 data = run_iters_rotate(num_iters, func, rotate_args)
 
-            print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+            # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
             avg = get_trace_perf(prof, num_iters)
 
-            return data, avg
+            return data, avg, prof.key_averages()
 
         return wrapper
 

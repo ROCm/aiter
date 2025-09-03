@@ -981,6 +981,23 @@
           py::arg("reduce_final_map"),                  \
           py::arg("reduce_partial_map"),                \
           py::arg("split_params") = std::nullopt);      \
+    m.def("get_mla_metadata_v1_tunable",                \
+          &get_mla_metadata_v1_tunable,                 \
+          "get_mla_metadata_v1_tunable",                \
+          py::arg("seqlens_qo_indptr"),                 \
+          py::arg("seqlens_kv_indptr"),                 \
+          py::arg("num_heads_per_head_k"),              \
+          py::arg("num_heads_k"),                       \
+          py::arg("is_causal"),                         \
+          py::arg("work_metadata_ptrs"),                \
+          py::arg("work_info_set"),                     \
+          py::arg("work_indptr"),                       \
+          py::arg("reduce_indptr"),                     \
+          py::arg("reduce_final_map"),                  \
+          py::arg("reduce_partial_map"),                \
+          py::arg("test_params"),                       \
+          py::arg("test_outputs"),                      \
+          py::arg("split_params") = std::nullopt);      \
     m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
 
 #define MLA_REDUCE_PYBIND                             \

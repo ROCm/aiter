@@ -350,6 +350,26 @@ def get_mla_metadata_v1(
 
 
 @compile_ops("module_mla_metadata")
+def get_mla_metadata_v1_tunable(
+    seqlens_qo_indptr: torch.Tensor,
+    seqlens_kv_indptr: torch.Tensor,
+    num_heads_per_head_k: int,
+    num_heads_k: int,
+    is_causal: bool,
+    kv_granularity: int,
+    work_metadata_ptrs: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    test_params: torch.Tensor,
+    test_outputs: torch.Tensor,
+    split_params: Optional[dict[str, int]] = None,
+): ...
+
+
+@compile_ops("module_mla_metadata")
 def get_mla_metadata_v1_no_redundant(
     seqlens_qo_indptr: torch.Tensor,
     seqlens_kv_indptr: torch.Tensor,

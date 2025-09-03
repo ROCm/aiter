@@ -267,7 +267,7 @@ def test_mla(
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (attn_logits, attn_lse), us_asm_decode, avg_prof = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
             kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -334,7 +334,7 @@ def test_mla(
             kv_scale=kv_scale,
         )
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (attn_logits, attn_lse), us_asm_decode, avg_prof = run_perftest(
             aiter.mla.mla_decode_fwd,
             q_fp8,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),

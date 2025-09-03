@@ -63,6 +63,10 @@ struct MlaMetadataV1KernelParameter
     int32_t        uni_seqlen_qo;
     int32_t        topk;
     bool           is_causal;
+
+    const int32_t* p_test_params;
+    int32_t*       p_test_outputs;
+    int32_t        stride_test_outputs;
 };
 
 template <typename T>

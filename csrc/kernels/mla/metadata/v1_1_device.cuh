@@ -171,7 +171,7 @@ CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v2(
 }
 
 template <typename Traits, bool kOnlyGatherWorkCount>
-CK_TILE_DEVICE void generate_work(
+CK_TILE_DEVICE int32_t generate_work(
     const int32_t       batch_idx,
     const int32_t       tile_idx,
     const int32_t       qo_len,
@@ -192,10 +192,12 @@ CK_TILE_DEVICE void generate_work(
     MlaPartialTileInfo* p_reduce_final_map,
     MlaPartialTileInfo* p_reduce_partial_map,
     int32_t*            p_cost_heap,
-    int32_t*            p_cluster_work_counter)
+    int32_t*            p_cluster_work_counter,
+    int32_t*            p_touch_ugly)
 {
     int32_t remaining_kv_len = kv_len;
     int32_t kv_start_local = 0;
+    int32_t num_splits = 0;
 
     const int32_t kv_len_limit_floor =
         ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len, num_clusters), kv_granularity);
@@ -214,6 +216,7 @@ CK_TILE_DEVICE void generate_work(
         // Check and update cost_heap
         auto [cid, accum_cost] = get_cost_top(p_cost_heap, num_clusters);
         const int32_t remaining_capability = cal_kv_len(workload_limit_global - accum_cost, packed_qo_tile_len);
+        if (remaining_capability <= 0 && p_touch_ugly != nullptr) *p_touch_ugly=1;
         const int32_t kv_len_limit_local =
         [&]() {
             const int32_t limit_ori = ck_tile::max(remaining_capability, kv_len_limit_floor);
@@ -267,6 +270,7 @@ CK_TILE_DEVICE void generate_work(
             }
 
             ++p_cluster_work_counter[cid];
+            ++num_splits;
         }
 
         // Update state
@@ -274,9 +278,11 @@ CK_TILE_DEVICE void generate_work(
         kv_start_local += kv_len_consuming;
     }
     while (remaining_kv_len > 0);
+
+    return num_splits;
 }
 
-template <typename Traits>
+template <typename Traits, bool kTunable>
 __launch_bounds__(ck_tile::get_warp_size(), 1)
 __global__ void kn_get_mla_metadata_v1_1(
     const MlaMetadataV1KernelParameter params)
@@ -284,6 +290,12 @@ __global__ void kn_get_mla_metadata_v1_1(
     extern __shared__ uint8_t p_smem[];
 
     const int32_t lane_idx = ck_tile::get_lane_id();
+
+    int32_t touch_ugly = 0;
+
+    int32_t* p_test_metadata = params.p_test_outputs + 0 * params.stride_test_outputs;
+    int32_t* p_test_num_splits = params.p_test_outputs + 1 * params.stride_test_outputs;
+    int32_t* p_test_workloads = params.p_test_outputs + 2 * params.stride_test_outputs;
 
     // Step.0. Get sequence lengths of query/output and key/value for each batch.
     int32_t* p_batch_idx = reinterpret_cast<int32_t*>(p_smem);
@@ -367,10 +379,17 @@ __global__ void kn_get_mla_metadata_v1_1(
     const int32_t tot_qo_tiles = warp_sum(p_qo_tiles, params.num_batches);
 
     const int32_t workload_limit_global =
-        params.num_heads == 16 ?
+    [&]() {
+        if constexpr (kTunable)
+        {
+            if (params.p_test_params[0] > 0)
+                return ck_tile::integer_least_multiple(params.p_test_params[0], params.kv_granularity);
+        }
+        return params.num_heads == 16 ?
             cal_workload_limit_global_v1(
                 workload_avg, workload_var, cluster_len_q, num_qo_tiles, num_clusters, params.kv_granularity) :
             cal_workload_limit_global_v0(workload_sum, num_clusters, params.kv_granularity);
+    }();
 #if PRINT_DBG
     if (lane_idx == 0)
     {
@@ -413,11 +432,19 @@ __global__ void kn_get_mla_metadata_v1_1(
                 cal_packed_causal_kv_len(
                     qo_len, kv_len, tid, packed_qo_tile_len, num_qo_tiles, params.num_heads, params.is_causal);
 
-            generate_work<Traits, true>(
+            const int32_t num_splits = generate_work<Traits, true>(
                 bid, tid, qo_len, tile_kv_len, qo_tile_len, packed_qo_tile_len, qo_batch_start, kv_batch_start,
                 kv_batch_end, workload_limit_global, num_clusters, params.kv_granularity, nullptr,
                 p_num_qo_clusters_indptr, nullptr, nullptr, nullptr, nullptr, nullptr, p_cost_heap,
-                p_cluster_work_counter);
+                p_cluster_work_counter, nullptr);
+
+            if constexpr (kTunable)
+            {
+                if (lane_idx==0)
+                {
+                    p_test_num_splits[bid] = num_splits;
+                }
+            }
         }
     }
 
@@ -487,7 +514,7 @@ __global__ void kn_get_mla_metadata_v1_1(
                 bid, tid, qo_len, tile_kv_len, qo_tile_len, packed_qo_tile_len, qo_batch_start, kv_batch_start,
                 kv_batch_end, workload_limit_global, num_clusters, params.kv_granularity, params.p_work_indptr,
                 p_num_qo_clusters_indptr, &loc_partial_outputs, &num_partial_outputs, p_work_info_set,
-                p_reduce_final_map, p_reduce_partial_map, p_cost_heap, p_cluster_work_counter);
+                p_reduce_final_map, p_reduce_partial_map, p_cost_heap, p_cluster_work_counter, &touch_ugly);
         }
     }
 
@@ -545,6 +572,17 @@ __global__ void kn_get_mla_metadata_v1_1(
         params.p_work_metadata_ptrs[1] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(params.p_work_info_set_raw));
     }
 
+    if constexpr (kTunable)
+    {
+        if (lane_idx == 0)
+        {
+            for (int32_t cid = 0; cid < num_clusters; ++cid)
+            {
+                p_test_workloads[cid] = p_cost_heap[cid];
+            }
+        }
+    }
+
 #if PRINT_DBG
     if (lane_idx == 0)
     {
@@ -555,6 +593,14 @@ __global__ void kn_get_mla_metadata_v1_1(
         }
     }
 #endif
+    if constexpr (kTunable)
+    {
+        if (lane_idx == 0)
+        {
+            p_test_metadata[0] = workload_limit_global;
+            p_test_metadata[1] = touch_ugly;
+        }
+    }
 }
 
 template <typename Traits>
@@ -572,8 +618,13 @@ void get_mla_metadata_v1_1_device(
     torch::Tensor&       work_indptr,
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
-    torch::Tensor&       reduce_partial_map)
+    torch::Tensor&       reduce_partial_map,
+    torch::Tensor*       p_test_params,
+    torch::Tensor*       p_test_outputs)
 {
+    TORCH_CHECK((p_test_params == nullptr) == (p_test_outputs == nullptr),
+                __func__, ": test parameters should be in same type!");
+
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     hipDevice_t dev;
@@ -644,8 +695,22 @@ void get_mla_metadata_v1_1_device(
     params.kv_granularity       = kv_granularity;
     params.is_causal            = is_causal;
 
+    if (p_test_params != nullptr)
+    {
+        params.p_test_params       = p_test_params->data_ptr<int32_t>();
+        params.p_test_outputs      = p_test_outputs->data_ptr<int32_t>();
+        params.stride_test_outputs = p_test_outputs->stride(0);
+    }
+
     // launch kernel
     const dim3 grid = dim3(1, 1, 1);
     const int32_t num_thr = dev_prop.warpSize; // only use 1 warp for simplicity
-    kn_get_mla_metadata_v1_1<Traits><<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
+    if (p_test_params != nullptr)
+    {
+        kn_get_mla_metadata_v1_1<Traits, true><<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
+    }
+    else
+    {
+        kn_get_mla_metadata_v1_1<Traits, false><<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
+    }
 }

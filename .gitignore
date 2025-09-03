@@ -49,3 +49,6 @@ __pycache__
 debug
 aiter_logs
 *.log
+
+# metadata results
+/metadata_autotune*.yaml

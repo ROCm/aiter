@@ -188,8 +188,99 @@ void get_mla_metadata_v1(
             work_indptr,
             reduce_indptr,
             reduce_final_map,
-            reduce_partial_map);
+            reduce_partial_map,
+            nullptr,
+            nullptr);
     }
+}
+
+void get_mla_metadata_v1_tunable(
+    const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
+    const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
+    const int32_t        num_heads_per_head_k,
+    const int32_t        num_heads_k,
+    const bool           is_causal,
+    torch::Tensor&       work_metadata_ptrs,
+    torch::Tensor&       work_info_set,
+    torch::Tensor&       work_indptr,
+    torch::Tensor&       reduce_indptr,
+    torch::Tensor&       reduce_final_map,
+    torch::Tensor&       reduce_partial_map,
+    torch::Tensor&       test_params,
+    torch::Tensor&       test_outputs,
+    std::optional<std::map<std::string, int32_t>> split_params)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
+
+    int32_t kv_granularity = 16;
+    int32_t max_seqlen_qo  = -1;
+    int32_t uni_seqlen_qo  = -1;
+    int32_t topk           = -1;
+    bool    fast_mode      = false;
+
+    if (split_params.has_value())
+    {
+        if (split_params->find("kv_granularity") != split_params->end())
+        {
+            kv_granularity = split_params->find("kv_granularity")->second;
+        }
+
+        if (split_params->find("max_seqlen_qo") != split_params->end())
+        {
+            max_seqlen_qo = split_params->find("max_seqlen_qo")->second;
+        }
+
+        if (split_params->find("uni_seqlen_qo") != split_params->end())
+        {
+            uni_seqlen_qo = split_params->find("uni_seqlen_qo")->second;
+            max_seqlen_qo = (uni_seqlen_qo > 0) ? uni_seqlen_qo : max_seqlen_qo;
+        }
+
+        if (split_params->find("fast_mode") != split_params->end())
+        {
+            fast_mode = split_params->find("fast_mode")->second != 0;
+        }
+
+        if (split_params->find("topk") != split_params->end())
+        {
+            topk = split_params->find("topk")->second;
+        }
+    }
+
+    TORCH_CHECK((kv_granularity & (kv_granularity - 1)) == 0,
+                __func__, ": kv_granularity Must be power of 2!");
+    TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
+                __func__, ": seqlens_qo_indptr should be continuous!");
+    TORCH_CHECK(seqlens_qo_indptr.scalar_type() == at::ScalarType::Int,
+                __func__, ": seqlens_qo_indptr's element type should be int!");
+    TORCH_CHECK(seqlens_kv_indptr.stride(0) == 1,
+                __func__, ": seqlens_kv_indptr should be continuous!");
+    TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
+                __func__, ": seqlens_kv_indptr's element type should be int!");
+
+    // This default settings is for our ASM MLA decode kernel. This kernel supports num_heads=16 and qo size from 1
+    // to 4 without support to split qo for each workgroup. This means that kPackedQoLenPerWg should be 4*16=64 to
+    // prevent spliting in any case supported by it.
+    //                                PackedQoLenPerWg, MaxClusterSize
+    using Traits  = MlaMetadataTraits<128,              1>;
+
+    get_mla_metadata_v1_1_device<Traits>(
+        seqlens_qo_indptr,
+        seqlens_kv_indptr,
+        num_heads_per_head_k,
+        num_heads_k,
+        is_causal,
+        false,
+        kv_granularity,
+        max_seqlen_qo,
+        work_metadata_ptrs,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        &test_params,
+        &test_outputs);
 }
 
 std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(
