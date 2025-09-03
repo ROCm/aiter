@@ -242,9 +242,10 @@ CK_TILE_DEVICE void WarpSort(
     const int32_t  num_batches)
 {
     const int32_t lane_idx = ck_tile::get_lane_id();
+    const int32_t batch_next_power_of_two = num_batches == 1 ? 2 : ck_tile::next_power_of_two(num_batches);
 
     const int32_t num_batches_padded =
-        ck_tile::integer_least_multiple(ck_tile::next_power_of_two(num_batches), ck_tile::get_warp_size());
+        ck_tile::integer_least_multiple(batch_next_power_of_two, ck_tile::get_warp_size());
     const int32_t warp_loops = num_batches_padded / ck_tile::get_warp_size();
     int32_t* p_costs = p_workspace;
     int32_t* p_indices = p_costs + num_batches_padded;
@@ -835,9 +836,11 @@ void get_mla_metadata_v1_device(
         // Memory for indptr about #cluster for each batch in direction of qo
         lds_size += (num_batches + 1) * sizeof(int32_t);
         // LDS for sorting
+
+        const int32_t batch_next_power_of_two = num_batches == 1 ? 2 : ck_tile::next_power_of_two(num_batches);
         const int32_t lds_sort_size =
             lds_size +
-            ck_tile::integer_least_multiple(ck_tile::next_power_of_two(num_batches),
+            ck_tile::integer_least_multiple(batch_next_power_of_two,
                                             ck_tile::get_warp_size()) * 2 * sizeof(int32_t);
         // Memory for cost. Its size should be the same as #clusters
         lds_size += num_clusters * sizeof(int32_t);
