@@ -75,7 +75,7 @@ if find_aiter is not None:
     package_parent_path = os.path.dirname(package_path)
     import site
 
-    site_packages_dirs = site.getsitepackages() + [site.getusersitepackages()]
+    site_packages_dirs = site.getsitepackages() + (site.getusersitepackages() or [])
     # develop mode
     isDevelopMode = (package_path not in site_packages_dirs) and (
         package_parent_path not in site_packages_dirs
