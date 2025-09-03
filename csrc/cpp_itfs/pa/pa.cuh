@@ -79,7 +79,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const int lane16id               = laneid % 16;
     const int rowid                  = laneid / 16;
 
-    const auto seq_idx = blockIdx.x;
+    const auto seq_idx   = blockIdx.x;
+    const int num_blocks = max_num_blocks_per_seq * gridDim.x;
     // NOTE queries with sequence len > 1 are prefills and taken care by another
     // kernel.
     if(query_start_loc_ptr != nullptr &&
@@ -290,8 +291,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
 
     constexpr int VTOKENS_PER_LANE =
         TOKENS_PER_WARP / ROWS_PER_WARP; // 64/4 = 16 contiguous vtokens per lane
-    constexpr int VBLOCKS_PER_LANE =
-        1; // assumes block size >=16, each lane can correspond to 1 block only
+
     constexpr int VTLOOP = NWARPS; // corresponds to tokens across warps
     constexpr int VTLANELOOP =
         DIVIDE_ROUND_UP(VTOKENS_PER_LANE,
@@ -299,22 +299,19 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                                                        // minimum block size is 16
     constexpr int VHELOOP = HEAD_SIZE / 16 / NWARPS;
 
-    int vphysical_block_number[VTLOOP][VBLOCKS_PER_LANE];
+    int vphysical_block_number[VTLOOP];
 
     // fetch v physical block numbers
     for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
     {
-        for(int vblock_depth = 0; vblock_depth < VBLOCKS_PER_LANE; vblock_depth++)
-        {
-            const int vlocal_token_idx = vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP +
-                                         rowid * VTOKENS_PER_LANE + vblock_depth * BLOCK_SIZE;
-            // Safe to use an int32_t here assuming we are working with < 2 billion
-            // tokens
-            const int vglobal_token_idx = partition_start_token_idx + vlocal_token_idx;
-            const int vblock_idx =
-                (vglobal_token_idx < context_len) ? vglobal_token_idx / BLOCK_SIZE : last_ctx_block;
-            vphysical_block_number[vtoken_depth][vblock_depth] = block_table_seq[vblock_idx];
-        }
+        const int vlocal_token_idx =
+            vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP + rowid * VTOKENS_PER_LANE;
+        // Safe to use an int32_t here assuming we are working with < 2 billion
+        // tokens
+        const int vglobal_token_idx = partition_start_token_idx + vlocal_token_idx;
+        const int vblock_idx =
+            (vglobal_token_idx < context_len) ? vglobal_token_idx / BLOCK_SIZE : last_ctx_block;
+        vphysical_block_number[vtoken_depth] = block_table_seq[vblock_idx];
     }
 
     _B16x8 Vlocal[VTLOOP][VHELOOP][VTLANELOOP]; // this could be B8x16 too
@@ -329,9 +326,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         const cache_t* v_ptr2 = v_ptr + vhead_elem * BLOCK_SIZE;
         for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
         {
-            const int vblock_depth = 0;
             const int64_t vblock_number =
-                static_cast<int64_t>(vphysical_block_number[vtoken_depth][vblock_depth]);
+                static_cast<int64_t>(vphysical_block_number[vtoken_depth]);
             const cache_t* v_ptr3 = v_ptr2 + (vblock_number * kv_block_stride);
             for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
             {
@@ -348,8 +344,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
     {
         // multiply by k_scale if fp8 kv cache
-        float k_scale = k_scale_ptr ? *k_scale_ptr : 1.0;
-        scale2 *= k_scale;
         scale2 *= q_scale;
     }
     const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
@@ -361,24 +355,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         {
             for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
             {
-                if constexpr(CAUSAL)
-                {
-                    for(int i = 0; i < 4; i++)
-                    {
-                        const int local_token_idx = qkout_token_idx + token_depth * 16 + i;
-                        const int k_token_idx     = local_token_idx % context_len;
-                        const int q_token_idx =
-                            (local_token_idx / context_len) * MTP_PER_THREAD + mtp;
-                        d_out[gqa_ratio_loop][mtp][token_depth][i] = {
-                            (k_token_idx <= (context_len - MTP)) || (q_token_idx >= (MTP - 1))
-                                ? 0
-                                : -FLT_MAX};
-                    }
-                }
-                else
-                {
-                    d_out[gqa_ratio_loop][mtp][token_depth] = {0};
-                }
+                d_out[gqa_ratio_loop][mtp][token_depth] = {0};
                 for(int head_loop = 0; head_loop < HEAD_LOOP; head_loop++)
                 {
                     for(int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++)
@@ -444,6 +421,32 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                     }
                 }
                 d_out[gqa_ratio_loop][mtp][token_depth] *= scale2;
+                if constexpr(CAUSAL)
+                {
+                    const int local_token_idx = qkout_token_idx + token_depth * 16;
+                    for(int i = 0; i < 4; i++)
+                    {
+                        // const int klocal_token_idx  = TOKENS_PER_WARP * warpid + token_depth * 16
+                        // + lane16id; const int kglobal_token_idx = partition_start_token_idx +
+                        // klocal_token_idx;
+                        const int k_token_idx = local_token_idx + i;
+                        const int q_token_idx = warp_mtp_idx * MTP_PER_THREAD + mtp;
+                        d_out[gqa_ratio_loop][mtp][token_depth][i] +=
+                            {(k_token_idx <= (context_len - MTP)) || (q_token_idx >= (MTP - 1))
+                                 ? 0
+                                 : -FLT_MAX};
+                    }
+                }
+                if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
+                {
+                    const int klocal_token_idx =
+                        TOKENS_PER_WARP * warpid + token_depth * 16 + lane16id;
+                    const int kglobal_token_idx = partition_start_token_idx + klocal_token_idx;
+                    const int k_scale_idx =
+                        wg_start_kv_head_idx * num_blocks * BLOCK_SIZE + kglobal_token_idx;
+                    d_out[gqa_ratio_loop][mtp][token_depth] *=
+                        k_scale_ptr ? *(k_scale_ptr + k_scale_idx) : 1.0;
+                }
             }
         }
     }
@@ -482,9 +485,10 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                 const int local_token_idx = qkout_token_idx + token_depth * 16;
                 for(int i = 0; i < 4; i++)
                 {
-                    const float tmp = ((local_token_idx + i) < context_len * (warp_mtp_idx + 1))
-                                          ? d_out[gqa_ratio_loop][mtp][token_depth][i]
-                                          : -FLT_MAX;
+                    const float tmp =
+                        ((local_token_idx + i) < (context_len - 1) * (warp_mtp_idx + 1))
+                            ? d_out[gqa_ratio_loop][mtp][token_depth][i]
+                            : -FLT_MAX;
                     qk_max[gqa_ratio_loop][mtp] = fmaxf(qk_max[gqa_ratio_loop][mtp], tmp);
                 }
             }
@@ -588,6 +592,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                 for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
                     d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
+
                     if constexpr(LOGITS_RTZ_CONVERSION)
                     {
                         // use rtz conversion for better performance, with negligible impact on
@@ -711,6 +716,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                     }
                     else
                     {
+                        floatx4 tmp_out_depth = {0};
                         // KV cache fp8
                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
                         {
@@ -729,22 +735,27 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                                     const int offset2 = offset / ROWS_PER_WARP;
                                     // output format is 16 qheads across 16 lanes, 16 head elems
                                     // spread across 4 rows
-                                    tmp_out = gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
+                                    tmp_out_depth = gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
                                         reinterpret_cast<_T8x8*>(&Vtmp8x8)->i64,
                                         reinterpret_cast<_T8x8*>(
                                             &shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
                                                           [offset2][lane16id][offset1])
                                             ->i64,
-                                        tmp_out);
+                                        tmp_out_depth);
                                 }
                             }
                         }
+                        const int vlocal_token_idx =
+                            vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP +
+                            rowid * VTOKENS_PER_LANE;
+                        // Safe to use an int32_t here assuming we are working with < 2 billion
+                        // tokens
+                        const int vglobal_token_idx = partition_start_token_idx + vlocal_token_idx;
+                        const int v_scale_idx =
+                            wg_start_kv_head_idx * num_blocks * BLOCK_SIZE + vglobal_token_idx;
+                        tmp_out_depth *= v_scale_ptr ? *(v_scale_ptr + v_scale_idx) : 1.0;
+                        tmp_out += tmp_out_depth;
                     }
-                }
-                if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
-                {
-                    float v_scale = v_scale_ptr ? *v_scale_ptr : 1.0;
-                    tmp_out *= v_scale;
                 }
 
                 // apply post Softmax V mfma v_scale
