@@ -72,19 +72,11 @@ def get_dp_shared_expert_token_range(token_num, dp_size, rank):
 
 
 @functools.lru_cache(maxsize=1024)
-def get_dp_shared_expert_topk_ids(token_num, share_expert_num, device):
-    topk_ids_list = [list(range(share_expert_num)) for i in range(token_num)]
-    topk_ids = torch.tensor(topk_ids_list, dtype=dtypes.i32, device=device)
-    return topk_ids
-
-
-@functools.lru_cache(maxsize=1024)
 def get_dp_shared_expert_stage1_moe_sorting_result(
     token_num, share_expert_num, device, block_size_M, share_expert_score=1.0
 ):
-    topk_ids = get_dp_shared_expert_topk_ids(token_num, share_expert_num, device).view(
-        -1, 1
-    )
+    topk_ids_list = [[i] * token_num for i in range(share_expert_num)]
+    topk_ids = torch.tensor(topk_ids_list, dtype=dtypes.i32, device=device).view(-1, 1)
     topk_weights = torch.empty(
         (token_num * share_expert_num), dtype=dtypes.fp32, device=device
     )
@@ -102,14 +94,15 @@ def get_dp_shared_expert_stage1_moe_sorting_result(
     )
     del moe_buf
     del sorted_weights
-    return sorted_ids, sorted_expert_ids, num_valid_ids
+    return topk_ids, sorted_ids, sorted_expert_ids, num_valid_ids
 
 
 @functools.lru_cache(maxsize=1024)
 def get_dp_shared_expert_stage2_moe_sorting_result(
     token_num, share_expert_num, device, block_size_M, share_expert_score=1.0
 ):
-    topk_ids = get_dp_shared_expert_topk_ids(token_num, share_expert_num, device)
+    topk_ids_list = [list(range(share_expert_num)) for i in range(token_num)]
+    topk_ids = torch.tensor(topk_ids_list, dtype=dtypes.i32, device=device)
     topk_weights = torch.empty(
         (token_num, share_expert_num), dtype=dtypes.fp32, device=device
     )
@@ -126,7 +119,7 @@ def get_dp_shared_expert_stage2_moe_sorting_result(
         dispatch_policy=0,
     )
     del moe_buf
-    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
+    return topk_ids, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
 
 
 @functools.lru_cache(maxsize=1024)
@@ -610,8 +603,7 @@ def fused_moe_2stages(
         activation,
         doweight_stage1,
     )
-    topk_ids = get_dp_shared_expert_topk_ids(token_num, E, hidden_states.device)
-    sorted_ids, sorted_expert_ids, num_valid_ids = (
+    topk_ids, sorted_ids, sorted_expert_ids, num_valid_ids = (
         get_dp_shared_expert_stage1_moe_sorting_result(
             token_num, E, device, block_size_M
         )
@@ -633,7 +625,7 @@ def fused_moe_2stages(
             dtype=q_dtype_a,
             device=device,
         )
-        hidden_states = hidden_states.view(token_num, 1, model_dim).expand(-1, topk, -1)
+        hidden_states = hidden_states.view(1, token_num, model_dim).expand(topk, -1, -1)
         # aiter.moe_smoothquant_fwd(
         #     a1, hidden_states, sm1_scale, topk_ids, a1_scale
         # )
@@ -698,7 +690,7 @@ def fused_moe_2stages(
         sorted_weights=None,
     )
 
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = (
+    topk_ids, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = (
         get_dp_shared_expert_stage2_moe_sorting_result(
             token_num, E, device, block_size_M
         )
@@ -711,7 +703,7 @@ def fused_moe_2stages(
             dtype=q_dtype_a,
             device=device,
         )
-        # a2 = a2.view(topk, token_num, inter_dim).permute(1, 0, 2)
+        a2 = a2.view(topk, token_num, inter_dim).permute(1, 0, 2)
         aiter.smooth_per_token_scaled_quant(a2_tmp, a2, a2_scale, sm2_scale, topk_ids)
         a2 = a2_tmp
     elif quant_type == QuantType.per_1x32:
