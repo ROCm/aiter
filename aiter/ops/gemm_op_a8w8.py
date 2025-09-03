@@ -392,6 +392,7 @@ def gemm_a8w8_blockscale(
     else:
         return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
 
+
 def flatmm_a8w8_blockscale_ASM(
     XQ: Tensor,
     WQ: Tensor,
