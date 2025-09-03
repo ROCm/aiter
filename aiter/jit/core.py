@@ -416,7 +416,20 @@ def build_module(
                 prebuild=prebuild,
             )
             if is_python_module and not is_standalone:
-                shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
+                if prebuild == 1:
+                    shutil.copy(
+                        f"{opbd_dir}/{target_name}",
+                        f"{get_user_jit_dir()}/build/aiter_/build",
+                    )
+                elif prebuild == 2:
+                    from pathlib import Path
+
+                    src_dir = Path(opbd_dir)
+                    dst_dir = Path(get_user_jit_dir())
+                    for src_file in src_dir.glob("*.so"):
+                        shutil.move(str(src_file), str(dst_dir / src_file.name))
+                else:
+                    shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
             else:
                 shutil.copy(
                     f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"

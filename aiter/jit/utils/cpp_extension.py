@@ -1724,8 +1724,8 @@ def _write_ninja_file(
         for root, dirs, files in os.walk(o_path):
             for file in files:
                 mid_file_dir = o_path + file
-                if file.endswith(".so") and mid_file_dir not in objects:
-                    objects.append(mid_file_dir)
+                if file.endswith(".so") and file not in objects:
+                    objects.append(file)
 
     flags.append(f'ldflags = {" ".join(ldflags)}')
     if cuda_dlink_post_cflags:
@@ -1740,9 +1740,14 @@ def _write_ninja_file(
     if library_target is not None:
         link_rule = ["rule link"]
 
-        link_rule.append(
-            "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
-        )
+        if prebuild == 2:
+            link_rule.append(
+                f"  command = $cxx @$out.rsp $ldflags -Wl,-rpath,'$$ORIGIN' -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
+            )
+        else:
+            link_rule.append(
+                "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
+            )
 
         link = [f'build {library_target}: link {" ".join(objects)}']
 
