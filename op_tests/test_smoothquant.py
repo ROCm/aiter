@@ -139,31 +139,33 @@ def test_moe_Smoothquant_instance(
 
 
 def test_Smoothquant(l_dtype: list, l_m: list, l_n: list):
-    # print("\nstart Smoothquant test")
-    # for scaleType in [dtypes.fp32]:
-    #     for dtype in [dtypes.fp16, dtypes.bf16][1:]:
-    #         for qtype in [dtypes.i8]:
-    #             for n in l_n:
-    #                 df = []
-    #                 for m in l_m:
-    #                     ret = test_Smoothquant_instance(dtype, m, n, xscaleType=scaleType, quant_dtype=qtype)
-    #                     df.append(ret)
-    #                 df = pd.DataFrame(df)
-    #                 aiter.logger.info(f"summary:\n{df}")
+    print("\nstart Smoothquant test")
+    for scaleType in [dtypes.fp32]:
+        for dtype in [dtypes.fp16, dtypes.bf16][1:]:
+            for qtype in [dtypes.i8]:
+                for n in l_n:
+                    df = []
+                    for m in l_m:
+                        ret = test_Smoothquant_instance(
+                            dtype, m, n, xscaleType=scaleType, quant_dtype=qtype
+                        )
+                        df.append(ret)
+                    df = pd.DataFrame(df)
+                    aiter.logger.info(f"summary:\n{df}")
 
-    # print("\nstart topk Smoothquant test")
-    # for scaleType in [dtypes.fp32]:
-    #     for dtype in [dtypes.fp16, dtypes.bf16][1:]:
-    #         for qtype in [dtypes.i8, dtypes.fp8][1:]:
-    #             for n in l_n:
-    #                 df = []
-    #                 for m in l_m:
-    #                     ret = test_topK_Smoothquant_instance(
-    #                         dtype, m, n, xscaleType=scaleType, quant_dtype=qtype
-    #                     )
-    #                     df.append(ret)
-    #                 df = pd.DataFrame(df)
-    #                 aiter.logger.info(f"summary:\n{df}")
+    print("\nstart topk Smoothquant test")
+    for scaleType in [dtypes.fp32]:
+        for dtype in [dtypes.fp16, dtypes.bf16][1:]:
+            for qtype in [dtypes.i8, dtypes.fp8][1:]:
+                for n in l_n:
+                    df = []
+                    for m in l_m:
+                        ret = test_topK_Smoothquant_instance(
+                            dtype, m, n, xscaleType=scaleType, quant_dtype=qtype
+                        )
+                        df.append(ret)
+                    df = pd.DataFrame(df)
+                    aiter.logger.info(f"summary:\n{df}")
 
     print("\nstart moe Smoothquant test")
     for scaleType in [dtypes.fp32]:
