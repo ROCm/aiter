@@ -3,35 +3,35 @@
 
 #pragma once
 
-#include <string>
 #include "ck_tile/core.hpp"
 #include "ck_tile/host/kernel_launch.hpp"
 #include "ck_tile/ops/epilogue.hpp"
 #include "ck_tile/ops/flatmm.hpp"
 #include "ck_tile/ops/gemm.hpp"
 #include "m_grouped_gemm.h"
-#include <hip/hip_runtime.h>
 #include <ATen/ATen.h>
+#include <hip/hip_runtime.h>
+#include <string>
 
+#include <cstdlib>
+#include <initializer_list>
 #include <iostream>
 #include <numeric>
-#include <initializer_list>
-#include <cstdlib>
 
 #include <ATen/ATen.h>
-#include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <torch/extension.h>
 
 template <typename DataType,
-          int M_Tile_, 
-          int N_Tile_, 
-          int K_Tile_, 
-          int M_Warp_, 
-          int N_Warp_, 
-          int M_Warp_Tile_, 
-          int N_Warp_Tile_, 
+          int M_Tile_,
+          int N_Tile_,
+          int K_Tile_,
+          int M_Warp_,
+          int N_Warp_,
+          int M_Warp_Tile_,
+          int N_Warp_Tile_,
           int K_Warp_Tile_>
 struct MGroupedFlatmmConfig
 {
@@ -46,7 +46,8 @@ struct MGroupedFlatmmConfig
     static constexpr ck_tile::index_t M_Warp_Tile = M_Warp_Tile_;
     static constexpr ck_tile::index_t N_Warp_Tile = N_Warp_Tile_;
     // TODO:
-    static constexpr ck_tile::index_t K_Warp_Tile = 64 / sizeof(DataType); // sizeof(DataType) == 2 ? 32 : 64;
+    static constexpr ck_tile::index_t K_Warp_Tile =
+        64 / sizeof(DataType); // sizeof(DataType) == 2 ? 32 : 64;
 
     static constexpr bool kPadM = false;
     static constexpr bool kPadN = false;
@@ -67,52 +68,52 @@ struct MGroupedFlatmmConfig
 };
 
 template <typename FlatmmConfig,
-            typename ADataType,
-            typename BDataType,
-            typename DsDatatype,
-            typename AccDataType,
-            typename CDataType,
-            typename ALayout,
-            typename BLayout,
-            typename DsLayout,
-            typename ELayout,
-            bool persistent,
-            typename CDEElementWise,
-            typename KernelArguments>
+          typename ADataType,
+          typename BDataType,
+          typename DsDatatype,
+          typename AccDataType,
+          typename CDataType,
+          typename ALayout,
+          typename BLayout,
+          typename DsLayout,
+          typename ELayout,
+          bool persistent,
+          typename CDEElementWise,
+          typename KernelArguments>
 void grouped_flatmm(KernelArguments& args, ck_stream_config& s)
 {
     using CodegenFlatmmShape = ck_tile::TileGemmShape<
         ck_tile::sequence<FlatmmConfig::M_Tile, FlatmmConfig::N_Tile, FlatmmConfig::K_Tile>,
         ck_tile::sequence<FlatmmConfig::M_Warp, FlatmmConfig::N_Warp, FlatmmConfig::K_Warp>,
         ck_tile::sequence<FlatmmConfig::M_Warp_Tile,
-                        FlatmmConfig::N_Warp_Tile,
-                        FlatmmConfig::K_Warp_Tile>>;
+                          FlatmmConfig::N_Warp_Tile,
+                          FlatmmConfig::K_Warp_Tile>>;
 
     using TilePartitioner =
         ck_tile::GemmSpatiallyLocalTilePartitioner<CodegenFlatmmShape,
-                                                FlatmmConfig::TileParitionerGroupNum,
-                                                FlatmmConfig::TileParitionerM01>;
+                                                   FlatmmConfig::TileParitionerGroupNum,
+                                                   FlatmmConfig::TileParitionerM01>;
 
     using Traits = ck_tile::TileGemmTraits<FlatmmConfig::kPadM,
-                                        FlatmmConfig::kPadN,
-                                        FlatmmConfig::kPadK,
-                                        ALayout,
-                                        BLayout,
-                                        ELayout,
-                                        FlatmmConfig::NumWaveGroups>;
+                                           FlatmmConfig::kPadN,
+                                           FlatmmConfig::kPadK,
+                                           ALayout,
+                                           BLayout,
+                                           ELayout,
+                                           FlatmmConfig::NumWaveGroups>;
 
     using CodegenGemmTraits = ck_tile::TileGemmUniversalTraits<FlatmmConfig::kPadM,
-                                                            FlatmmConfig::kPadN,
-                                                            FlatmmConfig::kPadK,
-                                                            FlatmmConfig::DoubleSmemBuffer,
-                                                            ALayout,
-                                                            BLayout,
-                                                            ELayout,
-                                                            FlatmmConfig::TransposeC,
-                                                            FlatmmConfig::UseStructuredSparsity,
-                                                            persistent,
-                                                            FlatmmConfig::NumWaveGroups,
-                                                            true>;
+                                                               FlatmmConfig::kPadN,
+                                                               FlatmmConfig::kPadK,
+                                                               FlatmmConfig::DoubleSmemBuffer,
+                                                               ALayout,
+                                                               BLayout,
+                                                               ELayout,
+                                                               FlatmmConfig::TransposeC,
+                                                               FlatmmConfig::UseStructuredSparsity,
+                                                               persistent,
+                                                               FlatmmConfig::NumWaveGroups,
+                                                               true>;
 
     using GemmPipelineProblem =
         ck_tile::GemmPipelineProblem<ADataType, BDataType, AccDataType, CodegenFlatmmShape, Traits>;
@@ -154,7 +155,6 @@ void grouped_flatmm(KernelArguments& args, ck_stream_config& s)
                                              DsLayout,
                                              ELayout,
                                              CDEElementWise,
-                                             CodegenPipelineProblem::kBlockSize,
                                              TilePartitioner::MPerBlock,
                                              TilePartitioner::NPerBlock,
                                              FlatmmConfig::M_Warp,
@@ -198,7 +198,8 @@ void grouped_flatmm(KernelArguments& args, ck_stream_config& s)
         //     auto size_b_buffer = b_n.get_element_space_size_in_bytes() / BPackedSize;
 
         //     ck_tile::RotatingMemWrapper<ADataType, BDataType> rotating_mem(
-        //         kargs.a_ptr, kargs.b_shuffle_ptr, s.rotating_count_, size_a_buffer, size_b_buffer);
+        //         kargs.a_ptr, kargs.b_shuffle_ptr, s.rotating_count_, size_a_buffer,
+        //         size_b_buffer);
         //     rotating_mem.Print();
 
         //     auto run_flush_cache = [&]() {
@@ -209,7 +210,8 @@ void grouped_flatmm(KernelArguments& args, ck_stream_config& s)
         //         // clear c mem
         //         if(args.k_batch > 1)
         //             hipGetErrorString(hipMemsetAsync(
-        //                 args.e_ptr, 0, args.group_count * args.M * args.N * sizeof(CDataType), s.stream_id_));
+        //                 args.e_ptr, 0, args.group_count * args.M * args.N * sizeof(CDataType),
+        //                 s.stream_id_));
         //     };
         //     ave_time = ck_tile::launch_kernel_preprocess(
         //         s,
@@ -219,9 +221,8 @@ void grouped_flatmm(KernelArguments& args, ck_stream_config& s)
         // }
         // else
         // {
-        ck_tile::launch_kernel(s,
-                                ck_tile::make_kernel<blocks.x, FlatmmConfig::kBlockPerCu>(
-                                    Kernel{}, grids, blocks, 0, kargs));
+        ck_tile::launch_kernel(
+            s, ck_tile::make_kernel<FlatmmConfig::kBlockPerCu>(Kernel{}, grids, blocks, 0, kargs));
         // }
 
         // return ave_time;
@@ -233,26 +234,26 @@ void grouped_flatmm(KernelArguments& args, ck_stream_config& s)
             Run(has_hot_loop_,
                 tail_number_,
                 ck_tile::integral_constant<ck_tile::memory_operation_enum,
-                                        ck_tile::memory_operation_enum::set>{});
+                                           ck_tile::memory_operation_enum::set>{});
         }
         else
         {
             Run(has_hot_loop_,
                 tail_number_,
                 ck_tile::integral_constant<ck_tile::memory_operation_enum,
-                                        ck_tile::memory_operation_enum::atomic_add>{});
+                                           ck_tile::memory_operation_enum::atomic_add>{});
         }
     };
 
     if(tail_num == ck_tile::TailNumber::Odd)
     {
         RunSplitk(ck_tile::bool_constant<true>{},
-                ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Odd>{});
+                  ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Odd>{});
     }
     else if(tail_num == ck_tile::TailNumber::Even)
     {
         RunSplitk(ck_tile::bool_constant<true>{},
-                ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Even>{});
+                  ck_tile::integral_constant<ck_tile::TailNumber, ck_tile::TailNumber::Even>{});
     }
     else
     {

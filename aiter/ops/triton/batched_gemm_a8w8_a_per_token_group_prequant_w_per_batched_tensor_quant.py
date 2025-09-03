@@ -193,11 +193,11 @@ def _get_config(
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
+        _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT.json"
-        # print(f"fpath={fpath}")
         with open(fpath, "r") as file:
             config = json.load(file)
-        _get_config._config_dict = config
+        _get_config._config_dict["default"] = config
 
     key = f"{N}_{K}"
     if key not in _get_config._config_dict.keys():
@@ -224,7 +224,6 @@ def _get_config(
         return _get_config._config_dict[key]["large"]
     else:
         return _get_config._config_dict[key]["xlarge"]
-    return _get_config._config_dict[key]["any"]
 
 
 def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(

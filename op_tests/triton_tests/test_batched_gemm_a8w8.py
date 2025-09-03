@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import triton
 import pytest
 import functools
 from aiter.ops.triton.batched_gemm_a8w8 import batched_gemm_a8w8
@@ -31,20 +30,22 @@ def generate_batched_gemm_a8w8_inputs(
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
     if layout[0] == "T":
-        x = torch.randint(-20, 20, (B, M, K), dtype=torch.int8).cuda()
+        x = torch.randint(-20, 20, (B, M, K), dtype=torch.int8, device="cuda")
     else:
-        x = torch.randint(-20, 20, (B, K, M), dtype=torch.int8).cuda().permute(0, 2, 1)
-
-    if layout[1] == "N":
-        weight = torch.randint(-20, 20, (B, N, K), dtype=torch.int8).cuda()
-    else:
-        weight = (
-            torch.randint(-20, 20, (B, K, N), dtype=torch.int8).cuda().permute(0, 2, 1)
+        x = torch.randint(-20, 20, (B, K, M), dtype=torch.int8, device="cuda").permute(
+            0, 2, 1
         )
 
-    x_scale = torch.rand([B, M, 1], dtype=torch.float32).cuda() + 1e-6
-    w_scale = torch.rand([B, 1, N], dtype=torch.float32).cuda() + 1e-6
-    bias = torch.rand([B, 1, N], dtype=dtype).cuda() * 10
+    if layout[1] == "N":
+        weight = torch.randint(-20, 20, (B, N, K), dtype=torch.int8, device="cuda")
+    else:
+        weight = torch.randint(
+            -20, 20, (B, K, N), dtype=torch.int8, device="cuda"
+        ).permute(0, 2, 1)
+
+    x_scale = torch.rand([B, M, 1], dtype=torch.float32, device="cuda") + 1e-6
+    w_scale = torch.rand([B, 1, N], dtype=torch.float32, device="cuda") + 1e-6
+    bias = torch.rand([B, 1, N], dtype=dtype, device="cuda") * 10
 
     y = None
     if output:
@@ -141,7 +142,7 @@ def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
     a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y)
 
-    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
 
 
 @pytest.mark.parametrize(
@@ -165,4 +166,4 @@ def test_batched_gemm_a8w8_layout(dtype, b, m, n, k, layout, output):
     a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y)
 
-    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)

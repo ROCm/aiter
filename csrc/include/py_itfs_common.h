@@ -2,20 +2,20 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
-#include <torch/all.h>
 #include "aiter_hip_common.h"
+#include <torch/all.h>
 
-bool static isGPUArch(const std::vector<std::string> &archs)
+bool static isGPUArch(const std::vector<std::string>& archs)
 {
     hipDeviceProp_t props;
 
     hipGetDeviceProperties(&props, 0);
 
     std::string device_arch = props.gcnArchName;
-    for (std::string arch : archs)
+    for(std::string arch : archs)
     {
         size_t substring = device_arch.find(arch);
-        if (substring != std::string::npos)
+        if(substring != std::string::npos)
         {
             return true;
         }
@@ -29,7 +29,14 @@ const constexpr auto torch_fp8 = at::ScalarType::Float8_e4m3fn;
 const constexpr auto torch_fp8 = at::ScalarType::Float8_e4m3fnuz;
 #endif
 #else
-const auto torch_fp8 = isGPUArch({"gfx94"}) ? at::ScalarType::Float8_e4m3fnuz : at::ScalarType::Float8_e4m3fn;
+const auto torch_fp8 =
+    isGPUArch({"gfx94"}) ? at::ScalarType::Float8_e4m3fnuz : at::ScalarType::Float8_e4m3fn;
+#endif
+
+#ifdef TORCH_Float4_e2m1fn_x2
+const constexpr auto torch_fp4x2 = torch::kFloat4_e2m1fn_x2;
+#else
+const constexpr auto torch_fp4x2 = torch::kUInt8;
 #endif
 
 // clang-format off
@@ -54,16 +61,16 @@ template <> struct t2ck<int8_t> { using type = ck_tile::int8_t; };
 inline std::string torchDTypeToStr(caffe2::TypeMeta dtype)
 {
 #define TYPE_CASE(type, torch_type) \
-    case torch_type:                \
-    {                               \
+    case torch_type: {              \
         return type;                \
     }
 
-    switch (dtype.toScalarType())
+    switch(dtype.toScalarType())
     {
         FOREACH_BUFFER_TORCH_TYPE_MAP(TYPE_CASE);
     default:
-        throw std::runtime_error("CKPyInterface: Unsupported data type " + std::to_string((int8_t)(dtype.toScalarType())));
+        throw std::runtime_error("CKPyInterface: Unsupported data type " +
+                                 std::to_string((int8_t)(dtype.toScalarType())));
     }
 
 #undef TYPE_CASE

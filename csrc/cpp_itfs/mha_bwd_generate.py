@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
     AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter/jit/utils")  # pip install mode
 else:
@@ -69,7 +69,9 @@ float mha_bwd(mha_bwd_args args,
               bool deterministic,
               bool use_ext_asm,
               bool is_v3_atomic_fp32,
-              int how_v3_bf16_cvt)
+              int how_v3_bf16_cvt,
+              const void* seqlen_q_padded,
+              const void* seqlen_k_padded)
 {{
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
@@ -100,9 +102,9 @@ V2_API = "t = fmha_bwd(traits, args, stream_config);"
 
 V3_MULTI_TARGET_API = """
     if (get_gpu_arch() == "gfx942") {
-        t = gfx942::fmha_bwd_v3(traits, args, stream_config);
+        t = gfx942::fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded);
     } else if (get_gpu_arch() == "gfx950") {
-        t = gfx950::fmha_bwd_v3(traits, args, stream_config);
+        t = gfx950::fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded);
     } else {
         std::cout << "No supported GPU arch found!" << std::endl;
         return -1;
@@ -113,7 +115,7 @@ V3_MULTI_TARGET_API = """
 def get_v3_api():
     gfx_list = get_gfx_list()
     if len(gfx_list) == 1:
-        return f"t = {gfx_list[0]}::fmha_bwd_v3(traits, args, stream_config);"
+        return f"t = {gfx_list[0]}::fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded);"
     else:
         return V3_MULTI_TARGET_API
 

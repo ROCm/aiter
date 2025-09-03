@@ -329,6 +329,11 @@ def build_module(
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
+
+        import torch
+
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
@@ -519,7 +524,7 @@ MANUAL_SCHEMA_OPS = [
 NONE_WRAPPED_OP = [
     # "hipb_create_extension",
     # "hipb_destroy_extension",
-    # "getHipblasltKernelName",
+    "getHipblasltKernelName",
     # "rocb_create_extension",
     # "rocb_destroy_extension",
     "get_meta_buffer_ipc_handle",
@@ -543,7 +548,8 @@ SPECIAL_OPS_MUTATES_ARGS = {
     "biased_grouped_topk_hip": ["topk_weights", "topk_ids"],
     "moe_fused_gate": ["topk_weights", "topk_ids"],
     "grouped_topk": ["topk_weights", "topk_ids"],
-    "mha_varlen_fwd": ["out"],
+    "rope_cached_positions_2c_fwd_impl": ["input_x", "input_y"],
+    "rotary_embedding_fwd": ["query", "key"],
 }
 
 
