@@ -93,6 +93,10 @@ def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 @benchmark()
 def test_gemm_asm_mi350(dtype, m, n, k):
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if get_gfx() not in ["gfx950"]:
+        return
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
     print("block_shape", block_shape)
