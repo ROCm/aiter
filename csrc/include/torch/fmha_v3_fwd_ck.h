@@ -9,9 +9,6 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
                                        const at::Tensor& k, // [b, sk, hk, d]
                                        const at::Tensor& v, // [b, sk, hk, d_v]
                                        float softmax_scale,
-                                       bool is_causal,
-                                       int window_size_left,
-                                       int window_size_right,
-                                       bool return_softmax_lse);
+                                       bool is_causal);
 } // namespace torch_itfs
 } // namespace aiter

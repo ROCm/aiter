@@ -609,10 +609,7 @@
           py::arg("k"),                       \
           py::arg("v"),                       \
           py::arg("softmax_scale"),           \
-          py::arg("is_causal"),               \
-          py::arg("window_size_left"),        \
-          py::arg("window_size_right"),       \
-          py::arg("return_softmax_lse"));
+          py::arg("is_causal"));
 
 #define MHA_BATCH_PREFILL_PYBIND                  \
     m.def("mha_batch_prefill",                    \

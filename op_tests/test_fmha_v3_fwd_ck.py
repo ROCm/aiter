@@ -22,7 +22,6 @@ def run_torch(
     k,
     v,
     causal,
-    window_size,
     upcast=True,
     reorder_ops=False,
 ):
@@ -31,7 +30,6 @@ def run_torch(
         k,
         v,
         causal=causal,
-        window_size=window_size,
         upcast=upcast,
         reorder_ops=reorder_ops,
     )
@@ -78,7 +76,6 @@ def efficiency(flop, time_in_us):
     ],
 )
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("seed", [None])
@@ -90,7 +87,6 @@ def test_fmha_v3_fwd_ck(
     d,
     d_v,
     causal,
-    local,
     mha_type,
     dtype,
     seed,
@@ -101,9 +97,6 @@ def test_fmha_v3_fwd_ck(
     torch.cuda.empty_cache()
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
-    window_size = (
-        (-1, -1) if not local else tuple(torch.randint(0, seqlen_k, (2,)).tolist())
-    )
 
     if causal and seqlen_k < seqlen_q:
         pytest.skip("Causal attention not supported for seqlen_k < seqlen_q")
@@ -155,26 +148,11 @@ def test_fmha_v3_fwd_ck(
 
     attention = aiter.fmha_v3_fwd_ck_func
     if profile:
-        out, time = profile_func(
-            attention,
-            q,
-            k,
-            v,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-        )
+        out, time = profile_func(attention, q, k, v, causal=causal)
         tflops = efficiency(flops(batch_size, seqlen_q, d, nheads, causal), time)
         print(f"time: {time:.2f} us, {tflops:.2f} TFlops")
     else:
-        out = attention(
-            q,
-            k,
-            v,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-        )
+        out = attention(q, k, v, causal=causal)
 
     # print_tensor(out.squeeze(0).squeeze(1), 'O')
 
@@ -184,7 +162,6 @@ def test_fmha_v3_fwd_ck(
             k,
             v,
             causal=causal,
-            window_size=window_size,
         )
 
         # print_tensor(out_ref.squeeze(0).squeeze(1), 'out_ref')
@@ -194,7 +171,6 @@ def test_fmha_v3_fwd_ck(
             k,
             v,
             causal=causal,
-            window_size=window_size,
             upcast=False,
             reorder_ops=True,
         )
@@ -217,7 +193,6 @@ if __name__ == "__main__":
         seqlens: Tuple[int, ...]
         head_sizes: Tuple[int, ...]
 
-    local = False
     profile = True
     seed = 0
 
@@ -269,7 +244,6 @@ if __name__ == "__main__":
             d,
             d_v,
             causal,
-            local,
             mha_type,
             dtype,
             seed,

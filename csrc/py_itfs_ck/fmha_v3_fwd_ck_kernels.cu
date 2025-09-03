@@ -17,10 +17,7 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
                                        const at::Tensor& k, // [b, sk, hk, d]
                                        const at::Tensor& v, // [b, sk, hk, d_v]
                                        float softmax_scale,
-                                       bool is_causal,
-                                       int window_size_left,
-                                       int window_size_right,
-                                       bool return_softmax_lse)
+                                       bool is_causal)
 {
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == at::ScalarType::Half || q_dtype == at::ScalarType::BFloat16,
@@ -61,33 +58,16 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_q);
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
 
-    if(window_size_left >= seqlen_k)
-    {
-        window_size_left = -1;
-    }
-    if(window_size_right >= seqlen_k)
-    {
-        window_size_right = -1;
-    }
-
     mask_info mask;
     if(is_causal)
     {
         // Causal is the special case where window_size_right == 0 and window_size_left < 0.
-        window_size_right         = 0;
-        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0";
+        std::string mask_identify = "b:-1,0";
         mask                      = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // casual
-    }
-    else if(window_size_left == -1 && window_size_right == -1)
-    {
-        mask = mask_info::decode("0", seqlen_q, seqlen_k); // no mask
     }
     else
     {
-        // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-        std::string mask_identify =
-            "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
-        mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
+        mask = mask_info::decode("0", seqlen_q, seqlen_k); // no mask
     }
 
     ck_tile::fmha_fwd_v3_args args;
