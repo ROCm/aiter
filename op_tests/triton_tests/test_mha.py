@@ -313,13 +313,15 @@ def test_mha_with_pe(
     HEAD_SZ_QK: int,
     HEAD_SZ_V: int,
 ):
+    DUMP_TENSORS: bool = False
+
     device: str = "cuda"
     dtype: torch.dtype = torch.float16
     # |_ bfloat16 dtype didn't change anything
     DROPOUT: float = 0
     dropout_mask: torch.Tensor | None = None
-    RETURN_LSE: bool = False
-    RETURN_SOFTMAX: bool = False
+    RETURN_LSE: bool = DUMP_TENSORS
+    RETURN_SOFTMAX: bool = DUMP_TENSORS
     CAUSAL: bool = True
 
     torch.manual_seed(20)
@@ -343,8 +345,24 @@ def test_mha_with_pe(
         return_lse=RETURN_LSE,
         return_attn_probs=RETURN_SOFTMAX,
     )
+    if RETURN_LSE:
+        assert len(triton_out) > 1
+        triton_lse = triton_out[1]
+        # triton_lse.shape should be (BATCH, NUM_Q_HEADS, SEQLEN_Q)
+        # triton_lse.dtype should be float32.
+    if RETURN_SOFTMAX:
+        if RETURN_LSE:
+            assert len(triton_out) == 3
+            triton_sd_mask = triton_out[2]
+        else:
+            assert len(triton_out) == 2
+            triton_sd_mask = triton_out[1]
+        # triton_sd_mask.shape should be (BATCH, NUM_Q_HEADS, SEQLEN_Q, SEQLEN_K),
+        # triton_sd_mask.dtype should be float32
+    if RETURN_SOFTMAX or RETURN_LSE:
+        triton_out = triton_out[0]
 
-    torch_out = attention_ref(
+    torch_out, torch_attn = attention_ref(
         q,
         k,
         v,
@@ -354,9 +372,8 @@ def test_mha_with_pe(
         # upcast=False,
         # |_ avoiding upcast didn't change anything
     )
-    torch_out, _ = torch_out
-
-    DUMP_TENSORS: bool = False
+    # torch_attn.shape should be (BATCH, NUM_Q_HEADS, SEQLEN_Q, SEQLEN_K),
+    # torch_attn.dtype should be float16
 
     if DUMP_TENSORS:
         import numpy as np
@@ -370,8 +387,14 @@ def test_mha_with_pe(
             k=torch_to_np(k),
             v=torch_to_np(v),
             triton_out=torch_to_np(triton_out),
+            triton_lse=torch_to_np(triton_lse),
+            triton_sd_mask=torch_to_np(triton_sd_mask),
             torch_out=torch_to_np(torch_out),
+            torch_attn=torch_to_np(torch_attn),
         )
+        # print(f"triton_lse => {triton_lse.dtype} {triton_lse.shape}")
+        # print(f"triton_sd_mask => {triton_sd_mask.dtype} {triton_sd_mask.shape}")
+        # print(f"torch_attn => {torch_attn.dtype} {torch_attn.shape}")
 
     # This assertion is failing:
     # Mismatched elements: 45966898 / 67108864 (68.5%)
