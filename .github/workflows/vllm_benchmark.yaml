@@ -1,0 +1,52 @@
+name: vLLM Benchmark
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vllm_image_build:
+    runs-on: aiter-k8s-build
+    env:
+        VLLM_BRANCH: "main"
+        VLLM_REPOSITORY_URL: "https://github.com/ROCm/vllm"
+
+    steps:
+      - name: Checkout code with retry
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          command: |
+            git clone --branch ${{ env.VLLM_BRANCH }} ${{ env.VLLM_REPOSITORY_URL }}
+
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push images
+        run: |
+          cd vllm
+          docker build --no-cache -f docker/Dockerfile.rocm_base --build-arg AITER_BRANCH=${{ env.GITHUB_COMMIT_SHA }} --build-arg AITER_REPO=${{ env.GITHUB_REPO_URL }} --build-arg PYTORCH_ROCM_ARCH=gfx942 -t vllm_aiter_base .
+          docker build --no-cache -f docker/Dockerfile.rocm --build-arg BASE_IMAGE=vllm_aiter_base -t rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} .
+          docker push rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
+        env:
+          GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
+          GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+
+      - name: Upload test logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: triton-test-logs
+          path: test-reports/triton.xml
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f triton_test || true
