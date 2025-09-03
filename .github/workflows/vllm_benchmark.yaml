@@ -16,6 +16,8 @@ jobs:
     env:
         VLLM_BRANCH: "main"
         VLLM_REPOSITORY_URL: "https://github.com/ROCm/vllm"
+        GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
+        GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
     steps:
       - name: Checkout code with retry
@@ -35,18 +37,33 @@ jobs:
           docker build --no-cache -f docker/Dockerfile.rocm_base --build-arg AITER_BRANCH=${{ env.GITHUB_COMMIT_SHA }} --build-arg AITER_REPO=${{ env.GITHUB_REPO_URL }} --build-arg PYTORCH_ROCM_ARCH=gfx942 -t vllm_aiter_base .
           docker build --no-cache -f docker/Dockerfile.rocm --build-arg BASE_IMAGE=vllm_aiter_base -t rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} .
           docker push rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
-        env:
-          GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
-          GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
-      - name: Upload test logs
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: triton-test-logs
-          path: test-reports/triton.xml
+  vllm_benchmark:
+    runs-on: mi300x-8gpu
+    needs: vllm_image_build
+    env:
+        GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
+        GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+        
+    steps:
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Run benchmarks
+        run: |
+          #!/usr/bin/bash
+          set -x -o pipefail
+          docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+              --ulimit core=0:0 --ulimit memlock=-1:-1 --cap-add=SYS_PTRACE \
+              -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} -e VLLM_ROCM_USE_AITER=1 \
+              rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} python3 /app/vllm/benchmarks/benchmark_latency.py \
+                  --model mistralai/Mixtral-8x7B-Instruct-v0.1 --batch-size 1 \
+                  --input-len 128 --output-len 128 -tp 8 --num-scheduler-steps 10 \
+                  --load-format dummy |& tee result.log
+          grep "Avg latency:" result.log | awk '{print \$3}'
 
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f triton_test || true
+          docker rm -f vllm_aiter_base || true
+          docker rm -f rocm_aiter || true
