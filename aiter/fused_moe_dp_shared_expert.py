@@ -67,8 +67,9 @@ def moe_sorting(
 def get_dp_shared_expert_token_range(token_num, dp_size, rank):
     per_dp_token = (token_num + dp_size - 1) // dp_size
     start = min(per_dp_token * rank, token_num)
-    end = min(per_dp_token * (rank + 1), token_num) 
+    end = min(per_dp_token * (rank + 1), token_num)
     return start, end
+
 
 @functools.lru_cache(maxsize=1024)
 def get_dp_shared_expert_topk_ids(token_num, share_expert_num, device):
@@ -76,11 +77,17 @@ def get_dp_shared_expert_topk_ids(token_num, share_expert_num, device):
     topk_ids = torch.tensor(topk_ids_list, dtype=dtypes.i32, device=device)
     return topk_ids
 
+
 @functools.lru_cache(maxsize=1024)
-def get_dp_shared_expert_stage1_moe_sorting_result(token_num, share_expert_num, device, block_size_M, share_expert_score=1.0):
-    topk_ids_list = [[i] * token_num for i in range(share_expert_num)]
-    topk_ids = torch.tensor(topk_ids_list, dtype=dtypes.i32, device=device).view(-1, 1)
-    topk_weights = torch.empty((token_num * share_expert_num), dtype=dtypes.fp32, device=device)
+def get_dp_shared_expert_stage1_moe_sorting_result(
+    token_num, share_expert_num, device, block_size_M, share_expert_score=1.0
+):
+    topk_ids = get_dp_shared_expert_topk_ids(token_num, share_expert_num, device).view(
+        -1, 1
+    )
+    topk_weights = torch.empty(
+        (token_num * share_expert_num), dtype=dtypes.fp32, device=device
+    )
     topk_weights.fill_(share_expert_score)
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
@@ -99,9 +106,13 @@ def get_dp_shared_expert_stage1_moe_sorting_result(token_num, share_expert_num, 
 
 
 @functools.lru_cache(maxsize=1024)
-def get_dp_shared_expert_stage2_moe_sorting_result(token_num, share_expert_num, device, block_size_M, share_expert_score=1.0):
+def get_dp_shared_expert_stage2_moe_sorting_result(
+    token_num, share_expert_num, device, block_size_M, share_expert_score=1.0
+):
     topk_ids = get_dp_shared_expert_topk_ids(token_num, share_expert_num, device)
-    topk_weights = torch.empty((token_num, share_expert_num), dtype=dtypes.fp32, device=device)
+    topk_weights = torch.empty(
+        (token_num, share_expert_num), dtype=dtypes.fp32, device=device
+    )
     topk_weights.fill_(share_expert_score)
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
@@ -148,12 +159,13 @@ def fused_moe_dp_share_expert(
     dtype=None,
     dp_size=1,
     dp_rank=0,
-    moe_buf: Optional[torch.tensor] = None, # you can use no-shared expert result here, it will atomic add to it
+    moe_buf: Optional[
+        torch.tensor
+    ] = None,  # you can use no-shared expert result here, it will atomic add to it
 ):
     """user API"""
     orig_M, model_dim = hidden_states.shape
-    start, end = get_dp_shared_expert_token_range(
-        orig_M, dp_size, dp_rank)
+    start, end = get_dp_shared_expert_token_range(orig_M, dp_size, dp_rank)
     hidden_states_dp = hidden_states[start:end]
     M = end - start
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -576,7 +588,7 @@ def fused_moe_2stages(
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
 ):
-    
+
     quant_func = get_quant(quant_type)
 
     token_num, _ = hidden_states.shape
@@ -599,7 +611,11 @@ def fused_moe_2stages(
         doweight_stage1,
     )
     topk_ids = get_dp_shared_expert_topk_ids(token_num, E, hidden_states.device)
-    sorted_ids, sorted_expert_ids, num_valid_ids = get_dp_shared_expert_stage1_moe_sorting_result(token_num, E, device, block_size_M)
+    sorted_ids, sorted_expert_ids, num_valid_ids = (
+        get_dp_shared_expert_stage1_moe_sorting_result(
+            token_num, E, device, block_size_M
+        )
+    )
 
     if a1_scale is not None and hidden_states.dtype != q_dtype_a:
         sm1_scale = a1_scale
@@ -611,16 +627,18 @@ def fused_moe_2stages(
         sm2_scale = None
 
     if sm1_scale is not None:
-        a1_scale = torch.empty(
-            (token_num, topk, 1), device=device, dtype=dtypes.fp32
-        )
+        a1_scale = torch.empty((token_num, topk, 1), device=device, dtype=dtypes.fp32)
         a1 = torch.empty(
             (token_num, topk, model_dim),
             dtype=q_dtype_a,
             device=device,
         )
-        aiter.moe_smoothquant_fwd(
-            a1, hidden_states, sm1_scale, topk_ids, a1_scale
+        hidden_states = hidden_states.view(token_num, 1, model_dim).expand(-1, topk, -1)
+        # aiter.moe_smoothquant_fwd(
+        #     a1, hidden_states, sm1_scale, topk_ids, a1_scale
+        # )
+        aiter.smooth_per_token_scaled_quant(
+            a1, hidden_states, a1_scale, sm1_scale, topk_ids
         )
         a1 = a1.view(-1, model_dim)
     elif quant_type == QuantType.per_1x32:
@@ -679,24 +697,23 @@ def fused_moe_2stages(
         w1_scale=w1_scale,
         sorted_weights=None,
     )
-    
 
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = get_dp_shared_expert_stage2_moe_sorting_result(token_num, E, device, block_size_M)
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = (
+        get_dp_shared_expert_stage2_moe_sorting_result(
+            token_num, E, device, block_size_M
+        )
+    )
 
     if sm2_scale is not None:
-            a2_scale = torch.empty(
-                (token_num, topk, 1), device=device, dtype=dtypes.fp32
-            )
-            a2_tmp = torch.empty(
-                (token_num, topk, inter_dim),
-                dtype=q_dtype_a,
-                device=device,
-            )
-            a2 = a2.view(topk, token_num, inter_dim).permute(1, 0, 2)
-            aiter.smooth_per_token_scaled_quant(
-                a2_tmp, a2, a2_scale, sm2_scale, topk_ids
-            )
-            a2 = a2_tmp
+        a2_scale = torch.empty((token_num, topk, 1), device=device, dtype=dtypes.fp32)
+        a2_tmp = torch.empty(
+            (token_num, topk, inter_dim),
+            dtype=q_dtype_a,
+            device=device,
+        )
+        # a2 = a2.view(topk, token_num, inter_dim).permute(1, 0, 2)
+        aiter.smooth_per_token_scaled_quant(a2_tmp, a2, a2_scale, sm2_scale, topk_ids)
+        a2 = a2_tmp
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
         a2, a2_scale = quant_func(
@@ -839,6 +856,7 @@ def torch_moe(
     activation=ActivationType.Silu,
 ):
     from aiter import pertoken_quant
+
     computeType = dtypes.fp32
     dtype = hidden_states.dtype
     torch_act = aiter.get_torch_act(activation)
@@ -884,7 +902,9 @@ def torch_moe(
                 sub_tokens = sub_tokens * (fc1_smooth_scale[E_id])
 
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
-            act_out = torch_moe_act(act_input, torch_act, inter_dim).to(dtype).to(computeType)
+            act_out = (
+                torch_moe_act(act_input, torch_act, inter_dim).to(dtype).to(computeType)
+            )
             if fc2_smooth_scale is not None:
                 act_out = act_out * (fc2_smooth_scale[E_id])
             act_out_q, scale = pertoken_quant(act_out, quant_dtype=quant_dtype)
