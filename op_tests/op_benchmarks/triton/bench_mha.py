@@ -213,7 +213,8 @@ def run_benchmark(custom, args):
 
         fused_backward = "fused-bwd" in provider
 
-        mha_set_use_fused_bwd_kernel(fused_backward)
+        # FIXME: Dirty hack to disable fused benchmarking, since PE isn't implemented in fused.
+        mha_set_use_fused_bwd_kernel(False)
 
         # Default softmax scale to match standard attention
         if sm_scale is None:
@@ -291,6 +292,7 @@ def run_benchmark(custom, args):
             return 0
 
         # Generate base inputs
+        # FIXME: Dirty hack to hardcode (DQK, DV) = (192, 128).
         q = torch.randn((BATCH, N_CTX_Q, HQ, 192), device=device, dtype=dtype)
         k = torch.randn((BATCH, N_CTX_K, HK, 192), device=device, dtype=dtype)
         v = torch.randn((BATCH, N_CTX_K, HK, 128), device=device, dtype=dtype)
