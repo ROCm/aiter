@@ -153,7 +153,7 @@ def sytrd_lower(A, nb=32, nx=16):
 
 def symmetric_random(n, seed=0):
     rng = np.random.default_rng(seed)
-    A = np.array(np.random.standard_normal((n, n)), order="F")
+    A = np.array(rng.standard_normal((n, n)), order="F")
     A = (A + A.T) / 2.0
     return A
 
