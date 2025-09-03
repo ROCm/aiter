@@ -369,6 +369,10 @@ struct MlaMetadataV1KernelParameter
     int32_t        reduce_indptr_size;
     int32_t        kv_granularity;
     bool           is_causal;
+
+    const int32_t* p_test_params;
+    int32_t*       p_test_outputs;
+    int32_t        stride_test_outputs;
 };
 
 // This version just follows Flashinfer
@@ -490,7 +494,7 @@ CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v2(
 }
 
 template <typename Traits, bool kOnlyGatherWorkCount>
-CK_TILE_DEVICE void generate_work(
+CK_TILE_DEVICE int32_t generate_work(
     const int32_t       batch_idx,
     const int32_t       tile_idx,
     const int32_t       qo_len,
@@ -515,6 +519,7 @@ CK_TILE_DEVICE void generate_work(
 {
     int32_t remaining_kv_len = kv_len;
     int32_t kv_start_local = 0;
+    int32_t num_splits = 0;
 
     const int32_t kv_len_limit_floor =
         ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len, num_clusters), kv_granularity);
@@ -586,6 +591,7 @@ CK_TILE_DEVICE void generate_work(
             }
 
             ++p_cluster_work_counter[cid];
+            ++num_splits;
         }
 
         // Update state
@@ -593,6 +599,8 @@ CK_TILE_DEVICE void generate_work(
         kv_start_local += kv_len_consuming;
     }
     while (remaining_kv_len > 0);
+
+    return num_splits;
 }
 
 template <typename T>
@@ -623,7 +631,7 @@ CK_TILE_DEVICE T warp_prefix_sum(T value, const int32_t size)
     return value;
 }
 
-template <typename Traits>
+template <typename Traits, bool kTunable>
 __launch_bounds__(ck_tile::get_warp_size(), 1)
 __global__ void kn_get_mla_metadata_v1(
     const MlaMetadataV1KernelParameter params)
@@ -631,6 +639,10 @@ __global__ void kn_get_mla_metadata_v1(
     extern __shared__ uint8_t p_smem[];
 
     const int32_t lane_idx = ck_tile::get_lane_id();
+
+    int32_t* p_test_metadata = params.p_test_outputs + 0 * params.stride_test_outputs;
+    int32_t* p_test_num_splits = params.p_test_outputs + 1 * params.stride_test_outputs;
+    int32_t* p_test_workloads = params.p_test_outputs + 2 * params.stride_test_outputs;
 
     // Step.0. Get sequence lengths of query/output and key/value for each batch.
     int32_t* p_batch_idx = reinterpret_cast<int32_t*>(p_smem);
@@ -714,10 +726,24 @@ __global__ void kn_get_mla_metadata_v1(
     const int32_t tot_qo_tiles = warp_sum(p_qo_tiles, params.num_batches);
 
     const int32_t workload_limit_global =
-        params.num_heads == 16 ?
+    [&]() {
+        if constexpr (kTunable)
+        {
+            if (params.p_test_params[0] > 0)
+                return ck_tile::integer_least_multiple(params.p_test_params[0], params.kv_granularity);
+        }
+        return params.num_heads == 16 ?
             cal_workload_limit_global_v1(
                 workload_avg, workload_var, cluster_len_q, num_qo_tiles, num_clusters, params.kv_granularity) :
             cal_workload_limit_global_v0(workload_sum, num_clusters, params.kv_granularity);
+    }();
+    if constexpr (kTunable)
+    {
+        if (lane_idx == 0)
+        {
+            p_test_metadata[0] = workload_limit_global;
+        }
+    }
 #if PRINT_DBG
     if (lane_idx == 0)
     {
@@ -760,11 +786,19 @@ __global__ void kn_get_mla_metadata_v1(
                 cal_packed_causal_kv_len(
                     qo_len, kv_len, tid, packed_qo_tile_len, num_qo_tiles, params.num_heads, params.is_causal);
 
-            generate_work<Traits, true>(
+            const int32_t num_splits = generate_work<Traits, true>(
                 bid, tid, qo_len, tile_kv_len, qo_tile_len, packed_qo_tile_len, qo_batch_start, kv_batch_start,
                 kv_batch_end, workload_limit_global, num_clusters, params.kv_granularity, nullptr,
                 p_num_qo_clusters_indptr, nullptr, nullptr, nullptr, nullptr, nullptr, p_cost_heap,
                 p_cluster_work_counter);
+
+            if constexpr (kTunable)
+            {
+                if (lane_idx==0)
+                {
+                    p_test_num_splits[bid] = num_splits;
+                }
+            }
         }
     }
 
@@ -892,6 +926,17 @@ __global__ void kn_get_mla_metadata_v1(
         params.p_work_metadata_ptrs[1] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(params.p_work_info_set_raw));
     }
 
+    if constexpr (kTunable)
+    {
+        if (lane_idx == 0)
+        {
+            for (int32_t cid = 0; cid < num_clusters; ++cid)
+            {
+                p_test_workloads[cid] = p_cost_heap[cid];
+            }
+        }
+    }
+
 #if PRINT_DBG
     if (lane_idx == 0)
     {
@@ -918,6 +963,8 @@ void get_mla_metadata_v1_device(
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
     torch::Tensor&       reduce_partial_map,
+    torch::Tensor*       p_test_params,
+    torch::Tensor*       p_test_outputs,
     std::optional<std::map<std::string, int32_t>> split_params)
 {
     TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
@@ -928,6 +975,8 @@ void get_mla_metadata_v1_device(
                 __func__, ": seqlens_kv_indptr should be continuous!");
     TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
                 __func__, ": seqlens_kv_indptr's element type should be int!");
+    TORCH_CHECK((p_test_params == nullptr) == (p_test_outputs == nullptr),
+                __func__, ": test parameters should be in same type!");
 
     int32_t kv_granularity = 16;
     int32_t max_seqlen_qo = -1;
@@ -1016,10 +1065,24 @@ void get_mla_metadata_v1_device(
     params.kv_granularity       = kv_granularity;
     params.is_causal            = is_causal;
 
+    if (p_test_params != nullptr)
+    {
+        params.p_test_params       = p_test_params->data_ptr<int32_t>();
+        params.p_test_outputs      = p_test_outputs->data_ptr<int32_t>();
+        params.stride_test_outputs = p_test_outputs->stride(0);
+    }
+
     // launch kernel
     const dim3 grid = dim3(1, 1, 1);
     const int32_t num_thr = dev_prop.warpSize; // only use 1 warp for simplicity
-    kn_get_mla_metadata_v1<Traits><<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
+    if (p_test_params != nullptr)
+    {
+        kn_get_mla_metadata_v1<Traits, true><<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
+    }
+    else
+    {
+        kn_get_mla_metadata_v1<Traits, false><<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
+    }
 }
 
 template <typename Traits>
@@ -1340,6 +1403,50 @@ void get_mla_metadata_v1(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+        nullptr,
+        nullptr,
+        split_params);
+}
+
+void get_mla_metadata_v1_tunable(
+    const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
+    const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
+    const int32_t        num_heads_per_head_k,
+    const int32_t        num_heads_k,
+    const bool           is_causal,
+    torch::Tensor&       work_metadata_ptrs,
+    torch::Tensor&       work_info_set,
+    torch::Tensor&       work_indptr,
+    torch::Tensor&       reduce_indptr,
+    torch::Tensor&       reduce_final_map,
+    torch::Tensor&       reduce_partial_map,
+    torch::Tensor&       test_params,
+    torch::Tensor&       test_outputs,
+    std::optional<std::map<std::string, int32_t>> split_params)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
+
+    // This default settings is for our ASM MLA decode kernel. This kernel supports num_heads=16 and qo size from 1 to 4
+    // without support to split qo for each workgroup. This means that kPackedQoLenPerWg should be 4*16=64 to prevent
+    // spliting in any case supported by it.
+    //                                PackedQoLenPerWg, MaxClusterSize
+    using Traits  = MlaMetadataTraits<64,               1>;
+
+    get_mla_metadata_v1_device<Traits>(
+        seqlens_qo_indptr,
+        seqlens_kv_indptr,
+        num_heads_per_head_k,
+        num_heads_k,
+        is_causal,
+        false,
+        work_metadata_ptrs,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        &test_params,
+        &test_outputs,
         split_params);
 }
 
