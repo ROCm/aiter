@@ -306,20 +306,7 @@ def test_fmoe_ep(
             f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:>8.2f}TB/s"
         )
 
-        if use_smooth and (
-            (
-                (inter_dim % 512 == 0 or inter_dim % 320 == 0)
-                and (w1b.dtype == dtypes.fp8 and inter_dim * 2 == w1b.shape[1])
-            )
-            or (
-                (inter_dim % 320 == 0)
-                and (w1b.dtype == dtypes.i8 and inter_dim * 2 == w1b.shape[1])
-            )
-            or (
-                (inter_dim % 512 == 0)
-                and (w1b.dtype == dtypes.i8 and inter_dim == w1b.shape[1])
-            )
-        ):
+        if use_smooth:
             out_b2, avg_b2 = asm_moe_test(
                 input,
                 w1b,
@@ -593,7 +580,7 @@ for test in l_test:
                                 topk,
                                 quant="int8smoothquant",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=0,
                                 ep=ep,
                             )
     elif test == "g1u1_fp8smoothquant":
