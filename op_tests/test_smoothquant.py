@@ -126,16 +126,26 @@ def test_moe_Smoothquant_instance(
     (a, yscale_a), avg_a = run_torch_topk(
         input, x_scale=xscale, topk_id=topk_id, quant_dtype=quant_dtype
     )
+    (b, yscale_b), avg_b = run_hip(
+        input.expand(-1, topk, -1),
+        x_scale=xscale,
+        topk_id=topk_id,
+        quant_dtype=quant_dtype,
+    )
     (c, yscale_c), avg_c = run_ck_moe_smoothquant(
         input, x_scale=xscale, topk_id=topk_id, quant_dtype=quant_dtype
     )
+
+    err_b = checkAllclose(a.to(dtypes.fp32), b.to(dtypes.fp32), rtol=0.01, atol=0.01)
+    checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
+
     _, ids = torch.sort(topk_id.view(-1))
     a = a.view(-1, n)[ids].view(m, topk, n)
     yscale_a = yscale_a.view(-1, 1)[ids].view(m, topk, 1)
 
     err_c = checkAllclose(a.to(dtypes.fp32), c.to(dtypes.fp32), rtol=0.01, atol=0.01)
     checkAllclose(yscale_a, yscale_c, rtol=1e-3, atol=1e-3)
-    return {"hip us": avg_c, "err hip": err_c}
+    return {"hip us": avg_b, "hip err": err_b, "ck us": avg_c, "ckerr": err_c}
 
 
 def test_Smoothquant(l_dtype: list, l_m: list, l_n: list):
