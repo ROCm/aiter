@@ -374,7 +374,12 @@ def gemm_a8w8_bpreshuffle(
 
 
 def gemm_a8w8_blockscale(
-    XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, dtype=dtypes.bf16
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype=dtypes.bf16,
+    isBpreshuffled=False,
 ):
     assert dtype in [
         dtypes.bf16,
@@ -383,13 +388,16 @@ def gemm_a8w8_blockscale(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    get_CKGEMM_config(m, n, k, "a8w8_blockscale_tuned_gemm.csv")
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     from aiter.jit.utils.chip_info import get_gfx
 
-    if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
-        return mi350_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
+    if isBpreshuffled:
+        if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
+            return mi350_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
+        else:
+            assert 0, f"asm kernel only support B preshuffle and m >= 16"
     else:
+        get_CKGEMM_config(m, n, k, "a8w8_blockscale_tuned_gemm.csv")
         return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
