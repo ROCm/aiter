@@ -21,7 +21,6 @@ def input_helper(
     H,
     S,
     kv_lora_rank,
-    rotary_dim,
     qk_rope_head_dim,
     num_kv_splits,
     dtype,
@@ -29,11 +28,10 @@ def input_helper(
     rope_base=10,
     rope_max_seq_len=16324,
     rope_scaling=1.0,
-    equal_seqlens=False,
-    is_neox_style=True,
+    varlen=False,
     mtp=0,
 ):
-    if not equal_seqlens:
+    if varlen:
         seqlens = torch.randint(1, S + 1, (B,), dtype=torch.int32, device=device)
     else:
         seqlens = torch.full((B,), S, dtype=torch.int32, device=device)
@@ -52,35 +50,27 @@ def input_helper(
 
     q = torch.randn(B, SQ, H, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
     kv_cache = torch.randn(
-        total_seqlen, HK, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
+        total_seqlen, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
     )
+    # q = torch.randn(B, H, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
+    # kv_cache = torch.randn(
+    #     total_seqlen, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
+    # )
 
     # interlancing [batch_start_off, batch_seq_len, batch_start_off, batch_seq_len, ...,]
     kv_indptr = cu_seqlens
     kv_indices = torch.arange(total_seqlen, device=device)
 
-    attn_logits = torch.empty(
-        B, H, num_kv_splits, kv_lora_rank + 1, dtype=dtype, device=device
+    attn_logits = torch.zeros(
+        B * SQ, H, num_kv_splits, kv_lora_rank, dtype=torch.float, device=device
+    )
+    attn_lse = torch.zeros(
+        B * SQ, H, num_kv_splits, 1, dtype=torch.float, device=device
     )
 
-    rotary_emb = DeepseekScalingRotaryEmbedding(
-        qk_rope_head_dim,
-        rotary_dim,
-        rope_max_seq_len,
-        rope_base,
-        is_neox_style,
-        rope_scaling,
-        q.dtype,
-        device=device,
-    )
+    o = torch.zeros(B * SQ, H, kv_lora_rank, dtype=dtype, device=device)
 
-    positions = (
-        torch.tensor([S], device=device).unsqueeze(0).repeat(B, 1)
-    )  # k positions and q position as last
-
-    o = torch.empty(B, H, kv_lora_rank, dtype=dtype, device=device)
-
-    return kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, o
+    return kv_indptr, kv_indices, q, kv_cache, attn_logits, attn_lse, o
 
 
 def ref_preprocess(kv_cache, kv_lora_rank):
@@ -557,3 +547,4 @@ def test_op_fwd_rope_integration(
 
     torch.testing.assert_close(ref_logits, tri_logits, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(ref_o, tri_o, atol=1e-2, rtol=1e-2)
+
