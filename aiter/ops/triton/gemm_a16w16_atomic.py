@@ -29,6 +29,7 @@ _LOGGER = AiterTritonLogger()
 def _gemm_a16_w16_atomic_kernel(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M,
     N,
@@ -49,6 +50,7 @@ def _gemm_a16_w16_atomic_kernel(
     cache_modifier: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -97,6 +99,15 @@ def _gemm_a16_w16_atomic_kernel(
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+        if ADD_BIAS & (pid_k == 0):
+            accumulator = tl.load(bias_ptr + offs_bn, cache_modifier=".cg").to(
+                dtype=acc_dtype
+            )
+            accumulator = tl.broadcast_to(
+                accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
+            )
+        else:
+            accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
             # Load the next block of A and B, generate a mask by checking the K dimension.
@@ -176,6 +187,7 @@ def _get_config(
 def gemm_a16w16_atomic(
     x,
     w,
+    bias: Optional[torch.Tensor] = None,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
@@ -186,6 +198,7 @@ def gemm_a16w16_atomic(
     Key parameters:
     - X: Matrix X with shape (M, K).
     - W: Matrix W with shape (N, K).
+    - bias: Vector with shape (N).
     - dtype: Optional parameter to specifcy bf16 or fp16 datatype. Default is bf16
     - Y: Output Matrix Y with shape (M, N). If this is none, then it's created by this API and returned as output
 
@@ -197,10 +210,9 @@ def gemm_a16w16_atomic(
         f"GEMM_A16W16_ATOMIC: x.shape={tuple(x.shape)}, w.shape={tuple(w.shape)} "
     )
 
-    w = w.T
-
     M, K = x.shape
-    K, N = w.shape
+    N, K = w.shape
+    w = w.T
 
     if config is None:
         config = _get_config(M, N, K)
@@ -229,6 +241,7 @@ def gemm_a16w16_atomic(
     _gemm_a16_w16_atomic_kernel[grid](
         x,
         w,
+        bias,
         y,
         M,
         N,
@@ -239,6 +252,7 @@ def gemm_a16w16_atomic(
         w.stride(1),
         y.stride(0),
         y.stride(1),
+        ADD_BIAS=(bias is not None),
         **config,
     )
 

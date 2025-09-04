@@ -98,15 +98,15 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
-    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
+    x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output, bias=True)
 
-    torch_out = F.linear(x, w, bias=None)
+    torch_out = F.linear(x, w, bias=bias)
 
     # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
     if output:
         y = y.to(torch.float32).zero_()
-        triton_out = gemm_a16w16_atomic(x, w, torch.float32, y).to(dtype)
+        triton_out = gemm_a16w16_atomic(x, w, bias, torch.float32, y).to(dtype)
     else:
-        triton_out = gemm_a16w16_atomic(x, w, dtype=torch.float32).to(dtype)
+        triton_out = gemm_a16w16_atomic(x, w, bias, dtype=torch.float32).to(dtype)
 
     triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
