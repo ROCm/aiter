@@ -34,6 +34,8 @@ class TestConfig:
         Number of the kv heads
     head_dim : int
         feature dimention per head
+    hidden_size: int
+        feature dimention in attention
     intermediate_size : int
         feature dimention in MLP module
     is_moe : bool
@@ -44,17 +46,19 @@ class TestConfig:
     attention_head: int
     kv_head: int
     head_dim: int
+    hidden_size: int
     intermediate_size: int
     is_moe: bool
 
 
 TEST_CONFIGS = {
-    # model,                  model_name,   attention_head,   kv_head,   head_dim,  intermediate_size    is_moe
-    "Qwen3-32B": TestConfig("Qwen3-32B", 64, 8, 80, 25600, False),
-    "Qwen3-30B": TestConfig("Qwen3-30B", 16, 16, 128, 6144, True),
-    "Qwen3-235B": TestConfig("Qwen3-235B", 32, 32, 128, 12288, True),
-    "Llama3-70B": TestConfig("Llama3-70B", 64, 8, 128, 28672, False),
-    "Llama3-405B": TestConfig("Llama3-405B", 128, 8, 128, 53248, False),
+    # model,                  model_name,   attention_head,   kv_head,   head_dim,  hidden_size, intermediate_size    is_moe
+    "Qwen3-32B": TestConfig("Qwen3-32B", 64, 8, 80, 5120, 25600, False),
+    "Qwen3-30B": TestConfig("Qwen3-30B", 16, 16, 128, 2048, 6144, True),
+    "Qwen3-235B": TestConfig("Qwen3-235B", 32, 32, 128, 4096, 12288, True),
+    "Llama3-70B": TestConfig("Llama3-70B", 64, 8, 128, 8192, 28672, False),
+    "Llama3-405B": TestConfig("Llama3-405B", 128, 8, 128, 16384, 53248, False),
+    "gpt-oss-120B": TestConfig("gpt-oss-120B", 64, 8, 64, 2880, 2880, True),
 }
 
 
@@ -239,25 +243,24 @@ class GemmTestRunner:
             if self.get_model_in_single_card and (tp == 8 or tp == 4):
                 continue
 
-            hidden_size = config.attention_head * config.head_dim
             # attn qkv fused gemm
-            QKV_K = hidden_size
+            QKV_K = config.hidden_size
             QKV_N = (
                 config.attention_head // tp + 2 * ((config.kv_head + tp - 1) // tp)
             ) * config.head_dim
             # attn output gemm
             Out_K = (config.attention_head // tp) * config.head_dim
-            Out_N = hidden_size
+            Out_N = config.hidden_size
 
             if not config.is_moe:
                 # mlp up-gate fused gemm
-                Up_Gate_K = hidden_size
+                Up_Gate_K = config.hidden_size
                 Up_Gate_N = config.intermediate_size * 2 // tp
                 # mlp up-gate non-fused gemm
                 Up_N = config.intermediate_size // tp
                 # mlp down gemm
                 Down_K = config.intermediate_size // tp
-                Down_N = hidden_size
+                Down_N = config.hidden_size
 
             for m in M:
                 records.append(Record(M=m, N=QKV_N, K=QKV_K, TP=tp))
