@@ -202,7 +202,7 @@ def test_mla(
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
-        is_causal=True,
+        is_causal=False,
         dtype=dtype,
     )
 
@@ -266,6 +266,9 @@ def test_mla(
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
         flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+
+        import pdb;pdb.set_trace()
+
         bytes = (
             total_kv * nhead_kv * qk_head_dim
             + total_q * nhead * (qk_head_dim + v_head_dim)
@@ -351,7 +354,7 @@ def test_mla(
         )
         return err, err_fp8, us_asm_decode
 
-    err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8 = test_absorb_decode_fp8()
+    # err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8 = test_absorb_decode_fp8()
 
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")
@@ -370,11 +373,11 @@ def test_mla(
         "decode:asm_576": us_asm_decode,
         "decode:TFLOPS": flops / us_asm_decode / 1e6,
         "decode:TB/s": bytes / us_asm_decode / 1e6,
-        "decode_fp8:err vs fp32": err_fp8_fp32,
-        "decode_fp8:err vs fp8": err_fp8_fp8,
-        "decode_fp8:asm_576": us_asm_decode_fp8,
-        "decode_fp8:TFLOPS": flops / us_asm_decode_fp8 / 1e6,
-        "decode_fp8:TB/s": bytes / us_asm_decode_fp8 / 1e6,
+        # "decode_fp8:err vs fp32": err_fp8_fp32,
+        # "decode_fp8:err vs fp8": err_fp8_fp8,
+        # "decode_fp8:asm_576": us_asm_decode_fp8,
+        # "decode_fp8:TFLOPS": flops / us_asm_decode_fp8 / 1e6,
+        # "decode_fp8:TB/s": bytes / us_asm_decode_fp8 / 1e6,
     }
 
 

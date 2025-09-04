@@ -221,25 +221,66 @@ def mla_decode_fwd(
         )
         return logits, final_lse
 
-    aiter.mla_decode_stage1_asm_fwd(
-        q,
+    from aiter.ops.triton.mla_decode_ps import (
+        decode_grouped_att_m_fwd_ps,
+    )
+    import aiter.ops.triton.utils.arch_info as arch_info
+    import json
+
+    @functools.lru_cache(maxsize=1024)
+    def _get_config():
+        if not hasattr(_get_config, "_config_dict"):
+            dev = arch_info.get_device()
+            _get_config._config_dict = {}
+            fpath = f"aiter/ops/triton/configs/{dev}-MLA_DECODE_ROPE-DEFAULT.json"
+            with open(fpath, "r") as file:
+                config = json.load(file)
+            _get_config._config_dict = config
+
+        return _get_config._config_dict
+
+    config = _get_config()["fwd_grouped_kernel_stage1_rope"]
+
+
+    qo_len = 2
+
+    decode_grouped_att_m_fwd_ps(
+        q.reshape(-1, nhead * qo_len, 576),               # [B, Sq, hq, 576]
+        kv_buffer,        # [Pages, hk, 576]
         kv_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_lens,
-        num_kv_splits_indptr,
-        work_meta_data,
+        logits.reshape(-1, nhead * qo_len, 512),
+        attn_lse.reshape(-1, nhead * qo_len, 1),
+        o.reshape(-1, nhead * qo_len, 512),
         work_indptr,
         work_info_set,
-        max_seqlen_q,
+        512,  # c
+        kv_indptr,
+        kv_indices,
         sm_scale,
-        logits,
-        attn_lse,
-        o,
-        q_scale,
-        kv_scale,
+        logit_cap,
+        qo_len - 1,
+        config,
     )
+
+    # aiter.mla_decode_stage1_asm_fwd(
+    #     q,
+    #     kv_buffer,
+    #     qo_indptr,
+    #     kv_indptr,
+    #     kv_indices,
+    #     kv_last_page_lens,
+    #     num_kv_splits_indptr,
+    #     work_meta_data,
+    #     work_indptr,
+    #     work_info_set,
+    #     max_seqlen_q,
+    #     sm_scale,
+    #     logits,
+    #     attn_lse,
+    #     o,
+    #     q_scale,
+    #     kv_scale,
+    # )
 
     aiter.mla_reduce_v1(
         logits,
