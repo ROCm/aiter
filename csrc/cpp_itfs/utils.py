@@ -207,7 +207,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
             cxxflags += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         archs = validate_and_update_archs()
         cxxflags += [f"--offload-arch={arch}" for arch in archs]
-        cxxflags = [flag for flag in set(cxxflags) if hip_flag_checker(f)]
+        cxxflags = [flag for flag in set(cxxflags) if hip_flag_checker(flag)]
         makefile_file = makefile_template.render(
             includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags
         )
