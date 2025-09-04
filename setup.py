@@ -52,6 +52,17 @@ def getMaxJobs():
     return max_jobs
 
 
+def is_develop_mode():
+    return "develop" in sys.argv
+
+
+if is_develop_mode():
+    with open("./aiter/install_mode", "w") as f:
+        f.write("develop")
+else:
+    with open("./aiter/install_mode", "w") as f:
+        f.write("install")
+
 if IS_ROCM:
     assert os.path.exists(
         ck_dir
