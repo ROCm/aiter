@@ -1104,7 +1104,7 @@ def _flash_attn_forward(
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    if can_impl_fmha_v3_fwd():
+    if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
         out, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,
