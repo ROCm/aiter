@@ -195,9 +195,6 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
             "Gluon implementation is not supported on this device (requires CDNA4)."
         )
 
-    if impl == "gluon" and N == 2112 and K == 7168:
-        pytest.skip()
-
     dtype = str_to_torch_dtype[dtype]
     x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
         M,
