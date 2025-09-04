@@ -1,0 +1,13 @@
+{
+  "small" : {
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 128,
+    "GROUP_SIZE_M": 1,
+    "num_warps": 8,
+    "num_stages": 2,
+    "waves_per_eu": 2,
+    "matrix_instr_nonkdim": 16
+  }
+}
+
+  
