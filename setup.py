@@ -53,7 +53,14 @@ def getMaxJobs():
 
 
 def is_develop_mode():
-    return "develop" in sys.argv
+    for arg in sys.argv:
+        if arg == "develop":
+            return True
+        # pip install -e
+        elif "editable" in arg:
+            return True
+    else:
+        return False
 
 
 if is_develop_mode():
