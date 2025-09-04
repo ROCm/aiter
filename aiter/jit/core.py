@@ -18,7 +18,7 @@ from packaging.version import parse, Version
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from torch_guard import torch_compile_guard  # noqa: E402
+from torch_guard import torch_compile_guard, is_torch_equal_or_newer  # noqa: E402
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
 from chip_info import get_gfx
@@ -162,20 +162,28 @@ def hip_flag_checker(flag_hip: str) -> bool:
 
 
 def check_and_set_ninja_worker():
-    max_num_jobs_cores = int(max(1, os.cpu_count() * 0.8))
-    if int(os.environ.get("MAX_JOBS", "1")) < max_num_jobs_cores:
-        import psutil
+    max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
+    import psutil
 
-        # calculate the maximum allowed NUM_JOBS based on free memory
-        free_memory_gb = psutil.virtual_memory().available / (
-            1024**3
-        )  # free memory in GB
-        max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
+    # calculate the maximum allowed NUM_JOBS based on free memory
+    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
+    max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
-        # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-        max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
-        max_jobs = str(max_jobs)
-        os.environ["MAX_JOBS"] = max_jobs
+    # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
+    max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
+    max_jobs_env = os.environ.get("MAX_JOBS")
+    if max_jobs_env != None:
+        try:
+            max_processes = int(max_jobs_env)
+            # too large value
+            if max_processes > max_jobs:
+                os.environ["MAX_JOBS"] = str(max_jobs)
+        # error value
+        except ValueError:
+            os.environ["MAX_JOBS"] = str(max_jobs)
+    # none value
+    else:
+        os.environ["MAX_JOBS"] = str(max_jobs)
 
 
 def rename_cpp_to_cu(els, dst, recurisve=False):
@@ -408,7 +416,20 @@ def build_module(
                 prebuild=prebuild,
             )
             if is_python_module and not is_standalone:
-                shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
+                if prebuild == 1:
+                    shutil.copy(
+                        f"{opbd_dir}/{target_name}",
+                        f"{get_user_jit_dir()}/build/aiter_/build",
+                    )
+                elif prebuild == 2:
+                    from pathlib import Path
+
+                    src_dir = Path(opbd_dir)
+                    dst_dir = Path(get_user_jit_dir())
+                    for src_file in src_dir.glob("*.so"):
+                        shutil.move(str(src_file), str(dst_dir / src_file.name))
+                else:
+                    shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
             else:
                 shutil.copy(
                     f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
@@ -939,8 +960,12 @@ def compile_ops(
             )
 
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
+            if is_torch_equal_or_newer("2.8.0"):
+                tags = ()
+            else:
+                tags = (torch.Tag.needs_fixed_stride_order,)
             op_schema = f"aiter::wrapper_{loadName}" + schema
-            aiter_lib.define(op_schema, tags=())
+            aiter_lib.define(op_schema, tags=tags)
             aiter_lib.impl(
                 f"aiter::wrapper_{loadName}", outer_wrapper, dispatch_key="CUDA"
             )
