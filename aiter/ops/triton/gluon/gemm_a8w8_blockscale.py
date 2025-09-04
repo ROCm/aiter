@@ -461,7 +461,9 @@ def _get_config(
             config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
     config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
 
-    config = config.copy() # avoid later inplace modification from interacting with cached config
+    config = (
+        config.copy()
+    )  # avoid later inplace modification from interacting with cached config
     return config
 
 
