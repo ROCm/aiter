@@ -44,12 +44,12 @@
 #define DIVIDE_ROUND_UP(a, b) (((a) + (b)-1) / (b))
 
 #if defined(__HIP__GFX9__)
-// grid (num_seqs, num_partitions, num_kv_heads)
+// grid (num_seqs, max_num_partitions, num_kv_heads)
 // block (256)
 // clang-format off
 template <typename scalar_t, typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE, int BLOCK_SIZE,
-          int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED, int GQA_RATIO, int MTP=1, bool CAUSAL=false>
+          int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED, int GQA_RATIO, int MTP=1>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,         // [num_seqs*mtp, num_heads, head_size]
@@ -421,22 +421,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                     }
                 }
                 d_out[gqa_ratio_loop][mtp][token_depth] *= scale2;
-                if constexpr(CAUSAL)
-                {
-                    const int local_token_idx = qkout_token_idx + token_depth * 16;
-                    for(int i = 0; i < 4; i++)
-                    {
-                        // const int klocal_token_idx  = TOKENS_PER_WARP * warpid + token_depth * 16
-                        // + lane16id; const int kglobal_token_idx = partition_start_token_idx +
-                        // klocal_token_idx;
-                        const int k_token_idx = local_token_idx + i;
-                        const int q_token_idx = warp_mtp_idx * MTP_PER_THREAD + mtp;
-                        d_out[gqa_ratio_loop][mtp][token_depth][i] +=
-                            {(k_token_idx <= (context_len - MTP)) || (q_token_idx >= (MTP - 1))
-                                 ? 0
-                                 : -FLT_MAX};
-                    }
-                }
+
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
                 {
                     const int klocal_token_idx =
@@ -478,6 +463,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
 
     for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
     {
+        const int q_token_idx = warp_mtp_idx + mtp * MTP_PARALLEL_THREADS;
         for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
         {
             for(int token_depth = 0; token_depth < TLOOP; token_depth++)
@@ -485,10 +471,10 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                 const int local_token_idx = qkout_token_idx + token_depth * 16;
                 for(int i = 0; i < 4; i++)
                 {
-                    const float tmp =
-                        ((local_token_idx + i) < (context_len - 1) * (warp_mtp_idx + 1))
-                            ? d_out[gqa_ratio_loop][mtp][token_depth][i]
-                            : -FLT_MAX;
+                    const float tmp             = ((local_token_idx + i) <
+                                       (context_len * (warp_mtp_idx + 1) - MTP + q_token_idx))
+                                                      ? d_out[gqa_ratio_loop][mtp][token_depth][i]
+                                                      : -FLT_MAX;
                     qk_max[gqa_ratio_loop][mtp] = fmaxf(qk_max[gqa_ratio_loop][mtp], tmp);
                 }
             }
@@ -504,10 +490,11 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                 const int local_token_idx = qkout_token_idx + token_depth * 16;
                 for(int i = 0; i < 4; i++)
                 {
-                    const float tmp = ((local_token_idx + i) < context_len * (warp_mtp_idx + 1))
-                                          ? __expf(d_out[gqa_ratio_loop][mtp][token_depth][i] -
+                    const float tmp                            = ((local_token_idx + i) <
+                                       (context_len * (warp_mtp_idx + 1) - MTP + q_token_idx + 1))
+                                                                     ? __expf(d_out[gqa_ratio_loop][mtp][token_depth][i] -
                                                    qk_max[gqa_ratio_loop][mtp])
-                                          : 0.0f;
+                                                                     : 0.0f;
                     d_out[gqa_ratio_loop][mtp][token_depth][i] = tmp;
                     exp_sum[gqa_ratio_loop][mtp] += tmp;
                 }
@@ -857,10 +844,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
     const int max_num_partitions,
     const float* __restrict__ fp8_out_scale_ptr)
 {
-    const auto num_heads = gridDim.x;
-    const auto MTP       = gridDim.z;
-    const auto head_idx  = blockIdx.x;
-    const auto seq_idx   = blockIdx.y;
+    const auto MTP     = gridDim.z;
+    const auto seq_idx = blockIdx.y;
     // NOTE queries with sequence len > 1 are prefills and taken care by another
     // kernel.
     if(query_start_loc_ptr != nullptr &&
@@ -869,11 +854,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
         return;
     }
 
-    const int context_len                    = context_lens[seq_idx];
-    const int num_partitions                 = DIVIDE_ROUND_UP(context_len, PARTITION_SIZE);
-    [[maybe_unused]] constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
-    const auto warpid                        = threadIdx.x / WARP_SIZE;
-    [[maybe_unused]] const auto laneid       = threadIdx.x % WARP_SIZE;
+    const int context_len = context_lens[seq_idx];
     const int64_t query_start_off =
         static_cast<int64_t>(query_start_loc_ptr ? query_start_loc_ptr[seq_idx] : seq_idx * MTP);
     _paged_attention_ll4mi_reduce_kernel<scalar_t,
@@ -895,7 +876,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
 template <typename scalar_t, typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE, int BLOCK_SIZE,
           int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED,
-          int GQA_RATIO, int MTP=1, bool CAUSAL=false>
+          int GQA_RATIO, int MTP=1>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
