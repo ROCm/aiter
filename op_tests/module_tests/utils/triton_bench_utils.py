@@ -34,8 +34,8 @@ def get_avg_latency(filename, kernel_name_key_list):
     p25_idx = sort_idx[len(sort_idx) // 4]
     p75_idx = sort_idx[len(sort_idx) // 4 * 3]
     runtime = runtime_list[p50_idx]
-    runtime_25 = runtime_list[p25_idx]
-    runtime_75 = runtime_list[p75_idx]
+    # runtime_25 = runtime_list[p25_idx]
+    # runtime_75 = runtime_list[p75_idx]
 
     print(f"{runtime : .3f} (us)")
     return runtime
