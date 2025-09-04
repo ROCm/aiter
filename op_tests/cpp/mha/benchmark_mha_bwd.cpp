@@ -2,6 +2,7 @@
 // Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "ck_tile/host.hpp"
 #include "mha_bwd.h"
+#include "mha_bwd_param_v3_check.h"
 #include "utils.hpp"
 
 #include <array>
@@ -100,7 +101,9 @@ auto create_args(int argc, char* argv[])
             "if set to 0 will use atomic fp16/bf16(w/o convert_dq kernel) when bwd_v3 is set to 1")
         .insert("v3_bf16_cvt",
                 "1",
-                "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ");
+                "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
+        .insert("is_check_v3_param", "0", "if set to 1, will check param is match fwd_v3 mode")
+        .insert("arch", "gfx942", "only needded when is_check_v3_param set to be 1, arch support gfx942 and gfx950");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -578,6 +581,32 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              p_undrop,
                              drop_seed_offset};
     }();
+
+    bool is_check_v3_param = arg_parser.get_bool("is_check_v3_param");
+    const std::string arch = arg_parser.get_str("arch");
+
+    if (is_check_v3_param) {
+        auto arch_version = (arch == "gfx942") ?
+            arch_enum::gfx942 : arch_enum::gfx950;
+        bool check_v3 = mha_bwd_v3_check(arch_version,
+                                    fmha_args,
+                                    stream_config,
+                                    data_type,
+                                    mode == mode_enum::group,
+                                    mask.type,
+                                    bias.type,
+                                    use_dbias,
+                                    s_randval,
+                                    deterministic,
+                                    bwd_v3,
+                                    v3_atomic_fp32,
+                                    v3_bf16_cvt);
+        if (check_v3 != bwd_v3) {
+            printf("\n[Error]:bwd_v3 param check is wrong!\n");
+        } else {
+            printf("\n[Success]:bwd_v3 param check is correct!\n");
+        }
+    }
 
     float ave_time = aiter::mha_bwd(fmha_args,
                                     stream_config,

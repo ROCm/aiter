@@ -3,6 +3,7 @@
 #include "ck_tile/host.hpp"
 #include "ck_tile/ref/naive_attention.hpp"
 #include "mha_fwd.h"
+#include "mha_fwd_param_v3_check.h"
 #include "rotary.hpp"
 #include "utils.hpp"
 
@@ -135,7 +136,9 @@ auto create_args(int argc, char* argv[])
         .insert("v3_bf16_cvt",
                 "1",
                 "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
-        .insert("fwd_v3", "0", "if set to 1, some cases will call the fwd v3 kernel");
+        .insert("fwd_v3", "0", "if set to 1, some cases will call the fwd v3 kernel")
+        .insert("is_check_v3_param", "0", "if set to 1, will check param is match fwd_v3 mode")
+        .insert("arch", "gfx942", "only needded when is_check_v3_param set to be 1, arch support gfx942 and gfx950");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -1040,29 +1043,53 @@ bool run(const ck_tile::ArgParser& arg_parser)
 #if CK_TILE_FMHA_FWD_SPLITKV_API
         if(1 < num_splits || use_kvcache)
         {
-            aiter::mha_fwd_splitkv_args fmha_splitkv_args;
-            init_args(fmha_splitkv_args);
+            // aiter::mha_fwd_splitkv_args fmha_splitkv_args;
+            // init_args(fmha_splitkv_args);
 
-            return aiter::mha_fwd_splitkv(fmha_splitkv_args,
-                                          stream_config,
-                                          data_type,
-                                          mode == mode_enum::group,
-                                          mask.type,
-                                          bias.type,
-                                          lse);
+            // return aiter::mha_fwd_splitkv(fmha_splitkv_args,
+            //                               stream_config,
+            //                               data_type,
+            //                               mode == mode_enum::group,
+            //                               mask.type,
+            //                               bias.type,
+            //                               lse);
         }
 #endif
         aiter::mha_fwd_args fmha_args;
         init_args(fmha_args);
+
+        bool is_check_v3_param = arg_parser.get_bool("is_check_v3_param");
+        std::string arch = arg_parser.get_str("arch");
+
+        if (is_check_v3_param) {
+            auto arch_version = (arch == "gfx942") ?
+                arch_enum::gfx942 : arch_enum::gfx950;
+            bool check_fwd_v3 = mha_fwd_v3_check(arch_version,
+                                        fmha_args,
+                                        stream_config,
+                                        data_type,
+                                        mode == mode_enum::group,
+                                        mask.type,
+                                        bias.type,
+                                        lse,
+                                        fwd_v3,
+                                        v3_bf16_cvt);
+            if (check_fwd_v3 != fwd_v3) {
+                printf("\n[Error]:fwd_v3 param check is wrong!\n");
+            } else {
+                printf("\n[Success]:fwd_v3 param check is correct!\n");
+            }
+        }
+
         return aiter::mha_fwd(fmha_args,
-                              stream_config,
-                              data_type,
-                              mode == mode_enum::group,
-                              mask.type,
-                              bias.type,
-                              lse,
-                              fwd_v3,
-                              v3_bf16_cvt);
+                        stream_config,
+                        data_type,
+                        mode == mode_enum::group,
+                        mask.type,
+                        bias.type,
+                        lse,
+                        fwd_v3,
+                        v3_bf16_cvt);
     }();
 
     if(fwd_ave_time < 0.0f)
