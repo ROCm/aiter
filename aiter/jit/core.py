@@ -80,7 +80,8 @@ if find_aiter is not None:
             # develop mode
             isDevelopMode = f.read().strip() == "develop"
     except FileNotFoundError:
-        isDevelopMode = False
+        # pip install -e
+        isDevelopMode = True
 
     if isDevelopMode:
         AITER_META_DIR = AITER_ROOT_DIR
