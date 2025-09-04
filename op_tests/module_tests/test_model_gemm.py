@@ -11,7 +11,6 @@ import argparse
 
 from aiter.jit.utils.chip_info import get_gfx
 from utils.gemm_utils import save_gemm_benchmark_result, save_untuned_gemm_csv
-from op_tests.module_tests.utils.triton_bench_utils import run_triton_a4w4
 
 # Setup logging
 logging.basicConfig(
@@ -219,6 +218,7 @@ def run_a4w4_gemm(dtype, record, run_triton=False):
 
     latency_triton = 0.0
     if run_triton:
+        from op_tests.module_tests.utils.triton_bench_utils import run_triton_a4w4
         latency_triton = run_triton_a4w4(record.M, record.N, record.K)
 
     return latency, latency_asm, latency_triton
@@ -535,7 +535,7 @@ def create_argument_parser():
         const=None,
         default=None,
         help="""Data type.
-        e.g.: -d bf16""",
+        e.g.: --dtype bf16""",
     )
     parser.add_argument(
         "--quant_dtype",
@@ -545,7 +545,7 @@ def create_argument_parser():
         const=None,
         default=None,
         help="""Date type of quantization.
-        e.g.: -q fp8""",
+        e.g.: --quant_dtype fp8""",
     )
     parser.add_argument(
         "--fp8_quant_method",
@@ -555,7 +555,7 @@ def create_argument_parser():
         const=None,
         default=None,
         help="""fp8 quantization method.
-        e.g.: -qm per_token""",
+        e.g.: --fp8_quant_method per_token""",
     )
     parser.add_argument(
         "--model",
@@ -565,7 +565,7 @@ def create_argument_parser():
         const=None,
         default=None,
         help="""Supported model.
-        e.g. -m Llama3-70B""",
+        e.g. --model Llama3-70B""",
     )
     parser.add_argument(
         "--m",
@@ -574,7 +574,7 @@ def create_argument_parser():
         const=None,
         default=None,
         help="""M dimention of GEMM.
-        e.g.: -m 1024,2048""",
+        e.g.: --m 1024,2048""",
     )
     parser.add_argument(
         "-tp",
