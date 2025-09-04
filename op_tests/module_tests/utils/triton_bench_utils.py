@@ -55,8 +55,8 @@ def run_triton_a4w4(M, N, K):
         str(K),
     ]
     command_str = " ".join(cmd)
-    print("--------command_str={}".format(command_str))
-    process = subprocess.run(cmd, stderr=subprocess.STDOUT, text=True)
+    print("command_string={}".format(command_str))
+    subprocess.run(cmd, stderr=subprocess.STDOUT, text=True)
 
     filename = "results_res.csv"
     kernel_name_key_list = ["gemm"]
@@ -77,8 +77,8 @@ def run_triton_a8w8_blockscale(M, N, K):
         str(K),
     ]
     command_str = " ".join(cmd)
-    print("--------command_str={}".format(command_str))
-    process = subprocess.run(cmd, stderr=subprocess.STDOUT, text=True)
+    print("command_string={}".format(command_str))
+    subprocess.run(cmd, stderr=subprocess.STDOUT, text=True)
 
     filename = "results_res.csv"
     kernel_name_key_list = ["gemm"]
@@ -99,8 +99,8 @@ def run_triton_a8w8_per_token(M, N, K):
         str(K),
     ]
     command_str = " ".join(cmd)
-    print("--------command_str={}".format(command_str))
-    process = subprocess.run(cmd, stderr=subprocess.STDOUT, text=True)
+    print("command_string={}".format(command_str))
+    subprocess.run(cmd, stderr=subprocess.STDOUT, text=True)
 
     filename = "results_res.csv"
     kernel_name_key_list = ["gemm"]
@@ -121,8 +121,8 @@ def run_triton_a8w8_per_tensor(M, N, K):
         str(K),
     ]
     command_str = " ".join(cmd)
-    print("--------command_str={}".format(command_str))
-    process = subprocess.run(cmd, stderr=subprocess.STDOUT, text=True)
+    print("command_string={}".format(command_str))
+    subprocess.run(cmd, stderr=subprocess.STDOUT, text=True)
 
     filename = "results_res.csv"
     kernel_name_key_list = ["gemm"]
@@ -143,8 +143,8 @@ def run_triton_a16w16(M, N, K):
         str(K),
     ]
     command_str = " ".join(cmd)
-    print("--------command_str={}".format(command_str))
-    process = subprocess.run(cmd, stderr=subprocess.STDOUT, text=True)
+    print("command_string={}".format(command_str))
+    subprocess.run(cmd, stderr=subprocess.STDOUT, text=True)
 
     filename = "results_res.csv"
     kernel_name_key_list = ["gemm"]
