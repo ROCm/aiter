@@ -560,7 +560,7 @@ def create_argument_parser():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["Qwen3-32B", "Qwen3-30B", "Qwen3-235B", "Llama3-70B", "Llama3-405B"],
+        choices=["Qwen3-32B", "Qwen3-30B", "Qwen3-235B", "Llama3-70B", "Llama3-405B", "gpt-oss-120B"],
         nargs="?",
         const=None,
         default=None,
