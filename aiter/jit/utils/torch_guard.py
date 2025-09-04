@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+from packaging import version
+from packaging.version import Version
+import importlib
 
 
 aiter_lib = None
@@ -77,3 +80,27 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
         return outer_wrapper
 
     return decorator
+
+
+def is_torch_equal_or_newer(target: str) -> bool:
+    """Check if the installed torch version is >= the target version.
+
+    Args:
+        target: a version string, like "2.6.0".
+
+    Returns:
+        Whether the condition meets.
+    """
+    import torch
+
+    try:
+        return _is_torch_equal_or_newer(str(torch.__version__), target)
+    except Exception:
+        # Fallback to PKG-INFO to load the package info, needed by the doc gen.
+        return Version(importlib.metadata.version("torch")) >= Version(target)
+
+
+# Helper function used in testing.
+def _is_torch_equal_or_newer(torch_version: str, target: str) -> bool:
+    torch_version = version.parse(torch_version)
+    return torch_version >= version.parse(target)
