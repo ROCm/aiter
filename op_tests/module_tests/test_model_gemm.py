@@ -130,8 +130,7 @@ def run_a16w16_gemm(dtype, record, run_triton=False):
     latency_triton = 0.0
     if run_triton:
         from op_tests.module_tests.utils.triton_bench_utils import run_triton_a16w16
-
-        latency_triton = run_triton_a16w16(M, N, K)
+        latency_triton = run_triton_a16w16(record.M, record.N, record.K)
     return latency, latency_asm, latency_triton
 
 
@@ -154,6 +153,7 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
     elif fp8_quant_method == "per_token":
         from op_tests.test_gemm_a8w8 import test_gemm
 
+        logger.info(f"Running AITER per_token gemm_a8w8: MNK={record.M},{record.N},{record.K}")
         ret = test_gemm(dtype, record.M, record.N, record.K, dtypes.fp8)
         ck_time = ret["ck us"]
         ck_bpreshuffle_time = ret["ck bpreshuffle us"]
@@ -168,6 +168,7 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
     elif fp8_quant_method == "per_block":
         from op_tests.test_gemm_a8w8_blockscale import test_gemm
 
+        logger.info(f"Running AITER per_block gemm_a8w8: MNK={record.M},{record.N},{record.K}")
         ret = test_gemm(dtype, record.M, record.N, record.K)
         latency = ret["us"]
     else:
@@ -179,19 +180,19 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
             from op_tests.module_tests.utils.triton_bench_utils import (
                 run_triton_a8w8_per_tensor,
             )
-
+            logger.info(f"Running Triton per_tensor gemm_a8w8: MNK={record.M},{record.N},{record.K}")
             latency_triton = run_triton_a8w8_per_tensor(record.M, record.N, record.K)
         elif fp8_quant_method == "per_token":
             from op_tests.module_tests.utils.triton_bench_utils import (
                 run_triton_a8w8_per_token,
             )
-
+            logger.info(f"Running Triton per_token gemm_a8w8: MNK={record.M},{record.N},{record.K}")
             latency_triton = run_triton_a8w8_per_token(record.M, record.N, record.K)
         elif fp8_quant_method == "per_block":
             from op_tests.module_tests.utils.triton_bench_utils import (
                 run_triton_a8w8_blockscale,
             )
-
+            logger.info(f"Running Triton per_block gemm_a8w8: MNK={record.M},{record.N},{record.K}")
             latency_triton = run_triton_a8w8_blockscale(record.M, record.N, record.K)
         else:
             raise ValueError(f"Unsupported quantization method '{fp8_quant_method}'!")
