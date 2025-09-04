@@ -16,7 +16,6 @@ from triton import language as tl
 _LOGGER = AiterTritonLogger()
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language.amd.cdna4 import async_copy
 
 
 @triton.heuristics(
@@ -101,13 +100,13 @@ def _gemm_a8w8_blockscale_kernel(
         pid_n = pid % num_pid_n
 
     blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 16],  # 16 * 128
+        size_per_thread=[4, 16],  # 128 * 128
         threads_per_warp=[8, 8],
         warps_per_cta=[4, 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, 1],  # 16 * 128
+        size_per_thread=[16, 4],
         threads_per_warp=[8, 8],
         warps_per_cta=[1, 4],
         order=[0, 1],
@@ -450,9 +449,20 @@ def _get_config(
 
     for bound in bounds:
         if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key][f"M_LEQ_{bound}"]
+            config = _get_config._config_dict[key][f"M_LEQ_{bound}"]
     else:
-        return _get_config._config_dict[key]["any"]
+        config = _get_config._config_dict[key]["any"]
+
+    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+
+    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
+        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
+    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
+
+    config = config.copy() # avoid later inplace modification from interacting with cached config
+    return config
 
 
 def gemm_a8w8_blockscale(
@@ -499,28 +509,22 @@ def gemm_a8w8_blockscale(
     if config is None:
         config = _get_config(M, N, K)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+    # Scale block sizes
+    # TODO: need a better way to pass scale block sizes around
+    config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
+    config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
+
+    if config["NUM_KSPLIT"] == 1:
+        assert (
+            config["GROUP_K"] == config["BLOCK_SIZE_K"]
+        ), f"GROUP_K: {config['GROUP_K']} must equal BLOCK_SIZE_K: {config['BLOCK_SIZE_K']} when not using KSPLIT"
+
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
         )
     else:
         y_pp = None
-
-    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
-    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
-
-    # Scale block sizes
-    # TODO: need a better way to pass scale block sizes around
-    config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
-    config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
-
-    assert (
-        config["GROUP_K"] == config["BLOCK_SIZE_K"]
-    ), "GROUP_K must equal BLOCK_SIZE_K"
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
