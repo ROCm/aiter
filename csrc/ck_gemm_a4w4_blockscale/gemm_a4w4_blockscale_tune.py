@@ -7,7 +7,7 @@ import torch
 from aiter import dtypes
 from aiter.utility import fp4_utils
 from aiter.test_common import perftest
-from aiter.utility.baseTuner import GemmCommonTuner
+from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.ops.shuffle import shuffle_weight
 from gemm_a4w4_blockscale_common import kernels_list
 import argparse

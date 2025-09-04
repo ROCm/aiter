@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from aiter import dtypes
 from aiter.test_common import perftest
-from aiter.utility.baseTuner import GemmCommonTuner
+from aiter.utility.base_tuner import GemmCommonTuner
 from gemm_a8w8_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
 import argparse

@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter.test_common import perftest
-from aiter.utility.baseTuner import GemmCommonTuner
+from aiter.utility.base_tuner import GemmCommonTuner
 from aiter import dtypes
 from batched_gemm_bf16_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner

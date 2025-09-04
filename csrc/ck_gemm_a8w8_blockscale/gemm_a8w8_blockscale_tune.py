@@ -7,13 +7,14 @@ import torch
 import torch.nn.functional as F
 from aiter import dtypes
 from aiter.test_common import perftest
-from aiter.utility.baseTuner import GemmCommonTuner
+from aiter.utility.base_tuner import GemmCommonTuner
 from gemm_a8w8_blockscale_common import kernels_list
 import argparse
 from einops import rearrange
 from aiter.utility.mp_tuner import mp_tuner
 
 block_shape = (128, 128)
+
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     block_shape_n, block_shape_k = block_shape
@@ -162,7 +163,6 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
-        print("ret: ", ret)
         return ret
 
 

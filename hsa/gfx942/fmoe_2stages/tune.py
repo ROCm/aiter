@@ -32,7 +32,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility import fp4_utils
 import torch.nn.functional as F
 from einops import rearrange
-from aiter.utility.baseTuner import TunerCommon
+from aiter.utility.base_tuner import TunerCommon
 
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
