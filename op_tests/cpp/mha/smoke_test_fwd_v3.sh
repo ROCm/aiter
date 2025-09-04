@@ -38,7 +38,7 @@ run_gfx950_fwd_v3() {
 
 run_gfx942_fwd_v3() {
     echo "Start smoke test for gfx 942"
-    for mode in 0 ; do
+    for mode in 0 1; do
     for perm in 0 1 ; do
     for mask in 0 2 ; do
     for lse in 0 1 ; do
@@ -60,7 +60,7 @@ run_gfx942_fwd_v3() {
 }
 
 run_fwd_v3_mask_1() {
-    echo "Start smoke test for gfx 942"
+    echo "Start smoke test for mask = 1"
     for mode in 0; do
     for perm in 0 1 ; do
     for lse in 0 1 ; do
@@ -103,11 +103,11 @@ fi
 case "$mode" in
     "gfx942")
         run_gfx942_fwd_v3
-        # run_fwd_v3_mask_1
+        run_fwd_v3_mask_1
         ;;
     "gfx950")
         run_gfx950_fwd_v3
-        # run_fwd_v3_mask_1
+        run_fwd_v3_mask_1
         ;;
     *)
         echo "Unrecognized arch name: '$mode'" >&2
