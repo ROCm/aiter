@@ -59,6 +59,26 @@ run_gfx942_fwd_v3() {
     done
 }
 
+run_gfx942_fwd_v3_mask1() {
+    echo "Start smoke test for gfx 942"
+    for mode in 0; do
+    for perm in 0 1 ; do
+    for lse in 0 1 ; do
+    for seqlen_k in 127 700 1023; do
+    for v3_bf16_cvt in 0 1 2; do
+
+    $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=128 -s=$seqlen_k -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=1 -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=128 -s=$seqlen_k -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=1 -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=128 -s=$seqlen_k -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=1 -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+
+    done
+    done
+    done
+    done
+    done
+}
+
+
 while getopts ":a:h" opt; do
     case "${opt}" in
         a)
@@ -83,6 +103,7 @@ fi
 case "$mode" in
     "gfx942")
         run_gfx942_fwd_v3
+        # run_gfx942_fwd_v3_mask1
         ;;
     "gfx950")
         run_gfx950_fwd_v3
