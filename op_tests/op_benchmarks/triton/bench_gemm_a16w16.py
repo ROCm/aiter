@@ -38,7 +38,7 @@ def bench_gemm_fn(
         # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
         y = y.to(torch.float32).zero_()
         ms = triton.testing.do_bench(
-            lambda: gemm_a16w16_atomic(x, w, torch.float32, y),
+            lambda: gemm_a16w16_atomic(x, w, bias, torch.float32, y),
             warmup=25,
             rep=100,  # noqa: E731
         )
