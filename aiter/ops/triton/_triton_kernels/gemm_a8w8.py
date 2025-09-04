@@ -22,10 +22,10 @@ def _gemm_a8w8_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
-    c_ptr,
     a_scale_ptr,
     b_scale_ptr,
     bias_ptr,
+    c_ptr,
     # Matrix dimensions
     M,
     N,

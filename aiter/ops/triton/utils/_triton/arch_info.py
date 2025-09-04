@@ -8,7 +8,17 @@ _ARCH_TO_DEVICE = {
 
 
 def get_arch():
-    return triton.runtime.driver.active.get_current_target().arch
+    try:
+        arch = (
+            triton.runtime.driver.active.get_current_target().arch
+        )  # If running with torch
+    except RuntimeError:  # else running with JAX
+        from jax._src.lib import gpu_triton as triton_kernel_call_lib
+
+        arch = triton_kernel_call_lib.get_arch_details("0")
+        arch = arch.split(":")[0]
+
+    return arch
 
 
 def get_device():

@@ -71,10 +71,10 @@ def gemm_a8w8(
     _gemm_a8w8_kernel[grid](
         x,
         w,
-        y,
         x_scale,
         w_scale,
         bias,
+        y,
         M,
         N,
         K,
