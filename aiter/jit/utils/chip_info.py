@@ -98,7 +98,6 @@ def get_gfx_list() -> list[str]:
 
 @torch_compile_guard()
 def get_cu_num_custom_op() -> int:
-    print("get_cu_num_custom_op")
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
