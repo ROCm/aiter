@@ -31,8 +31,8 @@ def get_avg_latency(filename, kernel_name_key_list):
     runtime_list = runtime_list / 1e3
     sort_idx = np.argsort(runtime_list)
     p50_idx = sort_idx[len(sort_idx) // 2]
-    p25_idx = sort_idx[len(sort_idx) // 4]
-    p75_idx = sort_idx[len(sort_idx) // 4 * 3]
+    # p25_idx = sort_idx[len(sort_idx) // 4]
+    # p75_idx = sort_idx[len(sort_idx) // 4 * 3]
     runtime = runtime_list[p50_idx]
     # runtime_25 = runtime_list[p25_idx]
     # runtime_75 = runtime_list[p75_idx]
