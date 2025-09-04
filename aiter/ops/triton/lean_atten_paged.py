@@ -77,7 +77,49 @@ def persistent_lean_attention_paged(
 
     o = torch.empty_like(q, dtype=v.dtype)
 
-    la_persistent_paged[grid]
+    la_persistent_paged[grid](
+        q,
+        k,
+        v,
+        qk_scale,
+        Mp,
+        Lp,
+        Op,
+        o,
+        kv_block_tables,
+        kv_shape,
+        batch_num_block_n,
+        locks,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        Op.stride(0),
+        Op.stride(1),
+        Op.stride(2),
+        HEAD_DIM=HEAD_DIM_K,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        batch_size=batch_size,
+        num_m_blocks=num_m_blocks,
+        # leanAttention params
+        high_load_wgs=high_load_wgs,
+        max_tiles_per_wg=max_tiles_per_wg,
+        tiles_per_head=tiles_per_head,
+        num_splits=num_splits,
+        waves_per_eu=waves_per_eu,
+        num_warps=waves_per_eu,
+    )
+
+    return o
 
 
 def get_num_splits_and_buffer_sizes(
