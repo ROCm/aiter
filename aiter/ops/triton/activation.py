@@ -46,7 +46,6 @@ def _relu(x):
     return tl.maximum(0.0, x)
 
 
-@triton.constexpr_function
 def _get_activation_from_str(activation: str):
     mapping = {
         "gelu": _gelu,
@@ -56,6 +55,22 @@ def _get_activation_from_str(activation: str):
         "relu": _relu,
     }
     return mapping[activation]
+
+
+@triton.jit
+def _apply_activation_from_str(x, activation: tl.constexpr):
+    if activation == "gelu":
+        return _gelu(x)
+    elif activation == "gelu_tanh":
+        return _gelu_tanh(x)
+    elif activation == "silu":
+        return _silu(x)
+    elif activation == "silu_exp2":
+        return _silu_exp2(x)
+    elif activation == "relu":
+        return _relu(x)
+    else:
+        return x  # No activation if it is not recognized
 
 
 @triton.heuristics(
@@ -122,7 +137,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
                 x_ptr + x_offs + stride_x_n * N, mask=x_mask, cache_modifier=".cg"
             ).to(tl.float32)
 
-        x = _get_activation_from_str(ACTIVATION)(a) * b
+        x = _apply_activation_from_str(a, ACTIVATION) * b
 
         out_tensor, bs_e8m0 = _mxfp4_quant_op(
             x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE

@@ -83,7 +83,6 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     static constexpr ck::index_t Scale_Block_M = 1;
     static constexpr ck::index_t Scale_Block_N = 128;
     static constexpr ck::index_t Scale_Block_K = 128;
-
     using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemmBlockScale
         // clang-format off
           <     Row,  Col,  DsLayout, ELayout, 
@@ -218,7 +217,6 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     constexpr auto StrideDs = std::array<ck::index_t, NumDTensor>{0};
 
     static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
-
     // static constexpr ck::index_t BLOCKSIZE = 256;
     static constexpr ck::index_t WAVES = BLOCKSIZE / 64;
     static constexpr ck::index_t MNPerXDL = 16;
