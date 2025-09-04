@@ -162,20 +162,28 @@ def hip_flag_checker(flag_hip: str) -> bool:
 
 
 def check_and_set_ninja_worker():
-    max_num_jobs_cores = int(max(1, os.cpu_count() * 0.8))
-    if int(os.environ.get("MAX_JOBS", "1")) < max_num_jobs_cores:
-        import psutil
+    max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
+    import psutil
 
-        # calculate the maximum allowed NUM_JOBS based on free memory
-        free_memory_gb = psutil.virtual_memory().available / (
-            1024**3
-        )  # free memory in GB
-        max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
+    # calculate the maximum allowed NUM_JOBS based on free memory
+    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
+    max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
-        # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-        max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
-        max_jobs = str(max_jobs)
-        os.environ["MAX_JOBS"] = max_jobs
+    # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
+    max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
+    max_jobs_env = os.environ.get("MAX_JOBS")
+    if max_jobs_env != None:
+        try:
+            max_processes = int(max_jobs_env)
+            # too large value
+            if max_processes > max_jobs:
+                os.environ["MAX_JOBS"] = str(max_jobs)
+        # error value
+        except ValueError:
+            os.environ["MAX_JOBS"] = str(max_jobs)
+    # none value
+    else:
+        os.environ["MAX_JOBS"] = str(max_jobs)
 
 
 def rename_cpp_to_cu(els, dst, recurisve=False):
@@ -408,7 +416,20 @@ def build_module(
                 prebuild=prebuild,
             )
             if is_python_module and not is_standalone:
-                shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
+                if prebuild == 1:
+                    shutil.copy(
+                        f"{opbd_dir}/{target_name}",
+                        f"{get_user_jit_dir()}/build/aiter_/build",
+                    )
+                elif prebuild == 2:
+                    from pathlib import Path
+
+                    src_dir = Path(opbd_dir)
+                    dst_dir = Path(get_user_jit_dir())
+                    for src_file in src_dir.glob("*.so"):
+                        shutil.move(str(src_file), str(dst_dir / src_file.name))
+                else:
+                    shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
             else:
                 shutil.copy(
                     f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
