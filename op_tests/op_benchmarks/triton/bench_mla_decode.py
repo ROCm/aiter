@@ -102,8 +102,6 @@ def benchmark(args):
         is_neox_style = True
 
         k_pe_tokens = torch.empty(B, qk_rope_head_dim, dtype=dtype, device=device)
-        
-        mtp = 0
 
         kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, o = (
             input_helper(
@@ -121,7 +119,6 @@ def benchmark(args):
             )
         )
         k_input, v_input = ref_preprocess(kv_cache, kv_lora_rank)
-
 
         def fn():
             return decode_attention_fwd_grouped_rope(

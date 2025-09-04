@@ -102,7 +102,7 @@ def _fwd_grouped_kernel_stage1(
     mask_c = offs_c < kv_lora_rank
     mask_qk_r = offs_qk_r < (kv_lora_rank + qk_rope_head_dim)
 
-    cur_batch_kv = cur_batch // max_qo_len
+    cur_batch_kv = cur_batch # // (max_qo_len // 2)
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch_kv)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch_kv + 1) - cur_batch_kv_start_idx
 
@@ -166,19 +166,21 @@ def _fwd_grouped_kernel_stage1(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
             )
 
-            offs_buf_v = kv_loc[:, None] * stride_buf_vbs + offs_c[None, :]
-            v = tl.load(
-                V_buffer + offs_buf_v,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_c[None, :]),
-                other=0.0,
-            )
+            # offs_buf_v = kv_loc[:, None] * stride_buf_vbs + offs_c[None, :]
+            # v = tl.load(
+            #     V_buffer + offs_buf_v,
+            #     mask=(offs_n[:, None] < split_kv_end) & (mask_c[None, :]),
+            #     other=0.0,
+            # )
+            # v = tl.transpose(kv)
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
             # (16, 32) x (32, 512)
-            acc += tl.dot(p.to(v.dtype), v)
+            acc += tl.dot(p.to(kv.dtype), kv.T)
+            # acc += tl.dot(p.to(v.dtype), v)
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -225,13 +227,17 @@ def _decode_grouped_att_m_fwd(
     config,
 ):
     qk_rope_head_dim = k_buffer.shape[-1] - kv_lora_rank
-    batch, head_num = kv_indptr.shape[0] - 1, q.shape[1]
+    # batch, head_num = kv_indptr.shape[0] - 1, q.shape[1]
+    batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
-    batch = batch*(mtp + 1)
+    # batch = batch*(mtp + 1)
 
     config["BLOCK_C"] = triton.next_power_of_2(kv_lora_rank)
     config["BLOCK_R"] = triton.next_power_of_2(qk_rope_head_dim)
+    # print(batch, head_num, kv_group_num)
+
+    config["BLOCK_H"] = ((kv_group_num + 15) // 16) * 16
 
     config["NUM_KV_SPLITS"] = num_kv_splits
     grid = (
@@ -239,6 +245,7 @@ def _decode_grouped_att_m_fwd(
         * batch
         * config["NUM_KV_SPLITS"],
     )
+    # print(q.shape, grid)
 
     _fwd_grouped_kernel_stage1[grid](
         q,
@@ -368,7 +375,7 @@ def _decode_softmax_reducev_fwd(
         att_lse.stride(0),
         att_lse.stride(1),
         att_lse.stride(2),
-        o.stride(0),
+        o.stride(0) * (mtp + 1),
         o.stride(1),
         Lv=Lv,
         head_num=head_num,

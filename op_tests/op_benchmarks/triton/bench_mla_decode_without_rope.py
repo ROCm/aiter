@@ -19,6 +19,7 @@ from op_tests.triton_tests.test_mla_decode import input_helper, ref_preprocess
 from aiter.test_common import checkAllclose
 
 arg_to_torch_dtype = {
+    "fp8": torch.float8_e4m3fnuz,
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
     "fp32": torch.float32,
@@ -126,10 +127,11 @@ def nonvarlen_benchmark_configs(args: argparse.Namespace):
 
     kv_lora_rank = 512
     qk_rope_head_dim = 64
+    mtp = args.mtp if args.mtp else 1
 
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_k))
     configs = [
-        (batch_size, N_HEAD, seq_len_k, kv_lora_rank, qk_rope_head_dim)
+        (batch_size, N_HEAD, seq_len_k, kv_lora_rank, qk_rope_head_dim, mtp)
         for batch_size, N_HEAD, seq_len_k in configs
     ]
     return configs
@@ -140,6 +142,7 @@ def model_benchmark_configs(args: argparse.Namespace):
     configs = get_model_configs(config_path=config_file, models=args.model)
     fa_configs = []
     batch_size = args.B if args.B else 4
+    mtp = args.mtp if args.mtp else 1
 
     for model_name, config in configs.items():
         num_q_heads = config["num_attention_heads"]
@@ -161,6 +164,7 @@ def model_benchmark_configs(args: argparse.Namespace):
                         seq_len,
                         kv_lora_rank,
                         qk_rope_head_dim,
+                        mtp,
                     )
                 )
         else:
@@ -171,6 +175,7 @@ def model_benchmark_configs(args: argparse.Namespace):
                     N_CTX_K,
                     kv_lora_rank,
                     qk_rope_head_dim,
+                    mtp,
                 )
             )
 
@@ -179,7 +184,7 @@ def model_benchmark_configs(args: argparse.Namespace):
 
 def create_benchmark_configs(args: argparse.Namespace):
     dtype = arg_to_torch_dtype[args.dtype]
-    x_names = ["BATCH", "H", "S", "kv_lora_rank", "qk_rope_head_dim"]
+    x_names = ["BATCH", "H", "S", "kv_lora_rank", "qk_rope_head_dim", "mtp"]
 
     configs = []
     extra_args = {
@@ -227,8 +232,9 @@ def run_benchmark(args: argparse.Namespace):
         S: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
+        mtp: int,
         dtype: torch.dtype,
-        num_kv_splits: int = 1,
+        num_kv_splits: int = 5,
         sm_scale: float = 1.0,
         logit_cap: float = 0.0,
         device="cuda",
@@ -245,8 +251,8 @@ def run_benchmark(args: argparse.Namespace):
         Right now q_heads == kv_heads).
         """
 
-        mtp = 1
-
+        # mtp = 1
+        #
         kv_indptr, kv_indices, q, kv_cache, attn_logits, attn_lse, out_tri = (
             input_helper(
                 BATCH,
@@ -300,7 +306,7 @@ def run_benchmark(args: argparse.Namespace):
             num_q_heads * kv_lora_rank * S * 2
         )  # multiplying attention map with v
 
-        total_flops = BATCH * (
+        total_flops = BATCH * (mtp + 1) * (
             attn_nope_flops + attn_rope_flops + av_flops
         )
 
@@ -332,9 +338,15 @@ def run_benchmark(args: argparse.Namespace):
 
         mem = bytes_read + bytes_written
 
+        q_fp8 = q.to(torch.float8_e4m3fnuz)
+        k_input_fp8 = k_input.to(torch.float8_e4m3fnuz)
+        v_input_fp8 = v_input.to(torch.float8_e4m3fnuz)
         ms = triton.testing.do_bench(
             lambda: decode_attention_fwd_grouped(
-                q.reshape(-1, H, 576),
+                # q_fp8.reshape(-1, H * 2, 576),
+                # k_input_fp8,
+                # v_input_fp8,
+                q.reshape(-1, H * (mtp + 1), 576),
                 k_input,
                 v_input,
                 out_tri,
@@ -398,6 +410,12 @@ def parse_args():
         type=int,
         default=0,
         help="Sequence length (since this is decode, this is the length of the key/value sequence)",
+    )
+    parser.add_argument(
+        "-mtp",
+        type=int,
+        default=1,
+        help="Q sequence length (mtp + 1 == qo_len) in MTP mode",
     )
     parser.add_argument(
         "--no-rope",

@@ -62,13 +62,13 @@ def input_helper(
     kv_indices = torch.arange(total_seqlen, device=device)
 
     attn_logits = torch.zeros(
-        B * SQ, H, num_kv_splits, kv_lora_rank, dtype=torch.float, device=device
+        B, H * SQ, num_kv_splits, kv_lora_rank, dtype=torch.float, device=device
     )
     attn_lse = torch.zeros(
-        B * SQ, H, num_kv_splits, 1, dtype=torch.float, device=device
+        B, H * SQ, num_kv_splits, 1, dtype=torch.float, device=device
     )
 
-    o = torch.zeros(B * SQ, H, kv_lora_rank, dtype=dtype, device=device)
+    o = torch.zeros(B * SQ, H, kv_lora_rank, dtype=torch.bfloat16, device=device)
 
     return kv_indptr, kv_indices, q, kv_cache, attn_logits, attn_lse, o
 
