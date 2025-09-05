@@ -628,14 +628,10 @@ namespace aiter
                                                                     bank_mask,
                                                                     bound_ctrl));
 
-                        // max2 = remote_max_1 > max2 ? remote_max_1 : max2;
-                        // max2 = remote_max_1 > max1 ? max1 : max2;
-                        // max1 = remote_max_1 > max1 ? remote_max_1 : max1;
                         max2 = dev_max_(remote_max_1, max2);
                         max2 = remote_max_1 > max1 ? max1 : max2;
                         max1 = dev_max_(remote_max_1, max1);
 
-                        // max2 = max2 > remote_max_2 ? max2 : remote_max_2;
                         max2 = dev_max_(max2, remote_max_2);
                     });
                 }
@@ -725,7 +721,7 @@ namespace aiter
                 group_map_idx[topk_group + threadIdx.x] = -1;
             }
 #endif
-            //__syncthreads();
+            __syncthreads();
         } else {
 #pragma unroll
             for (int k = 0; k < topk_group; k++)
@@ -745,6 +741,7 @@ namespace aiter
 #endif
 
 #if 1
+        __syncthreads();
         for (int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
         {
             int group_idx = e * vec_size / experts_per_group;
@@ -860,15 +857,20 @@ namespace aiter
             vec8_t local_res[final_score_vec];
             for(int i = 0; i < final_score_vec; i++) {
                 auto res_16 = warp_merge_sort_to_reg(s[i], ck_tile::number<16>{});
-                auto res_32 = warp_merge_sort_combine2(vec8_t{res_16[0], res_16[1], res_16[2], res_16[3], res_16[4], res_16[5], res_16[6], res_16[7]}, ck_tile::number<16>{}, ck_tile::number<16>{});
-                auto res_64 = warp_merge_sort_combine2(vec8_t{res_32[0], res_32[1], res_32[2], res_32[3], res_32[4], res_32[5], res_32[6], res_32[7]}, ck_tile::number<16>{}, ck_tile::number<32>{});
+
+                vec8_t res_16_8 = vec8_t{res_16[0], res_16[1], res_16[2], res_16[3], res_16[4], res_16[5], res_16[6], res_16[7]};
+                vec8_t res_16_8_r = mov_dpp_vec_from_(res_16_8, ck_tile::number<16>{});
+                auto res_32 = warp_merge_sort_combine2(res_16_8, res_16_8_r, ck_tile::number<16>{});
+
+                vec8_t res_32_8 = vec8_t{res_32[0], res_32[1], res_32[2], res_32[3], res_32[4], res_32[5], res_32[6], res_32[7]};
+                vec8_t res_32_8_r = mov_dpp_vec_from_(res_32_8, ck_tile::number<32>{});
+                auto res_64 = warp_merge_sort_combine2(res_32_8, res_32_8_r, ck_tile::number<16>{});
 
                 local_res[i] = vec8_t{res_64[0], res_64[1], res_64[2], res_64[3], res_64[4], res_64[5], res_64[6], res_64[7]};
             }
 
             auto local_res_16 = warp_merge_sort_combine2(local_res[0], local_res[1], ck_tile::number<16>{});
-            // vec8_t local_res_8 = vec8_t{local_res_16[0], local_res_16[1], local_res_16[2], local_res_16[3], local_res_16[4], local_res_16[5], local_res_16[6], local_res_16[7]};
-            // float pivot = local_res_16[7];
+
             float pivot = __shfl(local_res_16[7], 0);
 
             int offset = 0;
@@ -885,19 +887,6 @@ namespace aiter
                 offset = __shfl(local_cnt, 63); 
             }
 
-            // int topk_exp_id = -1;
-            // float topk_value = -INFINITY;
-            // if(threadIdx.x < topk) {
-            //     topk_exp_id = final_topk_idx[threadIdx.x];
-            //     topk_value = scores[topk_exp_id];
-            //     // if constexpr (isBiased) {
-            //     //     topk_value -= bias[topk_exp_id];
-            //     // }
-
-            // }
-
-            // auto [topk_v, topk_e] = warp_arg_merge_sort_to_reg(topk_value, topk_exp_id, ck_tile::number<8>{});
-
             if constexpr (isBiased) {
                 if (threadIdx.x < topk) {
                     topk_values[threadIdx.x] -= bias[final_topk_idx[threadIdx.x]];
@@ -907,7 +896,6 @@ namespace aiter
             {
                 if (threadIdx.x < topk) {
                     sum = multithread_reduce(topk_values[threadIdx.x], [&](auto x_, auto y_){ return x_ + y_;}, 8);
-                    // sum = wave_reduce(topk_values[threadIdx.x], [&](auto x_, auto y_){ return x_ + y_;}, ck_tile::number<8>{});
                     topk_values[threadIdx.x] = topk_values[threadIdx.x] * routed_scaling_factor / sum;
                 }
             }
@@ -915,14 +903,6 @@ namespace aiter
                 topk_weights[token_idx * stride_tk + threadIdx.x] = topk_values[threadIdx.x];
                 topk_ids[token_idx * stride_tk + threadIdx.x] = final_topk_idx[threadIdx.x];
             }
-
-            // if(threadIdx.x == 0) {
-            //     using vec_int8_t = ck_tile::ext_vector_t<int, 8>;
-            //     *reinterpret_cast<vec8_t*>(&topk_weights[token_idx * stride_tk]) = *reinterpret_cast<vec8_t*>(topk_values); 
-            //     *reinterpret_cast<vec_int8_t*>(&topk_ids[token_idx * stride_tk]) = *reinterpret_cast<vec_int8_t*>(final_topk_idx);
-            //     // topk_indices[threadIdx.x ] = topk_e[0];
-            //     // topk_values[threadIdx.x ] = topk_v[0];
-            // }
         }
 #endif
 
