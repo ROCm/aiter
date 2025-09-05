@@ -63,6 +63,7 @@ def _gemm_a8w8_blockscale_kernel(
     SPLITK_BLOCK_SIZE: gl.constexpr,
     EVEN_K: gl.constexpr,
     GRID_MN: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
     cache_modifier: gl.constexpr,
 ):
     """
@@ -99,17 +100,29 @@ def _gemm_a8w8_blockscale_kernel(
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
 
+    threads_per_elem_mk: gl.constexpr = triton.cdiv(
+        BLOCK_SIZE_M * BLOCK_SIZE_K // (NUM_WARPS * 64), 16
+    )
+    threads_per_elem_kn: gl.constexpr = triton.cdiv(
+        BLOCK_SIZE_K * BLOCK_SIZE_N // (NUM_WARPS * 64), 16
+    )
     blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[4, 16],  # 128 * 128
+        size_per_thread=[threads_per_elem_mk, 16],
         threads_per_warp=[8, 8],
-        warps_per_cta=[4, 1],
+        warps_per_cta=[NUM_WARPS, 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, 4],
+        size_per_thread=[16, threads_per_elem_kn],
         threads_per_warp=[8, 8],
-        warps_per_cta=[1, 4],
+        warps_per_cta=[1, NUM_WARPS],
         order=[0, 1],
+    )
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16],
+        transposed=True,
+        warps_per_cta=[NUM_WARPS // 2, 2],
     )
 
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
@@ -123,9 +136,6 @@ def _gemm_a8w8_blockscale_kernel(
     )
     shared_b_scale: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[0]
-    )
-    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[2, 2]
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=16
@@ -450,8 +460,13 @@ def _get_config(
     for bound in bounds:
         if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
             config = _get_config._config_dict[key][f"M_LEQ_{bound}"]
-    else:
-        config = _get_config._config_dict[key]["any"]
+            break
+        else:
+            config = _get_config._config_dict[key]["any"]
+
+    config = (
+        config.copy()
+    )  # avoid later inplace modification from interacting with cached config
 
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
 
@@ -461,9 +476,6 @@ def _get_config(
             config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
     config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
 
-    config = (
-        config.copy()
-    )  # avoid later inplace modification from interacting with cached config
     return config
 
 
@@ -556,6 +568,7 @@ def gemm_a8w8_blockscale(
         x_scale.stride(1),
         w_scale.stride(0),
         w_scale.stride(1),
+        NUM_WARPS=config["num_warps"],
         **config,
     )
 
