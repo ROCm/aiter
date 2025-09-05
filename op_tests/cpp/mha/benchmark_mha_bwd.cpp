@@ -102,8 +102,8 @@ auto create_args(int argc, char* argv[])
         .insert("v3_bf16_cvt",
                 "1",
                 "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
-        .insert("is_check_v3_param", "0", "if set to 1, will check param is match fwd_v3 mode")
-        .insert("arch", "gfx942", "only needded when is_check_v3_param set to be 1, arch support gfx942 and gfx950");
+        .insert("is_check_v3_param", "0", "if set to 1, will check if param matches fwd_v3 mode")
+        .insert("arch", "gfx942", "only needed when is_check_v3_param set to be 1, arch support gfx942 and gfx950");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);

@@ -8,48 +8,35 @@ import re
 from dataclasses import dataclass
 
 
-def process_file(
-    file_path: Path,
-    output_file_path: Path,
-    start_line: int = 0,
-    end_line: int = -1,
-    encoding: str = "utf-8",
-):
-    if not file_path.exists():
-        raise FileNotFoundError(f"file is not exist: {file_path}")
-
-    with file_path.open("r", encoding=encoding, errors="surrogateescape") as f:
-        lines = f.readlines()
-
-    # deal the line:delete the line which has '<',replace the  "return r" -> "is_v3=true"
-    out_lines = []
-    for line in lines:
-        if "<" in line:
-            continue
-        new_line = line.replace("return r", "is_v3=true")
-        out_lines.append(new_line)
-
-    with output_file_path.open("w", encoding=encoding, newline="") as f:
-        f.writelines(out_lines)
-
-    print(f"replace success, write to: {output_file_path}")
-
-
 @dataclass(frozen=True)
 class CodegenInfo:
-    version: str = "gfx942"
-    kernel_type: str = "fmha_v3_bwd"
-    func_name: str = "fmha_bwd_v3("
-    target_start_line: int = 0
-    target_end_line: int = 0
-    output_file_name: str = "mha_bwd_param_v3_check.cpp"
-    encoding: str = "utf-8"
+    version: str = "gfx942"  # arch version, support gfx942 and gfx950
+    kernel_type: str = "fmha_v3_bwd"  # kernel type, support fmha_v3_fwd and fmha_v3_bwd
+    func_name: str = (
+        "fmha_bwd_v3("  # the param check function will be generated base on the original function name
+    )
+    target_start_line: int = (
+        0  # the original function code snippets(start line) we will handle
+    )
+    target_end_line: int = (
+        0  # the original function code snippets(end line) we will handle
+    )
+    output_file_name: str = (
+        "mha_bwd_param_v3_check.cpp"  # which file the generated function will be writed
+    )
+    encoding: str = "utf-8"  # the file encoding type
 
 
 codegen_info_list = [
-    # CodegenInfo("gfx942", "fmha_v3_fwd", "fmha_fwd_v3(", 226, 394, "mha_fwd_param_v3_check.cpp"),
-    # CodegenInfo("gfx950", "fmha_v3_fwd", "fmha_fwd_v3(", 181, 245, "mha_fwd_param_v3_check.cpp"),
-    # CodegenInfo("gfx942", "fmha_v3_bwd", "fmha_bwd_v3(", 842, 2106, "mha_bwd_param_v3_check.cpp"),
+    CodegenInfo(
+        "gfx942", "fmha_v3_fwd", "fmha_fwd_v3(", 226, 394, "mha_fwd_param_v3_check.cpp"
+    ),
+    CodegenInfo(
+        "gfx950", "fmha_v3_fwd", "fmha_fwd_v3(", 181, 245, "mha_fwd_param_v3_check.cpp"
+    ),
+    CodegenInfo(
+        "gfx942", "fmha_v3_bwd", "fmha_bwd_v3(", 842, 2106, "mha_bwd_param_v3_check.cpp"
+    ),
     CodegenInfo(
         "gfx950",
         "fmha_v3_bwd",
@@ -57,7 +44,7 @@ codegen_info_list = [
         1218,
         2319,
         "mha_bwd_param_v3_check.cpp",
-    )
+    ),
 ]
 
 
@@ -77,9 +64,8 @@ def write_param_check_func(work_path: Path, codegen_info: CodegenInfo) -> None:
 
     lines = lines[codegen_info.target_start_line : codegen_info.target_end_line]
     target_func_name = f"{codegen_info.func_name[:-1]}_{codegen_info.version}_check("
-    # deal the line:delete the line which has '<',replace the  "return r" -> "is_v3=true"
-    out_lines = []
 
+    out_lines = []
     for line in lines:
         if "using " in line:
             continue
@@ -114,7 +100,6 @@ def main():
         help="the input aiter work path to be process",
         default="/home/memin/code/aiter/hsa",
     )
-    # parser.add_argument("--output_file", help="result save file", default="mha_param_v3_check.cpp")
 
     args = parser.parse_args()
     work_path = Path(args.work_path)

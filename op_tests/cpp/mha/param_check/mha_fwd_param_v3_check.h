@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "mha_fwd.h"
-
-enum arch_enum {
-    gfx942 = 0,
-    gfx950 = 1
-};
+#include "common_param.h"
 
 bool mha_fwd_v3_check(const arch_enum gfx_version,
                     aiter::mha_fwd_args args,

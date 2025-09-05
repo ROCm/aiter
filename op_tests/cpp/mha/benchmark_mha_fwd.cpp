@@ -137,8 +137,8 @@ auto create_args(int argc, char* argv[])
                 "1",
                 "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
         .insert("fwd_v3", "0", "if set to 1, some cases will call the fwd v3 kernel")
-        .insert("is_check_v3_param", "0", "if set to 1, will check param is match fwd_v3 mode")
-        .insert("arch", "gfx942", "only needded when is_check_v3_param set to be 1, arch support gfx942 and gfx950");
+        .insert("is_check_v3_param", "0", "if set to 1, will check if param matches fwd_v3 mode")
+        .insert("arch", "gfx942", "only needed when is_check_v3_param set to be 1, arch support gfx942 and gfx950");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -1043,16 +1043,16 @@ bool run(const ck_tile::ArgParser& arg_parser)
 #if CK_TILE_FMHA_FWD_SPLITKV_API
         if(1 < num_splits || use_kvcache)
         {
-            // aiter::mha_fwd_splitkv_args fmha_splitkv_args;
-            // init_args(fmha_splitkv_args);
+            aiter::mha_fwd_splitkv_args fmha_splitkv_args;
+            init_args(fmha_splitkv_args);
 
-            // return aiter::mha_fwd_splitkv(fmha_splitkv_args,
-            //                               stream_config,
-            //                               data_type,
-            //                               mode == mode_enum::group,
-            //                               mask.type,
-            //                               bias.type,
-            //                               lse);
+            return aiter::mha_fwd_splitkv(fmha_splitkv_args,
+                                          stream_config,
+                                          data_type,
+                                          mode == mode_enum::group,
+                                          mask.type,
+                                          bias.type,
+                                          lse);
         }
 #endif
         aiter::mha_fwd_args fmha_args;
