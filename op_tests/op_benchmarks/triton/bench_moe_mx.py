@@ -2,7 +2,7 @@ import argparse
 import sys
 import triton
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
-import aiter.ops.triton.utils.arch_info as arch_info
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
 from aiter.ops.triton.moe_op_mxfp4_silu_fused import fused_moe_mxfp4_silu
 from op_tests.triton_tests.test_moe_mx import input_helper

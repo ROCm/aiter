@@ -5,7 +5,8 @@ import torch
 import pytest
 from enum import Enum
 from aiter.ops.triton.gemm_a8wfp4 import gemm_a8wfp4
-import aiter.ops.triton.utils.arch_info as arch_info
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils import types
 from typing import Union
 
 # Debug
@@ -349,7 +350,7 @@ def run_torch_emulation(x, w, x_scales, w_scales, dtype):
     return torch.mm(x_f32, w_f32.T).to(dtype)
 
 
-e5m2_type, e4m3_type = arch_info.get_fp8_dtypes()
+e5m2_type, e4m3_type = types.get_fp8_dtypes()
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())

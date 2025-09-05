@@ -6,8 +6,8 @@ from typing import Any, Dict, Optional
 import os
 import json
 import functools
-import aiter.ops.triton.utils.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from ._triton import arch_info
+from .core import AITER_TRITON_CONFIGS_PATH
 import warnings
 
 M_THRESHOLD_SMALL = 256

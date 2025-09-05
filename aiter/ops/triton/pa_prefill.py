@@ -10,6 +10,7 @@
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton._triton_kernels.pa_prefill import _fwd_kernel, _fwd_kernel_alibi
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
