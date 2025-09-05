@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import itertools
+
+import pandas as pd
 import torch
 import torch.nn.functional as F
-import aiter
-from aiter import dtypes
-from aiter.test_common import checkAllclose, perftest, benchmark
 from einops import rearrange
 from einops import repeat as eirp
-import pandas as pd
-import argparse
+from typing_extensions import List
+
+import aiter
+from aiter import dtypes
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 block_shape = (128, 128)
 
@@ -44,8 +49,15 @@ def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
 
 
+@perftest()
+def run_gemm_bpreshuffle_ck(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
+    return aiter.gemm_a8w8_blockscale_bpreshuffle(
+        x, weightshuffle, x_scale, w_scale, dtype
+    )
+
+
 @benchmark()
-def test_gemm(dtype, m, n, k):
+def test_gemm(dtype, m, n, k, preshuffle=False):
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -56,12 +68,16 @@ def test_gemm(dtype, m, n, k):
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
-    b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, dtype)
+    x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+    gemm_x_scale = x_scale_t if preshuffle else x_scale
+    gemm_weight = shuffle_weight(weight, layout=(16, 16)) if preshuffle else weight
+    run_func = run_gemm_bpreshuffle_ck if preshuffle else run_gemm_ck
+    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}"
-    checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
+    failed = checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
-    return {"us": avg_b}
+    return {"us": avg_b, "failed": failed}
 
 
 @perftest(num_iters=5)
@@ -164,6 +180,12 @@ parser.add_argument(
     help="""N&K of mnk.
     e.g.: -nk 4096,512""",
 )
+parser.add_argument(
+    "--preshuffle",
+    nargs="+",
+    default=[True, False],
+    help="weight preshuffle or not",
+)
 
 args = parser.parse_args()
 if args.dtype is None:
@@ -174,14 +196,13 @@ if args.m is not None:
     l_m = [args.m]
 if args.nk is not None:
     l_nk = [args.nk]
+l_preshuffle: List[bool] = args.preshuffle
 
 df = []
-for dtype in l_dtype:
+for dtype, m, (n, k), preshuffle in itertools.product(l_dtype, l_m, l_nk, l_preshuffle):
     # deepseek-r1
-    for m in l_m:
-        for n, k in l_nk:
-            ret = test_gemm(dtype, m, n, k)
-            df.append(ret)
+    ret = test_gemm(dtype, m, n, k, preshuffle)
+    df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary:\n{df}")
 # for dtype in [dtypes.fp16]:
@@ -190,3 +211,5 @@ aiter.logger.info(f"summary:\n{df}")
 #         for (n, k) in [(1536,7168), (3072,1536), (7168, 256), (7168, 2048), (4608, 7168), (7168, 2304), (512, 7168), (4096, 512)][1:2]:
 #             test_gemm_asm(dtype, m, n, k)
 #             break
+if df["failed"].any():
+    print("Failed cases:", df[df["failed"] > 0], sep="\n")
