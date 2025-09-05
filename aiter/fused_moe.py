@@ -552,7 +552,7 @@ def get_2stage_cfgs(
                 run_1stage = True and (inter_dim % 256 == 0)
             elif q_type == QuantType.per_Token and q_dtype_w in [dtypes.i8, dtypes.fp8]:
                 run_1stage = token > 32
-            else:
+            elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
         block_m = (
             BLOCK_SIZE_M
@@ -583,7 +583,7 @@ def get_2stage_cfgs(
             dtypes.bf16,
             dtypes.fp16,
             torch.uint32,
-            torch.uint8,
+            dtypes.fp4x2,
         ]
     ):
         return MOEMetadata(
