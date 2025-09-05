@@ -17,6 +17,9 @@ def f32_to_mxfp4(x):
 
 
 def mxfp4_to_f32(x):
+    if x.dtype == torch.float4_e2m1fn_x2:
+        x = x.view(torch.uint8)
+
     # 2 because we pack fp4 in uint8.
     x = x.repeat_interleave(2, dim=-1)
     x[..., ::2] = x[..., ::2] & 0xF
