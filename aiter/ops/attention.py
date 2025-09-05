@@ -11,7 +11,11 @@ from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
 )
-from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+from csrc.cpp_itfs.torch_utils import (
+    direct_register_custom_op,
+    set_gpu_stream,
+    set_warp_size_for_device
+)
 
 MD_NAME = "module_attention"
 
@@ -321,3 +325,11 @@ def mla_prefill_asm_fwd(
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor,
 ) -> None: ...
+
+
+def aiter_set_gpu_stream(stream: Optional[torch.cuda.Stream]) -> None:
+    set_gpu_stream(stream)
+
+
+def aiter_set_warp_size_for_device(device: int) -> None:
+    set_warp_size_for_device(device)
