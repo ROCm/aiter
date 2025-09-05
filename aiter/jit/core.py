@@ -18,7 +18,7 @@ from packaging.version import parse, Version
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from torch_guard import torch_compile_guard  # noqa: E402
+from torch_guard import torch_compile_guard, is_torch_equal_or_newer  # noqa: E402
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
 from chip_info import get_gfx
@@ -960,8 +960,12 @@ def compile_ops(
             )
 
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
+            if is_torch_equal_or_newer("2.8.0"):
+                tags = ()
+            else:
+                tags = (torch.Tag.needs_fixed_stride_order,)
             op_schema = f"aiter::wrapper_{loadName}" + schema
-            aiter_lib.define(op_schema, tags=())
+            aiter_lib.define(op_schema, tags=tags)
             aiter_lib.impl(
                 f"aiter::wrapper_{loadName}", outer_wrapper, dispatch_key="CUDA"
             )
