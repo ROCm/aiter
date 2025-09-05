@@ -93,6 +93,8 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         K *= 2;
     }
 
+    activation = !activation;
+
     auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight);
 
     kernel(at::cuda::getCurrentCUDAStream().stream(),
@@ -147,6 +149,8 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     {
         K *= 2;
     }
+
+    activation = !activation;
     auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight);
 
     kernel(at::cuda::getCurrentCUDAStream().stream(),
