@@ -341,6 +341,8 @@ __global__ void kn_mla_reduce_v1(
                 case at::ScalarType::BFloat16:                                                              \
                 {                                                                                           \
                     using out_t = ck_tile::bf16_t;                                                          \
+                    MLA_MERGE_CASE_IF(NUM_HEAD,   8, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
+                    MLA_MERGE_CASE_EF(NUM_HEAD,   8, OUTPUT_LSE, false, NAME, __VA_ARGS__)                  \
                     MLA_MERGE_CASE_IF(NUM_HEAD,  16, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
                     MLA_MERGE_CASE_EF(NUM_HEAD,  16, OUTPUT_LSE, false, NAME, __VA_ARGS__)                  \
                     MLA_MERGE_CASE_EF(NUM_HEAD, 128, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
@@ -351,6 +353,8 @@ __global__ void kn_mla_reduce_v1(
                 case at::ScalarType::Half:                                                                  \
                 {                                                                                           \
                     using out_t = ck_tile::fp16_t;                                                          \
+                    MLA_MERGE_CASE_IF(NUM_HEAD,   8, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
+                    MLA_MERGE_CASE_EF(NUM_HEAD,   8, OUTPUT_LSE, false, NAME, __VA_ARGS__)                  \
                     MLA_MERGE_CASE_IF(NUM_HEAD,  16, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
                     MLA_MERGE_CASE_EF(NUM_HEAD,  16, OUTPUT_LSE, false, NAME, __VA_ARGS__)                  \
                     MLA_MERGE_CASE_EF(NUM_HEAD, 128, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \

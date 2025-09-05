@@ -203,29 +203,29 @@ def _fwd_grouped_kernel_stage1_ps(
                 acc / e_sum[:, None],
                 mask=(mask_h[:, None]) & (mask_c[None, :]),
             )
-        # else:
-        #     offs_mid_o = (
-        #         split_id * stride_mid_ob
-        #         + cur_head[:, None] * stride_mid_oh
-        #         + offs_c[None, :]
-        #     )
-        #
-        #     tl.store(
-        #         Att_Out + offs_mid_o,
-        #         acc / e_sum[:, None],
-        #         mask=(mask_h[:, None]) & (mask_c[None, :]),
-        #     )
-        #
-        #     offs_mid_lse = (
-        #         split_id * stride_mid_lse_b
-        #         + cur_head * stride_mid_lse_h
-        #     )
-        #
-        #     tl.store(
-        #         Att_Lse + offs_mid_lse,
-        #         e_max + tl.log(e_sum),
-        #         mask=mask_h,
-        #     )
+        else:
+            offs_mid_o = (
+                split_id * stride_mid_ob // max_qo_len
+                + cur_head[:, None] * stride_mid_oh
+                + offs_c[None, :]
+            )
+
+            tl.store(
+                Att_Out + offs_mid_o,
+                acc / e_sum[:, None],
+                mask=(mask_h[:, None]) & (mask_c[None, :]),
+            )
+
+            offs_mid_lse = (
+                split_id * stride_mid_lse_b // max_qo_len
+                + cur_head * stride_mid_lse_h
+            )
+
+            tl.store(
+                Att_Lse + offs_mid_lse,
+                e_max + tl.log(e_sum),
+                mask=mask_h,
+            )
 
 
 def decode_grouped_att_m_fwd_ps(
