@@ -107,6 +107,6 @@ default_kernels_dict = {
     ################|      |     M|     N|     K|      |      |      |    |    |    |     | Wave| Wave| Lengths_K0_M_K1| Lengths_K0_N_K1|  PerShuffle|  PerShuffle| _NBlock_NXdlPerWave_NWaveNPerXdl|   _NWaveNPerXdl|    Scheduler   |           Verision|
     ################|      |      |      |      |      |      |      |    |    |    |     |     |     |                |                |            |            |                                 |                |                |                   |
     # Compute friendly
-    (-1):kernelInstance(256,     1,   128,   128,    16,   128,   256,  16,  16,  16,   16,    1,    2,     [16, 16, 1],     [16, 16, 1],           1,           2,                   [1, 16, 1, 16],             [8],     "Intrawave",                  1,),
+    (-1):kernelInstance(256,     1,   128,   128,    64,    64,   128,  16,  16,  16,   16,    4,    1,     [ 8, 32, 1],     [ 8, 32, 1],           2,           1,                   [1, 32, 1,  8],             [8],     "Intrawave",                  1,),
 }
 # fmt: on

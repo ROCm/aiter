@@ -86,7 +86,7 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
     }
   
     // Otherwise, use heuristics.
-    return a8w8_blockscale_bpreshuffle_1x128x128_256x64x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1<
+    return a8w8_blockscale_bpreshuffle_1x128x128_256x64x64x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1<
         DDataType,
         EDataType>;
 }
