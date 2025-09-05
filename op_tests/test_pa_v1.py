@@ -277,6 +277,7 @@ def run_aiter(
     logits_soft_cap,
     k_scale,
     v_scale,
+    mtp=1,
 ):
     # copied from ops.PagedAttention.forward_decode()
     _PARTITION_SIZE_ROCM = 256
@@ -297,8 +298,9 @@ def run_aiter(
     #   3. max_logits (shape=(num_seqs, num_heads, max_num_partitions), dtype=float32)
     nbyes_per_qo_elem = torch.finfo(output.dtype).bits // 8
     workspace_buffer = torch.empty(
-        (num_seqs * num_heads * max_num_partitions * head_size) * nbyes_per_qo_elem
-        + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
+        (num_seqs * mtp * num_heads * max_num_partitions * head_size)
+        * nbyes_per_qo_elem
+        + 2 * (num_seqs * mtp * num_heads * max_num_partitions) * 4,
         dtype=torch.uint8,
         device=output.device,
     )
