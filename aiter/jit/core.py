@@ -166,7 +166,9 @@ def check_and_set_ninja_worker():
     import psutil
 
     # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
+    free_memory_gb = psutil.virtual_memory().available / (
+        1024**3
+    )  # free memory in GB
     max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
@@ -943,9 +945,10 @@ def compile_ops(
             return_int = True
 
         schema = f"{new_input} -> {output_part}".strip()
+
         def rewrite_symint_schema(schema: str) -> str:
-            pattern = re.compile(r'(SymInt\s+\w+)=0')
-            modified_schema = pattern.sub(r'\1=None', schema)
+            pattern = re.compile(r"(SymInt\s+\w+)=0")
+            modified_schema = pattern.sub(r"\1=None", schema)
             return modified_schema
 
         schema = rewrite_symint_schema(schema)
