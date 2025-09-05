@@ -60,7 +60,7 @@ jobs:
                   --model mistralai/Mixtral-8x7B-Instruct-v0.1 --batch-size 1 \
                   --input-len 128 --output-len 128 -tp 8 --num-scheduler-steps 10 \
                   --load-format dummy |& tee result.log
-          grep "Avg latency:" result.log | awk '{print \$3}'
+          grep "Avg latency:" result.log | awk '{print $3}'
 
       - name: Cleanup container
         if: always()
