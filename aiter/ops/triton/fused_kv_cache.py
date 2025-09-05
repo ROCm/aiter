@@ -100,7 +100,7 @@ def _unit_rope_cat(
 
 
 @triton.jit
-def _qk_rope_cat_and_cache_mla_kernel(
+def _fused_qk_rope_cat_and_cache_mla_kernel(
     q_nope_ptr,
     q_pe_ptr,
     k_nope_ptr,
@@ -396,7 +396,7 @@ def fused_qk_rope_cat_and_cache_mla(
 
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
-    _qk_rope_cat_and_cache_mla_kernel[grid](
+    _fused_qk_rope_cat_and_cache_mla_kernel[grid](
         q_nope,
         q_pe,
         k_nope,
@@ -439,6 +439,7 @@ def fused_qk_rope_cat_and_cache_mla(
         BLOCK_D_HALF_pe=d_pe // 2,
         OUTPUT_Q_NOPE_ZEROS=(q_nope_zeros_out is not None),
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
+        num_warps=1,
     )
 
     if num_decode_toks_for_zeros > 0:
@@ -920,6 +921,7 @@ def fused_qk_rope_reshape_and_cache(
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         HAVE_V_SCALE=(v_scale is not None and apply_scale),
         HAVE_ZEROS=output_zeros,
+        num_warps=1,
     )
 
     if zeros_out is not None:
