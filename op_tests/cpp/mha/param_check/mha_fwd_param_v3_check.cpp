@@ -38,7 +38,7 @@ bool mha_fwd_v3_check(const arch_enum gfx_version,
             r = fmha_fwd_v3_gfx942_check(traits, args, stream_config);
             break;
         case arch_enum::gfx950:
-            r= fmha_fwd_v3_gfx950_check(traits, args, stream_config);
+            r = fmha_fwd_v3_gfx950_check(traits, args, stream_config);
             break;
     }
     return r != -1;
