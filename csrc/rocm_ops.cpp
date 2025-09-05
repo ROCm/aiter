@@ -28,6 +28,7 @@
 #include "norm.h"
 #include "pos_encoding.h"
 #include "quant.h"
+#include "quick_all_reduce.h"
 #include "rmsnorm.h"
 #include "rocsolgemm.cuh"
 #include "rope.h"
@@ -90,6 +91,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     AITER_OPERATOR_PYBIND;
     AITER_UNARY_PYBIND;
     CUSTOM_ALL_REDUCE_PYBIND;
+    QUICK_ALL_REDUCE_PYBIND;
     CACHE_PYBIND;
     HIPBSOLGEMM_PYBIND;
     ROCSOLGEMM_PYBIND;
