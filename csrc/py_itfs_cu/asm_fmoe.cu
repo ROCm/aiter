@@ -591,7 +591,7 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
-        impl_ptr = get_heuristic_kernel(down.size(2), sub_X_cnt, config_map, smf, kernel_name);
+        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name);
         impl_ptr->set_4bit(true);
     }
 #endif
@@ -610,7 +610,7 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u1. ");
-        impl_ptr = get_heuristic_kernel(down.size(2), sub_X_cnt, config_map, smf, kernel_name);
+        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name);
     }
     else if(input.dtype() == torch_fp8) // fp8
     {
@@ -626,7 +626,7 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
             config_map = &cfg_fmoe_bf16_pertokenFp8_g1u1_gelu;
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenFp8_g1u1. ");
-        impl_ptr = get_heuristic_kernel(down.size(2), sub_X_cnt, config_map, smf, kernel_name);
+        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name);
     }
     else
     {
@@ -671,6 +671,9 @@ void fmoe_g1u1_tkw1(torch::Tensor& out,                            // [token_cnt
     const int token_cnt = input.size(0);
     const int block_m   = 32; // fmoe sorting kernel and fmoe kernel only support 32 for now
     const int estimated_sub_X_cnt = (token_cnt * topk + block_m - 1) / block_m;
+    int model_dim        = down.size(1);
+    int inter_dim        = down.size(2);
+    inter_dim *= model_dim / gate.size(2);
 
     if(fc2_smooth_scale.has_value())
     {
@@ -690,7 +693,7 @@ void fmoe_g1u1_tkw1(torch::Tensor& out,                            // [token_cnt
         else
             TORCH_CHECK(false, __func__, ": unsupport current activation type");
     }
-    impl_ptr = get_heuristic_kernel(down.size(2), estimated_sub_X_cnt, config_map, 0, kernel_name);
+    impl_ptr = get_heuristic_kernel(inter_dim, estimated_sub_X_cnt, config_map, 0, kernel_name);
     impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
                                                input,
                                                gate,
@@ -790,7 +793,7 @@ void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
     else
         TORCH_CHECK(false, __func__, "Unsupported gate dtype for fmoe_g1u1_a16");
 
-    impl_ptr = get_heuristic_kernel(down.size(2), sorted_expert_ids.size(0), config_map, 1);
+    impl_ptr = get_heuristic_kernel(inter_dim, sorted_expert_ids.size(0), config_map, 1);
     impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
                                                      input,
                                                      gate,
@@ -843,7 +846,7 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
             TORCH_CHECK(
                 false, __func__, "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
 
-        impl_ptr = get_heuristic_kernel(down.size(2), sorted_expert_ids.size(0), config_map, 0, kernel_name);
+        impl_ptr = get_heuristic_kernel(inter_dim, sorted_expert_ids.size(0), config_map, 0, kernel_name);
 
         impl_ptr->launch_kernel<uint8_t, uint16_t, false>(out,
                                                           input,
