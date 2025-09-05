@@ -373,7 +373,12 @@ def run_1stage_fmoe_g1u1(
 
 def get_1stage_fmoe_func(quant_type, q_dtype_a, activation, isG1U1, doweight_stage1):
     fmoe_func = None
-    if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
+    if (
+        quant_type == QuantType.No
+        and activation == ActivationType.Silu
+        and not isG1U1
+        or doweight_stage1
+    ):
         print("not support No Quant Silu G1U0 1 stage tuning!")
     else:
         if quant_type == QuantType.per_1x128:
@@ -1144,7 +1149,6 @@ class FmoeTuner(TunerCommon):
                 + m * n * self.get_bpe(dtype)
                 + k * n * self.get_bpe(q_dtype_w) * expert
             )
-
         elif stage == "stage2":
             ## gemm2
             m = token
