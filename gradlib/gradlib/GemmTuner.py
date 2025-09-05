@@ -120,6 +120,7 @@ class Gemm:
         scaleAB=False,
         rocblas_decode=False,
         mp=1,
+        err_ratio=0.01,
     ):
         self.m = m
         self.k = k
@@ -140,7 +141,7 @@ class Gemm:
         self.rtol = 1e-2
         self.atol = 1e-2
         self.ref = self.get_gemm_ref()
-        self.check_err_ratio = 0.01
+        self.check_err_ratio = err_ratio
         self.start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
         # prefer hipblaslt unless rocblas time is less than this
@@ -148,6 +149,30 @@ class Gemm:
         self.hipb_prefer_ratio = 0.995
         self.rocblas_decode = rocblas_decode
         self.mp = mp
+        self.inbpe = self.inp.element_size()
+        self.outbpe = self.ref.element_size()
+
+    def calculate_perf(
+        self,
+        results,
+        inbpe,
+        outbpe,
+    ):
+        """calculate TFLOPS and bandwidth"""
+        ### gemm flops,bw
+        info, time, err_ratio = results
+        if time == -1:
+            return -1, -1
+        print("info is ", info)
+        cu_num, m, n, k = info[0]
+        flops = m * n * k * 2
+        tflops = round(flops / (time * 1000000), 2)
+
+        bw = round(
+            (m * k * inbpe + n * k * inbpe + m * n * outbpe) / (time * 1e-6) / 1e9,
+            2,
+        )
+        return tflops, bw
 
     def find_hipblas_sols(self):
         sols = aiter.hipb_findallsols(
@@ -263,6 +288,7 @@ class Gemm:
                 if err_ratio > self.check_err_ratio:
                     continue
             gtimes[solidx] = us / 1000.0
+
         self.hipb_gtimedf = pd.DataFrame.from_dict(
             gtimes, orient="index", columns=["gtimems"]
         ).sort_values(by="gtimems")
@@ -410,7 +436,15 @@ class Gemm:
 
 class GemmTuner:
 
-    def __init__(self, indtype, outdtype, tuned_file=None, rocblas_decode=False, mp=1):
+    def __init__(
+        self,
+        indtype,
+        outdtype,
+        tuned_file=None,
+        rocblas_decode=False,
+        mp=1,
+        err_ratio=0.01,
+    ):
         self.gemm_problems = pd.DataFrame(columns=["M", "N", "K", "bias"])
         self.indtype = indtype
         self.outdtype = outdtype
@@ -427,7 +461,7 @@ class GemmTuner:
             self.tuned_shapes = None
             with open(tuned_file, "w") as tf:
                 tf.write(
-                    "M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,soltimes,kernelName\n"
+                    "M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,soltimes,kernelName,tflops, bw\n"
                 )
 
         gpu = torch.cuda.current_device()
@@ -484,6 +518,7 @@ class GemmTuner:
                 scaleAB=ds["scaleAB"],
                 rocblas_decode=self.rocblas_decode,
                 mp=self.mp,
+                err_ratio=0.01,
             )
             gemmobj.find_fastest_solution()
 
@@ -493,11 +528,20 @@ class GemmTuner:
                 if gemmobj.best_libtype == "hipblaslt"
                 else "rocblas"
             )
-
+            ret = (
+                ((self.cu_num, ds["M"], ds["N"], ds["K"]), int(gemmobj.best_solidx)),
+                soltimes,
+                gemmobj.check_err_ratio,
+            )
+            tflops, bw = gemmobj.calculate_perf(
+                ret,
+                gemmobj.inbpe,
+                gemmobj.outbpe,
+            )
             with open(self.tuned_file, "a") as tf:
                 tf.write(
                     f"{ds['M']},{ds['N']},{ds['K']},{ds['bias']},{indtype},{outdtype},{ds['scaleAB']},"
-                    f"{self.cu_num},{gemmobj.best_libtype},{int(gemmobj.best_solidx)},{soltimes},{kernal_name}\n"
+                    f"{self.cu_num},{gemmobj.best_libtype},{int(gemmobj.best_solidx)},{soltimes},{kernal_name},{tflops},{bw}\n"
                 )
 
             del gemmobj
