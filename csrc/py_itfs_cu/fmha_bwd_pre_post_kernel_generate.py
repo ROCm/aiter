@@ -241,8 +241,10 @@ using fmha_bwd_convert_dq_pipeline_problem_{F_idx} =
         {F_bm0},
         {F_bn0},
         {F_hdim},
+        {F_wn0},
         {F_mode},
         {F_deterministic},
+        {F_atomic32},
         fmha_bwd_convert_dq_trait_{F_idx}>;
 
 using fmha_bwd_convert_dq_{F_idx} =
@@ -256,7 +258,8 @@ using convert_dq_trait_{F_idx} = fmha_bwd_convert_dq_traits_<{F_hdim},
                                                              {F_mode},
                                                              {F_spad},
                                                              {F_dpad},
-                                                             {F_deterministic}>;
+                                                             {F_deterministic},
+                                                             {F_atomic32}>;
 
 #include <iostream>
 
@@ -301,11 +304,13 @@ class FmhaBwdConvertQGradKernel:
     F_dtype: str  # data type
     F_bm0: int  # tile size along q seqlen (block size)
     F_bn0: int  # tile size along k seqlen
+    F_wn0: int  # warp size along n in gemm0/gemm2/gemm4
     F_spad: str  # true/false
     F_dpad: str  #
     F_mode: str  # value from MODE_MAP
     F_occupancy: int  #
     F_deterministic: str  #
+    F_atomic32: str  #
 
     @property
     def template(self) -> str:
@@ -315,11 +320,13 @@ class FmhaBwdConvertQGradKernel:
             F_dtype=BWD_DTYPE_MAP[self.F_dtype],
             F_bm0=self.F_bm0,
             F_bn0=self.F_bn0,
+            F_wn0=self.F_wn0,
             F_spad=BOOL_MAP[self.F_spad],
             F_dpad=BOOL_MAP[self.F_dpad],
             F_mode=MODE_MAP[self.F_mode],
             F_occupancy=self.F_occupancy,
             F_deterministic=BOOL_MAP[self.F_deterministic],
+            F_atomic32=BOOL_MAP[self.F_atomic32],
         )
 
     @property
@@ -335,15 +342,17 @@ class FmhaBwdConvertQGradKernel:
             return n
 
         pn = pad_name()
-        n = f"fmha_bwd_convert_dq_d{self.F_hdim}_{self.F_dtype}_b{self.F_bm0}x{self.F_bn0}_{self.F_mode}_o{self.F_occupancy}"
+        n = f"fmha_bwd_convert_dq_d{self.F_hdim}_{self.F_dtype}_b{self.F_bm0}x{self.F_bn0}_wn0{self.F_wn0}_{self.F_mode}_o{self.F_occupancy}"
         if pn != "":
             n += f"_{pn}"
         else:
             n += "_npad"
         if self.F_deterministic == "t":
             n += "_deterministic"
+        elif self.F_atomic32 == "t":
+            n += "_atomic32"
         else:
-            n += "_ndeterministic"
+            n += "_atomic16"
         return n
 
     @property
@@ -365,8 +374,8 @@ def get_bwd_convert_dq_blobs(
         d = get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype)
         if d is None:
             continue
-        for hdim_str, mode, spad, dpad, deterministic in itertools.product(
-            d.keys(), MODE_MAP.keys(), ["t", "f"], ["t", "f"], ["t", "f"]
+        for hdim_str, mode, spad, dpad, deterministic, atomic32 in itertools.product(
+            d.keys(), MODE_MAP.keys(), ["t", "f"], ["t", "f"], ["t", "f"], ["t", "f"]
         ):
             hdim = int(hdim_str)
             tile = d[hdim_str][0]
@@ -378,11 +387,13 @@ def get_bwd_convert_dq_blobs(
                 F_dtype=dtype,
                 F_bm0=64,
                 F_bn0=tile.F_bn0,
+                F_wn0=tile.F_wn0,
                 F_spad=spad,
                 F_dpad=dpad,
                 F_mode=mode,
                 F_occupancy=get_occupancy(dtype, hdim),
                 F_deterministic=deterministic,
+                F_atomic32=atomic32,
             )
             if kernel_filter != "":
                 if not fnmatch.fnmatch(k.name, kernel_filter):
