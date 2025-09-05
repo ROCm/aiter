@@ -230,6 +230,7 @@ def _attn_fwd_inner(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DMODEL_POW2: tl.constexpr,
     SM_SCALE: tl.constexpr,
+    QK_SCALE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     MASK_STEPS: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
@@ -237,12 +238,15 @@ def _attn_fwd_inner(
     PADDED_HEAD: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    ENABLE_PIPELINING: tl.constexpr,
 ):
-    RCP_LN2: tl.constexpr = 1.4426950408889634
+    num_stages: tl.constexpr = (
+        None if ENABLE_PIPELINING else 1
+    )  # Set num_stages==1 if we want to disable pipelining
 
     # loop over k, v, and update accumulator
 
-    for start_n in range(block_min, block_max, BLOCK_N):
+    for start_n in range(block_min, block_max, BLOCK_N, num_stages=num_stages):
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         if MASK_STEPS:
@@ -289,7 +293,7 @@ def _attn_fwd_inner(
         if IS_CAUSAL:
             causal_boundary = start_n + offs_n_causal
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
-            mask = mask and causal_mask
+            mask = mask & causal_mask
 
         qk = tl.where(mask, qk, float("-inf"))
 
@@ -303,10 +307,10 @@ def _attn_fwd_inner(
             qk += alibi_block / SM_SCALE
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        m_ij_scaled = m_ij * SM_SCALE * RCP_LN2
+        m_ij_scaled = m_ij * QK_SCALE
 
         # scale and subtract max
-        q_shifted = qk * SM_SCALE * RCP_LN2 - m_ij_scaled[:, None]
+        q_shifted = qk * QK_SCALE - m_ij_scaled[:, None]
 
         # Compute scaled QK and softmax probabilities
         p = tl.math.exp2(q_shifted)
@@ -333,7 +337,7 @@ def _attn_fwd_inner(
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff_scaled = m_i * SM_SCALE * RCP_LN2 - m_ij_scaled
+        m_diff_scaled = m_i * QK_SCALE - m_ij_scaled
         alpha = tl.math.exp2(m_diff_scaled)
         acc = acc * alpha[:, None]
         v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
@@ -403,7 +407,7 @@ def _attn_fwd(
     stride_lse_z_in,
     stride_lse_h_in,
     stride_lse_m_in,
-    sm_scale,
+    sm_scale: tl.constexpr,
     cu_seqlens_q,
     cu_seqlens_k,
     dropout_p,
@@ -428,16 +432,11 @@ def _attn_fwd(
     USE_INT64_STRIDES: tl.constexpr,
 ):
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
-    # calculate offsets
-    wid = tl.program_id(
-        0
-    )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
-    # num blocks along seqlen
 
-    off_q_head = wid % NUM_Q_HEADS
+    off_q_head = tl.program_id(0)
     off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
-    start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
-    off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    start_m = tl.program_id(1)
+    off_z = tl.program_id(2)
 
     # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -516,6 +515,37 @@ def _attn_fwd(
         stride_lse_z = stride_lse_z_in
         stride_lse_h = stride_lse_h_in
         stride_lse_m = stride_lse_m_in
+
+    tl.assume(stride_qz >= 0)
+    tl.assume(stride_qh >= 0)
+    tl.assume(stride_qm >= 0)
+    tl.assume(stride_qk >= 0)
+    tl.assume(stride_kz >= 0)
+    tl.assume(stride_kh >= 0)
+    tl.assume(stride_kn >= 0)
+    tl.assume(stride_kk >= 0)
+    tl.assume(stride_vz >= 0)
+    tl.assume(stride_vh >= 0)
+    tl.assume(stride_vk >= 0)
+    tl.assume(stride_vn >= 0)
+    if IS_FP8:
+        tl.assume(stride_descale_q_z >= 0)
+        tl.assume(stride_descale_k_z >= 0)
+        tl.assume(stride_descale_v_z >= 0)
+    tl.assume(stride_oz >= 0)
+    tl.assume(stride_oh >= 0)
+    tl.assume(stride_om >= 0)
+    tl.assume(stride_on >= 0)
+    tl.assume(stride_alibi_z >= 0)
+    tl.assume(stride_alibi_h >= 0)
+    tl.assume(philox_offset_base >= 0)
+    tl.assume(stride_sd_z >= 0)
+    tl.assume(stride_sd_h >= 0)
+    tl.assume(stride_sd_m >= 0)
+    tl.assume(stride_sd_n >= 0)
+    tl.assume(stride_lse_z >= 0)
+    tl.assume(stride_lse_h >= 0)
+    tl.assume(stride_lse_m >= 0)
 
     if VARLEN:
         cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
@@ -662,6 +692,7 @@ def _attn_fwd(
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=tl.float32)
+    qk_scale: tl.constexpr = sm_scale * 1.44269504089
     if BLOCK_DMODEL == BLOCK_DMODEL_POW2:
         q_mask = offs_m[:, None] < seqlen_q
     else:
@@ -735,6 +766,7 @@ def _attn_fwd(
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
             sm_scale,
+            qk_scale,
             False,
             MASK_STEPS=False,
             ENABLE_DROPOUT=ENABLE_DROPOUT,
@@ -742,6 +774,7 @@ def _attn_fwd(
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            ENABLE_PIPELINING=True,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -792,6 +825,7 @@ def _attn_fwd(
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
             sm_scale,
+            qk_scale,
             IS_CAUSAL,
             MASK_STEPS=True,
             ENABLE_DROPOUT=ENABLE_DROPOUT,
@@ -799,6 +833,7 @@ def _attn_fwd(
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            ENABLE_PIPELINING=False,
         )
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -827,11 +862,10 @@ def _attn_fwd(
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     overflow_size = end_m_idx - seqlen_q
     if softmax_lse_ptr is not None:
-        RCP_LN2: tl.constexpr = 1.4426950408889634
         LN2: tl.constexpr = 0.6931471824645996
         # compute log-sum-exp in base 2 units
         # mi_base2 = m_i * RCP_LN2
-        mi_base2 = m_i * RCP_LN2 * sm_scale
+        mi_base2 = m_i * qk_scale
         softmax_lse = mi_base2 + tl.math.log2(l_i)
         # convert back to natural units
         softmax_lse *= LN2
@@ -1029,7 +1063,9 @@ def _flash_attn_forward(
     """
 
     grid = lambda META: (  # noqa: E731
-        batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
+        num_q_heads,
+        triton.cdiv(seqlen_q, META["BLOCK_M"]),
+        batch,
     )
 
     _attn_fwd[grid](
