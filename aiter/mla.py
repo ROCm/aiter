@@ -151,7 +151,7 @@ def mla_decode_fwd(
     num_kv_splits = 80
     if nhead == 16 and max_seqlen_q == 1:
         # special case for 16 heads and max_seqlen_q == 1
-        logits = torch.zeros(
+        logits = torch.empty(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -159,7 +159,7 @@ def mla_decode_fwd(
         MAYBE_FINAL_OUT = False
     elif nhead in [8, 16, 128]:
         MAYBE_FINAL_OUT = True
-        logits = torch.zeros(
+        logits = torch.empty(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -242,7 +242,7 @@ def mla_decode_fwd(
     config = _get_config()["fwd_grouped_kernel_stage1_rope"]
 
 
-    qo_len = 2
+    qo_len = 1
 
     decode_grouped_att_m_fwd_ps(
         q.reshape(-1, nhead * qo_len, 576),               # [B, Sq, hq, 576]

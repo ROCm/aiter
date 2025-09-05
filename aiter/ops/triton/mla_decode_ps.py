@@ -1,21 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-# Copyright (C) 2023-2025 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
 """
-Memory-efficient attention for decoding.
+Memory-efficient attention for mtp.
 It supports page size = 1.
 """
 
@@ -68,6 +55,7 @@ def _fwd_grouped_kernel_stage1_ps(
     batch: tl.constexpr,
     logit_cap: tl.constexpr,
     max_qo_len: tl.constexpr,
+    nhead: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -93,6 +81,8 @@ def _fwd_grouped_kernel_stage1_ps(
 
         split_kv_start = tl.load(work_info_set + work_id * 8 + 4)
         split_kv_end = tl.load(work_info_set + work_id * 8 + 5)
+
+        token_to_batch_end = tl.load(work_info_set + work_id * 8 + 6)
 
         num_q_head_blk = tl.cdiv(q_head_num, BLOCK_H)
 
@@ -128,6 +118,15 @@ def _fwd_grouped_kernel_stage1_ps(
         e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
         e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
         acc = tl.zeros([BLOCK_H, BLOCK_C], dtype=tl.float32)
+
+        indices = tl.arange(0, BLOCK_H)
+        if token_to_batch_end == 0:
+
+            quarter = BLOCK_H // max_qo_len
+            seq_m_extand = max_qo_len - 1 - (indices % BLOCK_H) // quarter
+            # seq_m_extand = tl.where(indices < nhead, 1, 0)
+        else:
+            seq_m_extand = tl.where(indices, 0, 0)
 
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -167,7 +166,8 @@ def _fwd_grouped_kernel_stage1_ps(
                 qk = logit_cap * _tanh(qk / logit_cap)
 
             qk = tl.where(
-                mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
+                # mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
+                ((seq_m_extand[:, None] + offs_n[None, :]) < split_kv_end), qk, float("-inf")
             )
 
             # offs_buf_v = kv_loc[:, None] * stride_buf_vbs + offs_c[None, :]
@@ -259,7 +259,7 @@ def decode_grouped_att_m_fwd_ps(
     config["BLOCK_H"] = ((kv_group_num + 15) // 16) * 16
 
     grid = (80,)
-    # print(work_indptr)
+    # print(config["BLOCK_H"])
 
     _fwd_grouped_kernel_stage1_ps[grid](
         q,
@@ -293,5 +293,6 @@ def decode_grouped_att_m_fwd_ps(
         batch=batch,
         logit_cap=logit_cap,
         max_qo_len=mtp + 1,
+        nhead=head_num // (mtp + 1),
         **config,
     )

@@ -12,6 +12,12 @@ import argparse
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+setup_seed(1)
 
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
@@ -159,9 +165,9 @@ def test_mla(
         seq_lens_kv.fill_(ctx_lens)
         seq_lens_qo.fill_(ctx_lens)
 
-    seq_lens_kv = torch.tensor([3819,9978,784,530,8062,1390,287,1008,5090,5304,7396,2288,2104,4063,3644,5091,6470,4732,7237,430,2777,956,1357,5478,1292,521,6802,1347,2388,5062,443,8560,5049,7235,927,9580,623,4913,2511,8120,1638,4859,600,7289,8278,6693,136,1021,1465,5859,1278,7123,7839,2459,1090,6333,812,9358,6345,8616,2313,6115,6059,4963,
-        12343, 213, 143, 12312, 12345, 3215, 4444, 5325, 2132, 123, 456, 2135, 135, 2564, 5465, 4362], device="cuda")
-    seq_lens_kv = seq_lens_kv[:batch_size]
+    # seq_lens_kv = torch.tensor([3819,9978,784,530,8062,1390,287,1008,5090,5304,7396,2288,2104,4063,3644,5091,6470,4732,7237,430,2777,956,1357,5478,1292,521,6802,1347,2388,5062,443,8560,5049,7235,927,9580,623,4913,2511,8120,1638,4859,600,7289,8278,6693,136,1021,1465,5859,1278,7123,7839,2459,1090,6333,812,9358,6345,8616,2313,6115,6059,4963,
+    #     12343, 213, 143, 12312, 12345, 3215, 4444, 5325, 2132, 123, 456, 2135, 135, 2564, 5465, 4362], device="cuda")
+    # seq_lens_kv = seq_lens_kv[:batch_size]
 
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
     kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
@@ -206,7 +212,7 @@ def test_mla(
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
-        is_causal=False,
+        is_causal=True,
         dtype=dtype,
     )
 
@@ -292,9 +298,11 @@ def test_mla(
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
-        q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
-        q_scale = q_scale.to(torch.float)
+        # q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
+        # q_scale = q_scale.to(torch.float)
 
+        q_fp8 = q.to(torch.float8_e4m3fnuz)
+        q_scale = torch.ones([1], dtype=torch.float, device="cuda")
         kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
@@ -358,7 +366,7 @@ def test_mla(
         )
         return err, err_fp8, us_asm_decode
 
-    # err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8 = test_absorb_decode_fp8()
+    err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8 = test_absorb_decode_fp8()
 
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")
@@ -377,11 +385,11 @@ def test_mla(
         "decode:asm_576": us_asm_decode,
         "decode:TFLOPS": flops / us_asm_decode / 1e6,
         "decode:TB/s": bytes / us_asm_decode / 1e6,
-        # "decode_fp8:err vs fp32": err_fp8_fp32,
-        # "decode_fp8:err vs fp8": err_fp8_fp8,
-        # "decode_fp8:asm_576": us_asm_decode_fp8,
-        # "decode_fp8:TFLOPS": flops / us_asm_decode_fp8 / 1e6,
-        # "decode_fp8:TB/s": bytes / us_asm_decode_fp8 / 1e6,
+        "decode_fp8:err vs fp32": err_fp8_fp32,
+        "decode_fp8:err vs fp8": err_fp8_fp8,
+        "decode_fp8:asm_576": us_asm_decode_fp8,
+        "decode_fp8:TFLOPS": flops / us_asm_decode_fp8 / 1e6,
+        "decode_fp8:TB/s": bytes / us_asm_decode_fp8 / 1e6,
     }
 
 
@@ -392,7 +400,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16"]
 l_kv_dtype = ["bf16"]
-list_nhead = [(16, 2)]
+list_nhead = [(8, 1)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -472,7 +480,8 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(1, 80)],  # [41],
+    # default=[i for i in range(1, 80)],  # [41],
+    default=[64],  # [41],
     help="""Batch size.
     e.g.: -b 16""",
 )
