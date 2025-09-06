@@ -75,11 +75,14 @@ if find_aiter is not None:
     package_parent_path = os.path.dirname(package_path)
     import site
 
-    site_packages_dirs = site.getsitepackages()
-    # develop mode
-    isDevelopMode = (package_path not in site_packages_dirs) and (
-        package_parent_path not in site_packages_dirs
-    )
+    try:
+        with open(f"{this_dir}/../install_mode", "r") as f:
+            # develop mode
+            isDevelopMode = f.read().strip() == "develop"
+    except FileNotFoundError:
+        # pip install -e
+        isDevelopMode = True
+
     if isDevelopMode:
         AITER_META_DIR = AITER_ROOT_DIR
     # install mode
