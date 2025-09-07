@@ -1,7 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
-from aiter.jit.utils.chip_info import get_gfx
+import os
+import sys
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
+if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
+    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter/jit/utils")  # pip install mode
+else:
+    AITER_CORE_DIR = os.path.abspath(
+        f"{this_dir}/../../aiter/jit/utils"
+    )  # develop mode
+sys.path.insert(0, AITER_CORE_DIR)
+
+from chip_info import get_gfx  # noqa: E402
 
 
 @dataclass
@@ -46,9 +59,9 @@ class kernelInstanceGEMM1:
                 "Quant" + str(self.QuantType),
                 "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
                 "silu" if self.ActOP else "gelu",
-                self.Adtype,
-                self.Bdtype,
-                self.Cdtype,
+                self.Adtype.upper(),
+                self.Bdtype.upper(),
+                self.Cdtype.upper(),
             ]
         )
 
@@ -90,9 +103,9 @@ class kernelInstanceGEMM2:
                 "Nswizzle" + str(int(self.Nswizzle)),
                 "Quant" + str(self.QuantType),
                 "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
-                self.Adtype,
-                self.Bdtype,
-                self.Cdtype,
+                self.Adtype.upper(),
+                self.Bdtype.upper(),
+                self.Cdtype.upper(),
             ]
         )
 
@@ -296,7 +309,7 @@ def get_gemm1_kernels_list(
     Cdtype: str,
     Nswizzle: bool,
     QuantType: str,
-    ActOP: bool,
+    ActOP: str,
     MulRoutedWeight: bool,
 ) -> list:
     arch = get_gfx()
@@ -330,7 +343,7 @@ def get_gemm1_kernels_list(
     kernels_list = gemm1_kernels_dict[tag]
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
-        kernel.ActOP = ActOP
+        kernel.ActOP = ActOP == "silu"
         kernel.Nswizzle = Nswizzle
         kernel.QuantType = QuantType
         kernel.Adtype = Adtype

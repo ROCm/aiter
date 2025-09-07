@@ -17,7 +17,8 @@
 
 using fp8_type = ck_tile::fp8_t;
 
-static constexpr int32_t max_vec_size = 16;
+static constexpr int32_t max_vec_size = 8;
+static constexpr int32_t max_wave_num = 8;
 
 namespace aiter {
 
@@ -132,8 +133,10 @@ static constexpr int nextPow2(unsigned int num)
     int64_t num_tokens = input.numel() / input.size(-1);                                   \
     int vec_size       = nextPow2(d / 64);                                                 \
     vec_size           = vec_size > max_vec_size ? max_vec_size : vec_size;                \
+    int num_wave       = nextPow2(d / 64 / vec_size);                                      \
+    num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;                \
     dim3 grid(num_tokens);                                                                 \
-    dim3 block(vec_size * 64);                                                             \
+    dim3 block(num_wave * 64);                                                             \
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));                      \
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();                          \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "act_and_mul_kernel", [&] {       \
@@ -152,8 +155,10 @@ static constexpr int nextPow2(unsigned int num)
     int64_t num_tokens = input.numel() / input.size(-1);                                    \
     int vec_size       = nextPow2(d / 64);                                                  \
     vec_size           = vec_size > max_vec_size ? max_vec_size : vec_size;                 \
+    int num_wave       = nextPow2(d / 64 / vec_size);                                       \
+    num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;                 \
     dim3 grid(num_tokens);                                                                  \
-    dim3 block(vec_size * 64);                                                              \
+    dim3 block(num_wave * 64);                                                              \
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));                       \
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();                           \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_act_and_mul_kernel", [&] { \

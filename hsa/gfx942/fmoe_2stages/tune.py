@@ -372,7 +372,12 @@ def run_1stage_fmoe_g1u1(
 
 def get_1stage_fmoe_func(quant_type, q_dtype_a, activation, isG1U1, doweight_stage1):
     fmoe_func = None
-    if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
+    if (
+        quant_type == QuantType.No
+        and activation == ActivationType.Silu
+        and not isG1U1
+        or doweight_stage1
+    ):
         print("not support No Quant Silu G1U0 1 stage tuning!")
     else:
         if quant_type == QuantType.per_1x128:
@@ -1162,16 +1167,19 @@ def go(
         _, ck_stage1_kernels = get_gemm1_kernels_list(
             dtype2str_dict[q_dtype_a],
             dtype2str_dict[q_dtype_w],
+            dtype2str_dict[dtype],
             False,
-            str(q_type).split(".")[-1].lower(),
+            int(q_type),
             str(act_type).split(".")[-1].lower(),
             doweight_stage1,
         )
+
         _, ck_stage2_kernels = get_gemm2_kernels_list(
             dtype2str_dict[q_dtype_a],
             dtype2str_dict[q_dtype_w],
+            dtype2str_dict[dtype],
             False,
-            str(q_type).split(".")[-1].lower(),
+            int(q_type),
             not doweight_stage1,
         )
         for blockM in blockMs:
@@ -1490,10 +1498,7 @@ def go(
             )
         profileDF = pd.DataFrame(
             profileDF,
-            columns=["stage"]
-            + ["cu_num"]
-            + args
-            + ["block_m", "ksplit", "us", "kernelName", "err"],
+            columns=["stage"] + args + ["block_m", "ksplit", "us", "kernelName", "err"],
         )
         prorfiles.append(profileDF)
         profileDF = profileDF.sort_values("us").drop_duplicates(
