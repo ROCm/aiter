@@ -95,7 +95,7 @@ def ck_moe_stage2(
     D = w2.shape[1]
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
-    out = torch.zeros(
+    out = torch.empty(
         (token_num, D),
         dtype=dtype,
         device=hidden_states.device,
@@ -131,6 +131,8 @@ def cktile_moe_stage1(
     exp_bias1,
     dtype,
     topk,
+    n_pad_zeros = 0,
+    k_pad_zeros = 0,
     block_size=32,
     Activation=ActivationType.Silu,
     quant_type=aiter.QuantType.No,
@@ -154,6 +156,8 @@ def cktile_moe_stage1(
         sorted_expert_ids,
         num_valid_ids,
         topk,
+        n_pad_zeros,
+        k_pad_zeros,
         sorted_weights,
         a1_scale,
         w1_scale,
@@ -174,20 +178,25 @@ def cktile_moe_stage2(
     exp_bias2,
     dtype,
     topk,
+    n_pad_zeros = 0,
+    k_pad_zeros = 0,
     block_size=32,
     Activation=ActivationType.Silu,
     quant_type=aiter.QuantType.No,
     sorted_weights=None,  # [max_num_tokens_padded]
+    zeros_out = False
 ):
     token_num = hidden_states.shape[0]
     D = w2.shape[1]
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
-    out = torch.zeros(
+    out = torch.empty(
         (token_num, D),
         dtype=dtype,
         device=hidden_states.device,
     )
+    if zeros_out:
+        out.fill_(0)
     # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(hidden_states.shape[0]*hidden_states.shape[1], w2.shape[1], hidden_states.shape[2], topk, w2.shape[0]))
     aiter.moe_cktile2stages_gemm2(
         hidden_states,
@@ -197,6 +206,8 @@ def cktile_moe_stage2(
         sorted_expert_ids,
         num_valid_ids,
         topk,
+        n_pad_zeros,
+        k_pad_zeros,
         sorted_weights,
         a2_scale,
         w2_scale,
@@ -280,13 +291,20 @@ def test_fmoe(
     torch_quant = aiter.get_torch_quant(qType)
     # torch_act = aiter.get_torch_act(actType)
     input = torch.randn((token, model_dim), dtype=dtype)
+    npad0 = 192
+    kpad0 = 128
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
+        w1[:,:,-kpad0:] = 0
+        w1[:,-npad0:,:] = 0
+        w1[:,inter_dim-npad0:inter_dim,:] = 0
         exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
+    w2[:,:,-kpad0:] = 0
+    w2[:,-npad0:,:] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
@@ -294,9 +312,9 @@ def test_fmoe(
     M, _ = topk_ids.shape
 
     # BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
-    BLOCK_SIZE_M = 128
-    if qType == aiter.QuantType.per_128x128:
-        BLOCK_SIZE_M = 64
+    BLOCK_SIZE_M = 16
+    # if qType == aiter.QuantType.per_128x128:
+    #     BLOCK_SIZE_M = 64
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids, topk_weights, E, model_dim, dtype, BLOCK_SIZE_M
     )
@@ -381,7 +399,6 @@ def test_fmoe(
     else:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-
     if qType == aiter.QuantType.per_128x128:
         a1_qt, a1_scale = aiter.pertoken_quant(
             input.view(token, -1, 128), quant_dtype=AQDType
@@ -519,6 +536,8 @@ def test_fmoe(
         exp_bias1_aiter,
         dtype,
         topk,
+        npad0 * 2,
+        kpad0,
         BLOCK_SIZE_M,
         actType,
         quant_type=qType,
@@ -528,8 +547,8 @@ def test_fmoe(
         # num_warmup=0,
     )
     checkAllclose(
-        out1_ref,
-        out1_ck,
+        out1_ref[:,:-npad0],
+        out1_ck[:,:-npad0],
         msg=f"[perf]  ck_moe_stage1:{us:>8.2f} us, {token*model_dim*inter_dim*2*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
     # ######################## stage 1 end ###########
@@ -620,7 +639,7 @@ def test_fmoe(
     # )
 
     # # cktil2stage
-    out2_ck, us = run_perftest(
+    _, us = run_perftest(
         cktile_moe_stage2,
         a2_qt,
         w1_qt_aiter,
@@ -633,6 +652,8 @@ def test_fmoe(
         exp_bias2_aiter,
         dtype,
         topk,
+        npad0,
+        kpad0,
         BLOCK_SIZE_M,
         actType,
         quant_type,
@@ -640,7 +661,26 @@ def test_fmoe(
         # num_iters=2,
         # num_warmup=0,
     )
-
+    out2_ck = cktile_moe_stage2(
+        a2_qt,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        w2_scale_aiter,
+        a2_scale,
+        exp_bias2_aiter,
+        dtype,
+        topk,
+        npad0,
+        kpad0,
+        BLOCK_SIZE_M,
+        actType,
+        quant_type,
+        sorted_weights if not doweight_stage1 else None,
+        True
+    )
 
     checkAllclose(
         out2_ref,
@@ -704,14 +744,14 @@ l_tokenNum = [
     # 1,
     # 3,
     # 5,
-    # 16,
-    # 32,
-    # 64,
-    # 128,
-    # 256,
+    16,
+    32,
+    64,
+    128,
+    256,
     # 1024,
     # 4096,
-    8192,
+    # 8192,
     # 163840,
 ]
 l_quant = [
@@ -776,7 +816,7 @@ parser.add_argument(
     4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
     5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8""",
 )
-
+torch.cuda.manual_seed_all(1)
 parser.add_argument(
     "-a",
     "--act",
