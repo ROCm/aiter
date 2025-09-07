@@ -31,6 +31,11 @@ jobs:
       - name: Make authenticated API request
         run: |
           curl -sSfL https://api.github.com/repos/casey/just/releases/latest
+      
+      - name: Workaround to change the connection of unbuntu from http to https
+        run: |
+          cd sglang
+          sed -i "79iRUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/* && sed -i 's|http://|https://|g' /etc/apt/sources.list && apt update -o Acquire::https::Verify-Peer=false && apt install -o Acquire::https::Verify-Peer=false ca-certificates -y && echo 'Acquire::https::Verify-Peer \"false\";' > /etc/apt/apt.conf.d/99insecure" docker/Dockerfile.rocm
 
       - name: Build sglang_aiter_test image
         run: |
