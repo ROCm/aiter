@@ -163,7 +163,7 @@ if __name__ == "__main__":
         "N",
         "K",
     ]
-    tuneList = [
+    resultList = [
         "kernelId",
         "splitK",
         "us",
@@ -176,7 +176,7 @@ if __name__ == "__main__":
     tuner = BatchedGemmBf16Tuner(
         "BatchedGemmBf16Tuner",
         key,
-        key + tuneList,
+        resultList,
         "gen API for CK batch gemm bf16 kernel",
     )
 

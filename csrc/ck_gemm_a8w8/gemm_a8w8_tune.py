@@ -176,10 +176,10 @@ class GemmA8W8Tuner(GemmCommonTuner):
 
 if __name__ == "__main__":
 
-    ## tuner =GemmA8W8Tuner("GemmA8W8Tuner", key, key + tuneList,"gen API for CK gemm a8w8 kernel")
+    ## tuner =GemmA8W8Tuner("GemmA8W8Tuner", key, resultList,"gen API for CK gemm a8w8 kernel")
     ## use default key and resultList
     tuner = GemmA8W8Tuner(
-        "GemmA8W8Tuner",
+        "GemmA8W8Tuner",  # key, resultList,
         description="gen API for CK gemm a8w8 kernel",
     )
 

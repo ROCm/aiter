@@ -41,7 +41,7 @@ class TunerCommon:
         self.parser = argparse.ArgumentParser(description=description)
         self._setup_common_arguments()
         self._setup_specific_arguments()
-        self.columns = resultList
+        self.columns = key + resultList
         self.keys = key
         self.tunedf = None
         self.untunedf = None
@@ -220,6 +220,10 @@ class TunerCommon:
     def result_to_csv(self, results, file):
         pass
 
+    def update_tflops_bw(self, tune_file):
+        """update tflops and bw from old tune_file"""
+        pass
+
     #
     def run(self, args, fast_mode=False):
         """tuner run function"""
@@ -227,7 +231,7 @@ class TunerCommon:
         if args.verbose:
             logger.info(f"args: {args}")
         if len(self.untunedf) == 0:
-            # self.result_to_csv(None, args.tune_file)
+            self.update_tflops_bw(args.tune_file)
             logger.info(f"no shapes to be tuned, skip tuning")
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
         batch_size = min(args.batch, len(self.untunedf))
@@ -286,7 +290,7 @@ class GemmCommonTuner(TunerCommon):
         ],
         description=None,
     ):
-        super().__init__(name, key, key + resultList, description)
+        super().__init__(name, key, resultList, description)
 
     def pre_process(self, args):
         self.untunedf = self.get_untuned_gemm_list(args.untune_file)
@@ -319,37 +323,6 @@ class GemmCommonTuner(TunerCommon):
     def result_to_csv(self, results, file):
         """post process of tuning results"""
         resultdf = self.get_tuned_gemm_list(file)
-        # for i in range(len(resultdf)):
-        #    if len(resultdf.loc[i]) == 8:
-        #        cu_num, M, N, K, kernelId, splitK, us, kernelName = tuple(
-        #            resultdf.loc[i]
-        #        )
-        #    else:
-        #        (
-        #            cu_num,
-        #            M,
-        #            N,
-        #            K,
-        #            kernelId,
-        #            splitK,
-        #            us,
-        #            kernelName,
-        #            tflops,
-        #            bw,
-        #            errRatio,
-        #        ) = resultdf.iloc[i]
-        #    errRatio = 0
-        #    print(cu_num, M, N, K)
-        #    keys = (int(cu_num), int(M), int(N), int(K))
-        #    info = (keys, kernelId, splitK, ""), us, errRatio
-        #    tflops, bw = self.calculate(info)
-        #    resultdf.loc[i, "cu_num"] = int(cu_num)
-        #    resultdf.loc[i, "M"] = int(M)
-        #    resultdf.loc[i, "N"] = int(N)
-        #    resultdf.loc[i, "K"] = int(K)
-        #    resultdf.loc[i, "tflops"] = tflops
-        #    resultdf.loc[i, "bw"] = bw
-        #    resultdf.loc[i, "errRatio"] = 0
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName = info
@@ -377,4 +350,29 @@ class GemmCommonTuner(TunerCommon):
             )
             temp = pd.DataFrame(key_dict)
             resultdf = pd.concat([resultdf, temp], ignore_index=True)
+        resultdf.to_csv(file, index=False, na_rep="Null")
+
+    def update_tflops_bw(self, file):
+        resultdf = self.get_tuned_gemm_list(file)
+        for i in range(len(resultdf)):
+            if len(resultdf.loc[i]) == 8:
+                *keys, kernelId, splitK, us, kernelName = tuple(resultdf.loc[i])
+            else:
+                (
+                    *keys,
+                    kernelId,
+                    splitK,
+                    us,
+                    kernelName,
+                    tflops,
+                    bw,
+                    errRatio,
+                ) = resultdf.iloc[i]
+            errRatio = 0
+            keys = tuple(keys)
+            info = (keys, kernelId, splitK, ""), us, errRatio
+            tflops, bw = self.calculate(info)
+            resultdf.loc[i, "tflops"] = tflops
+            resultdf.loc[i, "bw"] = bw
+            resultdf.loc[i, "errRatio"] = 0
         resultdf.to_csv(file, index=False, na_rep="Null")

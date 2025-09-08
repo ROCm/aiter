@@ -169,7 +169,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
 if __name__ == "__main__":
     ## use default key and resultList
     tuner = GemmA8W8BlockScaleTuner(
-        "GemmA8W8BlockScaleTuner",
+        "GemmA8W8BlockScaleTuner",  # keys, resultList
         description="gen API for CK gemm a8w8 blockscale kernel",
     )
 

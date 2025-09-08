@@ -1177,7 +1177,7 @@ class FmoeTuner(TunerCommon):
                 + n * model_dim * self.get_bpe(q_dtype_w) * expert
                 + inter_dim * model_dim * self.get_bpe(q_dtype_w) * expert
                 + token * model_dim * self.get_bpe(dtype)
-            )
+            )  # Rough Estimate
         tflops = round(flop / (us * 1000000), 2)
         bw = round(data_bytes / (us * 1e-6) / 1e9, 2)
         return tflops, bw
@@ -1230,7 +1230,6 @@ class FmoeTuner(TunerCommon):
             act_type = eval(act_type)
 
             kernels_list_csv = f"{get_asm_dir()}/fmoe_2stages/fmoe_stage1_bf16_pertoken{{quantDtype}}{{extraInfo}}_g1u1.csv"
-
             extraInfo = ""
             if q_type == QuantType.per_1x128:
                 extraInfo += "_blockscale"
@@ -1243,7 +1242,6 @@ class FmoeTuner(TunerCommon):
                 quantDtype = "Fp8"
             else:
                 quantDtype = ""
-
             asm_kernels = get_kernels_dict(
                 kernels_list_csv.format(quantDtype=quantDtype, extraInfo=extraInfo)
             )
@@ -1289,7 +1287,18 @@ class FmoeTuner(TunerCommon):
                                 ),
                                 run_asm_stage1,  # func
                                 (
-                                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                                    [
+                                        0,
+                                        1,
+                                        2,
+                                        3,
+                                        4,
+                                        5,
+                                        6,
+                                        7,
+                                        8,
+                                        9,
+                                    ],  # index of args in generate_asm_stage1
                                     topk,
                                     blockM,
                                     el,
@@ -1301,7 +1310,15 @@ class FmoeTuner(TunerCommon):
                                 {},
                                 run_torch_moe_stage1_ref,
                                 (
-                                    [0, 12, 13, 10, 11, 14, 9],
+                                    [
+                                        0,
+                                        12,
+                                        13,
+                                        10,
+                                        11,
+                                        14,
+                                        9,
+                                    ],  # index of args in generate_asm_stage1
                                     dtype,
                                     act_type,
                                     q_type,
@@ -1784,7 +1801,7 @@ if __name__ == "__main__":
         "tflops",
         "bw",
     ]
-    tuner = FmoeTuner("fmoeTuner", key, key + resultList, "fmoe tuner")
+    tuner = FmoeTuner("fmoeTuner", key, resultList, "fmoe tuner")
     args = tuner.parse_args()
 
     tuner.run(args, False)

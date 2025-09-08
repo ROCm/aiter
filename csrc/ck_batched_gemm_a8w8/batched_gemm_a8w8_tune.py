@@ -186,7 +186,7 @@ if __name__ == "__main__":
         "N",
         "K",
     ]
-    tuneList = [
+    resultList = [
         "kernelId",
         "splitK",
         "us",
@@ -199,7 +199,7 @@ if __name__ == "__main__":
     tuner = BatchedGemma8W8Tuner(
         "BatchGemmA8W8Tuner",
         key,
-        key + tuneList,
+        resultList,
         "gen API for CK batch gemm a8w8 kernel",
     )
 
