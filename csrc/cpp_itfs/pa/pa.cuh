@@ -67,7 +67,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     float* __restrict__ exp_sums,           // [num_seqs*mtp, num_heads, max_num_partitions]
     float* __restrict__ max_logits,         // [num_seqs*mtp, num_heads, max_num_partitions]
     scalar_t* __restrict__ out,             // [num_seqs*mtp, num_heads, max_num_partitions, head_size]
-    const float* q_scale_ptr,
+    const float* q_scale_ptr,               // [num_seqs*mtp, num_heads]
     const float* k_scale_ptr, const float* v_scale_ptr) {
     // clang-format on
     constexpr int NWARPS             = NUM_THREADS / WARP_SIZE;
@@ -340,13 +340,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     }
 
     // calculate post qk mfma scale
-    float scale2  = scale;
-    float q_scale = q_scale_ptr ? *q_scale_ptr : 1.0;
-    if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
-    {
-        // multiply by k_scale if fp8 kv cache
-        scale2 *= q_scale;
-    }
     const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
     floatx4 d_out[GQA_RATIO_LOOP][MTP_PER_THREAD][TLOOP];
     // qk mfma
@@ -389,6 +382,13 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                         { // kv cache dtype fp8
                             auto Ktmp       = Klocal[head_loop][token_depth][qkhe_depth];
                             _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
+                            const float q_scale =
+                                q_scale_ptr != nullptr
+                                    ? *(q_scale_ptr +
+                                        (query_start_off + mtp * MTP_PARALLEL_THREADS) *
+                                            total_num_heads +
+                                        global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP)
+                                    : 1.0;
                             for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
                             {
                                 _T8x8 Ktmp8x8, Qtmp8x8;
@@ -421,7 +421,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                         }
                     }
                 }
-                d_out[gqa_ratio_loop][mtp][token_depth] *= scale2;
+                d_out[gqa_ratio_loop][mtp][token_depth] *= scale;
 
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
                 {
