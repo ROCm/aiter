@@ -79,7 +79,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
         q_dtype_str = "fp8bf16"; // only support bf16 out for fp8
     
     bias_enum bias_type = bias_.has_value() ? bias_enum::elementwise_bias :
-        alibi_slopes_.has_value() ? bias_type = bias_enum::alibi : bias_enum::no_bias;
+        (alibi_slopes_.has_value() ? bias_type = bias_enum::alibi : bias_enum::no_bias);
     
     if (bias_.has_value()) {
         auto bias = bias_.value();

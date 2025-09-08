@@ -972,7 +972,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
             args.window_size_right = mask.right;
             args.mask_type         = static_cast<ck_tile::index_t>(mask.type);
 
-            if constexpr(std::is_same_v<fmha_fwd_args, std::decay_t<decltype(args)>>)
+            if constexpr(std::is_same_v<aiter::mha_fwd_args, std::decay_t<decltype(args)>>)
             {
                 args.rand_val_ptr = randval_buf.GetDeviceBuffer();
 
@@ -993,7 +993,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                 }
                 args.q_dtype_str = data_type;
                 args.is_group_mode = mode == mode_enum::group;
-                args.mask_type = mask.type;
+                args.mask_type_enum = mask.type;
                 args.bias_type = bias.type;
                 args.has_lse = lse;
                 args.use_ext_asm = fwd_v3;
