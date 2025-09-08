@@ -388,7 +388,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                                         (query_start_off + mtp * MTP_PARALLEL_THREADS) *
                                             total_num_heads +
                                         global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP)
-                                    : 1.0;
+                                    : float(1.0);
                             for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
                             {
                                 _T8x8 Ktmp8x8, Qtmp8x8;
@@ -431,7 +431,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                     const int k_scale_idx =
                         wg_start_kv_head_idx * num_blocks * BLOCK_SIZE + kglobal_token_idx;
                     d_out[gqa_ratio_loop][mtp][token_depth] *=
-                        k_scale_ptr ? *(k_scale_ptr + k_scale_idx) : 1.0;
+                        k_scale_ptr ? *(k_scale_ptr + k_scale_idx) : float(1.0);
                 }
             }
         }
@@ -741,7 +741,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                         const int vglobal_token_idx = partition_start_token_idx + vlocal_token_idx;
                         const int v_scale_idx =
                             wg_start_kv_head_idx * num_blocks * BLOCK_SIZE + vglobal_token_idx;
-                        tmp_out_depth *= v_scale_ptr ? *(v_scale_ptr + v_scale_idx) : 1.0;
+                        tmp_out_depth *= v_scale_ptr ? *(v_scale_ptr + v_scale_idx) : float(1.0);
                         tmp_out += tmp_out_depth;
                     }
                 }
