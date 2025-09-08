@@ -75,11 +75,14 @@ if find_aiter is not None:
     package_parent_path = os.path.dirname(package_path)
     import site
 
-    site_packages_dirs = site.getsitepackages()
-    # develop mode
-    isDevelopMode = (package_path not in site_packages_dirs) and (
-        package_parent_path not in site_packages_dirs
-    )
+    try:
+        with open(f"{this_dir}/../install_mode", "r") as f:
+            # develop mode
+            isDevelopMode = f.read().strip() == "develop"
+    except FileNotFoundError:
+        # pip install -e
+        isDevelopMode = True
+
     if isDevelopMode:
         AITER_META_DIR = AITER_ROOT_DIR
     # install mode
@@ -943,6 +946,14 @@ def compile_ops(
             return_int = True
 
         schema = f"{new_input} -> {output_part}".strip()
+
+        def rewrite_symint_schema(schema: str) -> str:
+            pattern = re.compile(r"(SymInt\s+\w+)=0")
+            modified_schema = pattern.sub(r"\1=None", schema)
+            return modified_schema
+
+        schema = rewrite_symint_schema(schema)
+
         loadName = func.__name__
 
         def abstract_impl(dummy, *args, custom_build_args={}, **kwargs):
