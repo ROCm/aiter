@@ -1074,10 +1074,10 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                         lse,
                                         fwd_v3,
                                         v3_bf16_cvt);
-            if (check_fwd_v3 != fwd_v3) {
-                printf("\n[Error]:fwd_v3 param check is wrong!\n");
+            if (check_fwd_v3) {
+                printf("\n[Success]:the param satisfy the fwd v3 request!\n");
             } else {
-                printf("\n[Success]:fwd_v3 param check is correct!\n");
+                printf("\n[Error]:the param is not match the fwd v3 request!\n");
             }
         }
 

@@ -8,8 +8,8 @@ else
     FMA_API=""  # build all
 fi
 
-# echo "######## building mha kernel $FMA_API"
-# python3 compile.py --api=$FMA_API
+echo "######## building mha kernel $FMA_API"
+python3 compile.py --api=$FMA_API
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TOP_DIR=$(dirname "$SCRIPT_DIR")/../../

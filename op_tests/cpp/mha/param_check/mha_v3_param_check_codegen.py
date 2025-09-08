@@ -29,13 +29,28 @@ class CodegenInfo:
 
 codegen_info_list = [
     CodegenInfo(
-        "gfx942", "fmha_v3_fwd", "fmha_fwd_v3(", 226, 394, "mha_fwd_param_v3_check.cpp"
+        "gfx942",
+        "fmha_v3_fwd",
+        "fmha_fwd_v3(",
+        226,
+        394,
+        "mha_fwd_param_v3_check.cpp",
     ),
     CodegenInfo(
-        "gfx950", "fmha_v3_fwd", "fmha_fwd_v3(", 181, 245, "mha_fwd_param_v3_check.cpp"
+        "gfx950",
+        "fmha_v3_fwd",
+        "fmha_fwd_v3(",
+        181,
+        245,
+        "mha_fwd_param_v3_check.cpp",
     ),
     CodegenInfo(
-        "gfx942", "fmha_v3_bwd", "fmha_bwd_v3(", 842, 2106, "mha_bwd_param_v3_check.cpp"
+        "gfx942",
+        "fmha_v3_bwd",
+        "fmha_bwd_v3(",
+        842,
+        2106,
+        "mha_bwd_param_v3_check.cpp",
     ),
     CodegenInfo(
         "gfx950",
@@ -98,7 +113,7 @@ def main():
     parser.add_argument(
         "--work_path",
         help="the input aiter work path to be process",
-        default="/home/memin/code/aiter/hsa",
+        default="../../../../hsa/",
     )
 
     args = parser.parse_args()
