@@ -229,6 +229,10 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
                 f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM , kernel name is {config['kernelName']}!"
             )
             break
+    if config is None:
+        logger.info(
+            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in CKGEMM, will use default config!"
+        )
     return config
 
 
@@ -254,6 +258,10 @@ def get_ASMGEMM_config(
     config = get_ASMGEMM_config.asmgemm_dict.get((M, N, K, bias, str(dtype)), None)
     if config is not None:
         logger.info(f"shape M:{M}, N:{N}, K:{K} is tuned, in ASMGEMM !")
+    else:
+        logger.info(
+            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in ASMGEMM, will use default config!"
+        )
     return config
 
 
