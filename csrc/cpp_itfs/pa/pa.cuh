@@ -105,7 +105,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     }
 
     constexpr int MAX_ELEMENTS_PER_QUERY = 16 / GQA_RATIO;
-    constexpr int MTP_PER_THREAD         = DIVIDE_ROUND_UP(MTP, MAX_ELEMENTS_PER_QUERY);
+    // constexpr int MTP_PER_THREAD         = DIVIDE_ROUND_UP(MTP, MAX_ELEMENTS_PER_QUERY);
+    constexpr int MTP_PER_THREAD = MTP;
 
     constexpr int MTP_PARALLEL_THREADS   = MTP / MTP_PER_THREAD;
     constexpr int GQA_RATIO_LOOP         = DIVIDE_ROUND_UP(GQA_RATIO, 16);
@@ -193,7 +194,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
             {
                 const int qhead_element =
                     lane16id * CONTIGUOUS_SCALAR_ELEMS_16B + head_loop * HEAD_SIZE_PER_LOOP;
-                if((local_mtp_qhead_idx < GQA_RATIO_MTP_PARALLEL) && (qhead_element < HEAD_SIZE))
+                if((local_qhead_idx < GQA_RATIO_MTP_PARALLEL) && (qhead_element < HEAD_SIZE))
                 {
                     const scalar_t* q_fetch_ptr   = q_ptr + qhead_element;
                     const _B16x8* q_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(q_fetch_ptr);
@@ -472,7 +473,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                 for(int i = 0; i < 4; i++)
                 {
                     const float tmp             = ((local_token_idx + i) <
-                                       (context_len * (warp_mtp_idx + 1) - MTP + q_token_idx))
+                                       (context_len * (warp_mtp_idx + 1) - MTP + q_token_idx + 1))
                                                       ? d_out[gqa_ratio_loop][mtp][token_depth][i]
                                                       : -FLT_MAX;
                     qk_max[gqa_ratio_loop][mtp] = fmaxf(qk_max[gqa_ratio_loop][mtp], tmp);
