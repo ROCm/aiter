@@ -59,9 +59,9 @@ class kernelInstanceGEMM1:
                 "Quant" + str(self.QuantType),
                 "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
                 "silu" if self.ActOP else "gelu",
-                self.Adtype,
-                self.Bdtype,
-                self.Cdtype,
+                self.Adtype.upper(),
+                self.Bdtype.upper(),
+                self.Cdtype.upper(),
             ]
         )
 
@@ -103,9 +103,9 @@ class kernelInstanceGEMM2:
                 "Nswizzle" + str(int(self.Nswizzle)),
                 "Quant" + str(self.QuantType),
                 "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
-                self.Adtype,
-                self.Bdtype,
-                self.Cdtype,
+                self.Adtype.upper(),
+                self.Bdtype.upper(),
+                self.Cdtype.upper(),
             ]
         )
 
@@ -309,7 +309,7 @@ def get_gemm1_kernels_list(
     Cdtype: str,
     Nswizzle: bool,
     QuantType: str,
-    ActOP: bool,
+    ActOP: str,
     MulRoutedWeight: bool,
 ) -> list:
     arch = get_gfx()
@@ -343,7 +343,7 @@ def get_gemm1_kernels_list(
     kernels_list = gemm1_kernels_dict[tag]
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
-        kernel.ActOP = ActOP
+        kernel.ActOP = ActOP == "silu"
         kernel.Nswizzle = Nswizzle
         kernel.QuantType = QuantType
         kernel.Adtype = Adtype
