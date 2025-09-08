@@ -469,7 +469,7 @@ block_size = 16
 l_dtype = ["bf16"]
 l_num_heads = [(5, 1), (8, 1), (16, 1)][:-1]
 l_qlen = [1, 2, 3, 4]
-l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097]
+l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097,16384]
 l_batch_size = [128]
 
 parser = argparse.ArgumentParser(
