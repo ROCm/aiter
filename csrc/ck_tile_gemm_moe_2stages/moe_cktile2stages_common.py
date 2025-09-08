@@ -99,18 +99,18 @@ a8w8_gemm2_kernels_list= {
 # gemm1 out:bf16/fp16 AB:bf16/fp4
 a16w4_gemm1_kernels_list_gfx950= {
     #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N|| BlockPerCU|
-    0: kernelInstance(       1,        256,       16,        256,       256,           16,         16,          32,          1,           4,          1,),
-    # 5: kernelInstance(       1,        256,       16,        512,       256,           16,         16,          32,          1,           4,          2,),
-    1: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          32,          1,           4,          1,),
+    0: kernelInstance(       1,        256,       16,        256,       256,           16,         16,          32,          1,           4,          2,),
+    # 5: kernelInstance(       1,        256,       16,        512,       256,           16,         16,          32,          1,           4,          4,),
+    1: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          32,          1,           4,          2,),
     3: kernelInstance(       1,        256,       64,        256,       256,           16,         16,          32,          1,           4,          1,),
     4: kernelInstance(       1,        256,      128,        256,       256,           16,         16,          32,          1,           4,          1,),
 }
 # gemm2 out:bf16/fp16 AB:bf16/fp4
 a16w4_gemm2_kernels_list_gfx950= {
     #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
-    0: kernelInstance(       2,        256,       16,        256,       256,           16,         16,          32,          1,        4,            1,),
-    # 5: kernelInstance(       2,        256,       16,        512,       256,           16,         16,          32,          1,        4,            2,),
-    1: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          32,          1,        4,            1,),
+    0: kernelInstance(       2,        256,       16,        256,       256,           16,         16,          32,          1,        4,            2,),
+    # 5: kernelInstance(       2,        256,       16,        512,       256,           16,         16,          32,          1,        4,            4,),
+    1: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          32,          1,        4,            2,),
     3: kernelInstance(       2,        256,       64,        256,       256,           16,         16,          32,          1,        4,            1,),
     4: kernelInstance(       2,        256,      128,        256,       256,           16,         16,          32,          1,        4,            1,),
     # 4: kernelInstance(       2,        256,      256,        256,       256,           16,         16,          32,          1,        4,),

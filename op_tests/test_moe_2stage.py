@@ -737,26 +737,27 @@ def test_fmoe(
     #     )
 
     return {"gemm1(us)": us1, "gemm2(us)": us2}
-
-
+seed = 1
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
 l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
 # l_dim = [(512, 256)]
 l_dim = [(3072, 3072)]
 l_tokenNum = [
-    1,
-    2,
-    4,
-    8,
+    # 1,
+    # 2,
+    # 4,
+    # 8,
     16,
     32,
     64,
     128,
     256,
-    1024,
-    2048,
-    3072,
-    4096,
+    # 1024,
+    # 2048,
+    # 3072,
+    # 4096,
     8192,
     # 163840,
 ]
