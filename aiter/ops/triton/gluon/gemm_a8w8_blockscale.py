@@ -63,6 +63,7 @@ def _gemm_a8w8_blockscale_kernel(
     SPLITK_BLOCK_SIZE: gl.constexpr,
     EVEN_K: gl.constexpr,
     GRID_MN: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
     cache_modifier: gl.constexpr,
 ):
     """
@@ -99,17 +100,29 @@ def _gemm_a8w8_blockscale_kernel(
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
 
+    threads_per_elem_mk: gl.constexpr = triton.cdiv(
+        BLOCK_SIZE_M * BLOCK_SIZE_K // (NUM_WARPS * 64), 16
+    )
+    threads_per_elem_kn: gl.constexpr = triton.cdiv(
+        BLOCK_SIZE_K * BLOCK_SIZE_N // (NUM_WARPS * 64), 16
+    )
     blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[4, 16],  # 128 * 128
+        size_per_thread=[threads_per_elem_mk, 16],
         threads_per_warp=[8, 8],
-        warps_per_cta=[4, 1],
+        warps_per_cta=[NUM_WARPS, 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, 4],
+        size_per_thread=[16, threads_per_elem_kn],
         threads_per_warp=[8, 8],
-        warps_per_cta=[1, 4],
+        warps_per_cta=[1, NUM_WARPS],
         order=[0, 1],
+    )
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16],
+        transposed=True,
+        warps_per_cta=[NUM_WARPS // 2, 2],
     )
 
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
@@ -123,9 +136,6 @@ def _gemm_a8w8_blockscale_kernel(
     )
     shared_b_scale: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[0]
-    )
-    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[2, 2]
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=16
@@ -193,9 +203,10 @@ def _gemm_a8w8_blockscale_kernel(
             offsets=offs_a_scale,
             cache=cache_modifier,
         )
+
         offs_b = offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-        offs_bsn = offs_bn // GROUP_N
-        offs_b_scale = offs_k_scale * stride_bscale_k + offs_bsn * stride_bscale_n
+        offs_b_scale_n = offs_bn // GROUP_N
+        offs_b_scale = offs_k_scale * stride_bscale_k + offs_b_scale_n * stride_bscale_n
 
         if EVEN_K:
             b = gl.amd.cdna4.buffer_load(
@@ -217,8 +228,8 @@ def _gemm_a8w8_blockscale_kernel(
             offsets=offs_b_scale,
             cache=cache_modifier,
         )
-        smem_a.store(a)
         smem_scale_a.store(a_scale)
+        smem_a.store(a)
 
         acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
         acc = gl.zeros(
@@ -324,7 +335,7 @@ def _gemm_a8w8_blockscale_kernel(
         )
 
 
-@triton.jit
+@gluon.jit
 def _gemm_a8w8_blockscale_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
@@ -335,7 +346,7 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     stride_c_in_n,
     stride_c_out_m,
     stride_c_out_n,
-    BLOCK_SIZE_M: gl.constexpr,
+    BLOCK_SIZE_M: gl.constexpr,  # Note: Can be distinct from GEMM block size
     BLOCK_SIZE_N: gl.constexpr,
     ACTUAL_KSPLIT: gl.constexpr,
     MAX_KSPLIT: gl.constexpr,
@@ -344,33 +355,68 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     pid_m = gl.program_id(axis=0)
     pid_n = gl.program_id(axis=1)
 
-    offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N)
-    offs_k = gl.arange(0, MAX_KSPLIT)
-    c_in_ptrs = (
-        c_in_ptr
-        + (offs_k[:, None, None] * stride_c_in_k)
+    blocked_read: gl.constexpr = gl.BlockedLayout(  # (MAX_KSPLIT, BLOCK_M, BLOCK_N)
+        size_per_thread=[1, 1, 4],
+        threads_per_warp=[1, 8, 8],
+        warps_per_cta=[1, 4, 1],
+        order=[2, 1, 0],
+    )
+
+    # blocked_write: gl.constexpr = gl.BlockedLayout(
+    #     size_per_thread=[1, 4], # (BLOCK_M, BLOCK_N)
+    #     threads_per_warp=[8, 8],
+    #     warps_per_cta=[4, 1],
+    #     order=[1, 0],
+    # )
+
+    offs_m = pid_m * BLOCK_SIZE_M + gl.arange(
+        0,
+        BLOCK_SIZE_M,  # keep dim 1
+        gl.SliceLayout(0, gl.SliceLayout(2, blocked_read)),
+    )
+    offs_n = pid_n * BLOCK_SIZE_N + gl.arange(
+        0,
+        BLOCK_SIZE_N,  # keep dim 2
+        gl.SliceLayout(0, gl.SliceLayout(1, blocked_read)),
+    )
+    offs_k = gl.arange(
+        0, MAX_KSPLIT, gl.SliceLayout(1, gl.SliceLayout(2, blocked_read))  # keep dim 0
+    )
+    c_in_offs = (
+        (offs_k[:, None, None] * stride_c_in_k)
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )
-
     if ACTUAL_KSPLIT == MAX_KSPLIT:
-        c = gl.load(c_in_ptrs)
+        c_in_mask = (offs_m[None, :, None] < M) & (offs_n[None, None, :] < N)
+        c = gl.amd.cdna4.buffer_load(c_in_ptr, c_in_offs, mask=c_in_mask, cache=".ca")
     else:
-        c = gl.load(
-            c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT
+        c_in_mask = (
+            (offs_m[None, :, None] < M)
+            & (offs_n[None, None, :] < N)
+            & (offs_k[:, None, None] < ACTUAL_KSPLIT)
+        )
+        c = gl.amd.cdna4.buffer_load(
+            c_in_ptr, c_in_offs, mask=c_in_mask, cache=".ca"
         )  # , other=0.0)
-    c = gl.sum(c, axis=0)
+    c = tl.sum(c, 0)
 
     c = c.to(c_out_ptr.type.element_ty)
 
-    c_out_ptrs = (
-        c_out_ptr
-        + (offs_m[:, None] * stride_c_out_m)
-        + (offs_n[None, :] * stride_c_out_n)
+    offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
+        0, BLOCK_SIZE_M, gl.SliceLayout(1, gl.SliceLayout(0, blocked_read))
     )
+    offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
+        0, BLOCK_SIZE_N, gl.SliceLayout(0, gl.SliceLayout(0, blocked_read))
+    )
+    c_out_offs = (offs_cm[:, None] * stride_c_out_m) + (
+        offs_cn[None, :] * stride_c_out_n
+    )
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-    gl.store(c_out_ptrs, c)
+    gl.amd.cdna4.buffer_store(
+        stored_value=c, ptr=c_out_ptr, offsets=c_out_offs, mask=c_mask
+    )
 
 
 @functools.lru_cache(maxsize=1024)
@@ -404,7 +450,33 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    return _get_config._config_dict[key]["any"]
+    # Config keys should be named M_LEQ_<bound> or "any"
+    bounds = []
+    for setting in _get_config._config_dict[key].keys():
+        potential_block_m = setting.replace("M_LEQ_", "")
+        if potential_block_m.isnumeric():
+            bounds.append(int(potential_block_m))
+
+    for bound in bounds:
+        if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
+            config = _get_config._config_dict[key][f"M_LEQ_{bound}"]
+            break
+        else:
+            config = _get_config._config_dict[key]["any"]
+
+    config = (
+        config.copy()
+    )  # avoid later inplace modification from interacting with cached config
+
+    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+
+    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
+        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
+    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
+
+    return config
 
 
 def gemm_a8w8_blockscale(
@@ -451,37 +523,22 @@ def gemm_a8w8_blockscale(
     if config is None:
         config = _get_config(M, N, K)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+    # Scale block sizes
+    # TODO: need a better way to pass scale block sizes around
+    config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
+    config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
+
+    if config["NUM_KSPLIT"] == 1:
+        assert (
+            config["GROUP_K"] == config["BLOCK_SIZE_K"]
+        ), f"GROUP_K: {config['GROUP_K']} must equal BLOCK_SIZE_K: {config['BLOCK_SIZE_K']} when not using KSPLIT"
+
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
         )
     else:
         y_pp = None
-
-    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
-    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
-
-    # Scale block sizes
-    # TODO: need a better way to pass scale block sizes around
-    config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
-    config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
-
-    assert (
-        config["GROUP_K"] == config["BLOCK_SIZE_K"]
-    ), "GROUP_K must equal BLOCK_SIZE_K"
-    assert (
-        config["BLOCK_SIZE_M"] == 128
-    ), "Before modifying the hparams, also make sure to modify the Gluon layouts. Afterwards, modify this assert."
-    assert (
-        config["BLOCK_SIZE_N"] == 128
-    ), "Before modifying the hparams, also make sure to modify the Gluon layouts. Afterwards, modify this assert."
-    assert (
-        config["BLOCK_SIZE_K"] == 128
-    ), "Before modifying the hparams, also make sure to modify the Gluon layouts. Afterwards, modify this assert."
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
@@ -511,6 +568,7 @@ def gemm_a8w8_blockscale(
         x_scale.stride(1),
         w_scale.stride(0),
         w_scale.stride(1),
+        NUM_WARPS=config["num_warps"],
         **config,
     )
 
@@ -523,6 +581,7 @@ def gemm_a8w8_blockscale(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
+
         _gemm_a8w8_blockscale_reduce_kernel[grid_reduce](
             y_pp,
             y,
