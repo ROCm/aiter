@@ -82,10 +82,6 @@ mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
 FMHA_FWD_API = """
 float mha_fwd(mha_fwd_args args, const ck_tile::stream_config& stream_config)
 {{
-    std::cout << "mmd   " << std::endl;
-    std::cout << "q_dtype_str: " << args.q_dtype_str << ";is_group_mode: " << args.is_group_mode <<
-             ", has_lse: " << args.has_lse << ", use_ext_asm: " << args.use_ext_asm << ",how_v3_bf16_cvt: " << args.how_v3_bf16_cvt <<  ",seqstart_q_padding_ptr: " << args.seqstart_q_padding_ptr <<
-             ", seqstart_k_padding_ptr: " << args.seqstart_k_padding_ptr << ", hdim_q: " << args.hdim_q << ", hdim_v: " << args.hdim_v << std::endl;
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
