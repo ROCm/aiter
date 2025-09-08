@@ -1056,13 +1056,8 @@ def fmha_v3_varlen_bwd(
 ) -> List[Tensor]: ...
 
 
-@torch_compile_guard()
-def maybe_contiguous_custom_op(x: torch.Tensor) -> torch.Tensor:
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
-
-
 def maybe_contiguous(x):
-    return maybe_contiguous_custom_op(x)
+    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
 def _flash_attn_forward(
