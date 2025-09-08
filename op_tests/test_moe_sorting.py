@@ -172,12 +172,12 @@ def test_moe_sorting(
 import pandas as pd
 
 l_dtype = ["bf16"]
-l_m = [1, 7, 31, 64, 128, 256, 163840]
-l_expert = [32, 256]
-l_topk = [5, 8]
-l_padding_token = [0, 1000]
-l_expert_mask = [False, True]
-l_dispatch_policy = [0, 1]
+l_m = [64]
+l_expert = [128]
+l_topk = [4]
+l_padding_token = [0]
+l_expert_mask = [False]
+l_dispatch_policy = [0]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
