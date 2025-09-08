@@ -73,7 +73,6 @@ if find_aiter is not None:
         package_path = find_aiter.origin
     package_path = os.path.dirname(package_path)
     package_parent_path = os.path.dirname(package_path)
-    import site
 
     try:
         with open(f"{this_dir}/../install_mode", "r") as f:
@@ -948,8 +947,16 @@ def compile_ops(
         schema = f"{new_input} -> {output_part}".strip()
 
         def rewrite_symint_schema(schema: str) -> str:
-            pattern = re.compile(r"(SymInt\s+\w+)=0")
-            modified_schema = pattern.sub(r"\1=None", schema)
+            def replacer(match):
+                _ = match.group(1)
+                param_name = match.group(2)
+                return f"SymInt? {param_name}=None"
+
+            pattern = re.compile(r"(SymInt)\s+(\w+)=0")
+            modified_schema = pattern.sub(replacer, schema)
+
+            # pattern = re.compile(r"(SymInt\s+\w+)=0")
+            # modified_schema = pattern.sub(r"\1=None", schema)
             return modified_schema
 
         schema = rewrite_symint_schema(schema)
