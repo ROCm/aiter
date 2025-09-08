@@ -1099,7 +1099,7 @@ def _flash_attn_forward(
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    if can_impl_fmha_v3_fwd():
+    if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
         out, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,
@@ -1312,12 +1312,15 @@ def can_impl_fmha_v3_bwd(
 
         return ret
 
+    # only 1 block when sk <= 256, thus deterministic
+    is_950_1block = get_gfx() == "gfx950" and seqlen_k <= 256
+
     # basic
     ret = alibi_slopes is None
     ret &= bias is None
     ret &= dbias is None
     ret &= dropout_p == 0.0
-    ret &= not deterministic
+    ret &= not deterministic or is_950_1block
     ret &= hdim_q == hdim_v
     ret &= nhead_q % nhead_k == 0
     ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
@@ -1374,7 +1377,12 @@ def _flash_attn_backward(
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    if can_impl_fmha_v3_bwd_:
+    (_, seqlen_q, _, _) = q.shape
+    (_, seqlen_k, _, _) = k.shape
+    if (
+        can_impl_fmha_v3_bwd_ and seqlen_q > 16
+    ):  # ck fmha bwd has optimization for seqlen_q <= 16
+        is_950_1block = get_gfx() == "gfx950" and seqlen_k <= 256
         (
             dq,
             dk,
@@ -1392,8 +1400,8 @@ def _flash_attn_backward(
             causal,
             window_size_left,
             window_size_right,
-            deterministic,
-            is_v3_atomic_fp32,
+            False if is_950_1block else deterministic,
+            False if is_950_1block else is_v3_atomic_fp32,
             how_v3_bf16_cvt,
             dq,
             dk,

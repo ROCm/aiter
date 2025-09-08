@@ -32,6 +32,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility import fp4_utils
 import torch.nn.functional as F
 from einops import rearrange
+from aiter.utility.base_tuner import TunerCommon
 
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
@@ -1086,374 +1087,33 @@ def torch_moe_blockscale(
     return (out * topk_weight.view(B, -1, 1)).sum(dim=1).to(dtype)
 
 
-def go(
-    untunedf,
-    tunedf,
-    mp_num=1,
-):
-    startTS = time.perf_counter()
-    # blockMs = [16, 32, 48, 64, 80, 96, 112, 128, 144, 160]
-    blockMs = [32, 64, 128]
+class FmoeTuner(TunerCommon):
+    ARG_DEFAULTS = {
+        "verbose": False,
+        "tune_file": "aiter/configs/tuned_fmoe.csv",
+        "untune_file": "aiter/configs/untuned_fmoe.csv",
+        "errRatio": 0.5,
+        "batch": 100,
+        "profile_file": "aiter/configs/profile_fmoe.csv",  # for all results
+    }
 
-    args = [
-        "cu_num",
-        "token",
-        "model_dim",
-        "inter_dim",
-        "expert",
-        "topk",
-        "act_type",
-        "dtype",
-        "q_dtype_a",
-        "q_dtype_w",
-        "q_type",
-        "use_g1u1",
-        "doweight_stage1",
-    ]
-    print(untunedf[args])
-    prorfiles = []
-    bests = []
-    tasks = []
-    tasks_ck = []
-    task_1stage = []
-    in_data = []
-    for line in untunedf[args].values:
-        (
-            cu_num,
-            token,
-            model_dim,
-            inter_dim,
-            expert,
-            topk,
-            act_type,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            q_type,
-            use_g1u1,
-            doweight_stage1,
-        ) = line
-        info = line
-        dtype = eval(dtype)
-        q_dtype_a = eval(q_dtype_a)
-        q_dtype_w = eval(q_dtype_w)
-        q_type = eval(q_type)
-        q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
-        print("\nStart tuning", line)
-        if not use_g1u1:
-            print("no moe solution(g1u0) can tune for ", line)
-            continue
-        act_type = eval(act_type)
-
-        kernels_list_csv = f"{get_asm_dir()}/fmoe_2stages/fmoe_stage1_bf16_pertoken{{quantDtype}}{{extraInfo}}_g1u1.csv"
-
-        extraInfo = ""
-        if q_type == QuantType.per_1x128:
-            extraInfo += "_blockscale"
-        if doweight_stage1:
-            extraInfo += "_doweight"
-
-        if q_dtype_a == dtypes.i8:
-            quantDtype = "Int8"
-        elif q_dtype_a == dtypes.fp8:
-            quantDtype = "Fp8"
-        else:
-            quantDtype = ""
-
-        asm_kernels = get_kernels_dict(
-            kernels_list_csv.format(quantDtype=quantDtype, extraInfo=extraInfo)
+    def _setup_specific_arguments(self):
+        self.parser.add_argument(
+            "--all",
+            action="store_true",
+            required=False,
+            help="All the kernels are tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
         )
 
-        _, ck_stage1_kernels = get_gemm1_kernels_list(
-            dtype2str_dict[q_dtype_a],
-            dtype2str_dict[q_dtype_w],
-            dtype2str_dict[dtype],
-            False,
-            int(q_type),
-            str(act_type).split(".")[-1].lower(),
-            doweight_stage1,
+        self.parser.add_argument(
+            "--last",
+            action="store_true",
+            required=False,
+            help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
         )
 
-        _, ck_stage2_kernels = get_gemm2_kernels_list(
-            dtype2str_dict[q_dtype_a],
-            dtype2str_dict[q_dtype_w],
-            dtype2str_dict[dtype],
-            False,
-            int(q_type),
-            not doweight_stage1,
-        )
-        for blockM in blockMs:
-            if use_g1u1 and q_dtype_w != torch.int4:
-                for el in asm_kernels.get(blockM, []):
-                    tasks.append(
-                        (
-                            (info, "stage1", el, blockM),  # tag
-                            generate_asm_stage1,
-                            (
-                                token,
-                                model_dim,
-                                inter_dim,
-                                expert,
-                                topk,
-                                act_type,
-                                dtype,
-                                q_dtype_a,
-                                q_dtype_w,
-                                q_type,
-                                use_g1u1,
-                                doweight_stage1,
-                                blockM,
-                            ),
-                            run_asm_stage1,  # func
-                            (
-                                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-                                topk,
-                                blockM,
-                                el,
-                                0,
-                                act_type,
-                                q_type,
-                                doweight_stage1,
-                            ),
-                            {},
-                            run_torch_moe_stage1_ref,
-                            (
-                                [0, 12, 13, 10, 11, 14, 9],
-                                dtype,
-                                act_type,
-                                q_type,
-                                doweight_stage1,
-                                topk,
-                            ),
-                            {},
-                            (None),
-                            0.01,
-                            0.01,
-                            True,
-                        )
-                    )
-
-            if blockM in [32, 64, 128] and use_g1u1:
-                for kernel in ck_stage1_kernels.values():
-                    if kernel.MPerBlock != blockM:
-                        continue
-                    tasks_ck.append(
-                        (
-                            (info, "stage1", kernel.name, blockM),  # tag
-                            generate_data_2stages,
-                            (
-                                token,
-                                model_dim,
-                                inter_dim,
-                                expert,
-                                topk,
-                                act_type,
-                                dtype,
-                                q_dtype_a,
-                                q_dtype_w,
-                                q_type,
-                                use_g1u1,
-                                doweight_stage1,
-                                blockM,
-                                1,
-                            ),
-                            ck_moe_stage1_fwd_out,  # func
-                            (
-                                [0, 1, 2, 5, 6, 7, 8, 4, 3],
-                                dtype,
-                                topk,
-                                kernel.name,
-                                blockM,
-                                q_type,
-                                act_type,
-                            ),
-                            {},
-                            run_torch_moe_stage1,
-                            (
-                                [0, 10, 11, 12, 13, 3, 4],
-                                dtype,
-                                act_type,
-                                q_type,
-                                doweight_stage1,
-                                topk,
-                            ),
-                            {},
-                            (None),
-                            0.01,
-                            0.01,
-                            True,
-                        )
-                    )
-
-                for kernel in ck_stage2_kernels.values():
-                    if kernel.MPerBlock != blockM:
-                        continue
-                    tasks_ck.append(
-                        (
-                            (info, "stage2", kernel.name, blockM),  # tag
-                            generate_data_2stages,
-                            (
-                                token,
-                                model_dim,
-                                inter_dim,
-                                expert,
-                                topk,
-                                act_type,
-                                dtype,
-                                q_dtype_a,
-                                q_dtype_w,
-                                q_type,
-                                use_g1u1,
-                                doweight_stage1,
-                                blockM,
-                                2,
-                            ),
-                            ck_moe_stage2_fwd_out,  # func
-                            (
-                                [0, 1, 2, 5, 6, 7, 8, 4, 3],
-                                dtype,
-                                topk,
-                                kernel.name,
-                                blockM,
-                                q_type,
-                                act_type,
-                            ),
-                            {},
-                            run_torch_moe_stage2,
-                            (
-                                [0, 10, 11, 12, 13, 3, 4],
-                                dtype,
-                                q_type,
-                                doweight_stage1,
-                            ),
-                            {},
-                            (None),
-                            0.01,
-                            0.01,
-                            True,
-                        )
-                    )
-
-        ## asm moe 1 stage tuning
-        chip_name = get_gfx()
-        run_1stage_kernels_all = fused_moe_1stage_dict[chip_name]
-        # print(run_1stage_kernels_all)
-        key = (act_type, q_type, dtype, q_dtype_a, q_dtype_w, use_g1u1)
-        acti_dir = ""
-        if act_type == ActivationType.Silu:
-            acti_dir = "silu"
-        elif act_type == ActivationType.Gelu:
-            acti_dir = "gelu"
-        up = 1 if use_g1u1 else 0
-        extraInfo_1stage = ""
-        if doweight_stage1:
-            extraInfo_1stage = "_tkw1"
-            if q_dtype_a == dtypes.fp8:
-                quantDtype = "Int8"  ## tmp solution, need to be updated
-        if q_type == QuantType.No:
-            quantDtype_1stage = "noquant"
-        elif q_type == QuantType.per_1x128:
-            quantDtype_1stage = "blockscale" + quantDtype
-        else:
-            quantDtype_1stage = "pertoken" + quantDtype
-
-        kernels_list_csv_1stage = f"{get_asm_dir()}/fmoe/{acti_dir}/fmoe_bf16_{{quantDtype_1stage}}_g1u{up}_{acti_dir}{{extraInfo_1stage}}.csv"
-        asm_kernels_1stage = {}
-        if (
-            q_type != QuantType.No
-            and q_type != QuantType.per_1x32
-            and q_type != QuantType.per_Tensor
-            and q_dtype_w != torch.int4
-        ):
-            asm_kernels_1stage = get_kernels_dict(
-                kernels_list_csv_1stage.format(
-                    quantDtype_1stage=quantDtype_1stage,
-                    extraInfo_1stage=extraInfo_1stage,
-                ),
-                key=["subGU_m", "subGU_n", "smf"],
-            )
-        fmoe_func = get_1stage_fmoe_func(
-            q_type, q_dtype_a, act_type, use_g1u1, doweight_stage1
-        )
-        for tile_m, tile_n, smf in asm_kernels_1stage.keys():
-            if inter_dim % tile_n != 0 or smf != 0:
-                continue
-
-            for el in asm_kernels_1stage.get((tile_m, tile_n, 0), []):
-                task_1stage.append(
-                    (
-                        (info, "asm_1stage", el, tile_m),
-                        generate_data_1stage,
-                        (
-                            token,
-                            model_dim,
-                            inter_dim,
-                            expert,
-                            topk,
-                            act_type,
-                            dtype,
-                            q_dtype_a,
-                            q_dtype_w,
-                            q_type,
-                            use_g1u1,
-                            tile_m,
-                        ),
-                        fmoe_func,
-                        (
-                            [0, 1, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17],
-                            q_type,
-                            use_g1u1,
-                            act_type,
-                            el,
-                            topk,
-                            dtype,
-                        ),
-                        {},
-                        (
-                            torch_moe_blockscale
-                            if q_type == QuantType.per_1x128
-                            else torch_moe_test
-                        ),
-                        (
-                            ([1, 12, 13, 14, 15, 9, 10, 11], None, (128, 128), dtype)
-                            if q_type == QuantType.per_1x128
-                            else (
-                                [0, 12, 13, 14, 15, 10, 11, 16, 17],
-                                act_type,
-                                doweight_stage1,
-                                q_dtype_a,
-                            )
-                        ),
-                        {},
-                        (None),
-                        0.01,
-                        1,
-                        True,
-                    )
-                )
-        if tasks is None and tasks_ck is None and task_1stage is None:
-            print("no moe solution can tune for ", line)
-            continue
-        print(
-            f"tasks is {len(tasks)}, tasks_ck is {len(tasks_ck)}, task_1stage is {len(task_1stage)}"
-        )
-    in_data.append((len(tasks) + len(tasks_ck) + len(task_1stage), ()))
-    rets = []
-    if len(tasks) + len(tasks_ck) + len(task_1stage) > 0:
-        ### shape_grouped should be False as multiple stages
-        rets = mp_tuner(tasks + tasks_ck + task_1stage, in_data, mp_num, True, False)
-    if not rets:
-        print("no shape to tune or no solution found")
-        return None, None
-    profileDF = []
-    from collections import defaultdict
-
-    ##group results by info[0](key)
-    grouped_rets = defaultdict(list)
-    for info, us, max_err_ratio in rets:
-        grouped_rets[tuple(info[0])].append((info[1:], us, max_err_ratio))
-    grouped_results = grouped_rets.items()
-    for key, rets in grouped_results:
+    def calculate(self, results, bpes=(1, 1, 2)):
+        key, stage, kernelName, block_m, us, err = results
         (
             cu_num,
             token,
@@ -1469,167 +1129,575 @@ def go(
             use_g1u1,
             doweight_stage1,
         ) = key
-        profileDF = []
-        for (stage, kernelName, block_m), us, err in rets:
-            if us == float("inf"):
-                continue
-            profileDF.append(
-                [
-                    stage,
-                    cu_num,
-                    token,
-                    model_dim,
-                    inter_dim,
-                    expert,
-                    topk,
-                    act_type,
-                    dtype,
-                    q_dtype_a,
-                    q_dtype_w if q_dtype_w != torch.int4 else "torch.int4",
-                    q_type,
-                    use_g1u1,
-                    doweight_stage1,
-                    block_m,
-                    0,
-                    us,
-                    kernelName,
-                    f"{err:.1%}",
-                ]
+
+        flop = 0
+        data_bytes = 0
+        stage = ""
+        if stage == "stage1":
+            ## gemm1
+            # input [token, topk, inter_dim]
+            # weight [exprt, 2*inter_dim, model_dim]
+            m = token
+            k = model_dim
+            if use_g1u1:
+                n = inter_dim * 2
+            else:
+                n = inter_dim
+            flop = m * n * k * topk * 2
+            data_bytes = (
+                m * k * self.get_bpe(q_dtype_a)
+                + m * n * self.get_bpe(dtype)
+                + k * n * self.get_bpe(q_dtype_w) * expert
             )
-        profileDF = pd.DataFrame(
-            profileDF,
-            columns=["stage"] + args + ["block_m", "ksplit", "us", "kernelName", "err"],
-        )
-        prorfiles.append(profileDF)
-        profileDF = profileDF.sort_values("us").drop_duplicates(
-            ["stage", "block_m"], keep="first"
-        )
-        stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
-            columns=["stage"], axis=1
-        )
-        stage1_profileDF = stage1_profileDF.rename(
-            columns={"kernelName": "kernelName1", "err": "err1", "us": "us1"}
-        )
-        stage2_profileDF = profileDF[profileDF["stage"] == "stage2"].drop(
-            columns=["stage", "ksplit"], axis=1
-        )
-        stage2_profileDF = stage2_profileDF.rename(
-            columns={"kernelName": "kernelName2", "err": "err2", "us": "us2"}
-        )
-        asm_1stage_profileDF = profileDF[profileDF["stage"] == "asm_1stage"].drop(
-            columns=["stage"], axis=1
-        )
-        asm_1stage_profileDF = asm_1stage_profileDF.rename(
-            columns={"kernelName": "kernelName1", "err": "err1", "us": "us1"}
-        )
-        empty_1stage_profileDF = pd.DataFrame(index=asm_1stage_profileDF.index)
-
-        empty_1stage_profileDF["kernelName2"] = None
-        empty_1stage_profileDF["err2"] = 0
-        empty_1stage_profileDF["us2"] = 0
-        asm_1stage_profileDF = pd.concat(
-            [asm_1stage_profileDF, empty_1stage_profileDF], axis=1
-        )
-        asm_1stage_profileDF["run_1stage"] = 1
-        profileDF = pd.merge(
-            stage1_profileDF,
-            stage2_profileDF,
-            on=[
-                "cu_num",
-                "token",
-                "model_dim",
-                "inter_dim",
-                "expert",
-                "topk",
-                "act_type",
-                "dtype",
-                "q_dtype_a",
-                "q_dtype_w",
-                "q_type",
-                "use_g1u1",
-                "doweight_stage1",
-                "block_m",
-            ],
-            how="inner",
-        )
-        profileDF["run_1stage"] = 0
-        profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
-        if profileDF.shape[0] == 0:
-            print("no moe solution can pass for ", key)
-            continue
-        profileDF["total_us"] = profileDF["us1"] + profileDF["us2"]
-        best_one = profileDF.loc[profileDF["total_us"].idxmin()]
-        bests.append(best_one)
-        print(f"finish tuning, cost {time.perf_counter()-startTS:.8f}s")
-    if len(prorfiles) > 0:
-        return pd.concat(prorfiles), pd.concat(bests, axis=1).T
-    else:
-        return None, None
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "-i",
-        "--untune_file",
-        default="aiter/configs/untuned_fmoe.csv",
-        required=False,
-        help="input",
-    )
-
-    parser.add_argument(
-        "-o",
-        "--tune_file",
-        default="aiter/configs/tuned_fmoe.csv",
-        required=False,
-        help="output: tuning result store this file",
-    )
-    parser.add_argument(
-        "-o2",
-        "--profile_file",
-        default="aiter/configs/profile_fmoe.csv",
-        required=False,
-        help="output: tuning result store this file",
-    )
-
-    parser.add_argument(
-        "--sort",
-        action="store_true",
-        required=False,
-        help="Arranged according to the B M N K size",
-    )
-
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        required=False,
-        help="All the kernels are tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
-    )
-
-    parser.add_argument(
-        "--last",
-        action="store_true",
-        required=False,
-        help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
-    )
-    parser.add_argument(
-        "--mp",
-        type=int,
-        default=torch.cuda.device_count(),
-        help="Tuning on multiple GPUs using multiple processes",
-    )
-
-    args = parser.parse_args()
-    untunedf = pd.read_csv(args.untune_file)
-    untunedf = untunedf.drop_duplicates(keep="last")
-
-    if not args.all or args.last:
-        if os.path.exists(args.tune_file):
-            old_tunedf = pd.read_csv(args.tune_file)
+        elif stage == "stage2":
+            ## gemm2
+            m = token
+            n = model_dim
+            k = inter_dim
+            b = topk
+            # input [token, topk, inter_dim]
+            # weight [exprt, dim, inter_dim]
+            flop = b * m * n * k * 2
+            data_bytes = (
+                m * k * self.get_bpe(q_dtype_a) * topk
+                + m * n * self.get_bpe(dtype)
+                + k * n * self.get_bpe(q_dtype_w) * expert
+            )
         else:
-            old_tunedf = pd.DataFrame(
-                columns=[
+            if use_g1u1:
+                n = inter_dim * 2
+            else:
+                n = inter_dim
+            flop = (
+                token * n * model_dim * topk * 2
+                + topk * token * model_dim * inter_dim * 2
+            )
+            data_bytes = (
+                token * model_dim * self.get_bpe(q_dtype_a)
+                + n * model_dim * self.get_bpe(q_dtype_w) * expert
+                + inter_dim * model_dim * self.get_bpe(q_dtype_w) * expert
+                + token * model_dim * self.get_bpe(dtype)
+            )  # Rough Estimate
+        tflops = round(flop / (us * 1000000), 2)
+        bw = round(data_bytes / (us * 1e-6) / 1e9, 2)
+        return tflops, bw
+
+    def tune(
+        self,
+        untunedf,
+        tunedf,
+        args,
+    ):
+        mp_num = args.mp
+        startTS = time.perf_counter()
+        # blockMs = [16, 32, 48, 64, 80, 96, 112, 128, 144, 160]
+        blockMs = [32, 64, 128]
+
+        args = self.keys
+        print(untunedf[args])
+        prorfiles = []
+        bests = []
+        tasks = []
+        tasks_ck = []
+        task_1stage = []
+        in_data = []
+        for line in untunedf[args].values:
+            (
+                cu_num,
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                act_type,
+                dtype,
+                q_dtype_a,
+                q_dtype_w,
+                q_type,
+                use_g1u1,
+                doweight_stage1,
+            ) = line
+            info = line
+            dtype = eval(dtype)
+            q_dtype_a = eval(q_dtype_a)
+            q_dtype_w = eval(q_dtype_w)
+            q_type = eval(q_type)
+            q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
+            print("\nStart tuning", line)
+            if not use_g1u1:
+                print("no moe solution(g1u0) can tune for ", line)
+                continue
+            act_type = eval(act_type)
+
+            kernels_list_csv = f"{get_asm_dir()}/fmoe_2stages/fmoe_stage1_bf16_pertoken{{quantDtype}}{{extraInfo}}_g1u1.csv"
+            extraInfo = ""
+            if q_type == QuantType.per_1x128:
+                extraInfo += "_blockscale"
+            if doweight_stage1:
+                extraInfo += "_doweight"
+
+            if q_dtype_a == dtypes.i8:
+                quantDtype = "Int8"
+            elif q_dtype_a == dtypes.fp8:
+                quantDtype = "Fp8"
+            else:
+                quantDtype = ""
+            asm_kernels = get_kernels_dict(
+                kernels_list_csv.format(quantDtype=quantDtype, extraInfo=extraInfo)
+            )
+
+            _, ck_stage1_kernels = get_gemm1_kernels_list(
+                dtype2str_dict[q_dtype_a],
+                dtype2str_dict[q_dtype_w],
+                dtype2str_dict[dtype],
+                False,
+                int(q_type),
+                str(act_type).split(".")[-1].lower(),
+                doweight_stage1,
+            )
+            _, ck_stage2_kernels = get_gemm2_kernels_list(
+                dtype2str_dict[q_dtype_a],
+                dtype2str_dict[q_dtype_w],
+                dtype2str_dict[dtype],
+                False,
+                int(q_type),
+                not doweight_stage1,
+            )
+            for blockM in blockMs:
+                if use_g1u1 and q_dtype_w != torch.int4:
+                    for el in asm_kernels.get(blockM, []):
+                        tasks.append(
+                            (
+                                (info, "stage1", el, blockM),  # tag
+                                generate_asm_stage1,
+                                (
+                                    token,
+                                    model_dim,
+                                    inter_dim,
+                                    expert,
+                                    topk,
+                                    act_type,
+                                    dtype,
+                                    q_dtype_a,
+                                    q_dtype_w,
+                                    q_type,
+                                    use_g1u1,
+                                    doweight_stage1,
+                                    blockM,
+                                ),
+                                run_asm_stage1,  # func
+                                (
+                                    [
+                                        0,
+                                        1,
+                                        2,
+                                        3,
+                                        4,
+                                        5,
+                                        6,
+                                        7,
+                                        8,
+                                        9,
+                                    ],  # index of args in generate_asm_stage1
+                                    topk,
+                                    blockM,
+                                    el,
+                                    0,
+                                    act_type,
+                                    q_type,
+                                    doweight_stage1,
+                                ),
+                                {},
+                                run_torch_moe_stage1_ref,
+                                (
+                                    [
+                                        0,
+                                        12,
+                                        13,
+                                        10,
+                                        11,
+                                        14,
+                                        9,
+                                    ],  # index of args in generate_asm_stage1
+                                    dtype,
+                                    act_type,
+                                    q_type,
+                                    doweight_stage1,
+                                    topk,
+                                ),
+                                {},
+                                (None),
+                                0.01,
+                                0.01,
+                                True,
+                            )
+                        )
+
+                if blockM in [32, 64, 128] and use_g1u1:
+                    for kernel in ck_stage1_kernels.values():
+                        if kernel.MPerBlock != blockM:
+                            continue
+                        tasks_ck.append(
+                            (
+                                (info, "stage1", kernel.name, blockM),  # tag
+                                generate_data_2stages,
+                                (
+                                    token,
+                                    model_dim,
+                                    inter_dim,
+                                    expert,
+                                    topk,
+                                    act_type,
+                                    dtype,
+                                    q_dtype_a,
+                                    q_dtype_w,
+                                    q_type,
+                                    use_g1u1,
+                                    doweight_stage1,
+                                    blockM,
+                                    1,
+                                ),
+                                ck_moe_stage1_fwd_out,  # func
+                                (
+                                    [0, 1, 2, 5, 6, 7, 8, 4, 3],
+                                    dtype,
+                                    topk,
+                                    kernel.name,
+                                    blockM,
+                                    q_type,
+                                    act_type,
+                                ),
+                                {},
+                                run_torch_moe_stage1,
+                                (
+                                    [0, 10, 11, 12, 13, 3, 4],
+                                    dtype,
+                                    act_type,
+                                    q_type,
+                                    doweight_stage1,
+                                    topk,
+                                ),
+                                {},
+                                (None),
+                                0.01,
+                                0.01,
+                                True,
+                            )
+                        )
+
+                    for kernel in ck_stage2_kernels.values():
+                        if kernel.MPerBlock != blockM:
+                            continue
+                        tasks_ck.append(
+                            (
+                                (info, "stage2", kernel.name, blockM),  # tag
+                                generate_data_2stages,
+                                (
+                                    token,
+                                    model_dim,
+                                    inter_dim,
+                                    expert,
+                                    topk,
+                                    act_type,
+                                    dtype,
+                                    q_dtype_a,
+                                    q_dtype_w,
+                                    q_type,
+                                    use_g1u1,
+                                    doweight_stage1,
+                                    blockM,
+                                    2,
+                                ),
+                                ck_moe_stage2_fwd_out,  # func
+                                (
+                                    [0, 1, 2, 5, 6, 7, 8, 4, 3],
+                                    dtype,
+                                    topk,
+                                    kernel.name,
+                                    blockM,
+                                    q_type,
+                                    act_type,
+                                ),
+                                {},
+                                run_torch_moe_stage2,
+                                (
+                                    [0, 10, 11, 12, 13, 3, 4],
+                                    dtype,
+                                    q_type,
+                                    doweight_stage1,
+                                ),
+                                {},
+                                (None),
+                                0.01,
+                                0.01,
+                                True,
+                            )
+                        )
+
+            ## asm moe 1 stage tuning
+            chip_name = get_gfx()
+            run_1stage_kernels_all = fused_moe_1stage_dict[chip_name]
+            # print(run_1stage_kernels_all)
+            key = (act_type, q_type, dtype, q_dtype_a, q_dtype_w, use_g1u1)
+            acti_dir = ""
+            if act_type == ActivationType.Silu:
+                acti_dir = "silu"
+            elif act_type == ActivationType.Gelu:
+                acti_dir = "gelu"
+            up = 1 if use_g1u1 else 0
+            extraInfo_1stage = ""
+            if doweight_stage1:
+                extraInfo_1stage = "_tkw1"
+                if q_dtype_a == dtypes.fp8:
+                    quantDtype = "Int8"  ## tmp solution, need to be updated
+            if q_type == QuantType.No:
+                quantDtype_1stage = "noquant"
+            elif q_type == QuantType.per_1x128:
+                quantDtype_1stage = "blockscale" + quantDtype
+            else:
+                quantDtype_1stage = "pertoken" + quantDtype
+
+            kernels_list_csv_1stage = f"{get_asm_dir()}/fmoe/{acti_dir}/fmoe_bf16_{{quantDtype_1stage}}_g1u{up}_{acti_dir}{{extraInfo_1stage}}.csv"
+            asm_kernels_1stage = {}
+            if (
+                q_type != QuantType.No
+                and q_type != QuantType.per_1x32
+                and q_type != QuantType.per_Tensor
+                and q_dtype_w != torch.int4
+            ):
+                asm_kernels_1stage = get_kernels_dict(
+                    kernels_list_csv_1stage.format(
+                        quantDtype_1stage=quantDtype_1stage,
+                        extraInfo_1stage=extraInfo_1stage,
+                    ),
+                    key=["subGU_m", "subGU_n", "smf"],
+                )
+            fmoe_func = get_1stage_fmoe_func(
+                q_type, q_dtype_a, act_type, use_g1u1, doweight_stage1
+            )
+            for tile_m, tile_n, smf in asm_kernels_1stage.keys():
+                if inter_dim % tile_n != 0 or smf != 0:
+                    continue
+
+                for el in asm_kernels_1stage.get((tile_m, tile_n, 0), []):
+                    task_1stage.append(
+                        (
+                            (info, "asm_1stage", el, tile_m),
+                            generate_data_1stage,
+                            (
+                                token,
+                                model_dim,
+                                inter_dim,
+                                expert,
+                                topk,
+                                act_type,
+                                dtype,
+                                q_dtype_a,
+                                q_dtype_w,
+                                q_type,
+                                use_g1u1,
+                                tile_m,
+                            ),
+                            fmoe_func,
+                            (
+                                [0, 1, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17],
+                                q_type,
+                                use_g1u1,
+                                act_type,
+                                el,
+                                topk,
+                                dtype,
+                            ),
+                            {},
+                            (
+                                torch_moe_blockscale
+                                if q_type == QuantType.per_1x128
+                                else torch_moe_test
+                            ),
+                            (
+                                (
+                                    [1, 12, 13, 14, 15, 9, 10, 11],
+                                    None,
+                                    (128, 128),
+                                    dtype,
+                                )
+                                if q_type == QuantType.per_1x128
+                                else (
+                                    [0, 12, 13, 14, 15, 10, 11, 16, 17],
+                                    act_type,
+                                    doweight_stage1,
+                                    q_dtype_a,
+                                )
+                            ),
+                            {},
+                            (None),
+                            0.01,
+                            1,
+                            True,
+                        )
+                    )
+            if tasks is None and tasks_ck is None and task_1stage is None:
+                print("no moe solution can tune for ", line)
+                continue
+            print(
+                f"tasks is {len(tasks)}, tasks_ck is {len(tasks_ck)}, task_1stage is {len(task_1stage)}"
+            )
+        in_data.append((len(tasks) + len(tasks_ck) + len(task_1stage), ()))
+        rets = []
+        if len(tasks) + len(tasks_ck) + len(task_1stage) > 0:
+            ### shape_grouped should be False as multiple stages
+            rets = mp_tuner(
+                tasks + tasks_ck + task_1stage, in_data, mp_num, True, False
+            )
+        if not rets:
+            print("no shape to tune or no solution found")
+            return None
+        else:
+            return rets
+
+    def result_to_csv(self, results, file):
+        old_tunedf = self.get_tuned_gemm_list(file)
+        resultdf = pd.concat([old_tunedf, results], ignore_index=True)
+        if results is not None:
+            resultdf = resultdf.astype(str).drop_duplicates(
+                subset=self.keys,
+                keep="last",
+            )
+        resultdf.to_csv(file, index=False)
+
+    def post_process(self, results, args, topk=-1, fast_mode=False):
+        profileDF = []
+        profileDF = []
+        prorfiles = []
+        bests = []
+        from collections import defaultdict
+
+        ##group results by info[0](key)
+        grouped_rets = defaultdict(list)
+        for info, us, max_err_ratio in results:
+            grouped_rets[tuple(info[0])].append((info[1:], us, max_err_ratio))
+        grouped_results = grouped_rets.items()
+        for key, rets in grouped_results:
+            (
+                cu_num,
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                act_type,
+                dtype,
+                q_dtype_a,
+                q_dtype_w,
+                q_type,
+                use_g1u1,
+                doweight_stage1,
+            ) = key
+            profileDF = []
+            for (stage, kernelName, block_m), us, err in rets:
+                if us == float("inf"):
+                    continue
+                if err > args.errRatio:
+                    continue
+                tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))
+                profileDF.append(
+                    [
+                        stage,
+                        cu_num,
+                        token,
+                        model_dim,
+                        inter_dim,
+                        expert,
+                        topk,
+                        act_type,
+                        dtype,
+                        q_dtype_a,
+                        q_dtype_w if q_dtype_w != torch.int4 else "torch.int4",
+                        q_type,
+                        use_g1u1,
+                        doweight_stage1,
+                        block_m,
+                        0,
+                        us,
+                        kernelName,
+                        f"{err:.1%}",
+                        tflops,
+                        bw,
+                    ]
+                )
+            if len(profileDF) == 0:
+                print(
+                    f"no valid candidate found for {key}, please check the time or errRatio in all result file running with --profile_file"
+                )
+            profileDF = pd.DataFrame(
+                profileDF,
+                columns=["stage"]
+                # + ["cu_num"]
+                + self.keys
+                + ["block_m", "ksplit", "us", "kernelName", "err", "tflops", "bw"],
+            )
+            prorfiles.append(profileDF)
+            profileDF = profileDF.sort_values("us").drop_duplicates(
+                ["stage", "block_m"], keep="first"
+            )
+            stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
+                columns=["stage"], axis=1
+            )
+
+            stage1_profileDF = stage1_profileDF.rename(
+                columns={
+                    "kernelName": "kernelName1",
+                    "err": "err1",
+                    "us": "us1",
+                    "tflops": "tflops1",
+                    "bw": "bw1",
+                }
+            )
+            stage2_profileDF = profileDF[profileDF["stage"] == "stage2"].drop(
+                columns=["stage", "ksplit"], axis=1
+            )
+            stage2_profileDF = stage2_profileDF.rename(
+                columns={
+                    "kernelName": "kernelName2",
+                    "err": "err2",
+                    "us": "us2",
+                    "tflops": "tflops2",
+                    "bw": "bw2",
+                }
+            )
+            if (stage1_profileDF.shape[0] == 0 and stage2_profileDF.shape[0] != 0) or (
+                stage1_profileDF.shape[0] != 0 and stage2_profileDF.shape[0] == 0
+            ):
+                print(
+                    "Error: please check errRatio, stage1 and stage2 should be valid together!"
+                )
+            asm_1stage_profileDF = profileDF[profileDF["stage"] == "asm_1stage"].drop(
+                columns=["stage"], axis=1
+            )
+            asm_1stage_profileDF = asm_1stage_profileDF.rename(
+                columns={
+                    "kernelName": "kernelName1",
+                    "err": "err1",
+                    "us": "us1",
+                    "tflops": "tflops1",
+                    "bw": "bw1",
+                }
+            )
+            empty_1stage_profileDF = pd.DataFrame(index=asm_1stage_profileDF.index)
+
+            empty_1stage_profileDF["kernelName2"] = None
+            empty_1stage_profileDF["err2"] = 0
+            empty_1stage_profileDF["us2"] = 0
+            empty_1stage_profileDF["tflops2"] = 0
+            empty_1stage_profileDF["bw2"] = 0
+            asm_1stage_profileDF = pd.concat(
+                [asm_1stage_profileDF, empty_1stage_profileDF], axis=1
+            )
+            asm_1stage_profileDF["run_1stage"] = 1
+            profileDF = pd.merge(
+                stage1_profileDF,
+                stage2_profileDF,
+                on=[
                     "cu_num",
                     "token",
                     "model_dim",
@@ -1644,58 +1712,96 @@ if __name__ == "__main__":
                     "use_g1u1",
                     "doweight_stage1",
                     "block_m",
-                    "ksplit",
-                    "us1",
-                    "kernelName1",
-                    "err1",
-                    "us2",
-                    "kernelName2",
-                    "err2",
-                    "total_us",
-                    "run_1stage",
-                ]
+                ],
+                how="inner",
             )
-    else:
-        old_tunedf = None
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
-    untunedf["cu_num"] = cu_num
-    if args.last:
-        untunedf = untunedf.iloc[-1:]
+            profileDF["run_1stage"] = 0
+            profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
+            if profileDF.shape[0] == 0:
+                print("no moe solution can pass for ", self.keys)
+                continue
+            profileDF["total_us"] = profileDF["us1"] + profileDF["us2"]
+            results = profileDF.apply(
+                lambda row: self.calculate(
+                    (
+                        tuple(row[col] for col in self.keys),
+                        "",
+                        row["kernelName1"],
+                        row["block_m"],
+                        row["total_us"],
+                        row["err1"],
+                    )
+                ),
+                axis=1,
+                result_type="expand",
+            )
+            profileDF["tflops"] = results[0]
+            profileDF["bw"] = results[1]
+            profileDF.drop(["tflops1", "tflops2", "bw1", "bw2"], axis=1, inplace=True)
+            best_one = profileDF.loc[profileDF["total_us"].idxmin()]
+            print(
+                f"Tuning result for {key} is {best_one['block_m'] ,best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'],  best_one['run_1stage']} {best_one['total_us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
+            )
+            bests.append(best_one)
+        if len(prorfiles) > 0:
+            profile_result = pd.concat(prorfiles)
+            profile_result.to_csv(args.profile_file, index=False)
+            return pd.concat(bests, axis=1).T
+        else:
+            return None
 
-    elif old_tunedf is not None and not args.all:
+    def pre_process(self, args):
+        untunedf = self.get_untuned_gemm_list(args.untune_file)
 
-        untunedf_cols = untunedf.columns
-        mask = untunedf.apply(tuple, axis=1).isin(
-            old_tunedf[untunedf_cols].apply(tuple, axis=1)
-        )
-        untunedf = untunedf[~mask]
+        if not args.all or args.last:
+            self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+        else:
+            self.tunedf = None
+        untunedf["cu_num"] = self.get_cu_num()
+        if args.last:
+            self.untunedf = untunedf.iloc[-1:]
 
-    tunedf = None
-    # tunedf = pd.read_csv(args.tune_file)
-    profiles, tunedf = go(untunedf, tunedf, args.mp)
-    if old_tunedf is not None and tunedf is not None:
-        tunedf = pd.concat([old_tunedf, tunedf], axis=0)
-    if tunedf is not None:
-        tunedf = tunedf.astype(str).drop_duplicates(
-            subset=[
-                "cu_num",
-                "token",
-                "model_dim",
-                "inter_dim",
-                "expert",
-                "topk",
-                "act_type",
-                "dtype",
-                "q_dtype_a",
-                "q_dtype_w",
-                "q_type",
-                "use_g1u1",
-                "doweight_stage1",
-            ],
-            keep="last",
-        )
-        tunedf.to_csv(args.tune_file, index=False)
-    if profiles is not None:
-        profiles.to_csv(args.profile_file, index=False)
+        elif self.tunedf is not None and not args.all:
+
+            untunedf_cols = untunedf.columns
+            mask = untunedf.apply(tuple, axis=1).isin(
+                self.tunedf[untunedf_cols].apply(tuple, axis=1)
+            )
+            self.untunedf = untunedf[~mask]
+
+
+if __name__ == "__main__":
+
+    key = [
+        "cu_num",
+        "token",
+        "model_dim",
+        "inter_dim",
+        "expert",
+        "topk",
+        "act_type",
+        "dtype",
+        "q_dtype_a",
+        "q_dtype_w",
+        "q_type",
+        "use_g1u1",
+        "doweight_stage1",
+    ]
+    resultList = [
+        "block_m",
+        "ksplit",
+        "us1",
+        "kernelName1",
+        "err1",
+        "us2",
+        "kernelName2",
+        "err2",
+        "total_us",
+        "run_1stage",
+        "tflops",
+        "bw",
+    ]
+    tuner = FmoeTuner("fmoeTuner", key, resultList, "fmoe tuner")
+    args = tuner.parse_args()
+
+    tuner.run(args, False)
