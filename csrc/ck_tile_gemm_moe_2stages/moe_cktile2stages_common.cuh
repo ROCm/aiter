@@ -31,7 +31,8 @@ template <typename DataType,
           int N_Warp_, 
           int M_Warp_Tile_, 
           int N_Warp_Tile_, 
-          int K_Warp_Tile_>
+          int K_Warp_Tile_,
+          int kBlockPerCu_>
 struct MoeFlatmmConfig
 {
     static constexpr ck_tile::index_t M_Tile = M_Tile_;
@@ -53,7 +54,7 @@ struct MoeFlatmmConfig
     static constexpr bool TransposeC            = false;
     static constexpr bool UseStructuredSparsity = false;
 
-    static constexpr int kBlockPerCu                = 1;
+    static constexpr int kBlockPerCu                = kBlockPerCu_;
     static constexpr int TileParitionerGroupNum     = 8;
     static constexpr int TileParitionerM01          = 4;
     static constexpr auto Scheduler                 = ck_tile::GemmPipelineScheduler::Default;

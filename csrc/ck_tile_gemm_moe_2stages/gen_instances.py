@@ -4,7 +4,8 @@ import os
 import argparse
 from pathlib import Path
 import shutil
-from moe_cktile2stages_common import kernelInstance, get_gemm1_kernels_list, get_gemm2_kernels_list
+import re
+from moe_cktile2stages_common import kernelInstance, get_gemm1_kernels_list, get_gemm2_kernels_list, get_heuristic_dispatch_template
 from aiter.jit.utils.chip_info import get_gfx
 
 class cktile_moe_2stage_gemm_codegen:
@@ -135,7 +136,8 @@ torch::Tensor
         {k.WAVE_MAP_N},
         {k.WAVE_TILE_M},
         {k.WAVE_TILE_N},
-        {k.WAVE_TILE_K}>;
+        {k.WAVE_TILE_K},
+        {k.Block_Per_CU}>;
     // Run kernel instance.
     auto stream_config = ck_stream_config{{at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream()}};
     moe_gemm<TileConfig, 
@@ -219,89 +221,38 @@ template torch::Tensor
                         # ).write_text(intsance)
 
     '''genarete heuristic dispatch'''
-    def gen_heuristic_dispatch(self,kernels_dict):
-        HEURISTIC_template = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "moe_cktile2stages.h"
+    def gen_heuristic_dispatch(self, tag, kernels_dict):
+        HEURISTIC_template =  get_heuristic_dispatch_template(tag)
+        # print(HEURISTIC_template)
+       
+        def validate_and_format(template: str, mapping: dict) -> str:
+            #check all format element in dict.
+            str_mapping = {str(key): value.name for key, value in mapping.items()}
+            cleaned_template = template.replace('{{', '').replace('}}', '')
+            placeholders = re.findall(r'\{([^{}]*)\}', cleaned_template)
+            missing = [p for p in placeholders if p not in str_mapping]
+            # print(placeholders)
+            # print(str_mapping)
+            if missing:
+                raise KeyError(f"Missing keys in mapping: {missing}")
+            result = template
+            # for placeholder in placeholders:
+            #     result = result.replace(placeholder, str_mapping[placeholder])
+            # return result
+            return template.format(**{k: v for k, v in str_mapping.items()})
 
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
-{{
-    // Apply shape heuristics to find a suitable kernel implementation.
-    if (block_m == 16)
-    {{
-        return moe_cktile2stages_gemm1_256x16x128x256_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    if (block_m == 32)
-    {{
-        return moe_cktile2stages_gemm1_256x32x128x256_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 64)
-    {{
-        return moe_cktile2stages_gemm1_256x64x256x256_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 128)
-    {{
-        return moe_cktile2stages_gemm1_256x128x256x256_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    //else if (block_m == 256)
-    //{{
-    //    return moe_cktile2stages_gemm1_256x256x256x256_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
-    else
-    {{
-        TORCH_CHECK(
-            false,
-            "Unsupported block_m value for moe_geem1 heuristic dispatch: ",
-            block_m);
-    }}
-}}
-
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
-{{
-    // Apply shape heuristics to find a suitable kernel implementation.
-    if (block_m == 16)
-    {{
-        return moe_cktile2stages_gemm2_256x16x128x256_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    if (block_m == 32)
-    {{
-        return moe_cktile2stages_gemm2_256x32x128x256_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 64)
-    {{
-        return moe_cktile2stages_gemm2_256x64x256x256_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 128)
-    {{
-        return moe_cktile2stages_gemm2_256x128x256x256_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    //else if (block_m == 256)
-    //{{
-    //    return moe_cktile2stages_gemm2_256x256x256x256_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
-    else
-    {{
-        TORCH_CHECK(
-            false,
-            "Unsupported block_m value for moe_gemm2 heuristic dispatch: ",
-            block_m);
-    }}
-}}
-"""
         #create heuristic heirarchy
         with open(os.path.join(self.working_path, "moe_cktile2stages_heuristic_dispatch.h"), "w") as f:
-            arch = get_gfx()
-            inst_k = "32" if self.quant_type == "1x32" else ("128" if arch == "gfx950" else "64")
-            f.write(
-                HEURISTIC_template.format(
-                    inst_k=inst_k,
-                    suffix1 = self.get_suffix(1),
-                    suffix2 = self.get_suffix(2)
-                )
-            )
+            f.write(validate_and_format(HEURISTIC_template, kernels_dict))
+            # arch = get_gfx()
+            # inst_k = "32" if self.quant_type == "1x32" else ("128" if arch == "gfx950" else "64")
+            # f.write(
+            #     HEURISTIC_template.format(
+            #         inst_k=inst_k,
+            #         suffix1 = self.get_suffix(1),
+            #         suffix2 = self.get_suffix(2)
+            #     )
+            # )
 
 
     '''generate lookup.h linking MNK/datatype to specific instance'''
@@ -383,7 +334,7 @@ torch::Tensor
             f.write(MAINFEST_end)
 
     '''generate all instances and headers'''
-    def gen_instances(self, kernels_dict):
+    def gen_instances(self, tag, kernels_dict):
         if os.path.exists(self.impl_path):
             shutil.rmtree(self.impl_path)
         os.mkdir(self.impl_path)
@@ -396,7 +347,7 @@ torch::Tensor
 
         self.gen_lookup_dict(kernels_dict)
         self.gen_manifest_head(kernels_dict)
-        self.gen_heuristic_dispatch(kernels_dict)
+        self.gen_heuristic_dispatch(tag, kernels_dict)
 
 
 # def get_tune_dict(tune_dict_csv):
@@ -551,12 +502,17 @@ if __name__ == "__main__":
 
 
     #single UT
-    # ab_type = "fp8"
+    # a_type = "fp8"
+    # b_type = "fp8"
+    # quant_type = "per_token"
+    
     a_type = "bf16"
     b_type = "fp4"
+    quant_type = "1x32"
+
+
     acc_type = "float"
     c_type ="bf16"
-    quant_type = "1x32" #"per_token"
     act_type = "silu"
     codegen = cktile_moe_2stage_gemm_codegen(
         args.working_path,
@@ -587,4 +543,4 @@ if __name__ == "__main__":
     kernel_dict_merge = {**{(1, key): value for key, value in gemm1_kernel_list.items()},
                          **{(2, key): value for key, value in gemm2_kernel_list.items()}}
     # print(kernel_dict_merge)
-    codegen.gen_instances(kernel_dict_merge)
+    codegen.gen_instances(tag, kernel_dict_merge)

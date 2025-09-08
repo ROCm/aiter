@@ -19,3 +19,16 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
     x_ = x_.contiguous()
     x_ = x_.view(*x.shape)
     return x_
+
+
+def shuffle_weight_NK(x: torch.Tensor, inst_N: int, inst_K: int, use_int4=False) -> torch.Tensor:
+    kPerLane = inst_K // (64 //  inst_N)
+    if(use_int4):
+        kPerLane *= 2
+    assert x.shape[-2] % inst_N == 0, f"{x.shape[-2]} % {inst_N} == {x.shape[-2] % N_WARP_TILE }"
+    assert x.shape[-1] % inst_K == 0, f"{x.shape[-1]} % {inst_K} == {x.shape[-1] % K_WARP_TILE }"
+
+    x_ = x
+    x_ = x_.view(-1, x.shape[-2] // inst_N, inst_N, x.shape[-1] // inst_K, 64 // inst_N, kPerLane)
+    x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
+    return x_.view(*x.shape)

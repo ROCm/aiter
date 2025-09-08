@@ -11,6 +11,7 @@ from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 import argparse
 import pandas as pd
+import numpy as np
 
 from aiter.fused_moe import (
     fused_topk,
@@ -22,12 +23,15 @@ from aiter.fused_moe import (
 )
 
 
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_weight, shuffle_weight_NK
 from aiter import ActivationType
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
 # torch.manual_seed(100)
+
+BLOCK_SZIE_OVERRIDE = 32
+
 
 def ck_moe_stage1(
     hidden_states,
@@ -293,8 +297,9 @@ def test_fmoe(
 
     M, _ = topk_ids.shape
 
+    sorting_override = False
     # BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
-    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_M = BLOCK_SZIE_OVERRIDE
     if qType == aiter.QuantType.per_128x128:
         BLOCK_SIZE_M = 64
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
@@ -302,37 +307,38 @@ def test_fmoe(
     )
 
     #override sorting
-    # tile_num = max((token * topk + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M, topk)
-    # sorted_ids_override = list()
-    # expert_ids_override = list()
-    # for i in range(tile_num):
-    #     expert_ids_override.append(i // ((tile_num + E - 1) // E))
+    if(sorting_override):
+        tile_num = max((token * topk + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M, topk)
+        sorted_ids_override = list()
+        expert_ids_override = list()
+        for i in range(tile_num):
+            expert_ids_override.append(i // ((tile_num + E - 1) // E))
 
-    # token_per_tile = (token * topk + tile_num - 1) // tile_num
-    # tokenid = 0
-    # for i in range(tile_num * BLOCK_SIZE_M):
-    #     tile_off = i % BLOCK_SIZE_M
-    #     if ((tile_off < token_per_tile) and (tokenid < token * topk)):
-    #         sorted_ids_override.append((tokenid % token) | ((tokenid // token) << 24))
-    #         tokenid+=1
-    #     else:
-    #         sorted_ids_override.append(token)
+        token_per_tile = (token * topk + tile_num - 1) // tile_num
+        tokenid = 0
+        for i in range(tile_num * BLOCK_SIZE_M):
+            tile_off = i % BLOCK_SIZE_M
+            if ((tile_off < token_per_tile) and (tokenid < token * topk)):
+                sorted_ids_override.append((tokenid % token) | ((tokenid // token) << 24))
+                tokenid+=1
+            else:
+                sorted_ids_override.append(token)
 
-    # # print(tile_num)
-    # sorted_ids = torch.tensor(sorted_ids_override)
-    # sorted_expert_ids = torch.tensor(expert_ids_override)
-    # num_valid_ids = torch.tensor([tile_num * BLOCK_SIZE_M, token])
-    # sorted_weights = torch.randn((tile_num * BLOCK_SIZE_M), dtype=float) / 10
+        # print(tile_num)
+        sorted_ids = torch.tensor(sorted_ids_override)
+        sorted_expert_ids = torch.tensor(expert_ids_override)
+        num_valid_ids = torch.tensor([tile_num * BLOCK_SIZE_M, token])
+        sorted_weights = torch.randn((tile_num * BLOCK_SIZE_M), dtype=float) / 10
 
 
     # print(len(sorted_expert_ids))
     # print(sorted_expert_ids)
     # print(sorted_ids)
-    # print(num_valid_ids)
+    print(num_valid_ids)
     # max_token_ids = num_valid_ids[0].item()
     # print(sorted_ids[max_token_ids-2: max_token_ids + 4])
 
-    #Quant-ing
+    #Quant-ing w
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
         w2_qt, w2_scale = aiter.pertoken_quant(w2.view(E, -1), quant_dtype=WQDType)
@@ -375,6 +381,7 @@ def test_fmoe(
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
+    #Re-shape and pack-k
     if qType != aiter.QuantType.per_1x32:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
@@ -382,6 +389,7 @@ def test_fmoe(
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
 
+    #Quant-ing a
     if qType == aiter.QuantType.per_128x128:
         a1_qt, a1_scale = aiter.pertoken_quant(
             input.view(token, -1, 128), quant_dtype=AQDType
@@ -395,8 +403,12 @@ def test_fmoe(
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
 
     #bias dtype convert
-    exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
-    exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
+    if qType == aiter.QuantType.per_1x32 and (AQDType in [dtypes.bf16, dtypes.fp16]) and (WQDType == dtypes.fp4x2): #a16w4
+        exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
+        exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
+    else:
+        exp_bias1_aiter = exp_bias1 = None
+        exp_bias2_aiter = exp_bias2 = None
 
     #pre-shuffle
     w1_scale_aiter = w1_scale
@@ -412,22 +424,25 @@ def test_fmoe(
                 shuffle_weight(w2_qt_aiter, (16, 16), use_int4=True)
             )
         )
-    elif (AQDType in [dtypes.bf16, dtypes.fp16]) and WQDType == dtypes.fp4x2: #a16w4
+    elif qType == aiter.QuantType.per_1x32 and (AQDType in [dtypes.bf16, dtypes.fp16]) and (WQDType == dtypes.fp4x2): #a16w4
         w1_qt_aiter = shuffle_mxfp4_weight(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_mxfp4_scale(w1_scale, E, True)
         w2_qt_aiter = shuffle_mxfp4_weight(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_mxfp4_scale(w2_scale, E, False)
+    elif WQDType != dtypes.fp4x2 and (get_gfx() in ["gfx950"]):
+        inst_K = 128 // w1_qt_aiter.element_size()
+        w1_qt_aiter = shuffle_weight_NK(w1_qt_aiter, 16, inst_K)
+        w2_qt_aiter = shuffle_weight_NK(w2_qt_aiter, 16, inst_K)
     elif WQDType != dtypes.fp4x2:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
+        
     
    
-    # a1_qt.fill_(0.0001)
+    # a1_qt.fill_(1)
+    # a1_qt = torch.clamp(torch.randn(*a1_qt.shape, dtype=dtype), 0 , 1).to(AQDType)
     # a1_qt = torch.arange(0,4).repeat(a1_qt.numel() // 4).reshape(*a1_qt.shape).to(AQDType)
-    # w1_qt = torch.tensor([0, 34, 68, 85] * (w1_qt.numel() // 4)).to(torch.uint8).reshape(*w1_qt.shape)
-    # w1_qt_aiter = shuffle_mxfp4_weight(w1_qt, 16, True)
-    # print(w1_qt)
-    # print(w1_qt_aiter)
+
 
     # print(a1_qt.shape, a1_qt)
     # a1_qt = torch.cat([ torch.full(( a1_qt.shape[0], a1_qt.shape[1] // 8), 1.34, dtype=AQDType),
@@ -440,14 +455,19 @@ def test_fmoe(
     #                     torch.full(( a1_qt.shape[0], a1_qt.shape[1] // 8), -8.34, dtype=AQDType),
     #                    ]).reshape(*a1_qt.shape)
     # print(a1_qt.shape, a1_qt)
-    # a1_scale.fill_(1)
+    # a1_scale.fill_(0.1)
     # print(a1_scale, "a1_scale")
 
-    # w1_scale = w1_scale.fill_(1)
+    # w1_scale.fill_(1)
     # w1_qt.fill_(1)
-    # a= fp4_utils.f32_to_mxfp4(torch.full((1,2), 6, dtype=float))
-    # print(a[0][0])
-    # w1_qt.fill_(34)
+    # w1_qt = torch.clamp(torch.randn(*w1_qt.shape, dtype=dtype), 0 , 1).to(torch.uint8)
+    # w1_scale = torch.clamp(torch.randn(*w1_scale.shape, dtype=dtype), 0 , 1).to(torch.uint8)
+    # w1_qt = torch.tensor([0, 34, 68, 85] * (w1_qt.numel() // 4)).to(torch.uint8).reshape(*w1_qt.shape)
+    # w1_qt = torch.tensor([n // 2 for n in range(32)] * (w1_qt.numel() // 32)).to(WQDType).reshape(*w1_qt.shape)
+    # print(w1_qt.shape)
+    # print(w1_qt[0][0])
+    # w1_qt_aiter = shuffle_mxfp4_weight(w1_qt, 16, True)
+    # fp4_utils.f32_to_mxfp4(torch.full((1,2), 6, dtype=float))
     # w1_qt = torch.cat([ torch.full((w1_qt.shape[1],w1_qt.shape[2]), 34, dtype=torch.uint8),
     #                     torch.full((w1_qt.shape[1],w1_qt.shape[2]), 68, dtype=torch.uint8),
     #                     torch.full((w1_qt.shape[1],w1_qt.shape[2]), 85, dtype=torch.uint8),
@@ -457,6 +477,19 @@ def test_fmoe(
     #                     torch.full((w1_qt.shape[1],w1_qt.shape[2]), 68, dtype=torch.uint8),
     #                     torch.full((w1_qt.shape[1],w1_qt.shape[2]), 34, dtype=torch.uint8),
     #                    ]).reshape(*w1_qt.shape)
+    # w1_qt = torch.cat([ torch.full((w1_qt.shape[0] // 8, w1_qt.shape[1],w1_qt.shape[2]), 1, dtype=WQDType),
+    #                     torch.full((w1_qt.shape[0] // 8, w1_qt.shape[1],w1_qt.shape[2]), 2, dtype=WQDType),
+    #                     torch.full((w1_qt.shape[0] // 8, w1_qt.shape[1],w1_qt.shape[2]), 3, dtype=WQDType),
+    #                     torch.full((w1_qt.shape[0] // 8, w1_qt.shape[1],w1_qt.shape[2]), 4, dtype=WQDType),
+    #                     torch.full((w1_qt.shape[0] // 8, w1_qt.shape[1],w1_qt.shape[2]), 5, dtype=WQDType),
+    #                     torch.full((w1_qt.shape[0] // 8, w1_qt.shape[1],w1_qt.shape[2]), 6, dtype=WQDType),
+    #                     torch.full((w1_qt.shape[0] // 8, w1_qt.shape[1],w1_qt.shape[2]), 7, dtype=WQDType),
+    #                     torch.full((w1_qt.shape[0] // 8, w1_qt.shape[1],w1_qt.shape[2]), 8, dtype=WQDType),
+    #                    ]).reshape(*w1_qt.shape)
+    # w1_qt_aiter = shuffle_weight_NK(w1_qt, 16, 128)
+    # w1_shuffle_weight = w1_qt_aiter.view(-1, w1_qt_aiter.shape[-2] // 16, 16, w1_qt_aiter.shape[-1] // 64, 4, 16)
+    # w1_shuffle_weight = w1_shuffle_weight.permute(0, 1, 3, 4, 2, 5).contiguous()
+    # w1_qt_aiter = w1_shuffle_weight.view(*w1_qt_aiter.shape)
     # w1_qt_aiter = w1_qt
     # w1_scale_aiter = w1_scale
     # print(num_valid_ids, "num_valid_ids")
@@ -506,7 +539,7 @@ def test_fmoe(
     # )
 
     # cktile_2stage
-    out1_ck, us = run_perftest(
+    out1_ck, us1 = run_perftest(
         cktile_moe_stage1,
         a1_qt,
         w1_qt_aiter,
@@ -523,15 +556,19 @@ def test_fmoe(
         actType,
         quant_type=qType,
         sorted_weights=sorted_weights if doweight_stage1 else None,
-        needTrace=True,
+        # needTrace=True,
         # num_iters=2,
         # num_warmup=0,
     )
     checkAllclose(
         out1_ref,
         out1_ck,
-        msg=f"[perf]  ck_moe_stage1:{us:>8.2f} us, {token*model_dim*inter_dim*2*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        msg=f"[perf]  ck_moe_stage1:{us1:>8.2f} us, {token*model_dim*inter_dim*2*topk*2/us1/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
+    # diff = torch.abs(out1_ref - out1_ck)
+    # max_value= diff.max()
+    # multi_index = np.unravel_index(torch.argmax(diff).item(), diff.shape)
+    # print("max_diff", max_value.item(), ",ref=", out1_ref[multi_index].item(), ",ck=", out1_ck[multi_index].item())
     # ######################## stage 1 end ###########
 
     # if WQDType != torch.int4:
@@ -601,6 +638,7 @@ def test_fmoe(
     # # )
     # # checkAllclose(out_ref, out2_ref, msg="[torch] 1_stage vs 2_stage")
 
+    out2_ck = torch.empty((token, model_dim), dtype=dtype)
     # out2_ck, us = run_perftest(
     #     ck_moe_stage2,
     #     a2_qt,
@@ -620,7 +658,7 @@ def test_fmoe(
     # )
 
     # # cktil2stage
-    out2_ck, us = run_perftest(
+    out2_ck, us2 = run_perftest(
         cktile_moe_stage2,
         a2_qt,
         w1_qt_aiter,
@@ -637,6 +675,7 @@ def test_fmoe(
         actType,
         quant_type,
         sorted_weights if not doweight_stage1 else None,
+        # needTrace=True,
         # num_iters=2,
         # num_warmup=0,
     )
@@ -645,8 +684,12 @@ def test_fmoe(
     checkAllclose(
         out2_ref,
         out2_ck,
-        msg=f"[perf]  ck_moe_stage2:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        msg=f"[perf]  ck_moe_stage2:{us2:>8.2f} us, {token*model_dim*inter_dim*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
+    # diff = torch.abs(out2_ref - out2_ck)
+    # max_value= diff.max()
+    # multi_index = np.unravel_index(torch.argmax(diff).item(), diff.shape)
+    # print("max_diff", max_value.item(), ",ref=", out2_ref[multi_index].item(), ",ck=", out2_ck[multi_index].item())
     # ######################## stage 2 end ###########
 
     # # ######################## fused 2 stage #########
@@ -693,7 +736,7 @@ def test_fmoe(
     #         msg=f"aiter_all_stages:{us_fuse:>8.2f} us......",
     #     )
 
-        # return {"us": us_fuse, "err": err}
+    return {"gemm1(us)": us1, "gemm2(us)": us2}
 
 
 l_dtype = ["bf16", "fp16"][:1]
@@ -701,16 +744,19 @@ l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(512, 256)]
 l_dim = [(3072, 3072)]
 l_tokenNum = [
-    # 1,
-    # 3,
-    # 5,
-    # 16,
-    # 32,
-    # 64,
-    # 128,
-    # 256,
-    # 1024,
-    # 4096,
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    1024,
+    2048,
+    3072,
+    4096,
     8192,
     # 163840,
 ]
