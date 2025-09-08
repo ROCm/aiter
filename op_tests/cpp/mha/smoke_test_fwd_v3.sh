@@ -28,6 +28,12 @@ run_gfx950_fwd_v3() {
     $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
     $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
 
+    if [[ "$seqlen_q" = "$seqlen_k" ]] && [[ "$mode" = "0" ]]; then
+        $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=128 -s=$seqlen_q -s_k=$seqlen_q -iperm=$perm -operm=$perm -mask=1 -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+        $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_q -iperm=$perm -operm=$perm -mask=1 -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+        $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_q -iperm=$perm -operm=$perm -mask=1 -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+    fi
+
     done
     done
     done
@@ -38,7 +44,7 @@ run_gfx950_fwd_v3() {
 
 run_gfx942_fwd_v3() {
     echo "Start smoke test for gfx 942"
-    for mode in 0 1; do
+    for mode in 0 1 ; do
     for perm in 0 1 ; do
     for mask in 0 2 ; do
     for lse in 0 1 ; do
@@ -50,27 +56,14 @@ run_gfx942_fwd_v3() {
     $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
     $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
 
-    done
-    done
-    done
-    done
-    done
-    done
-    done
-}
+    if [[ "$seqlen_q" = "$seqlen_k" ]] && [[ "$mode" = "0" ]]; then
+        $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=128 -s=$seqlen_q -s_k=$seqlen_q -iperm=$perm -operm=$perm -mask=1 -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+        $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_q -iperm=$perm -operm=$perm -mask=1 -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+        $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_q -iperm=$perm -operm=$perm -mask=1 -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+    fi
 
-run_fwd_v3_mask_1() {
-    echo "Start smoke test for mask = 1"
-    for mode in 0; do
-    for perm in 0 1 ; do
-    for lse in 0 1 ; do
-    for seqlen_k in 127 700 1023; do
-    for v3_bf16_cvt in 0 1 2; do
-
-    $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=128 -s=$seqlen_k -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=1 -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
-    $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=128 -s=$seqlen_k -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=1 -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
-    $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=128 -s=$seqlen_k -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=1 -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
-
+    done
+    done
     done
     done
     done
@@ -103,11 +96,9 @@ fi
 case "$mode" in
     "gfx942")
         run_gfx942_fwd_v3
-        run_fwd_v3_mask_1
         ;;
     "gfx950")
         run_gfx950_fwd_v3
-        run_fwd_v3_mask_1
         ;;
     *)
         echo "Unrecognized arch name: '$mode'" >&2
