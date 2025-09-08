@@ -20,6 +20,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                                const int h_k,
                                const int d,
                                const int d_v,
+                               const int page_block_size,
                                // device pointers
                                const at::Tensor q,
                                const at::Tensor k,
@@ -116,6 +117,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.nhead_q         = h;
     args.nhead_k         = h_k;
     args.num_total_pages = total_k;
+    args.page_block_size = page_block_size;
     args.kv_indptr       = kv_indptr.data_ptr();
     args.kv_page_indices = kv_page_indices.data_ptr();
     args.scale_s         = softmax_scale;
@@ -155,9 +157,9 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
 }
 
 std::vector<at::Tensor>
-mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
-                  const at::Tensor& k,            // [total_k, hk, d]
-                  const at::Tensor& v,            // [total_k, hk, d]
+mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_num, page_size, hq, d]
+                  const at::Tensor& k,            // [total_k, hk, d] or [page_num, page_size, hk, d]
+                  const at::Tensor& v,            // [total_k, hk, d] or [page_num, page_size, hk, d]
                   const at::Tensor& cu_seqlens_q, // [b+1]
                   const at::Tensor& kv_indptr,    // [b+1]
                   const at::Tensor& kv_page_indices,
@@ -211,11 +213,14 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
     const int batch_size  = cu_seqlens_q.numel() - 1;
     int num_heads         = sizes[1];
     const int head_size_q = sizes[2];
-    const int head_size_v = v.size(2);
-    const int num_heads_k = k.size(1);
+    const int head_size_v = v.size(-1);
+    const int num_heads_k = k.size(-2);
 
-    const int num_blocks = k.size(0);
+    // std::cout << "v size(0): " << k.size(0) << " v size(1): " << k.size(1) << " v size(2): " << k.size(2) << " v size(-1): " << k.size(-1)<< std::endl;
 
+    const int page_block_size = k.dim() == 3 ? 1 : k.size(1);
+    const int num_blocks = k.size(0) * page_block_size;
+    
     if(max_seqlen_q == 1 && !alibi_slopes_.has_value())
     {
         is_causal = false;
@@ -232,6 +237,9 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
     // this case H/t Daniel Haziza
 
     const int total_q = q.size(0);
+    // 4D shape reshape to 3D
+    k = k.reshape({-1, num_heads_k, head_size_q});
+    v = v.reshape({-1, num_heads_k, head_size_v});
 
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(head_size_q <= 256, "CK only supports head dimension at most 256");
@@ -363,6 +371,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                                                    num_heads_k,
                                                    head_size_q,
                                                    head_size_v,
+                                                   page_block_size,
                                                    q,
                                                    k,
                                                    v,
@@ -387,7 +396,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                                            bias_type,
                                            has_lse,
                                            false);
-        TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
+        TORCH_CHECK(t >= 0, "invalid argument for fmha_batch_prefill");
     }
     else
     {
