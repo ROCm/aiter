@@ -946,21 +946,6 @@ def compile_ops(
 
         schema = f"{new_input} -> {output_part}".strip()
 
-        def rewrite_symint_schema(schema: str) -> str:
-            def replacer(match):
-                _ = match.group(1)
-                param_name = match.group(2)
-                return f"SymInt? {param_name}=None"
-
-            pattern = re.compile(r"(SymInt)\s+(\w+)=0")
-            modified_schema = pattern.sub(replacer, schema)
-
-            # pattern = re.compile(r"(SymInt\s+\w+)=0")
-            # modified_schema = pattern.sub(r"\1=None", schema)
-            return modified_schema
-
-        schema = rewrite_symint_schema(schema)
-
         loadName = func.__name__
 
         def abstract_impl(dummy, *args, custom_build_args={}, **kwargs):
