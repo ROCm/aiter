@@ -52,6 +52,7 @@ def generate_data(b, m, n, k, device="cuda"):
     x_scale = torch.rand([b, m, 1], dtype=dtypes.bf16, device=device)
     w_scale = torch.rand([b, 1, n], dtype=dtypes.bf16, device=device)
     out = torch.empty(b, m, n, dtype=dtypes.bf16, device=device)
+    # index of data [0, 1, 2, 3, 4]
     return x, weight, x_scale, w_scale, out
 
 
@@ -148,7 +149,11 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
                                 generate_data,
                                 (B, M, N, K),
                                 kernel_instance_test,
-                                ([0, 1, 2, 3, 4], i, splitK),
+                                (
+                                    [0, 1, 2, 3, 4],
+                                    i,
+                                    splitK,
+                                ),  # [0, 1, 2, 3, 4] is index of paramters for kernel_instance_test in generate_data
                                 {},
                                 run_torch,
                                 ([0, 1, 2, 3],),
@@ -181,7 +186,7 @@ if __name__ == "__main__":
         "N",
         "K",
     ]
-    resultList = [
+    tuneList = [
         "kernelId",
         "splitK",
         "us",
@@ -194,7 +199,7 @@ if __name__ == "__main__":
     tuner = BatchedGemma8W8Tuner(
         "BatchGemmA8W8Tuner",
         key,
-        key + resultList,
+        key + tuneList,
         "gen API for CK batch gemm a8w8 kernel",
     )
 

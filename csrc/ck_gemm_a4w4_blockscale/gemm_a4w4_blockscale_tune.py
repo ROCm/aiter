@@ -52,25 +52,6 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     return torch.mm(x_f32, w_f32.T).to(dtype)[:m, :n]
 
 
-def get_untuned_gemm_list(untuned_gemm_file):
-    assert os.path.exists(
-        untuned_gemm_file
-    ), f"Not exist a4w4_untuned_gemm.csv file: {untuned_gemm_file}"
-    untunedf = pd.read_csv(untuned_gemm_file)
-    filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
-    return filtered_df
-
-
-def get_tuned_gemm_list(tuned_gemm_file):
-    if os.path.exists(tuned_gemm_file):
-        tunedf = pd.read_csv(tuned_gemm_file)
-    else:
-        tunedf = pd.DataFrame(
-            columns=["cu_num", "M", "N", "K", "kernelId", "splitK", "us", "kernelName"]
-        )
-    return tunedf
-
-
 @perftest()
 def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
     aiter.gemm_a4w4_blockscale_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
@@ -147,10 +128,9 @@ def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
 
 class GemmA4W4BlockScaleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
-        "verbose": False,
+        **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": "aiter/configs/a4w4_blockscale_tuned_gemm.csv",
         "untune_file": "aiter/configs/a4w4_blockscale_untuned_gemm.csv",
-        "errRatio": 0.05,
     }
 
     def _setup_specific_arguments(self):
@@ -179,7 +159,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             return None
         return kernels_list[kernelId].name
 
-    def tune_gemm_list(
+    def tune(
         self,
         untunedf,
         tunedf,
@@ -202,7 +182,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         tasks_in_data = []
 
         ck_kernels_num = len(kernels_list)
-        gemm_a4w4_data_idx = [0, 4, 5, 6, 7]
+        gemm_a4w4_data_idx = [0, 4, 5, 6, 7]  # index in generated data
         gemm_asm_data_idx = [0, 4, 5, 6, 7, 8]
         torch_data_idx = [0, 1, 2, 3]
         seed = 1000
@@ -220,7 +200,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 total_kernel_nums = 0
                 seed = seed + 1
 
-                for i in range(ck_kernels_num):
+                for i in range(1):
                     kernel = kernels_list[i]
                     maxsplitK = (
                         aiter.compute_gemm_SplitK(
@@ -328,23 +308,24 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
 
 
 if __name__ == "__main__":
-    key = [
-        "cu_num",
-        "M",
-        "N",
-        "K",
-    ]
-    resultList = [
-        "kernelId",
-        "splitK",
-        "us",
-        "kernelName",
-        "errRatio",
-        "tflops",
-        "bw",
-    ]
+    # key = [
+    #    "cu_num",
+    #    "M",
+    #    "N",
+    #    "K",
+    # ]
+    # resultList = key + [
+    #    "kernelId",
+    #    "splitK",
+    #    "us",
+    #    "kernelName",
+    #    "errRatio",
+    #    "tflops",
+    #    "bw",
+    # ]
+    ## use default key and resultList
     tuner = GemmA4W4BlockScaleTuner(
-        "GemmA4W4BlockScaleTuner", key, resultList, "gen API for CK gemm a4w4 kernel"
+        "GemmA4W4BlockScaleTuner", description="gen API for CK gemm a4w4 kernel"
     )
 
     args = tuner.parse_args()

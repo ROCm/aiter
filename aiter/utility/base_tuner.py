@@ -46,6 +46,7 @@ class TunerCommon:
         self.tunedf = None
         self.untunedf = None
         self.name = name
+        self.topk = 1
 
     def get_arg_defaults(self):
         """get default arguments"""
@@ -151,7 +152,9 @@ class TunerCommon:
 
     def get_tuned_gemm_list(self, tuned_gemm_file):
         if os.path.exists(tuned_gemm_file):
+            column_order = pd.read_csv(tuned_gemm_file, nrows=0).columns.tolist()
             tunedf = pd.read_csv(tuned_gemm_file)
+            tunedf = tunedf[column_order]
         else:
             print(f"Not exist tuned file: {tuned_gemm_file}")
             tunedf = pd.DataFrame(columns=self.columns)
@@ -202,7 +205,7 @@ class TunerCommon:
             if len(filtered_time) < topk:
                 topk = len(filtered_time)
                 print(f"choose {topk} kernels")
-
+            self.topk = topk
             best_config = [
                 ((info_key, *info_ex), us, max_err_ratio)
                 for info_ex, us, max_err_ratio in filtered_time[0:topk]
@@ -224,13 +227,15 @@ class TunerCommon:
         if args.verbose:
             logger.info(f"args: {args}")
         if len(self.untunedf) == 0:
-            #self.result_to_csv(None, args.tune_file)
+            # self.result_to_csv(None, args.tune_file)
             logger.info(f"no shapes to be tuned, skip tuning")
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
         batch_size = min(args.batch, len(self.untunedf))
         total_batches = (len(self.untunedf) + batch_size - 1) // batch_size
         if args.verbose:
-            logger.info(f"total_batches: {total_batches}, batch_size: {batch_size}")
+            logger.info(
+                f"total shapes to be tuned: {len(self.untunedf) }, total_batches: {total_batches}, batch_size: {batch_size}"
+            )
         processed_batches = 0
         results = []
         topk = -1 if fast_mode else 1
@@ -281,16 +286,18 @@ class GemmCommonTuner(TunerCommon):
         ],
         description=None,
     ):
-        super().__init__(name, key, resultList, description)
+        super().__init__(name, key, key + resultList, description)
+
     def pre_process(self, args):
         self.untunedf = self.get_untuned_gemm_list(args.untune_file)
         self.tunedf = self.get_tuned_gemm_list(args.tune_file)
         self.untunedf["cu_num"] = self.get_cu_num()
         untunedf_cols = self.untunedf.columns
-        mask = self.untunedf.apply(tuple, axis=1).isin(
-            self.tunedf[untunedf_cols].apply(tuple, axis=1)
-        )
-        self.untunedf = self.untunedf[~mask]
+        if len(self.tunedf) != 0:
+            mask = self.untunedf.apply(tuple, axis=1).isin(
+                self.tunedf[untunedf_cols].apply(tuple, axis=1)
+            )
+            self.untunedf = self.untunedf[~mask]
 
     def calculate(self, results, bpes=(2, 2, 2)):
         """calculate TFLOPS and bandwidth"""
@@ -313,12 +320,13 @@ class GemmCommonTuner(TunerCommon):
         """post process of tuning results"""
         resultdf = self.get_tuned_gemm_list(file)
         # for i in range(len(resultdf)):
-        #     if len(resultdf.loc[i]) == 9:
-        #         cu_num, B, M, N, K, kernelId, splitK, us, kernelName = resultdf.loc[i]
-        #     else:
-        #         (
+        #    if len(resultdf.loc[i]) == 8:
+        #        cu_num, M, N, K, kernelId, splitK, us, kernelName = tuple(
+        #            resultdf.loc[i]
+        #        )
+        #    else:
+        #        (
         #            cu_num,
-        #            B,
         #            M,
         #            N,
         #            K,
@@ -326,42 +334,47 @@ class GemmCommonTuner(TunerCommon):
         #            splitK,
         #            us,
         #            kernelName,
-        #            errRatio,
         #            tflops,
         #            bw,
-        #        ) = resultdf.loc[i]
-        #     errRatio = 0
-        #     keys = (cu_num, B, M, N, K)
-        #     info = (keys, kernelId, splitK, ""), us, errRatio
-        #     tflops, bw = self.calculate(info)
-        #     resultdf.loc[i, "tflops"] = tflops
-        #     resultdf.loc[i, "bw"] = bw
-        #     resultdf.loc[i, "errRatio"] = 0
+        #            errRatio,
+        #        ) = resultdf.iloc[i]
+        #    errRatio = 0
+        #    print(cu_num, M, N, K)
+        #    keys = (int(cu_num), int(M), int(N), int(K))
+        #    info = (keys, kernelId, splitK, ""), us, errRatio
+        #    tflops, bw = self.calculate(info)
+        #    resultdf.loc[i, "cu_num"] = int(cu_num)
+        #    resultdf.loc[i, "M"] = int(M)
+        #    resultdf.loc[i, "N"] = int(N)
+        #    resultdf.loc[i, "K"] = int(K)
+        #    resultdf.loc[i, "tflops"] = tflops
+        #    resultdf.loc[i, "bw"] = bw
+        #    resultdf.loc[i, "errRatio"] = 0
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName = info
             kernelName = (
-               "None"
-               if time == "nan"
-               else self.getKernelName(kernelId) if kernelName == "" else kernelName
-           )
+                "None"
+                if time == "nan"
+                else self.getKernelName(kernelId) if kernelName == "" else kernelName
+            )
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
-            print(
-               f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
-           )
+            if len(results) == self.topk:
+                print(
+                    f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
+                )
             key_dict.update(
-               {
-                   "kernelId": [kernelId],
-                   "splitK": [splitK],
-                   "us": [time],
-                   "kernelName": [kernelName],
-                   "errRatio": [err_ratio],
-                   "tflops": [tflops],
-                   "bw": [bw],
-               }
-           )
-
+                {
+                    "kernelId": [kernelId],
+                    "splitK": [splitK],
+                    "us": [time],
+                    "kernelName": [kernelName],
+                    "errRatio": [err_ratio],
+                    "tflops": [tflops],
+                    "bw": [bw],
+                }
+            )
             temp = pd.DataFrame(key_dict)
             resultdf = pd.concat([resultdf, temp], ignore_index=True)
         resultdf.to_csv(file, index=False, na_rep="Null")

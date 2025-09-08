@@ -127,7 +127,11 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
                                 generate_data,
                                 (B, M, N, K),
                                 run_batched_gemm,
-                                ([0, 1, 2], i, splitK),
+                                (
+                                    [0, 1, 2],
+                                    i,
+                                    splitK,
+                                ),  # [0, 1, 2] is index of paramters for run_batched_gemm in generate_data
                                 {},
                                 run_torch,
                                 ([0, 1],),
@@ -159,7 +163,7 @@ if __name__ == "__main__":
         "N",
         "K",
     ]
-    resultList = [
+    tuneList = [
         "kernelId",
         "splitK",
         "us",
@@ -172,7 +176,7 @@ if __name__ == "__main__":
     tuner = BatchedGemmBf16Tuner(
         "BatchedGemmBf16Tuner",
         key,
-        key + resultList,
+        key + tuneList,
         "gen API for CK batch gemm bf16 kernel",
     )
 

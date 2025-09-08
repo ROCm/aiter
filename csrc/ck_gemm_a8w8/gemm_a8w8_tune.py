@@ -114,7 +114,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
         cu_num = self.get_cu_num()
         task = []
         tasks_data = []
-        gemm_a8w8_data_idx = [0, 1, 2, 3, 4]
+        gemm_a8w8_data_idx = [0, 1, 2, 3, 4]  # input index in generate_data
         ref_data_idx = [0, 1, 2, 3]
         seed = 0
         for i in range(len(untunedf)):
@@ -176,27 +176,11 @@ class GemmA8W8Tuner(GemmCommonTuner):
 
 if __name__ == "__main__":
 
-    key = [
-        "cu_num",
-        "M",
-        "N",
-        "K",
-    ]
-    resultList = [
-        "kernelId",
-        "splitK",
-        "us",
-        "kernelName",
-        "errRatio",
-        "tflops",
-        "bw",
-    ]
-
+    ## tuner =GemmA8W8Tuner("GemmA8W8Tuner", key, key + tuneList,"gen API for CK gemm a8w8 kernel")
+    ## use default key and resultList
     tuner = GemmA8W8Tuner(
         "GemmA8W8Tuner",
-        key,
-        key + resultList,
-        "gen API for CK gemm a8w8 kernel",
+        description="gen API for CK gemm a8w8 kernel",
     )
 
     args = tuner.parse_args()

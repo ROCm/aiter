@@ -105,7 +105,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         cu_num = self.get_cu_num()
         task = []
         tasks_data = []
-        gemm_a8w8_data_idx = [0, 1, 2, 3, 4]
+        gemm_a8w8_data_idx = [0, 1, 2, 3, 4]  # input index in generate_data
         ref_data_idx = [0, 1, 2, 3]
         seed = 0
         for i in range(len(untunedf)):
@@ -162,31 +162,15 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 tasks_data.append((total_kernel_nums, ()))
         ret = []
         if task:
-            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
+            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
         return ret
 
 
 if __name__ == "__main__":
-    key = [
-        "cu_num",
-        "M",
-        "N",
-        "K",
-    ]
-    resultList = [
-        "kernelId",
-        "splitK",
-        "us",
-        "kernelName",
-        "errRatio",
-        "tflops",
-        "bw",
-    ]
+    ## use default key and resultList
     tuner = GemmA8W8BlockScaleTuner(
         "GemmA8W8BlockScaleTuner",
-        key,
-        key + resultList,
-        "gen API for CK gemm a8w8 blockscale kernel",
+        description="gen API for CK gemm a8w8 blockscale kernel",
     )
 
     args = tuner.parse_args()

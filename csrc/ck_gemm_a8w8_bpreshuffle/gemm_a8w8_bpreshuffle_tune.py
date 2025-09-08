@@ -101,7 +101,7 @@ class Gemma8W8BPreShuffleTuner(GemmCommonTuner):
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
             kernels_num = len(kernels_list)
-            gemm_a8w8_idx = [0, 1, 2, 3, 4]
+            gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
             ref_data_idx = [0, 5, 2, 3]
             if tunedf[
                 (tunedf["M"] == M)
@@ -166,26 +166,10 @@ class Gemma8W8BPreShuffleTuner(GemmCommonTuner):
 
 
 if __name__ == "__main__":
-    key = [
-        "cu_num",
-        "M",
-        "N",
-        "K",
-    ]
-    resultList = [
-        "kernelId",
-        "splitK",
-        "us",
-        "kernelName",
-        "errRatio",
-        "tflops",
-        "bw",
-    ]
+    ## use default key and resultList
     tuner = Gemma8W8BPreShuffleTuner(
         "Gemma8W8BPreShuffleTuner",
-        key,
-        key + resultList,
-        "gen API for CK gemm a8w8 bpreshuffle kernel",
+        description="gen API for CK gemm a8w8 bpreshuffle kernel",
     )
 
     args = tuner.parse_args()

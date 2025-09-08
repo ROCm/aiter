@@ -83,9 +83,8 @@ def worker(
 
     except Exception as e:
         print(f"Error in process:{pid} info:{info}: {e}")
-        # traceback.print_exc()
-        if res is None and ref is not None:
-            print("The output is None, can't match with reference")
+        # if res is None and ref is not None:
+        #    print("The output is None, can't match with reference")
         us = float("inf")
         max_err_ratio = 1.0
     return info, us, max_err_ratio
