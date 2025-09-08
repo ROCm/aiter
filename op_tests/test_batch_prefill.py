@@ -105,7 +105,7 @@ def ref_masked_attention(
         (2048, 2048),
     ],
 )
-@pytest.mark.parametrize("page_size", [1])
+@pytest.mark.parametrize("page_size", [1, 16])
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(6, 1), (3, 1)])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [False, True])
@@ -162,7 +162,8 @@ def test_batch_prefill_with_paged_kv_cache(
     q_indptr_cpu = convert_lens_to_indtpr(qo_lens)
     max_num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = max_num_pages_per_seq * batch_size
-    kv_shape = [total_num_pages, 2, num_kv_heads, page_size, head_dim]
+    # kv layout is NHD
+    kv_shape = [total_num_pages, 2, page_size, num_kv_heads, head_dim]
     if not contiguous_kv:
         tmp = [kv_shape[0]]
         for v in kv_shape[1:]:
@@ -203,8 +204,10 @@ def test_batch_prefill_with_paged_kv_cache(
     kv_indices_gpu = kv_indices_cpu.to(0)
 
     chunks = torch.chunk(kv_data, 2, dim=1)
-    k_cache = chunks[0].squeeze(2).squeeze(2)
-    v_cache = chunks[1].squeeze(2).squeeze(2)
+    k_cache = chunks[0].squeeze(1).squeeze(1)
+    v_cache = chunks[1].squeeze(1).squeeze(1)
+    # print(k_cache.shape)
+    # return
 
     o_ck_flash_attn = aiter.mha_batch_prefill_func(
         q,
