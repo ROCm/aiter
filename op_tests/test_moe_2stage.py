@@ -30,7 +30,6 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
 # torch.manual_seed(100)
 
-BLOCK_SZIE_OVERRIDE = 32
 
 
 def ck_moe_stage1(
@@ -299,7 +298,7 @@ def test_fmoe(
 
     sorting_override = False
     # BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
-    BLOCK_SIZE_M = BLOCK_SZIE_OVERRIDE
+    BLOCK_SIZE_M = 32 if M > 1024 else 16
     if qType == aiter.QuantType.per_128x128:
         BLOCK_SIZE_M = 64
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
