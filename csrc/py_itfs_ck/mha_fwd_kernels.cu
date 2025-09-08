@@ -152,14 +152,25 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
         std::optional<at::Generator> gen_)
 {
-    auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    auto q_dtype = q.scalar_type();
+    bool isQKVFp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
+
+    TORCH_CHECK(q_dtype == at::ScalarType::Half || q_dtype == at::ScalarType::BFloat16 || isQKVFp8,
+                "FlashAttention only support fp16, bf16 and fp8_e4m3 data type");
 
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
-    std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
+    std::string q_dtype_str;
+    if (q_dtype == at::ScalarType::Half)
+        q_dtype_str = "fp16";
+    else if (q_dtype == at::ScalarType::BFloat16)
+        q_dtype_str = "bf16";
+    else if (isQKVFp8)
+        q_dtype_str = "fp8bf16"; // only support bf16 out for fp8
+
+    // TODO - support descale
+    // TODO - set do_fp8_static_quant to true in fmha_fwd_traits
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
 
@@ -226,10 +237,11 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
 
     auto opts = q.options();
+    auto out_type = isQKVFp8 ? at::ScalarType::BFloat16 : q_dtype;
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        TORCH_CHECK(out.dtype() == out_type, "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size_v);
@@ -238,7 +250,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         }
     }
     else {
-        out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(q_dtype));
+        out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(out_type));
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
