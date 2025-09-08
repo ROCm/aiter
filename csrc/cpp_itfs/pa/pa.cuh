@@ -49,7 +49,7 @@
 // clang-format off
 template <typename scalar_t, typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE, int BLOCK_SIZE,
-          int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED, int GQA_RATIO, int MTP=1>
+          int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED, int GQA_RATIO, int MTP=1, vllm::Fp8QuantMethod QUANT_METHOD=vllm::Fp8QuantMethod::kPerTensor>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,         // [num_seqs*mtp, num_heads, head_size]
@@ -382,13 +382,21 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                         { // kv cache dtype fp8
                             auto Ktmp       = Klocal[head_loop][token_depth][qkhe_depth];
                             _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
-                            const float q_scale =
-                                q_scale_ptr != nullptr
-                                    ? *(q_scale_ptr +
-                                        (query_start_off + mtp * MTP_PARALLEL_THREADS) *
-                                            total_num_heads +
-                                        global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP)
-                                    : float(1.0);
+                            float q_scale;
+                            if constexpr(QUANT_METHOD == vllm::Fp8QuantMethod::kPerTensor)
+                            {
+                                q_scale = q_scale_ptr != nullptr ? *q_scale_ptr : float(1.0);
+                            }
+                            else if constexpr(QUANT_METHOD == vllm::Fp8QuantMethod::kPerHead)
+                            {
+                                q_scale =
+                                    q_scale_ptr != nullptr
+                                        ? *(q_scale_ptr +
+                                            (query_start_off + mtp * MTP_PARALLEL_THREADS) *
+                                                total_num_heads +
+                                            global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP)
+                                        : float(1.0);
+                            }
                             for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
                             {
                                 _T8x8 Ktmp8x8, Qtmp8x8;
@@ -425,13 +433,21 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
 
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
                 {
-                    const int klocal_token_idx =
-                        TOKENS_PER_WARP * warpid + token_depth * 16 + lane16id;
-                    const int kglobal_token_idx = partition_start_token_idx + klocal_token_idx;
-                    const int k_scale_idx =
-                        wg_start_kv_head_idx * num_blocks * BLOCK_SIZE + kglobal_token_idx;
-                    d_out[gqa_ratio_loop][mtp][token_depth] *=
-                        k_scale_ptr ? *(k_scale_ptr + k_scale_idx) : float(1.0);
+                    if constexpr(QUANT_METHOD == vllm::Fp8QuantMethod::kPerTensor)
+                    {
+                        d_out[gqa_ratio_loop][mtp][token_depth] *=
+                            k_scale_ptr ? *k_scale_ptr : float(1.0);
+                    }
+                    else if constexpr(QUANT_METHOD == vllm::Fp8QuantMethod::kPerHead)
+                    {
+                        const int klocal_token_idx =
+                            TOKENS_PER_WARP * warpid + token_depth * 16 + lane16id;
+                        const int kglobal_token_idx = partition_start_token_idx + klocal_token_idx;
+                        const int k_scale_idx =
+                            wg_start_kv_head_idx * num_blocks * BLOCK_SIZE + kglobal_token_idx;
+                        d_out[gqa_ratio_loop][mtp][token_depth] *=
+                            k_scale_ptr ? *(k_scale_ptr + k_scale_idx) : float(1.0);
+                    }
                 }
             }
         }
@@ -733,15 +749,24 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                                 }
                             }
                         }
-                        const int vlocal_token_idx =
-                            vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP +
-                            rowid * VTOKENS_PER_LANE;
-                        // Safe to use an int32_t here assuming we are working with < 2 billion
-                        // tokens
-                        const int vglobal_token_idx = partition_start_token_idx + vlocal_token_idx;
-                        const int v_scale_idx =
-                            wg_start_kv_head_idx * num_blocks * BLOCK_SIZE + vglobal_token_idx;
-                        tmp_out_depth *= v_scale_ptr ? *(v_scale_ptr + v_scale_idx) : float(1.0);
+                        if constexpr(QUANT_METHOD == vllm::Fp8QuantMethod::kPerTensor)
+                        {
+                            tmp_out_depth *= v_scale_ptr ? *v_scale_ptr : float(1.0);
+                        }
+                        else if constexpr(QUANT_METHOD == vllm::Fp8QuantMethod::kPerHead)
+                        {
+                            const int vlocal_token_idx =
+                                vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP +
+                                rowid * VTOKENS_PER_LANE;
+                            // Safe to use an int32_t here assuming we are working with < 2 billion
+                            // tokens
+                            const int vglobal_token_idx =
+                                partition_start_token_idx + vlocal_token_idx;
+                            const int v_scale_idx =
+                                wg_start_kv_head_idx * num_blocks * BLOCK_SIZE + vglobal_token_idx;
+                            tmp_out_depth *=
+                                v_scale_ptr ? *(v_scale_ptr + v_scale_idx) : float(1.0);
+                        }
                         tmp_out += tmp_out_depth;
                     }
                 }
@@ -877,7 +902,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
 template <typename scalar_t, typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE, int BLOCK_SIZE,
           int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED,
-          int GQA_RATIO, int MTP=1>
+          int GQA_RATIO, int MTP=1, vllm::Fp8QuantMethod QUANT_METHOD=vllm::Fp8QuantMethod::kPerTensor>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]

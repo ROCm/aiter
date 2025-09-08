@@ -33,6 +33,13 @@ enum class Fp8KVCacheDataType
     kFp8E5M2 = 2,
 };
 
+enum class Fp8QuantMethod
+{
+    kPerTensor = 0,
+    kPerHead   = 1,
+    kPerToken  = 2,
+};
+
 // fp8 vector types for quantization of kv cache
 template <>
 struct Vec<uint8_t, 1>
