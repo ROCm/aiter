@@ -509,7 +509,7 @@ class ck_moe_2stage_gemm_codegen:
             self.c_dtype,
             self.nswizzle,
             self.quant_type,
-            int(self.activation == "silu"),
+            self.activation,
             self.mul_routed_weight_stage == 1,
         )
         tag, gemm2_kernel_list = get_gemm2_kernels_list(
