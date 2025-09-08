@@ -452,7 +452,7 @@ if __name__ == "__main__":
         "-c",
         "--causal",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="""Causal attention, default is True.
     -c or --causal    # enable causal attention
     --no-causal       # disable causal attention""",
