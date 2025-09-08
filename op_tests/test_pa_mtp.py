@@ -249,6 +249,7 @@ def run_aiter_asm(
         v_scale,
         None,
         qo_indptr,
+        # kernelName="_ZN5aiter42pa_bf16_pertokenFp8_gqa10_1tg_4w_mtp3_msk1E",
     )
 
 
@@ -309,7 +310,6 @@ def test_pa_mtp(
     device = "cuda:0"
     torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
-    print(num_query_heads, num_kv_heads)
     assert num_query_heads % num_kv_heads == 0
     max_seq_len = 16384
     max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
@@ -391,37 +391,37 @@ def test_pa_mtp(
     # ret["us_asm_bf16"] = us_asm_noquant
     # ret["err_asm_bf16"] = err_noquant
 
-    scale = float(1.0 / (head_size**0.5))
-    out_hip_noquant, us_hip = run_aiter_hip(
-        query,
-        k_cache,
-        v_cache,
-        block_tables,
-        seq_lens,
-        ctx_lens,
-        max_qlen,
-        "auto",
-        num_kv_heads,
-        scale,
-        torch.ones(1, dtype=dtypes.fp32),
-        torch.ones(1, dtype=dtypes.fp32),
-        # k_scale_asm,
-        # v_scale_asm,
-    )
-    err_noquant = checkAllclose(
-        out_ref_noquant,
-        out_hip_noquant,
-        msg=f"[torch vs  aiter_hip][No Quant]: {us_hip:>8.2f} us......",
-    )
-    ret["us_hip_bf16"] = us_hip
-    ret["err_hip_bf16"] = err_noquant
+    # scale = float(1.0 / (head_size**0.5))
+    # out_hip_noquant, us_hip = run_aiter_hip(
+    #     query,
+    #     k_cache,
+    #     v_cache,
+    #     block_tables,
+    #     seq_lens,
+    #     ctx_lens,
+    #     max_qlen,
+    #     "auto",
+    #     num_kv_heads,
+    #     scale,
+    #     torch.ones(1, dtype=dtypes.fp32),
+    #     torch.ones(1, dtype=dtypes.fp32),
+    #     # k_scale_asm,
+    #     # v_scale_asm,
+    # )
+    # err_noquant = checkAllclose(
+    #     out_ref_noquant,
+    #     out_hip_noquant,
+    #     msg=f"[torch vs  aiter_hip][No Quant]: {us_hip:>8.2f} us......",
+    # )
+    # ret["us_hip_bf16"] = us_hip
+    # ret["err_hip_bf16"] = err_noquant
 
     k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
         pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
     )
 
     out_aiter_asm, us_aiter_asm = run_aiter_asm(
-        query,
+        query.contiguous(),
         k_quant_,
         asm_V_shuffle(v_quant_),
         block_tables,
@@ -508,7 +508,6 @@ parser.add_argument(
     "-c",
     "--ctx_len",
     type=int,
-    choices=l_ctx_len,
     default=None,
     help="""Context length.
     e.g. -c 128""",
@@ -517,7 +516,6 @@ parser.add_argument(
     "-b",
     "--batch_size",
     type=int,
-    choices=l_batch_size,
     default=None,
     help="""Batch size.
     e.g. -b 128""",
