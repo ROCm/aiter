@@ -45,7 +45,7 @@ def hipb_mm(
     scaleA: Optional[torch.Tensor] = None,
     scaleB: Optional[torch.Tensor] = None,
     scaleOut: Optional[torch.Tensor] = None,
-    swizzle: Optional[bool] = None,
+    bpreshuffle: Optional[bool] = None,
 ) -> torch.Tensor: ...
 
 

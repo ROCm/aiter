@@ -109,7 +109,7 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
 
 
 @perftest()
-def aiter_hip_swizzle(inp, weights, scaleA, scaleB, dtype):
+def aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
     if scaleB is not None:
         scaleB = scaleB.t()
     
@@ -123,7 +123,7 @@ def aiter_hip_swizzle(inp, weights, scaleA, scaleB, dtype):
     scaleA=scaleA, 
     scaleB=scaleB, 
     scaleOut=None,
-    swizzle=True
+    bpreshuffle=True
 )
 
 
@@ -294,7 +294,7 @@ def calculate_total_valid_points(cu_count, aligned_k):
 
 
 
-def swizzle_test_fp8(m, n, k):
+def bpreshuffle_test_fp8(m, n, k):
     dtype = dtypes.bf16
 
     inp = torch.randn((m, k), dtype=dtype, device="cuda")
@@ -306,18 +306,18 @@ def swizzle_test_fp8(m, n, k):
     out_hip, time_hip = aiter_hip(inp, weights, x_scale, w_scale, torch.bfloat16)
 
 
-    weight_swizzle = shuffle_weight(weights, layout=(16, 16), use_int4=False)
-    out_sw, time_sw = aiter_hip_swizzle(inp, weight_swizzle, x_scale, w_scale, torch.bfloat16)
-    out_ck, time_ck = run_gemm_ck_bpreshuffle(inp, weight_swizzle, x_scale, w_scale, torch.bfloat16)
+    weight_bpreshuffle = shuffle_weight(weights, layout=(16, 16), use_int4=False)
+    out_sw, time_sw = aiter_hip_bpreshuffle(inp, weight_bpreshuffle, x_scale, w_scale, torch.bfloat16)
+    out_ck, time_ck = run_gemm_ck_bpreshuffle(inp, weight_bpreshuffle, x_scale, w_scale, torch.bfloat16)
     
 
 
-    err_b = checkAllclose(out_sw, out_torch, msg=f"swizzle time:{time_sw}, hipblaslt time:{time_torch} ", rtol=1e-2, atol=1e-2)
+    err_b = checkAllclose(out_sw, out_torch, msg=f"bpreshuffle time:{time_sw}, hipblaslt time:{time_torch} ", rtol=1e-2, atol=1e-2)
 
     if err_b == 0:
-        msg = f'mnk={m} {n} {k}: swizzle time:{time_sw}, hipb_mm time:{time_hip}, ck time:{time_ck}, torch._scaled_mm time:{time_torch} All Close!'
+        msg = f'mnk={m} {n} {k}: bpreshuffle time:{time_sw}, hipb_mm time:{time_hip}, ck time:{time_ck}, torch._scaled_mm time:{time_torch} All Close!'
     else:
-        msg = f'mnk={m} {n} {k}: swizzle time:{time_sw}, hipb_mm time:{time_hip}, ck time:{time_ck}, torch._scaled_mm time:{time_torch} Not All Close!'
+        msg = f'mnk={m} {n} {k}: bpreshuffle time:{time_sw}, hipb_mm time:{time_hip}, ck time:{time_ck}, torch._scaled_mm time:{time_torch} Not All Close!'
    
 
     return msg
@@ -326,7 +326,7 @@ def swizzle_test_fp8(m, n, k):
 
 
 
-def swizzle_test_bf16(m, n, k):
+def bpreshuffle_test_bf16(m, n, k):
     dtype = dtypes.bf16
 
     inp = torch.randn((m, k), dtype=dtype, device="cuda")
@@ -335,17 +335,17 @@ def swizzle_test_bf16(m, n, k):
     out_torch, time_torch = torch_gemm_bf16(inp, weights)
     out_hipb, time_hipb = aiter_hip(inp, weights, None, None, torch.bfloat16)
 
-    weight_swizzle = shuffle_weight(weights, layout=(16, 16), use_int4=False)
-    out_swizzle, time_swizzle = aiter_hip_swizzle(inp, weight_swizzle, None, None, torch.bfloat16)
+    weight_bpreshuffle = shuffle_weight(weights, layout=(16, 16), use_int4=False)
+    out_bpreshuffle, time_bpreshuffle = aiter_hip_bpreshuffle(inp, weight_bpreshuffle, None, None, torch.bfloat16)
     
 
 
-    err_b = checkAllclose(out_swizzle, out_torch, msg=f"swizzle time:{time_swizzle}, hipblaslt time:{time_torch} ", rtol=1e-2, atol=1e-2)
+    err_b = checkAllclose(out_bpreshuffle, out_torch, msg=f"bpreshuffle time:{time_bpreshuffle}, hipblaslt time:{time_torch} ", rtol=1e-2, atol=1e-2)
 
     if err_b == 0:
-        msg = f'mnk={m} {n} {k}: swizzle time:{time_swizzle}, hipb_mm time:{time_hipb}, hipblaslt time:{time_torch} All Close!'
+        msg = f'mnk={m} {n} {k}: bpreshuffle time:{time_bpreshuffle}, hipb_mm time:{time_hipb}, hipblaslt time:{time_torch} All Close!'
     else:
-        msg = f'mnk={m} {n} {k}: swizzle time:{time_swizzle}, hipb_mm time:{time_hipb}, hipblaslt time:{time_torch} Not All Close!'
+        msg = f'mnk={m} {n} {k}: bpreshuffle time:{time_bpreshuffle}, hipb_mm time:{time_hipb}, hipblaslt time:{time_torch} Not All Close!'
     
     return msg
 
@@ -424,11 +424,11 @@ def test_skinny_gemm_a8w8_pertoken_quant():
 
 
 
-def test_hipb_swizzle_gemm_a8w8_pertoken_quant():
+def test_hipb_bpreshuffle_gemm_a8w8_pertoken_quant():
 
     if get_arch() == "gfx950":
         print("HipBLASLt Swizzle is not supported on MI350/355")
-        sys.exit(1)
+        return
 
 
     hipb_create_extension()
@@ -438,7 +438,7 @@ def test_hipb_swizzle_gemm_a8w8_pertoken_quant():
     func_dtype = 'bf16'
 
 
-    func = swizzle_test_fp8 if func_dtype == 'fp8' else swizzle_test_bf16
+    func = bpreshuffle_test_fp8 if func_dtype == 'fp8' else bpreshuffle_test_bf16
 
 
     for m in [16, 32, 48, 64, 4096, 5120, 8192]:
@@ -535,6 +535,6 @@ else:
 if args.mnk is not None:
     l_mnk_nm = [args.mnk]
 
-# test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
-# test_skinny_gemm_a8w8_pertoken_quant()
-test_hipb_swizzle_gemm_a8w8_pertoken_quant()
+test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
+test_skinny_gemm_a8w8_pertoken_quant()
+test_hipb_bpreshuffle_gemm_a8w8_pertoken_quant()

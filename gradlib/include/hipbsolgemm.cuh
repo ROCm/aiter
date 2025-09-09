@@ -45,7 +45,7 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
                       std::optional<torch::Tensor> scaleA = std::nullopt,
                       std::optional<torch::Tensor> scaleB = std::nullopt,
                       std::optional<torch::Tensor> scaleOut = std::nullopt, 
-                      std::optional<bool> swizzle = std::nullopt);
+                      std::optional<bool> bpreshuffle = std::nullopt);
 
 std::vector<int> hipb_findallsols(
     const torch::Tensor &mat1, const torch::Tensor &mat2,

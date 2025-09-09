@@ -90,14 +90,11 @@ def swizzle_test_fp8(m, n, k):
     weights, w_scale = aiter.pertoken_quant(weights, quant_dtype=dtypes.fp8)
 
     out_torch, time_torch = torch_gemm_fp8(inp, weights, x_scale, w_scale, torch.bfloat16)
-
     out_hip, time_hip = aiter_hip(inp, weights, x_scale, w_scale, torch.bfloat16)
 
 
     weight_swizzle = shuffle_weight(weights, layout=(16, 16), use_int4=False)
-    
     out_sw, time_sw = aiter_hip_swizzle(inp, weight_swizzle, x_scale, w_scale, torch.bfloat16)
-
     out_ck, time_ck = run_gemm_ck_bpreshuffle(inp, weight_swizzle, x_scale, w_scale, torch.bfloat16)
     
 
@@ -108,9 +105,7 @@ def swizzle_test_fp8(m, n, k):
         msg = f'mnk={m} {n} {k}: swizzle time:{time_sw}, hipb_mm time:{time_hip}, ck time:{time_ck}, torch._scaled_mm time:{time_torch} All Close!'
     else:
         msg = f'mnk={m} {n} {k}: swizzle time:{time_sw}, hipb_mm time:{time_hip}, ck time:{time_ck}, torch._scaled_mm time:{time_torch} Not All Close!'
-
-    # msg = f'{time_sw} {time_hip} {time_ck} {time_torch}'
-    
+   
 
     return msg
 
@@ -127,7 +122,6 @@ def swizzle_test_bf16(m, n, k):
     out_torch, time_torch = torch_gemm_bf16(inp, weights)
     out_hipb, time_hipb = aiter_hip(inp, weights, None, None, torch.bfloat16)
 
-
     weight_swizzle = shuffle_weight(weights, layout=(16, 16), use_int4=False)
     out_swizzle, time_swizzle = aiter_hip_swizzle(inp, weight_swizzle, None, None, torch.bfloat16)
     
@@ -140,9 +134,6 @@ def swizzle_test_bf16(m, n, k):
     else:
         msg = f'mnk={m} {n} {k}: swizzle time:{time_swizzle}, hipb_mm time:{time_hipb}, hipblaslt time:{time_torch} Not All Close!'
     
-
-    # msg = f'{time_swizzle} {time_hipb} {time_torch}'
-
     return msg
 
 
@@ -151,6 +142,10 @@ def swizzle_test_bf16(m, n, k):
 n, k = 7424, 8192
 msg_all = []
 func_dtype = 'bf16'
+
+from aiter.ops.triton.utils.arch_info import get_arch
+a = get_arch()
+
 
 
 func = swizzle_test_fp8 if func_dtype == 'fp8' else swizzle_test_bf16

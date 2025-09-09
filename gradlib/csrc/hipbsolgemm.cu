@@ -214,7 +214,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
     const void *scaleA, const void *b, int ldb, const void *scaleB,
     const void *beta, void *c, int ldc, const void *scaleC, const void *bias,
     hipDataType intype, hipDataType outtype, hipStream_t &stream,
-    int solution_index = -1, bool swizzle = false)
+    int solution_index = -1, bool bpreshuffle = false)
 {
   // TODO: flag is not supported for hipblasLt yet
   int flag{0};
@@ -235,7 +235,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matA, intype, k, m, lda));
   }
-  if (swizzle) 
+  if (bpreshuffle) 
   {
     hipblasLtOrder_t orderA;
     if (scaleA != nullptr)
@@ -345,9 +345,9 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
                       std::optional<torch::Tensor> scaleA,
                       std::optional<torch::Tensor> scaleB,
                       std::optional<torch::Tensor> scaleOut, 
-                      std::optional<bool> swizzle)
+                      std::optional<bool> bpreshuffle)
 {
-  bool swizzle_flag = swizzle.value_or(false);
+  bool bpreshuffle_flag = bpreshuffle.value_or(false);
   
   auto mat1_strides{mat1.strides()};
   auto mat2_strides{mat2.strides()};
@@ -454,7 +454,7 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
       transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k, &one, ptrA,
       mat1_ld, d_scaleA, ptrB, mat2_ld, d_scaleB, &zero, ptrC, result_ld,
       d_scaleOut, bias_ptr, hipblasInType, hipblasOutType, current_stream,
-      solution_index, swizzle_flag));
+      solution_index, bpreshuffle_flag));
 
   return result;
 }
@@ -620,7 +620,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("solution_index"), py::arg("bias") = std::nullopt,
         py::arg("out_dtype") = std::nullopt, py::arg("scaleA") = std::nullopt,
         py::arg("scaleB") = std::nullopt, py::arg("scaleOut") = std::nullopt, 
-        py::arg("swizzle")  = std::nullopt);
+        py::arg("bpreshuffle")  = std::nullopt);
   m.def("hipb_findallsols", &hipb_findallsols, "hipb_findallsols",
         py::arg("mat1"), py::arg("mat2"), py::arg("bias") = std::nullopt,
         py::arg("out_dtype") = std::nullopt, py::arg("scaleA") = std::nullopt,

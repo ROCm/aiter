@@ -1022,7 +1022,7 @@
           py::arg("scaleA")    = std::nullopt,                                     \
           py::arg("scaleB")    = std::nullopt,                                     \
           py::arg("scaleOut")  = std::nullopt,                                      \
-          py::arg("swizzle")  = std::nullopt);                                     \
+          py::arg("bpreshuffle")  = std::nullopt);                                     \
     m.def("hipb_findallsols",                                                      \
           &hipb_findallsols,                                                       \
           "hipb_findallsols",                                                      \
