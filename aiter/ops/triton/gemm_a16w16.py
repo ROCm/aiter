@@ -55,13 +55,24 @@ def gemm_a16w16(
     if config is None:
         config = _get_config(M, N, K)
 
+    if config["NUM_KSPLIT"] > 1:
+        y_pp = torch.empty(
+            (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
+        )
+    else:
+        y_pp = None
+
     grid = lambda META: (  # noqa: E731
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        (
+            META["NUM_KSPLIT"]
+            * triton.cdiv(M, META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+        ),
     )
     _gemm_a16_w16_kernel[grid](
         x,
         w,
-        y,
+        y if config["NUM_KSPLIT"] == 1 else y_pp,
         M,
         N,
         K,
@@ -69,11 +80,39 @@ def gemm_a16w16(
         x.stride(1),
         w.stride(0),
         w.stride(1),
-        y.stride(0),
-        y.stride(1),
+        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
         activation=_get_activation_from_str(activation) if activation else "",
         use_activation=activation is not None,
         **config,
     )
+
+    if config["NUM_KSPLIT"] > 1:
+        REDUCE_BLOCK_SIZE_M = 32
+        REDUCE_BLOCK_SIZE_N = 32
+        ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
+
+        grid_reduce = (
+            triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
+            triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
+        )
+        _gemm_a16w16_reduce_kernel[grid_reduce](
+            y_pp,
+            y,
+            M,
+            N,
+            y_pp.stride(0),
+            y_pp.stride(1),
+            y_pp.stride(2),
+            y.stride(0),
+            y.stride(1),
+            REDUCE_BLOCK_SIZE_M,
+            REDUCE_BLOCK_SIZE_N,
+            ACTUAL_KSPLIT,
+            triton.next_power_of_2(config["NUM_KSPLIT"]),
+            activation=_get_activation_from_str(activation) if activation else "",
+            use_activation=activation is not None,
+        )
 
     return y
