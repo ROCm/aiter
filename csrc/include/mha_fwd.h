@@ -58,7 +58,7 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                              bool has_lse,
                              bool has_dropout,
                              bool skip_min_seqlen_q,
-                             bool is_sglang)
+                             bool is_sglang_layout)
         : fmha_batch_prefill_traits{head_size_q,
                                     head_size_v,
                                     dtype,
@@ -71,7 +71,7 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                                     has_dropout,
                                     quant_scale_enum::no_scale, // qscale_type
                                     skip_min_seqlen_q,
-                                    is_sglang}
+                                    is_sglang_layout}
     {
     }
 };
