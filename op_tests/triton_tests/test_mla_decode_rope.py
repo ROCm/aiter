@@ -216,7 +216,6 @@ def test_op_fwd_rope(
     logit_cap=0.0,
     device="cuda",
 ):
-    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(0)
 
     kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
@@ -316,7 +315,6 @@ def test_op_fwd_rope_neox(
     logit_cap=0.0,
     device="cuda",
 ):
-    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(0)
 
     kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
@@ -425,7 +423,6 @@ def test_op_fwd_rope_integration(
     logit_cap=0.0,
     device="cuda",
 ):
-    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(0)
 
     kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (

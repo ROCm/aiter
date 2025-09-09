@@ -907,9 +907,16 @@ float fmha_bwd_v3_(const ck_tile::stream_config& s, fmha_bwd_args a)
     {F_dq_shuffle_kernel_define}
 
     static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
-    return ck_tile::launch_kernel(s,
-        [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
-        [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }}{F_dq_shuffle_kernel_call}
+
+    if (a.hdim_q > 64 && a.hdim_q <=128) {{
+        if(s.log_level_ > 0)
+            std::cout << ", " << "fmha_bwd_bf16_dq_shuffle" << std::flush;
+        fmha_bwd_dq_shuffle_args dq_shuffule_args;
+        dq_shuffule_args.ptr_dq  = a.dq_ptr;
+        dq_shuffule_args.Ts      = 64 * a.stride_q * 2; // ts_dq * a.stride_q * 2
+        dq_shuffule_args.Hs      = a.nhead_stride_q * 2;
+        dq_shuffule_args.BAs     = a.batch_stride_q * 2;
+        dq_shuffule_args.Seqs    = a.stride_q * 2;
 
     );
 }}
@@ -1349,7 +1356,7 @@ float fmha_bwd_v3(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_confi
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }}
-                            
+
                         }}
                         else if((t.mask_type != mask_enum::no_mask) && ((a.window_size_left == -1) && (a.window_size_right == 0)) && (t.mask_type == mask_enum::mask_top_left)){{
                             using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<256, FmhaBwdBf16, true/*group*/, true, true>;

@@ -11,23 +11,278 @@ import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.activation import _get_activation_from_str
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
-_LOGGER = AiterTritonLogger()
 
-
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 16,
+                "BLOCK_SIZE_K": 256,
+                "GROUP_SIZE_M": 2,
+                "waves_per_eu": 4,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": None,
+                "kpack": 1,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 256,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 4,
+                "waves_per_eu": 2,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": None,
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # M  N  K  Triton (us)  config
+        # 16  5120  2880    21.480  (config = 16 128 512 1 8 2 2 16 0)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 512,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 2,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": ".cg",
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # 16  2880  4096    26.920  (config = 16 128 512 1 8 2 1 16 0)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 512,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 1,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": ".cg",
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # 16  128  2880     7.320  (config = 16 16 512 1 8 2 8 16 0)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 16,
+                "BLOCK_SIZE_K": 512,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 8,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": ".cg",
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # 32  5120  2880    17.640  (config = 16 128 256 4 8 2 1 16 1)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 256,
+                "GROUP_SIZE_M": 4,
+                "waves_per_eu": 1,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": None,
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # 32  2880  4096    20.800  (config = 16 128 256 1 8 2 1 16 1)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 256,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 1,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": None,
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # 32  128  2880     7.240  (config = 16 16 512 1 8 2 8 16 1)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 16,
+                "BLOCK_SIZE_K": 512,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 8,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": None,
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # 64  5120  2880    20.480  (config = 16 128 512 1 8 2 1 16 0)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 512,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 1,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": ".cg",
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # 64  2880  4096    21.441  (config = 16 128 256 1 8 2 4 16 1)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 256,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 4,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": None,
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # 64  128  2880     7.240  (config = 16 16 512 1 8 2 1 16 0)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 16,
+                "BLOCK_SIZE_K": 512,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 1,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": ".cg",
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # 128  5120  2880    23.160  (config = 16 128 128 4 4 2 1 16 1)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 4,
+                "waves_per_eu": 1,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": None,
+                "kpack": 1,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        # 128  2880  4096    29.600  (config = 16 128 256 4 8 2 4 16 1)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 256,
+                "GROUP_SIZE_M": 4,
+                "waves_per_eu": 4,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": None,
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # 128  128  2880     7.160  (config = 16 16 512 1 8 2 8 16 1)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 16,
+                "BLOCK_SIZE_K": 512,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 8,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": None,
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        # 8192  5120  2880   307.442  (config = 128 128 128 1 4 2 2 16 1)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 1,
+                "waves_per_eu": 2,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": None,
+                "kpack": 1,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        # 8192  2880  4096   240.442  (config = 128 128 128 4 4 2 2 16 1)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 4,
+                "waves_per_eu": 2,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": None,
+                "kpack": 1,
+            },
+            num_warps=4,
+            num_stages=2,
+        ),
+        # 8192  128  2880    21.280  (config = 128 32 256 4 8 2 2 16 1)
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 256,
+                "GROUP_SIZE_M": 4,
+                "waves_per_eu": 2,
+                "matrix_instr_nonkdim": 16,
+                "cache_modifier": None,
+                "kpack": 1,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+    ],
+    key=["next_M_2", "N", "K"],
+)
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit
 def _gemm_a16_w16_kernel(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M,
     N,
@@ -38,16 +293,15 @@ def _gemm_a16_w16_kernel(
     stride_bn,
     stride_cm,
     stride_cn,
+    next_M_2,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
-    activation: tl.constexpr,
-    use_activation: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -67,7 +321,7 @@ def _gemm_a16_w16_kernel(
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    remap_xcd(pid, GRID_MN)
+    # remap_xcd(pid, GRID_MN)
 
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 
@@ -82,7 +336,15 @@ def _gemm_a16_w16_kernel(
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+    if ADD_BIAS:
+        accumulator = tl.load(bias_ptr + offs_bn, cache_modifier=".cg").to(
+            dtype=acc_dtype
+        )
+        accumulator = tl.broadcast_to(
+            accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
+        )
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
@@ -105,8 +367,6 @@ def _gemm_a16_w16_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    if use_activation:
-        accumulator = activation(accumulator)
     c = accumulator.to(c_ptr.type.element_ty)
 
     # Write back the block of the output matrix C with masks.
@@ -142,21 +402,19 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    bounds = [64, 128, 256, 512, 2048]
-    for bound in bounds:
-        if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key][f"M_LEQ_{bound}"]
+    if M < 128 and "small" in _get_config._config_dict[key]:
+        return _get_config._config_dict[key]["small"]
     else:
-        return _get_config._config_dict[key]["M_GEQ_4096"]
+        return _get_config._config_dict[key]["any"]
 
 
 def gemm_a16w16(
     x,
     w,
+    bias: Optional[torch.Tensor] = None,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
-    activation: Optional[str] = None,
 ):
     """
     Computes the 16 bit matmul Y = X x W
@@ -164,19 +422,13 @@ def gemm_a16w16(
     Key parameters:
     - X: Matrix X with shape (M, K).
     - W: Matrix W with shape (N, K).
+    - bias: Vector with shape (N).
     - dtype: Optional parameter to specifcy bf16 or fp16 datatype. Default is bf16
-    - Y: Output Matrix Y with shape (M, N).
-    If this is none, then it's created by this API and returned as output.
-    - activation: Optional activation function to apply to the output.
-    One of ("gelu", "gelu_tanh", "silu", "silu_exp2", "relu"). Default is None.
+    - Y: Output Matrix Y with shape (M, N). If this is none, then it's created by this API and returned as output
 
     Returns:
     - Y: The output matrix with shape (M, N).
     """
-
-    _LOGGER.info(f"GEMM_A16W16: x={tuple(x.shape)} w={tuple(w.shape)}")
-    # Shape checks
-    assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
 
     M, K = x.shape
     N, K = w.shape
@@ -185,8 +437,8 @@ def gemm_a16w16(
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    if config is None:
-        config = _get_config(M, N, K)
+    # if config is None:
+    #    config = _get_config(M, N, K)
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -194,6 +446,7 @@ def gemm_a16w16(
     _gemm_a16_w16_kernel[grid](
         x,
         w,
+        bias,
         y,
         M,
         N,
@@ -204,9 +457,8 @@ def gemm_a16w16(
         w.stride(1),
         y.stride(0),
         y.stride(1),
-        activation=_get_activation_from_str(activation) if activation else "",
-        use_activation=activation is not None,
-        **config,
+        ADD_BIAS=(bias is not None),
+        next_M_2=triton.next_power_of_2(M),
     )
 
     return y
