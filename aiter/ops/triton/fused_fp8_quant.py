@@ -2,7 +2,9 @@ import torch
 import triton
 import triton.language as tl
 import aiter
+
 fp8_dtype = aiter.dtypes.fp8
+
 
 @triton.jit
 def _rmsmorm_op(row, weight, n_cols, epsilon):
@@ -13,6 +15,7 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
     rms_norm = row * norm_factor * weight
     return rms_norm
 
+
 @triton.jit
 def _fp8_quant_op(
     x,
@@ -21,15 +24,16 @@ def _fp8_quant_op(
     QUANT_BLOCK_SIZE: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
-):  
+):
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
     x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, QUANT_BLOCK_SIZE)
     m = tl.maximum(tl.max(tl.abs(x), axis=-1), 1e-10)
     scale_out = m.to(tl.float32) / DTYPE_MAX
     scale_recip = 1.0 / scale_out.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, 1)
     x = tl.clamp(x * scale_recip, DTYPE_MIN, DTYPE_MAX)
-    
+
     return x, scale_out
+
 
 @triton.jit
 def _fused_rms_fp8_group_quant_kernel(
@@ -42,6 +46,7 @@ def _fused_rms_fp8_group_quant_kernel(
     out1_bs_ptr,
     out2_ptr,
     out_res1_ptr,
+    out1_ptr,
     eps1,
     eps2,
     n_rows,
@@ -61,12 +66,15 @@ def _fused_rms_fp8_group_quant_kernel(
     out2_col_stride,
     out_res1_row_stride,
     out_res1_col_stride,
+    out1_row_stride,
+    out1_col_stride,
     BLOCK_SIZE_N: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
     HAVE_SECOND_INPUT: tl.constexpr,
     FIRST_INPUT_RES: tl.constexpr,
+    FIRST_INPUT_OUT: tl.constexpr,
 ):
     m_pid = tl.program_id(0)
     n_offs = tl.arange(0, BLOCK_SIZE_N)
@@ -91,6 +99,15 @@ def _fused_rms_fp8_group_quant_kernel(
     w1 = tl.load(weight1_ptr + n_offs, mask=mask1, other=0.0).to(tl.float32)
 
     norm1 = _rmsmorm_op(inp1, w1, inp1_n_cols, eps1)
+
+    if FIRST_INPUT_OUT:
+        mask1 = n_offs < inp1_n_cols
+        tl.store(
+            out1_ptr + m_pid * out1_row_stride + n_offs * out1_col_stride,
+            norm1,
+            mask=mask1,
+        )
+
     out1_fp8, out1_block_scales = _fp8_quant_op(
         norm1, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
     )
@@ -120,14 +137,20 @@ def _fused_rms_fp8_group_quant_kernel(
         ).to(tl.float32)
         w2 = tl.load(weight2_ptr + n_offs, mask=mask2, other=0.0).to(tl.float32)
         norm2 = _rmsmorm_op(inp2, w2, inp2_n_cols, eps2)
-        tl.store(out2_ptr + m_pid * out2_row_stride + n_offs * out2_col_stride, norm2, mask=mask2)
-    
+        tl.store(
+            out2_ptr + m_pid * out2_row_stride + n_offs * out2_col_stride,
+            norm2,
+            mask=mask2,
+        )
+
     if FIRST_INPUT_RES:
         inp1 = inp1.to(out_res1_ptr.dtype.element_ty)
         tl.store(
-            out_res1_ptr + m_pid * out_res1_row_stride + n_offs * out_res1_col_stride, inp1, mask=mask1
+            out_res1_ptr + m_pid * out_res1_row_stride + n_offs * out_res1_col_stride,
+            inp1,
+            mask=mask1,
         )
-        
+
 
 def fused_rms_fp8_group_quant(
     inp1,
@@ -136,9 +159,10 @@ def fused_rms_fp8_group_quant(
     inp2=None,
     inp2_weight=None,
     inp2_epsilon=None,
-    group_size = 128,
-    dtype_quant = fp8_dtype,
+    group_size=128,
+    dtype_quant=fp8_dtype,
     res1=None,
+    output_unquantized_inp1=False,
 ):
     """
     This op contains several steps:
@@ -151,15 +175,12 @@ def fused_rms_fp8_group_quant(
     - x: Matrix X with shape (M, N1, N2).
 
     Returns:
-    - out1_fp8: The output matrix with shape (M, N1 // 2).
+    - out1_fp8: The output matrix with shape (M, N1).
     - out1_bs: The output matrix with shape (M, cdiv(N1, group_size)).
+    - out1: The output matrix with shape (M, N1).
     - out2: The output matrix with shape (M, N2).
     - out_res1: The output matrix with shape (M, N1).
-
-        if both inp2 and res1 provided, return (out1_fp8, out1_bs), out2, out_res1
-        if inp2 provided, return (out1_fp8, out1_bs), out2
-        if res1 provided, return (out1_fp8, out1_bs), out_res1
-        if both inp2 and res1 not provided, return (out1_fp8, out1_bs)
+    - out1: The output matrix with shape (M, N1).
     """
 
     M, N1 = inp1.shape
@@ -167,11 +188,17 @@ def fused_rms_fp8_group_quant(
     if inp2 is not None:
         M2, N2 = inp2.shape
         BLOCK_SIZE_N = max(triton.next_power_of_2(N2), BLOCK_SIZE_N)
-        assert M == M2, "The leading dimension should be identical between inp1 and inp2"
+        assert (
+            M == M2
+        ), "The leading dimension should be identical between inp1 and inp2"
     else:
         N2 = 0
     out1_fp8 = torch.empty((M, N1), dtype=dtype_quant, device=inp1.device)
-    out1_bs = torch.empty((M, (N1 + group_size - 1) // group_size), dtype=torch.float32, device=inp1.device)
+    out1_bs = torch.empty(
+        (M, (N1 + group_size - 1) // group_size),
+        dtype=torch.float32,
+        device=inp1.device,
+    )
 
     out2 = None
     out2_row_stride = 0
@@ -185,6 +212,14 @@ def fused_rms_fp8_group_quant(
         out2_row_stride = out2.stride(0)
         out2_col_stride = out2.stride(1)
 
+    out1 = None
+    out1_row_stride = 0
+    out1_col_stride = 0
+    if output_unquantized_inp1:
+        out1 = torch.empty((M, N1), dtype=inp1.dtype, device=inp1.device)
+        out1_row_stride = out1.stride(0)
+        out1_col_stride = out1.stride(1)
+
     BLOCK_SIZE_N = max(BLOCK_SIZE_N, group_size)
     out_res1 = None
     res1_row_stride = 0
@@ -193,7 +228,9 @@ def fused_rms_fp8_group_quant(
     out_res1_col_stride = 0
     if res1 is not None:
         Mr, Nr = res1.shape
-        assert M == Mr and N1 == Nr, "The shape should be identical between inp1 and res1"
+        assert (
+            M == Mr and N1 == Nr
+        ), "The shape should be identical between inp1 and res1"
         out_res1 = torch.empty((M, N1), dtype=inp1.dtype, device=inp1.device)
         res1_row_stride = res1.stride(0)
         res1_col_stride = res1.stride(1)
@@ -201,11 +238,11 @@ def fused_rms_fp8_group_quant(
         out_res1_col_stride = out_res1.stride(1)
 
     DTYPE_MAX = (
-            torch.finfo(out1_fp8.dtype).max
-            if torch.is_floating_point(out1_fp8)
-            else torch.iinfo(out1_fp8.dtype).max
-        )
-    _fused_rms_fp8_group_quant_kernel[(M, )](
+        torch.finfo(out1_fp8.dtype).max
+        if torch.is_floating_point(out1_fp8)
+        else torch.iinfo(out1_fp8.dtype).max
+    )
+    _fused_rms_fp8_group_quant_kernel[(M,)](
         inp1,
         inp1_weight,
         inp2,
@@ -215,6 +252,7 @@ def fused_rms_fp8_group_quant(
         out1_bs,
         out2,
         out_res1,
+        out1,
         inp1_epsilon,
         inp2_epsilon,
         M,
@@ -234,23 +272,18 @@ def fused_rms_fp8_group_quant(
         out2_col_stride,
         out_res1_row_stride,
         out_res1_col_stride,
+        out1_row_stride,
+        out1_col_stride,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         QUANT_BLOCK_SIZE=group_size,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
         HAVE_SECOND_INPUT=(inp2 is not None),
         FIRST_INPUT_RES=(res1 is not None),
+        FIRST_INPUT_OUT=output_unquantized_inp1,
     )
-    if inp2 is not None:
-        if res1 is not None:
-            return (out1_fp8, out1_bs), out2, out_res1
-        else:
-            return (out1_fp8, out1_bs), out2
-    else:
-        if res1 is not None:
-            return (out1_fp8, out1_bs), out_res1
-        else:
-            return (out1_fp8, out1_bs)
+
+    return (out1_fp8, out1_bs), out1, out2, out_res1
 
 
 @triton.jit
@@ -275,19 +308,19 @@ def _fused_flatten_fp8_group_quant_kernel(
     n1 = tl.program_id(1)
 
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N2 // QUANT_BLOCK_SIZE
-    
+
     n2_offs = tl.arange(0, BLOCK_SIZE_N2)
     x_offs = m * x_stride_m + n1 * x_stride_n1 + n2_offs * x_stride_n2
     x = tl.load(x_ptr + x_offs, mask=n2_offs < N2)
 
-    out, out_block_scales = _fp8_quant_op(x, 1, BLOCK_SIZE_N2, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN)
+    out, out_block_scales = _fp8_quant_op(
+        x, 1, BLOCK_SIZE_N2, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
+    )
     out = tl.ravel(out)
     out_block_scales = tl.ravel(out_block_scales)
 
     tl.store(
-        out_ptr
-        + m * out_stride_m
-        + (n1 * BLOCK_SIZE_N2 + n2_offs) * out_stride_n,
+        out_ptr + m * out_stride_m + (n1 * BLOCK_SIZE_N2 + n2_offs) * out_stride_n,
         out.to(out_ptr.dtype.element_ty),
         mask=n2_offs < N2,
     )
@@ -304,14 +337,16 @@ def _fused_flatten_fp8_group_quant_kernel(
 def fused_flatten_fp8_group_quant(
     x: torch.Tensor,
     group_size,
-    dtype_quant = fp8_dtype,
+    dtype_quant=fp8_dtype,
 ):
     M, N1, N2 = x.shape
 
     BLOCK_SIZE_N2 = max(triton.next_power_of_2(N2), group_size)
     N = N1 * N2
     out = torch.empty((M, N), dtype=dtype_quant, device=x.device)
-    out_block_scales = torch.empty((M, triton.cdiv(N, group_size)), dtype=torch.float32, device=x.device)
+    out_block_scales = torch.empty(
+        (M, triton.cdiv(N, group_size)), dtype=torch.float32, device=x.device
+    )
 
     DTYPE_MAX = (
         torch.finfo(out.dtype).max
@@ -335,5 +370,5 @@ def fused_flatten_fp8_group_quant(
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
     )
-    
+
     return out, out_block_scales

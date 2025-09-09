@@ -3,6 +3,10 @@ from typing import Literal
 import triton
 import triton.language as tl
 import torch
+import aiter
+
+fp8_dtype = aiter.dtypes.fp8
+from aiter.ops.triton.fused_fp8_quant import _fp8_quant_op
 
 
 @triton.jit
@@ -284,3 +288,158 @@ def act_mul_and_mxfp4_quant(
     )
 
     return x_fp4, blockscale_e8m0
+
+
+@triton.heuristics(
+    {
+        "EVEN_N": lambda args: args["N"] % args["BLOCK_SIZE_N"] == 0,
+    }
+)
+@triton.jit
+def _act_mul_and_dynamic_fp8_group_quant_kernel(
+    x_ptr,
+    x_fp8_ptr,
+    x_bs_ptr,
+    stride_x_m_in,
+    stride_x_n_in,
+    stride_x_fp8_m_in,
+    stride_x_fp8_n_in,
+    stride_bs_m_in,
+    stride_bs_n_in,
+    N,
+    ACTIVATION: tl.constexpr,
+    scaleN: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+    DTYPE_MIN: tl.constexpr,
+    EVEN_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    # cast strides to int64, in case M*N > max int32
+    stride_x_m = tl.cast(stride_x_m_in, tl.int64)
+    stride_x_n = tl.cast(stride_x_n_in, tl.int64)
+    stride_x_fp8_m = tl.cast(stride_x_fp8_m_in, tl.int64)
+    stride_x_fp8_n = tl.cast(stride_x_fp8_n_in, tl.int64)
+    stride_bs_m = tl.cast(stride_bs_m_in, tl.int64)
+    stride_bs_n = tl.cast(stride_bs_n_in, tl.int64)
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
+
+    x_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    x_offs = pid_m * stride_x_m + x_offs_n * stride_x_n
+
+    if EVEN_N:
+        a = tl.load(x_ptr + x_offs, cache_modifier=".cg").to(tl.float32)
+        b = tl.load(x_ptr + x_offs + stride_x_n * N, cache_modifier=".cg").to(
+            tl.float32
+        )
+    else:
+        x_mask = x_offs_n < N
+        a = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(tl.float32)
+        # a and b can share the same mask
+        b = tl.load(
+            x_ptr + x_offs + stride_x_n * N, mask=x_mask, cache_modifier=".cg"
+        ).to(tl.float32)
+
+    x = _get_activation_from_str(ACTIVATION)(a) * b
+
+    x_fp8, x_bs = _fp8_quant_op(
+        x, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
+    )
+    x_fp8 = tl.ravel(x_fp8)
+    x_bs = tl.ravel(x_bs)
+
+    out_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    out_offs = pid_m * stride_x_fp8_m + out_offs_n * stride_x_fp8_n
+
+    if EVEN_N:
+        tl.store(x_fp8_ptr + out_offs, x_fp8.to(x_fp8_ptr.dtype.element_ty))
+    else:
+        out_mask = out_offs_n < N
+        tl.store(
+            x_fp8_ptr + out_offs, x_fp8.to(x_fp8_ptr.dtype.element_ty), mask=out_mask
+        )
+
+    bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
+    bs_offs = pid_m * stride_bs_m + bs_offs_n * stride_bs_n
+    if EVEN_N:
+        tl.store(x_bs_ptr + bs_offs, x_bs.to(x_bs_ptr.dtype.element_ty))
+    else:
+        bs_mask = bs_offs_n < scaleN
+        tl.store(
+            x_bs_ptr + bs_offs,
+            x_bs.to(x_bs_ptr.dtype.element_ty),
+            mask=bs_mask,
+        )
+
+
+def act_mul_and_fp8_group_quant(
+    x: torch.Tensor,
+    activation: Literal["silu", "gelu", "gelu_tanh"],
+    group_size,
+    dtype_quant=fp8_dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply the activation function and quantize the result to MX FP4 format.
+
+    Args:
+        x: The input tensor, typically fp16 or bf16.
+        activation: activation function to apply before quantization.
+            - It splits the features into two parts and applies the activation to the first part.
+            - Then, it adds the results together before quantization.
+            - Supports the following activations:
+                - "silu"
+                - "gelu"
+                - "gelu_tanh"
+
+        scaling_mode: The method to calculate MX block scaling.
+            - "even" (default): `even_round` in `quark.torch.quantization.utils`.
+            - etc.
+        shuffle: Indicates whether to enable preshuffling of scales.
+            - When enabled, scale dimensions (X, Y) are adjusted to be multiples of 8 and 256, respectively.
+    Returns:
+        A tuple of (x_fp4, blockscale_e8m0).
+    """
+    # Assume x is 2D-Tensor for now
+    M, N = x.shape
+    assert N % 2 == 0
+
+    N_half = N // 2
+    scaleN = triton.cdiv(N, group_size)
+    x_fp8 = torch.empty((M, N_half), dtype=dtype_quant, device=x.device)
+    out_bs = torch.empty(
+        (M, triton.cdiv(N_half, group_size)), dtype=torch.float32, device=x.device
+    )
+
+    DTYPE_MAX = (
+        torch.finfo(x_fp8.dtype).max
+        if torch.is_floating_point(x_fp8)
+        else torch.iinfo(x_fp8.dtype).max
+    )
+    BLOCK_SIZE_N = group_size
+
+    grid = (
+        M,
+        triton.cdiv(N_half, BLOCK_SIZE_N),
+    )
+    _act_mul_and_dynamic_fp8_group_quant_kernel[grid](
+        x,
+        x_fp8,
+        out_bs,
+        *x.stride(),
+        *x_fp8.stride(),
+        *out_bs.stride(),
+        N=N_half,
+        ACTIVATION=activation,
+        scaleN=scaleN,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        QUANT_BLOCK_SIZE=group_size,
+        DTYPE_MAX=DTYPE_MAX,
+        DTYPE_MIN=-DTYPE_MAX,
+        # num_warps=NUM_WARPS,
+        # waves_per_eu=0,
+        # num_stages=1,
+    )
+
+    return x_fp8, out_bs
