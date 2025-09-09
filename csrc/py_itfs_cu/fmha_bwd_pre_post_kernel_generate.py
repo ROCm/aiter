@@ -256,7 +256,8 @@ using convert_dq_trait_{F_idx} = fmha_bwd_convert_dq_traits_<{F_hdim},
                                                              {F_mode},
                                                              {F_spad},
                                                              {F_dpad},
-                                                             {F_deterministic}>;
+                                                             {F_deterministic},
+                                                             {F_bn0}>;
 
 #include <iostream>
 
@@ -377,7 +378,7 @@ def get_bwd_convert_dq_blobs(
                 F_hdim=hdim,
                 F_dtype=dtype,
                 F_bm0=64,
-                F_bn0=tile.F_bn0,
+                F_bn0=tile.F_bn0 if deterministic == "t" else 0,
                 F_spad=spad,
                 F_dpad=dpad,
                 F_mode=mode,
