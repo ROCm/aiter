@@ -335,7 +335,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(seqlen_k, kN0);
         if (mask.type == mask_enum::no_mask) 
             dq_accum = torch::empty({nsplits, batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(at::kFloat));
-        else  // Some block may be skiped with casual mask and dq are not set to zeros
+        else  // Some block may be skipped with casual mask and dq are not set to zeros
             dq_accum = torch::zeros({nsplits, batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(at::kFloat));
     }
 
