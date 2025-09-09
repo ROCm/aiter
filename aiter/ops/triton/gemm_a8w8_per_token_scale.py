@@ -4,9 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton._triton_kernels.gemm_a8w8_per_token_scale import (
     _gemm_a8w8_per_token_scale_kernel,
     _gemm_a8w8_per_token_scale_reduce_kernel,
@@ -52,19 +49,12 @@ def gemm_a8w8_per_token_scale(
     if config is None:
         config = _get_config(M, N, K)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
         )
     else:
         y_pp = None
-
-    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
-    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
 
     grid = lambda META: (  # noqa: E731
         (

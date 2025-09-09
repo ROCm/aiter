@@ -4,9 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton._triton_kernels.gemm_a8w8_blockscale import (
     _gemm_a8w8_blockscale_kernel,
     _gemm_a8w8_blockscale_reduce_kernel,
@@ -61,24 +58,12 @@ def gemm_a8w8_blockscale(
     if config is None:
         config = _get_config(M, N, K)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
-        K, config["NUM_KSPLIT"]
-    )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
         )
     else:
         y_pp = None
-
-    # If block size is greater than split k size, shrink the block size
-    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
-    config["BLOCK_SIZE_K"] = max(
-        config["BLOCK_SIZE_K"], 16
-    )  # minimum block size is 16 for perf
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
