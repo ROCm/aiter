@@ -20,6 +20,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                                const int h_k,
                                const int d,
                                const int d_v,
+                               const int num_total_pages,
                                const int page_block_size,
                                // device pointers
                                const at::Tensor q,
@@ -49,18 +50,18 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     // randval: (nheads, total_q, max_seqlen_k)
 
     ck_tile::index_t total_q = q.size(0);
-    ck_tile::index_t total_k = k.size(0);
+    ck_tile::index_t total_k = k.size(0) * page_block_size;
 
-    ck_tile::index_t stride_q       = q.stride(0);
-    ck_tile::index_t stride_k       = k.stride(0);
-    ck_tile::index_t stride_v       = v.stride(0);
-    ck_tile::index_t stride_o       = out.stride(0);
+    ck_tile::index_t stride_q       = q.stride(-3);
+    ck_tile::index_t stride_k       = k.stride(-3);
+    ck_tile::index_t stride_v       = v.stride(-3);
+    ck_tile::index_t stride_o       = out.stride(-3);
     ck_tile::index_t stride_randval = has_dropout_randval ? dropout_randval.stride(1) : 0;
 
-    ck_tile::index_t nhead_stride_q       = q.stride(1);
-    ck_tile::index_t nhead_stride_k       = k.stride(1);
-    ck_tile::index_t nhead_stride_v       = v.stride(1);
-    ck_tile::index_t nhead_stride_o       = out.stride(1);
+    ck_tile::index_t nhead_stride_q       = q.stride(-2);
+    ck_tile::index_t nhead_stride_k       = k.stride(-2);
+    ck_tile::index_t nhead_stride_v       = v.stride(-2);
+    ck_tile::index_t nhead_stride_o       = out.stride(-2);
     ck_tile::index_t nhead_stride_lse     = has_lse ? softmax_lse.stride(0) : 0;
     ck_tile::index_t nhead_stride_randval = has_dropout_randval ? dropout_randval.stride(0) : 0;
 
@@ -116,7 +117,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.hdim_v          = d_v;
     args.nhead_q         = h;
     args.nhead_k         = h_k;
-    args.num_total_pages = total_k;
+    args.num_total_pages = num_total_pages;
     args.page_block_size = page_block_size;
     args.kv_indptr       = kv_indptr.data_ptr();
     args.kv_page_indices = kv_page_indices.data_ptr();
@@ -216,10 +217,24 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_n
     const int head_size_v = v.size(-1);
     const int num_heads_k = k.size(-2);
 
-    // std::cout << "v size(0): " << k.size(0) << " v size(1): " << k.size(1) << " v size(2): " << k.size(2) << " v size(-1): " << k.size(-1)<< std::endl;
-
+    const int num_blocks = k.size(0);
     const int page_block_size = k.dim() == 3 ? 1 : k.size(1);
-    const int num_blocks = k.size(0) * page_block_size;
+
+    std::cout << "batch_size: " << batch_size << " num_heads: " << num_heads << " head_size_q: " << head_size_q << " head_size_v: " << head_size_v 
+    << " num_heads_k: " << num_heads_k << " num_blocks: " << num_blocks << " page_block_size:" << page_block_size << std::endl;
+    
+    std::cout << "k dim: { ";
+    for(int i = 0; i < k.dim(); i++){
+        std::cout << k.size(i) << "  ";
+    }
+    std::cout << "}" << std::endl;
+
+    std::cout << "k stride: { ";
+    for(int i = 0; i < k.dim(); i++){
+        std::cout << k.stride(i) << " ";
+    }
+    std::cout << "}" << std::endl;
+
     
     if(max_seqlen_q == 1 && !alibi_slopes_.has_value())
     {
@@ -237,9 +252,6 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_n
     // this case H/t Daniel Haziza
 
     const int total_q = q.size(0);
-    // 4D shape reshape to 3D
-    k = k.reshape({-1, num_heads_k, head_size_q});
-    v = v.reshape({-1, num_heads_k, head_size_v});
 
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(head_size_q <= 256, "CK only supports head dimension at most 256");
@@ -282,8 +294,11 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_n
     }
 
     CHECK_SHAPE(q, total_q, num_heads, head_size_q);
-    CHECK_SHAPE(k, num_blocks, num_heads_k, head_size_q);
-    CHECK_SHAPE(v, num_blocks, num_heads_k, head_size_v);
+    if(k.dim() == 3)
+    {
+        CHECK_SHAPE(k, num_blocks, num_heads_k, head_size_q);
+        CHECK_SHAPE(v, num_blocks, num_heads_k, head_size_v);
+    }
 
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     CHECK_SHAPE(kv_indptr, batch_size + 1);
@@ -371,6 +386,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_n
                                                    num_heads_k,
                                                    head_size_q,
                                                    head_size_v,
+                                                   num_blocks,
                                                    page_block_size,
                                                    q,
                                                    k,
