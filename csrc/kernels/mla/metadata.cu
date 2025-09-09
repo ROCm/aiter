@@ -372,39 +372,122 @@ struct MlaMetadataV1KernelParameter
     bool           is_causal;
 };
 
-CK_TILE_DEVICE int32_t estimate_total_workload(
-    const int32_t workload_avg,
-    const int32_t workload_var,
-    const int32_t cluster_len_q,
-    const int32_t num_qo_tiles,
-    const int32_t num_clusters)
+// This version just follows Flashinfer
+CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v0(
+    const int32_t cum_workload,
+    const int32_t num_clusters,
+    const int32_t kv_granularity)
 {
-    const int32_t qo_factor = cluster_len_q >> 2;
-    const float cv = sqrtf(float(workload_var)) / float(workload_avg); // coefficient of variation
-    const int32_t A = int32_t(12.0f - (2.0f * cv + 1.0f)) * qo_factor;
+    int32_t limit;
 
-    const int32_t workload_tot = (workload_avg + A) * num_qo_tiles;
+    const int32_t avg_workload = ck_tile::max(ck_tile::integer_divide_ceil(cum_workload, num_clusters), 1);
+    if (avg_workload <= 8) limit = 32;
+    else if (avg_workload <= 16) limit = 64;
+    else if (avg_workload <= 32) limit = 128;
+    else if (avg_workload <= 64) limit = 192;
+    else limit = avg_workload;
 
-    return workload_tot;
+    return ck_tile::integer_least_multiple(limit, kv_granularity);
 }
 
-CK_TILE_DEVICE int32_t estimate_workload_per_cluster(
-    const int32_t workload_tot,
+// This version estimate the total #workload (especially for estimating global #splits) plus an amplifier
+CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v1(
+    const int32_t avg_workload,
+    const int32_t var_workload,
     const int32_t cluster_len_q,
     const int32_t num_qo_tiles,
-    const int32_t num_clusters)
+    const int32_t num_clusters,
+    const int32_t kv_granularity)
 {
-    // The following magic numbers come from regression analysis. They may need to be changed with platform and MLA
-    // kernels.
-    const float workload_per_cluster_raw = float(workload_tot) / float(num_clusters);
-    const float factor = -0.00000113f * powf(num_qo_tiles, 3) +
-                          0.00025215f * powf(num_qo_tiles, 2) +
-                         -0.00546401f * float(num_qo_tiles) +
-                          0.40612956f;
-    const float amplifier = ck_tile::max(factor * num_clusters / num_qo_tiles, 1.0f);
-    const int32_t workload_per_cluster = int32_t(workload_per_cluster_raw * amplifier);
+    auto estimate_total_workload = [](
+        const int32_t avg_workload,
+        const int32_t var_workload,
+        const int32_t cluster_len_q,
+        const int32_t num_qo_tiles,
+        const int32_t num_clusters)
+    {
+        const int32_t qo_factor = cluster_len_q >> 2;
+        const float cv = sqrtf(float(var_workload)) / float(avg_workload); // coefficient of variation
+        const int32_t A = int32_t(12.0f - (2.0f * cv + 1.0f)) * qo_factor;
 
-    return workload_per_cluster;
+        const int32_t workload_tot = (avg_workload + A) * num_qo_tiles;
+
+        return workload_tot;
+    };
+
+    auto estimate_workload_per_cluster = [](
+        const int32_t workload_tot,
+        const int32_t cluster_len_q,
+        const int32_t num_qo_tiles,
+        const int32_t num_clusters)
+    {
+        // The following coefficients come from regression analysis. They may need to be changed with platform and MLA
+        // kernels.
+        const float workload_per_cluster_raw = float(workload_tot) / float(num_clusters);
+        const float factor = -0.00000113f * powf(num_qo_tiles, 3) +
+                              0.00025215f * powf(num_qo_tiles, 2) +
+                             -0.00546401f * float(num_qo_tiles) +
+                              0.40612956f;
+        const float amplifier = ck_tile::max(factor * num_clusters / num_qo_tiles, 1.0f);
+        const int32_t workload_per_cluster = int32_t(workload_per_cluster_raw * amplifier);
+
+        return workload_per_cluster;
+    };
+
+    const int32_t tot_workload_estimated =
+        estimate_total_workload(avg_workload, var_workload, cluster_len_q, num_qo_tiles, num_clusters);
+    const int32_t workload_per_cluster_estimated =
+        estimate_workload_per_cluster(tot_workload_estimated, cluster_len_q, num_qo_tiles, num_clusters);
+
+    return ck_tile::integer_least_multiple(workload_per_cluster_estimated, kv_granularity);
+}
+
+// Just calculate the final value from features of kv seqlens. All the coefficients comes from linear-regression
+// analysis.
+CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v2(
+    const int32_t num_clusters,
+    const int32_t num_batches,
+    const int32_t avg_workload,
+    const int32_t var_workload,
+    const int32_t kv_granularity)
+{
+    const float len = float(num_batches);
+    const float len_2 = len * len;
+    const float len_3 = len_2 * len;
+    const float len_4 = len_2 * len_2;
+    const float std = sqrtf(var_workload);
+    const float mean = float(avg_workload);
+    const float len_mean = len * mean;
+
+    float limit;
+    if (num_batches <= (num_clusters / 2))
+    {
+        constexpr float coef[] =
+            { 5.99938779e+01, -8.60897143e-01,  9.98730735e-02, -3.41580286e-03,
+              3.20742779e-02, -1.21532871e-03,  2.06024521e-05,  6.86938582e-04,
+             -2.06666512e-05,  4.66947341e-05, -2.76209318e+01,  1.71001402e+03,
+              1.14275189e+02, -9.70046247e+02, -7.45775345e+01 };
+        limit =
+            1.0          * coef[0]  + len             * coef[1]  + mean         * coef[2]  + std         * coef[3]  +
+            len_2        * coef[4]  + len_mean        * coef[5]  + len * std    * coef[6]  + len_3       * coef[7]  +
+            len_4        * coef[8]  + len_2 * mean    * coef[9]  + 1.0f / len   * coef[10] + 1.0f / mean * coef[11] +
+            1.0f / len_2 * coef[12] + 1.0f / len_mean * coef[13] + 1.0f / len_3 * coef[14];
+    }
+    else
+    {
+        constexpr float coef[] =
+            { 1.47512976e+03, -9.29222552e+01,  8.58853904e-03, -5.97940105e-04,
+              2.24873043e+00,  2.79397812e-03, -7.44154816e-05, -2.39139141e-02,
+              9.52088885e-05,  2.39891509e-06,  1.27530223e+02,  7.68369536e+03,
+              6.70734798e+00, -2.30288307e+05,  2.78653564e-01 };
+        limit =
+            1.0          * coef[0]  + len             * coef[1]  + mean         * coef[2]  + std         * coef[3]  +
+            len_2        * coef[4]  + len_mean        * coef[5]  + len * std    * coef[6]  + len_3       * coef[7]  +
+            len_4        * coef[8]  + len_2 * mean    * coef[9]  + 1.0f / len   * coef[10] + 1.0f / mean * coef[11] +
+            1.0f / len_2 * coef[12] + 1.0f / len_mean * coef[13] + 1.0f / len_3 * coef[14];
+    }
+
+    return ck_tile::integer_least_multiple(ck_tile::max(int32_t(limit), kv_granularity), kv_granularity);
 }
 
 template <typename Traits, bool kOnlyGatherWorkCount>
@@ -626,14 +709,8 @@ __global__ void kn_get_mla_metadata_v1(
     const int32_t workload_var = workload_square_sum / params.num_batches - workload_avg * workload_avg;
 
     const int32_t workload_limit_global =
-    [&]() {
-        const int32_t tot_workload_estimated =
-            estimate_total_workload(workload_avg, workload_var, cluster_len_q, num_qo_tiles, num_clusters);
-        const int32_t workload_per_cluster_estimated =
-            estimate_workload_per_cluster(tot_workload_estimated, cluster_len_q, num_qo_tiles, num_clusters);
-        const int32_t limit = ck_tile::integer_least_multiple(workload_per_cluster_estimated, params.kv_granularity);
-        return limit;
-    }();
+        cal_workload_limit_global_v2(
+            num_clusters, params.num_batches, workload_avg, workload_var, params.kv_granularity);
 #if PRINT_DBG
     if (lane_idx == 0)
     {
@@ -995,18 +1072,8 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
             workload_sum += 2 * cal_cost(cluster_len_q, kv_len_splited) + kv_granularity;
         }
     }
-    const int32_t workload_limit_global =
-    [&]() {
-        const int32_t avg_workload = ck_tile::max(ck_tile::integer_divide_ceil(workload_sum, num_clusters), 1);
-        // TODO: The following code just follow FlashInfer. Further tune may be required for AMD GPU.
-        int32_t limit;
-        if (avg_workload <= 8) limit = 32;
-        else if (avg_workload <= 16) limit = 64;
-        else if (avg_workload <= 32) limit = 128;
-        else if (avg_workload <= 64) limit = 192;
-        else limit = ck_tile::integer_least_multiple(avg_workload, kv_granularity);
-        return limit;
-    }();
+
+    const int32_t workload_limit_global = cal_workload_limit_global_v0(workload_sum, num_clusters, kv_granularity);
 #if PRINT_DBG
     printf("[metadata] workload_limit_global=%d\n", workload_limit_global);
 #endif
