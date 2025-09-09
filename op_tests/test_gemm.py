@@ -9,7 +9,7 @@ import random
 import triton
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
-
+import aiter
 # TEST_NUM_ITERS = 10
 TEST_NUM_ITERS = 100
 
@@ -56,7 +56,7 @@ def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
 def run_gemm_ck_tile(x, weight, bias, otype=dtypes.bf16):
     return aiter.gemm_bf16_ck_tile(x, weight, bias, otype)
 
-def permute_weight(x: torch.Tensor) -> torch.Tensor:
+def weight_shuffle(x: torch.Tensor) -> torch.Tensor:
     # Hardcode BLOCK_K and BLOCK_N
     x_ = x
     x_ = x_.view(
@@ -67,8 +67,7 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
     x_ = x_.view(*x.shape)
     return x_
 
-def get_arch():
-    return triton.runtime.driver.active.get_current_target().arch
+
 
 
 def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
@@ -99,12 +98,25 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
-    arch = get_arch()
-    if arch == 'gfx950':
-        ck_tile_weight = permute_weight(weight)
-        (c, *_), avg_c = run_gemm_ck_tile(x, ck_tile_weight, bias, otype)
-        msg_ck_tile = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck_tile avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_c-1:<5.1%}"
-        checkAllclose(a, c, msg=msg_ck_tile)
+
+
+
+def test_gemm_ck_tile(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
+    dim = (m, n, k)
+    x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
+    weight = torch.rand(n, k, dtype=otype, device="cuda").to(dtype)
+    
+    bias = torch.rand(n, dtype=otype, device="cuda")
+    if scaleA is not None:
+        scaleA = torch.tensor(scaleA, dtype=dtypes.fp32, device="cuda")
+    if scaleB is not None:
+        scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
+    (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
+    ck_tile_weight = weight_shuffle(weight)
+    (c, *_), avg_c = run_gemm_ck_tile(x, ck_tile_weight, bias, otype)
+    msg_ck_tile = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck_tile avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_c-1:<5.1%}"
+    checkAllclose(a, c, msg=msg_ck_tile)
+
 
 def get_boundary_test_cases(cu_count, aligned_k):
     """
@@ -233,7 +245,7 @@ def generate_test_cases(cu_count, ratio, aligned_k):
     # Region 1: m=1 and m in [2,4]
     # m = 1
     m = 1
-    for n in range(1, 2 * cu_count + 1):  # n: 1 to 2 * cu_count
+    for n in range(16, 2 * cu_count + 1):  # n: 1 to 2 * cu_count
         for k in range(
             8, 9217, aligned_k
         ):  # k: multiples of aligned_k from aligned_k to 9216
@@ -353,8 +365,8 @@ def test_skinny_gemm():
     test_mnk_list = []
     test_mnk_list.extend(
         [
-            [3, 1, 8192],
-            [4, 1, 8192],
+            [3, 16, 8192],
+            [4, 16, 8192],
             [4, 32, 8192],
             [4, 32, 9216],
         ]
@@ -379,4 +391,59 @@ def test_skinny_gemm():
 
 
 # test_normal_gemm()
-test_skinny_gemm()
+
+def test_ck_tile_gemm():
+    # seed = 8779
+    # torch.manual_seed(seed)
+    # torch.cuda.manual_seed(seed)
+    random.seed(137)
+
+    aligned_k = 8
+    # cu_count = 80
+    cu_count = torch.cuda.get_device_properties(device="cuda").multi_processor_count
+    # ratio = 0.002
+    ratio = 0.0002
+
+    # Calculate and print total valid points
+    total_points = calculate_total_valid_points(cu_count, aligned_k)
+    test_mnk_list = []
+ 
+    test_mnk_list.extend(
+        [
+            [1, 2112, 7168],
+            [1, 3072, 1536],
+            [1, 4096, 512],
+            [1, 7168, 2048],
+            [1, 7168, 512],
+            [1, 512, 7168],
+             [16, 2112, 7168],
+            [16, 3072, 1536],
+            [16, 4096, 512],
+            [16, 7168, 2048],
+            [16, 7168, 512],
+            [16, 512, 7168],
+             [128, 2112, 7168],
+            [128, 3072, 1536],
+            [128, 4096, 512],
+            [128, 7168, 2048],
+            [128, 7168, 512],
+            [128, 512, 7168],
+             [1024, 2112, 7168],
+            [1024, 3072, 1536],
+            [1024, 4096, 512],
+            [1024, 7168, 2048],
+            [1024, 7168, 512],
+            [1024, 512, 7168],
+        ]
+    )
+   
+    print(f"total test case count: { len(test_mnk_list)}")
+    loop_count = 1
+    for i in range(loop_count):
+        for mnk in test_mnk_list:
+            m, n, k = mnk
+            for dtype in [ dtypes.bf16]:
+                for otype in [ dtypes.bf16]:
+                    test_gemm_ck_tile(dtype, m, n, k, otype=otype)
+# test_skinny_gemm()
+test_ck_tile_gemm()

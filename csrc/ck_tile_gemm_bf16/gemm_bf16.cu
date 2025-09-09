@@ -35,13 +35,10 @@
 #include "tile_gemm_shape_bias.hpp"
 #include "gemm_bias_kernel.hpp"
 
-//#include "run_gemm_example.inc"
-#if defined(CK_GFX950_SUPPORT)
-    using GemmConfig = GemmConfigPreshuffle_2<ck_tile::bf16_t>;
-#else
-    // 默认通用配置
-    using GemmConfig = GemmConfigComputeV3<ck_tile::bf16_t>;
-#endif
+
+
+using GemmConfig = GemmConfigPreshuffle_2<ck_tile::bf16_t>;
+
 
 template <typename ADataType,
           typename BDataType,
@@ -76,30 +73,6 @@ static constexpr inline auto is_row_major(Layout layout_)
 }
 
 
-template <typename GemmConfig>
-torch::Tensor shuffle_b(torch::Tensor& WQ) {
-    // 1. 输入检查
-    TORCH_CHECK(WQ.dim() == 2, "Input tensor must be 2-dimensional");
-    
-    // 2. 获取维度信息
-    const int64_t n = WQ.size(0);  // 列数
-    const int64_t k = WQ.size(1);  // 行数
-    
-    // 3. 参数计算
-    constexpr int n_warp = GemmConfig::N_Warp_Tile;
-    constexpr int k_warp = GemmConfig::K_Warp_Tile;
-    constexpr int divisor = (n_warp == 32) ? 2 : 4;
-    
-    
-    
-    // 6. 创建视图并置换维度
-    return WQ.view({n / n_warp,    // n_tiles
-                              n_warp,        // n_warp
-                              k / k_warp,    // k_tiles
-                              divisor,       // divisor
-                              k_warp / divisor})  // k_tile
-           .permute({0, 2, 3, 1, 4}).contiguous();  // [n_tiles, k_tiles, divisor, n_warp, k_tile]
-}
 torch::Tensor ck_tile_gemm_bf16(
                         torch::Tensor& XQ,
                         torch::Tensor& WQ,
@@ -118,7 +91,7 @@ torch::Tensor ck_tile_gemm_bf16(
     using CLayout = Row;
     using ELayout = Row;
     
-    // printf("1\n");
+    
     ck_tile::index_t M        = XQ.size(0);
     ck_tile::index_t N        = WQ.size(0);
     ck_tile::index_t K        = XQ.size(1);
@@ -158,15 +131,7 @@ torch::Tensor ck_tile_gemm_bf16(
     
     
     float ave_time;
-    // const cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    // at::cuda::CUDAGuard device_guard{(char)XQ.get_device()};
-    // const cudaStream_t stream = at::cuda::getCurrentCUDAStream(XQ.get_device());
-    // int device_id = XQ.get_device();
-    // at::hip::HIPGuard device_guard(device_id);
-    // hipStream_t stream;
-    // hipStreamCreate(&stream);  // 独立 Stream
-    // at::hip::HIPGuard device_guard(device_id);
-    // hipStream_t stream = at::hip::getCurrentHIPStream(device_id);
+   
     int device_id = XQ.device().index();
     at::hip::HIPGuard device_guard(device_id);
 
@@ -180,8 +145,7 @@ torch::Tensor ck_tile_gemm_bf16(
         
         if(persistent)
         {
-            //ck_tile::stream_config{nullptr, true, 1, n_warmup, n_repeat, true, true, 50});
-            //ck_tile::stream_config{nullptr, false, 0, n_warmup, n_repeat, true, false, 50});
+           
             ave_time = gemm_calc<ADataType,
                                 BDataType,
                                 AccDataType,
