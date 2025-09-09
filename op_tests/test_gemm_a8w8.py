@@ -11,6 +11,9 @@ from aiter.test_common import checkAllclose, perftest, benchmark
 import pandas as pd
 import argparse
 from aiter import hipb_mm, hipb_create_extension
+from aiter.ops.triton.utils.arch_info import get_arch
+import sys
+
 
 TEST_NUM_ITERS = 100
 
@@ -422,6 +425,12 @@ def test_skinny_gemm_a8w8_pertoken_quant():
 
 
 def test_hipb_swizzle_gemm_a8w8_pertoken_quant():
+
+    if get_arch() == "gfx950":
+        print("HipBLASLt Swizzle is not supported on MI350/355")
+        sys.exit(1)
+
+
     hipb_create_extension()
     dtype = dtypes.bf16
     n, k = 7424, 8192
