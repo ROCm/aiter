@@ -584,6 +584,11 @@ NONE_WRAPPED_OP = [
     # "get_padded_m",
     "compile_mha_fwd",
     "compile_mha_bwd",
+    "init_custom_qr",
+    "qr_max_size",
+    "qr_destroy",
+    "qr_open_handles",
+    "qr_get_handle",
 ]
 
 SPECIAL_OPS_MUTATES_ARGS = {
