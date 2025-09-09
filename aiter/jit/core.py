@@ -18,7 +18,7 @@ from packaging.version import parse, Version
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from torch_guard import torch_compile_guard  # noqa: E402
+from torch_guard import torch_compile_guard, is_torch_equal_or_newer  # noqa: E402
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
 from chip_info import get_gfx
@@ -73,13 +73,15 @@ if find_aiter is not None:
         package_path = find_aiter.origin
     package_path = os.path.dirname(package_path)
     package_parent_path = os.path.dirname(package_path)
-    import site
 
-    site_packages_dirs = site.getsitepackages()
-    # develop mode
-    isDevelopMode = (package_path not in site_packages_dirs) and (
-        package_parent_path not in site_packages_dirs
-    )
+    try:
+        with open(f"{this_dir}/../install_mode", "r") as f:
+            # develop mode
+            isDevelopMode = f.read().strip() == "develop"
+    except FileNotFoundError:
+        # pip install -e
+        isDevelopMode = True
+
     if isDevelopMode:
         AITER_META_DIR = AITER_ROOT_DIR
     # install mode
@@ -582,6 +584,11 @@ NONE_WRAPPED_OP = [
     # "get_padded_m",
     "compile_mha_fwd",
     "compile_mha_bwd",
+    "init_custom_qr",
+    "qr_max_size",
+    "qr_destroy",
+    "qr_open_handles",
+    "qr_get_handle",
 ]
 
 SPECIAL_OPS_MUTATES_ARGS = {
@@ -943,6 +950,7 @@ def compile_ops(
             return_int = True
 
         schema = f"{new_input} -> {output_part}".strip()
+
         loadName = func.__name__
 
         def abstract_impl(dummy, *args, custom_build_args={}, **kwargs):
@@ -960,8 +968,12 @@ def compile_ops(
             )
 
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
+            if is_torch_equal_or_newer("2.8.0"):
+                tags = ()
+            else:
+                tags = (torch.Tag.needs_fixed_stride_order,)
             op_schema = f"aiter::wrapper_{loadName}" + schema
-            aiter_lib.define(op_schema, tags=())
+            aiter_lib.define(op_schema, tags=tags)
             aiter_lib.impl(
                 f"aiter::wrapper_{loadName}", outer_wrapper, dispatch_key="CUDA"
             )
