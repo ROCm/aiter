@@ -68,7 +68,7 @@ mha_batch_prefill_traits get_mha_batch_prefill_traits(int head_size_q,
                                   bias_enum bias_type,
                                   bool has_lse,
                                   bool has_dropout,
-                                  bool is_sglang,
+                                  bool is_sglang_layout,
                                   bool skip_min_seqlen_q = false)
 {{
     return mha_batch_prefill_traits(head_size_q,
@@ -81,7 +81,7 @@ mha_batch_prefill_traits get_mha_batch_prefill_traits(int head_size_q,
                           has_lse,
                           has_dropout,
                           skip_min_seqlen_q,
-                          is_sglang);
+                          is_sglang_layout);
 }}
 
 mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
