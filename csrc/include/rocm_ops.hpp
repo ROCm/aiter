@@ -979,8 +979,24 @@
           py::arg("epsilon"),                                                                      \
           py::arg("out_before_quant")            = std::nullopt,                                   \
           py::arg("use_model_sensitive_rmsnorm") = 0);                                             \
-    m.def("rmsnorm2d_fwd_with_dynamicquant", &rmsnorm2d_with_dynamicquant);                        \
-    m.def("rmsnorm2d_fwd_with_add_dynamicquant", &rmsnorm2d_with_add_dynamicquant);
+      m.def("rmsnorm2d_fwd_with_dynamicquant",                                                     \
+            &rmsnorm2d_with_dynamicquant,                                                          \
+            py::arg("out"),                                                                        \
+            py::arg("input"),                                                                      \
+            py::arg("yscale"),                                                                     \
+            py::arg("weight"),                                                                     \
+            py::arg("epsilon"),                                                                    \
+            py::arg("use_model_sensitive_rmsnorm") = 0);                                           \
+      m.def("rmsnorm2d_fwd_with_add_dynamicquant",                                                 \
+            &rmsnorm2d_with_add_dynamicquant,                                                      \
+            py::arg("out"),                                                                        \
+            py::arg("input"),                                                                      \
+            py::arg("residual_in"),                                                                \
+            py::arg("residual_out"),                                                               \
+            py::arg("yscale"),                                                                     \
+            py::arg("weight"),                                                                     \
+            py::arg("epsilon"),                                                                    \
+            py::arg("use_model_sensitive_rmsnorm") = 0);
 
 #define ROPE_GENERAL_FWD_PYBIND                                 \
     m.def("rope_fwd_impl", &rope_fwd_impl);                     \
