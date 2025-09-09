@@ -46,6 +46,36 @@ struct mha_fwd_traits : public fmha_fwd_traits
     int how_v3_bf16_cvt;
 };
 
+struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
+{
+    mha_batch_prefill_traits(int head_size_q,
+                             int head_size_v,
+                             std::string dtype,
+                             bool is_group_mode,
+                             bool has_logits_soft_cap,
+                             mask_enum mask_type,
+                             bias_enum bias_type,
+                             bool has_lse,
+                             bool has_dropout,
+                             bool skip_min_seqlen_q,
+                             bool is_sglang)
+        : fmha_batch_prefill_traits{head_size_q,
+                                    head_size_v,
+                                    dtype,
+                                    is_group_mode,
+                                    true, // is_v_rowmajor
+                                    has_logits_soft_cap,
+                                    mask_type,
+                                    bias_type,
+                                    has_lse,
+                                    has_dropout,
+                                    quant_scale_enum::no_scale, // qscale_type
+                                    skip_min_seqlen_q,
+                                    is_sglang}
+    {
+    }
+};
+
 struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
 {
     mha_fwd_splitkv_traits(int head_size_q,
