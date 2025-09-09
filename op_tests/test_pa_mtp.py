@@ -421,7 +421,7 @@ def test_pa_mtp(
     )
 
     out_aiter_asm, us_aiter_asm = run_aiter_asm(
-        query.contiguous(),
+        query,
         k_quant_,
         asm_V_shuffle(v_quant_),
         block_tables,
