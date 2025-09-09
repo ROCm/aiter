@@ -8,7 +8,7 @@ from aiter.fused_moe import moe_sorting, fused_topk
 from aiter import dtypes
 import argparse
 
-BLOCK_SIZE_M = 32
+BLOCK_SIZE_M = 16
 
 
 def moe_sorting_native(
@@ -172,7 +172,7 @@ def test_moe_sorting(
 import pandas as pd
 
 l_dtype = ["bf16"]
-l_m = [64]
+l_m = [1, 3, 32, 64, 128, 256, 512]
 l_expert = [128]
 l_topk = [4]
 l_padding_token = [0]
