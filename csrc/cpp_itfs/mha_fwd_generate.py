@@ -53,6 +53,31 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                           skip_min_seqlen_q);
 }}
 
+mha_batch_prefill_traits get_mha_batch_prefill_traits(int head_size_q,
+                                  int head_size_v,
+                                  std::string dtype,
+                                  bool is_group_mode,
+                                  bool has_logits_soft_cap,
+                                  mask_enum mask_type,
+                                  bias_enum bias_type,
+                                  bool has_lse,
+                                  bool has_dropout,
+                                  bool is_sglang,
+                                  bool skip_min_seqlen_q = false)
+{{
+    return mha_batch_prefill_traits(head_size_q,
+                          head_size_v,
+                          dtype,
+                          is_group_mode,
+                          has_logits_soft_cap,
+                          mask_type,
+                          bias_type,
+                          has_lse,
+                          has_dropout,
+                          skip_min_seqlen_q,
+                          is_sglang);
+}}
+
 mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
                                                   int head_size_v,
                                                   std::string dtype,
@@ -141,7 +166,8 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
-    auto traits = get_mha_fwd_traits(head_size_q,
+    bool is_sglang_layout = args.page_block_size == 1;
+    auto traits = get_mha_batch_prefill_traits(head_size_q,
                                      head_size_v,
                                      q_dtype_str,
                                      is_group_mode,
@@ -150,7 +176,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
-                                     use_ext_asm);
+                                     is_sglang_layout);
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
 

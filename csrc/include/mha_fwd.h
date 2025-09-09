@@ -40,6 +40,36 @@ struct mha_fwd_traits : public fmha_fwd_traits
     bool use_ext_asm;
 };
 
+struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
+{
+    mha_batch_prefill_traits(int head_size_q,
+                             int head_size_v,
+                             std::string dtype,
+                             bool is_group_mode,
+                             bool has_logits_soft_cap,
+                             mask_enum mask_type,
+                             bias_enum bias_type,
+                             bool has_lse,
+                             bool has_dropout,
+                             bool skip_min_seqlen_q,
+                             bool is_sglang)
+        : fmha_batch_prefill_traits{head_size_q,
+                                    head_size_v,
+                                    dtype,
+                                    is_group_mode,
+                                    true, // is_v_rowmajor
+                                    has_logits_soft_cap,
+                                    mask_type,
+                                    bias_type,
+                                    has_lse,
+                                    has_dropout,
+                                    false, // do_fp8_static_quant
+                                    skip_min_seqlen_q,
+                                    is_sglang}
+    {
+    }
+};
+
 struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
 {
     mha_fwd_splitkv_traits(int head_size_q,
