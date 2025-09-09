@@ -8,6 +8,10 @@ import os
 import random
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
+from aiter.ops.shuffle import shuffle_weight
+from aiter import hipb_mm, hipb_create_extension
+from functools import lru_cache
+from aiter.jit.utils.chip_info import get_gfx
 
 # TEST_NUM_ITERS = 10
 TEST_NUM_ITERS = 100
@@ -51,6 +55,28 @@ def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
     return tgemm.mm(x, weight, bias, otype, scaleA, scaleB)
 
 
+@perftest(num_iters=TEST_NUM_ITERS)
+def aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
+    if scaleB is not None:
+        scaleB = scaleB.t()
+    return hipb_mm(
+        inp,
+        weights.t(),
+        solution_index=-1,
+        bias=None,
+        out_dtype=dtype,
+        scaleA=scaleA,
+        scaleB=scaleB,
+        scaleOut=None,
+        bpreshuffle=True,
+    )
+
+
+@lru_cache(maxsize=1)
+def init_hipblas():
+    hipb_create_extension()
+
+
 def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
@@ -65,7 +91,15 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
     (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
     (b, *_), avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
-
+    if n % 16 == 0 and k % 32 == 0 and dtype == otype and get_gfx() == "gfx942":
+        init_hipblas()
+        weight_bpreshuffle = shuffle_weight(weight, layout=(16, 16), use_int4=False)
+        c, avg_c = aiter_hip_bpreshuffle(x, weight_bpreshuffle, None, None, otype)
+        if bias is not None:
+            c = c + bias
+    else:
+        c = None
+        avg_c = None
     assert (
         a.dtype == b.dtype
     ), f"Expected a.dtype == b.dtype, but a={a.dtype}, b={b.dtype}, input dtype={dtype}"
@@ -76,8 +110,14 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         assert (
             b.dtype == otype
         ), f"b={b.dtype}, expected output dtype={otype}, input dtype={dtype}"
-
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+        if c is not None:
+            assert (
+                c.dtype == otype
+            ), f"c={c.dtype}, expected output dtype={otype}, input dtype={dtype}"
+    avg_c = "%-8.2f" % avg_c if avg_c is not None else "%-8.2f" % 0
+    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, C avg: {{bpreshuffle_avg}} us, B uplift: {avg_a/avg_b-1:<5.1%}, ".format(
+        bpreshuffle_avg=avg_c
+    )
     checkAllclose(a, b, msg=msg)
 
 
@@ -332,6 +372,12 @@ def test_skinny_gemm():
             [4, 1, 8192],
             [4, 32, 8192],
             [4, 32, 9216],
+            [16, 7424, 8192],
+            [32, 7424, 8192],
+            [64, 7424, 8192],
+            [4096, 7424, 8192],
+            [5120, 7424, 8192],
+            [8192, 7424, 8192],
         ]
     )
     test_mnk_list.extend(boundary_mnk_list)
