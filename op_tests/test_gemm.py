@@ -15,6 +15,10 @@ from functools import lru_cache
 from aiter.jit.utils.chip_info import get_gfx
 import pandas as pd
 
+# pd.set_option('display.max_rows', 500)
+# pd.set_option('display.max_columns', 100)
+# pd.set_option('display.width', 1000)
+
 # TEST_NUM_ITERS = 10
 TEST_NUM_ITERS = 100
 
@@ -415,7 +419,8 @@ def test_skinny_gemm():
             for dtype in [dtypes.fp16, dtypes.bf16]:
                 for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
                     ret = test_gemm(dtype, m, n, k, otype=otype)
-                    df.append(ret)
+                    if dtype == otype:
+                        df.append(ret)
         df = pd.DataFrame(df)
         aiter.logger.info(f"skinny summary:\n{df}")
 
