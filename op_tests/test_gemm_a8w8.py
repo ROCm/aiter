@@ -137,61 +137,6 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         "hipmm err": err_e,
     }
 
-
-@perftest()
-def aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
-    if scaleB is not None:
-        scaleB = scaleB.t()
-
-    return hipb_mm(
-        inp,
-        weights.t(),
-        solution_index=-1,
-        bias=None,
-        out_dtype=dtype,
-        scaleA=scaleA,
-        scaleB=scaleB,
-        scaleOut=None,
-        bpreshuffle=True,
-    )
-
-
-@perftest()
-def aiter_hip(inp, weights, scaleA, scaleB, dtype):
-    if scaleB is not None:
-        scaleB = scaleB.t()
-
-    return hipb_mm(
-        inp,
-        weights.t(),
-        solution_index=-1,
-        bias=None,
-        out_dtype=dtype,
-        scaleA=scaleA,
-        scaleB=scaleB,
-        scaleOut=None,
-    )
-
-
-@perftest()
-def torch_gemm_fp8(inp, weights, scale_a, scale_b, out_dtype):
-    output = torch._scaled_mm(
-        inp,
-        weights.t(),
-        out_dtype=out_dtype,
-        scale_a=scale_a,
-        scale_b=scale_b.t(),
-        bias=None,
-    )
-
-    return output
-
-
-@perftest()
-def torch_gemm_bf16(inp, weights):
-    return torch.matmul(inp, weights.t())
-
-
 def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     dim = (m, n, k)
     x = torch.randn((m, k), dtype=dtype, device="cuda")
