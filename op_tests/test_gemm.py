@@ -6,12 +6,14 @@ import torch.nn.functional as F
 import sys
 import os
 import random
+import aiter
 from aiter import dtypes
-from aiter.test_common import checkAllclose, perftest
+from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter.ops.shuffle import shuffle_weight
 from aiter import hipb_mm, hipb_create_extension
 from functools import lru_cache
 from aiter.jit.utils.chip_info import get_gfx
+import pandas as pd
 
 # TEST_NUM_ITERS = 10
 TEST_NUM_ITERS = 100
@@ -77,6 +79,7 @@ def init_hipblas():
     hipb_create_extension()
 
 
+@benchmark()
 def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
@@ -94,7 +97,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     if n % 16 == 0 and k % 32 == 0 and dtype == otype and get_gfx() == "gfx942":
         init_hipblas()
         weight_bpreshuffle = shuffle_weight(weight, layout=(16, 16), use_int4=False)
-        c, avg_c = aiter_hip_bpreshuffle(x, weight_bpreshuffle, None, None, otype)
+        (c, *_), avg_c = aiter_hip_bpreshuffle(x, weight_bpreshuffle, None, None, otype)
         if bias is not None:
             c = c + bias
     else:
@@ -114,11 +117,18 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
             assert (
                 c.dtype == otype
             ), f"c={c.dtype}, expected output dtype={otype}, input dtype={dtype}"
-    avg_c = "%-8.2f" % avg_c if avg_c is not None else "%-8.2f" % 0
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, C avg: {{bpreshuffle_avg}} us, B uplift: {avg_a/avg_b-1:<5.1%}, ".format(
-        bpreshuffle_avg=avg_c
-    )
-    checkAllclose(a, b, msg=msg)
+    msg_b = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us,B uplift: {avg_a/avg_b-1:<5.1%}, "
+    if avg_c is not None:
+        msg_c = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, C avg: {avg_c:<8.2f} us, C uplift: {avg_a/avg_c-1:<5.1%}, "
+    err_b = checkAllclose(a, b, msg=msg_b)
+    err_c = checkAllclose(a, c, msg=msg_c) if c is not None else None
+    return {
+        "torch_us": avg_a,
+        "tgemm_us": avg_b,
+        "tgemm_err": err_b,
+        "hipmm_bpreshuffle_us": avg_c,
+        "hipmm_bpreshuffle_err": err_c,
+    }
 
 
 def get_boundary_test_cases(cu_count, aligned_k):
@@ -313,7 +323,8 @@ def calculate_total_valid_points(cu_count, aligned_k):
 
 
 def test_normal_gemm():
-    test_gemm(
+    df = []
+    ret1 = test_gemm(
         dtypes.fp8,
         128,
         768,
@@ -323,30 +334,35 @@ def test_normal_gemm():
         scaleA=0.5,
         scaleB=0.5,
     )
-    test_gemm(dtypes.bf16, 128, 32, 8192)
+    df.append(ret1)
+    ret2 = test_gemm(dtypes.bf16, 128, 32, 8192)
+    df.append(ret2)
     for dtype in [dtypes.fp16, dtypes.bf16]:
         for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
-            test_gemm(dtype, 128, 32, 8192, otype=otype)
-        # # qkv_proj
-        # for (m, n, k) in [(4096, 1280, 8192),
-        #                   (128, 1280, 8192),
-        #                   (128, 1024, 8192),
-        #                   (128, 128, 8192),
-        #                   ]:
-        #     test_gemm(dtype, m, n, k)
-        # # attn_out
-        # for (m, n, k) in [(4096, 8192, 1024),
-        #                   (128, 8192, 1024)]:
-        #     test_gemm(dtype, m, n, k)
-        # test_gemm(dtype, 128, 1024, 8192)
-        # # gating
-        # for (m, n, k) in [(4096, 32, 8192),
-        #                   (128, 32, 8192)]:
-        #     test_gemm(dtype, m, n, k)
-        # # gating
-        # for (m, n, k) in [(1, 19392, 8192),
-        #                   (128, 19392, 8192)]:
-        #     test_gemm(dtype, m, n, k)
+            ret = test_gemm(dtype, 128, 32, 8192, otype=otype)
+            df.append(ret)
+    df = pd.DataFrame(df)
+    aiter.logger.info(f"normal summary:\n{df}")
+    # # qkv_proj
+    # for (m, n, k) in [(4096, 1280, 8192),
+    #                   (128, 1280, 8192),
+    #                   (128, 1024, 8192),
+    #                   (128, 128, 8192),
+    #                   ]:
+    #     test_gemm(dtype, m, n, k)
+    # # attn_out
+    # for (m, n, k) in [(4096, 8192, 1024),
+    #                   (128, 8192, 1024)]:
+    #     test_gemm(dtype, m, n, k)
+    # test_gemm(dtype, 128, 1024, 8192)
+    # # gating
+    # for (m, n, k) in [(4096, 32, 8192),
+    #                   (128, 32, 8192)]:
+    #     test_gemm(dtype, m, n, k)
+    # # gating
+    # for (m, n, k) in [(1, 19392, 8192),
+    #                   (128, 19392, 8192)]:
+    #     test_gemm(dtype, m, n, k)
 
 
 def test_skinny_gemm():
@@ -374,6 +390,7 @@ def test_skinny_gemm():
             [4, 32, 9216],
             [16, 7424, 8192],
             [32, 7424, 8192],
+            [48, 7424, 8192],
             [64, 7424, 8192],
             [4096, 7424, 8192],
             [5120, 7424, 8192],
@@ -392,11 +409,15 @@ def test_skinny_gemm():
 
     loop_count = 1
     for i in range(loop_count):
+        df = []
         for mnk in test_mnk_list:
             m, n, k = mnk
             for dtype in [dtypes.fp16, dtypes.bf16]:
                 for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
-                    test_gemm(dtype, m, n, k, otype=otype)
+                    ret = test_gemm(dtype, m, n, k, otype=otype)
+                    df.append(ret)
+        df = pd.DataFrame(df)
+        aiter.logger.info(f"skinny summary:\n{df}")
 
 
 # test_normal_gemm()

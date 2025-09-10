@@ -133,8 +133,8 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         "ck bpreshuffle err": err_c,
         "asm us": avg_d,
         "asm err": err_d,
-        "hipmm us": avg_e,
-        "hipmm err": err_e,
+        "hipmm bpreshuffle us": avg_e,
+        "hipmm bpreshuffle err": err_e,
     }
 
 
