@@ -172,7 +172,7 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
         ret = []
         if task:
             shape_grouped = False
-            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
+            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
 
         return ret
 
