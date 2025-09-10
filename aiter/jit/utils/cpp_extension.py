@@ -1440,26 +1440,23 @@ def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
 def _get_num_workers(verbose: bool) -> Optional[int]:
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs is not None and max_jobs.isdigit():
+        if int(max_jobs) > int(max(1, os.cpu_count() * 0.8)):
+            max_jobs = int(max(1, os.cpu_count() * 0.8))
         if verbose:
             print(
                 f"Using envvar MAX_JOBS ({max_jobs}) as the number of workers...",
                 file=sys.stderr,
             )
-        return int(max_jobs)
     else:
         max_jobs = int(max(1, os.cpu_count() * 0.8))
         print(
             f"Using 0.8*cpu_cnt MAX_JOBS ({max_jobs}) as the number of workers...",
             file=sys.stderr,
         )
-        return max_jobs
-    if verbose:
-        print(
-            "Allowing ninja to set a default number of workers... "
-            "(overridable by setting the environment variable MAX_JOBS=N)",
-            file=sys.stderr,
-        )
-    return None
+    prebuild_thread_num = os.environ.get("PREBUILD_THREAD_NUM")
+    if prebuild_thread_num != None:
+        max_jobs = int(max_jobs) / int(prebuild_thread_num)
+    return int(max_jobs)
 
 
 def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> None:
@@ -1727,8 +1724,8 @@ def _write_ninja_file(
         for root, dirs, files in os.walk(o_path):
             for file in files:
                 mid_file_dir = o_path + file
-                if file.endswith(".so") and mid_file_dir not in objects:
-                    objects.append(mid_file_dir)
+                if file.endswith(".so") and file not in objects:
+                    objects.append(file)
 
     flags.append(f'ldflags = {" ".join(ldflags)}')
     if cuda_dlink_post_cflags:
@@ -1743,9 +1740,14 @@ def _write_ninja_file(
     if library_target is not None:
         link_rule = ["rule link"]
 
-        link_rule.append(
-            "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
-        )
+        if prebuild == 2:
+            link_rule.append(
+                f"  command = $cxx @$out.rsp $ldflags -Wl,-rpath,'$$ORIGIN' -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
+            )
+        else:
+            link_rule.append(
+                "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
+            )
 
         link = [f'build {library_target}: link {" ".join(objects)}']
 
