@@ -191,12 +191,17 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         sin = tl.load(sin_ptr + cos_offs)
 
         q_nope_ptrs = (
-            q_nope_ptr 
-            + pid_b * q_nope_stride_b 
-            + pid_hq * q_nope_stride_h 
+            q_nope_ptr
+            + pid_b * q_nope_stride_b
+            + pid_hq * q_nope_stride_h
             + d_nope_offs * q_nope_stride_d
         )
-        q_pe_ptrs = q_pe_ptr + pid_b * q_pe_stride_b + pid_hq * q_pe_stride_h + d_pe_offs * q_pe_stride_d
+        q_pe_ptrs = (
+            q_pe_ptr
+            + pid_b * q_pe_stride_b
+            + pid_hq * q_pe_stride_h
+            + d_pe_offs * q_pe_stride_d
+        )
         q_out_ptrs = q_out_ptr + pid_b * q_out_stride_b + pid_hq * q_out_stride_h
         q_nope = tl.load(q_nope_ptrs)
         q_pe = _unit_rope(
@@ -208,12 +213,25 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             BLOCK_D_pe,
             BLOCK_D_HALF_pe,
         )
-        tl.store(q_out_ptrs + d_nope_offs * q_out_stride_d, q_nope.to(q_out_ptr.dtype.element_ty))
-        tl.store(q_out_ptrs + (d_pe_offs + BLOCK_D_nope) * q_out_stride_d, q_pe.to(q_out_ptr.dtype.element_ty))
-        
+        tl.store(
+            q_out_ptrs + d_nope_offs * q_out_stride_d,
+            q_nope.to(q_out_ptr.dtype.element_ty),
+        )
+        tl.store(
+            q_out_ptrs + (d_pe_offs + BLOCK_D_nope) * q_out_stride_d,
+            q_pe.to(q_out_ptr.dtype.element_ty),
+        )
+
         if pid < num_decode_toks_for_zeros * QH:
-            decode_q_pe_out_ptrs = decode_q_pe_out_ptr + pid_b * decode_q_pe_out_stride_b + pid_hq * decode_q_pe_out_stride_h
-            tl.store(decode_q_pe_out_ptrs + d_pe_offs * decode_q_pe_out_stride_d, q_pe.to(decode_q_pe_out_ptr.dtype.element_ty))
+            decode_q_pe_out_ptrs = (
+                decode_q_pe_out_ptr
+                + pid_b * decode_q_pe_out_stride_b
+                + pid_hq * decode_q_pe_out_stride_h
+            )
+            tl.store(
+                decode_q_pe_out_ptrs + d_pe_offs * decode_q_pe_out_stride_d,
+                q_pe.to(decode_q_pe_out_ptr.dtype.element_ty),
+            )
 
         if OUTPUT_Q_NOPE_ZEROS and pid < num_decode_toks_for_zeros * QH:
             z = tl.zeros((BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
@@ -232,17 +250,31 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     k_scale = tl.load(k_scale_ptr)
                 else:
                     k_scale = 1
-                    
+
                 pid_hk = pid_hq // QH_PER_KH
                 k_nope_ptrs = (
-                    k_nope_ptr 
-                    + pid_b * k_nope_stride_b 
-                    + pid_hk * k_nope_stride_h 
+                    k_nope_ptr
+                    + pid_b * k_nope_stride_b
+                    + pid_hk * k_nope_stride_h
                     + dk_nope_offs * k_nope_stride_d
                 )
-                k_pe_ptrs = k_pe_ptr + pid_b * k_pe_stride_b + pid_hk * k_pe_stride_h + d_pe_offs * k_pe_stride_d
-                k_pe_out_ptrs = k_pe_out_ptr + pid_b * k_pe_out_stride_b + pid_hk * k_pe_out_stride_h + d_pe_offs * k_pe_out_stride_d
-                kv_cache_ptrs = kv_cache_ptr + pid_slot * kv_cache_stride_b + pid_hk * kv_cache_stride_h
+                k_pe_ptrs = (
+                    k_pe_ptr
+                    + pid_b * k_pe_stride_b
+                    + pid_hk * k_pe_stride_h
+                    + d_pe_offs * k_pe_stride_d
+                )
+                k_pe_out_ptrs = (
+                    k_pe_out_ptr
+                    + pid_b * k_pe_out_stride_b
+                    + pid_hk * k_pe_out_stride_h
+                    + d_pe_offs * k_pe_out_stride_d
+                )
+                kv_cache_ptrs = (
+                    kv_cache_ptr
+                    + pid_slot * kv_cache_stride_b
+                    + pid_hk * kv_cache_stride_h
+                )
                 k_nope = tl.load(k_nope_ptrs)
                 k_pe = _unit_rope(
                     k_pe_ptrs,
@@ -255,10 +287,17 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                 )
                 tl.store(k_pe_out_ptrs, k_pe.to(k_pe_out_ptr.dtype.element_ty))
                 k_scale_rcprl = (1 / k_scale).to(tl.float32)
-                k_nope = (k_nope.to(tl.float32) * k_scale_rcprl).to(kv_cache_ptr.dtype.element_ty)
-                k_pe = (k_pe.to(tl.float32) * k_scale_rcprl).to(kv_cache_ptr.dtype.element_ty)
+                k_nope = (k_nope.to(tl.float32) * k_scale_rcprl).to(
+                    kv_cache_ptr.dtype.element_ty
+                )
+                k_pe = (k_pe.to(tl.float32) * k_scale_rcprl).to(
+                    kv_cache_ptr.dtype.element_ty
+                )
                 tl.store(kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope)
-                tl.store(kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d, k_pe)
+                tl.store(
+                    kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
+                    k_pe,
+                )
     else:
         pid = pid - B * QH + B * KH
         if pid < B_slot * KH:
@@ -270,24 +309,45 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     k_scale = tl.load(k_scale_ptr)
                 else:
                     k_scale = 1
-                
+
                 k_nope_ptrs = (
-                    k_nope_ptr 
-                    + pid_b * k_nope_stride_b 
-                    + pid_hk * k_nope_stride_h 
+                    k_nope_ptr
+                    + pid_b * k_nope_stride_b
+                    + pid_hk * k_nope_stride_h
                     + dk_nope_offs * k_nope_stride_d
                 )
-                k_pe_ptrs = k_pe_ptr + pid_b * k_pe_stride_b + pid_hk * k_pe_stride_h + d_pe_offs * k_pe_stride_d
-                k_pe_out_ptrs = k_pe_out_ptr + pid_b * k_pe_out_stride_b + pid_hk * k_pe_out_stride_h + d_pe_offs * k_pe_out_stride_d
-                kv_cache_ptrs = kv_cache_ptr + pid_slot * kv_cache_stride_b + pid_hk * kv_cache_stride_h
+                k_pe_ptrs = (
+                    k_pe_ptr
+                    + pid_b * k_pe_stride_b
+                    + pid_hk * k_pe_stride_h
+                    + d_pe_offs * k_pe_stride_d
+                )
+                k_pe_out_ptrs = (
+                    k_pe_out_ptr
+                    + pid_b * k_pe_out_stride_b
+                    + pid_hk * k_pe_out_stride_h
+                    + d_pe_offs * k_pe_out_stride_d
+                )
+                kv_cache_ptrs = (
+                    kv_cache_ptr
+                    + pid_slot * kv_cache_stride_b
+                    + pid_hk * kv_cache_stride_h
+                )
                 k_nope = tl.load(k_nope_ptrs)
                 k_pe = tl.load(k_pe_ptrs)
                 tl.store(k_pe_out_ptrs, k_pe.to(k_pe_out_ptr.dtype.element_ty))
                 k_scale_rcprl = (1 / k_scale).to(tl.float32)
-                k_nope = (k_nope.to(tl.float32) * k_scale_rcprl).to(kv_cache_ptr.dtype.element_ty)
-                k_pe = (k_pe.to(tl.float32) * k_scale_rcprl).to(kv_cache_ptr.dtype.element_ty)
+                k_nope = (k_nope.to(tl.float32) * k_scale_rcprl).to(
+                    kv_cache_ptr.dtype.element_ty
+                )
+                k_pe = (k_pe.to(tl.float32) * k_scale_rcprl).to(
+                    kv_cache_ptr.dtype.element_ty
+                )
                 tl.store(kv_cache_ptrs + dk_nope_offs * kv_cache_stride_d, k_nope)
-                tl.store(kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d, k_pe)
+                tl.store(
+                    kv_cache_ptrs + (d_pe_offs + BLOCK_DK_nope) * kv_cache_stride_d,
+                    k_pe,
+                )
 
 
 def fused_qk_rope_cat_and_cache_mla(
@@ -338,7 +398,7 @@ def fused_qk_rope_cat_and_cache_mla(
     bk, kh, dk_nope = k_nope.shape
     bk2, kh2, dk2 = k_pe.shape
     b_cache, h_cache, d_cache = kv_cache.shape
-    (b_slot, ) = slot_mapping.shape
+    (b_slot,) = slot_mapping.shape
 
     assert (
         b_slot <= b and b == b2 == bk == bk2
@@ -366,8 +426,10 @@ def fused_qk_rope_cat_and_cache_mla(
         )
     else:
         b_q_out, qh_q_out, d_q_out = q_out.shape
-        assert b == b_q_out and qh == qh_q_out and d_nope + d_pe == d_q_out, "q_out shape mismatch"
-    
+        assert (
+            b == b_q_out and qh == qh_q_out and d_nope + d_pe == d_q_out
+        ), "q_out shape mismatch"
+
     if decode_q_pe_out is None:
         decode_q_pe_out = torch.empty(
             (num_decode_toks_for_zeros, qh, d_pe),
@@ -376,22 +438,26 @@ def fused_qk_rope_cat_and_cache_mla(
         )
     else:
         b_decode_q_pe_out, qh_decode_q_pe_out, d_decode_q_pe_out = decode_q_pe_out.shape
-        assert num_decode_toks_for_zeros == b_decode_q_pe_out and qh == qh_decode_q_pe_out and d_pe == d_decode_q_pe_out, "decode_q_pe_out shape mismatch"
+        assert (
+            num_decode_toks_for_zeros == b_decode_q_pe_out
+            and qh == qh_decode_q_pe_out
+            and d_pe == d_decode_q_pe_out
+        ), "decode_q_pe_out shape mismatch"
 
     if k_pe_out is None:
-        k_pe_out = torch.empty(
-            (b, kh, d_pe),
-            dtype=k_pe.dtype,
-            device=k_pe.device
-        )
+        k_pe_out = torch.empty((b, kh, d_pe), dtype=k_pe.dtype, device=k_pe.device)
     else:
         b_k_pe_out, hk_k_pe_out, d_k_pe_out = k_pe_out.shape
-        assert b == b_k_pe_out and kh == hk_k_pe_out and d_pe == d_k_pe_out, "k_pe_out shape mismatch"
+        assert (
+            b == b_k_pe_out and kh == hk_k_pe_out and d_pe == d_k_pe_out
+        ), "k_pe_out shape mismatch"
 
     q_nope_zeros_out = None
     if num_decode_toks_for_zeros > 0:
         q_nope_zeros_out = torch.empty(
-            (num_decode_toks_for_zeros, qh, dk_nope), dtype=q_nope.dtype, device=q_nope.device
+            (num_decode_toks_for_zeros, qh, dk_nope),
+            dtype=q_nope.dtype,
+            device=q_nope.device,
         )
 
     n_pid = b * qh + (b_slot - b) * kh

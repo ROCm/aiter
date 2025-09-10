@@ -279,7 +279,6 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     ], f"Output {dtype=} is currently not supported in batched_gemm_a8w8"
     assert splitK is None, "Currently, there isn't any support for splitK on Triton"
 
-
     WQ = WQ.transpose(1, 2)
 
     has_bias = bias is not None
