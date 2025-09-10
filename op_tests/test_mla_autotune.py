@@ -55,7 +55,7 @@ class YamlRecorder:
             )
         elif not self.curr or (
             (self.curr["avg_time_main"] + self.curr["avg_time_reduce"])
-            < (avg_time_main + avg_time_reduce)
+            >= (avg_time_main + avg_time_reduce)
         ):
             self.curr["type"] = self.type
             self.curr["seq_lens_kv"] = seq_lens_kv
@@ -68,6 +68,15 @@ class YamlRecorder:
             self.curr["default_workload_limit_global"] = default_workload_limit_global
             self.curr["avg_time_main"] = avg_time_main
             self.curr["avg_time_reduce"] = avg_time_reduce
+
+    def update_range(self, num_splits, workload_limit_global):
+        if self.curr["num_splits"] == num_splits:
+            self.curr["workload_limit_global"][0] = min(
+                self.curr["workload_limit_global"][0], workload_limit_global
+            )
+            self.curr["workload_limit_global"][1] = max(
+                self.curr["workload_limit_global"][1], workload_limit_global
+            )
 
     def flush(self):
         if self.curr:
@@ -200,8 +209,8 @@ def test_mla(
     page_size,
     varlen,
     mtp,
-    bf16_db=None,
-    fp8_db=None,
+    bf16_db: YamlRecorder = None,
+    fp8_db: YamlRecorder = None,
 ):
     kv_max_sz = (
         65536 * 32
@@ -346,8 +355,13 @@ def test_mla(
         int(math.ceil(default_workload_limit_global / 4 / 16) * 16), 16
     )
     workload_limit_global_min = min(workload_limit_global_min__, 32)
-    workload_limit_global_max = int(
-        math.ceil(default_workload_limit_global * 1.5 / 16) * 16
+    workload_limit_global_max = max(
+        default_workload_limit_global * 1.5,
+        total_kv + batch_size * 128 * (cu_num + 1) / cu_num,
+    )
+    workload_limit_global_max = int(math.ceil(workload_limit_global_max / 16) * 16) + 16
+    print(
+        f"[metadata-autotune] workload_limit_global[default, min, max]=[{default_workload_limit_global}, {workload_limit_global_min}, {workload_limit_global_max}]"
     )
 
     def test_absorb_decode(check_quality):
@@ -513,10 +527,9 @@ def test_mla(
     )
 
     last_num_splits = None
-
-    for test_workload_limit_global in range(
-        workload_limit_global_min, workload_limit_global_max, 16
-    ):
+    test_workload_limit_global = workload_limit_global_min
+    stride = 16
+    while test_workload_limit_global <= workload_limit_global_max:
         metadata_test_params[0] = test_workload_limit_global
         meta = aiter.get_mla_metadata_v1_tunable(
             qo_indptr,
@@ -540,7 +553,24 @@ def test_mla(
         workload_limit_global = metadata_test_outputs[0][0].item()
 
         if last_num_splits is not None and last_num_splits == num_splits:
+            if bf16_db is not None:
+                bf16_db.update_range(num_splits, workload_limit_global)
+            if fp8_db is not None:
+                fp8_db.update_range(num_splits, workload_limit_global)
+            last_test_workload_limit_global = test_workload_limit_global
+            test_workload_limit_global = test_workload_limit_global + stride
+            if last_test_workload_limit_global < workload_limit_global_max:
+                test_workload_limit_global = min(
+                    test_workload_limit_global, workload_limit_global_max
+                )
+            stride *= 2
             continue
+        elif last_num_splits is not None and stride > 16:
+            test_workload_limit_global = last_test_workload_limit_global + 16
+            stride = 16
+            continue
+
+        # print(f"test_workload_limit_global={test_workload_limit_global}, num_splits={num_splits}")
         last_num_splits = num_splits
 
         (err, us_asm_decode, avg_time_bf16_main, avg_time_bf16_reduce) = (0, 1, 1, 1)
@@ -594,6 +624,10 @@ def test_mla(
                 avg_time_fp8_reduce,
             )
 
+        # print(f"[metadata-autotune] workload_limit_global={test_workload_limit_global}, num_splits={num_splits}, bf16 times: {avg_time_bf16_main} + {avg_time_bf16_reduce} = {avg_time_bf16_main+avg_time_bf16_reduce}, fp8 times: {avg_time_fp8_main} + {avg_time_fp8_reduce} = {avg_time_fp8_main+avg_time_fp8_reduce}")
+
+        last_test_workload_limit_global = test_workload_limit_global
+
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")
     # checkAllclose(logits_ref, attn_logits,
@@ -603,6 +637,15 @@ def test_mla(
     bytes = (
         total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
     ) * (torch.finfo(dtype).bits // 8)
+
+    if bf16_db is not None:
+        print(
+            f"[metadata-autotune] bf16 best choice: workload_limit_global={bf16_db.curr['workload_limit_global']}, num_splits={bf16_db.curr['num_splits']}"
+        )
+    if fp8_db is not None:
+        print(
+            f"[metadata-autotune] fp8 best choice: workload_limit_global={fp8_db.curr['workload_limit_global']}, num_splits={fp8_db.curr['num_splits']}"
+        )
 
     return {
         "decode:flops": flops,
