@@ -15,7 +15,7 @@ jobs:
     name: sglang integration
     runs-on: mi300x-1gpu
     env:
-      SGL_BRANCH: v0.4.10
+      SGL_BRANCH: v0.5.1
       GPU_ARCH: gfx942
       HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
 
