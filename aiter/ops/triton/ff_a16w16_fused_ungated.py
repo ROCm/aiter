@@ -199,12 +199,25 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    bounds = [4, 8, 64]
+    # Config keys should be named M_LEQ_<bound> or "any"
+    bounds = []
+    for setting in _get_config._config_dict[key].keys():
+        potential_block_m = setting.replace("M_LEQ_", "")
+        if potential_block_m.isnumeric():
+            bounds.append(int(potential_block_m))
+
     for bound in bounds:
         if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key][f"M_LEQ_{bound}"]
-    else:
-        return _get_config._config_dict[key]["M_GEQ_4096"]
+            config = _get_config._config_dict[key][f"M_LEQ_{bound}"]
+            break
+        else:
+            config = _get_config._config_dict[key]["any"]
+
+    config = (
+        config.copy()
+    )  # avoid later inplace modification from interacting with cached config
+
+    return config
 
 
 def ff_a16w16_fused_ungated(

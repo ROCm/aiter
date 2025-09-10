@@ -49,7 +49,6 @@ def _ff_a16w16_fused_gated(
     cache_modifier: tl.constexpr,
     activation: tl.constexpr,
     use_activation: tl.constexpr,
-    USE_ATOMICS: tl.constexpr,
 ):
     """A fused kernel for computing a full MLP block with a gated activation.
 
@@ -177,43 +176,42 @@ def _ff_a16w16_fused_gated(
     offs_ym = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     y_ptrs = y_ptr + (offs_ym[:, None] * stride_ym + offs_k[None, :] * stride_yk)
 
-    if USE_ATOMICS:
-        # Stagger k-loop start position based on N block index (to minimize contention)
-        k_cyclic_offset = pid_n % tl.cdiv(K, BLOCK_SIZE_K)
-        w2_ptrs += k_cyclic_offset * stride_w2k * BLOCK_SIZE_K
-        y_ptrs += k_cyclic_offset * stride_yk * BLOCK_SIZE_K
+    # Stagger k-loop start position based on N block index (to minimize contention)
+    k_cyclic_offset = pid_n % tl.cdiv(K, BLOCK_SIZE_K)
+    w2_ptrs += k_cyclic_offset * stride_w2k * BLOCK_SIZE_K
+    y_ptrs += k_cyclic_offset * stride_yk * BLOCK_SIZE_K
 
-        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            if EVEN_K:
-                w2 = tl.load(
-                    w2_ptrs,
-                    mask=offs_w2n[:, None] < (N // 2),
-                )
-            else:
-                w2 = tl.load(
-                    w2_ptrs,
-                    mask=(offs_w2n[:, None] < (N // 2))
-                    & ((offs_k[None, :] + k_cyclic_offset * BLOCK_SIZE_K) < K),
-                    other=0.0,
-                )
-            partial_sum_y = tl.dot(acc_gated, w2)
-            # tl.device_print("w2:", w2)
-            # tl.device_print("partial y:", partial_sum_y)
-            y_mask = (offs_ym[:, None] < M) & (
-                (offs_k[None, :] + BLOCK_SIZE_K * k_cyclic_offset) < K
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        if EVEN_K:
+            w2 = tl.load(
+                w2_ptrs,
+                mask=offs_w2n[:, None] < (N // 2),
             )
-            tl.atomic_add(
-                y_ptrs, partial_sum_y, mask=y_mask, sem="relaxed", scope="gpu"
+        else:
+            w2 = tl.load(
+                w2_ptrs,
+                mask=(offs_w2n[:, None] < (N // 2))
+                & ((offs_k[None, :] + k_cyclic_offset * BLOCK_SIZE_K) < K),
+                other=0.0,
             )
-            # tl.store(y_ptrs, partial_sum_y, mask=y_mask)
-            k_cyclic_offset += 1
-            if k_cyclic_offset >= tl.cdiv(K, BLOCK_SIZE_K):
-                k_cyclic_offset = 0
-                w2_ptrs -= BLOCK_SIZE_K * stride_w2k * (tl.cdiv(K, BLOCK_SIZE_K) - 1)
-                y_ptrs -= BLOCK_SIZE_K * stride_yk * (tl.cdiv(K, BLOCK_SIZE_K) - 1)
-            else:
-                w2_ptrs += BLOCK_SIZE_K * stride_w2k
-                y_ptrs += BLOCK_SIZE_K * stride_yk
+        partial_sum_y = tl.dot(acc_gated, w2)
+        # tl.device_print("w2:", w2)
+        # tl.device_print("partial y:", partial_sum_y)
+        y_mask = (offs_ym[:, None] < M) & (
+            (offs_k[None, :] + BLOCK_SIZE_K * k_cyclic_offset) < K
+        )
+        tl.atomic_add(
+            y_ptrs, partial_sum_y, mask=y_mask, sem="relaxed", scope="gpu"
+        )
+        # tl.store(y_ptrs, partial_sum_y, mask=y_mask)
+        k_cyclic_offset += 1
+        if k_cyclic_offset >= tl.cdiv(K, BLOCK_SIZE_K):
+            k_cyclic_offset = 0
+            w2_ptrs -= BLOCK_SIZE_K * stride_w2k * (tl.cdiv(K, BLOCK_SIZE_K) - 1)
+            y_ptrs -= BLOCK_SIZE_K * stride_yk * (tl.cdiv(K, BLOCK_SIZE_K) - 1)
+        else:
+            w2_ptrs += BLOCK_SIZE_K * stride_w2k
+            y_ptrs += BLOCK_SIZE_K * stride_yk
 
 
 @functools.lru_cache(maxsize=1024)
@@ -310,14 +308,17 @@ def ff_a16w16_fused_gated(
 
     w_up = w_up.T
 
+    if config is None:
+        config = _get_config(M, N, K)
+
     if y is None:
         y = torch.zeros(
             (M, K), dtype=dtype, device=x.device
         )  # zeros, as this does atomic adds on top
 
-    if config is None:
-        config = _get_config(M, N, K)
-
+    # TODO: Experiment with two-stage kernel (first stage computes partial products for Y,
+    # second stage does a reduction). This would reduce contention on Y for large M &
+    # allow for greater parallelism for small M.
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
@@ -341,5 +342,4 @@ def ff_a16w16_fused_gated(
         use_activation=activation is not None,
         **config,
     )
-
     return y
