@@ -49,9 +49,23 @@ def _ff_a16w16_fused_gated(
     cache_modifier: tl.constexpr,
     activation: tl.constexpr,
     use_activation: tl.constexpr,
+    USE_ATOMICS: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
-    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """A fused kernel for computing a full MLP block with a gated activation.
+
+    Conceptually, this kernel's op is:
+
+    Y = [act(X @ W_gate) · (X @ W_up)] @ W_down
+
+    where:
+    - act: gating activation function (e.g silu)
+    - X: input tensor
+    - W_gate: weight tensor for gating mechanism
+    - W_up: weight tensor for upward projection
+    - W_down: weight tensor for downward projection
+
+    W_gate and W_up are concatenated along the N dimension to form a single weight tensor (w1_ptr) 
+    of shape [K, 2N].
     """
 
     tl.assume(stride_xm > 0)
@@ -163,40 +177,44 @@ def _ff_a16w16_fused_gated(
     offs_ym = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     y_ptrs = y_ptr + (offs_ym[:, None] * stride_ym + offs_k[None, :] * stride_yk)
 
-    # Stagger k-loop start position based on N block index (to minimize contention)
-    k_cyclic_offset = pid_n % tl.cdiv(K, BLOCK_SIZE_K)
-    w2_ptrs += k_cyclic_offset * stride_w2k * BLOCK_SIZE_K
-    y_ptrs += k_cyclic_offset * stride_yk * BLOCK_SIZE_K
+    if USE_ATOMICS:
+        # Stagger k-loop start position based on N block index (to minimize contention)
+        k_cyclic_offset = pid_n % tl.cdiv(K, BLOCK_SIZE_K)
+        w2_ptrs += k_cyclic_offset * stride_w2k * BLOCK_SIZE_K
+        y_ptrs += k_cyclic_offset * stride_yk * BLOCK_SIZE_K
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        if EVEN_K:
-            w2 = tl.load(
-                w2_ptrs,
-                mask=offs_w2n[:, None] < (N // 2),
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            if EVEN_K:
+                w2 = tl.load(
+                    w2_ptrs,
+                    mask=offs_w2n[:, None] < (N // 2),
+                )
+            else:
+                w2 = tl.load(
+                    w2_ptrs,
+                    mask=(offs_w2n[:, None] < (N // 2))
+                    & ((offs_k[None, :] + k_cyclic_offset * BLOCK_SIZE_K) < K),
+                    other=0.0,
+                )
+            partial_sum_y = tl.dot(acc_gated, w2)
+            # tl.device_print("w2:", w2)
+            # tl.device_print("partial y:", partial_sum_y)
+            y_mask = (offs_ym[:, None] < M) & (
+                (offs_k[None, :] + BLOCK_SIZE_K * k_cyclic_offset) < K
             )
-        else:
-            w2 = tl.load(
-                w2_ptrs,
-                mask=(offs_w2n[:, None] < (N // 2))
-                & ((offs_k[None, :] + k_cyclic_offset * BLOCK_SIZE_K) < K),
-                other=0.0,
-            )
-        partial_sum_y = tl.dot(acc_gated, w2)
-        # tl.device_print("w2:", w2)
-        # tl.device_print("partial y:", partial_sum_y)
-        y_mask = (offs_ym[:, None] < M) & (
-            (offs_k[None, :] + BLOCK_SIZE_K * k_cyclic_offset) < K
-        )
-        tl.atomic_add(y_ptrs, partial_sum_y, mask=y_mask, sem="relaxed", scope="gpu")
-        # tl.store(y_ptrs, partial_sum_y, mask=y_mask)
-        k_cyclic_offset += 1
-        if k_cyclic_offset >= tl.cdiv(K, BLOCK_SIZE_K):
-            k_cyclic_offset = 0
-            w2_ptrs -= BLOCK_SIZE_K * stride_w2k * (tl.cdiv(K, BLOCK_SIZE_K) - 1)
-            y_ptrs -= BLOCK_SIZE_K * stride_yk * (tl.cdiv(K, BLOCK_SIZE_K) - 1)
-        else:
-            w2_ptrs += BLOCK_SIZE_K * stride_w2k
-            y_ptrs += BLOCK_SIZE_K * stride_yk
+            tl.atomic_add(y_ptrs, partial_sum_y, mask=y_mask, sem="relaxed", scope="gpu")
+            # tl.store(y_ptrs, partial_sum_y, mask=y_mask)
+            k_cyclic_offset += 1
+            if k_cyclic_offset >= tl.cdiv(K, BLOCK_SIZE_K):
+                k_cyclic_offset = 0
+                w2_ptrs -= BLOCK_SIZE_K * stride_w2k * (tl.cdiv(K, BLOCK_SIZE_K) - 1)
+                y_ptrs -= BLOCK_SIZE_K * stride_yk * (tl.cdiv(K, BLOCK_SIZE_K) - 1)
+            else:
+                w2_ptrs += BLOCK_SIZE_K * stride_w2k
+                y_ptrs += BLOCK_SIZE_K * stride_yk
+
+    else:
+
 
 
 @functools.lru_cache(maxsize=1024)
@@ -245,6 +263,7 @@ def _get_config(
     )  # avoid later inplace modification from interacting with cached config
 
     return config
+
 
 def ff_a16w16_fused_gated(
     x,

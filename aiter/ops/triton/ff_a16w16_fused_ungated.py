@@ -50,8 +50,17 @@ def _ff_a16w16_fused_ungated(
     activation: tl.constexpr,
     use_activation: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
-    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """A fused kernel for computing a full MLP block with a nongated (standard) activation.
+
+    Conceptually, this kernel's op is:
+
+    Y = [act(X @ W_up)] @ W_down
+
+    where:
+    - act: gating activation function (e.g silu)
+    - X: input tensor
+    - W_up: weight tensor for upward projection
+    - W_down: weight tensor for downward projection
     """
 
     tl.assume(stride_xm > 0)
