@@ -64,7 +64,7 @@ def _ff_a16w16_fused_gated(
     - W_up: weight tensor for upward projection
     - W_down: weight tensor for downward projection
 
-    W_gate and W_up are concatenated along the N dimension to form a single weight tensor (w1_ptr) 
+    W_gate and W_up are concatenated along the N dimension to form a single weight tensor (w1_ptr)
     of shape [K, 2N].
     """
 
@@ -202,7 +202,9 @@ def _ff_a16w16_fused_gated(
             y_mask = (offs_ym[:, None] < M) & (
                 (offs_k[None, :] + BLOCK_SIZE_K * k_cyclic_offset) < K
             )
-            tl.atomic_add(y_ptrs, partial_sum_y, mask=y_mask, sem="relaxed", scope="gpu")
+            tl.atomic_add(
+                y_ptrs, partial_sum_y, mask=y_mask, sem="relaxed", scope="gpu"
+            )
             # tl.store(y_ptrs, partial_sum_y, mask=y_mask)
             k_cyclic_offset += 1
             if k_cyclic_offset >= tl.cdiv(K, BLOCK_SIZE_K):
@@ -212,9 +214,6 @@ def _ff_a16w16_fused_gated(
             else:
                 w2_ptrs += BLOCK_SIZE_K * stride_w2k
                 y_ptrs += BLOCK_SIZE_K * stride_yk
-
-    else:
-
 
 
 @functools.lru_cache(maxsize=1024)

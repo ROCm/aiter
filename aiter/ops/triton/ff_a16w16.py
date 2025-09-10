@@ -18,7 +18,7 @@ def ff_a16w16_nogate(
     activation: Optional[str] = None,
 ):
     """
-    Full feed-forward block with gating (e.g swiglu).
+    Full feed-forward block without gating.
 
     x: torch.Tensor (M, K)
     w_up: torch.Tensor (N, K)
@@ -68,7 +68,7 @@ def ff_a16w16_gated(
     activation: Optional[str] = None,
 ):
     """
-    Full feed-forward block with gating (e.g swiglu).
+    Full feed-forward block with gating (e.g Llama3 family with swiglu)
 
     x: torch.Tensor (M, K)
     w_up: torch.Tensor (N, K)
