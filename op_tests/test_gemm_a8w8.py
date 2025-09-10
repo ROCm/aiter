@@ -137,6 +137,7 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         "hipmm err": err_e,
     }
 
+
 def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     dim = (m, n, k)
     x = torch.randn((m, k), dtype=dtype, device="cuda")
