@@ -1071,7 +1071,7 @@ def torch_moe_blockscale(
         )
         w1 = w1 * fc1_scale
         w2 = w2 * fc2_scale
-        
+
     for E_id in range(w1.shape[0]):
         mask = topk_ids == E_id
         if mask.sum():
