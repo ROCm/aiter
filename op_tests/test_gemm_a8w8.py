@@ -107,26 +107,22 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
     }
 
 
-
 @perftest()
 def aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
     if scaleB is not None:
         scaleB = scaleB.t()
-    
-    
+
     return hipb_mm(
-    inp, 
-    weights.t(), 
-    solution_index=-1, 
-    bias=None, 
-    out_dtype=dtype, 
-    scaleA=scaleA, 
-    scaleB=scaleB, 
-    scaleOut=None,
-    bpreshuffle=True
-)
-
-
+        inp,
+        weights.t(),
+        solution_index=-1,
+        bias=None,
+        out_dtype=dtype,
+        scaleA=scaleA,
+        scaleB=scaleB,
+        scaleOut=None,
+        bpreshuffle=True,
+    )
 
 
 @perftest()
@@ -135,37 +131,34 @@ def aiter_hip(inp, weights, scaleA, scaleB, dtype):
         scaleB = scaleB.t()
 
     return hipb_mm(
-    inp, 
-    weights.t(), 
-    solution_index=-1, 
-    bias=None, 
-    out_dtype=dtype, 
-    scaleA=scaleA, 
-    scaleB=scaleB, 
-    scaleOut=None
-)
-
+        inp,
+        weights.t(),
+        solution_index=-1,
+        bias=None,
+        out_dtype=dtype,
+        scaleA=scaleA,
+        scaleB=scaleB,
+        scaleOut=None,
+    )
 
 
 @perftest()
 def torch_gemm_fp8(inp, weights, scale_a, scale_b, out_dtype):
-    output = torch._scaled_mm(inp,
-                            weights.t(),
-                            out_dtype=out_dtype,
-                            scale_a=scale_a,
-                            scale_b=scale_b.t(),
-                            bias=None)
-    
-    return output
+    output = torch._scaled_mm(
+        inp,
+        weights.t(),
+        out_dtype=out_dtype,
+        scale_a=scale_a,
+        scale_b=scale_b.t(),
+        bias=None,
+    )
 
+    return output
 
 
 @perftest()
 def torch_gemm_bf16(inp, weights):
     return torch.matmul(inp, weights.t())
-
-
-
 
 
 def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
@@ -293,7 +286,6 @@ def calculate_total_valid_points(cu_count, aligned_k):
     return total
 
 
-
 def bpreshuffle_test_fp8(m, n, k):
     dtype = dtypes.bf16
 
@@ -302,28 +294,33 @@ def bpreshuffle_test_fp8(m, n, k):
     inp, x_scale = aiter.pertoken_quant(inp, quant_dtype=dtypes.fp8)
     weights, w_scale = aiter.pertoken_quant(weights, quant_dtype=dtypes.fp8)
 
-    out_torch, time_torch = torch_gemm_fp8(inp, weights, x_scale, w_scale, torch.bfloat16)
+    out_torch, time_torch = torch_gemm_fp8(
+        inp, weights, x_scale, w_scale, torch.bfloat16
+    )
     out_hip, time_hip = aiter_hip(inp, weights, x_scale, w_scale, torch.bfloat16)
 
-
     weight_bpreshuffle = shuffle_weight(weights, layout=(16, 16), use_int4=False)
-    out_sw, time_sw = aiter_hip_bpreshuffle(inp, weight_bpreshuffle, x_scale, w_scale, torch.bfloat16)
-    out_ck, time_ck = run_gemm_ck_bpreshuffle(inp, weight_bpreshuffle, x_scale, w_scale, torch.bfloat16)
-    
+    out_sw, time_sw = aiter_hip_bpreshuffle(
+        inp, weight_bpreshuffle, x_scale, w_scale, torch.bfloat16
+    )
+    out_ck, time_ck = run_gemm_ck_bpreshuffle(
+        inp, weight_bpreshuffle, x_scale, w_scale, torch.bfloat16
+    )
 
-
-    err_b = checkAllclose(out_sw, out_torch, msg=f"bpreshuffle time:{time_sw}, hipblaslt time:{time_torch} ", rtol=1e-2, atol=1e-2)
+    err_b = checkAllclose(
+        out_sw,
+        out_torch,
+        msg=f"bpreshuffle time:{time_sw}, hipblaslt time:{time_torch} ",
+        rtol=1e-2,
+        atol=1e-2,
+    )
 
     if err_b == 0:
-        msg = f'mnk={m} {n} {k}: bpreshuffle time:{time_sw}, hipb_mm time:{time_hip}, ck time:{time_ck}, torch._scaled_mm time:{time_torch} All Close!'
+        msg = f"mnk={m} {n} {k}: bpreshuffle time:{time_sw}, hipb_mm time:{time_hip}, ck time:{time_ck}, torch._scaled_mm time:{time_torch} All Close!"
     else:
-        msg = f'mnk={m} {n} {k}: bpreshuffle time:{time_sw}, hipb_mm time:{time_hip}, ck time:{time_ck}, torch._scaled_mm time:{time_torch} Not All Close!'
-   
+        msg = f"mnk={m} {n} {k}: bpreshuffle time:{time_sw}, hipb_mm time:{time_hip}, ck time:{time_ck}, torch._scaled_mm time:{time_torch} Not All Close!"
 
     return msg
-
-
-
 
 
 def bpreshuffle_test_bf16(m, n, k):
@@ -336,20 +333,24 @@ def bpreshuffle_test_bf16(m, n, k):
     out_hipb, time_hipb = aiter_hip(inp, weights, None, None, torch.bfloat16)
 
     weight_bpreshuffle = shuffle_weight(weights, layout=(16, 16), use_int4=False)
-    out_bpreshuffle, time_bpreshuffle = aiter_hip_bpreshuffle(inp, weight_bpreshuffle, None, None, torch.bfloat16)
-    
+    out_bpreshuffle, time_bpreshuffle = aiter_hip_bpreshuffle(
+        inp, weight_bpreshuffle, None, None, torch.bfloat16
+    )
 
-
-    err_b = checkAllclose(out_bpreshuffle, out_torch, msg=f"bpreshuffle time:{time_bpreshuffle}, hipblaslt time:{time_torch} ", rtol=1e-2, atol=1e-2)
+    err_b = checkAllclose(
+        out_bpreshuffle,
+        out_torch,
+        msg=f"bpreshuffle time:{time_bpreshuffle}, hipblaslt time:{time_torch} ",
+        rtol=1e-2,
+        atol=1e-2,
+    )
 
     if err_b == 0:
-        msg = f'mnk={m} {n} {k}: bpreshuffle time:{time_bpreshuffle}, hipb_mm time:{time_hipb}, hipblaslt time:{time_torch} All Close!'
+        msg = f"mnk={m} {n} {k}: bpreshuffle time:{time_bpreshuffle}, hipb_mm time:{time_hipb}, hipblaslt time:{time_torch} All Close!"
     else:
-        msg = f'mnk={m} {n} {k}: bpreshuffle time:{time_bpreshuffle}, hipb_mm time:{time_hipb}, hipblaslt time:{time_torch} Not All Close!'
-    
+        msg = f"mnk={m} {n} {k}: bpreshuffle time:{time_bpreshuffle}, hipb_mm time:{time_hipb}, hipblaslt time:{time_torch} Not All Close!"
+
     return msg
-
-
 
 
 def test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk):
@@ -421,25 +422,19 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     # test_gemm(dtype, m, n, k, quant_dtype)
 
 
-
-
-
 def test_hipb_bpreshuffle_gemm_a8w8_pertoken_quant():
 
     if get_arch() == "gfx950":
         print("HipBLASLt Swizzle is not supported on MI350/355")
         return
 
-
     hipb_create_extension()
     dtype = dtypes.bf16
     n, k = 7424, 8192
     msg_all = []
-    func_dtype = 'bf16'
+    func_dtype = "bf16"
 
-
-    func = bpreshuffle_test_fp8 if func_dtype == 'fp8' else bpreshuffle_test_bf16
-
+    func = bpreshuffle_test_fp8 if func_dtype == "fp8" else bpreshuffle_test_bf16
 
     for m in [16, 32, 48, 64, 4096, 5120, 8192]:
 
@@ -448,10 +443,6 @@ def test_hipb_bpreshuffle_gemm_a8w8_pertoken_quant():
 
     for msg in msg_all:
         print(msg)
-
-
-
-
 
 
 l_dtype = ["bf16", "fp16"]
