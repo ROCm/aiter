@@ -3,11 +3,7 @@
 
 import torch
 import aiter
-from aiter.test_common import (
-    checkAllclose,
-    run_perftest,
-    perftest,
-)
+from aiter.test_common import checkAllclose, run_perftest, perftest, benchmark
 from aiter.fused_moe import (
     fused_topk,
     fused_moe,
@@ -20,6 +16,7 @@ from aiter import ActivationType
 from aiter import pertoken_quant
 from aiter import dtypes
 import argparse
+import pandas as pd
 
 BLOCK_SIZE_M = 32
 MAX_TOKENS = 4096 * 4
@@ -93,6 +90,7 @@ quant_algo = [
 ]
 
 
+@benchmark()
 def test_fmoe_ep(
     dtype,
     token,
@@ -338,6 +336,8 @@ def test_fmoe_ep(
         checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
 
+        return {"us": avg_b}
+
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -365,6 +365,7 @@ args = parser.parse_args()
 if args.test is not None:
     l_test = [args.test]
 
+df = []
 for test in l_test:
     print(f"\nRunning test: {test}")
     if test == "test_fmoe_16_bit":
@@ -417,21 +418,23 @@ for test in l_test:
                             )
     elif test == "g1u1_fp8quant":
         for dtype in [dtypes.bf16]:
-            for m in [128, 256]:
-                for dim in [4096, 8192]:
-                    for hdim in [1024]:
-                        for ep in [4, 8]:
-                            test_fmoe_ep(
-                                dtype,
-                                m,
-                                dim,
-                                hdim,
-                                32,
-                                5,
-                                quant="fp8quant",
-                                use_g1u1=True,
-                                shared_E=2,
-                                ep=ep,
+            for m in [128, 160, 256, 320, 512]:
+                for dim in [7168]:
+                    for hdim in [2048]:
+                        for ep in [8]:
+                            df.append(
+                                test_fmoe_ep(
+                                    dtype,
+                                    m,
+                                    dim,
+                                    hdim,
+                                    256,
+                                    8,
+                                    quant="fp8quant",
+                                    use_g1u1=True,
+                                    shared_E=1,
+                                    ep=ep,
+                                )
                             )
     elif test == "g1u0_int8smoothquant":
         for dtype in [dtypes.bf16]:
@@ -489,3 +492,5 @@ for test in l_test:
                             )
     else:
         raise ValueError(f"Unknown test: {test}")
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")
