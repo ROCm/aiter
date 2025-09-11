@@ -52,6 +52,24 @@ def getMaxJobs():
     return max_jobs
 
 
+def is_develop_mode():
+    for arg in sys.argv:
+        if arg == "develop":
+            return True
+        # pip install -e
+        elif "editable" in arg:
+            return True
+    else:
+        return False
+
+
+if is_develop_mode():
+    with open("./aiter/install_mode", "w") as f:
+        f.write("develop")
+else:
+    with open("./aiter/install_mode", "w") as f:
+        f.write("install")
+
 if IS_ROCM:
     assert os.path.exists(
         ck_dir

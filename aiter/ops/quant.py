@@ -150,17 +150,19 @@ def get_torch_quant(qType):
 @functools.lru_cache()
 def get_hip_quant(qType):
     tmp = {
-        QuantType.No: lambda *a, **k: (a[0], None),
-        QuantType.per_Tensor: per_tensor_quant_hip,
-        QuantType.per_Token: per_token_quant_hip,
-        QuantType.per_1x32: per_1x32_f4_quant_hip,
-        QuantType.per_1x128: functools.partial(per_group_quant_hip, group_size=128),
+        QuantType.No.value: lambda *a, **k: (a[0], None),
+        QuantType.per_Tensor.value: per_tensor_quant_hip,
+        QuantType.per_Token.value: per_token_quant_hip,
+        QuantType.per_1x32.value: per_1x32_f4_quant_hip,
+        QuantType.per_1x128.value: functools.partial(
+            per_group_quant_hip, group_size=128
+        ),
     }
 
     def raise_NotImplementedError(*a, **k):
         raise NotImplementedError(f"unsupported quant type {qType=}")
 
-    return tmp.get(qType, raise_NotImplementedError)
+    return tmp.get(qType.value, raise_NotImplementedError)
 
 
 @functools.lru_cache()
