@@ -12,15 +12,20 @@ import argparse
 torch.set_default_device("cuda")
 # torch.set_printoptions(sci_mode=False, threshold=torch.inf)
 
+
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
+
+
 # setup_seed(1)
 
 
-def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool=False) -> None:
+def cal_diff(
+    x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
+) -> None:
     x, y = x.double(), y.double()
     RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
@@ -61,7 +66,7 @@ def ref_masked_attention(
 
     m = attn_weights.max(-1).values
 
-    attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1)) 
+    attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
 
     l = attn_weights_exp.sum(-1)
 
@@ -71,8 +76,8 @@ def ref_masked_attention(
 
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
 
-    out = out / l.transpose(0,1).unsqueeze(-1)
-    
+    out = out / l.transpose(0, 1).unsqueeze(-1)
+
     if is_fp8:
         out *= kv_scale
     return out.to(dtype), lse
@@ -110,15 +115,17 @@ def torch_mla_extend(
         q = qs[i]
         k = kvc
         v, _ = torch.split(kvc, [kv_lora_rank, qk_rope_head_dim], dim=-1)
-        o, lse = ref_masked_attention(q,
-                                      k,
-                                      v,
-                                      sm_scale,
-                                      dtype,
-                                      is_causal=is_causal,
-                                      is_fp8=is_fp8,
-                                      q_scale=q_scale,
-                                      kv_scale=kv_scale)
+        o, lse = ref_masked_attention(
+            q,
+            k,
+            v,
+            sm_scale,
+            dtype,
+            is_causal=is_causal,
+            is_fp8=is_fp8,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+        )
         os.append(o)
         lses.append(lse)
     o = torch.concat(os)
@@ -237,16 +244,17 @@ def test_mla(
         kv_scale=kv_scale,
     )
 
-
     # aiter implementation
-    work_meta_data     = torch.empty([10], dtype=torch.uint64, device="cuda")
-    work_indptr        = torch.empty([81], dtype=torch.int32, device="cuda")
-    work_info_set      = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
-    reduce_indptr      = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
-    reduce_final_map   = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
-    reduce_partial_map = torch.empty([batch_size * 80], dtype=torch.int32, device="cuda")
+    work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
+    work_indptr = torch.empty([81], dtype=torch.int32, device="cuda")
+    work_info_set = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
+    reduce_indptr = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
+    reduce_final_map = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
+    reduce_partial_map = torch.empty(
+        [batch_size * 80], dtype=torch.int32, device="cuda"
+    )
     # num_reduce_tile    = torch.empty([1], dtype=torch.int32, device="cuda")
-    
+
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
@@ -261,7 +269,7 @@ def test_mla(
         reduce_partial_map,
     )
     print(work_indptr)
-    print(work_info_set[:work_indptr[-1]])
+    print(work_info_set[: work_indptr[-1]])
     print(reduce_indptr)
     print(reduce_final_map)
     print(reduce_partial_map)
@@ -327,7 +335,7 @@ def test_mla(
 
 
 kv_lora_rank = 512
-qk_nope_head_dim = 128 
+qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
@@ -405,7 +413,7 @@ parser.add_argument(
     type=int,
     nargs="*",
     # default=[28, 512, 1023, 4888, 12800], #
-    default=[4096, 8192, 16384], #
+    default=[4096, 8192, 16384],  #
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -414,7 +422,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(80, 128)], # [41],
+    default=[i for i in range(80, 128)],  # [41],
     # default=[64], # [41],
     help="""Batch size.
     e.g.: -b 16""",
@@ -461,5 +469,3 @@ for nhead, mtp in list_nhead:
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")
     aiter.logger.info(f"summary:\n{df}")
-
-
