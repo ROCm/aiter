@@ -72,7 +72,7 @@ def perftest(
             with tpf.profile(
                 activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                 profile_memory=False,
-                with_stack=False,
+                with_stack=True,
                 with_modules=True,
                 # record_shapes=True,
                 on_trace_ready=(

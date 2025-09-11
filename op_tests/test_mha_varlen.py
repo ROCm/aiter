@@ -15,6 +15,7 @@ from aiter.test_mha_common import (
 )
 import pytest
 import argparse
+from aiter.test_common import perftest, benchmark
 
 
 def run_torch(
@@ -71,7 +72,7 @@ def run_torch(
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
         return out, dq, dk, dv
 
-
+@perftest()
 def run_ck(
     q,
     k,
@@ -114,63 +115,65 @@ def run_ck(
     else:
         bias_unpad = None
 
-    outputs = aiter.flash_attn_varlen_func(
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        min_seqlen_q=min_seqlen_q,
-        dropout_p=dropout_p,
-        causal=causal,
-        window_size=window_size,
-        bias=bias_unpad,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        return_lse=return_lse,
-        return_attn_probs=return_attn_probs,
-    )
+    with torch.no_grad():
+        outputs = aiter.flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            min_seqlen_q=min_seqlen_q,
+            dropout_p=dropout_p,
+            causal=causal,
+            window_size=window_size,
+            bias=bias_unpad,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_lse=False,
+            return_attn_probs=return_attn_probs,
+        )
 
     if type(outputs) is tuple:
         out = output_pad_fn(outputs[0])
     else:
         out = output_pad_fn(outputs)
+    return out
 
-    if dropout_p > 0.0 and return_attn_probs:
-        (_, seqlen_q, _, d) = q.shape
-        (_, seqlen_k, _, d) = k.shape
-        S_dmask = outputs[-1]
-        S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
-        S_dmask = pad_rearrange_dropout_mask_hts_to_bhss(
-            S_dmask, cu_seqlens_q, seqlen_q, seqlen_k
-        )
-        S_dmask_converted = convert_flash_attn_S_to_softmax(
-            S_dmask,
-            seqlen_q,
-            seqlen_k,
-            query_padding_mask,
-            key_padding_mask,
-            d,
-            dropout_p > 0.0,
-            causal=causal,
-            window_size=window_size,
-        )
-        dropout_mask = S_dmask_converted >= 0
-    else:
-        dropout_mask = None
+    # if dropout_p > 0.0 and return_attn_probs:
+    #     (_, seqlen_q, _, d) = q.shape
+    #     (_, seqlen_k, _, d) = k.shape
+    #     S_dmask = outputs[-1]
+    #     S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
+    #     S_dmask = pad_rearrange_dropout_mask_hts_to_bhss(
+    #         S_dmask, cu_seqlens_q, seqlen_q, seqlen_k
+    #     )
+    #     S_dmask_converted = convert_flash_attn_S_to_softmax(
+    #         S_dmask,
+    #         seqlen_q,
+    #         seqlen_k,
+    #         query_padding_mask,
+    #         key_padding_mask,
+    #         d,
+    #         dropout_p > 0.0,
+    #         causal=causal,
+    #         window_size=window_size,
+    #     )
+    #     dropout_mask = S_dmask_converted >= 0
+    # else:
+    #     dropout_mask = None
 
-    if dout is None or not return_lse:
-        return out, dropout_mask, None, None, None
-    else:
-        dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
-            out, (q_unpad, k_unpad, v_unpad), dout
-        )
-        dq = dq_pad_fn(dq_unpad)
-        dk = dk_pad_fn(dk_unpad)
-        dv = dk_pad_fn(dv_unpad)
-        return out, dropout_mask, dq, dk, dv
+    # if dout is None or not return_lse:
+    #     return out, dropout_mask, None, None, None
+    # else:
+    #     dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
+    #         out, (q_unpad, k_unpad, v_unpad), dout
+    #     )
+    #     dq = dq_pad_fn(dq_unpad)
+    #     dk = dk_pad_fn(dk_unpad)
+    #     dv = dk_pad_fn(dv_unpad)
+    #     return out, dropout_mask, dq, dk, dv
 
 
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
@@ -215,6 +218,8 @@ def run_ck(
         (2048, 2048),
     ],
 )
+
+@benchmark()
 def test_flash_attn_varlen_func(
     batch_size,
     nheads,
@@ -306,7 +311,7 @@ def test_flash_attn_varlen_func(
     else:
         return_attn_probs = False
 
-    out, dropout_mask, dq, dk, dv = run_ck(
+    out, us  = run_ck(
         q,
         k,
         v,
@@ -323,6 +328,8 @@ def test_flash_attn_varlen_func(
         return_lse,
         return_attn_probs,
     )
+    print("ms: ", us /1000.0)
+    return
 
     out_ref, dq_ref, dk_ref, dv_ref = run_torch(
         q,

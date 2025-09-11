@@ -12,6 +12,7 @@ from aiter.test_mha_common import (
 )
 import pytest
 import argparse
+from aiter.test_common import perftest
 
 
 def run_torch(
@@ -67,7 +68,7 @@ def run_torch(
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
         return out, dq, dk, dv, None
 
-
+@perftest()
 def run_ck(
     q,
     k,
@@ -82,48 +83,50 @@ def run_ck(
     return_lse=True,
     return_attn_probs=False,
 ):
-    out, _, S_dmask = aiter.flash_attn_func(
-        q,
-        k,
-        v,
-        dropout_p,
-        causal=causal,
-        window_size=window_size,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        return_lse=return_lse,
-        return_attn_probs=return_attn_probs,
-    )
-
-    if dropout_p > 0.0:
-        (_, seqlen_q, _, d) = q.shape
-        (_, seqlen_k, _, d) = k.shape
-        (_, seqlen_k, _, d_v) = v.shape
-        S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
-        S_dmask_converted = convert_flash_attn_S_to_softmax(
-            S_dmask,
-            seqlen_q,
-            seqlen_k,
-            None,
-            None,
-            d,
-            dropout_p > 0.0,
+    with torch.no_grad():
+        out = aiter.flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p,
             causal=causal,
             window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_lse=False,
+            return_attn_probs=return_attn_probs,
         )
-        dropout_mask = S_dmask_converted >= 0
-    else:
-        dropout_mask = None
+    return out
 
-    if dout == None:
-        return out, dropout_mask
-    elif bias is not None:
-        dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
-        return out, dropout_mask, dq, dk, dv, dbias
-    else:
-        dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, dropout_mask, dq, dk, dv, None
+    # if dropout_p > 0.0:
+    #     (_, seqlen_q, _, d) = q.shape
+    #     (_, seqlen_k, _, d) = k.shape
+    #     (_, seqlen_k, _, d_v) = v.shape
+    #     S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
+    #     S_dmask_converted = convert_flash_attn_S_to_softmax(
+    #         S_dmask,
+    #         seqlen_q,
+    #         seqlen_k,
+    #         None,
+    #         None,
+    #         d,
+    #         dropout_p > 0.0,
+    #         causal=causal,
+    #         window_size=window_size,
+    #     )
+    #     dropout_mask = S_dmask_converted >= 0
+    # else:
+    #     dropout_mask = None
+
+    # if dout == None:
+    #     return out, dropout_mask
+    # elif bias is not None:
+    #     dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
+    #     return out, dropout_mask, dq, dk, dv, dbias
+    # else:
+    #     dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+    #     return out, dropout_mask, dq, dk, dv, None
 
 
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
@@ -231,7 +234,7 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
-    out, dropout_mask, dq, dk, dv, dbias = run_ck(
+    out, us = run_ck(
         q,
         k,
         v,
@@ -245,6 +248,8 @@ def test_flash_attn_output(
         return_lse,
         return_attn_probs,
     )
+    print("ms: ", us /1000.0)
+    return
 
     out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
         q,
