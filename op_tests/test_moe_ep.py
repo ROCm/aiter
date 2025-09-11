@@ -9,7 +9,6 @@ from aiter.fused_moe import (
     fused_moe,
     torch_moe,
 )
-
 from aiter.fused_moe_bf16_asm import asm_moe
 from aiter.ops.shuffle import shuffle_weight
 from aiter import ActivationType
