@@ -5,7 +5,7 @@ import os
 import sys
 import shutil
 
-from setuptools import setup
+from setuptools import Distribution, setup
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
@@ -16,7 +16,6 @@ from jit.utils.cpp_extension import (
     BuildExtension,
     IS_HIP_EXTENSION,
 )
-from multiprocessing import Pool
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 PACKAGE_NAME = "aiter"
@@ -36,6 +35,25 @@ else:
 FORCE_CXX11_ABI = False
 
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+
+
+def build_one_module(one_opt_args):
+    """Build a single module. Moved to module level to fix multiprocessing pickling issue."""
+    core.build_module(
+        md_name=one_opt_args["md_name"],
+        srcs=one_opt_args["srcs"],
+        flags_extra_cc=one_opt_args["flags_extra_cc"] + ["-DPREBUILD_KERNELS"],
+        flags_extra_hip=one_opt_args["flags_extra_hip"]
+        + ["-DPREBUILD_KERNELS"],
+        blob_gen_cmd=one_opt_args["blob_gen_cmd"],
+        extra_include=one_opt_args["extra_include"],
+        extra_ldflags=None,
+        verbose=False,
+        is_python_module=True,
+        is_standalone=False,
+        torch_exclude=False,
+        prebuild=1,
+    )
 
 
 def getMaxJobs():
@@ -99,23 +117,6 @@ if IS_ROCM:
         core.recopy_ck()
         os.makedirs(prebuild_dir + "/srcs")
 
-        def build_one_module(one_opt_args):
-            core.build_module(
-                md_name=one_opt_args["md_name"],
-                srcs=one_opt_args["srcs"],
-                flags_extra_cc=one_opt_args["flags_extra_cc"] + ["-DPREBUILD_KERNELS"],
-                flags_extra_hip=one_opt_args["flags_extra_hip"]
-                + ["-DPREBUILD_KERNELS"],
-                blob_gen_cmd=one_opt_args["blob_gen_cmd"],
-                extra_include=one_opt_args["extra_include"],
-                extra_ldflags=None,
-                verbose=False,
-                is_python_module=True,
-                is_standalone=False,
-                torch_exclude=False,
-                prebuild=1,
-            )
-
         # step 1, build *.cu -> module*.so
         prebuid_thread_num = 5
         prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
@@ -124,8 +125,9 @@ if IS_ROCM:
             prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-        with Pool(processes=prebuid_thread_num) as pool:
-            pool.map(build_one_module, all_opts_args_build)
+        # Use sequential processing to avoid multiprocessing pickling issues
+        for one_opt_args in all_opts_args_build:
+            build_one_module(one_opt_args)
 
         ck_batched_gemm_folders = [
             f"{this_dir}/csrc/{name}/include"
@@ -206,6 +208,12 @@ setup_requires = [
 if PREBUILD_KERNELS == 1:
     setup_requires.append("pandas")
 
+
+class ForcePlatlibDistribution(Distribution):
+    def has_ext_modules(self):
+        return True
+
+
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
@@ -229,6 +237,7 @@ setup(
         "einops",
     ],
     setup_requires=setup_requires,
+    distclass=ForcePlatlibDistribution,
 )
 
 if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
