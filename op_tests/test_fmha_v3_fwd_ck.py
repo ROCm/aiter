@@ -185,7 +185,7 @@ def test_fmha_v3_fwd_ck(
     else:
         out_ref, _ = flash_attn_func(q, k, v, causal=causal, return_lse=True)
         print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-        torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(out, out_ref, rtol=1e-3, atol=1e-2)
 
 
 if __name__ == "__main__":
