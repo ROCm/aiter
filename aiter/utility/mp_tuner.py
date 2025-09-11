@@ -83,12 +83,10 @@ def worker(
 
     except Exception as e:
         print(f"Error in process:{pid} info:{info}: {e}")
-        # traceback.print_exc()
-        if res is None and ref is not None:
-            print("The output is None, can't match with reference")
+        # if res is None and ref is not None:
+        #    print("The output is None, can't match with reference")
         us = float("inf")
         max_err_ratio = 1.0
-
     return info, us, max_err_ratio
 
 
@@ -210,8 +208,7 @@ def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
         )
         ret = worker(gpuIDMap, *work_args, tol_err_ratio=err_ratio)
         rets.append(ret)
-
-    return post_process(rets, fast_mode, err_ratio)[0] if shape_grouped else rets[0]
+    return rets
 
 
 def mp_tuner(
@@ -266,8 +263,11 @@ def mp_tuner(
 
     pool.close()
     pool.join()
-    return (
-        [el.get() for el in rets]
-        if shape_grouped and not fast_mode
-        else post_process([el.get() for el in rets], fast_mode, err_ratio)
-    )
+
+    import itertools
+
+    if shape_grouped:
+        result = list(itertools.chain.from_iterable(el.get() for el in rets))
+    else:
+        result = [el.get()[0] for el in rets]
+    return result
