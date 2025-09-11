@@ -24,6 +24,17 @@
 #define WARP_SIZE 64
 namespace aiter
 {
+    namespace impl {
+        // use this type for argsort
+        template<typename KType, typename VType>
+        struct kvpair_t {
+            KType key;
+            VType value;
+        };
+
+        using topk_score_t = kvpair_t<int, float>;
+    }
+
     template <typename T, typename F, int wave_size_ = 64>
     __device__ constexpr T wave_reduce(T local, F reduce_f, ck_tile::number<wave_size_> = {})
     {
@@ -435,7 +446,7 @@ namespace aiter
         extern __shared__ char shared_mem[];
         const int token_idx = blockIdx.x;
 
-        char *ptr = (char *)(((size_t)shared_mem + 255) & ~255);
+        char *ptr = shared_mem; // (char *)(((size_t)shared_mem + 255) & ~255);
         float *scores = reinterpret_cast<float *>(ptr);
         ptr += num_experts * sizeof(float);
 
@@ -446,7 +457,7 @@ namespace aiter
         ptr += NUM_GRP * sizeof(int);
 
         int *final_topk_idx = reinterpret_cast<int *>(ptr);
-        int *topk_indices = final_topk_idx; // reuse
+        // int *topk_indices = final_topk_idx; // reuse
         ptr += topk * sizeof(int);
 
         float *topk_values = reinterpret_cast<float *>(ptr);
@@ -454,6 +465,12 @@ namespace aiter
 
         float *bias = reinterpret_cast<float *>(ptr);
         ptr += num_experts * sizeof(float);
+
+        // used for arg sort
+        int *sorted_k= reinterpret_cast<int *>(ptr);
+        ptr += max(topk, topk_group) * sizeof(int);
+
+        float *sorted_v= reinterpret_cast<float *>(ptr);
 
         // float * sorting_smem = reinterpret_cast<float *>(ptr);
 
@@ -496,7 +513,7 @@ namespace aiter
                     reinterpret_cast<f32vec*>(bias)[e] = tmp2_f32;
                 }
             }
-            // __syncthreads();
+            __syncthreads();
         }
         else
         {
@@ -515,29 +532,10 @@ namespace aiter
                     max_val = gating;
                 }
             }
-#if 0
-            __shared__ float sdata;
-            __syncthreads();
-#pragma unroll
-            for (int i = 0; i < 6; i++)
-            {
-                int offset = 1 << i;
-                float tmp_val = __shfl_down(max_val, offset);
-                if (tmp_val > max_val)
-                {
-                    max_val = tmp_val;
-                }
-            }
-            if (threadIdx.x == 0)
-            {
-                sdata = max_val;
-            }
-            __syncthreads();
-            max_val = sdata;
-#else
+
             max_val = wave_reduce(max_val, [](auto a, auto b)
                                      { return a > b ? a : b; });
-#endif
+
             float thread_sum = 0.0;
             //for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
             for(int i_ = 0; i_ < 4; i_++)
@@ -560,23 +558,6 @@ namespace aiter
 
         if constexpr (isBiased)
         {
-#if 0
-            for (int g = threadIdx.x; g < NUM_GRP; g += blockDim.x)
-            {
-                float max1 = -INFINITY, max2 = -INFINITY;
-                const int start = g * experts_per_group;
-                const int end = start + experts_per_group;
-
-                for (int e = start; e < end; ++e)
-                {
-                    auto s_tmp = scores[e];
-                    max2 = s_tmp > max2 ? s_tmp : max2;
-                    max2 = s_tmp > max1 ? max1 : max2;
-                    max1 = s_tmp > max1 ? s_tmp : max1;
-                }
-                group_scores[g] = max1 + max2;
-            }
-#else
             constexpr int lane_group_size = 8;  // experts_per_group / 4 per thread to iter
             constexpr int lane_steps = [&](){
                 if constexpr (lane_group_size == 8) return 3;
@@ -594,9 +575,6 @@ namespace aiter
                 for (int e = start; e < end; e += lane_group_size)
                 {
                     auto s_tmp = scores[e + lane_id];
-                    // max2 = s_tmp > max2 ? s_tmp : max2;
-                    // max2 = s_tmp > max1 ? max1 : max2;
-                    // max1 = s_tmp > max1 ? s_tmp : max1;
                     max2 = dev_max_(s_tmp, max2);
                     max2 = s_tmp > max1 ? max1 : max2;
                     max1 = dev_max_(s_tmp, max1);
@@ -631,14 +609,12 @@ namespace aiter
                         max2 = dev_max_(remote_max_1, max2);
                         max2 = remote_max_1 > max1 ? max1 : max2;
                         max1 = dev_max_(remote_max_1, max1);
-
                         max2 = dev_max_(max2, remote_max_2);
                     });
                 }
                 if(lane_id == 0)
-                group_scores[g] = max1 + max2;
+                    group_scores[g] = max1 + max2;
             }
-#endif
             __syncthreads();
         }
         else
@@ -673,55 +649,40 @@ namespace aiter
             __syncthreads();
 #endif
         }
-#if 0
-        for (int k = 0; k < topk_group; k++)
-        {
-            float max_val = -INFINITY;
-            int max_idx = NUM_GRP;
-#pragma unroll
-            for (int g = 0; g < NUM_GRP; g++)
-            {
-                auto gs_tmp = group_scores[g];
-                max_idx = gs_tmp > max_val ? g : max_idx;
-                max_val = gs_tmp > max_val ? gs_tmp : max_val;
-            }
-            group_scores[max_idx] = -INFINITY;
-        }
-#else
+
         if constexpr (NUM_GRP == 8 || NUM_GRP == 4 || NUM_GRP == 2) {
             float gs_tmp = -INFINITY;
             if(threadIdx.x < NUM_GRP)
                 gs_tmp = group_scores[threadIdx.x];
-#if 0
-            warp_merge_sort_to_smem(sorting_smem, gs_tmp, ck_tile::number<NUM_GRP>{});
-            auto pivot = sorting_smem[topk_group - 1];
+#if 1
+            int group_id = threadIdx.x;
+            auto [sorted_gsc, sorted_gid] = warp_arg_merge_sort_to_reg(gs_tmp, group_id, ck_tile::number<NUM_GRP>{});
+
+            // NOTE: group_map_idx is now sorted
+            if(threadIdx.x == 0) {
+                *reinterpret_cast<ck_tile::remove_cvref_t<decltype(sorted_gid)>*>(group_map_idx) = sorted_gid;
+                // reinterpret_cast<ck_tile::remove_cvref_t<decltype(sorted_gsc)>*>(group_scores ) = sorted_gsc;
+            }
+            __syncthreads();
 #else
             auto sort_res = warp_merge_sort_to_reg(gs_tmp, ck_tile::number<NUM_GRP>{});
-            // auto pivot = sort_res[3];
-            auto pivot = __shfl(sort_res[topk_group - 1], 0);
-#endif
+            // auto pivot = __shfl(sort_res[topk_group - 1], 0);
+            auto pivot = __shfl(sort_res[3], 0);    // TODO: avoid indexing register using dyanmic value
 
-#if 1
-            if(gs_tmp >= pivot ) {
+            __syncthreads();
+
+            int local_cnt = gs_tmp >= pivot ? 1 : 0;
+            warp_cumsum(local_cnt, ck_tile::number<NUM_GRP>{});
+
+            if(gs_tmp >= pivot && local_cnt <= topk_group) {
                 group_scores[threadIdx.x] = -INFINITY;
             }
 
-            int local_cnt = gs_tmp >= pivot ? 1 : 0;
-            warp_cumsum(local_cnt, ck_tile::number<NUM_GRP>{});
-            if(gs_tmp >= pivot) {
+            if(gs_tmp >= pivot && local_cnt <= topk_group) {
                 group_map_idx[local_cnt - 1] = threadIdx.x;
-            }
-#else
-            int local_cnt = gs_tmp >= pivot ? 1 : 0;
-            warp_cumsum(local_cnt, ck_tile::number<NUM_GRP>{});
-            if(gs_tmp >= pivot) {
-                group_map_idx[local_cnt - 1] = threadIdx.x;
-            }
-            if(threadIdx.x < (NUM_GRP - topk_group)) {
-                group_map_idx[topk_group + threadIdx.x] = -1;
             }
 #endif
-            __syncthreads();
+            //__syncthreads();
         } else {
 #pragma unroll
             for (int k = 0; k < topk_group; k++)
@@ -738,10 +699,9 @@ namespace aiter
                 group_scores[max_idx] = -INFINITY;
             }
         }
-#endif
 
-#if 1
         __syncthreads();
+#if 0
         for (int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
         {
             int group_idx = e * vec_size / experts_per_group;
@@ -751,108 +711,82 @@ namespace aiter
             }
         }
 #else
-        for (int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
         {
-            constexpr int experts_per_group___ = 32;
-            int group_idx = e * vec_size / experts_per_group___;
-            if (group_map_idx[group_idx] == -1)
+            // constexpr int lanegroups = 4;   // equal to topk group
+            constexpr int lanegroup_size = 16;  // 16*4 = 64
+            int lanegroup_id = threadIdx.x / lanegroup_size;
+            int lane_id      = threadIdx.x % lanegroup_size;
+            // group_map_idx from left to right is sorted :)
+            int masked_out_expert_group_id = group_map_idx[topk_group + lanegroup_id];
+            for (int offset = lane_id; offset < experts_per_group; offset += lanegroup_size)
             {
-                // auto remapped_idx = group_map_idx[group_idx] * experts_per_group___ / vec_size;
-                // TODO: this is not correct, need remap the real group-idx
-                scores_vec[e] = -INFINITY;
+                int idx = masked_out_expert_group_id * experts_per_group + offset;
+                scores[idx] = -INFINITY;
             }
         }
 #endif
         __syncthreads();
 
         float sum = 0.0f;
-#if 0
-        using kvp = hipcub::KeyValuePair<int, float>;
-        using BlockReduce = hipcub::BlockReduce<kvp, WARP_SIZE>;
-        __shared__ typename BlockReduce::TempStorage tmpStorage;
-        kvp thread_kvp;
-        hipcub::ArgMax arg_max;
-        for (int k = 0; k < topk; ++k)
-        {
-            float max_val = scores[k];
-            int max_idx = k;
-
-            for (int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
-            {
-                f32vec tmp = scores_vec[e];
-#pragma unroll
-                for (size_t i = 0; i < vec_size; i++)
-                {
-                    max_idx = tmp[i] > max_val ? (e * vec_size + i) : max_idx;
-                    max_val = tmp[i] > max_val ? tmp[i] : max_val;
-                    // if (tmp[i] > max_val)
-                    // {
-                    //     max_val = tmp[i];
-                    //     max_idx = e * vec_size + i;
-                    // }
-                }
-            }
-            thread_kvp.key = max_idx;
-            thread_kvp.value = max_val;
-            const kvp result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
-            // warpReduceMax(max_val, max_idx);
-            // blockReduceMax(max_val, max_idx);
-
-            if (threadIdx.x == 0)
-            {
-                max_val = result_kvp.value;
-                max_idx = result_kvp.key;
-                if constexpr (isBiased)
-                {
-                    max_val -= bias[max_idx];
-                }
-                scores[max_idx] = -INFINITY;
-                topk_indices[k] = max_idx;
-                topk_values[k] = max_val;
-                if (need_renorm)
-                {
-                    sum += max_val;
-                }
-            }
-            __syncthreads();
-        }
-
-        if (need_renorm)
-        {
-            if (threadIdx.x == 0)
-            {
-                scores[0] = routed_scaling_factor / sum; // reuse lds
-            }
-            __syncthreads();
-            sum = scores[0];
-        }
-        else
-        {
-            sum = routed_scaling_factor;
-        }
-
-        for (int k = threadIdx.x; k < topk; k += blockDim.x)
-        {
-            topk_weights[token_idx * stride_tk + k] = topk_values[k] * sum;
-            topk_ids[token_idx * stride_tk + k] = topk_indices[k];
-        }
-#else
 
         if constexpr (NUM_GRP == 8 ) {
             constexpr int experts_per_group___ = 32;
             constexpr int final_score_vec = 2;
 
             using final_score_vec_t = ck_tile::ext_vector_t<float, final_score_vec>;
+            using final_expid_vec_t = ck_tile::ext_vector_t<int, final_score_vec>;
             final_score_vec_t s;
+            final_expid_vec_t e;
 
             for(int i = 0; i < final_score_vec; i++) {
                 int expert_group_id = (threadIdx.x + i * 64) / experts_per_group___; //
                 int expert_id_inside_group = threadIdx.x % experts_per_group___;
                 int remapped_group_id = group_map_idx[expert_group_id];
-                // if(remapped_group_id != -1)
+                e[i] = remapped_group_id * experts_per_group___ + expert_id_inside_group;
                 s[i] = scores[remapped_group_id * experts_per_group___ + expert_id_inside_group];
             }
+#if 1
+            using vec8_t = ck_tile::ext_vector_t<float, 8>;
+            using aec8_t = ck_tile::ext_vector_t<int, 8>;
+            vec8_t local_res[final_score_vec];
+            aec8_t local_arg[final_score_vec];
 
+            for(int i = 0; i < final_score_vec; i++) {
+                auto [res_16, arg_16] = warp_arg_merge_sort_to_reg(s[i], e[i], ck_tile::number<16>{});
+
+                vec8_t res_16_8 = vec8_t{res_16[0], res_16[1], res_16[2], res_16[3], res_16[4], res_16[5], res_16[6], res_16[7]};
+                vec8_t res_16_8_r = mov_dpp_vec_from_(res_16_8, ck_tile::number<16>{});
+                aec8_t arg_16_8 = aec8_t{arg_16[0], arg_16[1], arg_16[2], arg_16[3], arg_16[4], arg_16[5], arg_16[6], arg_16[7]};
+                aec8_t arg_16_8_r = mov_dpp_vec_from_(arg_16_8, ck_tile::number<16>{});
+                auto [res_32, arg_32] = warp_arg_merge_sort_combine2(res_16_8_r, res_16_8, arg_16_8_r, arg_16_8, ck_tile::number<16>{});
+
+                vec8_t res_32_8 = vec8_t{res_32[0], res_32[1], res_32[2], res_32[3], res_32[4], res_32[5], res_32[6], res_32[7]};
+                vec8_t res_32_8_r = mov_dpp_vec_from_(res_32_8, ck_tile::number<32>{});
+                aec8_t arg_32_8 = aec8_t{arg_32[0], arg_32[1], arg_32[2], arg_32[3], arg_32[4], arg_32[5], arg_32[6], arg_32[7]};
+                aec8_t arg_32_8_r = mov_dpp_vec_from_(arg_32_8, ck_tile::number<32>{});
+                auto [res_64, arg_64] = warp_arg_merge_sort_combine2(res_32_8_r, res_32_8, arg_32_8_r, arg_32_8, ck_tile::number<16>{});
+
+                local_res[i] = vec8_t{res_64[0], res_64[1], res_64[2], res_64[3], res_64[4], res_64[5], res_64[6], res_64[7]};
+                local_arg[i] = aec8_t{arg_64[0], arg_64[1], arg_64[2], arg_64[3], arg_64[4], arg_64[5], arg_64[6], arg_64[7]};
+            }
+
+            auto [lr_16, la_16] = warp_arg_merge_sort_combine2(local_res[0], local_res[1], local_arg[0], local_arg[1], ck_tile::number<16>{});
+            
+            // if(threadIdx.x == 0) {
+            //     printf("+++ %f,%f,%f,%f,%f,%f,%f,%f\n", lr_16[0], lr_16[1], lr_16[2], lr_16[3], lr_16[4], lr_16[5], lr_16[6], lr_16[7]);
+            //     printf("+++ %d,%d,%d,%d,%d,%d,%d,%d\n", la_16[0], la_16[1], la_16[2], la_16[3], la_16[4], la_16[5], la_16[6], la_16[7]);
+            // }
+
+            // use first topk element
+            if (threadIdx.x == 0){
+                auto topk_v = vec8_t{lr_16[0], lr_16[1], lr_16[2], lr_16[3], lr_16[4], lr_16[5], lr_16[6], lr_16[7]};
+                auto topk_i = aec8_t{la_16[0], la_16[1], la_16[2], la_16[3], la_16[4], la_16[5], la_16[6], la_16[7]};
+
+                *reinterpret_cast<vec8_t*>(topk_values) = topk_v;
+                *reinterpret_cast<aec8_t*>(final_topk_idx) = topk_i;
+            }
+            __syncthreads();
+#else
             using vec8_t = ck_tile::ext_vector_t<float, 8>;
             vec8_t local_res[final_score_vec];
             for(int i = 0; i < final_score_vec; i++) {
@@ -872,25 +806,40 @@ namespace aiter
             auto local_res_16 = warp_merge_sort_combine2(local_res[0], local_res[1], ck_tile::number<16>{});
 
             float pivot = __shfl(local_res_16[7], 0);
-
+            // reinterpret_cast<vec8_t*>(sorted_score) = vec8_t{local_res_16[0], local_res_16[1], local_res_16[2], local_res_16[3], local_res_16[4], local_res_16[5], local_res_16[6], local_res_16[7]}
+            __syncthreads();
+            {
+                // if(threadIdx.x == 0 && blockIdx.x > 5000 ) {
+                // if(threadIdx.x == 0 ) {
+                //     printf("#### [%4d] pivot:%f, %f,%f,%f,%f, %f,%f,%f,%f\n", static_cast<int>(blockIdx.x), pivot,
+                //     local_res_16[0], local_res_16[1], local_res_16[2],local_res_16[3], 
+                //                                         local_res_16[4], local_res_16[5], local_res_16[6],local_res_16[7]);
+                // }
+            }
             int offset = 0;
             for(int i = 0; i < final_score_vec; i++) {
                 int local_cnt = s[i] >= pivot ? 1 : 0;
                 warp_cumsum(local_cnt, ck_tile::number<64>{});
-                if(s[i] >= pivot) {
+                if(s[i] >= pivot && (local_cnt + offset) <= topk ) {
                     int expert_group_id = (threadIdx.x + i * 64) / experts_per_group___;
                     int expert_id_inside_group = threadIdx.x % experts_per_group___;
                     int remapped_group_id = group_map_idx[expert_group_id];
                     final_topk_idx[offset + local_cnt - 1] = remapped_group_id * experts_per_group___ + expert_id_inside_group;
                     topk_values[offset + local_cnt - 1] = s[i];
                 }
-                offset = __shfl(local_cnt, 63); 
+                offset = __shfl(local_cnt, 63);
+                // offset = offset >= topk ? topk : offset; // in case of duplication value case problem
+                __syncthreads();
             }
+#endif
+            __syncthreads();
 
+#if 1
             if constexpr (isBiased) {
                 if (threadIdx.x < topk) {
                     topk_values[threadIdx.x] -= bias[final_topk_idx[threadIdx.x]];
                 }
+                __syncthreads();
             }
             if (need_renorm)
             {
@@ -898,14 +847,14 @@ namespace aiter
                     sum = multithread_reduce(topk_values[threadIdx.x], [&](auto x_, auto y_){ return x_ + y_;}, 8);
                     topk_values[threadIdx.x] = topk_values[threadIdx.x] * routed_scaling_factor / sum;
                 }
+                __syncthreads();
             }
+#endif
             if (threadIdx.x < topk) {
                 topk_weights[token_idx * stride_tk + threadIdx.x] = topk_values[threadIdx.x];
                 topk_ids[token_idx * stride_tk + threadIdx.x] = final_topk_idx[threadIdx.x];
             }
         }
-#endif
-
     }
 } // namespace aiter end
 
@@ -1044,6 +993,8 @@ void biased_grouped_topk(
                               topk * sizeof(int) +
                               topk * sizeof(float)
                               + num_experts * sizeof(float) /*bias*/
+                              + (topk > topk_grp ? topk : topk_grp) * sizeof(int) /* sort_k*/
+                              + (topk > topk_grp ? topk : topk_grp) * sizeof(float) /* sort_v*/
                               + 255) &
                              ~255;
                             //   + 64 / num_expert_group * sizeof(float) /* for sorting */

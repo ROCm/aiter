@@ -353,6 +353,158 @@ __device__ __inline__ auto mov_dpp_vec_from_(const V& v, ck_tile::number<remote>
         res8_r[6] = mov_dpp_(res8[6],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
         res8_r[7] = mov_dpp_(res8[7],  ck_tile::number<0x108>{}); /* row_shl:8 */
 
+#define DPP_ARG_MERGE_16_CMP_(x_, y_, ax_, ay_)             \
+        using vec16_t = ck_tile::ext_vector_t<T, 16>;       \
+        using aec16_t = ck_tile::ext_vector_t<V, 16>;       \
+        vec16_t res16;                                      \
+        aec16_t arg16;                                      \
+                                                            \
+        res16[0]      = x_[0] > y_[0] ? x_[0] : y_[0];      \
+        T res16_8_tmp = x_[0] > y_[0] ? y_[0] : x_[0];      \
+        arg16[0]      = x_[0] > y_[0] ? ax_[0] : ay_[0];    \
+        V arg16_8_tmp = x_[0] > y_[0] ? ay_[0] : ax_[0];    \
+                                                            \
+        T res16_1_tmp = x_[1] > y_[1] ? x_[1] : y_[1];      \
+        T res16_9_tmp = x_[1] > y_[1] ? y_[1] : x_[1];      \
+        V arg16_1_tmp = x_[1] > y_[1] ? ax_[1] : ay_[1];    \
+        V arg16_9_tmp = x_[1] > y_[1] ? ay_[1] : ax_[1];    \
+                                                            \
+        T res16_2_tmp  = x_[2] > y_[2] ? x_[2] : y_[2];     \
+        T res16_10_tmp = x_[2] > y_[2] ? y_[2] : x_[2];     \
+        V arg16_2_tmp  = x_[2] > y_[2] ? ax_[2] : ay_[2];   \
+        V arg16_10_tmp = x_[2] > y_[2] ? ay_[2] : ax_[2];   \
+                                                            \
+        T res16_3_tmp  = x_[3] > y_[3] ? x_[3] : y_[3];     \
+        T res16_11_tmp = x_[3] > y_[3] ? y_[3] : x_[3];     \
+        V arg16_3_tmp  = x_[3] > y_[3] ? ax_[3] : ay_[3];   \
+        V arg16_11_tmp = x_[3] > y_[3] ? ay_[3] : ax_[3];   \
+                                                            \
+        T res16_4_tmp  = x_[4] > y_[4] ? x_[4] : y_[4];     \
+        T res16_12_tmp = x_[4] > y_[4] ? y_[4] : x_[4];     \
+        V arg16_4_tmp  = x_[4] > y_[4] ? ax_[4] : ay_[4];   \
+        V arg16_12_tmp = x_[4] > y_[4] ? ay_[4] : ax_[4];   \
+                                                            \
+        T res16_5_tmp  = x_[5] > y_[5] ? x_[5] : y_[5];     \
+        T res16_13_tmp = x_[5] > y_[5] ? y_[5] : x_[5];     \
+        V arg16_5_tmp  = x_[5] > y_[5] ? ax_[5] : ay_[5];   \
+        V arg16_13_tmp = x_[5] > y_[5] ? ay_[5] : ax_[5];   \
+                                                            \
+        T res16_6_tmp  = x_[6] > y_[6] ? x_[6] : y_[6];     \
+        T res16_14_tmp = x_[6] > y_[6] ? y_[6] : x_[6];     \
+        V arg16_6_tmp  = x_[6] > y_[6] ? ax_[6] : ay_[6];   \
+        V arg16_14_tmp = x_[6] > y_[6] ? ay_[6] : ax_[6];   \
+                                                            \
+        T res16_7_tmp  = x_[7] > y_[7] ? x_[7] : y_[7];     \
+        res16[15]      = x_[7] > y_[7] ? y_[7] : x_[7];     \
+        V arg16_7_tmp  = x_[7] > y_[7] ? ax_[7] : ay_[7];   \
+        arg16[15]      = x_[7] > y_[7] ? ay_[7] : ax_[7];   \
+                                                            \
+        T res16_4_tmp_x = res16_4_tmp > res16_8_tmp ? res16_4_tmp : res16_8_tmp;        \
+        T res16_8_tmp_x = res16_4_tmp > res16_8_tmp ? res16_8_tmp : res16_4_tmp;        \
+        V arg16_4_tmp_x = res16_4_tmp > res16_8_tmp ? arg16_4_tmp : arg16_8_tmp;        \
+        V arg16_8_tmp_x = res16_4_tmp > res16_8_tmp ? arg16_8_tmp : arg16_4_tmp;        \
+                                                                                        \
+        T res16_5_tmp_x = res16_5_tmp > res16_9_tmp ? res16_5_tmp : res16_9_tmp;        \
+        T res16_9_tmp_x = res16_5_tmp > res16_9_tmp ? res16_9_tmp : res16_5_tmp;        \
+        V arg16_5_tmp_x = res16_5_tmp > res16_9_tmp ? arg16_5_tmp : arg16_9_tmp;        \
+        V arg16_9_tmp_x = res16_5_tmp > res16_9_tmp ? arg16_9_tmp : arg16_5_tmp;        \
+                                                                                        \
+        T res16_6_tmp_x  = res16_6_tmp > res16_10_tmp ? res16_6_tmp  : res16_10_tmp;    \
+        T res16_10_tmp_x = res16_6_tmp > res16_10_tmp ? res16_10_tmp : res16_6_tmp;     \
+        V arg16_6_tmp_x  = res16_6_tmp > res16_10_tmp ? arg16_6_tmp  : arg16_10_tmp;    \
+        V arg16_10_tmp_x = res16_6_tmp > res16_10_tmp ? arg16_10_tmp : arg16_6_tmp;     \
+                                                                                        \
+        T res16_7_tmp_x  = res16_7_tmp > res16_11_tmp ? res16_7_tmp  : res16_11_tmp;    \
+        T res16_11_tmp_x = res16_7_tmp > res16_11_tmp ? res16_11_tmp : res16_7_tmp;     \
+        V arg16_7_tmp_x  = res16_7_tmp > res16_11_tmp ? arg16_7_tmp  : arg16_11_tmp;    \
+        V arg16_11_tmp_x = res16_7_tmp > res16_11_tmp ? arg16_11_tmp : arg16_7_tmp;     \
+                                                                                        \
+        T res16_2_tmp_x  = res16_2_tmp > res16_4_tmp_x ? res16_2_tmp   : res16_4_tmp_x;     \
+        T res16_4_tmp_xx = res16_2_tmp > res16_4_tmp_x ? res16_4_tmp_x : res16_2_tmp ;      \
+        V arg16_2_tmp_x  = res16_2_tmp > res16_4_tmp_x ? arg16_2_tmp   : arg16_4_tmp_x;     \
+        V arg16_4_tmp_xx = res16_2_tmp > res16_4_tmp_x ? arg16_4_tmp_x : arg16_2_tmp ;      \
+                                                                                            \
+        T res16_3_tmp_x  = res16_3_tmp > res16_5_tmp_x ? res16_3_tmp   : res16_5_tmp_x;     \
+        T res16_5_tmp_xx = res16_3_tmp > res16_5_tmp_x ? res16_5_tmp_x : res16_3_tmp ;      \
+        V arg16_3_tmp_x  = res16_3_tmp > res16_5_tmp_x ? arg16_3_tmp   : arg16_5_tmp_x;     \
+        V arg16_5_tmp_xx = res16_3_tmp > res16_5_tmp_x ? arg16_5_tmp_x : arg16_3_tmp ;      \
+                                                                                            \
+        T res16_6_tmp_xx = res16_6_tmp_x > res16_8_tmp_x ? res16_6_tmp_x : res16_8_tmp_x;   \
+        T res16_8_tmp_xx = res16_6_tmp_x > res16_8_tmp_x ? res16_8_tmp_x : res16_6_tmp_x;   \
+        V arg16_6_tmp_xx = res16_6_tmp_x > res16_8_tmp_x ? arg16_6_tmp_x : arg16_8_tmp_x;   \
+        V arg16_8_tmp_xx = res16_6_tmp_x > res16_8_tmp_x ? arg16_8_tmp_x : arg16_6_tmp_x;   \
+                                                                                            \
+        T res16_7_tmp_xx = res16_7_tmp_x > res16_9_tmp_x ? res16_7_tmp_x : res16_9_tmp_x;   \
+        T res16_9_tmp_xx = res16_7_tmp_x > res16_9_tmp_x ? res16_9_tmp_x : res16_7_tmp_x;   \
+        V arg16_7_tmp_xx = res16_7_tmp_x > res16_9_tmp_x ? arg16_7_tmp_x : arg16_9_tmp_x;   \
+        V arg16_9_tmp_xx = res16_7_tmp_x > res16_9_tmp_x ? arg16_9_tmp_x : arg16_7_tmp_x;   \
+                                                                                            \
+        T res16_10_tmp_xx = res16_10_tmp_x > res16_12_tmp ? res16_10_tmp_x : res16_12_tmp  ;    \
+        T res16_12_tmp_xx = res16_10_tmp_x > res16_12_tmp ? res16_12_tmp   : res16_10_tmp_x;    \
+        V arg16_10_tmp_xx = res16_10_tmp_x > res16_12_tmp ? arg16_10_tmp_x : arg16_12_tmp  ;    \
+        V arg16_12_tmp_xx = res16_10_tmp_x > res16_12_tmp ? arg16_12_tmp   : arg16_10_tmp_x;    \
+                                                                                                \
+        T res16_11_tmp_xx = res16_11_tmp_x > res16_13_tmp ? res16_11_tmp_x : res16_13_tmp  ;    \
+        T res16_13_tmp_xx = res16_11_tmp_x > res16_13_tmp ? res16_13_tmp   : res16_11_tmp_x;    \
+        V arg16_11_tmp_xx = res16_11_tmp_x > res16_13_tmp ? arg16_11_tmp_x : arg16_13_tmp  ;    \
+        V arg16_13_tmp_xx = res16_11_tmp_x > res16_13_tmp ? arg16_13_tmp   : arg16_11_tmp_x;    \
+                                                                                        \
+        res16[1]  = res16_1_tmp > res16_2_tmp_x ? res16_1_tmp   : res16_2_tmp_x ;       \
+        res16[2]  = res16_1_tmp > res16_2_tmp_x ? res16_2_tmp_x : res16_1_tmp   ;       \
+        arg16[1]  = res16_1_tmp > res16_2_tmp_x ? arg16_1_tmp   : arg16_2_tmp_x ;       \
+        arg16[2]  = res16_1_tmp > res16_2_tmp_x ? arg16_2_tmp_x : arg16_1_tmp   ;       \
+                                                                                        \
+        res16[3]  = res16_3_tmp_x > res16_4_tmp_xx ? res16_3_tmp_x  : res16_4_tmp_xx;   \
+        res16[4]  = res16_3_tmp_x > res16_4_tmp_xx ? res16_4_tmp_xx : res16_3_tmp_x ;   \
+        arg16[3]  = res16_3_tmp_x > res16_4_tmp_xx ? arg16_3_tmp_x  : arg16_4_tmp_xx;   \
+        arg16[4]  = res16_3_tmp_x > res16_4_tmp_xx ? arg16_4_tmp_xx : arg16_3_tmp_x ;   \
+                                                                                        \
+        res16[5]  = res16_5_tmp_xx > res16_6_tmp_xx ? res16_5_tmp_xx : res16_6_tmp_xx;  \
+        res16[6]  = res16_5_tmp_xx > res16_6_tmp_xx ? res16_6_tmp_xx : res16_5_tmp_xx;  \
+        arg16[5]  = res16_5_tmp_xx > res16_6_tmp_xx ? arg16_5_tmp_xx : arg16_6_tmp_xx;  \
+        arg16[6]  = res16_5_tmp_xx > res16_6_tmp_xx ? arg16_6_tmp_xx : arg16_5_tmp_xx;  \
+                                                                                        \
+        res16[7]  = res16_7_tmp_xx > res16_8_tmp_xx ? res16_7_tmp_xx : res16_8_tmp_xx;  \
+        res16[8]  = res16_7_tmp_xx > res16_8_tmp_xx ? res16_8_tmp_xx : res16_7_tmp_xx;  \
+        arg16[7]  = res16_7_tmp_xx > res16_8_tmp_xx ? arg16_7_tmp_xx : arg16_8_tmp_xx;  \
+        arg16[8]  = res16_7_tmp_xx > res16_8_tmp_xx ? arg16_8_tmp_xx : arg16_7_tmp_xx;  \
+                                                                                            \
+        res16[9]  = res16_9_tmp_xx > res16_10_tmp_xx ? res16_9_tmp_xx  : res16_10_tmp_xx;   \
+        res16[10] = res16_9_tmp_xx > res16_10_tmp_xx ? res16_10_tmp_xx : res16_9_tmp_xx ;   \
+        arg16[9]  = res16_9_tmp_xx > res16_10_tmp_xx ? arg16_9_tmp_xx  : arg16_10_tmp_xx;   \
+        arg16[10] = res16_9_tmp_xx > res16_10_tmp_xx ? arg16_10_tmp_xx : arg16_9_tmp_xx ;   \
+                                                                                            \
+        res16[11] = res16_11_tmp_xx > res16_12_tmp_xx ? res16_11_tmp_xx : res16_12_tmp_xx;  \
+        res16[12] = res16_11_tmp_xx > res16_12_tmp_xx ? res16_12_tmp_xx : res16_11_tmp_xx;  \
+        arg16[11] = res16_11_tmp_xx > res16_12_tmp_xx ? arg16_11_tmp_xx : arg16_12_tmp_xx;  \
+        arg16[12] = res16_11_tmp_xx > res16_12_tmp_xx ? arg16_12_tmp_xx : arg16_11_tmp_xx;  \
+                                                                                        \
+        res16[13] = res16_13_tmp_xx > res16_14_tmp ? res16_13_tmp_xx : res16_14_tmp   ; \
+        res16[14] = res16_13_tmp_xx > res16_14_tmp ? res16_14_tmp    : res16_13_tmp_xx; \
+        arg16[13] = res16_13_tmp_xx > res16_14_tmp ? arg16_13_tmp_xx : arg16_14_tmp   ; \
+        arg16[14] = res16_13_tmp_xx > res16_14_tmp ? arg16_14_tmp    : arg16_13_tmp_xx;
+
+#define DPP_ARG_MERGE_16_DPP_()                                 \
+        vec8_t res8_r;                                          \
+        aec8_t arg8_r;                                          \
+        /* only lane 0,1,2,3 contain valid data */              \
+        res8_r[0] = mov_dpp_(res8[0],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        res8_r[1] = mov_dpp_(res8[1],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        res8_r[2] = mov_dpp_(res8[2],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        res8_r[3] = mov_dpp_(res8[3],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        res8_r[4] = mov_dpp_(res8[4],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        res8_r[5] = mov_dpp_(res8[5],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        res8_r[6] = mov_dpp_(res8[6],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        res8_r[7] = mov_dpp_(res8[7],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        arg8_r[0] = mov_dpp_(arg8[0],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        arg8_r[1] = mov_dpp_(arg8[1],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        arg8_r[2] = mov_dpp_(arg8[2],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        arg8_r[3] = mov_dpp_(arg8[3],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        arg8_r[4] = mov_dpp_(arg8[4],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        arg8_r[5] = mov_dpp_(arg8[5],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        arg8_r[6] = mov_dpp_(arg8[6],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
+        arg8_r[7] = mov_dpp_(arg8[7],  ck_tile::number<0x108>{}); /* row_shl:8 */ 
+
 // https://en.wikipedia.org/wiki/Batcher_odd%E2%80%93even_mergesort
 // TODO: this is assuming descending order sort
 // result store to smem :)
@@ -366,27 +518,27 @@ __device__ __inline__ void warp_merge_sort_to_smem(T* smem, const T& x, ck_tile:
 
     if constexpr (lanegroup_size == 2) {
         DPP_MERGE_2_DPP_();
-        DPP_MERGE_2_CMP_(res1, res1_r);
+        DPP_MERGE_2_CMP_(res1_r, res1);
 
         if(lane_id == 0) {
             reinterpret_cast<vec2_t*>(smem)[group_id] = res2;
         }
     } else if constexpr (lanegroup_size == 4) {
         DPP_MERGE_2_DPP_();
-        DPP_MERGE_2_CMP_(res1, res1_r);
+        DPP_MERGE_2_CMP_(res1_r, res1);
         DPP_MERGE_4_DPP_();
-        DPP_MERGE_4_CMP_(res2, res2_r);
+        DPP_MERGE_4_CMP_(res2_r, res2);
 
         if(lane_id == 0) {
             reinterpret_cast<vec4_t*>(smem)[group_id] = res4;
         }
     } else if constexpr (lanegroup_size == 8) {
         DPP_MERGE_2_DPP_();
-        DPP_MERGE_2_CMP_(res1, res1_r);
+        DPP_MERGE_2_CMP_(res1_r, res1);
         DPP_MERGE_4_DPP_();
-        DPP_MERGE_4_CMP_(res2, res2_r);
+        DPP_MERGE_4_CMP_(res2_r, res2);
         DPP_MERGE_8_DPP_();
-        DPP_MERGE_8_CMP_(res4, res4_r);
+        DPP_MERGE_8_CMP_(res4_r, res4);
 
         if(lane_id == 0) {
             union {
@@ -402,13 +554,13 @@ __device__ __inline__ void warp_merge_sort_to_smem(T* smem, const T& x, ck_tile:
         }
     } else if constexpr (lanegroup_size == 16) {
         DPP_MERGE_2_DPP_();
-        DPP_MERGE_2_CMP_(res1, res1_r);
+        DPP_MERGE_2_CMP_(res1_r, res1);
         DPP_MERGE_4_DPP_();
-        DPP_MERGE_4_CMP_(res2, res2_r);
+        DPP_MERGE_4_CMP_(res2_r, res2);
         DPP_MERGE_8_DPP_();
-        DPP_MERGE_8_CMP_(res4, res4_r);
+        DPP_MERGE_8_CMP_(res4_r, res4);
         DPP_MERGE_16_DPP_();
-        DPP_MERGE_16_CMP_(res8, res8_r);
+        DPP_MERGE_16_CMP_(res8_r, res8);
 
         if(lane_id == 0) {
 #if 0
@@ -444,32 +596,32 @@ __device__ __inline__ auto warp_merge_sort_to_reg(const T& x, ck_tile::number<la
 
     if constexpr (lanegroup_size == 2) {
         DPP_MERGE_2_DPP_();
-        DPP_MERGE_2_CMP_(res1, res1_r);
+        DPP_MERGE_2_CMP_(res1_r, res1);
         return res2;
     } else if constexpr (lanegroup_size == 4) {
         DPP_MERGE_2_DPP_();
-        DPP_MERGE_2_CMP_(res1, res1_r);
+        DPP_MERGE_2_CMP_(res1_r, res1);
         DPP_MERGE_4_DPP_();
-        DPP_MERGE_4_CMP_(res2, res2_r);
+        DPP_MERGE_4_CMP_(res2_r, res2);
         return res4;
     } else if constexpr (lanegroup_size == 8) {
         DPP_MERGE_2_DPP_();
-        DPP_MERGE_2_CMP_(res1, res1_r);
+        DPP_MERGE_2_CMP_(res1_r, res1);
         DPP_MERGE_4_DPP_();
-        DPP_MERGE_4_CMP_(res2, res2_r);
+        DPP_MERGE_4_CMP_(res2_r, res2);
         DPP_MERGE_8_DPP_();
-        DPP_MERGE_8_CMP_(res4, res4_r);
+        DPP_MERGE_8_CMP_(res4_r, res4);
         // TODO: only lane:1,2,3,4 within 8 lanes does not have correct result !
         return res8;
     } else if constexpr (lanegroup_size == 16) {
         DPP_MERGE_2_DPP_();
-        DPP_MERGE_2_CMP_(res1, res1_r);
+        DPP_MERGE_2_CMP_(res1_r, res1);
         DPP_MERGE_4_DPP_();
-        DPP_MERGE_4_CMP_(res2, res2_r);
+        DPP_MERGE_4_CMP_(res2_r, res2);
         DPP_MERGE_8_DPP_();
-        DPP_MERGE_8_CMP_(res4, res4_r);
+        DPP_MERGE_8_CMP_(res4_r, res4);
         DPP_MERGE_16_DPP_();
-        DPP_MERGE_16_CMP_(res8, res8_r);
+        DPP_MERGE_16_CMP_(res8_r, res8);
         // TODO: only lane:1,2,3,4 within 16 lanes does not have correct result !
         return res16;
     } else {
@@ -487,40 +639,37 @@ __device__ __inline__ auto warp_arg_merge_sort_to_reg(const T& x, const V& v, ck
 
     if constexpr (lanegroup_size == 2) {
         DPP_ARG_MERGE_2_DPP_();
-        DPP_ARG_MERGE_2_CMP_(res1, res1_r, arg1, arg1_r);
+        DPP_ARG_MERGE_2_CMP_(res1_r, res1, arg1_r, arg1);
         return ck_tile::make_tuple(res2, arg2);
     } else if constexpr (lanegroup_size == 4) {
         DPP_ARG_MERGE_2_DPP_();
-        DPP_ARG_MERGE_2_CMP_(res1, res1_r, arg1, arg1_r);
+        DPP_ARG_MERGE_2_CMP_(res1_r, res1, arg1_r, arg1);
         DPP_ARG_MERGE_4_DPP_();
-        DPP_ARG_MERGE_4_CMP_(res2, res2_r, arg2, arg2_r);
+        DPP_ARG_MERGE_4_CMP_(res2_r, res2, arg2_r, arg2);
         return ck_tile::make_tuple(res4, arg4);
     } else if constexpr (lanegroup_size == 8) {
         DPP_ARG_MERGE_2_DPP_();
-        DPP_ARG_MERGE_2_CMP_(res1, res1_r, arg1, arg1_r);
+        DPP_ARG_MERGE_2_CMP_(res1_r, res1, arg1_r, arg1);
         DPP_ARG_MERGE_4_DPP_();
-        DPP_ARG_MERGE_4_CMP_(res2, res2_r, arg2, arg2_r);
+        DPP_ARG_MERGE_4_CMP_(res2_r, res2, arg2_r, arg2);
         DPP_ARG_MERGE_8_DPP_();
-        DPP_ARG_MERGE_8_CMP_(res4, res4_r, arg4, arg4_r);
+        DPP_ARG_MERGE_8_CMP_(res4_r, res4, arg4_r, arg4);
         // TODO: only lane:1,2,3,4 within 8 lanes does not have correct result !
         return ck_tile::make_tuple(res8, arg8);
-    }
-#if 0
-    else if constexpr (lanegroup_size == 16) {
-        DPP_MERGE_2_DPP_();
-        DPP_MERGE_2_CMP_(res1, res1_r);
-        DPP_MERGE_4_DPP_();
-        DPP_MERGE_4_CMP_(res2, res2_r);
-        DPP_MERGE_8_DPP_();
-        DPP_MERGE_8_CMP_(res4, res4_r);
-        DPP_MERGE_16_DPP_();
-        DPP_MERGE_16_CMP_(res8, res8_r);
+    } else if constexpr (lanegroup_size == 16) {
+        DPP_ARG_MERGE_2_DPP_();
+        DPP_ARG_MERGE_2_CMP_(res1_r, res1, arg1_r, arg1);
+        DPP_ARG_MERGE_4_DPP_();
+        DPP_ARG_MERGE_4_CMP_(res2_r, res2, arg2_r, arg2);
+        DPP_ARG_MERGE_8_DPP_();
+        DPP_ARG_MERGE_8_CMP_(res4_r, res4, arg4_r, arg4);
+        DPP_ARG_MERGE_16_DPP_();
+        DPP_ARG_MERGE_16_CMP_(res8_r, res8, arg8_r, arg8);
         // TODO: only lane:1,2,3,4 within 16 lanes does not have correct result !
-        return res16;
+        return ck_tile::make_tuple(res16, arg16);
     } else {
         return 0;
     }
-#endif
 }
 
 // combine 2 register and sort together, the other register buffer is from current lane
@@ -549,6 +698,33 @@ __device__ __inline__ auto warp_merge_sort_combine2(const T_vec& x, const T_vec&
     }
 }
 
+// combine 2 register and sort together, the other register buffer is from current lane
+template <typename T_vec, typename V_vec, int lanegroup_size = ck_tile::get_warp_size()>
+__device__ __inline__ auto warp_arg_merge_sort_combine2(const T_vec& x, const T_vec& y, const V_vec& ax, const V_vec& ay, ck_tile::number<lanegroup_size> = {})
+{
+    using T = typename ck_tile::vector_traits<ck_tile::remove_cvref_t<T_vec>>::scalar_type;
+    using V = typename ck_tile::vector_traits<ck_tile::remove_cvref_t<V_vec>>::scalar_type;
+    static_assert(sizeof(T) == 4 && sizeof(V) == 4);
+
+    if constexpr (lanegroup_size == 2) {
+        DPP_ARG_MERGE_2_CMP_(x, y, ax, ay);
+        return ck_tile::make_tuple(res2, arg2);
+    } else if constexpr (lanegroup_size == 4) {
+        DPP_ARG_MERGE_4_CMP_(x, y, ax, ay);
+        return ck_tile::make_tuple(res4, arg4);
+    } else if constexpr (lanegroup_size == 8) {
+        DPP_ARG_MERGE_8_CMP_(x, y, ax, ay);
+        // TODO: only lane:1,2,3,4 within 8 lanes does not have correct result !
+        return ck_tile::make_tuple(res8, arg8);
+    } else if constexpr (lanegroup_size == 16) {
+        DPP_ARG_MERGE_16_CMP_(x, y, ax, ay);
+        // TODO: only lane:1,2,3,4 within 16 lanes does not have correct result !
+        return ck_tile::make_tuple(res16, arg16);
+    } else {
+        return 0;
+    }
+}
+
 #undef DPP_MERGE_2_DPP_
 #undef DPP_MERGE_2_CMP_
 #undef DPP_MERGE_4_DPP_
@@ -563,6 +739,8 @@ __device__ __inline__ auto warp_merge_sort_combine2(const T_vec& x, const T_vec&
 #undef DPP_ARG_MERGE_4_CMP_
 #undef DPP_ARG_MERGE_8_DPP_
 #undef DPP_ARG_MERGE_8_CMP_
+#undef DPP_ARG_MERGE_16_DPP_
+#undef DPP_ARG_MERGE_16_CMP_
 
 // [a, b, c, d....] -> [a, a+b, a+b+c, a+b+c+d, ....]
 // NOTE: wave_size need at least be 16!! dpp 16 is one row
