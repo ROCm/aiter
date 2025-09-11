@@ -145,17 +145,17 @@ def _fwd_grouped_kernel_stage1_ps(
     )
 
     dot_q_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfma_layout_qk, k_width=16
+        operand_index=0, parent=mfma_layout_qk, k_width=4
     )
     dot_k_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfma_layout_qk, k_width=16
+        operand_index=1, parent=mfma_layout_qk, k_width=4
     )
 
     dot_p_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfma_layout_kv, k_width=16
+        operand_index=0, parent=mfma_layout_kv, k_width=4
     )
     dot_v_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfma_layout_kv, k_width=16
+        operand_index=1, parent=mfma_layout_kv, k_width=4
     )
 
 
