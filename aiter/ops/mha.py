@@ -1383,6 +1383,8 @@ def _flash_attn_backward(
         can_impl_fmha_v3_bwd_ and seqlen_q > 16
     ):  # ck fmha bwd has optimization for seqlen_q <= 16
         is_950_1block = get_gfx() == "gfx950" and seqlen_k <= 256
+        if dq is not None:
+            dq.zero_()
         (
             dq,
             dk,
@@ -1512,7 +1514,7 @@ class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
-        dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
         head_size_q_og = ctx.head_size_q_og
