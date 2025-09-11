@@ -49,7 +49,8 @@ void get_mla_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size 
                          torch::Tensor& work_info,
                          torch::Tensor& reduce_indptr,
                          torch::Tensor& reduce_final_map,
-                         torch::Tensor& reduce_partial_map);
+                         torch::Tensor& reduce_partial_map,
+                         const int32_t page_block_size = 1);
 
 std::vector<torch::Tensor>
 get_mla_metadata_v1_no_redundant(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]

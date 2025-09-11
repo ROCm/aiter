@@ -646,6 +646,7 @@ __global__ void kn_get_mla_metadata_v1(
     const int32_t workload_avg = workload_sum / params.num_batches;
     const int32_t workload_var = workload_square_sum / params.num_batches - workload_avg * workload_avg;
 
+    /*
     const int32_t workload_limit_global =
     [&]() {
         const int32_t tot_workload_estimated =
@@ -655,6 +656,8 @@ __global__ void kn_get_mla_metadata_v1(
         const int32_t limit = ck_tile::integer_least_multiple(workload_per_cluster_estimated, 16);
         return limit;
     }();
+    */
+    const int32_t workload_limit_global = 4096;
 #if PRINT_DBG
     if (lane_idx == 0)
     {
@@ -853,7 +856,8 @@ void get_mla_metadata_v1_device(
     torch::Tensor&       work_indptr,
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
-    torch::Tensor&       reduce_partial_map)
+    torch::Tensor&       reduce_partial_map,
+    const int32_t        page_block_size)
 {
     TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
                 __func__, ": seqlens_qo_indptr should be continuous!");
@@ -930,7 +934,7 @@ void get_mla_metadata_v1_device(
     params.num_cu               = num_cu;
     params.reduce_indptr_size   = reduce_indptr.size(0);
     params.is_causal            = is_causal;
-    params.page_block_size      = 32;
+    params.page_block_size      = page_block_size;
 
     // launch kernel
     const dim3 grid = dim3(1, 1, 1);
@@ -1239,7 +1243,8 @@ void get_mla_metadata_v1(
     torch::Tensor&       work_indptr,
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
-    torch::Tensor&       reduce_partial_map)
+    torch::Tensor&       reduce_partial_map,
+    const int32_t        page_block_size)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
 
@@ -1261,7 +1266,8 @@ void get_mla_metadata_v1(
         work_indptr,
         reduce_indptr,
         reduce_final_map,
-        reduce_partial_map);
+        reduce_partial_map,
+        page_block_size);
 }
 
 std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(
