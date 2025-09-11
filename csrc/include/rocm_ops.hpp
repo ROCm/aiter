@@ -580,6 +580,45 @@
           py::arg("block_m")        = 32,            \
           py::arg("sorted_weights") = std::nullopt);
 
+
+#define MOE_CKTILE_2STAGES_PYBIND                    \
+    m.def("cktile_moe_gemm1",                        \
+          &cktile_moe_gemm1,                         \
+          "cktile_moe_gemm1",                        \
+          py::arg("XQ"),                             \
+          py::arg("WQ"),                             \
+          py::arg("Y"),                              \
+          py::arg("sorted_ids"),                     \
+          py::arg("sorted_expert_ids"),              \
+          py::arg("max_token_ids"),                  \
+          py::arg("topk"),                           \
+          py::arg("n_padded_zeros")    = 0,          \
+          py::arg("k_padded_zeros")    = 0,          \
+          py::arg("topk_weight")    = std::nullopt,  \
+          py::arg("x_scale")        = std::nullopt,  \
+          py::arg("w_scale")        = std::nullopt,  \
+          py::arg("exp_bias")       = std::nullopt,  \
+          py::arg("block_m")        = 32);           \
+                                                     \
+                                                     \
+    m.def("cktile_moe_gemm2",                        \
+          &cktile_moe_gemm2,                         \
+          "cktile_moe_gemm2",                        \
+          py::arg("XQ"),                             \
+          py::arg("WQ"),                             \
+          py::arg("Y"),                              \
+          py::arg("sorted_ids"),                     \
+          py::arg("sorted_expert_ids"),              \
+          py::arg("max_token_ids"),                  \
+          py::arg("topk"),                           \
+          py::arg("n_padded_zeros")    = 0,          \
+          py::arg("k_padded_zeros")    = 0,          \
+          py::arg("topk_weight")    = std::nullopt,  \
+          py::arg("x_scale")        = std::nullopt,  \
+          py::arg("w_scale")        = std::nullopt,  \
+          py::arg("exp_bias")       = std::nullopt,  \
+          py::arg("block_m")        = 32);           \
+
 #define MHA_VARLEN_FWD_PYBIND                     \
     m.def("mha_varlen_fwd",                       \
           &aiter::torch_itfs::mha_varlen_fwd,     \
