@@ -72,6 +72,7 @@ def ref_masked_attention(
 
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
 
+    # import pdb; pdb.set_trace()
     out = out / l.transpose(0, 1).unsqueeze(-1)
 
     if is_fp8:
@@ -203,19 +204,6 @@ def test_mla(
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=dtype)
 
     # troch implementation
-    out_ref, lse_ref = torch_mla_extend(
-        q,
-        kv_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        sm_scale,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        is_causal=True,
-        dtype=dtype,
-    )
-
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
@@ -251,6 +239,24 @@ def test_mla(
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
+        kv_indptr_ex = torch.zeros_like(kv_indptr)
+        kv_indptr_ex[-1] = 16
+        # out_ref, lse_ref = torch_mla_extend(
+        #     q,
+        #     kv_buffer,
+        #     qo_indptr,
+        #     kv_indptr_ex,
+        #     kv_indices[:16],
+        #     # kv_indptr,
+        #     # kv_indices,
+        #     sm_scale,
+        #     kv_lora_rank,
+        #     qk_rope_head_dim,
+        #     is_causal=False,
+        #     dtype=dtype,
+        # )
+        #
+
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
@@ -270,6 +276,24 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
         )
 
+        # import pdb;pdb.set_trace()
+
+        out_ref, lse_ref = torch_mla_extend(
+            q,
+            kv_buffer,
+            qo_indptr,
+            # kv_indptr_ex,
+            # kv_indices[16:],
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            is_causal=False,
+            dtype=dtype,
+        )
+        import pdb;pdb.set_trace()
+
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
         # checkAllclose(logits_ref, attn_logits,
@@ -277,7 +301,6 @@ def test_mla(
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
         flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
 
-        import pdb;pdb.set_trace()
 
         bytes = (
             total_kv * nhead_kv * qk_head_dim
@@ -400,7 +423,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16"]
 l_kv_dtype = ["bf16"]
-list_nhead = [(8, 1)]
+list_nhead = [(16, 1)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -471,7 +494,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[512, 1023, 4888, 12800],  #
+    default=[32],  #
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -481,7 +504,7 @@ parser.add_argument(
     type=int,
     nargs="*",
     # default=[i for i in range(1, 80)],  # [41],
-    default=[64],  # [41],
+    default=[1],  # [41],
     help="""Batch size.
     e.g.: -b 16""",
 )
@@ -520,7 +543,7 @@ for nhead, mtp in list_nhead:
             dtype,
             kvtype,
             args.block_size,
-            varlen=True,
+            varlen=False,
             mtp=mtp,
         )
         df.append(ret)

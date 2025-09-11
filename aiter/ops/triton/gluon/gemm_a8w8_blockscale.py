@@ -107,7 +107,7 @@ def _gemm_a8w8_blockscale_kernel(
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[16, 4],
-        threads_per_warp=[8, 8],
+        threads_per_warp=[8, 8],  # 
         warps_per_cta=[1, 4],
         order=[0, 1],
     )
@@ -286,6 +286,7 @@ def _gemm_a8w8_blockscale_kernel(
             )
             cur_b = smem_b.load(layout=dot_b_layout)
 
+//mk * nk
             mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
             acc += mfma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
 

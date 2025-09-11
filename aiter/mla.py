@@ -151,7 +151,7 @@ def mla_decode_fwd(
     num_kv_splits = 80
     if nhead == 16 and max_seqlen_q == 1:
         # special case for 16 heads and max_seqlen_q == 1
-        logits = torch.empty(
+        logits = torch.zeros(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -159,7 +159,7 @@ def mla_decode_fwd(
         MAYBE_FINAL_OUT = False
     elif nhead in [8, 16, 128]:
         MAYBE_FINAL_OUT = True
-        logits = torch.empty(
+        logits = torch.zeros(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -167,10 +167,10 @@ def mla_decode_fwd(
     else:
         assert False, f"{nhead=} not supported"
 
-    attn_lse = torch.empty(
+    attn_lse = torch.zeros(
         (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
     )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    final_lse = torch.zeros((total_s, nhead), dtype=dtypes.fp32, device=device)
     
     if num_kv_splits_indptr is not None:
         if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):
@@ -221,7 +221,8 @@ def mla_decode_fwd(
         )
         return logits, final_lse
 
-    from aiter.ops.triton.mla_decode_ps import (
+    # from aiter.ops.triton.mla_decode_ps import (
+    from aiter.ops.triton.gluon.mla_decode_ps import (
         decode_grouped_att_m_fwd_ps,
     )
     import aiter.ops.triton.utils.arch_info as arch_info
@@ -262,8 +263,9 @@ def mla_decode_fwd(
         config,
     )
 
-    # logits_copy = torch.zeros_like(logits)
-    #
+    logits_copy = torch.zeros_like(logits)
+    attn_lse_copy = torch.zeros_like(attn_lse)
+
     # aiter.mla_decode_stage1_asm_fwd(
     #     q,
     #     kv_buffer,
@@ -278,7 +280,7 @@ def mla_decode_fwd(
     #     max_seqlen_q,
     #     sm_scale,
     #     logits_copy,
-    #     attn_lse,
+    #     attn_lse_copy,
     #     o,
     #     q_scale,
     #     kv_scale,
