@@ -7,7 +7,7 @@ aiter_config_file="${script_dir}/aiter/ops/triton/configs/MI350X-MHA-DEFAULT.jso
 
 
 os_path() {
-    path="${1}"
+    local path="${1}"
     if [ "${os}" != "Linux" ]; then
         path=$(cygpath --windows "${path}")
     fi
@@ -15,6 +15,8 @@ os_path() {
 }
 
 
+# Stolen from Pure Bash Bible:
+# https://github.com/dylanaraps/pure-bash-bible?tab=readme-ov-file#get-the-base-name-of-a-file-path
 basename() {
     # Usage: basename "path" ["suffix"]
     local tmp
@@ -30,6 +32,7 @@ basename() {
 gen_tune_configs() {
     rm --recursive --force "${tune_configs_dir}"
     mkdir --parents "${tune_configs_dir}"
+    local os_tune_configs_dir
     os_tune_configs_dir=$(os_path "${tune_configs_dir}")
     python <<EOF
 import itertools
@@ -81,9 +84,11 @@ EOF
 
 
 replace_aiter_config() {
-    tune_config_file="${1}"
+    local tune_config_file="${1}"
     git restore "${aiter_config_file}"
+    local os_tune_config_file
     os_tune_config_file=$(os_path "${tune_config_file}")
+    local os_aiter_config_file
     os_aiter_config_file=$(os_path "${aiter_config_file}")
 python <<EOF
 import json
@@ -124,7 +129,7 @@ for tune_config in "${tune_configs_dir}"/*.json; do
         time=$(python "${script_dir}/op_tests/op_benchmarks/triton/bench_mha.py" \
             --dtype fp16 -mode bwd -b 1 -hq 128 -hk 128 -sq 4096 -sk 4096 -d 128 \
             -causal true --layout bshd -metric time 2> /dev/null \
-            | tail -1 | tr -s ' ' | cut -d ' ' -f8)
+            | tail -1 | tr --squeeze-repeats ' ' | cut --delimiter=' ' --fields=8)
         result="pass,${time}"
     fi
 
