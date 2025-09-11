@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
+#include "asm_i8gemm_configs.hpp"
+#include "py_itfs_common.h"
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -37,6 +39,24 @@ struct __attribute__((packed)) KernelArgs
     p3 _p17;
     unsigned int ks;
     p3 _p18;
+};
+
+static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
+{
+    if((inp.dtype() == torch::kUInt8) && out.scalar_type() == at::ScalarType::BFloat16)
+
+    {
+        return &cfg_i8gemm_bf16_per1x32int8;
+    }
+    else
+    {
+        TORCH_CHECK(false,
+                    __func__,
+                    " Unsupported input_type:",
+                    inp.scalar_type(),
+                    ", out_type:",
+                    out.scalar_type());
+    }
 };
 
 torch::Tensor gemm_a8w8_asm(torch::Tensor &A,       // A:[M, K] i8
