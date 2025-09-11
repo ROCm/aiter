@@ -150,7 +150,9 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             .sort_values(by=["tile_m", "tile_n", "splitK"])
         )
         kernel_dict = (
-            shuffle_df.groupby(["tile_m", "tile_n"])["knl_name"].apply(list).to_dict()
+            shuffle_df.groupby(["tile_m", "tile_n", "splitK"])["knl_name"]
+            .apply(list)
+            .to_dict()
         )
         return kernel_dict
 
@@ -174,7 +176,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
 
         if get_gfx() not in ["gfx950"]:
             print(f"tuning is not supported in this chip {get_gfx()}")
-            return tunedf
+            return []
         gpu = torch.cuda.current_device()
         device_properties = torch.cuda.get_device_properties(gpu)
         cu_num = device_properties.multi_processor_count
@@ -200,7 +202,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 total_kernel_nums = 0
                 seed = seed + 1
 
-                for i in range(1):
+                for i in range(ck_kernels_num):
                     kernel = kernels_list[i]
                     maxsplitK = (
                         aiter.compute_gemm_SplitK(
@@ -250,20 +252,21 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 )
                 asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
                 asm_tiles = [key for key in asm_kernels.keys()]
-                for tile_m, tile_n in asm_tiles:
+                for key in asm_tiles:
+                    tile_m, tile_n, splitk = key
                     maxsplitK = (
                         aiter.compute_gemm_SplitK(M, N, K, tile_m, tile_n, 256)
                         if useSplitK
                         else 0
                     )
-                    kernelName = asm_kernels.get((tile_m, tile_n), [])
+                    kernelName = asm_kernels.get((tile_m, tile_n, splitk), [])
                     if len(kernelName) == 0:
                         print(f"no kernel name for ({tile_m}, {tile_n})!!!!")
                         continue
-                    if len(kernelName) == 1:
+                    if splitk == 0:
                         maxsplitK = 0
                     for splitK in range(maxsplitK + 1):
-                        kernel_name = kernelName[0] if splitK == 0 else kernelName[1]
+                        kernel_name = kernelName[0]
                         info = ((cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
                         task.append(
                             (

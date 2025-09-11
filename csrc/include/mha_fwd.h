@@ -81,7 +81,8 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      bool use_ext_asm,
                                                      int how_v3_bf16_cvt                = 1,
                                                      const void* seqstart_q_padding_ptr = nullptr,
-                                                     const void* seqstart_k_padding_ptr = nullptr);
+                                                     const void* seqstart_k_padding_ptr = nullptr,
+                                                     bool is_v3_api_check = false);
 
 __attribute__((visibility("default"))) float
 mha_fwd_splitkv(mha_fwd_splitkv_args args,
@@ -216,7 +217,8 @@ float fmha_fwd_v3(mha_fwd_traits t,
                   mha_fwd_args a,
                   const ck_tile::stream_config& s,
                   const void* seqstart_q_padding_ptr = nullptr,
-                  const void* seqstart_k_padding_ptr = nullptr);
+                  const void* seqstart_k_padding_ptr = nullptr,
+                  bool is_v3_api_check = false);
 }
 
 namespace gfx950 {
@@ -224,6 +226,7 @@ float fmha_fwd_v3(mha_fwd_traits t,
                   mha_fwd_args a,
                   const ck_tile::stream_config& s,
                   const void* seqstart_q_padding_ptr = nullptr,
-                  const void* seqstart_k_padding_ptr = nullptr);
+                  const void* seqstart_k_padding_ptr = nullptr,
+                  bool is_v3_api_check = false);
 }
 } // namespace aiter
