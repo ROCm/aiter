@@ -160,7 +160,7 @@ CK_TILE_HOST_DEVICE int32_t cal_packed_causal_kv_len(
     const int32_t qo_len,
     const int32_t kv_len,
     const int32_t qo_tile_idx,
-    const int32_t block_size_q,
+    const int32_t packed_qo_tile_len,
     const int32_t num_qo_tiles,
     const int32_t num_heads,
     const bool    is_causal)
@@ -170,7 +170,7 @@ CK_TILE_HOST_DEVICE int32_t cal_packed_causal_kv_len(
     if (is_causal && (qo_tile_idx < num_qo_tiles))
     {
         const int kv_len_init = kv_len - qo_len;
-        const int kv_len_slop = ck_tile::integer_divide_ceil((qo_tile_idx + 1) * block_size_q, num_heads);
+        const int kv_len_slop = ck_tile::integer_divide_ceil((qo_tile_idx + 1) * packed_qo_tile_len, num_heads);
         result = ck_tile::min(kv_len_init + kv_len_slop, kv_len);
     }
 
@@ -496,7 +496,8 @@ CK_TILE_DEVICE void generate_work(
     const int32_t       tile_idx,
     const int32_t       qo_len,
     const int32_t       kv_len,
-    const int32_t       cluster_len_q,
+    const int32_t       qo_tile_len,
+    const int32_t       packed_qo_tile_len,
     const int32_t       qo_batch_start,
     const int32_t       kv_batch_start,
     const int32_t       kv_batch_end,
@@ -520,7 +521,7 @@ CK_TILE_DEVICE void generate_work(
         ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len, num_clusters), kv_granularity);
     const auto [cid_top, accum_cost_top] = get_cost_top(p_cost_heap, num_clusters);
     const int32_t remaining_capability_top =
-        ck_tile::max(cal_kv_len(workload_limit_global - accum_cost_top, cluster_len_q), kv_len_limit_floor);
+        ck_tile::max(cal_kv_len(workload_limit_global - accum_cost_top, packed_qo_tile_len), kv_len_limit_floor);
     const int32_t num_splits_estimated =
         ck_tile::integer_divide_ceil(remaining_kv_len, remaining_capability_top);
     // For the case of #splits==2, make sure that the tailing tile is smaller than Traits::kSplitTolerance.
@@ -532,7 +533,7 @@ CK_TILE_DEVICE void generate_work(
     {
         // Check and update cost_heap
         auto [cid, accum_cost] = get_cost_top(p_cost_heap, num_clusters);
-        const int32_t remaining_capability = cal_kv_len(workload_limit_global - accum_cost, cluster_len_q);
+        const int32_t remaining_capability = cal_kv_len(workload_limit_global - accum_cost, packed_qo_tile_len);
         const int32_t kv_len_limit_local =
         [&]() {
             const int32_t limit_ori = ck_tile::max(remaining_capability, kv_len_limit_floor);
@@ -544,7 +545,7 @@ CK_TILE_DEVICE void generate_work(
 
         if (ck_tile::get_lane_id() == 0)
         {
-            const int32_t cost = cal_cost(cluster_len_q, kv_len_consuming);
+            const int32_t cost = cal_cost(packed_qo_tile_len, kv_len_consuming);
             const int32_t new_cost = accum_cost + cost;
             p_cost_heap[cid] = new_cost;
 
@@ -553,8 +554,8 @@ CK_TILE_DEVICE void generate_work(
                 // Record work
                 MlaWorkInfo work_info{};
                 work_info.bs_index  = batch_idx;
-                work_info.q_start   = tile_idx * cluster_len_q + qo_batch_start;
-                work_info.q_end     = ck_tile::min(work_info.q_start + cluster_len_q, qo_batch_start + qo_len);
+                work_info.qo_start  = tile_idx * qo_tile_len + qo_batch_start;
+                work_info.qo_end    = ck_tile::min(work_info.qo_start + qo_tile_len, qo_batch_start + qo_len);
                 work_info.kv_start  = kv_start_local + kv_batch_start;
                 work_info.kv_end    = work_info.kv_start + kv_len_consuming;
                 work_info.kv_offset = kv_batch_end - work_info.kv_end;
@@ -565,10 +566,10 @@ CK_TILE_DEVICE void generate_work(
                     if (p_reduce_partial_map[global_cluster_q_idx].q_start == -1)
                     {
                         p_reduce_partial_map[global_cluster_q_idx].q_start = *p_loc_partial_outputs;
-                        p_reduce_final_map[global_cluster_q_idx] = { work_info.q_start, work_info.q_end };
+                        p_reduce_final_map[global_cluster_q_idx] = { work_info.qo_start, work_info.qo_end };
                     }
                     ++(*p_num_partial_outputs);
-                    *p_loc_partial_outputs += (work_info.q_end - work_info.q_start);
+                    *p_loc_partial_outputs += (work_info.qo_end - work_info.qo_start);
                     p_reduce_partial_map[global_cluster_q_idx].q_end = *p_loc_partial_outputs;
                 }
                 else
@@ -645,12 +646,12 @@ __global__ void kn_get_mla_metadata_v1(
 
     // Step.1. Calculate the size of cluster and some related information. The size is the number of workgroups
     //         composing each cluster. The size is determined by average packed qo length.
-    int32_t sum_packed_qo_len = warp_sum(p_qo_lens, params.num_batches);
+    const int32_t sum_qo_len = warp_sum(p_qo_lens, params.num_batches);
+    const int32_t avg_qo_len = sum_qo_len / params.num_batches;
     const int32_t cluster_size =
     [&]() {
-        const int32_t avg_packed_qo_len = sum_packed_qo_len / params.num_batches;
         const int32_t cluster_size =
-            ck_tile::integer_divide_ceil(avg_packed_qo_len, Traits::kPackedQoLenPerWg);
+            ck_tile::integer_divide_ceil(avg_qo_len, Traits::kPackedQoLenPerWg);
         return ck_tile::min(cluster_size, Traits::kMaxClusterSize);
     }();
     // assert((params.num_cu % cluster_size) == 0);
@@ -682,13 +683,14 @@ __global__ void kn_get_mla_metadata_v1(
             const int32_t qo_len = p_qo_lens[bid];
             const int32_t packed_qo_len = qo_len * params.num_heads;
             num_qo_tiles = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+            const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
 
             for (int32_t tid = 0; tid < num_qo_tiles; ++tid)
             {
                 const int32_t kv_len_valid =
                     cal_packed_causal_kv_len(
-                        qo_len, kv_len, tid, cluster_len_q, num_qo_tiles, params.num_heads, params.is_causal);
-                workload += cal_cost(cluster_len_q, kv_len_valid);
+                        qo_len, kv_len, tid, packed_qo_tile_len, num_qo_tiles, params.num_heads, params.is_causal);
+                workload += cal_cost(packed_qo_tile_len, kv_len_valid);
             }
         }
 
@@ -709,8 +711,10 @@ __global__ void kn_get_mla_metadata_v1(
     const int32_t workload_var = workload_square_sum / params.num_batches - workload_avg * workload_avg;
 
     const int32_t workload_limit_global =
-        cal_workload_limit_global_v2(
-            num_clusters, params.num_batches, workload_avg, workload_var, params.kv_granularity);
+        params.num_heads == 16 ?
+            cal_workload_limit_global_v1(
+                workload_avg, workload_var, cluster_len_q, num_qo_tiles, num_clusters, params.kv_granularity) :
+            cal_workload_limit_global_v0(workload_sum, num_clusters, params.kv_granularity);
 #if PRINT_DBG
     if (lane_idx == 0)
     {
@@ -732,30 +736,35 @@ __global__ void kn_get_mla_metadata_v1(
     }
 
     // Step.5. Fill the output buffers except indptrs
-    const int32_t max_qo_tiles = params.num_batches * Traits::kMaxQoTilePerBatch;
+    const int32_t qo_tile_per_batch =
+        ck_tile::integer_divide_ceil(avg_qo_len * params.num_heads, Traits::kPackedQoLenPerWg);
+    const int32_t max_qo_tiles = params.num_batches * qo_tile_per_batch;
 
     // Step.5.1. Get total work for each cluster
     for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
-        const int32_t bid            = p_batch_idx[idx];
-        const int32_t qo_batch_start = params.p_seqlens_qo_indptr[bid];
-        const int32_t kv_batch_start = params.p_seqlens_kv_indptr[bid];
-        const int32_t kv_batch_end   = params.p_seqlens_kv_indptr[bid + 1];
-        const int32_t kv_len         = kv_batch_end - kv_batch_start;
-        const int32_t qo_len         = params.p_seqlens_qo_indptr[bid + 1] - qo_batch_start;
-        const int32_t packed_qo_len  = qo_len * params.num_heads;
-        const int32_t num_qo_tiles   = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t bid                = p_batch_idx[idx];
+        const int32_t qo_batch_start     = params.p_seqlens_qo_indptr[bid];
+        const int32_t kv_batch_start     = params.p_seqlens_kv_indptr[bid];
+        const int32_t kv_batch_end       = params.p_seqlens_kv_indptr[bid + 1];
+        const int32_t kv_len             = kv_batch_end - kv_batch_start;
+        const int32_t qo_len             = params.p_seqlens_qo_indptr[bid + 1] - qo_batch_start;
+        const int32_t packed_qo_len      = qo_len * params.num_heads;
+        const int32_t num_qo_tiles       = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
+        const int32_t qo_tile_len        = ck_tile::integer_divide_ceil(packed_qo_tile_len, params.num_heads);
 
         for (int32_t tid = 0; tid < num_qo_tiles; ++tid)
         {
             const int32_t tile_kv_len =
                 cal_packed_causal_kv_len(
-                    qo_len, kv_len, tid, cluster_len_q, num_qo_tiles, params.num_heads, params.is_causal);
+                    qo_len, kv_len, tid, packed_qo_tile_len, num_qo_tiles, params.num_heads, params.is_causal);
 
             generate_work<Traits, true>(
-                bid, tid, qo_len, tile_kv_len, cluster_len_q, qo_batch_start, kv_batch_start, kv_batch_end,
-                workload_limit_global, num_clusters, params.kv_granularity, nullptr, p_num_qo_clusters_indptr,
-                nullptr, nullptr, nullptr, nullptr, nullptr, p_cost_heap, p_cluster_work_counter);
+                bid, tid, qo_len, tile_kv_len, qo_tile_len, packed_qo_tile_len, qo_batch_start, kv_batch_start,
+                kv_batch_end, workload_limit_global, num_clusters, params.kv_granularity, nullptr,
+                p_num_qo_clusters_indptr, nullptr, nullptr, nullptr, nullptr, nullptr, p_cost_heap,
+                p_cluster_work_counter);
         }
     }
 
@@ -797,14 +806,16 @@ __global__ void kn_get_mla_metadata_v1(
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
     for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
-        const int32_t bid            = p_batch_idx[idx];
-        const int32_t qo_batch_start = params.p_seqlens_qo_indptr[bid];
-        const int32_t kv_batch_start = params.p_seqlens_kv_indptr[bid];
-        const int32_t kv_batch_end   = params.p_seqlens_kv_indptr[bid + 1];
-        const int32_t kv_len         = kv_batch_end - kv_batch_start;
-        const int32_t qo_len         = params.p_seqlens_qo_indptr[bid + 1] - qo_batch_start;
-        const int32_t packed_qo_len  = qo_len * params.num_heads;
-        const int32_t num_qo_tiles   = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t bid                = p_batch_idx[idx];
+        const int32_t qo_batch_start     = params.p_seqlens_qo_indptr[bid];
+        const int32_t kv_batch_start     = params.p_seqlens_kv_indptr[bid];
+        const int32_t kv_batch_end       = params.p_seqlens_kv_indptr[bid + 1];
+        const int32_t kv_len             = kv_batch_end - kv_batch_start;
+        const int32_t qo_len             = params.p_seqlens_qo_indptr[bid + 1] - qo_batch_start;
+        const int32_t packed_qo_len      = qo_len * params.num_heads;
+        const int32_t num_qo_tiles       = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
+        const int32_t qo_tile_len        = ck_tile::integer_divide_ceil(packed_qo_tile_len, params.num_heads);
 
 #if PRINT_DBG
         if (lane_idx == 0)
@@ -817,11 +828,11 @@ __global__ void kn_get_mla_metadata_v1(
         {
             const int32_t tile_kv_len =
                 cal_packed_causal_kv_len(
-                    qo_len, kv_len, tid, cluster_len_q, num_qo_tiles, params.num_heads, params.is_causal);
+                    qo_len, kv_len, tid, packed_qo_tile_len, num_qo_tiles, params.num_heads, params.is_causal);
 
             generate_work<Traits, false>(
-                bid, tid, qo_len, tile_kv_len, cluster_len_q, qo_batch_start, kv_batch_start, kv_batch_end,
-                workload_limit_global, num_clusters, params.kv_granularity, params.p_work_indptr,
+                bid, tid, qo_len, tile_kv_len, qo_tile_len, packed_qo_tile_len, qo_batch_start, kv_batch_start,
+                kv_batch_end, workload_limit_global, num_clusters, params.kv_granularity, params.p_work_indptr,
                 p_num_qo_clusters_indptr, &loc_partial_outputs, &num_partial_outputs, p_work_info_set,
                 p_reduce_final_map, p_reduce_partial_map, p_cost_heap, p_cluster_work_counter);
         }
@@ -929,8 +940,12 @@ void get_mla_metadata_v1_device(
 
     const int32_t num_batches  = seqlens_qo_indptr.size(0) - 1;
     const int32_t num_cu       = dev_prop.multiProcessorCount;
-    const int32_t max_works    = num_cu + num_batches * Traits::kMaxQoTilePerBatch;
-    const int32_t max_qo_tiles = num_batches * Traits::kMaxQoTilePerBatch;
+    const int32_t num_heads    = num_heads_per_head_k * num_heads_k;
+    // TODO: We're assuming that qo lengths are identical while it would be better to get the max of qo_len
+    const int32_t qo_len       = seqlens_qo_indptr[1].item<int32_t>() - seqlens_qo_indptr[0].item<int32_t>();
+    const int32_t qo_tile_per_batch =
+        ck_tile::integer_divide_ceil(qo_len * num_heads, Traits::kPackedQoLenPerWg);
+    const int32_t max_qo_tiles = num_batches * qo_tile_per_batch;
 
     const int32_t lds_size_in_bytes = [&]()
     {
@@ -980,7 +995,7 @@ void get_mla_metadata_v1_device(
     params.p_seqlens_qo_indptr  = seqlens_qo_indptr.data_ptr<int32_t>();
     params.p_seqlens_kv_indptr  = seqlens_kv_indptr.data_ptr<int32_t>();
     params.num_batches          = num_batches;
-    params.num_heads            = num_heads_per_head_k * num_heads_k;
+    params.num_heads            = num_heads;
     params.num_cu               = num_cu;
     params.reduce_indptr_size   = reduce_indptr.size(0);
     params.kv_granularity       = kv_granularity;
@@ -1057,19 +1072,21 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
     num_qo_clusters_indptr.push_back(0);
     for (const auto& binfo : batch_infos)
     {
-        const int32_t packed_qo_len = binfo.qo_len * num_heads;
-        const int32_t num_qo_tiles  = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t packed_qo_len      = binfo.qo_len * num_heads;
+        const int32_t num_qo_tiles       = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
 
         num_qo_clusters_indptr.push_back(num_qo_clusters_indptr.back() + num_qo_tiles);
 
         for (int32_t tid = 0; tid < num_qo_tiles; ++tid)
         {
             const int32_t kv_len_valid =
-                cal_packed_causal_kv_len(binfo.qo_len, binfo.kv_len, tid, cluster_len_q, num_qo_tiles, num_heads, is_causal);
+                cal_packed_causal_kv_len(
+                    binfo.qo_len, binfo.kv_len, tid, packed_qo_tile_len, num_qo_tiles, num_heads, is_causal);
             // always assume that each batch of tile will be splited once along kv.
             const int32_t kv_len_splited =
                 ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len_valid, 2), kv_granularity);
-            workload_sum += 2 * cal_cost(cluster_len_q, kv_len_splited) + kv_granularity;
+            workload_sum += 2 * cal_cost(packed_qo_tile_len, kv_len_splited) + kv_granularity;
         }
     }
 
@@ -1150,8 +1167,8 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
                 // Record work
                 MlaWorkInfo work_info{};
                 work_info.bs_index  = bid;
-                work_info.q_start   = tid * cluster_len_q + qo_batch_start;
-                work_info.q_end     = ck_tile::min(work_info.q_start + cluster_len_q, qo_batch_start + qo_len);
+                work_info.qo_start  = tid * cluster_len_q + qo_batch_start;
+                work_info.qo_end    = ck_tile::min(work_info.qo_start + cluster_len_q, qo_batch_start + qo_len);
                 work_info.kv_start  = kv_start_local + kv_batch_start;
                 work_info.kv_end    = work_info.kv_start + kv_len_consuming;
                 work_info.kv_offset = kv_batch_end - work_info.kv_end;
@@ -1161,11 +1178,11 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
                     if (reduce_partial_map[global_cluster_q_idx].empty())
                     {
                         ++num_reduce_row;
-                        reduce_partial_info[global_cluster_q_idx] = { work_info.q_start, work_info.q_end };
+                        reduce_partial_info[global_cluster_q_idx] = { work_info.qo_start, work_info.qo_end };
                     }
                     reduce_partial_map[global_cluster_q_idx].push_back(loc_partial_outputs);
                     ++num_partial_outputs;
-                    loc_partial_outputs += (work_info.q_end - work_info.q_start);
+                    loc_partial_outputs += (work_info.qo_end - work_info.qo_start);
                 }
                 else
                 {
@@ -1293,7 +1310,7 @@ void get_mla_metadata_v1(
     // without support to split qo for each workgroup. This means that kPackedQoLenPerWg should be 4*16=64 to prevent
     // spliting in any case supported by it.
     //                                PackedQoLenPerWg, MaxClusterSize
-    using Traits  = MlaMetadataTraits<64,               1>;
+    using Traits  = MlaMetadataTraits<128,              1>;
 
     get_mla_metadata_v1_device<Traits>(
         seqlens_qo_indptr,
