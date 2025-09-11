@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from aiter import dtypes
 from aiter.test_common import perftest
+from aiter.utility.base_tuner import GemmCommonTuner
 from gemm_a8w8_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
 import argparse
@@ -77,139 +78,110 @@ def run_gemm_a8w8(x, weight, x_scale, w_scale, out, kernelId, splitK):
     return out
 
 
-def tune_gemm_list(
-    untunedf, tunedf, issorted=False, useSplitK=False, mp_num=1, shape_grouped=False
-):
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
-    task = []
-    tasks_data = []
-    gemm_a8w8_data_idx = [0, 1, 2, 3, 4]
-    ref_data_idx = [0, 1, 2, 3]
-    seed = 0
-    for i in range(len(untunedf)):
-        M = untunedf.loc[i, "M"]
-        N = untunedf.loc[i, "N"]
-        K = untunedf.loc[i, "K"]
-        kernels_num = len(kernels_list)
-        seed = seed + 1
-        if tunedf[
-            (tunedf["M"] == M)
-            & (tunedf["N"] == N)
-            & (tunedf["K"] == K)
-            & (tunedf["cu_num"] == cu_num)
-        ].empty:
-            total_kernel_nums = 0
-            for i in range(kernels_num):
-                kernel = kernels_list[i]
-                maxsplitK = (
-                    aiter.compute_gemm_SplitK(
-                        M, N, K, kernel.MPerBLOCK, kernel.NPerBLOCK, kernel.KPerBLOCK
-                    )
-                    if useSplitK
-                    else 0
-                )
-                for splitK in range(maxsplitK + 1):
-                    info = ((cu_num, M, N, K), i, splitK)
-                    task.append(
-                        (
-                            info,
-                            generate_data,
-                            (M, N, K, seed),
-                            run_gemm_a8w8,
-                            (gemm_a8w8_data_idx, i, splitK),
-                            {},
-                            gemm_a8w8_ref,
-                            (ref_data_idx,),
-                            {},
-                            None,
-                            1e-2,
-                            1e-2,
+class GemmA8W8Tuner(GemmCommonTuner):
+    ARG_DEFAULTS = {
+        "verbose": False,
+        "tune_file": "aiter/configs/a8w8_tuned_gemm.csv",
+        "untune_file": "aiter/configs/a8w8_untuned_gemm.csv",
+        "errRatio": 0.05,
+        "batch": 100,
+        "profile_file": "",
+    }
+
+    def getKernelName(self, kernelId):
+        if kernelId >= len(kernels_list) or kernelId < 0:
+            return None
+        return kernels_list[kernelId].name
+
+    def _setup_specific_arguments(self):
+        # self.parser.add_argument()
+        pass
+
+    def calculate(self, results, bpes=(1, 1, 2)):
+        return super().calculate(results, bpes=(1, 1, 2))
+
+    def tune(
+        self,
+        untunedf,
+        tunedf,
+        args,
+    ):
+        issorted = args.sort
+        useSplitK = args.splitK
+        mp_num = args.mp
+        shape_grouped = False
+        errRatio = args.errRatio
+        cu_num = self.get_cu_num()
+        task = []
+        tasks_data = []
+        gemm_a8w8_data_idx = [0, 1, 2, 3, 4]  # input index in generate_data
+        ref_data_idx = [0, 1, 2, 3]
+        seed = 0
+        for i in range(len(untunedf)):
+            M = untunedf.loc[i, "M"]
+            N = untunedf.loc[i, "N"]
+            K = untunedf.loc[i, "K"]
+            kernels_num = len(kernels_list)
+            seed = seed + 1
+            if tunedf[
+                (tunedf["M"] == M)
+                & (tunedf["N"] == N)
+                & (tunedf["K"] == K)
+                & (tunedf["cu_num"] == cu_num)
+            ].empty:
+                total_kernel_nums = 0
+                for i in range(kernels_num):
+                    kernel = kernels_list[i]
+                    maxsplitK = (
+                        aiter.compute_gemm_SplitK(
+                            M,
+                            N,
+                            K,
+                            kernel.MPerBLOCK,
+                            kernel.NPerBLOCK,
+                            kernel.KPerBLOCK,
                         )
+                        if useSplitK
+                        else 0
                     )
-                    total_kernel_nums = total_kernel_nums + 1
+                    for splitK in range(maxsplitK + 1):
+                        info = ((cu_num, M, N, K), i, splitK, "")
+                        task.append(
+                            (
+                                info,
+                                generate_data,
+                                (M, N, K, seed),
+                                run_gemm_a8w8,
+                                (gemm_a8w8_data_idx, i, splitK),
+                                {},
+                                gemm_a8w8_ref,
+                                (ref_data_idx,),
+                                {},
+                                None,
+                                1e-2,
+                                1e-2,
+                            )
+                        )
+                        total_kernel_nums = total_kernel_nums + 1
 
-            tasks_data.append((total_kernel_nums, ()))
-        else:
-            print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
-            print()
-    if task:
-        ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
-        for el in ret:
-            info, time, err_ratio = el
-            (cu_num, M, N, K), kernelId, splitK = info
-            kernelName = (
-                "None"
-                if kernelId == -1 or time == "nan"
-                else kernels_list[kernelId].name
-            )
-            print(
-                f"Tuning result for M:{M}, N:{N}, K:{K}, cu_num:{cu_num} is kernelId={kernelId} {kernels_list[kernelId].name} {splitK=}, {time}us"
-            )
-            temp = pd.DataFrame(
-                {
-                    "M": [M],
-                    "N": [N],
-                    "K": [K],
-                    "cu_num": [cu_num],
-                    "kernelId": [kernelId],
-                    "splitK": [splitK],
-                    "us": [time],
-                    "kernelName": [kernelName],
-                }
-            )
-            tunedf = pd.concat([tunedf, temp], ignore_index=True)
-
-    if issorted:
-        tunedf = tunedf.sort_values(by=["M", "N", "K"])
-    print("Totall tuning result:")
-    print(tunedf)
-    return tunedf
+                tasks_data.append((total_kernel_nums, ()))
+            else:
+                print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
+                print()
+        ret = []
+        if task:
+            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
+        return ret
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        prog="generate",
+
+    ## tuner =GemmA8W8Tuner("GemmA8W8Tuner", key, resultList,"gen API for CK gemm a8w8 kernel")
+    ## use default key and resultList
+    tuner = GemmA8W8Tuner(
+        "GemmA8W8Tuner",  # key, resultList,
         description="gen API for CK gemm a8w8 kernel",
     )
 
-    parser.add_argument(
-        "-i",
-        "--untune_file",
-        default="aiter/configs/a8w8_untuned_gemm.csv",
-        required=False,
-        help="input",
-    )
-
-    parser.add_argument(
-        "--mp",
-        type=int,
-        default=torch.cuda.device_count(),
-        help="Tuning on multiple GPUs using multiple processes",
-    )
-
-    parser.add_argument(
-        "-o",
-        "--tune_file",
-        default="aiter/configs/a8w8_tuned_gemm.csv",
-        required=False,
-        help="output: tuning result store this file",
-    )
-
-    parser.add_argument(
-        "-k", "--splitK", action="store_true", required=False, help="Use splitK kernels"
-    )
-
-    parser.add_argument(
-        "--sort",
-        action="store_true",
-        required=False,
-        help="Arranged according to the M N K size",
-    )
-
-    args = parser.parse_args()
-    untunedf = get_untuned_gemm_list(args.untune_file)
-    tunedf = get_tuned_gemm_list(args.tune_file)
-    tunedf = tune_gemm_list(untunedf, tunedf, args.sort, args.splitK, args.mp)
-    tunedf.to_csv(args.tune_file, index=False)
+    args = tuner.parse_args()
+    tuner.run(args, False)
