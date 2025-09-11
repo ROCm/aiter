@@ -2,8 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
-import functools
-import json
 import torch
 import triton
 import triton.language as tl

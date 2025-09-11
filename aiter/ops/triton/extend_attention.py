@@ -18,8 +18,6 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
 from typing import Optional
-import functools
-import json
 import torch
 import triton
 import triton.language as tl

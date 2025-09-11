@@ -1,4 +1,3 @@
-from .quant import _mxfp4_quant_op
 from typing import Literal
 import triton
 import triton.language as tl
