@@ -62,11 +62,11 @@ FUNCTION_DEFINE
                                             NTHR,
                                             {{alibi_enabled}},                    
                                             {{gqa_ratio}},
-                                            {{mtp}}>               
+                                            {{mtp}},
+                                            {{quant_method}}>               
     <<<grid, block, 0, reinterpret_cast<hipStream_t>(stream)>>>(reinterpret_cast<{{dtype}}*>(query_ptr),                      
                                     reinterpret_cast<{{kv_dtype}}*>(key_cache_ptr),                  
-                                    reinterpret_cast<{{kv_dtype}}*>(value_cache_ptr),         
-                                    num_kv_heads,       
+                                    reinterpret_cast<{{kv_dtype}}*>(value_cache_ptr),      
                                     scale,                          
                                     block_tables_ptr,                  
                                     context_lens_ptr,
