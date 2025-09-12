@@ -844,7 +844,8 @@ float fmha_bwd_v3(mha_bwd_traits t,
                   fmha_bwd_args a,
                   const ck_tile::stream_config& s,
                   const void* seqlen_q_padded,
-                  const void* seqlen_k_padded){
+                  const void* seqlen_k_padded,
+                  bool is_v3_api_check){
     float r = -1;
 
     if (t.use_ext_asm == true){
@@ -858,6 +859,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                             using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16, false, true, 0, true, true, GPUArch::gfx942>;
                             using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<256, FmhaBwdFp16, false, true, true, false, 0>;
                             // const std::string bwd_v3_name = "bwd_v3_hd192_fp16_a32_psskddv";
+                            if (is_v3_api_check) {
+                                return 1;
+                            }
                             r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                             return r;
                         }
@@ -867,6 +871,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                             using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16, true, true, 0, true, true, GPUArch::gfx942>;
                             using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<256, FmhaBwdFp16, false, true, true, false, 0>;
                             // const std::string bwd_v3_name = "bwd_v3_hd192_fp16_causal_a32_psskddv";
+                            if (is_v3_api_check) {
+                                return 1;
+                            }
                             r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                             return r;
                         }
@@ -877,6 +884,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                             using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16, false/*causal*/, true/*Atimoc32*/, 0, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                             using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<256, FmhaBwdFp16, true/*group*/, true, true, false, 0>;
                             // const std::string bwd_v3_name = "bwd_v3_hd192_fp16_a32_psskddv_group";
+                            if (is_v3_api_check) {
+                                return 1;
+                            }
                             r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                             return r;
                         }
@@ -885,6 +895,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                             using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16, true/*causal*/, true/*Atimoc32*/, 0, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                             using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<256, FmhaBwdFp16, true/*group*/, true, true, false, 0>;
                             // const std::string bwd_v3_name = "bwd_v3_hd192_fp16_causal_a32_psskddv_group";
+                            if (is_v3_api_check) {
+                                return 1;
+                            }
                             r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                             return r;
                         }
@@ -898,6 +911,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16, false, true, 0, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<256, FmhaBwdBf16, false, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd192_bf16_a32_rtne_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -906,6 +922,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16, false, true, 1, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<256, FmhaBwdBf16, false, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd192_bf16_a32_rtna_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -914,6 +933,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16, false, true, 2, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<256, FmhaBwdBf16, false, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd192_bf16_a32_rtz_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -925,6 +947,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16, true, true, 0, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<256, FmhaBwdBf16, false, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd192_bf16_causal_a32_rtne_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -933,6 +958,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16, true, true, 1, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<256, FmhaBwdBf16, false, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd192_bf16_causal_a32_rtna_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -941,6 +969,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16, true, true, 2, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<256, FmhaBwdBf16, false, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd192_bf16_causal_a32_rtz_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -953,18 +984,27 @@ float fmha_bwd_v3(mha_bwd_traits t,
                             if(t.how_v3_bf16_cvt == 0){
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16, false/*causal*/, true/*Atimoc32*/, 0, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd192_bf16_a32_rtne_psskddv_group";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
                             else if(t.how_v3_bf16_cvt == 1){
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16, false/*causal*/, true/*Atimoc32*/, 1, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd192_bf16_a32_rtna_psskddv_group";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
                             else if(t.how_v3_bf16_cvt == 2){
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16, false/*causal*/, true/*Atimoc32*/, 2, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd192_bf16_a32_rtz_psskddv_group";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
@@ -976,18 +1016,27 @@ float fmha_bwd_v3(mha_bwd_traits t,
                             if(t.how_v3_bf16_cvt == 0){
                                 // const std::string bwd_v3_name = "bwd_v3_hd192_bf16_causal_a32_rtne_psskddv_group";
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16, true/*causal*/, true/*Atimoc32*/, 0, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
                             else if(t.how_v3_bf16_cvt == 1){
                                 // const std::string bwd_v3_name = "bwd_v3_hd192_bf16_causal_a32_rtna_psskddv_group";
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16, true/*causal*/, true/*Atimoc32*/, 1, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
                             else if(t.how_v3_bf16_cvt == 2){
                                 // const std::string bwd_v3_name = "bwd_v3_hd192_bf16_causal_a32_rtz_psskddv_group";
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16, true/*causal*/, true/*Atimoc32*/, 2, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
@@ -1006,6 +1055,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false, true, 0, false, false, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, false, false, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a32";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -1014,6 +1066,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false, true, 0, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, false, false, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a32_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -1022,6 +1077,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false, true, 0, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, true, false, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a32_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -1030,6 +1088,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false, true, 0, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, false, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a32_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -1038,6 +1099,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false, true, 0, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a32_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -1049,6 +1113,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, false, false, false>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false, false, 0, false, false, GPUArch::gfx942>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a16";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                 return r;
                             }
@@ -1056,6 +1123,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, false, false, true>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false, false, 0, false, true, GPUArch::gfx942>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a16_pddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_gen_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                 return r;
                             }
@@ -1068,6 +1138,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false/*causal*/, true/*Atimoc32*/, 0, true/*PadS*/, false/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, true, true, false, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a32_pssk_group";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
@@ -1076,6 +1149,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false/*causal*/, true/*Atimoc32*/, 0, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, true, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a32_psskddv_group";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
@@ -1090,6 +1166,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true, true, 0, false, false, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, false, false, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a32";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -1099,6 +1178,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true, true, 0, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a32_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1107,6 +1189,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true, true, 0, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a32_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1115,6 +1200,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true, true, 0, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, false, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a32_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1123,6 +1211,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true, true, 0, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a32_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1135,6 +1226,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, false, false, false>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true, false, 0, false, false, GPUArch::gfx942>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a16";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                 return r;
                             }
@@ -1142,6 +1236,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, false, false, true>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true, false, 0, false, true, GPUArch::gfx942>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a16_pddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_gen_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                 return r;
                             }
@@ -1154,6 +1251,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, 2, true, 0, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, false, false, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_swa_a32_rtne_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -1162,6 +1262,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, 2, true, 0, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, true, false, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_swa_a32_rtne_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -1170,6 +1273,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, 2, true, 0, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, false, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_swa_a32_rtne_psskddv;
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -1178,6 +1284,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, 2, true, 0, true, true, GPUArch::gfx942>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, false, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_swa_a32_rtne_psskddv";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }
@@ -1190,6 +1299,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true/*causal*/, true/*Atimoc32*/, 0, true/*PadS*/, false/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, true, true, false, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a32_pssk_group";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
@@ -1198,6 +1310,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true/*causal*/, true/*Atimoc32*/, 0, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, true, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a32_psskddv_group";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
@@ -1215,6 +1330,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 0, false, false, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtne";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1223,6 +1341,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 0, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtne_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1231,6 +1352,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 0, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtne_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1239,6 +1363,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 0, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtne_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1247,6 +1374,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 0, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtne_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1259,6 +1389,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 1, false, false, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtna";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1267,6 +1400,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 1, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtna_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1275,6 +1411,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 1, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtna_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1283,6 +1422,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 1, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtna_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1291,6 +1433,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 1, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtna_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1303,6 +1448,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 2, false, false, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtz";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1311,6 +1459,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 2, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtz_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1319,6 +1470,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 2, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtz_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1327,6 +1481,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 2, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtz_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1335,6 +1492,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 2, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtz_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1348,6 +1508,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, false>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, false, 0, false, false, GPUArch::gfx942>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a16_rtne";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
@@ -1355,6 +1518,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, true>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, false, 0, false, true, GPUArch::gfx942>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a16_rtne_pddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_gen_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
@@ -1364,6 +1530,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, false>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, false, 1, false, false, GPUArch::gfx942>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a16_rtna";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
@@ -1371,6 +1540,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, true>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, false, 1, false, true, GPUArch::gfx942>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a16_rtna_pddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_gen_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
@@ -1380,6 +1552,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, false>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, false, 2, false, false, GPUArch::gfx942>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a16_rtz";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
@@ -1387,6 +1562,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, true>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, false, 2, false, true, GPUArch::gfx942>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a16_rtz_pddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_gen_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
@@ -1401,6 +1579,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false/*causal*/, true/*Atimoc32*/, 0, true/*PadS*/, false/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtne_pssk_group";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
@@ -1409,6 +1590,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false/*causal*/, true/*Atimoc32*/, 0, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_a32_rtne_psskddv_group";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
@@ -1419,6 +1603,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false/*causal*/, true/*Atimoc32*/, 1, true/*PadS*/, false/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a32_rtna_pssk_group";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
@@ -1427,6 +1614,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false/*causal*/, true/*Atimoc32*/, 1, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a32_rtna_psskddv_group";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
@@ -1437,6 +1627,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false/*causal*/, true/*Atimoc32*/, 2, true/*PadS*/, false/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a32_rtz_pssk_group";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
@@ -1445,6 +1638,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false/*causal*/, true/*Atimoc32*/, 2, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a32_rtz_psskddv_group";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
@@ -1461,6 +1657,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 0, false, false, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtne";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1470,6 +1669,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 0, true, true, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtne_psskddv";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1478,6 +1680,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 0, true, true, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtne_psskddv";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1486,6 +1691,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 0, true, true, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, true, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtne_psskddv";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1494,6 +1702,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 0, true, true, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, true, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtne_psskddv";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1507,6 +1718,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 1, false, false, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtna";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1516,6 +1730,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 1, true, true, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtna_psskddv";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1524,6 +1741,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 1, true, true, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtna_psskddv";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1532,6 +1752,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 1, true, true, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, true, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtna_psskddv";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1540,6 +1763,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 1, true, true, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, true, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtna_psskddv";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1553,6 +1779,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 2, false, false, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtz";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1562,6 +1791,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 2, true, true, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtz_psskddv";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1570,6 +1802,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 2, true, true, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtz_psskddv";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1578,6 +1813,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 2, true, true, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, true, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtz_psskddv";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1586,6 +1824,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 2, true, true, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, true, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtz_psskddv";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1600,6 +1841,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, false>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, false, 0, false, false, GPUArch::gfx942>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a16_rtne";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
@@ -1607,6 +1851,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, true>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, false, 0, false, true, GPUArch::gfx942>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a16_rtne_pddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_gen_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
@@ -1616,6 +1863,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, false>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, false, 1, false, false, GPUArch::gfx942>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a16_rtna";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
@@ -1623,6 +1873,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, true>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, false, 1, false, true, GPUArch::gfx942>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a16_rtna_pddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_gen_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
@@ -1632,6 +1885,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, false>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, false, 2, false, false, GPUArch::gfx942>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a16_rtz";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
@@ -1639,6 +1895,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, true>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, false, 2, false, true, GPUArch::gfx942>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a16_rtz_pddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_gen_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                     return r;
                                 }
@@ -1653,6 +1912,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 0, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_swa_a32_rtne_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1661,6 +1923,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 0, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_swa_a32_rtne_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1669,6 +1934,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 0, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_swa_a32_rtne_psskddv;
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1677,6 +1945,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 0, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_swa_a32_rtne_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1687,6 +1958,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 1, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_swa_a32_rtna_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1695,6 +1969,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 1, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_swa_a32_rtna_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1703,6 +1980,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 1, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_swa_a32_rtna_psskddv;
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1711,6 +1991,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 1, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_swa_a32_rtna_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1721,6 +2004,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 2, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_swa_a32_rtz_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1729,6 +2015,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 2, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_swa_a32_rtz_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1737,6 +2026,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 2, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_swa_a32_rtz_psskddv;
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1745,6 +2037,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 2, true, true, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_swa_a32_rtz_psskddv";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_swa_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1759,6 +2054,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true/*causal*/, true/*Atimoc32*/, 0, true/*PadS*/, false/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtne_pssk_group";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
@@ -1767,6 +2065,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true/*causal*/, true/*Atimoc32*/, 0, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_bf16_causal_a32_rtne_psskddv_group";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
@@ -1777,6 +2078,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true/*causal*/, true/*Atimoc32*/, 1, true/*PadS*/, false/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a32_rtna_pssk_group";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
@@ -1785,6 +2089,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true/*causal*/, true/*Atimoc32*/, 1, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a32_rtna_psskddv_group";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
@@ -1795,6 +2102,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true/*causal*/, true/*Atimoc32*/, 2, true/*PadS*/, false/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a32_rtz_pssk_group";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
@@ -1803,6 +2113,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true/*causal*/, true/*Atimoc32*/, 2, true/*PadS*/, true/*PadD*/, GPUArch::gfx942, true/*group*/>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, true, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_causal_a32_rtz_psskddv_group";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                     return r;
                                 }
@@ -1821,6 +2134,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdFp16, false, true, 0, true, false, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdFp16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd64_fp16_a32_pssk";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1829,6 +2145,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdFp16, false, true, 0, true, false, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdFp16, false, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd64_fp16_a32_pssk";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1838,6 +2157,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdFp16, false, true, 0, true, false, GPUArch::gfx942, true>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdFp16, true, true, false, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd64_fp16_a32_pssk_group";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
@@ -1848,6 +2170,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                             using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<64, FmhaBwdFp16, false, false, false>;
                             using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdFp16, false, false, 0, false, false, GPUArch::gfx942>;
                             // const std::string bwd_v3_name = "bwd_v3_hd64_fp16_a16";
+                            if (is_v3_api_check) {
+                                return 1;
+                            }
                             r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                             return r;
                         }
@@ -1860,6 +2185,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdFp16, true, true, 0, true, false, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdFp16, false, false, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd64_fp16_causal_a32_pssk";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1868,6 +2196,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdFp16, true, true, 0, true, false, GPUArch::gfx942>;
                                     using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdFp16, false, true, false, false, 0>;
                                     // const std::string bwd_v3_name = "bwd_v3_hd64_fp16_causal_a32_pssk";
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                     return r;
                                 }
@@ -1877,6 +2208,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdFp16, true, true, 0, true, false, GPUArch::gfx942, true>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdFp16, true, true, false, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd64_fp16_causal_a32_pssk_group";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
@@ -1887,6 +2221,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                             using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<64, FmhaBwdFp16, false, false, false>;
                             using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdFp16, true, false, 0, false, false, GPUArch::gfx942>;
                             // const std::string bwd_v3_name = "bwd_v3_hd64_fp16_causal_a16";
+                            if (is_v3_api_check) {
+                                return 1;
+                            }
                             r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                             return r;
                         }
@@ -1902,6 +2239,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, false, true, 0, true, false, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, false, false, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_a32_rtne_pssk";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1910,6 +2250,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, false, true, 0, true, false, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, false, true, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_a32_rtne_pssk";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1920,6 +2263,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, false, true, 1, true, false, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, false, false, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_a32_rtna_pssk";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1928,6 +2274,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, false, true, 1, true, false, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, false, true, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_a32_rtna_pssk";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1938,6 +2287,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, false, true, 2, true, false, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, false, false, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_a32_rtz_pssk";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1946,6 +2298,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, false, true, 2, true, false, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, false, true, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_a32_rtz_pssk";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -1956,14 +2311,23 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, true, true, false, false, 0>;
                                 if(t.how_v3_bf16_cvt == 0){
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, false, true, 0, true, false, GPUArch::gfx942, true>;
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 }
                                 else if(t.how_v3_bf16_cvt == 1){
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, false, true, 1, true, false, GPUArch::gfx942, true>;
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 }
                                 else{
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, false, true, 2, true, false, GPUArch::gfx942, true>;
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 }
                                 return r;
@@ -1976,6 +2340,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<64, FmhaBwdBf16, false, false, false>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, false, false, 0, false, false, GPUArch::gfx942>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_a16_rtne";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                 return r;
                             }
@@ -1983,6 +2350,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<64, FmhaBwdBf16, false, false, false>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, false, false, 1, false, false, GPUArch::gfx942>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_a16_rtna";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                 return r;
                             }
@@ -1990,6 +2360,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<64, FmhaBwdBf16, false, false, false>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, false, false, 2, false, false, GPUArch::gfx942>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_a16_rtz";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                 return r;
                             }
@@ -2004,6 +2377,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, true, 0, true, false, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, false, false, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_causal_a32_rtne_pssk";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -2012,6 +2388,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, true, 0, true, false, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, false, true, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_causal_a32_rtne_pssk";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -2022,6 +2401,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, true, 1, true, false, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, false, false, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_causal_a32_rtna_pssk";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -2030,6 +2412,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, true, 1, true, false, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, false, true, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_causal_a32_rtna_pssk";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -2040,6 +2425,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, true, 2, true, false, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, false, false, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_causal_a32_rtz_pssk";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -2048,6 +2436,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                         using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, true, 2, true, false, GPUArch::gfx942>;
                                         using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, false, true, false, false, 0>;
                                         // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_causal_a32_rtz_pssk";
+                                        if (is_v3_api_check) {
+                                            return 1;
+                                        }
                                         r = fmha_bwd_v3_genl_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                         return r;
                                     }
@@ -2058,14 +2449,23 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, true, true, false, false, 0>;
                                 if(t.how_v3_bf16_cvt == 0){
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, true, 0, true, false, GPUArch::gfx942, true>;
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 }
                                 else if(t.how_v3_bf16_cvt == 1){
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, true, 1, true, false, GPUArch::gfx942, true>;
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 }
                                 else{
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, true, 2, true, false, GPUArch::gfx942, true>;
+                                    if (is_v3_api_check) {
+                                        return 1;
+                                    }
                                     r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 }
                                 return r;
@@ -2078,6 +2478,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<64, FmhaBwdBf16, false, false, false>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, false, 0, false, false, GPUArch::gfx942>;
                                 const std::string bwd_v3_name = "bwd_v3_hd64_bf16_causal_a16_rtne";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                 return r;
                             }
@@ -2085,6 +2488,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<64, FmhaBwdBf16, false, false, false>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, false, 1, false, false, GPUArch::gfx942>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_causal_a16_rtna";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                 return r;
                             }
@@ -2092,6 +2498,9 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<64, FmhaBwdBf16, false, false, false>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, false, 2, false, false, GPUArch::gfx942>;
                                 // const std::string bwd_v3_name = "bwd_v3_hd64_bf16_causal_a16_rtz";
+                                if (is_v3_api_check) {
+                                    return 1;
+                                }
                                 r = fmha_bwd_v3_<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
                                 return r;
                             }

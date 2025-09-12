@@ -1551,7 +1551,7 @@ class FmoeTuner(TunerCommon):
             )
         if not rets:
             print("no shape to tune or no solution found")
-            return None
+            return []
         else:
             return rets
 

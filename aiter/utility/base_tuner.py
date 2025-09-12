@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 import os
 import argparse
 import torch
@@ -231,7 +234,7 @@ class TunerCommon:
         if args.verbose:
             logger.info(f"args: {args}")
         if len(self.untunedf) == 0:
-            self.update_tflops_bw(args.tune_file)
+            # self.update_tflops_bw(args.tune_file)
             logger.info(f"no shapes to be tuned, skip tuning")
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
         batch_size = min(args.batch, len(self.untunedf))
@@ -249,7 +252,7 @@ class TunerCommon:
                 batch = self.untunedf.iloc[i : i + batch_size].reset_index(drop=True)
                 processed_batches += 1
                 all_results = self.tune(batch, self.tunedf, args)
-                if all_results or all_results is not None:
+                if all_results:
                     results = self.post_process(all_results, args, topk)
                     self.result_to_csv(results, args.tune_file)
                     logger.info(
