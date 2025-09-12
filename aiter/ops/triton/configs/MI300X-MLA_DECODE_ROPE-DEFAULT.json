@@ -5,7 +5,7 @@
         "num_stages": 1,
         "waves_per_eu": 1, 
         "matrix_instr_nonkdim": 16, 
-        "cache_modifier": ".cg",
+        "cache_modifier": null,
         "kpack": 2
     },
     "fwd_kernel_stage2": {
