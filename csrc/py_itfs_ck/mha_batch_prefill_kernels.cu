@@ -220,20 +220,20 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_n
     const int num_blocks = k.size(0);
     const int page_block_size = k.dim() == 3 ? 1 : k.size(1);
 
-    std::cout << "batch_size: " << batch_size << " num_heads: " << num_heads << " head_size_q: " << head_size_q << " head_size_v: " << head_size_v 
-    << " num_heads_k: " << num_heads_k << " num_blocks: " << num_blocks << " page_block_size:" << page_block_size << std::endl;
+    // std::cout << "batch_size: " << batch_size << " num_heads: " << num_heads << " head_size_q: " << head_size_q << " head_size_v: " << head_size_v 
+    // << " num_heads_k: " << num_heads_k << " num_blocks: " << num_blocks << " page_block_size:" << page_block_size << std::endl;
     
-    std::cout << "k dim: { ";
-    for(int i = 0; i < k.dim(); i++){
-        std::cout << k.size(i) << "  ";
-    }
-    std::cout << "}" << std::endl;
+    // std::cout << "k dim: { ";
+    // for(int i = 0; i < k.dim(); i++){
+    //     std::cout << k.size(i) << "  ";
+    // }
+    // std::cout << "}" << std::endl;
 
-    std::cout << "k stride: { ";
-    for(int i = 0; i < k.dim(); i++){
-        std::cout << k.stride(i) << " ";
-    }
-    std::cout << "}" << std::endl;
+    // std::cout << "k stride: { ";
+    // for(int i = 0; i < k.dim(); i++){
+    //     std::cout << k.stride(i) << " ";
+    // }
+    // std::cout << "}" << std::endl;
 
     
     if(max_seqlen_q == 1 && !alibi_slopes_.has_value())

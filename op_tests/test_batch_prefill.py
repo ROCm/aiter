@@ -6,6 +6,8 @@ import math
 import os
 import pytest
 import torch
+import numpy as np
+
 
 import aiter
 from aiter import dtypes
@@ -105,7 +107,7 @@ def ref_masked_attention(
         (2048, 2048),
     ],
 )
-@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("page_size", [1])
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(6, 1), (3, 1)])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [False, True])
@@ -162,8 +164,7 @@ def test_batch_prefill_with_paged_kv_cache(
     q_indptr_cpu = convert_lens_to_indtpr(qo_lens)
     max_num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = max_num_pages_per_seq * batch_size
-    # kv layout is NHD
-    kv_shape = [total_num_pages, 2, page_size, num_kv_heads, head_dim]
+    kv_shape = [total_num_pages, 2, num_kv_heads, page_size, head_dim]
     if not contiguous_kv:
         tmp = [kv_shape[0]]
         for v in kv_shape[1:]:
@@ -204,10 +205,8 @@ def test_batch_prefill_with_paged_kv_cache(
     kv_indices_gpu = kv_indices_cpu.to(0)
 
     chunks = torch.chunk(kv_data, 2, dim=1)
-    k_cache = chunks[0].squeeze(1).squeeze(1)
-    v_cache = chunks[1].squeeze(1).squeeze(1)
-    # print(k_cache.shape)
-    # return
+    k_cache = chunks[0].squeeze(2).squeeze(2)
+    v_cache = chunks[1].squeeze(2).squeeze(2)
 
     o_ck_flash_attn = aiter.mha_batch_prefill_func(
         q,
@@ -272,6 +271,200 @@ def test_batch_prefill_with_paged_kv_cache(
         o_i = o_ck_flash_attn[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
         torch.testing.assert_close(o_i, o_ref_i, rtol=rtol, atol=atol)
 
+@pytest.mark.parametrize("batch_size", [1, 3, 7])
+@pytest.mark.parametrize(
+    "qo_len,kv_len",
+    [
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
+    ],
+)
+@pytest.mark.parametrize("page_size", [16])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(6, 1), (3, 1)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("contiguous_kv", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("q_init_min,q_init_max", [(-10, 10)])
+@pytest.mark.parametrize("kv_init_min,kv_init_max", [(-5, 5)])
+@pytest.mark.parametrize("seed", [19378])
+def test_batch_prefill_with_paged_kv_cache2(
+    batch_size,
+    kv_len,
+    qo_len,
+    page_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    causal,
+    kv_layout,
+    logits_soft_cap,
+    contiguous_kv,
+    dtype,
+    q_init_min,
+    q_init_max,
+    kv_init_min,
+    kv_init_max,
+    seed,
+):
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    if causal and kv_len < qo_len:
+        pytest.skip("kv_len < qo_len is not allowed if causal=True")
+
+    if head_dim == 64 and qo_len <= 64:
+        pytest.skip("Unsupported configuration")
+
+    def create_tensor(min, max, *args, **kwargs):
+        x = torch.randn(*args, **kwargs)
+        x = (x - x.min()) / (x.max() - x.min())
+        return min + (max - min) * x
+    def create_tensor2(min, max, *args, **kwargs):
+        return torch.ones(*args, **kwargs)
+
+    def convert_lens_to_indtpr(lens):
+        return torch.cumsum(torch.cat((torch.tensor([0]), lens)), dim=0).int()
+
+    q = create_tensor(
+        q_init_min, q_init_max, batch_size * qo_len, num_qo_heads, head_dim, dtype=dtype
+    ).to(0)
+    if 1 < batch_size:
+        qo_lens = torch.randint(1, qo_len + 1, (batch_size,)).int()
+    else:
+        qo_lens = torch.full((batch_size,), qo_len).int()
+    q_indptr_cpu = convert_lens_to_indtpr(qo_lens)
+    # print("\n")
+    # print("q shape: ", q.shape)
+    # print("q_indptr_cpu: ",q_indptr_cpu)
+    max_num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = max_num_pages_per_seq * batch_size
+    # kv layout is NHD
+    kv_shape = [total_num_pages, page_size, num_kv_heads,  head_dim]
+    
+    k_data_fp32 = create_tensor(
+            kv_init_min, kv_init_max, *kv_shape, dtype=torch.float32
+        ).to(0)
+    k_data = k_data_fp32.to(dtype)
+
+    v_data_fp32 = create_tensor(
+            kv_init_min, kv_init_max, *kv_shape, dtype=torch.float32
+        ).to(0)
+    v_data = v_data_fp32.to(dtype)
+
+    if 1 < batch_size:
+        kv_lens = torch.maximum(
+            qo_lens, torch.randint(1, kv_len + 1, (batch_size,))
+        ).int()
+    else:
+        kv_lens = torch.full((batch_size,), kv_len).int()
+    kv_num_used_pages = (kv_lens + page_size - 1) // page_size
+    kv_indptr_cpu = convert_lens_to_indtpr(kv_num_used_pages)
+    kv_indices_cpu = torch.nn.functional.pad(
+        torch.randperm(total_num_pages).int(), (0, 0), value=0
+    )
+    # kv_indices_cpu = torch.tensor([0, 1], dtype=torch.int32)
+    kv_last_page_len_cpu = ((kv_lens - 1) % page_size + 1).int()
+
+    q_indptr_gpu = q_indptr_cpu.to(0)
+    kv_indptr_gpu = kv_indptr_cpu.to(0)
+    kv_indices_gpu = kv_indices_cpu.to(0)
+    kv_last_page_len_gpu = kv_last_page_len_cpu.to(0)
+
+    k_cache = k_data
+    v_cache = v_data
+    # print('Q shape:', q.shape, ' contiguous:', q.is_contiguous())
+    # print('k shape:', k_cache.shape, ' contiguous:', k_cache.is_contiguous())
+    # print("kv_indptr_cpu: ", kv_indptr_cpu)
+    # print("kv_indices_cpu: ", kv_indices_cpu)
+    # print("kv_last_page_len_cpu: ", kv_last_page_len_cpu)
+    # return
+
+    o_ck_flash_attn = aiter.mha_batch_prefill_func(
+        q,
+        k_cache,
+        v_cache,
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        torch.max(qo_lens).item(),
+        torch.max(kv_lens).item(),
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        # kv_last_page_lens=kv_last_page_len_gpu,
+    )
+
+    for i in range(batch_size):
+        perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
+        perm_dims_last = [1, 0, 2] if kv_layout == "HND" else [0, 1, 2]
+        qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+        used_kv_indices = kv_indices_cpu[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
+        ki = torch.cat(
+            [
+                k_data_fp32[used_kv_indices[:-1]]
+                .permute(*perm_dims)
+                .reshape(-1, num_kv_heads, head_dim),
+                (
+                    k_data_fp32[used_kv_indices[-1], :, : kv_last_page_len_cpu[i]]
+                    if kv_layout == "HND"
+                    else k_data_fp32[
+                        used_kv_indices[-1], : kv_last_page_len_cpu[i], :
+                    ]
+                )
+                .permute(*perm_dims_last)
+                .reshape(-1, num_kv_heads, head_dim),
+            ],
+            dim=0,
+        ).to(dtype)
+        vi = torch.cat(
+            [
+                v_data_fp32[used_kv_indices[:-1]]
+                .permute(*perm_dims)
+                .reshape(-1, num_kv_heads, head_dim),
+                (
+                    v_data_fp32[used_kv_indices[-1], :, : kv_last_page_len_cpu[i]]
+                    if kv_layout == "HND"
+                    else v_data_fp32[
+                        used_kv_indices[-1], : kv_last_page_len_cpu[i], :
+                    ]
+                )
+                .permute(*perm_dims_last)
+                .reshape(-1, num_kv_heads, head_dim),
+            ],
+            dim=0,
+        ).to(dtype)
+
+        # enlarge rtol for bf16 to allow passing very few numeric errors
+        rtol, atol = (1e-3, 1e-3) if dtype == torch.float16 else (2e-2, 1e-2)
+
+        o_ref_i = ref_masked_attention(
+            qi, ki, vi, causal=causal, logits_soft_cap=logits_soft_cap
+        )
+
+        o_i = o_ck_flash_attn[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+ 
+        # print("qi.shape: ", qi.shape)
+        # # print(qi)
+        # print("ki.shape: ", ki.shape)
+        # # print(ki)
+        # print("vi.shape: ", vi.shape)
+        # # print(vi)
+
+        # print("o_i.shape: ", o_i.shape)
+        # # print(o_i)
+        # print("o_ref_i.shape: ", o_ref_i.shape)
+        # # print(o_ref_i)
+        # np.savetxt("./qi.txt", qi.to(torch.float32).reshape(-1,qi.shape[-1]).cpu().numpy())
+        # np.savetxt("./ki.txt", ki.to(torch.float32).reshape(-1,ki.shape[-1]).cpu().numpy())
+        # np.savetxt("./vi.txt", vi.to(torch.float32).reshape(-1,vi.shape[-1]).cpu().numpy())
+        # np.savetxt("./o_i.txt", o_i.to(torch.float32).reshape(-1,o_i.shape[-1]).cpu().numpy())
+        # np.savetxt("./o_ref_i.txt", o_ref_i.to(torch.float32).reshape(-1,o_i.shape[-1]).cpu().numpy())
+        torch.testing.assert_close(o_i, o_ref_i, rtol=rtol, atol=atol)
+
 
 l_causal = [False, True]
 l_logits_soft_cap = [0.0, 30.0]
@@ -329,15 +522,15 @@ if __name__ == "__main__":
         logits_soft_cap,
         dtype,
     ) in itertools.product(l_causal, l_logits_soft_cap, l_dtype):
-        test_batch_prefill_with_paged_kv_cache(
-            batch_size=1,
-            kv_len=8192,
-            qo_len=8192,
-            page_size=1,
-            num_qo_heads=6,
+        test_batch_prefill_with_paged_kv_cache2(
+            batch_size=2,
+            kv_len=32,
+            qo_len=16,
+            page_size=16,
+            num_qo_heads=1,
             num_kv_heads=1,
             head_dim=128,
-            causal=causal,
+            causal=None,
             kv_layout="NHD",
             logits_soft_cap=logits_soft_cap,
             contiguous_kv=True,
