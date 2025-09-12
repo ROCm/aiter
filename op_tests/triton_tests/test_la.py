@@ -8,9 +8,9 @@ from typing import Union, List
 from aiter.ops.triton.lean_atten import (
     _persistent_lean_attention,
     persistent_lean_attention,
-    _get_config,
 )
-import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton._triton_kernels.lean_atten import _get_config
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
 def get_lean_attn_inputs(
