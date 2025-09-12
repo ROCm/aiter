@@ -172,8 +172,11 @@ def run_mori(
 
     combine_output = mori_op.combine(out, topk_weights, topk_ids)
     # print(f"{rankID=} {combine_output.shape=} {combine_output.dtype=} {out.dtype=}")
+    # Extract the actual output tensor from the tuple (assuming it's the first element)
+    output_tensor = combine_output[0] if isinstance(combine_output, tuple) else combine_output
+    
     aiter.destroy_dist_env()
-    return combine_output[:token_num].cpu()
+    return output_tensor[:token_num].cpu()
 
 
 def weight_per_128x128_quant(weight, quant_dtype):
