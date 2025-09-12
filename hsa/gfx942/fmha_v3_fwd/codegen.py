@@ -167,7 +167,7 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, mha_fwd_args a,
 {
     if(s.log_level_ > 0)
         std::cout << ", " << FmhaFwdV3Name<fmha_fwd_kernel_selector>::fwd_v3_name << std::flush;
-
+    std::cout << ", " << FmhaFwdV3Name<fmha_fwd_kernel_selector>::fwd_v3_name << std::flush;
     int tune_opt = 5;
     if (a.mask_type != 0 && ((a.nhead_q % 8 != 0) || (a.seqlen_q > 16384))) //if num_head is not 8N, or seqlen is bigger than 16K, downgrade to 2and3
     {
@@ -209,6 +209,15 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, mha_fwd_args a,
     args.ptr_kseq = a.seqstart_k_ptr;
     args.ptr_qseq_padding = seqstart_q_padding_ptr == nullptr ? a.seqstart_q_ptr : seqstart_q_padding_ptr;
     args.ptr_kseq_padding = seqstart_k_padding_ptr == nullptr ? a.seqstart_k_ptr : seqstart_k_padding_ptr;
+
+    std::cout << " args.s_seq_len:" << args.s_seq_len << " args.s_Seqs:" << args.s_Seqs << " args.s_Ts:" << args.s_Ts <<
+                " args.s_Hs:" << args.s_Hs << " args.s_Bs:" << args.s_Bs << " args.s_gqa: " << args.s_gqa <<
+                " args.s_k_Seqs:" << args.s_k_Seqs << " args.s_k_Hs:" << args.s_k_Hs << " args.s_k_Bs:" << args.s_k_Bs <<
+                " args.s_opt:" << args.s_opt << " args.s_lse:" << args.s_lse << "args.s_kv_seq_len:" << args.s_kv_seq_len <<
+                " args.s_qk_head_dim: " << args.s_qk_head_dim << " args.s_v_head_dim:" << args.s_v_head_dim <<
+                " args.s_q_head_num:" << args.s_q_head_num << " args.s_v_Seqs:" << args.s_v_Seqs << " args.s_v_Hs:" << args.s_v_Hs <<
+                " args.s_v_Bs:" << args.s_v_Bs << " args.s_o_Seqs:" << args.s_o_Seqs << " args.s_o_Hs:" << args.s_o_Hs <<
+                " args.s_o_Bs:" << args.s_o_Bs << " args.s_lse_Hs:" << args.s_lse_Hs << std::endl;
 
     auto traits = fmha_fwd_v3_traits{a.batch,
                                      a.nhead_q,
