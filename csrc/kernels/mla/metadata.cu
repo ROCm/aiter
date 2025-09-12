@@ -911,14 +911,14 @@ void get_mla_metadata_v1_device(
     const int32_t        num_heads_per_head_k,
     const int32_t        num_heads_k,
     const bool           is_causal,
-    const int32_t        kv_granularity,
     const bool           no_redundant,
     torch::Tensor&       work_metadata_ptrs,
     torch::Tensor&       work_info_set,
     torch::Tensor&       work_indptr,
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
-    torch::Tensor&       reduce_partial_map)
+    torch::Tensor&       reduce_partial_map,
+    std::optional<std::map<std::string, int32_t>> split_params)
 {
     TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
                 __func__, ": seqlens_qo_indptr should be continuous!");
@@ -929,6 +929,22 @@ void get_mla_metadata_v1_device(
     TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
                 __func__, ": seqlens_kv_indptr's element type should be int!");
 
+    int32_t kv_granularity = 16;
+    int32_t max_seqlen_qo = -1;
+
+    if (split_params.has_value())
+    {
+        if (split_params->find("kv_granularity") != split_params->end())
+        {
+            kv_granularity = split_params->find("kv_granularity")->second;
+        }
+
+        if (split_params->find("max_seqlen_qo") != split_params->end())
+        {
+            max_seqlen_qo = split_params->find("max_seqlen_qo")->second;
+        }
+    }
+
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     auto opts = seqlens_kv_indptr.options();
@@ -938,38 +954,37 @@ void get_mla_metadata_v1_device(
     HIP_CALL(hipGetDevice(&dev));
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
 
-    const int32_t num_batches  = seqlens_qo_indptr.size(0) - 1;
-    const int32_t num_cu       = dev_prop.multiProcessorCount;
-    const int32_t num_heads    = num_heads_per_head_k * num_heads_k;
-    // TODO: We're assuming that qo lengths are identical while it would be better to get the max of qo_len
-    const int32_t qo_len       = seqlens_qo_indptr[1].item<int32_t>() - seqlens_qo_indptr[0].item<int32_t>();
-    const int32_t qo_tile_per_batch =
-        ck_tile::integer_divide_ceil(qo_len * num_heads, Traits::kPackedQoLenPerWg);
-    const int32_t max_qo_tiles = num_batches * qo_tile_per_batch;
+    const int32_t num_batches = seqlens_qo_indptr.size(0) - 1;
+    const int32_t num_cu      = dev_prop.multiProcessorCount;
+    const int32_t num_heads   = num_heads_per_head_k * num_heads_k;
 
     const int32_t lds_size_in_bytes = [&]()
     {
-        int32_t lds_size = 0;
-
+        const int32_t qo_tile_per_batch =
+            ck_tile::integer_divide_ceil(ck_tile::max(max_seqlen_qo, 1) * num_heads, Traits::kPackedQoLenPerWg);
+        const int32_t tot_qo_tiles      = num_batches * qo_tile_per_batch;
         // this is maximun #clusters
         const int32_t num_clusters = dev_prop.multiProcessorCount;
+
+        int32_t lds_size = 0;
+
         // Stores batch_id, qo_len and kv_len
         lds_size += 3 * num_batches * sizeof(int32_t);
         // Memory for indptr about #cluster for each batch in direction of qo
         lds_size += (num_batches + 1) * sizeof(int32_t);
         // LDS for sorting
+        const int32_t power_2_num_batches = (num_batches <= 1) ? num_batches : ck_tile::next_power_of_two(num_batches);
         const int32_t lds_sort_size =
             lds_size +
-            ck_tile::integer_least_multiple(ck_tile::next_power_of_two(num_batches),
-                                            ck_tile::get_warp_size()) * 2 * sizeof(int32_t);
+            ck_tile::integer_least_multiple(power_2_num_batches, ck_tile::get_warp_size()) * 2 * sizeof(int32_t);
         // Memory for cost. Its size should be the same as #clusters
         lds_size += num_clusters * sizeof(int32_t);
         // Memory for counter of #works for each cluster.
         lds_size += num_clusters * sizeof(int32_t);
         // Memory for range of partial memory
-        lds_size += max_qo_tiles * sizeof(MlaPartialTileInfo);
+        lds_size += tot_qo_tiles * sizeof(MlaPartialTileInfo);
         // Memory for range of output of partial memory
-        lds_size += max_qo_tiles * sizeof(MlaPartialTileInfo);
+        lds_size += tot_qo_tiles * sizeof(MlaPartialTileInfo);
 
         return ck_tile::max(lds_size, lds_sort_size);
     }();
@@ -1296,13 +1311,13 @@ void get_mla_metadata_v1(
     const int32_t        num_heads_per_head_k,
     const int32_t        num_heads_k,
     const bool           is_causal,
-    const int32_t        kv_granularity,
     torch::Tensor&       work_metadata_ptrs,
     torch::Tensor&       work_info_set,
     torch::Tensor&       work_indptr,
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
-    torch::Tensor&       reduce_partial_map)
+    torch::Tensor&       reduce_partial_map,
+    std::optional<std::map<std::string, int32_t>> split_params)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
 
@@ -1318,14 +1333,14 @@ void get_mla_metadata_v1(
         num_heads_per_head_k,
         num_heads_k,
         is_causal,
-        kv_granularity,
         false,
         work_metadata_ptrs,
         work_info_set,
         work_indptr,
         reduce_indptr,
         reduce_final_map,
-        reduce_partial_map);
+        reduce_partial_map,
+        split_params);
 }
 
 std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(

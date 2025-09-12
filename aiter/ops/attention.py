@@ -303,13 +303,13 @@ def get_mla_metadata_v1(
     num_heads_per_head_k: int,
     num_heads_k: int,
     is_causal: bool,
-    kv_granularity: int,
     work_metadata_ptrs: torch.Tensor,
     work_indptr: torch.Tensor,
     work_info: torch.Tensor,
     reduce_indptr: torch.Tensor,
     reduce_final_map: torch.Tensor,
     reduce_partial_map: torch.Tensor,
+    split_params: Optional[dict[str, int]] = None,
 ):
     """
     Inputs:
@@ -318,7 +318,9 @@ def get_mla_metadata_v1(
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: whether causal mask is enabled.
-        kv_granularity: the granularity on kv sequence length when cutting batch.
+        split_params: detailed settings for spliting. all of them are optional.
+            kv_granularity: default=16. the granularity on kv sequence length when cutting batch.
+            max_seqlen_qo: default=-1. used to check lds usage and save time.
     Outputs:
         [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
                                                     work_info.

@@ -44,13 +44,13 @@ void get_mla_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size 
                          const int32_t num_heads_per_head_k,
                          const int32_t num_heads_k,
                          const bool is_causal,
-                         const int32_t kv_granularity,
                          torch::Tensor& work_metadata_ptrs,
                          torch::Tensor& work_indptr,
                          torch::Tensor& work_info,
                          torch::Tensor& reduce_indptr,
                          torch::Tensor& reduce_final_map,
-                         torch::Tensor& reduce_partial_map);
+                         torch::Tensor& reduce_partial_map,
+                         std::optional<std::map<std::string, int32_t>> split_params);
 
 std::vector<torch::Tensor>
 get_mla_metadata_v1_no_redundant(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
