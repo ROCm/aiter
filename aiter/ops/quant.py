@@ -14,13 +14,13 @@ from ..utility import dtypes, fp4_utils
 
 @compile_ops("module_smoothquant")
 def smoothquant_fwd(
-    input: Tensor, out: Tensor, x_scale: Tensor, y_scale: Tensor
+    out: Tensor, input: Tensor, x_scale: Tensor, y_scale: Tensor
 ) -> None: ...
 
 
 @compile_ops("module_smoothquant")
 def moe_smoothquant_fwd(
-    input: Tensor, out: Tensor, x_scale: Tensor, topk_ids: Tensor, y_scale: Tensor
+    out: Tensor, input: Tensor, x_scale: Tensor, topk_ids: Tensor, y_scale: Tensor
 ) -> None: ...
 
 
@@ -393,6 +393,19 @@ def dynamic_per_group_scaled_quant_fp4(
     Only support group_size in [32, 64, 128]
     """
     ...
+
+
+@compile_ops("module_quant")
+def smooth_per_token_scaled_quant(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    smooth_scale: torch.Tensor,
+    smooth_scale_map: Optional[torch.Tensor] = None,
+    shuffle_scale: bool = False,
+    num_rows: Optional[torch.Tensor] = None,
+    num_rows_factor: int = 1,
+) -> None: ...
 
 
 @compile_ops("module_quant")
