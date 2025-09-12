@@ -17,6 +17,7 @@ from aiter.ops.triton.utils.read_json_configs import build_triton_configs_from_j
 fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/GPT_OSS_BF16_configs.json"
 GPT_oss_configs = build_triton_configs_from_json(fpath)
 
+
 @triton.autotune(
     configs=GPT_oss_configs,
     key=["next_M_2", "N", "K"],
@@ -84,9 +85,7 @@ def _gemm_a16_w16_kernel(
 
     acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
     if ADD_BIAS:
-        accumulator = tl.load(bias_ptr + offs_bn).to(
-            dtype=acc_dtype
-        )
+        accumulator = tl.load(bias_ptr + offs_bn).to(dtype=acc_dtype)
         accumulator = tl.broadcast_to(
             accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
         )
