@@ -5,10 +5,42 @@ import triton.language as tl
 import torch
 from aiter.ops.triton.utils.arch_info import get_num_sms, get_fp8_dtypes
 import math
+from aiter.ops.triton.quant import _mxfp4_quant_op
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 float8_info = torch.finfo(e4m3_type)
+global_iter = 1
+saved_flag = False
+mxfp4_list = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+]
+lut = torch.tensor(mxfp4_list, dtype=torch.float32, device="cuda")
 
+@triton.jit
+def _fp32_to_mxfp4_to_fp32(x,
+                            lut_ptr,
+                            BLOCK_M,
+                            BLOCK_N,
+                            GROUP_SIZE):
+    x_u8, bs_e8m0 = _mxfp4_quant_op(x, BLOCK_N, BLOCK_M, GROUP_SIZE)
+    low = x_u8 & 0xF
+    high = x_u8 >> 4
+
+    # LUT lookup (elementwise gather)
+    x_low_fp32 = tl.load(lut_ptr + low)
+    x_high_fp32 = tl.load(lut_ptr + high)
+    x_fp32 = tl.interleave(x_low_fp32, x_high_fp32)
+    # x_fp32: [M,N]
+    # scale_f32: [M, N//GROUP_SIZE]
+    exp_unbiased = bs_e8m0.to(tl.int32) - 127
+    scale_f32 = tl.exp2(exp_unbiased.to(tl.float32))
+
+    x_fp32 = x_fp32.reshape(BLOCK_M, BLOCK_N//GROUP_SIZE, GROUP_SIZE)
+    scale_f32 = scale_f32.reshape(BLOCK_M, BLOCK_N//GROUP_SIZE, 1)
+    final_x = (x_fp32 * scale_f32).reshape(BLOCK_M, BLOCK_N)
+
+    return final_x
 
 @triton.jit
 def cdiv_fn(x, y):
@@ -732,6 +764,102 @@ def reduce_segments(
     )
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 
+@triton.jit
+def convert_kv_cache_kernel(key_cache_ptr,
+                         value_cache_ptr, #[num_blks, blk_size, num_kv_heads, head_size]
+                         block_tables_ptr, #[num_blks, blk_size, num_kv_heads, head_size]
+                         lut_ptr,
+                         kv_lengths,
+                        block_table_stride: tl.int64,  # int
+                        stride_k_cache_0: tl.int64,  # int
+                        stride_k_cache_1: tl.int64,  # int
+                        stride_k_cache_2: tl.int64,  # int
+                        stride_k_cache_3: tl.constexpr,  # int
+                        stride_v_cache_0: tl.int64,  # int
+                        stride_v_cache_1: tl.int64,  # int
+                        stride_v_cache_2: tl.int64,  # int
+                        stride_v_cache_3: tl.constexpr,  # int
+                        BLOCK_SIZE: tl.constexpr,
+                        HEAD_SIZE: tl.constexpr,
+                        GROUP_SIZE: tl.constexpr):
+    
+    seq_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+
+    kv_length = tl.load(kv_lengths + seq_idx)
+    num_blocks = cdiv_fn(kv_length, BLOCK_SIZE)
+    block_table_offset = seq_idx * block_table_stride
+    offs_d = tl.arange(0, HEAD_SIZE)
+    # iterate through tiles
+    for j in range(0, num_blocks):
+
+        physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j)
+
+        offs_n = tl.arange(0, BLOCK_SIZE)
+
+        k_offset = (
+            kv_head_idx * stride_k_cache_2
+            + offs_d[:, None] * stride_k_cache_3
+            + offs_n[None, :] * stride_k_cache_1
+        )
+
+        v_offset = (
+            kv_head_idx * stride_v_cache_2
+            + offs_d[:, None] * stride_v_cache_3
+            + offs_n[None, :] * stride_v_cache_1
+        )
+
+        # K : (HEAD_SIZE, BLOCK_SIZE)
+        K_load = tl.load(
+            key_cache_ptr + k_offset + physical_block_idx * stride_k_cache_0, cache_modifier=".cg"
+        )
+
+        K_load = _fp32_to_mxfp4_to_fp32(K_load.to(tl.float32), lut_ptr, HEAD_SIZE, BLOCK_SIZE, GROUP_SIZE).to(tl.bfloat16)
+
+        out_offset = (
+            kv_head_idx * stride_k_cache_2
+            + offs_d[:, None] * stride_k_cache_3
+            + offs_n[None, :] * stride_k_cache_1
+        )
+
+        tl.store(key_cache_ptr + k_offset + physical_block_idx * stride_k_cache_0, K_load)
+
+        # V : (BLOCK_SIZE, HEAD_SIZE)
+        V_load = tl.load(
+            value_cache_ptr + v_offset + physical_block_idx * stride_v_cache_0, cache_modifier=".cg"
+        )
+
+        V_load = _fp32_to_mxfp4_to_fp32(V_load.to(tl.float32), lut_ptr, HEAD_SIZE, BLOCK_SIZE, GROUP_SIZE).to(tl.bfloat16)
+
+        tl.store(value_cache_ptr + v_offset + physical_block_idx * stride_v_cache_0, V_load)
+
+def convert_kv_cache(q, k, v, seqused_k, max_seqlen_k, block_table, group_size=32):
+    block_size = v.shape[1]
+    num_seqs = len(seqused_k)
+    num_query_heads = q.shape[1]
+    num_kv_heads = k.shape[2]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    head_size = q.shape[2]
+    num_blocks = math.ceil(max_seqlen_k / block_size)
+    convert_kv_cache_kernel[(num_seqs, num_kv_heads)](
+        k,
+        v,
+        block_table,
+        lut,
+        seqused_k,
+        block_table.stride(0),
+        stride_k_cache_0=k.stride(0),
+        stride_k_cache_1=k.stride(1),
+        stride_k_cache_2=k.stride(2),
+        stride_k_cache_3=k.stride(3),
+        stride_v_cache_0=v.stride(0),
+        stride_v_cache_1=v.stride(1),
+        stride_v_cache_2=v.stride(2),
+        stride_v_cache_3=v.stride(3),
+        BLOCK_SIZE=block_size,
+        HEAD_SIZE=head_size,
+        GROUP_SIZE=group_size,
+    )
 
 def unified_attention(
     q,
@@ -796,6 +924,22 @@ def unified_attention(
     target_num_prgms = get_num_sms() * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
+    global global_iter, saved_flag
+
+    global_iter += 1
+    if saved_flag == False and global_iter >= 1024 and SLIDING_WINDOW == 0 and max_seqlen_k > 1024:
+        saved_flag = True
+        torch.save(k, 'k.pt')
+        torch.save(v, 'v.pt')
+        torch.save(q, 'q.pt')
+        torch.save(cu_seqlens_q, 'cu_seqlens_q.pt')
+        torch.save(seqused_k, 'seqused_k.pt')
+        torch.save(block_table, 'block_table.pt')
+        torch.save(sinks, 'sinks.pt')
+        torch.save(softmax_scale, 'softmax_scale.pt')
+    convert_kv_cache(q, k, v, seqused_k, max_seqlen_k, block_table, group_size=32)
+
+
 
     # call 2d if sliding window is used
     if SLIDING_WINDOW > 0 or num_2d_prgms >= target_num_prgms or max_seqlen_k <= 1024:
