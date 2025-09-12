@@ -67,10 +67,10 @@ def _gemm_a8w8_blockscale_kernel(
     cache_modifier: gl.constexpr,
 ):
     """
-    Note: this is Triton jited function and not meant to be called direcgly. Call gemm_a8w8_blockscale function
-    below
+    Note: this is Gluon jited function and not meant to be called directly. Call the gemm_a8w8_blockscale function
+    below.
 
-    Computes the 8 bit matmul C = A x B using the block-scale quantization approach.
+    Computes the 8 bit matmul C = A x B using a block-scale quantization approach.
 
     Key parameters:
     - A: Matrix A with shape (M, K).
@@ -100,6 +100,7 @@ def _gemm_a8w8_blockscale_kernel(
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
 
+    # Generating layouts
     threads_per_elem_mk: gl.constexpr = triton.cdiv(
         BLOCK_SIZE_M * BLOCK_SIZE_K // (NUM_WARPS * 64), 16
     )
@@ -184,6 +185,8 @@ def _gemm_a8w8_blockscale_kernel(
         offs_a_scale = offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
 
         if EVEN_K:
+            # EVEN_K is a boolean denoting if K evenly divides BLOCK_K
+            # Minimize masking overhead if possible
             a = gl.amd.cdna4.buffer_load(
                 ptr=a_ptr,
                 offsets=offs_a,
