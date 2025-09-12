@@ -12,10 +12,10 @@ from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils import read_json_configs
+from aiter.ops.triton.utils.read_json_configs import build_triton_configs_from_json
 
 fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/GPT_OSS_BF16_configs.json"
-GPT_oss_configs = read_json_configs(fpath)
+GPT_oss_configs = build_triton_configs_from_json(fpath)
 
 @triton.autotune(
     configs=GPT_oss_configs,
@@ -24,8 +24,6 @@ GPT_oss_configs = read_json_configs(fpath)
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit
@@ -50,7 +48,6 @@ def _gemm_a16_w16_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
     ADD_BIAS: tl.constexpr,
 ):
@@ -72,7 +69,7 @@ def _gemm_a16_w16_kernel(
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    pid = remap_xcd(pid, GRID_MN)
+    pid = remap_xcd(pid, num_pid_m * num_pid_n)
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 
     tl.assume(pid_m >= 0)
