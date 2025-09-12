@@ -1040,16 +1040,16 @@ bool run(const ck_tile::ArgParser& arg_parser)
 #if CK_TILE_FMHA_FWD_SPLITKV_API
         if(1 < num_splits || use_kvcache)
         {
-            // aiter::mha_fwd_splitkv_args fmha_splitkv_args;
-            // init_args(fmha_splitkv_args);
+            aiter::mha_fwd_splitkv_args fmha_splitkv_args;
+            init_args(fmha_splitkv_args);
 
-            // return aiter::mha_fwd_splitkv(fmha_splitkv_args,
-            //                               stream_config,
-            //                               data_type,
-            //                               mode == mode_enum::group,
-            //                               mask.type,
-            //                               bias.type,
-            //                               lse);
+            return aiter::mha_fwd_splitkv(fmha_splitkv_args,
+                                          stream_config,
+                                          data_type,
+                                          mode == mode_enum::group,
+                                          mask.type,
+                                          bias.type,
+                                          lse);
         }
 #endif
         aiter::mha_fwd_args fmha_args;

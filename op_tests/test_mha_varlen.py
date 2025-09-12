@@ -114,16 +114,6 @@ def run_ck(
     else:
         bias_unpad = None
 
-    qkv = torch.cat([q_unpad, k_unpad, v_unpad], dim=1)
-    q_unpad, k_unpad, v_unpad = torch.split(
-        qkv, [q_unpad.shape[1], k_unpad.shape[1], v_unpad.shape[1]], dim=1
-    )
-    print(q_unpad.shape)
-    print(q_unpad.stride())
-    print(k_unpad.shape)
-    print(k_unpad.stride())
-    print(v_unpad.shape)
-    print(v_unpad.stride())
     outputs = aiter.flash_attn_varlen_func(
         q_unpad,
         k_unpad,
@@ -243,7 +233,7 @@ def test_flash_attn_varlen_func(
 ):
     return_lse = True
     torch.random.manual_seed(0)
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 8)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -321,7 +311,7 @@ def test_flash_attn_varlen_func(
         k,
         v,
         query_padding_mask,
-        query_padding_mask,
+        key_padding_mask,
         min_seqlen_q,
         attn_bias,
         alibi_slopes,
@@ -339,7 +329,7 @@ def test_flash_attn_varlen_func(
         k,
         v,
         query_padding_mask,
-        query_padding_mask,
+        key_padding_mask,
         attn_bias,
         alibi_slopes,
         dout,
@@ -354,7 +344,7 @@ def test_flash_attn_varlen_func(
         k,
         v,
         query_padding_mask,
-        query_padding_mask,
+        key_padding_mask,
         attn_bias,
         alibi_slopes,
         dout,
@@ -411,7 +401,7 @@ if __name__ == "__main__":
         "--nheads",
         type=int,
         nargs="?",
-        default=32,
+        default=4,
         help="""Number of attention heads.
     e.g. -nh 4""",
     )
@@ -420,7 +410,7 @@ if __name__ == "__main__":
         "--seqlen_q_k",
         type=dtypes.str2tuple,
         nargs="?",
-        default=(4, 4),
+        default=(4, 8),
         help="""Sequence length of query&key.
     e.g. -s 4,8""",
     )
@@ -495,7 +485,7 @@ if __name__ == "__main__":
         "-mha",
         "--mha_type",
         type=str,
-        default="gqa",
+        default="mha",
         help="""Type of multi-head attention.
     e.g. -mha mha/mqa/gqa""",
     )
