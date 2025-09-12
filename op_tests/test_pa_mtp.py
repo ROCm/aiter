@@ -5,6 +5,7 @@ import torch
 from typing import List, Optional, Tuple, Union
 import aiter
 from aiter.test_common import checkAllclose, benchmark, perftest
+from aiter import paged_attn as ops
 import random
 import pandas as pd
 import argparse
@@ -251,6 +252,38 @@ def run_aiter_asm(
     )
 
 
+@perftest()
+def run_aiter_hip(
+    query,
+    k_cache,
+    v_cache,
+    block_tables,
+    seq_lens,
+    max_seq_len,
+    max_qlen,
+    kv_cache_dtype,
+    num_kv_heads,
+    scale,
+    k_scale=None,
+    v_scale=None,
+):
+    return aiter.paged_attn.PagedAttention.forward_decode(
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        kv_cache_dtype,
+        num_kv_heads,
+        scale,
+        None,
+        k_scale,
+        v_scale,
+        mtp=max_qlen,
+    )
+
+
 def asm_V_shuffle(VC):
     # [num_blocks, num_kv_heads, head_size, block_size]
     x = 16 // VC.element_size()
@@ -270,11 +303,13 @@ def test_pa_mtp(
     block_size: int,
     dtype: torch.dtype,
     qlen,
-) -> None:
+) -> dict:
+    ret = {}
     seed = 0
     device = "cuda:0"
     torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
+    print(num_query_heads, num_kv_heads)
     assert num_query_heads % num_kv_heads == 0
     max_seq_len = 16384
     max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
@@ -338,21 +373,48 @@ def test_pa_mtp(
         qo_indptr,
     )
 
-    out_asm_noquant, us_asm_noquant = run_aiter_asm(
+    # out_asm_noquant, us_asm_noquant = run_aiter_asm(
+    #     query,
+    #     k_cache,
+    #     asm_V_shuffle(v_cache),
+    #     block_tables,
+    #     seq_lens,
+    #     block_tables.size(1),
+    #     max_qlen,
+    #     qo_indptr=qo_indptr,
+    # )
+    # err_noquant = checkAllclose(
+    #     out_ref_noquant,
+    #     out_asm_noquant,
+    #     msg=f"[torch vs  aiter_asm][No Quant]: {us_asm_noquant:>8.2f} us......",
+    # )
+    # ret["us_asm_bf16"] = us_asm_noquant
+    # ret["err_asm_bf16"] = err_noquant
+
+    scale = float(1.0 / (head_size**0.5))
+    out_hip_noquant, us_hip = run_aiter_hip(
         query,
         k_cache,
-        asm_V_shuffle(v_cache),
+        v_cache,
         block_tables,
         seq_lens,
-        block_tables.size(1),
+        ctx_lens,
         max_qlen,
-        qo_indptr=qo_indptr,
+        "auto",
+        num_kv_heads,
+        scale,
+        torch.ones(1, dtype=dtypes.fp32),
+        torch.ones(1, dtype=dtypes.fp32),
+        # k_scale_asm,
+        # v_scale_asm,
     )
     err_noquant = checkAllclose(
         out_ref_noquant,
-        out_asm_noquant,
-        msg=f"[torch vs  aiter_asm][No Quant]: {us_asm_noquant:>8.2f} us......",
+        out_hip_noquant,
+        msg=f"[torch vs  aiter_hip][No Quant]: {us_hip:>8.2f} us......",
     )
+    ret["us_hip_bf16"] = us_hip
+    ret["err_hip_bf16"] = err_noquant
 
     k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
         pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
@@ -370,6 +432,21 @@ def test_pa_mtp(
         v_scale_asm,
         qo_indptr,
     )
+    ret["us_asm_fp8"] = us_aiter_asm
+
+    # out_hip, us_hip = run_aiter_hip(
+    #     query,
+    #     k_quant_,
+    #     v_quant_,
+    #     block_tables,
+    #     seq_lens,
+    #     ctx_lens,
+    #     max_qlen,
+    #     "auto",
+    #     num_kv_heads,
+    #     # k_scale_asm,
+    #     # v_scale_asm,
+    # )
 
     out_ref = torch_mha_extend(
         query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
@@ -383,12 +460,8 @@ def test_pa_mtp(
         out_aiter_asm,
         msg=f"[torch vs  aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
     )
-    return {
-        "No Quant": us_asm_noquant,
-        "Quant": us_aiter_asm,
-        "err_noquant": err_noquant,
-        "err quant": err,
-    }
+    ret["err fp8"] = err
+    return ret
 
 
 head_dim = 128
@@ -418,7 +491,6 @@ parser.add_argument(
     "-n",
     "--num_heads",
     type=dtypes.str2tuple,
-    choices=l_num_heads,
     default=None,
     help="""Number of heads.
     e.g. -n 8,1""",

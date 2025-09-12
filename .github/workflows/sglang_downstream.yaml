@@ -15,7 +15,7 @@ jobs:
     name: sglang integration
     runs-on: mi300x-1gpu
     env:
-      SGL_BRANCH: v0.4.10
+      SGL_BRANCH: v0.5.1
       GPU_ARCH: gfx942
       HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
 
@@ -25,7 +25,7 @@ jobs:
 
       - name: Clone sglang repo
         run: |
-          git clone https://github.com/sgl-project/sglang.git
+          git clone -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git
 
       # TODO: Currently, we use PAT, it should be replaced by repo token
       - name: Make authenticated API request
