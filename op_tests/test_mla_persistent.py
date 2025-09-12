@@ -235,7 +235,7 @@ def test_mla(
     )
 
     split_params = {
-        "kv_granularity": max(page_size, 32),
+        "kv_granularity": max(page_size, 16),
         "max_seqlen_qo": max_seqlen_qo,
     }
 
