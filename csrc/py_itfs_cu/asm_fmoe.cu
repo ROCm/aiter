@@ -530,7 +530,35 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
             {256, {"fmoe_int8_g1u1_multix_subGU_256", "fmoe_int8_g1u1_multix_subGU_256.co", 256}},
             {192, {"fmoe_int8_g1u1_multix_subGU_192", "fmoe_int8_g1u1_multix_subGU_192.co", 192}},
             {128, {"fmoe_int8_g1u1_multix_subGU_128", "fmoe_int8_g1u1_multix_subGU_128.co", 128}}};
-
+        static std::unordered_map<int, FMoeKernelConfig> multix_kernel_int8_vs_configs = {
+            {384,
+             {"_ZN5aiter53fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x384E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x384.co",
+              384}},
+            {512,
+             {"_ZN5aiter53fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x512E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x512.co",
+              512}},
+            {128,
+             {"_ZN5aiter53fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x128E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x128.co",
+              128}},
+            {192,
+             {"_ZN5aiter53fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x192E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x192.co",
+              192}},
+            {256,
+             {"_ZN5aiter53fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x256E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x256.co",
+              256}},
+            {320,
+             {"_ZN5aiter53fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x320E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x320.co",
+              320}},
+            {448,
+             {"_ZN5aiter53fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x448E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_multix_silu_1tg_32x448.co",
+              448}}};
         static std::unordered_map<int, FMoeKernelConfig> silu_kernel_int8_configs = {
             {512, {"fmoe_int8_g1u1_subGU_512", "fmoe/silu/fmoe_int8_g1u1_subGU_512.co", 512}},
             {448, {"fmoe_int8_g1u1_subGU_448", "fmoe/silu/fmoe_int8_g1u1_subGU_448.co", 448}},
@@ -539,7 +567,35 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
             {256, {"fmoe_int8_g1u1_subGU_256", "fmoe/silu/fmoe_int8_g1u1_subGU_256.co", 256}},
             {192, {"fmoe_int8_g1u1_subGU_192", "fmoe/silu/fmoe_int8_g1u1_subGU_192.co", 192}},
             {128, {"fmoe_int8_g1u1_subGU_128", "fmoe/silu/fmoe_int8_g1u1_subGU_128.co", 128}}};
-
+        static std::unordered_map<int, FMoeKernelConfig> silu_kernel_int8_vs_configs = {
+            {128,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x128E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x128.co",
+              128}},
+            {448,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x448E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x448.co",
+              448}},
+            {384,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x384E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x384.co",
+              384}},
+            {192,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x192E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x192.co",
+              192}},
+            {320,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x320E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x320.co",
+              320}},
+            {512,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x512E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x512.co",
+              512}},
+            {256,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x256E",
+              "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_silu_1tg_32x256.co",
+              256}}};
         static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_int8_configs = {
             {512,
              {"fmoe_int8_g1u1_subGU_512_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_512_gelu.co", 512}},
@@ -555,7 +611,35 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
              {"fmoe_int8_g1u1_subGU_192_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_192_gelu.co", 192}},
             {128,
              {"fmoe_int8_g1u1_subGU_128_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_128_gelu.co", 128}}};
-
+        static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_int8_vs_configs = {
+            {256,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x256E",
+              "fmoe/gelu/fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x256.co",
+              256}},
+            {320,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x320E",
+              "fmoe/gelu/fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x320.co",
+              320}},
+            {128,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x128E",
+              "fmoe/gelu/fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x128.co",
+              128}},
+            {512,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x512E",
+              "fmoe/gelu/fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x512.co",
+              512}},
+            {384,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x384E",
+              "fmoe/gelu/fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x384.co",
+              384}},
+            {192,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x192E",
+              "fmoe/gelu/fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x192.co",
+              192}},
+            {448,
+             {"_ZN5aiter46fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x448E",
+              "fmoe/gelu/fmoe_bf16_pertokenInt8_g1u1_vs_gelu_1tg_32x448.co",
+              448}}};
         int selectedTile =
             get_heuristic_tile(inter_dim,
                                sub_X_cnt,
@@ -564,15 +648,24 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
         std::unordered_map<int, FMoeKernelConfig>* config_map = nullptr;
         if(fc2_smooth_scale.has_value())
         {
-            config_map = &multix_kernel_int8_configs;
+            if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+                config_map = &multix_kernel_int8_vs_configs;
+            else
+                config_map = &multix_kernel_int8_configs;
         }
         else if(activation == ActivationType::Gelu)
         {
-            config_map = &gelu_kernel_int8_configs;
+            if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+                config_map = &gelu_kernel_int8_vs_configs;
+            else
+                config_map = &gelu_kernel_int8_configs;
         }
         else if(activation == ActivationType::Silu)
         {
-            config_map = &silu_kernel_int8_configs;
+            if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+                config_map = &silu_kernel_int8_vs_configs;
+            else
+                config_map = &silu_kernel_int8_configs;
         }
 
         if(config_map)
@@ -614,7 +707,35 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
             {256, {"fmoe_fp8_g1u1_multix_subGU_256", "fmoe_fp8_g1u1_multix_subGU_256.co", 256}},
             {192, {"fmoe_fp8_g1u1_multix_subGU_192", "fmoe_fp8_g1u1_multix_subGU_192.co", 192}},
             {128, {"fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128}}};
-
+        static std::unordered_map<int, FMoeKernelConfig> multix_kernel_fp8_vs_configs = {
+            {384,
+             {"_ZN5aiter52fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x384E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x384.co",
+              384}},
+            {192,
+             {"_ZN5aiter52fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x192E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x192.co",
+              192}},
+            {512,
+             {"_ZN5aiter52fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x512E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x512.co",
+              512}},
+            {448,
+             {"_ZN5aiter52fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x448E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x448.co",
+              448}},
+            {320,
+             {"_ZN5aiter52fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x320E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x320.co",
+              320}},
+            {256,
+             {"_ZN5aiter52fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x256E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x256.co",
+              256}},
+            {128,
+             {"_ZN5aiter52fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x128E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_multix_silu_1tg_32x128.co",
+              128}}};
         static std::unordered_map<int, FMoeKernelConfig> silu_kernel_fp8_configs = {
             {512, {"fmoe_fp8_g1u1_subGU_512", "fmoe/silu/fmoe_fp8_g1u1_subGU_512.co", 512}},
             {448, {"fmoe_fp8_g1u1_subGU_448", "fmoe/silu/fmoe_fp8_g1u1_subGU_448.co", 448}},
@@ -625,10 +746,34 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
             {128, {"fmoe_fp8_g1u1_subGU_128", "fmoe/silu/fmoe_fp8_g1u1_subGU_128.co", 128}}};
 
         static std::unordered_map<int, FMoeKernelConfig> silu_kernel_fp8_vs_configs = {
+            {320,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x320E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x320.co",
+              320}},
+            {192,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x192E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x192.co",
+              192}},
+            {448,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x448E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x448.co",
+              448}},
+            {512,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x512E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x512.co",
+              512}},
+            {128,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x128E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x128.co",
+              128}},
             {256,
-             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_silu_vs_1tg_32x256E",
-              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_silu_vs_1tg_32x256.co",
-              256}}};
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x256E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x256.co",
+              256}},
+            {384,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x384E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x384.co",
+              384}}};
         static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_fp8_configs = {
             {512,
              {"fmoe_fp8_g1u1_subGU_512_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_512_gelu.co", 512}},
@@ -644,6 +789,35 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
              {"fmoe_fp8_g1u1_subGU_192_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_192_gelu.co", 192}},
             {128,
              {"fmoe_fp8_g1u1_subGU_128_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_128_gelu.co", 128}}};
+        static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_fp8_vs_configs = {
+            {128,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x128E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x128.co",
+              128}},
+            {384,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x384E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x384.co",
+              384}},
+            {192,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x192E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x192.co",
+              192}},
+            {256,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x256E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x256.co",
+              256}},
+            {320,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x320E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x320.co",
+              320}},
+            {512,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x512E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x512.co",
+              512}},
+            {448,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x448E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_gelu_1tg_32x448.co",
+              448}}};
 
         int selectedTile =
             get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128});
@@ -651,24 +825,22 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
         std::unordered_map<int, FMoeKernelConfig>* config_map = nullptr;
         if(fc2_smooth_scale.has_value())
         {
-            config_map = &multix_kernel_fp8_configs;
+            if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+                config_map = &multix_kernel_fp8_vs_configs;
+            else
+                config_map = &multix_kernel_fp8_configs;
         }
         else if(activation == ActivationType::Gelu)
         {
-            config_map = &gelu_kernel_fp8_configs;
+            if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+                config_map = &gelu_kernel_fp8_vs_configs;
+            else
+                config_map = &gelu_kernel_fp8_configs;
         }
         else if(activation == ActivationType::Silu)
         {
             if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
-            {
-                if(inter_dim % 256 == 0)
-                {
-                    config_map   = &silu_kernel_fp8_vs_configs;
-                    selectedTile = 256;
-                }
-                else
-                    TORCH_CHECK(false, __func__, "Only supports inter_dim divisible by 256.");
-            }
+                config_map = &silu_kernel_fp8_vs_configs;
             else
                 config_map = &silu_kernel_fp8_configs;
         }
@@ -751,7 +923,7 @@ void fmoe_g1u1_tkw1(torch::Tensor& out,                            // [token_cnt
     const int token_cnt = input.size(0);
     const int block_m   = 32; // fmoe sorting kernel and fmoe kernel only support 32 for now
     const int estimated_sub_X_cnt = (token_cnt * topk + block_m - 1) / block_m;
-
+    const char* enable_vskip      = std::getenv("AITER_ENABLE_VSKIP");
     if(input.dtype() == torch_fp8)
     {
         static std::unordered_map<int, FMoeKernelConfig> silu_kernel_fp8_configs = {
@@ -783,7 +955,64 @@ void fmoe_g1u1_tkw1(torch::Tensor& out,                            // [token_cnt
              {"fmoe_fp8_g1u1_subGU_128_silu_tkw1",
               "fmoe/silu/fmoe_fp8_g1u1_subGU_128_silu_tkw1.co",
               128}}};
-
+        static std::unordered_map<int, FMoeKernelConfig> silu_kernel_fp8_vs_configs = {
+            {512,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x512E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x512.co",
+              512}},
+            {192,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x192E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x192.co",
+              192}},
+            {448,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x448E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x448.co",
+              448}},
+            {384,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x384E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x384.co",
+              384}},
+            {128,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x128E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x128.co",
+              128}},
+            {256,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x256E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x256.co",
+              256}},
+            {320,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x320E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_silu_1tg_32x320.co",
+              320}}};
+        static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_fp8_vs_configs = {
+            {128,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x128E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x128.co",
+              128}},
+            {256,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x256E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x256.co",
+              256}},
+            {320,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x320E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x320.co",
+              320}},
+            {512,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x512E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x512.co",
+              512}},
+            {448,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x448E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x448.co",
+              448}},
+            {192,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x192E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x192.co",
+              192}},
+            {384,
+             {"_ZN5aiter50fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x384E",
+              "fmoe/gelu/fmoe_bf16_pertokenFp8_g1u1_vs_tkw1_gelu_1tg_32x384.co",
+              384}}};
         static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_fp8_configs = {
             {512,
              {"fmoe_fp8_g1u1_subGU_512_gelu_tkw1",
@@ -824,11 +1053,17 @@ void fmoe_g1u1_tkw1(torch::Tensor& out,                            // [token_cnt
         }
         else if(activation == ActivationType::Gelu)
         {
-            config_map = &gelu_kernel_fp8_configs;
+            if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+                config_map = &gelu_kernel_fp8_vs_configs;
+            else
+                config_map = &gelu_kernel_fp8_configs;
         }
         else if(activation == ActivationType::Silu)
         {
-            config_map = &silu_kernel_fp8_configs;
+            if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+                config_map = &silu_kernel_fp8_vs_configs;
+            else
+                config_map = &silu_kernel_fp8_configs;
         }
 
         if(config_map)
@@ -928,24 +1163,47 @@ void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
                    torch::Tensor& fc2_smooth_scale   // [expert, 1, inter_dim]
 )
 {
-    FMoeKernel* impl_ptr = nullptr;
-    int inter_dim        = down.size(2);
-    int sub_X_cnt        = sorted_expert_ids.size(0);
+    FMoeKernel* impl_ptr     = nullptr;
+    int inter_dim            = down.size(2);
+    int sub_X_cnt            = sorted_expert_ids.size(0);
+    const char* enable_vskip = std::getenv("AITER_ENABLE_VSKIP");
 
     if(gate.dtype() == at::ScalarType::Char || gate.dtype() == at::ScalarType::Byte)
     {
         int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {320, 256});
         if(selectedTile == 320)
         {
-            static FMoeKernel impl_int8_320(
-                "fmoe_int8_g1u1_smf_subGU_320", "fmoe_int8_g1u1_smf_subGU_320.co", 320);
-            impl_ptr = &impl_int8_320;
+            if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+            {
+                static FMoeKernel impl_int8_320_vs(
+                    "_ZN5aiter50fmoe_bf16_pertokenInt8_g1u1_vs_smf_silu_1tg_32x320E",
+                    "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_smf_silu_1tg_32x320.co",
+                    320);
+                impl_ptr = &impl_int8_320_vs;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_320(
+                    "fmoe_int8_g1u1_smf_subGU_320", "fmoe_int8_g1u1_smf_subGU_320.co", 320);
+                impl_ptr = &impl_int8_320;
+            }
         }
         else if(selectedTile == 256)
         {
-            static FMoeKernel impl_int8_256(
-                "fmoe_int8_g1u1_smf_subGU_256", "fmoe_int8_g1u1_smf_subGU_256.co", 256);
-            impl_ptr = &impl_int8_256;
+            if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+            {
+                static FMoeKernel impl_int8_256_vs(
+                    "_ZN5aiter54fmoe_bf16_pertokenInt8_g1u1_vs_smf_silu_1tg_1tg_32x256E",
+                    "fmoe/silu/fmoe_bf16_pertokenInt8_g1u1_vs_smf_silu_1tg_1tg_32x256.co",
+                    256);
+                impl_ptr = &impl_int8_256_vs;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_256(
+                    "fmoe_int8_g1u1_smf_subGU_256", "fmoe_int8_g1u1_smf_subGU_256.co", 256);
+                impl_ptr = &impl_int8_256;
+            }
         }
         else
             TORCH_CHECK(false,
@@ -959,15 +1217,37 @@ void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
             get_heuristic_tile(inter_dim, sub_X_cnt, {512, 320}); // todo,add tune interface here
         if(selectedTile == 512)
         {
-            static FMoeKernel impl_fp8_512(
-                "fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co", 512);
-            impl_ptr = &impl_fp8_512;
+            if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+            {
+                static FMoeKernel impl_fp8_512_vs(
+                    "_ZN5aiter49fmoe_bf16_pertokenFp8_g1u1_vs_smf_silu_1tg_32x512E",
+                    "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_smf_silu_1tg_32x512.co",
+                    512);
+                impl_ptr = &impl_fp8_512_vs;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_512(
+                    "fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co", 512);
+                impl_ptr = &impl_fp8_512;
+            }
         }
         else if(selectedTile == 320)
         {
-            static FMoeKernel impl_fp8_320(
-                "fmoe_fp8_g1u1_smf_subGU_320", "fmoe_fp8_g1u1_smf_subGU_320.co", 320);
-            impl_ptr = &impl_fp8_320;
+            if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+            {
+                static FMoeKernel impl_fp8_320_vs(
+                    "_ZN5aiter49fmoe_bf16_pertokenFp8_g1u1_vs_smf_silu_1tg_32x320E",
+                    "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_vs_smf_silu_1tg_32x320.co",
+                    320);
+                impl_ptr = &impl_fp8_320_vs;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_320(
+                    "fmoe_fp8_g1u1_smf_subGU_320", "fmoe_fp8_g1u1_smf_subGU_320.co", 320);
+                impl_ptr = &impl_fp8_320;
+            }
         }
         else
             TORCH_CHECK(false,
