@@ -188,7 +188,7 @@ def check_and_set_ninja_worker():
         os.environ["MAX_JOBS"] = str(max_jobs)
 
 
-def rename_cpp_to_cu(els, dst, recurisve=False):
+def rename_cpp_to_cu(els, dst, recursive=False):
     def do_rename_and_mv(name, src, dst, ret):
         newName = name
         if name.endswith(".cpp") or name.endswith(".cu"):
@@ -204,8 +204,8 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
         if os.path.isdir(el):
             for entry in os.listdir(el):
                 if os.path.isdir(f"{el}/{entry}"):
-                    if recurisve:
-                        ret += rename_cpp_to_cu([f"{el}/{entry}"], dst, recurisve)
+                    if recursive:
+                        ret += rename_cpp_to_cu([f"{el}/{entry}"], dst, recursive)
                     continue
                 do_rename_and_mv(entry, el, dst, ret)
         else:
@@ -370,7 +370,7 @@ def build_module(
                 if AITER_LOG_MORE:
                     logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
                 os.system(f"{PY} {blob_gen_cmd.format(blob_dir)}")
-                sources += rename_cpp_to_cu([blob_dir], src_dir, recurisve=True)
+                sources += rename_cpp_to_cu([blob_dir], src_dir, recursive=True)
             return sources
 
         if prebuild != 2:
