@@ -64,6 +64,8 @@ def moe_sorting(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
+# Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
+# We can use torch.compile(dynamic=False) to avoid
 @functools.lru_cache(maxsize=1024)
 def get_inter_dim(w1_shape, w2_shape):
     E, _, model_dim = w1_shape
