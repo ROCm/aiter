@@ -1031,7 +1031,8 @@ namespace py = pybind11;
           py::arg("out")          = std::nullopt, \
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
-          py::arg("gen")          = std::nullopt);
+          py::arg("gen")          = std::nullopt, \
+          py::arg("kv_last_page_lens") = std::nullopt);
 
 #define MOE_OP_PYBIND                                                          \
     m.def("topk_softmax",                                                      \
