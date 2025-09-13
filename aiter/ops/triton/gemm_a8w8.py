@@ -9,6 +9,11 @@ import triton
 import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
+
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.heuristics(
@@ -49,6 +54,7 @@ def _gemm_a8w8_kernel(
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8 function
@@ -67,8 +73,6 @@ def _gemm_a8w8_kernel(
     - B_scale: Second scale tensor with shape (1, N).
     - Bias: Bias tensor with shape (1, N).
     """
-
-    NUM_XCDS: tl.constexpr = 8
 
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
@@ -120,8 +124,8 @@ def _gemm_a8w8_kernel(
         pid_m = first_pid_m + (pid % group_size_m)
         pid_n = (pid % num_pid_in_group) // group_size_m
 
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
 
     # Create pointers for first block of A and B input matrices
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -218,14 +222,18 @@ def gemm_a8w8(
     - Y: The output matrix with shape (M, N).
     """
 
+    _LOGGER.info(
+        f"GEMM_A8W8: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+    )
+
     # Check constraints.
     assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
 
-    # Transpose w
-    w = w.T
-
     M, K = x.shape
-    K, N = w.shape
+    N, K = w.shape
+
+    # Transpose w (kernel expects (K, N))
+    w = w.T
 
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -253,6 +261,7 @@ def gemm_a8w8(
         y.stride(0),
         y.stride(1),
         bias is not None,
+        NUM_XCDS=get_num_xcds(),
         **config,
     )
 

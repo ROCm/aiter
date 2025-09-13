@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Optional, Tuple
+import functools
+import json
 import torch
 import triton
 import triton.language as tl
 
-from typing import Optional, Tuple
 import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.pid_preprocessing import remap_xcd
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.mha_fused_bwd import flash_attn_fused_backward
@@ -14,6 +17,10 @@ from aiter.ops.triton.utils.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
     _is_fp8,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
+
+_LOGGER = AiterTritonLogger()
 
 global _USE_FUSED_BWD_KERNEL
 _USE_FUSED_BWD_KERNEL = False
@@ -28,6 +35,7 @@ _USE_INT64_STRIDES = True
 
 
 def mha_set_use_int64_strides(value: bool):
+    """Use 64-bit integer strides to prevent integer overflows with very large tensors."""
     global _USE_INT64_STRIDES
     _USE_INT64_STRIDES = value
 
@@ -37,7 +45,15 @@ def _cast_to_fp8(
     fp8_dtype,
     layout,
     clamp_val=1e-9,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert a tensor to FP8 format, returning an FP8 tensor and a descale factor.
+    Args:
+        - x (torch.Tensor): shape [batch, seq_len, heads, dim]
+    Returns:
+        - x_fp8 (torch.Tensor): FP8 tensor with the same shape as x
+        - descale_factor (torch.Tensor): tensor of shape [batch, 1, heads, 1]
+    """
     if len(x.shape) != 4:
         raise ValueError(
             f"'bshd' tensor should have shape [batch, seqlen, heads, dim], got {x.shape}"
@@ -70,6 +86,14 @@ def _cast_varlen_to_fp8(
     cu_seqlens,
     clamp_val: float = 1e-9,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert a tensor of sequences with variable seq_len into fp8.
+    Args:
+        - x (torch.Tensor): shape [total_seq_len, heads, dim]
+    Returns:
+        - x_fp8 (torch.Tensor): shape [total_seq_len, heads, dim]
+        - descale_factors (torch.Tensor): shape [batch, heads]
+    """
     # validate tensor shape
     if len(x.shape) != 3:
         raise ValueError(
@@ -853,6 +877,25 @@ def _attn_fwd(
     tl.store(out_ptr + offs_out, op, mask=out_mask)
 
 
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    enable_dropout: bool,
+    dtype: torch.dtype,
+):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        _get_config._config_dict = {}
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict["default"] = config
+
+    if enable_dropout or dtype == torch.float32:
+        return _get_config._config_dict["default"]["fwd"]["dropout_or_fp32"]
+    else:
+        return _get_config._config_dict["default"]["fwd"]["default"]
+
+
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -873,6 +916,7 @@ def _flash_attn_forward(
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
+    config: Optional[dict[str, any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     if bias is not None:
@@ -959,6 +1003,10 @@ def _flash_attn_forward(
         s_dmask = None
         dropout_mask = None
 
+    if config is None:
+        config = _get_config(enable_dropout, q.dtype)
+
+    """
     # Tuned for MI300x
     config = {
         "BLOCK_M": 128,
@@ -978,6 +1026,7 @@ def _flash_attn_forward(
             "num_ctas": 1,
             "num_stages": 1,
         }
+    """
 
     grid = lambda META: (  # noqa: E731
         batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
@@ -1030,7 +1079,7 @@ def _flash_attn_forward(
         FP8_MAX=FP8_MAX,
         VARLEN=is_varlen,
         BATCH=batch,
-        NUM_XCD=8,
+        NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
         **config,
     )
@@ -1055,6 +1104,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
+        config=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -1080,6 +1130,7 @@ class _FlashAttnFunc(torch.autograd.Function):
                 return_softmax=return_softmax and dropout_p > 0,
                 max_seqlen_q=q.shape[1],
                 max_seqlen_k=k.shape[1],
+                config=config,
             )
         )
 
@@ -1114,8 +1165,6 @@ class _FlashAttnFunc(torch.autograd.Function):
         do_padded = do
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
-
-        print("Using fused backward kernel:", _USE_FUSED_BWD_KERNEL)
 
         if _USE_FUSED_BWD_KERNEL:
             flash_attn_fused_backward(
@@ -1169,7 +1218,22 @@ class _FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            dbias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def flash_attn_func(
@@ -1185,6 +1249,7 @@ def flash_attn_func(
     deterministic=True,
     return_lse=False,
     return_attn_probs=False,
+    config: Optional[dict[str, any]] = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1235,7 +1300,9 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
-
+    _LOGGER.info(
+        f"FLASH_ATTN:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+    )
     return _FlashAttnFunc.apply(
         q,
         k,
@@ -1250,6 +1317,7 @@ def flash_attn_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
+        config,
     )
 
 
@@ -1269,6 +1337,7 @@ class _FlashAttnFP8Func(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
+        config=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -1306,6 +1375,7 @@ class _FlashAttnFP8Func(torch.autograd.Function):
                 descale_q=descale_q,
                 descale_k=descale_k,
                 descale_v=descale_v,
+                config=config,
             )
         )
 
@@ -1414,7 +1484,22 @@ class _FlashAttnFP8Func(torch.autograd.Function):
         # dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
         # dk = dk[..., : k_fp8.shape[-1]]
         # dv = dv[..., : v_fp8.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def flash_attn_fp8_func(
@@ -1429,7 +1514,11 @@ def flash_attn_fp8_func(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
+    config: Optional[dict[str, any]] = None,
 ):
+    _LOGGER.info(
+        f"FLASH_ATTN_FP8:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+    )
     return _FlashAttnFP8Func.apply(
         q,
         k,
@@ -1443,6 +1532,7 @@ def flash_attn_fp8_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
+        config,
     )
 
 
@@ -1469,6 +1559,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         block_table,
         out,
         is_grad_enabled,
+        config=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -1496,6 +1587,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 max_seqlen_k=max_seqlen_k,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
+                config=config,
             )
         )
         if is_grad:
@@ -1605,6 +1697,8 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -1627,6 +1721,7 @@ def flash_attn_varlen_func(
     return_attn_probs=False,
     block_table=None,
     out=None,
+    config: Optional[dict[str, any]] = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1683,6 +1778,10 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+
+    _LOGGER.info(
+        f"FLASH_ATTN_VARLEN:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+    )
     return _FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -1703,6 +1802,7 @@ def flash_attn_varlen_func(
         block_table,
         out,
         torch.is_grad_enabled(),
+        config,
     )
 
 
@@ -1727,6 +1827,7 @@ class _FlashAttnVarlenFP8Func(torch.autograd.Function):
         return_softmax,
         block_table,
         is_grad_enabled,
+        config=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -1764,6 +1865,7 @@ class _FlashAttnVarlenFP8Func(torch.autograd.Function):
                 descale_q=descale_q,
                 descale_k=descale_k,
                 descale_v=descale_v,
+                config=config,
             )
         )
         if is_grad:
@@ -1885,7 +1987,7 @@ class _FlashAttnVarlenFP8Func(torch.autograd.Function):
         dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k_fp8.shape[-1]]
         dv = dv[..., : v_fp8.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_varlen_fp8_func(
@@ -1905,7 +2007,11 @@ def flash_attn_varlen_fp8_func(
     return_lse=False,
     return_attn_probs=False,
     block_table=None,
+    config: Optional[dict[str, any]] = None,
 ):
+    _LOGGER.info(
+        f"FLASH_ATTN_VARLEN_FP8:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+    )
     return _FlashAttnVarlenFP8Func.apply(
         q,
         k,
@@ -1924,4 +2030,5 @@ def flash_attn_varlen_fp8_func(
         return_attn_probs,
         block_table,
         torch.is_grad_enabled(),
+        config,
     )

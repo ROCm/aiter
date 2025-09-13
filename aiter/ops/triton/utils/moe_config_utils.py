@@ -8,6 +8,7 @@ import json
 import functools
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+import warnings
 
 M_THRESHOLD_SMALL = 256
 M_THRESHOLD_MEDIUM = 1024
@@ -19,6 +20,7 @@ def get_config_dtype_str(
     use_int8_w8a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
+    use_mxfp4: Optional[bool] = False,
 ):
     if use_fp8_w8a8:
         return "FP8_W8A8"
@@ -28,17 +30,13 @@ def get_config_dtype_str(
         return "INT8_W8A8"
     elif use_int4_w4a16:
         return "INT4_W4A16"
+    elif use_mxfp4:
+        return "MX_FP4"
     elif dtype == torch.float:
         # avoiding cases where kernel fails when float32 MoE
         # use fp16/bfloat16 configs
         return "float32"
     return None
-
-
-def get_config_file_name(dtype: Optional[str]) -> str:
-    device_name = torch.cuda.get_device_name(0).replace(" ", "_")
-    dtype_selector = "" if not dtype else f",dtype={dtype}"
-    return f"device_name={device_name}{dtype_selector}.json"
 
 
 @functools.lru_cache
@@ -53,12 +51,9 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
     """
     # First look up if an optimized configuration is available in the configs
     # directory
-    json_file_name = get_config_file_name(dtype)
-
+    dtype_str = "DEFAULT" if dtype is None else dtype
     dev = arch_info.get_device()
-    config_file_path = (
-        f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{json_file_name}.json"
-    )
+    config_file_path = f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{dtype_str}.json"
 
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
@@ -67,6 +62,9 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
 
     # If no optimized configuration is available, we will use the default
     # configuration
+    warnings.warn(
+        f"No MoE configuration found for device '{dev}' with dtype '{dtype_str}'. Using default configuration."
+    )
     return None
 
 
@@ -76,10 +74,11 @@ def get_optimal_moe_config(
     use_int8_w8a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
+    use_mxfp4: Optional[bool] = False,
     M: int = 1,
 ):
     dtype_str = get_config_dtype_str(
-        dtype, use_int8_w8a16, use_int8_w8a8, use_fp8_w8a8, use_int4_w4a16
+        dtype, use_int8_w8a16, use_int8_w8a8, use_fp8_w8a8, use_int4_w4a16, use_mxfp4
     )
     # print(f"dtype_str={dtype_str}")
     configs = get_moe_configs(dtype_str)
@@ -115,6 +114,7 @@ def get_optimal_moe_config_func(
     use_int8_w8a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
+    use_mxfp4: Optional[bool] = False,
 ):
     return functools.partial(
         get_optimal_moe_config,
@@ -123,4 +123,5 @@ def get_optimal_moe_config_func(
         use_int8_w8a8,
         use_fp8_w8a8,
         use_int4_w4a16,
+        use_mxfp4,
     )

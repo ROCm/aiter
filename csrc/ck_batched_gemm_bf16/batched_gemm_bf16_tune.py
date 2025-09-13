@@ -6,22 +6,11 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter.test_common import perftest
+from aiter.utility.base_tuner import GemmCommonTuner
 from aiter import dtypes
 from batched_gemm_bf16_common import kernels_list
+from aiter.utility.mp_tuner import mp_tuner
 import argparse
-
-
-def checkClose(a, b, rtol=1e-3, atol=0.01):
-    isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
-    mask = ~isClose
-    if isClose.all():
-        return True
-    else:
-        percent = (a[mask]).numel() / a.numel()
-        if percent > 0.01:
-            return False
-        else:
-            return True
 
 
 def run_torch(x, weight, bias=None, dtype=dtypes.bf16):
@@ -37,163 +26,159 @@ def run_torch(x, weight, bias=None, dtype=dtypes.bf16):
     return out.to(dtype)
 
 
-def get_untuned_batched_gemm_list(untuned_batched_gemm_file):
-    assert os.path.exists(
-        untuned_batched_gemm_file
-    ), f"Not exist bf16_untuned_batched_gemm.csv file: {untuned_batched_gemm_file}"
-    untunedf = pd.read_csv(untuned_batched_gemm_file)
-    return untunedf
-
-
-def get_tuned_batched_gemm_list(tuned_batched_gemm_file):
-    if os.path.exists(tuned_batched_gemm_file):
-        tunedf = pd.read_csv(tuned_batched_gemm_file)
-    else:
-        tunedf = pd.DataFrame(
-            columns=["B", "M", "N", "K", "kernelId", "splitK", "us", "kernelName"]
-        )
-    return tunedf
-
-
-@perftest()
-def kernel_instance_test(x, weight, out, kernel_id, splitK=0):
+def run_batched_gemm(x, weight, out, kernel_id, splitK=0):
     aiter.batched_gemm_bf16_tune(x, weight, out, kernel_id, splitK)
     return out
 
 
-def tune_batched_gemm(b, m, n, k, useSplitK=False):
-    dim = (b, m, n, k)
-    x = torch.randint(-20, 20, (b, m, k), dtype=dtypes.bf16, device="cuda")
-    weight = torch.randint(-20, 20, (b, n, k), dtype=dtypes.bf16, device="cuda")
-    out = torch.empty(b, m, n, dtype=dtypes.bf16, device="cuda")
+def generate_data(b, m, n, k, device="cuda"):
+    x = torch.randint(-20, 20, (b, m, k), dtype=dtypes.bf16, device=device)
+    weight = torch.randint(-20, 20, (b, n, k), dtype=dtypes.bf16, device=device)
+    out = torch.empty(b, m, n, dtype=dtypes.bf16, device=device)
+    return x, weight, out
 
-    ref_out = run_torch(x, weight)
 
-    print(f"*******************B:{b} X M:{m} X N:{n} X K:{k}**************************")
-    print(f"Start tuning bf16 batched_gemm kernel for B:{b}, M:{m}, N:{n}, K{k}:")
-    kernels_num = len(kernels_list)
-    best_kernelConfig = (-1, 0)
-    best_time = -1
-    for i in range(kernels_num):
-        kernel = kernels_list[i]
-        maxsplitK = (
-            aiter.compute_batched_gemm_SplitK(
-                b, m, n, k, kernel.MPerBLOCK, kernel.NPerBLOCK, kernel.KPerBLOCK
-            )
-            if useSplitK
-            else 0
+class BatchedGemmBf16Tuner(GemmCommonTuner):
+    ARG_DEFAULTS = {
+        "verbose": False,
+        "tune_file": "aiter/configs/bf16_tuned_batched_gemm.csv",
+        "untune_file": "aiter/configs/bf16_untuned_batched_gemm.csv",
+        "errRatio": 0.05,
+        "batch": 100,
+        "profile_file": "",
+    }
+
+    def _setup_specific_arguments(self):
+        pass
+
+    def calculate(self, results, bpes=(2, 2, 2)):
+        info, time, err_ratio = results
+        if time == -1:
+            return -1, -1
+        cu_num, b, m, n, k = info[0]
+        flops = m * n * k * 2 * b
+        tflops = round(flops / (time * 1000000), 2)
+        lhs_bpe, rhs_bpe, out_bpe = bpes
+        bw = round(
+            b
+            * (m * k * lhs_bpe + n * k * rhs_bpe + m * n * out_bpe)
+            / (time * 1e-6)
+            / 1e9,
+            2,
         )
-        for splitK in range(maxsplitK + 1):
-            try:
-                (out), avg_t = kernel_instance_test(x, weight, out, i, splitK)
-                isClosed = checkClose(ref_out, out, rtol=1e-2, atol=0.01)
-                if isClosed:
-                    print(
-                        f"{str(dim):<20} kernelid:{i:<3d}\t avg: {avg_t:<8.2f} us, {kernel.name}, {splitK=}"
+        return tflops, bw
+
+    def getKernelName(self, kernelId):
+        if kernelId >= len(kernels_list) or kernelId < 0:
+            return None
+        return kernels_list[kernelId].name
+
+    def tune(
+        self,
+        untunedf,
+        tunedf,
+        args,
+    ):
+        issorted = args.sort
+        useSplitK = args.splitK
+        mp_num = args.mp
+        shape_grouped = False
+        errRatio = args.errRatio
+        cu_num = self.get_cu_num()
+
+        task = []
+        tasks_data = []
+        for i in range(len(untunedf)):
+            B = untunedf.loc[i, "B"]
+            M = untunedf.loc[i, "M"]
+            N = untunedf.loc[i, "N"]
+            K = untunedf.loc[i, "K"]
+            kernels_num = len(kernels_list)
+            if tunedf[
+                (tunedf["B"] == B)
+                & (tunedf["M"] == M)
+                & (tunedf["N"] == N)
+                & (tunedf["K"] == K)
+                & (tunedf["cu_num"] == cu_num)
+            ].empty:
+                print(f"tuning B:{B}, M:{M}, N:{N}, K:{K}")
+                # kernelId, splitK, time = tune_batched_gemm(B, M, N, K, useSplitK)
+                total_kernel_nums = 0
+                for i in range(kernels_num):
+                    kernel = kernels_list[i]
+                    maxsplitK = (
+                        aiter.compute_batched_gemm_SplitK(
+                            B,
+                            M,
+                            N,
+                            K,
+                            kernel.MPerBLOCK,
+                            kernel.NPerBLOCK,
+                            kernel.KPerBLOCK,
+                        )
+                        if useSplitK
+                        else 0
                     )
-                    if best_time < 0 or avg_t < best_time:
-                        best_kernelConfig = (i, splitK)
-                        best_time = avg_t
-                else:
-                    print(
-                        f"{str(dim):<20} kernelid:{i:<3d}\t No pass         , {kernel.name}, {splitK=}"
-                    )
-            except RuntimeError as e:
-                print(f"error = {e}")
-                print(
-                    f"{str(dim):<20} kernelid:{i:<3d}\t No support      , {kernel.name}, {splitK=}"
-                )
+                    for splitK in range(maxsplitK + 1):
+                        info = ((cu_num, B, M, N, K), i, splitK, "")
+                        task.append(
+                            (
+                                info,
+                                generate_data,
+                                (B, M, N, K),
+                                run_batched_gemm,
+                                (
+                                    [0, 1, 2],
+                                    i,
+                                    splitK,
+                                ),  # [0, 1, 2] is index of paramters for run_batched_gemm in generate_data
+                                {},
+                                run_torch,
+                                ([0, 1],),
+                                {},
+                                None,
+                                1e-2,
+                                1e-2,
+                            )
+                        )
+                        total_kernel_nums = total_kernel_nums + 1
 
-    best_kernelId, splitK = best_kernelConfig
-    if best_kernelConfig[0] == -1:
-        print(f"No kernel can be used for B{b}, M:{m}, N:{n}, K:{k}")
-        best_time = "nan"
-    else:
-        best_time = round(best_time, 4)
+                tasks_data.append((total_kernel_nums, ()))
+            else:
+                print(f"B:{B}, M:{M}, N:{N}, K{K} is in tuned batched_gemm, skip!!!")
+                print()
+                print()
+        ret = []
+        if task:
+            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
 
-        print(
-            f"Tuning result for B:{b}, M:{m}, N:{n}, K:{k} is kernelId={best_kernelId} {kernel.name} {splitK=}, {best_time}us"
-        )
-    print(f"*******************B:{b} X M:{m} X N:{n} X K{k}**************************")
-
-    return best_kernelId, splitK, best_time
-
-
-def tune_batched_gemm_list(untunedf, tunedf, issorted=False, useSplitK=False):
-    for i in range(len(untunedf)):
-        B = untunedf.loc[i, "B"]
-        M = untunedf.loc[i, "M"]
-        N = untunedf.loc[i, "N"]
-        K = untunedf.loc[i, "K"]
-
-        if tunedf[
-            (tunedf["B"] == B)
-            & (tunedf["M"] == M)
-            & (tunedf["N"] == N)
-            & (tunedf["K"] == K)
-        ].empty:
-            kernelId, splitK, time = tune_batched_gemm(B, M, N, K, useSplitK)
-            kernelName = "None" if kernelId == -1 else kernels_list[kernelId].name
-            temp = pd.DataFrame(
-                {
-                    "B": [B],
-                    "M": [M],
-                    "N": [N],
-                    "K": [K],
-                    "kernelId": [kernelId],
-                    "splitK": [splitK],
-                    "us": [time],
-                    "kernelName": [kernelName],
-                }
-            )
-            tunedf = pd.concat([tunedf, temp], ignore_index=True)
-
-        else:
-            print(f"B:{B}, M:{M}, N:{N}, K{K} is in tuned batched_gemm, skip!!!")
-        print()
-        print()
-    if issorted:
-        tunedf = tunedf.sort_values(by=["B", "M", "N", "K"])
-    print("Totall tuning result:")
-    print(tunedf)
-    return tunedf
+        return ret
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        prog="generate",
-        description="gen API for CK batched_gemm bf16 kernel",
+    key = [
+        "cu_num",
+        "B",
+        "M",
+        "N",
+        "K",
+    ]
+    resultList = [
+        "kernelId",
+        "splitK",
+        "us",
+        "kernelName",
+        "errRatio",
+        "tflops",
+        "bw",
+    ]
+
+    tuner = BatchedGemmBf16Tuner(
+        "BatchedGemmBf16Tuner",
+        key,
+        resultList,
+        "gen API for CK batch gemm bf16 kernel",
     )
 
-    parser.add_argument(
-        "-i",
-        "--untune_file",
-        default="aiter/configs/bf16_untuned_batched_gemm.csv",
-        required=False,
-        help="input",
-    )
-
-    parser.add_argument(
-        "-o",
-        "--tune_file",
-        default="aiter/configs/bf16_tuned_batched_gemm.csv",
-        required=False,
-        help="output: tuning result store this file",
-    )
-
-    parser.add_argument(
-        "-k", "--splitK", action="store_true", required=False, help="Use splitK kernels"
-    )
-
-    parser.add_argument(
-        "--sort",
-        action="store_true",
-        required=False,
-        help="Arranged according to the B M N K size",
-    )
-
-    args = parser.parse_args()
-    untunedf = get_untuned_batched_gemm_list(args.untune_file)
-    tunedf = get_tuned_batched_gemm_list(args.tune_file)
-    tunedf = tune_batched_gemm_list(untunedf, tunedf, args.sort, args.splitK)
-    tunedf.to_csv(args.tune_file, index=False)
+    args = tuner.parse_args()
+    tuner.run(args, False)

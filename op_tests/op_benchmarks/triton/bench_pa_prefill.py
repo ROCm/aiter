@@ -1,20 +1,21 @@
+import torch
+import sys
+import math
+import random
 import triton
-import triton.language as tl
-from utils.benchmark_utils import (
+
+from aiter.ops.triton.pa_prefill import context_attention_fwd
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
-    get_available_models,
     get_dtype_bytes,
+    get_caller_name_no_ext,
+    print_vgpr,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_pa_prefill import (
     seed_everything,
     STR_DTYPE_TO_TORCH_DTYPE,
 )
-import torch
-import argparse
-from aiter.ops.triton.pa_prefill import context_attention_fwd
-import sys
-import math
-import random
 
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
@@ -210,7 +211,7 @@ def run_benchmark(args):
 
     model_name = "paged-attn-decode"
 
-    line_names = ["Time (ms)", "TFLOPS", "Bandwidth (GB/s)"]
+    line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
     line_vals = ["time", "tflops", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
@@ -221,7 +222,7 @@ def run_benchmark(args):
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
         ylabel="ms / TFLOPS / GB/s",
-        plot_name=f"{model_name}-benchmark",
+        plot_name=get_caller_name_no_ext(),
         args={},
     )
 
@@ -336,36 +337,29 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_paged_attn_decode.run(save_path=".", print_data=True)
+    bench_paged_attn_decode.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark Paged Attention decode",
-        allow_abbrev=False,
-    )
-    parser.add_argument(
-        "-model_configs",
-        type=str,
-        default="utils/model_configs.json",
-        help="Model config json file.",
-    )
-    available_models = get_available_models()  # Dynamically load model names
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
-    )
-    parser.add_argument("-model", type=str, default=None, help=model_help)
+    parser = get_parser(kernel_name="Paged Attention Decode")
+
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
     parser.add_argument("-sq", type=int, default=0)
     parser.add_argument("-use_alibi_slope", action="store_true", default=False)
-    parser.add_argument("-dtype", default="fp16")
-    parser.add_argument("-kv_cache_dtype", default="auto")
-    parser.add_argument("-compute_type", default="fp16")
-
+    parser.add_argument("--dtype", default="fp16")
+    parser.add_argument("--kv_cache_dtype", default="auto")
+    parser.add_argument("--compute_type", default="fp16")
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
+    parser.add_argument(
+        "-print_vgpr",
+        action="store_true",
+        default=False,
+        help="Print VGPR usage for Triton kernels.",
+    )
     args = parser.parse_args()
     return args
 
@@ -381,6 +375,11 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+        fun = lambda: run_benchmark(args)  # noqa: E731
+        print_vgpr(fun, get_caller_name_no_ext())
+        return 0
     run_benchmark(args)
 
 

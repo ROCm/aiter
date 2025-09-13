@@ -1,17 +1,27 @@
 import torch
-import triton
 import pytest
 from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
+import aiter.ops.triton.utils.arch_info as arch_info
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
 
 
-def generate_gemm_afp4wfp4_pre_quant_inputs(M, N, K):
+def generate_gemm_afp4wfp4_pre_quant_inputs(
+    M: int,
+    N: int,
+    K: int,
+    output: bool,
+    layout: str = "TN",
+):
     torch.manual_seed(5)
     # 34 is two packed e2m1 values 0010 which is 1.0.
-    x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
-    x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
+    if layout[0] == "T":
+        x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
+        x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
+    else:
+        x_low = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8, device="cuda").T
+        x_high = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8, device="cuda").T
     x = x_low | x_high << 4
     x_scales = torch.randint(
         124, 128, (K // SCALE_GROUP_SIZE, M), dtype=torch.uint8, device="cuda"
@@ -24,17 +34,24 @@ def generate_gemm_afp4wfp4_pre_quant_inputs(M, N, K):
     x = x_f32.to(torch.bfloat16)
 
     # x = torch.rand((B, M, K), dtype=torch.bfloat16, device="cuda")
-    w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
-    w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
+    if layout[1] == "N":
+        w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
+        w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
+    else:
+        w_low = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
+        w_high = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
     w = w_low | w_high << 4
-    w = w.T
     # Scale of 1.0 in e8m0, bias 127.
     w_scales = torch.randint(
         124, 128, (K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device="cuda"
     )
     w_scales = w_scales.T
 
-    return x, w, x_scales, w_scales
+    y = None
+    if output:
+        y = torch.zeros((M, N), device=x.device, dtype=torch.float32)
+
+    return x, w, x_scales, w_scales, y
 
 
 def get_x_vals():
@@ -72,6 +89,8 @@ def get_x_vals():
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(32, 512, 7168)]
+    x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case
+    x_vals += [(1, 1280, 8192)]
     return x_vals
 
 
@@ -108,37 +127,40 @@ def e8m0_to_f32(x):
     return x_f32
 
 
-def run_torch(x, w, x_scales, w_scales, dtype):
+def run_torch(x, w, w_scales, dtype):
     # First convert the x and w inputs to f32.
     x_f32 = x.to(torch.float32)
-    w_f32 = mxfp4_to_f32(w.transpose(-2, -1))
-    w_f32 = w_f32.transpose(-2, -1)
+    w_f32 = mxfp4_to_f32(w)
     # Next convert the e8m0 scales to f32.
     w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=-1).to(torch.float32)
     w_scales_f32 = e8m0_to_f32(w_scales)
-    w_f32 = w_f32 * w_scales_f32.transpose(-2, -1)
-    return torch.mm(x_f32, w_f32).to(dtype)
+    assert w_f32.shape == w_scales_f32.shape
+    w_f32 = w_f32 * w_scales_f32
+    return torch.mm(x_f32, w_f32.T).to(dtype)
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, output: bool):
-    if triton.runtime.driver.active.get_current_target().arch not in ("gfx950"):
+def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, layout, output: bool):
+    if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     # TODO resolve this compilation error
     if M == 4864 and N == 8192 and K == 4160:
         pytest.skip("Skipping this config. due to compilation error.")
 
-    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_pre_quant_inputs(M, N, K)
-
+    x, w, _, w_scales, y = generate_gemm_afp4wfp4_pre_quant_inputs(
+        M, N, K, layout=layout, output=output
+    )
     if output:
-        out = torch.zeros((M, N), device=x.device, dtype=dtype)
-        gemm_afp4wfp4_pre_quant(x, w, x_scales, w_scales, dtype, out)
+        y = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32, y).to(dtype)
     else:
-        out = gemm_afp4wfp4_pre_quant(x, w, x_scales, w_scales, dtype)
+        y = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32).to(dtype)
 
-    torch_out = run_torch(x, w, x_scales, w_scales, dtype)
+    torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
-    torch.testing.assert_close(torch_out, out)
+    torch.testing.assert_close(torch_out, y)

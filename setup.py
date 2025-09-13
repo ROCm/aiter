@@ -16,6 +16,7 @@ from jit.utils.cpp_extension import (
     BuildExtension,
     IS_HIP_EXTENSION,
 )
+from multiprocessing import Pool
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 PACKAGE_NAME = "aiter"
@@ -36,6 +37,39 @@ FORCE_CXX11_ABI = False
 
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 
+
+def getMaxJobs():
+    # calculate the maximum allowed NUM_JOBS based on cores
+    max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
+    import psutil
+
+    # calculate the maximum allowed NUM_JOBS based on free memory
+    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
+    max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
+
+    # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
+    max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
+    return max_jobs
+
+
+def is_develop_mode():
+    for arg in sys.argv:
+        if arg == "develop":
+            return True
+        # pip install -e
+        elif "editable" in arg:
+            return True
+    else:
+        return False
+
+
+if is_develop_mode():
+    with open("./aiter/install_mode", "w") as f:
+        f.write("develop")
+else:
+    with open("./aiter/install_mode", "w") as f:
+        f.write("install")
+
 if IS_ROCM:
     assert os.path.exists(
         ck_dir
@@ -45,35 +79,91 @@ if IS_ROCM:
         exclude_ops = [
             "libmha_fwd",
             "libmha_bwd",
-            "module_moe_ck2stages",
             "module_fmha_v3_fwd",
             "module_mha_fwd",
             "module_mha_varlen_fwd",
             "module_mha_batch_prefill",
             "module_fmha_v3_bwd",
             "module_fmha_v3_varlen_bwd",
+            "module_fmha_v3_varlen_fwd",
             "module_mha_bwd",
             "module_mha_varlen_bwd",
         ]
-        all_opts_args_build = core.get_args_of_build("all", exclude=exclude_ops)
-        # remove pybind, because there are already duplicates in rocm_opt
-        new_list = [el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
-        all_opts_args_build["srcs"] = new_list
 
+        all_opts_args_build, prebuild_link_param = core.get_args_of_build(
+            "all", exclude=exclude_ops
+        )
+        os.system(f"rm -rf {core.get_user_jit_dir()}/build")
+        os.system(f"rm -rf {core.get_user_jit_dir()}/*.so")
+        prebuild_dir = f"{core.get_user_jit_dir()}/build/aiter_/build"
+        core.recopy_ck()
+        os.makedirs(prebuild_dir + "/srcs")
+
+        def build_one_module(one_opt_args):
+            core.build_module(
+                md_name=one_opt_args["md_name"],
+                srcs=one_opt_args["srcs"],
+                flags_extra_cc=one_opt_args["flags_extra_cc"] + ["-DPREBUILD_KERNELS"],
+                flags_extra_hip=one_opt_args["flags_extra_hip"]
+                + ["-DPREBUILD_KERNELS"],
+                blob_gen_cmd=one_opt_args["blob_gen_cmd"],
+                extra_include=one_opt_args["extra_include"],
+                extra_ldflags=None,
+                verbose=False,
+                is_python_module=True,
+                is_standalone=False,
+                torch_exclude=False,
+                prebuild=1,
+            )
+
+        # step 1, build *.cu -> module*.so
+        prebuid_thread_num = 5
+        prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
+        max_jobs = os.environ.get("MAX_JOBS")
+        if max_jobs != None and max_jobs.isdigit():
+            prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
+        os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
+
+        with Pool(processes=prebuid_thread_num) as pool:
+            pool.map(build_one_module, all_opts_args_build)
+
+        ck_batched_gemm_folders = [
+            f"{this_dir}/csrc/{name}/include"
+            for name in os.listdir(f"{this_dir}/csrc")
+            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name))
+            and name.startswith("ck_batched_gemm")
+        ]
+        ck_gemm_folders = [
+            f"{this_dir}/csrc/{name}/include"
+            for name in os.listdir(f"{this_dir}/csrc")
+            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name))
+            and name.startswith("ck_gemm_a")
+        ]
+        ck_gemm_inc = ck_batched_gemm_folders + ck_gemm_folders
+        for src in ck_gemm_inc:
+            dst = f"{prebuild_dir}/include"
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+
+        shutil.copytree(
+            f"{this_dir}/csrc/include", f"{prebuild_dir}/include", dirs_exist_ok=True
+        )
+
+        # step 2, link module*.so -> aiter_.so
         core.build_module(
             md_name="aiter_",
-            srcs=all_opts_args_build["srcs"] + [f"{this_dir}/csrc"],
-            flags_extra_cc=all_opts_args_build["flags_extra_cc"]
+            srcs=[f"{prebuild_dir}/srcs/rocm_ops.cu"],
+            flags_extra_cc=prebuild_link_param["flags_extra_cc"]
             + ["-DPREBUILD_KERNELS"],
-            flags_extra_hip=all_opts_args_build["flags_extra_hip"]
+            flags_extra_hip=prebuild_link_param["flags_extra_hip"]
             + ["-DPREBUILD_KERNELS"],
-            blob_gen_cmd=all_opts_args_build["blob_gen_cmd"],
-            extra_include=all_opts_args_build["extra_include"],
+            blob_gen_cmd=prebuild_link_param["blob_gen_cmd"],
+            extra_include=prebuild_link_param["extra_include"],
             extra_ldflags=None,
             verbose=False,
             is_python_module=True,
             is_standalone=False,
             torch_exclude=False,
+            prebuild=2,
         )
 else:
     raise NotImplementedError("Only ROCM is supported")
@@ -89,20 +179,19 @@ shutil.copytree("csrc", "aiter_meta/csrc")
 
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
-        # calculate the maximum allowed NUM_JOBS based on cores
-        max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
-        if int(os.environ.get("MAX_JOBS", "1")) < max_num_jobs_cores:
-            import psutil
-
-            # calculate the maximum allowed NUM_JOBS based on free memory
-            free_memory_gb = psutil.virtual_memory().available / (
-                1024**3
-            )  # free memory in GB
-            # each JOB peak memory cost is ~8-9GB when threads = 4
-            max_num_jobs_memory = int(free_memory_gb / 0.5)
-
-            # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-            max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
+        max_jobs = getMaxJobs()
+        max_jobs_env = os.environ.get("MAX_JOBS")
+        if max_jobs_env != None:
+            try:
+                max_processes = int(max_jobs_env)
+                # too large value
+                if max_processes > max_jobs:
+                    os.environ["MAX_JOBS"] = str(max_jobs)
+            # error value
+            except ValueError:
+                os.environ["MAX_JOBS"] = str(max_jobs)
+        # none value
+        else:
             os.environ["MAX_JOBS"] = str(max_jobs)
 
         super().__init__(*args, **kwargs)
@@ -120,7 +209,7 @@ if PREBUILD_KERNELS == 1:
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
-    packages=["aiter_meta", "aiter", "csrc"],
+    packages=["aiter_meta", "aiter"],
     include_package_data=True,
     package_data={
         "": ["*"],

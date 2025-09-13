@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+
 import shutil
 import os
 import subprocess
@@ -5,12 +9,19 @@ from jinja2 import Template
 import ctypes
 from packaging.version import parse, Version
 from collections import OrderedDict
-from functools import lru_cache
+from functools import lru_cache, partial
 import binascii
 import hashlib
+from aiter.jit.utils.file_baton import FileBaton
+import logging
+import time
 
+
+logger = logging.getLogger("aiter")
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
+    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
 DEFAULT_GPU_ARCH = (
     subprocess.run(
         "/opt/rocm/llvm/bin/amdgpu-arch", shell=True, capture_output=True, text=True
@@ -26,6 +37,7 @@ AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
+AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 
 if AITER_REBUILD >= 1:
     subprocess.run(f"rm -rf {BUILD_DIR}/*", shell=True)
@@ -53,6 +65,31 @@ clean:
 )
 
 
+def mp_lock(
+    lock_path: str,
+    main_func: callable,
+    final_func: callable = None,
+    wait_func: callable = None,
+):
+    """
+    Using FileBaton for multiprocessing.
+    """
+    baton = FileBaton(lock_path)
+    if baton.try_acquire():
+        try:
+            ret = main_func()
+        finally:
+            if final_func is not None:
+                final_func()
+            baton.release()
+    else:
+        baton.wait()
+        if wait_func is not None:
+            ret = wait_func()
+        ret = None
+    return ret
+
+
 def get_hip_version():
     version = subprocess.run(
         "/opt/rocm/bin/hipconfig --version", shell=True, capture_output=True, text=True
@@ -62,7 +99,7 @@ def get_hip_version():
 
 def validate_and_update_archs():
     archs = GPU_ARCH.split(";")
-    archs = [arch.strip() for arch in archs]
+    archs = [arch.strip().split(":")[0] for arch in archs]
     # List of allowed architectures
     allowed_archs = [
         "native",
@@ -71,7 +108,6 @@ def validate_and_update_archs():
         "gfx941",
         "gfx942",
         "gfx950",
-        "gfx1100",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -85,83 +121,101 @@ def validate_and_update_archs():
     return archs
 
 
-def init_build_dir(dir):
-    if not os.path.exists(dir):
-        os.makedirs(dir)
-    else:
-        subprocess.run(f"rm -rf {dir}/*", shell=True)
-
-
 def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
-    if includes is None:
-        includes = []
-    if sources is None:
-        sources = []
-    if cxxflags is None:
-        cxxflags = []
     sub_build_dir = os.path.join(BUILD_DIR, folder)
-    init_build_dir(sub_build_dir)
     include_dir = f"{sub_build_dir}/include"
     os.makedirs(include_dir, exist_ok=True)
-    for include in includes + [f"{CK_DIR}/include"]:
-        if os.path.isdir(include):
-            shutil.copytree(include, include_dir, dirs_exist_ok=True)
-        else:
-            shutil.copy(include, include_dir)
-    for source in sources:
-        if os.path.isdir(source):
-            shutil.copytree(source, sub_build_dir, dirs_exist_ok=True)
-        else:
-            shutil.copy(source, sub_build_dir)
-    with open(f"{sub_build_dir}/{folder}.cpp", "w") as f:
-        f.write(src_file)
-    sources += [f"{folder}.cpp"]
-    cxxflags += [
-        "-DUSE_ROCM",
-        "-DENABLE_FP8",
-        "-O3",
-        "-std=c++17",
-        "-DLEGACY_HIPBLAS_DIRECT",
-        "-DUSE_PROF_API=1",
-        "-D__HIP_PLATFORM_HCC__=1",
-        "-D__HIP_PLATFORM_AMD__=1",
-        "-U__HIP_NO_HALF_CONVERSIONS__",
-        "-U__HIP_NO_HALF_OPERATORS__",
-        "-mllvm",
-        "--amdgpu-kernarg-preload-count=16",
-        # "-v", "--save-temps",
-        "-Wno-unused-result",
-        "-Wno-switch-bool",
-        "-Wno-vla-cxx-extension",
-        "-Wno-undefined-func-template",
-        "-fgpu-flush-denormals-to-zero",
-    ]
+    lock_path = f"{sub_build_dir}/lock"
+    start_ts = time.perf_counter()
 
-    # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
-    hip_version = get_hip_version()
-    if hip_version > Version("5.7.23302"):
-        cxxflags += ["-fno-offload-uniform-block"]
-    if hip_version > Version("6.1.40090"):
-        cxxflags += ["-mllvm", "-enable-post-misched=0"]
-    if hip_version > Version("6.2.41132"):
+    def main_func(includes=None, sources=None, cxxflags=None):
+        logger.info(f"start build {sub_build_dir}")
+        if includes is None:
+            includes = []
+        if sources is None:
+            sources = []
+        if cxxflags is None:
+            cxxflags = []
+
+        for include in includes + [f"{CK_DIR}/include"]:
+            if os.path.isdir(include):
+                shutil.copytree(include, include_dir, dirs_exist_ok=True)
+            else:
+                shutil.copy(include, include_dir)
+        for source in sources:
+            if os.path.isdir(source):
+                shutil.copytree(source, sub_build_dir, dirs_exist_ok=True)
+            else:
+                shutil.copy(source, sub_build_dir)
+        with open(f"{sub_build_dir}/{folder}.cpp", "w") as f:
+            f.write(src_file)
+
+        sources += [f"{folder}.cpp"]
         cxxflags += [
+            "-DUSE_ROCM",
+            "-DENABLE_FP8",
+            "-O3" if not AITER_DEBUG else "-O0",
+            "-std=c++20",
+            "-DLEGACY_HIPBLAS_DIRECT",
+            "-DUSE_PROF_API=1",
+            "-D__HIP_PLATFORM_HCC__=1",
+            "-D__HIP_PLATFORM_AMD__=1",
+            "-U__HIP_NO_HALF_CONVERSIONS__",
+            "-U__HIP_NO_HALF_OPERATORS__",
             "-mllvm",
-            "-amdgpu-early-inline-all=true",
-            "-mllvm",
-            "-amdgpu-function-calls=false",
+            "--amdgpu-kernarg-preload-count=16",
+            "-Wno-unused-result",
+            "-Wno-switch-bool",
+            "-Wno-vla-cxx-extension",
+            "-Wno-undefined-func-template",
+            "-fgpu-flush-denormals-to-zero",
         ]
-    if hip_version > Version("6.2.41133") and hip_version < Version("6.3.00000"):
-        cxxflags += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
-    archs = validate_and_update_archs()
-    cxxflags += [f"--offload-arch={arch}" for arch in archs]
-    makefile_file = makefile_template.render(
-        includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags
+
+        if AITER_DEBUG:
+            cxxflags += [
+                "-g",
+                "-ggdb",
+                "-fverbose-asm",
+                "--save-temps",
+                "-Wno-gnu-line-marker",
+            ]
+
+        # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
+        hip_version = get_hip_version()
+        if hip_version > Version("5.5.00000"):
+            cxxflags += ["-mllvm --lsr-drop-solution=1"]
+        if hip_version > Version("5.7.23302"):
+            cxxflags += ["-fno-offload-uniform-block"]
+        if hip_version > Version("6.1.40090"):
+            cxxflags += ["-mllvm -enable-post-misched=0"]
+        if hip_version > Version("6.2.41132"):
+            cxxflags += [
+                "-mllvm -amdgpu-early-inline-all=true",
+                "-mllvm -amdgpu-function-calls=false",
+            ]
+        if hip_version > Version("6.2.41133"):
+            cxxflags += ["-mllvm -amdgpu-coerce-illegal-types=1"]
+        archs = validate_and_update_archs()
+        cxxflags += [f"--offload-arch={arch}" for arch in archs]
+        makefile_file = makefile_template.render(
+            includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags
+        )
+        with open(f"{sub_build_dir}/Makefile", "w") as f:
+            f.write(makefile_file)
+        subprocess.run(
+            f"cd {sub_build_dir} && make build -j{len(sources)}", shell=True, check=True
+        )
+
+    def final_func():
+        logger.info(
+            f"finish build {sub_build_dir}, cost {time.perf_counter()-start_ts:.8f}s"
+        )
+
+    main_func = partial(
+        main_func, includes=includes, sources=sources, cxxflags=cxxflags
     )
-    with open(f"{sub_build_dir}/Makefile", "w") as f:
-        f.write(makefile_file)
-    subprocess.run(
-        f"cd {sub_build_dir} && make build -j{len(sources)}", shell=True, check=True
-    )
+
+    mp_lock(lock_path=lock_path, main_func=main_func, final_func=final_func)
 
 
 @lru_cache(maxsize=AITER_MAX_CACHE_SIZE)

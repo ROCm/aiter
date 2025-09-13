@@ -327,7 +327,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
 torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
                       const int solution_index,
                       std::optional<torch::Tensor> bias,
-                      std::optional<py::object> out_dtype,
+                      std::optional<c10::ScalarType> out_dtype,
                       std::optional<torch::Tensor> scaleA,
                       std::optional<torch::Tensor> scaleB,
                       std::optional<torch::Tensor> scaleOut)
@@ -347,7 +347,7 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
   auto inDtype{mat1.options().dtype().toScalarType()};
   auto outDtype{
       out_dtype.has_value()
-          ? torch::python::detail::py_object_to_dtype(out_dtype.value())
+          ? out_dtype.value()
           : inDtype};
   auto options{at::TensorOptions().dtype(outDtype).device(at::kCUDA)};
   auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
@@ -446,7 +446,7 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
 std::vector<int> hipb_findallsols(
     const torch::Tensor &mat1, const torch::Tensor &mat2,
     std::optional<torch::Tensor> bias,
-    std::optional<py::object> out_dtype,
+    std::optional<c10::ScalarType> out_dtype,
     std::optional<torch::Tensor> scaleA,
     std::optional<torch::Tensor> scaleB,
     std::optional<torch::Tensor> scaleC)
@@ -465,7 +465,7 @@ std::vector<int> hipb_findallsols(
   auto inType{mat1.options().dtype().toScalarType()};
   auto outType{
       out_dtype.has_value()
-          ? torch::python::detail::py_object_to_dtype(out_dtype.value())
+          ? out_dtype.value()
           : inType};
 
   auto options{at::TensorOptions().dtype(outType).device(at::kCUDA)};

@@ -9,6 +9,9 @@ import triton
 import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.heuristics(
@@ -108,14 +111,16 @@ def _batched_gemm_a8w8_kernel(
         pid_m = first_pid_m + (pid % group_size_m)
         pid_n = (pid % num_pid_in_group) // group_size_m
 
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
 
     # Cast batch id and batch dimension strides to int64 to avoid int32 overflow during offset calculation
-    batch_id = batch_id.to(tl.int64)
-    stride_ab = stride_ab.to(tl.int64)
-    stride_bb = stride_bb.to(tl.int64)
-    stride_cb = stride_cb.to(tl.int64)
+    # Note: If you're attempting to cast strides to int64 to prevent integer overflow, use `tl.cast` instead of `.to()`.
+    # See https://github.com/ROCm/aiter/pull/597 for rationale
+    batch_id = tl.cast(batch_id, tl.int64)
+    stride_ab = tl.cast(stride_ab, tl.int64)
+    stride_bb = tl.cast(stride_bb, tl.int64)
+    stride_cb = tl.cast(stride_cb, tl.int64)
 
     # Create pointers for first block of A and B input matrices
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -231,6 +236,9 @@ def batched_gemm_a8w8(
     Returns:
     - YQ: The output batch tensor with shape (B, M, N).
     """
+    _LOGGER.info(
+        f"BATCHED_GEMM_A8W8: x={tuple(XQ.shape)} w={tuple(WQ.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+    )
 
     # Make sure XQ and WQ are contiguous in memory
     XQ = XQ.contiguous()
@@ -243,7 +251,7 @@ def batched_gemm_a8w8(
         torch.bfloat16,
         torch.float16,
     ], f"Output {dtype=} is currently not supported in batched_gemm_a8w8"
-    assert splitK == None, "Currently, there isn't any support for splitK on Triton"
+    assert splitK is None, "Currently, there isn't any support for splitK on Triton"
 
     # Transpose N and K dimensions of WQ: (B, N, K) -> (B, K, N)
     WQ = WQ.transpose(1, 2)

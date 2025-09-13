@@ -236,7 +236,7 @@ def get_tune_dict(tune_dict_csv):
             N = tune_df.loc[i, "N"]
             K = tune_df.loc[i, "K"]
             kid = tune_df.loc[i, "kernelId"]
-            if kid < 0:
+            if kid < 0 or kid > len(kernels_list):
                 continue
             tune_dict[(M, N, K)] = kernels_list[kid]
     return tune_dict

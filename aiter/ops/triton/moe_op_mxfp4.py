@@ -7,9 +7,13 @@ import triton.language as tl
 from typing import Any, Dict
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
+
+_LOGGER = AiterTritonLogger()
 
 
-@tl.constexpr_function
 def get_scaled_dot_format_string(dtype: tl.dtype):
     mapping = {
         tl.float16: "fp16",
@@ -23,8 +27,7 @@ def get_scaled_dot_format_string(dtype: tl.dtype):
 
 @triton.heuristics(
     {
-        "GRID_MN": lambda args: triton.cdiv(args["EM"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
     }
 )
 @triton.jit
@@ -60,16 +63,19 @@ def _fused_moe_kernel_mxfp4(
     stride_bmxk,
     stride_bmxn,
     # Meta-parameters
+    A_DTYPE_FORMAT: tl.constexpr,
+    B_DTYPE_FORMAT: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
-    GRID_MN: tl.constexpr,
     SWIZZLE_MX_A: tl.constexpr,  # TODO add swizzle support
     SWIZZLE_MX_B: tl.constexpr,  # TODO add swizzle support
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -131,11 +137,16 @@ def _fused_moe_kernel_mxfp4(
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    NUM_XCDS: tl.constexpr = 8
-    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    GRID_MN = num_pid_n * num_pid_m
+    if pid < GRID_MN:
+        pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    else:
+        return  # rest of the tiles are dummy paddings
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     # ----------------------------------------------------------
@@ -144,9 +155,6 @@ def _fused_moe_kernel_mxfp4(
     # and accumulate
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
@@ -174,7 +182,7 @@ def _fused_moe_kernel_mxfp4(
     a_scale = tl.load(a_scale_ptr)
     b_scale = tl.load(b_scale_ptr + off_expert)
     # Set offsets of B on dim N
-    offs_b_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_b_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     offs_b_n = tl.max_contiguous(
         tl.multiple_of(offs_b_n % N, BLOCK_SIZE_N), BLOCK_SIZE_N
     )
@@ -280,20 +288,27 @@ def _fused_moe_kernel_mxfp4(
     for k in range(0, tl.cdiv(K, PACKED_BLOCK_K_A)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_a_k[None, :] < (K - k * PACKED_BLOCK_K_A)),
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=offs_b_k[:, None] < (K - k * PACKED_BLOCK_K_B),
-            other=0.0,
-        )
+        if EVEN_K:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None],
+                other=0.0,
+            )
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None]
+                & (offs_a_k[None, :] < (K - k * PACKED_BLOCK_K_A)),
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptrs,
+                mask=offs_b_k[:, None] < (K - k * PACKED_BLOCK_K_B),
+                other=0.0,
+            )
         # We accumulate along the K dimension.
         if is_a_microscaled_format or is_b_microscaled_format:
-            a_format: tl.constexpr = get_scaled_dot_format_string(a.dtype)
-            b_format: tl.constexpr = get_scaled_dot_format_string(b.dtype)
             if is_a_microscaled_format:
                 # if SWIZZLE_MX_A:
                 #    a_mx_scales = _unswizzle_mx_block(tl.load(a_mx_scale_ptrs))
@@ -319,10 +334,10 @@ def _fused_moe_kernel_mxfp4(
             accumulator = tl.dot_scaled(
                 a,
                 a_mx_scales,
-                a_format,
+                A_DTYPE_FORMAT,
                 b,
                 b_mx_scales,
-                b_format,
+                B_DTYPE_FORMAT,
                 acc=accumulator,
                 fast_math=True,
             )
@@ -377,6 +392,14 @@ def fused_moe_mxfp4(
     """
     #TODO: Add doc
     """
+    _LOGGER.info(
+        f"MOE_OP_MXFP4:  A={tuple(A.shape)}  B={tuple(B.shape)}  C={tuple(C.shape)} "
+        + "A_scale={tuple(A_scale.shape)}  B_scale={tuple(B_scale.shape)} "
+        + "A_mx_scale={tuple(A_mx_scale.shape)}  B_mx_scale={tuple(B_mx_scale.shape)} "
+        + "topk_weights={tuple(topk_weights.shape)} sorted_token_ids={tuple(sorted_token_ids.shape)} "
+        + "expert_ids={tuple(expert_ids.shape)} num_tokens_post_padded={tuple(num_tokens_post_padded.shape)} "
+        + "top_k={top_k}"
+    )
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
@@ -398,6 +421,11 @@ def fused_moe_mxfp4(
         # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
         # and we can skip some invalid blocks.
         EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
+
+    A_tl_dtype = torch_to_triton_dtype[A.dtype]
+    A_DTYPE_FORMAT = get_scaled_dot_format_string(A_tl_dtype)
+    B_tl_dtype = torch_to_triton_dtype[B.dtype]
+    B_DTYPE_FORMAT = get_scaled_dot_format_string(B_tl_dtype)
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
@@ -431,10 +459,13 @@ def fused_moe_mxfp4(
         B_mx_scale.stride(0),
         B_mx_scale.stride(2),
         B_mx_scale.stride(1),
+        A_DTYPE_FORMAT=A_DTYPE_FORMAT,
+        B_DTYPE_FORMAT=B_DTYPE_FORMAT,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         compute_type=compute_type,
         SWIZZLE_MX_A=swizzle_mx_a,  # TODO add swizzle support
         SWIZZLE_MX_B=swizzle_mx_b,  # TODO add swizzle support
+        NUM_XCDS=get_num_xcds(),
         **config,
     )

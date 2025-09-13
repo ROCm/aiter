@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -155,6 +155,7 @@ def asm_moe_test(
         a1_scale,
         fc1_scale,
         fc2_scale,
+        "",
         scale_blk_n,
         scale_blk_k,
         None,
@@ -331,6 +332,22 @@ parser.add_argument(
     help="""Intermediate dimension. Default is 256.
     e.g.: -idim 256""",
 )
+parser.add_argument(
+    "-e",
+    "--expert",
+    type=int,
+    default=256,
+    help="""Number of experts. Default is 256.
+    e.g.: -e 256""",
+)
+parser.add_argument(
+    "-k",
+    "--topk",
+    type=int,
+    default=8,
+    help="""Top-k value. Default is 8.
+    e.g.: -k 8""",
+)
 
 args = parser.parse_args()
 if args.dtype is None:
@@ -347,5 +364,13 @@ for dtype in l_dtype:
             for idim in [args.idim]:
                 scale_blks = (128, 128)
                 test_fmoe(
-                    dtype, m, dim, idim, scale_blks, 256, 8, quant="No", use_g1u1=True
+                    dtype,
+                    m,
+                    dim,
+                    idim,
+                    scale_blks,
+                    args.expert,
+                    args.topk,
+                    quant="No",
+                    use_g1u1=True,
                 )

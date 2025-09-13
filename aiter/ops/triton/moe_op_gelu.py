@@ -10,6 +10,10 @@ from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.activation import _gelu_tanh
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
+
+_LOGGER = AiterTritonLogger()
 
 # Source:
 # MoE Kernel adapted from VLLM
@@ -45,8 +49,7 @@ def moe_set_quant_func(func):
 
 @triton.heuristics(
     {
-        "GRID_MN": lambda args: triton.cdiv(args["EM"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
     }
 )
 @triton.jit
@@ -91,12 +94,13 @@ def _fused_moe_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
-    GRID_MN: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -128,11 +132,16 @@ def _fused_moe_kernel(
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    NUM_XCDS: tl.constexpr = 8
-    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    GRID_MN = num_pid_n * num_pid_m
+    if pid < GRID_MN:
+        pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    else:
+        return  # rest of the tiles are dummy paddings
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     # Create pointers for the first blocks of A and B.
@@ -140,9 +149,6 @@ def _fused_moe_kernel(
     # and accumulate
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
@@ -204,12 +210,16 @@ def _fused_moe_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
-        )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if EVEN_K:
+            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            )
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -310,6 +320,7 @@ def _fused_moe_persistent_kernel(
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -341,7 +352,6 @@ def _fused_moe_persistent_kernel(
     # -----------------------------------------------------------
     # Simply compute how many iterations each persistent block needs to do
     start_pid = tl.program_id(axis=0)
-    NUM_XCDS: tl.constexpr = 8
 
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
@@ -362,17 +372,17 @@ def _fused_moe_persistent_kernel(
         pid_m, pid_n = pid_grid(tile_id_remapped, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
         # Compute the mask
-        offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
         offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
         token_mask = offs_token < num_valid_tokens
-        off_experts = tl.load(expert_ids_ptr + pid_m)
+        off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
 
         # Compute the A pointer
         a_ptrs = a_ptr + (
             offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
         )
         # Compute the B pointer
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
         b_ptrs = (
             b_ptr
             + off_experts * stride_be
@@ -487,6 +497,11 @@ def fused_moe_gelu(
     """
     #TODO: Add doc
     """
+    _LOGGER.info(
+        f"FUSED_MOE_GELU:  A={tuple(A.shape)}  B={tuple(B.shape)}  C={tuple(C.shape)}  topk_weights-{tuple(topk_weights.shape)}"
+        + f"sorted_token_ids={tuple(sorted_token_ids.shape)} expert_ids={tuple(expert_ids.shape)}"
+        + f"num_tokens_post_padded={tuple(num_tokens_post_padded.shape)} top_k={top_k} "
+    )
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
@@ -566,6 +581,7 @@ def fused_moe_gelu(
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
+            NUM_XCDS=get_num_xcds(),
             **config,
         )
     else:
@@ -607,5 +623,6 @@ def fused_moe_gelu(
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
+            NUM_XCDS=get_num_xcds(),
             **config,
         )

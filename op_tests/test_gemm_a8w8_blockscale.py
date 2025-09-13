@@ -41,7 +41,7 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 @perftest()
 def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_blockscale_CK(x, weight, x_scale, w_scale, dtype)
+    return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
 
 
 @benchmark()

@@ -10,6 +10,9 @@ import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
@@ -97,8 +100,8 @@ def _gemm_a8wfp4_kernel(
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
 
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
     # We assume 32 elements along K share the same scale.
     SCALE_GROUP_SIZE: tl.constexpr = 32
 
@@ -333,7 +336,7 @@ def gemm_a8wfp4(
 
     Key parameters:
     - x: Matrix X with shape (M, K) in fp8 e4m3 format
-    - w: Matrix W with shape (K//2, N) in packed fp4 format (2 values per uint8)
+    - w: Matrix W with shape (N, K//2) in packed fp4 format (2 values per uint8)
     - y: Pre-allocated output matrix with shape (M, N)
     - x_scales: Per-row scales for X with shape (M, 1) in fp32 format
     - w_scales: Per-group scales for W with shape (N, K//32) in e8m0 format
@@ -344,14 +347,19 @@ def gemm_a8wfp4(
 
     Note:
     - W is stored in packed format where each uint8 contains 2 fp4 values
-    - The logical shape of W after unpacking would be (K, N)
+    - The logical shape of W after unpacking would be (N, K)
     - Every 32 consecutive elements in the K dimension of W share one e8m0 scale
     - X uses per-row scaling (not per-group scaling)
     """
-    M, K = x.shape
-    K_packed, N = w.shape
+    _LOGGER.info(
+        f"GEMM_A8FP4: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)}  "
+    )
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+
+    M, K = x.shape
+    N, K_packed = w.shape
+    w = w.T
 
     assert (
         K_packed == K // 2
