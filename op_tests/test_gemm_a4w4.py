@@ -3,7 +3,7 @@
 
 import torch
 import aiter
-from aiter.test_common import checkAllclose, benchmark, perftest
+from aiter.test_common import checkAllclose, benchmark, perftest, run_perftest
 from aiter import dtypes
 from aiter.utility import fp4_utils
 from aiter.ops.shuffle import shuffle_weight
@@ -89,6 +89,7 @@ def test_gemm(dtype, M, N, K):
 
     if get_gfx() not in ["gfx950"]:
         return
+    ret = {}
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
     x = torch.randn((M, K), dtype=dtype)
     w = torch.randn((N, K), dtype=dtype)
@@ -105,72 +106,53 @@ def test_gemm(dtype, M, N, K):
     w_scales = w_scales.view(torch.uint8)
     a, avg_a = run_torch(x, w, x_scales, w_scales, dtype)
     # b, avg_b = run_triton(x, w.T, x_scales, w_scales, out1, dtype)
-    b, avg_b = a, 0
-    err_b = checkAllclose(a, b, msg="triton        ")
+    # b, avg_b = a, 0
+    # err_b = checkAllclose(a, b, msg="triton        ")
 
-    err_c = None
-    avg_c = None
-    tflops_c = None
-    tbs_c = None
-    c, avg_c = run_gemm_asm(
+    c, us = run_perftest(
+        aiter.gemm_a4w4,
         x,
         wshuffle,
         x_scales_shuffle,
         w_scales_shuffle,
         out2,
-        "",  # kernelName _ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_192x256E
-        bias_f32,
         bpreshuffle=True,
-        log2_k_split=0,
     )
+    err = checkAllclose(a, c[:M], msg="unified api")
+    ret["us"] = us
+    ret["TFLOPS"] = M * N * K * 2 / us / 1e6
+    ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
+    ret["err"] = err
 
-    err_c = checkAllclose(a, c[:M], msg="asm no splitK  ")
-    tflops_c = M * N * K * 2 / avg_c / 1e6
-    tbs_c = (x.nbytes + w.nbytes) / avg_c / 1e6
-    err_d = None
-    avg_d = None
-    tflops_d = None
-    tbs_d = None
-    d, avg_d = run_gemm_asm(
-        x,
-        wshuffle,
-        x_scales_shuffle,
-        w_scales_shuffle,
-        out3,
-        "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E",  # kernelName
-        bias_f32,
-        bpreshuffle=True,
-        log2_k_split=1,
-    )
-    err_d = checkAllclose(a, d[:M], msg="asm splitK ")
-    tflops_d = M * N * K * 2 / avg_d / 1e6
-    tbs_d = (x.nbytes + w.nbytes) / avg_d / 1e6
+    # kernelName = ""  # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
+    # log2_k_split = 1
+    # d, us = run_gemm_asm(
+    #     x,
+    #     wshuffle,
+    #     x_scales_shuffle,
+    #     w_scales_shuffle,
+    #     out3,
+    #     kernelName,
+    #     bias_f32,
+    #     bpreshuffle=True,
+    #     log2_k_split=log2_k_split,
+    # )
+    # err = checkAllclose(a, d[:M], msg=f"asm {kernelName} log2_k_split_{log2_k_split}")
+    # tag = "asm_dbg"
+    # ret[f"us {tag}"] = us
+    # ret[f"TFLOPS {tag}"] = M * N * K * 2 / us / 1e6
+    # ret[f"TB/s {tag}"] = (x.nbytes + w.nbytes) / us / 1e6
+    # ret[f"err {tag}"] = err
 
-    err_e = None
-    avg_e = None
-    tflops_e = None
-    tbs_e = None
-    e, avg_e = run_gemm_ck(x, wshuffle, x_scales_shuffle, w_scales_shuffle, out3)
-    err_e = checkAllclose(a, e[:M], msg="ck            ")
-    tflops_e = M * N * K * 2 / avg_e / 1e6
-    tbs_e = (x.nbytes + w.nbytes) / avg_e / 1e6
+    # e, us = run_gemm_ck(x, wshuffle, x_scales_shuffle, w_scales_shuffle, out3)
+    # err = checkAllclose(a, e[:M], msg="ck            ")
+    # tag = "ck"
+    # ret[f"us {tag}"] = us
+    # ret[f"TFLOPS {tag}"] = M * N * K * 2 / us / 1e6
+    # ret[f"TB/s {tag}"] = (x.nbytes + w.nbytes) / us / 1e6
+    # ret[f"err {tag}"] = err
 
-    return {
-        "triton": avg_b,
-        "asm no splitK": avg_c,
-        "asm splitK": avg_d,
-        "ck": avg_e,
-        "triton err": err_b,
-        "asm no splitK err": err_c,
-        "asm splitK err": err_d,
-        "ck err": err_e,
-        "asm no splitK TFLOPS": tflops_c,
-        "asm splitK TFLOPS": tflops_d,
-        "ck TFLOPS": tflops_e,
-        "asm no splitK TB/s": tbs_c,
-        "asm splitK TB/s": tbs_d,
-        "ck TB/s": tbs_e,
-    }
+    return ret
 
 
 l_dtype = ["bf16"]
