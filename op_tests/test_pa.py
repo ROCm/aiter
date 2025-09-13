@@ -634,6 +634,14 @@ def test_paged_attention(
             )
             k_scale_asm.fill_(k_scale_.item())
             v_scale_asm.fill_(v_scale_.item())
+            k_scale_hip_ = torch.empty(
+                num_blocks * block_size, num_kv_heads, dtype=dtypes.fp32, device=device
+            )
+            v_scale_hip_ = torch.empty(
+                num_blocks * block_size, num_kv_heads, dtype=dtypes.fp32, device=device
+            )
+            k_scale_hip_.fill_(k_scale_.item())
+            v_scale_hip_.fill_(v_scale_.item())
 
             out_aiter, time_aiter = run_aiter(
                 query,
@@ -646,8 +654,8 @@ def test_paged_attention(
                 num_kv_heads,
                 scale,
                 alibi_slopes,
-                k_scale_,
-                v_scale_,
+                k_scale_hip_,
+                v_scale_hip_,
             )
             checkAllclose(
                 out_golden,
