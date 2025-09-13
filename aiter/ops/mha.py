@@ -809,8 +809,10 @@ def cmdGenFunc_mha_batch_prefill(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    kv_last_page_lens: Optional[Tensor] = None,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -2118,8 +2120,10 @@ def mha_batch_prefill(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    kv_last_page_lens: Optional[Tensor]=None,
 ) -> List[Tensor]: ...
 
 
@@ -2143,6 +2147,7 @@ def _mha_batch_prefill(
     return_softmax: bool = False,
     zero_tensors: bool = False,
     out: torch.Tensor = None,
+    kv_last_page_lens: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2165,8 +2170,10 @@ def _mha_batch_prefill(
         return_lse,
         return_softmax,
         out,
+        None,
         alibi_slopes,
         None,
+        kv_last_page_lens,
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out, softmax_lse, S_dmask, rng_state
@@ -2191,6 +2198,7 @@ def mha_batch_prefill_func(
     return_lse=False,
     return_attn_probs=False,
     out=None,
+    kv_last_page_lens=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -2220,6 +2228,7 @@ def mha_batch_prefill_func(
         return_lse=return_lse,
         return_softmax=return_attn_probs and dropout_p > 0,
         out=out,
+        kv_last_page_lens=kv_last_page_lens,
     )
     out = out_padded[..., :head_size_v_og]
 
