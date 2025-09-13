@@ -37,7 +37,8 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                                float softmax_scale,
                                float logits_soft_cap,
                                float p_dropout,
-                               std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                               std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                               std::optional<const at::Tensor>& kv_last_page_lens_)
 {
     // q: (total_q, nheads, d)
     // k: (total_k, nheads_k, d)
@@ -99,31 +100,41 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
+    void* kv_last_page_lens_ptr     = nullptr;
+    if(kv_last_page_lens_.has_value())
+    {
+        auto kv_last_page_lens = kv_last_page_lens_.value();
+        CHECK_DEVICE(kv_last_page_lens);
+        TORCH_CHECK(kv_last_page_lens.dim() == 1, "kv_last_page_lens must be 1d");
+        kv_last_page_lens_ptr = kv_last_page_lens.data_ptr();
+    }
+
     fmha_batch_prefill_args args;
 
-    args.q_ptr           = q.data_ptr();
-    args.k_ptr           = k.data_ptr();
-    args.v_ptr           = v.data_ptr();
-    args.bias_ptr        = bias_ptr;
-    args.rand_val_ptr    = has_dropout_randval ? dropout_randval.data_ptr() : nullptr;
-    args.lse_ptr         = has_lse ? softmax_lse.data_ptr() : nullptr;
-    args.o_ptr           = out.data_ptr();
-    args.seqstart_q_ptr  = seqlens_q.data_ptr();
-    args.seqlen_q        = total_q;
-    args.seqlen_k        = total_k;
-    args.batch           = b;
-    args.max_seqlen_q    = max_seqlen_q;
-    args.hdim_q          = d;
-    args.hdim_v          = d_v;
-    args.nhead_q         = h;
-    args.nhead_k         = h_k;
-    args.num_total_pages = num_total_pages;
-    args.page_block_size = page_block_size;
-    args.kv_indptr       = kv_indptr.data_ptr();
-    args.kv_page_indices = kv_page_indices.data_ptr();
-    args.scale_s         = softmax_scale;
-    args.scale_p         = 1;
-    args.scale_o         = 1;
+    args.q_ptr             = q.data_ptr();
+    args.k_ptr             = k.data_ptr();
+    args.v_ptr             = v.data_ptr();
+    args.bias_ptr          = bias_ptr;
+    args.rand_val_ptr      = has_dropout_randval ? dropout_randval.data_ptr() : nullptr;
+    args.lse_ptr           = has_lse ? softmax_lse.data_ptr() : nullptr;
+    args.o_ptr             = out.data_ptr();
+    args.seqstart_q_ptr    = seqlens_q.data_ptr();
+    args.seqlen_q          = total_q;
+    args.seqlen_k          = total_k;
+    args.batch             = b;
+    args.max_seqlen_q      = max_seqlen_q;
+    args.hdim_q            = d;
+    args.hdim_v            = d_v;
+    args.nhead_q           = h;
+    args.nhead_k           = h_k;
+    args.num_total_pages   = num_total_pages;
+    args.page_block_size   = page_block_size;
+    args.kv_indptr         = kv_indptr.data_ptr();
+    args.kv_page_indices   = kv_page_indices.data_ptr();
+    args.kv_last_page_lens = kv_last_page_lens_ptr;
+    args.scale_s           = softmax_scale;
+    args.scale_p           = 1;
+    args.scale_o           = 1;
 
     args.logits_soft_cap = logits_soft_cap;
 
@@ -178,7 +189,8 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_n
                   std::optional<at::Tensor> out_,                // [total_q, hq, d]
                   std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
                   std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-                  std::optional<at::Generator> gen_)
+                  std::optional<at::Generator> gen_,
+                  std::optional<const at::Tensor> kv_last_page_lens)
 {
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -402,7 +414,8 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_n
                                                    softmax_scale,
                                                    logits_soft_cap,
                                                    p_dropout,
-                                                   drop_seed_offset);
+                                                   drop_seed_offset,
+                                                   kv_last_page_lens);
 
         float t = aiter::mha_batch_prefill(args,
                                            stream_config,

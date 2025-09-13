@@ -395,7 +395,7 @@ def test_batch_prefill_with_paged_kv_cache2(
         torch.max(kv_lens).item(),
         causal=causal,
         logits_soft_cap=logits_soft_cap,
-        # kv_last_page_lens=kv_last_page_len_gpu,
+        kv_last_page_lens=kv_last_page_len_gpu,
     )
 
     for i in range(batch_size):
@@ -530,7 +530,7 @@ if __name__ == "__main__":
             num_qo_heads=1,
             num_kv_heads=1,
             head_dim=128,
-            causal=None,
+            causal=causal,
             kv_layout="NHD",
             logits_soft_cap=logits_soft_cap,
             contiguous_kv=True,
