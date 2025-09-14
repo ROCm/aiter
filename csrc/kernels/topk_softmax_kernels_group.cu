@@ -6,7 +6,7 @@
  * @Email: lingpeng.jin@amd.com
  * @Create At: 2025-03-01 12:16:14
  * @Last Modified By: valarLip
- * @Last Modified At: 2025-05-02 15:52:13
+ * @Last Modified At: 2025-09-14 19:41:14
  * @Description: This is description.
  */
 
@@ -164,21 +164,77 @@ namespace aiter
         }
     }
 
-    __inline__ __device__ void warpReduceMax(float &val, int &idx)
+    __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
     {
         static_assert(64 == WARP_SIZE, "WARP_SIZE == 64");
-#pragma unroll
-        for (int i = 0; i < 6; i++)
-        {
-            int offset = 1 << i;
-            float tmp_val = __shfl_down(val, offset);
-            int tmp_idx = __shfl_down(idx, offset);
-            if (tmp_val > val)
-            {
-                val = tmp_val;
-                idx = tmp_idx;
-            }
-        }
+        constexpr int lane_steps  = 6;
+        constexpr int row_mask    = 0xf;
+        constexpr int bank_mask   = 0xf;
+        constexpr bool bound_ctrl = true;
+        float val=val_o;
+
+        constexpr auto get_dpp_i = [&](auto i_step) {
+            if constexpr(i_step.value == 0)
+                return 0xb1; // quad_perm:[1,0,3,2]
+            if constexpr(i_step.value == 1)
+                return 0x4e; // quad_perm:[2,3,0,1]
+            if constexpr(i_step.value == 2)
+                return 0x114; // row_shr:4
+            if constexpr(i_step.value == 3)
+                return 0x118; // row_shr:8
+            if constexpr(i_step.value == 4)
+                return 0x142; // row_bcast:15
+            if constexpr(i_step.value == 5)
+                return 0x143; // row_bcast:31
+            else
+                return 0xffff; // return a value to let compile crash
+        };
+        ck_tile::static_for<0, lane_steps, 1>{}([&](auto i_step) {
+            constexpr int dpp_i = get_dpp_i(i_step);
+
+            float remote_val = __builtin_bit_cast(
+                float,
+                __builtin_amdgcn_mov_dpp(
+                    __builtin_bit_cast(int, val), dpp_i, row_mask, bank_mask, bound_ctrl));
+            int remote_idx = __builtin_bit_cast(
+                int,
+                __builtin_amdgcn_mov_dpp(
+                    __builtin_bit_cast(int, idx), dpp_i, row_mask, bank_mask, bound_ctrl));
+
+            idx = val > remote_val ? idx : remote_idx;
+            val = val > remote_val ? val : remote_val;
+        });
+        val_o = __builtin_bit_cast(
+            float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, val), WARP_SIZE-1));
+        idx = __builtin_amdgcn_readlane(idx, WARP_SIZE - 1);
+
+        // val = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, val), 63));
+        // if (val==val_o)
+        // {
+        //     unsigned long long active_mask = __builtin_amdgcn_read_exec();
+        //     int first_lane;
+        //     asm volatile("s_ff1_i32_b64 %0, %1\n" : "=s"(first_lane) : "s"(active_mask));
+        //     if(threadIdx.x == first_lane)
+        //     {
+        //         int tmp = __builtin_amdgcn_readlane(idx, first_lane);
+        //         asm volatile("v_writelane_b32 %0, %1, 63\n" : "=v"(idx) : "s"(tmp));
+        //     }
+        // }
+        // val_o = val;
+        // idx = __builtin_amdgcn_readlane(idx, 63);
+
+        // #pragma unroll
+        //         for(int i = 0; i < 6; i++)
+        //         {
+        //             int offset = 1 << i;
+        //             float tmp_val = __shfl_down(val, offset);
+        //             int tmp_idx = __shfl_down(idx, offset);
+        //             if (tmp_val > val)
+        //             {
+        //                 val = tmp_val;
+        //                 idx = tmp_idx;
+        //             }
+        //         }
     }
 
     __device__ void blockReduceMax(float &val, int &idx)
@@ -222,22 +278,26 @@ namespace aiter
         const float routed_scaling_factor)
     {
         static_assert(NUM_GRP <= WARP_SIZE, "NUM_GRP must be <= WARP_SIZE");
+        static constexpr int THREAD_PER_GRP = (WARP_SIZE + NUM_GRP-1) / NUM_GRP;
         // 256 E, 8->4 group, 32 e/group
         const int experts_per_group = num_experts / NUM_GRP;
         extern __shared__ char shared_mem[];
         const int token_idx = blockIdx.x;
 
-        char *ptr = (char *)(((size_t)shared_mem + 255) & ~255);
-        float *scores = reinterpret_cast<float *>(ptr);
+        char* ptr     = shared_mem;
+        float* scores = reinterpret_cast<float*>(ptr);
         ptr += num_experts * sizeof(float);
 
-        float *group_scores = reinterpret_cast<float *>(ptr);
+        float* group_scores = reinterpret_cast<float*>(ptr);
         ptr += NUM_GRP * sizeof(float);
 
-        int *topk_indices = reinterpret_cast<int *>(ptr);
-        ptr += topk * sizeof(int);
+        // float* bias = reinterpret_cast<float*>(ptr);
+        // ptr += num_experts * sizeof(float);
 
-        float *topk_values = reinterpret_cast<float *>(ptr);
+        // int* topk_indices   = reinterpret_cast<int*>(ptr);
+        // ptr += topk * sizeof(int);
+
+        // float* topk_values = reinterpret_cast<float*>(ptr);
         // ptr += topk * sizeof(float);
 
         // int *topk_indices_f = reinterpret_cast<int *>(ptr);
@@ -258,7 +318,8 @@ namespace aiter
             {
                 vec_i tmp = reinterpret_cast<vec_i const *>(input_ptr)[e];
                 vec_i tmp2;
-                if constexpr (isBiased)
+                f32vec tmp2_f32;
+                if constexpr(isBiased)
                     tmp2 = reinterpret_cast<vec_i const *>(correction_bias)[e];
                 f32vec gating;
 #pragma unroll
@@ -268,10 +329,15 @@ namespace aiter
                     gating[i] = 1.0f / (1.0f + expf(-gating[i]));
                     if constexpr (isBiased)
                     {
-                        gating[i] += ck_tile::type_convert<float>(tmp2[i]);
+                        tmp2_f32[i] = ck_tile::type_convert<float>(tmp2[i]);
+                        gating[i] += tmp2_f32[i];
                     }
                 }
                 scores_vec[e] = gating;
+                // if constexpr(isBiased)
+                // {
+                //     reinterpret_cast<f32vec*>(bias)[e] = tmp2_f32;
+                // }
             }
             __syncthreads();
         }
@@ -324,25 +390,76 @@ namespace aiter
 
         if constexpr (isBiased)
         {
-            for (int g = threadIdx.x; g < NUM_GRP; g += blockDim.x)
+            constexpr int lane_steps = [&]() {
+                if constexpr(THREAD_PER_GRP == 8)
+                    return 3;
+                if constexpr(THREAD_PER_GRP == 4)
+                    return 2;
+                if constexpr(THREAD_PER_GRP == 2)
+                    return 1;
+                else
+                    return 0;
+            }();
+            const int lane_id = threadIdx.x % THREAD_PER_GRP;
+            for(int g = threadIdx.x / THREAD_PER_GRP; g < NUM_GRP; g += blockDim.x / THREAD_PER_GRP)
             {
                 float max1 = -INFINITY, max2 = -INFINITY;
                 const int start = g * experts_per_group;
-                const int end = start + experts_per_group;
+                const int end   = experts_per_group/vec_size;
+                f32vec* sc = reinterpret_cast<f32vec*>(scores + start);
 
-                for (int e = start; e < end; ++e)
+                for(int e = lane_id; e < end; e += THREAD_PER_GRP)
                 {
-                    if (scores[e] > max1)
+                    auto s_vec = sc[e];
+                    for(int j = 0; j < vec_size; j++)
                     {
-                        max2 = max1;
-                        max1 = scores[e];
-                    }
-                    else if (scores[e] > max2)
-                    {
-                        max2 = scores[e];
+                        auto s_tmp = s_vec[j];
+                        max2       = dev_max_(s_tmp, max2);
+                        max2       = s_tmp > max1 ? max1 : max2;
+                        max1       = dev_max_(s_tmp, max1);
                     }
                 }
-                group_scores[g] = max1 + max2;
+
+                {
+                    constexpr int row_mask    = 0xf;
+                    constexpr int bank_mask   = 0xf;
+                    constexpr bool bound_ctrl = true; // ! out-of-bound is zero !
+
+                    constexpr auto get_dpp_i = [&](auto i_step) {
+                        if constexpr(i_step.value == 0)
+                            return 0xb1; // quad_perm:[1,0,3,2]
+                        if constexpr(i_step.value == 1)
+                            return 0x4e; // quad_perm:[2,3,0,1]
+                        if constexpr(i_step.value == 2)
+                            return 0x141; // row_half_mirror
+                        else
+                            return 0xffff; // return a value to let compile crash
+                    };
+                    ck_tile::static_for<0, lane_steps, 1>{}([&](auto i_step) {
+                        constexpr int dpp_i = get_dpp_i(i_step);
+                        float remote_max_1  = __builtin_bit_cast(
+                            float,
+                            __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, max1),
+                                                     dpp_i,
+                                                     row_mask,
+                                                     bank_mask,
+                                                     bound_ctrl));
+                        float remote_max_2 = __builtin_bit_cast(
+                            float,
+                            __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, max2),
+                                                     dpp_i,
+                                                     row_mask,
+                                                     bank_mask,
+                                                     bound_ctrl));
+
+                        max2 = dev_max_(remote_max_1, max2);
+                        max2 = remote_max_1 > max1 ? max1 : max2;
+                        max1 = dev_max_(remote_max_1, max1);
+                        max2 = dev_max_(max2, remote_max_2);
+                    });
+                }
+                if(lane_id == 0)
+                    group_scores[g] = max1 + max2;
             }
             __syncthreads();
         }
@@ -356,10 +473,7 @@ namespace aiter
                 const int end = start + experts_per_group;
                 for (int e = start; e < end; ++e)
                 {
-                    if (scores[e] > max1)
-                    {
-                        max1 = scores[e];
-                    }
+                    max1 = scores[e] > max1 ? scores[e] : max1;
                 }
                 group_scores[g] = max1;
             }
@@ -371,13 +485,11 @@ namespace aiter
             float max_val = -INFINITY;
             int max_idx = NUM_GRP;
 #pragma unroll
-            for (int g = 0; g < NUM_GRP; g++)
+            for(int g = 0; g < NUM_GRP; g++)
             {
-                if (group_scores[g] > max_val)
-                {
-                    max_val = group_scores[g];
-                    max_idx = g;
-                }
+                auto gs_tmp = group_scores[g];
+                max_idx     = gs_tmp > max_val ? g : max_idx;
+                max_val     = gs_tmp > max_val ? gs_tmp : max_val;
             }
             group_scores[max_idx] = -INFINITY;
         }
@@ -392,16 +504,18 @@ namespace aiter
         }
         __syncthreads();
 
-        using kvp = hipcub::KeyValuePair<int, float>;
-        using BlockReduce = hipcub::BlockReduce<kvp, WARP_SIZE>;
-        __shared__ typename BlockReduce::TempStorage tmpStorage;
-        kvp thread_kvp;
-        hipcub::ArgMax arg_max;
+        // using kvp = hipcub::KeyValuePair<int, float>;
+        // using BlockReduce = hipcub::BlockReduce<kvp, WARP_SIZE>;
+        // __shared__ typename BlockReduce::TempStorage tmpStorage;
+        // kvp thread_kvp;
+        // hipcub::ArgMax arg_max;
 
         float sum = 0.0f;
+        int topk_indice;
+        float topk_value;
         for (int k = 0; k < topk; ++k)
         {
-            float max_val = scores[k];
+            float max_val = -INFINITY;
             int max_idx = k;
 
             for (int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
@@ -417,39 +531,38 @@ namespace aiter
                     }
                 }
             }
-            thread_kvp.key = max_idx;
-            thread_kvp.value = max_val;
-            const kvp result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
-            // warpReduceMax(max_val, max_idx);
+            // thread_kvp.key = max_idx;
+            // thread_kvp.value = max_val;
+            // const kvp result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
+            
+            warpReduceMax(max_val, max_idx);
             // blockReduceMax(max_val, max_idx);
 
-            if (threadIdx.x == 0)
+            // if (threadIdx.x == 0)
             {
-                max_val = result_kvp.value;
-                max_idx = result_kvp.key;
+                // max_val = result_kvp.value;
+                // max_idx = result_kvp.key;
                 if constexpr (isBiased)
                 {
                     max_val -= correction_bias[max_idx];
+                    // max_val -= bias[max_idx];
                 }
                 scores[max_idx] = -INFINITY;
-                topk_indices[k] = max_idx;
-                topk_values[k] = max_val;
+                // topk_indices[k] = max_idx;
+                // topk_values[k] = max_val;
+                topk_indice = threadIdx.x == k ? max_idx : topk_indice;
+                topk_value  = threadIdx.x == k ? max_val : topk_value;
                 if (need_renorm)
                 {
                     sum += max_val;
                 }
             }
-            __syncthreads();
+            // __syncthreads();
         }
 
         if (need_renorm)
         {
-            if (threadIdx.x == 0)
-            {
-                scores[0] = routed_scaling_factor / sum; // reuse lds
-            }
-            __syncthreads();
-            sum = scores[0];
+            sum = routed_scaling_factor / sum;;
         }
         else
         {
@@ -458,8 +571,8 @@ namespace aiter
 
         for (int k = threadIdx.x; k < topk; k += blockDim.x)
         {
-            topk_weights[token_idx * stride_tk + k] = topk_values[k] * sum;
-            topk_ids[token_idx * stride_tk + k] = topk_indices[k];
+            topk_weights[token_idx * stride_tk + k] = topk_value * sum;
+            topk_ids[token_idx * stride_tk + k] = topk_indice;
         }
     }
 
@@ -477,6 +590,8 @@ namespace aiter
         const float routed_scaling_factor)
     {
         static_assert(NUM_GRP <= WARP_SIZE, "NUM_GRP must be <= WARP_SIZE");
+        // number of lanes responsible for a expert group
+        static constexpr int THREAD_PER_GRP = (WARP_SIZE + NUM_GRP - 1) / NUM_GRP;
         // 256 E, 8->4 group, 32 e/group
         const int experts_per_group = num_experts / NUM_GRP;
         extern __shared__ char shared_mem[];
@@ -545,9 +660,9 @@ namespace aiter
                     }
                 }
                 scores_vec[e] = gating;
-                if constexpr (isBiased)  {
-                    reinterpret_cast<f32vec*>(bias)[e] = tmp2_f32;
-                }
+                // if constexpr (isBiased)  {
+                //     reinterpret_cast<f32vec*>(bias)[e] = tmp2_f32;
+                // }
             }
             __syncthreads();
         }
@@ -593,56 +708,70 @@ namespace aiter
         }
 
         float group_score_;
-        constexpr int expert_group_lanes = 64 / NUM_GRP; // number of lanes responsible for a expert group
 
         if constexpr (isBiased)
         {
-            constexpr int lane_steps = [&](){
-                if constexpr (expert_group_lanes == 8) return 3;
-                if constexpr (expert_group_lanes == 4) return 2;
-                if constexpr (expert_group_lanes == 2) return 1;
-                else return 0;
+            constexpr int lane_steps = [&]() {
+                if constexpr(THREAD_PER_GRP == 8)
+                    return 3;
+                if constexpr(THREAD_PER_GRP == 4)
+                    return 2;
+                if constexpr(THREAD_PER_GRP == 2)
+                    return 1;
+                else
+                    return 0;
             }();
-            const int lane_id = threadIdx.x % expert_group_lanes;
-            for (int g = threadIdx.x / expert_group_lanes; g < NUM_GRP; g += blockDim.x / expert_group_lanes)
+            const int lane_id = threadIdx.x % THREAD_PER_GRP;
+            for(int g = threadIdx.x / THREAD_PER_GRP; g < NUM_GRP; g += blockDim.x / THREAD_PER_GRP)
             {
                 float max1 = -INFINITY, max2 = -INFINITY;
                 const int start = g * experts_per_group;
-                const int end = start + experts_per_group;
+                const int end   = experts_per_group / vec_size;
+                f32vec* sc      = reinterpret_cast<f32vec*>(scores + start);
 
-                for (int e = start; e < end; e += expert_group_lanes)
+                for(int e = lane_id; e < end; e += THREAD_PER_GRP)
                 {
-                    auto s_tmp = scores[e + lane_id];
-                    max2 = dev_max_(s_tmp, max2);
-                    max2 = s_tmp > max1 ? max1 : max2;
-                    max1 = dev_max_(s_tmp, max1);
+                    auto s_vec = sc[e];
+                    for(int j = 0; j < vec_size; j++)
+                    {
+                        auto s_tmp = s_vec[j];
+                        max2       = dev_max_(s_tmp, max2);
+                        max2       = s_tmp > max1 ? max1 : max2;
+                        max1       = dev_max_(s_tmp, max1);
+                    }
                 }
 
                 {
                     constexpr int row_mask    = 0xf;
                     constexpr int bank_mask   = 0xf;
-                    constexpr bool bound_ctrl = true;   // ! out-of-bound is zero !
+                    constexpr bool bound_ctrl = true; // ! out-of-bound is zero !
 
-                    constexpr auto get_dpp_i = [&](auto i_step){
-                        if constexpr (i_step.value == 0) return 0xb1; // quad_perm:[1,0,3,2]
-                        if constexpr (i_step.value == 1) return 0x4e; // quad_perm:[2,3,0,1]
-                        if constexpr (i_step.value == 2) return 0x141; // row_half_mirror
-                        else return 0xffff;  // return a value to let compile crash
+                    constexpr auto get_dpp_i = [&](auto i_step) {
+                        if constexpr(i_step.value == 0)
+                            return 0xb1; // quad_perm:[1,0,3,2]
+                        if constexpr(i_step.value == 1)
+                            return 0x4e; // quad_perm:[2,3,0,1]
+                        if constexpr(i_step.value == 2)
+                            return 0x141; // row_half_mirror
+                        else
+                            return 0xffff; // return a value to let compile crash
                     };
-                    ck_tile::static_for<0, lane_steps, 1>{}([&](auto i_step){
+                    ck_tile::static_for<0, lane_steps, 1>{}([&](auto i_step) {
                         constexpr int dpp_i = get_dpp_i(i_step);
-                        float remote_max_1 = __builtin_bit_cast(float,
-                                                        __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, max1),
-                                                                    dpp_i,
-                                                                    row_mask,
-                                                                    bank_mask,
-                                                                    bound_ctrl));
-                        float remote_max_2 = __builtin_bit_cast(float,
-                                                        __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, max2),
-                                                                    dpp_i,
-                                                                    row_mask,
-                                                                    bank_mask,
-                                                                    bound_ctrl));
+                        float remote_max_1  = __builtin_bit_cast(
+                            float,
+                            __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, max1),
+                                                     dpp_i,
+                                                     row_mask,
+                                                     bank_mask,
+                                                     bound_ctrl));
+                        float remote_max_2 = __builtin_bit_cast(
+                            float,
+                            __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, max2),
+                                                     dpp_i,
+                                                     row_mask,
+                                                     bank_mask,
+                                                     bound_ctrl));
 
                         max2 = dev_max_(remote_max_1, max2);
                         max2 = remote_max_1 > max1 ? max1 : max2;
@@ -688,7 +817,7 @@ namespace aiter
         }
 
         if constexpr (NUM_GRP == 8 || NUM_GRP == 4 || NUM_GRP == 2) {
-            float gs_tmp_remote = __shfl(group_score_, threadIdx.x * expert_group_lanes);
+            float gs_tmp_remote = __shfl(group_score_, threadIdx.x * THREAD_PER_GRP);
             float gs_tmp = threadIdx.x < NUM_GRP ? gs_tmp_remote : -INFINITY;
 
             auto sort_res = warp_merge_sort_to_reg(gs_tmp, ck_tile::number<NUM_GRP>{});
@@ -792,7 +921,7 @@ namespace aiter
                 float topk_v = topk_values[threadIdx.x];
                 int topk_i = final_topk_idx[threadIdx.x];
                 if constexpr (isBiased) {
-                    topk_v -= bias[topk_i];
+                    topk_v -= correction_bias[topk_i];
                 }
                 if(need_renorm) {
                     sum = multithread_reduce(topk_v, [&](auto x_, auto y_){ return x_ + y_;}, 8);
@@ -931,20 +1060,23 @@ void biased_grouped_topk(
     TORCH_CHECK(gating_output.dtype() == correction_bias.dtype(), "gating_output.dtype() == correction_bias.dtype()");
 
     // TODO: expand usage in the future
-    bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) && (topk_grp == 4) && (isBiased == true);
+    // bool use_opt_sort = false;
+    bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
+                        (topk_grp == 4) && (isBiased == true);
 
     dim3 grid(num_tokens);
     dim3 block(64);
-    size_t shared_mem_size = (num_experts * sizeof(float) +
-                              (num_expert_group + 1) * sizeof(float) +
-                              topk * sizeof(int) +
-                              topk * sizeof(float)
-                              + num_experts * sizeof(float) /*bias*/
-                              + (topk > topk_grp ? topk : topk_grp) * sizeof(int) /* sort_k*/
+    size_t shared_mem_size = (num_experts * sizeof(float) + num_expert_group * sizeof(float));
+    shared_mem_size += !use_opt_sort
+                           ? 0
+                           : (num_expert_group * sizeof(int) /*group_map_idx*/
+                              + topk * sizeof(int)           /*idx+weight*/
+                              + topk * sizeof(float)         /*idx+weight*/
+                              //   + num_experts * sizeof(float)                         /*bias*/
+                              + (topk > topk_grp ? topk : topk_grp) * sizeof(int)   /* sort_k*/
                               + (topk > topk_grp ? topk : topk_grp) * sizeof(float) /* sort_v*/
-                              + 255) &
-                             ~255;
-                            //   + 64 / num_expert_group * sizeof(float) /* for sorting */
+                              //    + 64 / num_expert_group * sizeof(float) /* for sorting */
+                             );
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
     const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();

@@ -85,8 +85,8 @@ def check_topk_softmax_allclose(
     tar_val, tar_idx,
     scores,
     bias,
-    target_dim = -1,     # last dim by default 
-    target_dim_len = -1, # the dim could be larger than ref/tar val dim length. if -1, then same size as 
+    target_dim = -1,     # last dim by default
+    target_dim_len = -1, # the dim could be larger than ref/tar val dim length. if -1, then same size as
     sort_before_compare = True, # this is useful when we don't care about the absolute position of the val/idx
     rtol=1e-2,
     atol=1e-2,
@@ -107,12 +107,12 @@ def check_topk_softmax_allclose(
         t_val = tar_val
         r_idx = ref_idx
         t_idx = tar_idx
-    
+
     if target_dim_len < 0:
         target_dim_len = ref_val.shape[target_dim]
 
     assert target_dim_len >= ref_val.shape[target_dim]
-    
+
     original_shape = list(ref_val.shape)
     original_shape[target_dim] = target_dim_len
 
@@ -126,7 +126,7 @@ def check_topk_softmax_allclose(
     if is_close_v.all():
         if printLog:
             logger.info(f"{msg}[check_topk_softmax_allclose/value {atol=} {rtol=} \033[32mpassed~\033[0m]")
-        
+
         if is_close_i.all():
             if printLog:
                 logger.info(f"{msg}[check_topk_softmax_allclose/index \033[32mpassed~\033[0m]")
@@ -186,6 +186,7 @@ def check_topk_softmax_allclose(
 def test_biased_grouped_topk(
     token, expert, group, topk, topk_group, need_renorm, dtype, scale_factor=1.0
 ):
+    ret = {}
     gating_output = torch.randn((token, expert), dtype=dtype)
     correction_bias = torch.randn((expert,), dtype=dtype)
 
@@ -218,9 +219,26 @@ def test_biased_grouped_topk(
 
     # use a special function to check result. The HIP topk may using sort algorithm
     # ... which will make the result order unpredictable
-    check_topk_softmax_allclose(w_ref, id_ref, w_aiter, id_aiter, score_ref, correction_bias,
-                    target_dim_len=expert,
-                    msg=f"[golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......")   
+    # check_topk_softmax_allclose(w_ref, id_ref, w_aiter, id_aiter, score_ref, correction_bias,
+    #                 target_dim_len=expert,
+    #                 msg=f"[golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......")
+    id_ref, _ref = torch.sort(id_ref)
+    id_aiter, _aiter = torch.sort(id_aiter)
+    w_ref = w_ref.gather(1, _ref)
+    w_aiter = w_aiter.gather(1, _aiter)
+    # print(f'  {id_ref=}')
+    # print(f'{id_aiter=}')
+    # print(f'  {w_ref=}')
+    # print(f'{w_aiter=}')
+    err = checkAllclose(w_ref, w_aiter, msg="topk_weights [golden vs aiter]")
+    checkAllclose(
+        id_ref,
+        id_aiter,
+        msg=f"topk_ids     [golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......",
+    )
+    ret["us_aiter"] = us_aiter
+    ret["err_aiter"] = err
+    # return {"err": err, "us": us_aiter}
 
     w_sglang = torch.empty_strided((token, topk), (topk, 1), dtype=dtypes.fp32)
     id_sglang = torch.empty_strided((token, topk), (topk, 1), dtype=dtypes.i32)
@@ -240,25 +258,23 @@ def test_biased_grouped_topk(
     w_sglang = _[0]
     id_sglang = _[1]
 
-    # sort
-    id_ref, _ref = torch.sort(id_ref)
-    w_ref = w_ref.gather(1, _ref)
-
     id_sglang, _sglang = torch.sort(id_sglang)
     w_sglang = w_sglang.gather(1, _sglang)
+    ret["us_sglang"] = us_sglang
 
     # print(f"{w_ref=}")
     # print(f"{w_sglang=}")
     # print(f"{id_ref=}")
     # print(f"{id_sglang=}")
 
-    checkAllclose(w_ref, w_sglang, msg="topk_weights [golden vs sglang]")
+    err = checkAllclose(w_ref, w_sglang, msg="topk_weights [golden vs sglang]")
     checkAllclose(
         id_ref,
         id_sglang,
         msg=f"topk_ids     [aiter vs sglang]:{us_aiter:>8.2f} us vs {us_sglang:>8.2f} us......",
     )
-    return {"us_aiter": us_aiter, "us_sglang": us_sglang}
+    ret["err_sglang"] = err
+    return ret
 
 
 @benchmark()
@@ -319,8 +335,25 @@ def test_grouped_topk(
 
 l_dtype = ["fp32", "bf16", "fp16"]
 l_expert = [64, 256]
-l_m = [1, 8, 16, 32, 64, 128, 256, 65536, 163840]
-l_token = [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000, 16384]
+l_token = [
+    1,
+    2,
+    5,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    10000,
+    16384,
+    65536,
+    163840,
+]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -349,13 +382,6 @@ parser.add_argument(
     e.g.: -e 64""",
 )
 parser.add_argument(
-    "-m",
-    type=int,
-    default=None,
-    help="""M of mnk.
-    e.g.: -m 64""",
-)
-parser.add_argument(
     "-t",
     "--token",
     type=int,
@@ -374,15 +400,13 @@ else:
     l_dtype = [dtypes.d_dtypes[args.dtype]]
 if args.expert is not None:
     l_expert = [args.expert]
-if args.m is not None:
-    l_m = [args.m]
 if args.token is not None:
     l_token = [args.token]
 
 df = []
 for dtype in l_dtype:
     for e in l_expert:
-        for m in l_m:
+        for m in l_token:
             ret = test_topk_softmax(dtype, m, e, 5)
             df.append(ret)
 df = pd.DataFrame(df)
