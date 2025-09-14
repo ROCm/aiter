@@ -875,6 +875,35 @@ def compile_ops(
 
                 log_args(func, *args, **kwargs)
 
+            if loadName in activation_list or loadName in quant_list:
+                import inspect
+
+                sig = inspect.signature(func)
+                params = list(sig.parameters.keys())
+                if loadName in activation_list:
+                    activation_index = params.index("activation")
+                    args_list = list(args)
+                    from aiter import ActivationType, QuantType
+
+                    if len(args_list) > activation_index and isinstance(
+                        args_list[activation_index], int
+                    ):
+                        args_list[activation_index] = ActivationType(
+                            args_list[activation_index]
+                        )
+                        args = tuple(args_list)
+
+                if loadName in quant_list:
+                    quant_index = params.index("quant_type")
+                    args_list = list(args)
+                    from aiter import ActivationType, QuantType
+
+                    if len(args_list) > quant_index and isinstance(
+                        args_list[quant_index], int
+                    ):
+                        args_list[quant_index] = QuantType(args_list[quant_index])
+                        args = tuple(args_list)
+
             return op(*args, **kwargs)
 
         if func.__name__ in NONE_WRAPPED_OP:
