@@ -592,23 +592,25 @@ namespace aiter
             __syncthreads();
         }
 
+        float group_score_;
+        constexpr int expert_group_lanes = 64 / NUM_GRP; // number of lanes responsible for a expert group
+
         if constexpr (isBiased)
         {
-            constexpr int lane_group_size = 8;  // experts_per_group / 4 per thread to iter
             constexpr int lane_steps = [&](){
-                if constexpr (lane_group_size == 8) return 3;
-                if constexpr (lane_group_size == 4) return 2;
-                if constexpr (lane_group_size == 2) return 1;
+                if constexpr (expert_group_lanes == 8) return 3;
+                if constexpr (expert_group_lanes == 4) return 2;
+                if constexpr (expert_group_lanes == 2) return 1;
                 else return 0;
             }();
-            const int lane_id = threadIdx.x % lane_group_size;
-            for (int g = threadIdx.x / lane_group_size; g < NUM_GRP; g += blockDim.x / lane_group_size)
+            const int lane_id = threadIdx.x % expert_group_lanes;
+            for (int g = threadIdx.x / expert_group_lanes; g < NUM_GRP; g += blockDim.x / expert_group_lanes)
             {
                 float max1 = -INFINITY, max2 = -INFINITY;
                 const int start = g * experts_per_group;
                 const int end = start + experts_per_group;
 
-                for (int e = start; e < end; e += lane_group_size)
+                for (int e = start; e < end; e += expert_group_lanes)
                 {
                     auto s_tmp = scores[e + lane_id];
                     max2 = dev_max_(s_tmp, max2);
@@ -648,10 +650,9 @@ namespace aiter
                         max2 = dev_max_(max2, remote_max_2);
                     });
                 }
-                if(lane_id == 0)
-                    group_scores[g] = max1 + max2;
+                // not all lanes store the correct result!
+                group_score_ = max1 + max2;
             }
-            __syncthreads();
         }
         else
         {
@@ -687,45 +688,18 @@ namespace aiter
         }
 
         if constexpr (NUM_GRP == 8 || NUM_GRP == 4 || NUM_GRP == 2) {
-            float gs_tmp = -INFINITY;
-            if(threadIdx.x < NUM_GRP)
-                gs_tmp = group_scores[threadIdx.x];
-#if 0
-            int group_id = threadIdx.x;
-            auto [sorted_gsc, sorted_gid] = warp_arg_merge_sort_to_reg(gs_tmp, group_id, ck_tile::number<NUM_GRP>{});
+            float gs_tmp_remote = __shfl(group_score_, threadIdx.x * expert_group_lanes);
+            float gs_tmp = threadIdx.x < NUM_GRP ? gs_tmp_remote : -INFINITY;
 
-            // NOTE: group_map_idx is now sorted
-            if(threadIdx.x == 0) {
-                *reinterpret_cast<ck_tile::remove_cvref_t<decltype(sorted_gid)>*>(group_map_idx) = sorted_gid;
-                // reinterpret_cast<ck_tile::remove_cvref_t<decltype(sorted_gsc)>*>(group_scores ) = sorted_gsc;
-            }
-            __syncthreads();
-#else
             auto sort_res = warp_merge_sort_to_reg(gs_tmp, ck_tile::number<NUM_GRP>{});
-            // auto pivot = __shfl(sort_res[topk_group - 1], 0);
             auto pivot = __shfl(sort_res[3], 0);    // TODO: avoid indexing register using dyanmic value
-            //float pivot = __builtin_bit_cast(float, __builtin_amdgcn_readlane(
-            //                                    __builtin_bit_cast(int, sort_res[3]), 0));
 
-            // __syncthreads();
-
-            // 
             int local_cnt = cumsum_topk_with_pivot(gs_tmp, pivot, ck_tile::number<NUM_GRP>{});
-            // if(threadIdx.x < NUM_GRP )
-            //     printf("bid:%d, lane:%d, %f(%f), local_cnt:%d, flag:%d\n", blockIdx.x, threadIdx.x, gs_tmp, pivot, local_cnt,
-            //         (gs_tmp >= pivot && local_cnt <= topk_group) ? 1 : 0
-            //     );
-
-            // if(gs_tmp >= pivot && local_cnt <= topk_group) {
-            //     group_scores[threadIdx.x] = -INFINITY;
-            // }
 
             if(gs_tmp >= pivot && local_cnt <= topk_group) {
                 group_map_idx[local_cnt - 1] = threadIdx.x;
             }
             __syncthreads();
-#endif
-            //__syncthreads();
         } else {
 #pragma unroll
             for (int k = 0; k < topk_group; k++)
@@ -743,33 +717,6 @@ namespace aiter
             }
         }
 
-        __syncthreads();
-#if 0
-        for (int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
-        {
-            int group_idx = e * vec_size / experts_per_group;
-            if (group_scores[group_idx] != -INFINITY)
-            {
-                scores_vec[e] = -INFINITY;
-            }
-        }
-#else
-        {
-            // constexpr int lanegroups = 4;   // equal to topk group
-            // constexpr int lanegroup_size = 16;  // 16*4 = 64
-            // int lanegroup_id = threadIdx.x / lanegroup_size;
-            // int lane_id      = threadIdx.x % lanegroup_size;
-            // // group_map_idx from left to right is sorted :)
-            // int masked_out_expert_group_id = group_map_idx[topk_group + lanegroup_id];
-            // for (int offset = lane_id; offset < experts_per_group; offset += lanegroup_size)
-            // {
-            //     int idx = masked_out_expert_group_id * experts_per_group + offset;
-            //     scores[idx] = -INFINITY;
-            // }
-        }
-#endif
-        __syncthreads();
-
         float sum = 0.0f;
 
         if constexpr (NUM_GRP == 8 ) {
@@ -780,56 +727,16 @@ namespace aiter
             using final_expid_vec_t = ck_tile::ext_vector_t<int, final_score_vec>;
             final_score_vec_t s;
             final_expid_vec_t e;
+            final_expid_vec_t remapped_group_ids;
 
             for(int i = 0; i < final_score_vec; i++) {
                 int expert_group_id = (threadIdx.x + i * 64) / experts_per_group___; //
                 int expert_id_inside_group = threadIdx.x % experts_per_group___;
-                int remapped_group_id = group_map_idx[expert_group_id];
-                e[i] = remapped_group_id * experts_per_group___ + expert_id_inside_group;
-                s[i] = scores[remapped_group_id * experts_per_group___ + expert_id_inside_group];
-            }
-#if 0
-            using vec8_t = ck_tile::ext_vector_t<float, 8>;
-            using aec8_t = ck_tile::ext_vector_t<int, 8>;
-            vec8_t local_res[final_score_vec];
-            aec8_t local_arg[final_score_vec];
-
-            for(int i = 0; i < final_score_vec; i++) {
-                auto [res_16, arg_16] = warp_arg_merge_sort_to_reg(s[i], e[i], ck_tile::number<16>{});
-
-                vec8_t res_16_8 = vec8_t{res_16[0], res_16[1], res_16[2], res_16[3], res_16[4], res_16[5], res_16[6], res_16[7]};
-                vec8_t res_16_8_r = mov_dpp_vec_from_(res_16_8, ck_tile::number<16>{});
-                aec8_t arg_16_8 = aec8_t{arg_16[0], arg_16[1], arg_16[2], arg_16[3], arg_16[4], arg_16[5], arg_16[6], arg_16[7]};
-                aec8_t arg_16_8_r = mov_dpp_vec_from_(arg_16_8, ck_tile::number<16>{});
-                auto [res_32, arg_32] = warp_arg_merge_sort_combine2(res_16_8_r, res_16_8, arg_16_8_r, arg_16_8, ck_tile::number<16>{});
-
-                vec8_t res_32_8 = vec8_t{res_32[0], res_32[1], res_32[2], res_32[3], res_32[4], res_32[5], res_32[6], res_32[7]};
-                vec8_t res_32_8_r = mov_dpp_vec_from_(res_32_8, ck_tile::number<32>{});
-                aec8_t arg_32_8 = aec8_t{arg_32[0], arg_32[1], arg_32[2], arg_32[3], arg_32[4], arg_32[5], arg_32[6], arg_32[7]};
-                aec8_t arg_32_8_r = mov_dpp_vec_from_(arg_32_8, ck_tile::number<32>{});
-                auto [res_64, arg_64] = warp_arg_merge_sort_combine2(res_32_8_r, res_32_8, arg_32_8_r, arg_32_8, ck_tile::number<16>{});
-
-                local_res[i] = vec8_t{res_64[0], res_64[1], res_64[2], res_64[3], res_64[4], res_64[5], res_64[6], res_64[7]};
-                local_arg[i] = aec8_t{arg_64[0], arg_64[1], arg_64[2], arg_64[3], arg_64[4], arg_64[5], arg_64[6], arg_64[7]};
+                remapped_group_ids[i] = group_map_idx[expert_group_id];
+                e[i] = remapped_group_ids[i] * experts_per_group___ + expert_id_inside_group;
+                s[i] = scores[remapped_group_ids[i] * experts_per_group___ + expert_id_inside_group];
             }
 
-            auto [lr_16, la_16] = warp_arg_merge_sort_combine2(local_res[0], local_res[1], local_arg[0], local_arg[1], ck_tile::number<16>{});
-            
-            // if(threadIdx.x == 0) {
-            //     printf("+++ %f,%f,%f,%f,%f,%f,%f,%f\n", lr_16[0], lr_16[1], lr_16[2], lr_16[3], lr_16[4], lr_16[5], lr_16[6], lr_16[7]);
-            //     printf("+++ %d,%d,%d,%d,%d,%d,%d,%d\n", la_16[0], la_16[1], la_16[2], la_16[3], la_16[4], la_16[5], la_16[6], la_16[7]);
-            // }
-
-            // use first topk element
-            if (threadIdx.x == 0){
-                auto topk_v = vec8_t{lr_16[0], lr_16[1], lr_16[2], lr_16[3], lr_16[4], lr_16[5], lr_16[6], lr_16[7]};
-                auto topk_i = aec8_t{la_16[0], la_16[1], la_16[2], la_16[3], la_16[4], la_16[5], la_16[6], la_16[7]};
-
-                *reinterpret_cast<vec8_t*>(topk_values) = topk_v;
-                *reinterpret_cast<aec8_t*>(final_topk_idx) = topk_i;
-            }
-            __syncthreads();
-#else
             using vec8_t = ck_tile::ext_vector_t<float, 8>;
             vec8_t local_res[final_score_vec];
             for(int i = 0; i < final_score_vec; i++) {
@@ -849,33 +756,7 @@ namespace aiter
             auto local_res_16 = warp_merge_sort_combine2(local_res[0], local_res[1], ck_tile::number<16>{});
 
             float pivot = __shfl(local_res_16[7], 0);
-            // reinterpret_cast<vec8_t*>(sorted_score) = vec8_t{local_res_16[0], local_res_16[1], local_res_16[2], local_res_16[3], local_res_16[4], local_res_16[5], local_res_16[6], local_res_16[7]}
-            //__syncthreads();
-            {
-                // if(threadIdx.x == 0 && blockIdx.x > 5000 ) {
-                // if(threadIdx.x == 0 ) {
-                //     printf("#### [%4d] pivot:%f, %f,%f,%f,%f, %f,%f,%f,%f\n", static_cast<int>(blockIdx.x), pivot,
-                //     local_res_16[0], local_res_16[1], local_res_16[2],local_res_16[3], 
-                //                                         local_res_16[4], local_res_16[5], local_res_16[6],local_res_16[7]);
-                // }
-            }
-#if 0
-            int offset = 0;
-            for(int i = 0; i < final_score_vec; i++) {
-                int local_cnt = s[i] >= pivot ? 1 : 0;
-                warp_cumsum(local_cnt, ck_tile::number<64>{});
-                if(s[i] >= pivot && (local_cnt + offset) <= topk ) {
-                    int expert_group_id = (threadIdx.x + i * 64) / experts_per_group___;
-                    int expert_id_inside_group = threadIdx.x % experts_per_group___;
-                    int remapped_group_id = group_map_idx[expert_group_id];
-                    final_topk_idx[offset + local_cnt - 1] = remapped_group_id * experts_per_group___ + expert_id_inside_group;
-                    topk_values[offset + local_cnt - 1] = s[i];
-                }
-                offset = __shfl(local_cnt, 63);
-                // offset = offset >= topk ? topk : offset; // in case of duplication value case problem
-                __syncthreads();
-            }
-#else
+
             int offset = 0;
             final_expid_vec_t cumsum_cnt{0};
             // 1st
@@ -897,44 +778,28 @@ namespace aiter
                 cumsum_cnt[i] = s[i] == pivot ? cnt_ : cumsum_cnt[i];
             }
 
-            // if(threadIdx.x < NUM_GRP)
-            // printf("bid:%d, lane:%d, %f,%f(%f), cnt:%d.%d, flag:%d,%d\n", blockIdx.x, threadIdx.x, s[0], s[1], pivot, cumsum_cnt[0], cumsum_cnt[1],
-            //     (s[0] >= pivot && cumsum_cnt[0] <= topk) ? 1 : 0,
-            //     (s[1] >= pivot && cumsum_cnt[1] <= topk)
-            // );
-
             for(int i = 0; i < final_score_vec; i++) {
                 if(s[i] >= pivot && cumsum_cnt[i] <= topk ) {
-                    int expert_group_id = (threadIdx.x + i * 64) / experts_per_group___;
                     int expert_id_inside_group = threadIdx.x % experts_per_group___;
-                    int remapped_group_id = group_map_idx[expert_group_id];
-                    final_topk_idx[cumsum_cnt[i] - 1] = remapped_group_id * experts_per_group___ + expert_id_inside_group;
+                    final_topk_idx[cumsum_cnt[i] - 1] = remapped_group_ids[i] * experts_per_group___ + expert_id_inside_group;
                     topk_values[cumsum_cnt[i] - 1] = s[i];
                 }
             }
-#endif
-#endif
+
             __syncthreads();
 
-#if 1
-            if constexpr (isBiased) {
-                if (threadIdx.x < topk) {
-                    topk_values[threadIdx.x] -= bias[final_topk_idx[threadIdx.x]];
-                }
-                __syncthreads();
-            }
-            if (need_renorm)
-            {
-                if (threadIdx.x < topk) {
-                    sum = multithread_reduce(topk_values[threadIdx.x], [&](auto x_, auto y_){ return x_ + y_;}, 8);
-                    topk_values[threadIdx.x] = topk_values[threadIdx.x] * routed_scaling_factor / sum;
-                }
-                __syncthreads();
-            }
-#endif
             if (threadIdx.x < topk) {
-                topk_weights[token_idx * stride_tk + threadIdx.x] = topk_values[threadIdx.x];
-                topk_ids[token_idx * stride_tk + threadIdx.x] = final_topk_idx[threadIdx.x];
+                float topk_v = topk_values[threadIdx.x];
+                int topk_i = final_topk_idx[threadIdx.x];
+                if constexpr (isBiased) {
+                    topk_v -= bias[topk_i];
+                }
+                if(need_renorm) {
+                    sum = multithread_reduce(topk_v, [&](auto x_, auto y_){ return x_ + y_;}, 8);
+                    topk_v = topk_v * routed_scaling_factor / sum;
+                }
+                topk_weights[token_idx * stride_tk + threadIdx.x] = topk_v;
+                topk_ids[token_idx * stride_tk + threadIdx.x] = topk_i;
             }
         }
     }
