@@ -906,6 +906,7 @@ def compile_ops(
 
         schema = wrapper_register(func)
 
+        import torch
         import inspect
 
         sig = inspect.signature(func)
