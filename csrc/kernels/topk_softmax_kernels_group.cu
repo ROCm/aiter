@@ -921,7 +921,7 @@ namespace aiter
                 float topk_v = topk_values[threadIdx.x];
                 int topk_i = final_topk_idx[threadIdx.x];
                 if constexpr (isBiased) {
-                    topk_v -= correction_bias[topk_i];
+                    topk_v -= ck_tile::type_convert<float>(correction_bias[topk_i]);
                 }
                 if(need_renorm) {
                     sum = multithread_reduce(topk_v, [&](auto x_, auto y_){ return x_ + y_;}, 8);

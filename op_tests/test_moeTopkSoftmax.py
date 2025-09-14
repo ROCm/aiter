@@ -175,8 +175,8 @@ def check_topk_softmax_allclose(
         if percent > tol_err_ratio:
             logger.info(
                 f"""{msg}[check_topk_softmax_allclose.value {atol=} {rtol=} \033[31mfailed!\033[0m]
-    ref  : {t_msked[:printNum]}
-    tar  : {b_msked[:printNum]}
+    ref  : {r_msked[:printNum]}
+    tar  : {t_msked[:printNum]}
     delta:
            {delta[:printNum]}"""
             )
@@ -219,9 +219,9 @@ def test_biased_grouped_topk(
 
     # use a special function to check result. The HIP topk may using sort algorithm
     # ... which will make the result order unpredictable
-    # check_topk_softmax_allclose(w_ref, id_ref, w_aiter, id_aiter, score_ref, correction_bias,
-    #                 target_dim_len=expert,
-    #                 msg=f"[golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......")
+    err = check_topk_softmax_allclose(w_ref, id_ref, w_aiter, id_aiter, score_ref, correction_bias,
+                    target_dim_len=expert,
+                    msg=f"[golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......")
     id_ref, _ref = torch.sort(id_ref)
     id_aiter, _aiter = torch.sort(id_aiter)
     w_ref = w_ref.gather(1, _ref)
@@ -230,12 +230,12 @@ def test_biased_grouped_topk(
     # print(f'{id_aiter=}')
     # print(f'  {w_ref=}')
     # print(f'{w_aiter=}')
-    err = checkAllclose(w_ref, w_aiter, msg="topk_weights [golden vs aiter]")
-    checkAllclose(
-        id_ref,
-        id_aiter,
-        msg=f"topk_ids     [golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......",
-    )
+    # err = checkAllclose(w_ref, w_aiter, msg="topk_weights [golden vs aiter]")
+    # checkAllclose(
+    #     id_ref,
+    #     id_aiter,
+    #     msg=f"topk_ids     [golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......",
+    # )
     ret["us_aiter"] = us_aiter
     ret["err_aiter"] = err
     # return {"err": err, "us": us_aiter}
