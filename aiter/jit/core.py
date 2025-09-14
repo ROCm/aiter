@@ -591,20 +591,8 @@ NONE_WRAPPED_OP = [
     "qr_get_handle",
 ]
 
-SPECIAL_OPS_MUTATES_ARGS = {
-    "topk_softmax": [
-        "arg0",
-        "arg1",
-        "arg2",
-    ],  # "topk_weights", "topk_indices", "token_expert_indices"
-    "biased_grouped_topk_hip": ["topk_weights", "topk_ids"],
-    "moe_fused_gate": ["topk_weights", "topk_ids"],
-    "grouped_topk": ["topk_weights", "topk_ids"],
-    "rope_cached_positions_2c_fwd_impl": ["input_x", "input_y"],
-    "rotary_embedding_fwd": ["query", "key"],
-    "reshape_and_cache": ["key_cache", "value_cache"],
-    "reshape_and_cache_with_pertoken_quant": ["key_cache", "value_cache"],
-}
+# We default all args are inplace, you can define inplace args for specific op
+SPECIAL_OPS_MUTATES_ARGS = {}
 
 
 def generate_schema(func) -> str:
@@ -618,9 +606,9 @@ def generate_schema(func) -> str:
     for idx, (name, param) in enumerate(sig.parameters.items()):
         param_type = param.annotation
         flag = True
-        is_mutates = False
-        if name in mutates_args:
-            is_mutates = True
+        is_mutates = True
+        if len(mutates_args) > 0 and name not in mutates_args:
+            is_mutates = False
 
         if param_type is torch.Tensor:
             if is_mutates:
@@ -920,7 +908,7 @@ def compile_ops(
                 schema = generate_schema(func)
             else:
                 sig = inspect.signature(func)
-                mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, [])
+                mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, "unknown")
                 if hasattr(torch.library, "infer_schema"):
                     sig = torch.library.infer_schema(func, mutates_args=mutates_args)
                 else:
