@@ -31,7 +31,7 @@ def generate_ff_inputs(
             w1 = torch.randn(
                 (hidden_dim, intermediate_dim), dtype=dtype, device="cuda"
             ).T
-        w2 = torch.randn((intermediate_dim, hidden_dim), dtype=dtype, device="cuda")
+        w2 = torch.randn((hidden_dim, intermediate_dim), dtype=dtype, device="cuda").T
     else:
         if gating:
             w1 = torch.randn(
@@ -39,7 +39,7 @@ def generate_ff_inputs(
             )
         else:
             w1 = torch.randn((intermediate_dim, hidden_dim), dtype=dtype, device="cuda")
-        w2 = torch.randn((hidden_dim, intermediate_dim), dtype=dtype, device="cuda").T
+        w2 = torch.randn((intermediate_dim, hidden_dim), dtype=dtype, device="cuda")
 
     w1 = w1 / (intermediate_dim**0.5)  # scale down output variance
     w2 = w2 / (hidden_dim**0.5)

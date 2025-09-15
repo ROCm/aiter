@@ -50,8 +50,21 @@ def _ff_a16w16_fused_gated(
     activation: tl.constexpr,
     use_activation: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
-    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """A fused kernel for computing a full MLP block with a gated activation.
+
+    Conceptually, this kernel's op is:
+
+    Y = [act(X @ W_gate) · (X @ W_up)] @ W_down
+
+    where:
+    - act: gating activation function (e.g silu)
+    - X: input tensor
+    - W_gate: weight tensor for gating mechanism
+    - W_up: weight tensor for upward projection
+    - W_down: weight tensor for downward projection
+
+    W_gate and W_up are concatenated along the N dimension to form a single weight tensor (w1_ptr)
+    of shape [K, 2N].
     """
 
     tl.assume(stride_xm > 0)
@@ -226,12 +239,25 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    bounds = [4, 8, 64]
+    # Config keys should be named M_LEQ_<bound> or "any"
+    bounds = []
+    for setting in _get_config._config_dict[key].keys():
+        potential_block_m = setting.replace("M_LEQ_", "")
+        if potential_block_m.isnumeric():
+            bounds.append(int(potential_block_m))
+
     for bound in bounds:
         if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key][f"M_LEQ_{bound}"]
-    else:
-        return _get_config._config_dict[key]["M_GEQ_4096"]
+            config = _get_config._config_dict[key][f"M_LEQ_{bound}"]
+            break
+        else:
+            config = _get_config._config_dict[key]["any"]
+
+    config = (
+        config.copy()
+    )  # avoid later inplace modification from interacting with cached config
+
+    return config
 
 
 def ff_a16w16_fused_gated(
@@ -280,14 +306,17 @@ def ff_a16w16_fused_gated(
 
     w_up = w_up.T
 
+    if config is None:
+        config = _get_config(M, N, K)
+
     if y is None:
         y = torch.zeros(
             (M, K), dtype=dtype, device=x.device
         )  # zeros, as this does atomic adds on top
 
-    if config is None:
-        config = _get_config(M, N, K)
-
+    # TODO: Experiment with two-stage kernel (first stage computes partial products for Y,
+    # second stage does a reduction). This would reduce contention on Y for large M &
+    # allow for greater parallelism for small M.
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
@@ -311,5 +340,4 @@ def ff_a16w16_fused_gated(
         use_activation=activation is not None,
         **config,
     )
-
     return y
