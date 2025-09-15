@@ -115,7 +115,7 @@ def get_optimal_skinny_moe_config(
 ):
     return {
             "BLOCK_SIZE_M": 16,
-            "BLOCK_SIZE_N": N,
+            "BLOCK_SIZE_N": triton.next_power_of_2(N),
             "BLOCK_SIZE_K": 64,
             "GROUP_SIZE_M": 8,
             "num_warps": 8,
