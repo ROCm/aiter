@@ -88,7 +88,7 @@ def test_asm(
     )
     if (
         get_gfx() == "gfx942"
-        and (expert, topk) in [(128, 6), (128, 8), (256, 8)]
+        and (expert, topk) in [(128, 6), (128, 8), (256, 6), (256, 8)]
         and gating_output.dtype == dtypes.fp32
     ):
         aiter.topk_softmax_asm(
@@ -103,7 +103,7 @@ def test_asm(
 
 
 @benchmark()
-def test_topk_softmax(dtype, token, E, topk, renormalize=False):
+def test_topk_softmax(dtype, token, E, topk, renormalize=True):
     gating_output = torch.randn((token, E), dtype=dtype, device="cuda")
 
     (topk_weights_a, topk_ids_a), avg_a = test_nofuse(gating_output, topk, renormalize)
