@@ -4,8 +4,10 @@ import torch
 import triton
 from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
 from aiter.ops.triton.moe_op import fused_moe as triton_moe
+from aiter.ops.triton.moe_op_e2e import e2e_moe as triton_e2e_moe
 from aiter.ops.triton.moe_op_silu_fused import fused_moe_silu as triton_moe_silu
 from op_tests.triton_tests.test_moe import input_helper, input_helper_int4_w4a16
+from op_tests.triton_tests.test_moe import input_helper_e2e
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
@@ -55,8 +57,59 @@ def fused_moe(
     group_size=128,
     has_zp=True,
     silu_fused=False,
+    e2e_fused=False
 ):
     moe_fn = triton_moe_silu if silu_fused else triton_moe
+
+    if e2e_fused:
+        (
+            a,
+            w1,
+            w2,
+            triton_out,
+            a_scale,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            config,
+        ) = input_helper_e2e(
+            M,
+            N,
+            K,
+            top_k,
+            E,
+            routed_weight=routed_weight,
+            dtype=dtype,
+            fp8_w8a8=fp8_w8a8,
+            int8_w8a16=int8_w8a16,
+            persistent=False,
+        )
+
+        # intermediate is none for persistent mode
+        return lambda: triton_e2e_moe(
+            a,
+            w1,
+            w2,
+            None,
+            triton_out,
+            a_scale,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            sorted_token_ids,
+            topk_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            routed_weight,
+            top_k,
+            fp8_w8a8,
+            int8_w8a16,
+            config,
+        )
 
     if int4_w4a16:
         (
@@ -163,11 +216,15 @@ def run_benchmark(args):
     has_zp = args.has_zp
     print_time = args.print_time
     silu_fused = args.silu_fused
+    e2e_fused = args.e2e_fused
     dtype = str_to_torch_dtype[args.dtype]
     fp8_type = str_to_torch_dtype[args.fp8_type]
 
     if silu_fused:
         args.no_bench_stage2 = True
+
+    if e2e_fused:
+        args.no_bench_stage2 = False
 
     if int4_w4a16:
         assert group_size != None, "set group_size with -group_size"
@@ -242,6 +299,7 @@ def run_benchmark(args):
             group_size=group_size,
             has_zp=has_zp,
             silu_fused=silu_fused,
+            e2e_fused=e2e_fused
         )
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
@@ -290,6 +348,7 @@ def parse_args():
     parser.add_argument("-int4_w4a16", action="store_true", default=False)
     parser.add_argument("-has_zp", action="store_true", default=False)
     parser.add_argument("-print_time", action="store_true", default=False)
+    parser.add_argument("-e2e_fused", action="store_true", default=False)
     parser.add_argument(
         "-print_vgpr",
         action="store_true",
