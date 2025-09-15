@@ -3,7 +3,7 @@ import pytest
 from aiter.ops.triton.fused_mul_add import fused_mul_add
 
 
-def generate_qk_inputs(shape, a_type_is_scalar, b_type_is_scalar, dtype):
+def generate_inputs(shape, a_type_is_scalar, b_type_is_scalar, dtype):
     x = torch.randn(*shape, dtype=dtype, device="cuda")
 
     if a_type_is_scalar[1]:
