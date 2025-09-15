@@ -44,9 +44,9 @@ debug = False
 if debug:
     print("Generating configs....")
 
-block_sizes = [2**n for n in range(4, 9)]
+block_sizes = [2**n for n in range(4, 8)]
 num_warps_range = [2**n for n in range(1, 4)]
-num_stages_range = list(range(1, 5))
+num_stages_range = list(range(1, 4))
 
 for i, config in enumerate(
     itertools.product(
@@ -59,7 +59,7 @@ for i, config in enumerate(
     )
 ):
     block_m1, block_n1, block_m2, block_n2, num_warps, num_stages = config
-    config_name = f"{i:04d}__BM1_{block_m1:03d}__BN1_{block_n1:03d}__BM2_{block_m2:03d}__BN_{block_n2:03d}__NW_{num_warps}__NS_{num_stages}"
+    config_name = f"{i:04d}__BM1_{block_m1:03d}__BN1_{block_n1:03d}__BM2_{block_m2:03d}__BN2_{block_n2:03d}__NW_{num_warps}__NS_{num_stages}"
     config_dict = {
         "BLOCK_M1": block_m1,
         "BLOCK_N1": block_n1,
