@@ -9,7 +9,7 @@ from aiter.test_common import (
     run_perftest,
     perftest,
 )
-from aiter import dtypes
+from aiter import dtypes, get_gfx
 import pandas as pd
 import argparse
 
@@ -19,15 +19,10 @@ torch.set_printoptions(sci_mode=False)
 
 @perftest(num_iters=2, num_warmup=1)
 def test_nofuse(
-    hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
 ):
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-
-    M, _ = hidden_states.shape
-
     gating_output = torch.nn.functional.softmax(
         gating_output.float(),
         dim=-1,
@@ -47,34 +42,85 @@ def test_nofuse(
 
 @perftest()
 def test_fuse(
-    hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
 ):
-    from aiter.fused_moe import fused_topk
+    # hidden_states = torch.empty(gating_output.shape, dtype=dtypes.fp32, device=gating_output.device)
+    # from aiter.fused_moe import fused_topk
+    # return fused_topk(hidden_states, gating_output, topk, renormalize)
 
-    return fused_topk(hidden_states, gating_output, topk, renormalize)
+    M, expert = gating_output.shape
+    topk_weights = torch.empty_strided(
+        (M, topk), (topk + 10, 1), dtype=dtypes.fp32, device=gating_output.device
+    )
+    topk_ids = torch.empty_strided(
+        (M, topk), (topk + 10, 1), dtype=dtypes.i32, device=gating_output.device
+    )
+    token_expert_indicies = torch.empty_strided(
+        (M, topk), (topk + 10, 1), dtype=dtypes.i32, device=gating_output.device
+    )
+    aiter.topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output,
+        renormalize,
+    )
+    return topk_weights, topk_ids
+
+
+@perftest()
+def test_asm(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+):
+    M, expert = gating_output.shape
+    topk_weights = torch.empty_strided(
+        (M, topk), (topk + 10, 1), dtype=dtypes.fp32, device=gating_output.device
+    )
+    topk_ids = torch.empty_strided(
+        (M, topk), (topk + 10, 1), dtype=dtypes.u32, device=gating_output.device
+    )
+    token_expert_indicies = torch.empty_strided(
+        (M, topk), (topk + 10, 1), dtype=dtypes.i32, device=gating_output.device
+    )
+    if (
+        get_gfx() == "gfx942"
+        and (expert, topk) in [(128, 6), (128, 8), (256, 8)]
+        and gating_output.dtype == dtypes.fp32
+    ):
+        aiter.topk_softmax_asm(
+            topk_weights,
+            topk_ids,
+            token_expert_indicies,
+            gating_output,
+            renormalize,
+        )
+    del token_expert_indicies  # Not used. Will be used in the future.
+    return topk_weights, topk_ids
 
 
 @benchmark()
-def test_topk_softmax(dtype, token, E, topk):
-    hidden_states = torch.randn((token, 1), dtype=dtype, device="cuda")
-    gating_output = torch.randn((m, E), dtype=dtype, device="cuda")
+def test_topk_softmax(dtype, token, E, topk, renormalize=False):
+    gating_output = torch.randn((token, E), dtype=dtype, device="cuda")
 
-    (topk_weights_a, topk_ids_a), avg_a = test_nofuse(
-        hidden_states, gating_output, topk, True
-    )
-    (topk_weights_b, topk_ids_b), avg_b = test_fuse(
-        hidden_states, gating_output, topk, True
-    )
+    (topk_weights_a, topk_ids_a), avg_a = test_nofuse(gating_output, topk, renormalize)
     id_ref, _ref = torch.sort(topk_ids_a)
     w_ref = topk_weights_a.gather(1, _ref)
-    id_aiter, _aiter = torch.sort(topk_ids_b)
-    w_aiter = topk_weights_b.gather(1, _aiter)
-    err = checkAllclose(w_ref, w_aiter)
-    checkAllclose(id_ref, id_aiter, msg="topk_ids")
-    return {"err": err, "us": avg_b}
+
+    func_dict = {"hip": test_fuse, "asm": test_asm}
+    ret = {}
+    for tag, func in func_dict.items():
+        (topk_weights, topk_ids), us = func(gating_output, topk, renormalize)
+        topk_ids = topk_ids.to(dtypes.i32)
+        id, _ref = torch.sort(topk_ids)
+        weight = topk_weights.gather(1, _ref)
+        ret[f"{tag} err"] = checkAllclose(w_ref, weight)
+        checkAllclose(id_ref, id, msg=f"{tag} topk_ids")
+        ret[f"{tag} us"] = us
+    return ret
 
 
 @aiter.test_common.benchmark()
@@ -216,10 +262,11 @@ def test_grouped_topk(
     return {"err": err, "us": us_aiter}
 
 
-l_dtype = ["fp32", "bf16", "fp16"]
-l_expert = [64, 256]
+l_dtype = ["fp32", "bf16", "fp16"][:1]
+l_expert = [128, 256]
 l_m = [1, 8, 16, 32, 64, 128, 256, 65536, 163840]
 l_token = [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000, 16384]
+l_topk = 8
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -251,7 +298,7 @@ parser.add_argument(
     "-m",
     type=int,
     default=None,
-    help="""M of mnk.
+    help="""Number of tokens for topksoftmax.
     e.g.: -m 64""",
 )
 parser.add_argument(
@@ -265,6 +312,13 @@ parser.add_argument(
     help="""Number of tokens.
     e.g.: -t 64""",
 )
+parser.add_argument(
+    "-k",
+    type=int,
+    default=None,
+    help="""Number of topk.
+    e.g.: -k 8""",
+)
 
 args = parser.parse_args()
 if args.dtype is None:
@@ -277,12 +331,14 @@ if args.m is not None:
     l_m = [args.m]
 if args.token is not None:
     l_token = [args.token]
+if args.k is not None:
+    l_topk = args.k
 
 df = []
 for dtype in l_dtype:
     for e in l_expert:
         for m in l_m:
-            ret = test_topk_softmax(dtype, m, e, 5)
+            ret = test_topk_softmax(dtype, m, e, l_topk)
             df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary:\n{df}")

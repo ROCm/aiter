@@ -593,10 +593,15 @@ NONE_WRAPPED_OP = [
 
 SPECIAL_OPS_MUTATES_ARGS = {
     "topk_softmax": [
-        "arg0",
-        "arg1",
-        "arg2",
-    ],  # "topk_weights", "topk_indices", "token_expert_indices"
+        "topk_weights",
+        "topk_indices",
+        "token_expert_indices",
+    ],
+    "topk_softmax_asm": [
+        "topk_weights",
+        "topk_indices",
+        "token_expert_indices",
+    ],
     "biased_grouped_topk_hip": ["topk_weights", "topk_ids"],
     "moe_fused_gate": ["topk_weights", "topk_ids"],
     "grouped_topk": ["topk_weights", "topk_ids"],

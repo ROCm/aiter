@@ -326,7 +326,8 @@
             "f'{AITER_CSRC_DIR}/kernels/moe_fused_gate.cu'",
             "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_2stage.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_2stage.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topksoftmax.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
