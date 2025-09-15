@@ -2,7 +2,6 @@ import triton
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     print_vgpr,
-    get_caller_name_no_ext,
 )
 import torch
 import sys
@@ -215,7 +214,7 @@ def create_benchmark_configs(args: argparse.Namespace):
             line_names=line_vals,
             styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
             ylabel=unit,
-            plot_name=get_caller_name_no_ext(),
+            plot_name="mla",
             args=extra_args,
         )
     )

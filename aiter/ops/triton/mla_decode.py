@@ -33,9 +33,6 @@ from aiter.ops.triton.activation import _tanh
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-
-_LOGGER = AiterTritonLogger()
 
 
 # Need to 
@@ -126,32 +123,33 @@ def _fwd_grouped_kernel_stage1(
     acc = tl.zeros([BLOCK_H, BLOCK_C], dtype=tl.float32)
 
     if split_kv_end > split_kv_start:
+        offs_n = split_kv_start + tl.arange(0, BLOCK_N)
+        kv_loc = tl.load(
+            kv_indices + cur_batch_kv_start_idx + offs_n,
+            mask=offs_n < split_kv_end,
+            other=0,
+        )
+
+        offs_buf_kv = kv_loc[None, :] * stride_buf_kbs + offs_c[:, None]
+        offs_buf_k_pe = kv_loc[None, :] * stride_buf_kbs + offs_qk_r[:, None]
+
+        k_pe = tl.load(
+            K_Buffer + offs_buf_k_pe,
+            mask=(offs_n[None, :] < split_kv_end) & (mask_qk_r[:, None]),
+            other=0.0,
+        )  # positional embedding part of keys
+
+        kv = tl.load(
+            K_Buffer + offs_buf_kv,
+            mask=(offs_n[None, :] < split_kv_end) & (mask_c[:, None]),
+            other=0.0,
+        )  # the shared latent tensor for keys and values
+
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
-            offs_n = start_n + tl.arange(0, BLOCK_N)
-            kv_loc = tl.load(
-                kv_indices + cur_batch_kv_start_idx + offs_n,
-                mask=offs_n < split_kv_end,
-                other=0,
-            )
-
-            offs_buf_kv = kv_loc[None, :] * stride_buf_kbs + offs_c[:, None]
-            offs_buf_k_pe = kv_loc[None, :] * stride_buf_kbs + offs_qk_r[:, None]
-
-            k_pe = tl.load(
-                K_Buffer + offs_buf_k_pe,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_qk_r[:, None]),
-                other=0.0,
-            )  # positional embedding part of keys
-
             # (16, 64) x (64, 32)
+            v = kv.T
             # dot product of rope parts
             qk = tl.dot(q_pe, k_pe.to(q_pe.dtype))
-
-            kv = tl.load(
-                K_Buffer + offs_buf_kv,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_c[:, None]),
-                other=0.0,
-            )  # the shared latent tensor for keys and values
 
             # (16, 512) x (512, 32)
             # dot product of nope parts
@@ -165,6 +163,30 @@ def _fwd_grouped_kernel_stage1(
             qk = tl.where(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
             )
+            if start_n + BLOCK_N < split_kv_end:
+                offs_n = start_n + tl.arange(0, BLOCK_N) + BLOCK_N
+                kv_loc = tl.load(
+                    kv_indices + cur_batch_kv_start_idx + offs_n,
+                    mask=offs_n < split_kv_end,
+                    other=0,
+                )
+
+                offs_buf_kv = kv_loc[None, :] * stride_buf_kbs + offs_c[:, None]
+                offs_buf_k_pe = kv_loc[None, :] * stride_buf_kbs + offs_qk_r[:, None]
+
+                k_pe = tl.load(
+                    K_Buffer + offs_buf_k_pe,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_qk_r[:, None]),
+                    other=0.0,
+                )  # positional embedding part of keys
+
+                kv = tl.load(
+                    K_Buffer + offs_buf_kv,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_c[:, None]),
+                    other=0.0,
+                )  # the shared latent tensor for keys and values
+
+
 
             # offs_buf_v = kv_loc[:, None] * stride_buf_vbs + offs_c[None, :]
             # v = tl.load(
@@ -179,7 +201,7 @@ def _fwd_grouped_kernel_stage1(
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
             # (16, 32) x (32, 512)
-            acc += tl.dot(p.to(kv.dtype), kv.T)
+            acc += tl.dot(p.to(v.dtype), v)
             # acc += tl.dot(p.to(v.dtype), v)
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
@@ -434,9 +456,6 @@ def decode_attention_fwd_grouped(
     o: output Tensor
 
     """
-    _LOGGER.info(
-        f"DECODE_ATTENTION_FWD_GROUPED_ROPE:  q={tuple(q.shape)}  k_buffer={tuple(k_buffer.shape)}  v_buffer={tuple(v_buffer.shape)} "
-    )
     if config is None:
         config = _get_config()
 

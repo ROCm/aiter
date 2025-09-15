@@ -240,7 +240,7 @@ def mla_decode_fwd(
 
         return _get_config._config_dict
 
-    config = _get_config()["fwd_grouped_kernel_stage1_rope"]
+    config = _get_config()["fwd_grouped_kernel_stage1_rope_ps"]
 
 
     qo_len = 1
