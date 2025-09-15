@@ -165,8 +165,7 @@ def _use_rocm_custom_paged_attention(
         not _ON_NAVI
         and (qtype == torch.half or qtype == dtypes.bf16)
         and (head_size == 64 or head_size == 128)
-        and (block_size == 16 or block_size == 32)
-        and (gqa_ratio >= 1 and gqa_ratio <= 16)
+        and (gqa_ratio >= 1 and gqa_ratio <= 32)
         and max_seq_len <= 65536
     )
 
@@ -258,7 +257,6 @@ class PagedAttention:
             max_num_partitions = (
                 max_seq_len + _PARTITION_SIZE_ROCM - 1
             ) // _PARTITION_SIZE_ROCM
-            assert _PARTITION_SIZE_ROCM % block_size == 0
             tmp_output = torch.empty(
                 size=(num_seqs, num_heads, max_num_partitions, head_size),
                 dtype=output.dtype,
