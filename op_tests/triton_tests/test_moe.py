@@ -322,7 +322,18 @@ def get_default_config() -> Dict[str, int]:
     return config
 
 
-def get_default_config_moe_e2e(persistent: bool) -> Dict[str, int]:
+def get_default_config_moe_e2e(N: int, persistent: bool) -> Dict[str, int]:
+    if N <= 768:
+        return {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": triton.next_power_of_2(N),
+            "BLOCK_SIZE_K1": 64,
+            "BLOCK_SIZE_K2": 64,
+            "GROUP_SIZE_M": 2,
+        }
+    
+    
+    
     if persistent:
         return {
             "BLOCK_SIZE_M": 64,
