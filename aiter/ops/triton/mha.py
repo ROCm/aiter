@@ -10,7 +10,6 @@ import triton.language as tl
 
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.pid_preprocessing import remap_xcd
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.utils.mha_kernel_utils import (
@@ -434,9 +433,26 @@ def _attn_fwd(
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
     # num blocks along seqlen
 
-    off_q_head = wid % NUM_Q_HEADS
-    off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
-    start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
+    chunk_size = (
+        NUM_XCD * NUM_BLOCKS
+    )  # number of total workgroups in 8 (NUM_XCD) q_heads
+    wid_per_batch = wid % (NUM_Q_HEADS * NUM_BLOCKS)  # per batch id
+    q_heads_per_xcd = NUM_Q_HEADS // NUM_XCD  # q_heads per xcd
+
+    # fall back to triton default mapping in case of lesser or non multiple of 8 q_heads
+    if NUM_Q_HEADS // NUM_XCD == 0 or NUM_Q_HEADS % NUM_XCD != 0:
+        start_m = wid % NUM_BLOCKS
+        off_q_head = (wid // NUM_BLOCKS) % NUM_Q_HEADS
+
+    else:
+        # swizzling wids via Head-first Mapping
+        # first element indexes starting head for each XCD, second element adds 1 for every next head on the same XCD
+        off_q_head = (wid_per_batch % NUM_XCD) * q_heads_per_xcd + (
+            wid_per_batch // chunk_size
+        )
+        # continuous block ids for the q_head mapped to the same xcd
+        start_m = (wid_per_batch % chunk_size) // NUM_XCD
+
     off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
 
     # offsets

@@ -358,7 +358,6 @@ def run_benchmark(custom, args):
             else:
                 flops_per_matmul = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * D_HEAD
 
-        # Benchmark mode
         if varlen:
             if args.fp8:
 
@@ -540,6 +539,7 @@ def parse_args():
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )
+
     return parser.parse_args()
 
 
