@@ -69,11 +69,17 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
                                                        "/topksoftmax/topksoftmax_4x128x6.co");
         impl_ptr = &impl_topksoftmax_4x128x6;
     }
+    else if(num_experts == 256 && topk == 6)
+    {
+        static AiterAsmKernel impl_topksoftmax_4x256x6("_ZN5aiter19topksoftmax_4x256x6E",
+                                                       "/topksoftmax/topksoftmax_4x256x6.co");
+        impl_ptr = &impl_topksoftmax_4x256x6;
+    }
     else
     {
         TORCH_CHECK(false,
                     __func__,
-                    " only suppot num_experts/topk in [128/6, 128/8, 256/8], but get num_experts: ",
+                    " only support num_experts/topk in [128/6, 128/8, 256/6, 256/8], but get num_experts: ",
                     num_experts,
                     " , topk: ",
                     topk);

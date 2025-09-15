@@ -81,7 +81,7 @@ def test_asm(
         (M, topk), (topk + 10, 1), dtype=dtypes.fp32, device=gating_output.device
     )
     topk_ids = torch.empty_strided(
-        (M, topk), (topk + 10, 1), dtype=dtypes.u32, device=gating_output.device
+        (M, topk), (topk + 10, 1), dtype=dtypes.i32, device=gating_output.device
     )
     token_expert_indicies = torch.empty_strided(
         (M, topk), (topk + 10, 1), dtype=dtypes.i32, device=gating_output.device
@@ -262,7 +262,7 @@ def test_grouped_topk(
     return {"err": err, "us": us_aiter}
 
 
-l_dtype = ["fp32", "bf16", "fp16"][:1]
+l_dtype = ["fp32", "bf16", "fp16"]
 l_expert = [128, 256]
 l_m = [1, 8, 16, 32, 64, 128, 256, 65536, 163840]
 l_token = [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000, 16384]
