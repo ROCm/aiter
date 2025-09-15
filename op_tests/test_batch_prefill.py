@@ -276,9 +276,14 @@ def test_batch_prefill_with_paged_kv_cache(
     "qo_len,kv_len",
     [
         (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
         (2048, 2048),
+
+        (6,    7),
+
+        (1024+15, 1024+15),
+        (2048+17, 2048+17),
+        (4096+15, 4096+15),
+        (8192+17, 8192+17),
     ],
 )
 @pytest.mark.parametrize("page_size", [16])
@@ -343,8 +348,8 @@ def test_batch_prefill_with_paged_kv_cache2(
     # print("q_indptr_cpu: ",q_indptr_cpu)
     max_num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = max_num_pages_per_seq * batch_size
-    # kv layout is NHD
-    kv_shape = [total_num_pages, page_size, num_kv_heads,  head_dim]
+    # kv layout
+    kv_shape = [total_num_pages, page_size, num_kv_heads,  head_dim] if kv_layout == "NHD" else [total_num_pages, num_kv_heads, page_size,  head_dim]
     
     k_data_fp32 = create_tensor(
             kv_init_min, kv_init_max, *kv_shape, dtype=torch.float32
@@ -524,11 +529,11 @@ if __name__ == "__main__":
     ) in itertools.product(l_causal, l_logits_soft_cap, l_dtype):
         test_batch_prefill_with_paged_kv_cache2(
             batch_size=2,
-            kv_len=32,
-            qo_len=16,
+            kv_len=1024,
+            qo_len=1024,
             page_size=16,
-            num_qo_heads=1,
-            num_kv_heads=1,
+            num_qo_heads=8,
+            num_kv_heads=8,
             head_dim=128,
             causal=causal,
             kv_layout="NHD",
