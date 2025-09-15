@@ -77,32 +77,43 @@ def test_topk_softmax(dtype, token, E, topk):
     return {"err": err, "us": avg_b}
 
 
-
 # this function test a value/index pair, like the output of a topk function
 # w.r.t a target dim
 def check_topk_softmax_allclose(
-    ref_val, ref_idx,
-    tar_val, tar_idx,
+    ref_val,
+    ref_idx,
+    tar_val,
+    tar_idx,
     scores,
     bias,
-    target_dim = -1,     # last dim by default
-    target_dim_len = -1, # the dim could be larger than ref/tar val dim length. if -1, then same size as
-    sort_before_compare = True, # this is useful when we don't care about the absolute position of the val/idx
+    target_dim=-1,  # last dim by default
+    target_dim_len=-1,  # the dim could be larger than ref/tar val dim length. if -1, then same size as
+    sort_before_compare=True,  # this is useful when we don't care about the absolute position of the val/idx
     rtol=1e-2,
     atol=1e-2,
-    tol_err_ratio=0.05, msg="", printNum=8, printLog=True
+    tol_err_ratio=0.05,
+    msg="",
+    printNum=8,
+    printLog=True,
 ):
     from aiter import logger
+
     # first let's sort the index in case
     if sort_before_compare:
         # NOTE: need add bias before sorting
-        _, _r_sorted_idx = torch.sort(ref_val + bias.repeat(ref_val.shape[0], 1).gather(-1, ref_idx.to(dtype=torch.int64)))
-        _, _t_sorted_idx = torch.sort(tar_val + bias.repeat(ref_val.shape[0], 1).gather(-1, tar_idx.to(dtype=torch.int64)))
+        _, _r_sorted_idx = torch.sort(
+            ref_val
+            + bias.repeat(ref_val.shape[0], 1).gather(-1, ref_idx.to(dtype=torch.int64))
+        )
+        _, _t_sorted_idx = torch.sort(
+            tar_val
+            + bias.repeat(ref_val.shape[0], 1).gather(-1, tar_idx.to(dtype=torch.int64))
+        )
         r_val = ref_val.gather(target_dim, _r_sorted_idx)
         t_val = tar_val.gather(target_dim, _t_sorted_idx)
         r_idx = ref_idx.gather(target_dim, _r_sorted_idx)
         t_idx = tar_idx.gather(target_dim, _t_sorted_idx)
-    else :
+    else:
         r_val = ref_val
         t_val = tar_val
         r_idx = ref_idx
@@ -117,7 +128,7 @@ def check_topk_softmax_allclose(
     original_shape[target_dim] = target_dim_len
 
     is_close_v = torch.isclose(r_val, t_val, rtol=rtol, atol=atol)
-    is_close_i = torch.isclose(r_idx, t_idx)    # use high resolution for index
+    is_close_i = torch.isclose(r_idx, t_idx)  # use high resolution for index
 
     scores_for_choice = scores.view(original_shape)
     if bias != None:
@@ -125,11 +136,15 @@ def check_topk_softmax_allclose(
 
     if is_close_v.all():
         if printLog:
-            logger.info(f"{msg}[check_topk_softmax_allclose/value {atol=} {rtol=} \033[32mpassed~\033[0m]")
+            logger.info(
+                f"{msg}[check_topk_softmax_allclose/value {atol=} {rtol=} \033[32mpassed~\033[0m]"
+            )
 
         if is_close_i.all():
             if printLog:
-                logger.info(f"{msg}[check_topk_softmax_allclose/index \033[32mpassed~\033[0m]")
+                logger.info(
+                    f"{msg}[check_topk_softmax_allclose/index \033[32mpassed~\033[0m]"
+                )
             return 0
         else:
             # this case there must be some duplicate value, and due to compare order, index maybe different
@@ -147,19 +162,25 @@ def check_topk_softmax_allclose(
                 num = mask.sum()
                 printNum = min(printNum, num)
                 percent = (num / r_val.numel()).item()
-                logger.info(f"""{msg}[check_topk_softmax_allclose/index \033[32mfailed~\033[0m]""")
+                logger.info(
+                    f"""{msg}[check_topk_softmax_allclose/index \033[32mfailed~\033[0m]"""
+                )
                 for i_row in range(r_idx.shape[0]):
                     for i_col in range(r_idx.shape[1]):
                         if r_idx[i_row, i_col] != t_idx[i_row, i_col]:
                             sr = scores_for_choice[i_row, r_idx[i_row, i_col]]
                             st = scores_for_choice[i_row, t_idx[i_row, i_col]]
                             is_close_ = torch.isclose(sr, st, rtol=rtol, atol=atol)
-                            logger.info(f"{msg} [{i_row}x{i_col}], r:{r_idx[i_row, i_col]}->{sr}, t:{t_idx[i_row, i_col]}->{st}")
+                            logger.info(
+                                f"{msg} [{i_row}x{i_col}], r:{r_idx[i_row, i_col]}->{sr}, t:{t_idx[i_row, i_col]}->{st}"
+                            )
                 return 1
 
             else:
                 if printLog:
-                    logger.info(f"{msg}[check_topk_softmax_allclose/index(duplicated) \033[32mpassed~\033[0m]")
+                    logger.info(
+                        f"{msg}[check_topk_softmax_allclose/index(duplicated) \033[32mpassed~\033[0m]"
+                    )
                 return 0
 
     else:
@@ -182,6 +203,7 @@ def check_topk_softmax_allclose(
             )
         return percent
 
+
 @aiter.test_common.benchmark()
 def test_biased_grouped_topk(
     token, expert, group, topk, topk_group, need_renorm, dtype, scale_factor=1.0
@@ -198,7 +220,7 @@ def test_biased_grouped_topk(
         need_renorm,
         group,
         topk_group,
-        True,   # return score
+        True,  # return score
         num_iters=2,
         num_warmup=1,
     )
@@ -219,9 +241,16 @@ def test_biased_grouped_topk(
 
     # use a special function to check result. The HIP topk may using sort algorithm
     # ... which will make the result order unpredictable
-    err = check_topk_softmax_allclose(w_ref, id_ref, w_aiter, id_aiter, score_ref, correction_bias,
-                    target_dim_len=expert,
-                    msg=f"[golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......")
+    err = check_topk_softmax_allclose(
+        w_ref,
+        id_ref,
+        w_aiter,
+        id_aiter,
+        score_ref,
+        correction_bias,
+        target_dim_len=expert,
+        msg=f"[golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......",
+    )
     id_ref, _ref = torch.sort(id_ref)
     id_aiter, _aiter = torch.sort(id_aiter)
     w_ref = w_ref.gather(1, _ref)
