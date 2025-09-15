@@ -71,7 +71,7 @@ def run_torch(
     else:
         attn_bias = None
 
-    out, _ = attention_ref(
+    out, _, softmax_lse = attention_ref(
         q,
         k,
         v,
@@ -87,16 +87,17 @@ def run_torch(
     )
 
     if dout == None:
-        return out
+        return out, softmax_lse
     elif bias is not None:
         dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
         # If seqlen_q > seqlen_k with mask, pytorch will output NaN.
         # Align with ck behavior here
         dbias = torch.nan_to_num(dbias, nan=0.0)
-        return out, dq, dk, dv, dbias
+        return out, softmax_lse, dq, dk, dv, dbias
     else:
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, dq, dk, dv, None
+        return out, softmax_lse, dq, dk, dv, None
+        # return out, softmax_lse, None, None, None, None
 
 
 def run_ck(
@@ -113,7 +114,7 @@ def run_ck(
     return_lse=True,
     return_attn_probs=False,
 ):
-    out, _, S_dmask = aiter.flash_attn_func(
+    out, softmax_lse, S_dmask = aiter.flash_attn_func(
         q,
         k,
         v,
@@ -148,13 +149,14 @@ def run_ck(
         dropout_mask = None
 
     if dout == None:
-        return out, dropout_mask
+        return out, softmax_lse, dropout_mask
     elif bias is not None:
         dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
-        return out, dropout_mask, dq, dk, dv, dbias
+        return out, softmax_lse, dropout_mask, dq, dk, dv, dbias
     else:
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, dropout_mask, dq, dk, dv, None
+        return out, softmax_lse, dropout_mask, dq, dk, dv, None
+        # return out, softmax_lse, None, None, None, None, None
 
 
 @pytest.mark.parametrize("iperm", ["BSHD", "BHSD", "BS3HD", "BSHD+BS2HD", "SBHD"])
@@ -269,7 +271,7 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
-    out, dropout_mask, dq, dk, dv, dbias = run_ck(
+    out, softmax_lse, dropout_mask, dq, dk, dv, dbias = run_ck(
         q,
         k,
         v,
@@ -283,8 +285,10 @@ def test_flash_attn_output(
         return_lse,
         return_attn_probs,
     )
-    print(f"out shape:{out.shape}, out stride: {out.stride()}")
-    out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
+    print(
+        f"softmax_lse shape:{softmax_lse.shape}, softmax_lse stride: {softmax_lse.stride()}"
+    )
+    out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
         q,
         k,
         v,
@@ -296,8 +300,10 @@ def test_flash_attn_output(
         causal,
         window_size,
     )
-    print(f"out_ref shape:{out_ref.shape}, out_ref stride: {out_ref.stride()}")
-    out_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
+    print(
+        f"softmax_lse_ref shape:{softmax_lse_ref.shape}, softmax_lse_ref stride: {softmax_lse_ref.stride()}"
+    )
+    out_pt, softmax_lse_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
         q,
         k,
         v,
@@ -311,12 +317,23 @@ def test_flash_attn_output(
         upcast=False,
         reorder_ops=True,
     )
-    print(f"out_pt shape:{out_pt.shape}, out_ref stride: {out_pt.stride()}")
+    print(
+        f"softmax_lse_pt shape:{softmax_lse_pt.shape}, out_ref stride: {softmax_lse_pt.stride()}"
+    )
 
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
     assert (out - out_ref).abs().max().item() <= out_tol
+
+    print(f"softmax_lse max diff: {(softmax_lse - softmax_lse_ref).abs().max().item()}")
+    print(
+        f"softmax_lse Pytorch max diff: {(softmax_lse_pt - softmax_lse_ref).abs().max().item()}"
+    )
+    softmax_lse_tol = max(
+        2 * (softmax_lse_pt - softmax_lse_ref).abs().max().item(), 0.01
+    )
+    assert (softmax_lse - softmax_lse_ref).abs().max().item() <= softmax_lse_tol
 
     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
     print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
@@ -364,7 +381,7 @@ parser.add_argument(
     "-q",
     "--seqlen_q",
     type=int,
-    default=8192,
+    default=1024,
     help="""Sequence length for query. Default is 512.
     e.g.: -q 1024""",
 )
@@ -372,7 +389,7 @@ parser.add_argument(
     "-k",
     "--seqlen_k",
     type=int,
-    default=8192,
+    default=1024,
     help="""Sequence length for key. Default is 512.
     e.g.: -k 1024""",
 )

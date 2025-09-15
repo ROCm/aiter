@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
 from .bert_padding import pad_input, unpad_input
@@ -384,6 +384,7 @@ def attention_ref(
     Output:
         output: (batch_size, seqlen_q, nheads, head_dim_v)
         attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
+        lse: (batch_size, nheads, seqlen_q), logsumexp of scores
     """
     if causal:
         window_size = (window_size[0], 0)
@@ -419,6 +420,7 @@ def attention_ref(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
+    lse = torch.logsumexp(scores, dim=-1).to(v.dtype)
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
     # Some rows might be completely masked out so we fill them with zero instead of NaN
     if window_size[0] >= 0 or window_size[1] >= 0:
@@ -441,4 +443,8 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
-    return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
+    return (
+        output.to(dtype=dtype_og),
+        attention.to(dtype=dtype_og),
+        lse.to(dtype=dtype_og),
+    )
