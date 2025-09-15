@@ -216,7 +216,7 @@ def test_flash_attn_output(
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 8)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -246,12 +246,9 @@ def test_flash_attn_output(
     )
 
     q, k, v = qkv_transform(iperm, q, k, v)
-    print(q.shape)
-    print(q.stride())
-    print(k.shape)
-    print(k.stride())
-    print(v.shape)
-    print(v.stride())
+    print(f"q shape:{q.shape}, q stride: {q.stride()}")
+    print(f"k shape:{k.shape}, k stride: {k.stride()}")
+    print(f"v shape:{v.shape}, v stride: {v.stride()}")
 
     attn_bias = None
     alibi_slopes = None
@@ -286,7 +283,7 @@ def test_flash_attn_output(
         return_lse,
         return_attn_probs,
     )
-
+    print(f"out shape:{out.shape}, out stride: {out.stride()}")
     out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
         q,
         k,
@@ -299,7 +296,7 @@ def test_flash_attn_output(
         causal,
         window_size,
     )
-
+    print(f"out_ref shape:{out_ref.shape}, out_ref stride: {out_ref.stride()}")
     out_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
         q,
         k,
@@ -314,6 +311,7 @@ def test_flash_attn_output(
         upcast=False,
         reorder_ops=True,
     )
+    print(f"out_pt shape:{out_pt.shape}, out_ref stride: {out_pt.stride()}")
 
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
@@ -350,7 +348,7 @@ parser.add_argument(
     "-b",
     "--batch_size",
     type=int,
-    default=2,
+    default=4,
     help="""Batch size. Default is 2.
     e.g.: -b 16""",
 )
@@ -358,7 +356,7 @@ parser.add_argument(
     "-n",
     "--nheads",
     type=int,
-    default=5,
+    default=32,
     help="""Number of heads. Default is 5.
     e.g.: -n 8""",
 )
@@ -366,7 +364,7 @@ parser.add_argument(
     "-q",
     "--seqlen_q",
     type=int,
-    default=512,
+    default=8192,
     help="""Sequence length for query. Default is 512.
     e.g.: -q 1024""",
 )
@@ -374,7 +372,7 @@ parser.add_argument(
     "-k",
     "--seqlen_k",
     type=int,
-    default=512,
+    default=8192,
     help="""Sequence length for key. Default is 512.
     e.g.: -k 1024""",
 )
