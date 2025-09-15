@@ -87,12 +87,10 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         std::cerr << "detect null ptr !" << std::endl;
         return;
     }
-
-    if (hidden_states.dtype() == at::ScalarType::Byte && w1.dtype() == at::ScalarType::Byte)
+    if (hidden_states.dtype() == torch_fp4x2 && w1.dtype() == torch_fp4x2)
     {
         K *= 2;
     }
-
     activation = !activation;
 
     auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight);
@@ -145,7 +143,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
         std::cerr << "detect null ptr !" << std::endl;
         return;
     }
-    if (inter_states.dtype() == at::ScalarType::Byte && w2.dtype() == at::ScalarType::Byte)
+    if (inter_states.dtype() == torch_fp4x2 && w2.dtype() == torch_fp4x2)
     {
         K *= 2;
     }

@@ -295,7 +295,7 @@ def per_1x32_f4_quant_hip(
         num_rows=num_rows,
         num_rows_factor=num_rows_factor,
     )
-    return y.view(torch.uint8), scale
+    return y, scale
 
 
 def per_tensor_quant_hip(
