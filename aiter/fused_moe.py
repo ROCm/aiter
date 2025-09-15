@@ -655,9 +655,9 @@ def fused_moe_2stages(
         )
 
     a2 = metadata.stage1(
-        a1,
-        w1,
-        w2,
+        a1.view(dtypes.fp4x2),
+        w1.view(dtypes.fp4x2),
+        w2.view(dtypes.fp4x2),
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
@@ -707,9 +707,9 @@ def fused_moe_2stages(
         a2 = a2.view(token_num, topk, inter_dim)
 
     metadata.stage2(
-        a2,
-        w1,
-        w2,
+        a2.view(dtypes.fp4x2),
+        w1.view(dtypes.fp4x2),
+        w2.view(dtypes.fp4x2),
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
