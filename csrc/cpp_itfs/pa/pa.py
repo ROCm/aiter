@@ -21,6 +21,7 @@ def compile(
     block_size: int,
     alibi_enabled: str,
     mtp: int = 1,
+    quant_method: str = "vllm::Fp8QuantMethod::kPerTensor",
     folder: str = None,
 ):
     return compile_template_op(
@@ -44,6 +45,7 @@ def compile(
         block_size=block_size,
         alibi_enabled=alibi_enabled,
         mtp=mtp,
+        quant_method=quant_method,
         folder=folder,
     )
 
@@ -64,8 +66,8 @@ def paged_attention_rocm(
     max_context_len,
     alibi_slopes,
     kv_cache_dtype,
-    k_scale,
-    v_scale,
+    key_scale=None,
+    value_scale=None,
     fp8_out_scale=None,
     partition_size=256,
     mtp=1,
@@ -102,7 +104,6 @@ def paged_attention_rocm(
         out_dtype = "_Float16"
     else:
         raise ValueError(f"Unsupported data type: {out.dtype}")
-
     num_seqs = block_tables.size(0)
     num_heads = query.size(1)
     head_size = query.size(2)
@@ -113,6 +114,12 @@ def paged_attention_rocm(
     gqa_ratio = int(num_heads / num_kv_heads)
     max_num_partitions = int(math.ceil(max_context_len / partition_size))
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
+
+    quant_method = "vllm::Fp8QuantMethod::kPerTensor"
+    if key_scale is not None:
+        if key_scale.numel() == (key_cache.size(0) * block_size * num_kv_heads):
+            quant_method = "vllm::Fp8QuantMethod::kPerHead"
+
     func = compile(
         gqa_ratio,
         head_size,
@@ -124,6 +131,7 @@ def paged_attention_rocm(
         block_size,
         "true" if alibi_slopes is not None else "false",
         mtp,
+        quant_method,
     )
 
     alibi_slopes_ptr = (
@@ -187,6 +195,17 @@ def paged_attention_rocm(
         if q_scale is not None
         else ctypes.POINTER(ctypes.c_float)()
     )
+    k_scale_ptr = (
+        ctypes.cast(key_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if key_scale is not None
+        else ctypes.POINTER(ctypes.c_float)()
+    )
+    v_scale_ptr = (
+        ctypes.cast(value_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if value_scale is not None
+        else ctypes.POINTER(ctypes.c_float)()
+    )
+
     func(
         out_ptr,
         exp_sums_ptr,
@@ -208,8 +227,8 @@ def paged_attention_rocm(
         kv_head_stride,
         alibi_slopes_ptr,
         q_scale_ptr,
-        ctypes.cast(k_scale.data_ptr(), ctypes.POINTER(ctypes.c_float)),
-        ctypes.cast(v_scale.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+        k_scale_ptr,
+        v_scale_ptr,
         fp8_out_scale_ptr,
         stream,
     )
