@@ -190,7 +190,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_n
                   std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
                   std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
                   std::optional<at::Generator> gen_,
-                  std::optional<const at::Tensor> kv_last_page_lens)
+                  std::optional<const at::Tensor> kv_last_page_lens_)
 {
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -311,6 +311,21 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_n
         CHECK_SHAPE(k, num_blocks, num_heads_k, head_size_q);
         CHECK_SHAPE(v, num_blocks, num_heads_k, head_size_v);
     }
+    else if(k.dim() == 4)
+    {
+        CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size_q);
+        CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size_v);
+    }
+    else
+    {
+        TORCH_CHECK(false, "Currently only supports dim equal to 3 or dim equal to 4");
+    }
+
+    if(page_block_size > 1)
+    {
+        TORCH_CHECK(kv_last_page_lens_.has_value(),
+                    "if page_block_size > 1, must pass kv_last_page_lens to kernel");
+    }
 
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     CHECK_SHAPE(kv_indptr, batch_size + 1);
@@ -415,7 +430,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d] or [page_n
                                                    logits_soft_cap,
                                                    p_dropout,
                                                    drop_seed_offset,
-                                                   kv_last_page_lens);
+                                                   kv_last_page_lens_);
 
         float t = aiter::mha_batch_prefill(args,
                                            stream_config,
