@@ -332,7 +332,7 @@ def run_benchmark(args: argparse.Namespace):
         new_k_pe_elems = qk_rope_head_dim  # to add to kv cache
 
         bytes_written = (
-            BATCH * out_elems * out_tri.element_size()
+            BATCH * (mtp + 1) * out_elems * out_tri.element_size()
         )
 
         mem = bytes_read + bytes_written
