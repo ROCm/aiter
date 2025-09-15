@@ -324,6 +324,7 @@ def get_default_config() -> Dict[str, int]:
 
 def get_default_config_moe_e2e(N: int, persistent: bool) -> Dict[str, int]:
     if N <= 768:
+        # we fit the whole token intermediate representation in registers in order to fuse the two gemms
         return {
             "BLOCK_SIZE_M": 16,
             "BLOCK_SIZE_N": triton.next_power_of_2(N),
