@@ -14,6 +14,37 @@ import pytest
 import argparse
 
 
+def qkv_transform(iperm, q, k, v):
+    if iperm == "BS3HD":
+        # BSHD-->BS3HD
+        qkv = torch.cat([q, k, v], dim=2)
+        return torch.split(qkv, [q.shape[2], k.shape[2], v.shape[2]], dim=2)
+    elif iperm == "BSHD+BS2HD":
+        # BSHD-->BS2HD
+        kv = torch.cat([k, v], dim=2)
+        k_new, v_new = torch.split(kv, [k.shape[2], v.shape[2]], dim=2)
+        return q, k_new, v_new
+    elif iperm == "BHSD":
+        # BSHD-->BHSD
+        q_new = q.permute(0, 2, 1, 3).contiguous()
+        q_new = q_new.permute(0, 2, 1, 3)
+        k_new = k.permute(0, 2, 1, 3).contiguous()
+        k_new = k_new.permute(0, 2, 1, 3)
+        v_new = v.permute(0, 2, 1, 3).contiguous()
+        v_new = v_new.permute(0, 2, 1, 3)
+        return q_new, k_new, v_new
+    elif iperm == "SBHD":
+        # BSHD-->SBHD
+        q_new = q.permute(1, 0, 2, 3).contiguous()
+        q_new = q_new.permute(1, 0, 2, 3)
+        k_new = k.permute(1, 0, 2, 3).contiguous()
+        k_new = k_new.permute(1, 0, 2, 3)
+        v_new = v.permute(1, 0, 2, 3).contiguous()
+        v_new = v_new.permute(1, 0, 2, 3)
+        return q_new, k_new, v_new
+    return q, k, v
+
+
 def run_torch(
     q,
     k,
@@ -126,6 +157,7 @@ def run_ck(
         return out, dropout_mask, dq, dk, dv, None
 
 
+@pytest.mark.parametrize("iperm", ["BSHD", "BHSD", "BS3HD", "BSHD+BS2HD", "SBHD"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("deterministic", [True, False])
@@ -180,6 +212,7 @@ def test_flash_attn_output(
     deterministic,
     mha_type,
     dtype,
+    iperm,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -211,6 +244,14 @@ def test_flash_attn_output(
         dtype=dtype,
         requires_grad=True,
     )
+
+    q, k, v = qkv_transform(iperm, q, k, v)
+    print(q.shape)
+    print(q.stride())
+    print(k.shape)
+    print(k.stride())
+    print(v.shape)
+    print(v.stride())
 
     attn_bias = None
     alibi_slopes = None
@@ -406,6 +447,14 @@ parser.add_argument(
     help="""Data type.
     e.g.: -d bf16""",
 )
+parser.add_argument(
+    "-i",
+    "--iperm",
+    type=str,
+    default="BSHD",
+    help="""iperm.
+    e.g.: -i BSHD""",
+)
 if __name__ == "__main__":
     args = parser.parse_args()
     dtype = dtypes.d_dtypes[args.dtype]
@@ -423,4 +472,5 @@ if __name__ == "__main__":
         args.deterministic,
         args.mha_type,
         dtype,
+        args.iperm,
     )
