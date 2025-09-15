@@ -17,6 +17,7 @@ from aiter import get_hip_quant as get_quant
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.jit.core import AITER_ROOT_DIR, PY, get_asm_dir, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 BLOCK_SIZE_M = 32
 
@@ -63,6 +64,8 @@ def moe_sorting(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
+# Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
+# We can use torch.compile(dynamic=False) to avoid
 @functools.lru_cache(maxsize=1024)
 def get_inter_dim(w1_shape, w2_shape):
     E, _, model_dim = w1_shape
@@ -94,6 +97,56 @@ def fused_moe(
     moe_sorting_dispatch_policy=0,
     dtype=None,
 ):
+    if not block_size_M:
+        block_size_M = -1
+    return fused_moe_(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
+        expert_mask=expert_mask,
+        activation=activation.value,
+        quant_type=quant_type.value,
+        doweight_stage1=doweight_stage1,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_size_M=block_size_M,
+        num_local_tokens=num_local_tokens,
+        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+        dtype=dtype,
+    )
+
+
+@torch_compile_guard()
+def fused_moe_(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+    w2: torch.Tensor,  # [expert(local_expert:EP), dim, inter_dim]
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_mask: Optional[torch.Tensor] = None,  # EP
+    activation: int = ActivationType.Silu.value,
+    quant_type: int = QuantType.No.value,
+    doweight_stage1: bool = False,
+    # following for quant
+    w1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
+    w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
+    a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
+    a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    # following for tuning
+    block_size_M: int = -1,
+    num_local_tokens: Optional[torch.Tensor] = None,
+    moe_sorting_dispatch_policy: bool = 0,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    # We do such convert since custom_op schema restriction on block_size_M, and Enum type
+    activation = ActivationType(activation)
+    quant_type = QuantType(quant_type)
+    if block_size_M == -1:
+        block_size_M = None
     """user API"""
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -221,7 +274,11 @@ def fused_moe_1stage(
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
 ):
-    if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
+    if (
+        quant_type.value == QuantType.No.value
+        and activation.value == ActivationType.Silu.value
+        and not isG1U1
+    ):
         # pure bf16
         aiter.fmoe(
             moe_buf,
@@ -238,7 +295,7 @@ def fused_moe_1stage(
     else:
         quant_func = get_quant(quant_type)
         if hidden_states.dtype != q_dtype_a:
-            if quant_type == QuantType.per_1x128:
+            if quant_type.value == QuantType.per_1x128.value:
                 quant_func = functools.partial(quant_func, transpose_scale=True)
             a1, a1_scale = quant_func(
                 hidden_states,
@@ -251,7 +308,7 @@ def fused_moe_1stage(
                 a1_scale is not None or quant_type == QuantType.No
             ), "a1_scale must be provided for quantized input for fused_moe"
             a1 = hidden_states
-            if quant_type == QuantType.per_1x128:
+            if quant_type.value == QuantType.per_1x128.value:
                 scale_t = torch.empty_like(a1_scale)
                 aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
                 a1_scale = scale_t
@@ -269,7 +326,7 @@ def fused_moe_1stage(
             w1_scale = w1_scale.view(E, -1)
             w2_scale = w2_scale.view(E, -1)
 
-        if quant_type == QuantType.per_1x128:
+        if quant_type.value == QuantType.per_1x128.value:
             fmoe_func = functools.partial(
                 aiter.fmoe_fp8_blockscale_g1u1,
                 fc_scale_blkn=128,
@@ -464,12 +521,14 @@ def get_2stage_cfgs(
     def FinalFunc():
         logger.info("\033[0m")
 
-    cfg = cfg_2stages.get(keys, None)
+    # cfg = cfg_2stages.get(keys, None)
+    cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
-        cfg = cfg_2stages.get(keys, None)
+        # cfg = cfg_2stages.get(keys, None)
+        cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
     if cfg is None:
@@ -612,7 +671,7 @@ def fused_moe_2stages(
         doweight_stage1,
     )
 
-    if quant_type == QuantType.per_1x32:
+    if quant_type.value == QuantType.per_1x32.value:
         a1, a1_scale = quant_func(
             hidden_states,
             scale=a1_scale,
@@ -627,7 +686,10 @@ def fused_moe_2stages(
             block_size=block_size_M,
         )
     elif hidden_states.dtype != q_dtype_a:
-        if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+        if (
+            quant_type.value == QuantType.per_1x128.value
+            and metadata.stage1.func is asm_stage1
+        ):
             quant_func = functools.partial(quant_func, transpose_scale=True)
         a1, a1_scale = quant_func(
             hidden_states,
@@ -637,10 +699,13 @@ def fused_moe_2stages(
         )
     else:
         assert (
-            a1_scale is not None or quant_type == QuantType.No
+            a1_scale is not None or quant_type.value == QuantType.No.value
         ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
-    if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+    if (
+        quant_type.value == QuantType.per_1x128.value
+        and metadata.stage1.func is asm_stage1
+    ):
         ratio = a1_scale.element_size() // a1.element_size()
         a2 = torch.empty(
             (token_num + (token_num * ratio + 127) // 128, topk, inter_dim),
@@ -669,7 +734,7 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
 
-    if quant_type == QuantType.per_1x32:
+    if quant_type.value == QuantType.per_1x32.value:
         a2 = a2.view(-1, inter_dim)
         a2, a2_scale = quant_func(
             a2,
@@ -687,7 +752,10 @@ def fused_moe_2stages(
             block_size=block_size_M,
         )
 
-    elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+    elif (
+        quant_type.value == QuantType.per_1x128.value
+        and metadata.stage1.func is asm_stage1
+    ):
         a2_v = a2[:token_num, :, :]
         a2_scale = (
             a2[token_num:, ...]

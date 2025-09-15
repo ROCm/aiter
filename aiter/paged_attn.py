@@ -244,6 +244,7 @@ class PagedAttention:
         blocksparse_block_size: int = 64,
         blocksparse_head_sliding_step: int = 0,
         fp8_out_scale=None,
+        mtp: int = 1,
     ) -> torch.Tensor:
         # Whether to use rocm custom paged attention or not
         num_seqs, num_heads, head_size = query.shape
@@ -293,6 +294,7 @@ class PagedAttention:
                 v_scale,
                 fp8_out_scale if cpa_fp8_out else None,
                 _PARTITION_SIZE_ROCM,
+                mtp=mtp,
             )
             if cpa_fp8_out:
                 return output.view(num_seqs, num_heads * head_size)
