@@ -279,7 +279,6 @@ def _fwd_grouped_kernel_stage1_ps(
         e_sum = gl.zeros_like(e_max, dtype=gl.float32)
 
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
-        # if True:
             # start_n = split_kv_start
             offs_n = start_n + gl.arange(0, BLOCK_N,
                 layout=gl.SliceLayout(0, blocked_ld_k_nope_kn)
@@ -289,16 +288,15 @@ def _fwd_grouped_kernel_stage1_ps(
             )
             kv_loc = gl.load(
                 kv_indices + start_n + cur_head,
-                mask=cur_head < split_kv_end,
-                other=0.0,
+                # mask=cur_head < split_kv_end,
+                # other=0.0,
             )
             kv_pe_loc = gl.load(
                 kv_indices + start_n + cur_head_pe,
-                mask= cur_head_pe < split_kv_end,
-                other=0.0,
+                # mask= cur_head_pe < split_kv_end,
+                # other=0.0,
             )
 
-            # gl.device_print("kv_loc", kv_loc)
 
             offs_buf_kv = kv_loc[:, None] * stride_buf_kbs + offs_c[None, :]
             offs_buf_k_pe = kv_pe_loc[:, None] * stride_buf_kbs + offs_qk_r[None, :]
@@ -308,13 +306,17 @@ def _fwd_grouped_kernel_stage1_ps(
                 offsets=offs_buf_k_pe,
                 # offsets=off_q_pe,
                 # mask=(offs_n_pe[None, :] < split_kv_end) & (mask_k_r[:, None]),
-                mask=(mask_h_pe[:, None]) & (mask_qk_r[None, :]),
+                # mask=(mask_h_pe[:, None]) & (mask_qk_r[None, :]),
                 # cache=cache_modifier,
             )  # positional embedding part of keys
+
+            # if cur_batch == 1:
+            #     gl.device_print("offs_buf_k_pe", offs_buf_k_pe)
+                # gl.device_print("cur_k_pe", k_pe)
+
+
             smem_k_rope.store(k_pe.T)
             cur_k_pe = smem_k_rope.load(layout=dot_k_layout)
-            # if cur_batch == 1:
-            #     gl.device_print("cur_k_pe", cur_k_pe)
 
 
             # (16, 64) x (64, 32)
@@ -326,7 +328,7 @@ def _fwd_grouped_kernel_stage1_ps(
                 ptr=K_Buffer,
                 offsets=offs_buf_kv,
                 # offsets=offs_q,
-                mask=(mask_h[:, None]) & (mask_c[None, :]),
+                # mask=(mask_h[:, None]) & (mask_c[None, :]),
                 # mask=(offs_n[None, :] < split_kv_end) & (mask_k_c[:, None]),
                 cache=cache_modifier,
             )  # the shared latent tensor for keys and values
@@ -337,7 +339,7 @@ def _fwd_grouped_kernel_stage1_ps(
             # (16, 512) x (512, 32)
             # dot product of nope parts
             # qk = tl.dot(q, kv)
-            qk = gl.amd.cdna3.mfma(q, cur_kv, zeros)
+            qk = gl.amd.cdna3.mfma(q, cur_kv, qk)
 
             # smem_v.store(cur_kv)
 
@@ -355,6 +357,8 @@ def _fwd_grouped_kernel_stage1_ps(
             n_e_max = gl.maximum(gl.max(qk, 1), e_max)
             re_scale = gl.exp(e_max - n_e_max)
             p = gl.exp(qk - n_e_max[:, None])
+
+            # gl.device_print("p", p)
 
             acc = acc * re_scale[:, None]
 
