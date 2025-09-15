@@ -20,7 +20,6 @@ def get_config_dtype_str(
     use_int8_w8a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
-    use_mxfp4: Optional[bool] = False,
 ):
     if use_fp8_w8a8:
         return "FP8_W8A8"
@@ -30,8 +29,6 @@ def get_config_dtype_str(
         return "INT8_W8A8"
     elif use_int4_w4a16:
         return "INT4_W4A16"
-    elif use_mxfp4:
-        return "MX_FP4"
     elif dtype == torch.float:
         # avoiding cases where kernel fails when float32 MoE
         # use fp16/bfloat16 configs
@@ -74,11 +71,10 @@ def get_optimal_moe_config(
     use_int8_w8a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
-    use_mxfp4: Optional[bool] = False,
     M: int = 1,
 ):
     dtype_str = get_config_dtype_str(
-        dtype, use_int8_w8a16, use_int8_w8a8, use_fp8_w8a8, use_int4_w4a16, use_mxfp4
+        dtype, use_int8_w8a16, use_int8_w8a8, use_fp8_w8a8, use_int4_w4a16
     )
     # print(f"dtype_str={dtype_str}")
     configs = get_moe_configs(dtype_str)
@@ -108,14 +104,49 @@ def get_optimal_moe_config(
     return config
 
 
-def get_optimal_moe_config_func(
+def get_optimal_skinny_moe_config(
+    N: int,
     dtype: torch.dtype,
     use_int8_w8a16: Optional[bool] = False,
     use_int8_w8a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
-    use_mxfp4: Optional[bool] = False,
+    M: int = 1,
 ):
+    return {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": N,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 8,
+            "num_stages": 2,
+            "waves_per_eu": 0,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+        }
+
+
+
+def get_optimal_moe_config_func(
+    N: int,
+    dtype: torch.dtype,
+    use_int8_w8a16: Optional[bool] = False,
+    use_int8_w8a8: Optional[bool] = False,
+    use_fp8_w8a8: Optional[bool] = False,
+    use_int4_w4a16: Optional[bool] = False,
+):
+    if N <= 768:
+        return functools.partial(
+            get_optimal_skinny_moe_config,
+            N,
+            dtype,
+            use_int8_w8a16,
+            use_int8_w8a8,
+            use_fp8_w8a8,
+            use_int4_w4a16,
+        )
+
+
     return functools.partial(
         get_optimal_moe_config,
         dtype,
@@ -123,5 +154,4 @@ def get_optimal_moe_config_func(
         use_int8_w8a8,
         use_fp8_w8a8,
         use_int4_w4a16,
-        use_mxfp4,
     )
