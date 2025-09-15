@@ -803,6 +803,7 @@ def compile_ops(
                 "fmoe_g1u1_tkw1",
                 "fmoe_fp8_blockscale_g1u1",
                 "moe_stage1_g1u1",
+                "fmoe_g1u1_a16",
             ]
             quant_list = ["moe_stage1_g1u1"]
 
@@ -874,35 +875,6 @@ def compile_ops(
                 from ..test_common import log_args
 
                 log_args(func, *args, **kwargs)
-
-            if loadName in activation_list or loadName in quant_list:
-                import inspect
-
-                sig = inspect.signature(func)
-                params = list(sig.parameters.keys())
-                if loadName in activation_list:
-                    activation_index = params.index("activation")
-                    args_list = list(args)
-                    from aiter import ActivationType, QuantType
-
-                    if len(args_list) > activation_index and isinstance(
-                        args_list[activation_index], int
-                    ):
-                        args_list[activation_index] = ActivationType(
-                            args_list[activation_index]
-                        )
-                        args = tuple(args_list)
-
-                if loadName in quant_list:
-                    quant_index = params.index("quant_type")
-                    args_list = list(args)
-                    from aiter import ActivationType, QuantType
-
-                    if len(args_list) > quant_index and isinstance(
-                        args_list[quant_index], int
-                    ):
-                        args_list[quant_index] = QuantType(args_list[quant_index])
-                        args = tuple(args_list)
 
             return op(*args, **kwargs)
 
