@@ -251,7 +251,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         }
     }
 
-    constexpr int KX     = 16 / sizeof(cache_t); // vLLM defines x as 16 Bytes of kv cache elements
     const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
 
     const int row_head_elem = rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD;
@@ -260,7 +259,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     {
         const int64_t kblock_number = static_cast<int64_t>(kphysical_block_number[token_depth]);
         const cache_t* k_ptr2       = k_ptr + kblock_number * kv_block_stride;
-        const cache_t* k_ptr3       = k_ptr2 + kphysical_block_offset[token_depth] * KX;
+        const cache_t* k_ptr3 =
+            k_ptr2 + kphysical_block_offset[token_depth] * CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
         for(int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++)
         {
@@ -268,9 +268,10 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
             {
                 const int head_elem =
                     row_head_elem + qkhe_depth * QKHE_PER_FETCH + head_loop * HEAD_SIZE_PER_LOOP;
-                const int offset1             = head_elem / KX;
-                const int offset2             = head_elem % KX;
-                const cache_t* k_fetch_ptr    = k_ptr3 + offset1 * BLOCK_SIZE * KX + offset2;
+                const int offset1 = head_elem / CONTIGUOUS_KV_ELEMS_16B_LOAD;
+                const int offset2 = head_elem % CONTIGUOUS_KV_ELEMS_16B_LOAD;
+                const cache_t* k_fetch_ptr =
+                    k_ptr3 + offset1 * BLOCK_SIZE * CONTIGUOUS_KV_ELEMS_16B_LOAD + offset2;
                 const _B16x8* k_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(k_fetch_ptr);
                 Klocal[head_loop][token_depth][qkhe_depth] = *k_fetch_ptr_16B;
             }
@@ -329,6 +330,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         {
             const int64_t vblock_number =
                 static_cast<int64_t>(vphysical_block_number[vtoken_depth]);
+            // const int offset = vphysical_block_offset[vtoken_depth] /
+            // CONTIGUOUS_KV_ELEMS_16B_LOAD;
             const cache_t* v_ptr3 =
                 v_ptr2 + (vblock_number * kv_block_stride) + vphysical_block_offset[vtoken_depth];
             for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
