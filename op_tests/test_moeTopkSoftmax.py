@@ -171,8 +171,8 @@ def test_biased_grouped_topk(
     )
     # return {"err": err, "us": us_aiter}
 
-    w_sglang = torch.empty_strided((token, topk), (topk, 1), dtype=dtypes.fp32)
-    id_sglang = torch.empty_strided((token, topk), (topk, 1), dtype=dtypes.i32)
+    w_sglang = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
+    id_sglang = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
     _, us_sglang = run_perftest(
         aiter.moe_fused_gate,
         gating_output,
