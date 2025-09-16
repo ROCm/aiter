@@ -9,11 +9,10 @@ from aiter.ops.triton.gemm_a8w8_blockscale import (
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
-from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
-from aiter.ops.triton.utils.types import str_to_torch_dtype
+from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
-import aiter.ops.triton.utils.arch_info as arch_info
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
 block_shape = (128, 128)
@@ -87,6 +86,28 @@ def get_x_vals():
         (256, 1024, 8192),
         (256, 32768, 8192),
         (256, 8192, 32768),
+    ]
+    x_vals += [
+        (16, 2112, 7168),
+        (32, 2112, 7168),
+        (64, 2112, 7168),
+        (128, 2112, 7168),
+        (16, 3072, 1536),
+        (32, 3072, 1536),
+        (64, 3072, 1536),
+        (128, 3072, 1536),
+        (16, 7168, 2048),
+        (32, 7168, 2048),
+        (64, 7168, 2048),
+        (128, 7168, 2048),
+        (16, 4096, 7168),
+        (32, 4096, 7168),
+        (64, 4096, 7168),
+        (128, 4096, 7168),
+        (16, 7168, 256),
+        (32, 7168, 256),
+        (64, 7168, 256),
+        (128, 7168, 256),
     ]
     # x_vals += [(1, 1, 1)]  # minimal case
     return x_vals

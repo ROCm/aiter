@@ -60,7 +60,8 @@ __attribute__((visibility("default"))) float mha_bwd(mha_bwd_args args,
                                                      bool is_v3_atomic_fp32,
                                                      int how_v3_bf16_cvt,
                                                      const void* seqlen_q_padded = nullptr,
-                                                     const void* seqlen_k_padded = nullptr);
+                                                     const void* seqlen_k_padded = nullptr,
+                                                     bool is_v3_api_check = false);
 
 struct __attribute__((packed)) fmha_bwd_v3_args
 {
@@ -412,7 +413,8 @@ float fmha_bwd_v3(mha_bwd_traits t,
                   mha_bwd_args a,
                   const ck_tile::stream_config& s,
                   const void* seqlen_q_padded = nullptr,
-                  const void* seqlen_k_padded = nullptr);
+                  const void* seqlen_k_padded = nullptr,
+                  bool is_v3_api_check = false);
 }
 
 namespace gfx950 {
@@ -420,6 +422,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                   mha_bwd_args a,
                   const ck_tile::stream_config& s,
                   const void* seqlen_q_padded = nullptr,
-                  const void* seqlen_k_padded = nullptr);
+                  const void* seqlen_k_padded = nullptr,
+                  bool is_v3_api_check = false);
 }
 } // namespace aiter

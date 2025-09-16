@@ -73,13 +73,15 @@ if find_aiter is not None:
         package_path = find_aiter.origin
     package_path = os.path.dirname(package_path)
     package_parent_path = os.path.dirname(package_path)
-    import site
 
-    site_packages_dirs = site.getsitepackages()
-    # develop mode
-    isDevelopMode = (package_path not in site_packages_dirs) and (
-        package_parent_path not in site_packages_dirs
-    )
+    try:
+        with open(f"{this_dir}/../install_mode", "r") as f:
+            # develop mode
+            isDevelopMode = f.read().strip() == "develop"
+    except FileNotFoundError:
+        # pip install -e
+        isDevelopMode = True
+
     if isDevelopMode:
         AITER_META_DIR = AITER_ROOT_DIR
     # install mode
@@ -582,6 +584,11 @@ NONE_WRAPPED_OP = [
     # "get_padded_m",
     "compile_mha_fwd",
     "compile_mha_bwd",
+    "init_custom_qr",
+    "qr_max_size",
+    "qr_destroy",
+    "qr_open_handles",
+    "qr_get_handle",
 ]
 
 SPECIAL_OPS_MUTATES_ARGS = {
@@ -943,6 +950,7 @@ def compile_ops(
             return_int = True
 
         schema = f"{new_input} -> {output_part}".strip()
+
         loadName = func.__name__
 
         def abstract_impl(dummy, *args, custom_build_args={}, **kwargs):

@@ -931,11 +931,45 @@
           py::arg("shuffle_scale")   = true,                             \
           py::arg("num_rows")        = std::nullopt,                     \
           py::arg("num_rows_factor") = 1);                               \
+    m.def("smooth_per_token_scaled_quant",                               \
+          &aiter::smooth_per_token_scaled_quant,                         \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("scales"),                                             \
+          py::arg("smooth_scale"),                                       \
+          py::arg("smooth_scale_map") = std::nullopt,                    \
+          py::arg("shuffle_scale")    = false,                           \
+          py::arg("num_rows")         = std::nullopt,                    \
+          py::arg("num_rows_factor")  = 1);                               \
     m.def("partial_transpose",                                           \
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \
           py::arg("input"),                                              \
           py::arg("num_rows"));
+
+#define QUICK_ALL_REDUCE_PYBIND                                                            \
+    m.def("init_custom_qr",                                                                \
+          &aiter::init_custom_qr,                                                          \
+          py::arg("rank"),                                                                 \
+          py::arg("world_size"),                                                           \
+          py::arg("qr_max_size") = std::nullopt);                                          \
+    m.def("qr_destroy", &aiter::qr_destroy, "qr_destroy(int fa) -> ()", py::arg("fa"));    \
+    m.def("qr_all_reduce",                                                                 \
+          &aiter::qr_all_reduce,                                                           \
+          "qr_all_reduce(int fa, Tensor inp, Tensor out,"                                  \
+          "int quant_level, bool cast_bf2half) -> ()",                                     \
+          py::arg("fa"),                                                                   \
+          py::arg("inp"),                                                                  \
+          py::arg("out"),                                                                  \
+          py::arg("quant_level"),                                                          \
+          py::arg("cast_bf2half") = false);                                                \
+    m.def("qr_get_handle", &aiter::qr_get_handle, "qr_get_handle(int fa)", py::arg("fa")); \
+    m.def("qr_open_handles",                                                               \
+          &aiter::qr_open_handles,                                                         \
+          "qr_open_handles(int fa, Tensor[] handles)",                                     \
+          py::arg("fa"),                                                                   \
+          py::arg("handles"));                                                             \
+    m.def("qr_max_size", &aiter::qr_max_size);
 
 #define RMSNORM_PYBIND                                                                             \
     m.def("rms_norm_cu",                                                                           \
@@ -979,8 +1013,24 @@
           py::arg("epsilon"),                                                                      \
           py::arg("out_before_quant")            = std::nullopt,                                   \
           py::arg("use_model_sensitive_rmsnorm") = 0);                                             \
-    m.def("rmsnorm2d_fwd_with_dynamicquant", &rmsnorm2d_with_dynamicquant);                        \
-    m.def("rmsnorm2d_fwd_with_add_dynamicquant", &rmsnorm2d_with_add_dynamicquant);
+      m.def("rmsnorm2d_fwd_with_dynamicquant",                                                     \
+            &rmsnorm2d_with_dynamicquant,                                                          \
+            py::arg("out"),                                                                        \
+            py::arg("input"),                                                                      \
+            py::arg("yscale"),                                                                     \
+            py::arg("weight"),                                                                     \
+            py::arg("epsilon"),                                                                    \
+            py::arg("use_model_sensitive_rmsnorm") = 0);                                           \
+      m.def("rmsnorm2d_fwd_with_add_dynamicquant",                                                 \
+            &rmsnorm2d_with_add_dynamicquant,                                                      \
+            py::arg("out"),                                                                        \
+            py::arg("input"),                                                                      \
+            py::arg("residual_in"),                                                                \
+            py::arg("residual_out"),                                                               \
+            py::arg("yscale"),                                                                     \
+            py::arg("weight"),                                                                     \
+            py::arg("epsilon"),                                                                    \
+            py::arg("use_model_sensitive_rmsnorm") = 0);
 
 #define ROPE_GENERAL_FWD_PYBIND                                 \
     m.def("rope_fwd_impl", &rope_fwd_impl);                     \
