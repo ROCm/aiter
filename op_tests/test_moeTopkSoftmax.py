@@ -86,18 +86,13 @@ def test_asm(
     token_expert_indicies = torch.empty_strided(
         (M, topk), (topk + 10, 1), dtype=dtypes.i32, device=gating_output.device
     )
-    if (
-        get_gfx() == "gfx942"
-        and (expert, topk) in [(128, 6), (128, 8), (256, 6), (256, 8)]
-        and gating_output.dtype == dtypes.fp32
-    ):
-        aiter.topk_softmax_asm(
-            topk_weights,
-            topk_ids,
-            token_expert_indicies,
-            gating_output,
-            renormalize,
-        )
+    aiter.topk_softmax_asm(
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output,
+        renormalize,
+    )
     del token_expert_indicies  # Not used. Will be used in the future.
     return topk_weights, topk_ids
 
@@ -113,11 +108,17 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
     func_dict = {"hip": test_fuse, "asm": test_asm}
     ret = {}
     for tag, func in func_dict.items():
+        if tag == "asm" and not (
+            get_gfx() == "gfx942"
+            and (E, topk) in [(128, 6), (128, 8), (256, 6), (256, 8)]
+            and dtype == dtypes.fp32
+        ):
+            continue
         (topk_weights, topk_ids), us = func(gating_output, topk, renormalize)
         topk_ids = topk_ids.to(dtypes.i32)
         id, _ref = torch.sort(topk_ids)
         weight = topk_weights.gather(1, _ref)
-        ret[f"{tag} err"] = checkAllclose(w_ref, weight)
+        ret[f"{tag} err"] = checkAllclose(w_ref, weight, msg=f"{tag} topk_weights")
         checkAllclose(id_ref, id, msg=f"{tag} topk_ids")
         ret[f"{tag} us"] = us
     return ret
