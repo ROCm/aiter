@@ -27,23 +27,23 @@ struct __attribute__((packed)) fmha_bwd_v3_args_gfx950
     p2 _p1;
     void *ptr_dv;                   // 0x20
     p2 _p2;
-    void *ptr_q;                    // 0x30
+    const void *ptr_q;              // 0x30
     p2 _p3;
-    void *ptr_k;                    // 0x40
+    const void *ptr_k;              // 0x40
     p2 _p4;
-    void *ptr_v;                    // 0x50
+    const void *ptr_v;              // 0x50
     p2 _p5;
-    void *ptr_do;                   // 0x60
+    const void *ptr_do;             // 0x60
     p2 _p6;
-    void *ptr_lse;                  // 0x70
+    const void *ptr_lse;            // 0x70
     p2 _p7;
-    void *ptr_d;                    // 0x80
+    const void *ptr_d;              // 0x80
     p2 _p8;
     float scalar;                   // 0x90
     p3 _p9;
     float log2e;                    // 0xa0
     p3 _p10;
-    unsigned int seq_len_q;         // 0xb0: s_seq_len_q
+    unsigned int seqlen_q;          // 0xb0: s_seq_len_q
     p3 _p11;
     unsigned int Ts;                // 0xc0: s_Seqs_k*sub_K
     p3 _p12;
@@ -63,7 +63,7 @@ struct __attribute__((packed)) fmha_bwd_v3_args_gfx950
     p3 _p19;
     unsigned int Seqs_dk;           // 0x140: s_Seqs_dk
     p3 _p20;
-    unsigned int seq_len_k;         // 0x150: batch mode
+    unsigned int seqlen_k;          // 0x150: batch mode
     p3 _p21;
     unsigned int head_dim_q;        // 0x160: batch&group mode for headdim padding
     p3 _p22;
@@ -991,18 +991,26 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
     args.Hs_dv          = a.nhead_stride_dv * 2;
     args.BAs_dv         = a.batch_stride_dv * 2;
     args.Seqs_dv        = a.stride_dv * 2;
-    args.Hs_dq          = a.nhead_stride_dq * 2;
-    args.BAs_dq         = a.batch_stride_dq * 2;
-    args.Seqs_dq        = a.stride_dq * 2;
+    args.Hs_lsed            = a.nhead_stride_lsed * 4;
+    args.ptr_qseq           = a.seqstart_q_ptr;
+    args.ptr_kseq           = a.seqstart_k_ptr;
+    args.ptr_qseq_padded    = seqlen_q_padded == nullptr
+                            ? a.seqstart_q_ptr
+                            : seqlen_q_padded;
+    args.ptr_kseq_padded    = seqlen_k_padded == nullptr
+                            ? a.seqstart_k_ptr
+                            : seqlen_k_padded;
+    args.max_seq_len_dq     = a.max_seqlen_q;
 
     auto traits = fmha_bwd_v3_traits{a.batch,
-                                      a.nhead_q,
-                                      a.seqlen_q,
-                                      a.seqlen_k,
-                                      a.hdim_q,
-                                      a.mask_type,
-                                      FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
-                                      FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv};
+                                     a.nhead_q,
+                                     a.seqlen_q,
+                                     a.seqlen_k,
+                                     a.hdim_q,
+                                     a.mask_type,
+                                     FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
+                                     FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv,
+                                     dq_shuffle_traits::ts_dq};
 
     static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::file_name); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
@@ -1065,7 +1073,7 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
                             : seqlen_q_padded;
     args.ptr_kseq_padded    = seqlen_k_padded == nullptr
                             ? a.seqstart_k_ptr
-                            : seqlen_k_padded;;
+                            : seqlen_k_padded;
     args.max_seq_len_dq     = a.max_seqlen_q;
 
     fmha_bwd_dq_shuffle_args dq_shuffule_args;
