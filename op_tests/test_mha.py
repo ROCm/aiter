@@ -248,9 +248,6 @@ def test_flash_attn_output(
     )
 
     q, k, v = qkv_transform(iperm, q, k, v)
-    print(f"q shape:{q.shape}, q stride: {q.stride()}")
-    print(f"k shape:{k.shape}, k stride: {k.stride()}")
-    print(f"v shape:{v.shape}, v stride: {v.stride()}")
 
     attn_bias = None
     alibi_slopes = None
@@ -285,9 +282,7 @@ def test_flash_attn_output(
         return_lse,
         return_attn_probs,
     )
-    print(
-        f"softmax_lse shape:{softmax_lse.shape}, softmax_lse stride: {softmax_lse.stride()}"
-    )
+
     out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
         q,
         k,
@@ -300,9 +295,7 @@ def test_flash_attn_output(
         causal,
         window_size,
     )
-    print(
-        f"softmax_lse_ref shape:{softmax_lse_ref.shape}, softmax_lse_ref stride: {softmax_lse_ref.stride()}"
-    )
+
     out_pt, softmax_lse_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
         q,
         k,
@@ -316,9 +309,6 @@ def test_flash_attn_output(
         window_size,
         upcast=False,
         reorder_ops=True,
-    )
-    print(
-        f"softmax_lse_pt shape:{softmax_lse_pt.shape}, out_ref stride: {softmax_lse_pt.stride()}"
     )
 
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")

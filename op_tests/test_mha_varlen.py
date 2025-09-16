@@ -58,7 +58,7 @@ def run_torch(
     else:
         attn_bias = None
 
-    out, _ = attention_ref(
+    out, _, _ = attention_ref(
         q,
         k,
         v,
@@ -126,12 +126,6 @@ def run_ck(
 
     q_unpad, k_unpad, v_unpad = qkv_transform(iperm, q_unpad, k_unpad, v_unpad)
 
-    print(q_unpad.shape)
-    print(q_unpad.stride())
-    print(k_unpad.shape)
-    print(k_unpad.stride())
-    print(v_unpad.shape)
-    print(v_unpad.stride())
     outputs = aiter.flash_attn_varlen_func(
         q_unpad,
         k_unpad,
