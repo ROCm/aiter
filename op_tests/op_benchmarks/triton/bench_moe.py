@@ -242,8 +242,8 @@ def run_benchmark(args):
         line_names = ["Time_(ms)"]
         line_vals = ["time"]
     else:
-        line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
-        line_vals = ["time", "tflops", "bandwidth"]
+        line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)", "Arithmetic_Intensity_(Flops/Byte)"]
+        line_vals = ["time", "tflops", "bandwidth", "ai"]
 
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
@@ -251,7 +251,7 @@ def run_benchmark(args):
         line_arg="metric",
         line_vals=line_vals,
         line_names=line_names,
-        styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
+        styles=[("red", "-"), ("blue", "-"), ("yellow", "-"), ("green", "-")],
         ylabel="ms / TFLOPS / GB/s",
         plot_name=get_caller_name_no_ext(),
         args={},
@@ -324,6 +324,8 @@ def run_benchmark(args):
             return tflops
         elif metric == "bandwidth":
             return bandwidth
+        elif metric == "ai":
+            return flops / mem
         else:
             raise ValueError("Unknown metric: " + metric)
 

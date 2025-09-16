@@ -104,31 +104,7 @@ def get_optimal_moe_config(
     return config
 
 
-def get_optimal_skinny_moe_config(
-    N: int,
-    dtype: torch.dtype,
-    use_int8_w8a16: Optional[bool] = False,
-    use_int8_w8a8: Optional[bool] = False,
-    use_fp8_w8a8: Optional[bool] = False,
-    use_int4_w4a16: Optional[bool] = False,
-    M: int = 1,
-):
-    return {
-            "BLOCK_SIZE_M": 16,
-            "BLOCK_SIZE_N": triton.next_power_of_2(N),
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
-            "num_warps": 8,
-            "num_stages": 2,
-            "waves_per_eu": 0,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 1,
-        }
-
-
-
 def get_optimal_moe_config_func(
-    N: int,
     dtype: torch.dtype,
     use_int8_w8a16: Optional[bool] = False,
     use_int8_w8a8: Optional[bool] = False,
