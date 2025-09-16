@@ -161,6 +161,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const int* block_table_seq = block_tables + seq_idx * max_num_blocks_per_seq;
 
     int kphysical_block_number[TLOOP];
+    int kphysical_block_offset[TLOOP];
 
     // fetch k physical block numbers
     for(int token_depth = 0; token_depth < TLOOP; token_depth++)
@@ -170,6 +171,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         const int kblock_idx =
             (kglobal_token_idx < context_len) ? kglobal_token_idx / BLOCK_SIZE : last_ctx_block;
         kphysical_block_number[token_depth] = block_table_seq[kblock_idx];
+        kphysical_block_offset[token_depth] = kglobal_token_idx % BLOCK_SIZE;
     }
 
     // fetch Q in shared across warps and then write to registers
@@ -258,10 +260,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     {
         const int64_t kblock_number = static_cast<int64_t>(kphysical_block_number[token_depth]);
         const cache_t* k_ptr2       = k_ptr + kblock_number * kv_block_stride;
-        const int klocal_token_idx  = TOKENS_PER_WARP * warpid + token_depth * 16 + lane16id;
-        [[maybe_unused]] const int kglobal_token_idx = partition_start_token_idx + klocal_token_idx;
-        const int kphysical_block_offset             = klocal_token_idx % BLOCK_SIZE;
-        const cache_t* k_ptr3                        = k_ptr2 + kphysical_block_offset * KX;
+        const cache_t* k_ptr3       = k_ptr2 + kphysical_block_offset[token_depth] * KX;
 
         for(int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++)
         {
@@ -301,6 +300,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     constexpr int VHELOOP = HEAD_SIZE / 16 / NWARPS;
 
     int vphysical_block_number[VTLOOP];
+    int vphysical_block_offset[VTLOOP];
 
     // fetch v physical block numbers
     for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
@@ -313,12 +313,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         const int vblock_idx =
             (vglobal_token_idx < context_len) ? vglobal_token_idx / BLOCK_SIZE : last_ctx_block;
         vphysical_block_number[vtoken_depth] = block_table_seq[vblock_idx];
+        vphysical_block_offset[vtoken_depth] = vglobal_token_idx % BLOCK_SIZE;
     }
 
     _B16x8 Vlocal[VTLOOP][VHELOOP][VTLANELOOP]; // this could be B8x16 too
 
-    const cache_t* v_ptr =
-        v_cache + wg_start_kv_head_idx * kv_head_stride + ((rowid * VTOKENS_PER_LANE) % BLOCK_SIZE);
+    const cache_t* v_ptr = v_cache + wg_start_kv_head_idx * kv_head_stride;
 
     // v fetches are 16head elems across lanes x 16 tokens per lane
     for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
@@ -329,7 +329,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         {
             const int64_t vblock_number =
                 static_cast<int64_t>(vphysical_block_number[vtoken_depth]);
-            const cache_t* v_ptr3 = v_ptr2 + (vblock_number * kv_block_stride);
+            const cache_t* v_ptr3 =
+                v_ptr2 + (vblock_number * kv_block_stride) + vphysical_block_offset[vtoken_depth];
             for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
             {
                 const cache_t* v_fetch_ptr = v_ptr3 + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;

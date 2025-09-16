@@ -322,7 +322,6 @@ _paged_attention_kernel(const int* block_table_seq,
     {
         // multiply by k_scale if fp8 kv cache
         scale2 *= *k_scale_ptr;
-        scale2 *= q_scale;
     }
 
     const auto variant_params = [&] {
