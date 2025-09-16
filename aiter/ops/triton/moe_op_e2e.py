@@ -688,9 +688,6 @@ def e2e_moe(
         stride_im = Intermediate.stride(0)
         EVEN_N = (N // 2) % config["BLOCK_SIZE_N2"] == 0
 
-        
-
-
         e2e_moe_persistent_kernel[grid](
             A,
             W1,

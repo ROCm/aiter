@@ -135,18 +135,6 @@ def get_optimal_moe_config_func(
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
 ):
-    if N <= 768:
-        return functools.partial(
-            get_optimal_skinny_moe_config,
-            N,
-            dtype,
-            use_int8_w8a16,
-            use_int8_w8a8,
-            use_fp8_w8a8,
-            use_int4_w4a16,
-        )
-
-
     return functools.partial(
         get_optimal_moe_config,
         dtype,

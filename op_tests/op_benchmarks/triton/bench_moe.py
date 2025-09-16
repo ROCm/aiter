@@ -220,6 +220,8 @@ def run_benchmark(args):
     dtype = str_to_torch_dtype[args.dtype]
     fp8_type = str_to_torch_dtype[args.fp8_type]
 
+    assert not (e2e_fused and silu_fused)
+
     if silu_fused:
         args.no_bench_stage2 = True
 
@@ -282,6 +284,14 @@ def run_benchmark(args):
         if silu_fused:
             mem = mem_read + (mem_write // 2)
             flops += M * top_k * N
+        elif e2e_fused:
+            flops += 2.0 * M * top_k * K * (N // 2)
+            flops += M * top_k * N
+            # The weight is applied on the gemm product which has the shape of (M, top_k, N)
+            if routed_weight:
+                flops += M * top_k * (N // 2)
+            mem_read_expert2 = (max_expert_loaded * (N // 2) * K) * b_bytes
+            mem = mem_read + mem_read_expert2 + (M * top_k * K) * c_bytes
         else:
             mem = mem_read + mem_write
 

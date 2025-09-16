@@ -323,11 +323,22 @@ def get_default_config() -> Dict[str, int]:
 
 
 def get_default_config_moe_e2e(persistent: bool) -> Dict[str, int]:
+    return {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 1024,
+        "BLOCK_SIZE_K1": 64,
+        "BLOCK_SIZE_K2": 64,
+        "GROUP_SIZE_M": 2,
+        "num_warps": 8,
+        "num_stages": 1,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    }
     if persistent:
         return {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N1": 128,
-            "BLOCK_SIZE_N2": 64,
             "BLOCK_SIZE_K1": 64,
             "BLOCK_SIZE_K2": 64,
         }
