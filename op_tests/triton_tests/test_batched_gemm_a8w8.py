@@ -5,8 +5,7 @@ import torch
 import pytest
 import functools
 from aiter.ops.triton.batched_gemm_a8w8 import batched_gemm_a8w8
-from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
-from aiter.ops.triton.utils.types import str_to_torch_dtype
+from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 from typing import Union
 
