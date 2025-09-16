@@ -1,8 +1,36 @@
 import torch
 import triton.language as tl
-from . import arch_info
+from ._triton import arch_info
 
-e5m2_dtype, e4m3_dtype = arch_info.get_fp8_dtypes()
+
+def get_dtype_max(dtype):
+    if torch.is_floating_point(torch.tensor([], dtype=dtype)):
+        return torch.finfo(dtype).max
+    else:
+        return torch.iinfo(dtype).max
+
+
+def get_fp8_dtypes():
+    if arch_info.get_arch() in ("gfx950"):
+        e5m2_dtype = torch.float8_e5m2
+        e4m3_dtype = torch.float8_e4m3fn
+    else:
+        e5m2_dtype = torch.float8_e5m2fnuz
+        e4m3_dtype = torch.float8_e4m3fnuz
+
+    return e5m2_dtype, e4m3_dtype
+
+
+def get_fp8_e4m3_dtype():
+    if arch_info.get_arch() in ("gfx950"):
+        e4m3_dtype = torch.float8_e4m3fn
+    else:
+        e4m3_dtype = torch.float8_e4m3fnuz
+
+    return e4m3_dtype
+
+
+e5m2_dtype, e4m3_dtype = get_fp8_dtypes()
 str_to_torch_dtype = {
     "float64": torch.float64,
     "float32": torch.float32,
@@ -42,8 +70,16 @@ torch_to_triton_dtype = {
 }
 
 
-def get_dtype_max(dtype):
-    if torch.is_floating_point(torch.tensor([], dtype=dtype)):
-        return torch.finfo(dtype).max
+def _is_fp8(x):
+    if x.dtype in {
+        torch.float8_e4m3fnuz,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+    }:
+        if arch_info.is_fp8_avail():
+            return True
+        else:
+            raise RuntimeError("This device does not support fp8")
     else:
-        return torch.iinfo(dtype).max
+        return False
