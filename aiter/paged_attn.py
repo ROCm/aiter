@@ -247,7 +247,7 @@ class PagedAttention:
     ) -> torch.Tensor:
         # Whether to use rocm custom paged attention or not
         num_seqs, num_heads, head_size = query.shape
-        block_size = value_cache.shape[3]
+        block_size = key_cache.size(3)
         gqa_ratio = num_heads // num_kv_heads
         use_custom = _use_rocm_custom_paged_attention(
             query.dtype, head_size, block_size, gqa_ratio, max_seq_len
@@ -300,7 +300,6 @@ class PagedAttention:
             max_num_partitions = (max_seq_len + _PARTITION_SIZE - 1) // _PARTITION_SIZE
             if blocksparse_vert_stride is not None and blocksparse_vert_stride > 1:
                 # use blocksparse paged attention
-                block_size = value_cache.size(-1)
                 assert (
                     blocksparse_block_size > 0
                     and blocksparse_block_size % block_size == 0
