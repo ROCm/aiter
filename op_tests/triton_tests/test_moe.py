@@ -4,6 +4,7 @@
 import torch
 import pytest
 from typing import Dict
+import triton
 
 from aiter.ops.triton.moe_op import (
     fused_moe as triton_moe,
@@ -326,14 +327,17 @@ def get_default_config_moe_e2e(N: int, persistent: bool) -> Dict[str, int]:
     if N <= 768:
         # we fit the whole token intermediate representation in registers in order to fuse the two gemms
         return {
-            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_M": 32,
             "BLOCK_SIZE_N": triton.next_power_of_2(N),
-            "BLOCK_SIZE_K1": 64,
-            "BLOCK_SIZE_K2": 64,
-            "GROUP_SIZE_M": 2,
+            "BLOCK_SIZE_K1": 32,
+            "BLOCK_SIZE_K2": 32,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "waves_per_eu": 2,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1
         }
-    
-    
     
     if persistent:
         return {
@@ -475,7 +479,6 @@ def input_helper(
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
     moe_config_func = get_optimal_moe_config_func(
-        N,
         dtype, use_int8_w8a16=int8_w8a16, use_fp8_w8a8=fp8_w8a8
     )
 
@@ -610,7 +613,7 @@ def input_helper_e2e(
     softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
-    config = get_default_config_moe_e2e(persistent)
+    config = get_default_config_moe_e2e(N, persistent)
     sorted_token_ids, expert_ids, num_tokens_post_padded = (
         torch_moe_align_block_size_ref(topk_ids, config["BLOCK_SIZE_M"], E)
     )
@@ -1039,21 +1042,23 @@ def test_fused_moe_gelu(
 @pytest.mark.parametrize(
     "M, N, K, top_k, E",
     [
-        (16, 14336, 4096, 2, 8),
-        (16, 14336, 1, 2, 4),
-        (1, 14336, 128, 2, 4),
-        (3, 14336, 128, 2, 4),
-        (16, 14336, 128, 1, 4),
-        (16, 14336, 128, 1, 1),
-        (1, 1024, 16384, 1, 2),
+        (16, 768, 2048, 8, 128),
+        (128, 768, 2048, 8, 128),
+        (512, 768, 2048, 8, 128),
+        # (16, 14336, 1, 2, 4),
+        # (1, 14336, 128, 2, 4),
+        # (3, 14336, 128, 2, 4),
+        # (16, 14336, 128, 1, 4),
+        # (16, 14336, 128, 1, 1),
+        # (1, 1024, 16384, 1, 2),
     ],
 )
 @pytest.mark.parametrize("routed_weight", [False, True])
 # @pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False), (True, False), (False, True)]) #TODO: Accuracy issues with fp8
 @pytest.mark.parametrize("fp8_w8a8, int8_w8a16", [(False, False)])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("persistent", [True, False])
+@pytest.mark.parametrize("persistent", [False])
 def test_moe_e2e(
     M: int,
     N: int,

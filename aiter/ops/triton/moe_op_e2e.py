@@ -10,6 +10,8 @@ from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.arch_info import get_num_xcds
+from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
 
 _LOGGER = AiterTritonLogger()
 
@@ -141,134 +143,94 @@ def e2e_moe_kernel(
         tl.assume(stride_w2se > 0)
         tl.assume(stride_w2sk > 0)
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    ## pid remapping on xcds
-    # Number of pids per XCD in the new arrangement
-    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
-    # When GRID_MN cannot divide NUM_XCDS, some xcds will have
-    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
-    # We calculate the number of xcds that have pids_per_xcd pids as
-    # tall_xcds
-    tall_xcds = GRID_MN % NUM_XCDS
-    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
-    # Compute current XCD and local pid within the XCD
-    xcd = pid % NUM_XCDS
-    local_pid = pid // NUM_XCDS
-    # Calculate new pid based on the new grouping
-    # Note that we need to consider the following two cases:
-    # 1. the current pid is on a tall xcd
-    # 2. the current pid is on a short xcd
-    if xcd < tall_xcds:
-        pid = xcd * pids_per_xcd + local_pid
+    GRID_MN = num_pid_n * num_pid_m
+    if pid < GRID_MN:
+        pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
     else:
-        pid = (
-            tall_xcds * pids_per_xcd
-            + (xcd - tall_xcds) * (pids_per_xcd - 1)
-            + local_pid
-        )
-
-    if GROUP_SIZE_M == 1:
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-    else:
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + (pid % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
+        return
+    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
     # ----------------------------------------------------------
     # Create pointers for the first blocks of A and B.
     # We will advance this pointer as we move in the K direction
     # and accumulate
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
+
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m)
+    # TODO: add off_experts=-1 return condition
+
     offs_k1 = tl.arange(0, BLOCK_SIZE_K1)
     offs_k2 = tl.arange(0, BLOCK_SIZE_K2)
 
-    BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
-    i = tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
-    # [0, 0, 1, 1, ..., BLOCK_SIZE_HALF - 1, BLOCK_SIZE_HALF - 1]
-    i_floor = i // 2
-    offs_half = (pid_n * (BLOCK_SIZE_N // 2) + i_floor) % (N // 2)
-    # (i % 2): [0, 1, 0, 1, ...] (alternating)
-    # (i % 2) * (N // 2) : [0, (N // 2), 0, (N // 2),...]
-    # So offs_w1n now takes element from the first BLOCK_SIZE_HALF half and the second BLOCK_SIZE_HALF half in an alternating way (This allows us to do reshape without permute)
-    offs_w1n = (offs_half + (i % 2) * (N // 2)) % N
+    BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2 # TODO: quarantee that BLOCK_SIZE_HALF*2=BLOCK_SIZE_N
+    offs_i0 = tl.arange(0, BLOCK_SIZE_HALF)
+    offs_i1 = tl.arange(0, BLOCK_SIZE_HALF) + N // 2
 
-    mask_w1n = (pid_n * BLOCK_SIZE_N + i) < N
+    i0 = pid_n * BLOCK_SIZE_HALF + offs_i0
+    i1 = pid_n * BLOCK_SIZE_HALF + offs_i1
+
+    # TODO: add EVEN_N and pid_n is not last pid_n so no need for masking conditions
+    mask_w1n = i0 < (N//2)
 
     a_ptrs = A + (
         offs_token[:, None] // top_k * stride_am + offs_k1[None, :] * stride_ak
     )
-    w1_ptrs = (
+    w1_ptrs_i0 = (
         W1
         + off_experts * stride_w1e
-        + (offs_k1[:, None] * stride_w1k + offs_w1n[None, :] * stride_w1n)
+        + (offs_k1[:, None] * stride_w1k + i0[None, :] * stride_w1n)
     )
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    w1_ptrs_i1 = (
+        W1
+        + off_experts * stride_w1e
+        + (offs_k1[:, None] * stride_w1k + i1[None, :] * stride_w1n)
+    )
 
-    if use_int8_w8a16:
-        w1_scale_ptrs = (
-            W1_scale + off_experts * stride_w1se + offs_w1n[None, :] * stride_w1sn
-        )
-        w1_scale = tl.load(w1_scale_ptrs)
-
-    if use_fp8_w8a8:
-        a_scale = tl.load(A_scale)
-        w1_scale = tl.load(W1_scale + off_experts)
+    silu_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=tl.float32)
+    mul_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=tl.float32)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K1)):
         # Masking ensures we don't load from invalid tokens or indices
         if EVEN_K:
             a = tl.load(a_ptrs, mask=(token_mask[:, None]), other=0.0)
-            w1 = tl.load(w1_ptrs, mask=mask_w1n[None, :], other=0.0)
+            w1_i0 = tl.load(w1_ptrs_i0, mask=mask_w1n[None, :], other=0.0)
+            w1_i1 = tl.load(w1_ptrs_i1, mask=mask_w1n[None, :], other=0.0)
         else:
             a = tl.load(
                 a_ptrs,
                 mask=(token_mask[:, None] & (offs_k1[None, :] < K - k * BLOCK_SIZE_K1)),
                 other=0.0,
             )
-            w1 = tl.load(
-                w1_ptrs,
+            w1_i0 = tl.load(
+                w1_ptrs_i0,
                 mask=(offs_k1[:, None] < K - k * BLOCK_SIZE_K1) & mask_w1n[None, :],
                 other=0.0,
             )
-        # w1 = tl.zeros((BLOCK_SIZE_K1, BLOCK_SIZE_N), dtype=dtype)
+            w1_i1 = tl.load(
+                w1_ptrs_i1,
+                mask=(offs_k1[:, None] < K - k * BLOCK_SIZE_K1) & mask_w1n[None, :],
+                other=0.0,
+            )
+        
+        mul_acc = tl.dot(a, w1_i1, acc=mul_acc)
+        silu_acc = tl.dot(a, w1_i0, acc=silu_acc)
 
-        if use_int8_w8a16:
-            accumulator = tl.dot(a, w1.to(a.type), acc=accumulator)
-        elif use_fp8_w8a8:
-            accumulator += tl.dot(a, w1)
-        else:
-            accumulator = tl.dot(a, w1, acc=accumulator)
         a_ptrs += BLOCK_SIZE_K1 * stride_ak
-        w1_ptrs += BLOCK_SIZE_K1 * stride_w1k
+        w1_ptrs_i0 += BLOCK_SIZE_K1 * stride_w1k
+        w1_ptrs_i1 += BLOCK_SIZE_K1 * stride_w1k
 
-    if use_int8_w8a16:
-        accumulator = accumulator * w1_scale
-    elif use_fp8_w8a8:
-        accumulator = accumulator * a_scale * w1_scale
-
-    silu_acc, mul_acc = accumulator.reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
     silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
     acc = (silu_acc * mul_acc).to(dtype)
-
-    # TODO scale acc
-    acc_scale = 1.0
-    # TODO scale acc
-    # -------------------------------
 
     offs_w2n = tl.arange(0, BLOCK_SIZE_N // 2) + pid_n * (BLOCK_SIZE_N // 2)
 
@@ -279,28 +241,8 @@ def e2e_moe_kernel(
     )
     out_ptrs = Out + stride_cm * offs_token[:, None] + offs_k2[None, :]
 
-    # if use_int8_w8a16:
-    #     w2_scale_ptrs = W2_scale + off_experts * stride_w2se + offs_w2n[None, :]
-    #     w2_scale = tl.load(w2_scale_ptrs)
-    if use_fp8_w8a8:
-        # acc_quantized, _, acc_scale = quantize_tensor_triton(acc, dtype=fp8_type)
-        w2_scale = tl.load(W2_scale + off_experts)
-
-    # minus if pid_m is even otherwise positive
-    k_sign = (pid_m % 2) * 2 - 1
     num_k = tl.cdiv(K, BLOCK_SIZE_K2)
-    for _k in tl.range(0, num_k, num_stages=atomic_num_stages):
-        k = (num_k + (_k * k_sign)) % num_k
-        k = ((k + pid_n * 4)) % num_k
-        # k = _k
-
-        if use_int8_w8a16:
-            w2_scale_ptrs = (
-                W2_scale
-                + off_experts * stride_w2se
-                + (offs_k2 + k * BLOCK_SIZE_K2)[None, :] * stride_w2sk
-            )
-            w2_scale = tl.load(w2_scale_ptrs)
+    for k in tl.range(0, num_k, num_stages=atomic_num_stages):
 
         if EVEN_K:
             w2 = tl.load(
@@ -317,12 +259,8 @@ def e2e_moe_kernel(
                 ),
                 other=0.0,
             )
-        # w2 = tl.zeros((BLOCK_SIZE_HALF, BLOCK_SIZE_K2), dtype=dtype)
 
-        if use_int8_w8a16:
-            out = tl.dot(acc, w2.to(dtype))
-        else:
-            out = tl.dot(acc, w2)
+        out = tl.dot(acc, w2)
 
         if MUL_ROUTED_WEIGHT:
             moe_weight = tl.load(
@@ -330,18 +268,14 @@ def e2e_moe_kernel(
             )
             out = out * moe_weight[:, None]
 
-        if use_int8_w8a16:
-            out = out * w2_scale
-        elif use_fp8_w8a8:
-            out = out * acc_scale * w2_scale
-
-        # # atomic add
         if EVEN_K:
             c_mask = token_mask[:, None]
         else:
             c_mask = token_mask[:, None] & ((offs_k2 + k * BLOCK_SIZE_K2)[None, :] < K)
 
         if SKINNY:
+            # Skinny means that we can fit the whole intermediate representation of a token in register memory (i.e. N <= BLOCK_SIZE_N). 
+            # Thus we don't need atomics, as there is only workgroup updating the output tile.
             tl.store(out_ptrs + k * BLOCK_SIZE_K2, out, mask=c_mask)
         
         else:
