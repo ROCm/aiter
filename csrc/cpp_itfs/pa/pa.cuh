@@ -49,7 +49,7 @@
 // clang-format off
 template <typename scalar_t, typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE, int BLOCK_SIZE,
-          int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED, int GQA_RATIO, int MTP=1, vllm::Fp8QuantMethod QUANT_METHOD=vllm::Fp8QuantMethod::kPerTensor>
+          int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED, int GQA_RATIO, int MTP=1, vllm::Fp8QuantMethod QUANT_METHOD=vllm::Fp8QuantMethod::kPerTensor, bool V_SHUFFLE=false>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,         // [num_seqs*mtp, num_heads, head_size]
@@ -324,21 +324,42 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     // v fetches are 16head elems across lanes x 16 tokens per lane
     for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
     {
-        const int vhead_elem  = vhe_depth * NWARPS * 16 + warpid * 16 + lane16id;
-        const cache_t* v_ptr2 = v_ptr + vhead_elem * BLOCK_SIZE;
-        for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
+        const int vhead_elem = vhe_depth * NWARPS * 16 + warpid * 16 + lane16id;
+        if constexpr(V_SHUFFLE)
         {
-            const int64_t vblock_number =
-                static_cast<int64_t>(vphysical_block_number[vtoken_depth]);
-            // const int offset = vphysical_block_offset[vtoken_depth] /
-            // CONTIGUOUS_KV_ELEMS_16B_LOAD;
-            const cache_t* v_ptr3 =
-                v_ptr2 + (vblock_number * kv_block_stride) + vphysical_block_offset[vtoken_depth];
-            for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
+            const cache_t* v_ptr2 = v_ptr + vhead_elem * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+            for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
             {
-                const cache_t* v_fetch_ptr = v_ptr3 + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
-                const _B16x8* v_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(v_fetch_ptr);
-                Vlocal[vtoken_depth][vhe_depth][vfetch_depth] = *v_fetch_ptr_16B;
+                const int64_t vblock_number =
+                    static_cast<int64_t>(vphysical_block_number[vtoken_depth]);
+                const int offset =
+                    vphysical_block_offset[vtoken_depth] / CONTIGUOUS_KV_ELEMS_16B_LOAD;
+                const cache_t* v_ptr3 = v_ptr2 + vblock_number * kv_block_stride;
+                for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
+                {
+                    const cache_t* v_fetch_ptr =
+                        v_ptr3 + (offset + vfetch_depth) * HEAD_SIZE * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+                    const _B16x8* v_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(v_fetch_ptr);
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] = *v_fetch_ptr_16B;
+                }
+            }
+        }
+        else
+        {
+            const cache_t* v_ptr2 = v_ptr + vhead_elem * BLOCK_SIZE;
+            for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
+            {
+                const int64_t vblock_number =
+                    static_cast<int64_t>(vphysical_block_number[vtoken_depth]);
+                const cache_t* v_ptr3 = v_ptr2 + (vblock_number * kv_block_stride) +
+                                        vphysical_block_offset[vtoken_depth];
+                for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
+                {
+                    const cache_t* v_fetch_ptr =
+                        v_ptr3 + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
+                    const _B16x8* v_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(v_fetch_ptr);
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] = *v_fetch_ptr_16B;
+                }
             }
         }
     }
@@ -906,7 +927,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
 template <typename scalar_t, typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE, int BLOCK_SIZE,
           int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED,
-          int GQA_RATIO, int MTP=1, vllm::Fp8QuantMethod QUANT_METHOD=vllm::Fp8QuantMethod::kPerTensor>
+          int GQA_RATIO, int MTP=1, vllm::Fp8QuantMethod QUANT_METHOD=vllm::Fp8QuantMethod::kPerTensor, bool V_SHUFFLE=false>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
