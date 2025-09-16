@@ -364,6 +364,15 @@ def test_pa_mtp(
     )
     k_cache, v_cache = k_caches[0], v_caches[0]
 
+    out_ref_noquant = torch_mha_extend(
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        qo_indptr,
+    )
+
     # out_asm_noquant, us_asm_noquant = run_aiter_asm(
     #     query,
     #     k_cache,
@@ -383,37 +392,35 @@ def test_pa_mtp(
     # ret["err_asm_bf16"] = err_noquant
 
     scale = float(1.0 / (head_size**0.5))
-
-    k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
-        pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
-    )
-
-    out_ref = torch_mha_extend(
-        query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
-    )
-
-    out_hip, us_hip = run_aiter_hip(
+    out_hip_noquant, us_hip = run_aiter_hip(
         query,
-        k_quant_,
-        asm_V_shuffle(v_quant_),
+        k_cache,
+        v_cache,
         block_tables,
         seq_lens,
         ctx_lens,
         max_qlen,
-        "fp8",
+        "auto",
         num_kv_heads,
         scale,
-        k_scale_,
-        v_scale_,
     )
     err_noquant = checkAllclose(
-        out_ref,
-        out_hip,
+        out_ref_noquant,
+        out_hip_noquant,
         msg=f"[torch vs  aiter_hip][No Quant]: {us_hip:>8.2f} us......",
     )
     ret["us_hip_bf16"] = us_hip
     ret["err_hip_bf16"] = err_noquant
 
+    # ################## quant start ######################
+    k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
+        pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
+    )
+
+    # torch ref
+    out_ref = torch_mha_extend(
+        query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
+    )
     out_aiter_asm, us_aiter_asm = run_aiter_asm(
         query,
         k_quant_,
@@ -426,40 +433,44 @@ def test_pa_mtp(
         v_scale_asm,
         qo_indptr,
     )
-    ret["us_asm_fp8"] = us_aiter_asm
-
-    # out_hip, us_hip = run_aiter_hip(
-    #     query,
-    #     k_quant_,
-    #     v_quant_,
-    #     block_tables,
-    #     seq_lens,
-    #     ctx_lens,
-    #     max_qlen,
-    #     "auto",
-    #     num_kv_heads,
-    #     # k_scale_asm,
-    #     # v_scale_asm,
-    # )
-
-    # print(out_ref)
-    # print(out_aiter_asm)
-
     err = checkAllclose(
         out_ref,
         out_aiter_asm,
         msg=f"[torch vs  aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
     )
+    ret["us_asm_fp8"] = us_aiter_asm
     ret["err fp8"] = err
+
+    out_hip, us_hip = run_aiter_hip(
+        query,
+        k_quant_,
+        asm_V_shuffle(v_quant_),
+        block_tables,
+        seq_lens,
+        ctx_lens,
+        max_qlen,
+        "fp8",
+        num_kv_heads,
+        scale,
+        k_scale_asm,
+        v_scale_asm,
+    )
+    err = checkAllclose(
+        out_ref,
+        out_hip,
+        msg=f"[torch vs  aiter_hip][   Quant]: {us_hip:>8.2f} us......",
+    )
+    ret["us_hip_fp8"] = us_hip
+    ret["err_hip_fp8"] = err
     return ret
 
 
 head_dim = 128
-block_size = 1024
+block_size = 16
 l_dtype = ["bf16"]
-l_num_heads = [(5, 1), (8, 1), (16, 1)][:-1]
+l_num_heads = [(5, 1), (8, 1), (10, 1)]
 l_qlen = [1, 2, 3, 4]
-l_ctx_len = [57, 66, 109, 128, 257, 282, 4097]
+l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097]
 l_batch_size = [128]
 
 parser = argparse.ArgumentParser(
