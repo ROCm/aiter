@@ -175,10 +175,13 @@ def e2e_moe_kernel(
     offs_i0 = tl.arange(0, BLOCK_SIZE_HALF)
     offs_i1 = tl.arange(0, BLOCK_SIZE_HALF) + N // 2
 
+    # offset for silu_acc
     i0 = pid_n * BLOCK_SIZE_HALF + offs_i0
+    # offset for mul_acc
     i1 = pid_n * BLOCK_SIZE_HALF + offs_i1
 
     # TODO: add EVEN_N and pid_n is not last pid_n so no need for masking conditions
+    # same mask applicable to both silu and mul acc
     mask_w1n = i0 < (N//2)
 
     a_ptrs = A + (
