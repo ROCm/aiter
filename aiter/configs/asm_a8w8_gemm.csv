@@ -1,8 +1,9 @@
 M,N,K,bias,outdtype,splitK,us
 128,1280,8192,True,torch.bfloat16,3,13.85
+192,128,5120,True,torch.bfloat16,8,18.90
 192,1280,8192,True,torch.bfloat16,3,13.90
-192,1536,5120,True,torch.bfloat16,3,13.90
-192,5120,1280,True,torch.bfloat16,3,13.90
+192,1536,5120,True,torch.bfloat16,6,15.90
+192,5120,1280,True,torch.bfloat16,2,13.90
 256,1280,8192,True,torch.bfloat16,3,25.54
 320,1280,8192,True,torch.bfloat16,3,25.56
 512,1280,8192,True,torch.bfloat16,3,48.06
