@@ -330,11 +330,11 @@ def get_default_config_moe_e2e(N: int, persistent: bool) -> Dict[str, int]:
             "BLOCK_SIZE_M": 32,
             "BLOCK_SIZE_N": triton.next_power_of_2(N),
             "BLOCK_SIZE_K1": 32,
-            "BLOCK_SIZE_K2": 32,
+            "BLOCK_SIZE_K2": 64,
             "GROUP_SIZE_M": 1,
             "num_warps": 4,
             "num_stages": 2,
-            "waves_per_eu": 2,
+            "waves_per_eu": 1,
             "matrix_instr_nonkdim": 16,
             "kpack": 1
         }
