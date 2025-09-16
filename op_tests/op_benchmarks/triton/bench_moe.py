@@ -176,7 +176,11 @@ def run_benchmark(args):
     if (int8_w8a16 or int4_w4a16) and (group_size is not None) and group_size > 0:
         kernel_name = "_fused_moe_kernel_gptq_awq"
 
-    x_vals_list = model_benchmark_configs(args)
+    # python3 op_tests/test_moe_blockscale.py -d bf16 -m 32 -dim 7168 -idim 512 -e 512 -k 8
+    if args.M and args.N and args.K and args.TopK and args.E:
+        x_vals_list = [("custom shape", args.M, args.N, args.K, args.E, args.TopK)]
+    else:
+        x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k"]
 
     if print_time:
@@ -280,7 +284,13 @@ def parse_args():
         + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
     )
     parser.add_argument("--model", type=str, default=None, help=model_help)
-    parser.add_argument("-M", type=int, default=0, help="M dimension")
+    parser.add_argument("-M", type=int, default=0, help="num tokens")
+    parser.add_argument("-N", type=int, default=0, help="intermediate dimension")
+    parser.add_argument("-K", type=int, default=0, help="hidden dimension (input/output dimension of moe)")
+    parser.add_argument("-TopK", type=int, default=0, help="topk experts chosen per token")
+    parser.add_argument("-E", type=int, default=0, help="number of experts")
+
+    
     parser.add_argument(
         "-group_size", type=int, default=None, help="group_size for in4"
     )
