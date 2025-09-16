@@ -953,7 +953,7 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
 {
     if(s.log_level_ > 0)
         std::cout << ", " << fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name << ", " << fmha_bwd_convert_dq_get_name_<convert_dq_trait_>() << std::flush;
-    if (is_v3_api_check) return -1;
+    if (is_v3_api_check) return 1;
 
     fmha_bwd_v3_args_gfx950 args;
     args.ptr_dq         = a.dq_acc_ptr;
@@ -1019,7 +1019,7 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
 
     if(s.log_level_ > 0)
         std::cout << ", " << fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name << dq_shuffle_traits::kernel_name() << std::flush;
-    if (is_v3_api_check) return -1;
+    if (is_v3_api_check) return 1;
 
     fmha_bwd_v3_args_gfx950 args;
     args.ptr_dq             = a.dq_acc_ptr;
