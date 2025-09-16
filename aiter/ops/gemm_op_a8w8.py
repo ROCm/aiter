@@ -72,7 +72,7 @@ def gemm_a8w8_bpreshuffle_ck(
 
 def gen_gemm_a8w8_asm_fake_tensors(
     XQ: Tensor,  # A:[M, K] i8
-    WQ: Tensor,  # B:[N, K] i8 -> shuffle layout(16,16)
+    WQ: Tensor,  # B:[N, K] i8 -> shuffle layout(32,16)
     x_scale: Tensor,  # A_scale:[M, 1] f32
     w_scale: Tensor,  # B_scale:[1, N] f32
     Out: Tensor,  # Out:[M, N] bf16
@@ -91,7 +91,7 @@ def gen_gemm_a8w8_asm_fake_tensors(
 )
 def gemm_a8w8_asm(
     XQ: Tensor,  # A:[M, K] i8
-    WQ: Tensor,  # B:[N, K] i8 -> shuffle layout(16,16)
+    WQ: Tensor,  # B:[N, K] i8 -> shuffle layout(32,16)
     x_scale: Tensor,  # A_scale:[M, 1] f32
     w_scale: Tensor,  # B_scale:[1, N] f32
     Out: Tensor,  # Out:[M, N] bf16
@@ -287,7 +287,7 @@ def gemm_a8w8_ASM(
     """
     Notes for use gemm_a8w8_ASM:
     1. WQ(weight) must be shuffle, you can use \
-        'weightshuffle = shuffle_weight(weight,layout=(16,16))'
+        'weightshuffle = shuffle_weight(weight,layout=(32,16))'
     2. Use asm gemm must give bias, if not have bias, please give  \
         'bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')'
     """

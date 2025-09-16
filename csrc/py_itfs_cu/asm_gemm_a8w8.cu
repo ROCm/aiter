@@ -66,12 +66,13 @@ std::tuple<std::string, int> get_heuristic_kernel(
     hipDeviceProp_t dev_prop;
     HIP_CALL(hipGetDevice(&dev));
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-    uint32_t num_cu                = dev_prop.multiProcessorCount;
-    uint32_t empty_cu              = num_cu;
-    uint32_t tg_num                = 0;
-    uint32_t round                 = 0xffffffff;
-    float compute2mem_effi         = 1.0;
-    int k_split_en                 = (k_split.has_value() && k_split.value() != 0) ? 1 : 0;
+    uint32_t num_cu        = dev_prop.multiProcessorCount;
+    uint32_t empty_cu      = num_cu;
+    uint32_t tg_num        = 0;
+    uint32_t round         = 0xffffffff;
+    float compute2mem_effi = 1.0;
+    // int k_split_en                 = (k_split.has_value() && k_split.value() != 0) ? 1 : 0;
+    int k_split_en                 = 1;
     int bpreshuffle_en             = (bpreshuffle.has_value() && !bpreshuffle) ? 0 : 1;
     std::string selectedKernelName = "";
     int selectedsplitK             = 1;
@@ -125,7 +126,7 @@ std::tuple<std::string, int> get_heuristic_kernel(
 }
 
 torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
-                            torch::Tensor& B,       // B:[N, K] i8 -> shuffle layout(16,16)
+                            torch::Tensor& B,       // B:[N, K] i8 -> shuffle layout(32,16)
                             torch::Tensor& A_scale, // A_scale:[M, 1] f32
                             torch::Tensor& B_scale, // B_scale:[1, N] f32
                             torch::Tensor& out,     // Out:[M, N] bf16
@@ -146,7 +147,7 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
     int stride_b = Kdim + pad_b;
     int stride_c = Ndim + pad_c;
     stride_c     = stride_c * sizeof(uint16_t);
-    int ks       = splitK.value_or(1);
+    int ks       = splitK.value_or(0) ?: 1;
 
     KernelArgs args;
     size_t arg_size = sizeof(args);
@@ -252,13 +253,8 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
             //        ks,
             //        k_per_split,
             //        k_per_split_aligned);
-            // int k_num         = 1 << args.k_split;
-            // TORCH_CHECK(Kdim % k_num == 0, __func__, " Kdim % (1 << args.k_split) != 0 !");
             if(selectedksplit > 1)
                 out.zero_();
-            // int k_per_tg = Kdim / k_num;
-            // k_per_tg     = ((k_per_tg + 256 - 1) / 256) * 256;
-            // gdz          = (Kdim + k_per_tg - 1) / k_per_tg;
         }
         gdx         = gdx * ks;
         auto result = impl_ptr_map.emplace(name, nullptr);

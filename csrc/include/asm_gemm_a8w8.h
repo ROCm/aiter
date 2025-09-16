@@ -4,7 +4,7 @@
 #include <torch/extension.h>
 
 torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
-                            torch::Tensor& B,       //  B:[N, K] i8 -> shuffle layout(16,16)
+                            torch::Tensor& B,       //  B:[N, K] i8 -> shuffle layout(32,16)
                             torch::Tensor& A_scale, // A_scale:[M, 1] f32
                             torch::Tensor& B_scale, // B_scale:[1, N] f32
                             torch::Tensor& out,     // Out:[M, N] bf16
