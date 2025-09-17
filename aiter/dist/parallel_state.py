@@ -389,6 +389,7 @@ class GroupCoordinator:
             and self.ca_comm.should_custom_ar(input_)
         ):
             outplace_all_reduce_method = "ca"
+        if outplace_all_reduce_method is not None:
             return torch.ops.aiter.outplace_all_reduce(
                 input_,
                 group_name=self.unique_name,
