@@ -123,29 +123,50 @@ def _fwd_grouped_kernel_stage1(
     acc = tl.zeros([BLOCK_H, BLOCK_C], dtype=tl.float32)
 
     if split_kv_end > split_kv_start:
-        offs_n = split_kv_start + tl.arange(0, BLOCK_N)
-        kv_loc = tl.load(
-            kv_indices + cur_batch_kv_start_idx + offs_n,
-            mask=offs_n < split_kv_end,
-            other=0,
-        )
-
-        offs_buf_kv = kv_loc[None, :] * stride_buf_kbs + offs_c[:, None]
-        offs_buf_k_pe = kv_loc[None, :] * stride_buf_kbs + offs_qk_r[:, None]
-
-        k_pe = tl.load(
-            K_Buffer + offs_buf_k_pe,
-            mask=(offs_n[None, :] < split_kv_end) & (mask_qk_r[:, None]),
-            other=0.0,
-        )  # positional embedding part of keys
-
-        kv = tl.load(
-            K_Buffer + offs_buf_kv,
-            mask=(offs_n[None, :] < split_kv_end) & (mask_c[:, None]),
-            other=0.0,
-        )  # the shared latent tensor for keys and values
+        # offs_n = split_kv_start + tl.arange(0, BLOCK_N)
+        # kv_loc = tl.load(
+        #     kv_indices + cur_batch_kv_start_idx + offs_n,
+        #     mask=offs_n < split_kv_end,
+        #     other=0,
+        # )
+        #
+        # offs_buf_kv = kv_loc[None, :] * stride_buf_kbs + offs_c[:, None]
+        # offs_buf_k_pe = kv_loc[None, :] * stride_buf_kbs + offs_qk_r[:, None]
+        #
+        # k_pe = tl.load(
+        #     K_Buffer + offs_buf_k_pe,
+        #     mask=(offs_n[None, :] < split_kv_end) & (mask_qk_r[:, None]),
+        #     other=0.0,
+        # )  # positional embedding part of keys
+        #
+        # kv = tl.load(
+        #     K_Buffer + offs_buf_kv,
+        #     mask=(offs_n[None, :] < split_kv_end) & (mask_c[:, None]),
+        #     other=0.0,
+        # )  # the shared latent tensor for keys and values
 
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            kv_loc = tl.load(
+                kv_indices + cur_batch_kv_start_idx + offs_n,
+                mask=offs_n < split_kv_end,
+                other=0,
+            )
+
+            offs_buf_kv = kv_loc[None, :] * stride_buf_kbs + offs_c[:, None]
+            offs_buf_k_pe = kv_loc[None, :] * stride_buf_kbs + offs_qk_r[:, None]
+
+            k_pe = tl.load(
+                K_Buffer + offs_buf_k_pe,
+                mask=(offs_n[None, :] < split_kv_end) & (mask_qk_r[:, None]),
+                other=0.0,
+            )  # positional embedding part of keys
+
+            kv = tl.load(
+                K_Buffer + offs_buf_kv,
+                mask=(offs_n[None, :] < split_kv_end) & (mask_c[:, None]),
+                other=0.0,
+            )  # the shared latent tensor for keys and values
             # (16, 64) x (64, 32)
             v = kv.T
             # dot product of rope parts
@@ -163,28 +184,28 @@ def _fwd_grouped_kernel_stage1(
             qk = tl.where(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
             )
-            if start_n + BLOCK_N < split_kv_end:
-                offs_n = start_n + tl.arange(0, BLOCK_N) + BLOCK_N
-                kv_loc = tl.load(
-                    kv_indices + cur_batch_kv_start_idx + offs_n,
-                    mask=offs_n < split_kv_end,
-                    other=0,
-                )
-
-                offs_buf_kv = kv_loc[None, :] * stride_buf_kbs + offs_c[:, None]
-                offs_buf_k_pe = kv_loc[None, :] * stride_buf_kbs + offs_qk_r[:, None]
-
-                k_pe = tl.load(
-                    K_Buffer + offs_buf_k_pe,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_qk_r[:, None]),
-                    other=0.0,
-                )  # positional embedding part of keys
-
-                kv = tl.load(
-                    K_Buffer + offs_buf_kv,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_c[:, None]),
-                    other=0.0,
-                )  # the shared latent tensor for keys and values
+            # if start_n + BLOCK_N < split_kv_end:
+            #     offs_n = start_n + tl.arange(0, BLOCK_N) + BLOCK_N
+            #     kv_loc = tl.load(
+            #         kv_indices + cur_batch_kv_start_idx + offs_n,
+            #         mask=offs_n < split_kv_end,
+            #         other=0,
+            #     )
+            #
+            #     offs_buf_kv = kv_loc[None, :] * stride_buf_kbs + offs_c[:, None]
+            #     offs_buf_k_pe = kv_loc[None, :] * stride_buf_kbs + offs_qk_r[:, None]
+            #
+            #     k_pe = tl.load(
+            #         K_Buffer + offs_buf_k_pe,
+            #         mask=(offs_n[None, :] < split_kv_end) & (mask_qk_r[:, None]),
+            #         other=0.0,
+            #     )  # positional embedding part of keys
+            #
+            #     kv = tl.load(
+            #         K_Buffer + offs_buf_kv,
+            #         mask=(offs_n[None, :] < split_kv_end) & (mask_c[:, None]),
+            #         other=0.0,
+            #     )  # the shared latent tensor for keys and values
 
 
 

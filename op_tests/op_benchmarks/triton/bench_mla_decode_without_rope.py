@@ -10,12 +10,12 @@ import itertools
 
 import aiter
 
-# from aiter.ops.triton.mla_decode import (
-#     decode_attention_fwd_grouped,
-# )
-from aiter.ops.triton.gluon.mla_decode import (
+from aiter.ops.triton.mla_decode import (
     decode_attention_fwd_grouped,
 )
+# from aiter.ops.triton.gluon.mla_decode import (
+#     decode_attention_fwd_grouped,
+# )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_mla_decode import input_helper, ref_preprocess
 from aiter.test_common import checkAllclose, run_perftest
