@@ -16,6 +16,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_evaluation_unit,
+    get_evaluation_label,
     model_benchmark_shapes,
     get_shape_benchmark_object,
     print_vgpr,
@@ -37,14 +38,7 @@ def get_model_benchmark_object(
         x_names = ["M", "hidden_dim", "intermediate_dim", "model_name"]
     x_vals_list = model_benchmark_shapes(args)
 
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "throughput":
-        ylabel = "Throughput (TFLOPS)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GB/s)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
+    ylabel = get_evaluation_label(args.metric)
 
     line_names = [get_evaluation_unit(args.metric)]
     line_vals = line_names
