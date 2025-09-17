@@ -176,7 +176,7 @@ def mha_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_fwd_fake_tensors(
@@ -218,7 +218,7 @@ def fmha_v3_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def cmdGenFunc_mha_varlen_fwd(
@@ -716,7 +716,7 @@ def gen_mha_bwd_fake_tensors(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
 
@@ -747,7 +747,7 @@ def mha_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_bwd_fake_tensors(
@@ -771,7 +771,7 @@ def gen_fmha_v3_bwd_fake_tensors(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
 
@@ -799,7 +799,7 @@ def fmha_v3_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def cmdGenFunc_mha_varlen_bwd(
@@ -987,7 +987,7 @@ def mha_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_varlen_bwd_fake_tensor(
@@ -1053,7 +1053,7 @@ def fmha_v3_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def maybe_contiguous(x):
@@ -2204,7 +2204,7 @@ def mha_batch_prefill_fake_tensors(
     out: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_heads = q.size(1)  # num_heads = q.sizes()[1]
     head_size_v = v.size(2)  # head_size_v = v.size(2)
@@ -2269,7 +2269,7 @@ def mha_batch_prefill(
     out: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def _mha_batch_prefill(
