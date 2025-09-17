@@ -931,6 +931,16 @@
           py::arg("shuffle_scale")   = true,                             \
           py::arg("num_rows")        = std::nullopt,                     \
           py::arg("num_rows_factor") = 1);                               \
+    m.def("smooth_per_token_scaled_quant",                               \
+          &aiter::smooth_per_token_scaled_quant,                         \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("scales"),                                             \
+          py::arg("smooth_scale"),                                       \
+          py::arg("smooth_scale_map") = std::nullopt,                    \
+          py::arg("shuffle_scale")    = false,                           \
+          py::arg("num_rows")         = std::nullopt,                    \
+          py::arg("num_rows_factor")  = 1);                               \
     m.def("partial_transpose",                                           \
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \
