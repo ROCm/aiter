@@ -82,9 +82,7 @@ def allreduce_quick(tp_size, pp_size, rankID, x, withGraph=False):
 
 
 @benchmark()
-def test_allreduce_quick(
-    tp_size=2, pp_size=1, shape=(1024, 8192), dtype=torch.float16, withGraph=False
-):
+def test_allreduce_quick(tp_size, pp_size, shape, dtype, withGraph=False):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
