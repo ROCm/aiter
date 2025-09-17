@@ -59,7 +59,7 @@ def input_helper(
 
     # interlancing [batch_start_off, batch_seq_len, batch_start_off, batch_seq_len, ...,]
     kv_indptr = cu_seqlens
-    kv_indices = torch.arange(total_seqlen, device=device)
+    kv_indices = torch.arange(total_seqlen, device=device).to(torch.int32)
 
     attn_logits = torch.zeros(
         B, H * SQ, num_kv_splits, kv_lora_rank, dtype=torch.float, device=device

@@ -33,9 +33,6 @@ from aiter.ops.triton.activation import _tanh
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-
-_LOGGER = AiterTritonLogger()
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -192,274 +189,216 @@ def _fwd_grouped_kernel_stage1(
         VALID_BLOCK_H: gl.constexpr = BLOCK_H
     else:
         VALID_BLOCK_H: gl.constexpr = kv_group_num
-    cur_head = cur_head_id * VALID_BLOCK_H + gl.arange(0, BLOCK_H)
+
+    cur_head = cur_head_id * VALID_BLOCK_H + gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope_mk)
+    )
     mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
     mask_h = mask_h & (cur_head < q_head_num)
 
-    offs_c = gl.arange(0, BLOCK_C)
-    offs_qk_r = gl.arange(kv_lora_rank, kv_lora_rank + BLOCK_R)  # to get the k_pe
+    cur_head_pe = gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_rope_mk)
+    )
+    mask_h_pe = cur_head_pe < VALID_BLOCK_H
+    mask_h_pe = mask_h_pe & (cur_head_pe < q_head_num)
+
+    offs_c = gl.arange(
+        0, BLOCK_C, layout=gl.SliceLayout(0, blocked_q_nope_mk)
+    )
+
+    offs_om = gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout_kv)
+    )
+    mask_om = offs_om < VALID_BLOCK_H
+    mask_om = mask_om & (offs_om < q_head_num)
+    offs_on = gl.arange(
+        0, BLOCK_C, layout=gl.SliceLayout(0, mfma_layout_kv)
+    )
+    mask_on = offs_on < kv_lora_rank
+
+    offs_qk_r = gl.arange(
+        kv_lora_rank,
+        kv_lora_rank + BLOCK_R,
+        layout=gl.SliceLayout(0, blocked_q_rope_mk)
+    )  # to get the k_pe
+
+    offs_k_c = gl.arange(
+        0, BLOCK_C, layout=gl.SliceLayout(1, blocked_ld_k_nope_kn)
+    )
+    offs_k_r = gl.arange(
+        kv_lora_rank,
+        kv_lora_rank + BLOCK_R,
+        layout=gl.SliceLayout(1, blocked_ld_k_rope_kn)
+    )  # to get the k_pe
 
     off_q_pe = (
-        cur_batch * stride_qb + cur_head[:, None] * stride_qh + offs_qk_r[None, :]
+        cur_batch * stride_qb + cur_head_pe[:, None] * stride_qh + offs_qk_r[None, :]
     )
     offs_q = cur_batch * stride_qb + cur_head[:, None] * stride_qh + offs_c[None, :]
 
     mask_c = offs_c < kv_lora_rank
+    mask_k_c = offs_k_c < kv_lora_rank
     mask_qk_r = offs_qk_r < (kv_lora_rank + qk_rope_head_dim)
+    mask_k_r = offs_k_r < (kv_lora_rank + qk_rope_head_dim)
 
     cur_batch_kv = cur_batch # // (max_qo_len // 2)
     cur_batch_kv_start_idx = gl.load(kv_indptr + cur_batch_kv)
     cur_batch_seq_len = gl.load(kv_indptr + cur_batch_kv + 1) - cur_batch_kv_start_idx
 
-    for work_id in range(work_start, work_end):
-        cur_batch = gl.load(work_info_set + work_id * 8)
-        split_id = gl.load(work_info_set + work_id * 8 + 1)
-
-        # q_start = gl.load(work_info_set + work_id * 8 + 2) # batch_start
-        # q_end = gl.load(work_info_set + work_id * 8 + 3) # batch_end
-
-        split_kv_start = gl.load(work_info_set + work_id * 8 + 4)
-        split_kv_end = gl.load(work_info_set + work_id * 8 + 5)
-
-        token_to_batch_end = gl.load(work_info_set + work_id * 8 + 6)
-
-        num_q_head_blk = gl.cdiv(q_head_num, BLOCK_H)
-
-        if BLOCK_H < kv_group_num:
-            VALID_BLOCK_H: gl.constexpr = BLOCK_H
-        else:
-            VALID_BLOCK_H: gl.constexpr = kv_group_num
-
-        cur_head = gl.arange(
-            0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope_mk)
-        )
-        mask_h = cur_head < VALID_BLOCK_H
-        mask_h = mask_h & (cur_head < q_head_num)
-
-        cur_head_pe = gl.arange(
-            0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_rope_mk)
-        )
-        mask_h_pe = cur_head_pe < VALID_BLOCK_H
-        mask_h_pe = mask_h_pe & (cur_head_pe < q_head_num)
-
-        offs_c = gl.arange(
-            0, BLOCK_C, layout=gl.SliceLayout(0, blocked_q_nope_mk)
-        )
-
-        offs_om = gl.arange(
-            0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout_kv)
-        )
-        mask_om = offs_om < VALID_BLOCK_H
-        mask_om = mask_om & (offs_om < q_head_num)
-        offs_on = gl.arange(
-            0, BLOCK_C, layout=gl.SliceLayout(0, mfma_layout_kv)
-        )
-        mask_on = offs_on < kv_lora_rank
-
-        offs_qk_r = gl.arange(
-            kv_lora_rank,
-            kv_lora_rank + BLOCK_R,
-            layout=gl.SliceLayout(0, blocked_q_rope_mk)
-        )  # to get the k_pe
-
-        offs_k_c = gl.arange(
-            0, BLOCK_C, layout=gl.SliceLayout(1, blocked_ld_k_nope_kn)
-        )
-        offs_k_r = gl.arange(
-            kv_lora_rank,
-            kv_lora_rank + BLOCK_R,
-            layout=gl.SliceLayout(1, blocked_ld_k_rope_kn)
-        )  # to get the k_pe
+    q = gl.amd.cdna3.buffer_load(
+        ptr=Q,
+        offsets=offs_q,
+        mask=(mask_h[:, None]) & (mask_c[None, :]),
+        # cache=cache_modifier,
+    )
+    smem_q_nope.store(q)
+    q = smem_q_nope.load(layout=dot_q_layout)
+    q_pe = gl.amd.cdna3.buffer_load(
+        ptr=Q,
+        offsets=off_q_pe,
+        mask=(mask_h_pe[:, None]) & (mask_qk_r[None, :]),
+        # cache=cache_modifier,
+    )
+    smem_q_rope.store(q_pe)
+    q_pe = smem_q_rope.load(layout=dot_q_layout)
 
 
-        off_q_pe = (
-            cur_batch * stride_qb + cur_head_pe[:, None] * stride_qh + offs_qk_r[None, :]
-        )
-        offs_q = cur_batch * stride_qb + cur_head[:, None] * stride_qh + offs_c[None, :]
+    kv_len_per_split = gl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
-        mask_c = offs_c < kv_lora_rank
-        mask_k_c = offs_k_c < kv_lora_rank
-        mask_qk_r = offs_qk_r < (kv_lora_rank + qk_rope_head_dim)
-        mask_k_r = offs_k_r < (kv_lora_rank + qk_rope_head_dim)
 
-        # cur_batch_kv = cur_batch # // (max_qo_len // 2)
-        # cur_batch_kv_start_idx = gl.load(kv_indptr + cur_batch_kv)
-        # cur_batch_seq_len = gl.load(kv_indptr + cur_batch_kv + 1) - cur_batch_kv_start_idx
+    acc = gl.zeros([BLOCK_H, BLOCK_C], dtype=gl.float32,
+        layout=mfma_layout_kv,
+    )
+    zeros = gl.zeros(
+        (BLOCK_H, BLOCK_N), dtype=gl.float32, layout=mfma_layout_qk,
+    )
+    e_max = gl.zeros_like(gl.max(zeros, 1), dtype=gl.float32) - float("inf")
+    e_sum = gl.zeros_like(e_max, dtype=gl.float32)
 
-        q = gl.amd.cdna3.buffer_load(
-            ptr=Q,
-            offsets=offs_q,
-            mask=(mask_h[:, None]) & (mask_c[None, :]),
-            cache=cache_modifier,
-        )
-        smem_q_nope.store(q)
-        q = smem_q_nope.load(layout=dot_q_layout)
-        q_pe = gl.amd.cdna3.buffer_load(
-            ptr=Q,
-            offsets=off_q_pe,
-            mask=(mask_h_pe[:, None]) & (mask_qk_r[None, :]),
-            cache=cache_modifier,
-        )
-        smem_q_rope.store(q_pe)
-        q_pe = smem_q_rope.load(layout=dot_q_layout)
-
-        acc = gl.zeros([BLOCK_H, BLOCK_C], dtype=gl.float32,
-            layout=mfma_layout_kv,
-        )
-        # acc_zeros = gl.zeros([BLOCK_H, BLOCK_C], dtype=gl.float32,
-        #     layout=mfma_layout_kv,
+    for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+        # start_n = split_kv_start
+        # offs_n = start_n + gl.arange(0, BLOCK_N,
+        #     layout=gl.SliceLayout(0, blocked_ld_k_nope_kn)
         # )
-        zeros = gl.zeros(
-            (BLOCK_H, BLOCK_N), dtype=gl.float32, layout=mfma_layout_qk,
+        # offs_n_pe = start_n + gl.arange(0, BLOCK_N,
+        #     layout=gl.SliceLayout(0, blocked_ld_k_rope_kn)
+        # )
+        kv_loc = gl.load(
+            kv_indices + start_n + cur_head + cur_batch_kv_start_idx,
+            # mask=cur_head < split_kv_end,
+            # other=0.0,
         )
-        e_max = gl.zeros_like(gl.max(zeros, 1), dtype=gl.float32) - float("inf")
-        e_sum = gl.zeros_like(e_max, dtype=gl.float32)
+        kv_pe_loc = gl.load(
+            kv_indices + start_n + cur_head_pe + cur_batch_kv_start_idx,
+            # mask= cur_head_pe < split_kv_end,
+            # other=0.0,
+        )
 
-        for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
-            # start_n = split_kv_start
-            offs_n = start_n + gl.arange(0, BLOCK_N,
-                layout=gl.SliceLayout(0, blocked_ld_k_nope_kn)
-            )
-            offs_n_pe = start_n + gl.arange(0, BLOCK_N,
-                layout=gl.SliceLayout(0, blocked_ld_k_rope_kn)
-            )
-            kv_loc = gl.load(
-                kv_indices + start_n + cur_head,
-                # mask=cur_head < split_kv_end,
-                # other=0.0,
-            )
-            kv_pe_loc = gl.load(
-                kv_indices + start_n + cur_head_pe,
-                # mask= cur_head_pe < split_kv_end,
-                # other=0.0,
-            )
+        # if cur_batch == 1:
+        #     gl.device_print("kv_pe_loc", kv_pe_loc)
 
+        offs_buf_kv = kv_loc[:, None] * stride_buf_kbs + offs_c[None, :]
+        offs_buf_k_pe = kv_pe_loc[:, None] * stride_buf_kbs + offs_qk_r[None, :]
 
-            offs_buf_kv = kv_loc[:, None] * stride_buf_kbs + offs_c[None, :]
-            offs_buf_k_pe = kv_pe_loc[:, None] * stride_buf_kbs + offs_qk_r[None, :]
+        k_pe = gl.amd.cdna3.buffer_load(
+            ptr=K_Buffer,
+            offsets=offs_buf_k_pe,
+            # mask=(offs_n_pe[none, :] < split_kv_end) & (mask_k_r[:, none]),
+            # mask=(mask_h_pe[:, none]) & (mask_qk_r[none, :]),
+            # cache=cache_modifier,
+        )  # positional embedding part of keys
 
-            k_pe = gl.amd.cdna3.buffer_load(
-                ptr=K_Buffer,
-                offsets=offs_buf_k_pe,
-                # offsets=off_q_pe,
-                # mask=(offs_n_pe[None, :] < split_kv_end) & (mask_k_r[:, None]),
-                # mask=(mask_h_pe[:, None]) & (mask_qk_r[None, :]),
-                # cache=cache_modifier,
-            )  # positional embedding part of keys
-
-            # if cur_batch == 1:
-            #     gl.device_print("offs_buf_k_pe", offs_buf_k_pe)
-                # gl.device_print("cur_k_pe", k_pe)
+        smem_k_rope.store(k_pe.T)
+        cur_k_pe = smem_k_rope.load(layout=dot_k_layout)
 
 
-            smem_k_rope.store(k_pe.T)
-            cur_k_pe = smem_k_rope.load(layout=dot_k_layout)
+        # (16, 64) x (64, 32)
+        # dot product of rope parts
+        # qk = tl.dot(q_pe, k_pe.to(q_pe.dtype))
+        qk = gl.amd.cdna3.mfma(q_pe, cur_k_pe, zeros)
+
+        kv = gl.amd.cdna3.buffer_load(
+            ptr=K_Buffer,
+            offsets=offs_buf_kv,
+            # offsets=offs_q,
+            # mask=(mask_h[:, none]) & (mask_c[none, :]),
+            # mask=(offs_n[none, :] < split_kv_end) & (mask_k_c[:, none]),
+            # cache=cache_modifier,
+        )  # the shared latent tensor for keys and values
+        smem_v.store(kv)
+        smem_k_nope.store(kv.T)
+        cur_kv = smem_k_nope.load(layout=dot_k_layout)
+
+        # (16, 512) x (512, 32)
+        # dot product of nope parts
+        # qk = tl.dot(q, kv)
+        qk = gl.amd.cdna3.mfma(q, cur_kv, qk)
+
+        qk *= sm_scale
+
+        if logit_cap > 0:
+            qk = logit_cap * _tanh(qk / logit_cap)
+
+        # qk = gl.where(
+        #     mask_h[:, none] & (offs_n[none, :] < split_kv_end), qk, float("-inf")
+        # )
+
+        cur_v = smem_v.load(layout=dot_v_layout)
+
+        n_e_max = gl.maximum(gl.max(qk, 1), e_max)
+        re_scale = gl.exp(e_max - n_e_max)
+        p = gl.exp(qk - n_e_max[:, None])
+
+        # gl.device_print("p", p)
+
+        acc = acc * re_scale[:, None]
 
 
-            # (16, 64) x (64, 32)
-            # dot product of rope parts
-            # qk = tl.dot(q_pe, k_pe.to(q_pe.dtype))
-            qk = gl.amd.cdna3.mfma(q_pe, cur_k_pe, zeros)
+        smem_p.store(p.to(cur_v.dtype))
+        e_sum = e_sum * re_scale + gl.sum(p, 1)
+        cur_p = smem_p.load(layout=dot_p_layout)
+        e_max = n_e_max
 
-            kv = gl.amd.cdna3.buffer_load(
-                ptr=K_Buffer,
-                offsets=offs_buf_kv,
-                # offsets=offs_q,
-                # mask=(mask_h[:, None]) & (mask_c[None, :]),
-                # mask=(offs_n[None, :] < split_kv_end) & (mask_k_c[:, None]),
-                cache=cache_modifier,
-            )  # the shared latent tensor for keys and values
-            smem_v.store(kv)
-            smem_k_nope.store(kv.T)
-            cur_kv = smem_k_nope.load(layout=dot_k_layout)
+        # gl.device_print("e_max", e_max)
+        # gl.device_print("e_sum", e_sum)
 
-            # (16, 512) x (512, 32)
-            # dot product of nope parts
-            # qk = tl.dot(q, kv)
-            qk = gl.amd.cdna3.mfma(q, cur_kv, qk)
-
-            # smem_v.store(cur_kv)
-
-            qk *= sm_scale
-
-            if logit_cap > 0:
-                qk = logit_cap * _tanh(qk / logit_cap)
-
-            # qk = gl.where(
-            #     mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
-            # )
-
-            cur_v = smem_v.load(layout=dot_v_layout)
-
-            n_e_max = gl.maximum(gl.max(qk, 1), e_max)
-            re_scale = gl.exp(e_max - n_e_max)
-            p = gl.exp(qk - n_e_max[:, None])
-
-            # gl.device_print("p", p)
-
-            acc = acc * re_scale[:, None]
+        # if start_n  == 0:
+        acc = gl.amd.cdna3.mfma(cur_p, cur_v, acc)
 
 
-            smem_p.store(p.to(cur_v.dtype))
-            e_sum = e_sum * re_scale + gl.sum(p, 1)
-            cur_p = smem_p.load(layout=dot_p_layout)
-            e_max = n_e_max
+    offs_mid_o = (
+        cur_batch * stride_mid_ob
+        + offs_om[:, None] * stride_mid_oh
+        + split_kv_id * stride_mid_os
+        + offs_on[None, :]
+    )
 
-            # gl.device_print("e_max", e_max)
-            # gl.device_print("e_sum", e_sum)
+    gl.amd.cdna3.buffer_store(
+        stored_value=acc / e_sum[:, None],
+        ptr=Att_Out,
+        offsets=offs_mid_o,
+        # mask=(mask_om[:, none]) & (mask_on[none, :]),
+    )
 
-            # if start_n  == 0:
-            acc = gl.amd.cdna3.mfma(cur_p, cur_v, acc)
-            # acc += gl.amd.cdna3.mfma(cur_p, cur_v, acc_zeros)
+    offs_mid_lse = (
+        cur_batch * stride_mid_lse_b
+        + offs_om * stride_mid_lse_h
+        + split_kv_id * stride_mid_lse_s 
+    )
 
-
-        # ======= Epilogue ========
-        if split_id == -1:
-            offs_o = (
-                cur_batch * stride_ob
-                + offs_om[:, None] * stride_oh
-                + offs_on[None, :]
-            )
-
-            acc = acc / e_sum[:, None]
-            o = acc.to(Out.type.element_ty)
-            gl.amd.cdna3.buffer_store(
-                stored_value=o,
-                ptr=Out,
-                offsets=offs_o,
-                mask=(mask_om[:, None]) & (mask_on[None, :]),
-            )
-        else:
-            offs_mid_o = (
-                split_id * stride_mid_ob
-                + offs_om[:, None] * stride_mid_oh
-                + offs_on[None, :]
-            )
-
-            gl.amd.cdna3.buffer_store(
-                # stored_value=acc / e_sum[:, None],
-                stored_value=acc,
-                ptr=Att_Out,
-                offsets=offs_mid_o,
-                # mask=(mask_om[:, None]) & (mask_on[None, :]),
-            )
-
-            offs_mid_lse = (
-                split_id * stride_mid_lse_b
-                + offs_om * stride_mid_lse_h
-            )
-
-            gl.amd.cdna3.buffer_store(
-                stored_value=e_max + gl.log(e_sum),
-                ptr=Att_Lse,
-                offsets=offs_mid_lse,
-                # mask=mask_om,
-            )
+    gl.amd.cdna3.buffer_store(
+        stored_value=e_max + gl.log(e_sum),
+        ptr=Att_Lse,
+        offsets=offs_mid_lse,
+        # mask=mask_om,
+    )
 
 
 def _decode_grouped_att_m_fwd(
-    q,               # [B, Sq, hq, 576]
-    k_buffer,        # [Pages, hk, 576]
+    q,               # [b, sq, hq, 576]
+    k_buffer,        # [pages, hk, 576]
     v_buffer,
     att_out,
     att_lse,
@@ -484,6 +423,8 @@ def _decode_grouped_att_m_fwd(
     # print(batch, head_num, kv_group_num)
 
     config["BLOCK_H"] = ((kv_group_num + 15) // 16) * 16
+
+    # print(config["BLOCK_H"])
 
     config["NUM_KV_SPLITS"] = num_kv_splits
     grid = (
@@ -680,9 +621,6 @@ def decode_attention_fwd_grouped(
     o: output Tensor
 
     """
-    _LOGGER.info(
-        f"DECODE_ATTENTION_FWD_GROUPED_ROPE:  q={tuple(q.shape)}  k_buffer={tuple(k_buffer.shape)}  v_buffer={tuple(v_buffer.shape)} "
-    )
     if config is None:
         config = _get_config()
 

@@ -10,12 +10,15 @@ import itertools
 
 import aiter
 
-from aiter.ops.triton.mla_decode import (
+# from aiter.ops.triton.mla_decode import (
+#     decode_attention_fwd_grouped,
+# )
+from aiter.ops.triton.gluon.mla_decode import (
     decode_attention_fwd_grouped,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_mla_decode import input_helper, ref_preprocess
-from aiter.test_common import checkAllclose
+from aiter.test_common import checkAllclose, run_perftest
 
 arg_to_torch_dtype = {
     "fp8": torch.float8_e4m3fnuz,
@@ -126,7 +129,7 @@ def nonvarlen_benchmark_configs(args: argparse.Namespace):
 
     kv_lora_rank = 512
     qk_rope_head_dim = 64
-    mtp = args.mtp if args.mtp else 1
+    mtp = args.mtp
 
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_k))
     configs = [
@@ -237,7 +240,7 @@ def run_benchmark(args: argparse.Namespace):
         sm_scale: float = 1.0,
         logit_cap: float = 0.0,
         device="cuda",
-        metric: str = "throughput",
+        metric: str = "bandwidth",
         **kwargs,
     ):
         """
@@ -336,32 +339,36 @@ def run_benchmark(args: argparse.Namespace):
         )
 
         mem = bytes_read + bytes_written
+        # print(mem)
 
         q_fp8 = q.to(torch.float8_e4m3fnuz)
         k_input_fp8 = k_input.to(torch.float8_e4m3fnuz)
         v_input_fp8 = v_input.to(torch.float8_e4m3fnuz)
-        ms = triton.testing.do_bench(
-            lambda: decode_attention_fwd_grouped(
+        # ms = triton.testing.do_bench(
+        _, us = run_perftest(
+            # lambda: decode_attention_fwd_grouped(
                 # q_fp8.reshape(-1, H * 2, 576),
                 # k_input_fp8,
                 # v_input_fp8,
-                q.reshape(-1, H * (mtp + 1), 576),
-                k_input,
-                v_input,
-                out_tri,
-                kv_indptr,
-                kv_indices,
-                kv_lora_rank,
-                attn_logits,
-                attn_lse,
-                num_kv_splits,
-                sm_scale,
-                logit_cap,
-                mtp,
-            ),
-            warmup=25,
-            rep=100,
+            decode_attention_fwd_grouped,
+            q.reshape(-1, H * (mtp + 1), 576),
+            k_input,
+            v_input,
+            out_tri,
+            kv_indptr,
+            kv_indices,
+            kv_lora_rank,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            sm_scale,
+            logit_cap,
+            mtp,
+            # ),
+            # warmup=25,
+            # rep=100,
         )
+        ms = us / 1000
         # import pdb;pdb.set_trace()
 
         checkAllclose(out_ref, out_tri,
