@@ -1684,7 +1684,7 @@ def _flash_attn_varlen_forward(
 
     def can_impl_fmha_wholek_fwd():
         ret = q.shape[0] * q.shape[1] / 128 <= get_cu_num() * 0.8
-    return ret
+        return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if can_impl_fmha_v3_fwd() and not can_impl_fmha_wholek_fwd():
