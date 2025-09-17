@@ -109,40 +109,40 @@ def test_gemm(dtype, M, N, K):
     # b, avg_b = a, 0
     # err_b = checkAllclose(a, b, msg="triton        ")
 
-    c, us = run_perftest(
-        aiter.gemm_a4w4,
-        x,
-        wshuffle,
-        x_scales_shuffle,
-        w_scales_shuffle,
-        out2,
-        bpreshuffle=True,
-    )
-    err = checkAllclose(a, c[:M], msg="unified api")
-    ret["us"] = us
-    ret["TFLOPS"] = M * N * K * 2 / us / 1e6
-    ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
-    ret["err"] = err
-
-    # kernelName = ""  # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
-    # log2_k_split = 1
-    # d, us = run_gemm_asm(
+    # c, us = run_perftest(
+    #     aiter.gemm_a4w4,
     #     x,
     #     wshuffle,
     #     x_scales_shuffle,
     #     w_scales_shuffle,
-    #     out3,
-    #     kernelName,
-    #     bias_f32,
+    #     out2,
     #     bpreshuffle=True,
-    #     log2_k_split=log2_k_split,
     # )
-    # err = checkAllclose(a, d[:M], msg=f"asm {kernelName} log2_k_split_{log2_k_split}")
-    # tag = "asm_dbg"
-    # ret[f"us {tag}"] = us
-    # ret[f"TFLOPS {tag}"] = M * N * K * 2 / us / 1e6
-    # ret[f"TB/s {tag}"] = (x.nbytes + w.nbytes) / us / 1e6
-    # ret[f"err {tag}"] = err
+    # err = checkAllclose(a, c[:M], msg="unified api")
+    # ret["us"] = us
+    # ret["TFLOPS"] = M * N * K * 2 / us / 1e6
+    # ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
+    # ret["err"] = err
+
+    kernelName = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"  # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
+    log2_k_split = 0
+    d, us = run_gemm_asm(
+        x,
+        wshuffle,
+        x_scales_shuffle,
+        w_scales_shuffle,
+        out3,
+        kernelName,
+        bias_f32,
+        bpreshuffle=True,
+        log2_k_split=log2_k_split,
+    )
+    err = checkAllclose(a, d[:M], msg=f"asm {kernelName} log2_k_split_{log2_k_split}")
+    tag = "asm_dbg"
+    ret[f"us {tag}"] = us
+    ret[f"TFLOPS {tag}"] = M * N * K * 2 / us / 1e6
+    ret[f"TB/s {tag}"] = (x.nbytes + w.nbytes) / us / 1e6
+    ret[f"err {tag}"] = err
 
     # e, us = run_gemm_ck(x, wshuffle, x_scales_shuffle, w_scales_shuffle, out3)
     # err = checkAllclose(a, e[:M], msg="ck            ")
