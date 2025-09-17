@@ -119,6 +119,7 @@ def biased_grouped_topk_torch(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
+    return_score: bool = False,
 ):
     scores = gating_output.to(dtypes.fp32).sigmoid()
     num_token = scores.shape[0]
@@ -149,7 +150,10 @@ def biased_grouped_topk_torch(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
+    if return_score:
+        return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32), scores
+    else:
+        return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
 
 
 # this one copied from sglang

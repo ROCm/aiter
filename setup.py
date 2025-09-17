@@ -227,6 +227,7 @@ setup(
         # "ninja",
         "pandas",
         "einops",
+        "psutil",
     ],
     setup_requires=setup_requires,
 )
