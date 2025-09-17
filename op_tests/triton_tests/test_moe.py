@@ -21,7 +21,7 @@ from aiter.ops.triton.moe_op_gelu import (
     fused_moe_gelu as triton_moe_gelu,
     moe_set_use_persistent_kernel as triton_moe_gelu_set_use_persistent_kernel,
 )
-import aiter.ops.triton.utils.arch_info as arch_info
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from aiter.ops.triton.utils.moe_common import torch_silu_and_mul_ref
