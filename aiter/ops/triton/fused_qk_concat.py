@@ -744,7 +744,8 @@ def fused_qk_rope_cat_and_cache_mla(
         BLOCK_D_pe=d_pe,
         BLOCK_D_HALF_pe=d_pe // 2,
         OUTPUT_Q_NOPE_ZEROS=output_q_nope_zeros,
-        HAS_K_SCALE=(k_scale is not None)
+        HAS_K_SCALE=(k_scale is not None),
+        num_warps=1,
     )
 
     if output_q_nope_zeros:
