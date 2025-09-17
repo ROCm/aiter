@@ -9,11 +9,10 @@ from aiter.ops.triton.gemm_a8w8_blockscale import (
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
-from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
-from aiter.ops.triton.utils.types import str_to_torch_dtype
+from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
-import aiter.ops.triton.utils.arch_info as arch_info
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
 block_shape = (128, 128)
