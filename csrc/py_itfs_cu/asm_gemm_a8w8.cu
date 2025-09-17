@@ -189,8 +189,8 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
         TORCH_CHECK(false, __func__, " no kernel support a4w4 for this gpu arch");
     }
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    int selectedksplit = splitK.has_value() ? splitK.value() : 1;
 
+    int selectedksplit = splitK.value_or(0) ?: 1;
     if(kernelName.empty())
     {
         auto it = heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, splitK, bpreshuffle));
@@ -232,31 +232,31 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
 
         if(cfg.splitK == 1 && selectedksplit > 0)
         {
-            args.ks                 = selectedksplit;
-            int k_per_split         = (Kdim + ks - 1) / ks;
+            int k_per_split         = (Kdim + ks - 1) / selectedksplit;
             int k_per_split_aligned = ((k_per_split + 127) / 128) * 128;
 
             int actual_splitK = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
-            if(actual_splitK != ks)
+            if(actual_splitK != selectedksplit)
             {
                 printf("warning: change splitK form %d to %d to make sure every block deals with "
                        "128x k\n",
-                       ks,
+                       selectedksplit,
                        actual_splitK);
-                ks = actual_splitK;
+                selectedksplit = actual_splitK;
             }
 
-            k_per_split         = (Kdim + ks - 1) / ks;
+            k_per_split         = (Kdim + selectedksplit - 1) / selectedksplit;
             k_per_split_aligned = ((k_per_split + 127) / 128) * 128;
             // printf("K info: _s_K=%d, _s_splitK=%d, _s_K_per_tg=%d, k_per_split_aligned=%d\n",
             //        Kdim,
-            //        ks,
+            //        selectedksplit,
             //        k_per_split,
             //        k_per_split_aligned);
+            args.ks = selectedksplit;
             if(selectedksplit > 1)
                 out.zero_();
         }
-        gdx         = gdx * ks;
+        gdx         = gdx * selectedksplit;
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
         {
