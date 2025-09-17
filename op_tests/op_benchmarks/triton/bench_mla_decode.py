@@ -1,15 +1,14 @@
 import triton
-
+from aiter.ops.triton.mla_decode_rope import decode_attention_fwd_grouped_rope
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
     print_vgpr,
     get_caller_name_no_ext,
 )
-from aiter.ops.triton.mla_decode_rope import decode_attention_fwd_grouped_rope
 import torch
 import argparse
-from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.test_mla_decode_rope import input_helper
 
 

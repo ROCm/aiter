@@ -1,4 +1,7 @@
 import triton
+from aiter.ops.triton.mla_decode_rope import (
+    decode_attention_fwd_grouped_rope,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     print_vgpr,
@@ -8,10 +11,6 @@ import torch
 import sys
 import argparse
 import itertools
-
-from aiter.ops.triton.mla_decode_rope import (
-    decode_attention_fwd_grouped_rope,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_mla_decode_rope import input_helper, ref_preprocess
 
