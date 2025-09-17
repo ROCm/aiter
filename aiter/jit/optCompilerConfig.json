@@ -357,7 +357,7 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'",
             "'-mllvm --slp-threshold=-32'",
-            "'-mllvm --misched-bottomup=1'"
+            "'-mllvm --misched-prera-direction=bottomup' if int(torch.version.hip.split('.')[0]) >= 7 else '-mllvm --misched-bottomup=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
