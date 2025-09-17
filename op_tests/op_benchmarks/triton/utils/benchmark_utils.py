@@ -16,6 +16,23 @@ import matplotlib.pyplot as plt
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
 
 
+def get_evaluation_unit(metric):
+    evaluation_metric_to_unit = {
+        "throughput": "TFLOPS",
+        "time": "ms",
+        "bandwidth": "GB/s",
+    }
+    
+    unit = evaluation_metric_to_unit[metric]
+    if unit:
+        return unit
+    else:
+        raise NotImplementedError(f"{metric} is not supported")
+
+def get_evaluation_label(metric):
+    return metric.capitalize() + " (" + get_evaluation_unit(metric) + ")"
+
+
 def get_shape_benchmark_object(plot_name, args, x_names=None):
     """
     Utility function for returning a triton.testing.Benchmark object to populate.
@@ -46,28 +63,16 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
     else:
         x_vals_list = get_x_vals(dims=len(x_names), args=args)
 
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "throughput":
-        ylabel = "Throughput (TFLOPS)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GB/s)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
-
-    evaluation_metric_to_unit = {
-        "throughput": "TFLOPS",
-        "time": "Time_(ms)",
-        "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
-    }
+    ylabel = get_evaluation_label(args.metric)
+    
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
         x_log=True,
         y_log=True,
         line_arg="unit",
-        line_vals=[evaluation_metric_to_unit[args.metric]],
-        line_names=[evaluation_metric_to_unit[args.metric]],
+        line_vals=[get_evaluation_unit(args.metric)],
+        line_names=[get_evaluation_unit(args.metric)],
         styles=[("green", "-")],
         ylabel=ylabel,
         plot_name=plot_name,
@@ -97,20 +102,13 @@ def get_model_benchmark_object(
         args.fc2 = True
     x_vals_list = model_benchmark_shapes_fn(args)
 
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "throughput":
-        ylabel = "Throughput (TFLOPS)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GB/s)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
+    ylabel = get_evaluation_label(args.metric)
 
     line_names = []
     if args.fc1:
-        line_names.append("fc1")
+        line_names.append("fc1" + " (" + get_evaluation_unit(args.metric) + ")")
     if args.fc2:
-        line_names.append("fc2")
+        line_names.append("fc2" + " (" + get_evaluation_unit(args.metric) + ")")
     line_vals = line_names
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]

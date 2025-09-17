@@ -270,7 +270,7 @@ def run_benchmark(args, x_vals_list):
         ylabel = "Memory (MB)"
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
-    line_names = ["Triton"]
+    line_names = ["Time"]   # TODO: This needs to change for the column name to change
     line_vals = line_names
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
