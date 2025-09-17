@@ -15,6 +15,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 )
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_evaluation_unit,
     model_benchmark_shapes,
     get_shape_benchmark_object,
     print_vgpr,
@@ -45,12 +46,7 @@ def get_model_benchmark_object(
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
-    evaluation_metric_to_unit = {
-        "throughput": "TFLOPS",
-        "time": "Time_(ms)",
-        "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
-    }
-    line_names = [evaluation_metric_to_unit[args.metric]]
+    line_names = [get_evaluation_unit(args.metric)]
     line_vals = line_names
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
