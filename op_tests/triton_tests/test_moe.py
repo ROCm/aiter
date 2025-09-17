@@ -321,16 +321,37 @@ def get_default_config_moe_e2e(persistent: bool) -> Dict[str, int]:
 
 
 def quantize_fp8(
-    tensor: torch.Tensor, dim=()
+    tensor: torch.Tensor, dim=(),
+    block_shape=None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    use_block_scale = block_shape != None and len(block_shape) == 2
+    use_dim_quantization = dim != None and len(dim) == 2
+
+    if use_block_scale:
+        block_shape_n, block_shape_k = block_shape[0], block_shape[1]
+        use_block_scale = use_block_scale and ((block_shape_n) and (block_shape_k))
+
+    assert not (use_block_scale and use_dim_quantization)
+
+    e, n, k = tensor.shape
+
     dev = arch_info.get_device()
     if dev == "MI350X":
         fp8_type = torch.float8_e4m3fn
     else:
         fp8_type = torch.float8_e4m3fnuz
 
-    quantize_dim = [i for i in range(tensor.dim()) if i not in dim]
-    max_vals = tensor.abs().amax(dim=quantize_dim, keepdim=True)
+    # If using block-scale quantization, reshape the tensor to merge block dimensions
+    if use_block_scale:
+        # Reshape to merge the second and third dimensions (n direction)
+        # and the fourth and fifth dimensions (k direction)
+        tensor = tensor.reshape(e, block_shape_n, n // block_shape_n, block_shape_k, k // block_shape_k)
+        tensor = tensor.permute(0, 1, 3, 2, 4)
+        tensor = tensor.reshape(e, block_shape_n * block_shape_k, n // block_shape_n, k // block_shape_k)
+        max_vals = torch.max(tensor, 1, keepdim=True).values
+    else:
+        quantize_dim = [i for i in range(tensor.dim()) if i not in dim]
+        max_vals = tensor.abs().amax(dim=quantize_dim, keepdim=True)
     max_repr_val = torch.finfo(fp8_type).max
     max_vals[max_vals == 0] = 1e-8  # Avoid division by zero
 
@@ -342,7 +363,43 @@ def quantize_fp8(
     tensor.clamp_(-max_repr_val, max_repr_val)
     tensor_quantized = tensor.to(fp8_type)
 
-    scale = scale.squeeze(dim=quantize_dim)
+    if use_block_scale:
+        tensor_quantized = tensor_quantized.reshape(e, block_shape_n, block_shape_k, n // block_shape_n, k // block_shape_k)
+        tensor_quantized = tensor_quantized.permute(0, 1, 3, 2, 4)
+        tensor_quantized = tensor_quantized.reshape(e, n, k)
+        scale = scale.reshape(e, n // block_shape_n, k // block_shape_k)
+    else:
+        scale = scale.squeeze(dim=quantize_dim)
+
+    return tensor_quantized, scale, 1 / scale
+
+
+def quantize_fp8_a(
+    a: torch.Tensor,
+    block_shape_k=None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    M, K = a.shape
+    dev = arch_info.get_device()
+    if dev == "MI350X":
+        fp8_type = torch.float8_e4m3fn
+    else:
+        fp8_type = torch.float8_e4m3fnuz
+
+    a = a.reshape(M, block_shape_k, K // block_shape_k)
+    max_vals = torch.max(a, 1, keepdim=True).values
+    max_repr_val = torch.finfo(fp8_type).max
+    max_vals[max_vals == 0] = 1e-8  # Avoid division by zero
+
+    # Compute scale factors for each channel
+    scale: torch.Tensor = max_repr_val / max_vals.to(torch.float32)
+
+    # Quantize the tensor
+    a = a * scale
+    a.clamp_(-max_repr_val, max_repr_val)
+    tensor_quantized = a.to(fp8_type)
+    tensor_quantized = tensor_quantized.reshape(M, K)
+
+    scale = scale.reshape(M, K // block_shape_k)
 
     return tensor_quantized, scale, 1 / scale
 
@@ -422,6 +479,7 @@ def input_helper(
     E: int,
     routed_weight: bool,
     dtype,
+    block_shape,
     fp8_w8a8: bool,
     int8_w8a16: bool,
 ):
@@ -433,7 +491,10 @@ def input_helper(
     b_scale = None
 
     if fp8_w8a8:
-        b, _, b_scale = quantize_fp8(b, dim=(0,))
+        b, _, b_scale = quantize_fp8(b, dim=(0,), block_shape=block_shape)
+        if block_shape is not None:
+            block_shape_k = block_shape[1]
+            a, _, a_scale = quantize_fp8_a(a, block_shape_k)
 
     if int8_w8a16:
         b, _, b_scale = quantize_int8(b, dim=(0,))
