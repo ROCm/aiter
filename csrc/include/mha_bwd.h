@@ -364,11 +364,11 @@ struct __attribute__((packed)) fmha_bwd_dq_shuffle_args
     p3 _p9;
     unsigned int head_dim;
     p3 _p10;
-    void *ptr_seqstart_q;
+    const void *ptr_qseq;
     p2 _p11;
-    void *ptr_seqstart_q_padded;
+    const void *ptr_qseq_padded;
     p2 _p12;
-    unsigned int max_seq_len_dq;
+    unsigned int max_seqlen_dq;
     p3 _p13;
 };
 
