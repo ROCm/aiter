@@ -6,3 +6,8 @@ token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,
 16,5120,1536,2,2,ActivationType.Silu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,1,0
 24,5120,1536,2,2,ActivationType.Silu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,1,0
 32,5120,1536,2,2,ActivationType.Silu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,1,0
+64,5120,1536,2,2,ActivationType.Silu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,1,0
+128,5120,1536,2,2,ActivationType.Silu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,1,0
+256,5120,1536,2,2,ActivationType.Silu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,1,0
+512,5120,1536,2,2,ActivationType.Silu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,1,0
+1024,5120,1536,2,2,ActivationType.Silu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,1,0

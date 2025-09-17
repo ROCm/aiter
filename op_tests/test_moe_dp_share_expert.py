@@ -87,7 +87,7 @@ def test_dp_shared_expert_moe(
     return {"us": avg_t, "err": err}
 
 
-list_M = [1, 4, 8, 16, 32, 64, 128, 192, 256]
+list_M = [1, 4, 8, 16, 32, 64, 128, 192, 256, 384, 512, 1024, 8192]
 list_E = [2]
 list_dim = [(5120, 1536)]
 list_q_dtype = [dtypes.i8, dtypes.fp8][0:1]
