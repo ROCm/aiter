@@ -133,20 +133,6 @@ def gemm_a8w8_blockscale_ck(
 
 
 @compile_ops(
-    "module_gemm_a8w8_blockscale_asm",
-    fc_name="flatmm_a8w8_blockscale_asm",
-    gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
-)
-def flatmm_a8w8_blockscale_asm(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
-) -> Tensor: ...
-
-
-@compile_ops(
     "module_gemm_a8w8_blockscale_bpreshuffle",
     fc_name="gemm_a8w8_blockscale_bpreshuffle",
     gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
@@ -160,10 +146,44 @@ def gemm_a8w8_blockscale_bpreshuffle_ck(
 ) -> torch.Tensor: ...
 
 
+def gen_flatmm_a8w8_blockscale_asm_fake_tensors(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+) -> Tensor:
+    return out
+
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale_asm",
+    fc_name="flatmm_a8w8_blockscale_asm",
+    gen_fake=gen_flatmm_a8w8_blockscale_asm_fake_tensors,
+)
+def flatmm_a8w8_blockscale_asm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+) -> Tensor: ...
+
+
+def gen_mi350_a8w8_blockscale_asm_fake_tensors(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+) -> Tensor:
+    return out
+
+
 @compile_ops(
     "module_gemm_mi350_a8w8_blockscale_asm",
     fc_name="mi350_a8w8_blockscale_asm",
-    gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
+    gen_fake=gen_mi350_a8w8_blockscale_asm_fake_tensors,
 )
 def mi350_a8w8_blockscale_asm(
     XQ: Tensor,
