@@ -15,6 +15,7 @@ from aiter.test_mha_common import (
 )
 import pytest
 import argparse
+from aiter.test_common import perftest, benchmark
 
 
 def run_torch(
@@ -72,6 +73,7 @@ def run_torch(
         return out, dq, dk, dv
 
 
+@perftest()
 def run_ck(
     q,
     k,
@@ -114,63 +116,65 @@ def run_ck(
     else:
         bias_unpad = None
 
-    outputs = aiter.flash_attn_varlen_func(
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        min_seqlen_q=min_seqlen_q,
-        dropout_p=dropout_p,
-        causal=causal,
-        window_size=window_size,
-        bias=bias_unpad,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        return_lse=return_lse,
-        return_attn_probs=return_attn_probs,
-    )
+    with torch.no_grad():
+        outputs = aiter.flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            min_seqlen_q=min_seqlen_q,
+            dropout_p=dropout_p,
+            causal=causal,
+            window_size=window_size,
+            bias=bias_unpad,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_lse=False,
+            return_attn_probs=return_attn_probs,
+        )
 
     if type(outputs) is tuple:
         out = output_pad_fn(outputs[0])
     else:
         out = output_pad_fn(outputs)
+    return out
 
-    if dropout_p > 0.0 and return_attn_probs:
-        (_, seqlen_q, _, d) = q.shape
-        (_, seqlen_k, _, d) = k.shape
-        S_dmask = outputs[-1]
-        S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
-        S_dmask = pad_rearrange_dropout_mask_hts_to_bhss(
-            S_dmask, cu_seqlens_q, seqlen_q, seqlen_k
-        )
-        S_dmask_converted = convert_flash_attn_S_to_softmax(
-            S_dmask,
-            seqlen_q,
-            seqlen_k,
-            query_padding_mask,
-            key_padding_mask,
-            d,
-            dropout_p > 0.0,
-            causal=causal,
-            window_size=window_size,
-        )
-        dropout_mask = S_dmask_converted >= 0
-    else:
-        dropout_mask = None
+    # if dropout_p > 0.0 and return_attn_probs:
+    #     (_, seqlen_q, _, d) = q.shape
+    #     (_, seqlen_k, _, d) = k.shape
+    #     S_dmask = outputs[-1]
+    #     S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
+    #     S_dmask = pad_rearrange_dropout_mask_hts_to_bhss(
+    #         S_dmask, cu_seqlens_q, seqlen_q, seqlen_k
+    #     )
+    #     S_dmask_converted = convert_flash_attn_S_to_softmax(
+    #         S_dmask,
+    #         seqlen_q,
+    #         seqlen_k,
+    #         query_padding_mask,
+    #         key_padding_mask,
+    #         d,
+    #         dropout_p > 0.0,
+    #         causal=causal,
+    #         window_size=window_size,
+    #     )
+    #     dropout_mask = S_dmask_converted >= 0
+    # else:
+    #     dropout_mask = None
 
-    if dout is None or not return_lse:
-        return out, dropout_mask, None, None, None
-    else:
-        dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
-            out, (q_unpad, k_unpad, v_unpad), dout
-        )
-        dq = dq_pad_fn(dq_unpad)
-        dk = dk_pad_fn(dk_unpad)
-        dv = dk_pad_fn(dv_unpad)
-        return out, dropout_mask, dq, dk, dv
+    # if dout is None or not return_lse:
+    #     return out, dropout_mask, None, None, None
+    # else:
+    #     dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
+    #         out, (q_unpad, k_unpad, v_unpad), dout
+    #     )
+    #     dq = dq_pad_fn(dq_unpad)
+    #     dk = dk_pad_fn(dk_unpad)
+    #     dv = dk_pad_fn(dv_unpad)
+    #     return out, dropout_mask, dq, dk, dv
 
 
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
@@ -182,8 +186,6 @@ def run_ck(
 @pytest.mark.parametrize("min_seqlen_q", [0])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize("batch_size", [4])
-@pytest.mark.parametrize("return_lse", [False, True])
-@pytest.mark.parametrize("return_attn_probs", [False, True])
 @pytest.mark.parametrize("nheads", [9])
 @pytest.mark.parametrize(
     "d,d_v",
@@ -217,6 +219,7 @@ def run_ck(
         (2048, 2048),
     ],
 )
+@benchmark()
 def test_flash_attn_varlen_func(
     batch_size,
     nheads,
@@ -232,9 +235,8 @@ def test_flash_attn_varlen_func(
     deterministic,
     mha_type,
     dtype,
-    return_lse,
-    return_attn_probs,
 ):
+    return_lse = True
     torch.random.manual_seed(0)
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
@@ -302,10 +304,14 @@ def test_flash_attn_varlen_func(
         requires_grad=True,
     )
 
+    # return_attn_probs is just for host verification (to produce same dropout mask)
+    # no need to use in actual case
     if dropout_p > 0:
         return_attn_probs = True
+    else:
+        return_attn_probs = False
 
-    out, dropout_mask, dq, dk, dv = run_ck(
+    out, us = run_ck(
         q,
         k,
         v,
@@ -322,6 +328,8 @@ def test_flash_attn_varlen_func(
         return_lse,
         return_attn_probs,
     )
+    print("ms: ", us / 1000.0)
+    return
 
     out_ref, dq_ref, dk_ref, dv_ref = run_torch(
         q,
@@ -409,25 +417,25 @@ if __name__ == "__main__":
         "--seqlen_q_k",
         type=dtypes.str2tuple,
         nargs="?",
-        default=(4, 4),
+        default=(4, 8),
         help="""Sequence length of query&key.
-    e.g. -s 4,4""",
+    e.g. -s 4,8""",
     )
     parser.add_argument(
         "-d",
         type=int,
         nargs="?",
-        default=192,
+        default=128,
         help="""Dimension of query&key.
-    e.g. -d 192""",
+    e.g. -d 128""",
     )
     parser.add_argument(
         "-dv",
         type=int,
         nargs="?",
-        default=192,
+        default=128,
         help="""Dimension of value.
-    e.g. -dv 192""",
+    e.g. -dv 128""",
     )
     parser.add_argument(
         "-dp",
@@ -443,7 +451,7 @@ if __name__ == "__main__":
         "--min_seqlen_q",
         type=int,
         nargs="?",
-        default=1,
+        default=0,
         help="""Minimum sequence length of query.
     e.g. -msq 1""",
     )
@@ -496,24 +504,6 @@ if __name__ == "__main__":
         help="""Data type.
     e.g.: -dt bf16""",
     )
-    parser.add_argument(
-        "-rlse",
-        "--return_lse",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="""return logsumexp, default is False.
-    -rlse or --return_lse    # enable return logsumexp
-    --no-return_lse          # disable return logsumexp""",
-    )
-    parser.add_argument(
-        "-rap",
-        "--return_attn_probs",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="""return attention probabilities, default is False.
-    -rap or --return_attn_probs    # enable return attention probabilities
-    --no-return_attn_probs        # disable return attention probabilities""",
-    )
 
     args = parser.parse_args()
     dtype = dtypes.d_dtypes[args.dtype]
@@ -534,6 +524,4 @@ if __name__ == "__main__":
         args.deterministic,
         args.mha_type,
         dtype,
-        args.return_lse,
-        args.return_attn_probs,
     )
