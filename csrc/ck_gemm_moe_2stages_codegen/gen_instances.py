@@ -59,6 +59,9 @@ MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarTy
 """
 
 heuristic_dispatch_end = """
+    TORCH_CHECK(
+        false,
+        "Unsupported kernel config for moe heuristic dispatch");
 }}
 
 """
@@ -227,7 +230,6 @@ A16W16_A8W8_gemm2_gfx950_heuristic_dispatch = """
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
-        && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
@@ -261,7 +263,6 @@ A16W16_A8W8_gemm2_heuristic_dispatch = """
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
-        && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
@@ -295,7 +296,6 @@ A8W4_gemm2_heuristic_dispatch = """
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
-        && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
@@ -331,7 +331,6 @@ A4W4_gemm2_heuristic_dispatch = """
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
-        && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
@@ -389,7 +388,6 @@ A8W8_blockscale_gemm2_heuristic_dispatch = """
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
-        && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
