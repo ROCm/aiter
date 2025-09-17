@@ -411,6 +411,7 @@ def test_grouped_topk(
 
 l_dtype = ["fp32", "bf16", "fp16"]
 l_expert = [128, 256]
+l_topk = 8
 l_token = [
     1,
     2,
@@ -492,7 +493,7 @@ df = []
 for dtype in l_dtype:
     for e in l_expert:
         for m in l_token:
-            ret = test_topk_softmax(dtype, m, e, 5)
+            ret = test_topk_softmax(dtype, m, e, l_topk)
             df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary:\n{df}")
