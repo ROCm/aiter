@@ -515,7 +515,8 @@ CK_TILE_DEVICE int32_t generate_work(
     MlaPartialTileInfo* p_reduce_final_map,
     MlaPartialTileInfo* p_reduce_partial_map,
     int32_t*            p_cost_heap,
-    int32_t*            p_cluster_work_counter)
+    int32_t*            p_cluster_work_counter,
+    int32_t*            p_touch_ugly)
 {
     int32_t remaining_kv_len = kv_len;
     int32_t kv_start_local = 0;
@@ -538,6 +539,7 @@ CK_TILE_DEVICE int32_t generate_work(
         // Check and update cost_heap
         auto [cid, accum_cost] = get_cost_top(p_cost_heap, num_clusters);
         const int32_t remaining_capability = cal_kv_len(workload_limit_global - accum_cost, packed_qo_tile_len);
+        if (remaining_capability <= 0 && p_touch_ugly != nullptr) *p_touch_ugly=1;
         const int32_t kv_len_limit_local =
         [&]() {
             const int32_t limit_ori = ck_tile::max(remaining_capability, kv_len_limit_floor);
@@ -640,6 +642,8 @@ __global__ void kn_get_mla_metadata_v1(
 
     const int32_t lane_idx = ck_tile::get_lane_id();
 
+    int32_t touch_ugly = 0;
+
     int32_t* p_test_metadata = params.p_test_outputs + 0 * params.stride_test_outputs;
     int32_t* p_test_num_splits = params.p_test_outputs + 1 * params.stride_test_outputs;
     int32_t* p_test_workloads = params.p_test_outputs + 2 * params.stride_test_outputs;
@@ -737,13 +741,6 @@ __global__ void kn_get_mla_metadata_v1(
                 workload_avg, workload_var, cluster_len_q, num_qo_tiles, num_clusters, params.kv_granularity) :
             cal_workload_limit_global_v0(workload_sum, num_clusters, params.kv_granularity);
     }();
-    if constexpr (kTunable)
-    {
-        if (lane_idx == 0)
-        {
-            p_test_metadata[0] = workload_limit_global;
-        }
-    }
 #if PRINT_DBG
     if (lane_idx == 0)
     {
@@ -790,7 +787,7 @@ __global__ void kn_get_mla_metadata_v1(
                 bid, tid, qo_len, tile_kv_len, qo_tile_len, packed_qo_tile_len, qo_batch_start, kv_batch_start,
                 kv_batch_end, workload_limit_global, num_clusters, params.kv_granularity, nullptr,
                 p_num_qo_clusters_indptr, nullptr, nullptr, nullptr, nullptr, nullptr, p_cost_heap,
-                p_cluster_work_counter);
+                p_cluster_work_counter, nullptr);
 
             if constexpr (kTunable)
             {
@@ -868,7 +865,7 @@ __global__ void kn_get_mla_metadata_v1(
                 bid, tid, qo_len, tile_kv_len, qo_tile_len, packed_qo_tile_len, qo_batch_start, kv_batch_start,
                 kv_batch_end, workload_limit_global, num_clusters, params.kv_granularity, params.p_work_indptr,
                 p_num_qo_clusters_indptr, &loc_partial_outputs, &num_partial_outputs, p_work_info_set,
-                p_reduce_final_map, p_reduce_partial_map, p_cost_heap, p_cluster_work_counter);
+                p_reduce_final_map, p_reduce_partial_map, p_cost_heap, p_cluster_work_counter, &touch_ugly);
         }
     }
 
@@ -947,6 +944,14 @@ __global__ void kn_get_mla_metadata_v1(
         }
     }
 #endif
+    if constexpr (kTunable)
+    {
+        if (lane_idx == 0)
+        {
+            p_test_metadata[0] = workload_limit_global;
+            p_test_metadata[1] = touch_ugly;
+        }
+    }
 }
 
 template <typename Traits>
