@@ -64,14 +64,14 @@ def run_model_benchmark(args):
     def bench_batched_gemm_a8w8(
         M, hidden_dim, intermediate_dim, batch, metric, layer, **kwargs
     ):
-        if layer == "fc1":
+        if layer.startswith("fc1"):
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
             else:
                 N, K = intermediate_dim * 2, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
-        elif layer == "fc2":
+        elif layer.startswith("fc2"):
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
