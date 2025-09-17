@@ -4,7 +4,7 @@
 from torch import Tensor, Generator
 from typing import List, Optional, Tuple, Any
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
-from ..jit.utils.chip_info import get_gfx,get_cu_num
+from ..jit.utils.chip_info import get_gfx, get_cu_num
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 import torch
@@ -1683,8 +1683,8 @@ def _flash_attn_varlen_forward(
         return ret
 
     def can_impl_fmha_wholek_fwd():
-        ret = q.shape[0]*q.shape[1]/128<=get_cu_num()*0.8
-        return ret
+        ret = q.shape[0] * q.shape[1] / 128 <= get_cu_num() * 0.8
+    return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if can_impl_fmha_v3_fwd() and not can_impl_fmha_wholek_fwd():
