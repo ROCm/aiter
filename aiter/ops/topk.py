@@ -84,7 +84,7 @@ def biased_grouped_topk(
 ):
     token_num = gating_output.shape[0]
     cu_num = get_cu_num()
-    if token_num <= cu_num * 16 or not topk_ids.is_contiguous():
+    if token_num <= cu_num * 48:
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
