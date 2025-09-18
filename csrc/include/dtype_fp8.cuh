@@ -1,7 +1,7 @@
 #pragma once
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
+ * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,39 +24,45 @@
 #endif // USE_ROCM
 #endif // ENABLE_FP8
 
-namespace vllm
-{
+namespace vllm {
 
-  enum class Fp8KVCacheDataType
-  {
-    kAuto = 0,
+enum class Fp8KVCacheDataType
+{
+    kAuto    = 0,
     kFp8E4M3 = 1,
     kFp8E5M2 = 2,
-  };
+};
 
-  // fp8 vector types for quantization of kv cache
-  template <>
-  struct Vec<uint8_t, 1>
-  {
+enum class Fp8QuantMethod
+{
+    kPerTensor = 0,
+    kPerHead   = 1,
+    kPerToken  = 2,
+};
+
+// fp8 vector types for quantization of kv cache
+template <>
+struct Vec<uint8_t, 1>
+{
     using Type = uint8_t;
-  };
+};
 
-  template <>
-  struct Vec<uint8_t, 2>
-  {
+template <>
+struct Vec<uint8_t, 2>
+{
     using Type = uint16_t;
-  };
+};
 
-  template <>
-  struct Vec<uint8_t, 4>
-  {
+template <>
+struct Vec<uint8_t, 4>
+{
     using Type = uint32_t;
-  };
+};
 
-  template <>
-  struct Vec<uint8_t, 8>
-  {
-    using Type = uint2;
-  };
+template <>
+struct Vec<uint8_t, 8>
+{
+    using Type = uint64_t;
+};
 
 } // namespace vllm
