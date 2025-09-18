@@ -50,7 +50,7 @@ def run_torch(
     else:
         attn_bias = None
 
-    out, _ = attention_ref(
+    out, _, _ = attention_ref(
         q,
         k,
         v,
@@ -88,6 +88,7 @@ def run_ck(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
+    iperm="BSHD",
 ):
     (
         q_unpad,
@@ -103,7 +104,17 @@ def run_ck(
         output_pad_fn,
         dq_pad_fn,
         dk_pad_fn,
-    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+    ) = generate_qkv(
+        q,
+        k,
+        v,
+        query_padding_mask,
+        key_padding_mask,
+        kvpacked=(iperm == "KVPACKED"),
+        qkvpacked=(iperm == "QKVPACKED"),
+        iperm=iperm,
+    )
+
     if bias is not None:
         # TODO - implement generate_bias() to unpad
         total_q = q_unpad.shape[0]
@@ -113,6 +124,11 @@ def run_ck(
         bias_unpad = bias.reshape(batch_size * max_seqlen_q, max_seqlen_k)
     else:
         bias_unpad = None
+
+    # q_unpad, k_unpad, v_unpad = qkv_transform(iperm, q_unpad, k_unpad, v_unpad)
+    print(f"q_unpad shape: {q_unpad.shape}, stride is: {q_unpad.stride()}")
+    print(f"k_unpad shape: {k_unpad.shape}, stride is: {k_unpad.stride()}")
+    print(f"v_unpad shape: {v_unpad.shape}, stride is: {v_unpad.stride()}")
 
     outputs = aiter.flash_attn_varlen_func(
         q_unpad,
@@ -173,6 +189,7 @@ def run_ck(
         return out, dropout_mask, dq, dk, dv
 
 
+@pytest.mark.parametrize("iperm", ["BSHD", "QKVPACKED", "KVPACKED"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("deterministic", [True, False])
@@ -230,10 +247,11 @@ def test_flash_attn_varlen_func(
     deterministic,
     mha_type,
     dtype,
+    iperm,
 ):
     return_lse = True
     torch.random.manual_seed(0)
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -274,6 +292,10 @@ def test_flash_attn_varlen_func(
         key_padding_mask = generate_random_padding_mask(
             seqlen_k, batch_size, "cuda", mode="random"
         )
+
+    if iperm == "QKVPACKED":
+        query_padding_mask = None
+        key_padding_mask = None
 
     attn_bias = None
     alibi_slopes = None
@@ -322,6 +344,7 @@ def test_flash_attn_varlen_func(
         deterministic,
         return_lse,
         return_attn_probs,
+        iperm,
     )
 
     out_ref, dq_ref, dk_ref, dv_ref = run_torch(
@@ -410,7 +433,7 @@ if __name__ == "__main__":
         "--seqlen_q_k",
         type=dtypes.str2tuple,
         nargs="?",
-        default=(4, 8),
+        default=(4, 4),
         help="""Sequence length of query&key.
     e.g. -s 4,8""",
     )
@@ -418,7 +441,7 @@ if __name__ == "__main__":
         "-d",
         type=int,
         nargs="?",
-        default=128,
+        default=64,
         help="""Dimension of query&key.
     e.g. -d 128""",
     )
@@ -426,7 +449,7 @@ if __name__ == "__main__":
         "-dv",
         type=int,
         nargs="?",
-        default=128,
+        default=64,
         help="""Dimension of value.
     e.g. -dv 128""",
     )
@@ -497,7 +520,14 @@ if __name__ == "__main__":
         help="""Data type.
     e.g.: -dt bf16""",
     )
-
+    parser.add_argument(
+        "-i",
+        "--iperm",
+        type=str,
+        default="BSHD",
+        help="""iperm.
+        e.g.: -i BSHD""",
+    )
     args = parser.parse_args()
     dtype = dtypes.d_dtypes[args.dtype]
     (seqlen_q, seqlen_k) = args.seqlen_q_k
@@ -517,4 +547,5 @@ if __name__ == "__main__":
         args.deterministic,
         args.mha_type,
         dtype,
+        args.iperm,
     )
