@@ -1479,7 +1479,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = False,
+        is_v3_atomic_fp32: Optional[bool] = True,
         how_v3_bf16_cvt: Optional[int] = 1,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
@@ -1976,7 +1976,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_table,
         out,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = False,
+        is_v3_atomic_fp32: Optional[bool] = True,
         how_v3_bf16_cvt: Optional[int] = 1,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
