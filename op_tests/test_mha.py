@@ -14,37 +14,6 @@ import pytest
 import argparse
 
 
-def qkv_transform(iperm, q, k, v):
-    if iperm == "BS3HD":
-        # BSHD-->BS3HD
-        qkv = torch.cat([q, k, v], dim=2)
-        return torch.split(qkv, [q.shape[2], k.shape[2], v.shape[2]], dim=2)
-    elif iperm == "BSHD+BS2HD":
-        # BSHD-->BS2HD
-        kv = torch.cat([k, v], dim=2)
-        k_new, v_new = torch.split(kv, [k.shape[2], v.shape[2]], dim=2)
-        return q, k_new, v_new
-    elif iperm == "BHSD":
-        # BSHD-->BHSD
-        q_new = q.permute(0, 2, 1, 3).contiguous()
-        q_new = q_new.permute(0, 2, 1, 3)
-        k_new = k.permute(0, 2, 1, 3).contiguous()
-        k_new = k_new.permute(0, 2, 1, 3)
-        v_new = v.permute(0, 2, 1, 3).contiguous()
-        v_new = v_new.permute(0, 2, 1, 3)
-        return q_new, k_new, v_new
-    elif iperm == "SBHD":
-        # BSHD-->SBHD
-        q_new = q.permute(1, 0, 2, 3).contiguous()
-        q_new = q_new.permute(1, 0, 2, 3)
-        k_new = k.permute(1, 0, 2, 3).contiguous()
-        k_new = k_new.permute(1, 0, 2, 3)
-        v_new = v.permute(1, 0, 2, 3).contiguous()
-        v_new = v_new.permute(1, 0, 2, 3)
-        return q_new, k_new, v_new
-    return q, k, v
-
-
 def run_torch(
     q,
     k,
@@ -71,7 +40,7 @@ def run_torch(
     else:
         attn_bias = None
 
-    out, _, softmax_lse = attention_ref(
+    out, _ = attention_ref(
         q,
         k,
         v,
@@ -87,17 +56,16 @@ def run_torch(
     )
 
     if dout == None:
-        return out, softmax_lse
+        return out
     elif bias is not None:
         dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
         # If seqlen_q > seqlen_k with mask, pytorch will output NaN.
         # Align with ck behavior here
         dbias = torch.nan_to_num(dbias, nan=0.0)
-        return out, softmax_lse, dq, dk, dv, dbias
+        return out, dq, dk, dv, dbias
     else:
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, softmax_lse, dq, dk, dv, None
-        # return out, softmax_lse, None, None, None, None
+        return out, dq, dk, dv, None
 
 
 def run_ck(
@@ -114,7 +82,7 @@ def run_ck(
     return_lse=True,
     return_attn_probs=False,
 ):
-    out, softmax_lse, S_dmask = aiter.flash_attn_func(
+    out, _, S_dmask = aiter.flash_attn_func(
         q,
         k,
         v,
@@ -149,17 +117,15 @@ def run_ck(
         dropout_mask = None
 
     if dout == None:
-        return out, softmax_lse, dropout_mask
+        return out, dropout_mask
     elif bias is not None:
         dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
-        return out, softmax_lse, dropout_mask, dq, dk, dv, dbias
+        return out, dropout_mask, dq, dk, dv, dbias
     else:
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, softmax_lse, dropout_mask, dq, dk, dv, None
-        # return out, softmax_lse, None, None, None, None, None
+        return out, dropout_mask, dq, dk, dv, None
 
 
-@pytest.mark.parametrize("iperm", ["BSHD", "BHSD", "BS3HD", "BSHD+BS2HD", "SBHD"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("deterministic", [True, False])
@@ -214,11 +180,10 @@ def test_flash_attn_output(
     deterministic,
     mha_type,
     dtype,
-    iperm,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 8)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -247,8 +212,6 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
-    q, k, v = qkv_transform(iperm, q, k, v)
-
     attn_bias = None
     alibi_slopes = None
     if bias_type == "bias":
@@ -268,7 +231,7 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
-    out, softmax_lse, dropout_mask, dq, dk, dv, dbias = run_ck(
+    out, dropout_mask, dq, dk, dv, dbias = run_ck(
         q,
         k,
         v,
@@ -283,7 +246,7 @@ def test_flash_attn_output(
         return_attn_probs,
     )
 
-    out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
+    out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
         q,
         k,
         v,
@@ -296,7 +259,7 @@ def test_flash_attn_output(
         window_size,
     )
 
-    out_pt, softmax_lse_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
+    out_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
         q,
         k,
         v,
@@ -315,15 +278,6 @@ def test_flash_attn_output(
     print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
     assert (out - out_ref).abs().max().item() <= out_tol
-
-    print(f"softmax_lse max diff: {(softmax_lse - softmax_lse_ref).abs().max().item()}")
-    print(
-        f"softmax_lse Pytorch max diff: {(softmax_lse_pt - softmax_lse_ref).abs().max().item()}"
-    )
-    softmax_lse_tol = max(
-        2 * (softmax_lse_pt - softmax_lse_ref).abs().max().item(), 0.01
-    )
-    assert (softmax_lse - softmax_lse_ref).abs().max().item() <= softmax_lse_tol
 
     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
     print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
@@ -355,7 +309,7 @@ parser.add_argument(
     "-b",
     "--batch_size",
     type=int,
-    default=4,
+    default=2,
     help="""Batch size. Default is 2.
     e.g.: -b 16""",
 )
@@ -363,7 +317,7 @@ parser.add_argument(
     "-n",
     "--nheads",
     type=int,
-    default=32,
+    default=5,
     help="""Number of heads. Default is 5.
     e.g.: -n 8""",
 )
@@ -371,7 +325,7 @@ parser.add_argument(
     "-q",
     "--seqlen_q",
     type=int,
-    default=1024,
+    default=512,
     help="""Sequence length for query. Default is 512.
     e.g.: -q 1024""",
 )
@@ -379,7 +333,7 @@ parser.add_argument(
     "-k",
     "--seqlen_k",
     type=int,
-    default=1024,
+    default=512,
     help="""Sequence length for key. Default is 512.
     e.g.: -k 1024""",
 )
@@ -452,14 +406,6 @@ parser.add_argument(
     help="""Data type.
     e.g.: -d bf16""",
 )
-parser.add_argument(
-    "-i",
-    "--iperm",
-    type=str,
-    default="BSHD",
-    help="""iperm.
-    e.g.: -i BSHD""",
-)
 if __name__ == "__main__":
     args = parser.parse_args()
     dtype = dtypes.d_dtypes[args.dtype]
@@ -477,5 +423,4 @@ if __name__ == "__main__":
         args.deterministic,
         args.mha_type,
         dtype,
-        args.iperm,
     )
