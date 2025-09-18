@@ -70,6 +70,7 @@ def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
 
     ylabel = get_evaluation_label(args.metric, space=True)
     
+    line_vals = [get_evaluation_unit(args.metric)]
     line_names = [get_evaluation_label(args.metric)]
     
     benchmark = triton.testing.Benchmark(
@@ -78,7 +79,7 @@ def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
         x_log=True,
         y_log=True,
         line_arg="unit",
-        line_vals=line_names,
+        line_vals=line_vals,
         line_names=line_names,
         styles=[("green", "-")],
         ylabel=ylabel,
@@ -112,11 +113,13 @@ def get_gemm_model_benchmark_object(
     ylabel = get_evaluation_label(args.metric, space=True)
 
     line_names = []
+    line_vals = []
     if args.fc1:
         line_names.append(get_evaluation_label(args.metric, prefix="fc1"))
+        line_vals.append("fc1")
     if args.fc2:
         line_names.append(get_evaluation_label(args.metric, prefix="fc2"))
-    line_vals = line_names
+        line_vals.append("fc2")
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(

@@ -98,14 +98,14 @@ def run_model_benchmark(args):
     def bench_gemm_a8wfp4(
         M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
     ):
-        if "fc1" in layer:
+        if layer == "fc1":
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
             else:
                 N, K = intermediate_dim * 2, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
-        elif "fc2" in layer:
+        elif layer == "fc2":
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
