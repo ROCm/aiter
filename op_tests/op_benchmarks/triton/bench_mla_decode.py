@@ -6,6 +6,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
     print_vgpr,
     get_caller_name_no_ext,
+    get_evaluation_label,
 )
 import torch
 import argparse
@@ -65,7 +66,7 @@ def benchmark(args):
     if args.model:
         x_names, x_vals_list = model_benchmark_configs(args)
 
-    line_vals = ["mla_decode_fwd"]
+    line_vals = [get_evaluation_label("time", prefix="mla_decode_fwd")]
 
     configs.append(
         triton.testing.Benchmark(
@@ -75,7 +76,7 @@ def benchmark(args):
             line_vals=line_vals,
             line_names=line_vals,
             styles=[("red", "-"), ("green", "-")],
-            ylabel="ms",
+            ylabel=get_evaluation_label("time", space=True),
             plot_name=get_caller_name_no_ext(),
             args={"sm_scale": 1.0, "logit_cap": 0.0, "device": args.device},
         )

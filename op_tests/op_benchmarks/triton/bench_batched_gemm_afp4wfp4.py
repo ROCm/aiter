@@ -15,8 +15,8 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_ff_args,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_benchmark_object,
-    get_shape_benchmark_object,
+    get_gemm_model_benchmark_object,
+    get_gemm_shape_benchmark_object,
     batched_model_benchmark_shapes,
     print_vgpr,
     get_caller_name_no_ext,
@@ -68,7 +68,7 @@ def bench_gemm_fn(
 
 
 def run_model_benchmark(args):
-    benchmark = get_model_benchmark_object(
+    benchmark = get_gemm_model_benchmark_object(
         plot_name=get_caller_name_no_ext(),
         args=args,
         x_names=["model_name", "M", "hidden_dim", "intermediate_dim", "batch"],
@@ -79,14 +79,14 @@ def run_model_benchmark(args):
     def bench_batched_gemm_afp4wfp4(
         M, hidden_dim, intermediate_dim, batch, metric, layer, model_name=None, **kwargs
     ):
-        if layer.startswith("fc1"):
+        if "fc1" in layer:
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
             else:
                 N, K = intermediate_dim * 2, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
-        elif layer.startswith("fc2"):
+        elif "fc2" in layer:
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
@@ -98,7 +98,7 @@ def run_model_benchmark(args):
 
 
 def run_shape_benchmark(args):
-    benchmark = get_shape_benchmark_object(
+    benchmark = get_gemm_shape_benchmark_object(
         plot_name=get_caller_name_no_ext(),
         args=args,
         x_names=["batch", "M", "N", "K"],

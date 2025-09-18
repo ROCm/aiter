@@ -12,8 +12,8 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 )
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_benchmark_object,
-    get_shape_benchmark_object,
+    get_gemm_model_benchmark_object,
+    get_gemm_shape_benchmark_object,
     print_vgpr,
     get_caller_name_no_ext,
 )
@@ -79,7 +79,7 @@ def run_model_benchmark(args):
     """
     Runs benchmark given a --model argument.
     """
-    benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
+    benchmark = get_gemm_model_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a16w16(M, hidden_dim, intermediate_dim, metric, layer, **kwargs):
@@ -94,14 +94,14 @@ def run_model_benchmark(args):
 
         Tensor parallel splits across int_dim (N for fc1, K for fc2)
         """
-        if layer.startswith("fc1"):
+        if "fc1" in layer:
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
             else:
                 N, K = intermediate_dim * 2, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
-        elif layer.startswith("fc2"):
+        elif "fc2" in layer:
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
@@ -118,7 +118,7 @@ def run_shape_benchmark(args):
     """
     Runs a benchmark with given tensor shapes.
     """
-    benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
+    benchmark = get_gemm_shape_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a16w16(M, N, K, metric, **kwargs):

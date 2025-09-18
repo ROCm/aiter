@@ -18,13 +18,13 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_evaluation_unit,
     get_evaluation_label,
     model_benchmark_shapes,
-    get_shape_benchmark_object,
+    get_gemm_shape_benchmark_object,
     print_vgpr,
 )
 import matplotlib.pyplot as plt
 
 
-def get_model_benchmark_object(
+def get_gemm_model_benchmark_object(
     plot_name,
     args,
     x_names=None,
@@ -38,9 +38,9 @@ def get_model_benchmark_object(
         x_names = ["M", "hidden_dim", "intermediate_dim", "model_name"]
     x_vals_list = model_benchmark_shapes(args)
 
-    ylabel = get_evaluation_label(args.metric)
+    ylabel = get_evaluation_label(args.metric, space=True)
 
-    line_names = [get_evaluation_unit(args.metric)]
+    line_names = [get_evaluation_label(args.metric)]
     line_vals = line_names
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
@@ -143,7 +143,7 @@ def run_model_benchmark(args):
         label = "E2E"
     else:
         label = "Act+Gate+GEMM" if not args.ungated else "Act+GEMM"
-    benchmark = get_model_benchmark_object(f"Fused FF A16W16 {label} Benchmark", args)
+    benchmark = get_gemm_model_benchmark_object(f"Fused FF A16W16 {label} Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
     def bench_a16w16(M, hidden_dim, intermediate_dim, metric, **kwargs):
@@ -171,7 +171,7 @@ def run_shape_benchmark(args):
         label = "E2E"
     else:
         label = "Act+Gate+GEMM" if not args.ungated else "Act+GEMM"
-    benchmark = get_shape_benchmark_object(f"Fused FF A16W16 {label} Benchmark", args)
+    benchmark = get_gemm_shape_benchmark_object(f"Fused FF A16W16 {label} Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
     def bench_a16w16(M, N, K, metric, **kwargs):

@@ -21,6 +21,8 @@ def get_evaluation_unit(metric):
         "throughput": "TFLOPS",
         "time": "ms",
         "bandwidth": "GB/s",
+        "latency": "us",
+        "memory": "MB",
     }
     
     unit = evaluation_metric_to_unit[metric]
@@ -29,11 +31,14 @@ def get_evaluation_unit(metric):
     else:
         raise NotImplementedError(f"{metric} is not supported")
 
-def get_evaluation_label(metric):
-    return metric.capitalize() + " (" + get_evaluation_unit(metric) + ")"
+def get_evaluation_label(metric, space=False, prefix=None):
+    if space:
+        return (prefix + " " if prefix else "") + metric.capitalize() + " (" + get_evaluation_unit(metric) + ")"
+    else:
+        return (prefix + "_" if prefix else "") + metric.capitalize() + "_(" + get_evaluation_unit(metric) + ")"
 
 
-def get_shape_benchmark_object(plot_name, args, x_names=None):
+def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
     """
     Utility function for returning a triton.testing.Benchmark object to populate.
 
@@ -63,7 +68,9 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
     else:
         x_vals_list = get_x_vals(dims=len(x_names), args=args)
 
-    ylabel = get_evaluation_label(args.metric)
+    ylabel = get_evaluation_label(args.metric, space=True)
+    
+    line_names = [get_evaluation_label(args.metric)]
     
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
@@ -71,8 +78,8 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
         x_log=True,
         y_log=True,
         line_arg="unit",
-        line_vals=[get_evaluation_unit(args.metric)],
-        line_names=[get_evaluation_unit(args.metric)],
+        line_vals=line_names,
+        line_names=line_names,
         styles=[("green", "-")],
         ylabel=ylabel,
         plot_name=plot_name,
@@ -81,7 +88,7 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
     return benchmark
 
 
-def get_model_benchmark_object(
+def get_gemm_model_benchmark_object(
     plot_name, args, x_names=None, model_benchmark_shapes_fn=None
 ):
     """
@@ -102,13 +109,13 @@ def get_model_benchmark_object(
         args.fc2 = True
     x_vals_list = model_benchmark_shapes_fn(args)
 
-    ylabel = get_evaluation_label(args.metric)
+    ylabel = get_evaluation_label(args.metric, space=True)
 
     line_names = []
     if args.fc1:
-        line_names.append("fc1" + " (" + get_evaluation_unit(args.metric) + ")")
+        line_names.append(get_evaluation_label(args.metric, prefix="fc1"))
     if args.fc2:
-        line_names.append("fc2" + " (" + get_evaluation_unit(args.metric) + ")")
+        line_names.append(get_evaluation_label(args.metric, prefix="fc2"))
     line_vals = line_names
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]

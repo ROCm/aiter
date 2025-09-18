@@ -20,6 +20,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     print_vgpr,
     get_caller_name_no_ext,
+    get_evaluation_label,
 )
 
 
@@ -137,31 +138,22 @@ def create_benchmark_configs(custom, args):
             plot_name = f"fused-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
-    if args.metric == "time":
-        unit = "ms"
-    elif args.metric == "throughput":
-        unit = "TFLOPS"
-    elif args.metric == "bandwidth":
-        unit = "GB/s"
-    else:
-        raise ValueError("Unknown metric: " + args.metric)
-
     if mode == "bwd":
         if args.fused_bwd:
-            line_vals = [f"fused-bwd({unit})"]
+            line_vals = [get_evaluation_label(args.metric, prefix="fused-bwd")]
         else:
-            line_vals = [f"fused-bwd({unit})", f"bwd({unit})"]
+            line_vals = [get_evaluation_label(args.metric, prefix="fused-bwd"), get_evaluation_label(args.metric, prefix="bwd")]
     else:
-        line_vals = [f"fwd({unit})"]
+        line_vals = [get_evaluation_label(args.metric, prefix="fwd")]
 
     if args.bench_torch:
-        line_vals = [f"Triton({unit})", f"Torch({unit})"]
+        line_vals = [get_evaluation_label(args.metric, prefix="triton"), get_evaluation_label(args.metric, prefix="torch")]
 
     if args.test_mode:
         if args.fused_bwd:
-            line_vals = [f"fused-bwd({unit})"]
+            line_vals = [get_evaluation_label(args.metric, prefix="fused-bwd")]
         else:
-            line_vals = [f"bwd({unit})"]
+            line_vals = [get_evaluation_label(args.metric, prefix="bwd")]
 
     configs.append(
         triton.testing.Benchmark(
@@ -171,7 +163,7 @@ def create_benchmark_configs(custom, args):
             line_vals=line_vals,
             line_names=line_vals,
             styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
-            ylabel=unit,
+            ylabel=get_evaluation_label(args.metric, space=True),
             plot_name=plot_name,
             args=extra_args,
         )

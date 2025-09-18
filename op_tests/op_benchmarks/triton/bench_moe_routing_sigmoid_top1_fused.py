@@ -13,6 +13,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_caller_name_no_ext,
+    get_evaluation_label,
 )
 from op_tests.triton_tests.test_moe_routing_sigmoid_top1_fused import (
     torch_routing_sigmoid_top1,
@@ -32,20 +33,8 @@ def run_benchmark(args, x_vals_list):
     """
     x_names = ["M", "N", "K"]
 
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "throughput":
-        ylabel = "Throughput (TFLOPS)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GB/s)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
-    evaluation_metric_to_unit = {
-        "throughput": "TFLOPS",
-        "time": "Time_(ms)",
-        "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
-    }
-    line_names = [evaluation_metric_to_unit[args.metric]]
+    ylabel = get_evaluation_label(args.metric, space=True)
+    line_names = [get_evaluation_label(args.metric)]
     line_vals = line_names
     benchmark = triton.testing.Benchmark(
         x_names=x_names,

@@ -11,6 +11,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_caller_name_no_ext,
     print_vgpr,
+    get_evaluation_label,
 )
 
 
@@ -50,8 +51,8 @@ def run_benchmark(args):
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k"]
 
-    line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
-    line_vals = ["time", "tflops", "bandwidth"]
+    line_names = [get_evaluation_label("time"), get_evaluation_label("throughput"), get_evaluation_label("bandwidth")]
+    line_vals = ["time", "throughput", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
@@ -60,7 +61,9 @@ def run_benchmark(args):
         line_vals=line_vals,
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
-        ylabel="ms / TFLOPS / GB/s",
+        ylabel=f"{get_evaluation_label("time", space=True)} / \
+                 {get_evaluation_label("throughput", space=True)} / \
+                 {get_evaluation_label("bandwidth", space=True)}",
         plot_name=get_caller_name_no_ext(),
         args={"a_dtype": a_dtype_str, "swizzle_mx": swizzle_mx},
     )
@@ -137,7 +140,7 @@ def run_benchmark(args):
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
             return ms
-        elif metric == "tflops":
+        elif metric == "throughput":
             return tflops
         elif metric == "bandwidth":
             return bandwidth

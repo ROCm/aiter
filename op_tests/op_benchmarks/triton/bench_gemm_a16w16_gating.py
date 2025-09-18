@@ -13,13 +13,13 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     model_benchmark_shapes,
-    get_shape_benchmark_object,
+    get_gemm_shape_benchmark_object,
     print_vgpr,
 )
 import matplotlib.pyplot as plt
 
 
-def get_model_benchmark_object(
+def get_gemm_model_benchmark_object(
     plot_name,
     args,
     x_names=None,
@@ -111,7 +111,7 @@ def run_model_benchmark(args):
     """
     Runs benchmark given a --model argument.
     """
-    benchmark = get_model_benchmark_object("Fused-act-gate GEMM A16W16 Benchmark", args)
+    benchmark = get_gemm_model_benchmark_object("Fused-act-gate GEMM A16W16 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a16w16(M, hidden_dim, intermediate_dim, metric, **kwargs):
@@ -129,7 +129,7 @@ def run_shape_benchmark(args):
     """
     Runs a benchmark with given tensor shapes.
     """
-    benchmark = get_shape_benchmark_object("Fused-act-gate GEMM A16W16 Benchmark", args)
+    benchmark = get_gemm_shape_benchmark_object("Fused-act-gate GEMM A16W16 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a16w16(M, N, K, metric, **kwargs):

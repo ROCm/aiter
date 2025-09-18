@@ -6,6 +6,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     print_vgpr,
     get_caller_name_no_ext,
+    get_evaluation_label,
 )
 import torch
 import sys
@@ -104,16 +105,7 @@ def create_benchmark_configs(args: argparse.Namespace):
     else:
         x_vals_list = nonvarlen_benchmark_configs(args)
 
-    if args.metric == "time":
-        unit = "ms"
-    elif args.metric == "throughput":
-        unit = "TFLOPS"
-    elif args.metric == "bandwidth":
-        unit = "GB/s"
-    else:
-        raise ValueError("Unknown metric: " + args.metric)
-
-    line_vals = [f"{unit}"]
+    line_vals = [get_evaluation_label(args.metric)]
     configs.append(
         triton.testing.Benchmark(
             x_names=x_names,
@@ -122,7 +114,7 @@ def create_benchmark_configs(args: argparse.Namespace):
             line_vals=line_vals,
             line_names=line_vals,
             styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
-            ylabel=unit,
+            ylabel=get_evaluation_label(args.metric, space=True),
             plot_name=get_caller_name_no_ext(),
             args=extra_args,
         )

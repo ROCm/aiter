@@ -3,6 +3,7 @@ from aiter.ops.triton import extend_attention, prefill_attention
 import triton
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_evaluation_label,
     get_model_configs,
     get_available_models,
     print_vgpr,
@@ -175,7 +176,7 @@ def benchmark(args):
         elif args.mode == "prefill":
             x_names, x_vals_list = get_prefill_benchmark_configs()
 
-    line_vals = ["fwd_Time_(ms)"]
+    line_vals = [get_evaluation_label("time", prefix="fwd")]
 
     configs.append(
         triton.testing.Benchmark(

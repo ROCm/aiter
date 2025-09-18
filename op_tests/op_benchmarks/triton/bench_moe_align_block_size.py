@@ -5,6 +5,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
     get_caller_name_no_ext,
     print_vgpr,
+    get_evaluation_label,
 )
 from op_tests.triton_tests.test_moe_align_block_size import input_helper
 import torch
@@ -61,7 +62,7 @@ def run_benchmark(custom, args):
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k"]
 
-    line_names = ["Time_(ms)", "Bandwidth_(GB/s)"]
+    line_names = [get_evaluation_label("time"), get_evaluation_label("bandwidth")]
     line_vals = ["time", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
@@ -71,7 +72,7 @@ def run_benchmark(custom, args):
         line_vals=line_vals,
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-")],
-        ylabel="ms / GB/s",
+        ylabel=f"{get_evaluation_label("time", space=True)} / {get_evaluation_label("bandwidth", space=True)}",
         plot_name=get_caller_name_no_ext(),
         args={},
     )
