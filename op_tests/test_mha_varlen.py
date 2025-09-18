@@ -125,11 +125,6 @@ def run_ck(
     else:
         bias_unpad = None
 
-    # q_unpad, k_unpad, v_unpad = qkv_transform(iperm, q_unpad, k_unpad, v_unpad)
-    print(f"q_unpad shape: {q_unpad.shape}, stride is: {q_unpad.stride()}")
-    print(f"k_unpad shape: {k_unpad.shape}, stride is: {k_unpad.stride()}")
-    print(f"v_unpad shape: {v_unpad.shape}, stride is: {v_unpad.stride()}")
-
     outputs = aiter.flash_attn_varlen_func(
         q_unpad,
         k_unpad,
@@ -189,7 +184,6 @@ def run_ck(
         return out, dropout_mask, dq, dk, dv
 
 
-@pytest.mark.parametrize("iperm", ["BSHD", "QKVPACKED", "KVPACKED"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("deterministic", [True, False])
