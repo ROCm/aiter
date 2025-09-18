@@ -45,16 +45,16 @@
       "PRE_BLOCK": 128
     }, 
     "onekernel" : {
-        "BLOCK_M1": 16,
+        "BLOCK_M1": 32,
         "BLOCK_N1": 128,
-        "BLOCK_M2": 32,
+        "BLOCK_M2": 128,
         "BLOCK_N2": 32,
         "BLK_SLICE_FACTOR": 2,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
-        "num_warps": 8,
+        "num_warps": 4,
         "num_ctas": 1,
-        "num_stages": 2
+        "num_stages": 1
     }
   }
 
