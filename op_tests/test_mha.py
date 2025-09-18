@@ -9,6 +9,7 @@ from aiter.test_mha_common import (
     attn_bias_from_alibi_slopes,
     ck_randval_to_dropout_mask,
     convert_flash_attn_S_to_softmax,
+    generate_qkv,
 )
 import pytest
 import argparse
@@ -40,7 +41,7 @@ def run_torch(
     else:
         attn_bias = None
 
-    out, _ = attention_ref(
+    out, _, softmax_lse = attention_ref(
         q,
         k,
         v,
@@ -56,16 +57,16 @@ def run_torch(
     )
 
     if dout == None:
-        return out
+        return out, softmax_lse
     elif bias is not None:
         dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
         # If seqlen_q > seqlen_k with mask, pytorch will output NaN.
         # Align with ck behavior here
         dbias = torch.nan_to_num(dbias, nan=0.0)
-        return out, dq, dk, dv, dbias
+        return out, softmax_lse, dq, dk, dv, dbias
     else:
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, dq, dk, dv, None
+        return out, softmax_lse, dq, dk, dv, None
 
 
 def run_ck(
@@ -82,7 +83,7 @@ def run_ck(
     return_lse=True,
     return_attn_probs=False,
 ):
-    out, _, S_dmask = aiter.flash_attn_func(
+    out, softmax_lse, S_dmask = aiter.flash_attn_func(
         q,
         k,
         v,
@@ -117,13 +118,13 @@ def run_ck(
         dropout_mask = None
 
     if dout == None:
-        return out, dropout_mask
+        return out, softmax_lse, dropout_mask
     elif bias is not None:
         dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
-        return out, dropout_mask, dq, dk, dv, dbias
+        return out, softmax_lse, dropout_mask, dq, dk, dv, dbias
     else:
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, dropout_mask, dq, dk, dv, None
+        return out, softmax_lse, dropout_mask, dq, dk, dv, None
 
 
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
@@ -180,10 +181,11 @@ def test_flash_attn_output(
     deterministic,
     mha_type,
     dtype,
+    iperm,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -212,6 +214,31 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
+    (
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        q,
+        k,
+        v,
+        _,
+        _,
+        _,
+    ) = generate_qkv(
+        q,
+        k,
+        v,
+        None,
+        None,
+        kvpacked=(iperm == "KVPACKED"),
+        qkvpacked=(iperm == "QKVPACKED"),
+        iperm=iperm,
+    )
+
     attn_bias = None
     alibi_slopes = None
     if bias_type == "bias":
@@ -231,7 +258,7 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
-    out, dropout_mask, dq, dk, dv, dbias = run_ck(
+    out, softmax_lse, dropout_mask, dq, dk, dv, dbias = run_ck(
         q,
         k,
         v,
@@ -246,7 +273,7 @@ def test_flash_attn_output(
         return_attn_probs,
     )
 
-    out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
+    out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
         q,
         k,
         v,
@@ -259,7 +286,7 @@ def test_flash_attn_output(
         window_size,
     )
 
-    out_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
+    out_pt, softmax_lse_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
         q,
         k,
         v,
@@ -278,6 +305,15 @@ def test_flash_attn_output(
     print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
     assert (out - out_ref).abs().max().item() <= out_tol
+
+    print(f"softmax_lse max diff: {(softmax_lse - softmax_lse_ref).abs().max().item()}")
+    print(
+        f"softmax_lse Pytorch max diff: {(softmax_lse_pt - softmax_lse_ref).abs().max().item()}"
+    )
+    softmax_lse_tol = max(
+        2 * (softmax_lse_pt - softmax_lse_ref).abs().max().item(), 0.01
+    )
+    assert (softmax_lse - softmax_lse_ref).abs().max().item() <= softmax_lse_tol
 
     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
     print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
@@ -309,7 +345,7 @@ parser.add_argument(
     "-b",
     "--batch_size",
     type=int,
-    default=2,
+    default=4,
     help="""Batch size. Default is 2.
     e.g.: -b 16""",
 )
@@ -317,7 +353,7 @@ parser.add_argument(
     "-n",
     "--nheads",
     type=int,
-    default=5,
+    default=32,
     help="""Number of heads. Default is 5.
     e.g.: -n 8""",
 )
@@ -325,7 +361,7 @@ parser.add_argument(
     "-q",
     "--seqlen_q",
     type=int,
-    default=512,
+    default=1024,
     help="""Sequence length for query. Default is 512.
     e.g.: -q 1024""",
 )
@@ -333,7 +369,7 @@ parser.add_argument(
     "-k",
     "--seqlen_k",
     type=int,
-    default=512,
+    default=1024,
     help="""Sequence length for key. Default is 512.
     e.g.: -k 1024""",
 )
@@ -341,7 +377,7 @@ parser.add_argument(
     "-qk",
     "--d_qk",
     type=int,
-    default=128,
+    default=64,
     help="""Dimension of query and key. Default is 128.
     e.g.: -qk 256""",
 )
@@ -349,7 +385,7 @@ parser.add_argument(
     "-v",
     "--d_v",
     type=int,
-    default=128,
+    default=64,
     help="""Dimension of value. Default is 128.
     e.g.: -v 256""",
 )
@@ -406,6 +442,14 @@ parser.add_argument(
     help="""Data type.
     e.g.: -d bf16""",
 )
+parser.add_argument(
+    "-i",
+    "--iperm",
+    type=str,
+    default="BSHD",
+    help="""iperm.
+    e.g.: -i BSHD""",
+)
 if __name__ == "__main__":
     args = parser.parse_args()
     dtype = dtypes.d_dtypes[args.dtype]
@@ -423,4 +467,5 @@ if __name__ == "__main__":
         args.deterministic,
         args.mha_type,
         dtype,
+        args.iperm,
     )
