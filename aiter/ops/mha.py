@@ -1087,7 +1087,6 @@ def _flash_attn_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
-        gfx = get_gfx()
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
@@ -1246,7 +1245,6 @@ def can_impl_fmha_v3_bwd(
         # bwd_hd64_bf16_causal_a32_rtz_pssk
         # bwd_hd64_fp16_a32_pssk
         # bwd_hd64_fp16_causal_a32_pssk
-        gfx = get_gfx()
         # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret = hdim_q == 64 and is_v3_atomic_fp32 == True
         ret &= nmask or (
@@ -1689,7 +1687,6 @@ def _flash_attn_varlen_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
-        gfx = get_gfx()
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
