@@ -103,9 +103,9 @@ def get_asm_dir():
 
 
 @functools.lru_cache(maxsize=1)
-def get_user_jit_dir():
-    if "JIT_WORKSPACE_DIR" in os.environ:
-        path = os.getenv("JIT_WORKSPACE_DIR")
+def get_user_jit_dir() -> str:
+    if "AITER_JIT_DIR" in os.environ:
+        path = os.getenv("AITER_JIT_DIR", "")
         os.makedirs(path, exist_ok=True)
         return path
     else:
@@ -148,8 +148,8 @@ def validate_and_update_archs():
 
 
 @functools.lru_cache()
-def hip_flag_checker(flag_hip: str):
-    ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
+def hip_flag_checker(flag_hip: str) -> bool:
+    ret = os.system(f"hipcc {flag_hip} -x hip -E -P /dev/null -o /dev/null")
     if ret == 0:
         return [flag_hip]
     else:
@@ -504,7 +504,7 @@ def compile_ops(
                         module = aiter_
                 elif AITER_REBUILD and md_name not in rebuilded_list:
                     rebuilded_list.append(md_name)
-                    raise ModuleNotFoundError("")
+                    raise ModuleNotFoundError("start rebuild")
                 if module is None:
                     if gen_func is not None:
                         gen_build_args = gen_func(*args, **kwargs)
