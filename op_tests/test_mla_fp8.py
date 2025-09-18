@@ -8,6 +8,7 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
+import math
 
 torch.set_default_device("cuda")
 # torch.set_printoptions(sci_mode=False, threshold=torch.inf)
@@ -30,7 +31,7 @@ def cal_diff(
     RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
     amax_diff = (x - y).abs().max().item()
-    # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
+    print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
     else:
@@ -244,14 +245,31 @@ def test_mla(
         kv_scale=kv_scale,
     )
 
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+
+    # 128 here is the maxmium len in packed_qo (qolen*#heads) can handled by mla main kernel
+    # It would be more decent to query this value from aiter.
+    max_qo_tiles_per_batch = int(math.ceil(torch.max(seq_lens_qo).item() * nhead / 128))
+
     # aiter implementation
+    # the tensor's meaning please refer aiter/ops/attention.py
     work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
-    work_indptr = torch.empty([81], dtype=torch.int32, device="cuda")
-    work_info_set = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
-    reduce_indptr = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
-    reduce_final_map = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
+    work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
+    work_info_set = torch.empty(
+        [batch_size * max_qo_tiles_per_batch * cu_num, 8],
+        dtype=torch.int32,
+        device="cuda",
+    ).fill_(-1)
+    reduce_indptr = torch.empty(
+        [batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
+    )
+    reduce_final_map = torch.empty(
+        [batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
+    )
     reduce_partial_map = torch.empty(
-        [batch_size * 80], dtype=torch.int32, device="cuda"
+        [batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
     )
     # num_reduce_tile    = torch.empty([1], dtype=torch.int32, device="cuda")
 
@@ -341,7 +359,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16"]
 l_kv_dtype = ["bf16"]
-list_nhead = [(16, 2)]
+list_nhead = [(128, 2)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -422,7 +440,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(80, 128)],  # [41],
+    default=[i for i in range(1, 128)],  # [41],
     # default=[64], # [41],
     help="""Batch size.
     e.g.: -b 16""",

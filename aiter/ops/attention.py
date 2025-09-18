@@ -303,14 +303,13 @@ def get_mla_metadata_v1(
     num_heads_per_head_k: int,
     num_heads_k: int,
     is_causal: bool,
-
-    work_meta_data: torch.Tensor,
-    work_info_set_tsr: torch.Tensor,
-    work_indptr_tsr: torch.Tensor,
-    reduce_indptr_tsr: torch.Tensor,
-    reduce_final_map_tsr: torch.Tensor,
-    reduce_partial_map_tsr: torch.Tensor,
-    # num_reduce_tile_tensor: torch.Tensor,
+    work_metadata_ptrs: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    split_params: Optional[dict[str, int]] = None,
 ) -> Tuple[torch.Tensor]:
     """
     Arguments:
@@ -338,23 +337,23 @@ def get_mla_metadata_v1(
     """
     ...
 
-@compile_ops("module_mla_metadata")
-def get_mla_metadata_v2(
-    seqlens_qo_indptr: torch.Tensor,
-    seqlens_kv_indptr: torch.Tensor,
-    num_heads_per_head_k: int,
-    num_heads_k: int,
-    is_causal: bool,
-
-    work_meta_data: torch.Tensor,
-    work_info_set_tsr: torch.Tensor,
-    work_indptr_tsr: torch.Tensor,
-    reduce_indptr_tsr: torch.Tensor,
-    reduce_final_map_tsr: torch.Tensor,
-    reduce_partial_map_tsr: torch.Tensor,
-    # num_reduce_tile_tensor: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    ...
+# @compile_ops("module_mla_metadata")
+# def get_mla_metadata_v2(
+#     seqlens_qo_indptr: torch.Tensor,
+#     seqlens_kv_indptr: torch.Tensor,
+#     num_heads_per_head_k: int,
+#     num_heads_k: int,
+#     is_causal: bool,
+#
+#     work_meta_data: torch.Tensor,
+#     work_info_set_tsr: torch.Tensor,
+#     work_indptr_tsr: torch.Tensor,
+#     reduce_indptr_tsr: torch.Tensor,
+#     reduce_final_map_tsr: torch.Tensor,
+#     reduce_partial_map_tsr: torch.Tensor,
+#     # num_reduce_tile_tensor: torch.Tensor,
+# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+#     ...
 
 @compile_ops("module_mla_reduce")
 def mla_reduce_v1(
