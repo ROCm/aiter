@@ -7,7 +7,7 @@ from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_spli
 from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import attention_prefill_forward_ref_impl, attention_decode_forward_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
-from .utils import DEBUG, USE_REF, MetaData, is_fp8
+from .utils import DEBUG, USE_REF, MetaData
 from einops import rearrange, repeat
 from flash_attn.layers.rotary import apply_rotary_emb
 from typing import Literal, Optional, Union
@@ -29,10 +29,15 @@ def fwd(q: torch.Tensor,
         softcap: float,
         return_softmax: bool,
         gen_: Optional[torch.Tensor] = None,
-        descale_q: Optional[torch.Tensor] = None,
-        descale_k: Optional[torch.Tensor] = None,
-        descale_v: Optional[torch.Tensor] = None
     ):
+
+    # Reject FP8 tensors (FA2 AMD path does not support FP8)
+    if str(q.dtype).startswith("torch.float8"):
+        raise NotImplementedError("FP8 tensors are not supported in the AMD Triton FA2 interface. Use the FA3 path instead.")
+
+    # Unsupported features assertions (keep behavior explicit like v3 shim)
+    if softcap != 0.0:
+        raise NotImplementedError("softcap is not supported in the AMD Triton FA2 interface (expected 0.0).")
 
     if DEBUG:
         print()
@@ -49,17 +54,7 @@ def fwd(q: torch.Tensor,
         print("window_size_right:", window_size_right)
         print("softcap:", softcap)
         print("return_softmax:", return_softmax)
-        print("descale_q:", descale_q, descale_q.shape if descale_q is not None else None)
-        print("descale_k:", descale_k, descale_k.shape if descale_k is not None else None)
-        print("descale_v:", descale_v, descale_v.shape if descale_v is not None else None)
-
-    if is_fp8(q):
-        assert out is not None, "fp8 output tensor should be passed in."
-        if (descale_q is None) or (descale_k is None) or (descale_v is None):
-            import warnings
-            warnings.warn("FP8 tensors detected but descale factors not provided. Using default scale of 1.0", UserWarning)
-    else:
-        out = torch.zeros_like(q) if out is None else out.zero_()
+    out = torch.zeros_like(q) if out is None else out.zero_()
 
     # Setup metadata
     metadata = MetaData(sm_scale=softmax_scale)
@@ -138,9 +133,9 @@ def fwd(q: torch.Tensor,
                                                 metadata.philox_offset,
                                                 metadata.return_softmax,
                                                 USE_EXP2,
-                                                descale_q,
-                                                descale_k,
-                                                descale_v)
+                                                None,
+                                                None,
+                                                None)
         softmax_lse=softmax_lse_triton
         sd_mask=sd_mask_triton
 
@@ -173,15 +168,10 @@ def bwd(
     deterministic: bool,
     gen_: Optional[torch.Tensor] = None,
     rng_state:Optional[torch.Tensor] = None,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_o: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
-    descale_dq: Optional[torch.Tensor] = None,
-    descale_dk: Optional[torch.Tensor] = None,
-    descale_dv: Optional[torch.Tensor] = None,
 ):
+    if softcap != 0.0:
+        raise NotImplementedError("softcap is not supported in the AMD Triton FA2 interface (expected 0.0).")
+
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::bwd inputs")
@@ -204,14 +194,6 @@ def bwd(
         print("deterministic:", deterministic)
         print("gen_:", gen_)
         print("rng_state:", rng_state)
-        print("descale_q:", descale_q, descale_q.shape if descale_q is not None else None)
-        print("descale_k:", descale_k, descale_k.shape if descale_k is not None else None)
-        print("descale_v:", descale_v, descale_v.shape if descale_v is not None else None)
-        print("descale_o:", descale_o, descale_o.shape if descale_o is not None else None)
-        print("descale_do:", descale_do, descale_do.shape if descale_do is not None else None)
-        print("descale_dq:", descale_dq, descale_dq.shape if descale_dq is not None else None)
-        print("descale_dk:", descale_dk, descale_dk.shape if descale_dk is not None else None)
-        print("descale_dv:", descale_dv, descale_dv.shape if descale_dv is not None else None)
 
     dq = torch.zeros_like(q) if dq is None else dq.zero_()
     dk = torch.zeros_like(k) if dk is None else dk.zero_()
@@ -291,14 +273,14 @@ def bwd(
                 philox_seed,
                 philox_offset,
                 USE_EXP2,
-                descale_q,
-                descale_k,
-                descale_v,
-                descale_o,
-                descale_do,
-                descale_dq,
-                descale_dk,
-                descale_dv,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
             delta = delta_triton
         elif BWD_MODE == "fused_atomics":
@@ -322,10 +304,10 @@ def bwd(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                descale_q,
-                descale_k,
-                descale_v,
-                descale_o,
+                None,
+                None,
+                None,
+                None,
                 True,
             )
             delta = delta_triton
@@ -352,14 +334,14 @@ def bwd(
                 philox_seed,
                 philox_offset,
                 USE_EXP2,
-                descale_q,
-                descale_k,
-                descale_v,
-                descale_o,
-                descale_do,
-                descale_dq,
-                descale_dk,
-                descale_dv,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
             delta = delta_triton
         else:
@@ -368,14 +350,8 @@ def bwd(
     if DEBUG:
         print("flash_attn_triton_amd.py::bwd outputs")
         print("dv:", dv, dv.shape)
-        if is_fp8(dv):
-            print("descale_dv:", descale_dv, descale_dv.shape if descale_dv is not None else None)
         print("dk:", dk, dk.shape)
-        if is_fp8(dk):
-            print("descale_dk:", descale_dk, descale_dk.shape if descale_dk is not None else None)
         print("dq:", dq, dq.shape)
-        if is_fp8(dq):
-            print("descale_dq:", descale_dq, descale_dq.shape if descale_dq is not None else None)
     return dq, dk, dv, delta
 
 def varlen_fwd(
@@ -400,10 +376,19 @@ def varlen_fwd(
         softcap: float,
         return_softmax: bool,
         gen_: Optional[torch.Tensor] = None,
-        descale_q: Optional[torch.Tensor] = None,
-        descale_k: Optional[torch.Tensor] = None,
-        descale_v: Optional[torch.Tensor] = None
     ):
+
+    if str(q.dtype).startswith("torch.float8"):
+        raise NotImplementedError("FP8 tensors are not supported in the AMD Triton FA2 interface (varlen_fwd). Use the FA3 path instead.")
+
+    if softcap != 0.0:
+        raise NotImplementedError("softcap is not supported in varlen_fwd (expected 0.0).")
+    if leftpad_k is not None:
+        raise NotImplementedError("leftpad_k is not supported in AMD Triton FA2 varlen_fwd.")
+    if block_table_ is not None:
+        raise NotImplementedError("block_table / paged attention is not supported in AMD Triton FA2 varlen_fwd.")
+    if seqused_k is not None:
+        raise NotImplementedError("seqused_k is not supported in AMD Triton FA2 varlen_fwd.")
 
     if DEBUG:
         print()
@@ -422,17 +407,7 @@ def varlen_fwd(
         print("window_size_left:", window_size_left)
         print("window_size_right:", window_size_right)
         print("gen_:", gen_)
-        print("descale_q:", descale_q, descale_q.shape if descale_q is not None else None)
-        print("descale_k:", descale_k, descale_k.shape if descale_k is not None else None)
-        print("descale_v:", descale_v, descale_v.shape if descale_v is not None else None)
-
-    if is_fp8(q):
-        assert out is not None, "fp8 output tensor should be passed in."
-        if (descale_q is None) or (descale_k is None) or (descale_v is None):
-            import warnings
-            warnings.warn("FP8 tensors detected but descale factors not provided. Using default scale of 1.0", UserWarning)
-    else:
-        out = torch.zeros_like(q) if out is None else out.zero_()
+    out = torch.zeros_like(q) if out is None else out.zero_()
 
     # Setup metadata
     metadata = MetaData(sm_scale=softmax_scale)
@@ -511,9 +486,9 @@ def varlen_fwd(
                                                             metadata.philox_offset,
                                                             metadata.return_softmax,
                                                             USE_EXP2,
-                                                            descale_q,
-                                                            descale_k,
-                                                            descale_v)
+                                                            None,
+                                                            None,
+                                                            None)
         softmax_lse=softmax_lse_triton
         sd_mask=sd_mask_triton
 
@@ -551,15 +526,12 @@ def varlen_bwd(
     deterministic: bool,
     gen_ : Optional[torch.Tensor] = None,
     rng_state: Optional[torch.Tensor] = None,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_o: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
-    descale_dq: Optional[torch.Tensor] = None,
-    descale_dk: Optional[torch.Tensor] = None,
-    descale_dv: Optional[torch.Tensor] = None,
 ):
+    if str(q.dtype).startswith("torch.float8"):
+        raise NotImplementedError("FP8 tensors are not supported in the AMD Triton FA2 interface (varlen_bwd). Use the FA3 path instead.")
+    if softcap != 0.0:
+        raise NotImplementedError("softcap is not supported in varlen_bwd (expected 0.0).")
+
     if DEBUG:
         print()
         print("varlen_bwd")
@@ -585,10 +557,6 @@ def varlen_bwd(
         print("deterministic:", deterministic)
         print("gen_:", gen_)
         print("rng_state:", rng_state)
-        print("descale_q:", descale_q, descale_q.shape if descale_q is not None  else None)
-        print("descale_k:", descale_k, descale_k.shape if descale_k is not None  else None)
-        print("descale_v:", descale_v, descale_v.shape if descale_v is not None  else None)
-        print("descale_do:", descale_do, descale_do.shape if descale_do else None)
 
     dq = torch.zeros_like(q) if dq is None else dq.zero_()
     dk = torch.zeros_like(k) if dk is None else dk.zero_()
@@ -668,14 +636,14 @@ def varlen_bwd(
                 philox_seed,
                 philox_offset,
                 USE_EXP2,
-                descale_q,
-                descale_k,
-                descale_v,
-                descale_o,
-                descale_do,
-                descale_dq,
-                descale_dk,
-                descale_dv,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
             delta = delta_triton
         elif BWD_MODE == "fused_atomics":
@@ -699,10 +667,10 @@ def varlen_bwd(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                descale_q,
-                descale_k,
-                descale_v,
-                descale_o,
+                None,
+                None,
+                None,
+                None,
                 True,
             )
             delta = delta_triton
@@ -729,14 +697,14 @@ def varlen_bwd(
                 philox_seed,
                 philox_offset,
                 USE_EXP2,
-                descale_q,
-                descale_k,
-                descale_v,
-                descale_o,
-                descale_do,
-                descale_dq,
-                descale_dk,
-                descale_dv,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
             delta = delta_triton
         else:
@@ -773,6 +741,11 @@ def fwd_kvcache(
         rotary_interleaved: bool,
         num_splits: int
     ):
+
+    if softcap != 0.0:
+        raise NotImplementedError("softcap is not supported in fwd_kvcache (expected 0.0).")
+    if num_splits not in (0, 1):
+        raise NotImplementedError("num_splits > 1 not supported in AMD Triton FA2 fwd_kvcache.")
 
     if DEBUG:
         print()
