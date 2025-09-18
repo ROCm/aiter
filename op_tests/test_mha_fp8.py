@@ -5,12 +5,6 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter import per_tensor_quant
-from aiter.test_mha_common import (
-    attention_ref,
-    attn_bias_from_alibi_slopes,
-    ck_randval_to_dropout_mask,
-    convert_flash_attn_S_to_softmax,
-)
 import pytest
 import argparse
 
@@ -22,21 +16,22 @@ def run_ck(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
 ):
-    out = aiter.flash_attn_func(
-        q,
-        k,
-        v,
-        dropout_p=0.0,
-        causal=causal,
-        window_size=window_size,
-        bias=None,
-        alibi_slopes=None,
-        deterministic=True,
-        return_lse=False,
-        return_attn_probs=False,
-    )
-
-    return out
+    if q.dtype == dtypes.fp8 and k.dtype == dtypes.fp8 and v.dtype == dtypes.fp8:
+        return aiter.flash_attn_fp8_pertensor_func(q, k, v, causal=causal, window_size=window_size)
+    else:
+        return aiter.flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            causal=causal,
+            window_size=window_size,
+            bias=None,
+            alibi_slopes=None,
+            deterministic=True,
+            return_lse=False,
+            return_attn_probs=False,
+        )
 
 
 # @pytest.mark.parametrize("local", [False, True])

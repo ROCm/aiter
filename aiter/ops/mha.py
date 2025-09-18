@@ -2395,3 +2395,39 @@ def mha_batch_prefill_func(
         result.append(S_dmask)
 
     return result[0] if len(result) == 1 else tuple(result)
+
+
+def flash_attn_fp8_pertensor_func(
+    q,
+    k,
+    v,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softmax_scale=None,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    head_size_q_og = q.size(3)
+    head_size_v_og = v.size(3)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+    out_padded, _, _, _ = _flash_attn_forward(
+        q,
+        k,
+        v,
+        0.0,
+        softmax_scale,
+        causal=causal,
+        window_size_left=int(window_size[0]),
+        window_size_right=int(window_size[1]),
+        bias=None,
+        alibi_slopes=None,
+        return_lse=False,
+        return_softmax=False
+    )
+    out = out_padded[..., :head_size_v_og]
+    return out
+
