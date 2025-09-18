@@ -70,18 +70,25 @@ def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
 
     ylabel = get_evaluation_label(args.metric, space=True)
     
-    line_vals = [get_evaluation_unit(args.metric)]
-    line_names = [get_evaluation_label(args.metric)]
+    if not args.bench_torch:
+        line_vals = [get_evaluation_unit(args.metric)]
+        line_names = [get_evaluation_label(args.metric)]
+    else:
+        line_vals = ["triton", "torch"]
+        line_names = [get_evaluation_label(args.metric, prefix="triton"), get_evaluation_label(args.metric, prefix="torch")]
     
+    mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
         x_log=True,
         y_log=True,
-        line_arg="unit",
+        line_arg="provider",
         line_vals=line_vals,
         line_names=line_names,
-        styles=[("green", "-")],
+        styles=[
+            (mpl_colors[i], "-") for i in range(len(line_names))
+        ],
         ylabel=ylabel,
         plot_name=plot_name,
         args={"metric": args.metric},
@@ -115,11 +122,23 @@ def get_gemm_model_benchmark_object(
     line_names = []
     line_vals = []
     if args.fc1:
-        line_names.append(get_evaluation_label(args.metric, prefix="fc1"))
-        line_vals.append("fc1")
+        if not args.bench_torch:
+            line_names.append(get_evaluation_label(args.metric, prefix="fc1"))
+            line_vals.append("fc1")
+        else:
+            line_names.append(get_evaluation_label(args.metric, prefix="triton_fc1"))
+            line_vals.append(("triton", "fc1"))
+            line_names.append(get_evaluation_label(args.metric, prefix="torch_fc1"))
+            line_vals.append(("torch", "fc1"))
     if args.fc2:
-        line_names.append(get_evaluation_label(args.metric, prefix="fc2"))
-        line_vals.append("fc2")
+        if not args.bench_torch:
+            line_names.append(get_evaluation_label(args.metric, prefix="fc2"))
+            line_vals.append("fc2")
+        else:
+            line_names.append(get_evaluation_label(args.metric, prefix="triton_fc2"))
+            line_vals.append(("triton", "fc2"))
+            line_names.append(get_evaluation_label(args.metric, prefix="torch_fc2"))
+            line_vals.append(("torch", "fc2"))
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(
@@ -127,7 +146,7 @@ def get_gemm_model_benchmark_object(
         x_vals=x_vals_list,
         x_log=True,
         y_log=True,
-        line_arg="layer",
+        line_arg="provider",
         line_vals=line_vals,
         line_names=line_names,
         styles=[
