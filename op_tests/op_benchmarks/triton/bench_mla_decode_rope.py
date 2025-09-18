@@ -7,6 +7,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
     get_evaluation_label,
+    get_evaluation_unit,
 )
 import torch
 import sys
@@ -105,14 +106,15 @@ def create_benchmark_configs(args: argparse.Namespace):
     else:
         x_vals_list = nonvarlen_benchmark_configs(args)
 
-    line_vals = [get_evaluation_label(args.metric)]
+    line_vals = [get_evaluation_unit(args.metric)]
+    line_names = [get_evaluation_label(args.metric)]
     configs.append(
         triton.testing.Benchmark(
             x_names=x_names,
             x_vals=x_vals_list,
-            line_arg="provider",
+            line_arg="unit",
             line_vals=line_vals,
-            line_names=line_vals,
+            line_names=line_names,
             styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
             ylabel=get_evaluation_label(args.metric, space=True),
             plot_name=get_caller_name_no_ext(),

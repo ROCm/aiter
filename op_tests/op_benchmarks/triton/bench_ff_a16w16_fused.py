@@ -41,7 +41,7 @@ def get_gemm_model_benchmark_object(
     ylabel = get_evaluation_label(args.metric, space=True)
 
     line_names = [get_evaluation_label(args.metric)]
-    line_vals = line_names
+    line_vals = [get_evaluation_unit(args.metric)]
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(

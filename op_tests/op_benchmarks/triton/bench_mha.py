@@ -140,20 +140,22 @@ def create_benchmark_configs(custom, args):
 
     if mode == "bwd":
         if args.fused_bwd:
-            line_vals = [get_evaluation_label(args.metric, prefix="fused-bwd")]
+            line_vals = ["fused-bwd"]
         else:
-            line_vals = [get_evaluation_label(args.metric, prefix="fused-bwd"), get_evaluation_label(args.metric, prefix="bwd")]
+            line_vals = ["fused-bwd", "bwd"]
     else:
-        line_vals = [get_evaluation_label(args.metric, prefix="fwd")]
+        line_vals = ["fwd"]
 
     if args.bench_torch:
-        line_vals = [get_evaluation_label(args.metric, prefix="triton"), get_evaluation_label(args.metric, prefix="torch")]
+        line_vals = ["triton", "torch"]
 
     if args.test_mode:
         if args.fused_bwd:
-            line_vals = [get_evaluation_label(args.metric, prefix="fused-bwd")]
+            line_vals = ["fused-bwd"]
         else:
-            line_vals = [get_evaluation_label(args.metric, prefix="bwd")]
+            line_vals = ["bwd"]
+            
+    line_names = [get_evaluation_label(args.metric, prefix=val) for val in line_vals]
 
     configs.append(
         triton.testing.Benchmark(
@@ -161,7 +163,7 @@ def create_benchmark_configs(custom, args):
             x_vals=x_vals_list,
             line_arg="provider",
             line_vals=line_vals,
-            line_names=line_vals,
+            line_names=line_names,
             styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
             ylabel=get_evaluation_label(args.metric, space=True),
             plot_name=plot_name,
@@ -451,9 +453,9 @@ def run_benchmark(custom, args):
             + total_num_tokens_q * HQ * D_HEAD * output_bytes
         )
         # return ms
-        if "ms" in provider:
+        if args.metric == "time":
             return ms
-        elif "TFLOPS" in provider:
+        elif args.metric == "throughput":
             return total_flops / ms * 1e-9
         else:  # GB/s
             return mem / ms * 1e-6

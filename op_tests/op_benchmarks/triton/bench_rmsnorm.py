@@ -10,6 +10,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
     get_evaluation_label,
+    get_evaluation_unit,
 )
 
 
@@ -58,7 +59,7 @@ def run_benchmark(args):
     ylabel = get_evaluation_label(args.metric, space=True)
 
     line_names = [get_evaluation_label(args.metric)]
-    line_vals = [get_evaluation_label(args.metric)]
+    line_vals = [get_evaluation_unit(args.metric)]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,

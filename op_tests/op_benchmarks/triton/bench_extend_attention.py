@@ -176,7 +176,8 @@ def benchmark(args):
         elif args.mode == "prefill":
             x_names, x_vals_list = get_prefill_benchmark_configs()
 
-    line_vals = [get_evaluation_label("time", prefix="fwd")]
+    line_vals = ["time"]
+    line_names = [get_evaluation_label("time", prefix="fwd")]
 
     configs.append(
         triton.testing.Benchmark(
@@ -184,7 +185,7 @@ def benchmark(args):
             x_vals=x_vals_list,
             line_arg="metric",
             line_vals=line_vals,
-            line_names=line_vals,
+            line_names=line_names,
             styles=[("red", "-"), ("green", "-")],
             ylabel="ms",
             plot_name=get_caller_name_no_ext(),

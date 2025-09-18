@@ -16,6 +16,7 @@ from triton.testing import runtime
 from aiter.ops.triton.topk import topk as triton_topk
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_evaluation_label,
+    get_evaluation_unit,
     get_model_configs,
     get_available_models,
     get_caller_name_no_ext,
@@ -268,11 +269,11 @@ def run_benchmark(args, x_vals_list):
 
     ylabel = get_evaluation_label(args.metric, space=True)
     line_names = [get_evaluation_label(args.metric)]
-    line_vals = line_names
+    line_vals = [get_evaluation_unit(args.metric)]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
-        line_arg="provider",
+        line_arg="unit",
         line_vals=line_vals,
         line_names=line_names,
         styles=[("green", "-")],  # match line names to colors

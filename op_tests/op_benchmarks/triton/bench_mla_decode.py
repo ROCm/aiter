@@ -66,7 +66,8 @@ def benchmark(args):
     if args.model:
         x_names, x_vals_list = model_benchmark_configs(args)
 
-    line_vals = [get_evaluation_label("time", prefix="mla_decode_fwd")]
+    line_vals = ["mla_decode_fwd"]
+    line_names = [get_evaluation_label("time", prefix="mla_decode_fwd")]
 
     configs.append(
         triton.testing.Benchmark(
@@ -74,7 +75,7 @@ def benchmark(args):
             x_vals=x_vals_list,
             line_arg="provider",
             line_vals=line_vals,
-            line_names=line_vals,
+            line_names=line_names,
             styles=[("red", "-"), ("green", "-")],
             ylabel=get_evaluation_label("time", space=True),
             plot_name=get_caller_name_no_ext(),

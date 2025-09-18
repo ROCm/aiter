@@ -14,6 +14,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_caller_name_no_ext,
     get_evaluation_label,
+    get_evaluation_unit,
 )
 from op_tests.triton_tests.test_moe_routing_sigmoid_top1_fused import (
     torch_routing_sigmoid_top1,
@@ -35,11 +36,11 @@ def run_benchmark(args, x_vals_list):
 
     ylabel = get_evaluation_label(args.metric, space=True)
     line_names = [get_evaluation_label(args.metric)]
-    line_vals = line_names
+    line_vals = [get_evaluation_unit(args.metric)]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
-        line_arg="provider",
+        line_arg="unit",
         line_vals=line_vals,
         line_names=line_names,
         styles=[("green", "-")],  # match line names to colors

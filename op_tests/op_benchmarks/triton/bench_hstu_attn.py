@@ -14,6 +14,7 @@ from op_tests.triton_tests.test_hstu_attn import (
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_evaluation_label,
+    get_evaluation_unit,
     print_vgpr,
     get_caller_name_no_ext,
 )
@@ -61,7 +62,7 @@ def run_benchmark(args):
     ylabel = get_evaluation_label(args.metric, space=True)
 
     line_names = [get_evaluation_label(args.metric)]
-    line_vals = line_names
+    line_vals = [get_evaluation_unit(args.metric)]
     modes = [args.mode]
     if args.mode == "both":
         modes = ["fwd", "bwd"]
