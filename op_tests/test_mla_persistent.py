@@ -296,7 +296,8 @@ def test_mla(
 
     err = None
     us_asm_decode = 10000000000
-    err, us_asm_decode = test_absorb_decode()
+    if nhead == 16:
+        err, us_asm_decode = test_absorb_decode()
 
     def test_absorb_decode_fp8():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)

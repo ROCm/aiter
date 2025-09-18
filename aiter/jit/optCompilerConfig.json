@@ -817,7 +817,8 @@
             "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v0.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_comm.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_1_device.cuh'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_1_host.cuh'"
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_1_host.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_2_device.cuh'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

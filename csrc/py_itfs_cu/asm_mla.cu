@@ -249,6 +249,27 @@ void mla_decode_stage1_asm_fwd(
                 TORCH_CHECK(false, __func__, ":only support persistent fp8 mla");
             }
         }
+        else if(gqa_ratio == 128)
+        {
+            if(persistent)
+            {
+                // assert(false);
+                sub_Q = 128;
+                static AiterAsmKernel impl_fp8(
+                    "_ZN5aiter28mla_a8w8_qh16_gqaratio128_psE",
+                    "/mla/mla_a8w8_qh16_gqaratio128_ps.co");
+                impl_ptr = &impl_fp8;
+            }
+            else
+            {
+                sub_Q = 128;
+                static AiterAsmKernel impl_fp8(
+                    "_ZN5aiter25mla_a8w8_qh16_gqaratio128E",
+                    "/mla/mla_a8w8_qh16_gqaratio128.co");
+                impl_ptr = &impl_fp8;
+            }
+        }
+
     }
 
     TORCH_CHECK(impl_ptr != nullptr, __func__, ": unsupport current Q_type:", Q.scalar_type());
