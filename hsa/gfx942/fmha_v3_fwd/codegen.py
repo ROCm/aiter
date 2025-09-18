@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 from typing import Optional
 
+from aiter.jit.utils.chip_info import get_gfx, get_device_name
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 

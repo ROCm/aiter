@@ -418,38 +418,6 @@ def gen_mha_varlen_fwd_fake_tensor(
     return [out_tensor, softmax_lse_tensor, p_tensor, rng_state_tensor]
 
 
-@compile_ops(
-    "module_mha_varlen_fwd",
-    fc_name="mha_varlen_fwd",
-    gen_func=cmdGenFunc_mha_varlen_fwd,
-    gen_fake=gen_mha_varlen_fwd_fake_tensor,
-)
-def fmha_v3_varlen_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: Optional[torch.Tensor],
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    min_seqlen_q: int,
-    dropout_p: float,
-    softmax_scale: float,
-    logits_soft_cap: float,
-    zero_tensors: bool,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    return_softmax_lse: bool,
-    return_dropout_randval: bool,
-    how_v3_bf16_cvt: int,
-    out: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    gen: Optional[torch.Generator] = None,
-) -> List[torch.Tensor]: ...
-
 
 def gen_fmha_v3_varlen_fwd_fake_tensor(
     q: torch.Tensor,

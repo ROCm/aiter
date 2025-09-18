@@ -4,6 +4,7 @@ import functools
 import os
 import re
 import subprocess
+from torch_guard import torch_compile_guard
 
 from cpp_extension import executable_path
 
@@ -82,6 +83,10 @@ def get_cu_num_custom_op() -> int:
         cu_num = gpu_compute_units[0]
     return cu_num
 
+@functools.lru_cache(maxsize=1)
+def get_cu_num():
+    cu_num = get_cu_num_custom_op()
+    return cu_num
 
 def get_device_name():
     gfx = get_gfx()
