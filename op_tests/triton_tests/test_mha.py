@@ -7,13 +7,15 @@ import logging
 import numpy as np
 from aiter.ops.triton.mha import (
     flash_attn_func,
-    flash_attn_func_v3,
     flash_attn_varlen_func,
-    flash_attn_varlen_func_v3,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
     _cast_to_fp8,
     _cast_varlen_to_fp8,
+)
+from aiter.ops.triton.mha_v3 import (
+    flash_attn_func as flash_attn_func_v3,
+    flash_attn_varlen_func as flash_attn_varlen_func_v3,
 )
 from aiter.ops.triton.utils.arch_info import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
@@ -136,7 +138,7 @@ def test_mha(
     if FP8:
         if DROPOUT > 0.0 or RETURN_LSE or RETURN_SOFTMAX:
             pytest.skip(
-                "flash_attn_func_v3 doesn't support dropout, return_lse, or return_attn_probs"
+                "flash_attn_func (v3) doesn't support dropout, return_lse, or return_attn_probs"
             )
 
         fp8_dtype = get_fp8_e4m3_dtype()

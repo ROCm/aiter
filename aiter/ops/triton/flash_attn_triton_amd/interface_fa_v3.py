@@ -9,7 +9,7 @@ from .fwd_ref import attention_prefill_forward_ref_impl, attention_decode_forwar
 from .bwd_ref import attention_backward_pytorch_ref_impl
 from .utils import DEBUG, USE_REF, MetaData, is_fp8
 from einops import rearrange, repeat
-from flash_attn.layers.rotary import apply_rotary_emb
+# from flash_attn.layers.rotary import apply_rotary_emb
 from typing import Optional, Union, Tuple
 
 USE_EXP2 = True

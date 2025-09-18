@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from flash_attn.flash_attn_triton_amd.utils import compute_fp8_scaling_factors, DEBUG, is_fp8
+from .utils import compute_fp8_scaling_factors, DEBUG, is_fp8
 
 from typing import Optional, Tuple
 
