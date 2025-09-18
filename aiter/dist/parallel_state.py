@@ -129,7 +129,12 @@ if supports_custom_op():
         )
 
     @outplace_all_reduce.register_fake
-    def _(tensor: torch.Tensor, open_fp8_quant: bool, group_name: str) -> torch.Tensor:
+    def _(
+        tensor: torch.Tensor,
+        group_name: str,
+        outplace_all_reduce_method: str,
+        ca_fp8_quant: bool,
+    ) -> torch.Tensor:
         return torch.empty_like(tensor)
 
 
@@ -343,7 +348,9 @@ class GroupCoordinator:
             with maybe_pynccl_context:
                 yield graph_capture_context
 
-    def all_reduce(self, input_: torch.Tensor, ca_fp8_quant: bool) -> torch.Tensor:
+    def all_reduce(
+        self, input_: torch.Tensor, ca_fp8_quant: bool = False
+    ) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
         all-reduce operation.
