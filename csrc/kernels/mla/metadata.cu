@@ -8,6 +8,7 @@
 #include "custom_all_reduce.cuh"
 #include "mla.h"
 
+#define WARP_SIZE 64
 
 #define PRINT_DBG 0
 
@@ -1254,9 +1255,9 @@ struct FlashMlaKernelTrait
     static constexpr int32_t kSizeD                  = kSizeD_;    // hidden dimension size of query and key
     static constexpr int32_t kSizeDV                 = kSizeDV_;   // hidden dimension size of value
     static constexpr int32_t kNumWarps               = kNumWarps_;
-    static constexpr int32_t kNumThreads             = kNumWarps * warpSize;
+    static constexpr int32_t kNumThreads             = kNumWarps * WARP_SIZE;
     static constexpr int32_t kNumWarpsSoftmax        = 4;
-    static constexpr int32_t kNumThreadsSoftmax      = kNumWarpsSoftmax * warpSize;
+    static constexpr int32_t kNumThreadsSoftmax      = kNumWarpsSoftmax * WARP_SIZE;
     static constexpr int32_t kBlockM                 = kBlockM_;
     static constexpr int32_t kBlockN                 = kBlockN_;
     static constexpr int32_t kFixedOverheadNumBlocks = 16;
@@ -1430,7 +1431,7 @@ __global__ void kn_get_mla_metadata(
     __shared__ int lds_seqlens_k[Traits::kMaxBatchSize];
 
     int32_t sum_blocks = 0;
-    for (int32_t i = threadIdx.x; i < batch_size; i += warpSize)
+    for (int32_t i = threadIdx.x; i < batch_size; i += WARP_SIZE)
     {
         int32_t seqlen_k = p_seqlens_kv_indptr[i + 1] - p_seqlens_kv_indptr[i];
         const int32_t num_blocks = ck_tile::integer_divide_ceil(seqlen_k, Traits::kBlockN);
@@ -1531,7 +1532,7 @@ __global__ void kn_get_mla_metadata(
         }
     }
 
-    for (int32_t i = threadIdx.x; i <= num_cu_parts; i += warpSize)
+    for (int32_t i = threadIdx.x; i <= num_cu_parts; i += WARP_SIZE)
     {
         p_work_indptr[i] = lds_num_splits[i];
     }
@@ -1563,7 +1564,7 @@ void dispatch_get_mla_metadata(
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     const uint32_t grid  = 1;
-    const uint32_t block = warpSize;
+    const uint32_t block = WARP_SIZE;
 
     kn_get_mla_metadata<Traits><<<grid, block, 0, stream>>>(
         p_work_metadata,
