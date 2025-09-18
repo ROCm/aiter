@@ -232,7 +232,7 @@ def test_flash_attn_output(
     )
     dout = None
 
-    out, dropout_mask, dq, dk, dv, dbias = run_ck(
+    out, dropout_mask = run_ck(
         q,
         k,
         v,
@@ -247,7 +247,7 @@ def test_flash_attn_output(
         return_attn_probs,
     )
 
-    out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
+    out_ref = run_torch(
         q,
         k,
         v,
@@ -260,7 +260,7 @@ def test_flash_attn_output(
         window_size,
     )
 
-    out_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
+    out_pt = run_torch(
         q,
         k,
         v,
