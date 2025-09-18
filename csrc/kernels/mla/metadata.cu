@@ -4,6 +4,7 @@
 #include "v0.cuh"
 #include "v1_1_device.cuh"
 #include "v1_1_host.cuh"
+#include "v1_2_device.cuh"
 
 // ===================================================================================================================
 // MLA Metadata V0
