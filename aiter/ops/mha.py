@@ -1248,8 +1248,7 @@ def can_impl_fmha_v3_bwd(
         # bwd_hd64_fp16_causal_a32_pssk
         gfx = get_gfx()
         # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        ret = (hdim_q == 64 and is_v3_atomic_fp32 == True) or (
-        )
+        ret = hdim_q == 64 and is_v3_atomic_fp32 == True
         ret &= nmask or (
             mask and seqlen_q == seqlen_k
         )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
@@ -1372,10 +1371,9 @@ def _flash_attn_backward(
         is_v3_atomic_fp32,
     )
 
-
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    
+
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
     mask = causal and window_size_left == -1  # causal mask
@@ -1388,14 +1386,13 @@ def _flash_attn_backward(
         ret &= bias is None
         ret &= dbias is None
         ret &= dropout_p == 0.0
-        ret &= not deterministic or is_950_1block  # only 1 block when sk <= 256, thus deterministic
+        ret &= (
+            not deterministic or is_950_1block
+        )  # only 1 block when sk <= 256, thus deterministic
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
-        ret &= (
-            nmask
-            or (mask and seqlen_q == seqlen_k)
-        )
+        ret &= nmask or (mask and seqlen_q == seqlen_k)
 
         return ret
 
