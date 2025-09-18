@@ -575,12 +575,17 @@ def get_2stage_cfgs(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
 
-    if "ck2stages" in kernelName1 or q_dtype_w in [
-        dtypes.bf16,
-        dtypes.fp16,
-        torch.uint32,
-        torch.uint8,
-    ]:
+    if (
+        "ck2stages" in kernelName1
+        or (q_type == QuantType.per_1x128 and doweight_stage1)
+        or q_dtype_w
+        in [
+            dtypes.bf16,
+            dtypes.fp16,
+            torch.uint32,
+            torch.uint8,
+        ]
+    ):
         return MOEMetadata(
             functools.partial(
                 aiter.ck_moe_stage1_fwd,
@@ -1105,24 +1110,51 @@ def fused_topk(
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     M, _ = hidden_states.shape
+    expert = gating_output.shape[1]
 
-    if topk_weights is None:
-        topk_weights = torch.empty(
-            M, topk, dtype=dtypes.fp32, device=hidden_states.device
-        )
-    if topk_ids is None:
-        topk_ids = torch.empty(M, topk, dtype=dtypes.i32, device=hidden_states.device)
     token_expert_indicies = torch.empty(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
-    aiter.topk_softmax(
-        topk_weights,
-        topk_ids,
-        token_expert_indicies,
-        gating_output,
-        renormalize,
-    )
+    if (
+        get_gfx() == "gfx942"
+        and (expert, topk) in [(128, 6), (128, 8), (256, 6), (256, 8)]
+        and gating_output.dtype == dtypes.fp32
+    ):
+        if topk_weights is None:
+            topk_weights = torch.empty(
+                (M + 3) // 4 * 4, topk, dtype=dtypes.fp32, device=hidden_states.device
+            )
+        if topk_ids is None:
+            topk_ids = torch.empty(
+                (M + 3) // 4 * 4, topk, dtype=dtypes.i32, device=hidden_states.device
+            )
+        aiter.topk_softmax_asm(
+            topk_weights,
+            topk_ids,
+            token_expert_indicies,
+            gating_output,
+            renormalize,
+        )
+        topk_weights = topk_weights[:M, :]
+        topk_ids = topk_ids[:M, :]
+    else:
+        if topk_weights is None:
+            topk_weights = torch.empty(
+                M, topk, dtype=dtypes.fp32, device=hidden_states.device
+            )
+        if topk_ids is None:
+            topk_ids = torch.empty(
+                M, topk, dtype=dtypes.i32, device=hidden_states.device
+            )
+        aiter.topk_softmax(
+            topk_weights,
+            topk_ids,
+            token_expert_indicies,
+            gating_output,
+            renormalize,
+        )
+
     del token_expert_indicies  # Not used. Will be used in the future.
 
     # if renormalize:

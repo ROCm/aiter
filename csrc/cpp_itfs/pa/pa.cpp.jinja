@@ -32,7 +32,6 @@ FUNCTION_DEFINE;
                         
 FUNCTION_DEFINE
 {
-    constexpr int block_size = {{block_size}};
     constexpr int PARTITION_SIZE = 256;
 
     const int max_num_partitions =
@@ -63,7 +62,8 @@ FUNCTION_DEFINE
                                             {{alibi_enabled}},                    
                                             {{gqa_ratio}},
                                             {{mtp}},
-                                            {{quant_method}}>               
+                                            {{quant_method}},
+                                            {{"true" if v_shuffle else "false"}}>               
     <<<grid, block, 0, reinterpret_cast<hipStream_t>(stream)>>>(reinterpret_cast<{{dtype}}*>(query_ptr),                      
                                     reinterpret_cast<{{kv_dtype}}*>(key_cache_ptr),                  
                                     reinterpret_cast<{{kv_dtype}}*>(value_cache_ptr),      

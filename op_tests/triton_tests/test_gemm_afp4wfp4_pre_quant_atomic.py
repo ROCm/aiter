@@ -1,7 +1,7 @@
 import torch
 import pytest
 from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
-import aiter.ops.triton.utils.arch_info as arch_info
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
