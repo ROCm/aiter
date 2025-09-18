@@ -1155,9 +1155,9 @@ def can_impl_fmha_v3_bwd(
     deterministic: bool,
     is_v3_atomic_fp32: Optional[bool] = True,
 ) -> bool:
+
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
-
     batch_stride_q = q.stride(0)
     stride_q = q.stride(1)
     nhead_stride_q = q.stride(2)
@@ -1353,23 +1353,6 @@ def _flash_attn_backward(
         )
         how_v3_bf16_cvt = 0
 
-    is_950_1block = get_gfx() == "gfx950" and seqlen_k <= 256
-
-    def can_impl_fmha_v3_bwd_gfx950():
-        ret = get_gfx() == "gfx950"
-        ret &= alibi_slopes is None
-        ret &= bias is None
-        ret &= dbias is None
-        ret &= dropout_p == 0.0
-        ret &= not deterministic or is_950_1block  # only 1 block when sk <= 256, thus deterministic
-        ret &= hdim_q == hdim_v
-        ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
-        ret &= (
-            nmask
-            or (mask and seqlen_q == seqlen_k)
-        )
-
     # can_impl_fmha_v3_bwd should before maybe_contiguous to get pure dout, q, k, v, out
     can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd(
         dout,
@@ -1389,12 +1372,35 @@ def _flash_attn_backward(
         is_v3_atomic_fp32,
     )
 
-    can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    (_, seqlen_q, _, _) = q.shape
-    (_, seqlen_k, _, _) = k.shape
+    
+    (_, seqlen_q, nhead_q, hdim_q) = q.shape
+    (_, seqlen_k, nhead_k, hdim_v) = v.shape
+    mask = causal and window_size_left == -1  # causal mask
+    nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
+    is_950_1block = get_gfx() == "gfx950" and seqlen_k <= 256
+
+    def can_impl_fmha_v3_bwd_gfx950():
+        ret = get_gfx() == "gfx950"
+        ret &= alibi_slopes is None
+        ret &= bias is None
+        ret &= dbias is None
+        ret &= dropout_p == 0.0
+        ret &= not deterministic or is_950_1block  # only 1 block when sk <= 256, thus deterministic
+        ret &= hdim_q == hdim_v
+        ret &= nhead_q % nhead_k == 0
+        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
+        ret &= (
+            nmask
+            or (mask and seqlen_q == seqlen_k)
+        )
+
+        return ret
+
+    can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
+
     if (
         can_impl_fmha_v3_bwd_ and seqlen_q > 16
     ):  # ck fmha bwd has optimization for seqlen_q <= 16
@@ -1476,7 +1482,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = True,
+        is_v3_atomic_fp32: Optional[bool] = False,
         how_v3_bf16_cvt: Optional[int] = 1,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
@@ -1848,8 +1854,8 @@ def _flash_attn_varlen_backward(
     def can_impl_fmha_v3_bwd():
         # basic
         ret = alibi_slopes is None
-        ret &= bias is None
-        ret &= dbias is None
+        # ret &= bias is None
+        # ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= deterministic == False
         ret &= hdim_q == hdim_v
@@ -1863,8 +1869,8 @@ def _flash_attn_varlen_backward(
     def can_impl_fmha_v3_bwd_gfx950():
         ret = get_gfx() == "gfx950"
         ret &= alibi_slopes is None
-        ret &= bias is None
-        ret &= dbias is None
+        # ret &= bias is None
+        # ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= deterministic == False
         ret &= hdim_q == hdim_v
@@ -1872,10 +1878,13 @@ def _flash_attn_varlen_backward(
         ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
         ret &= nmask
 
+        return ret
+
     can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd() or can_impl_fmha_v3_bwd_gfx950()
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    if can_impl_fmha_v3_bwd():
+
+    if can_impl_fmha_v3_bwd_:
         (
             dq,
             dk,
@@ -1970,7 +1979,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_table,
         out,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = True,
+        is_v3_atomic_fp32: Optional[bool] = False,
         how_v3_bf16_cvt: Optional[int] = 1,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
