@@ -4,7 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton._triton_kernels.batched_gemm_afp4wfp4_pre_quant import (
     _batched_gemm_afp4_wfp4_pre_quant_reduce_kernel,
@@ -64,14 +63,6 @@ def batched_gemm_afp4wfp4_pre_quant(
         config = _get_config(M, N, K)
 
     if config["NUM_KSPLIT"] > 1:
-        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
-        )
-
-        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
-        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
-        config["NUM_KSPLIT"] = NUM_KSPLIT
-
         if _USE_GEMM_SPLITK_BF16:
             y_pp = torch.empty(
                 (Batch, config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=y.device
@@ -83,12 +74,7 @@ def batched_gemm_afp4wfp4_pre_quant(
                 device=y.device,
             )
     else:
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
-
-    if config["BLOCK_SIZE_K"] >= 2 * K:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     grid = lambda META: (  # noqa: E731
         Batch,

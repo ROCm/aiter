@@ -4,7 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
@@ -23,39 +22,6 @@ _USE_GEMM_SPLITK_BF16 = False
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
-
-
-def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
-    # heuristics for make "EVEN_K == True" as much as possible
-    NUM_KSPLIT_STEP = 2
-    BLOCK_SIZE_K_STEP = 2
-    SPLITK_BLOCK_SIZE = (
-        triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
-    )
-    while NUM_KSPLIT > 1 and BLOCK_SIZE_K > 16:
-        if (
-            K % (SPLITK_BLOCK_SIZE // 2) == 0
-            and SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0
-            and K % (BLOCK_SIZE_K // 2) == 0
-        ):
-            break
-        elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
-            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
-        elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
-            if NUM_KSPLIT > 1:
-                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
-            elif BLOCK_SIZE_K > 16:
-                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
-        elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
-            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
-        else:
-            break
-
-        SPLITK_BLOCK_SIZE = (
-            triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
-        )
-
-    return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
 
 
 def gemm_afp4wfp4(
@@ -103,14 +69,6 @@ def gemm_afp4wfp4(
         config = _get_config(M, N, K)
 
     if config["NUM_KSPLIT"] > 1:
-        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
-        )
-
-        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
-        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
-        config["NUM_KSPLIT"] = NUM_KSPLIT
-
         if _USE_GEMM_SPLITK_BF16:
             y_pp = torch.empty(
                 (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=y.device
@@ -120,7 +78,6 @@ def gemm_afp4wfp4(
                 (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
             )
     else:
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
     grid = lambda META: (  # noqa: E731
@@ -226,14 +183,6 @@ def gemm_afp4wfp4_preshuffled_scales(
         config = _get_config(M, N, K)
 
     if config["NUM_KSPLIT"] > 1:
-        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
-        )
-
-        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
-        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
-        config["NUM_KSPLIT"] = NUM_KSPLIT
-
         if _USE_GEMM_SPLITK_BF16:
             y_pp = torch.empty(
                 (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=y.device
@@ -243,7 +192,6 @@ def gemm_afp4wfp4_preshuffled_scales(
                 (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
             )
     else:
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
     if config["BLOCK_SIZE_K"] >= 2 * K:
