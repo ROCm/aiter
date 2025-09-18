@@ -14,12 +14,10 @@ Taking GEMM kernel in Llama-70B model for example, `aiter/configs/model_configs/
   If you want to tune the Llama-70B GEMM kernels, then copy `aiter/configs/model_configs/llama70B_untuned_gemm_bf16.csv` to `aiter/configs/untuned_gemm.csv`.
   Then refer to the steps in [GEMM performance tune](https://github.com/ROCm/aiter/tree/main/gradlib) for kernel performance tuning. 
 
-
 #### 3.2 FP8 GEMM kernel performance tuning
 
 - ##### MXFP8 GEMM with Per Token or Per Tensor quantization. Weight in plain format:
   If you want to tune the Llama-70B GEMM kernels with FP8 datatype and the weight is in plain format, then copy `aiter/configs/model_configs/llama70B_untuned_gemm.csv` to `aiter/configs/a8w8_untuned_gemm.csv`.Then refer to the steps in [CK gemm a8w8 tune](https://github.com/ROCm/aiter/tree/main/csrc/ck_gemm_a8w8) for kernel performance tuning. 
-
 
 - ##### MXFP8 GEMM with Per Token or Per Tensor quantization. Weight in preshuffling format:
    If you want to tune the Llama-70B GEMM kernels with FP8 datatype and the weight is in preshuffling format, then copy `aiter/configs/model_configs/llama70B_untuned_gemm.csv` to `aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv`.
