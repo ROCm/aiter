@@ -137,37 +137,36 @@ def _fwd_grouped_kernel_stage1(
         vec=8, per_phase=4, max_phase=8, order=[0, 1]
     )
 
-    BLOCK_N_HALF = BLOCK_N // 2
+    BLOCK_N_HALF = 16 
 
     smem_k_nope_1 = gl.allocate_shared_memory(
         # K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank], layout=shared_k
-        K_Buffer.type.element_ty, [kv_lora_rank, BLOCK_N_HALF], layout=shared_k
+        K_Buffer.type.element_ty, [kv_lora_rank, 16], layout=shared_k
     )
 
     smem_k_nope_2 = gl.allocate_shared_memory(
         # K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank], layout=shared_k
-        K_Buffer.type.element_ty, [kv_lora_rank, BLOCK_N_HALF], layout=shared_k
+        K_Buffer.type.element_ty, [kv_lora_rank, 16], layout=shared_k
     )
 
-    smem_k_rope = gl.allocate_shared_memory(
-        K_Buffer.type.element_ty, [qk_rope_head_dim, BLOCK_N_HALF], layout=shared_k
+    smem_k_rope_1 = gl.allocate_shared_memory(
+        K_Buffer.type.element_ty, [qk_rope_head_dim, 16], layout=shared_k
     )
+    # smem_k_rope_2 = gl.allocate_shared_memory(
+    #     K_Buffer.type.element_ty, [qk_rope_head_dim, 16], layout=shared_k
+    # )
 
     smem_q_nope = gl.allocate_shared_memory(
-        Q.type.element_ty, [BLOCK_H, kv_lora_rank], layout=shared_q
+        Q.type.element_ty, [16, 512], layout=shared_q
     )
     smem_q_rope = gl.allocate_shared_memory(
         Q.type.element_ty, [BLOCK_H, qk_rope_head_dim], layout=shared_q
     )
 
-    smem_v = gl.allocate_shared_memory(
-        # K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank], layout=shared_k
-        K_Buffer.type.element_ty, [BLOCK_N_HALF, kv_lora_rank], layout=shared_k
-    )
 
     smem_p = gl.allocate_shared_memory(
         # K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank], layout=shared_k
-        Q.type.element_ty, [BLOCK_H, BLOCK_N_HALF], layout=shared_k
+        Q.type.element_ty, [BLOCK_H, 16], layout=shared_k
     )
 
 
@@ -275,12 +274,21 @@ def _fwd_grouped_kernel_stage1(
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
+    smem_q_nope._keep_alive()
+    smem_q_rope._keep_alive()
+
+    smem_v = gl.allocate_shared_memory(
+        K_Buffer.type.element_ty, [16, 512], layout=shared_k
+    )
 
     acc = gl.zeros([BLOCK_H, BLOCK_C], dtype=gl.float32,
         layout=mfma_layout_kv,
     )
+    # zeros = gl.zeros(
+    #     (BLOCK_H, BLOCK_N), dtype=gl.float32, layout=mfma_layout_qk,
+    # )
     zeros = gl.zeros(
-        (BLOCK_H, BLOCK_N), dtype=gl.float32, layout=mfma_layout_qk,
+        (BLOCK_H, 16), dtype=gl.float32, layout=mfma_layout_qk,
     )
     e_max = gl.zeros_like(gl.max(zeros, 1), dtype=gl.float32) - float("inf")
     e_sum = gl.zeros_like(e_max, dtype=gl.float32)
@@ -360,9 +368,7 @@ def _fwd_grouped_kernel_stage1(
 
         smem_k_nope_1.store(kv_1.T)
         cur_kv = smem_k_nope_1.load(layout=dot_k_layout)
-        # (16, 64) x (64, 32)
-        # dot product of rope parts
-        # qk = tl.dot(q_pe, k_pe.to(q_pe.dtype))
+
         qk = gl.amd.cdna3.mfma(q_pe, cur_k_pe, zeros)
 
         qk = gl.amd.cdna3.mfma(q, cur_kv, qk)
@@ -385,11 +391,11 @@ def _fwd_grouped_kernel_stage1(
 
         # gl.device_print("p", p)
 
-        smem_k_rope_2.store(k_pe_2.T)
-        cur_k_pe = smem_k_rope_2.load(layout=dot_k_layout)
-
-        smem_k_nope_1.store(kv.T)
-        cur_kv = smem_k_nope_1.load(layout=dot_k_layout)
+        # smem_k_rope_1.store(k_pe_2.T)
+        # cur_k_pe = smem_k_rope_2.load(layout=dot_k_layout)
+        #
+        # smem_k_nope_2.store(kv_2.T)
+        # cur_kv = smem_k_nope_1.load(layout=dot_k_layout)
 
         acc = acc * re_scale[:, None]
 
@@ -405,14 +411,15 @@ def _fwd_grouped_kernel_stage1(
         # if start_n  == 0:
         acc = gl.amd.cdna3.mfma(cur_p, cur_v, acc)
 
+
         qk = gl.amd.cdna3.mfma(q_pe, cur_k_pe, zeros)
 
         qk = gl.amd.cdna3.mfma(q, cur_kv, qk)
 
-        smem_k_rope_2.store(k_pe_2.T)
-        cur_k_pe = smem_k_rope_2.load(layout=dot_k_layout)
+        smem_k_rope_1.store(k_pe_2.T)
+        cur_k_pe = smem_k_rope_1.load(layout=dot_k_layout)
 
-        smem_k_nope_2.store(kv.T)
+        smem_k_nope_2.store(kv_2.T)
         cur_kv = smem_k_nope_2.load(layout=dot_k_layout)
 
         qk *= sm_scale
@@ -438,6 +445,8 @@ def _fwd_grouped_kernel_stage1(
         e_sum = e_sum * re_scale + gl.sum(p, 1)
         cur_p = smem_p.load(layout=dot_p_layout)
         e_max = n_e_max
+
+        acc = gl.amd.cdna3.mfma(cur_p, cur_v, acc)
 
 
     offs_mid_o = (

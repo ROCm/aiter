@@ -10,12 +10,12 @@ import itertools
 
 import aiter
 
-from aiter.ops.triton.mla_decode import (
-    decode_attention_fwd_grouped,
-)
-# from aiter.ops.triton.gluon.mla_decode import (
+# from aiter.ops.triton.mla_decode import (
 #     decode_attention_fwd_grouped,
 # )
+from aiter.ops.triton.gluon.mla_decode import (
+    decode_attention_fwd_grouped,
+)
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_mla_decode import input_helper, ref_preprocess
 from aiter.test_common import checkAllclose, run_perftest
@@ -236,7 +236,7 @@ def run_benchmark(args: argparse.Namespace):
         qk_rope_head_dim: int,
         mtp: int,
         dtype: torch.dtype,
-        num_kv_splits: int = 5,
+        num_kv_splits: int = 1,
         sm_scale: float = 1.0,
         logit_cap: float = 0.0,
         device="cuda",
