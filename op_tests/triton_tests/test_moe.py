@@ -333,8 +333,6 @@ def quantize_fp8(
 
     assert not (use_block_scale and use_dim_quantization)
 
-    e, n, k = tensor.shape
-
     dev = arch_info.get_device()
     if dev == "MI350X":
         fp8_type = torch.float8_e4m3fn
@@ -343,6 +341,7 @@ def quantize_fp8(
 
     # If using block-scale quantization, reshape the tensor to merge block dimensions
     if use_block_scale:
+        e, n, k = tensor.shape
         # Reshape to merge the second and third dimensions (n direction)
         # and the fourth and fifth dimensions (k direction)
         tensor = tensor.reshape(e, block_shape_n, n // block_shape_n, block_shape_k, k // block_shape_k)
@@ -479,9 +478,9 @@ def input_helper(
     E: int,
     routed_weight: bool,
     dtype,
-    block_shape,
     fp8_w8a8: bool,
     int8_w8a16: bool,
+    block_shape=None,
 ):
     assert not (fp8_w8a8 and int8_w8a16)
 
@@ -670,6 +669,7 @@ def input_helper_e2e(
 @pytest.mark.parametrize(
     "M, N, K, top_k, E",
     [
+        (32, 512, 7168, 8, 512),
         (64, 14336, 4096, 2, 8),
         (16, 14336, 1, 2, 4),
         (4, 4, 8, 1, 2),
