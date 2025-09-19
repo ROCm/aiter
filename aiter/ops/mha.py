@@ -418,7 +418,6 @@ def gen_mha_varlen_fwd_fake_tensor(
     return [out_tensor, softmax_lse_tensor, p_tensor, rng_state_tensor]
 
 
-
 def gen_fmha_v3_varlen_fwd_fake_tensor(
     q: torch.Tensor,
     k: torch.Tensor,
