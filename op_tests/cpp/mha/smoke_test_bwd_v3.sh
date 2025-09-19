@@ -58,6 +58,28 @@ run_swa_tests() {
     done
 }
 
+run_causal_mask_tests() {
+    for mask in "t" "b"; do
+    for prec in "bf16" "fp16" ; do
+    for perm in 0 1 ; do
+    for seqlen_q in 187 192 200 501 700; do
+    for seqlen_k in 187 192 200 501 700; do
+    for hdim in 64 96 128 192; do
+    for mode in 0 1; do
+
+    $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=$hdim -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=1 -h=3 -h_k=1 -d=$hdim -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=2 -h=2 -d=$hdim -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+
+    done
+    done
+    done
+    done
+    done
+    done
+    done
+}
+
 run_group_mode_tests() {
     for seqlen in 63 127 200; do
     for prec in "bf16" "fp16" ; do
@@ -130,4 +152,5 @@ run_batch_mode_tests
 run_group_mode_tests
 run_swa_tests
 # run_gfx950_group_bwd_v3
+# run_causal_mask_tests
 # run_gfx950_bwd_v3
