@@ -1,0 +1,4 @@
+DataType,HDim,MaskType,kIsSEQPad,kIsHDPad,kStoreLSE,GPUArch,BF16Cvt,kIsGroupMode_,fwd_v3_name,fwd_v3_buf,ts_qo,ts_kv
+FmhaFwdBf16,128,0,false,false,1,gfx942,1,0,fmha_fwd_hd128_bf16_rtna,fwd_hd128_bf16_rtna.co,256,32
+FmhaFwdBf16,128,0,false,false,1,gfx942,0,0,fmha_fwd_hd128_bf16_rtne,fwd_hd128_bf16_rtne.co,256,32
+FmhaFwdBf16,128,0,false,false,1,gfx942,2,0,fmha_fwd_hd128_bf16_rtz,fwd_hd128_bf16_rtz.co,256,32
