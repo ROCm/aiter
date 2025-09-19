@@ -93,7 +93,7 @@ __global__ void kn_get_mla_metadata_v1_2(
 {
     extern __shared__ uint8_t p_smem[];
     int32_t* p_lds_seqlens_qo = reinterpret_cast<int32_t*>(p_smem);
-    int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + params.num_batches;
+    int32_t* p_lds_seqlens_kv_indptr = p_lds_seqlens_qo + params.num_batches;
 
     QoState<Traits> qo_state(params.uni_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
 
@@ -104,8 +104,9 @@ __global__ void kn_get_mla_metadata_v1_2(
     int32_t sum_blocks = 0;
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
-        const int32_t seqlen_kv = params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid];
-        p_lds_seqlens_kv[bid] = seqlen_kv;
+        const int32_t kv_end = params.p_seqlens_kv_indptr[bid + 1];
+        const int32_t seqlen_kv = kv_end - params.p_seqlens_kv_indptr[bid];
+        p_lds_seqlens_kv_indptr[bid] = kv_end;
         const int32_t num_blocks = ck_tile::integer_divide_ceil(seqlen_kv, params.kv_granularity);
         sum_blocks += num_blocks;
 
@@ -134,6 +135,10 @@ __global__ void kn_get_mla_metadata_v1_2(
     int32_t curr_kv_block = 0;      // #blocks handled by previous cu part(s)
     int32_t curr_n_split_idx = 0;   // #cu parts used to handle current batch
 
+    int32_t curr_kv_begin  = 0;
+    int32_t curr_kv_end    = p_lds_seqlens_kv_indptr[0];
+    int32_t curr_kv_seqlen = curr_kv_end - curr_kv_begin;
+
     int32_t num_works = 0;
     int32_t partial_idx = 0;
     int32_t tot_qo_tiles = 0;
@@ -144,12 +149,11 @@ __global__ void kn_get_mla_metadata_v1_2(
         int32_t remain_payload = payload;
         while (curr_batch < params.num_batches)
         {
-            const int32_t seqlen_kv = p_lds_seqlens_kv[curr_batch];
             const int32_t packed_qo_len = qo_state.get_seqlen(curr_batch) * params.num_heads;
             const int32_t num_qo_tiles =
                 Traits::kQoSplits ? ck_tile::integer_divide_ceil(packed_qo_len, Traits::kPackedQoLenPerWg) : 1;
             const int32_t qo_tile_size = ck_tile::integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
-            const int32_t num_kv_blocks = ck_tile::integer_divide_ceil(seqlen_kv, params.kv_granularity);
+            const int32_t num_kv_blocks = ck_tile::integer_divide_ceil(curr_kv_seqlen, params.kv_granularity);
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
 
             // If current cu part is able to handle this batch of seqences
@@ -168,12 +172,11 @@ __global__ void kn_get_mla_metadata_v1_2(
                     work_info.batch_idx = curr_batch;
                     work_info.qo_start = qo_state.get_begin(curr_batch) + qo_tile_idx * qo_tile_size;
                     work_info.qo_end = ck_tile::min(work_info.qo_start + qo_tile_size, qo_state.get_end(curr_batch));
-                    work_info.kv_start = params.p_seqlens_kv_indptr[curr_batch] + curr_kv_block * params.kv_granularity;
+                    work_info.kv_start = curr_kv_begin + curr_kv_block * params.kv_granularity;
                     work_info.kv_end =
-                        ck_tile::min(work_info.kv_start + remain_kv_blocks * params.kv_granularity,
-                                     params.p_seqlens_kv_indptr[curr_batch+1]) -
+                        ck_tile::min(work_info.kv_start + remain_kv_blocks * params.kv_granularity, curr_kv_end) -
                         (num_qo_tiles - 1 - qo_tile_idx);
-                    work_info.kv_offset = params.p_seqlens_kv_indptr[curr_batch+1] - work_info.kv_end;
+                    work_info.kv_offset = curr_kv_end - work_info.kv_end;
 
                     // split related info
                     if (curr_n_split_idx > 0)
@@ -221,8 +224,14 @@ __global__ void kn_get_mla_metadata_v1_2(
                 // update state
                 remain_payload -= (remain_kv_blocks + Traits::kFixedOverheadNumBlocks);
                 ++curr_batch;
-                curr_kv_block = 0;
-                curr_n_split_idx = 0;
+                if (curr_batch < params.num_batches)
+                {
+                    curr_kv_block = 0;
+                    curr_n_split_idx = 0;
+                    curr_kv_begin  = curr_kv_end;
+                    curr_kv_end    = p_lds_seqlens_kv_indptr[curr_batch];
+                    curr_kv_seqlen = curr_kv_end - curr_kv_begin;
+                }
             }
             else
             {
@@ -239,9 +248,9 @@ __global__ void kn_get_mla_metadata_v1_2(
                         work_info.batch_idx = curr_batch;
                         work_info.qo_start = qo_state.get_begin(curr_batch) + qo_tile_idx * qo_tile_size;
                         work_info.qo_end = ck_tile::min(work_info.qo_start + qo_tile_size, qo_state.get_end(curr_batch));
-                        work_info.kv_start = params.p_seqlens_kv_indptr[curr_batch] + curr_kv_block * params.kv_granularity;
+                        work_info.kv_start = curr_kv_begin + curr_kv_block * params.kv_granularity;
                         work_info.kv_end = work_info.kv_start + consuming_blks * params.kv_granularity; // TODO: we need to take casual mask into consideration
-                        work_info.kv_offset = params.p_seqlens_kv_indptr[curr_batch+1] - work_info.kv_end;
+                        work_info.kv_offset = curr_kv_end - work_info.kv_end;
                         work_info.partial_qo_loc = partial_idx + qo_tile_idx * qo_tile_size;
                         p_work_info_set[num_works + qo_tile_idx] = work_info;
                     }

@@ -121,6 +121,7 @@ void get_mla_metadata_v1(
         if (split_params->find("uni_seqlen_qo") != split_params->end())
         {
             uni_seqlen_qo = split_params->find("uni_seqlen_qo")->second;
+            max_seqlen_qo = (uni_seqlen_qo > 0) ? uni_seqlen_qo : max_seqlen_qo;
         }
 
         if (split_params->find("fast_mode") != split_params->end())
