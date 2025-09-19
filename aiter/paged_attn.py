@@ -15,11 +15,13 @@
 * limitations under the License.
 """
 
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
+
 import torch
+
 import aiter as ops
 from aiter import dtypes
-from dataclasses import dataclass
 
 
 # from vllm.utils import is_hip
@@ -237,6 +239,7 @@ class PagedAttention:
         alibi_slopes: Optional[torch.Tensor],
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
+        q_scale: Optional[torch.Tensor],
         tp_rank: int = 0,
         blocksparse_local_blocks: int = 0,
         blocksparse_vert_stride: int = 0,
@@ -292,6 +295,7 @@ class PagedAttention:
                 v_scale,
                 fp8_out_scale if cpa_fp8_out else None,
                 _PARTITION_SIZE_ROCM,
+                q_scale=q_scale,
                 mtp=mtp,
             )
             if cpa_fp8_out:
