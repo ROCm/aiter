@@ -5,6 +5,7 @@ import math
 from aiter.ops.triton.batched_gemm_bf16 import batched_gemm_bf16
 from op_tests.triton_tests.test_batched_gemm_bf16 import (
     generate_batched_gemm_a16w16_inputs,
+    run_torch,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
@@ -20,7 +21,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
-def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
+def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False):
     c_dtype = torch.bfloat16
     x, w, bias, y = generate_batched_gemm_a16w16_inputs(
         batch, M, N, K, dtype=c_dtype, layout=layout, output=True
@@ -33,11 +34,18 @@ def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: batched_gemm_bf16(x, w, bias, c_dtype, YQ=y),
-        warmup=25,
-        rep=100,
-    )
+    if use_torch:
+        ms = triton.testing.do_bench(
+            lambda: run_torch(x, w, bias, c_dtype),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
+    else:
+        ms = triton.testing.do_bench(
+            lambda: batched_gemm_bf16(x, w, bias, c_dtype, YQ=y),
+            warmup=25,
+            rep=100,
+        )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -62,22 +70,22 @@ def run_model_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_a8w8(
-        M, hidden_dim, intermediate_dim, batch, metric, layer, **kwargs
+        M, hidden_dim, intermediate_dim, batch, metric, provider, **kwargs
     ):
-        if layer == "fc1":
+        if provider[1] == "fc1":
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
             else:
                 N, K = intermediate_dim * 2, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
-        elif layer == "fc2":
+        elif provider[1] == "fc2":
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout, use_torch=(provider[0]=="torch"))
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -90,8 +98,8 @@ def run_shape_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_a8w8(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
+    def bench_batched_gemm_a8w8(batch, M, N, K, metric, provider, **kwargs):
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout, use_torch=(provider=="torch"))
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 

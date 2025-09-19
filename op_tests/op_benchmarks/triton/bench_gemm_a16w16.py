@@ -17,6 +17,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_gemm_shape_benchmark_object,
     print_vgpr,
     get_caller_name_no_ext,
+    get_torch_activation_from_str,
 )
 from typing import Optional
 
@@ -47,11 +48,20 @@ def bench_gemm_fn(
     mem = mem_read + mem_write
 
     if use_torch:
-        ms = triton.testing.do_bench(
-            lambda: F.linear(x, w, bias=None),
-            warmup=25,
-            rep=100,  # noqa: E731
-        )
+        # Atomic kernel does not use activation, so just bench torch linear layer
+        if atomic:
+            ms = triton.testing.do_bench(
+                lambda: F.linear(x, w, bias=None),
+                warmup=25,
+                rep=100,  # noqa: E731
+            )
+        else:
+            ms = triton.testing.do_bench(
+                lambda: get_torch_activation_from_str(activation)(F.linear(x, w, bias=None)) if activation else \
+                lambda: F.linear(x, w, bias=None),
+                warmup=25,
+                rep=100,  # noqa: E731
+            )
     else:
         if atomic:
             # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that

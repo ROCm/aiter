@@ -5,6 +5,7 @@ import math
 from aiter.ops.triton.gemm_a16w16_gated import gemm_a16w16_gated
 from op_tests.triton_tests.test_gemm_a16w16_gated import (
     generate_gemm_a16w16_gated_inputs,
+    run_torch,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,

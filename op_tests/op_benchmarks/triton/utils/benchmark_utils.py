@@ -10,7 +10,9 @@ import sys
 import time
 import tempfile
 import re
+from functools import partial
 import matplotlib.pyplot as plt
+import torch.nn.functional as F
 
 # Base directory where configs are located
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
@@ -36,6 +38,17 @@ def get_evaluation_label(metric, space=False, prefix=None):
         return (prefix + " " if prefix else "") + metric.capitalize() + " (" + get_evaluation_unit(metric) + ")"
     else:
         return (prefix + "_" if prefix else "") + metric.capitalize() + "_(" + get_evaluation_unit(metric) + ")"
+    
+    
+def get_torch_activation_from_str(activation: str):
+    mapping = {
+        "gelu": F.gelu,
+        "gelu_tanh": partial(F.gelu, approximate='tanh'),
+        "silu": F.silu,
+        "silu_exp2": F.silu,
+        "relu": F.relu,
+    }
+    return mapping[activation]
 
 
 def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
@@ -124,7 +137,7 @@ def get_gemm_model_benchmark_object(
     if args.fc1:
         if not args.bench_torch:
             line_names.append(get_evaluation_label(args.metric, prefix="fc1"))
-            line_vals.append("fc1")
+            line_vals.append(("triton", "fc1"))
         else:
             line_names.append(get_evaluation_label(args.metric, prefix="triton_fc1"))
             line_vals.append(("triton", "fc1"))
@@ -133,7 +146,7 @@ def get_gemm_model_benchmark_object(
     if args.fc2:
         if not args.bench_torch:
             line_names.append(get_evaluation_label(args.metric, prefix="fc2"))
-            line_vals.append("fc2")
+            line_vals.append(("triton", "fc2"))
         else:
             line_names.append(get_evaluation_label(args.metric, prefix="triton_fc2"))
             line_vals.append(("triton", "fc2"))

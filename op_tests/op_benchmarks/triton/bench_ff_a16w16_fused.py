@@ -7,6 +7,8 @@ from aiter.ops.triton.ff_a16w16_fused_ungated import ff_a16w16_fused_ungated
 from aiter.ops.triton.ff_a16w16 import ff_a16w16_gated, ff_a16w16_nogate
 from op_tests.triton_tests.ff_test_utils import (
     generate_ff_inputs,
+    run_torch_gated,
+    run_torch_ungated,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
@@ -40,8 +42,16 @@ def get_gemm_model_benchmark_object(
 
     ylabel = get_evaluation_label(args.metric, space=True)
 
-    line_names = [get_evaluation_label(args.metric)]
-    line_vals = [get_evaluation_unit(args.metric)]
+    line_names = []
+    line_vals = []
+    if not args.bench_torch:
+        line_names.append(get_evaluation_label(args.metric))
+        line_vals.append("triton")
+    else:
+        line_names.append(get_evaluation_label(args.metric, prefix="triton"))
+        line_vals.append("triton")
+        line_names.append(get_evaluation_label(args.metric, prefix="torch"))
+        line_vals.append("torch")
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(
@@ -49,7 +59,7 @@ def get_gemm_model_benchmark_object(
         x_vals=x_vals_list,
         x_log=True,
         y_log=True,
-        line_arg="unit",
+        line_arg="provider",
         line_vals=line_vals,
         line_names=line_names,
         styles=[
@@ -71,6 +81,7 @@ def bench_fn(
     gating: bool,
     activation: str = None,
     e2e_fused: bool = False,
+    use_torch: bool = False,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
@@ -110,17 +121,25 @@ def bench_fn(
         )
     mem_write = (batch * hidden_dim) * x.element_size()
     mem = mem_read + mem_write
-
+    
     if e2e_fused:
         fn = ff_a16w16_fused_gated if gating else ff_a16w16_fused_ungated
     else:
         fn = ff_a16w16_gated if gating else ff_a16w16_nogate
 
-    ms = triton.testing.do_bench(
-        lambda: fn(x, w1, w2, c_dtype, y=y, activation=activation),
-        warmup=25,
-        rep=100,  # noqa: E731
-    )
+    if use_torch:
+        ms = triton.testing.do_bench(
+            lambda: run_torch_gated(x, w1, w2, intermediate_dim, activation) if gating else \
+            lambda: run_torch_ungated(x, w1, w2, activation),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
+    else:
+        ms = triton.testing.do_bench(
+            lambda: fn(x, w1, w2, c_dtype, y=y, activation=activation),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -146,7 +165,7 @@ def run_model_benchmark(args):
     benchmark = get_gemm_model_benchmark_object(f"Fused FF A16W16 {label} Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_a16w16(M, hidden_dim, intermediate_dim, metric, **kwargs):
+    def bench_a16w16(M, hidden_dim, intermediate_dim, metric, provider, **kwargs):
         intermediate_dim = math.ceil(intermediate_dim / args.tp)
 
         return bench_fn(
@@ -158,6 +177,7 @@ def run_model_benchmark(args):
             gating=not args.ungated,
             activation=args.activation,
             e2e_fused=args.e2e,
+            use_torch=(provider=="torch"),
         )
 
     bench_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -174,7 +194,7 @@ def run_shape_benchmark(args):
     benchmark = get_gemm_shape_benchmark_object(f"Fused FF A16W16 {label} Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_a16w16(M, N, K, metric, **kwargs):
+    def bench_a16w16(M, N, K, metric, provider, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
         return bench_fn(
@@ -186,6 +206,7 @@ def run_shape_benchmark(args):
             gating=not args.ungated,
             activation=args.activation,
             e2e_fused=args.e2e,
+            use_torch=(provider=="torch"),
         )
 
     bench_a16w16.run(save_path="." if args.o else None, print_data=True)
