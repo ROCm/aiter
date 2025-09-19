@@ -22,6 +22,7 @@ def compile(
     alibi_enabled: str,
     mtp: int = 1,
     quant_method: str = "vllm::Fp8QuantMethod::kPerTensor",
+    v_shuffle: bool = False,
     folder: str = None,
 ):
     return compile_template_op(
@@ -46,6 +47,7 @@ def compile(
         alibi_enabled=alibi_enabled,
         mtp=mtp,
         quant_method=quant_method,
+        v_shuffle=v_shuffle,
         folder=folder,
     )
 
@@ -114,6 +116,7 @@ def paged_attention_rocm(
     gqa_ratio = int(num_heads / num_kv_heads)
     max_num_partitions = int(math.ceil(max_context_len / partition_size))
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
+    v_shuffle = value_cache.dim() == 5
 
     quant_method = "vllm::Fp8QuantMethod::kPerTensor"
     if key_scale is not None:
@@ -132,6 +135,7 @@ def paged_attention_rocm(
         "true" if alibi_slopes is not None else "false",
         mtp,
         quant_method,
+        v_shuffle,
     )
 
     alibi_slopes_ptr = (

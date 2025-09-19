@@ -257,10 +257,10 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
 
         if(cfg.splitK == 1)
         {
-            out.zero_();
             args.log2_k_split = selectedksplit;
             int k_num         = 1 << args.log2_k_split;
             TORCH_CHECK(Kdim % k_num == 0, __func__, " Kdim % (1 << args.log2_k_split) != 0 !");
+            if(k_num>1)out.zero_();
             int k_per_tg = Kdim / k_num;
             k_per_tg     = ((k_per_tg + 256 - 1) / 256) * 256;
             gdz          = (Kdim + k_per_tg - 1) / k_per_tg;
