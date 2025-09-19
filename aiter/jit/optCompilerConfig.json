@@ -236,6 +236,23 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv'"
     },
+    "module_gemm_a8w8_blockscale_bpreshuffle": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/include'",
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_bpreshuffle_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-mllvm -greedy-reverse-local-assignment=1'",
+            "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv'"
+    },
     "module_gemm_a4w4_blockscale": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/include'",
@@ -494,6 +511,19 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune'"
+    },
+    "module_gemm_a8w8_blockscale_bpreshuffle_tune": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_bpreshuffle_tune_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle_tune.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/include'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gen_instances.py --working_path {{}} --tune'"
     },
     "module_gemm_a4w4_blockscale_tune": {
         "srcs": [
