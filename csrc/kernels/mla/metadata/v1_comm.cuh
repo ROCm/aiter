@@ -59,6 +59,7 @@ struct MlaMetadataV1KernelParameter
     int32_t        num_cu;
     int32_t        reduce_indptr_size;
     int32_t        kv_granularity;
+    int32_t        uni_seqlen_qo;
     bool           is_causal;
 };
 

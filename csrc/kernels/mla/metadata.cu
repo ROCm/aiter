@@ -103,6 +103,7 @@ void get_mla_metadata_v1(
 
     int32_t kv_granularity = 16;
     int32_t max_seqlen_qo  = -1;
+    int32_t uni_seqlen_qo  = -1;
     bool    fast_mode      = false;
 
     if (split_params.has_value())
@@ -115,6 +116,11 @@ void get_mla_metadata_v1(
         if (split_params->find("max_seqlen_qo") != split_params->end())
         {
             max_seqlen_qo = split_params->find("max_seqlen_qo")->second;
+        }
+
+        if (split_params->find("uni_seqlen_qo") != split_params->end())
+        {
+            uni_seqlen_qo = split_params->find("uni_seqlen_qo")->second;
         }
 
         if (split_params->find("fast_mode") != split_params->end())
@@ -132,6 +138,8 @@ void get_mla_metadata_v1(
             num_heads_k,
             is_causal,
             kv_granularity,
+            max_seqlen_qo,
+            uni_seqlen_qo,
             work_metadata_ptrs,
             work_info_set,
             work_indptr,

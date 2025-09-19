@@ -320,7 +320,11 @@ def get_mla_metadata_v1(
         is_causal: whether causal mask is enabled.
         split_params: detailed settings for spliting. all of them are optional.
             kv_granularity: default=16. the granularity on kv sequence length when cutting batch.
-            max_seqlen_qo: default=-1. used to check lds usage and save time.
+            max_seqlen_qo: default=-1. used to check lds usage and save time. value less than 1 means unknown.
+            uni_seqlen_qo: default=-1. sequence length of qo is uniform across batches. value less than 1 means the
+                           length is not fixed.
+            fast_mode: default=0. a non-zero value means user want metadata become as fast as possible. Note that fast
+                       mode may lead to bad overall performance.
     Outputs:
         [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
                                                     work_info.

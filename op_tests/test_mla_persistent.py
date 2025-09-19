@@ -237,6 +237,8 @@ def test_mla(
     split_params = {
         "kv_granularity": max(page_size, 16),
         "max_seqlen_qo": max_seqlen_qo,
+        "uni_seqlen_qo": mtp,
+        "fast_mode": 1,
     }
 
     meta = aiter.get_mla_metadata_v1(
