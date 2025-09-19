@@ -14,12 +14,12 @@ from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.read_json_configs import build_triton_configs_from_json
 
-fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/GPT_OSS_BF16_configs.json"
-GPT_oss_configs = build_triton_configs_from_json(fpath)
+fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/updated_BF16_configs.json"
+updated_configs = build_triton_configs_from_json(fpath)
 
 
 @triton.autotune(
-    configs=GPT_oss_configs,
+    configs=updated_configs,
     key=["next_M_2", "N", "K"],
 )
 @triton.heuristics(
