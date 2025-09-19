@@ -3,6 +3,7 @@
 
 # user interface
 
+from typing import List
 import torch
 from ..jit.core import (
     compile_ops,
@@ -34,10 +35,30 @@ def grouped_topk(
     need_renorm: bool,
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,
-): ...
+) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+def gen_moe_fused_gate_fake_tensor(
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    n_share_experts_fusion: int,
+    routed_scaling_factor: float = 1.0,
+) -> List[torch.Tensor]:
+    output = torch.empty_like(
+        topk_weights, dtype=topk_weights.dtype, device=topk_weights.device
+    )
+
+    indices = torch.empty_like(topk_ids, dtype=topk_ids.dtype, device=topk_ids.device)
+
+    return [output, indices]
+
+
+@compile_ops("module_moe_asm", gen_fake=gen_moe_fused_gate_fake_tensor)
 def moe_fused_gate(
     input: torch.Tensor,
     bias: torch.Tensor,
@@ -48,7 +69,7 @@ def moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> list[torch.Tensor]: ...
+) -> List[torch.Tensor]: ...
 
 
 def biased_grouped_topk(
