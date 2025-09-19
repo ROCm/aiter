@@ -22,7 +22,8 @@ def _fp32_to_mxfp4_to_fp32(x,
                             lut_ptr,
                             BLOCK_M,
                             BLOCK_N,
-                            GROUP_SIZE):
+                            GROUP_SIZE,
+                            IGNORE_SCALES):
     x_u8, bs_e8m0 = _mxfp4_quant_op(x, BLOCK_N, BLOCK_M, GROUP_SIZE)
     low = x_u8 & 0xF
     high = x_u8 >> 4
@@ -38,6 +39,8 @@ def _fp32_to_mxfp4_to_fp32(x,
 
     x_fp32 = x_fp32.reshape(BLOCK_M, BLOCK_N//GROUP_SIZE, GROUP_SIZE)
     scale_f32 = scale_f32.reshape(BLOCK_M, BLOCK_N//GROUP_SIZE, 1)
+    if IGNORE_SCALES:
+        scale_f32 = 1.0    
     final_x = (x_fp32 * scale_f32).reshape(BLOCK_M, BLOCK_N)
 
     return final_x
@@ -781,7 +784,9 @@ def convert_kv_cache_kernel(key_cache_ptr,
                         stride_v_cache_3: tl.constexpr,  # int
                         BLOCK_SIZE: tl.constexpr,
                         HEAD_SIZE: tl.constexpr,
-                        GROUP_SIZE: tl.constexpr):
+                        GROUP_SIZE: tl.constexpr,
+                        IGNORE_SCALES: tl.constexpr,
+                        SLIDING_WINDOW: tl.constexpr):
     
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -790,8 +795,18 @@ def convert_kv_cache_kernel(key_cache_ptr,
     num_blocks = cdiv_fn(kv_length, BLOCK_SIZE)
     block_table_offset = seq_idx * block_table_stride
     offs_d = tl.arange(0, HEAD_SIZE)
+
+    # if SLIDING_WINDOW > 0:
+    #     num_blocks_start = (
+    #         kv_length - SLIDING_WINDOW - 1
+    #     ) // BLOCK_SIZE
+    #     num_blocks_start = max(0, num_blocks_start - 1)
+    # else:
+    #     num_blocks_start = 0
+    num_blocks_start = 0
+    quant_head_dim: tl.constexpr = 0
     # iterate through tiles
-    for j in range(0, num_blocks):
+    for j in range(num_blocks_start, num_blocks):
 
         physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j)
 
@@ -799,41 +814,52 @@ def convert_kv_cache_kernel(key_cache_ptr,
 
         k_offset = (
             kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + offs_n[None, :] * stride_k_cache_1
+            + offs_d[None, :]  * stride_k_cache_3
+            + offs_n[:, None] * stride_k_cache_1
         )
 
         v_offset = (
             kv_head_idx * stride_v_cache_2
-            + offs_d[:, None] * stride_v_cache_3
-            + offs_n[None, :] * stride_v_cache_1
+            + offs_d[None, :] * stride_v_cache_3
+            + offs_n[:, None] * stride_v_cache_1
         )
 
-        # K : (HEAD_SIZE, BLOCK_SIZE)
+        seq_offset = j * BLOCK_SIZE + offs_n
+
+        seq_mask = seq_offset[:, None] < kv_length
+
+        if quant_head_dim == 0:
+            k_offset = k_offset.T
+            v_offset = v_offset.T
+            seq_mask = seq_mask.T
+        # K : (BLOCK_SIZE, HEAD_SIZE)
         K_load = tl.load(
-            key_cache_ptr + k_offset + physical_block_idx * stride_k_cache_0, cache_modifier=".cg"
+            key_cache_ptr + k_offset + physical_block_idx * stride_k_cache_0, cache_modifier=".cg",
+            mask=seq_mask, other=0.0
         )
+        #K_load = K_load.to(tl.float8e4nv)
+        K_load = _fp32_to_mxfp4_to_fp32(K_load.to(tl.float32), lut_ptr, BLOCK_SIZE, HEAD_SIZE, GROUP_SIZE, IGNORE_SCALES).to(tl.bfloat16)
 
-        K_load = _fp32_to_mxfp4_to_fp32(K_load.to(tl.float32), lut_ptr, HEAD_SIZE, BLOCK_SIZE, GROUP_SIZE).to(tl.bfloat16)
-
-        out_offset = (
-            kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + offs_n[None, :] * stride_k_cache_1
-        )
+        # out_offset = (
+        #     kv_head_idx * stride_k_cache_2
+        #     + offs_d[:, None] * stride_k_cache_3
+        #     + offs_n[None, :] * stride_k_cache_1
+        # )
 
         tl.store(key_cache_ptr + k_offset + physical_block_idx * stride_k_cache_0, K_load)
 
         # V : (BLOCK_SIZE, HEAD_SIZE)
         V_load = tl.load(
-            value_cache_ptr + v_offset + physical_block_idx * stride_v_cache_0, cache_modifier=".cg"
+            value_cache_ptr + v_offset + physical_block_idx * stride_v_cache_0, cache_modifier=".cg",
+            mask=seq_mask, other=0.0
         )
 
-        V_load = _fp32_to_mxfp4_to_fp32(V_load.to(tl.float32), lut_ptr, HEAD_SIZE, BLOCK_SIZE, GROUP_SIZE).to(tl.bfloat16)
+        #V_load = V_load.to(tl.float8e4nv)
+        V_load = _fp32_to_mxfp4_to_fp32(V_load.to(tl.float32), lut_ptr, HEAD_SIZE, BLOCK_SIZE, GROUP_SIZE, IGNORE_SCALES).to(tl.bfloat16)
 
         tl.store(value_cache_ptr + v_offset + physical_block_idx * stride_v_cache_0, V_load)
 
-def convert_kv_cache(q, k, v, seqused_k, max_seqlen_k, block_table, group_size=32):
+def convert_kv_cache(q, k, v, seqused_k, max_seqlen_k, block_table, group_size=32, ignore_scales=False, sliding_window=0):
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
@@ -859,6 +885,11 @@ def convert_kv_cache(q, k, v, seqused_k, max_seqlen_k, block_table, group_size=3
         BLOCK_SIZE=block_size,
         HEAD_SIZE=head_size,
         GROUP_SIZE=group_size,
+        IGNORE_SCALES=ignore_scales,
+        SLIDING_WINDOW=sliding_window,
+        num_stages=4,
+        num_warps=2,
+
     )
 
 def unified_attention(
@@ -924,21 +955,19 @@ def unified_attention(
     target_num_prgms = get_num_sms() * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    global global_iter, saved_flag
-
-    global_iter += 1
-    if saved_flag == False and global_iter >= 1024 and SLIDING_WINDOW == 0 and max_seqlen_k > 1024:
-        saved_flag = True
-        torch.save(k, 'k.pt')
-        torch.save(v, 'v.pt')
-        torch.save(q, 'q.pt')
-        torch.save(cu_seqlens_q, 'cu_seqlens_q.pt')
-        torch.save(seqused_k, 'seqused_k.pt')
-        torch.save(block_table, 'block_table.pt')
-        torch.save(sinks, 'sinks.pt')
-        torch.save(softmax_scale, 'softmax_scale.pt')
-    convert_kv_cache(q, k, v, seqused_k, max_seqlen_k, block_table, group_size=32)
-
+    # global global_iter, saved_flag
+    # global_iter += 1
+    # if saved_flag == False and global_iter >= 1024 and SLIDING_WINDOW == 0 and max_seqlen_k > 1024:
+    #     saved_flag = True
+    #     torch.save(k, 'k.pt')
+    #     torch.save(v, 'v.pt')
+    #     torch.save(q, 'q.pt')
+    #     torch.save(cu_seqlens_q, 'cu_seqlens_q.pt')
+    #     torch.save(seqused_k, 'seqused_k.pt')
+    #     torch.save(block_table, 'block_table.pt')
+    #     torch.save(sinks, 'sinks.pt')
+    #     torch.save(softmax_scale, 'softmax_scale.pt')
+    convert_kv_cache(q, k, v, seqused_k, max_seqlen_k, block_table, group_size=32, ignore_scales=False, sliding_window=SLIDING_WINDOW)
 
 
     # call 2d if sliding window is used
