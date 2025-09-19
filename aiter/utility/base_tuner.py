@@ -184,9 +184,6 @@ class TunerCommon:
             # retune shapes that are in both untune_file and tune_file
             untunedf = self.get_untuned_gemm_list(args.untune_file)
             self.untunedf = untunedf[self.keys]
-            print(self.untunedf)
-
-            print(len(self.untunedf))
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
             self.untunedf["cu_num"] = self.get_cu_num()
             untunedf_cols = self.untunedf.columns
