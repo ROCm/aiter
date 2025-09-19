@@ -57,7 +57,7 @@ def fused_moe(
     silu_fused=False,
 ):
     moe_fn = triton_moe_silu if silu_fused else triton_moe
-    block_shape_k = 128 if (block_shape == None or not block_shape[1]) else block_shape[1]
+    block_shape_k = block_shape[1]
 
     if int4_w4a16:
         (
@@ -162,7 +162,7 @@ def run_benchmark(args):
     int8_w8a16 = args.int8_w8a16
     fp8_w8a8 = args.fp8_w8a8
     int4_w4a16 = args.int4_w4a16
-    block_shape = args.block_shape
+    
     # group_size = args.group_size
     has_zp = args.has_zp
     print_time = args.print_time
@@ -174,17 +174,16 @@ def run_benchmark(args):
         args.no_bench_stage2 = True
 
 
-    if block_shape:
-        block_shape_n, block_shape_k = block_shape[0], block_shape[1]
+    if args.block_shape is not None:
+        if len(args.block_shape) > 1:
+            block_shape = args.block_shape # 2D block quantization both in n and k
+        elif len(args.block_shape) > 0:
+            block_shape = (1, args.block_shape[0]) # 1D quantization in k
     else:
-        block_shape_n, block_shape_k = None, None
+        block_shape = None
 
     if int4_w4a16:
         assert block_shape != None, "set group_size with -group_size"
-
-    kernel_name = "_fused_moe_kernel"
-    if (int8_w8a16 or int4_w4a16) and (block_shape_k is not None) and block_shape_k > 0:
-        kernel_name = "_fused_moe_kernel_gptq_awq"
 
     # python3 op_tests/test_moe_blockscale.py -d bf16 -m 32 -dim 7168 -idim 512 -e 512 -k 8
     if args.M and args.N and args.K and args.TopK and args.E:
@@ -300,7 +299,7 @@ def parse_args():
     parser.add_argument("-TopK", type=int, default=0, help="topk experts chosen per token")
     parser.add_argument("-E", type=int, default=0, help="number of experts")
 
-    parser.add_argument('-block_shape', nargs=2, type=int, default=None, help='block shape n and k')
+    parser.add_argument('-block_shape', nargs='+', type=int, default=None, help='block shape n and k. If only 1 provided then it is k.')
 
     parser.add_argument("-routed_weight", action="store_true", default=False)
     parser.add_argument("-int8_w8a16", action="store_true", default=False)
