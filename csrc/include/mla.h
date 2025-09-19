@@ -9,7 +9,7 @@ union MlaWorkInfo
 {
     struct
     {
-        int32_t bs_index;
+        int32_t batch_idx;
         int32_t partial_qo_loc;
         int32_t qo_start;
         int32_t qo_end;

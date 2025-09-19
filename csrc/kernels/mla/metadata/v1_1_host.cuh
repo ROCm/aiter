@@ -5,7 +5,7 @@
 #include "v1_comm.cuh"
 
 template <typename Traits>
-std::vector<torch::Tensor> get_mla_metadata_v1_host(
+std::vector<torch::Tensor> get_mla_metadata_v1_1_host(
     const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
     const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
     const int32_t        num_heads_per_head_k,
@@ -163,7 +163,7 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
 
                 // Record work
                 MlaWorkInfo work_info{};
-                work_info.bs_index  = bid;
+                work_info.batch_idx = bid;
                 work_info.qo_start  = tid * cluster_len_q + qo_batch_start;
                 work_info.qo_end    = ck_tile::min(work_info.qo_start + cluster_len_q, qo_batch_start + qo_len);
                 work_info.kv_start  = kv_start_local + kv_batch_start;

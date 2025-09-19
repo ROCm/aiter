@@ -233,7 +233,7 @@ CK_TILE_DEVICE void generate_work(
             {
                 // Record work
                 MlaWorkInfo work_info{};
-                work_info.bs_index  = batch_idx;
+                work_info.batch_idx = batch_idx;
                 work_info.qo_start  = tile_idx * qo_tile_len + qo_batch_start;
                 work_info.qo_end    = ck_tile::min(work_info.qo_start + qo_tile_len, qo_batch_start + qo_len);
                 work_info.kv_start  = kv_start_local + kv_batch_start;
@@ -278,7 +278,7 @@ CK_TILE_DEVICE void generate_work(
 
 template <typename Traits>
 __launch_bounds__(ck_tile::get_warp_size(), 1)
-__global__ void kn_get_mla_metadata_v1(
+__global__ void kn_get_mla_metadata_v1_1(
     const MlaMetadataV1KernelParameter params)
 {
     extern __shared__ uint8_t p_smem[];
@@ -558,20 +558,21 @@ __global__ void kn_get_mla_metadata_v1(
 }
 
 template <typename Traits>
-void get_mla_metadata_v1_device(
+void get_mla_metadata_v1_1_device(
     const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
     const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
     const int32_t        num_heads_per_head_k,
     const int32_t        num_heads_k,
     const bool           is_causal,
     const bool           no_redundant,
+    const int32_t        kv_granularity,
+    const int32_t        max_seqlen_qo,
     torch::Tensor&       work_metadata_ptrs,
     torch::Tensor&       work_info_set,
     torch::Tensor&       work_indptr,
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
-    torch::Tensor&       reduce_partial_map,
-    std::optional<std::map<std::string, int32_t>> split_params)
+    torch::Tensor&       reduce_partial_map)
 {
     TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
                 __func__, ": seqlens_qo_indptr should be continuous!");
@@ -582,25 +583,7 @@ void get_mla_metadata_v1_device(
     TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
                 __func__, ": seqlens_kv_indptr's element type should be int!");
 
-    int32_t kv_granularity = 16;
-    int32_t max_seqlen_qo = -1;
-
-    if (split_params.has_value())
-    {
-        if (split_params->find("kv_granularity") != split_params->end())
-        {
-            kv_granularity = split_params->find("kv_granularity")->second;
-        }
-
-        if (split_params->find("max_seqlen_qo") != split_params->end())
-        {
-            max_seqlen_qo = split_params->find("max_seqlen_qo")->second;
-        }
-    }
-
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    auto opts = seqlens_kv_indptr.options();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -645,6 +628,7 @@ void get_mla_metadata_v1_device(
     TORCH_CHECK(lds_size_in_bytes <= dev_prop.maxSharedMemoryPerMultiProcessor,
                 __func__, ": There is no enough LDS.");
 
+    // auto opts = seqlens_kv_indptr.options();
     // auto work_ptrs          = torch::empty({2}, opts.dtype(torch::kUInt64));
     // auto work_indptr        = torch::empty({num_cu + 1}, opts);
     // auto work_info_set      = torch::empty({max_works, kSizeMlaWorkInfoInDw}, opts);
@@ -672,5 +656,5 @@ void get_mla_metadata_v1_device(
     // launch kernel
     const dim3 grid = dim3(1, 1, 1);
     const int32_t num_thr = dev_prop.warpSize; // only use 1 warp for simplicity
-    kn_get_mla_metadata_v1<Traits><<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
+    kn_get_mla_metadata_v1_1<Traits><<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
 }
