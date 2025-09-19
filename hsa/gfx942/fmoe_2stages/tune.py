@@ -44,7 +44,7 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 
 
 class FmoeTuner(TunerCommon):
-    
+
     ARG_DEFAULTS = {
         "verbose": False,
         "tune_file": "aiter/configs/tuned_fmoe.csv",
@@ -55,12 +55,6 @@ class FmoeTuner(TunerCommon):
     }
 
     def _setup_specific_arguments(self):
-        #self.parser.add_argument(
-        #    "--all",
-        #    action="store_true",
-        #    required=False,
-        #    help="All the kernels are tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
-        #)
 
         self.parser.add_argument(
             "--last",
@@ -74,7 +68,7 @@ class FmoeTuner(TunerCommon):
         weight,
         qType,
         quant_dtype,
-        ):
+    ):
         E, dim1, dim2 = weight.shape
         if qType == aiter.QuantType.per_Tensor and quant_dtype != torch.int4:
             weight_qt, weight_scale = aiter.pertoken_quant(
@@ -113,6 +107,7 @@ class FmoeTuner(TunerCommon):
             torch_quant = aiter.get_torch_quant(qType)
             weight_qt, weight_scale = torch_quant(weight, quant_dtype=quant_dtype)
         return weight_qt, weight_scale
+
     def get_kernels_dict(self, file, key="tile_m"):
         if not os.path.exists(file):
             print(f"ASM kernel list file not exist: {file}")
@@ -120,6 +115,7 @@ class FmoeTuner(TunerCommon):
         df = pd.read_csv(file)
         kernel_dict = df.groupby(key)["knl_name"].apply(list).to_dict()
         return kernel_dict
+
     @staticmethod
     def ck_moe_stage1_fwd_out(
         a1_qt,
@@ -258,7 +254,6 @@ class FmoeTuner(TunerCommon):
         )
         return out
 
-    
     # do weight at stage1
     @staticmethod
     def run_1stage_fmoe_g1u1_tkw1(
@@ -396,7 +391,9 @@ class FmoeTuner(TunerCommon):
         return moe_buf
 
     @staticmethod
-    def get_1stage_fmoe_func(quant_type, q_dtype_a, activation, isG1U1, doweight_stage1):
+    def get_1stage_fmoe_func(
+        quant_type, q_dtype_a, activation, isG1U1, doweight_stage1
+    ):
         fmoe_func = None
         if (
             quant_type == QuantType.No
@@ -457,8 +454,8 @@ class FmoeTuner(TunerCommon):
 
         w1_qt_shffle = shuffle_weight(w1_qt, (16, 16))
         w2_qt_shffle = shuffle_weight(w2_qt, (16, 16))
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
-            topk_ids, topk_weights, expert, model_dim, dtype, blockM
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+            moe_sorting(topk_ids, topk_weights, expert, model_dim, dtype, blockM)
         )
         return (
             input,
@@ -610,10 +607,14 @@ class FmoeTuner(TunerCommon):
         )
         if q_dtype_w == torch.int4:
             w1_qt_shffle_ck = rearrange_4bit_elements(
-                convert_int8_to_uint32_int4(shuffle_weight(w1_qt, (16, 16), use_int4=True))
+                convert_int8_to_uint32_int4(
+                    shuffle_weight(w1_qt, (16, 16), use_int4=True)
+                )
             )
             w2_qt_shffle_ck = rearrange_4bit_elements(
-                convert_int8_to_uint32_int4(shuffle_weight(w2_qt, (16, 16), use_int4=True))
+                convert_int8_to_uint32_int4(
+                    shuffle_weight(w2_qt, (16, 16), use_int4=True)
+                )
             )
         else:
             w1_qt_shffle_ck = w1_qt_shffle
@@ -885,9 +886,9 @@ class FmoeTuner(TunerCommon):
             )
             ref1_asm = torch.zeros_like(out1)
             ref1_asm[:token] = a2_qt
-            ref1_asm[token:, ...].view(-1)[: token * topk * inter_dim * ratio // 128] = (
-                a2_scale.view(a1_qt.dtype).view(-1)
-            )
+            ref1_asm[token:, ...].view(-1)[
+                : token * topk * inter_dim * ratio // 128
+            ] = a2_scale.view(a1_qt.dtype).view(-1)
             return ref1_asm
 
         else:
@@ -896,7 +897,6 @@ class FmoeTuner(TunerCommon):
                 dtype=dtype,
             )
             return ref1
-
 
     ## 1 stage ref
     @staticmethod
@@ -1063,7 +1063,9 @@ class FmoeTuner(TunerCommon):
 
         blk_n, blk_k = scale_blks
         if a_scale is not None:
-            hidden_states = hidden_states.view(token_num, -1, blk_k) * a_scale.unsqueeze(-1)
+            hidden_states = hidden_states.view(
+                token_num, -1, blk_k
+            ) * a_scale.unsqueeze(-1)
             hidden_states = hidden_states.view(token_num, -1)
 
         hidden_states = hidden_states.view(token_num, 1, model_dim).repeat(1, topk, 1)
@@ -1181,7 +1183,8 @@ class FmoeTuner(TunerCommon):
         tflops = round(flop / (us * 1000000), 2)
         bw = round(data_bytes / (us * 1e-6) / 1e9, 2)
         return tflops, bw
-    def get_1stage_file_info(self,q_type,q_dtype_a,doweight_stage1):
+
+    def get_1stage_file_info(self, q_type, q_dtype_a, doweight_stage1):
         extraInfo_1stage = ""
         if q_dtype_a == dtypes.i8:
             quantDtype = "Int8"
@@ -1200,28 +1203,27 @@ class FmoeTuner(TunerCommon):
         else:
             quantDtype_1stage = "pertoken" + quantDtype
         return quantDtype_1stage, extraInfo_1stage
+
     def gen_1stage_asm_task(self, key):
         task_1stage = []
         info = key
         (
-                cu_num,
-                token,
-                model_dim,
-                inter_dim,
-                expert,
-                topk,
-                act_type,
-                dtype,
-                q_dtype_a,
-                q_dtype_w,
-                q_type,
-                use_g1u1,
-                doweight_stage1,
-            ) = info
+            cu_num,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        ) = info
         ## asm moe 1 stage tuning
         chip_name = get_gfx()
-        run_1stage_kernels_all = fused_moe_1stage_dict[chip_name]
-        # print(run_1stage_kernels_all)
         key = (act_type, q_type, dtype, q_dtype_a, q_dtype_w, use_g1u1)
         acti_dir = ""
         if act_type == ActivationType.Silu:
@@ -1229,7 +1231,9 @@ class FmoeTuner(TunerCommon):
         elif act_type == ActivationType.Gelu:
             acti_dir = "gelu"
         up = 1 if use_g1u1 else 0
-        quantDtype_1stage, extraInfo_1stage = self.get_1stage_file_info(q_type, q_dtype_a, doweight_stage1)
+        quantDtype_1stage, extraInfo_1stage = self.get_1stage_file_info(
+            q_type, q_dtype_a, doweight_stage1
+        )
         kernels_list_csv_1stage = f"{get_asm_dir()}/fmoe/{acti_dir}/fmoe_bf16_{{quantDtype_1stage}}_g1u{up}_{acti_dir}{{extraInfo_1stage}}.csv"
         asm_kernels_1stage = {}
         if (
@@ -1309,26 +1313,26 @@ class FmoeTuner(TunerCommon):
                     )
                 )
         return task_1stage
-    
+
     def gen_2stages_asm1_task(self, key, blockMs):
         info = key
-        #blockMs = [32, 64, 128]
+        # blockMs = [32, 64, 128]
         tasks = []
         (
-                cu_num,
-                token,
-                model_dim,
-                inter_dim,
-                expert,
-                topk,
-                act_type,
-                dtype,
-                q_dtype_a,
-                q_dtype_w,
-                q_type,
-                use_g1u1,
-                doweight_stage1,
-            ) = info
+            cu_num,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        ) = info
         kernels_list_csv = f"{get_asm_dir()}/fmoe_2stages/fmoe_stage1_bf16_pertoken{{quantDtype}}{{extraInfo}}_g1u1.csv"
         extraInfo = ""
         if q_type == QuantType.per_1x128:
@@ -1415,26 +1419,26 @@ class FmoeTuner(TunerCommon):
                         )
                     )
         return tasks
+
     def gen_2stages_task(self, key, blockMs):
-        #blockMs = [32, 64, 128]
+        # blockMs = [32, 64, 128]
         info = key
         tasks_ck = []
         (
-                cu_num,
-                token,
-                model_dim,
-                inter_dim,
-                expert,
-                topk,
-                act_type,
-                dtype,
-                q_dtype_a,
-                q_dtype_w,
-                q_type,
-                use_g1u1,
-                doweight_stage1,
-            ) =info
-
+            cu_num,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        ) = info
 
         _, ck_stage1_kernels = get_gemm1_kernels_list(
             dtype2str_dict[q_dtype_a],
@@ -1554,7 +1558,8 @@ class FmoeTuner(TunerCommon):
                             True,
                         )
                     )
-            return tasks_ck
+        return tasks_ck
+
     def tune(
         self,
         untunedf,
@@ -1585,7 +1590,7 @@ class FmoeTuner(TunerCommon):
                 use_g1u1,
                 doweight_stage1,
             ) = line
-            #info = line
+            # info = line
             dtype = eval(dtype)
             q_dtype_a = eval(q_dtype_a)
             q_dtype_w = eval(q_dtype_w)
@@ -1599,7 +1604,8 @@ class FmoeTuner(TunerCommon):
                 print("no moe solution(g1u0) can tune for ", line)
                 continue
             act_type = eval(act_type)
-            info = ( cu_num,
+            info = (
+                cu_num,
                 token,
                 model_dim,
                 inter_dim,
@@ -1611,7 +1617,8 @@ class FmoeTuner(TunerCommon):
                 q_dtype_w,
                 q_type,
                 use_g1u1,
-                doweight_stage1,)
+                doweight_stage1,
+            )
             tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
             tasks_ck.extend(self.gen_2stages_task(info, blockMs))
             task_1stage.extend(self.gen_1stage_asm_task(info))
@@ -1637,6 +1644,7 @@ class FmoeTuner(TunerCommon):
     def result_to_csv(self, results, file, concat=False):
         old_tunedf = self.get_tuned_gemm_list(file)
         resultdf = self.update_tunedf(old_tunedf, results)
+        resultdf["run_1stage"] = resultdf["run_1stage"].astype(int)
         if results is not None:
             resultdf = resultdf.astype(str).drop_duplicates(
                 subset=self.keys,
@@ -1829,8 +1837,10 @@ class FmoeTuner(TunerCommon):
             bests.append(best_one)
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
-            old_profile = self.get_tuned_gemm_list(args.profile_file,profile_result.columns.tolist())
-            
+            old_profile = self.get_tuned_gemm_list(
+                args.profile_file, profile_result.columns.tolist()
+            )
+
             profile_result = pd.concat([old_profile, profile_result])
             profile_result.to_csv(args.profile_file, index=False)
             return pd.concat(bests, axis=1).T
@@ -1850,7 +1860,7 @@ class FmoeTuner(TunerCommon):
             self.untunedf["cu_num"] = self.get_cu_num()
             if args.last:
                 self.untunedf = self.untunedf.iloc[-1:]
-    
+
             elif self.tunedf is not None:
                 untunedf_cols = self.untunedf.columns
                 mask = self.untunedf.apply(tuple, axis=1).isin(

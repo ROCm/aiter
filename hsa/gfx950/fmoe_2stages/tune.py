@@ -9,7 +9,7 @@ import time
 import os
 import sys
 from aiter import QuantType
-from aiter.jit.core import get_asm_dir, AITER_CSRC_DIR
+from aiter.jit.core import get_asm_dir, AITER_CSRC_DIR, AITER_META_DIR
 from aiter.fused_moe import (
     fused_topk,
     moe_sorting,
@@ -22,18 +22,13 @@ from aiter.fused_moe import (
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.mp_tuner import mp_tuner
-from aiter.int4_utils import (
-    rearrange_4bit_elements,
-    convert_int8_to_uint32_int4,
-)
+
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.utility import fp4_utils
-import torch.nn.functional as F
-from einops import rearrange
-from aiter.utility.base_tuner import TunerCommon
-from aiter.hsa.gfx950.fmoe_2stages import FmoeTuner
+
+sys.path.insert(0, f"{AITER_META_DIR}/hsa/gfx942")
+from fmoe_2stages.tune import FmoeTuner
 
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
@@ -52,6 +47,7 @@ def get_kernels_dict(file, key="tile_m"):
     kernel_dict = df.groupby(key)["knl_name"].apply(list).to_dict()
     return kernel_dict
 
+
 class FmoeTuner950(FmoeTuner):
     ARG_DEFAULTS = {
         "verbose": False,
@@ -61,7 +57,8 @@ class FmoeTuner950(FmoeTuner):
         "batch": 100,
         "profile_file": "aiter/configs/profile_fmoe.csv",  # for all results
     }
-    def get_1stage_file_info(self,q_type,q_dtype_a,doweight_stage1):
+
+    def get_1stage_file_info(self, q_type, q_dtype_a, doweight_stage1):
         extraInfo_1stage = ""
         if q_dtype_a == dtypes.i8:
             quantDtype = "Int8"
@@ -81,7 +78,8 @@ class FmoeTuner950(FmoeTuner):
             quantDtype_1stage = "pertoken" + "MXfp4"
         else:
             quantDtype_1stage = "pertoken" + quantDtype
-        return extraInfo_1stage,quantDtype_1stage
+        return quantDtype_1stage, extraInfo_1stage
+
     def tune(
         self,
         untunedf,
@@ -115,7 +113,6 @@ class FmoeTuner950(FmoeTuner):
                 use_g1u1,
                 doweight_stage1,
             ) = line
-            #info = line
             dtype = eval(dtype)
             q_dtype_a = eval(q_dtype_a)
             q_dtype_w = eval(q_dtype_w)
@@ -126,7 +123,8 @@ class FmoeTuner950(FmoeTuner):
                 print("no moe solution(g1u0) can tune for ", line)
                 continue
             act_type = eval(act_type)
-            info = ( cu_num,
+            info = (
+                cu_num,
                 token,
                 model_dim,
                 inter_dim,
@@ -138,7 +136,8 @@ class FmoeTuner950(FmoeTuner):
                 q_dtype_w,
                 q_type,
                 use_g1u1,
-                doweight_stage1,)
+                doweight_stage1,
+            )
             tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
             tasks_ck.extend(self.gen_2stages_task(info, blockMs))
             task_1stage.extend(self.gen_1stage_asm_task(info))
@@ -160,7 +159,6 @@ class FmoeTuner950(FmoeTuner):
             return []
         else:
             return rets
-
 
 
 if __name__ == "__main__":
