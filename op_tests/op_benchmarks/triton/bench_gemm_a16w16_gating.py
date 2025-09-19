@@ -16,6 +16,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     model_benchmark_shapes,
     get_gemm_shape_benchmark_object,
     print_vgpr,
+    get_evaluation_label,
 )
 import matplotlib.pyplot as plt
 
@@ -34,17 +35,18 @@ def get_gemm_model_benchmark_object(
         x_names = ["M", "hidden_dim", "intermediate_dim", "model_name"]
     x_vals_list = model_benchmark_shapes(args)
 
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "throughput":
-        ylabel = "Throughput (TFLOPS)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GB/s)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
+    ylabel = get_evaluation_label(args.metric, space=True)
 
-    line_names = ["fc1"]
-    line_vals = line_names
+    line_names = []
+    line_vals = []
+    if not args.bench_torch:
+        line_names.append(get_evaluation_label(args.metric, prefix="fc1"))
+        line_vals.append(("triton", "fc1"))
+    else:
+        line_names.append(get_evaluation_label(args.metric, prefix="triton_fc1"))
+        line_vals.append(("triton", "fc1"))
+        line_names.append(get_evaluation_label(args.metric, prefix="torch_fc1"))
+        line_vals.append(("torch", "fc1"))
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(
@@ -52,7 +54,7 @@ def get_gemm_model_benchmark_object(
         x_vals=x_vals_list,
         x_log=True,
         y_log=True,
-        line_arg="layer",
+        line_arg="provider",
         line_vals=line_vals,
         line_names=line_names,
         styles=[
@@ -72,6 +74,7 @@ def bench_gemm_fn(
     metric: str,
     layout: str,
     activation: str = None,
+    use_torch: bool = False,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
@@ -89,11 +92,19 @@ def bench_gemm_fn(
     mem_read = (M * K) * x.element_size() + (N * K) * w.element_size()
     mem_write = (M * N // 2) * x.element_size()
     mem = mem_read + mem_write
-    ms = triton.testing.do_bench(
-        lambda: gemm_a16w16_gated(x, w, c_dtype, y, activation=activation),
-        warmup=25,
-        rep=100,  # noqa: E731
-    )
+    
+    if use_torch:
+        ms = triton.testing.do_bench(
+            lambda: run_torch(x, w, N, activation),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
+    else:
+        ms = triton.testing.do_bench(
+            lambda: gemm_a16w16_gated(x, w, c_dtype, y, activation=activation),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -113,15 +124,15 @@ def run_model_benchmark(args):
     Runs benchmark given a --model argument.
     """
     benchmark = get_gemm_model_benchmark_object("Fused-act-gate GEMM A16W16 Benchmark", args)
-
+    
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a16w16(M, hidden_dim, intermediate_dim, metric, **kwargs):
+    def bench_gemm_a16w16(M, hidden_dim, intermediate_dim, metric, provider, **kwargs):
         N, K = intermediate_dim * 2, hidden_dim
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, activation=args.activation)
+        return bench_gemm_fn(M, N, K, metric, args.layout, activation=args.activation, use_torch=(provider[0]=="torch"))
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
@@ -133,10 +144,10 @@ def run_shape_benchmark(args):
     benchmark = get_gemm_shape_benchmark_object("Fused-act-gate GEMM A16W16 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a16w16(M, N, K, metric, **kwargs):
+    def bench_gemm_a16w16(M, N, K, metric, provider, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, activation=args.activation)
+        return bench_gemm_fn(M, N, K, metric, args.layout, activation=args.activation, use_torch=(provider=="torch"))
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
@@ -206,6 +217,9 @@ def parse_args():
         type=str,
         default=None,
         help="Optional activation function to apply to the output. One of ('gelu', 'gelu_tanh', 'silu', 'silu_exp2', 'relu').",
+    )
+    parser.add_argument(
+        "-bench_torch", action="store_true", help="Compare against native torch implementation"
     )
     return get_ff_args(parser)
 

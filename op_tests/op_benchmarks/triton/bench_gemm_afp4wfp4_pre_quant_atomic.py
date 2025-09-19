@@ -7,6 +7,7 @@ from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
 )
 from op_tests.triton_tests.test_gemm_afp4wfp4_pre_quant_atomic import (
     generate_gemm_afp4wfp4_pre_quant_inputs,
+    run_torch,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
@@ -21,7 +22,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
+def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False):
     c_dtype = (
         torch.float32
     )  # NOTE: test_gemm_afp4wfp4_pre_quant_atomic occasionally fails when c_dtype is set to bfloat16
@@ -40,11 +41,18 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: gemm_afp4wfp4_pre_quant(x, w, w_scale, c_dtype, y),
-        warmup=25,
-        rep=100,
-    )
+    if use_torch:
+        ms = triton.testing.do_bench(
+            lambda: run_torch(x, w, w_scale, c_dtype),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
+    else:
+        ms = triton.testing.do_bench(
+            lambda: gemm_afp4wfp4_pre_quant(x, w, w_scale, c_dtype, y),
+            warmup=25,
+            rep=100,
+        )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -89,20 +97,20 @@ def run_model_benchmark(args):
     benchmark = get_gemm_model_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_afp4wfp4(M, hidden_dim, intermediate_dim, metric, layer, **kwargs):
-        if layer == "fc1":
+    def bench_gemm_afp4wfp4(M, hidden_dim, intermediate_dim, metric, provider, **kwargs):
+        if provider[1] == "fc1":
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
             else:
                 N, K = intermediate_dim * 2, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
-        elif layer == "fc2":
+        elif provider[1] == "fc2":
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
 
-        return bench_gemm_fn(M, N, K, metric, args.layout)
+        return bench_gemm_fn(M, N, K, metric, args.layout, use_torch=(provider[0]=="torch"))
 
     bench_gemm_afp4wfp4.run(save_path=".", print_data=True)
 
@@ -111,8 +119,8 @@ def run_shape_benchmark(args):
     benchmark = get_gemm_shape_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_afp4wfp4(M, N, K, metric, **kwargs):
-        return bench_gemm_fn(M, N, K, metric, args.layout)
+    def bench_gemm_afp4wfp4(M, N, K, metric, provider, **kwargs):
+        return bench_gemm_fn(M, N, K, metric, args.layout, use_torch=(provider=="torch"))
 
     bench_gemm_afp4wfp4.run(save_path=".", print_data=True)
 
