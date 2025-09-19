@@ -375,6 +375,8 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                 p_dropout,
                 drop_seed_offset);
 
+        stream_config.log_level_ = 1;
+
         float t = aiter::mha_bwd(args,
                                  stream_config,
                                  q_dtype_str,
