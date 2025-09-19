@@ -20,6 +20,7 @@ import torch
 import aiter as ops
 from aiter import dtypes
 from dataclasses import dataclass
+from aiter.ops.quant import per_token_quant_hip
 
 
 # from vllm.utils import is_hip
@@ -272,6 +273,10 @@ class PagedAttention:
             if fp8_out_scale is not None:
                 output = torch.empty_like(output, dtype=dtypes.fp8)
                 cpa_fp8_out = True
+            if kv_cache_dtype == "fp8":
+                _, q_scale = per_token_quant_hip(query)
+            else:
+                q_scale = None
             torch.ops.aiter.paged_attention_rocm(
                 output,
                 exp_sums,
@@ -293,6 +298,7 @@ class PagedAttention:
                 fp8_out_scale if cpa_fp8_out else None,
                 _PARTITION_SIZE_ROCM,
                 mtp=mtp,
+                q_scale=q_scale,
             )
             if cpa_fp8_out:
                 return output.view(num_seqs, num_heads * head_size)
