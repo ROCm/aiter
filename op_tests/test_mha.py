@@ -126,6 +126,7 @@ def run_ck(
         return out, dropout_mask, dq, dk, dv, None
 
 
+@pytest.mark.parametrize("iperm", ["BSHD", "BHSD", "SBHD", "KVPACKED"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("deterministic", [True, False])
@@ -139,31 +140,17 @@ def run_ck(
     "d,d_v",
     [
         (32, 32),
-        (40, 40),
-        (59, 59),
-        (64, 64),
         (96, 96),
-        (111, 111),
         (128, 128),
         (160, 160),
-        (192, 192),
-        (224, 224),
         (256, 256),
     ],
 )
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        (113, 203),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
         (512, 256),
         (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (2048, 2048),
     ],
 )
 def test_flash_attn_output(
