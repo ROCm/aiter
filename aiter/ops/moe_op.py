@@ -312,7 +312,7 @@ dtype2str_dict = {
     dtypes.bf16: "b16",
     dtypes.fp8: "f8",
     dtypes.i8: "i8",
-    torch.uint8: "fp4x2",
+    dtypes.fp4x2: "fp4x2",
     torch.uint32: "i4",
     torch.int4: "i4",
 }

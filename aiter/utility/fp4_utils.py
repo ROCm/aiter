@@ -11,8 +11,8 @@ def f32_to_mxfp4(x):
     FP4_EBITS, FP4_MBITS = 2, 1
     x = _f32_to_floatx_unpacked(x.float(), FP4_EBITS, FP4_MBITS)
     x = pack_uint4(x)
-    # x = x.view(dtypes.fp4x2) # to(fp32) for this datatype gives all 0 for torch...
-    x = x.view(torch.uint8)
+    x = x.view(dtypes.fp4x2)  # to(fp32) for this datatype gives all 0 for torch...
+    # x = x.view(torch.uint8)
     return x
 
 
