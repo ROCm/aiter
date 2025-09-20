@@ -100,6 +100,7 @@ def benchmark():
             ret = func(*args, **kwargs)
             if ret is not None:
                 callargs.update(ret)
+            torch.cuda.empty_cache()
             return callargs
 
         return wrapper
