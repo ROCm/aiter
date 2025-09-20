@@ -115,16 +115,26 @@ if supports_custom_op():
 
     @torch.library.custom_op("aiter::outplace_all_reduce", mutates_args=["tensor"])
     def outplace_all_reduce(
-        tensor: torch.Tensor, open_fp8_quant: bool, group_name: str
+        tensor: torch.Tensor,
+        group_name: str,
+        outplace_all_reduce_method: str,
+        ca_fp8_quant: bool,
     ) -> torch.Tensor:
         assert group_name in _groups, f"Group {group_name} is not found."
         group = _groups[group_name]()
         if group is None:
             raise ValueError(f"Group {group_name} is destroyed.")
-        return group._all_reduce_out_place(tensor, open_fp8_quant)
+        return group._all_reduce_out_place(
+            tensor, outplace_all_reduce_method, ca_fp8_quant
+        )
 
     @outplace_all_reduce.register_fake
-    def _(tensor: torch.Tensor, open_fp8_quant: bool, group_name: str) -> torch.Tensor:
+    def _(
+        tensor: torch.Tensor,
+        group_name: str,
+        outplace_all_reduce_method: str,
+        ca_fp8_quant: bool,
+    ) -> torch.Tensor:
         return torch.empty_like(tensor)
 
 
@@ -159,6 +169,7 @@ class GroupCoordinator:
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
+    qr_comm: Optional[Any]  # Quick allreduce communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
     def __init__(
@@ -210,6 +221,7 @@ class GroupCoordinator:
 
         # lazy import to avoid documentation build error
         from .custom_all_reduce import CustomAllreduce
+        from .quick_all_reduce import QuickAllReduce, qr_rocm_arch_available
 
         # from vllm.distributed.device_communicators.pynccl import (
         #     PyNcclCommunicator)
@@ -222,13 +234,24 @@ class GroupCoordinator:
             )
 
         self.ca_comm: Optional[CustomAllreduce] = None
+        self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
             )
-
+            try:
+                # Initialize a custom quick all-reduce implementation for AMD
+                # when rocm >= gfx942. Quick reduce is designed as a
+                # complement to custom allreduce.
+                # Based on quickreduce (https://github.com/mk1-project/quickreduce).
+                if qr_rocm_arch_available():
+                    self.qr_comm = QuickAllReduce(
+                        group=self.cpu_group, device=self.device
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to initialize QuickAllReduce: {e}")
         # from vllm.distributed.device_communicators.tpu_communicator import (
         #     TpuCommunicator)
         self.tpu_communicator = None
@@ -326,7 +349,7 @@ class GroupCoordinator:
                 yield graph_capture_context
 
     def all_reduce(
-        self, input_: torch.Tensor, open_fp8_quant: bool = False
+        self, input_: torch.Tensor, ca_fp8_quant: bool = False
     ) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -353,26 +376,42 @@ class GroupCoordinator:
         if self.tpu_communicator is not None and not self.tpu_communicator.disabled:
             # TPU handles Dynamo with its own logic.
             return self.tpu_communicator.all_reduce(input_)
-
+        outplace_all_reduce_method = None
         if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+        ):
+            outplace_all_reduce_method = "qr"
+        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
         ):
+            outplace_all_reduce_method = "ca"
+        if outplace_all_reduce_method is not None:
             return torch.ops.aiter.outplace_all_reduce(
-                input_, open_fp8_quant, group_name=self.unique_name
+                input_,
+                group_name=self.unique_name,
+                outplace_all_reduce_method=outplace_all_reduce_method,
+                ca_fp8_quant=ca_fp8_quant,
             )
         else:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
     def _all_reduce_out_place(
-        self, input_: torch.Tensor, open_fp8_quant: bool
+        self, input_: torch.Tensor, outplace_all_reduce_method: str, ca_fp8_quant: bool
     ) -> torch.Tensor:
+        qr_comm = self.qr_comm
         ca_comm = self.ca_comm
-        assert ca_comm is not None
-        assert not ca_comm.disabled
-        out = ca_comm.custom_all_reduce(input_, open_fp8_quant)
+        assert any([qr_comm, ca_comm])
+        if outplace_all_reduce_method == "qr":
+            assert not qr_comm.disabled
+            out = qr_comm.quick_all_reduce(input_)
+        elif outplace_all_reduce_method == "ca":
+            assert not ca_comm.disabled
+            out = ca_comm.custom_all_reduce(input_, ca_fp8_quant)
         assert out is not None
         return out
 
@@ -817,6 +856,8 @@ class GroupCoordinator:
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
+        if self.qr_comm is not None:
+            self.qr_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 

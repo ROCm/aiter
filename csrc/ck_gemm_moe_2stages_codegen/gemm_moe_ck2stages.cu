@@ -38,7 +38,7 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::
     }
     else
     {
-        return moe_stage2_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, act_op, quant_type, mul_routed_weight);
+        return moe_stage2_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, 0, quant_type, mul_routed_weight);
     }
 }
 
@@ -92,6 +92,8 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     {
         K *= 2;
     }
+
+    activation = !activation;
 
     auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight);
 
@@ -147,6 +149,8 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     {
         K *= 2;
     }
+
+    activation = !activation;
     auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight);
 
     kernel(at::cuda::getCurrentCUDAStream().stream(),
