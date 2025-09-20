@@ -2435,7 +2435,7 @@ def flash_attn_fp8_pertensor_func(
         bias=None,
         alibi_slopes=None,
         return_lse=False,
-        return_softmax=False
+        return_softmax=False,
     )
     out = out_padded[..., :head_size_v_og]
     return out
@@ -2482,8 +2482,7 @@ def flash_attn_varlen_fp8_pertensor_func(
         bias=None,
         alibi_slopes=None,
         return_lse=False,
-        return_softmax=False
+        return_softmax=False,
     )
     out = out_padded[..., :head_size_v_og]
     return out
-
