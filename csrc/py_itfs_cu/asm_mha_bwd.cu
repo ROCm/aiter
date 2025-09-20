@@ -106,77 +106,77 @@ fmha_bwd_args get_asm_fmha_bwd_args(const mask_info &mask,
     }
 
     return fmha_bwd_args{q.data_ptr(),
-        k.data_ptr(),
-        v.data_ptr(),
-        alibi_slopes_ptr, // bias
-        out.data_ptr(),
-        softmax_lse.data_ptr(),
-        dout.data_ptr(),
-        d.data_ptr(),
-        nullptr, // rand_val
-        dq.data_ptr(),
-        dk.data_ptr(),
-        dv.data_ptr(),
-        nullptr, // dbias
-        dq_acc.data_ptr(), // dq_acc
-        nullptr, // seqstart_q
-        nullptr, // seqstart_k
-        nullptr, // seqlen_k_ptr
-        seqlen_q,
-        seqlen_k,
-        b,
-        seqlen_q, // max_seqlen_q
-        seqlen_k, // max_seqlen_k
-        hdim_q, // hdim_q
-        hdim_v, // hdim_v
-        h, // nhead
-        h_k, // nhead_k
-        softmax_scale,
-        stride_q,
-        stride_k,
-        stride_v,
-        stride_alibi_slopes,
-        stride_o,
-        0, // stride_randval
-        stride_do,
-        stride_dq_acc,
-        stride_dq,
-        stride_dk,
-        stride_dv,
-        0, // stride_dbias, FA without bias
-        nhead_stride_q,
-        nhead_stride_k,
-        nhead_stride_v,
-        0, // nhead_stride_bias, FA without bias
-        nhead_stride_o,
-        0, // nhead_stride_randval
-        nhead_stride_do,
-        nhead_stride_lse,
-        nhead_stride_dq_acc,
-        nhead_stride_dq,
-        nhead_stride_dk,
-        nhead_stride_dv,
-        0, // nhead_stride_dbias, FA without dbias
-        batch_stride_q,
-        batch_stride_k,
-        batch_stride_v,
-        0  , // batch_stride_bias, FA without bias
-        batch_stride_o,
-        0, // batch_stride_randval
-        batch_stride_do,
-        batch_stride_lse,
-        batch_stride_dq_acc,
-        batch_stride_dq,
-        batch_stride_dk,
-        batch_stride_dv,
-        0  , // batch_stride_dbias, FA without dbias
-        split_stride_dq_acc,
-        mask.left,
-        mask.right,
-        static_cast<ck_tile::index_t>(mask.type),
-        p_dropout,
-        p_undrop,
-        drop_seed_offset};
+                         k.data_ptr(),
+                         v.data_ptr(),
+                         alibi_slopes_ptr, // bias
+                         out.data_ptr(),
+                         softmax_lse.data_ptr(),
+                         dout.data_ptr(),
+                         d.data_ptr(),
+                         nullptr, // rand_val
+                         dq.data_ptr(),
+                         dk.data_ptr(),
+                         dv.data_ptr(),
+                         nullptr, // dbias
+                         dq_acc.data_ptr(), // dq_acc
+                         nullptr, // seqstart_q
+                         nullptr, // seqstart_k
+                         nullptr, // seqlen_k_ptr
+                         seqlen_q,
+                         seqlen_k,
+                         b,
+                         seqlen_q, // max_seqlen_q
+                         seqlen_k, // max_seqlen_k
+                         hdim_q, // hdim_q
+                         hdim_v, // hdim_v
+                         h, // nhead
+                         h_k, // nhead_k
+                         softmax_scale,
+                         stride_q,
+                         stride_k,
+                         stride_v,
+                         stride_alibi_slopes,
+                         stride_o,
+                         0, // stride_randval
+                         stride_do,
+                         stride_dq_acc,
+                         stride_dq,
+                         stride_dk,
+                         stride_dv,
+                         0, // stride_dbias, FA without bias
+                         nhead_stride_q,
+                         nhead_stride_k,
+                         nhead_stride_v,
+                         0, // nhead_stride_bias, FA without bias
+                         nhead_stride_o,
+                         0, // nhead_stride_randval
+                         nhead_stride_do,
+                         nhead_stride_lse,
+                         nhead_stride_dq_acc,
+                         nhead_stride_dq,
+                         nhead_stride_dk,
+                         nhead_stride_dv,
+                         0, // nhead_stride_dbias, FA without dbias
+                         batch_stride_q,
+                         batch_stride_k,
+                         batch_stride_v,
+                         0  , // batch_stride_bias, FA without bias
+                         batch_stride_o,
+                         0, // batch_stride_randval
+                         batch_stride_do,
+                         batch_stride_lse,
+                         batch_stride_dq_acc,
+                         batch_stride_dq,
+                         batch_stride_dk,
+                         batch_stride_dv,
+                         0  , // batch_stride_dbias, FA without dbias
+                         split_stride_dq_acc,
+                         mask.left,
+                         mask.right,
+                         static_cast<ck_tile::index_t>(mask.type),
+                         p_dropout,
+                         p_undrop,
+                         drop_seed_offset};
 }
 
 std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]

@@ -1087,7 +1087,6 @@ def _flash_attn_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
-        gfx = get_gfx()
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
@@ -1155,9 +1154,9 @@ def can_impl_fmha_v3_bwd(
     deterministic: bool,
     is_v3_atomic_fp32: Optional[bool] = True,
 ) -> bool:
+
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
-
     batch_stride_q = q.stride(0)
     stride_q = q.stride(1)
     nhead_stride_q = q.stride(2)
@@ -1246,11 +1245,8 @@ def can_impl_fmha_v3_bwd(
         # bwd_hd64_bf16_causal_a32_rtz_pssk
         # bwd_hd64_fp16_a32_pssk
         # bwd_hd64_fp16_causal_a32_pssk
-        gfx = get_gfx()
         # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        ret = (hdim_q == 64 and gfx == "gfx942" and is_v3_atomic_fp32 == True) or (
-            hdim_q == 128 and gfx == "gfx950"
-        )
+        ret = hdim_q == 64 and is_v3_atomic_fp32 == True
         ret &= nmask or (
             mask and seqlen_q == seqlen_k
         )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
@@ -1312,15 +1308,12 @@ def can_impl_fmha_v3_bwd(
 
         return ret
 
-    # only 1 block when sk <= 256, thus deterministic
-    is_950_1block = get_gfx() == "gfx950" and seqlen_k <= 256
-
     # basic
     ret = alibi_slopes is None
     ret &= bias is None
     ret &= dbias is None
     ret &= dropout_p == 0.0
-    ret &= not deterministic or is_950_1block
+    ret &= not deterministic
     ret &= hdim_q == hdim_v
     ret &= nhead_q % nhead_k == 0
     ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
@@ -1356,6 +1349,7 @@ def _flash_attn_backward(
             "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
         )
         how_v3_bf16_cvt = 0
+
     # can_impl_fmha_v3_bwd should before maybe_contiguous to get pure dout, q, k, v, out
     can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd(
         dout,
@@ -1377,12 +1371,31 @@ def _flash_attn_backward(
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    (_, seqlen_q, _, _) = q.shape
-    (_, seqlen_k, _, _) = k.shape
+
+    (_, seqlen_q, nhead_q, hdim_q) = q.shape
+    (_, seqlen_k, nhead_k, hdim_v) = v.shape
+    mask = causal and window_size_left == -1  # causal mask
+    nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
+
+    def can_impl_fmha_v3_bwd_gfx950():
+        ret = get_gfx() == "gfx950"
+        ret &= alibi_slopes is None
+        ret &= bias is None
+        ret &= dbias is None
+        ret &= dropout_p == 0.0
+        ret &= not deterministic
+        ret &= hdim_q == hdim_v
+        ret &= nhead_q % nhead_k == 0
+        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
+        ret &= nmask or (mask and seqlen_q == seqlen_k)
+
+        return ret
+
+    can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
+
     if (
         can_impl_fmha_v3_bwd_ and seqlen_q > 16
     ):  # ck fmha bwd has optimization for seqlen_q <= 16
-        is_950_1block = get_gfx() == "gfx950" and seqlen_k <= 256
         if dq is not None:
             dq.zero_()
         (
@@ -1402,8 +1415,8 @@ def _flash_attn_backward(
             causal,
             window_size_left,
             window_size_right,
-            False if is_950_1block else deterministic,
-            False if is_950_1block else is_v3_atomic_fp32,
+            deterministic,
+            is_v3_atomic_fp32,
             how_v3_bf16_cvt,
             dq,
             dk,
@@ -1671,7 +1684,6 @@ def _flash_attn_varlen_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
-        gfx = get_gfx()
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
@@ -1839,15 +1851,31 @@ def _flash_attn_varlen_backward(
         ret &= deterministic == False
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q >= 64 and hdim_q <= 128 and hdim_q % 8 == 0
+        ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
         ret &= mask or nmask
         ret &= pssk() or psskddv()
 
         return ret
 
+    def can_impl_fmha_v3_bwd_gfx950():
+        ret = get_gfx() == "gfx950"
+        ret &= alibi_slopes is None
+        # ret &= bias is None
+        # ret &= dbias is None
+        ret &= dropout_p == 0.0
+        ret &= deterministic == False
+        ret &= hdim_q == hdim_v
+        ret &= nhead_q % nhead_k == 0
+        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
+        ret &= nmask
+
+        return ret
+
+    can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd() or can_impl_fmha_v3_bwd_gfx950()
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    if can_impl_fmha_v3_bwd():
+
+    if can_impl_fmha_v3_bwd_:
         (
             dq,
             dk,

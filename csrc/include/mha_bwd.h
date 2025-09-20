@@ -364,6 +364,12 @@ struct __attribute__((packed)) fmha_bwd_dq_shuffle_args
     p3 _p9;
     unsigned int head_dim;
     p3 _p10;
+    const void *ptr_qseq;
+    p2 _p11;
+    const void *ptr_qseq_padded;
+    p2 _p12;
+    unsigned int max_seqlen_dq;
+    p3 _p13;
 };
 
 struct fmha_bwd_v3_traits
@@ -387,8 +393,8 @@ template <ck_tile::index_t HDim_,
           ck_tile::index_t BF16Cvt_,
           bool kIsSEQPad_,
           bool kIsHDPad_,
-          GPUArch GPUArch_,
-          bool kIsGroupMode_ = false>
+          bool kIsGroupMode_,
+          GPUArch GPUArch_>
 struct fmha_bwd_dq_dk_dv_v3_traits_
 {
     static constexpr ck_tile::index_t HDim    = HDim_;
