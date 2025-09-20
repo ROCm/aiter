@@ -16,7 +16,7 @@ from jit.utils.cpp_extension import (
     BuildExtension,
     IS_HIP_EXTENSION,
 )
-from multiprocessing import Pool
+from concurrent.futures import ThreadPoolExecutor
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 PACKAGE_NAME = "aiter"
@@ -124,8 +124,8 @@ if IS_ROCM:
             prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-        with Pool(processes=prebuid_thread_num) as pool:
-            pool.map(build_one_module, all_opts_args_build)
+        with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
+            list(executor.map(build_one_module, all_opts_args_build))
 
         ck_batched_gemm_folders = [
             f"{this_dir}/csrc/{name}/include"
