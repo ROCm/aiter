@@ -391,7 +391,7 @@ def gen_mha_varlen_fwd_fake_tensor(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
-) -> List[torch.Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     device = q.device
     dtype = q.dtype
 
@@ -453,7 +453,7 @@ def mha_varlen_fwd(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
-) -> List[torch.Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_varlen_fwd_fake_tensor(
@@ -480,7 +480,7 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
-) -> List[torch.Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
 
     device = q.device
     dtype = q.dtype
@@ -543,7 +543,7 @@ def fmha_v3_varlen_fwd(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
-) -> List[torch.Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def cmdGenFunc_mha_bwd(

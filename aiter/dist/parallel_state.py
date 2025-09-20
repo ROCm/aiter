@@ -113,7 +113,7 @@ if supports_custom_op():
     # def _(tensor: torch.Tensor, group_name: str) -> None:
     #     return
 
-    @torch.library.custom_op("aiter::outplace_all_reduce", mutates_args=["tensor"])
+    @torch.library.custom_op("aiter::outplace_all_reduce", mutates_args=[])
     def outplace_all_reduce(
         tensor: torch.Tensor,
         group_name: str,
@@ -389,6 +389,7 @@ class GroupCoordinator:
             and self.ca_comm.should_custom_ar(input_)
         ):
             outplace_all_reduce_method = "ca"
+        if outplace_all_reduce_method is not None:
             return torch.ops.aiter.outplace_all_reduce(
                 input_,
                 group_name=self.unique_name,
