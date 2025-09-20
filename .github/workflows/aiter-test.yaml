@@ -1,0 +1,84 @@
+name: Aiter Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]  # Triggers on PRs targeting `main`
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  aiter:
+    runs-on: mi300x-8gpu
+    env:
+      DOCKER_IMAGE: "rocm/pytorch:latest"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Sync submodules
+        run: |
+          set -e
+          if [[ ${{ github.ref }} == "main" ]]; then
+            git submodule sync --remote
+          else
+            git submodule sync
+          fi
+          git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: aiter_test"
+          docker run -dt \
+          --device=/dev/dri \
+          --device=/dev/kfd \
+          --shm-size=16G \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name aiter_test \
+          ${{ env.DOCKER_IMAGE }}
+
+      - name: Setup-Triton
+        run: |
+          set -ex
+          echo "Setuping Triton..."
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          ./.github/scripts/build_triton.sh
+      
+      - name: Standard Tests
+        run: |
+          set -ex
+          echo "Running Standard Tests..."
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          ./.github/scripts/aiter_test.sh 
+
+      # - name: MultiGPU Tests
+      #   run: |
+      #     set -ex
+      #     echo "Running MultiGPU Tests..."
+      #     docker exec \
+      #     -e MULTIGPU=TRUE \
+      #     -w /workspace \
+      #     aiter_test \
+      #     ./.github/scripts/aiter_test.sh
+      
+      - name: Upload test logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-logs
+          path: latest_test.log
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f aiter_test || true
