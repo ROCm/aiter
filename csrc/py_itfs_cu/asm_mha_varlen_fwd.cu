@@ -67,7 +67,7 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
     ck_tile::index_t batch_stride_q = total_q * q.stride(0);
     ck_tile::index_t batch_stride_k = total_k * k.stride(0);
     ck_tile::index_t batch_stride_v = total_k * v.stride(0);
-    ck_tile::index_t batch_stride_o = total_q * h * v.stride(1);
+    ck_tile::index_t batch_stride_o = total_q * out.stride(0);
     ck_tile::index_t batch_stride_lse = has_lse ? h * softmax_lse.stride(0) : 0;
     ck_tile::index_t batch_stride_randval = has_dropout_randval ? h * dropout_randval.stride(0) : 0;
 

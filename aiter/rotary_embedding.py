@@ -260,8 +260,9 @@ class RotaryEmbedding(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         import aiter as ops
 
-        self.cos_cache = self.cos_cache.to(query.device, dtype=query.dtype)
-        self.sin_cache = self.sin_cache.to(query.device, dtype=query.dtype)
+        assert (
+            self.cos_cache.dtype == query.dtype
+        ), f"cos_cache dtype ({self.cos_cache.dtype}) does not match query dtype ({query.dtype})"
         cos, sin = self.cos_cache, self.sin_cache
 
         rotate_style = 0 if self.is_neox_style else 1

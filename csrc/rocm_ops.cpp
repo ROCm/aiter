@@ -21,6 +21,7 @@
 #include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
 #include "gemm_a8w8_bpreshuffle.h"
+#include "gemm_common.h"
 #include "hipbsolgemm.cuh"
 #include "moe_ck.h"
 #include "moe_op.h"
@@ -28,6 +29,7 @@
 #include "norm.h"
 #include "pos_encoding.h"
 #include "quant.h"
+#include "quick_all_reduce.h"
 #include "rmsnorm.h"
 #include "rocsolgemm.cuh"
 #include "rope.h"
@@ -52,6 +54,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     // GEMM_A8W8_TUNE_PYBIND;
     AITER_ENUM_PYBIND;
     RMSNORM_PYBIND;
+    GEMM_COMMON_PYBIND;
     // MHA_VARLEN_FWD_PYBIND;
     // MHA_VARLEN_BWD_PYBIND;
     // MHA_FWD_PYBIND;
@@ -90,6 +93,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     AITER_OPERATOR_PYBIND;
     AITER_UNARY_PYBIND;
     CUSTOM_ALL_REDUCE_PYBIND;
+    QUICK_ALL_REDUCE_PYBIND;
     CACHE_PYBIND;
     HIPBSOLGEMM_PYBIND;
     ROCSOLGEMM_PYBIND;

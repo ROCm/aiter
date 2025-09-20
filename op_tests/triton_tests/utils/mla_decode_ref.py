@@ -25,7 +25,7 @@ It supports page size = 1.
 
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.arch_info import get_arch
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def is_hip():

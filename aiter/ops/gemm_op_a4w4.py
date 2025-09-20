@@ -49,7 +49,10 @@ def get_GEMM_config(M: int, N: int, K: int):
                 f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM or asmGEMM, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
             )
             break
-
+    if config is None:
+        logger.info(
+            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in CKGEMM or asmGEMM, will use default config!"
+        )
     return config
 
 
