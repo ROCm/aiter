@@ -17,7 +17,9 @@ def run_ck(
     window_size=(-1, -1),  # -1 means infinite context window
 ):
     if q.dtype == dtypes.fp8 and k.dtype == dtypes.fp8 and v.dtype == dtypes.fp8:
-        return aiter.flash_attn_fp8_pertensor_func(q, k, v, causal=causal, window_size=window_size)
+        return aiter.flash_attn_fp8_pertensor_func(
+            q, k, v, causal=causal, window_size=window_size
+        )
     else:
         return aiter.flash_attn_func(
             q,
