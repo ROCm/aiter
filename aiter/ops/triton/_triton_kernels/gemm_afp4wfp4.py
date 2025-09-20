@@ -421,19 +421,69 @@ def _get_config(
             key = "default"  # fall back to default config
 
     if M < 32:
-        return _get_config._config_dict[key]["small"]
+        temp_config = _get_config._config_dict[key]["small"]
     elif M <= 128:
         BLK_M = triton.next_power_of_2(M)
         if BLK_M == 32:
-            return _get_config._config_dict[key]["medium_M32"]
+            temp_config = _get_config._config_dict[key]["medium_M32"]
         elif BLK_M == 64:
-            return _get_config._config_dict[key]["medium_M64"]
+            temp_config = _get_config._config_dict[key]["medium_M64"]
         elif BLK_M == 128:
-            return _get_config._config_dict[key]["medium_M128"]
+            temp_config = _get_config._config_dict[key]["medium_M128"]
     elif M <= 256:
-        return _get_config._config_dict[key]["large"]
+        temp_config = _get_config._config_dict[key]["large"]
     else:
         BLK_M = triton.next_power_of_2(M)
         if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
-        return _get_config._config_dict[key]["xlarge"]
+            temp_config = _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
+        else:
+            temp_config = _get_config._config_dict[key]["xlarge"]
+
+    # Copy to avoid mutating the cached config
+    config = dict(temp_config)
+
+    if config["NUM_KSPLIT"] > 1:
+        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
+            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+        )
+
+        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
+        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+        config["NUM_KSPLIT"] = NUM_KSPLIT
+    else:
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+
+    return config
+
+
+def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
+    # heuristics for make "EVEN_K == True" as much as possible
+    NUM_KSPLIT_STEP = 2
+    BLOCK_SIZE_K_STEP = 2
+    SPLITK_BLOCK_SIZE = (
+        triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+    )
+    while NUM_KSPLIT > 1 and BLOCK_SIZE_K > 16:
+        if (
+            K % (SPLITK_BLOCK_SIZE // 2) == 0
+            and SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0
+            and K % (BLOCK_SIZE_K // 2) == 0
+        ):
+            break
+        elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
+            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+        elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
+            if NUM_KSPLIT > 1:
+                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+            elif BLOCK_SIZE_K > 16:
+                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+        elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
+            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+        else:
+            break
+
+        SPLITK_BLOCK_SIZE = (
+            triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+        )
+
+    return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
