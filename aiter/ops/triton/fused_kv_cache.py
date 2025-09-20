@@ -512,7 +512,6 @@ def fused_qk_rope_cat_and_cache_mla(
         return q_out, decode_q_pe_out, k_pe_out, kv_cache, q_nope_zeros_out
     return q_out, decode_q_pe_out, k_pe_out, kv_cache
 
-
 @triton.jit
 def _unit_rope(
     x_ptrs,
@@ -523,20 +522,20 @@ def _unit_rope(
     BLOCK_D_pe: tl.constexpr,
     BLOCK_D_HALF_pe: tl.constexpr,
 ):
-    x_pe = tl.load(x_ptrs)
-
+    x = tl.load(x_ptrs).to(tl.float64)
+  
     if IS_NEOX:
         x_rotated_mask = d_pe_offs < BLOCK_D_HALF_pe
         x_pe_rotated = _get_neox_rotated_x_1D(
-            x_pe, x_rotated_mask, BLOCK_D_pe, BLOCK_D_HALF_pe
+            x, x_rotated_mask, BLOCK_D_pe, BLOCK_D_HALF_pe
         )
     else:
         x_rotated_mask = d_pe_offs % 2 == 0
         x_pe_rotated = _get_gptj_rotated_x_1D(
-            x_pe, x_rotated_mask, BLOCK_D_pe, BLOCK_D_HALF_pe
+            x, x_rotated_mask, BLOCK_D_pe, BLOCK_D_HALF_pe
         )
 
-    x_pe = x_pe * cos + x_pe_rotated * sin
+    x_pe = x * cos + x_pe_rotated * sin
 
     return x_pe
 
@@ -619,21 +618,20 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     d_cos_offs - BLOCK_D_HALF_pe,
                     d_cos_offs,
                 ).to(d_cos_offs.dtype)
-                # d_cos_mask = d_cos_offs < BLOCK_D_pe
             else:
                 d_cos_offs = d_pe_offs // 2
-                # d_cos_mask = d_cos_offs < BLOCK_D_HALF_pe
+                d_cos_mask = d_cos_offs < BLOCK_D_HALF_pe
+ 
         else:
             d_cos_offs = d_pe_offs
-            # d_cos_mask = d_cos_offs < BLOCK_D_pe
 
         pos = tl.load(pos_ptr + pid_t)
         if HAVE_POS:
             offset = tl.load(offs_ptr + pid_t)
             pos = pos + offset
         cos_offs = pos * cos_stride_t + d_cos_offs * cos_stride_d
-        cos = tl.load(cos_ptr + cos_offs)
-        sin = tl.load(sin_ptr + cos_offs)
+        cos = tl.load(cos_ptr + cos_offs).to(tl.float64)
+        sin = tl.load(sin_ptr + cos_offs).to(tl.float64)
 
         q_ptrs = (
             q_ptr + pid_t * q_stride_t + pid_hq * q_stride_h + d_pe_offs * q_stride_d
@@ -668,8 +666,8 @@ def _fused_qk_rope_reshape_and_cache_kernel(
         if pid_hq % QH_PER_KH == 0:
             pid_slot = tl.load(slot_mapping_ptr + pid_t).to(tl.int64)
             if pid_slot >= 0:
-                pid_t_slot = pid_slot // BLOCK_SIZE
-                pid_b = pid_slot % BLOCK_SIZE
+                pid_t_slot = pid_t
+                pid_b = pid_slot
                 pid_hk = pid_hq // QH_PER_KH
                 if HAVE_K_SCALE:
                     k_scale = tl.load(k_scale_ptr)
@@ -690,14 +688,6 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     BLOCK_D_pe,
                     BLOCK_D_HALF_pe,
                 )
-
-                k_out_ptrs = (
-                    k_out_ptr
-                    + pid_t * k_out_stride_t
-                    + pid_hk * k_out_stride_h
-                    + d_pe_offs * k_out_stride_d
-                )
-                tl.store(k_out_ptrs, k_pe.to(k_out_ptr.dtype.element_ty))
 
                 k_scale_rcprl = 1 / k_scale
                 k_pe = k_pe * k_scale_rcprl
@@ -752,8 +742,8 @@ def _fused_qk_rope_reshape_and_cache_kernel(
             pid_hk = pid % KH
             pid_slot = tl.load(slot_mapping_ptr + pid_t).to(tl.int64)
             if pid_slot >= 0:
-                pid_t_slot = pid_slot // BLOCK_SIZE
-                pid_b = pid_slot % BLOCK_SIZE
+                pid_t_slot = pid_t
+                pid_b = pid_slot
                 if HAVE_K_SCALE:
                     k_scale = tl.load(k_scale_ptr)
                 else:
@@ -766,14 +756,6 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                 )
 
                 k_pe = tl.load(k_ptrs)
-
-                k_out_ptrs = (
-                    k_out_ptr
-                    + pid_t * k_out_stride_t
-                    + pid_hk * k_out_stride_h
-                    + d_pe_offs * k_out_stride_d
-                )
-                tl.store(k_out_ptrs, k_pe.to(k_out_ptr.dtype.element_ty))
 
                 k_scale_rcprl = 1 / k_scale
                 k_pe = k_pe * k_scale_rcprl
@@ -907,21 +889,16 @@ def fused_qk_rope_reshape_and_cache(
         assert x_cache == triton.next_power_of_2(x_cache), "x_size should be power of 2"
 
     assert d == triton.next_power_of_2(d), "D dimension should be power of 2"
-    assert block_size == triton.next_power_of_2(
-        block_size
-    ), "block_size should be power of 2"
     assert qh % kh == 0, "Q heads must be multiple of H heads"
     d_freq = cos.shape[-1]
     assert (d_freq == d // 2) or (
         d_freq == d
     ), "cos/sin last dim should be the same or half of the qk last dim"
     reuse_freqs_front_part = d_freq == d // 2
+    
 
     if q_out is None:
         q_out = torch.empty((t, qh, d), dtype=q.dtype, device=q.device)
-
-    if k_out is None:
-        k_out = torch.empty((tk, kh, dk), dtype=k.dtype, device=q.device)
 
     if zeros_out is not None:
         tz, qhz, dz = zeros_out.shape
@@ -958,7 +935,9 @@ def fused_qk_rope_reshape_and_cache(
         cos.stride(0),
         cos.stride(-1),
         *q_out.stride(),
-        *k_out.stride(),
+        0,
+        0,
+        0,
         key_cache.stride(0) if not flash_layout else key_cache.stride(0),
         key_cache.stride(1) if not flash_layout else key_cache.stride(2),
         key_cache.stride(2) if not flash_layout else key_cache.stride(3),
