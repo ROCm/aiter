@@ -76,12 +76,12 @@ def _gemm_a16_w16_atomic_kernel(
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
     tl.assume(pid_k >= 0)
-    if (pid_k * SPLITK_BLOCK_SIZE) < K:
-        num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
 
+    split_k_start = pid_k * SPLITK_BLOCK_SIZE
+    if split_k_start < K:
         # Create pointers for first block of A and B input matrices
         offs_k = tl.arange(0, BLOCK_SIZE_K)
-        offs_k_split = pid_k * (SPLITK_BLOCK_SIZE) + offs_k
+        offs_k_split = split_k_start + offs_k
         offs_am = (pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         a_ptrs = a_ptr + (
@@ -94,7 +94,11 @@ def _gemm_a16_w16_atomic_kernel(
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
+        k_span = split_k_end - split_k_start
+        num_k_iter = tl.cdiv(k_span, BLOCK_SIZE_K)
+
+        for k in range(num_k_iter):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -102,10 +106,10 @@ def _gemm_a16_w16_atomic_kernel(
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                    a_ptrs, mask=offs_k[None, :] < k_span - k * BLOCK_SIZE_K, other=0.0
                 )
                 b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                    b_ptrs, mask=offs_k[:, None] < k_span - k * BLOCK_SIZE_K, other=0.0
                 )
 
             accumulator += tl.dot(a, b, input_precision="ieee")
@@ -152,18 +156,34 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
             # single config. for the default path
-            return _get_config._config_dict[key]["any"]
-    if M < 32:
-        return _get_config._config_dict[key]["small"]
-    elif M <= 128:
-        BLK_M = triton.next_power_of_2(M)
-        if BLK_M == 32:
-            return _get_config._config_dict[key]["medium_M32"]
-        elif BLK_M == 64:
-            return _get_config._config_dict[key]["medium_M64"]
-        elif BLK_M == 128:
-            return _get_config._config_dict[key]["medium_M128"]
-    elif M <= 256:
-        return _get_config._config_dict[key]["large"]
-    else:
-        return _get_config._config_dict[key]["xlarge"]
+            temp_config = _get_config._config_dict[key]["any"]
+    if key != "default":
+        if M < 32:
+            temp_config = _get_config._config_dict[key]["small"]
+        elif M <= 128:
+            BLK_M = triton.next_power_of_2(M)
+            if BLK_M == 32:
+                temp_config = _get_config._config_dict[key]["medium_M32"]
+            elif BLK_M == 64:
+                temp_config = _get_config._config_dict[key]["medium_M64"]
+            elif BLK_M == 128:
+                temp_config = _get_config._config_dict[key]["medium_M128"]
+        elif M <= 256:
+            temp_config = _get_config._config_dict[key]["large"]
+        else:
+            temp_config = _get_config._config_dict[key]["xlarge"]
+
+    # Copy to avoid mutating the cached config
+    chosen_config = dict(temp_config)
+
+    # For compatability reasons, these keys may not exist in the config
+    if "NUM_KSPLIT" not in chosen_config:
+        chosen_config["NUM_KSPLIT"] = 1
+
+    if "cache_modifier" not in chosen_config:
+        chosen_config["cache_modifier"] = ""
+
+    # NOTE: if k split doesnt divide K evenly, this will waste compute
+    chosen_config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, chosen_config["NUM_KSPLIT"])
+
+    return chosen_config
