@@ -224,7 +224,7 @@ def fwd(
                 expected_kv_heads = k.shape[1]
 
             assert q_descale.dim() == 2 and q_descale.shape[0] == expected_batch and q_descale.shape[1] == expected_kv_heads, \
-                f"q_descale expected shape ({expected_batch}, {expected_q_heads}) got {tuple(q_descale.shape)}"
+                f"q_descale expected shape ({expected_batch}, {expected_kv_heads}) got {tuple(q_descale.shape)}"
             assert k_descale.dim() == 2 and k_descale.shape[0] == expected_batch and k_descale.shape[1] == expected_kv_heads, \
                 f"k_descale expected shape ({expected_batch}, {expected_kv_heads}) got {tuple(k_descale.shape)}"
             assert v_descale.dim() == 2 and v_descale.shape[0] == expected_batch and v_descale.shape[1] == expected_kv_heads, \

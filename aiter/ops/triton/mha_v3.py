@@ -5,21 +5,15 @@ from __future__ import annotations
 from typing import Optional, Tuple
 import torch
 
-from aiter.ops.triton.flash_attn_triton_amd import interface_fa_v3 as _fa3_amd
+from aiter.ops.triton.flash_attn_triton_amd import flash_attn_3
 
 # Emulated (FA2-backed) path imports
-from aiter.ops.triton import mha as _fa2  # reuse _flash_attn_forward and flags
-from aiter.ops.triton.mha_onekernel_bwd import (
-    flash_attn_onekernel_backward as _fa2_bwd_onekernel,
-)
-from aiter.ops.triton.mha_fused_bwd import (
-    flash_attn_fused_backward as _fa2_bwd_fused,
-)
+from aiter.ops.triton.mha import _flash_attn_forward
+from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
+from aiter.ops.triton.mha_fused_bwd import flash_attn_fused_backward 
 
-# ---------------------------------------------------------------------------
-# Mode flag: False -> use backend FA3 (default); True -> use emulated FA3 (FA2 kernel)
-# ---------------------------------------------------------------------------
-_USE_EMULATED_V3: bool = True
+
+_USE_AITER_FA: bool = False
 
 
 class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
@@ -65,7 +59,7 @@ class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
         requires_grad = any(t.requires_grad for t in (q, k, v)) and torch.is_grad_enabled()
 
         # Forward: basic path (no varlen / kv-cache parameters used here)
-        out, softmax_lse = _fa3_amd.fwd(
+        out, softmax_lse = flash_attn_3.fwd(
             q,
             k,
             v,
@@ -115,7 +109,7 @@ class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
         q, k, v, out, softmax_lse = ctx.saved_tensors
-        dq, dk, dv, _delta = _fa3_amd.bwd(
+        dq, dk, dv, _delta = flash_attn_3.bwd(
             dout,
             q,
             k,
@@ -159,12 +153,7 @@ class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
         )
 
 
-# =============================
-# Emulated FA3 (FA2-backed) autograd classes
-# =============================
-
-
-class _EmuFlashAttnV3Func(torch.autograd.Function):
+class _AITERFlashAttnV3Func(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -217,7 +206,7 @@ class _EmuFlashAttnV3Func(torch.autograd.Function):
             v = torch.nn.functional.pad(v, [0, pad])
 
         # Forward via FA2 kernel wrapper (_flash_attn_forward)
-        out_padded, softmax_lse, _s_unused, _seed, _offset = _fa2._flash_attn_forward(
+        out_padded, softmax_lse, _s_unused, _seed, _offset = _flash_attn_forward(
             q,
             k,
             v,
@@ -271,7 +260,7 @@ class _EmuFlashAttnV3Func(torch.autograd.Function):
 
         use_fused = getattr(_fa2, "_USE_FUSED_BWD_KERNEL", False)
         use_int64 = getattr(_fa2, "_USE_INT64_STRIDES", True)
-        bwd_fn = _fa2_bwd_fused if use_fused else _fa2_bwd_onekernel
+        bwd_fn = flash_attn_fused_backward if use_fused else flash_attn_onekernel_backward
         bwd_fn(
             dout_padded,
             q,
@@ -318,7 +307,7 @@ class _EmuFlashAttnV3Func(torch.autograd.Function):
         )
 
 
-class _EmuFlashAttnVarlenV3Func(torch.autograd.Function):
+class _AITERFlashAttnVarlenV3Func(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -362,7 +351,7 @@ class _EmuFlashAttnVarlenV3Func(torch.autograd.Function):
             k = torch.nn.functional.pad(k, [0, pad])
             v = torch.nn.functional.pad(v, [0, pad])
 
-        out_padded, softmax_lse, _s_unused, _seed, _offset = _fa2._flash_attn_forward(
+        out_padded, softmax_lse, _s_unused, _seed, _offset = _flash_attn_forward(
             q,
             k,
             v,
@@ -419,7 +408,7 @@ class _EmuFlashAttnVarlenV3Func(torch.autograd.Function):
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
         use_fused = getattr(_fa2, "_USE_FUSED_BWD_KERNEL", False)
         use_int64 = getattr(_fa2, "_USE_INT64_STRIDES", True)
-        bwd_fn = _fa2_bwd_fused if use_fused else _fa2_bwd_onekernel
+        bwd_fn = flash_attn_fused_backward if use_fused else flash_attn_onekernel_backward
         bwd_fn(
             dout_padded,
             q,
@@ -489,8 +478,8 @@ def flash_attn_func(
       False (default): use backend FA3 implementation (AMD Triton specialized path).
       True:  use emulated FA3 built on top of the FA2 kernel (`aiter.ops.triton.mha`).
     """
-    if _USE_EMULATED_V3:
-        return _EmuFlashAttnV3Func.apply(
+    if _USE_AITER_FA:
+        return _AITERFlashAttnV3Func.apply(
             q,
             k,
             v,
@@ -562,7 +551,7 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
 
         requires_grad = any(t.requires_grad for t in (q, k, v)) and torch.is_grad_enabled()
 
-        out, softmax_lse = _fa3_amd.fwd(
+        out, softmax_lse = flash_attn_3.fwd(
             q,
             k,
             v,
@@ -616,7 +605,7 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
         q, k, v, out, softmax_lse = ctx.saved_tensors
-        dq, dk, dv, _delta = _fa3_amd.bwd(
+        dq, dk, dv, _delta = flash_attn_3.bwd(
             dout,
             q,
             k,
@@ -684,8 +673,8 @@ def flash_attn_varlen_func(
 
     Respects global emulation flag. Returns only the output tensor.
     """
-    if _USE_EMULATED_V3:
-        return _EmuFlashAttnVarlenV3Func.apply(
+    if _USE_AITER_FA:
+        return _AITERFlashAttnVarlenV3Func.apply(
             q,
             k,
             v,

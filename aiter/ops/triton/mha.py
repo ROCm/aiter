@@ -57,6 +57,7 @@ def _cast_to_fp8(
     fp8_dtype,
     layout,
     clamp_val=1e-9,
+    group_size: int | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Convert a tensor to FP8 format, returning an FP8 tensor and a descale factor.
@@ -64,31 +65,36 @@ def _cast_to_fp8(
         - x (torch.Tensor): shape [batch, seq_len, heads, dim]
     Returns:
         - x_fp8 (torch.Tensor): FP8 tensor with the same shape as x
-        - descale_factor (torch.Tensor): tensor of shape [batch, 1, heads, 1]
+        - descale_factor (torch.Tensor): tensor of shape [batch, heads]
     """
     if len(x.shape) != 4:
         raise ValueError(
             f"'bshd' tensor should have shape [batch, seqlen, heads, dim], got {x.shape}"
         )
-    reduce_dims = (1, 3)  # seq_len and dim dimensions
-
-    # Compute the absolute max along reduce_dims, clamped to avoid 0-scale
-    x_abs_max = x.abs().amax(dim=reduce_dims)
-    x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
-
-    # Unsqueeze back to a shape suitable for broadcast
-    unsqueeze_dims = sorted(reduce_dims)
-    for d in unsqueeze_dims:
-        x_abs_max = x_abs_max.unsqueeze(d)
-
-    # compute scale and descale
+    batch, seqlen, nheads, dim = x.shape
+    if group_size is None:
+        # Standard per-head
+        x_abs_max = x.abs().amax(dim=(1, 3))  # (batch, heads)
+        x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
+        fp8_max = torch.finfo(fp8_dtype).max
+        scale = (fp8_max / x_abs_max).view(batch, 1, nheads, 1)
+        x_fp8 = (x * scale).to(fp8_dtype)
+        descale_factor = x_abs_max / fp8_max
+        return x_fp8, descale_factor
+    # Grouped path
+    if nheads % group_size != 0:
+        raise ValueError(
+            f"group_size {group_size} must divide number of heads {nheads} in _cast_to_fp8"
+        )
+    ngroups = nheads // group_size
+    # reshape to (B,S,ngroups,group_size,D)
+    xg = x.view(batch, seqlen, ngroups, group_size, dim)
+    x_abs_max_group = xg.abs().amax(dim=(1, 3, 4))  # (B, ngroups)
+    x_abs_max_group = torch.maximum(x_abs_max_group, x.new_tensor(clamp_val))
     fp8_max = torch.finfo(fp8_dtype).max
-    scale = fp8_max / x_abs_max
-    descale_factor = x_abs_max / fp8_max
-
-    # cast to FP8, optionally setting requires_grad
-    x_fp8 = (x * scale).to(fp8_dtype)
-
+    scale_group = (fp8_max / x_abs_max_group).view(batch, 1, ngroups, 1, 1)
+    x_fp8 = (xg * scale_group).to(fp8_dtype).view(batch, seqlen, nheads, dim)
+    descale_factor = x_abs_max_group / fp8_max  # (B, ngroups)
     return x_fp8, descale_factor
 
 
@@ -97,6 +103,7 @@ def _cast_varlen_to_fp8(
     fp8_dtype: torch.dtype,
     cu_seqlens,
     clamp_val: float = 1e-9,
+    group_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Convert a tensor of sequences with variable seq_len into fp8.
@@ -119,32 +126,38 @@ def _cast_varlen_to_fp8(
 
     # Compute scale and descale factors per sequence
     x_fp8 = torch.zeros_like(x, dtype=fp8_dtype)
-    descale_factors = torch.zeros(
-        (batch, num_heads), device=x.device, dtype=torch.float32
-    )
+    if group_size is not None and num_heads % group_size != 0:
+        raise ValueError(
+            f"group_size {group_size} must divide number of heads {num_heads} in _cast_varlen_to_fp8"
+        )
+    out_heads = num_heads if group_size is None else num_heads // group_size
+    descale_factors = torch.zeros((batch, out_heads), device=x.device, dtype=torch.float32)
 
     for i in range(batch):
         start = cu_seqlens[i]
         end = cu_seqlens[i + 1]
         x_slice = x[start:end]  # Slice for current sequence
 
-        # Standard tensor (0: seq_len, 2: head_dim)
-        x_abs_max = x_slice.abs().amax(dim=(0, 2))  # [heads]
-
-        # apply minimum clamping
-        x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
-
-        # compute scale and descale factors
-        scale_i = fp8_max / x_abs_max
-        descale_i = x_abs_max / fp8_max
-
-        # store descale factors
-        descale_factors[i, :] = descale_i
-
-        scale_reshape = scale_i.reshape(1, num_heads, 1)
-
-        # scale and cast to FP8
-        x_fp8[start:end] = (x_slice * scale_reshape).to(fp8_dtype)
+        if group_size is None:
+            x_abs_max = x_slice.abs().amax(dim=(0, 2))  # (heads)
+            x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
+            scale_i = fp8_max / x_abs_max
+            descale_i = x_abs_max / fp8_max
+            descale_factors[i, :] = descale_i
+            scale_reshape = scale_i.view(1, num_heads, 1)
+            x_fp8[start:end] = (x_slice * scale_reshape).to(fp8_dtype)
+        else:
+            ngroups = num_heads // group_size
+            xg = x_slice.view(end - start, ngroups, group_size, x_slice.shape[2])
+            x_abs_max_group = xg.abs().amax(dim=(0, 2, 3))  # (ngroups)
+            x_abs_max_group = torch.maximum(x_abs_max_group, x.new_tensor(clamp_val))
+            scale_group = fp8_max / x_abs_max_group
+            descale_group = x_abs_max_group / fp8_max
+            descale_factors[i, :] = descale_group
+            scale_group_reshape = scale_group.view(1, ngroups, 1, 1)
+            x_fp8[start:end] = (xg * scale_group_reshape).to(fp8_dtype).view(
+                end - start, num_heads, x_slice.shape[2]
+            )
 
     return x_fp8, descale_factors
 
