@@ -1,5 +1,6 @@
 import torch
 import os
+from typing import Literal, Optional, Union
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
 from .bwd_prefill_fused_atomics import attention_prefill_backward_triton_fused_atomics_impl
@@ -8,10 +9,6 @@ from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import attention_prefill_forward_ref_impl, attention_decode_forward_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
 from .utils import DEBUG, USE_REF, MetaData
-from einops import rearrange, repeat
-# from flash_attn.layers.rotary import apply_rotary_emb
-from typing import Literal, Optional, Union
-
 
 USE_EXP2 = True
 BWD_MODE = os.environ.get('BWD_MODE', 'fused_no_atomics').lower()
@@ -106,7 +103,12 @@ def fwd(q: torch.Tensor,
                                                 metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
-                                                USE_EXP2)
+                                                USE_EXP2,
+                                                rotary_cos=None,
+                                                rotary_sin=None,
+                                                rotary_interleaved=False,
+                                                rotary_seqlen_offsets=None,
+                                                )
         softmax_lse=softmax_lse_ref
         sd_mask=sd_mask_ref
     else:
@@ -459,7 +461,12 @@ def varlen_fwd(
                                                 metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
-                                                USE_EXP2)
+                                                USE_EXP2,
+                                                rotary_cos=None,
+                                                rotary_sin=None,
+                                                rotary_interleaved=False,
+                                                rotary_seqlen_offsets=None,
+                                                )
         softmax_lse=softmax_lse_ref
         sd_mask=sd_mask_ref
     else:
@@ -813,42 +820,9 @@ def fwd_kvcache(
             raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
 
-    # rotary boolean
-    apply_rotary = torch.is_tensor(rotary_cos) and torch.is_tensor(rotary_sin)
-    if apply_rotary:
+    # record rotary info in metadata
+    if torch.is_tensor(rotary_cos) and torch.is_tensor(rotary_sin):
         metadata.need_rotary(rotary_sin, rotary_cos, rotary_interleaved)
-
-    # Rotary Embedding Implementation
-    if apply_rotary:
-        if metadata.causal or (window_size_left != -1 or window_size_right !=-1):     # NOTE: when support is added. Add `or metadata.local`
-            q_ro = apply_rotary_emb(
-                q,
-                metadata.rotary_cos,
-                metadata.rotary_sin,
-                seqlen_offsets=metadata.cache_seqlens,
-                interleaved=metadata.rotary_interleaved,
-            )
-        else:
-            q_ro = rearrange(
-                apply_rotary_emb(
-                    rearrange(q, "b s h d -> b 1 (s h) d"),
-                    metadata.rotary_cos,
-                    metadata.rotary_sin,
-                    seqlen_offsets=metadata.cache_seqlens,
-                    interleaved=metadata.rotary_interleaved,
-                ),
-                "b 1 (s h) d -> b s h d",
-                s=metadata.max_seqlens_q,
-            )
-        k_ro = apply_rotary_emb(
-            k_new,
-            metadata.rotary_cos,
-            metadata.rotary_sin,
-            seqlen_offsets=metadata.cache_seqlens,
-            interleaved=metadata.rotary_interleaved,
-        )
-
-        q, k_new = q_ro.to(q.dtype), k_ro.to(q.dtype)
 
     # launch kernel
     if USE_REF:
@@ -870,6 +844,12 @@ def fwd_kvcache(
                 metadata.cache_seqlens,
                 metadata.cache_batch_idx,
                 block_table,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+                rotary_interleaved=rotary_interleaved,
             )
         softmax_lse=softmax_lse_ref
     else:
@@ -891,6 +871,12 @@ def fwd_kvcache(
             metadata.cache_seqlens,
             metadata.cache_batch_idx,
             block_table,
+            None,
+            None,
+            None,
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            rotary_interleaved=rotary_interleaved,
         )
         softmax_lse = softmax_lse_triton
     

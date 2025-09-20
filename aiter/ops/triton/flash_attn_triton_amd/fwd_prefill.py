@@ -2,7 +2,8 @@ import os
 import torch
 import triton
 import triton.language as tl
-from typing import Literal, Optional, Union
+from typing import Literal, Optional
+from .rotary import apply_rotary
 from .utils import DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_alibi_block, compute_fp8_scaling_factors, get_arch, is_cdna, is_fp8, is_rdna, create_dropout_mask, DEBUG
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -1118,6 +1119,11 @@ def attention_prefill_forward_triton_impl(
                                         # seqused for FA v3
                                         seqused_q: Optional[torch.Tensor] = None,
                                         seqused_k: Optional[torch.Tensor] = None,
+                                        # rotary (optional)
+                                        rotary_cos: Optional[torch.Tensor] = None,
+                                        rotary_sin: Optional[torch.Tensor] = None,
+                                        rotary_interleaved: bool = False,
+                                        seqlens_rotary: Optional[torch.Tensor] = None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -1207,6 +1213,23 @@ def attention_prefill_forward_triton_impl(
         stride_vb, stride_vh, stride_vn, stride_vd = v.stride(0), v.stride(2), v.stride(1), v.stride(3)
         stride_ob, stride_oh, stride_om, stride_od = o.stride(0), o.stride(2), o.stride(1), o.stride(3)
         stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
+
+    # apply rotary embeddings
+    if rotary_cos is not None and rotary_sin is not None:
+        if IS_VARLEN:
+            raise NotImplementedError("Rotary embeddings with varlen (thd layout) prefill are not implemented yet.")
+        seqlen_offsets = seqlens_rotary if seqlens_rotary is not None else 0
+        local = (window_size_left != -1) or (window_size_right != -1)
+        q, _ = apply_rotary(
+            q,
+            None,
+            rotary_cos,
+            rotary_sin,
+            causal=causal,
+            local=local,
+            interleaved=rotary_interleaved,
+            seqlen_offsets=seqlen_offsets,
+        )
 
     # fp8 setup and assertions
     IS_FP8 = is_fp8(q)

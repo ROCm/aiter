@@ -587,8 +587,14 @@ def attention_prefill_forward_ref_impl(
     dropout_p: float,
     philox_seed: Optional[int],
     philox_offset: Optional[int],
-    use_exp2: bool
+    use_exp2: bool,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    rotary_interleaved: bool = False,
+    rotary_seqlen_offsets: Optional[torch.Tensor] = None,
 ):
+    if (rotary_cos is not None) or (rotary_sin is not None):
+        raise NotImplementedError("Rotary embeddings not implemented in reference prefill path.")
     # compute reference
     if layout == "thd":
         o_ref, softmax_lse_ref, sd_mask_ref = attention_varlen_forward_pytorch_ref_impl(
@@ -650,6 +656,9 @@ def attention_decode_forward_ref_impl(
         q_descale: Optional[torch.Tensor] = None,
         k_descale: Optional[torch.Tensor] = None,
         v_descale: Optional[torch.Tensor] = None,
+        rotary_cos: Optional[torch.Tensor] = None,
+        rotary_sin: Optional[torch.Tensor] = None,
+        rotary_interleaved: bool = False,
 ):
     """Compute reference output for decode attention using PyTorch's built-in functions"""
     
@@ -689,6 +698,9 @@ def attention_decode_forward_ref_impl(
             print(f"block_table values:\n{block_table}")
         print("=" * 60)
     
+    if (rotary_cos is not None) or (rotary_sin is not None):
+        raise NotImplementedError("Rotary embeddings not implemented in reference decode path.")
+
     # get batch size before any layout conversion
     batch_size = q.shape[0]
     

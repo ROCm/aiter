@@ -1,7 +1,8 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Literal, Optional, Union
+from typing import Literal, Optional
+from .rotary import apply_rotary
 from .utils import AUTOTUNE, get_padded_headsize, get_shape_and_strides_from_layout, is_cdna, is_fp8
 
 DEBUG = False
@@ -690,25 +691,46 @@ def get_split_k(B: int, G: int, H: int, Mk: int) -> int:
     return split_k
 
 def attention_decode_forward_triton_impl(
-        q: torch.Tensor, 
-        k_cache: torch.Tensor, 
-        v_cache: torch.Tensor,
-        k_new: Optional[torch.Tensor],
-        v_new: Optional[torch.Tensor],
-        out: torch.Tensor,
-        sm_scale: float, 
-        causal: bool,
-        window_size_left: int, 
-        window_size_right: int,
-        alibi_slopes: Optional[torch.Tensor], 
-        layout: Literal["bshd"], 
-        cache_seqlens: Optional[torch.Tensor], 
-        cache_batch_idx: Optional[torch.Tensor],
-        block_table: Optional[torch.Tensor] = None,
-        q_descale: Optional[torch.Tensor] = None,
-        k_descale: Optional[torch.Tensor] = None,
-        v_descale: Optional[torch.Tensor] = None,
+    q: torch.Tensor, 
+    k_cache: torch.Tensor, 
+    v_cache: torch.Tensor,
+    k_new: Optional[torch.Tensor],
+    v_new: Optional[torch.Tensor],
+    out: torch.Tensor,
+    sm_scale: float, 
+    causal: bool,
+    window_size_left: int, 
+    window_size_right: int,
+    alibi_slopes: Optional[torch.Tensor], 
+    layout: Literal["bshd"], 
+    cache_seqlens: Optional[torch.Tensor], 
+    cache_batch_idx: Optional[torch.Tensor],
+    block_table: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    # rotary (optional)
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    rotary_interleaved: bool = False,
+    seqlens_rotary: Optional[torch.Tensor] = None,
 ):
+    # apply rotary embedding
+    if rotary_cos is not None and rotary_sin is not None:
+        # Prefer explicitly provided rotary sequence start offsets if given; fall back to cache_seqlens.
+        seqlen_offsets = seqlens_rotary if seqlens_rotary is not None else (cache_seqlens if cache_seqlens is not None else 0)
+        local = (window_size_left != -1) or (window_size_right != -1)
+        q, k_new = apply_rotary(
+            q,
+            k_new,
+            rotary_cos,
+            rotary_sin,
+            causal=causal,
+            local=local,
+            interleaved=rotary_interleaved,
+            seqlen_offsets=seqlen_offsets,
+        )
+
     # handle cache updates
     if k_new is not None and v_new is not None:
         # Update cache with new KV values

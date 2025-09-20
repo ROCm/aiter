@@ -1,5 +1,6 @@
 import torch
 import os
+from typing import Optional, Union, Tuple
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
 from .bwd_prefill_fused_atomics import attention_prefill_backward_triton_fused_atomics_impl
@@ -8,9 +9,6 @@ from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import attention_prefill_forward_ref_impl, attention_decode_forward_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
 from .utils import DEBUG, USE_REF, MetaData, is_fp8
-from einops import rearrange, repeat
-# from flash_attn.layers.rotary import apply_rotary_emb
-from typing import Optional, Union, Tuple
 
 USE_EXP2 = True
 BWD_MODE = os.environ.get('BWD_MODE', 'fused_no_atomics').lower()
@@ -214,6 +212,23 @@ def fwd(
         if (q_descale is None) or (k_descale is None) or (v_descale is None):
             import warnings
             warnings.warn("FP8 tensors detected but descale factors not provided. Using default scale of 1.0", UserWarning)
+        else:
+            # Enforce exact expected shapes; no reshaping or normalization.
+            if metadata.layout == "bshd":
+                expected_batch = q.shape[0]
+                expected_q_heads = q.shape[2]
+                expected_kv_heads = k.shape[2]
+            else:  # thd layout
+                expected_batch = (len(cu_seqlens_q) - 1) if cu_seqlens_q is not None else 1
+                expected_q_heads = q.shape[1]
+                expected_kv_heads = k.shape[1]
+
+            assert q_descale.dim() == 2 and q_descale.shape[0] == expected_batch and q_descale.shape[1] == expected_kv_heads, \
+                f"q_descale expected shape ({expected_batch}, {expected_q_heads}) got {tuple(q_descale.shape)}"
+            assert k_descale.dim() == 2 and k_descale.shape[0] == expected_batch and k_descale.shape[1] == expected_kv_heads, \
+                f"k_descale expected shape ({expected_batch}, {expected_kv_heads}) got {tuple(k_descale.shape)}"
+            assert v_descale.dim() == 2 and v_descale.shape[0] == expected_batch and v_descale.shape[1] == expected_kv_heads, \
+                f"v_descale expected shape ({expected_batch}, {expected_kv_heads}) got {tuple(v_descale.shape)}"
     
     # Get shape
     if metadata.layout == "bshd":
@@ -242,30 +257,9 @@ def fwd(
     return_softmax = False
     metadata.need_dropout(dropout_p, return_softmax)
     
-    # Handle rotary embeddings
+    # rotary embeddings
     if rotary_cos is not None and rotary_sin is not None:
         metadata.need_rotary(rotary_sin, rotary_cos, rotary_interleaved)
-        
-        # Apply rotary embeddings if provided
-        if metadata.causal or window_size_left != -1 or window_size_right != -1:
-            q_rot = apply_rotary_emb(
-                q,
-                rotary_cos,
-                rotary_sin,
-                seqlen_offsets=seqlens_rotary,
-                interleaved=rotary_interleaved,
-            )
-            q = q_rot.to(q.dtype)
-            
-            if k_new is not None:
-                k_rot = apply_rotary_emb(
-                    k_new,
-                    rotary_cos,
-                    rotary_sin,
-                    seqlen_offsets=seqlens_rotary,
-                    interleaved=rotary_interleaved,
-                )
-                k_new = k_rot.to(k.dtype)
     
     # Store RNG state
     rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset])
@@ -298,6 +292,9 @@ def fwd(
                 q_descale,
                 k_descale,
                 v_descale,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+                rotary_interleaved=rotary_interleaved,
             )
         else:
             if DEBUG:
@@ -318,7 +315,11 @@ def fwd(
                 metadata.dropout_p,
                 metadata.philox_seed,
                 metadata.philox_offset,
-                USE_EXP2
+                USE_EXP2,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+                rotary_interleaved=rotary_interleaved,
+                rotary_seqlen_offsets=seqlens_rotary,
             )
             softmax_lse = softmax_lse_ref
     else:
@@ -350,6 +351,10 @@ def fwd(
                 q_descale,
                 k_descale,
                 v_descale,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+                rotary_interleaved=rotary_interleaved,
+                seqlens_rotary=seqlens_rotary,
             )
             # Decode kernel returns only softmax_lse, not sd_mask
             sd_mask_triton = None
@@ -380,6 +385,10 @@ def fwd(
                 v_descale,
                 seqused_q,
                 seqused_k,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+                rotary_interleaved=rotary_interleaved,
+                seqlens_rotary=seqlens_rotary,
             )
             softmax_lse = softmax_lse_triton
     
