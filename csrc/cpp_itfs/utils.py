@@ -12,7 +12,6 @@ from collections import OrderedDict
 from functools import lru_cache, partial
 import binascii
 import hashlib
-from aiter.jit.utils.file_baton import FileBaton
 import logging
 import time
 
@@ -74,6 +73,8 @@ def mp_lock(
     """
     Using FileBaton for multiprocessing.
     """
+    from aiter.jit.utils.file_baton import FileBaton
+
     baton = FileBaton(lock_path)
     if baton.try_acquire():
         try:

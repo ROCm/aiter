@@ -986,8 +986,8 @@ def compile_ops(
         custom_func = outer_wrapper
         fake_func = abstract_impl
         if not input_is_tensor:
-            custom_func = abstract_impl_dummy
-            fake_func = outer_wrapper_dummy
+            custom_func = outer_wrapper_dummy
+            fake_func = abstract_impl_dummy
 
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
             if is_torch_equal_or_newer("2.8.0"):
