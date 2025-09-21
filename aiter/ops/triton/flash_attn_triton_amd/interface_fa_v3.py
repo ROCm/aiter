@@ -2,9 +2,7 @@ import torch
 import os
 from typing import Optional, Union, Tuple
 from .fwd_prefill import attention_prefill_forward_triton_impl
-from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
-from .bwd_prefill_fused_atomics import attention_prefill_backward_triton_fused_atomics_impl
-from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_split_fused_no_atomics_impl
+from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_impl
 from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import attention_prefill_forward_ref_impl, attention_decode_forward_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
@@ -527,70 +525,42 @@ def bwd(
         delta = delta_ref
     else:
         if DEBUG:
-            print("Using Triton implementation")
-        
-        if BWD_MODE == "split":
-            delta_triton = attention_prefill_backward_triton_split_impl(
-                dout, q, k, v, out, softmax_lse,
-                dq, dk, dv,
-                softmax_scale,
-                alibi_slopes,
-                causal,
-                layout,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                dropout_p,
-                philox_seed,
-                philox_offset,
-                USE_EXP2,
-                descale_q, descale_k, descale_v, descale_o,
-                descale_do, descale_dq, descale_dk, descale_dv,
-                seqused_q, seqused_k,
-            )
-            delta = delta_triton
-        elif BWD_MODE == "fused_atomics":
-            delta_triton = attention_prefill_backward_triton_fused_atomics_impl(
-                dout, q, k, v, out, softmax_lse,
-                dq, dk, dv,
-                softmax_scale,
-                alibi_slopes,
-                causal,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                dropout_p,
-                philox_seed,
-                philox_offset,
-                descale_q, descale_k, descale_v, descale_o,
-                True,
-            )
-            delta = delta_triton
-        elif BWD_MODE == "fused_no_atomics":
-            delta_triton = attention_prefill_backward_triton_split_fused_no_atomics_impl(
-                dout, q, k, v, out, softmax_lse,
-                dq, dk, dv,
-                softmax_scale,
-                alibi_slopes,
-                causal,
-                layout,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                dropout_p,
-                philox_seed,
-                philox_offset,
-                USE_EXP2,
-                descale_q, descale_k, descale_v, descale_o,
-                descale_do, descale_dq, descale_dk, descale_dv,
-                seqused_q, seqused_k,
-            )
-            delta = delta_triton
-        else:
-            raise ValueError(f"Unknown bwd mode {BWD_MODE}")
+            print("Using Triton implementation (unified backward dispatcher)")
+        # Call unified backward implementation; it internally dispatches on mode.
+        delta = attention_prefill_backward_triton_impl(
+            do=dout,
+            q=q,
+            k=k,
+            v=v,
+            o=out,
+            softmax_lse=softmax_lse,
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            sm_scale=softmax_scale,
+            alibi_slopes=alibi_slopes,
+            causal=causal,
+            layout=layout,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            dropout_p=dropout_p,
+            philox_seed=philox_seed,
+            philox_offset=philox_offset,
+            descale_q=descale_q,
+            descale_k=descale_k,
+            descale_v=descale_v,
+            descale_o=descale_o,
+            descale_do=descale_do,
+            descale_dq=descale_dq,
+            descale_dk=descale_dk,
+            descale_dv=descale_dv,
+            use_exp2=USE_EXP2,
+            mode=BWD_MODE,
+        )
     
     if DEBUG:
         print("interface_fa_v3.py::bwd outputs")

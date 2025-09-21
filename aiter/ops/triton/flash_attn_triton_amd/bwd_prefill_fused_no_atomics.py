@@ -5,6 +5,10 @@ import triton.language as tl # type: ignore
 from typing import Literal, Optional
 from .utils import AUTOTUNE, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, DEBUG, compute_fp8_scaling_factors, \
     create_dropout_mask, create_dropout_mask_varlen, is_cdna, is_fp8, is_rdna, round_multiple
+# Import atomics implementation (kept for kernel launch path) and expose a unified wrapper below.
+from .bwd_prefill_fused_atomics import (
+    attention_prefill_backward_triton_fused_atomics_impl,
+)
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
@@ -1465,3 +1469,113 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
         return delta
     else:
         return delta_padded
+
+
+def attention_prefill_backward_triton_impl(
+    *,
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    sm_scale: float,
+    alibi_slopes: Optional[torch.Tensor],
+    causal: bool,
+    layout: str,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    philox_seed: Optional[int] = None,
+    philox_offset: Optional[int] = None,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+    descale_v: Optional[torch.Tensor] = None,
+    descale_o: Optional[torch.Tensor] = None,
+    descale_do: Optional[torch.Tensor] = None,
+    descale_dq: Optional[torch.Tensor] = None,
+    descale_dk: Optional[torch.Tensor] = None,
+    descale_dv: Optional[torch.Tensor] = None,
+    use_exp2: bool = True,
+    mode: str = "fused_no_atomics",
+) -> torch.Tensor:
+    """Unified backward interface dispatching to atomics or no-atomics implementation.
+
+    Parameters mirror the superset of the two legacy interfaces. The public API should
+    call ONLY this function going forward.
+    mode: 'fused_atomics' or 'fused_no_atomics'; layout: 'bshd' or 'thd'; use_exp2 retained for parity.
+    """
+    if mode == "fused_atomics":
+        # Atomics path ignores layout & use_exp2; pass varlen metadata directly.
+        return attention_prefill_backward_triton_fused_atomics_impl(
+            do,
+            q,
+            k,
+            v,
+            o,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            sm_scale,
+            alibi_slopes,
+            causal,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q if max_seqlen_q is not None else q.shape[1],
+            max_seqlen_k if max_seqlen_k is not None else k.shape[1],
+            dropout_p,
+            philox_seed or 0,
+            philox_offset or 0,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_o,
+            True,  # fused flag
+            None,
+            None,
+        )
+    elif mode == "fused_no_atomics":
+        return attention_prefill_backward_triton_split_fused_no_atomics_impl(
+            do,
+            q,
+            k,
+            v,
+            o,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            sm_scale,
+            alibi_slopes,
+            causal,
+            layout,  # layout required here
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p,
+            philox_seed,
+            philox_offset,
+            use_exp2,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_o,
+            descale_do,
+            descale_dq,
+            descale_dk,
+            descale_dv,
+            seqused_q,
+            seqused_k,
+        )
+    else:
+        raise ValueError(f"Unknown backward mode '{mode}'. Expected 'fused_atomics' or 'fused_no_atomics'.")
+
