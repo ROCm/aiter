@@ -97,6 +97,9 @@ def test_gemm_asm_mi350(dtype, m, n, k):
 
     if get_gfx() not in ["gfx950"]:
         return
+
+    torch.cuda.empty_cache()
+
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
     print("block_shape", block_shape)
