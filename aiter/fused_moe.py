@@ -203,7 +203,7 @@ def fused_moe_(
         assert (
             doweight_stage1 == False
         ), "doweight_stage1 not support in fused_moe_1stage"
-        return fused_moe_1stage(
+        return metadata.stage1(
             hidden_states,
             w1,
             w2,
@@ -215,8 +215,6 @@ def fused_moe_(
             moe_buf,
             isG1U1,
             block_size_M,
-            activation=activation,
-            quant_type=quant_type,
             q_dtype_a=q_dtype_a,
             q_dtype_w=q_dtype_w,
             w1_scale=w1_scale,
@@ -265,6 +263,7 @@ def fused_moe_1stage(
     block_size_M=32,
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
+    kernelName: str = "",
     # following for quant
     q_dtype_a=None,
     q_dtype_w=None,
@@ -366,7 +365,7 @@ def fused_moe_1stage(
             a1_scale,
             w1_scale,
             w2_scale,
-            "",
+            kernelName,
             fc2_smooth_scale=None,
             activation=activation,
         )
@@ -552,7 +551,7 @@ def get_2stage_cfgs(
                 run_1stage = True and (inter_dim % 256 == 0)
             elif q_type == QuantType.per_Token and q_dtype_w in [dtypes.i8, dtypes.fp8]:
                 run_1stage = token > 32
-            else:
+            elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
         block_m = (
             BLOCK_SIZE_M
@@ -574,7 +573,19 @@ def get_2stage_cfgs(
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
-
+    if run_1stage:
+        return MOEMetadata(
+            functools.partial(
+                fused_moe_1stage,
+                kernelName=kernelName1,
+                activation=activation,
+                quant_type=q_type,
+            ),
+            None,
+            block_m,
+            ksplit,
+            run_1stage,
+        )
     if (
         "ck2stages" in kernelName1
         or (q_type == QuantType.per_1x128 and doweight_stage1)
@@ -583,7 +594,7 @@ def get_2stage_cfgs(
             dtypes.bf16,
             dtypes.fp16,
             torch.uint32,
-            torch.uint8,
+            dtypes.fp4x2,
         ]
     ):
         return MOEMetadata(

@@ -147,7 +147,11 @@ def test_fmoe(
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
 
     score = torch.randn((token, E), dtype=dtype)
+    # rand
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    # sequence
+    # topk_ids_list = [[((i * topk) + j)% E for j in range(topk)] for i in range(token)]
+    # topk_ids = torch.tensor(topk_ids_list, device=topk_ids.device, dtype=topk_ids.dtype)
 
     M, _ = topk_ids.shape
 
