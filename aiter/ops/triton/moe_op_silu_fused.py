@@ -99,7 +99,7 @@ def fused_moe_silu(
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
     elif use_int8_w8a16 or use_int4_w4a16:
         assert B_scale is not None
-        assert block_shape is None or block_shape[0] == 0
+        assert block_shape is None or block_shape[0] <= 1
     else:
         assert A_scale is None
         assert B_scale is None
