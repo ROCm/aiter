@@ -417,7 +417,6 @@ if __name__ == "__main__":
     )
 
     if args.pytest:
-        print("pytest")
         start = time.time()
         ret = pytest.main(["test_mha.py"])
         print(
