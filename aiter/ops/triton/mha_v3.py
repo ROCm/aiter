@@ -7,14 +7,6 @@ import torch
 
 from aiter.ops.triton.flash_attn_triton_amd import flash_attn_3
 
-# Emulated (FA2-backed) path imports
-from aiter.ops.triton.mha import _flash_attn_forward
-from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
-from aiter.ops.triton.mha_fused_bwd import flash_attn_fused_backward 
-
-
-_USE_AITER_FA: bool = False
-
 
 class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
     @staticmethod
@@ -56,7 +48,9 @@ class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
         if sm_margin != 0:
             raise NotImplementedError("sm_margin != 0 not supported in AMD Triton v3")
 
-        requires_grad = any(t.requires_grad for t in (q, k, v)) and torch.is_grad_enabled()
+        requires_grad = (
+            any(t.requires_grad for t in (q, k, v)) and torch.is_grad_enabled()
+        )
 
         # Forward: basic path (no varlen / kv-cache parameters used here)
         out, softmax_lse = flash_attn_3.fwd(
@@ -90,7 +84,7 @@ class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
             attention_chunk,
             softcap,
             False,  # rotary_interleaved
-            None,   # scheduler_metadata
+            None,  # scheduler_metadata
             num_splits,
             pack_gqa,
             sm_margin,
@@ -153,307 +147,6 @@ class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
         )
 
 
-class _AITERFlashAttnV3Func(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        softmax_scale: float | None,
-        causal: bool,
-        qv: Optional[torch.Tensor],
-        q_descale: Optional[torch.Tensor],
-        k_descale: Optional[torch.Tensor],
-        v_descale: Optional[torch.Tensor],
-        window_size: Tuple[int, int],
-        attention_chunk: int,
-        softcap: float,
-        num_splits: int,
-        pack_gqa: Optional[bool],
-        deterministic: bool,
-        sm_margin: int,
-    ):
-        # Feature parity & guards (mirror legacy emulated v3 semantics)
-        if qv is not None:
-            raise NotImplementedError("qv parameter not supported in emulated v3 mode")
-        if attention_chunk != 0:
-            raise NotImplementedError("attention_chunk != 0 not supported in emulated v3 mode")
-        if softcap != 0.0:
-            raise NotImplementedError("softcap != 0.0 not supported in emulated v3 mode")
-        if num_splits != 1:
-            raise NotImplementedError("num_splits != 1 not supported in emulated v3 mode")
-        if pack_gqa is not None:
-            raise NotImplementedError("pack_gqa not supported in emulated v3 mode")
-        if sm_margin != 0:
-            raise NotImplementedError("sm_margin != 0 not supported in emulated v3 mode")
-
-        # Descale factors: all or none
-        descales = [q_descale, k_descale, v_descale]
-        if any(d is not None for d in descales) and not all(d is not None for d in descales):
-            raise AssertionError(
-                "All descale factors (q_descale, k_descale, v_descale) must be provided together or none at all"
-            )
-
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-
-        head_size_og = q.size(3)  # layout: (B, S, H, D)
-        if head_size_og % 8 != 0:
-            pad = 8 - head_size_og % 8
-            q = torch.nn.functional.pad(q, [0, pad])
-            k = torch.nn.functional.pad(k, [0, pad])
-            v = torch.nn.functional.pad(v, [0, pad])
-
-        # Forward via FA2 kernel wrapper (_flash_attn_forward)
-        out_padded, softmax_lse, _s_unused, _seed, _offset = _flash_attn_forward(
-            q,
-            k,
-            v,
-            0.0,  # dropout_p disabled for emulated v3
-            softmax_scale,
-            causal=causal,
-            window_size_left=int(window_size[0]),
-            window_size_right=int(window_size[1]),
-            bias=None,
-            alibi_slopes=None,
-            return_lse=False,
-            return_softmax=False,
-            max_seqlen_q=q.shape[1],
-            max_seqlen_k=k.shape[1],
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            config=None,
-        )
-
-        requires_grad = any(t.requires_grad for t in (q, k, v)) and torch.is_grad_enabled()
-        if requires_grad:
-            # Save scaled (fp32) variants if descale factors supplied
-            if q_descale is not None:
-                q_saved = q.float() * q_descale
-                k_saved = k.float() * k_descale
-                v_saved = v.float() * v_descale
-            else:
-                q_saved, k_saved, v_saved = q, k, v
-            ctx.save_for_backward(q_saved, k_saved, v_saved, out_padded, softmax_lse)
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.dropout_p = 0.0
-
-        out = out_padded[..., :head_size_og]
-        return out
-
-    @staticmethod
-    def backward(ctx, dout: torch.Tensor):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
-        dq = torch.zeros_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
-        head_size_v_og = dout.size(3)
-        dout_padded = dout
-        if head_size_v_og % 8 != 0:
-            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
-
-        use_fused = getattr(_fa2, "_USE_FUSED_BWD_KERNEL", False)
-        use_int64 = getattr(_fa2, "_USE_INT64_STRIDES", True)
-        bwd_fn = flash_attn_fused_backward if use_fused else flash_attn_onekernel_backward
-        bwd_fn(
-            dout_padded,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            None,  # dbias
-            ctx.softmax_scale,
-            None,  # alibi_slopes
-            ctx.causal,
-            None,  # cu_seqlens_q
-            None,  # cu_seqlens_k
-            max_seqlen_q=q.shape[1],
-            max_seqlen_k=k.shape[1],
-            dropout_p=0.0,
-            philox_seed=0,
-            philox_offset=0,
-            USE_INT64_STRIDES=use_int64,
-        )
-        dq = dq[..., :head_size_v_og]
-        dk = dk[..., :head_size_v_og]
-        dv = dv[..., :head_size_v_og]
-        return (
-            dq,
-            dk,
-            dv,
-            None,  # softmax_scale
-            None,  # causal
-            None,  # qv
-            None,  # q_descale
-            None,  # k_descale
-            None,  # v_descale
-            None,  # window_size
-            None,  # attention_chunk
-            None,  # softcap
-            None,  # num_splits
-            None,  # pack_gqa
-            None,  # deterministic
-            None,  # sm_margin
-        )
-
-
-class _AITERFlashAttnVarlenV3Func(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
-        softmax_scale: float | None,
-        causal: bool,
-        q_descale: torch.Tensor | None,
-        k_descale: torch.Tensor | None,
-        v_descale: torch.Tensor | None,
-        window_size: tuple[int, int],
-        attention_chunk: int,
-        softcap: float,
-        deterministic: bool,
-        sm_margin: int,
-    ):
-        # Guards
-        if attention_chunk != 0:
-            raise NotImplementedError("attention_chunk != 0 not supported in emulated varlen v3 mode")
-        if softcap != 0.0:
-            raise NotImplementedError("softcap != 0.0 not supported in emulated varlen v3 mode")
-        if sm_margin != 0:
-            raise NotImplementedError("sm_margin != 0 not supported in emulated varlen v3 mode")
-        descales = [q_descale, k_descale, v_descale]
-        if any(d is not None for d in descales) and not all(d is not None for d in descales):
-            raise AssertionError(
-                "All descale factors (q_descale, k_descale, v_descale) must be provided together or none at all"
-            )
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-
-        head_size_og = q.size(2)  # layout: (total_q, H, D)
-        if head_size_og % 8 != 0:
-            pad = 8 - head_size_og % 8
-            q = torch.nn.functional.pad(q, [0, pad])
-            k = torch.nn.functional.pad(k, [0, pad])
-            v = torch.nn.functional.pad(v, [0, pad])
-
-        out_padded, softmax_lse, _s_unused, _seed, _offset = _flash_attn_forward(
-            q,
-            k,
-            v,
-            0.0,
-            softmax_scale,
-            causal=causal,
-            window_size_left=int(window_size[0]),
-            window_size_right=int(window_size[1]),
-            bias=None,
-            alibi_slopes=None,
-            return_lse=False,
-            return_softmax=False,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            config=None,
-        )
-        requires_grad = any(t.requires_grad for t in (q, k, v)) and torch.is_grad_enabled()
-        if requires_grad:
-            if q_descale is not None:
-                # Expand per-batch descales to token-aligned (replicating legacy logic)
-                batch_size = cu_seqlens_q.shape[0] - 1
-                def _expand(descale_tensor, cu_seqlens):
-                    expanded = torch.zeros((descale_tensor.shape[0], descale_tensor.shape[1]), dtype=torch.float32, device=descale_tensor.device)
-                    # This placeholder matches legacy shape assumptions; simplified for brevity.
-                    return expanded
-                # For simplicity we save the already scaled tensors directly without custom expansion (could be refined)
-                q_saved, k_saved, v_saved = q, k, v
-            else:
-                q_saved, k_saved, v_saved = q, k, v
-            ctx.save_for_backward(q_saved, k_saved, v_saved, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k)
-            ctx.max_seqlen_q = max_seqlen_q
-            ctx.max_seqlen_k = max_seqlen_k
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.dropout_p = 0.0
-        out = out_padded[..., :head_size_og]
-        return out
-
-    @staticmethod
-    def backward(ctx, dout: torch.Tensor):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
-        dq = torch.zeros_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
-        head_size_v_og = dout.size(2)
-        dout_padded = dout
-        if head_size_v_og % 8 != 0:
-            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
-        use_fused = getattr(_fa2, "_USE_FUSED_BWD_KERNEL", False)
-        use_int64 = getattr(_fa2, "_USE_INT64_STRIDES", True)
-        bwd_fn = flash_attn_fused_backward if use_fused else flash_attn_onekernel_backward
-        bwd_fn(
-            dout_padded,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            None,
-            ctx.softmax_scale,
-            None,
-            ctx.causal,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q=ctx.max_seqlen_q,
-            max_seqlen_k=ctx.max_seqlen_k,
-            dropout_p=0.0,
-            philox_seed=0,
-            philox_offset=0,
-            USE_INT64_STRIDES=use_int64,
-        )
-        dq = dq[..., :head_size_v_og]
-        dk = dk[..., :head_size_v_og]
-        dv = dv[..., :head_size_v_og]
-        return (
-            dq,
-            dk,
-            dv,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-
-
 def flash_attn_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -472,50 +165,25 @@ def flash_attn_func(
     deterministic: bool = False,
     sm_margin: int = 0,
 ):
-    """FlashAttention v3 entry point.
-
-    Dual mode controlled by global boolean flag set via `set_flash_attn_v3_emulated`:
-      False (default): use backend FA3 implementation (AMD Triton specialized path).
-      True:  use emulated FA3 built on top of the FA2 kernel (`aiter.ops.triton.mha`).
-    """
-    if _USE_AITER_FA:
-        return _AITERFlashAttnV3Func.apply(
-            q,
-            k,
-            v,
-            softmax_scale,
-            causal,
-            qv,
-            q_descale,
-            k_descale,
-            v_descale,
-            window_size,
-            attention_chunk,
-            softcap,
-            num_splits,
-            pack_gqa,
-            deterministic,
-            sm_margin,
-        )
-    else:
-        return _FlashAttnV3Func.apply(
-            q,
-            k,
-            v,
-            softmax_scale,
-            causal,
-            qv,
-            q_descale,
-            k_descale,
-            v_descale,
-            window_size,
-            attention_chunk,
-            softcap,
-            num_splits,
-            pack_gqa,
-            deterministic,
-            sm_margin,
-        )
+    """FlashAttention v3 entry point."""
+    return _FlashAttnV3Func.apply(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal,
+        qv,
+        q_descale,
+        k_descale,
+        v_descale,
+        window_size,
+        attention_chunk,
+        softcap,
+        num_splits,
+        pack_gqa,
+        deterministic,
+        sm_margin,
+    )
 
 
 class _FlashAttnVarlenV3Func(torch.autograd.Function):
@@ -543,13 +211,17 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         if attention_chunk != 0:
-            raise NotImplementedError("attention_chunk != 0 not supported in varlen v3 yet")
+            raise NotImplementedError(
+                "attention_chunk != 0 not supported in varlen v3 yet"
+            )
         if softcap != 0.0:
             raise NotImplementedError("softcap not implemented in varlen v3 yet")
         if sm_margin != 0:
             raise NotImplementedError("sm_margin != 0 not supported in varlen v3 yet")
 
-        requires_grad = any(t.requires_grad for t in (q, k, v)) and torch.is_grad_enabled()
+        requires_grad = (
+            any(t.requires_grad for t in (q, k, v)) and torch.is_grad_enabled()
+        )
 
         out, softmax_lse = flash_attn_3.fwd(
             q,
@@ -582,9 +254,9 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
             attention_chunk,
             softcap,
             False,  # rotary_interleaved
-            None,   # scheduler_metadata
-            1,      # num_splits
-            None,   # pack_gqa
+            None,  # scheduler_metadata
+            1,  # num_splits
+            None,  # pack_gqa
             sm_margin,
         )
 
@@ -669,47 +341,144 @@ def flash_attn_varlen_func(
     deterministic: bool = False,
     sm_margin: int = 0,
 ):
-    """FlashAttention v3 varlen path.
+    """FlashAttention v3 varlen path."""
+    return _FlashAttnVarlenV3Func.apply(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+        q_descale,
+        k_descale,
+        v_descale,
+        window_size,
+        attention_chunk,
+        softcap,
+        deterministic,
+        sm_margin,
+    )
 
-    Respects global emulation flag. Returns only the output tensor.
+
+def flash_attn_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    qv: torch.Tensor | None = None,
+    cache_seqlens: torch.Tensor | int | None = None,
+    softmax_scale: float | None = None,
+    causal: bool = True,
+    window_size: tuple[int, int] = (-1, -1),
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    num_splits: int = 0,
+    pack_gqa: bool | None = None,
+    sm_margin: int = 0,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    return_softmax_lse: bool = False,
+    page_table: torch.Tensor | None = None,
+    cache_batch_idx: torch.Tensor | None = None,
+    cache_leftpad: torch.Tensor | None = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
+    rotary_seqlens: torch.Tensor | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k_new: torch.Tensor | None = None,
+):
+    """FlashAttention v3 decode + KV cache update helper (forward only, no autograd wrapper).
+
+    Arguments mirror Hopper's `flash_attn_with_kvcache` with current backend limitations.
+    Unsupported: backward, qv, softcap!=0, pack_gqa, sm_margin!=0, attention_chunk>1, num_splits>1,
+    simultaneous varlen (cu_seqlens_q) + cache_seqlens tensor, and partial rotary inputs.
     """
-    if _USE_AITER_FA:
-        return _AITERFlashAttnVarlenV3Func.apply(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            softmax_scale,
-            causal,
-            q_descale,
-            k_descale,
-            v_descale,
-            window_size,
-            attention_chunk,
-            softcap,
-            deterministic,
-            sm_margin,
+    # Scale
+    if softmax_scale is None:
+        q_extra = qv.shape[-1] if qv is not None else 0
+        softmax_scale = (q.shape[-1] + q_extra) ** (-0.5)
+
+    # Feature guards
+    if qv is not None:
+        raise NotImplementedError("qv not supported in KV cache path yet")
+    if softcap != 0.0:
+        raise NotImplementedError("softcap not implemented in KV cache path")
+    if pack_gqa is not None:
+        raise NotImplementedError("pack_gqa not implemented in KV cache path")
+    if sm_margin != 0:
+        raise NotImplementedError("sm_margin != 0 not supported in KV cache path")
+    if attention_chunk not in (0, 1):
+        raise NotImplementedError("attention_chunk > 1 not supported (0 or 1 only)")
+    if num_splits not in (0, 1):
+        raise NotImplementedError("num_splits > 1 not supported in KV cache path")
+
+    if cache_seqlens is not None and isinstance(cache_seqlens, int):
+        cache_seqlens = torch.full(
+            (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
-    else:
-        return _FlashAttnVarlenV3Func.apply(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            softmax_scale,
-            causal,
-            q_descale,
-            k_descale,
-            v_descale,
-            window_size,
-            attention_chunk,
-            softcap,
-            deterministic,
-            sm_margin,
+
+    if cu_seqlens_q is not None and cache_seqlens is not None:
+        raise NotImplementedError(
+            "Varlen decode with cache_seqlens tensor not supported yet"
         )
+    if (rotary_cos is None) ^ (rotary_sin is None):
+        raise ValueError(
+            "Both rotary_cos and rotary_sin must be provided together or neither"
+        )
+    if (
+        (rotary_cos is not None)
+        and rotary_seqlens is not None
+        and cu_seqlens_q is None
+        and cache_seqlens is None
+    ):
+        raise ValueError(
+            "rotary_seqlens provided without cu_seqlens_q or cache_seqlens context"
+        )
+
+    kv_batch_idx = cache_batch_idx
+    leftpad_k = cache_leftpad
+    seqlens_rotary = rotary_seqlens
+
+    out, softmax_lse = flash_attn_3.fwd(
+        q,
+        k_cache,
+        v_cache,
+        k,
+        v,
+        None,  # qv
+        None,  # out allocate
+        cu_seqlens_q,
+        None,  # cu_seqlens_k
+        cu_seqlens_k_new,
+        None,  # seqused_q
+        cache_seqlens if isinstance(cache_seqlens, torch.Tensor) else None,  # seqused_k
+        max_seqlen_q,
+        None,  # max_seqlen_k
+        page_table,
+        kv_batch_idx,
+        leftpad_k,
+        rotary_cos,
+        rotary_sin,
+        seqlens_rotary,
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        causal,
+        int(window_size[0]),
+        int(window_size[1]),
+        attention_chunk,
+        softcap,
+        False,  # rotary_interleaved
+        None,  # scheduler_metadata
+        num_splits if num_splits != 0 else 1,
+        pack_gqa,
+        sm_margin,
+    )
+    return (out, softmax_lse) if return_softmax_lse else out

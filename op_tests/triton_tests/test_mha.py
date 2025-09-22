@@ -16,6 +16,7 @@ from aiter.ops.triton.mha import (
 from aiter.ops.triton.mha_v3 import (
     flash_attn_func as flash_attn_func_v3,
     flash_attn_varlen_func as flash_attn_varlen_func_v3,
+    flash_attn_with_kvcache as flash_attn_with_kvcache_v3,
 )
 from aiter.ops.triton.utils.arch_info import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
@@ -146,9 +147,7 @@ def test_mha(
         )
         k_fp8, k_descale = _cast_to_fp8(k, fp8_dtype, "bshd")
         v_fp8, v_descale = _cast_to_fp8(v, fp8_dtype, "bshd")
-        q_fp8, q_descale = _cast_to_fp8(
-            q, fp8_dtype, "bshd", group_size=group_size
-        )
+        q_fp8, q_descale = _cast_to_fp8(q, fp8_dtype, "bshd", group_size=group_size)
         triton_out = flash_attn_func_v3(
             q_fp8,
             k_fp8,
@@ -394,7 +393,9 @@ def test_mha_varlen(
             )
 
         fp8_dtype = get_fp8_e4m3_dtype()
-        group_size = NUM_Q_HEADS // NUM_K_HEADS if NUM_Q_HEADS % NUM_K_HEADS == 0 else None
+        group_size = (
+            NUM_Q_HEADS // NUM_K_HEADS if NUM_Q_HEADS % NUM_K_HEADS == 0 else None
+        )
         k_fp8, k_descale = _cast_varlen_to_fp8(k_unpad, fp8_dtype, cu_seqlens_k)
         v_fp8, v_descale = _cast_varlen_to_fp8(v_unpad, fp8_dtype, cu_seqlens_k)
         q_fp8, q_descale = _cast_varlen_to_fp8(
@@ -549,7 +550,9 @@ def test_mha_backward(
         if FP8:
             # Use Flash Attention v3 for FP8
             fp8_dtype = get_fp8_e4m3_dtype()
-            group_size = NUM_Q_HEADS // NUM_K_HEADS if NUM_Q_HEADS % NUM_K_HEADS == 0 else None
+            group_size = (
+                NUM_Q_HEADS // NUM_K_HEADS if NUM_Q_HEADS % NUM_K_HEADS == 0 else None
+            )
             k_fp8, k_descale = _cast_to_fp8(k, fp8_dtype, "bshd")
             v_fp8, v_descale = _cast_to_fp8(v, fp8_dtype, "bshd")
             q_fp8, q_descale = _cast_to_fp8(q, fp8_dtype, "bshd", group_size=group_size)
@@ -743,7 +746,9 @@ def test_mha_backward_varlen(
         if FP8:
             # Use Flash Attention v3 for FP8
             fp8_dtype = get_fp8_e4m3_dtype()
-            group_size = NUM_Q_HEADS // NUM_K_HEADS if NUM_Q_HEADS % NUM_K_HEADS == 0 else None
+            group_size = (
+                NUM_Q_HEADS // NUM_K_HEADS if NUM_Q_HEADS % NUM_K_HEADS == 0 else None
+            )
             k_fp8, k_descale = _cast_varlen_to_fp8(k_unpad, fp8_dtype, cu_seqlens_k)
             v_fp8, v_descale = _cast_varlen_to_fp8(v_unpad, fp8_dtype, cu_seqlens_k)
             q_fp8, q_descale = _cast_varlen_to_fp8(
@@ -867,3 +872,159 @@ def test_mha_backward_varlen(
         torch.testing.assert_close(
             triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
         )
+
+
+@pytest.mark.parametrize("FP8", [False])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("new_kv", [False])
+@pytest.mark.parametrize(
+    "seqlen_q, seqlen_k, d",
+    [
+        (1, 64, 64),
+        (8, 128, 64),
+        (16, 256, 64),
+        (32, 256, 128),
+    ],
+)
+def test_mha_kvcache(
+    seqlen_q: int,
+    seqlen_k: int,
+    d: int,
+    causal: bool,
+    new_kv: bool,
+    FP8: bool,
+):
+    device = "cuda"
+    torch.manual_seed(0)
+
+    batch_size = 3
+    nheads = 4
+    nheads_k = nheads  # Only MHA path exercised
+
+    base_dtype = torch.float16  # allocate in fp16 first then cast if FP8
+    k_cache = torch.randn(
+        batch_size, seqlen_k, nheads_k, d, device=device, dtype=base_dtype
+    )
+    v_cache = torch.randn(
+        batch_size, seqlen_k, nheads_k, d, device=device, dtype=base_dtype
+    )
+
+    if new_kv:
+        seqlen_new = seqlen_q  # Append a block same length as query
+        max_prev = seqlen_k - seqlen_new
+        assert max_prev >= 0
+        cache_seqlens = torch.randint(
+            low=0,
+            high=max_prev + 1,
+            size=(batch_size,),
+            device=device,
+            dtype=torch.int32,
+        )
+        k_new = torch.randn(
+            batch_size, seqlen_new, nheads_k, d, device=device, dtype=base_dtype
+        )
+        v_new = torch.randn(
+            batch_size, seqlen_new, nheads_k, d, device=device, dtype=base_dtype
+        )
+    else:
+        cache_seqlens = torch.randint(
+            low=1,
+            high=seqlen_k + 1,
+            size=(batch_size,),
+            device=device,
+            dtype=torch.int32,
+        )
+        k_new = None
+        v_new = None
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=base_dtype)
+
+    # Cast to FP8 using same helpers as other tests for deterministic descale factors
+    if FP8:
+        fp8_dtype = get_fp8_e4m3_dtype()
+        group_size = None  # MHA path; no GQA grouping applied here
+        k_cache, k_descale = _cast_to_fp8(k_cache, fp8_dtype, "bshd", group_size=group_size)
+        v_cache, v_descale = _cast_to_fp8(v_cache, fp8_dtype, "bshd", group_size=group_size)
+        q, q_descale = _cast_to_fp8(q, fp8_dtype, "bshd", group_size=group_size)
+        if new_kv:
+            k_new, k_new_descale = _cast_to_fp8(k_new, fp8_dtype, "bshd", group_size=group_size)
+            v_new, v_new_descale = _cast_to_fp8(v_new, fp8_dtype, "bshd", group_size=group_size)
+            # Merge new kv descale factors into cache descales logically: kernel only receives descales for full cache & q
+            # We simply ignore k_new_descale/v_new_descale since kernel updates cache in FP8 domain already.
+        else:
+            k_new_descale = v_new_descale = None
+    else:
+        q_descale = k_descale = v_descale = None
+        k_new_descale = v_new_descale = None
+
+    # Reference: clone cache & apply append if needed
+    k_cache_ref = k_cache.clone()
+    v_cache_ref = v_cache.clone()
+    if new_kv:
+        for b in range(batch_size):
+            start = cache_seqlens[b].item()
+            end = start + seqlen_q
+            k_cache_ref[b, start:end] = k_new[b]
+            v_cache_ref[b, start:end] = v_new[b]
+        final_used = cache_seqlens + seqlen_q
+    else:
+        final_used = cache_seqlens
+
+    arange = torch.arange(seqlen_k, device=device).unsqueeze(0)
+    key_padding_mask = arange < final_used.unsqueeze(1)
+
+    max_used = final_used.max().item()
+    k_eff = k_cache_ref[:, :max_used]
+    v_eff = v_cache_ref[:, :max_used]
+    key_mask_eff = key_padding_mask[:, :max_used]
+
+    # Reference runs in fp16 space: if FP8 we convert fp8 tensors back to fp16 for reference
+    ref_q = q.to(torch.float16)
+    ref_k_eff = k_eff.to(torch.float16)
+    ref_v_eff = v_eff.to(torch.float16)
+    out_ref, _ = attention_ref(
+        ref_q,
+        ref_k_eff,
+        ref_v_eff,
+        query_padding_mask=None,
+        key_padding_mask=key_mask_eff,
+        causal=causal,
+        window_size=(-1, -1),
+    )
+
+    out_kernel = flash_attn_with_kvcache_v3(
+        q,
+        k_cache,
+        v_cache,
+        k=k_new,
+        v=v_new,
+        cache_seqlens=cache_seqlens,
+        causal=causal,
+        window_size=(-1, -1),
+        return_softmax_lse=False,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    assert out_kernel.shape == out_ref.shape
+    if FP8:
+        # Reuse fp8 tolerance constants from earlier (slightly relaxed)
+        torch.testing.assert_close(
+            out_kernel, out_ref.to(out_kernel.dtype), atol=2.5e-1, rtol=2.5e-1
+        )
+    else:
+        torch.testing.assert_close(
+            out_kernel, out_ref.to(out_kernel.dtype), atol=1e-2, rtol=1e-2
+        )
+
+    if new_kv:
+        for b in range(batch_size):
+            start = cache_seqlens[b].item()
+            end = start + seqlen_q
+            torch.testing.assert_close(
+                k_cache[b, start:end], k_new[b], atol=1e-5, rtol=1e-5
+            )
+            torch.testing.assert_close(
+                v_cache[b, start:end], v_new[b], atol=1e-5, rtol=1e-5
+            )

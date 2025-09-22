@@ -131,7 +131,9 @@ def _cast_varlen_to_fp8(
             f"group_size {group_size} must divide number of heads {num_heads} in _cast_varlen_to_fp8"
         )
     out_heads = num_heads if group_size is None else num_heads // group_size
-    descale_factors = torch.zeros((batch, out_heads), device=x.device, dtype=torch.float32)
+    descale_factors = torch.zeros(
+        (batch, out_heads), device=x.device, dtype=torch.float32
+    )
 
     for i in range(batch):
         start = cu_seqlens[i]
@@ -155,8 +157,10 @@ def _cast_varlen_to_fp8(
             descale_group = x_abs_max_group / fp8_max
             descale_factors[i, :] = descale_group
             scale_group_reshape = scale_group.view(1, ngroups, 1, 1)
-            x_fp8[start:end] = (xg * scale_group_reshape).to(fp8_dtype).view(
-                end - start, num_heads, x_slice.shape[2]
+            x_fp8[start:end] = (
+                (xg * scale_group_reshape)
+                .to(fp8_dtype)
+                .view(end - start, num_heads, x_slice.shape[2])
             )
 
     return x_fp8, descale_factors
@@ -1358,7 +1362,6 @@ def flash_attn_func(
         torch.is_grad_enabled(),
         config,
     )
-
 
 
 class _FlashAttnVarlenFunc(torch.autograd.Function):
