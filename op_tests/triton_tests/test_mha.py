@@ -874,7 +874,7 @@ def test_mha_backward_varlen(
         )
 
 
-@pytest.mark.parametrize("FP8", [False])
+@pytest.mark.parametrize("FP8", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize(
@@ -939,31 +939,25 @@ def test_mha_kvcache(
 
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=base_dtype)
 
-    # Cast to FP8 using same helpers as other tests for deterministic descale factors
+    # Cast to FP8 using helper (keep original fp16 copies for reference math)
     if FP8:
         fp8_dtype = get_fp8_e4m3_dtype()
-        group_size = None  # MHA path; no GQA grouping applied here
-        k_cache, k_descale = _cast_to_fp8(
-            k_cache, fp8_dtype, "bshd", group_size=group_size
-        )
-        v_cache, v_descale = _cast_to_fp8(
-            v_cache, fp8_dtype, "bshd", group_size=group_size
-        )
-        q, q_descale = _cast_to_fp8(q, fp8_dtype, "bshd", group_size=group_size)
+        group_size = None
+        k_cache_fp8, k_descale = _cast_to_fp8(k_cache, fp8_dtype, "bshd", group_size=group_size)
+        v_cache_fp8, v_descale = _cast_to_fp8(v_cache, fp8_dtype, "bshd", group_size=group_size)
+        q_fp8, q_descale = _cast_to_fp8(q, fp8_dtype, "bshd", group_size=group_size)
         if new_kv:
-            k_new, k_new_descale = _cast_to_fp8(
-                k_new, fp8_dtype, "bshd", group_size=group_size
-            )
-            v_new, v_new_descale = _cast_to_fp8(
-                v_new, fp8_dtype, "bshd", group_size=group_size
-            )
-            # Merge new kv descale factors into cache descales logically: kernel only receives descales for full cache & q
-            # We simply ignore k_new_descale/v_new_descale since kernel updates cache in FP8 domain already.
+            k_new_fp8, _ = _cast_to_fp8(k_new, fp8_dtype, "bshd", group_size=group_size)
+            v_new_fp8, _ = _cast_to_fp8(v_new, fp8_dtype, "bshd", group_size=group_size)
         else:
-            k_new_descale = v_new_descale = None
+            k_new_fp8 = v_new_fp8 = None
     else:
+        k_cache_fp8 = k_cache
+        v_cache_fp8 = v_cache
+        q_fp8 = q
+        k_new_fp8 = k_new
+        v_new_fp8 = v_new
         q_descale = k_descale = v_descale = None
-        k_new_descale = v_new_descale = None
 
     # Reference: clone cache & apply append if needed
     k_cache_ref = k_cache.clone()
@@ -986,14 +980,11 @@ def test_mha_kvcache(
     v_eff = v_cache_ref[:, :max_used]
     key_mask_eff = key_padding_mask[:, :max_used]
 
-    # Reference runs in fp16 space: if FP8 we convert fp8 tensors back to fp16 for reference
-    ref_q = q.to(torch.float16)
-    ref_k_eff = k_eff.to(torch.float16)
-    ref_v_eff = v_eff.to(torch.float16)
+    # Reference runs entirely on original fp16 tensors
     out_ref, _ = attention_ref(
-        ref_q,
-        ref_k_eff,
-        ref_v_eff,
+        q,
+        k_eff,
+        v_eff,
         query_padding_mask=None,
         key_padding_mask=key_mask_eff,
         causal=causal,
@@ -1001,11 +992,11 @@ def test_mha_kvcache(
     )
 
     out_kernel = flash_attn_with_kvcache_v3(
-        q,
-        k_cache,
-        v_cache,
-        k=k_new,
-        v=v_new,
+        q_fp8,
+        k_cache_fp8,
+        v_cache_fp8,
+        k=k_new_fp8,
+        v=v_new_fp8,
         cache_seqlens=cache_seqlens,
         causal=causal,
         window_size=(-1, -1),
@@ -1026,13 +1017,9 @@ def test_mha_kvcache(
             out_kernel, out_ref.to(out_kernel.dtype), atol=1e-2, rtol=1e-2
         )
 
-    if new_kv:
+    if new_kv and not FP8:  # Only verify in-place cache contents directly for non-FP8 for now
         for b in range(batch_size):
             start = cache_seqlens[b].item()
             end = start + seqlen_q
-            torch.testing.assert_close(
-                k_cache[b, start:end], k_new[b], atol=1e-5, rtol=1e-5
-            )
-            torch.testing.assert_close(
-                v_cache[b, start:end], v_new[b], atol=1e-5, rtol=1e-5
-            )
+            torch.testing.assert_close(k_cache[b, start:end], k_new[b], atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(v_cache[b, start:end], v_new[b], atol=1e-5, rtol=1e-5)
