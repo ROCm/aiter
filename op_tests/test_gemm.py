@@ -6,10 +6,14 @@ import torch.nn.functional as F
 import sys
 import os
 import random
+import aiter
+import pandas as pd
 from aiter import dtypes
-from aiter.test_common import checkAllclose, perftest
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import checkAllclose, perftest, benchmark
 
-# TEST_NUM_ITERS = 10
+torch.set_printoptions(sci_mode=False)
+# torch.set_printoptions(threshold=float("inf"))
 TEST_NUM_ITERS = 100
 
 if 1:
@@ -47,11 +51,18 @@ def run_torch(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
+def run_bf16gemm_asm(x, weight, out_asm, otype=dtypes.fp32, bias=None):
+    return aiter.gemm_a16w16_asm(x, weight, out_asm, bias)
+
+
+@perftest()
 def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
     return tgemm.mm(x, weight, bias, otype, scaleA, scaleB)
 
 
+@benchmark()
 def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
+    ret = {}
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
     weight = torch.rand(n, k, dtype=otype, device="cuda").to(dtype)
@@ -63,8 +74,22 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         scaleA = torch.tensor(scaleA, dtype=dtypes.fp32, device="cuda")
     if scaleB is not None:
         scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
-    (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
-    (b, *_), avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
+    a, avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
+    b, avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
+    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    err = checkAllclose(a, b, msg=msg)
+    ret["norm"] = avg_b
+    ret["norm err"] = err
+    ### run bf16gemm_f32 asm
+    if dtype == dtypes.bf16 and otype == dtypes.fp32 and k % 64 == 0 and n % 64 == 0:
+        out_asm = torch.zeros(m, n, dtype=otype, device=x.device)
+        c, avg_c = run_bf16gemm_asm(x, weight, out_asm, otype=dtypes.fp32)
+        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us, uplift: {avg_b/avg_c-1:<5.1%}"
+        err = checkAllclose(b, c[:m], msg=msg)
+        ret["asm"] = avg_c
+        ret["asm err"] = err
+    else:
+        print("ASM just support bf16*bf16 = fp32!")
 
     assert (
         a.dtype == b.dtype
@@ -77,8 +102,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
             b.dtype == otype
         ), f"b={b.dtype}, expected output dtype={otype}, input dtype={dtype}"
 
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
-    checkAllclose(a, b, msg=msg)
+    return ret
 
 
 def get_boundary_test_cases(cu_count, aligned_k):
@@ -284,9 +308,11 @@ def test_normal_gemm():
         scaleB=0.5,
     )
     test_gemm(dtypes.bf16, 128, 32, 8192)
-    for dtype in [dtypes.fp16, dtypes.bf16]:
-        for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
-            test_gemm(dtype, 128, 32, 8192, otype=otype)
+    df = []
+    for dtype in [dtypes.fp16, dtypes.bf16][-1:]:
+        for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32][-1:]:
+            for m in [64, 48, 128, 192, 256, 384, 448, 512][:]:
+                df.append(test_gemm(dtype, m, 128, 5120, otype=otype))
         # # qkv_proj
         # for (m, n, k) in [(4096, 1280, 8192),
         #                   (128, 1280, 8192),
@@ -307,6 +333,8 @@ def test_normal_gemm():
         # for (m, n, k) in [(1, 19392, 8192),
         #                   (128, 19392, 8192)]:
         #     test_gemm(dtype, m, n, k)
+    df = pd.DataFrame(df)
+    aiter.logger.info(f"summary:\n{df}")
 
 
 def test_skinny_gemm():
@@ -353,5 +381,5 @@ def test_skinny_gemm():
                     test_gemm(dtype, m, n, k, otype=otype)
 
 
-# test_normal_gemm()
-test_skinny_gemm()
+test_normal_gemm()
+# test_skinny_gemm()
