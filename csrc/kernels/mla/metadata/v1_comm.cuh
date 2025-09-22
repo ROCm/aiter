@@ -59,6 +59,7 @@ struct MlaMetadataV1KernelParameter
     int32_t        num_cu;
     int32_t        reduce_indptr_size;
     int32_t        kv_granularity;
+    int32_t        kv_granularity_log2;
     int32_t        uni_seqlen_qo;
     bool           is_causal;
 };
@@ -171,6 +172,12 @@ CK_TILE_DEVICE void warp_sort(
     {
         p_batch_idx[bid] = p_indices[bid];
     }
+}
+
+template <typename T>
+CK_TILE_DEVICE T integer_divide_ceil_power2(T x, T y, T y_log2)
+{
+    return (x + y - 1) >> y_log2;
 }
 
 template <typename T>

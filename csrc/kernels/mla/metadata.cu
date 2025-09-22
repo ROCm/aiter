@@ -130,6 +130,17 @@ void get_mla_metadata_v1(
         }
     }
 
+    TORCH_CHECK((kv_granularity & (kv_granularity - 1)) == 0,
+                __func__, ": kv_granularity Must be power of 2!");
+    TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
+                __func__, ": seqlens_qo_indptr should be continuous!");
+    TORCH_CHECK(seqlens_qo_indptr.scalar_type() == at::ScalarType::Int,
+                __func__, ": seqlens_qo_indptr's element type should be int!");
+    TORCH_CHECK(seqlens_kv_indptr.stride(0) == 1,
+                __func__, ": seqlens_kv_indptr should be continuous!");
+    TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
+                __func__, ": seqlens_kv_indptr's element type should be int!");
+
     if (fast_mode)
     {
         get_mla_metadata_v1_2_device(

@@ -574,15 +574,6 @@ void get_mla_metadata_v1_1_device(
     torch::Tensor&       reduce_final_map,
     torch::Tensor&       reduce_partial_map)
 {
-    TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
-                __func__, ": seqlens_qo_indptr should be continuous!");
-    TORCH_CHECK(seqlens_qo_indptr.scalar_type() == at::ScalarType::Int,
-                __func__, ": seqlens_qo_indptr's element type should be int!");
-    TORCH_CHECK(seqlens_kv_indptr.stride(0) == 1,
-                __func__, ": seqlens_kv_indptr should be continuous!");
-    TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
-                __func__, ": seqlens_kv_indptr's element type should be int!");
-
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     hipDevice_t dev;
