@@ -687,6 +687,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                     tmp2_f32[i] = ck_tile::type_convert<float>(tmp2[i]);
                     gating[i] += tmp2_f32[i];
                 }
+                gating[i] = ::isnan(gating[i]) ? -INFINITY : gating[i];
             }
             scores_vec[e] = gating;
             // if constexpr (isBiased)  {
@@ -842,14 +843,14 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
     if constexpr(NUM_GRP == 8 || NUM_GRP == 4 || NUM_GRP == 2)
     {
         float gs_tmp_remote = __shfl(group_score_, threadIdx.x * THREAD_PER_GRP);
-        float gs_tmp        = threadIdx.x < NUM_GRP ? gs_tmp_remote : -INFINITY;
+        float gs_tmp        =  gs_tmp_remote;
 
         auto sort_res = warp_bitonic_merge_sort_to_reg(gs_tmp, ck_tile::number<NUM_GRP>{});
         auto pivot    = __shfl(sort_res, 3);
 
         int local_cnt = cumsum_topk_with_pivot(gs_tmp, pivot, ck_tile::number<NUM_GRP>{});
 
-        if(gs_tmp >= pivot && local_cnt <= topk_group)
+        if(gs_tmp >= pivot && local_cnt <= topk_group && threadIdx.x < NUM_GRP)
         {
             group_map_idx[local_cnt - 1] = threadIdx.x;
         }
