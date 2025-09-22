@@ -943,12 +943,20 @@ def test_mha_kvcache(
     if FP8:
         fp8_dtype = get_fp8_e4m3_dtype()
         group_size = None  # MHA path; no GQA grouping applied here
-        k_cache, k_descale = _cast_to_fp8(k_cache, fp8_dtype, "bshd", group_size=group_size)
-        v_cache, v_descale = _cast_to_fp8(v_cache, fp8_dtype, "bshd", group_size=group_size)
+        k_cache, k_descale = _cast_to_fp8(
+            k_cache, fp8_dtype, "bshd", group_size=group_size
+        )
+        v_cache, v_descale = _cast_to_fp8(
+            v_cache, fp8_dtype, "bshd", group_size=group_size
+        )
         q, q_descale = _cast_to_fp8(q, fp8_dtype, "bshd", group_size=group_size)
         if new_kv:
-            k_new, k_new_descale = _cast_to_fp8(k_new, fp8_dtype, "bshd", group_size=group_size)
-            v_new, v_new_descale = _cast_to_fp8(v_new, fp8_dtype, "bshd", group_size=group_size)
+            k_new, k_new_descale = _cast_to_fp8(
+                k_new, fp8_dtype, "bshd", group_size=group_size
+            )
+            v_new, v_new_descale = _cast_to_fp8(
+                v_new, fp8_dtype, "bshd", group_size=group_size
+            )
             # Merge new kv descale factors into cache descales logically: kernel only receives descales for full cache & q
             # We simply ignore k_new_descale/v_new_descale since kernel updates cache in FP8 domain already.
         else:
