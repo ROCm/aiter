@@ -373,6 +373,8 @@ def _attn_fwd_inner(
             acc += tl.dot(p.to(v.type.element_ty), v)
 
         k_ptrs += BLOCK_N * stride_kn
+        if BLOCK_DMODEL_PE > 0:
+            k_pe_ptrs += BLOCK_N * stride_kn
         v_ptrs += BLOCK_N * stride_vk
         if RETURN_SCORES:
             sd_mask_ptrs += BLOCK_N * stride_sn

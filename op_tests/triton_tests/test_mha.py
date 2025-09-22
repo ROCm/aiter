@@ -296,7 +296,6 @@ def test_mha_int64_strides(
 
 # Run with:
 # pytest -s op_tests/triton_tests/test_mha.py::test_mha_with_pe
-@pytest.mark.skip(reason="This feature is under development")
 @pytest.mark.parametrize("BATCH", [1])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -397,18 +396,11 @@ def test_mha_with_pe(
         # print(f"triton_sd_mask => {triton_sd_mask.dtype} {triton_sd_mask.shape}")
         # print(f"torch_attn => {torch_attn.dtype} {torch_attn.shape}")
 
-    # This assertion is failing:
-    # Mismatched elements: 45966898 / 67108864 (68.5%)
-    # |_ with atol = rtol = 1e-1 we get 0.8% element mismatch ratio (same as varlen test)
-    # Greatest absolute difference: 1.2060546875 at index (0, 86, 70, 14) (up to 0.01 allowed)
-    # |_ with dtype = bfloat16 we get basically the same greatest absolute difference
-    # Greatest relative difference: inf at index (0, 68, 96, 99) (up to 0.01 allowed)
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
 # Run with:
 # pytest -s op_tests/triton_tests/test_mha.py::test_mha_varlen_with_pe
-@pytest.mark.skip(reason="This feature is under development")
 @pytest.mark.parametrize("BATCH", [1])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -576,11 +568,8 @@ def test_mha_varlen_with_pe(
             triton_out, torch_out.to(triton_out.dtype), atol=0.25, rtol=10
         )  # Lower tolerance for FP8
     else:
-        # Mismatched elements: 543573 / 67108864 (0.8%)
-        # Greatest absolute difference: 1.2060546875 at index (0, 86, 70, 14) (up to 0.1 allowed)
-        # Greatest relative difference: inf at index (0, 122, 0, 57) (up to 0.1 allowed)
         torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
+            triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
         )
 
 
@@ -1103,7 +1092,7 @@ def test_mha_backward_with_pe(
     dropout_mask = None
     FUSED: bool = False
 
-    DEBUG_SHAPES: bool = True
+    DEBUG_SHAPES: bool = False
     DEBUG_TENSORS: bool = False
     DEBUG: bool = DEBUG_SHAPES or DEBUG_TENSORS
 
@@ -1179,13 +1168,9 @@ def test_mha_backward_with_pe(
         )
     torch_out, torch_attn_scores = torch_out
 
-    # Forward is failing!
-    # Mismatched elements: 45966898 / 67108864 (68.5%)
-    # Greatest absolute difference: 1.2060546875 at index (0, 86, 70, 14) (up to 0.01 allowed)
-    # Greatest relative difference: inf at index (0, 68, 96, 99) (up to 0.01 allowed)
-    # torch.testing.assert_close(
-    #     triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-    # )
+    torch.testing.assert_close(
+        triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
 
     torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
 
@@ -1196,26 +1181,18 @@ def test_mha_backward_with_pe(
         debug("torch_dk", torch_dk)
         debug("torch_dv", torch_dv)
 
-    # dQ is failing:
-    # Mismatched elements: 2660692 / 100663296 (2.6%)
-    # Greatest absolute difference: 0.87939453125 at index (0, 100, 22, 2) (up to 0.01 allowed)
-    # Greatest relative difference: inf at index (0, 84, 112, 173) (up to 0.01 allowed)
+    # dQ is failing miserably:
+    # Mismatched elements: 74487946 / 100663296 (74.0%)
+    # Greatest absolute difference: 3.3515625 at index (0, 1, 21, 62) (up to 0.01 allowed)
+    # Greatest relative difference: inf at index (0, 9, 22, 76) (up to 0.01 allowed)
     # torch.testing.assert_close(
     #     triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     # )
 
-    # dk is failing:
-    # Mismatched elements: 2287591 / 100663296 (2.3%)
-    # Greatest absolute difference: 0.919921875 at index (0, 80, 22, 103) (up to 0.01 allowed)
-    # Greatest relative difference: inf at index (0, 8, 18, 98) (up to 0.01 allowed)
-    # torch.testing.assert_close(
-    #     triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-    # )
+    torch.testing.assert_close(
+        triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
 
-    # dv is failing:
-    # Mismatched elements: 1527450 / 67108864 (2.3%)
-    # Greatest absolute difference: 0.7802734375 at index (0, 80, 22, 3) (up to 0.01 allowed)
-    # Greatest relative difference: inf at index (0, 11, 54, 46) (up to 0.01 allowed)
-    # torch.testing.assert_close(
-    #     triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-    # )
+    torch.testing.assert_close(
+        triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
