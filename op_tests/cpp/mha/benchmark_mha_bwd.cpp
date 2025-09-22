@@ -296,7 +296,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     const ck_tile::index_t nsplits =
         deterministic ? ck_tile::integer_divide_ceil(max_seqlen_k, kN0) : 1;
     const ck_tile::index_t a16_dq_acc_seq =
-        v3_atomic_fp32 ? shape_seqlen_q : (shape_seqlen_q + 15) / 16 * 16;
+        v3_atomic_fp32 ? shape_seqlen_q : (mode == mode_enum::batch ? (seqlen_q + 15) / 16 * 16 : (max_seqlen_q + 15) / 16 * 16);
     const ck_tile::index_t a16_dq_acc_hdim = v3_atomic_fp32 ? hdim_q : 128;
 
     ck_tile::HostTensor<QDataType> q_host(
@@ -338,7 +338,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     ck_tile::HostTensor<AccDataType> dq_acc_host(
         std::array<ck_tile::index_t, 5>{nsplits, shape_batch, nhead, shape_seqlen_q, hdim_q});
     ck_tile::HostTensor<QGradDataType> dq_acc_host_a16(std::array<ck_tile::index_t, 5>{
-        nsplits, shape_batch, nhead, a16_dq_acc_seq, a16_dq_acc_hdim});
+        nsplits, batch, nhead, a16_dq_acc_seq, a16_dq_acc_hdim});
 
     if(init_method == 0)
     {
