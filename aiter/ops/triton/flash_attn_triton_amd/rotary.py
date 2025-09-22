@@ -87,9 +87,9 @@ def _rotary_kernel(
             & (rk_half[None, None, :] < ROTARY_DIM_HALF)
         )
         x0 = tl.load(X, mask=mask, other=0.0).to(tl.float32)
-        x1 = tl.load(
-            X + ROTARY_DIM_HALF * stride_x_headdim, mask=mask, other=0.0
-        ).to(tl.float32)
+        x1 = tl.load(X + ROTARY_DIM_HALF * stride_x_headdim, mask=mask, other=0.0).to(
+            tl.float32
+        )
         o0 = x0 * cos - x1 * sin
         o1 = x0 * sin + x1 * cos
         tl.store(OUT, o0, mask=mask)
@@ -279,16 +279,27 @@ def apply_rotary_emb(
     """
     # FP8 path: upcast to bfloat16 (preferred) or float16 for rotary math to avoid excessive error
     original_dtype = x.dtype
-    is_fp8_input = original_dtype == getattr(torch, 'float8_e4m3fn', None)
+    is_fp8_input = original_dtype == getattr(torch, "float8_e4m3fn", None)
     if is_fp8_input:
         # Choose bf16 if available in cos.dtype path; otherwise fallback to float16
-        target_dtype = torch.bfloat16 if cos.dtype == torch.bfloat16 or torch.cuda.is_bf16_supported() else torch.float16
+        target_dtype = (
+            torch.bfloat16
+            if cos.dtype == torch.bfloat16 or torch.cuda.is_bf16_supported()
+            else torch.float16
+        )
         # Upcast x, cos, sin for computation (without modifying originals in-place)
         x_up = x.to(target_dtype)
         cos_up = cos.to(target_dtype) if cos.dtype != target_dtype else cos
         sin_up = sin.to(target_dtype) if sin.dtype != target_dtype else sin
         out_up = _ApplyRotary.apply(
-            x_up, cos_up, sin_up, interleaved, False, seqlen_offsets, cu_seqlens, max_seqlen
+            x_up,
+            cos_up,
+            sin_up,
+            interleaved,
+            False,
+            seqlen_offsets,
+            cu_seqlens,
+            max_seqlen,
         )
         # Cast result back to original fp8 dtype
         if inplace:

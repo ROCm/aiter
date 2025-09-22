@@ -6,9 +6,23 @@ from .utils import compute_alibi_tensor_ref
 DEBUG = False
 DEBUG_CORE = False
 
+
 def attention_backward_core_ref_impl(
-    do, q, k, v, o, softmax_lse, sm_scale, causal, window_size_left, window_size_right, 
-    dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2
+    do,
+    q,
+    k,
+    v,
+    o,
+    softmax_lse,
+    sm_scale,
+    causal,
+    window_size_left,
+    window_size_right,
+    dropout_p,
+    philox_seed,
+    philox_offset,
+    alibi_slopes,
+    use_exp2,
 ):
     if DEBUG_CORE:
         print()
@@ -27,7 +41,7 @@ def attention_backward_core_ref_impl(
         print("philox_seed:", philox_seed)
         print("philox_offset:", philox_offset)
         print("use_exp2:", use_exp2)
-    
+
     # cast to float32
     do = do.to(torch.float32)
     q = q.to(torch.float32)
@@ -44,7 +58,11 @@ def attention_backward_core_ref_impl(
     # scale scores
     attention_scaled_scores = sm_scale * attention_scores
     if DEBUG_CORE:
-        print("attention_scaled_scores:", attention_scaled_scores, attention_scaled_scores.shape)
+        print(
+            "attention_scaled_scores:",
+            attention_scaled_scores,
+            attention_scaled_scores.shape,
+        )
 
     if alibi_slopes is not None:
         L_q, L_k = q.shape[1], k.shape[1]
@@ -56,14 +74,18 @@ def attention_backward_core_ref_impl(
             print("alibi_bias:", alibi_bias, alibi_bias.shape)
         attention_scaled_scores = attention_scaled_scores + alibi_bias
         if DEBUG_CORE:
-            print("attention_scaled_scores after alibi:", attention_scaled_scores, attention_scaled_scores.shape)
+            print(
+                "attention_scaled_scores after alibi:",
+                attention_scaled_scores,
+                attention_scaled_scores.shape,
+            )
 
     # Apply masks
     L_q, L_k = q.shape[1], k.shape[1]
     row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
     col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
     col_offset = L_k - L_q
-    
+
     mask_applied = False
     if causal and (window_size_left, window_size_right) == (-1, -1):
         # Pure causal: ensure query doesn't attend to future keys
@@ -77,11 +99,13 @@ def attention_backward_core_ref_impl(
             window_size_left = -1  # No left limit
         if window_size_right >= L_k:
             window_size_right = -1  # No right limit
-        
+
         if causal:
             # Causal + sliding window: ensure we don't attend to future
-            window_size_right = min(window_size_right, 0) if window_size_right != -1 else 0
-        
+            window_size_right = (
+                min(window_size_right, 0) if window_size_right != -1 else 0
+            )
+
         # Create sliding window mask
         # Each query at position i attends to keys in [i + offset - left, i + offset + right]
         if window_size_left == -1 and window_size_right == -1:
@@ -95,23 +119,30 @@ def attention_backward_core_ref_impl(
             if window_size_right != -1:
                 # Each query at position i attends to keys up to position (i + right) accounting for offset
                 mask = mask & (col_idx <= (row_idx + col_offset + window_size_right))
-        
+
         # Apply causal constraint
         if causal:
             causal_mask = row_idx >= (col_idx - col_offset)
             mask = mask & causal_mask
-        
+
         mask_applied = True
         if DEBUG_CORE:
-            print(f"sliding_window_mask (left={window_size_left}, right={window_size_right}):", mask)
-    
+            print(
+                f"sliding_window_mask (left={window_size_left}, right={window_size_right}):",
+                mask,
+            )
+
     # Apply the mask if created
     if mask_applied:
         attention_scaled_scores = attention_scaled_scores.masked_fill(
-            torch.logical_not(mask.unsqueeze(0)), float('-inf')
+            torch.logical_not(mask.unsqueeze(0)), float("-inf")
         )
         if DEBUG_CORE:
-            print("attention_scaled_scores after masking:", attention_scaled_scores, attention_scaled_scores.shape)
+            print(
+                "attention_scaled_scores after masking:",
+                attention_scaled_scores,
+                attention_scaled_scores.shape,
+            )
 
     # compute probabilities using softmax_lse
     if use_exp2:
@@ -123,29 +154,34 @@ def attention_backward_core_ref_impl(
     else:
         softmax_lse_3d = softmax_lse.unsqueeze(-1)
         p = torch.exp(attention_scaled_scores - softmax_lse_3d)
-    
+
     # Zero out positions outside the mask
     if mask_applied:
         p = p.masked_fill(torch.logical_not(mask.unsqueeze(0)), 0.0)
-    
+
     if DEBUG_CORE:
         print("softmax_lse_3d:", softmax_lse_3d, softmax_lse_3d.shape)
         print("p:", p, p.shape)
 
     if dropout_p > 0.0:
-        rand_vals = torch.rand(p.shape, generator=torch.Generator(device=p.device).manual_seed(philox_seed), device=p.device, dtype=p.dtype)
+        rand_vals = torch.rand(
+            p.shape,
+            generator=torch.Generator(device=p.device).manual_seed(philox_seed),
+            device=p.device,
+            dtype=p.dtype,
+        )
         dropout_mask, dropout_scale = rand_vals > dropout_p, (1.0 / (1 - dropout_p))
         if DEBUG_CORE:
             print("dropout_scale:", dropout_scale)
             print("dropout_mask:", dropout_mask)
-            
+
         p_drop = torch.where(dropout_mask, p, torch.zeros_like(p))
         p_drop_scaled = p_drop * dropout_scale
         if DEBUG_CORE:
             print("dropout_scale:", dropout_scale)
             print("p_drop:", p_drop, p_drop.shape)
             print("p_drop_scaled:", p_drop_scaled, p_drop_scaled.shape)
-        
+
         # compute dv
         dv = torch.matmul(p_drop_scaled.transpose(-2, -1), do)
         if DEBUG_CORE:
@@ -153,7 +189,10 @@ def attention_backward_core_ref_impl(
 
         # compute dp
         dp_dropout = torch.matmul(do, v.transpose(-2, -1))
-        dp = torch.where(dropout_mask, dp_dropout, torch.zeros_like(dp_dropout)) * dropout_scale
+        dp = (
+            torch.where(dropout_mask, dp_dropout, torch.zeros_like(dp_dropout))
+            * dropout_scale
+        )
         if DEBUG_CORE:
             print("dp_dropout:", dp_dropout, dp_dropout.shape)
             print("dp:", dp, dp.shape)
@@ -176,11 +215,13 @@ def attention_backward_core_ref_impl(
     if DEBUG_CORE:
         print("delta:", delta, delta.shape)
     dscores_scaled = p * (dp - delta)
-    
+
     # Zero out gradients for positions outside the mask
     if mask_applied:
-        dscores_scaled = dscores_scaled.masked_fill(torch.logical_not(mask.unsqueeze(0)), 0.0)
-    
+        dscores_scaled = dscores_scaled.masked_fill(
+            torch.logical_not(mask.unsqueeze(0)), 0.0
+        )
+
     ds = dscores_scaled * sm_scale
     if DEBUG_CORE:
         print("dscores_scaled:", dscores_scaled, dscores_scaled.shape)
@@ -209,6 +250,7 @@ def attention_backward_core_ref_impl(
 
     return dq, dk, dv, delta
 
+
 def attention_varlen_backward_pytorch_ref_impl(
     do,
     q,
@@ -225,14 +267,14 @@ def attention_varlen_backward_pytorch_ref_impl(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
-    dropout_p, 
-    philox_seed, 
+    dropout_p,
+    philox_seed,
     philox_offset,
     alibi_slopes,
     use_exp2,
 ):
     # Ensure the layout is 'thd'
-    if layout != 'thd':
+    if layout != "thd":
         raise ValueError(f"Unsupported layout {layout}. Expected 'thd'.")
 
     batch_size = cu_seqlens_q.shape[0] - 1
@@ -261,12 +303,12 @@ def attention_varlen_backward_pytorch_ref_impl(
         end_k = cu_seqlens_k[i + 1].item()
 
         # Extract q_i, k_i, v_i, do_i, o_i, softmax_lse_i
-        q_i = q[start_q:end_q, :, :]      # [L_q_i, nheads_q, head_dim]
-        k_i = k[start_k:end_k, :, :]      # [L_k_i, nheads_k, head_dim]
-        v_i = v[start_k:end_k, :, :]      # [L_k_i, nheads_k, head_dim]
-        do_i = do[start_q:end_q, :, :]    # [L_q_i, nheads_q, head_dim]
-        o_i = o[start_q:end_q, :, :]      # [L_q_i, nheads_q, head_dim]
-        softmax_lse_i = softmax_lse[:, start_q:end_q] # [nheads_q, L_q_i]
+        q_i = q[start_q:end_q, :, :]  # [L_q_i, nheads_q, head_dim]
+        k_i = k[start_k:end_k, :, :]  # [L_k_i, nheads_k, head_dim]
+        v_i = v[start_k:end_k, :, :]  # [L_k_i, nheads_k, head_dim]
+        do_i = do[start_q:end_q, :, :]  # [L_q_i, nheads_q, head_dim]
+        o_i = o[start_q:end_q, :, :]  # [L_q_i, nheads_q, head_dim]
+        softmax_lse_i = softmax_lse[:, start_q:end_q]  # [nheads_q, L_q_i]
 
         if group_size != 1:
             # MQA or GQA case
@@ -274,7 +316,9 @@ def attention_varlen_backward_pytorch_ref_impl(
             q_i = q_i.view(q_i.shape[0], nheads_k, group_size, head_dim)
             do_i = do_i.view(do_i.shape[0], nheads_k, group_size, head_dim)
             o_i = o_i.view(o_i.shape[0], nheads_k, group_size, head_dim)
-            softmax_lse_i = softmax_lse_i.view(nheads_k, group_size, softmax_lse_i.shape[1])
+            softmax_lse_i = softmax_lse_i.view(
+                nheads_k, group_size, softmax_lse_i.shape[1]
+            )
             # Expand k_i and v_i to match group_size
             k_i = k_i.unsqueeze(2).expand(-1, -1, group_size, -1)
             v_i = v_i.unsqueeze(2).expand(-1, -1, group_size, -1)
@@ -282,7 +326,9 @@ def attention_varlen_backward_pytorch_ref_impl(
             q_i = q_i.reshape(q_i.shape[0], nheads_k * group_size, head_dim)
             do_i = do_i.reshape(do_i.shape[0], nheads_k * group_size, head_dim)
             o_i = o_i.reshape(o_i.shape[0], nheads_k * group_size, head_dim)
-            softmax_lse_i = softmax_lse_i.reshape(nheads_k * group_size, softmax_lse_i.shape[2])
+            softmax_lse_i = softmax_lse_i.reshape(
+                nheads_k * group_size, softmax_lse_i.shape[2]
+            )
             k_i = k_i.reshape(k_i.shape[0], nheads_k * group_size, head_dim)
             v_i = v_i.reshape(v_i.shape[0], nheads_k * group_size, head_dim)
 
@@ -310,11 +356,11 @@ def attention_varlen_backward_pytorch_ref_impl(
             causal,
             window_size_left,
             window_size_right,
-            dropout_p, 
-            philox_seed, 
+            dropout_p,
+            philox_seed,
             philox_offset,
             alibi_slopes_i,
-            use_exp2
+            use_exp2,
         )
 
         # Convert back to 'thd' layout
@@ -347,6 +393,7 @@ def attention_varlen_backward_pytorch_ref_impl(
 
     return dq, dk, dv, delta
 
+
 def attention_vanilla_backward_pytorch_ref_impl(
     do,
     q,
@@ -378,7 +425,7 @@ def attention_vanilla_backward_pytorch_ref_impl(
         pass
     else:
         raise ValueError(f"Unknown layout {layout}")
-    
+
     # Prepare tensors
     batch_size, nheads_q, seq_len_q, head_dim = q.shape
     batch_size, nheads_k, seq_len_k, head_dim = k.shape
@@ -396,7 +443,9 @@ def attention_vanilla_backward_pytorch_ref_impl(
         # Reshape softmax_lse to [batch_size, nheads_k, group_size, seq_len_q]
         softmax_lse = softmax_lse.reshape(batch_size, nheads_k, group_size, seq_len_q)
         # Expand k and v to match group_size
-        k = k.unsqueeze(2).expand(-1, -1, group_size, -1, -1)  # [batch_size, nheads_k, group_size, seq_len_k, head_dim]
+        k = k.unsqueeze(2).expand(
+            -1, -1, group_size, -1, -1
+        )  # [batch_size, nheads_k, group_size, seq_len_k, head_dim]
         v = v.unsqueeze(2).expand(-1, -1, group_size, -1, -1)
         # Flatten the first three dimensions for computation
         do = do.reshape(batch_size * nheads_k * group_size, seq_len_q, head_dim)
@@ -426,11 +475,11 @@ def attention_vanilla_backward_pytorch_ref_impl(
         causal,
         window_size_left,
         window_size_right,
-        dropout_p, 
-        philox_seed, 
+        dropout_p,
+        philox_seed,
         philox_offset,
         alibi_slopes,
-        use_exp2
+        use_exp2,
     )
 
     if group_size != 1:
@@ -468,6 +517,7 @@ def attention_vanilla_backward_pytorch_ref_impl(
 
     return dq, dk, dv, delta
 
+
 def attention_backward_pytorch_ref_impl(
     do: torch.Tensor,
     q: torch.Tensor,
@@ -488,10 +538,10 @@ def attention_backward_pytorch_ref_impl(
     cu_seqlens_k: Optional[torch.Tensor],
     max_seqlen_q: Optional[int],
     max_seqlen_k: Optional[int],
-    dropout_p: float, 
-    philox_seed: Optional[int], 
+    dropout_p: float,
+    philox_seed: Optional[int],
     philox_offset: Optional[int],
-    use_exp2: bool
+    use_exp2: bool,
 ):
     if layout == "thd":
         dq_ref, dk_ref, dv_ref, delta = attention_varlen_backward_pytorch_ref_impl(
@@ -510,7 +560,7 @@ def attention_backward_pytorch_ref_impl(
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
-            dropout_p, 
+            dropout_p,
             philox_seed,
             philox_offset,
             alibi_slopes,
@@ -529,13 +579,12 @@ def attention_backward_pytorch_ref_impl(
             window_size_left,
             window_size_right,
             layout,
-            dropout_p, 
-            philox_seed, 
+            dropout_p,
+            philox_seed,
             philox_offset,
             alibi_slopes,
             use_exp2,
         )
-        
 
     # copy into output tensor
     dv.copy_(dv_ref.to(dv.dtype))
