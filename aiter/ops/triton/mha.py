@@ -16,7 +16,7 @@ from aiter.ops.triton.utils.mha_kernel_utils import _compute_fp8_scaling_factors
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton._triton_kernels.mha import _attn_fwd, _get_config
-from aiter.ops.triton.flash_attn_triton_amd import flash_attn_2
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 
 _LOGGER = AiterTritonLogger()
 
@@ -150,6 +150,7 @@ def _cast_varlen_to_fp8(
             )
 
     return x_fp8, descale_factors
+
 
 def _flash_attn_forward(
     q: torch.Tensor,

@@ -20,7 +20,7 @@ from aiter.ops.triton.mha_v3 import (
     flash_attn_varlen_func as flash_attn_varlen_func_v3,
     flash_attn_with_kvcache as flash_attn_with_kvcache_v3,
 )
-from aiter.ops.triton.utils.arch_info import get_fp8_e4m3_dtype
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     generate_random_padding_mask,

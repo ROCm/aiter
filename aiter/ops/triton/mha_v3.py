@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional, Tuple
 import torch
 
-from aiter.ops.triton.flash_attn_triton_amd import flash_attn_3
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 
 
 class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
