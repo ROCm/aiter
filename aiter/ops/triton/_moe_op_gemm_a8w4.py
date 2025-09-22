@@ -22,6 +22,12 @@ def matmul_launch_metadata(grid, kernel, args):
     repr = lambda s, x: f"{s}={x}" if x is not None else f"E_{len(hist)}({s})={n_rows}"
     nbits = X.dtype.itemsize * 8
     ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
+    if args["B"] is not None:
+        ret["name"] += "_bias"
+    if args["APPLY_SWIGLU"]:
+        ret["name"] += "_swiglu"
+    if args["quant_static_scale"] is not None:
+        ret["name"] += "_quant"
 
     fM = n_tokens
     fK = K if K is not None else n_tokens
@@ -106,6 +112,50 @@ def _swiglu(input, alpha, limit):
 
 
 @triton.jit
+def _compute_quant(tensor, scale):
+    tensor = tensor.to(tl.float32)
+    tensor = tensor / scale
+    tensor = tensor.to(tl.float8e4nv)
+    return tensor
+
+
+@triton.jit
+def _downcast_to_static_fp8(x_ptr, stride_x_m, stride_x_n,
+                      y_ptr, stride_y_m, stride_y_n,
+                      scale,
+                      M, N,
+                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+
+    x_dtype: tl.constexpr = x_ptr.dtype.element_ty
+    tl.static_assert((x_dtype == tl.bfloat16) or (x_dtype == tl.float16) or (x_dtype == tl.float32), f"{x_dtype=} must be bfloat16 or float16 or float32")
+
+    pid_m = tl.program_id(0).to(tl.int64)
+    pid_n = tl.program_id(1).to(tl.int64)
+
+    start_m = pid_m * BLOCK_M
+    start_n = pid_n * BLOCK_N
+
+    x_ptr += start_m * stride_x_m + start_n * stride_x_n
+    y_ptr += start_m * stride_y_m + start_n * stride_y_n
+
+    offs_m = tl.arange(0, BLOCK_M)[None, :].to(tl.int64)
+    offs_n = tl.arange(0, BLOCK_N)[:, None].to(tl.int64)
+
+    mask_m = start_m + offs_m < M
+    mask_n = start_n + offs_n < N
+    mask_xy = mask_m & mask_n
+
+    offs_x = offs_m * stride_x_m + offs_n * stride_x_n
+    offs_y = offs_m * stride_y_m + offs_n * stride_y_n
+
+    x = tl.load(x_ptr + offs_x, mask=mask_xy)
+
+    y = _compute_quant(x, scale)
+
+    tl.store(y_ptr + offs_y, y, mask=mask_xy)
+
+
+@triton.jit
 def _reduce_grouped(X, stride_xb: tl.uint64, stride_xm: tl.uint64, stride_xn,  #
                     Out, stride_om: tl.uint64, stride_on,  # output tensor
                     InIndx, B, N,  #
@@ -166,7 +216,7 @@ def _moe_gemm_a8w4(
              XMxScale, stride_x_mx_m, stride_x_mx_k,
              W, stride_w_e, stride_w_k, stride_w_n,
              WMxScale, stride_w_mx_e, stride_w_mx_k, stride_w_mx_n,
-             x_scalar_scale,
+             x_static_scale, quant_static_scale,
              B, stride_b_e, # Bias
              Gammas,
              N, K, # shapes
@@ -312,9 +362,6 @@ def _moe_gemm_a8w4(
         offs_x_k_scale = MX_SCALE_BLOCK_K * pid_k + tl.arange(0, MX_SCALE_BLOCK_K)
         XMxScalePtrs = XMxScale + offs_x_m.to(index_type)[:, None] * stride_x_mx_m + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
 
-    #offs_w_k = PACKED_BLOCK_K_W * pid_k + tl.arange(0, PACKED_BLOCK_K_W)
-    #W += expt_id * stride_w_e
-    #WPtrs = W + (offs_w_k.to(index_type)[:, None] * stride_w_k + offs_w_n.to(index_type)[None, :] * stride_w_n)
 
     # compute output
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -356,8 +403,8 @@ def _moe_gemm_a8w4(
         WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
 
     # scalar fp8 scale
-    if x_scalar_scale is not None:
-        acc = acc * x_scalar_scale
+    if x_static_scale is not None:
+        acc = acc * x_static_scale
     # bias
     offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
     offs_y_n = BLOCK_N * pid_n + tl.arange(0, BLOCK_N)
@@ -381,10 +428,12 @@ def _moe_gemm_a8w4(
     if Gammas is not None:
         gammas = tl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
         out *= gammas[:, None]
+    # quant
+    if quant_static_scale is not None:
+        out = _compute_quant(out, quant_static_scale)
     # write-back
     Y += start_m * stride_y_m
     offs_y_m = offs_m
-
     YPtrs = Y + offs_y_m.to(index_type)[:, None] * stride_y_m + offs_y_n.to(index_type)[None, :] * stride_y_n
     mask = mask_m[:, None] & mask_n[None, :]
     tl.store(YPtrs, out, mask=mask)

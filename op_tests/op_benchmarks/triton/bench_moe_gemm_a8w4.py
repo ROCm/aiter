@@ -10,22 +10,13 @@ import torch
 import argparse
 from triton_kernels.routing import routing
 from triton_kernels.matmul_ogs import matmul_ogs, PrecisionConfig, FlexCtx
-from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4, swizzle_scales
+from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4, swizzle_scales, downcast_to_static_fp8
 from triton_kernels.target_info import get_cdna_version
 import tempfile
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
 from triton_kernels.numerics import InFlexData
 from dataclasses import dataclass
 import inspect
-
-
-@dataclass
-class PerfRecord:
-    total_time_ns: float
-    kernel_time_ns: float
-    flops: float
-    bytes: float
-    reps: int
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -148,15 +139,15 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
         logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
         if x_dtype_str == "fp8":
-            x = x.to(x_dtype)
-            x = moe_gemm_a8w4(x, w1, None, w1_scale, 1e-4, b1, rdata, gather_indx=gather_indx, swizzle_mx_scale=swizzle_mx_scale1, out_dtype=x_dtype, apply_swiglu=True)
-            x = moe_gemm_a8w4(x, w2, None, w2_scale, 1e-4, b2, rdata, scatter_indx=scatter_indx, swizzle_mx_scale=swizzle_mx_scale2)
+            x = downcast_to_static_fp8(x, 1e-4)
+            x = moe_gemm_a8w4(x, w1, None, w1_scale, 1e-4, 1e-4, b1, rdata, gather_indx=gather_indx, swizzle_mx_scale=swizzle_mx_scale1, out_dtype=x_dtype, apply_swiglu=True)
+            x = moe_gemm_a8w4(x, w2, None, w2_scale, 1e-4, None, b2, rdata, scatter_indx=scatter_indx, swizzle_mx_scale=swizzle_mx_scale2)
         else:
             assert x_dtype_str == "mx8"
             x, _, x_scale = quantize(x, x_dtype_str)
-            x = moe_gemm_a8w4(x, w1, x_scale, w1_scale, None, b1, rdata, gather_indx=gather_indx, swizzle_mx_scale="CDNA4_SCALE", apply_swiglu=True)
+            x = moe_gemm_a8w4(x, w1, x_scale, w1_scale, None, None, b1, rdata, gather_indx=gather_indx, swizzle_mx_scale="CDNA4_SCALE", apply_swiglu=True)
             x, _, x_scale = quantize(x, x_dtype_str)
-            x = moe_gemm_a8w4(x, w2, x_scale, w2_scale, None, b2, rdata, scatter_indx=scatter_indx, swizzle_mx_scale="CDNA4_SCALE")
+            x = moe_gemm_a8w4(x, w2, x_scale, w2_scale, None, None, b2, rdata, scatter_indx=scatter_indx, swizzle_mx_scale="CDNA4_SCALE")
     proton.finalize()
     return parse_profile(fpath.with_suffix(".hatchet"), useful_op_regex=op_regex, reps=reps)
 

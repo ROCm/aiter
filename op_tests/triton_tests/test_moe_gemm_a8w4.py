@@ -10,7 +10,7 @@ import triton
 # routing utilities
 from triton_kernels.routing import routing
 # matmul utilities
-from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4, moe_gemm_torch, swizzle_scales
+from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4, moe_gemm_torch, swizzle_scales, downcast_to_static_fp8
 # numerics utilities
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, upcast_from_mxfp
 # target-specific utilities
@@ -164,8 +164,9 @@ class Case:
 ])
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-def test_op(m, n, k, do_gather, do_scatter, has_y_gammas, apply_swiglu, n_expts_tot,
-            n_expts_act, act_dtype_str, weight_dtype_str, hbm_swizzling, device="cuda"):
+@pytest.mark.parametrize("fused_quant", [False, True])
+def test_op(m, n, k, do_gather, do_scatter, has_y_gammas, apply_swiglu, fused_quant, 
+            n_expts_tot, n_expts_act, act_dtype_str, weight_dtype_str, hbm_swizzling, device="cuda"):
 
     if "float8" in act_dtype_str and "mx" in weight_dtype_str and not is_hip_cdna4():
         pytest.skip("float8 x mx only supported on CDNA4")
@@ -211,20 +212,25 @@ def test_op(m, n, k, do_gather, do_scatter, has_y_gammas, apply_swiglu, n_expts_
     if act_mxfp8:
         x_tri, x_mx_scales_tri = downcast_to_mxfp(x_tri, act_dtype, axis=-1)
         x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)
-        x_scalar_scale = None
+        x_static_scale = None
         out_dtype = torch.bfloat16
         maxtol = None
         rmstol = None
     else:
         x_mx_scales_tri = None
-        x_scalar_scale = x_tri.abs().max().item() / 448.0 
-        x_tri = x_tri / x_scalar_scale
-        x_tri = x_tri.to(act_dtype)
-        out_dtype = act_dtype
+        x_static_scale = x_tri.abs().max().item() / 448.0 
+        x_tri = downcast_to_static_fp8(x_tri, x_static_scale)
+        out_dtype = torch.float8_e4m3fn
         maxtol = 4e-1
         rmstol = 4e-2
 
-    # triton
-    tri_y = moe_gemm_a8w4(x_tri, w_tri, x_mx_scales_tri, w_scale_tri, x_scalar_scale, bias_tri, rdata, gindx, sindx, gammas, swizzle_mx_scale, out_dtype, apply_swiglu)
+
     ref_y = moe_gemm_torch(x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu)
+    if not act_mxfp8 and fused_quant:
+        quant_static_scale = ref_y.abs().max().item() / 448.0 
+    else:
+        quant_static_scale = None
+    tri_y = moe_gemm_a8w4(x_tri, w_tri, x_mx_scales_tri, w_scale_tri, x_static_scale, quant_static_scale, bias_tri, rdata, gindx, sindx, gammas, swizzle_mx_scale, out_dtype, apply_swiglu)
+    if not act_mxfp8 and fused_quant:
+        tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)

@@ -9,7 +9,7 @@ import triton
 from enum import Enum, auto
 import math
 from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
-from aiter.ops.triton._moe_op_gemm_a8w4 import _moe_gemm_a8w4, _reduce_grouped
+from aiter.ops.triton._moe_op_gemm_a8w4 import _moe_gemm_a8w4, _reduce_grouped, _downcast_to_static_fp8
 
 
 # -----------------------------------------------------------------------------
@@ -114,6 +114,27 @@ def swizzle_scales(data):
     return data.transpose(-1, -2)
 
 
+def downcast_to_static_fp8(x: torch.Tensor, scale: float):
+    M, N = x.shape
+    y = torch.empty((M, N), dtype=torch.float8_e4m3fn, device="cuda")
+
+    BLOCK_M = min(triton.next_power_of_2(M), 128)
+    if M <= 4096:
+        BLOCK_N = 32
+    else:
+        BLOCK_N = 64
+    grid_m = triton.cdiv(x.shape[0], BLOCK_M)
+    grid_n = triton.cdiv(x.shape[1], BLOCK_N)
+
+    _downcast_to_static_fp8[(grid_m, grid_n)](x, x.stride(0), x.stride(1),
+                                            y, y.stride(0), y.stride(1),
+                                            scale,
+                                            M, N, BLOCK_M, BLOCK_N,
+                                            num_warps=8)
+
+    return y
+
+
 def reduce_grouped(x: torch.Tensor, indx: torch.Tensor, out: torch.Tensor,
                    apply_swiglu = False, alpha = 1.0, limit = 1.0, reduction_n = 1,
                    out_dtype: bool = None):
@@ -171,7 +192,9 @@ def reduce_grouped(x: torch.Tensor, indx: torch.Tensor, out: torch.Tensor,
 # Triton Implementation
 # -----------------------------------------------------------------------------
 
-def moe_gemm_a8w4(x, w, x_scales, w_scales, x_scalar_scale = None, bias = None,
+def moe_gemm_a8w4(x, w, x_scales, w_scales, 
+               x_static_scale = None, quant_static_scale = None,
+               bias = None,
                routing_data: RoutingData | None = None,
                gather_indx: GatherIndx | None = None,
                scatter_indx: ScatterIndx | None = None,
@@ -240,7 +263,7 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales, x_scalar_scale = None, bias = None,
         x_scales, stride_x_mx_m, stride_x_mx_k,
         w, w.stride(0), w.stride(1), w.stride(2),
         w_scales, w_scales.stride(0), w_scales.stride(1), w_scales.stride(2),
-        x_scalar_scale,
+        x_static_scale, quant_static_scale,
         bias, stride_bias,
         gammas,
         N, K,
