@@ -33,13 +33,26 @@ def get_evaluation_unit(metric):
     else:
         raise NotImplementedError(f"{metric} is not supported")
 
+
 def get_evaluation_label(metric, space=False, prefix=None):
     if space:
-        return (prefix + " " if prefix else "") + metric.capitalize() + " (" + get_evaluation_unit(metric) + ")"
+        return (
+            (prefix + " " if prefix else "") 
+            + metric.capitalize() 
+            + " (" 
+            + get_evaluation_unit(metric) 
+            + ")"
+        )
     else:
-        return (prefix + "_" if prefix else "") + metric.capitalize() + "_(" + get_evaluation_unit(metric) + ")"
-    
-    
+        return (
+            (prefix + "_" if prefix else "") 
+            + metric.capitalize() 
+            + "_(" 
+            + get_evaluation_unit(metric) 
+            + ")"
+        )
+
+
 def get_torch_activation_from_str(activation: str):
     mapping = {
         "gelu": F.gelu,
@@ -88,7 +101,10 @@ def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
         line_names = [get_evaluation_label(args.metric)]
     else:
         line_vals = ["triton", "torch"]
-        line_names = [get_evaluation_label(args.metric, prefix="triton"), get_evaluation_label(args.metric, prefix="torch")]
+        line_names = [
+            get_evaluation_label(args.metric, prefix="triton"), 
+            get_evaluation_label(args.metric, prefix="torch")
+        ]
     
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(
@@ -99,9 +115,7 @@ def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
         line_arg="provider",
         line_vals=line_vals,
         line_names=line_names,
-        styles=[
-            (mpl_colors[i], "-") for i in range(len(line_names))
-        ],
+        styles=[(mpl_colors[i], "-") for i in range(len(line_names))],
         ylabel=ylabel,
         plot_name=plot_name,
         args={"metric": args.metric},

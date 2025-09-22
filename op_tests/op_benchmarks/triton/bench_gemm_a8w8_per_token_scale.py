@@ -20,7 +20,9 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 import math
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False):
+def bench_gemm_fn(
+    M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False
+):
     c_dtype = torch.bfloat16
 
     x, weight, x_scale, w_scale, y = generate_gemm_a8w8_per_token_scale_inputs(
@@ -95,7 +97,9 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, use_torch=(provider[0]=="torch"))
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, use_torch=(provider[0] == "torch")
+        )
 
     bench_gemm_a8w8_per_token_scale.run(
         save_path="." if args.o else None, print_data=True
@@ -106,10 +110,14 @@ def run_shape_benchmark(args):
     benchmark = get_gemm_shape_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a8w8_per_token_scale(M, N, K, metric, provider, model_name=None, **kwargs):
+    def bench_gemm_a8w8_per_token_scale(
+        M, N, K, metric, provider, model_name=None, **kwargs
+    ):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, use_torch=(provider=="torch"))
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, use_torch=(provider == "torch")
+        )
 
     bench_gemm_a8w8_per_token_scale.run(
         save_path="." if args.o else None, print_data=True

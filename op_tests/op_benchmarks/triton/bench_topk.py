@@ -154,7 +154,10 @@ def _plot_roofline(points: List[RoofDot], M: int, K: int, out_dir: Path) -> None
         x_log=False,
         line_arg="provider",
         line_vals=["triton", "torch"],
-        line_names=[get_evaluation_label("latency", prefix="triton"), get_evaluation_label("latency", prefix="torch")],
+        line_names=[
+            get_evaluation_label("latency", prefix="triton"), 
+            get_evaluation_label("latency", prefix="torch")
+        ],
         styles=[("blue", "-"), ("green", "-")],
         ylabel=get_evaluation_label("latency", space=True),
         plot_name="topk_latency",
@@ -193,7 +196,10 @@ def bench_latency(batch, provider, *, dim2: int, k: int):
         x_log=False,
         line_arg="provider",
         line_vals=["triton", "torch"],
-        line_names=[get_evaluation_label("memory", prefix="triton"), get_evaluation_label("memory", prefix="torch")],
+        line_names=[
+            get_evaluation_label("memory", prefix="triton"), 
+            get_evaluation_label("memory", prefix="torch")
+        ],
         styles=[("blue", "--"), ("green", "--")],
         ylabel=get_evaluation_label("memory", space=True),
         plot_name="topk_memory",

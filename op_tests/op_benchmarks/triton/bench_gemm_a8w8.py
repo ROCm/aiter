@@ -4,10 +4,7 @@ import math
 import torch.nn.functional as F
 from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from op_tests.triton_tests.test_gemm_a8w8 import (
-    generate_gemm_a8w8_inputs,
-    run_torch
-)
+from op_tests.triton_tests.test_gemm_a8w8 import generate_gemm_a8w8_inputs, run_torch
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
     add_argparse_ff,
@@ -22,7 +19,9 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False):
+def bench_gemm_fn(
+    M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False
+):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = str_to_torch_dtype["bf16"]
     x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
@@ -44,7 +43,9 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, use_torch: b
         )
     else:
         ms = triton.testing.do_bench(
-            lambda: gemm_a8w8(x, weight, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
+            lambda: gemm_a8w8(
+                x, weight, x_scale, w_scale, bias, c_dtype, y
+            ),  # noqa: E731
             warmup=25,
             rep=100,
         )
@@ -96,7 +97,9 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, use_torch=(provider[0]=="torch"))
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, use_torch=(provider[0] == "torch")
+        )
 
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -111,7 +114,9 @@ def run_shape_benchmark(args):
     def bench_gemm_a8w8(M, N, K, metric, provider, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, use_torch=(provider=="torch"))
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, use_torch=(provider == "torch")
+        )
 
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 

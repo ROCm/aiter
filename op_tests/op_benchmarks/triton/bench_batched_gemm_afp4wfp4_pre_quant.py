@@ -99,7 +99,9 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout, use_torch=(provider[0]=="torch"))
+        return bench_gemm_fn(
+            batch, M, N, K, metric, args.layout, use_torch=(provider[0] == "torch")
+        )
 
     bench_batched_gemm_afp4wfp4_pre_quant.run(
         save_path="." if args.o else None, print_data=True
@@ -123,7 +125,9 @@ def run_shape_benchmark(args):
         provider,
         **kwargs,
     ):
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout, use_torch=(provider=="torch"))
+        return bench_gemm_fn(
+            batch, M, N, K, metric, args.layout, use_torch=(provider == "torch")
+        )
 
     bench_batched_gemm_afp4wfp4_pre_quant.run(
         save_path="." if args.o else None, print_data=True

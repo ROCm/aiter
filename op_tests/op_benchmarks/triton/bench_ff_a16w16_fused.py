@@ -111,9 +111,8 @@ def bench_fn(
 
     # memory transfer
     if gating:
-        mem_read = (batch * intermediate_dim) * x.element_size() + (
-            hidden_dim * intermediate_dim * 2
-        ) * w1.element_size()
+        mem_read = (batch * intermediate_dim) * x.element_size() 
+        + (hidden_dim * intermediate_dim * 2) * w1.element_size()
     else:
         mem_read = (
             batch * intermediate_dim * x.element_size()
@@ -129,8 +128,11 @@ def bench_fn(
 
     if use_torch:
         ms = triton.testing.do_bench(
-            lambda: run_torch_gated(x, w1, w2, intermediate_dim, activation) if gating else \
-            lambda: run_torch_ungated(x, w1, w2, activation),
+            lambda: (
+                run_torch_gated(x, w1, w2, intermediate_dim, activation) 
+                if gating 
+                else lambda: run_torch_ungated(x, w1, w2, activation)
+            ),
             warmup=25,
             rep=100,  # noqa: E731
         )
@@ -162,7 +164,9 @@ def run_model_benchmark(args):
         label = "E2E"
     else:
         label = "Act+Gate+GEMM" if not args.ungated else "Act+GEMM"
-    benchmark = get_gemm_model_benchmark_object(f"Fused FF A16W16 {label} Benchmark", args)
+    benchmark = get_gemm_model_benchmark_object(
+        f"Fused FF A16W16 {label} Benchmark", args
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_a16w16(M, hidden_dim, intermediate_dim, metric, provider, **kwargs):
@@ -177,7 +181,7 @@ def run_model_benchmark(args):
             gating=not args.ungated,
             activation=args.activation,
             e2e_fused=args.e2e,
-            use_torch=(provider=="torch"),
+            use_torch=(provider == "torch"),
         )
 
     bench_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -191,7 +195,9 @@ def run_shape_benchmark(args):
         label = "E2E"
     else:
         label = "Act+Gate+GEMM" if not args.ungated else "Act+GEMM"
-    benchmark = get_gemm_shape_benchmark_object(f"Fused FF A16W16 {label} Benchmark", args)
+    benchmark = get_gemm_shape_benchmark_object(
+        f"Fused FF A16W16 {label} Benchmark", args
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_a16w16(M, N, K, metric, provider, **kwargs):
@@ -206,7 +212,7 @@ def run_shape_benchmark(args):
             gating=not args.ungated,
             activation=args.activation,
             e2e_fused=args.e2e,
-            use_torch=(provider=="torch"),
+            use_torch=(provider == "torch"),
         )
 
     bench_a16w16.run(save_path="." if args.o else None, print_data=True)

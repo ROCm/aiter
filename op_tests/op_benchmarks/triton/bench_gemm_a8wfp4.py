@@ -24,7 +24,9 @@ import aiter.ops.triton.utils.types as types
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False):
+def bench_gemm_fn(
+    M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False
+):
     e5m2_type, e4m3_type = types.get_fp8_dtypes()
     a_dtype = e4m3_type
     out_dtype = torch.float16
@@ -121,7 +123,9 @@ def run_model_benchmark(args):
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, use_torch=(provider[0]=="torch"))
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, use_torch=(provider[0] == "torch")
+        )
 
     bench_gemm_a8wfp4.run(save_path="." if args.o else None, print_data=True)
 
@@ -131,7 +135,9 @@ def run_shape_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_af8wfp4(M, N, K, metric, provider, model_name=None, **kwargs):
-        return bench_gemm_fn(M, N, K, metric, args.layout, use_torch=(provider=="torch"))
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, use_torch=(provider == "torch")
+        )
 
     bench_gemm_af8wfp4.run(save_path="." if args.o else None, print_data=True)
 

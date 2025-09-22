@@ -57,8 +57,11 @@ def bench_gemm_fn(
             )
         else:
             ms = triton.testing.do_bench(
-                lambda: get_torch_activation_from_str(activation)(F.linear(x, w, bias=None)) if activation else \
-                lambda: F.linear(x, w, bias=None),
+                lambda: (
+                    get_torch_activation_from_str(activation)(F.linear(x, w, bias=None)) 
+                    if activation 
+                    else lambda: F.linear(x, w, bias=None)
+                ),
                 warmup=25,
                 rep=100,  # noqa: E731
             )
@@ -127,7 +130,14 @@ def run_model_benchmark(args):
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
         return bench_gemm_fn(
-            M, N, K, metric, args.layout, use_torch=(provider[0]=="torch"), atomic=args.atomic, activation=args.activation
+            M, 
+            N, 
+            K, 
+            metric, 
+            args.layout, 
+            use_torch=(provider[0] == "torch"), 
+            atomic=args.atomic, 
+            activation=args.activation
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -143,7 +153,15 @@ def run_shape_benchmark(args):
     def bench_gemm_a16w16(M, N, K, metric, provider, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, use_torch=(provider=="torch"), atomic=args.atomic)
+        return bench_gemm_fn(
+            M, 
+            N, 
+            K, 
+            metric, 
+            args.layout, 
+            use_torch=(provider == "torch"), 
+            atomic=args.atomic
+        )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 

@@ -109,6 +109,8 @@ def add_argparse_ff(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "-o", action="store_true", help="Write performance results to CSV file"
     )
     parser.add_argument(
-        "-bench_torch", action="store_true", help="Compare against native torch implementation"
+        "-bench_torch", 
+        action="store_true", 
+        help="Compare against native torch implementation"
     )
     return parser

@@ -29,7 +29,9 @@ TRITON_HIP_PRESHUFFLE_SCALES = (
 )
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False):
+def bench_gemm_fn(
+    M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False
+):
     c_dtype = torch.bfloat16
     x, w, _, _, x_scale, w_scale, _, y = generate_gemm_afp4wfp4_inputs(
         M,
@@ -129,7 +131,9 @@ def run_model_benchmark(args):
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, use_torch=(provider[0]=="torch"))
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, use_torch=(provider[0] == "torch")
+        )
 
     bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 
@@ -139,7 +143,9 @@ def run_shape_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp4wfp4(M, N, K, metric, provider, model_name=None, **kwargs):
-        return bench_gemm_fn(M, N, K, metric, args.layout, use_torch=(provider=="torch"))
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, use_torch=(provider == "torch")
+        )
 
     bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 

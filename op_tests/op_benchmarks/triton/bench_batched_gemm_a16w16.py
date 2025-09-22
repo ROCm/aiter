@@ -21,7 +21,15 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
-def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False):
+def bench_gemm_fn(
+    batch: int, 
+    M: int, 
+    N: int, 
+    K: int, 
+    metric: str, 
+    layout: str, 
+    use_torch: bool = False
+):
     c_dtype = torch.bfloat16
     x, w, bias, y = generate_batched_gemm_a16w16_inputs(
         batch, M, N, K, dtype=c_dtype, layout=layout, output=True
@@ -85,7 +93,9 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout, use_torch=(provider[0]=="torch"))
+        return bench_gemm_fn(
+            batch, M, N, K, metric, args.layout, use_torch=(provider[0] == "torch")
+        )
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -99,7 +109,9 @@ def run_shape_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_a8w8(batch, M, N, K, metric, provider, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout, use_torch=(provider=="torch"))
+        return bench_gemm_fn(
+            batch, M, N, K, metric, args.layout, use_torch=(provider == "torch")
+        )
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 

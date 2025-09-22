@@ -212,7 +212,11 @@ def run_benchmark(args):
 
     model_name = "paged-attn-decode"
 
-    line_names = [get_evaluation_label("time"), get_evaluation_label("throughput"), get_evaluation_label("bandwidth")]
+    line_names = [
+        get_evaluation_label("time"), 
+        get_evaluation_label("throughput"), 
+        get_evaluation_label("bandwidth")
+    ]
     line_vals = ["time", "throughput", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
@@ -222,9 +226,9 @@ def run_benchmark(args):
         line_vals=line_vals,
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
-        ylabel=f"{get_evaluation_label("time", space=True)} / " + \
-               f"{get_evaluation_label("throughput", space=True)} / " + \
-               f"{get_evaluation_label("bandwidth", space=True)}",
+        ylabel=f"{get_evaluation_label("time", space=True)} / " 
+        + f"{get_evaluation_label("throughput", space=True)} / " 
+        + f"{get_evaluation_label("bandwidth", space=True)}",
         plot_name=get_caller_name_no_ext(),
         args={},
     )

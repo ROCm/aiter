@@ -154,7 +154,7 @@ def create_benchmark_configs(custom, args):
             line_vals = ["fused-bwd"]
         else:
             line_vals = ["bwd"]
-            
+    
     line_names = [get_evaluation_label(args.metric, prefix=val) for val in line_vals]
 
     configs.append(
