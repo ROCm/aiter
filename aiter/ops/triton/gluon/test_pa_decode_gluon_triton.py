@@ -426,31 +426,7 @@ def test_paged_attention(
         num_seq_partitions=0,
         alibi_slopes=None,
     )
-
-    def compare_tensor_in_dict(res_dict, ref_res_dict, key):
-        res = res_dict[key]
-        ref_res = ref_res_dict[key]
-        res_md5 = hashlib.md5(res.view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-        ref_res_md5 = hashlib.md5(ref_res.view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-        print(f"******************compare {key}******************")
-        compare_arrays(res.to(torch.float32).detach().cpu().numpy(), ref_res.to(torch.float32).detach().cpu().numpy())
-        print(f"res_md5={res_md5}")
-        print(f"ref_res_md5={ref_res_md5}")
-
-
-    compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), hip_output.to(torch.float32).detach().cpu().numpy())
-    compare_arrays(gluon_output.to(torch.float32).detach().cpu().numpy(), triton_output.to(torch.float32).detach().cpu().numpy())
-    compare_tensor_in_dict(gluon_time, triton_time, "tmp_output")
-    compare_tensor_in_dict(gluon_time, triton_time, "exp_sums")
-    compare_tensor_in_dict(gluon_time, triton_time, "max_logits")
-
-    hip_output_md5 = hashlib.md5(hip_output.view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-    triton_output_md5 = hashlib.md5(triton_output.view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-    gluon_output_md5 = hashlib.md5(gluon_output.view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-
-    print(f"hip_output_md5={hip_output_md5}")
-    print(f"triton_output_md5={triton_output_md5}")
-    print(f"gluon_output_md5={gluon_output_md5}")
+    print(f"triton_time={triton_time['triton_decode']}, gluon_time={gluon_time['triton_decode'], gluon_time['triton']}, hiptime= {time_hip['hip']}")
 
     checkAllclose(triton_output, hip_output)
     checkAllclose(gluon_output, hip_output)
@@ -469,8 +445,7 @@ SEED = 0
 # SEQ_LEN_LIST = [random.randint(64, 4096) for _ in range(8)]
 NUM_SEQS_LIST = [32]
 SEQ_LEN_LIST = [4096]
-NUM_HEADS_LIST = [(8, 1)]
-# NUM_HEADS_LIST = [(16, 1)]
+NUM_HEADS_LIST = [(16, 1), (8, 1)]
 DTYPE_LIST = [torch.bfloat16]
 
 for (num_seq, seq_len, num_heads, dtype) in itertools.product(

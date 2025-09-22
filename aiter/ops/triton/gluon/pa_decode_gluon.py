@@ -115,19 +115,33 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # )
     # QUERY_GRP_SZ_POW2 x HEAD_SZ_POW2
     # 16(mdim) x 128(kdim)
-    blocked_q: gl.constexpr = gl.BlockedLayout(
+    blocked_q0: gl.constexpr = gl.BlockedLayout(
         size_per_thread =[2, 4],
         threads_per_warp=[8, 8],
         warps_per_cta   =[1, 4],
         order           =[1, 0],
     )
+    blocked_q: gl.constexpr = gl.BlockedLayout(
+        size_per_thread =[1, 8],
+        threads_per_warp=[4, 16],
+        warps_per_cta   =[4, 1],
+        order           =[1, 0],
+    )
+    shared_a_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
     # MAX_NUM_KV_BLKS x K_HEAD_SZ_POW2_SPLIT x KV_BLK_SZ_POW2 x CONTIGUOUS_KV_ELEMS_16B_LOAD
     # 16 x 16 x 16 x 8
-    blocked_k: gl.constexpr = gl.BlockedLayout(
+    blocked_k0: gl.constexpr = gl.BlockedLayout(
         size_per_thread =[4, 2, 2, 8],
         threads_per_warp=[1, 8, 8, 1],
         warps_per_cta   =[4, 1, 1, 1],
         order           =[3, 2, 1, 0],
+    )
+    blocked_k: gl.constexpr = gl.DistributedLinearLayout( # 128x256
+        reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,1,0,0), (0,8,0,0), (4,0,0,0), (8,0,0,0)), # 16 x 8
+        lane_bases=((0,0,1,0), (0,0,2,0), (0,0,4,0), (0,0,8,0), (0,2,0,0), (0,4,0,0)), # 64
+        warp_bases=((1,0,0,0), (2,0,0,0)), # 4
+        block_bases=[], # 8
+        shape=[16, 16, 16, 8],
     )
 
     # transposed: indicates the result tensor is transposed so that each thread holds consecutive elements
@@ -147,10 +161,10 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[1, 4]
     )
     pv_lhs_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=pv_mfma_layout, k_width=4
+        operand_index=0, parent=pv_mfma_layout, k_width=16
     )
     pv_rhs_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=pv_mfma_layout, k_width=4
+        operand_index=1, parent=pv_mfma_layout, k_width=16
     )
 
     # # blocked_q dim1
@@ -221,6 +235,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs, mask=q_mask)
     # q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs)
     q = (q * scale).to(compute_type)
+    q_shared = gl.allocate_shared_memory(q.dtype, q.shape, shared_a_layout, q)
 
     # k_blk_offs[MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD]
     k_blk_offs = (
@@ -260,7 +275,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # qk[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
     # qk = gl.dot(q, k, out_dtype=gl.float32)
     accumulator = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2), dtype=gl.float32, layout=qk_mfma_layout)
-    qc = gl.convert_layout(q, layout=qk_lhs_layout)
+    # qc = gl.convert_layout(q, layout=qk_lhs_layout)
+    qc = q_shared.load(qk_lhs_layout)
     kc = gl.convert_layout(kt, layout=qk_rhs_layout)
     qk = gl.amd.cdna3.mfma(qc, kc, accumulator)
     # qk = qk.to(compute_type)
@@ -338,11 +354,18 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
 
     # MAX_NUM_KV_BLKS x HEAD_SZ_POW2 x KV_BLK_SZ_POW2
     # 16(kdim0) x 128(ndim) x 16(kdim1)
-    blocked_v_layout: gl.constexpr = gl.BlockedLayout(
+    blocked_v_layout0: gl.constexpr = gl.BlockedLayout(
         size_per_thread =[4, 4,  8],
         threads_per_warp=[1, 32, 2],
         warps_per_cta   =[4, 1,  1],
         order           =[2, 1,  0],
+    )
+    blocked_v_layout: gl.constexpr = gl.DistributedLinearLayout( # 256x128
+        reg_bases=((0,0,1), (0,0,2), (0,0,4), (0,0,8), (4,0,0), (8,0,0), (0,64,0)), # 16 x 8
+        lane_bases=((0,1,0), (0,2,0), (0,4,0), (0,8,0), (1,0,0), (2,0,0)), # 64
+        warp_bases=((0,16,0), (0,32,0)), # 4
+        block_bases=[], # 8
+        shape=[16, 128, 16],
     )
     v_dim0_offs = gl.arange(0, MAX_NUM_KV_BLKS, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
     v_dim1_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_v_layout)))
