@@ -23,7 +23,10 @@ from aiter.ops.triton.moe_op_gelu import (
     moe_set_use_persistent_kernel as triton_moe_gelu_set_use_persistent_kernel,
 )
 
-from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
+from aiter.ops.triton.utils.moe_config_utils import (
+    get_optimal_moe_config_func,
+    get_optimal_moe_e2e_config_func,
+)
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 DEBUG_MODE = False
@@ -313,48 +316,6 @@ def torch_e2e_moe(
     return c
 
 
-def get_default_config() -> Dict[str, int]:
-    config = {
-        "BLOCK_SIZE_M": 64,
-        "BLOCK_SIZE_N": 64,
-        "BLOCK_SIZE_K": 32,
-        "GROUP_SIZE_M": 8,
-    }
-    return config
-
-
-def get_default_config_moe_e2e(N: int, persistent: bool) -> Dict[str, int]:
-    if N <= 768:
-        # we fit the whole token intermediate representation in registers in order to fuse the two gemms
-        return {
-            "BLOCK_SIZE_M": 32,
-            "BLOCK_SIZE_N": triton.next_power_of_2(N),
-            "BLOCK_SIZE_K1": 32,
-            "BLOCK_SIZE_K2": 64,
-            "GROUP_SIZE_M": 1,
-            "num_warps": 4,
-            "num_stages": 2,
-            "waves_per_eu": 1,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 1
-        }
-    
-    if persistent:
-        return {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N1": 128,
-            "BLOCK_SIZE_K1": 64,
-            "BLOCK_SIZE_K2": 64,
-        }
-    return {
-        "BLOCK_SIZE_M": 64,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K1": 64,
-        "BLOCK_SIZE_K2": 64,
-        "GROUP_SIZE_M": 2,
-    }  # TODO setting GROUP_SIZE_M = 1 gives set fault, why?
-
-
 def quantize_fp8(
     tensor: torch.Tensor, dim=()
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -612,7 +573,12 @@ def input_helper_e2e(
     softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
-    config = get_default_config_moe_e2e(N, persistent)
+    moe_config_func = get_optimal_moe_e2e_config_func(
+        dtype, use_fp8_w8a8=fp8_w8a8, persistent=persistent
+    )
+
+    config = moe_config_func(M)
+
     sorted_token_ids, expert_ids, num_tokens_post_padded = (
         torch_moe_align_block_size_ref(topk_ids, config["BLOCK_SIZE_M"], E)
     )

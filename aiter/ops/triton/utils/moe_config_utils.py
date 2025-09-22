@@ -37,7 +37,11 @@ def get_config_dtype_str(
 
 
 @functools.lru_cache
-def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
+def get_moe_configs(
+    dtype: Optional[str],
+    e2e: Optional[bool] = False,
+    e2e_persistent: Optional[bool] = False,
+) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
 
@@ -50,7 +54,10 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
     # directory
     dtype_str = "DEFAULT" if dtype is None else dtype
     dev = arch_info.get_device()
-    config_file_path = f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{dtype_str}.json"
+    e2e_str = "-e2e" if e2e else "" + "-persistent" if (e2e and e2e_persistent) else ""
+    config_file_path = (
+        f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE{e2e_str}-{dtype_str}.json"
+    )
 
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
@@ -118,4 +125,59 @@ def get_optimal_moe_config_func(
         use_int8_w8a8,
         use_fp8_w8a8,
         use_int4_w4a16,
+    )
+
+
+def get_optimal_moe_e2e_config(
+    dtype: torch.dtype,
+    # blockscale fp8
+    use_fp8_w8a8: Optional[bool] = False,
+    persistent: Optional[bool] = False,
+    M: int = 1,
+):
+    dtype_str = get_config_dtype_str(dtype, use_fp8_w8a8=use_fp8_w8a8)
+    # print(f"dtype_str={dtype_str}")
+    configs = get_moe_configs(dtype_str, e2e=True, e2e_persistent=persistent)
+    if configs is not None:
+        if configs:
+            if M < M_THRESHOLD_SMALL:
+                config = configs["small_M"]
+            elif M < M_THRESHOLD_MEDIUM:
+                config = configs["medium_M"]
+            else:
+                config = configs["large_M"]
+    else:
+        # default config
+        # we fit the whole token intermediate representation in registers in order to fuse the two gemms
+        if persistent:
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N1": 128,
+                "BLOCK_SIZE_K1": 64,
+                "BLOCK_SIZE_K2": 64,
+            }
+        else:
+            config = {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 512,
+                "BLOCK_SIZE_K1": 32,
+                "BLOCK_SIZE_K2": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 4,
+                "num_stages": 2,
+                "waves_per_eu": 1,
+                "matrix_instr_nonkdim": 16,
+                "kpack": 1,
+            }
+
+    return config
+
+
+def get_optimal_moe_e2e_config_func(
+    dtype: torch.dtype,
+    use_fp8_w8a8: Optional[bool] = False,
+    persistent: Optional[bool] = False,
+):
+    return functools.partial(
+        get_optimal_moe_e2e_config, dtype, use_fp8_w8a8, persistent
     )
