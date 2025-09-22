@@ -20,11 +20,12 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-import aiter.ops.triton.utils.types as arch_info
+import aiter.ops.triton.utils.types as types
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
 def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, use_torch: bool = False):
-    e5m2_type, e4m3_type = arch_info.get_fp8_dtypes()
+    e5m2_type, e4m3_type = types.get_fp8_dtypes()
     a_dtype = e4m3_type
     out_dtype = torch.float16
     x, w, x_scales, w_scales, _, _, y = generate_gemm_a8wfp4_inputs(
