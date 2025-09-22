@@ -5,7 +5,7 @@ import math
 from aiter.ops.triton.batched_gemm_afp4wfp4 import (
     batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,
 )
-import aiter.ops.triton.utils.arch_info as arch_info
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 from op_tests.triton_tests.test_batched_gemm_afp4wfp4 import (
     generate_batched_gemm_afp4wfp4_inputs,
     run_torch,
