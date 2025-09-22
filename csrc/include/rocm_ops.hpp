@@ -1140,7 +1140,8 @@
         .value("No", ActivationType::No)                 \
         .value("Silu", ActivationType::Silu)             \
         .value("Gelu", ActivationType::Gelu)             \
-        .export_values();
-
+        .export_values();                                \
+    pybind11::implicitly_convertible<int, QuantType>();  \
+    pybind11::implicitly_convertible<int, ActivationType>();
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));

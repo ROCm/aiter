@@ -1,23 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import os
-from typing import Optional, Callable
-from dataclasses import dataclass
 import functools
+import os
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+import torch
+
 import aiter
-from aiter import logger
-from aiter import ActivationType, QuantType, dtypes
-from aiter.utility import fp4_utils
-from aiter.jit.utils.chip_info import get_gfx
 
 # from aiter import get_torch_quant as get_quant
+from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
-from aiter.utility.fp4_utils import moe_mxfp4_sort
-from aiter.jit.core import AITER_ROOT_DIR, PY, get_asm_dir, bd_dir, mp_lock
-from aiter.jit.utils.chip_info import get_cu_num
+from aiter import logger
+from aiter.jit.core import AITER_ROOT_DIR, PY, bd_dir, get_asm_dir, mp_lock
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.utility import fp4_utils
+from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 BLOCK_SIZE_M = 32
 
@@ -273,11 +274,7 @@ def fused_moe_1stage(
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
 ):
-    if (
-        quant_type.value == QuantType.No.value
-        and activation.value == ActivationType.Silu.value
-        and not isG1U1
-    ):
+    if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
         aiter.fmoe(
             moe_buf,
@@ -294,7 +291,7 @@ def fused_moe_1stage(
     else:
         quant_func = get_quant(quant_type)
         if hidden_states.dtype != q_dtype_a:
-            if quant_type.value == QuantType.per_1x128.value:
+            if quant_type == QuantType.per_1x128:
                 quant_func = functools.partial(quant_func, transpose_scale=True)
             a1, a1_scale = quant_func(
                 hidden_states,
@@ -307,7 +304,7 @@ def fused_moe_1stage(
                 a1_scale is not None or quant_type == QuantType.No
             ), "a1_scale must be provided for quantized input for fused_moe"
             a1 = hidden_states
-            if quant_type.value == QuantType.per_1x128.value:
+            if quant_type == QuantType.per_1x128:
                 scale_t = torch.empty_like(a1_scale)
                 aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
                 a1_scale = scale_t
@@ -325,7 +322,7 @@ def fused_moe_1stage(
             w1_scale = w1_scale.view(E, -1)
             w2_scale = w2_scale.view(E, -1)
 
-        if quant_type.value == QuantType.per_1x128.value:
+        if quant_type == QuantType.per_1x128:
             fmoe_func = functools.partial(
                 aiter.fmoe_fp8_blockscale_g1u1,
                 fc_scale_blkn=128,
@@ -687,7 +684,7 @@ def fused_moe_2stages(
         doweight_stage1,
     )
 
-    if quant_type.value == QuantType.per_1x32.value:
+    if quant_type == QuantType.per_1x32:
         a1, a1_scale = quant_func(
             hidden_states,
             scale=a1_scale,
@@ -702,10 +699,7 @@ def fused_moe_2stages(
             block_size=block_size_M,
         )
     elif hidden_states.dtype != q_dtype_a:
-        if (
-            quant_type.value == QuantType.per_1x128.value
-            and metadata.stage1.func is asm_stage1
-        ):
+        if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
             quant_func = functools.partial(quant_func, transpose_scale=True)
         a1, a1_scale = quant_func(
             hidden_states,
@@ -715,13 +709,10 @@ def fused_moe_2stages(
         )
     else:
         assert (
-            a1_scale is not None or quant_type.value == QuantType.No.value
+            a1_scale is not None or quant_type == QuantType.No
         ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
-    if (
-        quant_type.value == QuantType.per_1x128.value
-        and metadata.stage1.func is asm_stage1
-    ):
+    if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
         a2 = torch.empty(
             (token_num + (token_num * ratio + 127) // 128, topk, inter_dim),
@@ -750,7 +741,7 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
 
-    if quant_type.value == QuantType.per_1x32.value:
+    if quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
         a2, a2_scale = quant_func(
             a2,
@@ -768,10 +759,7 @@ def fused_moe_2stages(
             block_size=block_size_M,
         )
 
-    elif (
-        quant_type.value == QuantType.per_1x128.value
-        and metadata.stage1.func is asm_stage1
-    ):
+    elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         a2_v = a2[:token_num, :, :]
         a2_scale = (
             a2[token_num:, ...]
