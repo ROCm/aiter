@@ -22,6 +22,7 @@ def gen_gemm_a16w16_asm_fake_tensors(
     out: Tensor,
     bias: Optional[Tensor] = None,
     splitK: Optional[int] = None,
+    kernelName: Optional[str] = None,
 ) -> Tensor:
     return out
 
@@ -37,6 +38,7 @@ def gemm_a16w16_asm(
     out: Tensor,
     bias: Optional[Tensor] = None,
     splitK: Optional[int] = None,
+    kernelName: Optional[str] = None,
 ) -> Tensor: ...
 
 
@@ -46,5 +48,6 @@ def gemm_a16w16(
     out: Tensor,
     bias: Optional[Tensor] = None,
     splitK: Optional[int] = None,
+    kernelName: Optional[str] = None,
 ):
-    return gemm_a16w16_asm(A, B, out, bias, log2_k_split)
+    return gemm_a16w16_asm(A, B, out, bias, splitK, kernelName)

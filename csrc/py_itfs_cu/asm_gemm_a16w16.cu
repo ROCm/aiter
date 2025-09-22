@@ -51,7 +51,12 @@ struct __attribute__((packed)) KernelArgs
 };
 
 std::tuple<std::string, int>
-get_heuristic_kernel(int M, int N, int K, CFG* cfgs, std::optional<int> splitk = std::nullopt)
+get_heuristic_kernel(int M,
+                     int N,
+                     int K,
+                     CFG* cfgs,
+                     std::optional<int> splitk             = std::nullopt,
+                     std::optional<std::string> kernelName = std::nullopt)
 {
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -70,6 +75,8 @@ get_heuristic_kernel(int M, int N, int K, CFG* cfgs, std::optional<int> splitk =
     for(const auto& el : *cfgs)
     {
         const auto& cfg = el.second;
+        if(kernelName.has_value() && kernelName.value() != el.first)
+            continue;
         if(N % cfg.tileN == 0)
         {
             // 1. select splitK
@@ -123,7 +130,8 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
                               torch::Tensor& B,   // B:[N, K] bf16
                               torch::Tensor& out, // Out:[M, N] f32
                               std::optional<torch::Tensor> bias,
-                              std::optional<int> splitK)
+                              std::optional<int> splitK,
+                              std::optional<std::string> kernelName)
 {
     TORCH_CHECK(out.dtype() == torch::ScalarType::Float,
                 "GEMM A16W16 asm only support Float32 output now!");
@@ -187,40 +195,18 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     CFG* config_map          = &cfg_bf16gemm_outf32;
 
     // 2.1 static dict
-    using DictKey = std::tuple<int, int, int, std::optional<int>>;
-    struct SimpleHash
-    {
-        size_t operator()(const DictKey& key) const
-        {
-            const auto& [m, n, k, sk] = key;
-            int sk_key                = sk.has_value() ? sk.value() : -1;
-            return std::hash<int>()(m) ^ std::hash<int>()(n) ^ std::hash<int>()(k) ^
-                   std::hash<int>()(sk_key);
-        }
-    };
-    static std::unordered_map<DictKey, std::tuple<std::string, int>, SimpleHash>
-        heuristic_kernel_dict;
     std::string selectedKernelName;
     int selectedksplit;
-    auto it = heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, splitK));
-    if(it != heuristic_kernel_dict.end())
-    {
-        auto res           = it->second;
-        selectedKernelName = std::get<0>(res);
-        selectedksplit     = std::get<1>(res);
-    }
-    else
-    {
-        auto it_sel = get_heuristic_kernel(
-            Mdim, Ndim, Kdim, config_map, splitK.has_value() ? splitK : std::nullopt);
-        selectedKernelName = std::get<0>(it_sel);
-        selectedksplit     = std::get<1>(it_sel);
-        heuristic_kernel_dict[{Mdim, Ndim, Kdim, selectedksplit}] =
-            std::make_tuple(selectedKernelName, selectedksplit);
-    }
+    auto it_sel        = get_heuristic_kernel(Mdim,
+                                       Ndim,
+                                       Kdim,
+                                       config_map,
+                                       splitK.has_value() ? splitK : std::nullopt,
+                                       kernelName.has_value() ? kernelName : std::nullopt);
+    selectedKernelName = std::get<0>(it_sel);
+    selectedksplit     = std::get<1>(it_sel);
 
     args.splitk = selectedksplit;
-
     // printf("=== KernelArgs Important Parameters ===\n");
     // printf("ptr_D: %p\n", args.ptr_D);
     // printf("ptr_A: %p\n", args.ptr_A);
