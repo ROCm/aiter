@@ -109,7 +109,8 @@ def fused_moe(
             top_k,
             fp8_w8a8,
             int8_w8a16,
-            config,
+            block_shape=block_shape,
+            config=config,
         )
 
     if int4_w4a16:

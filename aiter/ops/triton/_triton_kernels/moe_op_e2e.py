@@ -251,6 +251,7 @@ def e2e_moe_kernel(
         silu_acc = silu_acc.to(compute_type)
         mul_acc = mul_acc.to(compute_type)
 
+
     silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
     acc = (silu_acc * mul_acc).to(dtype)
 
@@ -318,11 +319,11 @@ def e2e_moe_kernel(
 
         if use_fp8_w8a8:
             if group_k > 0 and group_n > 0:
-                accumulator = accumulator.to(compute_type)
+                out = out.to(compute_type)
             else:
-                accumulator = (accumulator * acc_scale * w2_scale).to(compute_type)
+                out = (out * acc_scale * w2_scale).to(compute_type)
         else:
-            accumulator = accumulator.to(compute_type)
+            out = out.to(compute_type)
 
 
         if EVEN_K:

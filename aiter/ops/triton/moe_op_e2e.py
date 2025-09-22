@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, List
 from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.arch_info import get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton._triton_kernels.moe_op_e2e import (
     e2e_moe_kernel,
     e2e_moe_persistent_kernel,
@@ -198,27 +198,32 @@ def e2e_moe(
             W2.stride(2),
             W2.stride(1),
             stride_cm,
+            A_scale.stride(0) if A_scale is not None else 0,
+            A_scale.stride(1) if A_scale is not None else 0,
             W1_scale.stride(0) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
             W1_scale.stride(1) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
+            W1_scale.stride(2) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
             W2_scale.stride(0) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
             W1_scale.stride(1) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
+            W2_scale.stride(2) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
             top_k,
             topk_weights,
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
             topk_ids.numel(),
+            0,0, # group n and k
             EM,
             N,
             K,
             EVEN_K,
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
             atomic_num_stages=atomic_num_stages,
             dtype=torch_to_triton_dtype[dtype],
             NUM_XCDS=get_num_xcds(),
             SKINNY=SKINNY,
+            compute_type=torch_to_triton_dtype[torch.float32],
             **config,
         )
 
