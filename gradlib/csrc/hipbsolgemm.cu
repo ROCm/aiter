@@ -348,7 +348,11 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
                       std::optional<bool> bpreshuffle)
 {
   bool bpreshuffle_flag = bpreshuffle.value_or(false);
-  
+
+  int version;
+  hipblasLtGetVersion(hipblaslt_handle, &version);
+  TORCH_CHECK(!bpreshuffle_flag || version >= 1500, " to use bpreshuffle feature, hipblaslt version should be at least 1500.");
+
   auto mat1_strides{mat1.strides()};
   auto mat2_strides{mat2.strides()};
   auto mat1_sizes{mat1.sizes()};

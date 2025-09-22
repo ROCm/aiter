@@ -125,7 +125,7 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         init_hipblas()
         e, avg_e = run_aiter_hip_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
         e = e + bias
-        err_e = checkAllclose(a, c, msg="hipmm bpreshuffle: ", rtol=1e-2, atol=1e-2)
+        err_e = checkAllclose(a, e, msg="hipmm bpreshuffle: ", rtol=1e-2, atol=1e-2)
     else:
         avg_e = None
         err_e = None

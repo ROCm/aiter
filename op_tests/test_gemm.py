@@ -98,7 +98,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
     (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
     (b, *_), avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
-    if n % 16 == 0 and k % 32 == 0 and dtype == otype and get_gfx() == "gfx942":
+    if n % 16 == 0 and k % 32 == 0 and dtype == otype and otype == dtypes.bf16 and get_gfx() == "gfx942":
         init_hipblas()
         weight_bpreshuffle = shuffle_weight(weight, layout=(16, 16), use_int4=False)
         (c, *_), avg_c = aiter_hip_bpreshuffle(x, weight_bpreshuffle, None, None, otype)
