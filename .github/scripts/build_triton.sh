@@ -4,6 +4,7 @@ set -ex
 
 # Install dependencies
 pip install --upgrade pandas zmq einops numpy==1.26.2
+pip uninstall -y aiter || true
 python3 setup.py develop
 
 # Install aiter
