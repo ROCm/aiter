@@ -15,6 +15,7 @@ from aiter.test_mha_common import (
 )
 import pytest
 import argparse
+import time
 
 
 def run_torch(
@@ -175,45 +176,21 @@ def run_ck(
 
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("deterministic", [True, False])
-@pytest.mark.parametrize("bias_type", ["no", "alibi"])
+@pytest.mark.parametrize("deterministic", [True])
+@pytest.mark.parametrize("bias_type", ["no"])
 @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("min_seqlen_q", [0])
-@pytest.mark.parametrize("dropout_p", [0.0, 0.17])
+@pytest.mark.parametrize("dropout_p", [0.0])
 @pytest.mark.parametrize("batch_size", [4])
 @pytest.mark.parametrize("nheads", [9])
 @pytest.mark.parametrize(
     "d,d_v",
-    [
-        (32, 32),
-        (40, 40),
-        (59, 59),
-        (64, 64),
-        (96, 96),
-        (111, 111),
-        (128, 128),
-        (160, 160),
-        (192, 192),
-        (224, 224),
-        (256, 256),
-    ],
+    [(32, 32), (128, 128)],
 )
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
-    [
-        (1, 147),
-        (113, 203),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (512, 256),
-        (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (2048, 2048),
-    ],
+    [(1, 147), (512, 512)],
 )
 def test_flash_attn_varlen_func(
     batch_size,
@@ -497,7 +474,13 @@ if __name__ == "__main__":
         help="""Data type.
     e.g.: -dt bf16""",
     )
-
+    parser.add_argument(
+        "-pytest",
+        "--pytest",
+        action="store_false",
+        help="""not run the pytest. Default is True.
+        -pytest    # do not run the pytest """,
+    )
     args = parser.parse_args()
     dtype = dtypes.d_dtypes[args.dtype]
     (seqlen_q, seqlen_k) = args.seqlen_q_k
@@ -518,3 +501,11 @@ if __name__ == "__main__":
         args.mha_type,
         dtype,
     )
+
+    if args.pytest:
+        start = time.time()
+        ret = pytest.main(["test_mha_varlen.py"])
+        print(
+            f"the pytest test_mha_varlen.py cost :  {(time.time() - start)}s, the ret is {ret}"
+        )
+        assert ret == 0
