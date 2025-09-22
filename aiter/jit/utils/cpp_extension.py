@@ -12,19 +12,19 @@ import os
 import re
 import shlex
 import shutil
-import setuptools
 import subprocess
 import sys
 import sysconfig
 import warnings
-from packaging.version import Version
-from setuptools.command.build_ext import build_ext
+from typing import Dict, List, Optional, Tuple, Union
 
-from file_baton import FileBaton
+import setuptools
 from _cpp_extension_versioner import ExtensionVersioner
+from file_baton import FileBaton
 from hipify import hipify_python
 from hipify.hipify_python import GeneratedFileCleaner
-from typing import Dict, List, Optional, Union, Tuple
+from packaging.version import Version
+from setuptools.command.build_ext import build_ext
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
@@ -1084,7 +1084,7 @@ def _get_pybind11_abi_build_flags():
 
     abi_cflags = []
     for pname in ["COMPILER_TYPE", "STDLIB", "BUILD_ABI"]:
-        pval = getattr(torch._C, f"_PYBIND11_{pname}")
+        pval = getattr(torch._C, f"_PYBIND11_{pname}", None)
         if pval is not None:
             abi_cflags.append(f'-DPYBIND11_{pname}=\\"{pval}\\"')
     return abi_cflags
