@@ -844,8 +844,8 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         float gs_tmp_remote = __shfl(group_score_, threadIdx.x * THREAD_PER_GRP);
         float gs_tmp        = threadIdx.x < NUM_GRP ? gs_tmp_remote : -INFINITY;
 
-        auto sort_res = warp_merge_sort_to_reg(gs_tmp, ck_tile::number<NUM_GRP>{});
-        auto pivot    = __shfl(sort_res[3], 0); // TODO: avoid indexing register using dyanmic value
+        auto sort_res = warp_bitonic_merge_sort_to_reg(gs_tmp, ck_tile::number<NUM_GRP>{});
+        auto pivot    = __shfl(sort_res, 3);
 
         int local_cnt = cumsum_topk_with_pivot(gs_tmp, pivot, ck_tile::number<NUM_GRP>{});
 
@@ -895,48 +895,39 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             s[i] = scores[remapped_group_ids[i] * experts_per_group___ + expert_id_inside_group];
         }
 
-        using vec8_t = ck_tile::ext_vector_t<float, 8>;
-        vec8_t local_res[final_score_vec];
-        for(int i = 0; i < final_score_vec; i++)
-        {
-            auto res_16 = warp_merge_sort_to_reg(s[i], ck_tile::number<16>{});
+        auto bitonic_get = [&](float v_, auto is_descending_){
+            
+            float o_x = warp_bitonic_merge_sort_build_with_early_stop(v_, threadIdx.x, ck_tile::number<64>{}, ck_tile::number<32>{}, ck_tile::number<1>{});
+            // descending
+            // 0..>..15, 16..<..31, 32..>..47, 48..<..63
+            // 0..7=>0..7, 24..31=> 8..15, 32..39=>16..23, 56..63=>24..31
+            // 0           16              48              32
+            // 
+            int m8_gid = threadIdx.x / 8;
+            int twi_0_ = m8_gid ^ (m8_gid / 2); // 0,1,2,3 ^ 0,0,1,1 -> 0,1,3,2
+            int twi_1_ = twi_0_ * 16;
+            float o_t = __shfl(o_x, threadIdx.x ^ twi_1_);
+            float o_r = warp_swap_(o_t, threadIdx.x, ck_tile::number<16>{});
+            
 
-            vec8_t res_16_8   = vec8_t{res_16[0],
-                                     res_16[1],
-                                     res_16[2],
-                                     res_16[3],
-                                     res_16[4],
-                                     res_16[5],
-                                     res_16[6],
-                                     res_16[7]};
-            vec8_t res_16_8_r = mov_dpp_vec_from_(res_16_8, ck_tile::number<16>{});
-            auto res_32 = warp_merge_sort_combine2(res_16_8, res_16_8_r, ck_tile::number<16>{});
+            // 0..>..15, 16..<..31,
+            float o_y = warp_bitonic_merge_sort_combine(o_t, o_r, threadIdx.x, (threadIdx.x / 16) & 1, ck_tile::number<16>{}, ck_tile::number<1>{});
+            float o_q = __shfl(o_y, threadIdx.x ^ twi_1_);
 
-            vec8_t res_32_8   = vec8_t{res_32[0],
-                                     res_32[1],
-                                     res_32[2],
-                                     res_32[3],
-                                     res_32[4],
-                                     res_32[5],
-                                     res_32[6],
-                                     res_32[7]};
-            vec8_t res_32_8_r = mov_dpp_vec_from_(res_32_8, ck_tile::number<32>{});
-            auto res_64 = warp_merge_sort_combine2(res_32_8, res_32_8_r, ck_tile::number<16>{});
+            
+            float o_w = warp_swap_(o_q, threadIdx.x, ck_tile::number<16>{});
+            float o_o = warp_bitonic_merge_sort_combine(o_q, o_w, threadIdx.x, 0, ck_tile::number<16>{}, is_descending_);
+            // printf("[%2d] v:%f, o_x:%f, o_t:%f, o_r:%f o_y:%f, o_q:%f, o_w:%f, o_o:%f\n", threadIdx.x, v_, o_x, o_t, o_r, o_y, o_q, o_w, o_o);
+            return o_o;
+        };
 
-            local_res[i] = vec8_t{res_64[0],
-                                  res_64[1],
-                                  res_64[2],
-                                  res_64[3],
-                                  res_64[4],
-                                  res_64[5],
-                                  res_64[6],
-                                  res_64[7]};
-        }
-
-        auto local_res_16 =
-            warp_merge_sort_combine2(local_res[0], local_res[1], ck_tile::number<16>{});
-
-        float pivot = __shfl(local_res_16[7], 0);
+        // o_0: 0..>.16, o_1: 0..<..15
+        float o_0 = bitonic_get(s[0], ck_tile::number<1>{});
+        float o_1 = bitonic_get(s[1], ck_tile::number<0>{});
+        float o_m = ((threadIdx.x / 8) == 0) ? o_0 : o_1;
+        float o_t = warp_swap_(o_m, threadIdx.x, ck_tile::number<16>{});
+        float o_sorted = warp_bitonic_merge_sort_combine(o_m, o_t, threadIdx.x, 0, ck_tile::number<16>{}, ck_tile::number<1>{});
+        float pivot = __shfl(o_sorted, 7);
 
         int offset = 0;
         final_expid_vec_t cumsum_cnt{0};
@@ -966,8 +957,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             if(s[i] >= pivot && cumsum_cnt[i] <= topk)
             {
                 int expert_id_inside_group = threadIdx.x % experts_per_group___;
-                final_topk_idx[cumsum_cnt[i] - 1] =
-                    remapped_group_ids[i] * experts_per_group___ + expert_id_inside_group;
+                final_topk_idx[cumsum_cnt[i] - 1] = e[i] ;
                 topk_values[cumsum_cnt[i] - 1] = s[i];
             }
         }
