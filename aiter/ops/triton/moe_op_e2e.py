@@ -4,7 +4,7 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
@@ -292,7 +292,7 @@ def e2e_moe_kernel(
     silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
     acc = (silu_acc * mul_acc).to(dtype)
 
-    # online quantization for acc
+    # TODO online quantization for acc
     if use_fp8_w8a8:
         acc_scale = 1.0
         acc = acc.to(compute_type)
@@ -347,8 +347,6 @@ def e2e_moe_kernel(
                 out = tl.dot(acc, w2)
         else:
             out = tl.dot(acc, w2)
-
-        
 
         if MUL_ROUTED_WEIGHT:
             moe_weight = tl.load(
@@ -655,6 +653,7 @@ def e2e_moe(
     top_k: int,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
+    block_shape: Optional[List[int]] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
@@ -668,29 +667,25 @@ def e2e_moe(
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
-    # if use_fp8_w8a8:
-    #     assert W1_scale is not None
-    #     assert W2_scale is not None
-    #     if block_shape is None:
-    #         output = torch.zeros(A.shape, device=A.device, dtype=torch.float8_e4m3fnuz)
-    #         A_scale = torch.zeros(1, device=A.device, dtype=torch.float32)
-    #         A, A_scale = _MOE_A_QUANT_FUNC(output, A, A_scale)
-    #     else:
-    #         #TODO: Add support for per token group quantization
-    #         assert len(block_shape) == 2
-    #         block_n, block_k = block_shape[0], block_shape[1]
-    #         #A, A_scale = per_token_group_quant_fp8(A, block_k)
-    #         assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
-    #         assert triton.cdiv(W1.shape[-2], block_n) == B_scale.shape[-2]
-    #         assert triton.cdiv(W1.shape[-1], block_k) == B_scale.shape[-1]
-    # elif use_int8_w8a16 or use_int4_w4a16:
-    #     assert W1_scale is not None
-    #     assert W2_scale is not None
-    #     assert block_shape is None or block_shape[0] == 0
-    # else:
-    #     assert A_scale is None
-    #     assert W1_scale is None
-    #     assert W2_scale is None
+    if use_fp8_w8a8:
+        assert W1_scale is not None
+        assert W2_scale is not None
+        if block_shape is None:
+            output = torch.zeros(A.shape, device=A.device, dtype=torch.float8_e4m3fnuz)
+            A_scale = torch.zeros(1, device=A.device, dtype=torch.float32)
+            A, A_scale = _MOE_A_QUANT_FUNC(output, A, A_scale)
+        else:
+            #TODO: Add support for per token group quantization
+            assert len(block_shape) == 2
+            block_n, block_k = block_shape[0], block_shape[1]
+            #A, A_scale = per_token_group_quant_fp8(A, block_k)
+            assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
+            assert triton.cdiv(W1.shape[-2], block_n) == B_scale.shape[-2]
+            assert triton.cdiv(W1.shape[-1], block_k) == B_scale.shape[-1]
+    else:
+        assert A_scale is None
+        assert W1_scale is None
+        assert W2_scale is None
 
     EM = sorted_token_ids.shape[0]
     if A.shape[0] < config["BLOCK_SIZE_M"]:
