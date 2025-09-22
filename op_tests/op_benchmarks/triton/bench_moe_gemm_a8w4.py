@@ -71,7 +71,7 @@ def compute_roofline(*args, \
 
 
 def check_and_swizzle_scales(scale, N, K):
-    if N % 32 == 0 or K % (32 * 8) == 0:
+    if N % 32 == 0 and K % (32 * 8) == 0:
         scale = swizzle_scales(scale)
         return scale, "CDNA4_SCALE"
     else:
