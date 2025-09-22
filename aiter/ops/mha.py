@@ -40,6 +40,10 @@ def cmdGenFunc_mha_fwd(
     elif q.dtype == dtypes.bf16:
         md_name += "_bf16"
         filter += "bf16*"
+    elif q.dtype == dtypes.fp8:
+        # only support bf16 out for fp8 input
+        md_name += "_fp8bf16"
+        filter += "fp8bf16*"
     if bias is not None:
         md_name += "_bias"
         filter += "_bias*"
@@ -176,7 +180,7 @@ def mha_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_fwd_fake_tensors(
@@ -218,7 +222,7 @@ def fmha_v3_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def cmdGenFunc_mha_varlen_fwd(
@@ -258,6 +262,10 @@ def cmdGenFunc_mha_varlen_fwd(
         elif q.dtype == dtypes.bf16:
             md_name += "_bf16"
             filter_fwd += "bf16*"
+        elif q.dtype == dtypes.fp8:
+            # only support bf16 out for fp8 input
+            md_name += "_fp8bf16"
+            filter_fwd += "fp8bf16*"
         if 0.0 < logits_soft_cap:
             md_name += "_logits"
             filter_fwd += "_logits*"
@@ -391,7 +399,7 @@ def gen_mha_varlen_fwd_fake_tensor(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
-) -> List[torch.Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     device = q.device
     dtype = q.dtype
 
@@ -453,7 +461,7 @@ def mha_varlen_fwd(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
-) -> List[torch.Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_varlen_fwd_fake_tensor(
@@ -480,7 +488,7 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
-) -> List[torch.Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
 
     device = q.device
     dtype = q.dtype
@@ -543,7 +551,7 @@ def fmha_v3_varlen_fwd(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
-) -> List[torch.Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def cmdGenFunc_mha_bwd(
@@ -716,7 +724,7 @@ def gen_mha_bwd_fake_tensors(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
 
@@ -747,7 +755,7 @@ def mha_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_bwd_fake_tensors(
@@ -771,7 +779,7 @@ def gen_fmha_v3_bwd_fake_tensors(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
 
@@ -799,7 +807,7 @@ def fmha_v3_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def cmdGenFunc_mha_varlen_bwd(
@@ -987,7 +995,7 @@ def mha_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_varlen_bwd_fake_tensor(
@@ -1053,7 +1061,7 @@ def fmha_v3_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def maybe_contiguous(x):
@@ -1548,7 +1556,24 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
         dv = dv[..., :head_size_v_og]
-        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            dbias,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def flash_attn_func(
@@ -2204,7 +2229,7 @@ def mha_batch_prefill_fake_tensors(
     out: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_heads = q.size(1)  # num_heads = q.sizes()[1]
     head_size_v = v.size(2)  # head_size_v = v.size(2)
@@ -2269,7 +2294,7 @@ def mha_batch_prefill(
     out: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def _mha_batch_prefill(
@@ -2379,3 +2404,85 @@ def mha_batch_prefill_func(
         result.append(S_dmask)
 
     return result[0] if len(result) == 1 else tuple(result)
+
+
+def flash_attn_fp8_pertensor_func(
+    q,
+    k,
+    v,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softmax_scale=None,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    head_size_q_og = q.size(3)
+    head_size_v_og = v.size(3)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+    out_padded, _, _, _ = _flash_attn_forward(
+        q,
+        k,
+        v,
+        0.0,
+        softmax_scale,
+        causal=causal,
+        window_size_left=int(window_size[0]),
+        window_size_right=int(window_size[1]),
+        bias=None,
+        alibi_slopes=None,
+        return_lse=False,
+        return_softmax=False,
+    )
+    out = out_padded[..., :head_size_v_og]
+    return out
+
+
+def flash_attn_varlen_fp8_pertensor_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    min_seqlen_q=0,
+    logits_soft_cap=0.0,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softmax_scale=None,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    head_size_q_og = q.size(-1)
+    head_size_v_og = v.size(-1)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+    out_padded, _, _, _ = _flash_attn_varlen_forward(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        min_seqlen_q,
+        0.0,
+        softmax_scale,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        window_size_left=int(window_size[0]),
+        window_size_right=int(window_size[1]),
+        bias=None,
+        alibi_slopes=None,
+        return_lse=False,
+        return_softmax=False,
+    )
+    out = out_padded[..., :head_size_v_og]
+    return out

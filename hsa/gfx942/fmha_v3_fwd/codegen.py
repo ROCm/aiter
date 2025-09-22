@@ -232,7 +232,8 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
             if ((t.bias_type == bias_enum::no_bias) && (t.has_dropout == false) &&
                     (a.hdim_q == 128) && (a.hdim_q == a.hdim_v)) {
                 if (t.is_group_mode == false) {
-                    if (t.mask_type == mask_enum::mask_bottom_right) {
+                    if ((t.mask_type == mask_enum::mask_bottom_right || (a.seqlen_q == a.seqlen_k && t.mask_type == mask_enum::mask_top_left)) &&
+                            ((a.window_size_left == -1) && (a.window_size_right == 0))) {
                         if (t.how_v3_bf16_cvt == 0) {
                             if (t.has_lse == false) {
                                 using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 0, GPUArch::gfx942, 0>;

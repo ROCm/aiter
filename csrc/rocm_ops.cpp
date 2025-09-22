@@ -21,6 +21,7 @@
 #include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
 #include "gemm_a8w8_bpreshuffle.h"
+#include "gemm_common.h"
 #include "hipbsolgemm.cuh"
 #include "moe_ck.h"
 #include "moe_op.h"
@@ -53,6 +54,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     // GEMM_A8W8_TUNE_PYBIND;
     AITER_ENUM_PYBIND;
     RMSNORM_PYBIND;
+    GEMM_COMMON_PYBIND;
     // MHA_VARLEN_FWD_PYBIND;
     // MHA_VARLEN_BWD_PYBIND;
     // MHA_FWD_PYBIND;

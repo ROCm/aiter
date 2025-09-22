@@ -76,21 +76,24 @@ static CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, Q
     else if ((inp.scalar_type() == torch_fp8) &&
              (w1.scalar_type() == torch_fp8) &&
              out.scalar_type() == at::ScalarType::BFloat16 &&
-             quant_type == QuantType::per_Token)
+             quant_type == QuantType::per_Token && 
+             !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenFp8_g1u1;
     }
     else if (inp.scalar_type() == at::ScalarType::Char &&
              w1.scalar_type() == at::ScalarType::Char &&
              out.scalar_type() == at::ScalarType::BFloat16 &&
-             quant_type == QuantType::per_Token)
+             quant_type == QuantType::per_Token && 
+             !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenInt8_g1u1;
     }
     else if ((inp.scalar_type() == torch_fp8) &&
              (w1.scalar_type() == torch_fp8) &&
              (out.scalar_type() == torch_fp8) &&
-             quant_type == QuantType::per_1x128)
+             quant_type == QuantType::per_1x128 && 
+             !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1;
     }

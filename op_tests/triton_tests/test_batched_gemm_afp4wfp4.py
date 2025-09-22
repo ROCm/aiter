@@ -1,7 +1,7 @@
 import torch
 import pytest
 from aiter.ops.triton.batched_gemm_afp4wfp4 import batched_gemm_afp4wfp4
-import aiter.ops.triton.utils.arch_info as arch_info
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 from typing import Union
 
 # Note this is specified by the HW and cannot be changed.
