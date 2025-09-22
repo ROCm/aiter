@@ -5,7 +5,7 @@ import os
 import sys
 import shutil
 
-from setuptools import setup
+from setuptools import Distribution, setup
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
@@ -206,6 +206,12 @@ setup_requires = [
 if PREBUILD_KERNELS == 1:
     setup_requires.append("pandas")
 
+
+class ForcePlatlibDistribution(Distribution):
+    def has_ext_modules(self):
+        return True
+
+
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
@@ -230,6 +236,7 @@ setup(
         "psutil",
     ],
     setup_requires=setup_requires,
+    distclass=ForcePlatlibDistribution,
 )
 
 if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
