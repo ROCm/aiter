@@ -53,6 +53,30 @@ __device__ constexpr T cross_wave_reduce(T local, F reduce_op, T* smem)
 //     return v_local;
 // }
 
+template <typename T, int thread_num, int warp_size = 64>
+__device__ inline T thread_broadcast(T val, int idx)
+{
+    constexpr int words_no = (sizeof(T) + sizeof(int) - 1) / sizeof(int);
+    struct V
+    {
+        int words[words_no];
+    };
+    auto a = __builtin_bit_cast(V, val);
+#pragma unroll
+    for(int j = 0; j < warp_size / thread_num; j++)
+    {
+        if(threadIdx.x / thread_num == j)
+        {
+#pragma unroll
+            for(int i = 0; i < words_no; i++)
+            {
+                a.words[i] = __builtin_amdgcn_readlane(a.words[i], idx + j * thread_num);
+            }
+        }
+    }
+    return __builtin_bit_cast(T, a);
+}
+
 // copied from
 // https://github.com/ROCm/rocPRIM/blob/3b6802d397c4e5266bb6ba7ea8c924d239288608/rocprim/include/rocprim/warp/detail/warp_reduce_dpp.hpp
 template <typename T, typename F, int WarpSize = 64, bool threadBroadcast = true>
@@ -102,11 +126,12 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
     {
         // Read the result from the last lane of the logical warp
         local = rocprim::warp_shuffle(local, WarpSize - 1, WarpSize);
+        // local = thread_broadcast<T, WarpSize, WarpSize>(local, WarpSize - 1);
     }
     return local;
 }
 
-template <typename T, typename F, bool threadBroadcast = true>
+template <typename T, typename F, int WarpSize = 64, bool threadBroadcast = true>
 __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
 {
     if(thread_num == 1)
@@ -126,23 +151,14 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
     {
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x114, 0xf, 0xa>(data), data);
-        if constexpr(threadBroadcast)
-        {
-            data = rocprim::warp_shuffle(data, thread_num - 1, thread_num);
-            // data = rocprim::detail::warp_move_dpp<T, 0x104, 0xf, 0x5>(data);
-        }
+        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(data), data);
     }
     else if(thread_num == 16)
     {
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x124>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x128>(data), data);
-        if constexpr(threadBroadcast)
-        {
-            data = rocprim::warp_shuffle(data, thread_num - 1, thread_num);
-        }
+        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(data), data);
+        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x140>(data), data);
     }
     else if(thread_num == 32)
     {
@@ -154,6 +170,7 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
         if constexpr(threadBroadcast)
         {
             data = rocprim::warp_shuffle(data, thread_num - 1, thread_num);
+            // data = thread_broadcast<T, 32, WarpSize>(data, thread_num - 1);
         }
     }
     else if(thread_num == 64)
@@ -167,6 +184,7 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
         if constexpr(threadBroadcast)
         {
             data = rocprim::warp_shuffle(data, thread_num - 1, thread_num);
+            // data = thread_broadcast<T, 64, WarpSize>(data, thread_num - 1);
         }
     }
 

@@ -87,7 +87,7 @@ def worker(
         #    print("The output is None, can't match with reference")
         us = float("inf")
         max_err_ratio = 1.0
-    return info, us, max_err_ratio
+    return info, us, round(max_err_ratio, 4)
 
 
 def get_pid():

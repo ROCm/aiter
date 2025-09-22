@@ -42,12 +42,12 @@ def _detect_native() -> list[str]:
 
 @torch_compile_guard()
 def get_gfx_custom_op() -> int:
-    gfx = os.getenv("GPU_ARCHS", "native")
-    return get_gfx_custom_op_core(gfx)
+    return get_gfx_custom_op_core()
 
 
 @functools.lru_cache(maxsize=10)
-def get_gfx_custom_op_core(gfx: str) -> int:
+def get_gfx_custom_op_core() -> int:
+    gfx = os.getenv("GPU_ARCHS", "native")
     gfx_mapping = {v: k for k, v in GFX_MAP.items()}
     # gfx = os.getenv("GPU_ARCHS", "native")
     if gfx == "native":
