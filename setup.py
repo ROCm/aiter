@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
-import sys
 import shutil
+import sys
 
 from setuptools import setup
 
@@ -16,6 +16,10 @@ from jit.utils.cpp_extension import (
     BuildExtension,
     IS_HIP_EXTENSION,
 )
+from multiprocessing import Pool
+
+from jit import core
+from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 PACKAGE_NAME = "aiter"
@@ -135,7 +139,7 @@ setup(
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     install_requires=[
-        "pybind11>=2.13,<3",
+        "pybind11>=2.13",
         # "ninja",
         "pandas",
         "einops",
