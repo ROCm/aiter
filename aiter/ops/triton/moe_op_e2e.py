@@ -71,23 +71,28 @@ def e2e_moe_kernel(
     stride_w2n,
     stride_w2k,
     stride_cm,
+    stride_asm,
+    stride_ask,
     stride_w1se,
     stride_w1sn,
+    stride_w1sk,
     stride_w2se,
     stride_w2sk,
+    stride_w2sn,
     top_k: tl.constexpr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
     num_valid_tokens,
+    group_n,
+    group_k,
     EM: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
     EVEN_K: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
-    use_int8_w8a16: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K1: tl.constexpr,  # original block_size_k
@@ -98,6 +103,7 @@ def e2e_moe_kernel(
     dtype: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     SKINNY: tl.constexpr,
+    compute_type: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -137,11 +143,13 @@ def e2e_moe_kernel(
     tl.assume(stride_w2n > 0)
     tl.assume(stride_w2k > 0)
     tl.assume(stride_cm > 0)
-    if use_int8_w8a16:
+    if use_fp8_w8a8:
         tl.assume(stride_w1se > 0)
         tl.assume(stride_w1sn > 0)
+        tl.assume(stride_w1sk > 0)
         tl.assume(stride_w2se > 0)
         tl.assume(stride_w2sk > 0)
+        tl.assume(stride_w2sn > 0)
     pid = tl.program_id(axis=0)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
@@ -202,6 +210,28 @@ def e2e_moe_kernel(
     silu_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=tl.float32)
     mul_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=tl.float32)
 
+    # if use_int8_w8a16:
+    #     b_scale_ptrs = (
+    #         b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+    #     )
+    #     b_scale = tl.load(b_scale_ptrs)
+
+    if use_fp8_w8a8:
+        if group_k > 0 and group_n > 0:
+            a_scale_ptrs = A_scale + (offs_token // top_k) * stride_asm
+            offs_w1_i0_sn = i0 // group_n
+            offs_w1_i1_sn = i1 // group_n
+
+            w1_i0_scale_ptrs = (
+                W1_scale + off_experts * stride_w1se + offs_w1_i0_sn * stride_w1sn
+            )
+            w1_i1_scale_ptrs = (
+                W1_scale + off_experts * stride_w1se + offs_w1_i1_sn * stride_w1sn
+            )
+        else:
+            a_scale = tl.load(A_scale)
+            w1_scale = tl.load(W1_scale + off_experts)
+
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K1)):
         # Masking ensures we don't load from invalid tokens or indices
         if EVEN_K:
@@ -225,16 +255,48 @@ def e2e_moe_kernel(
                 other=0.0,
             )
         
-        mul_acc = tl.dot(a, w1_i1, acc=mul_acc)
-        silu_acc = tl.dot(a, w1_i0, acc=silu_acc)
+        if use_fp8_w8a8:
+            if group_k > 0 and group_n > 0:
+                k_start = k * BLOCK_SIZE_K1
+                offs_ks = k_start // group_k
+                a_scale = tl.load(
+                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                )
+                w1_i0_scale = tl.load(w1_i0_scale_ptrs + offs_ks * stride_w1sk)
+                w1_i1_scale = tl.load(w1_i1_scale_ptrs + offs_ks * stride_w1sk)
+
+                silu_acc += tl.dot(a, w1_i0) * a_scale[:, None] * w1_i0_scale[None, :]
+                mul_acc += tl.dot(a, w1_i1) * a_scale[:, None] * w1_i1_scale[None, :]
+            else:
+                mul_acc = tl.dot(a, w1_i1, acc=mul_acc)
+                silu_acc = tl.dot(a, w1_i0, acc=silu_acc)
+        else:        
+            mul_acc = tl.dot(a, w1_i1, acc=mul_acc)
+            silu_acc = tl.dot(a, w1_i0, acc=silu_acc)
 
         a_ptrs += BLOCK_SIZE_K1 * stride_ak
         w1_ptrs_i0 += BLOCK_SIZE_K1 * stride_w1k
         w1_ptrs_i1 += BLOCK_SIZE_K1 * stride_w1k
+    
+    if use_fp8_w8a8:
+        if group_k > 0 and group_n > 0:
+            silu_acc = silu_acc.to(compute_type)
+            mul_acc = mul_acc.to(compute_type)
+        else:
+            silu_acc = (silu_acc * a_scale * w1_scale).to(compute_type)
+            mul_acc = (mul_acc * a_scale * w1_scale).to(compute_type)
+    else:
+        silu_acc = silu_acc.to(compute_type)
+        mul_acc = mul_acc.to(compute_type)
 
     silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
     acc = (silu_acc * mul_acc).to(dtype)
 
+    # online quantization for acc
+    if use_fp8_w8a8:
+        acc_scale = 1.0
+        acc = acc.to(compute_type)
+    
     offs_w2n = tl.arange(0, BLOCK_SIZE_N // 2) + pid_n * (BLOCK_SIZE_N // 2)
 
     w2_ptrs = (
@@ -242,6 +304,16 @@ def e2e_moe_kernel(
         + off_experts * stride_w2e
         + (offs_k2[None, :] * stride_w2k + offs_w2n[:, None] * stride_w2n)
     )
+
+    if use_fp8_w8a8:
+        if group_k > 0 and group_n > 0:
+            offs_w2_sn = offs_w2n // group_n
+            w2_scale_ptrs = (
+                W1_scale + off_experts * stride_w1se + offs_w1_i0_sn * offs_w2_sn
+            )
+        else:
+            w2_scale = tl.load(W2_scale + off_experts)
+    
     out_ptrs = Out + stride_cm * offs_token[:, None] + offs_k2[None, :]
 
     num_k = tl.cdiv(K, BLOCK_SIZE_K2)
@@ -263,13 +335,35 @@ def e2e_moe_kernel(
                 other=0.0,
             )
 
-        out = tl.dot(acc, w2)
+        if use_fp8_w8a8:
+            if group_k > 0 and group_n > 0:
+                k_start = k * BLOCK_SIZE_K2
+                offs_ks = k_start // group_k
+
+                w2_scale = tl.load(w2_scale_ptrs + offs_ks * stride_w2sk)
+
+                out = tl.dot(acc, w2) * acc_scale * w2_scale[None, :]
+            else:
+                out = tl.dot(acc, w2)
+        else:
+            out = tl.dot(acc, w2)
+
+        
 
         if MUL_ROUTED_WEIGHT:
             moe_weight = tl.load(
                 topk_weights_ptr + offs_token, mask=token_mask, other=0
             )
             out = out * moe_weight[:, None]
+
+        if use_fp8_w8a8:
+            if group_k > 0 and group_n > 0:
+                accumulator = accumulator.to(compute_type)
+            else:
+                accumulator = (accumulator * acc_scale * w2_scale).to(compute_type)
+        else:
+            accumulator = accumulator.to(compute_type)
+
 
         if EVEN_K:
             c_mask = token_mask[:, None]
