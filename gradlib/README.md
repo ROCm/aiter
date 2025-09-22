@@ -21,10 +21,10 @@ By gradlib, we can confirm the parameter of GEMMs with best performance in the s
    `
 
     then shapes will be captured in aiter/configs/untuned_gemm.csv
-3. to tune GEMMs in aiter/configs/untuned_gemm.csv,
+2. to tune GEMMs in aiter/configs/untuned_gemm.csv,
    run
    
    ` 
     python3 gradlib/gradlib/gemm_tuner.py --tuned_file aiter/configs/tuned_gemm.csv  --input_file aiter/configs/untuned_gemm.csv
    `
-4. then run your test as normal~
+3. then run your test as normal~
