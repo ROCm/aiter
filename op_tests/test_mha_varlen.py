@@ -16,6 +16,7 @@ from aiter.test_mha_common import (
 import pytest
 import argparse
 import time
+import os
 
 
 def run_torch(
@@ -504,8 +505,9 @@ if __name__ == "__main__":
 
     if args.pytest:
         start = time.time()
-        ret = pytest.main(["test_mha_varlen.py"])
+        this_file = os.path.basename(__file__)
+        ret = pytest.main([this_file])
         print(
-            f"the pytest test_mha_varlen.py cost :  {(time.time() - start)}s, the ret is {ret}"
+            f"the pytest {this_file} cost : {(time.time() - start)}s, the ret is {ret}"
         )
         assert ret == 0
