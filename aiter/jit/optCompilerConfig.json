@@ -345,7 +345,7 @@
             "f'{AITER_CSRC_DIR}/ck_tile_gemm_moe_2stages/moe_cktile2stages.cu'",
             "f'{AITER_CSRC_DIR}/pybind/moe_cktile_2stages_pybind.cu'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": ["'-std=c++20'"],
         "flags_extra_hip": [],
         "md_name": "'module_moe_cktile2stages'",
         "extra_ldflags": "None",

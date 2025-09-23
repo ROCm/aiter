@@ -168,7 +168,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                                               has_hot_loop_v,
                                                               tail_number_v>>;
 
-        constexpr int BlockedXDLN_PerWarp = (MXFP4_Pipeline || (moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up)) ? 2 : 1; // determined by scale shuffle pattern
+        constexpr int BlockedXDLN_PerWarp = 2; // (MXFP4_Pipeline || (moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up)) ? 2 : 1; // determined by scale shuffle pattern
 
         using GemmEpilogue = ck_tile::CShuffleEpilogue<
             ck_tile::CShuffleEpilogueProblem<ComputeDataType,
@@ -179,7 +179,6 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                              DsLayout,
                                              ELayout,
                                              CDEElementWise,
-                                             CodegenPipelineProblem::kBlockSize,
                                              TilePartitioner::MPerBlock,
                                              TilePartitioner::NPerBlock,
                                              FlatmmConfig::M_Warp,
@@ -199,7 +198,6 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
             MXFP4_Pipeline,
             ck_tile::F16xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>,
             ck_tile::MoeFlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>;
-
         using FusedAct =
             std::conditional_t<MXFP4_Pipeline, ck_tile::moe::Swiglu, ck_tile::moe::MoeSilu>;
 

@@ -163,10 +163,10 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
     }
     else if ((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) && (WQ.dtype() == at::ScalarType::Byte)) //a16w4
     {
-        // if (Y.dtype() == at::ScalarType::Half)
-        // {
-        //    moe_dispatch<fp16, pk_fp4, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
-        // }
+        if (Y.dtype() == at::ScalarType::Half)
+        {
+           moe_dispatch<fp16, pk_fp4, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
+        }
         if (Y.dtype() == at::ScalarType::BFloat16)
         {
             moe_dispatch<bf16, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
