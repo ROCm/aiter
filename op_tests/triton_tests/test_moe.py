@@ -341,8 +341,8 @@ def quantize_fp8(
         e, n, k = tensor.shape
         # Reshape to merge the second and third dimensions (n direction)
         # and the fourth and fifth dimensions (k direction)
-        tensor = tensor.reshape(e, block_shape_n, n // block_shape_n, block_shape_k, k // block_shape_k)
-        tensor = tensor.permute(0, 1, 3, 2, 4)
+        tensor = tensor.reshape(e, n // block_shape_n, block_shape_n, k // block_shape_k, block_shape_k)
+        tensor = tensor.permute(0, 2, 4, 1, 3)
         tensor = tensor.reshape(e, block_shape_n * block_shape_k, n // block_shape_n, k // block_shape_k)
         max_vals = torch.max(tensor, 1, keepdim=True).values
     else:
@@ -361,7 +361,7 @@ def quantize_fp8(
 
     if use_block_scale:
         tensor_quantized = tensor_quantized.reshape(e, block_shape_n, block_shape_k, n // block_shape_n, k // block_shape_k)
-        tensor_quantized = tensor_quantized.permute(0, 1, 3, 2, 4)
+        tensor_quantized = tensor_quantized.permute(0, 3, 1, 4, 2)
         tensor_quantized = tensor_quantized.reshape(e, n, k)
         scale = scale.reshape(e, n // block_shape_n, k // block_shape_k)
     else:
@@ -372,7 +372,7 @@ def quantize_fp8(
 
 def quantize_fp8_a(
     a: torch.Tensor,
-    block_shape_k=None
+    block_shape_k=1
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M, K = a.shape
     dev = arch_info.get_device()
@@ -381,8 +381,9 @@ def quantize_fp8_a(
     else:
         fp8_type = torch.float8_e4m3fnuz
 
-    a = a.reshape(M, block_shape_k, K // block_shape_k)
-    max_vals = torch.max(a, 1, keepdim=True).values
+    a = a.reshape(M, K // block_shape_k, block_shape_k)
+    a = a.permute(2, 1, 0)
+    max_vals = torch.max(a, 0, keepdim=True).values
     max_repr_val = torch.finfo(fp8_type).max
     max_vals[max_vals == 0] = 1e-8  # Avoid division by zero
 
@@ -393,6 +394,7 @@ def quantize_fp8_a(
     a = a * scale
     a.clamp_(-max_repr_val, max_repr_val)
     tensor_quantized = a.to(fp8_type)
+    tensor_quantized = tensor_quantized.permute(2, 1, 0)
     tensor_quantized = tensor_quantized.reshape(M, K)
 
     scale = scale.reshape(M, K // block_shape_k)
@@ -615,6 +617,7 @@ def input_helper_e2e(
     fp8_w8a8: bool,
     int8_w8a16: bool,
     persistent: bool,
+    block_shape=None,
 ):
     assert not (fp8_w8a8 and int8_w8a16)
 
@@ -626,8 +629,11 @@ def input_helper_e2e(
     w2_scale = None
 
     if fp8_w8a8:
-        w1, _, w1_scale = quantize_fp8(w1, dim=(0,))
-        w2, _, w2_scale = quantize_fp8(w2, dim=(0,))
+        w1, _, w1_scale = quantize_fp8(w1, dim=(0,), block_shape=block_shape)
+        w2, _, w2_scale = quantize_fp8(w2, dim=(0,), block_shape=block_shape)
+        if block_shape is not None:
+            block_shape_k = block_shape[1]
+            a, _, a_scale = quantize_fp8_a(a, block_shape_k)
 
     if int8_w8a16:
         w1, _, w1_scale = quantize_int8(w1, dim=(0,))
