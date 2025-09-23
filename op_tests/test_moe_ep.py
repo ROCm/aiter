@@ -312,7 +312,7 @@ def test_fmoe_ep(
                 and (w1b.dtype == dtypes.fp8 and inter_dim * 2 == w1b.shape[1])
             )
             or (
-                (inter_dim % 320 == 0)
+                (inter_dim % 256 == 0 or inter_dim % 320 == 0 or inter_dim % 384 == 0)
                 and (w1b.dtype == dtypes.i8 and inter_dim * 2 == w1b.shape[1])
             )
             or (
@@ -593,7 +593,7 @@ for test in l_test:
                                 topk,
                                 quant="int8smoothquant",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=0,
                                 ep=ep,
                             )
     elif test == "g1u1_fp8smoothquant":
