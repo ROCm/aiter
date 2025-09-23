@@ -44,23 +44,26 @@ struct mha_bwd_traits : public fmha_bwd_traits
     int how_v3_bf16_cvt;
 };
 
-using mha_bwd_args = fmha_bwd_args;
+// using mha_bwd_args = fmha_bwd_args;
+struct mha_bwd_args : public fmha_bwd_args
+{
+    std::string q_dtype_str;
+    bool is_group_mode;
+    mask_enum mask_type_enum;
+    bias_enum bias_type;
+    bool has_dbias;
+    bool is_store_randval;
+    bool deterministic;
+    bool use_ext_asm;
+    bool is_v3_atomic_fp32;
+    int how_v3_bf16_cvt;
+    const void* seqlen_q_padded;
+    const void* seqlen_k_padded;
+};
 
 // FIXME: use aiter mha_args
 __attribute__((visibility("default"))) float mha_bwd(mha_bwd_args args,
                                                      const ck_tile::stream_config& stream_config,
-                                                     std::string q_dtype_str,
-                                                     bool is_group_mode,
-                                                     mask_enum mask_type,
-                                                     bias_enum bias_type,
-                                                     bool has_dbias,
-                                                     bool is_store_randval,
-                                                     bool deterministic,
-                                                     bool use_ext_asm,
-                                                     bool is_v3_atomic_fp32,
-                                                     int how_v3_bf16_cvt,
-                                                     const void* seqlen_q_padded = nullptr,
-                                                     const void* seqlen_k_padded = nullptr,
                                                      bool is_v3_api_check = false);
 
 struct __attribute__((packed)) fmha_bwd_v3_args
@@ -418,8 +421,6 @@ namespace gfx942 {
 float fmha_bwd_v3(mha_bwd_traits t,
                   mha_bwd_args a,
                   const ck_tile::stream_config& s,
-                  const void* seqlen_q_padded = nullptr,
-                  const void* seqlen_k_padded = nullptr,
                   bool is_v3_api_check = false);
 }
 
@@ -427,8 +428,6 @@ namespace gfx950 {
 float fmha_bwd_v3(mha_bwd_traits t,
                   mha_bwd_args a,
                   const ck_tile::stream_config& s,
-                  const void* seqlen_q_padded = nullptr,
-                  const void* seqlen_k_padded = nullptr,
                   bool is_v3_api_check = false);
 }
 } // namespace aiter
