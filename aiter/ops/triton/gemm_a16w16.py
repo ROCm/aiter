@@ -15,6 +15,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -78,9 +79,7 @@ def _gemm_a16_w16_kernel(
 
     acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
     if ADD_BIAS:
-        accumulator = tl.load(bias_ptr + offs_bn).to(
-            dtype=acc_dtype
-        )
+        accumulator = tl.load(bias_ptr + offs_bn).to(dtype=acc_dtype)
         accumulator = tl.broadcast_to(
             accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
         )
@@ -150,6 +149,7 @@ def _get_config(
             return _get_config._config_dict[key][f"M_LEQ_{bound}"]
     return _get_config._config_dict[key]["any"]
 
+
 def gemm_a16w16(
     x,
     w,
@@ -175,7 +175,7 @@ def gemm_a16w16(
     _LOGGER.info(f"GEMM_A16W16: x={tuple(x.shape)} w={tuple(w.shape)}")
     # Shape checks
     assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
-    
+
     M, K = x.shape
     N, K = w.shape
     w = w.T
@@ -183,7 +183,7 @@ def gemm_a16w16(
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if config is None:
-       config = _get_config(M, N, K)
+        config = _get_config(M, N, K)
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
