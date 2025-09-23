@@ -12,10 +12,9 @@ import aiter
 # TEST_NUM_ITERS = 10
 TEST_NUM_ITERS = 100
 
-if 1:
-    _path = os.path.abspath(os.path.dirname(__file__))
-    sys.path.insert(0, f"{_path}/../../")
-    from aiter.tuned_gemm import tgemm
+_path = os.path.abspath(os.path.dirname(__file__))
+sys.path.insert(0, f"{_path}/../../")
+from aiter.tuned_gemm import tgemm
 
 
 @perftest(num_iters=101, num_warmup=50,needTrace=True)
