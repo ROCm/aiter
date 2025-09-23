@@ -505,7 +505,8 @@ if __name__ == "__main__":
 
     if args.pytest:
         start = time.time()
-        this_file = os.path.basename(__file__)
+        this_file = os.path.realpath(__file__)
+        print(this_file)
         ret = pytest.main([this_file])
         print(
             f"the pytest {this_file} cost : {(time.time() - start)}s, the ret is {ret}"
