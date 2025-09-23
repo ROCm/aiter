@@ -54,7 +54,7 @@ def e2e_moe(
     W1: torch.Tensor,
     W2: torch.Tensor,
     Intermediate: torch.Tensor,
-    C: torch.Tensor,
+    Out: torch.Tensor,
     A_scale: Optional[torch.Tensor],
     W1_scale: Optional[torch.Tensor],
     W2_scale: Optional[torch.Tensor],
@@ -80,6 +80,9 @@ def e2e_moe(
     )
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+
+    print("use_fp8_w8a8",use_fp8_w8a8)
+    print("a_scale",A_scale)
 
     if use_fp8_w8a8:
         assert W1_scale is not None
@@ -120,7 +123,7 @@ def e2e_moe(
     else:
         atomic_num_stages = 1
 
-    stride_cm = C.stride(1)
+    stride_om = Out.stride(1)
     if _USE_MOE_PERSISTENT_KERNEL:
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count * 2
         # TODO add N_split support to get more parallelism
@@ -135,7 +138,7 @@ def e2e_moe(
             W1,
             W2,
             Intermediate,
-            C,
+            Out,
             A_scale,
             W1_scale,
             W2_scale,
@@ -147,7 +150,7 @@ def e2e_moe(
             W2.stride(0),
             W2.stride(2),
             W2.stride(1),
-            stride_cm,
+            stride_om,
             W1_scale.stride(0) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
             W1_scale.stride(1) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
             W2_scale.stride(0) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
@@ -172,14 +175,15 @@ def e2e_moe(
             **config,
         )
 
-        return C
+        return Out
     else:
         grid = lambda META: (  # noqa: E731
             triton.cdiv(EM, META["BLOCK_SIZE_M"])
             * triton.cdiv(W1.shape[1], META["BLOCK_SIZE_N"]),
         )
-        dtype = C.dtype
-        Out = C.to(torch.float32) if dtype == torch.bfloat16 else C
+        dtype = W1.dtype # input dtype
+        out_dtype = Out.dtype
+        # Out = Out.to(torch.float32) if dtype == torch.bfloat16 else Out
 
         SKINNY = config["BLOCK_SIZE_N"] >= N
 
@@ -199,7 +203,7 @@ def e2e_moe(
             W2.stride(0),
             W2.stride(2),
             W2.stride(1),
-            stride_cm,
+            stride_om,
             A_scale.stride(0) if A_scale is not None else 0,
             A_scale.stride(1) if A_scale is not None else 0,
             W1_scale.stride(0) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
@@ -214,7 +218,8 @@ def e2e_moe(
             expert_ids,
             num_tokens_post_padded,
             topk_ids.numel(),
-            0,0, # group n and k
+            block_shape[0] if block_shape is not None else 0,
+            block_shape[1] if block_shape is not None else 0, # group n and k
             EM,
             N,
             K,
@@ -222,10 +227,11 @@ def e2e_moe(
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             use_fp8_w8a8=use_fp8_w8a8,
             atomic_num_stages=atomic_num_stages,
-            dtype=torch_to_triton_dtype[dtype],
             NUM_XCDS=get_num_xcds(),
             SKINNY=SKINNY,
-            compute_type=torch_to_triton_dtype[torch.float32],
+            dtype=torch_to_triton_dtype[dtype], # input dtype, mma dtype
+            compute_dtype=torch_to_triton_dtype[torch.float32], # activation dtype
+            out_dtype=torch_to_triton_dtype[out_dtype],
             **config,
         )
 

@@ -62,10 +62,12 @@ def e2e_moe_kernel(
     GROUP_SIZE_M: tl.constexpr,
     GRID_MN: tl.constexpr,
     atomic_num_stages: tl.constexpr,
-    dtype: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     SKINNY: tl.constexpr,
-    compute_type: tl.constexpr,
+    dtype: tl.constexpr,
+    compute_dtype: tl.constexpr,
+    out_dtype: tl.constexpr,
+    IS_BLOCKSCALEQ: tl.constexpr = True
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -172,14 +174,10 @@ def e2e_moe_kernel(
     silu_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=tl.float32)
     mul_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=tl.float32)
 
-    # if use_int8_w8a16:
-    #     b_scale_ptrs = (
-    #         b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
-    #     )
-    #     b_scale = tl.load(b_scale_ptrs)
+    # IS_BLOCKSCALEQ: tl.constexpr = (group_k > 0) & (group_n > 0)
 
     if use_fp8_w8a8:
-        if group_k > 0 and group_n > 0:
+        if IS_BLOCKSCALEQ:
             a_scale_ptrs = A_scale + (offs_token // top_k) * stride_asm
             offs_w1_i0_sn = i0 // group_n
             offs_w1_i1_sn = i1 // group_n
@@ -218,7 +216,7 @@ def e2e_moe_kernel(
             )
         
         if use_fp8_w8a8:
-            if group_k > 0 and group_n > 0:
+            if IS_BLOCKSCALEQ:
                 k_start = k * BLOCK_SIZE_K1
                 offs_ks = k_start // group_k
                 a_scale = tl.load(
@@ -241,24 +239,25 @@ def e2e_moe_kernel(
         w1_ptrs_i1 += BLOCK_SIZE_K1 * stride_w1k
     
     if use_fp8_w8a8:
-        if group_k > 0 and group_n > 0:
-            silu_acc = silu_acc.to(compute_type)
-            mul_acc = mul_acc.to(compute_type)
+        if IS_BLOCKSCALEQ:
+            silu_acc = silu_acc.to(compute_dtype)
+            mul_acc = mul_acc.to(compute_dtype)
         else:
-            silu_acc = (silu_acc * a_scale * w1_scale).to(compute_type)
-            mul_acc = (mul_acc * a_scale * w1_scale).to(compute_type)
+            silu_acc = (silu_acc * a_scale * w1_scale).to(compute_dtype)
+            mul_acc = (mul_acc * a_scale * w1_scale).to(compute_dtype)
     else:
-        silu_acc = silu_acc.to(compute_type)
-        mul_acc = mul_acc.to(compute_type)
+        silu_acc = silu_acc.to(compute_dtype)
+        mul_acc = mul_acc.to(compute_dtype)
 
 
     silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
-    acc = (silu_acc * mul_acc).to(dtype)
+    acc = silu_acc * mul_acc
 
     # TODO online quantization for acc
     if use_fp8_w8a8:
         acc_scale = 1.0
-        acc = acc.to(compute_type)
+    
+    acc = acc.to(dtype)
     
     offs_w2n = tl.arange(0, BLOCK_SIZE_N // 2) + pid_n * (BLOCK_SIZE_N // 2)
 
@@ -269,10 +268,10 @@ def e2e_moe_kernel(
     )
 
     if use_fp8_w8a8:
-        if group_k > 0 and group_n > 0:
+        if IS_BLOCKSCALEQ:
             offs_w2_sn = offs_w2n // group_n
             w2_scale_ptrs = (
-                W1_scale + off_experts * stride_w1se + offs_w1_i0_sn * offs_w2_sn
+                W2_scale + off_experts * stride_w2se + offs_w2n * offs_w2_sn
             )
         else:
             w2_scale = tl.load(W2_scale + off_experts)
@@ -299,12 +298,14 @@ def e2e_moe_kernel(
             )
 
         if use_fp8_w8a8:
-            if group_k > 0 and group_n > 0:
+            if IS_BLOCKSCALEQ:
                 k_start = k * BLOCK_SIZE_K2
                 offs_ks = k_start // group_k
 
                 w2_scale = tl.load(w2_scale_ptrs + offs_ks * stride_w2sk)
-
+                tl.static_print("acc", acc)
+                tl.static_print("w2", w2)
+                tl.static_print("w2_scale", w2_scale)
                 out = tl.dot(acc, w2) * acc_scale * w2_scale[None, :]
             else:
                 out = tl.dot(acc, w2)
@@ -318,12 +319,12 @@ def e2e_moe_kernel(
             out = out * moe_weight[:, None]
 
         if use_fp8_w8a8:
-            if group_k > 0 and group_n > 0:
-                out = out.to(compute_type)
+            if IS_BLOCKSCALEQ:
+                out = out.to(out_dtype)
             else:
-                out = (out * acc_scale * w2_scale).to(compute_type)
+                out = (out * acc_scale * w2_scale).to(out_dtype)
         else:
-            out = out.to(compute_type)
+            out = out.to(out_dtype)
 
 
         if EVEN_K:
