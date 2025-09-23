@@ -133,6 +133,8 @@ CK_TILE_DEVICE void reduce_lse(
     const int32_t                  seq_idx,
     const int32_t                  reduce_tile_start,
     const int32_t                  reduce_tile_end,
+    const int32_t                  reduce_partial_map_0,
+    const int32_t                  reduce_partial_map_1,
     const int32_t                  num_lse_per_thr,
     const float*                   p_partial_lse_seq_base,
     LocalLse&                      local_lse,
@@ -146,22 +148,57 @@ CK_TILE_DEVICE void reduce_lse(
         // Load thread local LSE and get local max LSE
         float max_lse = -INFINITY;
 
-        #pragma unroll 2
-        for (int32_t i = 0; i < num_lse_per_thr; ++i)
+        const int32_t num_splits = reduce_tile_end - reduce_tile_start;
+        if (num_splits == 2)
         {
-            const int32_t split_idx = i * ck_tile::get_warp_size() + lane_idx;
-            const int32_t tile_idx = reduce_tile_start + split_idx;
-            if (tile_idx < reduce_tile_end)
+            float lse = -INFINITY;
+            if (lane_idx < 2)
             {
-                const int64_t reduce_tile_pos =
-                    params.p_reduce_partial_map[tile_idx] * int64_t(Traits::kNumHeadQ);
-                const float lse = p_partial_lse_seq_base[reduce_tile_pos];
-                local_lse[i] = lse;
+                const int32_t reduce_partial_map = ((lane_idx == 0) ? reduce_partial_map_0 : reduce_partial_map_1);
+                const int64_t reduce_tile_pos = reduce_partial_map * int64_t(Traits::kNumHeadQ);
+                lse = p_partial_lse_seq_base[reduce_tile_pos];
                 max_lse = ck_tile::max(max_lse, lse);
+            }
+            local_lse[0] = lse;
+
+            for (int32_t i = 1; i < num_lse_per_thr; ++i)
+            {
+                local_lse[i] = -INFINITY;
+            }
+        }
+        else
+        {
+            auto cal_lse = [&](const int32_t local_idx) -> float
+            {
+                const int32_t split_idx = local_idx * ck_tile::get_warp_size() + lane_idx;
+                const int32_t tile_idx = reduce_tile_start + split_idx;
+                float lse = -INFINITY;
+                if (tile_idx < reduce_tile_end)
+                {
+                    const int64_t reduce_tile_pos =
+                        params.p_reduce_partial_map[tile_idx] * int64_t(Traits::kNumHeadQ);
+                    lse = p_partial_lse_seq_base[reduce_tile_pos];
+                    max_lse = ck_tile::max(max_lse, lse);
+                }
+                return lse;
+            };
+
+            if (num_splits <= ck_tile::get_warp_size())
+            {
+                local_lse[0] = cal_lse(0);
+
+                for (int32_t i = 1; i < num_lse_per_thr; ++i)
+                {
+                    local_lse[i] = -INFINITY;
+                }
             }
             else
             {
-                local_lse[i] = -INFINITY;
+                #pragma unroll 2
+                for (int32_t local_idx = 0; local_idx < num_lse_per_thr; ++local_idx)
+                {
+                    local_lse[local_idx] = cal_lse(local_idx);
+                }
             }
         }
 
@@ -199,15 +236,15 @@ CK_TILE_DEVICE void reduce_lse(
         }
 
         // Write LSE to LDS
-        #pragma unroll 2
-        for (int32_t i = 0; i < num_lse_per_thr; ++i)
+        int32_t split_idx = lane_idx;
+        int32_t local_idx = 0;
+        do
         {
-            const int32_t split_idx = i * ck_tile::get_warp_size() + lane_idx;
-            if ((reduce_tile_start + split_idx) < reduce_tile_end)
-            {
-                p_lds_lse_scale[split_idx] = expf(local_lse[i] - global_lse);
-            }
+            p_lds_lse_scale[split_idx] = expf(local_lse[local_idx] - global_lse);
+            split_idx += ck_tile::get_warp_size();
+            ++local_idx;
         }
+        while (local_idx < num_lse_per_thr);
     }
 }
 
@@ -318,6 +355,8 @@ __global__ void kn_mla_reduce_v1(
                 seq_idx,
                 reduce_tile_start,
                 reduce_tile_end,
+                reduce_partial_map_0,
+                reduce_partial_map_1,
                 num_lse_per_thr,
                 p_partial_lse_seq_base,
                 local_lse,
