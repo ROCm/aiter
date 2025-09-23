@@ -34,6 +34,7 @@
 #include "rocsolgemm.cuh"
 #include "rope.h"
 #include "smoothquant.h"
+#include "groupnorm.hpp"
 #include <torch/extension.h>
 
 // #include "torch/mha_batch_prefill.h"
@@ -87,6 +88,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     ROPE_GENERAL_FWD_PYBIND;
     ROPE_GENERAL_BWD_PYBIND;
     ROPE_POS_FWD_PYBIND;
+    GROUPNORM_PYBIND;
     // GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND;
     GEMM_A4W4_BLOCKSCALE_PYBIND;
     GEMM_A8W8_BLOCKSCALE_PYBIND;
