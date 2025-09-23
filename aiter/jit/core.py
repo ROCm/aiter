@@ -1,27 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import re
-import os
-import sys
-import shutil
-import time
-import types
-import importlib
 import functools
-import traceback
-from typing import List, Optional, Callable, Any
-import logging
+import importlib
 import json
+import logging
 import multiprocessing
-from packaging.version import parse, Version
+import os
+import re
+import shutil
+import sys
+import time
+import traceback
+import types
+from typing import Any, Callable, List, Optional
+
+from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from torch_guard import torch_compile_guard, is_torch_equal_or_newer  # noqa: E402
+from chip_info import get_gfx
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
-from chip_info import get_gfx
+from torch_guard import is_torch_equal_or_newer, torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
@@ -597,8 +598,9 @@ SPECIAL_OPS_MUTATES_ARGS = {}
 
 def generate_schema(func) -> str:
     import inspect
+    from typing import List, Optional, Union, get_args, get_origin
+
     import torch
-    from typing import Optional, Union, List, get_origin, get_args
 
     sig = inspect.signature(func)
     parameters = []
@@ -797,8 +799,9 @@ def compile_ops(
             def check_args():
                 get_asm_dir()
                 import inspect
-                import typing
                 import re
+                import typing
+
                 import torch
 
                 if not op.__doc__.startswith("Members:"):
@@ -863,42 +866,16 @@ def compile_ops(
 
                 log_args(func, *args, **kwargs)
 
-            import inspect
-
-            sig = inspect.signature(func)
-            params = list(sig.parameters.keys())
-            if loadName in activation_list:
-                activation_index = params.index("activation")
-                args_list = list(args)
-                from aiter import ActivationType, QuantType
-
-                if len(args_list) > activation_index and isinstance(
-                    args_list[activation_index], int
-                ):
-                    args_list[activation_index] = ActivationType(
-                        args_list[activation_index]
-                    )
-                    args = tuple(args_list)
-
-            if loadName in quant_list:
-                quant_index = params.index("quant_type")
-                args_list = list(args)
-                from aiter import ActivationType, QuantType
-
-                if len(args_list) > quant_index and isinstance(
-                    args_list[quant_index], int
-                ):
-                    args_list[quant_index] = QuantType(args_list[quant_index])
-                    args = tuple(args_list)
             return op(*args, **kwargs)
 
         if func.__name__ in NONE_WRAPPED_OP:
             return wrapper
 
         def wrapper_register(func):
+            import inspect
+
             import torch
             import torch.library
-            import inspect
             from torch.library import Library
 
             global aiter_lib
@@ -921,8 +898,9 @@ def compile_ops(
 
         schema = wrapper_register(func)
 
-        import torch
         import inspect
+
+        import torch
 
         sig = inspect.signature(func)
         input_is_tensor = False
