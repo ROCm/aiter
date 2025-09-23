@@ -402,7 +402,7 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=str,
-    default="bf16",
+    default="fp16",
     help="""Data type.
     e.g.: -d bf16""",
 )
