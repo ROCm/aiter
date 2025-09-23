@@ -34,7 +34,8 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    float p_dropout,
                                    std::pair<uint64_t*, uint64_t*> drop_seed_offset,
                                    const std::optional<at::Tensor> &cu_seqlens_q_,
-                                   const std::optional<at::Tensor> &cu_seqlens_kv_)
+                                   const std::optional<at::Tensor> &cu_seqlens_kv_,
+                                   std::string q_dtype_str)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -70,16 +71,8 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
     void *bias_ptr = nullptr;
     ck_tile::index_t stride_bias = 0;
 
-    std::string q_dtype_str;
-    if (q_dtype == at::ScalarType::Half)
-        q_dtype_str = "fp16";
-    else if (q_dtype == at::ScalarType::BFloat16)
-        q_dtype_str = "bf16";
-    else if (isQKVFp8)
-        q_dtype_str = "fp8bf16"; // only support bf16 out for fp8
-    
     bias_enum bias_type = bias_.has_value() ? bias_enum::elementwise_bias :
-        (alibi_slopes_.has_value() ? bias_type = bias_enum::alibi : bias_enum::no_bias);
+        alibi_slopes_.has_value() ? bias_type = bias_enum::alibi : bias_enum::no_bias;
     
     if (bias_.has_value()) {
         auto bias = bias_.value();
@@ -191,6 +184,14 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
 
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+
+    std::string q_dtype_str;
+    if (q_dtype == at::ScalarType::Half)
+        q_dtype_str = "fp16";
+    else if (q_dtype == at::ScalarType::BFloat16)
+        q_dtype_str = "bf16";
+    else if (isQKVFp8)
+        q_dtype_str = "fp8bf16"; // only support bf16 out for fp8
 
     // TODO - support descale
     // TODO - set do_fp8_static_quant to true in fmha_fwd_traits
@@ -340,7 +341,8 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                 p_dropout,
                 drop_seed_offset,
                 cu_seqlens_q_,
-                cu_seqlens_kv_);
+                cu_seqlens_kv_,
+                q_dtype_str);
 
         float t = aiter::mha_fwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
