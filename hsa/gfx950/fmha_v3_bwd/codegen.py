@@ -160,6 +160,7 @@ template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,  
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      0,    false,   false,       false, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd128_bf16_causal_a32"; }; // native gfx950, currently not used
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,      false,      0,     true,    true,       false, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd128_bf16_a16_psskddv"; }; // native gfx950
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      0,     true,    true,       false, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd128_bf16_a32_psskddv"; }; // native gfx950
+template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        3,      false,      0,     true,    true,       false, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd128_bf16_causal_br_a16_psskddv"; }; // native gfx950
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,      false,      0,     true,    true,       false, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd128_bf16_causal_a16_psskddv"; }; // native gfx950
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      0,     true,    true,       false, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd128_bf16_causal_a32_psskddv"; }; // native gfx950
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16,        0,      false,      0,     true,    true,       false, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd128_fp16_a16_psskddv"; }; // native gfx950
@@ -226,6 +227,7 @@ template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,   
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      0,    false,   false,        false,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd128_bf16_causal_a32.co"; };  // native gfx950, currently not used
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,      false,      0,     true,    true,        false,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd128_bf16_a16_psskddv.co"; }; // native gfx950
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      0,     true,    true,        false,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd128_bf16_a32_psskddv.co"; }; // native gfx950
+template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        3,      false,      0,     true,    true,        false,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd128_bf16_causal_br_a16_psskddv.co"; }; // native gfx950
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,      false,      0,     true,    true,        false,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd128_bf16_causal_a16_psskddv.co"; }; // native gfx950
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      0,     true,    true,        false,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd128_bf16_causal_a32_psskddv.co"; }; // native gfx950
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16,        0,      false,      0,     true,    true,        false,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd128_fp16_a16_psskddv.co"; }; // native gfx950
@@ -292,6 +294,7 @@ template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,    
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      0,    false,   false,         false, GPUArch::gfx950>> { static constexpr int ts_qo = 16; static constexpr int ts_kv = 256; };  // native gfx950, currently not used
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,      false,      0,     true,    true,         false, GPUArch::gfx950>> { static constexpr int ts_qo = 16; static constexpr int ts_kv = 256; };  // native gfx950
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      0,     true,    true,         false, GPUArch::gfx950>> { static constexpr int ts_qo = 16; static constexpr int ts_kv = 256; };  // native gfx950
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        3,      false,      0,     true,    true,         false, GPUArch::gfx950>> { static constexpr int ts_qo = 16; static constexpr int ts_kv = 256; };  // native gfx950
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,      false,      0,     true,    true,         false, GPUArch::gfx950>> { static constexpr int ts_qo = 16; static constexpr int ts_kv = 256; };  // native gfx950
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      0,     true,    true,         false, GPUArch::gfx950>> { static constexpr int ts_qo = 16; static constexpr int ts_kv = 256; };  // native gfx950
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16,        0,      false,      0,     true,    true,         false, GPUArch::gfx950>> { static constexpr int ts_qo = 16; static constexpr int ts_kv = 256; };  // native gfx950
@@ -1602,7 +1605,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     return r;
                                 }
                             }
-                        } else if ((t.mask_type != mask_enum::no_mask) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
+                        } else if ((t.mask_type == mask_enum::mask_top_left) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
                             if (t.is_v3_atomic_fp32 == true){
                                 if((a.seqlen_q % 64 == 0) && (a.hdim_q == 128)){
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, false>;
@@ -1663,6 +1666,71 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, true, true>;
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, false, 0, true, true, false, GPUArch::gfx950>;
                                     // const std::string kernel_name = "bwd_hd128_fp16_causal_a16_psskddv";
+                                    r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
+                                    return r;
+                                }
+                            }
+                        } else if ((t.mask_type == mask_enum::mask_bottom_right) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
+                            if (t.is_v3_atomic_fp32 == true){
+                                if((a.seqlen_q % 64 == 0) && (a.hdim_q == 128)){
+                                    using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, false>;
+                                    using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 0, true, true, false, GPUArch::gfx950>;
+                                    using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, false, false, 0>;
+                                    // const std::string kernel_name = "bwd_hd128_fp16_causal_a32_psskddv";
+                                    r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check);
+                                    return r;
+                                }
+                                else if((a.seqlen_q % 64 != 0) && (a.hdim_q == 128)){
+                                    using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, true, false>;
+                                    using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 0, true, true, false, GPUArch::gfx950>;
+                                    using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, false, false, 0>;
+                                    // const std::string kernel_name = "bwd_hd128_fp16_causal_a32_psskddv";
+                                    r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check);
+                                    return r;
+                                }
+                                else if((a.seqlen_q % 64 == 0) && (a.hdim_q != 128)){
+                                    using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, true>;
+                                    using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 0, true, true, false, GPUArch::gfx950>;
+                                    using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, false, true, false, 0>;
+                                    // const std::string kernel_name = "bwd_hd128_fp16_causal_a32_psskddv";
+                                    r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check);
+                                    return r;
+                                }
+                                else if((a.seqlen_q % 64 != 0) && (a.hdim_q != 128)){
+                                    using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, true, true>;
+                                    using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 0, true, true, false, GPUArch::gfx950>;
+                                    using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, false, true, true, false, 0>;
+                                    // const std::string kernel_name = "bwd_hd128_fp16_causal_a32_psskddv";
+                                    r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check);
+                                    return r;
+                                }
+                            }
+                            else if (t.is_v3_atomic_fp32 == false){
+                                if((a.seqlen_q % 64 == 0) && (a.hdim_q == 128)){
+                                    using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, false>;
+                                    using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 3, false, 0, true, true, false, GPUArch::gfx950>;
+                                    // const std::string kernel_name = "bwd_hd128_fp16_causal_br_a16_psskddv";
+                                    r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
+                                    return r;
+                                }
+                                else if((a.seqlen_q % 64 != 0) && (a.hdim_q == 128)){
+                                    using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, true, false>;
+                                    using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 3, false, 0, true, true, false, GPUArch::gfx950>;
+                                    // const std::string kernel_name = "bwd_hd128_fp16_causal_br_a16_psskddv";
+                                    r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
+                                    return r;
+                                }
+                                else if((a.seqlen_q % 64 == 0) && (a.hdim_q != 128)){
+                                    using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, false, true>;
+                                    using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 3, false, 0, true, true, false, GPUArch::gfx950>;
+                                    // const std::string kernel_name = "bwd_hd128_fp16_causal_br_a16_psskddv";
+                                    r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
+                                    return r;
+                                }
+                                else if((a.seqlen_q % 64 != 0) && (a.hdim_q != 128)){
+                                    using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, false, true, true>;
+                                    using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 3, false, 0, true, true, false, GPUArch::gfx950>;
+                                    // const std::string kernel_name = "bwd_hd128_fp16_causal_br_a16_psskddv";
                                     r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                     return r;
                                 }
@@ -1826,18 +1894,33 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
-                        } else if ((t.mask_type != mask_enum::no_mask) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
+                        } else if ((t.mask_type == mask_enum::mask_top_left) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
                             if (t.is_v3_atomic_fp32 == true){
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, true, true, true>;
-                                using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 0, true, true, true, GPUArch::gfx950>;
+                                using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, 3, 0, true, true, true, GPUArch::gfx950>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, true, false, 0>;
-                                // const std::string bwd_v3_name = "bwd_hd128_bf16_causal_a32_psskddv_group";
+                                // const std::string bwd_v3_name = "bwd_hd128_bf16_causal_br_a32_psskddv_group";
                                 r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             } else {
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, true, true, true>;
-                                using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, false, 0, true, true, true, GPUArch::gfx950>;
-                                // const std::string bwd_v3_name = "bwd_hd128_bf16_causal_a16_psskddv_group";
+                                using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, 3, 0, true, true, true, GPUArch::gfx950>;
+                                // const std::string bwd_v3_name = "bwd_hd128_bf16_causal_br_a16_psskddv_group";
+                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
+                                return r;
+                            }
+                        } else if ((t.mask_type == mask_enum::mask_bottom_right) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
+                            if (t.is_v3_atomic_fp32 == true){
+                                using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, true, true, true>;
+                                using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, true, 0, true, true, true, GPUArch::gfx950>;
+                                using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, true, false, 0>;
+                                // const std::string bwd_v3_name = "bwd_hd128_bf16_causal_br_a32_psskddv_group";
+                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
+                                return r;
+                            } else {
+                                using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, true, true, true>;
+                                using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, 2, false, 0, true, true, true, GPUArch::gfx950>;
+                                // const std::string bwd_v3_name = "bwd_hd128_bf16_causal_br_a16_psskddv_group";
                                 r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
