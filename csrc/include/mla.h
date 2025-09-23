@@ -63,7 +63,7 @@ get_mla_metadata_v1_no_redundant(const torch::Tensor& seqlens_qo_indptr, // [bat
 void mla_reduce_v1(const torch::Tensor& partial_output,
                    const torch::Tensor& partial_lse,
                    const torch::Tensor& reduce_indptr,
-                   const torch::Tensor& reduce_final_map,
+                   const std::optional<torch::Tensor>& reduce_final_map,
                    const torch::Tensor& reduce_partial_map,
                    torch::Tensor& final_output,
                    std::optional<torch::Tensor>& final_lse);

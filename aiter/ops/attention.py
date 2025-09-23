@@ -393,7 +393,7 @@ def mla_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
     reduce_indptr: torch.Tensor,
-    reduce_final_map: torch.Tensor,
+    reduce_final_map: Optional[torch.Tensor],
     reduce_partial_map: torch.Tensor,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,

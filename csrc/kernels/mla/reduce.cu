@@ -9,15 +9,19 @@
 
 template <int32_t kSizeDV_,
           int32_t kNumHeadQ_,
-          bool    kOutputLse_>
+          bool    kOutputLse_,
+          bool    kOmitReduceFinalMap_>
 struct MlaReduceKernelV1Traits
 {
-    static constexpr int32_t kSizeDV          = kSizeDV_;       // hidden dimension size of value/output
-    static constexpr int32_t kNumHeadQ        = kNumHeadQ_;     // head count of q
-    static constexpr int32_t kNumWarps        = 2;
-    static constexpr int32_t kNumThreads      = kNumWarps * ck_tile::get_warp_size();
-    static constexpr int32_t kMaxVgprLocalLse = 16;             // scratch buffer will be used with larger value
-    static constexpr bool    kOutputLse       = kOutputLse_;
+    static constexpr int32_t kSizeDV             = kSizeDV_;       // hidden dimension size of value/output
+    static constexpr int32_t kNumHeadQ           = kNumHeadQ_;     // head count of q
+    static constexpr int32_t kNumWarps           = 2;
+    static constexpr int32_t kNumThreads         = kNumWarps * ck_tile::get_warp_size();
+    static constexpr int32_t kMaxVgprLocalLse    = 16;             // scratch buffer will be used with larger value
+    static constexpr bool    kOutputLse          = kOutputLse_;
+    // There is no reduce final map. In this case, qo len is uniform and
+    // implicitly set by reduce_partial_map[1] - reduce_partial_map[0].
+    static constexpr bool    kOmitReduceFinalMap = kOmitReduceFinalMap_;
 };
 
 struct MlaReduceKernelV1Params
@@ -35,6 +39,12 @@ struct MlaReduceKernelV1Params
     int32_t stride_h_o;
     int32_t max_splits;
 };
+
+template <typename T>
+CK_TILE_DEVICE T integer_divide_ceil_power2(T x, T y, T y_log2)
+{
+    return (x + y - 1) >> y_log2;
+}
 
 // Returns count of warps which don't contain any idle thread.
 template <int32_t NumWarps, int32_t M, int32_t N>
@@ -207,6 +217,8 @@ CK_TILE_DEVICE void reduce_output(
     const int32_t                  seq_idx,
     const int32_t                  reduce_tile_start,
     const int32_t                  reduce_tile_end,
+    const int32_t                  reduce_partial_map_0,
+    const int32_t                  reduce_partial_map_1,
     const float*                   p_lds_lse_scale,
     const float*                   p_partial_output_seq_base,
     out_t*                         p_final_out_base)
@@ -217,12 +229,9 @@ CK_TILE_DEVICE void reduce_output(
         decltype(ck_tile::load_tile(oaccu_window))::get_tile_distribution());
     ck_tile::set_tile(reg_out, 0.f);
 
-    for (int32_t tile_idx = reduce_tile_start; tile_idx < reduce_tile_end; ++tile_idx)
+    auto cal_out = [&](const int32_t reduce_partial_map, const int32_t split_idx)
     {
-        const int32_t split_idx = tile_idx - reduce_tile_start;
-
-        const int64_t reduce_tile_pos =
-            params.p_reduce_partial_map[tile_idx] * int64_t(Traits::kNumHeadQ * Traits::kSizeDV);
+        const int64_t reduce_tile_pos = reduce_partial_map * int64_t(Traits::kNumHeadQ * Traits::kSizeDV);
         const float* p_partial_output = p_partial_output_seq_base + reduce_tile_pos;
         oaccu_window.set_bottom_tensor_view_data_ptr(p_partial_output);
 
@@ -231,6 +240,14 @@ CK_TILE_DEVICE void reduce_output(
         ck_tile::sweep_tile(oaccu, [&](auto idx) {
             reg_out(idx) += lse_scale * oaccu(idx);
         });
+    };
+
+    cal_out(reduce_partial_map_0, 0);
+    cal_out(reduce_partial_map_1, 1);
+
+    for (int32_t tile_idx = reduce_tile_start + 2; tile_idx < reduce_tile_end; ++tile_idx)
+    {
+        cal_out(params.p_reduce_partial_map[tile_idx], tile_idx - reduce_tile_start);
     }
 
     out_t* p_final_out = p_final_out_base + seq_idx * params.stride_s_o;
@@ -250,9 +267,24 @@ __global__ void kn_mla_reduce_v1(
     const int32_t reduce_tile_start = params.p_reduce_indptr[work_idx];
     const int32_t reduce_tile_end = params.p_reduce_indptr[work_idx + 1];
 
-    if (reduce_tile_start < reduce_tile_end)
+    // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata should be in charge of
+    // getting rid of this scenaro.
+    if (reduce_tile_start + 1 < reduce_tile_end)
     {
-        const MlaPartialTileInfo final_loc = params.p_reduce_final_map[work_idx];
+        const int32_t reduce_partial_map_0 = params.p_reduce_partial_map[reduce_tile_start];
+        const int32_t reduce_partial_map_1 = params.p_reduce_partial_map[reduce_tile_start + 1];
+        const MlaPartialTileInfo final_loc = [&]()
+        {
+            if constexpr (Traits::kOmitReduceFinalMap)
+            {
+                const int32_t qo_len = reduce_partial_map_1 - reduce_partial_map_0;
+                return MlaPartialTileInfo{work_idx * qo_len, (work_idx + 1) * qo_len};
+            }
+            else
+            {
+                return params.p_reduce_final_map[work_idx];
+            }
+        }();
 
         // Assuming that the layout of LSE final output is in [bs, h].
         // Thus, stride of head is 1 and stride of b/s is #heads.
@@ -267,8 +299,10 @@ __global__ void kn_mla_reduce_v1(
         const float* p_partial_output_base =
             reinterpret_cast<float*>(params.p_partial_output) + head_idx * Traits::kSizeDV;
 
+        static_assert((ck_tile::get_warp_size() & (ck_tile::get_warp_size() - 1)) == 0);
         const int32_t num_lse_per_thr =
-            ck_tile::integer_divide_ceil(params.max_splits, ck_tile::get_warp_size());
+            integer_divide_ceil_power2(
+                params.max_splits, ck_tile::get_warp_size(), __builtin_ctz(ck_tile::get_warp_size()));
 
         for (int32_t seq_idx = final_loc.q_start; seq_idx < final_loc.q_end; ++seq_idx)
         {
@@ -298,6 +332,8 @@ __global__ void kn_mla_reduce_v1(
                 seq_idx,
                 reduce_tile_start,
                 reduce_tile_end,
+                reduce_partial_map_0,
+                reduce_partial_map_1,
                 p_lds_lse_scale,
                 p_partial_output_seq_base,
                 p_final_out_base);
@@ -305,32 +341,45 @@ __global__ void kn_mla_reduce_v1(
     }
 }
 
-#define MLA_MERGE_CASE(NUM_HEAD_C, OUTPUT_LSE_C, NAME, ...)                                                 \
+#define MLA_MERGE_CASE(NUM_HEAD_C, OUTPUT_LSE_C, NO_REDUCE_FINAL_MAP_C, NAME, ...)                          \
     constexpr int32_t NumHeads  = (NUM_HEAD_C);                                                             \
     constexpr bool    OutputLse = (OUTPUT_LSE_C);                                                           \
-    using Traits = MlaReduceKernelV1Traits<512, NumHeads, OutputLse>;                                       \
+    constexpr bool    NoReduceFinalMap = (NO_REDUCE_FINAL_MAP_C);                                           \
+    using Traits = MlaReduceKernelV1Traits<512, NumHeads, OutputLse, NoReduceFinalMap>;                     \
     __VA_ARGS__;
 
-#define MLA_MERGE_CASE_IF(NUM_HEAD, NUM_HEAD_C, OUTPUT_LSE, OUTPUT_LSE_C, NAME, ...)                        \
-    if (((NUM_HEAD) == (NUM_HEAD_C)) && ((OUTPUT_LSE) == (OUTPUT_LSE_C)))                                   \
+#define MLA_MERGE_CASE_IF(NUM_HEAD, NUM_HEAD_C,                                                             \
+                          OUTPUT_LSE, OUTPUT_LSE_C,                                                         \
+                          NO_REDUCE_FINAL_MAP, NO_REDUCE_FINAL_MAP_C,                                       \
+                          NAME, ...)                                                                        \
+    if (((NUM_HEAD) == (NUM_HEAD_C)) &&                                                                     \
+        ((OUTPUT_LSE) == (OUTPUT_LSE_C)) &&                                                                 \
+        ((NO_REDUCE_FINAL_MAP) == (NO_REDUCE_FINAL_MAP_C)))                                                 \
     {                                                                                                       \
-        MLA_MERGE_CASE(NUM_HEAD_C, OUTPUT_LSE_C, NAME, __VA_ARGS__)                                         \
+        MLA_MERGE_CASE(NUM_HEAD_C, OUTPUT_LSE_C, NO_REDUCE_FINAL_MAP_C, NAME, __VA_ARGS__)                  \
     }
 
-#define MLA_MERGE_CASE_EF(NUM_HEAD, NUM_HEAD_C, OUTPUT_LSE, OUTPUT_LSE_C, NAME, ...)                        \
-    else if (((NUM_HEAD) == (NUM_HEAD_C)) && ((OUTPUT_LSE) == (OUTPUT_LSE_C)))                              \
+#define MLA_MERGE_CASE_EF(NUM_HEAD, NUM_HEAD_C,                                                             \
+                          OUTPUT_LSE, OUTPUT_LSE_C,                                                         \
+                          NO_REDUCE_FINAL_MAP, NO_REDUCE_FINAL_MAP_C,                                       \
+                          NAME, ...)                                                                        \
+    else if (((NUM_HEAD) == (NUM_HEAD_C)) &&                                                                \
+             ((OUTPUT_LSE) == (OUTPUT_LSE_C)) &&                                                            \
+             ((NO_REDUCE_FINAL_MAP) == (NO_REDUCE_FINAL_MAP_C)))                                            \
     {                                                                                                       \
-        MLA_MERGE_CASE(NUM_HEAD_C, OUTPUT_LSE_C, NAME, __VA_ARGS__)                                         \
+        MLA_MERGE_CASE(NUM_HEAD_C, OUTPUT_LSE_C, NO_REDUCE_FINAL_MAP_C, NAME, __VA_ARGS__)                  \
     }
 
-#define MLA_MERGE_ERROR(NUM_HEAD, OUTPUT_LSE, NAME)                                                         \
+#define MLA_MERGE_ERROR(NUM_HEAD, OUTPUT_LSE, NO_REDUCE_FINAL_MAP, NAME)                                    \
     {                                                                                                       \
         std::stringstream ss;                                                                               \
-        ss << "#heads: " << (NUM_HEAD) << ", Output LSE: " << (OUTPUT_LSE);                                 \
+        ss << "#heads: " << (NUM_HEAD)                                                                      \
+           << ", Output LSE: " << (OUTPUT_LSE)                                                              \
+           << ", Has reduce final map: " << (NO_REDUCE_FINAL_MAP);                                          \
         TORCH_CHECK(false, NAME " doesn't support the specified settings: ", ss.str().c_str(), ".");        \
     }
 
-#define DISPATCH_MLA_MERGE_KERNEL(LSE_TYPE, OUT_TYPE, NUM_HEAD, OUTPUT_LSE, NAME, ...)                      \
+#define DISPATCH_MLA_MERGE_KERNEL(LSE_TYPE, OUT_TYPE, NUM_HEAD, OUTPUT_LSE, NO_REDUCE_FINAL_MAP, NAME, ...) \
     switch ((LSE_TYPE))                                                                                     \
     {                                                                                                       \
         case at::ScalarType::Float:                                                                         \
@@ -341,21 +390,45 @@ __global__ void kn_mla_reduce_v1(
                 case at::ScalarType::BFloat16:                                                              \
                 {                                                                                           \
                     using out_t = ck_tile::bf16_t;                                                          \
-                    MLA_MERGE_CASE_IF(NUM_HEAD,  16, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
-                    MLA_MERGE_CASE_EF(NUM_HEAD,  16, OUTPUT_LSE, false, NAME, __VA_ARGS__)                  \
-                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
-                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, OUTPUT_LSE, false, NAME, __VA_ARGS__)                  \
-                    else MLA_MERGE_ERROR(NUM_HEAD, OUTPUT_LSE, NAME);                                       \
+                    MLA_MERGE_CASE_IF(                                                                      \
+                        NUM_HEAD,  16, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD,  16, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD, 128, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD, 128, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD,  16, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD,  16, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD, 128, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD, 128, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
+                    else MLA_MERGE_ERROR(NUM_HEAD, OUTPUT_LSE, NO_REDUCE_FINAL_MAP, NAME);                  \
                 }                                                                                           \
                 break;                                                                                      \
                 case at::ScalarType::Half:                                                                  \
                 {                                                                                           \
                     using out_t = ck_tile::fp16_t;                                                          \
-                    MLA_MERGE_CASE_IF(NUM_HEAD,  16, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
-                    MLA_MERGE_CASE_EF(NUM_HEAD,  16, OUTPUT_LSE, false, NAME, __VA_ARGS__)                  \
-                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
-                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, OUTPUT_LSE, false, NAME, __VA_ARGS__)                  \
-                    else MLA_MERGE_ERROR(NUM_HEAD, OUTPUT_LSE, NAME);                                       \
+                    MLA_MERGE_CASE_IF(                                                                      \
+                        NUM_HEAD,  16, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD,  16, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD, 128, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD, 128, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD,  16, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD,  16, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD, 128, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
+                    MLA_MERGE_CASE_EF(                                                                      \
+                        NUM_HEAD, 128, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
+                    else MLA_MERGE_ERROR(NUM_HEAD, OUTPUT_LSE, NO_REDUCE_FINAL_MAP, NAME);                  \
                 }                                                                                           \
                 break;                                                                                      \
                 default:                                                                                    \
@@ -391,13 +464,13 @@ void dispatch_mla_reduce_v1(
 }
 
 void mla_reduce_v1(
-    const torch::Tensor&          partial_output,        // contiguous [max(reduce_partial_map)+s, h, dv]
-    const torch::Tensor&          partial_lse,           // contiguous [max(reduce_partial_map)+s, h]
-    const torch::Tensor&          reduce_indptr,         // contiguous [#work + 1]
-    const torch::Tensor&          reduce_final_map,      // contiguous [#work, 2]
-    const torch::Tensor&          reduce_partial_map,    // contiguous [reduce_indptr[-1]]
-    torch::Tensor&                final_output,          //            [bs, h, dv]
-    std::optional<torch::Tensor>& final_lse)             // contiguous [bs, h]
+    const torch::Tensor&                partial_output,        // contiguous [max(reduce_partial_map)+s, h, dv]
+    const torch::Tensor&                partial_lse,           // contiguous [max(reduce_partial_map)+s, h]
+    const torch::Tensor&                reduce_indptr,         // contiguous [#work + 1]
+    const std::optional<torch::Tensor>& reduce_final_map,      // contiguous [#work, 2]
+    const torch::Tensor&                reduce_partial_map,    // contiguous [reduce_indptr[-1]]
+    torch::Tensor&                      final_output,          //            [bs, h, dv]
+    std::optional<torch::Tensor>&       final_lse)             // contiguous [bs, h]
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(final_output));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -408,6 +481,7 @@ void mla_reduce_v1(
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
 
     const bool output_lse = final_lse.has_value();
+    const bool no_reduce_final_map = (reduce_final_map.has_value() == false);
     const int32_t num_reduce_tile = reduce_indptr.size(0) - 1;
     const int32_t num_heads = partial_output.size(-2);
 
@@ -415,7 +489,8 @@ void mla_reduce_v1(
     {
         MlaReduceKernelV1Params params = {};
         params.p_reduce_indptr = reduce_indptr.data_ptr<int32_t>();
-        params.p_reduce_final_map = reinterpret_cast<const MlaPartialTileInfo*>(reduce_final_map.data_ptr());
+        params.p_reduce_final_map =
+            no_reduce_final_map ? nullptr : reinterpret_cast<const MlaPartialTileInfo*>(reduce_final_map->data_ptr());
         params.p_reduce_partial_map = reduce_partial_map.data_ptr<int32_t>();
         params.p_final_lse = output_lse ? final_lse.value().data_ptr() : nullptr;
         params.p_final_output = final_output.data_ptr();
@@ -430,6 +505,7 @@ void mla_reduce_v1(
             final_output.scalar_type(),
             num_heads,
             output_lse,
+            no_reduce_final_map,
             "kn_mla_reduce_v1",
             dispatch_mla_reduce_v1<Traits, lse_t, out_t>(params, num_reduce_tile, stream)
         );
