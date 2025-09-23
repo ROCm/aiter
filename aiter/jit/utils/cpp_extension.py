@@ -111,9 +111,10 @@ def _find_rocm_home() -> Optional[str]:
             fallback_path = "/opt/rocm"
             if os.path.exists(fallback_path):
                 rocm_home = fallback_path
-    # if rocm_home and torch.version.hip is None:
-    #     print(f"No ROCm runtime is found, using ROCM_HOME='{rocm_home}'",
-    #           file=sys.stderr)
+    if rocm_home is None:
+        print(
+            f"No ROCm runtime is found, using ROCM_HOME='{rocm_home}'", file=sys.stderr
+        )
     return rocm_home
 
 
