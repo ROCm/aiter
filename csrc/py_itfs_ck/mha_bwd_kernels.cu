@@ -10,7 +10,7 @@
 
 namespace aiter {
 namespace torch_itfs {
-mha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
+fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
                                    // sizes
                                    const int b,
                                    const int seqlen_q,
