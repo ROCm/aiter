@@ -12,6 +12,7 @@ from aiter.test_mha_common import (
 )
 import pytest
 import argparse
+import itertools
 
 
 def run_torch(
@@ -301,6 +302,15 @@ def test_flash_attn_output(
         assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
 
 
+l_dtype = ["bf16", "fp16"]
+l_dim = [96, 128]
+l_mha_type = ["mha", "mqa", "gqa"]
+l_causal = [False, True]
+l_local = [False, True]
+l_seq_q = [203, 512]
+l_seq_k = [107, 512]
+l_deterministic = [False, True]
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -317,15 +327,15 @@ parser.add_argument(
     "-n",
     "--nheads",
     type=int,
-    default=5,
-    help="""Number of heads. Default is 5.
+    default=6,
+    help="""Number of heads. Default is 6.
     e.g.: -n 8""",
 )
 parser.add_argument(
     "-q",
     "--seqlen_q",
     type=int,
-    default=512,
+    default=None,
     help="""Sequence length for query. Default is 512.
     e.g.: -q 1024""",
 )
@@ -333,7 +343,7 @@ parser.add_argument(
     "-k",
     "--seqlen_k",
     type=int,
-    default=512,
+    default=None,
     help="""Sequence length for key. Default is 512.
     e.g.: -k 1024""",
 )
@@ -341,7 +351,7 @@ parser.add_argument(
     "-qk",
     "--d_qk",
     type=int,
-    default=128,
+    default=None,
     help="""Dimension of query and key. Default is 128.
     e.g.: -qk 256""",
 )
@@ -349,7 +359,7 @@ parser.add_argument(
     "-v",
     "--d_v",
     type=int,
-    default=128,
+    default=None,
     help="""Dimension of value. Default is 128.
     e.g.: -v 256""",
 )
@@ -365,6 +375,7 @@ parser.add_argument(
     "-c",
     "--causal",
     action="store_true",
+    default=None,
     help="""Causal attention. Default is False.
     -c or --causal    # enable causal attention""",
 )
@@ -372,6 +383,7 @@ parser.add_argument(
     "-l",
     "--local",
     action="store_true",
+    default=None,
     help="""Local attention. Default is False.
     -l or --local    # enable local attention""",
 )
@@ -394,7 +406,7 @@ parser.add_argument(
     "-m",
     "--mha_type",
     type=str,
-    default="mha",
+    default=None,
     help="""Type of multi-head attention.
     e.g.: -m mha""",
 )
@@ -402,25 +414,55 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=str,
-    default="bf16",
+    default=None,
     help="""Data type.
     e.g.: -d bf16""",
 )
 if __name__ == "__main__":
     args = parser.parse_args()
-    dtype = dtypes.d_dtypes[args.dtype]
-    test_flash_attn_output(
-        args.batch_size,
-        args.nheads,
-        args.seqlen_q,
-        args.seqlen_k,
-        args.d_qk,
-        args.d_v,
-        args.dropout_p,
-        args.causal,
-        args.local,
-        args.bias_type,
-        args.deterministic,
-        args.mha_type,
+    if args.dtype is not None:
+        l_dtype = [dtypes.d_dtypes[args.dtype]]
+    else:
+        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+    if args.d_qk is not None:
+        l_dim = [args.d_qk]
+    if args.mha_type is not None:
+        l_mha_type = [args.mha_type]
+    if args.causal is not None:
+        l_causal = [args.causal]
+    if args.local is not None:
+        l_local = [args.local]
+    if args.seqlen_q is not None:
+        l_seq_q = [args.seqlen_q]
+    if args.seqlen_k is not None:
+        l_seq_k = [args.seqlen_k]
+    if args.deterministic is not None:
+        l_deterministic = [args.deterministic]
+
+    for (
         dtype,
-    )
+        dim,
+        mha_type,
+        causal,
+        local,
+        seq_q,
+        seq_k,
+        deterministic,
+    ) in itertools.product(
+        l_dtype, l_dim, l_mha_type, l_causal, l_local, l_seq_q, l_seq_k, l_deterministic
+    ):
+        test_flash_attn_output(
+            args.batch_size,
+            args.nheads,
+            seq_q,
+            seq_k,
+            dim,
+            dim,
+            args.dropout_p,
+            causal,
+            local,
+            args.bias_type,
+            deterministic,
+            mha_type,
+            dtype,
+        )

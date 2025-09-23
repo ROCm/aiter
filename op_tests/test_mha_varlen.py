@@ -15,6 +15,7 @@ from aiter.test_mha_common import (
 )
 import pytest
 import argparse
+import itertools
 
 
 def run_torch(
@@ -382,6 +383,13 @@ def test_flash_attn_varlen_func(
         assert (dv - dv_ref).abs().max().item() <= dv_tol
 
 
+l_dtype = ["bf16", "fp16"]
+l_dim = [96, 128]
+l_mha_type = ["mha", "mqa", "gqa"]
+l_causal = [False, True]
+l_local = [False, True]
+l_deterministic = [False, True]
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -401,7 +409,7 @@ if __name__ == "__main__":
         "--nheads",
         type=int,
         nargs="?",
-        default=4,
+        default=9,
         help="""Number of attention heads.
     e.g. -nh 4""",
     )
@@ -418,7 +426,7 @@ if __name__ == "__main__":
         "-d",
         type=int,
         nargs="?",
-        default=128,
+        default=None,
         help="""Dimension of query&key.
     e.g. -d 128""",
     )
@@ -426,7 +434,7 @@ if __name__ == "__main__":
         "-dv",
         type=int,
         nargs="?",
-        default=128,
+        default=None,
         help="""Dimension of value.
     e.g. -dv 128""",
     )
@@ -452,7 +460,7 @@ if __name__ == "__main__":
         "-c",
         "--causal",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="""Causal attention, default is True.
     -c or --causal    # enable causal attention
     --no-causal       # disable causal attention""",
@@ -461,7 +469,7 @@ if __name__ == "__main__":
         "-l",
         "--local",
         action="store_true",
-        default=False,
+        default=None,
         help="""Local attention. default is False.
     e.g. -l or --local    # enable local attention""",
     )
@@ -476,7 +484,7 @@ if __name__ == "__main__":
         "-det",
         "--deterministic",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="""Deterministic attention, default is True.
     -det or --deterministic    # enable deterministic attention
     --no-deterministic         # disable deterministic attention""",
@@ -485,7 +493,7 @@ if __name__ == "__main__":
         "-mha",
         "--mha_type",
         type=str,
-        default="mha",
+        default=None,
         help="""Type of multi-head attention.
     e.g. -mha mha/mqa/gqa""",
     )
@@ -493,28 +501,44 @@ if __name__ == "__main__":
         "-dt",
         "--dtype",
         type=str,
-        default="bf16",
+        default=None,
         help="""Data type.
     e.g.: -dt bf16""",
     )
 
     args = parser.parse_args()
-    dtype = dtypes.d_dtypes[args.dtype]
+    if args.dtype is not None:
+        l_dtype = [dtypes.d_dtypes[args.dtype]]
+    else:
+        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+    if args.d is not None:
+        l_dim = [args.d]
+    if args.mha_type is not None:
+        l_mha_type = [args.mha_type]
+    if args.causal is not None:
+        l_causal = [args.causal]
+    if args.local is not None:
+        l_local = [args.local]
+    if args.deterministic is not None:
+        l_deterministic = [args.deterministic]
     (seqlen_q, seqlen_k) = args.seqlen_q_k
 
-    test_flash_attn_varlen_func(
-        args.batch_size,
-        args.nheads,
-        seqlen_q,
-        seqlen_k,
-        args.d,
-        args.dv,
-        args.min_seqlen_q,
-        args.dropout_p,
-        args.causal,
-        args.local,
-        args.bias_type,
-        args.deterministic,
-        args.mha_type,
-        dtype,
-    )
+    for dtype, dim, mha_type, causal, local, deterministic in itertools.product(
+        l_dtype, l_dim, l_mha_type, l_causal, l_local, l_deterministic
+    ):
+        test_flash_attn_varlen_func(
+            args.batch_size,
+            args.nheads,
+            seqlen_q,
+            seqlen_k,
+            dim,
+            dim,
+            args.min_seqlen_q,
+            args.dropout_p,
+            causal,
+            local,
+            args.bias_type,
+            deterministic,
+            mha_type,
+            dtype,
+        )
