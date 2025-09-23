@@ -130,19 +130,19 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     shared_a_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
     # MAX_NUM_KV_BLKS x K_HEAD_SZ_POW2_SPLIT x KV_BLK_SZ_POW2 x CONTIGUOUS_KV_ELEMS_16B_LOAD
     # 16 x 16 x 16 x 8
-    blocked_k0: gl.constexpr = gl.BlockedLayout(
-        size_per_thread =[4, 2, 2, 8],
-        threads_per_warp=[1, 8, 8, 1],
+    blocked_k: gl.constexpr = gl.BlockedLayout(
+        size_per_thread =[1, 2, 1, 8],
+        threads_per_warp=[1, 4, 16, 1],
         warps_per_cta   =[4, 1, 1, 1],
         order           =[3, 2, 1, 0],
     )
-    blocked_k: gl.constexpr = gl.DistributedLinearLayout( # 128x256
-        reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,1,0,0), (0,8,0,0), (4,0,0,0), (8,0,0,0)), # 16 x 8
-        lane_bases=((0,0,1,0), (0,0,2,0), (0,0,4,0), (0,0,8,0), (0,2,0,0), (0,4,0,0)), # 64
-        warp_bases=((1,0,0,0), (2,0,0,0)), # 4
-        block_bases=[], # 8
-        shape=[16, 16, 16, 8],
-    )
+    # blocked_k: gl.constexpr = gl.DistributedLinearLayout( # 128x256
+    #     reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,1,0,0), (0,8,0,0), (4,0,0,0), (8,0,0,0)), # 16 x 8
+    #     lane_bases=((0,0,1,0), (0,0,2,0), (0,0,4,0), (0,0,8,0), (0,2,0,0), (0,4,0,0)), # 64
+    #     warp_bases=((1,0,0,0), (2,0,0,0)), # 4
+    #     block_bases=[], # 8
+    #     shape=[16, 16, 16, 8],
+    # )
 
     # transposed: indicates the result tensor is transposed so that each thread holds consecutive elements
     # in the same row instead of column, which is good for chained dot and global write.
@@ -354,19 +354,19 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
 
     # MAX_NUM_KV_BLKS x HEAD_SZ_POW2 x KV_BLK_SZ_POW2
     # 16(kdim0) x 128(ndim) x 16(kdim1)
-    blocked_v_layout0: gl.constexpr = gl.BlockedLayout(
-        size_per_thread =[4, 4,  8],
-        threads_per_warp=[1, 32, 2],
-        warps_per_cta   =[4, 1,  1],
+    blocked_v_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread =[1, 1,  16],
+        threads_per_warp=[4, 16, 1],
+        warps_per_cta   =[1, 4,  1],
         order           =[2, 1,  0],
     )
-    blocked_v_layout: gl.constexpr = gl.DistributedLinearLayout( # 256x128
-        reg_bases=((0,0,1), (0,0,2), (0,0,4), (0,0,8), (4,0,0), (8,0,0), (0,64,0)), # 16 x 8
-        lane_bases=((0,1,0), (0,2,0), (0,4,0), (0,8,0), (1,0,0), (2,0,0)), # 64
-        warp_bases=((0,16,0), (0,32,0)), # 4
-        block_bases=[], # 8
-        shape=[16, 128, 16],
-    )
+    # blocked_v_layout: gl.constexpr = gl.DistributedLinearLayout( # 256x128
+    #     reg_bases=((0,0,1), (0,0,2), (0,0,4), (0,0,8), (4,0,0), (8,0,0), (0,64,0)), # 16 x 8
+    #     lane_bases=((0,1,0), (0,2,0), (0,4,0), (0,8,0), (1,0,0), (2,0,0)), # 64
+    #     warp_bases=((0,16,0), (0,32,0)), # 4
+    #     block_bases=[], # 8
+    #     shape=[16, 128, 16],
+    # )
     v_dim0_offs = gl.arange(0, MAX_NUM_KV_BLKS, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
     v_dim1_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_v_layout)))
     v_dim2_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_v_layout)))
