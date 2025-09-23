@@ -10,7 +10,7 @@
 
 namespace aiter {
 namespace torch_itfs {
-fmha_bwd_args get_asm_fmha_bwd_args(const mask_info &mask,
+mha_bwd_args get_asm_fmha_bwd_args(const mask_info &mask,
                                     // sizes
                                     const int b,
                                     const int seqlen_q,
@@ -34,7 +34,10 @@ fmha_bwd_args get_asm_fmha_bwd_args(const mask_info &mask,
                                     at::Tensor dv,
                                     float softmax_scale,
                                     float p_dropout,
-                                    std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                    std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                    bool deterministic,
+                                    bool is_v3_atomic_fp32,
+                                    int how_v3_bf16_cvt)
 {
     // q: (batch_size, seqlen_q, nheads, hdim_q)
     ck_tile::index_t batch_stride_q = q.stride(0);
@@ -105,7 +108,10 @@ fmha_bwd_args get_asm_fmha_bwd_args(const mask_info &mask,
         stride_alibi_slopes = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
-    return fmha_bwd_args{q.data_ptr(),
+    std::string q_dtype_str = (q.dtype() == torch::kFloat16) ? "fp16" : "bf16";
+    bias_enum bias_type = alibi_slopes_.has_value() ? bias_enum::alibi : bias_enum::no_bias;
+
+    return mha_bwd_args{q.data_ptr(),
                          k.data_ptr(),
                          v.data_ptr(),
                          alibi_slopes_ptr, // bias
@@ -176,7 +182,19 @@ fmha_bwd_args get_asm_fmha_bwd_args(const mask_info &mask,
                          static_cast<ck_tile::index_t>(mask.type),
                          p_dropout,
                          p_undrop,
-                         drop_seed_offset};
+                         drop_seed_offset,
+                         q_dtype_str,
+                         false, // is_group_mode
+                         mask.type,
+                         bias_type,
+                         false, // has_dbias
+                         false,  // is_store_randval
+                         deterministic,
+                         true,  // use_ext_asm
+                         is_v3_atomic_fp32,
+                         how_v3_bf16_cvt,
+                         nullptr,
+                         nullptr};
 }
 
 std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
@@ -213,8 +231,6 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
     TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
-
-    std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(out); CHECK_DEVICE(dout); CHECK_DEVICE(softmax_lse);
@@ -324,8 +340,6 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
         dv_expanded = dv;
     }
 
-    bias_enum bias_type = alibi_slopes_.has_value() ? bias_enum::alibi : bias_enum::no_bias;
-
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
     gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
@@ -373,20 +387,12 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                 dv_expanded,
                 softmax_scale,
                 p_dropout,
-                drop_seed_offset);
+                drop_seed_offset,
+                deterministic,
+                is_v3_atomic_fp32,
+                how_v3_bf16_cvt);
 
-        float t = aiter::mha_bwd(args,
-                                 stream_config,
-                                 q_dtype_str,
-                                 false, // is_group_mode
-                                 mask.type,
-                                 bias_type,
-                                 false, // has_dbias
-                                 false,  // is_store_randval
-                                 deterministic,
-                                 true,  // use_ext_asm
-                                 is_v3_atomic_fp32,
-                                 how_v3_bf16_cvt);
+        float t = aiter::mha_bwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_bwd");
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.

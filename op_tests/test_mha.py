@@ -682,7 +682,7 @@ parser.add_argument(
     "-v",
     "--d_v",
     type=int,
-    default=128,
+    default=64,
     help="""Dimension of value. Default is 128.
     e.g.: -v 256""",
 )
