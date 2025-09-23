@@ -386,4 +386,7 @@ def test_skinny_gemm():
 
 
 # test_normal_gemm()
-test_skinny_gemm()
+
+if __name__ == '__main__':
+    # test_normal_gemm()
+    test_skinny_gemm()
