@@ -396,12 +396,8 @@ def attention_ref(
     d = q.shape[-1]
     if not reorder_ops:
         scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
-        # scores = torch.einsum("bthd,bshd->bhts", q, k)
     else:
         scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
-        # scores = torch.einsum("bthd,bshd->bhts", q, k)
-    # scores *= 1 / math.sqrt(d)
-    # |_ applying softmax scale on scores didn't change anything
     if softcap > 0:
         scores = scores / softcap
         scores = scores.tanh()
@@ -424,16 +420,6 @@ def attention_ref(
     if attn_bias is not None:
         scores = scores + attn_bias
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
-    # |_ fwd error: 1.2060546875
-    # exp_scores = torch.exp(scores - torch.max(scores, dim=-1, keepdim=True)[0])
-    # attention = exp_scores / torch.sum(exp_scores, dim=-1, keepdim=True)
-    # attention = attention.to(v.dtype)
-    # |_ fwd error: 1.2060546875
-    # inv_ln2 = 1.4426950408889634
-    # exp_scores = torch.exp2((scores - torch.max(scores, dim=-1, keepdim=True)[0]) * inv_ln2)
-    # attention = exp_scores / torch.sum(exp_scores, dim=-1, keepdim=True)
-    # attention = attention.to(v.dtype)
-    # |_ fwd error: 1.2060546875
     # Some rows might be completely masked out so we fill them with zero instead of NaN
     if window_size[0] >= 0 or window_size[1] >= 0:
         attention = attention.masked_fill(
