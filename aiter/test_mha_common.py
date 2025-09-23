@@ -182,7 +182,7 @@ def generate_qkv(
     key_padding_mask=None,
     kvpacked=False,
     qkvpacked=False,
-    iperm="BSHD",
+    input_layout="BSHD",
 ):
     """
     Arguments:
@@ -191,7 +191,7 @@ def generate_qkv(
         v: (batch_size, seqlen_k, nheads_k, d_v)
         query_padding_mask: (batch_size, seqlen), bool
         key_padding_mask: (batch_size, seqlen), bool
-        iperm: "BSHD", "BHSD", "SBHD"
+        input_layout: "BSHD", "BHSD", "SBHD"
     """
     assert not (kvpacked and qkvpacked)
     batch_size, seqlen_q, nheads, d = q.shape
@@ -200,12 +200,12 @@ def generate_qkv(
     assert k.shape == (batch_size, seqlen_k, nheads_k, d)
     assert v.shape == (batch_size, seqlen_k, nheads_k, d_v)
 
-    if iperm == "BHSD":
+    if input_layout == "BHSD":
         # BSHD-->BHSD
         q = q.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
-    elif iperm == "SBHD":
+    elif input_layout == "SBHD":
         # BSHD-->SBHD
         q = q.permute(1, 0, 2, 3).contiguous().permute(1, 0, 2, 3)
         k = k.permute(1, 0, 2, 3).contiguous().permute(1, 0, 2, 3)

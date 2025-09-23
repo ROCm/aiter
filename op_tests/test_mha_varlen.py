@@ -88,7 +88,7 @@ def run_ck(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
-    iperm="BSHD",
+    input_layout="BSHD",
 ):
     (
         q_unpad,
@@ -110,9 +110,9 @@ def run_ck(
         v,
         query_padding_mask,
         key_padding_mask,
-        kvpacked=(iperm == "KVPACKED"),
-        qkvpacked=(iperm == "QKVPACKED"),
-        iperm=iperm,
+        kvpacked=(input_layout == "KVPACKED"),
+        qkvpacked=(input_layout == "QKVPACKED"),
+        input_layout=input_layout,
     )
 
     if bias is not None:
@@ -184,6 +184,7 @@ def run_ck(
         return out, dropout_mask, dq, dk, dv
 
 
+@pytest.mark.parametrize("input_layout", ["BSHD", "KVPACKED"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("deterministic", [True, False])
@@ -241,11 +242,11 @@ def test_flash_attn_varlen_func(
     deterministic,
     mha_type,
     dtype,
-    iperm,
+    input_layout,
 ):
     return_lse = True
     torch.random.manual_seed(0)
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -287,7 +288,7 @@ def test_flash_attn_varlen_func(
             seqlen_k, batch_size, "cuda", mode="random"
         )
 
-    if iperm == "QKVPACKED":
+    if input_layout == "QKVPACKED":
         query_padding_mask = None
         key_padding_mask = None
 
@@ -338,7 +339,7 @@ def test_flash_attn_varlen_func(
         deterministic,
         return_lse,
         return_attn_probs,
-        iperm,
+        input_layout,
     )
 
     out_ref, dq_ref, dk_ref, dv_ref = run_torch(
@@ -516,10 +517,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-i",
-        "--iperm",
+        "--input_layout",
         type=str,
         default="BSHD",
-        help="""iperm.
+        help="""input_layout.
         e.g.: -i BSHD""",
     )
     args = parser.parse_args()
@@ -541,5 +542,5 @@ if __name__ == "__main__":
         args.deterministic,
         args.mha_type,
         dtype,
-        args.iperm,
+        args.input_layout,
     )
