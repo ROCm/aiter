@@ -158,42 +158,33 @@ torch::Tensor ck_tile_gemm_bf16(
     auto config = ck_tile::stream_config{nullptr, false, 0, n_warmup, n_repeat, false, false, 1};
     // 2. 配置异步执行
     
-    if (1)
+    if(persistent)
     {
         
-        if(persistent)
-        {
-           
-            ave_time = gemm_calc<ADataType,
-                                BDataType,
-                                AccDataType,
-                                CDataType,
-                                ALayout,
-                                BLayout,
-                                CLayout,
-                                ELayout,
-                                true>(
-                args, config);
-        }
-        else
-        {
-            ave_time = gemm_calc<ADataType,
-                                BDataType,
-                                AccDataType,
-                                CDataType,
-                                ALayout,
-                                BLayout,
-                                CLayout,
-                                ELayout,
-                                false>(
-                args, config);
-        }
-        
-        }
-        else
-        {
-            TORCH_CHECK(false, "Unsupported scales/output dtype!");
-        }
+        ave_time = gemm_calc<ADataType,
+                            BDataType,
+                            AccDataType,
+                            CDataType,
+                            ALayout,
+                            BLayout,
+                            CLayout,
+                            ELayout,
+                            true>(
+            args, config);
+    }
+    else
+    {
+        ave_time = gemm_calc<ADataType,
+                            BDataType,
+                            AccDataType,
+                            CDataType,
+                            ALayout,
+                            BLayout,
+                            CLayout,
+                            ELayout,
+                            false>(
+            args, config);
+    }
     
 
 
