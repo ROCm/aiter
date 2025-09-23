@@ -38,7 +38,7 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::
     }
     else
     {
-        return moe_stage2_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, act_op, quant_type, mul_routed_weight);
+        return moe_stage2_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, 0, quant_type, mul_routed_weight);
     }
 }
 
@@ -88,7 +88,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         return;
     }
 
-    if (hidden_states.dtype() == at::ScalarType::Byte && w1.dtype() == at::ScalarType::Byte)
+    if (hidden_states.dtype() == torch_fp4x2 && w1.dtype() == torch_fp4x2)
     {
         K *= 2;
     }
@@ -145,7 +145,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
         std::cerr << "detect null ptr !" << std::endl;
         return;
     }
-    if (inter_states.dtype() == at::ScalarType::Byte && w2.dtype() == at::ScalarType::Byte)
+    if (inter_states.dtype() == torch_fp4x2 && w2.dtype() == torch_fp4x2)
     {
         K *= 2;
     }

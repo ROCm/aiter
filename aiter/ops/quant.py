@@ -14,13 +14,13 @@ from ..utility import dtypes, fp4_utils
 
 @compile_ops("module_smoothquant")
 def smoothquant_fwd(
-    input: Tensor, out: Tensor, x_scale: Tensor, y_scale: Tensor
+    out: Tensor, input: Tensor, x_scale: Tensor, y_scale: Tensor
 ) -> None: ...
 
 
 @compile_ops("module_smoothquant")
 def moe_smoothquant_fwd(
-    input: Tensor, out: Tensor, x_scale: Tensor, topk_ids: Tensor, y_scale: Tensor
+    out: Tensor, input: Tensor, x_scale: Tensor, topk_ids: Tensor, y_scale: Tensor
 ) -> None: ...
 
 
@@ -150,17 +150,19 @@ def get_torch_quant(qType):
 @functools.lru_cache()
 def get_hip_quant(qType):
     tmp = {
-        QuantType.No: lambda *a, **k: (a[0], None),
-        QuantType.per_Tensor: per_tensor_quant_hip,
-        QuantType.per_Token: per_token_quant_hip,
-        QuantType.per_1x32: per_1x32_f4_quant_hip,
-        QuantType.per_1x128: functools.partial(per_group_quant_hip, group_size=128),
+        QuantType.No.value: lambda *a, **k: (a[0], None),
+        QuantType.per_Tensor.value: per_tensor_quant_hip,
+        QuantType.per_Token.value: per_token_quant_hip,
+        QuantType.per_1x32.value: per_1x32_f4_quant_hip,
+        QuantType.per_1x128.value: functools.partial(
+            per_group_quant_hip, group_size=128
+        ),
     }
 
     def raise_NotImplementedError(*a, **k):
         raise NotImplementedError(f"unsupported quant type {qType=}")
 
-    return tmp.get(qType, raise_NotImplementedError)
+    return tmp.get(qType.value, raise_NotImplementedError)
 
 
 @functools.lru_cache()
@@ -293,7 +295,7 @@ def per_1x32_f4_quant_hip(
         num_rows=num_rows,
         num_rows_factor=num_rows_factor,
     )
-    return y.view(torch.uint8), scale
+    return y, scale
 
 
 def per_tensor_quant_hip(
@@ -391,6 +393,19 @@ def dynamic_per_group_scaled_quant_fp4(
     Only support group_size in [32, 64, 128]
     """
     ...
+
+
+@compile_ops("module_quant")
+def smooth_per_token_scaled_quant(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    smooth_scale: torch.Tensor,
+    smooth_scale_map: Optional[torch.Tensor] = None,
+    shuffle_scale: bool = False,
+    num_rows: Optional[torch.Tensor] = None,
+    num_rows_factor: int = 1,
+) -> None: ...
 
 
 @compile_ops("module_quant")

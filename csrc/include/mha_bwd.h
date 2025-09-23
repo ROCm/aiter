@@ -60,7 +60,8 @@ __attribute__((visibility("default"))) float mha_bwd(mha_bwd_args args,
                                                      bool is_v3_atomic_fp32,
                                                      int how_v3_bf16_cvt,
                                                      const void* seqlen_q_padded = nullptr,
-                                                     const void* seqlen_k_padded = nullptr);
+                                                     const void* seqlen_k_padded = nullptr,
+                                                     bool is_v3_api_check = false);
 
 struct __attribute__((packed)) fmha_bwd_v3_args
 {
@@ -363,6 +364,12 @@ struct __attribute__((packed)) fmha_bwd_dq_shuffle_args
     p3 _p9;
     unsigned int head_dim;
     p3 _p10;
+    const void *ptr_qseq;
+    p2 _p11;
+    const void *ptr_qseq_padded;
+    p2 _p12;
+    unsigned int max_seqlen_dq;
+    p3 _p13;
 };
 
 struct fmha_bwd_v3_traits
@@ -386,8 +393,8 @@ template <ck_tile::index_t HDim_,
           ck_tile::index_t BF16Cvt_,
           bool kIsSEQPad_,
           bool kIsHDPad_,
-          GPUArch GPUArch_,
-          bool kIsGroupMode_ = false>
+          bool kIsGroupMode_,
+          GPUArch GPUArch_>
 struct fmha_bwd_dq_dk_dv_v3_traits_
 {
     static constexpr ck_tile::index_t HDim    = HDim_;
@@ -412,7 +419,8 @@ float fmha_bwd_v3(mha_bwd_traits t,
                   mha_bwd_args a,
                   const ck_tile::stream_config& s,
                   const void* seqlen_q_padded = nullptr,
-                  const void* seqlen_k_padded = nullptr);
+                  const void* seqlen_k_padded = nullptr,
+                  bool is_v3_api_check = false);
 }
 
 namespace gfx950 {
@@ -420,6 +428,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                   mha_bwd_args a,
                   const ck_tile::stream_config& s,
                   const void* seqlen_q_padded = nullptr,
-                  const void* seqlen_k_padded = nullptr);
+                  const void* seqlen_k_padded = nullptr,
+                  bool is_v3_api_check = false);
 }
 } // namespace aiter

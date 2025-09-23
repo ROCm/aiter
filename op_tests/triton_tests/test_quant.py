@@ -9,7 +9,7 @@ from aiter.ops.triton.quant import (
     dynamic_per_tensor_quant_fp8_i8,
     dynamic_per_token_quant_fp8_i8,
 )
-from aiter.ops.triton.utils.arch_info import get_fp8_e4m3_dtype
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 DEBUG = False
 

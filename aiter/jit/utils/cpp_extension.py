@@ -1337,7 +1337,7 @@ def _write_ninja_file_and_build_library(
     _write_ninja_file_to_build_library(
         path=build_file_path,
         name=name,
-        sources=list(set(sources)),
+        sources=sorted(set(sources)),
         extra_cflags=extra_cflags or [],
         extra_cuda_cflags=extra_cuda_cflags or [],
         extra_ldflags=extra_ldflags or [],
