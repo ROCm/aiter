@@ -113,7 +113,7 @@ if supports_custom_op():
     # def _(tensor: torch.Tensor, group_name: str) -> None:
     #     return
 
-    @torch.library.custom_op("aiter::outplace_all_reduce", mutates_args=["tensor"])
+    @torch.library.custom_op("aiter::outplace_all_reduce", mutates_args=[])
     def outplace_all_reduce(
         tensor: torch.Tensor,
         group_name: str,

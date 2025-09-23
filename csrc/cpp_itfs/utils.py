@@ -12,7 +12,6 @@ from collections import OrderedDict
 from functools import lru_cache, partial
 import binascii
 import hashlib
-from aiter.jit.utils.file_baton import FileBaton
 import logging
 import time
 
@@ -41,7 +40,9 @@ AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 
 if AITER_REBUILD >= 1:
     subprocess.run(f"rm -rf {BUILD_DIR}/*", shell=True)
-os.makedirs(BUILD_DIR, exist_ok=True)
+
+if not os.path.exists(BUILD_DIR):
+    os.makedirs(BUILD_DIR, exist_ok=True)
 
 CK_DIR = os.environ.get("CK_DIR", f"{AITER_CORE_DIR}/3rdparty/composable_kernel")
 
@@ -74,6 +75,8 @@ def mp_lock(
     """
     Using FileBaton for multiprocessing.
     """
+    from aiter.jit.utils.file_baton import FileBaton
+
     baton = FileBaton(lock_path)
     if baton.try_acquire():
         try:
@@ -274,6 +277,7 @@ def compile_template_op(
         if cxxflags is None:
             cxxflags = []
         src_file = src_template.render(func_name=func_name, **kwargs)
+        logger.info(f"compile_template_op {func_name = } with {locals()}...")
         compile_lib(src_file, folder, includes, sources, cxxflags)
     return run_lib(func_name, folder)
 
