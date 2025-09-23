@@ -1007,7 +1007,6 @@
           py::arg("reduce_indptr"),                     \
           py::arg("reduce_final_map"),                  \
           py::arg("reduce_partial_map"),                \
-          py::arg("split_params") = std::nullopt);      \
-    m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
+          py::arg("split_params") = std::nullopt);
 
 #define MLA_REDUCE_PYBIND m.def("mla_reduce_v1", &mla_reduce_v1);
