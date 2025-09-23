@@ -1130,9 +1130,9 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
                 "gating_output.dtype() == correction_bias.dtype()");
 
     // TODO: expand usage in the future
-    bool use_opt_sort = false;
-    // bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
-    //                     (topk_grp == 4) && (isBiased == true);
+    // bool use_opt_sort = false;
+    bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
+                        (topk_grp == 4) && (isBiased == true);
 
     dim3 grid(num_tokens);
     dim3 block(64);
