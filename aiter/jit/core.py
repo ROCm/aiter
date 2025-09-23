@@ -576,21 +576,26 @@ def compile_ops(
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
+                    for el in ["ActivationType", "QuantType"]:
+                        doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {
                         "List": List,
                         "Optional": Optional,
                         "torch": torch,
                     }
-                    exec(f"from aiter import*\ndef {doc_str}: pass", namespace)
+                    exec(
+                        f"from aiter import*\ndef {doc_str}: pass",
+                        namespace,
+                    )
                     foo = namespace[doc_str.split("(")[0]]
                     sig = inspect.signature(foo)
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
-
                     callargs = inspect.getcallargs(func, *args, **kwargs)
                     for el, arg in callargs.items():
                         expected_type = ann[el]
+                        got_type = type(arg)
                         origin = typing.get_origin(expected_type)
                         sub_t = typing.get_args(expected_type)
 
@@ -601,7 +606,7 @@ def compile_ops(
                                 and isinstance(arg, int)
                             ):
                                 raise TypeError(
-                                    f"{el} needs to be {expected_type} but got {type(arg)}"
+                                    f"{loadName}: {el} needs to be {expected_type} but got {got_type}"
                                 )
                         elif origin is list:
                             if (
@@ -609,12 +614,12 @@ def compile_ops(
                                 # or not all(isinstance(i, sub_t) for i in arg)
                             ):
                                 raise TypeError(
-                                    f"{el} needs to be List[{sub_t}] but got {arg}"
+                                    f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                 )
                         elif origin is typing.Union:
                             if arg is not None and not isinstance(arg, sub_t):
                                 raise TypeError(
-                                    f"{el} needs to be Optional[{sub_t}] but got {arg}"
+                                    f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
                                 )
                         else:
                             raise TypeError(f"Unsupported type: {expected_type}")
