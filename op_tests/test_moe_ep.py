@@ -593,7 +593,7 @@ for test in l_test:
                                 topk,
                                 quant="int8smoothquant",
                                 use_g1u1=True,
-                                shared_E=0,
+                                shared_E=2,
                                 ep=ep,
                             )
     elif test == "g1u1_fp8smoothquant":
