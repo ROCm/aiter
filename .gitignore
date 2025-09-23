@@ -49,7 +49,3 @@ __pycache__
 debug
 aiter_logs
 *.log
-dist/
-build/
-*.egg
-*.egg-info/
