@@ -1789,6 +1789,7 @@ def _flash_attn_varlen_forward(
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
     if can_impl_fmha_v3_fwd():
+        print("fmha_v3_varlen_fwd start")
         out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
             q,
             k,

@@ -815,7 +815,7 @@ if __name__ == "__main__":
         "-dv",
         type=int,
         nargs="?",
-        default=128,
+        default=64,
         help="""Dimension of value.
     e.g. -dv 128""",
     )

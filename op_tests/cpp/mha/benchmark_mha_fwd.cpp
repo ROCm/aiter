@@ -991,6 +991,15 @@ bool run(const ck_tile::ArgParser& arg_parser)
                 {
                     args.drop_seed_offset = std::make_pair(drop_seed, drop_offset);
                 }
+                args.q_dtype_str = data_type;
+                args.is_group_mode = mode == mode_enum::group;
+                args.mask_type = mask.type;
+                args.bias_type = bias.type;
+                args.has_lse = lse;
+                args.use_ext_asm = fwd_v3;
+                args.how_v3_bf16_cvt = v3_bf16_cvt;
+                args.seqstart_q_padding_ptr = nullptr;
+                args.seqstart_k_padding_ptr = nullptr;
             }
             else if constexpr(std::is_same_v<fmha_fwd_splitkv_args, std::decay_t<decltype(args)>>)
             {
@@ -1037,15 +1046,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
 #endif
         aiter::mha_fwd_args fmha_args;
         init_args(fmha_args);
-        return aiter::mha_fwd(fmha_args,
-                              stream_config,
-                              data_type,
-                              mode == mode_enum::group,
-                              mask.type,
-                              bias.type,
-                              lse,
-                              fwd_v3,
-                              v3_bf16_cvt);
+        return aiter::mha_fwd(fmha_args, stream_config);
     }();
 
     if(fwd_ave_time < 0.0f)
