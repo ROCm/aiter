@@ -62,6 +62,7 @@ static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
 std::tuple<std::string, int> get_heuristic_kernel(
     int M, int N, int K, std::optional<int> k_split, std::optional<bool> bpreshuffle, CFG* cfgs)
 {
+    k_split = k_split.value_or(0) ?: 1;
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
     HIP_CALL(hipGetDevice(&dev));
