@@ -1088,7 +1088,7 @@ def test_mha_backward_with_pe(
     HEAD_SZ_QK: int,
     HEAD_SZ_V: int,
 ):
-    DUMP_TENSORS: bool = True
+    DUMP_TENSORS: bool = False
 
     device: str = "cuda"
     dtype: torch.dtype = torch.float16
@@ -1097,9 +1097,9 @@ def test_mha_backward_with_pe(
     dropout_mask = None
     FUSED: bool = False
 
-    DEBUG_SHAPES: bool = False
-    DEBUG_TENSORS: bool = False
-    DEBUG: bool = DEBUG_SHAPES or DEBUG_TENSORS
+    DEBUG_SHAPES: bool = True
+    DEBUG_TENSORS: bool = True
+    DEBUG: bool = False  # DEBUG_SHAPES or DEBUG_TENSORS
 
     def debug(x_desc: str, x: torch.Tensor) -> None:
         if DEBUG_SHAPES:
@@ -1126,6 +1126,11 @@ def test_mha_backward_with_pe(
     v.requires_grad = True
 
     do = torch.randn((q.shape[:-1] + v.shape[-1:]), dtype=dtype, device=device)
+
+    # debug("q_nope[:3]", q[0, :3, 0, :16])  # OK
+    # debug("q_nope[15]", q[0, 15, 0, :16])  # OK
+    # debug("q_pe[:3]", q[0, :3, 0, 16:])  # OK
+    # debug("q_pe[15]", q[0, 15, 0, 16:])  # OK
 
     if DEBUG:
         print("--------------Triton----------------")

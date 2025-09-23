@@ -388,6 +388,7 @@ def _bwd_dq_inner(
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
+    import pdb; pdb.set_trace()
     # if HEAD_DIM is padded
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
     HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
@@ -703,16 +704,17 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         stride_ah = stride_ah_in
 
     # program ids
-    hkid = tl.program_id(0)
-    pid = tl.program_id(1)
-    bid = tl.program_id(2)
+    # import pdb; pdb.set_trace()
+    hkid = tl.program_id(0)  # 0
+    pid = tl.program_id(1)  # 0
+    bid = tl.program_id(2)  # 0
     if DEBUG_TRITON:
         print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")  # noqa: E701
     # figure out varlen start and end
     q_start = 0
     k_start = 0
-    seqlen_q = max_seqlen_q
-    seqlen_k = max_seqlen_k
+    seqlen_q = max_seqlen_q  # 18
+    seqlen_k = max_seqlen_k  # 18
     if IS_VARLEN:
         # Compute actual sequence lengths
         q_start = tl.load(cu_seqlens_q + bid)
@@ -722,7 +724,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         seqlen_q = q_end - q_start
         seqlen_k = k_end - k_start
 
-    delta_qk = seqlen_q - seqlen_k
+    delta_qk = seqlen_q - seqlen_k  # 0
     if DEBUG_TRITON:
         print(f"delta_qk = {delta_qk}")  # noqa: E701
 
@@ -730,9 +732,11 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
     PADDED_PE_HEAD: tl.constexpr = ACTUAL_PE_HEAD_DIM != PE_HEAD_DIM
     offs_d = tl.arange(0, HEAD_DIM)
+    # |_ 1D array [0, 15]
     if HAS_PE:
         offs_d_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
-    GROUP_SIZE: tl.constexpr = HQ // HK
+        # |_ 1D array [16, 31]
+    GROUP_SIZE: tl.constexpr = HQ // HK  # 1
 
     # align the delta_qk
     start_n = pid * BLOCK_N1
@@ -1006,14 +1010,15 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             tl.store(DK + adj_dk + offs_dk_pe, dk_pe, mask=mask_kv_pe)
 
     # This part does dq
-    start_m = pid * BLOCK_M2
-    if start_m < seqlen_q:
+    # import pdb; pdb.set_trace()
+    start_m = pid * BLOCK_M2  # 0 * 16 == 0
+    if start_m < seqlen_q:  # 0 < 18 == True
         # seqlen_q > seqlen_k, no need to process these tile for dq
         if DEBUG_TRITON:
             print(
                 f"end_n = start_m + BLOCK_M = {start_m} + {BLOCK_M2} = {start_m + BLOCK_M2}"
             )  # noqa: E701
-        if start_m + BLOCK_M2 < delta_qk:
+        if start_m + BLOCK_M2 < delta_qk:  # 0 + 16 < 0 == False
             if DEBUG_TRITON:
                 print(
                     f"start_m + BLOCK_M2 = {start_m} + {BLOCK_M2} = {start_m + BLOCK_M2} < delta_qk of {delta_qk}"
@@ -1021,8 +1026,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             return
 
         offs_m = start_m + tl.arange(0, BLOCK_M2)
+        # |_ 1D array [0, 15]
         # Mask for loading K and V
         mask_q = offs_m[:, None] < seqlen_q
+        # |_ 2D array, shape=(16, 1), 16 Trues
         if PADDED_HEAD:
             mask_d = offs_d < ACTUAL_HEAD_DIM
             mask_q &= mask_d[None, :]
@@ -1033,29 +1040,33 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 mask_q_pe = mask_q & mask_d_pe[None, :]
             else:
                 mask_q_pe = mask_q
+                # |_ 2D array, shape=(16, 1), 16 Trues
         offs_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        # |_ 2D shape=(16, 16), it seems to be correct (first 16 cols of q, inc 32)
         if HAS_PE:
             offs_q_pe = offs_m[:, None] * stride_qm + offs_d_pe[None, :] * stride_qd
+            # |_ 2D shape=(16, 16), it seems to be correct (last 16 cols of q, inc 32)
         offs_do = offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
         # NOTE: don't assume that the strides for k and v are the same!
         K += bid * stride_kb + hkid * stride_kh + k_start * stride_kn
         V += bid * stride_vb + hkid * stride_vh + k_start * stride_vn
+        # |_ K and V aren't incremented, it's 0
 
         # If MQA / GQA, set the K and V head offsets appropriately.
-        for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
+        for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):  # range(0, 1)
             # seqlen_q < seqlen_k: delta_qk more kv tokens are added at the front
             #   for every M-tile
             end_n = start_m + BLOCK_M2 - delta_qk
             # clamp end_n at [0, seqlen_k]
-            end_n = max(min(end_n, seqlen_k), 0)
+            end_n = max(min(end_n, seqlen_k), 0)  # 16
             if DEBUG_TRITON:
                 print(f"delta_qk: {delta_qk}; end_n: {end_n}")  # noqa: E701
             # offset input and output tensor by batch and Q/K heads
-            adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
-            adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
+            adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm  # 0
+            adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom  # 0
             adj_delta = (
                 bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam
-            )
+            )  # 0
             Delta_ptr = Delta + adj_delta
 
             if USE_ALIBI:
@@ -1075,19 +1086,26 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 dropout_offset = (
                     Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
                 )
+            # import pdb; pdb.set_trace()
             q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
+            # |_ 2D shape=(16, 16)
+            # |_ first 3 rows: p q.handle.data[:3]
+            # |_ last 3 rows: p q.handle.data[-3:]
+            # |_ loading OK!
             if HAS_PE:
                 q_pe = tl.load(Q + adj_q + offs_q_pe, mask=mask_q_pe, other=0.0)
+                # |_ 2D shape=(16, 16)
+                # |_ loading OK!
             else:
                 q_pe = None
             do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
             m = tl.load(M + adj_delta + offs_m * stride_deltam, mask=offs_m < seqlen_q)
             m = m[:, None]
 
-            MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
+            MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR  # 8
             # start can only be 0 at minimum
             start_n = max(end_n - BLOCK_M2, 0)
-            num_steps = tl.cdiv(end_n - start_n, MASK_BLOCK_N2)
+            num_steps = tl.cdiv(end_n - start_n, MASK_BLOCK_N2)  # 2
 
             if IS_FP8:
                 descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
@@ -1097,9 +1115,9 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             else:
                 descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
-            dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+            dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)  # (16, 16) shape
             if HAS_PE:
-                dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
+                dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)  # (16, 16) shape
             else:
                 dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
             dq, dq_pe = _bwd_dq_inner(
@@ -1851,11 +1869,13 @@ def flash_attn_onekernel_backward(
     seqlen = max(max_seqlen_q, max_seqlen_k)
 
     config_onekernel = config["onekernel"]
+    # import pdb; pdb.set_trace()
     grid = (
-        num_k_heads,
-        triton.cdiv(seqlen, config_onekernel["BLOCK_N1"]),
-        batch,
+        num_k_heads,  # 1
+        triton.cdiv(seqlen, config_onekernel["BLOCK_N1"]),  # cdiv(18, 64) == 1
+        batch, # 1
     )
+    # single workgroup
 
     if causal:
         bwd_kernel_causal[grid](
