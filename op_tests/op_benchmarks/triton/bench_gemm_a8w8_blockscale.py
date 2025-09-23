@@ -29,13 +29,13 @@ block_shape = (128, 128)
 
 
 def bench_gemm_fn(
-    M: int, 
-    N: int, 
-    K: int, 
-    metric: str, 
-    layout: str, 
-    impl: callable, 
-    use_torch: bool = False
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    impl: callable,
+    use_torch: bool = False,
 ):
     block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16

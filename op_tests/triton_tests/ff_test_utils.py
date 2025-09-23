@@ -120,8 +120,8 @@ def ff_ungated_test(
         )
 
     torch.testing.assert_close(triton_out, torch_out, atol=5e-2, rtol=5e-2)
-    
-    
+
+
 def run_torch_gated(x, w1, w2, intermediate_dim, activation):
     torch_out = F.linear(x, w1, bias=None)
     if activation == "gelu" or activation == "gelu_tanh":

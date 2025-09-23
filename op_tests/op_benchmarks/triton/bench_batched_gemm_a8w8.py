@@ -24,13 +24,13 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 
 def bench_gemm_fn(
-    batch: int, 
-    M: int, 
-    N: int, 
-    K: int, 
-    metric: str, 
-    layout: str, 
-    use_torch: bool = False
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    use_torch: bool = False,
 ):
     c_dtype = torch.bfloat16
     x, w, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(

@@ -26,7 +26,7 @@ def get_evaluation_unit(metric):
         "latency": "us",
         "memory": "MB",
     }
-    
+
     unit = evaluation_metric_to_unit[metric]
     if unit:
         return unit
@@ -37,18 +37,18 @@ def get_evaluation_unit(metric):
 def get_evaluation_label(metric, space=False, prefix=None):
     if space:
         return (
-            (prefix + " " if prefix else "") 
-            + metric.capitalize() 
-            + " (" 
-            + get_evaluation_unit(metric) 
+            (prefix + " " if prefix else "")
+            + metric.capitalize()
+            + " ("
+            + get_evaluation_unit(metric)
             + ")"
         )
     else:
         return (
-            (prefix + "_" if prefix else "") 
-            + metric.capitalize() 
-            + "_(" 
-            + get_evaluation_unit(metric) 
+            (prefix + "_" if prefix else "")
+            + metric.capitalize()
+            + "_("
+            + get_evaluation_unit(metric)
             + ")"
         )
 
@@ -56,7 +56,7 @@ def get_evaluation_label(metric, space=False, prefix=None):
 def get_torch_activation_from_str(activation: str):
     mapping = {
         "gelu": F.gelu,
-        "gelu_tanh": partial(F.gelu, approximate='tanh'),
+        "gelu_tanh": partial(F.gelu, approximate="tanh"),
         "silu": F.silu,
         "silu_exp2": F.silu,
         "relu": F.relu,
@@ -95,17 +95,17 @@ def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
         x_vals_list = get_x_vals(dims=len(x_names), args=args)
 
     ylabel = get_evaluation_label(args.metric, space=True)
-    
+
     if not args.bench_torch:
         line_vals = [get_evaluation_unit(args.metric)]
         line_names = [get_evaluation_label(args.metric)]
     else:
         line_vals = ["triton", "torch"]
         line_names = [
-            get_evaluation_label(args.metric, prefix="triton"), 
-            get_evaluation_label(args.metric, prefix="torch")
+            get_evaluation_label(args.metric, prefix="triton"),
+            get_evaluation_label(args.metric, prefix="torch"),
         ]
-    
+
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,

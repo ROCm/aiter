@@ -92,7 +92,7 @@ def bench_gemm_fn(
     mem_read = (M * K) * x.element_size() + (N * K) * w.element_size()
     mem_write = (M * N // 2) * x.element_size()
     mem = mem_read + mem_write
-    
+
     if use_torch:
         ms = triton.testing.do_bench(
             lambda: run_torch(x, w, N, activation),
@@ -126,7 +126,7 @@ def run_model_benchmark(args):
     benchmark = get_gemm_model_benchmark_object(
         "Fused-act-gate GEMM A16W16 Benchmark", args
     )
-    
+
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a16w16(M, hidden_dim, intermediate_dim, metric, provider, **kwargs):
         N, K = intermediate_dim * 2, hidden_dim
@@ -135,13 +135,13 @@ def run_model_benchmark(args):
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
         return bench_gemm_fn(
-            M, 
-            N, 
-            K, 
-            metric, 
-            args.layout, 
-            activation=args.activation, 
-            use_torch=(provider[0] == "torch")
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            activation=args.activation,
+            use_torch=(provider[0] == "torch"),
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -160,13 +160,13 @@ def run_shape_benchmark(args):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
         return bench_gemm_fn(
-            M, 
-            N, 
-            K, 
-            metric, 
-            args.layout, 
-            activation=args.activation, 
-            use_torch=(provider == "torch")
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            activation=args.activation,
+            use_torch=(provider == "torch"),
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -239,9 +239,9 @@ def parse_args():
         help="Optional activation function to apply to the output. One of ('gelu', 'gelu_tanh', 'silu', 'silu_exp2', 'relu').",
     )
     parser.add_argument(
-        "-bench_torch", 
-        action="store_true", 
-        help="Compare against native torch implementation"
+        "-bench_torch",
+        action="store_true",
+        help="Compare against native torch implementation",
     )
     return get_ff_args(parser)
 

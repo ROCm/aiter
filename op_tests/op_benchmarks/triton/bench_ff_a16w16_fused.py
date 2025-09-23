@@ -111,8 +111,8 @@ def bench_fn(
 
     # memory transfer
     if gating:
-        mem_read = (batch * intermediate_dim) * x.element_size() 
-        + (hidden_dim * intermediate_dim * 2) * w1.element_size()
+        mem_read = (batch * intermediate_dim) * x.element_size()
+        +(hidden_dim * intermediate_dim * 2) * w1.element_size()
     else:
         mem_read = (
             batch * intermediate_dim * x.element_size()
@@ -120,7 +120,7 @@ def bench_fn(
         )
     mem_write = (batch * hidden_dim) * x.element_size()
     mem = mem_read + mem_write
-    
+
     if e2e_fused:
         fn = ff_a16w16_fused_gated if gating else ff_a16w16_fused_ungated
     else:
@@ -129,8 +129,8 @@ def bench_fn(
     if use_torch:
         ms = triton.testing.do_bench(
             lambda: (
-                run_torch_gated(x, w1, w2, intermediate_dim, activation) 
-                if gating 
+                run_torch_gated(x, w1, w2, intermediate_dim, activation)
+                if gating
                 else lambda: run_torch_ungated(x, w1, w2, activation)
             ),
             warmup=25,

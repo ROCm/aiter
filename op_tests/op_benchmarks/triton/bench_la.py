@@ -7,7 +7,7 @@ from aiter.ops.triton.lean_atten import (
     _persistent_lean_attention,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_caller_name_no_ext, 
+    get_caller_name_no_ext,
     get_evaluation_label,
 )
 import torch

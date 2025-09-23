@@ -25,14 +25,14 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 
 def bench_gemm_fn(
-    batch: int, 
-    M: int, 
-    N: int, 
-    K: int, 
-    metric: str, 
-    layout: str, 
-    model_name=None, 
-    use_torch: bool = False
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    model_name=None,
+    use_torch: bool = False,
 ):
     c_dtype = torch.bfloat16
     x, w, x_scale, w_scale, y = generate_batched_gemm_afp4wfp4_inputs(
@@ -92,7 +92,14 @@ def run_model_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_afp4wfp4(
-        M, hidden_dim, intermediate_dim, batch, metric, provider, model_name=None, **kwargs
+        M,
+        hidden_dim,
+        intermediate_dim,
+        batch,
+        metric,
+        provider,
+        model_name=None,
+        **kwargs,
     ):
         if provider[1] == "fc1":
             if args.no_glu:

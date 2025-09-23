@@ -52,9 +52,9 @@ def run_benchmark(args):
     x_names = ["model", "M", "N", "K", "E", "top_k"]
 
     line_names = [
-        get_evaluation_label("time"), 
-        get_evaluation_label("throughput"), 
-        get_evaluation_label("bandwidth")
+        get_evaluation_label("time"),
+        get_evaluation_label("throughput"),
+        get_evaluation_label("bandwidth"),
     ]
     line_vals = ["time", "throughput", "bandwidth"]
 
@@ -65,8 +65,8 @@ def run_benchmark(args):
         line_vals=line_vals,
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
-        ylabel=f"{get_evaluation_label("time", space=True)} / " 
-        + f"{get_evaluation_label("throughput", space=True)} / " 
+        ylabel=f"{get_evaluation_label("time", space=True)} / "
+        + f"{get_evaluation_label("throughput", space=True)} / "
         + f"{get_evaluation_label("bandwidth", space=True)}",
         plot_name=get_caller_name_no_ext(),
         args={"a_dtype": a_dtype_str, "swizzle_mx": swizzle_mx},
