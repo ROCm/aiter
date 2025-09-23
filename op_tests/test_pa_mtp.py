@@ -253,7 +253,7 @@ def run_aiter_asm(
     )
 
 
-@perftest()
+@perftest(num_rotate_args=1)
 def run_aiter_hip(
     query,
     k_cache,
@@ -446,11 +446,15 @@ def test_pa_mtp(
 
     q_quant, q_scale = pertoken_quant(query, quant_dtype=aiter.dtypes.fp8)
     q_scale = q_scale.squeeze(-1)
-    print(f"{query.shape=}")
-    print(f"{q_quant.shape=}")
-    print(f"{q_scale.shape=}")
+    print(f"{query.shape=}, {query.dtype=}")
+    print(f"{q_quant.shape=}, {q_quant.dtype=}")
+    print(f"{q_scale.shape=}, {q_scale.dtype=}")
+    print(f"{k_quant_.shape=}, {k_quant_.dtype=}")
+    print(f"{v_quant_.shape=}, {v_quant_.dtype=}")
+    # print(f"{q_quant=}, {q_quant.to(torch.bfloat16)=}")
     out_hip, us_hip = run_aiter_hip(
-        q_quant.to(torch.bfloat16),
+        # q_quant.to(torch.bfloat16),
+        q_quant,
         k_quant_,
         asm_V_shuffle(v_quant_),
         block_tables,

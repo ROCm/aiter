@@ -14,6 +14,7 @@ def compile(
     gqa_ratio: int,
     head_size: int,
     npar_loops: int,
+    q_dtype: str,
     dtype: str,
     kv_dtype: str,
     fp8_kv_dtype: str,
@@ -39,6 +40,7 @@ def compile(
         gqa_ratio=gqa_ratio,
         head_size=head_size,
         npar_loops=npar_loops,
+        q_dtype=q_dtype,
         dtype=dtype,
         kv_dtype=kv_dtype,
         fp8_kv_dtype=fp8_kv_dtype,
@@ -79,6 +81,10 @@ def paged_attention_rocm(
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
     warpSize = torch.cuda.get_device_properties(out.device).warp_size
+    if query.dtype == torch.bfloat16:
+        q_dtype = "__hip_bfloat16"
+    elif query.dtype == torch.float8_e4m3fn:
+        q_dtype = "__hip_fp8_e4m3"
     if kv_cache_dtype == "auto":
         if query.dtype == torch.bfloat16:
             dtype = "__hip_bfloat16"
@@ -94,6 +100,9 @@ def paged_attention_rocm(
             kv_dtype = "uint8_t"
         elif query.dtype == torch.float16:
             dtype = "_Float16"
+            kv_dtype = "uint8_t"
+        elif query.dtype == torch.float8_e4m3fn:
+            dtype = "__hip_bfloat16"
             kv_dtype = "uint8_t"
         else:
             raise ValueError(f"Unsupported data type: {query.dtype}")
@@ -127,6 +136,7 @@ def paged_attention_rocm(
         gqa_ratio,
         head_size,
         npar_loops,
+        q_dtype,
         dtype,
         kv_dtype,
         kv_cache_dtype,
