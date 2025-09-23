@@ -72,7 +72,7 @@ run_swa_tests() {
 }
 
 run_group_mode_tests() {
-    for seqlen in 63 127 200; do
+    for sk in 63 127 200; do
     for prec in "bf16" "fp16" ; do
     for perm in 0 1 ; do
     for hdim in 64 80 96 120 128 144 160 192; do
@@ -84,13 +84,8 @@ run_group_mode_tests() {
         continue
     fi
 
-    if [ $mask = "b" ] && [ $v3_atomic_fp32 -eq 0 ]; then
-        echo "skip bottom-right mask & atomic16 cases"
-        continue
-    fi
-
-    $EXE -prec=$prec -b=2 -h=3 -d=$hdim -s=$seqlen  -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -v3_atomic_fp32=1 -mode=1 -kname=$KNAME $COMMON_ARGS
-    $EXE -prec=$prec -b=1 -h=4 -h_k=1 -d=$hdim -s=$seqlen  -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -v3_atomic_fp32=1 -mode=1 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=2 -h=3 -d=$hdim -s=65 -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -v3_atomic_fp32=1 -mode=1 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=1 -h=4 -h_k=1 -d=$hdim -s=129 -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -v3_atomic_fp32=1 -mode=1 -kname=$KNAME $COMMON_ARGS
 
     done
     done
