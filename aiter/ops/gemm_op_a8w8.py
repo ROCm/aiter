@@ -404,7 +404,7 @@ def gemm_a8w8_bpreshuffle(
 
 
 def gemm_bf16_ck_tile(
-    XQ: Tensor, WQ: Tensor,bias:Tensor, dtype=dtypes.bf16
+    XQ: Tensor, WQ: Tensor, bias: Tensor, dtype=dtypes.bf16
 ):
     assert dtype in [
         dtypes.bf16,
