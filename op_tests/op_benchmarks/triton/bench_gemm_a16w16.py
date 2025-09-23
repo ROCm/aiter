@@ -60,7 +60,7 @@ def bench_gemm_fn(
                 lambda: (
                     get_torch_activation_from_str(activation)(F.linear(x, w, bias=None))
                     if activation
-                    else lambda: F.linear(x, w, bias=None)
+                    else F.linear(x, w, bias=None)
                 ),
                 warmup=25,
                 rep=100,  # noqa: E731

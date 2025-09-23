@@ -131,7 +131,7 @@ def bench_fn(
             lambda: (
                 run_torch_gated(x, w1, w2, intermediate_dim, activation)
                 if gating
-                else lambda: run_torch_ungated(x, w1, w2, activation)
+                else run_torch_ungated(x, w1, w2, activation)
             ),
             warmup=25,
             rep=100,  # noqa: E731
