@@ -202,7 +202,7 @@ template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,  
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        1,       true,      2,     true,    true,        true, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd192_bf16_causal_a32_rtz_psskddv_group_recompile"; };
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        0,       true,      0,     true,    true,        true, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd192_fp16_a32_psskddv_group_recompile"; };
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        1,       true,      0,     true,    true,        true, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd192_fp16_causal_a32_psskddv_group_recompile"; };
-template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp32,        0,       true,      0,     true,   false,       false, GPUArch::gfx950>> { static constexpr const char * bwd_v3_name = "fmha_bwd_hd128_fp32_pssk"; };
+template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp32,        0,       true,      0,     true,   false,       false, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd128_fp32_pssk"; };
 
 // ########################################################|HDim|    DataType| MaskType|kIsAtomic32|BF16Cvt|kIsSEQPad|kIsHDPad|kIsGroupMode|         GPUArch|
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_< 64, FmhaBwdBf16,        0,      false,      0,    false,   false,        false,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd64_bf16_a16_rtne.co"; };
@@ -1152,7 +1152,7 @@ template <typename dq_dk_dv_v3_traits_>
 float fmha_bwd_v3_fp32_(const ck_tile::stream_config& s, fmha_bwd_args a)
 {
     if(s.log_level_ > 0)
-        std::cout << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name << std::flush;
+        std::cout << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name << std::flush;
     fmha_bwd_v3_fp32_args args;
     args.ptr_dq   = a.dq_ptr;
     args.ptr_dk   = a.dk_ptr;
