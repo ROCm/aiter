@@ -114,7 +114,7 @@ mha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
     std::string q_dtype_str = (q.dtype() == torch::kFloat16) ? "fp16" : "bf16";
     bias_enum bias_type = alibi_slopes_.has_value() ? bias_enum::alibi : bias_enum::no_bias;
 
-    return mha_bwd_args(q.data_ptr(),
+    return mha_bwd_args{q.data_ptr(),
                          k.data_ptr(),
                          v.data_ptr(),
                          alibi_slopes_ptr, // bias
@@ -197,7 +197,7 @@ mha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          false,  // is_v3_atomic_fp32
                          0,      // how_v3_bf16_cvt
                          nullptr,
-                         nullptr);     
+                         nullptr};     
 }
 
 std::vector<at::Tensor>

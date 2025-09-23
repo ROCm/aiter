@@ -820,7 +820,7 @@ float fmha_bwd_v3_genl_(const ck_tile::stream_config& s, fmha_bwd_args a)
 }
 
 template <typename dot_do_o_trait_, typename dq_dk_dv_v3_traits_, typename convert_dq_trait_>
-float fmha_bwd_v3_group_(const ck_tile::stream_config& s, fmha_bwd_args a)
+float fmha_bwd_v3_group_(const ck_tile::stream_config& s, mha_bwd_args a)
 {
     if(s.log_level_ > 0)
         std::cout << ", " << fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name << ", " << fmha_bwd_convert_dq_get_name_<convert_dq_trait_>() << std::flush;
@@ -949,7 +949,7 @@ float fmha_bwd_v3_swa_genl_(const ck_tile::stream_config& s, fmha_bwd_args a)
 }
 
 template <typename dot_do_o_trait_, typename dq_dk_dv_v3_traits_, typename convert_dq_trait_>
-float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, bool is_v3_api_check, const void* seqlen_q_padded = nullptr, const void* seqlen_k_padded = nullptr)
+float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, mha_bwd_args a, bool is_v3_api_check)
 {
     if(s.log_level_ > 0)
         std::cout << ", " << fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name << ", " << fmha_bwd_convert_dq_get_name_<convert_dq_trait_>() << std::flush;
@@ -994,12 +994,12 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
     args.Hs_lsed            = a.nhead_stride_lsed * 4;
     args.ptr_qseq           = a.seqstart_q_ptr;
     args.ptr_kseq           = a.seqstart_k_ptr;
-    args.ptr_qseq_padded    = seqlen_q_padded == nullptr
+    args.ptr_qseq_padded    = a.seqlen_q_padded == nullptr
                             ? a.seqstart_q_ptr
-                            : seqlen_q_padded;
-    args.ptr_kseq_padded    = seqlen_k_padded == nullptr
+                            : a.seqlen_q_padded;
+    args.ptr_kseq_padded    = a.seqlen_k_padded == nullptr
                             ? a.seqstart_k_ptr
-                            : seqlen_k_padded;
+                            : a.seqlen_k_padded;
     args.max_seqlen_dq     = a.max_seqlen_q;
 
     auto traits = fmha_bwd_v3_traits{a.batch,
@@ -1020,7 +1020,7 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
 }
 
 template <typename dot_do_o_trait_, typename dq_dk_dv_v3_traits_>
-float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, bool is_v3_api_check, const void* seqlen_q_padded = nullptr, const void* seqlen_k_padded = nullptr)
+float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, mha_bwd_args a, bool is_v3_api_check)
 {
     using dq_shuffle_traits = dq_shuffle_traits_<dq_dk_dv_v3_traits_::HDim, dq_dk_dv_v3_traits_::kIsGroupMode>;
 
@@ -1067,12 +1067,12 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
     args.Hs_lsed            = a.nhead_stride_lsed * 4;
     args.ptr_qseq           = a.seqstart_q_ptr;
     args.ptr_kseq           = a.seqstart_k_ptr;
-    args.ptr_qseq_padded    = seqlen_q_padded == nullptr
+    args.ptr_qseq_padded    = a.seqlen_q_padded == nullptr
                             ? a.seqstart_q_ptr
-                            : seqlen_q_padded;
-    args.ptr_kseq_padded    = seqlen_k_padded == nullptr
+                            : a.seqlen_q_padded;
+    args.ptr_kseq_padded    = a.seqlen_k_padded == nullptr
                             ? a.seqstart_k_ptr
-                            : seqlen_k_padded;
+                            : a.seqlen_k_padded;
     args.max_seqlen_dq     = (a.max_seqlen_q + 15) / 16 * 16;
 
     fmha_bwd_dq_shuffle_args dq_shuffule_args;
@@ -1088,9 +1088,9 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
     dq_shuffule_args.seqlen_q           = a.seqlen_q;
     dq_shuffule_args.head_dim           = a.hdim_q;
     dq_shuffule_args.ptr_qseq           = a.seqstart_q_ptr;
-    dq_shuffule_args.ptr_qseq_padded    = seqlen_q_padded == nullptr
+    dq_shuffule_args.ptr_qseq_padded    = a.seqlen_q_padded == nullptr
                                         ? a.seqstart_q_ptr
-                                        : seqlen_q_padded;
+                                        : a.seqlen_q_padded;
     dq_shuffule_args.max_seqlen_dq     = (a.max_seqlen_q + 15) / 16 * 16;
 
     auto traits = fmha_bwd_v3_traits{a.batch,
@@ -1114,10 +1114,8 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
 }
 
 float fmha_bwd_v3(mha_bwd_traits t,
-                  fmha_bwd_args a,
+                  mha_bwd_args a,
                   const ck_tile::stream_config& s,
-                  const void* seqlen_q_padded,
-                  const void* seqlen_k_padded,
                   bool is_v3_api_check){
     float r = -1;
 
@@ -1507,13 +1505,13 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false, true, 0, true, true, true, GPUArch::gfx950>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, true, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_hd128_fp16_a32_psskddv_group";
-                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
+                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check);
                                 return r;
                             } else {
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, true, true, true>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false, false, 0, true, true, true, GPUArch::gfx950>;
                                 // const std::string bwd_v3_name = "bwd_hd128_fp16_a16_psskddv_group";
-                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
+                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                 return r;
                             }
                         } else if ((t.mask_type != mask_enum::no_mask) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
@@ -1522,13 +1520,13 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true, true, 0, true, true, true, GPUArch::gfx950>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdFp16, true, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_hd128_fp16_causal_a32_psskddv_group";
-                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
+                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check);
                                 return r;
                             } else {
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, true, true, true>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true, false, 0, true, true, true, GPUArch::gfx950>;
                                 // const std::string bwd_v3_name = "bwd_hd128_fp16_causal_a16_psskddv_group";
-                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
+                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                 return r;
                             }
                         }
@@ -1817,13 +1815,13 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, true, 0, true, true, true, GPUArch::gfx950>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_hd128_bf16_a32_psskddv_group";
-                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
+                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check);
                                 return r;
                             } else {
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, true, true, true>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, false, false, 0, true, true, true, GPUArch::gfx950>;
                                 // const std::string bwd_v3_name = "bwd_hd128_bf16_a16_psskddv_group";
-                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
+                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                 return r;
                             }
                         } else if ((t.mask_type != mask_enum::no_mask) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
@@ -1832,13 +1830,13 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, true, 0, true, true, true, GPUArch::gfx950>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<128, FmhaBwdBf16, true, true, true, false, 0>;
                                 // const std::string bwd_v3_name = "bwd_hd128_bf16_causal_a32_psskddv_group";
-                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
+                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, is_v3_api_check);
                                 return r;
                             } else {
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdBf16, true, true, true>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16, true, false, 0, true, true, true, GPUArch::gfx950>;
                                 // const std::string bwd_v3_name = "bwd_hd128_bf16_causal_a16_psskddv_group";
-                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
+                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check);
                                 return r;
                             }
                         }
