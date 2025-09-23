@@ -1088,7 +1088,7 @@ def test_mha_backward_with_pe(
     HEAD_SZ_QK: int,
     HEAD_SZ_V: int,
 ):
-    DUMP_TENSORS: bool = True
+    DUMP_TENSORS: bool = False
 
     device: str = "cuda"
     dtype: torch.dtype = torch.float16
@@ -1097,9 +1097,9 @@ def test_mha_backward_with_pe(
     dropout_mask = None
     FUSED: bool = False
 
-    DEBUG_SHAPES: bool = False
-    DEBUG_TENSORS: bool = False
-    DEBUG: bool = DEBUG_SHAPES or DEBUG_TENSORS
+    DEBUG_SHAPES: bool = True
+    DEBUG_TENSORS: bool = True
+    DEBUG: bool = False  # DEBUG_SHAPES or DEBUG_TENSORS
 
     def debug(x_desc: str, x: torch.Tensor) -> None:
         if DEBUG_SHAPES:
@@ -1126,6 +1126,28 @@ def test_mha_backward_with_pe(
     v.requires_grad = True
 
     do = torch.randn((q.shape[:-1] + v.shape[-1:]), dtype=dtype, device=device)
+
+    # debug("q_nope[:3]", q[0, :3, 0, :16])  # OK
+    # debug("q_nope[15]", q[0, 15, 0, :16])  # OK
+    # debug("q_pe[:3]", q[0, :3, 0, 16:])  # OK
+    # debug("q_pe[15]", q[0, 15, 0, 16:])  # OK
+    # debug("k_nope[:3]", k[0, :3, 0, :16])  # OK
+    # debug("k_pe[:3]", k[0, :3, 0, 16:])  # OK
+    # debug("v[:3]", v[0, :3, 0, :])  # OK
+
+    # q_nope = q[0, :16, 0, :16]
+    # q_pe = q[0, :16, 0, 16:]
+    # k_nope_t = k[0, :8, 0, :16].T
+    # k_pe_t = k[0, :8, 0, 16:].T
+    # qk = (q_nope @ k_nope_t).float()
+    # qk += (q_pe @ k_pe_t).float()
+    # import math
+    # sm_scale = 1 / math.sqrt(HEAD_SZ_QK)
+    # qk_scaled = qk * sm_scale
+    # |_ 1st qk_scaled  matches Triton one!
+    # import pdb; pdb.set_trace()
+    # from aiter.ops.triton.mha_onekernel_bwd import set_global
+    # set_global(qk_scaled.detach().cpu().numpy())
 
     if DEBUG:
         print("--------------Triton----------------")
@@ -1178,6 +1200,7 @@ def test_mha_backward_with_pe(
     )
 
     torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
+    # debug("torch_dq", torch_dq)
 
     if DEBUG:
         debug("torch_out", torch_out)
@@ -1214,6 +1237,23 @@ def test_mha_backward_with_pe(
         triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     )
 
+    # adq = triton_dq[0, :, 0, :]
+    # rdq = torch_dq[0, :, 0, :]
+    # first_16_rows = torch.all(torch.abs(rdq[0:16] - adq[0:16]) < 1e-2)
+    # print(first_16_rows)
+
+    # * last 2 rows of triton_dq are untouched, they are all zeros and triton_dq
+    #   is allocated with torch.zeros_like(q).
+    # * the first 16 rows match with atol=1e-2 when using Triton interpreter and
+    #   running on CPU (TRITON_INTERPRET=1)
+    #   * in fact, with current block sizes, the inner dq loop wasn't running for
+    #     the last block. the outer loop was allocating dq parts as zeros and not
+    #     running the inner loop, writing zeros to memory in the end.
+    #   * now dq assertion pass with TRITON_INTERPRET=1
+
+    # * there are a lot of mismatches when running with real GPU!
+
+    # import pdb; pdb.set_trace()
     torch.testing.assert_close(
         triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     )
