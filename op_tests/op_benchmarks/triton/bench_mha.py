@@ -8,12 +8,12 @@ from aiter.ops.triton.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
-    _cast_to_fp8,
-    _cast_varlen_to_fp8,
 )
 from aiter.ops.triton.mha_v3 import (
     flash_attn_func as flash_attn_func_v3,
     flash_attn_varlen_func as flash_attn_varlen_func_v3,
+    _cast_to_fp8,
+    _cast_varlen_to_fp8,
 )
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (

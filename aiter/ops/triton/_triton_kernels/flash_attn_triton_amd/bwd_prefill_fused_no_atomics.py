@@ -2370,14 +2370,6 @@ def attention_prefill_backward_triton_impl(
     dropout_p: float = 0.0,
     philox_seed: Optional[int] = None,
     philox_offset: Optional[int] = None,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_o: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
-    descale_dq: Optional[torch.Tensor] = None,
-    descale_dk: Optional[torch.Tensor] = None,
-    descale_dv: Optional[torch.Tensor] = None,
     use_exp2: bool = True,
     mode: str = "fused_no_atomics",
 ) -> torch.Tensor:
@@ -2387,6 +2379,14 @@ def attention_prefill_backward_triton_impl(
     call ONLY this function going forward.
     mode: 'fused_atomics' or 'fused_no_atomics'; layout: 'bshd' or 'thd'; use_exp2 retained for parity.
     """
+    # Enforce supported dtypes (mirror Hopper behavior: FP8 forward-only)
+    supported_dtypes = {torch.float16, torch.bfloat16, torch.float32}
+    for name, t in {"q": q, "k": k, "v": v, "o": o, "do": do}.items():
+        if t.dtype not in supported_dtypes:
+            raise TypeError(
+                f"Backward only supports fp16/bf16/fp32; tensor '{name}' has dtype {t.dtype}"
+            )
+
     if mode == "fused_atomics":
         # Atomics path ignores layout & use_exp2; pass varlen metadata directly.
         return attention_prefill_backward_triton_fused_atomics_impl(
@@ -2409,10 +2409,10 @@ def attention_prefill_backward_triton_impl(
             dropout_p,
             philox_seed or 0,
             philox_offset or 0,
-            descale_q,
-            descale_k,
-            descale_v,
-            descale_o,
+            None,
+            None,
+            None,
+            None,
             True,  # fused flag
             None,
             None,
@@ -2440,14 +2440,14 @@ def attention_prefill_backward_triton_impl(
             philox_seed,
             philox_offset,
             use_exp2,
-            descale_q,
-            descale_k,
-            descale_v,
-            descale_o,
-            descale_do,
-            descale_dq,
-            descale_dk,
-            descale_dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             seqused_q,
             seqused_k,
         )

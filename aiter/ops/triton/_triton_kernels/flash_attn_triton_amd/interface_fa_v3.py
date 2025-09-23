@@ -616,17 +616,6 @@ def bwd(
     philox_seed, philox_offset = None, None
     alibi_slopes = None
 
-    # For fp8, we would need descale factors, but v3 interface doesn't expose them
-    # So we'll pass None for now
-    descale_q = None
-    descale_k = None
-    descale_v = None
-    descale_o = None
-    descale_do = None
-    descale_dq = None
-    descale_dk = None
-    descale_dv = None
-
     # Call implementation
     if USE_REF:
         if DEBUG:
@@ -684,14 +673,6 @@ def bwd(
             dropout_p=dropout_p,
             philox_seed=philox_seed,
             philox_offset=philox_offset,
-            descale_q=descale_q,
-            descale_k=descale_k,
-            descale_v=descale_v,
-            descale_o=descale_o,
-            descale_do=descale_do,
-            descale_dq=descale_dq,
-            descale_dk=descale_dk,
-            descale_dv=descale_dv,
             use_exp2=USE_EXP2,
             mode=BWD_MODE,
         )

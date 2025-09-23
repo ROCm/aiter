@@ -6,6 +6,204 @@ from typing import Optional, Tuple
 import torch
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
+from aiter.ops.triton.utils.types import get_fp8_dtypes
+
+# Global toggle: when enabled and FP8 descale factors are provided, we store the
+# dequantized representations (q * q_descale, etc.) instead of the raw FP8 tensors
+# in the autograd context for potential future backward experimentation and easier
+# numerical debugging. Forward behavior / outputs are unaffected.
+# NOTE: This does NOT enable FP8 backward; it only changes what is saved.
+FP8_DEQUANTIZED_BACKWARD = False
+
+
+def set_fp8_dequantized_backward(value: bool):
+    """Enable storing dequantized FP8 tensors (q/k/v * descale) in ctx instead of raw FP8.
+
+    This is a debug / research aid; no gradients are produced for FP8 yet.
+    """
+    global FP8_DEQUANTIZED_BACKWARD
+    FP8_DEQUANTIZED_BACKWARD = bool(value)
+
+
+def _cast_to_fp8(
+    x: torch.Tensor,
+    fp8_dtype,
+    layout,
+    clamp_val=1e-9,
+    group_size: int | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert a tensor to FP8 format, returning an FP8 tensor and a descale factor.
+    Args:
+        - x (torch.Tensor): shape [batch, seq_len, heads, dim]
+    Returns:
+        - x_fp8 (torch.Tensor): FP8 tensor with the same shape as x
+        - descale_factor (torch.Tensor): tensor of shape [batch, heads]
+    """
+    if len(x.shape) != 4:
+        raise ValueError(
+            f"'bshd' tensor should have shape [batch, seqlen, heads, dim], got {x.shape}"
+        )
+    batch, seqlen, nheads, dim = x.shape
+    if group_size is None:
+        # Standard per-head
+        x_abs_max = x.abs().amax(dim=(1, 3))  # (batch, heads)
+        x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
+        fp8_max = torch.finfo(fp8_dtype).max
+        scale = (fp8_max / x_abs_max).view(batch, 1, nheads, 1)
+        x_scaled = x * scale
+        x_fp8 = x_scaled.to(fp8_dtype)
+        # Preserve intent of requires_grad for downstream API expectations.
+        # This does NOT create a differentiable path back to x; gradients stop at the cast.
+        if x.requires_grad:
+            x_fp8.requires_grad_(True)
+        descale_factor = x_abs_max / fp8_max
+        return x_fp8, descale_factor
+    # Grouped path
+    if nheads % group_size != 0:
+        raise ValueError(
+            f"group_size {group_size} must divide number of heads {nheads} in _cast_to_fp8"
+        )
+    ngroups = nheads // group_size
+    # reshape to (B,S,ngroups,group_size,D)
+    xg = x.view(batch, seqlen, ngroups, group_size, dim)
+    x_abs_max_group = xg.abs().amax(dim=(1, 3, 4))  # (B, ngroups)
+    x_abs_max_group = torch.maximum(x_abs_max_group, x.new_tensor(clamp_val))
+    fp8_max = torch.finfo(fp8_dtype).max
+    scale_group = (fp8_max / x_abs_max_group).view(batch, 1, ngroups, 1, 1)
+    x_scaled = xg * scale_group
+    x_fp8 = x_scaled.to(fp8_dtype).view(batch, seqlen, nheads, dim)
+    if x.requires_grad:
+        x_fp8.requires_grad_(True)
+    descale_factor = x_abs_max_group / fp8_max  # (B, ngroups)
+    return x_fp8, descale_factor
+
+
+def _cast_varlen_to_fp8(
+    x: torch.Tensor,
+    fp8_dtype: torch.dtype,
+    cu_seqlens,
+    clamp_val: float = 1e-9,
+    group_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert a tensor of sequences with variable seq_len into fp8.
+    Args:
+        - x (torch.Tensor): shape [total_seq_len, heads, dim]
+    Returns:
+        - x_fp8 (torch.Tensor): shape [total_seq_len, heads, dim]
+        - descale_factors (torch.Tensor): shape [batch, heads]
+    """
+    # validate tensor shape
+    if len(x.shape) != 3:
+        raise ValueError(
+            f"tensor should have shape [total_seqlen, heads, dim], got {x.shape}"
+        )
+    num_heads = x.shape[1]
+
+    # Get batch size from cu_seqlens
+    batch = cu_seqlens.shape[0] - 1
+    fp8_max = torch.finfo(fp8_dtype).max
+
+    # Compute scale and descale factors per sequence
+    x_fp8 = torch.zeros_like(x, dtype=fp8_dtype)
+    if group_size is not None and num_heads % group_size != 0:
+        raise ValueError(
+            f"group_size {group_size} must divide number of heads {num_heads} in _cast_varlen_to_fp8"
+        )
+    out_heads = num_heads if group_size is None else num_heads // group_size
+    descale_factors = torch.zeros(
+        (batch, out_heads), device=x.device, dtype=torch.float32
+    )
+
+    for i in range(batch):
+        start = cu_seqlens[i]
+        end = cu_seqlens[i + 1]
+        x_slice = x[start:end]  # Slice for current sequence
+
+        if group_size is None:
+            x_abs_max = x_slice.abs().amax(dim=(0, 2))  # (heads)
+            x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
+            scale_i = fp8_max / x_abs_max
+            descale_i = x_abs_max / fp8_max
+            descale_factors[i, :] = descale_i
+            scale_reshape = scale_i.view(1, num_heads, 1)
+            x_fp8[start:end] = (x_slice * scale_reshape).to(fp8_dtype)
+        else:
+            ngroups = num_heads // group_size
+            xg = x_slice.view(end - start, ngroups, group_size, x_slice.shape[2])
+            x_abs_max_group = xg.abs().amax(dim=(0, 2, 3))  # (ngroups)
+            x_abs_max_group = torch.maximum(x_abs_max_group, x.new_tensor(clamp_val))
+            scale_group = fp8_max / x_abs_max_group
+            descale_group = x_abs_max_group / fp8_max
+            descale_factors[i, :] = descale_group
+            scale_group_reshape = scale_group.view(1, ngroups, 1, 1)
+            x_fp8[start:end] = (
+                (xg * scale_group_reshape)
+                .to(fp8_dtype)
+                .view(end - start, num_heads, x_slice.shape[2])
+            )
+
+    if x.requires_grad:
+        x_fp8.requires_grad_(True)
+    return x_fp8, descale_factors
+
+
+def _dequantize_bshd(x: torch.Tensor, descale: torch.Tensor | None) -> torch.Tensor:
+    """Return a float32 dequantized (or widened) version of a BSHD activation.
+
+    Steps:
+      1. If `x` is FP8, cast to float32 first (ALWAYS) to avoid unsupported FP8 * fp16/fp32 promotion.
+         If `x` is already fp16/bf16/fp32 we keep its current dtype (unless scaling forces fp32).
+      2. If `descale` is None, return the widened tensor (no scaling).
+      3. If `descale` provided, support per-head or grouped scaling shapes:
+            (B, H)  -> per-head scaling
+            (B, G) with H % G == 0 -> grouped scaling expanded over heads
+         Any mismatch now RAISES a ValueError (previous behavior silently continued).
+
+    Error conditions raised when descale is provided:
+      - x.dim() != 4 or descale.dim() != 2
+      - descale.shape[0] != B
+      - head/group dimension neither equals H nor divides H
+
+    Returns: float32 tensor (widened and optionally scaled) when successful.
+    """
+    is_fp8 = x.dtype in get_fp8_dtypes()
+    if not is_fp8:
+        raise TypeError(
+            f"_dequantize_bshd expects an FP8 tensor; got {x.dtype}. "
+            "This helper should only be invoked in the FP8 saving path."
+        )
+    # Always widen FP8 to float32 up front.
+    x_fp = x.float()
+    if descale is None:
+        return x_fp
+    # Ensure descale is float32 for stable math.
+    descale_fp = descale.float()
+    if x_fp.dim() != 4:
+        raise ValueError(
+            f"_dequantize_bshd expected x to have 4 dims (B,S,H,D); got shape {tuple(x_fp.shape)}"
+        )
+    if descale_fp.dim() != 2:
+        raise ValueError(
+            f"_dequantize_bshd expected descale to have 2 dims (B,H or B,G); got shape {tuple(descale_fp.shape)}"
+        )
+    B, S, H, D = x_fp.shape
+    if descale_fp.shape[0] != B:
+        raise ValueError(
+            f"Batch size mismatch: x has B={B} but descale first dim={descale_fp.shape[0]}"
+        )
+    head_or_groups = descale_fp.shape[1]
+    if head_or_groups == H:
+        return x_fp * descale_fp.view(B, 1, H, 1)
+    if H % head_or_groups == 0:  # grouped scaling
+        group_size = H // head_or_groups
+        expanded = descale_fp.unsqueeze(-1).repeat(1, 1, group_size).view(B, H)
+        return x_fp * expanded.view(B, 1, H, 1)
+    raise ValueError(
+        "Incompatible descale shape: second dim neither equals number of heads nor divides it "
+        f"(H={H}, descale second dim={head_or_groups})."
+    )
 
 
 class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
@@ -48,10 +246,6 @@ class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
         if sm_margin != 0:
             raise NotImplementedError("sm_margin != 0 not supported in AMD Triton v3")
 
-        requires_grad = (
-            any(t.requires_grad for t in (q, k, v)) and torch.is_grad_enabled()
-        )
-
         # Forward: basic path (no varlen / kv-cache parameters used here)
         out, softmax_lse = flash_attn_3.fwd(
             q,
@@ -90,14 +284,22 @@ class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
             sm_margin,
         )
 
-        if requires_grad:
-            ctx.save_for_backward(q, k, v, out, softmax_lse)
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.softcap = softcap
-            ctx.deterministic = deterministic
-            ctx.sm_margin = sm_margin
+        # FP8 save strategy (debug/experimental): widen FP8 -> fp32 then (optionally) apply descale.
+        # If toggle disabled or not FP8 we store originals. Scaling is only for debug/backward R&D.
+        if FP8_DEQUANTIZED_BACKWARD and q.dtype in get_fp8_dtypes():
+            q_save = _dequantize_bshd(q, q_descale)
+            k_save = _dequantize_bshd(k, k_descale)
+            v_save = _dequantize_bshd(v, v_descale)
+        else:
+            q_save, k_save, v_save = q, k, v
+
+        ctx.save_for_backward(q_save, k_save, v_save, out, softmax_lse)
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.softcap = softcap
+        ctx.deterministic = deterministic
+        ctx.sm_margin = sm_margin
         return out
 
     @staticmethod
@@ -219,10 +421,6 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
         if sm_margin != 0:
             raise NotImplementedError("sm_margin != 0 not supported in varlen v3 yet")
 
-        requires_grad = (
-            any(t.requires_grad for t in (q, k, v)) and torch.is_grad_enabled()
-        )
-
         out, softmax_lse = flash_attn_3.fwd(
             q,
             k,
@@ -259,19 +457,24 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
             None,  # pack_gqa
             sm_margin,
         )
-
-        if requires_grad:
-            ctx.save_for_backward(q, k, v, out, softmax_lse)
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.softcap = softcap
-            ctx.deterministic = deterministic
-            ctx.sm_margin = sm_margin
-            ctx.cu_seqlens_q = cu_seqlens_q
-            ctx.cu_seqlens_k = cu_seqlens_k
-            ctx.max_seqlen_q = max_seqlen_q
-            ctx.max_seqlen_k = max_seqlen_k
+        # Varlen FP8 save: same policy—widen and optionally scale (shape mismatches just widen).
+        if FP8_DEQUANTIZED_BACKWARD and q.dtype in get_fp8_dtypes():
+            q_save = _dequantize_bshd(q, q_descale)
+            k_save = _dequantize_bshd(k, k_descale)
+            v_save = _dequantize_bshd(v, v_descale)
+        else:
+            q_save, k_save, v_save = q, k, v
+        ctx.save_for_backward(q_save, k_save, v_save, out, softmax_lse)
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.softcap = softcap
+        ctx.deterministic = deterministic
+        ctx.sm_margin = sm_margin
+        ctx.cu_seqlens_q = cu_seqlens_q
+        ctx.cu_seqlens_k = cu_seqlens_k
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_k = max_seqlen_k
         return out
 
     @staticmethod
