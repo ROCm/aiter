@@ -391,7 +391,7 @@ def test_skinny_gemm():
 
 
 # test_normal_gemm()
-
+# test_skinny_gemm()
 def test_ck_tile_gemm():
     # seed = 8779
     # torch.manual_seed(seed)
@@ -416,19 +416,19 @@ def test_ck_tile_gemm():
             [1, 7168, 2048],
             [1, 7168, 512],
             [1, 512, 7168],
-             [16, 2112, 7168],
+            [16, 2112, 7168],
             [16, 3072, 1536],
             [16, 4096, 512],
             [16, 7168, 2048],
             [16, 7168, 512],
             [16, 512, 7168],
-             [128, 2112, 7168],
+            [128, 2112, 7168],
             [128, 3072, 1536],
             [128, 4096, 512],
             [128, 7168, 2048],
             [128, 7168, 512],
             [128, 512, 7168],
-             [1024, 2112, 7168],
+            [1024, 2112, 7168],
             [1024, 3072, 1536],
             [1024, 4096, 512],
             [1024, 7168, 2048],
@@ -445,5 +445,4 @@ def test_ck_tile_gemm():
             for dtype in [ dtypes.bf16]:
                 for otype in [ dtypes.bf16]:
                     test_gemm_ck_tile(dtype, m, n, k, otype=otype)
-# test_skinny_gemm()
 test_ck_tile_gemm()
