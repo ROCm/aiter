@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-from typing import List, Optional, Tuple, Union
-import aiter
-from aiter.test_common import checkAllclose, benchmark, perftest
-from aiter import paged_attn as ops
-import random
-import pandas as pd
 import argparse
+import itertools
+import random
+from typing import List, Optional, Tuple, Union
+
+import pandas as pd
+import torch
+
+import aiter
 from aiter import dtypes
+from aiter import paged_attn as ops
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -445,7 +448,6 @@ def test_pa_mtp(
     ret["us_hip_bf16"] = us_hip
     ret["err_hip_bf16"] = err_noquant
 
-
     # ################## quant start ######################
     k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
         pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
@@ -501,11 +503,11 @@ def test_pa_mtp(
 
 
 head_dim = 128
-block_size = 16
+l_block_size = [16]
 l_dtype = ["bf16"]
 l_num_heads = [(5, 1), (8, 1), (10, 1)]
 l_qlen = [1, 2, 3, 4]
-l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097,16384]
+l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
 l_batch_size = [128]
 
 parser = argparse.ArgumentParser(
@@ -556,7 +558,14 @@ parser.add_argument(
     help="""Batch size.
     e.g. -b 128""",
 )
-
+parser.add_argument(
+    "--block_size",
+    type=int,
+    nargs="*",
+    default=l_block_size,
+    help="""Batch size.
+    e.g. -b 128""",
+)
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -570,23 +579,23 @@ if args.ctx_len is not None:
     l_ctx_len = [args.ctx_len]
 if args.batch_size is not None:
     l_batch_size = [args.batch_size]
+l_block_size = args.block_size
 
 for dtype in l_dtype:
     df = []
-    for num_heads in l_num_heads:
-        for qlen in l_qlen:
-            for ctx_len in l_ctx_len:
-                for batch_size in l_batch_size:
-                    ret = test_pa_mtp(
-                        ctx_len,
-                        batch_size,
-                        num_heads,
-                        head_dim,
-                        block_size,
-                        dtype,
-                        qlen,
-                    )
-                    df.append(ret)
+    for num_heads, qlen, ctx_len, batch_size, block_size in itertools.product(
+        l_num_heads, l_qlen, l_ctx_len, l_batch_size, l_block_size
+    ):
+        ret = test_pa_mtp(
+            ctx_len,
+            batch_size,
+            num_heads,
+            head_dim,
+            block_size,
+            dtype,
+            qlen,
+        )
+        df.append(ret)
     df = pd.DataFrame(df)
     aiter.logger.info(f"summary:\n{df}")
     # df.to_csv("mla_prefill.csv")

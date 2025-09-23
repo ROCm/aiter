@@ -54,27 +54,26 @@ std::string get_heuristic_kernel(std::string q_type,
                                  int block_size,
                                  CFG* cfgs)
 {
-    for(const auto& el : *cfgs)
+    const std::vector<int> mtp_flags = (mtp > 0) ? std::vector<int>{mtp, 1} : std::vector<int>{0};
+    const std::vector<int> gqa_flags = {gqa, (gqa + 7) / 8 * 8};
+    for(int mtp_ : mtp_flags)
     {
-        const auto& cfg = el.second;
-        // hp is just distinct from uhp
-        if(cfg.q_type == q_type && cfg.kv_type == kv_type && cfg.gqa == gqa && cfg.mtp == mtp &&
-           cfg.msk == msk && (cfg.hp == hp || hp == 1) && cfg.block_size == block_size)
+        for(int gqa_ : gqa_flags)
+        {
+            // find exact match
+            for(const auto& el : *cfgs)
+            {
+                const auto& cfg = el.second;
+                // hp is just distinct from uhp
+                if(cfg.q_type == q_type && cfg.kv_type == kv_type && cfg.gqa == gqa_ &&
+                   cfg.mtp == mtp_ && cfg.msk == msk && (cfg.hp == hp || hp == 1) &&
+                   cfg.block_size == block_size)
 
-            return el.first;
+                    return el.first;
+            }
+        }
     }
 
-    // find gqa relaxed
-    int gqa_ = (gqa + 7) / 8 * 8; // 1~8 -> 8, 9~16 -> 16
-    for(const auto& el : *cfgs)
-    {
-        const auto& cfg = el.second;
-        // hp is just distinct from uhp
-        if(cfg.q_type == q_type && cfg.kv_type == kv_type && cfg.gqa == gqa_ && cfg.mtp == mtp &&
-           cfg.msk == msk && (cfg.hp == hp || hp == 1) && cfg.block_size == block_size)
-
-            return el.first;
-    }
     TORCH_CHECK(false,
                 __func__,
                 ": cannot get heuristic kernel!"
@@ -192,7 +191,7 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     // 4. "mtp" , 5. "mask"
     if(qo_indptr && max_qlen > 1)
     {
-        mtp = 1;
+        mtp = max_qlen + 10; // for kernels only support qlen=3, we encode it as 3+10=13
         msk = 1;
     }
     else
