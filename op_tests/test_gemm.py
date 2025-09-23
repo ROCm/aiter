@@ -445,4 +445,6 @@ def test_ck_tile_gemm():
             for dtype in [ dtypes.bf16]:
                 for otype in [ dtypes.bf16]:
                     test_gemm_ck_tile(dtype, m, n, k, otype=otype)
-test_ck_tile_gemm()
+
+if __name__ == '__main__':
+    test_ck_tile_gemm()
