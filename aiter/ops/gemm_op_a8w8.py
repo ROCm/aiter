@@ -413,7 +413,6 @@ def gemm_bf16_ck_tile(
     m = XQ.shape[0]
     n = WQ.shape[0]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    # WQ_=permute_weight(WQ)
     return ck_tile_gemm_bf16(XQ, WQ,bias, Y)
 
 def gemm_a8w8_blockscale(
