@@ -68,6 +68,7 @@ get_heuristic_kernel(int M,
     uint32_t pure_tg_num   = 0;
     uint32_t round         = 0xffffffff;
     float compute2mem_effi = 1.0;
+    int oob                = M;
 
     std::string selectedKernelName = "";
     int selectedsplitK             = 1;
@@ -108,14 +109,19 @@ get_heuristic_kernel(int M,
             bool is_earlier_round        = (local_round < round);
             bool is_same_round           = (local_round == round);
             bool has_sufficient_empty_cu = (empty_cu > (local_round * num_cu - tg_num));
+            bool has_same_empty_cu       = empty_cu == (local_round * num_cu - tg_num);
             bool has_better_efficiency   = (local_compute2mem_effi > compute2mem_effi);
+            // printf("oob %d,  tielM: %d\n", oob, cfg.tileM);
+            bool less_oob = (M % cfg.tileM == 0) ? (oob > 0) : (cfg.tileM - M % cfg.tileM < oob);
+            bool has_same_oob = (cfg.tileM - (M % cfg.tileM)) == oob;
 
-            if(is_earlier_round ||
-               (is_same_round && (has_sufficient_empty_cu || has_better_efficiency)))
+            if(is_earlier_round || (is_same_round && (has_sufficient_empty_cu || less_oob)) ||
+               (is_same_round && has_same_empty_cu && has_same_oob && has_better_efficiency))
             {
                 round              = local_round;
                 empty_cu           = local_round * num_cu - tg_num;
                 compute2mem_effi   = local_compute2mem_effi;
+                oob                = (M % cfg.tileM == 0) ? 0 : cfg.tileM - (M % cfg.tileM);
                 selectedKernelName = el.first;
                 selectedsplitK     = split_K;
             }
