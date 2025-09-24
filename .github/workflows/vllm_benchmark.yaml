@@ -31,14 +31,6 @@ jobs:
           git submodule sync
           git submodule update --init --recursive --depth 1 --jobs 4
 
-      - name: Checkout vLLM repo with retry
-        uses: nick-fields/retry@v2
-        with:
-          timeout_minutes: 5
-          max_attempts: 3
-          command: |
-            git clone --branch ${{ env.VLLM_BRANCH }} ${{ env.VLLM_REPOSITORY_URL }}
-
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
 
