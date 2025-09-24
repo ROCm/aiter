@@ -395,7 +395,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         kv_blk_nums2[:, None, None,None] * stride_v_b
         + kv_head_idx * stride_v_nh
         + v_dim1_offs[None, :, None, None] * stride_v_bx
-        + v_dim2_offs[None, None, :, None] * stride_v_h
+        + v_dim2_offs[None, None, :, None] * CONTIGUOUS_KV_ELEMS_16B_LOAD #stride_v_h
         + v_dim3_offs[None, None, None, :]
     )
     # if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 0:
@@ -574,6 +574,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     else:
         # import pdb
         # pdb.set_trace()
+        print(stride_v_h)
         # _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk[grid](
         k = _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon[grid](
             exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
