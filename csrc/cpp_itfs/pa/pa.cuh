@@ -248,7 +248,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                                              [lane16id % GQA_RATIO_MTP_PARALLEL][2 * qkratio + i];
                             if constexpr (KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto && q_scale_ptr == nullptr) {
                             scalar_t* qptr =
-                            reinterpret_cast<scalar_t*>(&Qlocal[qkhe_depth][qkratio].xy[i]);
+                            reinterpret_cast<scalar_t*>(&Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i]);
                             for (int k = 0; k < 4; k++)
                                  q_max = fmax(fabs(to_float<scalar_t>(qptr[k])), q_max);
                             }
