@@ -21,7 +21,7 @@ def _quantize_bshd(
     x: torch.Tensor,
     fp8_dtype,
     clamp_val=1e-9,
-    group_size: int | None = None,
+    group_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Convert a tensor to FP8 format, returning an FP8 tensor and a descale factor.
