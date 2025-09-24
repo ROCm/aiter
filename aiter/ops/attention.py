@@ -311,6 +311,7 @@ def get_mla_metadata_v1(
     reduce_final_map_tsr: torch.Tensor,
     reduce_partial_map_tsr: torch.Tensor,
     # num_reduce_tile_tensor: torch.Tensor,
+    split_params: Optional[dict[str, int]] = None,
 ) -> Tuple[torch.Tensor]:
     """
     Arguments:

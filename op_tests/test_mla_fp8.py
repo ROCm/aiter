@@ -8,6 +8,7 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
+import math 
 
 torch.set_default_device("cuda")
 # torch.set_printoptions(sci_mode=False, threshold=torch.inf)
@@ -244,18 +245,42 @@ def test_mla(
         kv_scale=kv_scale,
     )
 
-    # aiter implementation
-    work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
-    work_indptr = torch.empty([81], dtype=torch.int32, device="cuda")
-    work_info_set = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
-    reduce_indptr = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
-    reduce_final_map = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
-    reduce_partial_map = torch.empty(
-        [batch_size * 80], dtype=torch.int32, device="cuda"
-    )
-    # num_reduce_tile    = torch.empty([1], dtype=torch.int32, device="cuda")
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
 
-    meta = aiter.get_mla_metadata_v1(
+    # 128 here is the maxmium len in packed_qo (qolen*#heads) can handled by mla main kernel
+    # It would be more decent to query this value from aiter.
+    max_qo_tiles_per_batch = int(math.ceil(torch.max(seq_lens_qo).item() * nhead / 128))
+
+    # aiter implementation
+    # the tensor's meaning please refer aiter/ops/attention.py
+    work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
+    work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
+    work_info_set = torch.empty(
+        [batch_size * max_qo_tiles_per_batch * cu_num, 8],
+        dtype=torch.int32,
+        device="cuda",
+    ).fill_(-1)
+    reduce_indptr = torch.empty(
+        [batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
+    )
+    reduce_final_map = torch.empty(
+        [batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
+    )
+    reduce_partial_map = torch.empty(
+        [batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
+    )
+
+    split_params = {
+        "kv_granularity": max(page_size, 16),
+        "max_seqlen_qo": max_seqlen_qo,
+        "uni_seqlen_qo": mtp,
+        "fast_mode": 1,
+    }
+    # _, us_asm_decode = run_perftest(
+    #     aiter.get_mla_metadata_v1,
+    aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         nhead // nhead_kv,
@@ -267,12 +292,14 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+        split_params=split_params,
     )
-    print(work_indptr)
-    print(work_info_set[: work_indptr[-1]])
-    print(reduce_indptr)
-    print(reduce_final_map)
-    print(reduce_partial_map)
+
+    # print(work_indptr)
+    # print(work_info_set[: work_indptr[-1]])
+    # print(reduce_indptr)
+    # print(reduce_final_map)
+    # print(reduce_partial_map)
 
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
     out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
@@ -422,7 +449,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(80, 128)],  # [41],
+    default=[i for i in range(1, 128)],  # [41],
     # default=[64], # [41],
     help="""Batch size.
     e.g.: -b 16""",

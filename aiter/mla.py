@@ -299,6 +299,7 @@ def mla_decode_fwd(
     reduce_partial_map=None,
     q_scale=None,
     kv_scale=None,
+    return_lse=False,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -337,7 +338,11 @@ def mla_decode_fwd(
     attn_lse = torch.empty(
         (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
     )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+
+    if return_lse:
+        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    else:
+        final_lse = None
     
     if num_kv_splits_indptr is not None:
         if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):

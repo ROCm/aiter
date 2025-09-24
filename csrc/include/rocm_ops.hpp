@@ -1038,7 +1038,20 @@
 
 #define MLA_METADATA_PYBIND                             \
     m.def("get_mla_metadata_v0", &get_mla_metadata_v0); \
-    m.def("get_mla_metadata_v1", &get_mla_metadata_v1); \
-    m.def("get_mla_metadata_v2", &get_mla_metadata_v2);
+    m.def("get_mla_metadata_v1",                        \
+          &get_mla_metadata_v1,                         \
+          "get_mla_metadata_v1",                        \
+          py::arg("seqlens_qo_indptr"),                 \
+          py::arg("seqlens_kv_indptr"),                 \
+          py::arg("num_heads_per_head_k"),              \
+          py::arg("num_heads_k"),                       \
+          py::arg("is_causal"),                         \
+          py::arg("work_metadata_ptrs"),                \
+          py::arg("work_info_set"),                     \
+          py::arg("work_indptr"),                       \
+          py::arg("reduce_indptr"),                     \
+          py::arg("reduce_final_map"),                  \
+          py::arg("reduce_partial_map"),                \
+          py::arg("split_params") = std::nullopt);
 
 #define MLA_REDUCE_PYBIND m.def("mla_reduce_v1", &mla_reduce_v1);
