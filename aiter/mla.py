@@ -337,7 +337,8 @@ def mla_decode_fwd(
     attn_lse = torch.empty(
         (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
     )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    # final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    final_lse = None
     
     if num_kv_splits_indptr is not None:
         if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):

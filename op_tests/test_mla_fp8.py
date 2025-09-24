@@ -278,8 +278,9 @@ def test_mla(
         "uni_seqlen_qo": mtp,
         "fast_mode": 1,
     }
-    _, us_asm_decode = run_perftest(
-        aiter.get_mla_metadata_v1,
+    # _, us_asm_decode = run_perftest(
+    #     aiter.get_mla_metadata_v1,
+    aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         nhead // nhead_kv,
@@ -294,11 +295,11 @@ def test_mla(
         split_params=split_params,
     )
 
-    print(work_indptr)
-    print(work_info_set[: work_indptr[-1]])
-    print(reduce_indptr)
-    print(reduce_final_map)
-    print(reduce_partial_map)
+    # print(work_indptr)
+    # print(work_info_set[: work_indptr[-1]])
+    # print(reduce_indptr)
+    # print(reduce_final_map)
+    # print(reduce_partial_map)
 
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
     out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
