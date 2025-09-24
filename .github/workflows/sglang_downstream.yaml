@@ -14,6 +14,7 @@ concurrency:
 jobs:
   sglang:
     name: sglang integration
+    if: ${{ secrets.HF_TOKEN_TEST != '' }}
     runs-on: aiter-1gpu-runner
     env:
       SGL_BRANCH: v0.5.1

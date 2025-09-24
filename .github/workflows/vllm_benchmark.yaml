@@ -20,6 +20,7 @@ env:
 
 jobs:
   build_vllm_image:
+    if: ${{ secrets.DOCKER_PASSWORD != '' }}
     runs-on: aiter-k8s-build
 
     steps:
@@ -74,6 +75,7 @@ jobs:
           echo "Successfully prepared image: rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}"
 
   vllm_benchmark:
+    if: ${{ secrets.DOCKER_PASSWORD != '' }}
     runs-on: aiter-8gpu-runner
     needs: build_vllm_image
     strategy:
