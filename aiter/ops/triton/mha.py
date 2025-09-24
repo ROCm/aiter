@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
@@ -59,7 +59,7 @@ def _flash_attn_forward(
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
     config: Optional[dict[str, any]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int, int]:
 
     if bias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
@@ -737,20 +737,20 @@ def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    k: torch.Tensor | None = None,
-    v: torch.Tensor | None = None,
-    cache_seqlens: torch.Tensor | int | None = None,
-    softmax_scale: float | None = None,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[Union[torch.Tensor, int]] = None,
+    softmax_scale: Optional[float] = None,
     causal: bool = True,
     window_size: tuple[int, int] = (-1, -1),
     softcap: float = 0.0,
     num_splits: int = 0,
-    rotary_cos: torch.Tensor | None = None,
-    rotary_sin: torch.Tensor | None = None,
-    cache_batch_idx: torch.Tensor | None = None,
-    cache_leftpad: torch.Tensor | None = None,
-    block_table: torch.Tensor | None = None,
-    alibi_slopes: torch.Tensor | None = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
     rotary_interleaved: bool = True,
     return_softmax_lse: bool = False,
 ):

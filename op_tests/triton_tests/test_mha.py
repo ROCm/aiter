@@ -26,6 +26,7 @@ from aiter.test_mha_common import (
     generate_random_padding_mask,
     generate_qkv,
 )
+from typing import Optional
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -1009,7 +1010,7 @@ def test_mha_kvcache(
     d: int,
     causal: bool,
     FP8: bool,
-    page_size: int | None,
+    page_size: Optional[int],
     version: str,
 ):
     device = "cuda"

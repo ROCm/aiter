@@ -75,7 +75,7 @@ def _quantize_thd(
     fp8_dtype: torch.dtype,
     cu_seqlens,
     clamp_val: float = 1e-9,
-    group_size: int | None = None,
+    group_size: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Convert a tensor of sequences with variable seq_len into fp8.
