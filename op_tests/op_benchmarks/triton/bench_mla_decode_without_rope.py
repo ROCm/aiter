@@ -236,7 +236,7 @@ def run_benchmark(args: argparse.Namespace):
         qk_rope_head_dim: int,
         mtp: int,
         dtype: torch.dtype,
-        num_kv_splits: int = 1,
+        num_kv_splits: int = 5,
         sm_scale: float = 1.0,
         logit_cap: float = 0.0,
         device="cuda",
@@ -369,7 +369,7 @@ def run_benchmark(args: argparse.Namespace):
             # rep=100,
         )
         ms = us / 1000
-        # import pdb;pdb.set_trace()
+        import pdb;pdb.set_trace()
 
         checkAllclose(out_ref, out_tri,
             msg=f"mla_decode-absorb    [golden vs triton]: {ms * 1000} us......",
