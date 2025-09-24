@@ -218,15 +218,17 @@ def e2e_moe_kernel(
         if use_fp8_w8a8:
             if IS_BLOCKSCALEQ:
                 k_start = k * BLOCK_SIZE_K1
-                offs_ks = k_start // group_k
+                offs_ks = (k_start + offs_k1) // group_k
                 a_scale = tl.load(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
                 w1_i0_scale = tl.load(w1_i0_scale_ptrs + offs_ks * stride_w1sk)
                 w1_i1_scale = tl.load(w1_i1_scale_ptrs + offs_ks * stride_w1sk)
 
-                silu_acc += tl.dot(a, w1_i0) * a_scale[:, None] * w1_i0_scale[None, :]
-                mul_acc += tl.dot(a, w1_i1) * a_scale[:, None] * w1_i1_scale[None, :]
+                silu_acc += tl.dot_scaled(a, a_scale, "e4m3", w1_i0, w1_i0_scale, "e4m3")
+                mul_acc += tl.dot_scaled(a, a_scale, "e4m3", w1_i1, w1_i1_scale, "e4m3")
+                # silu_acc += tl.dot(a, w1_i0) * a_scale[:, None] * w1_i0_scale[None, :]
+                # mul_acc += tl.dot(a, w1_i1) * a_scale[:, None] * w1_i1_scale[None, :]
             else:
                 mul_acc = tl.dot(a, w1_i1, acc=mul_acc)
                 silu_acc = tl.dot(a, w1_i0, acc=silu_acc)
@@ -300,16 +302,9 @@ def e2e_moe_kernel(
         if use_fp8_w8a8:
             if IS_BLOCKSCALEQ:
                 k_start = k * BLOCK_SIZE_K2 + offs_k2[None, :]
-                offs_ks = k_start // group_k
-
+                offs_ks = (k_start + offs_k2) // group_k
                 w2_scale = tl.load(w2_scale_ptrs + offs_ks * stride_w2sk)
-                # tl.static_print("acc", acc)
-                # tl.static_print("w2", w2)
-                # tl.static_print("w2_scale", w2_scale)
-                # out = tl.dot(acc, w2) * acc_scale * w2_scale[None, :]
                 out = tl.dot_scaled(acc, acc_scale, "e4m3", w2, w2_scale, "e4m3")
-                # out = tl.dot(acc, w2)
-                # out = tl.dot(acc, w2)
             else:
                 out = tl.dot(acc, w2)
         else:
