@@ -8,6 +8,8 @@ import torch
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 
 FP8_DEQUANTIZED_BACKWARD = False
+
+
 def set_fp8_dequantized_backward(value: bool):
     """Enable storing dequantized FP8 tensors (q/k/v * descale) in ctx instead of raw FP8.
 
@@ -160,7 +162,12 @@ def _dequantize_bshd(x: torch.Tensor, descale: torch.Tensor | None) -> torch.Ten
 
     Returns: float32 tensor (widened and optionally scaled) when successful.
     """
-    is_fp8 = x.dtype in (torch.float8_e5m2, torch.float8_e5m2fnuz, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    is_fp8 = x.dtype in (
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    )
     if not is_fp8:
         raise TypeError(
             f"_dequantize_bshd expects an FP8 tensor; got {x.dtype}. "
@@ -220,7 +227,12 @@ def _dequantize_varlen_thd(
       * Validates tensor ranks & basic shape consistency; raises ValueError on mismatch.
       * Supports grouped scaling when H % G == 0.
     """
-    is_fp8 = x.dtype in (torch.float8_e5m2, torch.float8_e5m2fnuz, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    is_fp8 = x.dtype in (
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    )
     if not is_fp8:
         raise TypeError(
             f"_dequantize_varlen_thd expects an FP8 tensor; got {x.dtype}. "
@@ -352,7 +364,12 @@ class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
             sm_margin,
         )
 
-        if FP8_DEQUANTIZED_BACKWARD and q.dtype in (torch.float8_e5m2, torch.float8_e5m2fnuz, torch.float8_e4m3fn, torch.float8_e4m3fnuz ):
+        if FP8_DEQUANTIZED_BACKWARD and q.dtype in (
+            torch.float8_e5m2,
+            torch.float8_e5m2fnuz,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ):
             q_save = _dequantize_bshd(q, q_descale)
             k_save = _dequantize_bshd(k, k_descale)
             v_save = _dequantize_bshd(v, v_descale)
@@ -524,7 +541,12 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
             sm_margin,
         )
 
-        if FP8_DEQUANTIZED_BACKWARD and q.dtype in (torch.float8_e5m2, torch.float8_e5m2fnuz, torch.float8_e4m3fn, torch.float8_e4m3fnuz ):
+        if FP8_DEQUANTIZED_BACKWARD and q.dtype in (
+            torch.float8_e5m2,
+            torch.float8_e5m2fnuz,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ):
             q_save = _dequantize_varlen_thd(q, q_descale, cu_seqlens_q)
             k_save = _dequantize_varlen_thd(k, k_descale, cu_seqlens_k)
             v_save = _dequantize_varlen_thd(v, v_descale, cu_seqlens_k)
