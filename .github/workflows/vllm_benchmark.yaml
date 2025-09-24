@@ -10,15 +10,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  VLLM_BRANCH: "main"
+  VLLM_REPOSITORY_URL: "https://github.com/vllm-project/vllm"
+  BASE_IMAGE: rocm/vllm-dev:latest
+  GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
+  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+
 jobs:
-  vllm_benchmark:
-    runs-on: mi300x-8gpu
-    env:
-        VLLM_BRANCH: "main"
-        VLLM_REPOSITORY_URL: "https://github.com/ROCm/vllm"
-        GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
-        GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
-        
+  build_vllm_image:
+    runs-on: aiter-k8s-build
+
     steps:
       - name: Checkout aiter repo
         uses: actions/checkout@v4
@@ -42,77 +44,97 @@ jobs:
 
       - name: Download the vLLM nightly image
         run: |
-          docker pull rocm/vllm-dev:nightly
+          docker pull ${{ env.BASE_IMAGE }}
       
-      - name: Start the container
+      - name: Generate Dockerfile
         run: |
-          set -x -o pipefail
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.BASE_IMAGE }}
 
-          echo "Clean up containers..."
-          docker ps -aq -f name=aiter-vllm-ci | xargs -r docker stop | xargs -r docker rm
-          if [ -f "/etc/podinfo/gha-render-devices" ]; then
-            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
-          else
-            DEVICE_FLAG="--device /dev/dri"
-          fi
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
+          RUN pip uninstall -y aiter
 
-          echo "Starting container: aiter-vllm-ci..."
+          RUN git clone --recursive ${{ env.GITHUB_REPO_URL }} /aiter && \
+              cd /aiter && \
+              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \
+              python3 setup.py develop
 
-          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
-             -v "${GITHUB_WORKSPACE:-$PWD}:/aiter" \
-             --ipc=host --group-add video \
-             --shm-size 32g \
-             --cap-add=SYS_PTRACE \
-             -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} \
-             -e VLLM_ROCM_USE_AITER=1 \
-             --security-opt seccomp=unconfined \
-             --name aiter-vllm-ci \
-             -w /aiter \
-             rocm/vllm-dev:nightly
+          RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
+          EOF
+
+      - name: Show Dockerfile
+        run: cat Dockerfile.mod
+
+      - name: Build Docker image
+        run: |
+          IMAGE_TAG=rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
+          docker build -t $IMAGE_TAG -f Dockerfile.mod .
+
+      - name: Push Docker image
+        run: |
+          IMAGE_TAG=rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
+          docker push $IMAGE_TAG
+
+      - name: Success message
+        run: |
+          echo "Successfully prepared image: rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}"
+
+  vllm_benchmark:
+    runs-on: aiter-8gpu-runner
+    strategy:
+      matrix:
+        models: [
+          'mistralai/Mixtral-8x7B-Instruct-v0.1',
+          'deepseek-ai/DeepSeek-R1',
+        ]
+        
+    steps:
+      - name: Checkout vLLM repo with retry
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          command: |
+            git clone --branch ${{ env.VLLM_BRANCH }} ${{ env.VLLM_REPOSITORY_URL }}
+
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Download the vLLM image
+        run: |
+          docker pull rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
       
-      - name: Reinstall Aiter with current commit
+      - name: Clean up Rocm processes
         run: |
-          set -x -o pipefail
-
-          echo "Current Aiter version in the container:"
-          docker exec aiter-vllm-ci pip show aiter || true
-
-          echo "Reinstall Aiter with the current commit..."
-          docker exec aiter-vllm-ci pip uninstall -y aiter
-          docker exec aiter-vllm-ci pip freeze | grep -f requirements.txt | xargs pip uninstall -y
-          docker exec aiter-vllm-ci pip install -r requirements.txt
-          docker exec aiter-vllm-ci bash -c "PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py bdist_wheel --dist-dir=dist"
-          docker exec aiter-vllm-ci bash -c "pip install dist/aiter-*.whl"
-
-          echo "Current Aiter version in the container:"
-          docker exec aiter-vllm-ci pip show aiter || true
-
-      # - name: Reinstall Aiter with current commit
-      #   run: |
-      #     set -x -o pipefail
-
-      #     echo "Current Aiter version in the container:"
-      #     docker exec aiter-vllm-ci pip show aiter || true
-
-      #     echo "Reinstall Aiter with the current commit..."
-      #     docker exec aiter-vllm-ci pip uninstall -y aiter
-      #     docker exec aiter-vllm-ci python3 setup.py develop
-
-      #     echo "Current Aiter version in the container:"
-      #     docker exec aiter-vllm-ci pip show aiter || true
-
-      - name: Clean up the Rocm processes
-        run: |
+          rocm-smi
+          rocm-smi --showpids
+          echo 'Cleaning up ROCm processes...'
+          rocm-smi --showpids | awk '{if($1 ~ /^[0-9]+$/) print $1}' | xargs -r sudo kill -9 || true
           rocm-smi
           rocm-smi --showpids
 
       - name: Run benchmarks
         run: |
           set -x -o pipefail
-          docker exec aiter-vllm-ci printenv
-          docker exec aiter-vllm-ci python -m vllm.entrypoints.cli.main bench latency \
-              --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
-              --batch-size 1 --input-len 128 --output-len 128 -tp 8 --load-format dummy |& tee result.log
+          echo "Starting benchmark for model: ${model}"
+
+          logFile="result_$(echo "${model}" | sed 's/\//_/g').log"
+
+          if [[ "${model}" == *DeepSeek* ]]; then
+              extraArgs="--block-size 1"
+          else
+              extraArgs=""
+          fi
+
+          docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+              --ulimit core=0:0 --ulimit memlock=-1:-1 --ulimit stack=67108864 --cap-add=SYS_PTRACE \
+              --network=host --security-opt seccomp=unconfined --shm-size=16G \
+              -e HF_TOKEN=${{ secrets.HF_TOKEN }} -e VLLM_ROCM_USE_AITER=1 \
+              rocm/aiter-ci:${{ env.COMMIT_SHA }} python -m vllm.entrypoints.cli.main bench latency \
+              --model ${model} \
+              --batch-size 123 --input-len 456 --output-len 78 \
+              --num-iters-warmup 3 --num-iters 10 \
+              -tp 8 --load-format dummy ${extraArgs} aiter-vllm-ci |& tee ${logFile}
           grep "Avg latency:" result.log | awk '{print $3}'
 
       - name: Cleanup container
