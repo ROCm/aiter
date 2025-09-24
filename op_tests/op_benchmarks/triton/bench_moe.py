@@ -32,6 +32,9 @@ def model_benchmark_configs(args):
             N2 = config["hidden_size"]
             K2 = config["intermediate_size"] // 2
 
+        assert (
+            "num_expert" in config and "top_k" in config
+        ), "Missing 'num_expert' or 'top_k' in config. Is this model using MoE?"
         E = config["num_expert"]
         top_k = config["top_k"]
 
