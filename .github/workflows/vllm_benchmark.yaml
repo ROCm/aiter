@@ -132,3 +132,10 @@ jobs:
               --num-iters-warmup 3 --num-iters 10 \
               -tp 8 --load-format dummy ${extraArgs} |& tee ${logFile}
           grep "Avg latency:" ${logFile} | awk '{print $3}'
+
+  skip-job:
+    if: ${{ secrets.DOCKER_PASSWORD == '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip reason
+        run: echo "It's a fork repository or docker password is not set, skipping tests."

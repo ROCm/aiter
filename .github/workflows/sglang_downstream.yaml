@@ -14,6 +14,7 @@ concurrency:
 jobs:
   sglang:
     name: sglang integration
+    if: ${{ secrets.HF_TOKEN_TEST != '' }}
     runs-on: aiter-1gpu-runner
     env:
       SGL_BRANCH: v0.5.1
@@ -101,3 +102,10 @@ jobs:
         if: always()
         run:
           docker exec -u root sglang_aiter_test bash -c "rm -rf /sglang-checkout/sgl-kernel; rm -rf /sglang-checkout/python"
+
+  skip-job:
+    if: ${{ secrets.HF_TOKEN_TEST == '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip reason
+        run: echo "It's a fork repository or hugging face token is not set, skipping tests."
