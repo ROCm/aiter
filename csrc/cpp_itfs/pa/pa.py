@@ -77,35 +77,18 @@ def paged_attention_rocm(
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
+    dtype_map = {
+        torch.bfloat16: "__hip_bfloat16",
+        torch.float16: "_Float16",
+        torch.float8_e4m3fnuz: "uint8_t",
+    }
 
     warpSize = torch.cuda.get_device_properties(out.device).warp_size
-    if kv_cache_dtype == "auto":
-        if query.dtype == torch.bfloat16:
-            dtype = "__hip_bfloat16"
-            kv_dtype = "__hip_bfloat16"
-        elif query.dtype == torch.float16:
-            dtype = "_Float16"
-            kv_dtype = "_Float16"
-        else:
-            raise ValueError(f"Unsupported data type: {query.dtype}")
-    elif kv_cache_dtype == "fp8" or kv_cache_dtype == "fp8_e4m3":
-        if query.dtype == torch.bfloat16:
-            dtype = "__hip_bfloat16"
-            kv_dtype = "uint8_t"
-        elif query.dtype == torch.float16:
-            dtype = "_Float16"
-            kv_dtype = "uint8_t"
-        else:
-            raise ValueError(f"Unsupported data type: {query.dtype}")
-    else:
-        raise ValueError(f"Unsupported kv_cache_dtype: {kv_cache_dtype}")
 
-    if out.dtype == torch.bfloat16:
-        out_dtype = "__hip_bfloat16"
-    elif out.dtype == torch.float16:
-        out_dtype = "_Float16"
-    else:
-        raise ValueError(f"Unsupported data type: {out.dtype}")
+    dtype = dtype_map[query.dtype]
+    kv_dtype = dtype_map[key_cache.dtype]
+    out_dtype = dtype_map[out.dtype]
+
     num_seqs = block_tables.size(0)
     num_heads = query.size(1)
     head_size = query.size(2)

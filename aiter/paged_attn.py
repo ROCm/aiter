@@ -165,7 +165,6 @@ def _use_rocm_custom_paged_attention(
     # rocm custom page attention not support on navi (gfx1*)
     return (
         not _ON_NAVI
-        and (qtype == torch.half or qtype == dtypes.bf16)
         and (head_size == 64 or head_size == 128)
         and (gqa_ratio >= 1 and gqa_ratio <= 32)
         and max_seq_len <= 65536
@@ -247,6 +246,7 @@ class PagedAttention:
         blocksparse_head_sliding_step: int = 0,
         fp8_out_scale=None,
         mtp: int = 1,
+        output_dtype: torch.dtype = None,
     ) -> torch.Tensor:
         # Whether to use rocm custom paged attention or not
         num_seqs, num_heads, head_size = query.shape
@@ -255,7 +255,7 @@ class PagedAttention:
         use_custom = _use_rocm_custom_paged_attention(
             query.dtype, head_size, block_size, gqa_ratio, max_seq_len
         )
-        output = torch.empty_like(query)
+        output = torch.empty_like(query, dtype=output_dtype)
         if use_custom:
             max_num_partitions = (
                 max_seq_len + _PARTITION_SIZE_ROCM - 1

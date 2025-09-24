@@ -444,13 +444,9 @@ def test_pa_mtp(
     ret["us_asm_fp8"] = us_aiter_asm
     ret["err fp8"] = err
 
-    q_quant, q_scale = pertoken_quant(query, quant_dtype=aiter.dtypes.fp8)
-    q_scale = q_scale.squeeze(-1)
-    print(f"{query.shape=}")
-    print(f"{q_quant.shape=}")
-    print(f"{q_scale.shape=}")
+
     out_hip, us_hip = run_aiter_hip(
-        q_quant.to(torch.bfloat16),
+        query,
         k_quant_,
         asm_V_shuffle(v_quant_),
         block_tables,
@@ -462,7 +458,6 @@ def test_pa_mtp(
         scale,
         k_scale_asm,
         v_scale_asm,
-        q_scale,
     )
     err = checkAllclose(
         out_ref,
