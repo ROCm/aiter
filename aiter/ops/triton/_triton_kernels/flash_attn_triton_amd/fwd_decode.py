@@ -2,17 +2,15 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional
-from .rotary import apply_rotary
 from .utils import (
+    DEBUG,
     AUTOTUNE,
     get_padded_headsize,
     get_shape_and_strides_from_layout,
+    apply_rotary,
     is_cdna,
-    is_fp8,
+    is_fp8
 )
-
-DEBUG = False
-
 
 def get_cdna_autotune_configs():
     return [
@@ -836,7 +834,7 @@ def get_split_k(B: int, G: int, H: int, Mk: int) -> int:
     return split_k
 
 
-def attention_decode_forward_triton_impl(
+def attention_forward_decode_triton_impl(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -1357,4 +1355,4 @@ def attention_decode_forward_triton_impl(
         num_warps=num_warps_reduce,
     )
 
-    return lse
+    return lse.view(batch_size, n_group_q * heads_per_group_q, seqlen_q)

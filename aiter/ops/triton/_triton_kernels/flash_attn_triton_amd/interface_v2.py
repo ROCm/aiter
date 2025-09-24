@@ -1,18 +1,10 @@
 import torch
 import os
-from typing import Literal, Optional, Union
-from .fwd_prefill import attention_prefill_forward_triton_impl
-from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_impl
-from .fwd_decode import attention_decode_forward_triton_impl
-from .fwd_ref import (
-    attention_prefill_forward_ref_impl,
-    attention_decode_forward_ref_impl,
-)
-from .bwd_ref import attention_backward_pytorch_ref_impl
-from .utils import DEBUG, USE_REF, MetaData
-
-USE_EXP2 = True
-BWD_MODE = os.environ.get("BWD_MODE", "fused_no_atomics").lower()
+from typing import Optional, Union
+from .fwd_prefill import attention_forward_prefill_triton_impl
+from .fwd_decode import attention_forward_decode_triton_impl
+from .bwd import attention_backward_triton_impl
+from .utils import DEBUG, USE_EXP2, BWD_MODE, PHILOX_SEED, PHILOX_OFFSET
 
 
 def fwd(
@@ -60,98 +52,59 @@ def fwd(
         print("return_softmax:", return_softmax)
     out = torch.zeros_like(q) if out is None else out.zero_()
 
-    # Setup metadata
-    metadata = MetaData(sm_scale=softmax_scale)
-    metadata.max_seqlens_q = q.shape[1]
-    metadata.max_seqlens_k = k.shape[1]
-    metadata.layout = "bshd"
-
-    # get shape
+    # Layout / shapes
+    layout = "bshd"
+    max_seqlen_q = q.shape[1]
+    max_seqlen_k = k.shape[1]
     batch, _, nheads_q, _ = q.shape
 
-    if causal:
-        metadata.need_causal(True)
-
+    # Normalize / validate alibi
     if alibi_slopes is not None:
-        if alibi_slopes.dim() == 2:
-            pass
-        elif alibi_slopes.dim() == 1:
+        if alibi_slopes.dim() == 1:
             alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
-        else:
-            raise ValueError(
-                f"Alibi can be (nheads,) or (batch_size, nheads). Given tensor with shape {alibi_slopes.shape}"
-            )
-        metadata.need_alibi(alibi_slopes, batch, nheads_q)
+        assert alibi_slopes.is_cuda and alibi_slopes.dim() == 2
+        assert alibi_slopes.shape == (batch, nheads_q)
 
-    # store rng state
-    metadata.need_dropout(dropout_p, return_softmax)
-    rng_state = torch.as_tensor(
-        [metadata.philox_seed, metadata.philox_offset]
-    )  # as_tensors uses the underlying data and doesnot cast
+    # Dropout + RNG seed
+    philox_seed, philox_offset = PHILOX_SEED, PHILOX_OFFSET
+    rng_state = torch.as_tensor([philox_seed, philox_offset])
 
-    # check arguments
-    metadata.check_args(q, k, v, out)
+    # argument checks
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
+    assert q.shape[-1] == k.shape[-1] == v.shape[-1]
+    assert q.dtype == k.dtype == v.dtype
+    assert out.shape[:-1] == q.shape[:-1] and out.shape[-1] == v.shape[-1]
+    nheads_k = k.shape[2]
+    assert (nheads_q % nheads_k) == 0
 
     # call implementation
-    if USE_REF:
-        if DEBUG:
-            print("Using reference implementation")
-        softmax_lse_ref, sd_mask_ref = attention_prefill_forward_ref_impl(
-            q,
-            k,
-            v,
-            out,
-            metadata.sm_scale,
-            metadata.alibi_slopes,
-            metadata.causal,
-            window_size_left,
-            window_size_right,
-            metadata.layout,
-            metadata.cu_seqlens_q,
-            metadata.cu_seqlens_k,
-            metadata.max_seqlens_q,
-            metadata.max_seqlens_k,
-            metadata.dropout_p,
-            metadata.philox_seed,
-            metadata.philox_offset,
-            USE_EXP2,
-            rotary_cos=None,
-            rotary_sin=None,
-            rotary_interleaved=False,
-            rotary_seqlen_offsets=None,
-        )
-        softmax_lse = softmax_lse_ref
-        sd_mask = sd_mask_ref
-    else:
-        if DEBUG:
-            print("Using Triton implementation")
-        softmax_lse_triton, sd_mask_triton = attention_prefill_forward_triton_impl(
-            q,
-            k,
-            v,
-            out,
-            metadata.sm_scale,
-            metadata.alibi_slopes,
-            metadata.causal,
-            window_size_left,
-            window_size_right,
-            None,
-            metadata.layout,
-            metadata.cu_seqlens_q,
-            metadata.cu_seqlens_k,
-            metadata.max_seqlens_q,
-            metadata.max_seqlens_k,
-            metadata.dropout_p,
-            metadata.philox_seed,
-            metadata.philox_offset,
-            metadata.return_softmax,
-            USE_EXP2,
-            None,
-            None,
-            None,
-        )
-        softmax_lse = softmax_lse_triton
-        sd_mask = sd_mask_triton
+    if DEBUG:
+        print("Using Triton implementation")
+    softmax_lse, sd_mask = attention_forward_prefill_triton_impl(
+        q,
+        k,
+        v,
+        out,
+        softmax_scale,
+        alibi_slopes,
+        causal,
+        window_size_left,
+        window_size_right,
+        None,
+        layout,
+        None,
+        None,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        philox_seed,
+        philox_offset,
+        return_softmax,
+        USE_EXP2,
+        None,
+        None,
+        None,
+    )
 
     if DEBUG:
         print("flash_attn_triton_amd.py::fwd outputs")
@@ -159,6 +112,27 @@ def fwd(
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
         print("sd_mask:", sd_mask, sd_mask.shape if sd_mask is not None else None)
         print("rng_state:", rng_state)
+
+    # --- Assertions (shape + dtype contracts) ---
+    # out: (B, Sq, Hq, D)
+    assert out.shape == q.shape, f"[fwd] out shape {out.shape} != q shape {q.shape}"
+    # softmax_lse: (B, Hq, Sq)
+    expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
+    assert softmax_lse.shape == expected_lse_shape, (
+        f"[fwd] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
+    )
+    assert softmax_lse.dtype == torch.float32, (
+        f"[fwd] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
+    )
+    if return_softmax:
+        # sd_mask: (B, Hq, Sq, Sk)
+        assert sd_mask is not None, "[fwd] return_softmax=True but sd_mask is None"
+        assert sd_mask.dim() == 4, f"[fwd] sd_mask dim {sd_mask.dim()} != 4"
+        assert sd_mask.shape[0] == q.shape[0] and sd_mask.shape[1] == q.shape[2] and sd_mask.shape[2] == q.shape[1], (
+            f"[fwd] sd_mask leading dims {sd_mask.shape[:3]} mismatch (B,Hq,Sq) {(q.shape[0], q.shape[2], q.shape[1])}"
+        )
+    else:
+        assert sd_mask is None, "[fwd] return_softmax=False but sd_mask is not None"
 
     return out, softmax_lse, sd_mask, rng_state
 
@@ -219,8 +193,8 @@ def bwd(
     # get shape
     batch, _, nheads_q, _ = q.shape
 
-    if dropout_p > 0.0:
-        assert rng_state is not None
+    # Upstream change: base seeding logic on provided rng_state instead of dropout probability.
+    if rng_state is not None:
         philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
     else:
         philox_seed, philox_offset = None, None
@@ -234,71 +208,49 @@ def bwd(
             raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
 
     # call implementation
-    if USE_REF:
-        if DEBUG:
-            print("Using reference implementation")
-
-        delta_ref = attention_backward_pytorch_ref_impl(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            softmax_scale,
-            alibi_slopes,
-            causal,
-            window_size_left,
-            window_size_right,
-            "bshd",
-            None,
-            None,
-            None,
-            None,
-            dropout_p,
-            philox_seed,
-            philox_offset,
-            USE_EXP2,
-        )
-        delta = delta_ref
-    else:
-        if DEBUG:
-            print("Using Triton implementation")
-        delta = attention_prefill_backward_triton_impl(
-            do=dout,
-            q=q,
-            k=k,
-            v=v,
-            o=out,
-            softmax_lse=softmax_lse,
-            dq=dq,
-            dk=dk,
-            dv=dv,
-            sm_scale=softmax_scale,
-            alibi_slopes=alibi_slopes,
-            causal=causal,
-            layout="bshd",
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
-            max_seqlen_q=q.shape[1],
-            max_seqlen_k=k.shape[1],
-            seqused_q=None,
-            seqused_k=None,
-            dropout_p=dropout_p,
-            philox_seed=philox_seed,
-            philox_offset=philox_offset,
-            use_exp2=USE_EXP2,
-            mode=BWD_MODE,
-        )
+    if DEBUG:
+        print("Using Triton implementation")
+    delta = attention_backward_triton_impl(
+        do=dout,
+        q=q,
+        k=k,
+        v=v,
+        o=out,
+        softmax_lse=softmax_lse,
+        dq=dq,
+        dk=dk,
+        dv=dv,
+        sm_scale=softmax_scale,
+        alibi_slopes=alibi_slopes,
+        causal=causal,
+        layout="bshd",
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=q.shape[1],
+        max_seqlen_k=k.shape[1],
+        seqused_q=None,
+        seqused_k=None,
+        dropout_p=dropout_p,
+        philox_seed=philox_seed,
+        philox_offset=philox_offset,
+        use_exp2=USE_EXP2,
+        mode=BWD_MODE,
+    )
 
     if DEBUG:
         print("flash_attn_triton_amd.py::bwd outputs")
         print("dv:", dv, dv.shape)
         print("dk:", dk, dk.shape)
         print("dq:", dq, dq.shape)
+    # --- Assertions ---
+    assert dq.shape == q.shape, f"[bwd] dq shape {dq.shape} != q shape {q.shape}"
+    assert dk.shape == k.shape, f"[bwd] dk shape {dk.shape} != k shape {k.shape}"
+    assert dv.shape == v.shape, f"[bwd] dv shape {dv.shape} != v shape {v.shape}"
+    # delta (softmax_d) : (B, Hq, Sq)
+    expected_delta_shape = (q.shape[0], q.shape[2], q.shape[1])
+    assert delta.shape == expected_delta_shape, (
+        f"[bwd] delta shape {delta.shape} != {expected_delta_shape}"
+    )
     return dq, dk, dv, delta
 
 
@@ -367,105 +319,85 @@ def varlen_fwd(
         print("gen_:", gen_)
     out = torch.zeros_like(q) if out is None else out.zero_()
 
-    # Setup metadata
-    metadata = MetaData(sm_scale=softmax_scale)
-    metadata.set_varlen_params(
-        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
-    )  # set layout to "thd" and other metdata
-    assert metadata.layout is not None
-
-    # get shape
+    # Layout and basic info for varlen
+    layout = "thd"
     batch = len(cu_seqlens_q) - 1
     _, nheads_q, _ = q.shape
 
-    if causal:
-        metadata.need_causal(True)
-
     if alibi_slopes is not None:
-        if alibi_slopes.dim() == 2:
-            pass
-        elif alibi_slopes.dim() == 1:
+        if alibi_slopes.dim() == 1:
             alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
-        else:
-            raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
-        metadata.need_alibi(alibi_slopes, batch, nheads_q)
+        assert alibi_slopes.is_cuda and alibi_slopes.dim() == 2
+        assert alibi_slopes.shape == (batch, nheads_q)
 
-    # store rng state
-    metadata.need_dropout(dropout_p, return_softmax)
-    rng_state = torch.as_tensor(
-        [metadata.philox_seed, metadata.philox_offset]
-    )  # as_tensors uses the underlying data and doesnot cast
+    philox_seed, philox_offset = PHILOX_SEED, PHILOX_OFFSET
+    rng_state = torch.as_tensor([philox_seed, philox_offset])
 
-    # Check arguments
-    metadata.check_args(q, k, v, out)
+    # Inline checks (subset appropriate for varlen)
+    assert q.dim() == 3 and k.dim() == 3 and v.dim() == 3
+    assert q.shape[-1] == k.shape[-1] == v.shape[-1]
+    assert q.dtype == k.dtype == v.dtype
+    assert out.shape == q.shape
+    nheads_k = k.shape[1]
+    assert (nheads_q % nheads_k) == 0
 
     # call implementation
-    if USE_REF:
-        if DEBUG:
-            print("Using reference implementation")
-        softmax_lse_ref, sd_mask_ref = attention_prefill_forward_ref_impl(
-            q,
-            k,
-            v,
-            out,
-            metadata.sm_scale,
-            metadata.alibi_slopes,
-            metadata.causal,
-            window_size_left,
-            window_size_right,
-            metadata.layout,
-            metadata.cu_seqlens_q,
-            metadata.cu_seqlens_k,
-            metadata.max_seqlens_q,
-            metadata.max_seqlens_k,
-            metadata.dropout_p,
-            metadata.philox_seed,
-            metadata.philox_offset,
-            USE_EXP2,
-            rotary_cos=None,
-            rotary_sin=None,
-            rotary_interleaved=False,
-            rotary_seqlen_offsets=None,
-        )
-        softmax_lse = softmax_lse_ref
-        sd_mask = sd_mask_ref
-    else:
-        if DEBUG:
-            print("Using Triton implementation")
-        softmax_lse_triton, sd_mask_triton = attention_prefill_forward_triton_impl(
-            q,
-            k,
-            v,
-            out,
-            metadata.sm_scale,
-            metadata.alibi_slopes,
-            metadata.causal,
-            window_size_left,
-            window_size_right,
-            None,
-            metadata.layout,
-            metadata.cu_seqlens_q,
-            metadata.cu_seqlens_k,
-            metadata.max_seqlens_q,
-            metadata.max_seqlens_k,
-            metadata.dropout_p,
-            metadata.philox_seed,
-            metadata.philox_offset,
-            metadata.return_softmax,
-            USE_EXP2,
-            None,
-            None,
-            None,
-        )
-        softmax_lse = softmax_lse_triton
-        sd_mask = sd_mask_triton
+    if DEBUG:
+        print("Using Triton implementation")
+    softmax_lse, sd_mask = attention_forward_prefill_triton_impl(
+        q,
+        k,
+        v,
+        out,
+        softmax_scale,
+        alibi_slopes,
+        causal,
+        window_size_left,
+        window_size_right,
+        None,
+        layout,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        philox_seed,
+        philox_offset,
+        return_softmax,
+        USE_EXP2,
+        None,
+        None,
+        None,
+    )
 
     if DEBUG:
         print("varlen_fwd outputs")
         print("out:", out, out.shape)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
         print("sd_mask:", sd_mask, sd_mask.shape if sd_mask is not None else None)
-
+    # --- Assertions ---
+    # out: (Total_Q, Hq, D)
+    assert out.shape == q.shape, f"[varlen_fwd] out shape {out.shape} != q shape {q.shape}"
+    # softmax_lse: (Hq, Total_Q)
+    expected_lse_shape = (q.shape[1], q.shape[0])
+    assert softmax_lse.shape == expected_lse_shape, (
+        f"[varlen_fwd] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
+    )
+    assert softmax_lse.dtype == torch.float32, (
+        f"[varlen_fwd] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
+    )
+    if return_softmax:
+        # sd_mask expected: (B, Hq, max_seqlen_q, max_seqlen_k)
+        assert sd_mask is not None, "[varlen_fwd] return_softmax=True but sd_mask is None"
+        assert sd_mask.dim() == 4, f"[varlen_fwd] sd_mask dim {sd_mask.dim()} != 4"
+        assert sd_mask.shape[0] == (len(cu_seqlens_q) - 1), (
+            f"[varlen_fwd] sd_mask batch {sd_mask.shape[0]} != {len(cu_seqlens_q)-1}"
+        )
+        assert sd_mask.shape[1] == q.shape[1], (
+            f"[varlen_fwd] sd_mask nheads {sd_mask.shape[1]} != {q.shape[1]}"
+        )
+    else:
+        assert sd_mask is None, "[varlen_fwd] return_softmax=False but sd_mask is not None"
     return out, softmax_lse, sd_mask, rng_state
 
 
@@ -538,8 +470,8 @@ def varlen_bwd(
     batch = len(cu_seqlens_q) - 1
     _, nheads_q, _ = q.shape
 
-    if dropout_p > 0.0:
-        assert rng_state is not None
+    # Upstream change: base seeding logic on provided rng_state instead of dropout probability.
+    if rng_state is not None:
         philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
     else:
         philox_seed, philox_offset = None, None
@@ -553,72 +485,34 @@ def varlen_bwd(
             raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
 
     # call implementation
-    if USE_REF:
-        if DEBUG:
-            print("Using reference implementation")
-        delta_ref = attention_backward_pytorch_ref_impl(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            softmax_scale,
-            alibi_slopes,
-            causal,
-            window_size_left,
-            window_size_right,
-            "thd",
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p,
-            philox_seed,
-            philox_offset,
-            USE_EXP2,
-        )
-        delta = delta_ref
-    else:
-        if DEBUG:
-            print("Using Triton implementation")
-        delta = attention_prefill_backward_triton_impl(
-            do=dout,
-            q=q,
-            k=k,
-            v=v,
-            o=out,
-            softmax_lse=softmax_lse,
-            dq=dq,
-            dk=dk,
-            dv=dv,
-            sm_scale=softmax_scale,
-            alibi_slopes=alibi_slopes,
-            causal=causal,
-            layout="thd",
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            seqused_q=None,
-            seqused_k=None,
-            dropout_p=dropout_p,
-            philox_seed=philox_seed,
-            philox_offset=philox_offset,
-            descale_q=None,
-            descale_k=None,
-            descale_v=None,
-            descale_o=None,
-            descale_do=None,
-            descale_dq=None,
-            descale_dk=None,
-            descale_dv=None,
-            use_exp2=USE_EXP2,
-            mode=BWD_MODE,
-        )
+    if DEBUG:
+        print("Using Triton implementation")
+    delta = attention_backward_triton_impl(
+        do=dout,
+        q=q,
+        k=k,
+        v=v,
+        o=out,
+        softmax_lse=softmax_lse,
+        dq=dq,
+        dk=dk,
+        dv=dv,
+        sm_scale=softmax_scale,
+        alibi_slopes=alibi_slopes,
+        causal=causal,
+        layout="thd",
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        seqused_q=None,
+        seqused_k=None,
+        dropout_p=dropout_p,
+        philox_seed=philox_seed,
+        philox_offset=philox_offset,
+        use_exp2=USE_EXP2,
+        mode=BWD_MODE,
+    )
 
     if DEBUG:
         print("varlen_bwd outputs")
@@ -626,7 +520,14 @@ def varlen_bwd(
         print("dv:", dv, dv.shape)
         print("dk:", dk, dk.shape)
         print("dq:", dq, dq.shape)
-
+    # --- Assertions ---
+    assert dq.shape == q.shape, f"[varlen_bwd] dq shape {dq.shape} != q shape {q.shape}"
+    assert dk.shape == k.shape, f"[varlen_bwd] dk shape {dk.shape} != k shape {k.shape}"
+    assert dv.shape == v.shape, f"[varlen_bwd] dv shape {dv.shape} != v shape {v.shape}"
+    expected_delta_shape = (q.shape[1], q.shape[0])  # (Hq, Total_Q)
+    assert delta.shape == expected_delta_shape, (
+        f"[varlen_bwd] delta shape {delta.shape} != {expected_delta_shape}"
+    )
     return dq, dk, dv, delta
 
 
@@ -689,26 +590,17 @@ def fwd_kvcache(
     # output
     out = torch.zeros_like(q) if out is None else out.zero_()
 
-    # fill metadata
-    metadata = MetaData(sm_scale=softmax_scale)
-    metadata.layout = "bshd"
-    metadata.max_seqlens_q = q.shape[1]
-    metadata.max_seqlens_k = k_cache.shape[1]
-    metadata.cache_batch_idx = cache_batch_idx
-    if isinstance(cache_seqlens, int):
-        metadata.cache_seqlens = torch.tensor(cache_seqlens, device=q.device)
-    else:
-        metadata.cache_seqlens = cache_seqlens
-
-    # window_size can be a tensor sometimes
-    if isinstance(window_size_left, torch.Tensor):
-        metadata.window_size_left = int(window_size_left.item())
-    else:
-        metadata.window_size_left = window_size_left
-    if isinstance(window_size_right, torch.Tensor):
-        metadata.window_size_right = int(window_size_right.item())
-    else:
-        metadata.window_size_right = window_size_right
+    # Basic layout info for decode path
+    layout = "bshd"
+    max_seqlen_q = q.shape[1]
+    max_seqlen_k = k_cache.shape[1]
+    cache_seqlens_tensor = (
+        torch.tensor(cache_seqlens, device=q.device)
+        if isinstance(cache_seqlens, int)
+        else cache_seqlens
+    )
+    window_left = int(window_size_left.item()) if isinstance(window_size_left, torch.Tensor) else window_size_left
+    window_right = int(window_size_right.item()) if isinstance(window_size_right, torch.Tensor) else window_size_right
 
     k_new = k
     v_new = v
@@ -716,79 +608,49 @@ def fwd_kvcache(
     # get shape
     batch, _, nheads_q, _ = q.shape
 
-    if causal:
-        metadata.need_causal(True)
-
     if alibi_slopes is not None:
-        if alibi_slopes.dim() == 2:
-            pass
-        elif alibi_slopes.dim() == 1:
+        if alibi_slopes.dim() == 1:
             alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
-        else:
-            raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
-        metadata.need_alibi(alibi_slopes, batch, nheads_q)
-
-    # record rotary info in metadata
-    if torch.is_tensor(rotary_cos) and torch.is_tensor(rotary_sin):
-        metadata.need_rotary(rotary_sin, rotary_cos, rotary_interleaved)
+        assert alibi_slopes.is_cuda and alibi_slopes.dim() == 2
+        assert alibi_slopes.shape == (batch, nheads_q)
 
     # launch kernel
-    if USE_REF:
-        if DEBUG:
-            print("Using reference implementation")
-        softmax_lse_ref = attention_decode_forward_ref_impl(
-            q,
-            k_cache,
-            v_cache,
-            k_new,
-            v_new,
-            out,
-            metadata.sm_scale,
-            metadata.causal,
-            metadata.window_size_left,
-            metadata.window_size_right,
-            metadata.alibi_slopes,
-            metadata.layout,
-            metadata.cache_seqlens,
-            metadata.cache_batch_idx,
-            block_table,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-            rotary_cos=rotary_cos,
-            rotary_sin=rotary_sin,
-            rotary_interleaved=rotary_interleaved,
-        )
-        softmax_lse = softmax_lse_ref
-    else:
-        if DEBUG:
-            print("Using Triton implementation")
-        softmax_lse_triton = attention_decode_forward_triton_impl(
-            q,
-            k_cache,
-            v_cache,
-            k_new,
-            v_new,
-            out,
-            metadata.sm_scale,
-            metadata.causal,
-            metadata.window_size_left,
-            metadata.window_size_right,
-            metadata.alibi_slopes,
-            metadata.layout,
-            metadata.cache_seqlens,
-            metadata.cache_batch_idx,
-            block_table,
-            None,
-            None,
-            None,
-            rotary_cos=rotary_cos,
-            rotary_sin=rotary_sin,
-            rotary_interleaved=rotary_interleaved,
-        )
-        softmax_lse = softmax_lse_triton
+    if DEBUG:
+        print("Using Triton implementation")
+    softmax_lse = attention_forward_decode_triton_impl(
+        q,
+        k_cache,
+        v_cache,
+        k_new,
+        v_new,
+        out,
+        softmax_scale,
+        causal,
+        window_left,
+        window_right,
+        alibi_slopes,
+        layout,
+        cache_seqlens_tensor,
+        cache_batch_idx,
+        block_table,
+        None,
+        None,
+        None,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        rotary_interleaved=rotary_interleaved,
+    )
 
     if DEBUG:
         print("out:", out, out.shape)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
+    # --- Assertions ---
+    assert out.shape == q.shape, f"[fwd_kvcache] out shape {out.shape} != q shape {q.shape}"
+    expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
+    assert softmax_lse.shape == expected_lse_shape, (
+        f"[fwd_kvcache] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
+    )
+    assert softmax_lse.dtype == torch.float32, (
+        f"[fwd_kvcache] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
+    )
     return out, softmax_lse

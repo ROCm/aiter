@@ -3,11 +3,11 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional
-from .rotary import apply_rotary
 from .utils import (
+    DEBUG,
+    AUTOTUNE,
     DROPOUT_USE_PYTORCH,
     DROPOUT_DUMP,
-    AUTOTUNE,
     compute_alibi_block,
     compute_fp8_scaling_factors,
     get_arch,
@@ -15,7 +15,7 @@ from .utils import (
     is_fp8,
     is_rdna,
     create_dropout_mask,
-    DEBUG,
+    apply_rotary
 )
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -1567,7 +1567,7 @@ def attn_fwd(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
 
 
-def attention_prefill_forward_triton_impl(
+def attention_forward_prefill_triton_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
