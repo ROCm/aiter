@@ -1602,7 +1602,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
-                        } else if ((t.mask_type != mask_enum::no_mask) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
+                        } else if ((t.mask_type == mask_enum::mask_top_left) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
                             if (t.is_v3_atomic_fp32 == true){
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, true, true, true>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true, true, 0, true, true, true, GPUArch::gfx950>;
@@ -1617,7 +1617,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
-                        } else if ((t.mask_type != mask_enum::no_mask) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
+                        } else if ((t.mask_type == mask_enum::mask_bottom_right) && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
                             if (t.is_v3_atomic_fp32 == true){
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, true, true, true>;
                                 using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, true, true, 0, true, true, true, GPUArch::gfx950>;
