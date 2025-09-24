@@ -175,7 +175,7 @@ def check_and_set_ninja_worker():
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
     max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
     max_jobs_env = os.environ.get("MAX_JOBS")
-    if max_jobs_env != None:
+    if max_jobs_env is not None:
         try:
             max_processes = int(max_jobs_env)
             # too large value
@@ -533,7 +533,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
 
                 return all_ops_list, d_all_ops
             # no find opt_name in json.
-            elif data.get(ops_name) == None:
+            elif data.get(ops_name) is None:
                 logger.warning(
                     "Not found this operator ("
                     + ops_name

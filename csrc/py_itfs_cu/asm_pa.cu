@@ -45,18 +45,35 @@ struct __attribute__((packed)) KernelArgs
     p2 _p19;
 };
 
-std::string get_heuristic_kernel(
-    std::string q_type, std::string kv_type, int gqa, int mtp, int msk, int hp, CFG* cfgs)
+std::string get_heuristic_kernel(std::string q_type,
+                                 std::string kv_type,
+                                 int gqa,
+                                 int mtp,
+                                 int msk,
+                                 int hp,
+                                 int block_size,
+                                 CFG* cfgs)
 {
-    for(const auto& el : *cfgs)
+    const std::vector<int> mtp_flags = (mtp > 0) ? std::vector<int>{mtp, 1} : std::vector<int>{0};
+    const std::vector<int> gqa_flags = {gqa, (gqa + 7) / 8 * 8};
+    for(int mtp_ : mtp_flags)
     {
-        const auto& cfg = el.second;
-        // hp is just distinct from uhp
-        if(cfg.q_type == q_type && cfg.kv_type == kv_type && cfg.gqa == gqa && cfg.mtp == mtp &&
-           cfg.msk == msk && (cfg.hp == hp || hp == 1))
+        for(int gqa_ : gqa_flags)
+        {
+            // find exact match
+            for(const auto& el : *cfgs)
+            {
+                const auto& cfg = el.second;
+                // hp is just distinct from uhp
+                if(cfg.q_type == q_type && cfg.kv_type == kv_type && cfg.gqa == gqa_ &&
+                   cfg.mtp == mtp_ && cfg.msk == msk && (cfg.hp == hp || hp == 1) &&
+                   cfg.block_size == block_size)
 
-            return el.first;
+                    return el.first;
+            }
+        }
     }
+
     TORCH_CHECK(false,
                 __func__,
                 ": cannot get heuristic kernel!"
@@ -71,7 +88,9 @@ std::string get_heuristic_kernel(
                 " msk:",
                 msk,
                 " hp:",
-                hp);
+                hp,
+                " block_size:",
+                block_size);
     return "";
 }
 const float f_log2E = log2f(expf(1));
@@ -90,7 +109,6 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                      std::optional<int> high_precision      = 1,
                      std::optional<std::string> kernelName_ = std::nullopt)
 {
-    std::string kernelName = kernelName_.value_or("");
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch            = context_lens.size(0);
     // int block_tables_stride0 = block_tables.size(1);
@@ -99,7 +117,6 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     int num_kv_heads    = K.size(1);
     int block_size      = K.size(3);
     const int gqa_ratio = num_heads / num_kv_heads;
-    TORCH_CHECK(block_size == 16, __func__, " for now only support block_size == 16");
 
     int dim            = head_size;
     int stride_Q       = Q.stride(0) * Q.itemsize();
@@ -135,9 +152,9 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     args.KVs       = stride_KV_head;
     args.GQA       = gqa_ratio;
     args.ptr_QTP   = qo_indptr ? qo_indptr.value().data_ptr() : nullptr;
-    // std::cout << "sclg2e: " << args.sclg2e << " mblk:" << args.mblk << "
-    // kv_nheads:" << args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs <<
-    // " KVs:" << args.KVs << std::endl;
+    // std::cout << "sclg2e: " << args.sclg2e << " mblk:" << args.mblk
+    //           << " kv_nheads:" << args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs
+    //           << " KVs:" << args.KVs << std::endl;
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -169,12 +186,12 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
         TORCH_CHECK(false, __func__, ": unsupport K dtype:", K.scalar_type());
 
     // 3. "gqa_ratio"
-    gqa = (gqa_ratio <= 8) ? 8 : 16;
+    // gqa = (gqa_ratio <= 8) ? 8 : 16;
 
     // 4. "mtp" , 5. "mask"
     if(qo_indptr && max_qlen > 1)
     {
-        mtp = 1;
+        mtp = max_qlen + 10; // for kernels only support qlen=3, we encode it as 3+10=13
         msk = 1;
     }
     else
@@ -193,7 +210,8 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 
-    kernelName = get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, config_map);
+    std::string kernelName = kernelName_.value_or(
+        get_heuristic_kernel(q_type, kv_type, gqa_ratio, mtp, msk, hp, block_size, config_map));
     if(kernelName.empty())
     {
         TORCH_CHECK(false, __func__, "not supported this kernel now! ");

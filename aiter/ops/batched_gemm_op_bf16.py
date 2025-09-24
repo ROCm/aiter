@@ -59,7 +59,7 @@ def get_CKBatchedGEMM_config(
             ["B", "M", "N", "K"]
         ).to_dict("index")
     config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get((B, M, N, K), None)
-    if config != None:
+    if config is not None:
         mnk = config["kernelName"].split("_")[2].split("x")[1:]
         config["tile_m"] = int(mnk[0])
         config["tile_n"] = int(mnk[1])
@@ -84,8 +84,8 @@ def batched_gemm_bf16_CK(
     n = WQ.shape[1]
     k = XQ.shape[2]
     ck_config = get_CKBatchedGEMM_config(b, m, n, k)
-    if splitK == None:
-        if ck_config != None:
+    if splitK is None:
+        if ck_config is not None:
             splitK = ck_config["splitK"]
         else:
             splitK = 0
