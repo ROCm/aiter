@@ -170,7 +170,7 @@ def run_benchmark(args):
         args.no_bench_stage2 = True
 
     if int4_w4a16:
-        assert group_size != None, "set group_size with -group_size"
+        assert group_size is not None, "set group_size with -group_size"
 
     kernel_name = "_fused_moe_kernel"
     if (int8_w8a16 or int4_w4a16) and (group_size is not None) and group_size > 0:
