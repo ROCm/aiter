@@ -136,11 +136,5 @@ jobs:
               --model ${model} \
               --batch-size 123 --input-len 456 --output-len 78 \
               --num-iters-warmup 3 --num-iters 10 \
-              -tp 8 --load-format dummy ${extraArgs} aiter-vllm-ci |& tee ${logFile}
+              -tp 8 --load-format dummy ${extraArgs} |& tee ${logFile}
           grep "Avg latency:" result.log | awk '{print $3}'
-
-      - name: Cleanup container
-        if: always()
-        run: |
-          docker ps -aq -f name=aiter-vllm-ci | xargs -r docker stop || true
-          docker ps -aq -f name=aiter-vllm-ci | xargs -r docker rm || true
