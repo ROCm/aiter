@@ -892,6 +892,14 @@ def compile_ops(
                     # for pytorch 2.4
                     import torch._custom_op.impl
 
+                    # torch 2.4 not support mutates "unknown" for inplace all param
+                    if mutates_args == "unknown":
+                        mutates_args = []
+
+                        for param_name, param in sig.parameters.items():
+                            if param.annotation == torch.Tensor:
+                                mutates_args.append(param_name)
+
                     sig = torch._custom_op.impl.infer_schema(func, mutates_args)
                 schema = f"{sig}"
             return schema
