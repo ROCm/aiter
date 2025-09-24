@@ -20,7 +20,7 @@ env:
 
 jobs:
   build_vllm_image:
-    if: ${{ secrets.DOCKER_PASSWORD != '' }}
+    if: ${{ !github.event.pull_request.head.repo.fork }}
     runs-on: aiter-k8s-build
 
     steps:
@@ -75,7 +75,7 @@ jobs:
           echo "Successfully prepared image: rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}"
 
   vllm_benchmark:
-    if: ${{ secrets.DOCKER_PASSWORD != '' }}
+    if: ${{ !github.event.pull_request.head.repo.fork }}
     runs-on: aiter-8gpu-runner
     needs: build_vllm_image
     strategy:
@@ -134,8 +134,8 @@ jobs:
           grep "Avg latency:" ${logFile} | awk '{print $3}'
 
   skip-job:
-    if: ${{ secrets.DOCKER_PASSWORD == '' }}
+    if: ${{ github.event.pull_request.head.repo.fork }}
     runs-on: ubuntu-latest
     steps:
       - name: Skip reason
-        run: echo "It's a fork repository or docker password is not set, skipping tests."
+        run: echo "It's a fork repository, skipping tests."
