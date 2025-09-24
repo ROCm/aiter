@@ -271,7 +271,7 @@ def e2e_moe_kernel(
         if IS_BLOCKSCALEQ:
             offs_w2_sn = offs_w2n // group_n
             w2_scale_ptrs = (
-                W2_scale + off_experts * stride_w2se + offs_w2n * offs_w2_sn
+                W2_scale + off_experts * stride_w2se + offs_w2_sn[:, None] * stride_w2sn
             )
         else:
             w2_scale = tl.load(W2_scale + off_experts)

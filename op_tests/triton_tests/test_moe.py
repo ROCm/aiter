@@ -357,7 +357,7 @@ def quantize_fp8(
     # Quantize the tensor
     tensor = tensor * scale
     tensor.clamp_(-max_repr_val, max_repr_val)
-    tensor_quantized = tensor.to(torch.float8_e4m3fnuz)
+    tensor_quantized = tensor.to(fp8_type)
 
     if use_block_scale:
         tensor_quantized = tensor_quantized.reshape(e, block_shape_n, block_shape_k, n // block_shape_n, k // block_shape_k)
