@@ -205,14 +205,13 @@ A4W4_gemm1_heuristic_dispatch = """
 
 
 A8W8_blockscale_gemm1_heuristic_dispatch = """
-    if (dtype_checker<{A0DataType}>{{}}(x_dtype)
-        && dtype_checker<{B0DataType}>{{}}(w_dtype)
-        && dtype_checker<{EDataType}>{{}}(y_dtype)
-        && {ActOP} == act_op
-        && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+    if (true)
     {{
-        if (block_m == 64)
+        if (block_m == 16)
+        {{
+            return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else if (block_m == 64)
         {{
             return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
         }}
@@ -385,13 +384,13 @@ A4W4_gemm2_heuristic_dispatch = """
 
 A8W8_blockscale_gemm2_heuristic_dispatch = """
 
-    if (dtype_checker<{A0DataType}>{{}}(x_dtype)
-        && dtype_checker<{B0DataType}>{{}}(w_dtype)
-        && dtype_checker<{EDataType}>{{}}(y_dtype)
-        && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+    if (true)
     {{
-        if (block_m == 64)
+        if (block_m == 16)
+        {{
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 16, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else if (block_m == 64)
         {{
             return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
         }}
@@ -726,27 +725,27 @@ if __name__ == "__main__":
     generate_instance_and_lookUpTable_head(args.working_path)
     # build all
     if args.b_dtype is None:
-        # quanted moe
-        b_quant_dtypes = ["f8", "i8", "i4", "fp4x2"]
+        # # quanted moe
+        # b_quant_dtypes = ["f8", "i8", "i4", "fp4x2"]
         c_dtypes = ["f16", "b16"]
-        acts = ["silu", "gelu"]
-        routed_weight_l = [1, 2]
-        general_quant_l = ["per_tensor", "per_token"]
-        for b_dtype, c_dtype, act, routed_weight, quant in itertools.product(
-            b_quant_dtypes, c_dtypes, acts, routed_weight_l, general_quant_l
-        ):
-            a_dtype = b_dtype if b_dtype != "i4" else "f8"
-            quant = quant if b_dtype != "fp4x2" else "per_1x32"
-            codegen = ck_moe_2stage_gemm_codegen(
-                args.working_path,
-                a_dtype,
-                b_dtype,
-                c_dtype,
-                quant_dict[quant],
-                act,
-                routed_weight,
-            )
-            codegen.generate_instance_and_lookUpTable()
+        acts = ["silu"]
+        routed_weight_l = [2]
+        # general_quant_l = ["per_tensor", "per_token"]
+        # for b_dtype, c_dtype, act, routed_weight, quant in itertools.product(
+        #     b_quant_dtypes, c_dtypes, acts, routed_weight_l, general_quant_l
+        # ):
+        #     a_dtype = b_dtype if b_dtype != "i4" else "f8"
+        #     quant = quant if b_dtype != "fp4x2" else "per_1x32"
+        #     codegen = ck_moe_2stage_gemm_codegen(
+        #         args.working_path,
+        #         a_dtype,
+        #         b_dtype,
+        #         c_dtype,
+        #         quant_dict[quant],
+        #         act,
+        #         routed_weight,
+        #     )
+        #     codegen.generate_instance_and_lookUpTable()
 
         # blk-quant moe
         blk_quant_l = ["per_1x128"]
@@ -765,27 +764,27 @@ if __name__ == "__main__":
             codegen.generate_instance_and_lookUpTable()
 
         # no-quant moe
-        b_quant_dtypes = [
-            "f16",
-            "b16",
-        ]
-        for (
-            b_dtype,
-            act,
-            routed_weight,
-        ) in itertools.product(b_quant_dtypes, acts, routed_weight_l):
-            c_dtype = a_dtype = b_dtype
+        # b_quant_dtypes = [
+        #     "f16",
+        #     "b16",
+        # ]
+        # for (
+        #     b_dtype,
+        #     act,
+        #     routed_weight,
+        # ) in itertools.product(b_quant_dtypes, acts, routed_weight_l):
+        #     c_dtype = a_dtype = b_dtype
 
-            codegen = ck_moe_2stage_gemm_codegen(
-                args.working_path,
-                a_dtype,
-                b_dtype,
-                c_dtype,
-                quant_dict["no"],
-                act,
-                routed_weight,
-            )
-            codegen.generate_instance_and_lookUpTable()
+        #     codegen = ck_moe_2stage_gemm_codegen(
+        #         args.working_path,
+        #         a_dtype,
+        #         b_dtype,
+        #         c_dtype,
+        #         quant_dict["no"],
+        #         act,
+        #         routed_weight,
+        #     )
+        #     codegen.generate_instance_and_lookUpTable()
     else:
         for b_dtype in args.b_dtype:
             a_dtype = b_dtype if b_dtype != "i4" else "f8"
