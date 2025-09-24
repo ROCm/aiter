@@ -13,7 +13,7 @@ concurrency:
 jobs:
   sglang:
     name: sglang integration
-    runs-on: mi300x-1gpu
+    runs-on: aiter-1gpu-runner
     env:
       SGL_BRANCH: v0.5.1
       GPU_ARCH: gfx942
