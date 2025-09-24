@@ -22,8 +22,6 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
 
     steps:
-      - name: Check Hugging Face token
-
       - name: Checkout aiter repo
         uses: actions/checkout@v4
 
