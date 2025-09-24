@@ -140,7 +140,7 @@ def _quantize_thd(
     return x_fp8, descale_factors
 
 
-def _dequantize_bshd(x: torch.Tensor, descale: torch.Tensor | None) -> torch.Tensor:
+def _dequantize_bshd(x: torch.Tensor, descale: Optional[torch.Tensor]) -> torch.Tensor:
     """Return a float32 dequantized (or widened) version of a BSHD activation.
 
     Steps:
