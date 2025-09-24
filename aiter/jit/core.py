@@ -1,27 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import re
-import os
-import sys
-import shutil
-import time
-import types
-import importlib
 import functools
-import traceback
-from typing import List, Optional, Callable, Any
-import logging
+import importlib
 import json
+import logging
 import multiprocessing
-from packaging.version import parse, Version
+import os
+import re
+import shutil
+import sys
+import time
+import traceback
+import types
+from typing import Any, Callable, List, Optional
+
+from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from torch_guard import torch_compile_guard, is_torch_equal_or_newer  # noqa: E402
+from chip_info import get_gfx
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
-from chip_info import get_gfx
+from torch_guard import is_torch_equal_or_newer, torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
@@ -108,9 +109,9 @@ def get_asm_dir():
 
 
 @functools.lru_cache(maxsize=1)
-def get_user_jit_dir():
+def get_user_jit_dir() -> str:
     if "AITER_JIT_DIR" in os.environ:
-        path = os.getenv("AITER_JIT_DIR")
+        path = os.getenv("AITER_JIT_DIR", "")
         os.makedirs(path, exist_ok=True)
         sys.path.insert(0, path)
         return path
@@ -155,7 +156,7 @@ def validate_and_update_archs():
 
 @functools.lru_cache()
 def hip_flag_checker(flag_hip: str) -> bool:
-    ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
+    ret = os.system(f"hipcc {flag_hip} -x hip -E -P /dev/null -o /dev/null")
     if ret == 0:
         return True
     else:
@@ -174,7 +175,7 @@ def check_and_set_ninja_worker():
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
     max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
     max_jobs_env = os.environ.get("MAX_JOBS")
-    if max_jobs_env != None:
+    if max_jobs_env is not None:
         try:
             max_processes = int(max_jobs_env)
             # too large value
@@ -188,7 +189,7 @@ def check_and_set_ninja_worker():
         os.environ["MAX_JOBS"] = str(max_jobs)
 
 
-def rename_cpp_to_cu(els, dst, recurisve=False):
+def rename_cpp_to_cu(els, dst, recursive=False):
     def do_rename_and_mv(name, src, dst, ret):
         newName = name
         if name.endswith(".cpp") or name.endswith(".cu"):
@@ -204,8 +205,8 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
         if os.path.isdir(el):
             for entry in os.listdir(el):
                 if os.path.isdir(f"{el}/{entry}"):
-                    if recurisve:
-                        ret += rename_cpp_to_cu([f"{el}/{entry}"], dst, recurisve)
+                    if recursive:
+                        ret += rename_cpp_to_cu([f"{el}/{entry}"], dst, recursive)
                     continue
                 do_rename_and_mv(entry, el, dst, ret)
         else:
@@ -359,7 +360,7 @@ def build_module(
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
-        flags_hip = list(set(flags_hip))  # remove same flags
+        flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
 
@@ -370,7 +371,7 @@ def build_module(
                 if AITER_LOG_MORE:
                     logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
                 os.system(f"{PY} {blob_gen_cmd.format(blob_dir)}")
-                sources += rename_cpp_to_cu([blob_dir], src_dir, recurisve=True)
+                sources += rename_cpp_to_cu([blob_dir], src_dir, recursive=True)
             return sources
 
         if prebuild != 2:
@@ -532,7 +533,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
 
                 return all_ops_list, d_all_ops
             # no find opt_name in json.
-            elif data.get(ops_name) == None:
+            elif data.get(ops_name) is None:
                 logger.warning(
                     "Not found this operator ("
                     + ops_name
@@ -591,26 +592,15 @@ NONE_WRAPPED_OP = [
     "qr_get_handle",
 ]
 
-SPECIAL_OPS_MUTATES_ARGS = {
-    "topk_softmax": [
-        "arg0",
-        "arg1",
-        "arg2",
-    ],  # "topk_weights", "topk_indices", "token_expert_indices"
-    "biased_grouped_topk_hip": ["topk_weights", "topk_ids"],
-    "moe_fused_gate": ["topk_weights", "topk_ids"],
-    "grouped_topk": ["topk_weights", "topk_ids"],
-    "rope_cached_positions_2c_fwd_impl": ["input_x", "input_y"],
-    "rotary_embedding_fwd": ["query", "key"],
-    "reshape_and_cache": ["key_cache", "value_cache"],
-    "reshape_and_cache_with_pertoken_quant": ["key_cache", "value_cache"],
-}
+# We default all args are inplace, you can define inplace args for specific op
+SPECIAL_OPS_MUTATES_ARGS = {}
 
 
 def generate_schema(func) -> str:
     import inspect
+    from typing import List, Optional, Union, get_args, get_origin
+
     import torch
-    from typing import Optional, Union, List, get_origin, get_args
 
     sig = inspect.signature(func)
     parameters = []
@@ -618,9 +608,9 @@ def generate_schema(func) -> str:
     for idx, (name, param) in enumerate(sig.parameters.items()):
         param_type = param.annotation
         flag = True
-        is_mutates = False
-        if name in mutates_args:
-            is_mutates = True
+        is_mutates = True
+        if len(mutates_args) > 0 and name not in mutates_args:
+            is_mutates = False
 
         if param_type is torch.Tensor:
             if is_mutates:
@@ -737,7 +727,7 @@ def compile_ops(
                         module = aiter_
                 elif AITER_REBUILD and md_name not in rebuilded_list:
                     rebuilded_list.append(md_name)
-                    raise ModuleNotFoundError("")
+                    raise ModuleNotFoundError("start rebuild")
                 if module is None:
                     md = custom_build_args.get("md_name", md_name)
                     module = get_module(md)
@@ -809,8 +799,9 @@ def compile_ops(
             def check_args():
                 get_asm_dir()
                 import inspect
-                import typing
                 import re
+                import typing
+
                 import torch
 
                 if not op.__doc__.startswith("Members:"):
@@ -875,42 +866,16 @@ def compile_ops(
 
                 log_args(func, *args, **kwargs)
 
-            import inspect
-
-            sig = inspect.signature(func)
-            params = list(sig.parameters.keys())
-            if loadName in activation_list:
-                activation_index = params.index("activation")
-                args_list = list(args)
-                from aiter import ActivationType, QuantType
-
-                if len(args_list) > activation_index and isinstance(
-                    args_list[activation_index], int
-                ):
-                    args_list[activation_index] = ActivationType(
-                        args_list[activation_index]
-                    )
-                    args = tuple(args_list)
-
-            if loadName in quant_list:
-                quant_index = params.index("quant_type")
-                args_list = list(args)
-                from aiter import ActivationType, QuantType
-
-                if len(args_list) > quant_index and isinstance(
-                    args_list[quant_index], int
-                ):
-                    args_list[quant_index] = QuantType(args_list[quant_index])
-                    args = tuple(args_list)
             return op(*args, **kwargs)
 
         if func.__name__ in NONE_WRAPPED_OP:
             return wrapper
 
         def wrapper_register(func):
+            import inspect
+
             import torch
             import torch.library
-            import inspect
             from torch.library import Library
 
             global aiter_lib
@@ -920,12 +885,20 @@ def compile_ops(
                 schema = generate_schema(func)
             else:
                 sig = inspect.signature(func)
-                mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, [])
+                mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, "unknown")
                 if hasattr(torch.library, "infer_schema"):
                     sig = torch.library.infer_schema(func, mutates_args=mutates_args)
                 else:
                     # for pytorch 2.4
                     import torch._custom_op.impl
+
+                    # torch 2.4 not support mutates "unknown" for inplace all param
+                    if mutates_args == "unknown":
+                        mutates_args = []
+
+                        for param_name, param in sig.parameters.items():
+                            if param.annotation == torch.Tensor:
+                                mutates_args.append(param_name)
 
                     sig = torch._custom_op.impl.infer_schema(func, mutates_args)
                 schema = f"{sig}"
@@ -933,15 +906,30 @@ def compile_ops(
 
         schema = wrapper_register(func)
 
-        import torch
         import inspect
 
+        import torch
+
         sig = inspect.signature(func)
+        input_is_tensor = False
+        parameters = list(sig.parameters.values())
+
+        if parameters:
+            first_param = parameters[0]
+            if (
+                first_param.annotation is not inspect.Parameter.empty
+                and first_param.annotation is torch.Tensor
+            ):
+                input_is_tensor = True
+
         input_part, output_part = schema.split("->", 1)
-        if not sig.parameters:
-            new_input = "(Tensor dummy)"
+        if input_is_tensor:
+            new_input = input_part
         else:
-            new_input = "(Tensor dummy, " + input_part[1:]
+            if not sig.parameters:
+                new_input = "(Tensor dummy)"
+            else:
+                new_input = "(Tensor dummy, " + input_part[1:]
 
         return_int = False
         return_annotation = sig.return_annotation
@@ -953,19 +941,39 @@ def compile_ops(
 
         loadName = func.__name__
 
-        def abstract_impl(dummy, *args, custom_build_args={}, **kwargs):
+        def abstract_impl(*args, custom_build_args={}, **kwargs):
             if return_int:
                 return torch.empty(1, device="cuda"), 1
             if gen_fake is not None:
                 return gen_fake(*args, **kwargs)
             return func(*args, **kwargs)
 
-        def outer_wrapper(dummy, *args, **kwargs):
+        def outer_wrapper(*args, **kwargs):
             return (
                 wrapper(*args, **kwargs)
                 if not return_int
                 else (torch.empty(1, device="cuda"), wrapper(*args, **kwargs))
             )
+
+        def abstract_impl_dummy(dummy, *args, custom_build_args={}, **kwargs):
+            if return_int:
+                return torch.empty(1, device="cuda"), 1
+            if gen_fake is not None:
+                return gen_fake(*args, **kwargs)
+            return func(*args, **kwargs)
+
+        def outer_wrapper_dummy(dummy, *args, **kwargs):
+            return (
+                wrapper(*args, **kwargs)
+                if not return_int
+                else (torch.empty(1, device="cuda"), wrapper(*args, **kwargs))
+            )
+
+        custom_func = outer_wrapper
+        fake_func = abstract_impl
+        if not input_is_tensor:
+            custom_func = outer_wrapper_dummy
+            fake_func = abstract_impl_dummy
 
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
             if is_torch_equal_or_newer("2.8.0"):
@@ -975,17 +983,20 @@ def compile_ops(
             op_schema = f"aiter::wrapper_{loadName}" + schema
             aiter_lib.define(op_schema, tags=tags)
             aiter_lib.impl(
-                f"aiter::wrapper_{loadName}", outer_wrapper, dispatch_key="CUDA"
+                f"aiter::wrapper_{loadName}", custom_func, dispatch_key="CUDA"
             )
             aiter_lib.impl(
-                f"aiter::wrapper_{loadName}", outer_wrapper, dispatch_key="CPU"
+                f"aiter::wrapper_{loadName}", custom_func, dispatch_key="CPU"
             )
-            aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
+            aiter_lib._register_fake(f"wrapper_{loadName}", fake_func)
 
         def wrapper_custom(*args, custom_build_args={}, **kwargs):
-            dummy = torch.empty(1, device="cuda")
-            result = getattr(torch.ops.aiter, f"wrapper_{loadName}")(
-                dummy, *args, **kwargs
+            result = (
+                getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args, **kwargs)
+                if input_is_tensor
+                else getattr(torch.ops.aiter, f"wrapper_{loadName}")(
+                    torch.empty(1, device="cuda"), *args, **kwargs
+                )
             )
             return result[1] if return_int else result
 

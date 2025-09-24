@@ -1337,7 +1337,7 @@ def _write_ninja_file_and_build_library(
     _write_ninja_file_to_build_library(
         path=build_file_path,
         name=name,
-        sources=list(set(sources)),
+        sources=sorted(set(sources)),
         extra_cflags=extra_cflags or [],
         extra_cuda_cflags=extra_cuda_cflags or [],
         extra_ldflags=extra_ldflags or [],
@@ -1454,7 +1454,7 @@ def _get_num_workers(verbose: bool) -> Optional[int]:
             file=sys.stderr,
         )
     prebuild_thread_num = os.environ.get("PREBUILD_THREAD_NUM")
-    if prebuild_thread_num != None:
+    if prebuild_thread_num is not None:
         max_jobs = int(max_jobs) / int(prebuild_thread_num)
     return int(max_jobs)
 
