@@ -163,6 +163,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     int kphysical_block_number[TLOOP];
     int kphysical_block_offset[TLOOP];
 
+    float q_max = 0;
+
     // fetch k physical block numbers
     for(int token_depth = 0; token_depth < TLOOP; token_depth++)
     {
@@ -244,6 +246,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                             Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i] =
                                 shared_logits[gqa_ratio_loop][head_loop][mtp][qkhe_depth][rowid]
                                              [lane16id % GQA_RATIO_MTP_PARALLEL][2 * qkratio + i];
+                            if constexpr (KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto && q_scale_ptr == nullptr) {
+                            scalar_t* qptr =
+                            reinterpret_cast<scalar_t*>(&Qlocal[qkhe_depth][qkratio].xy[i]);
+                            for (int k = 0; k < 4; k++)
+                                 q_max = fmax(fabs(to_float<scalar_t>(qptr[k])), q_max);
+                            }
                         }
                     }
                 }
@@ -421,6 +429,14 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                                                 total_num_heads +
                                             global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP)
                                         : float(1.0);
+                                if(q_scale_ptr == nullptr)
+                                {
+                                    q_max = warpReduceMax(q_max);
+                                    constexpr float FP8_E4M3_SCALE_TARGET = 224.0f;
+                                    if constexpr (MFMA_TYPE == MFMAType::Fp8) {
+                                        q_scale = q_max > 0 ? FP8_E4M3_SCALE_TARGET / q_max : 1.0f;
+                                    }
+                                }
                             }
                             for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
                             {
