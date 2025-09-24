@@ -87,8 +87,8 @@ auto create_args(int argc, char* argv[])
                 "0",
                 "seed and offset values are present on GPU; 0 - host, 1 - device/GPU")
         .insert("timer", "gpu", "gpu:gpu timer, cpu:cpu timer")
-        .insert("warmup", "5", "number of iterations before benchmark the kernel")
-        .insert("repeat", "20", "number of iterations to benchmark the kernel")
+        .insert("warmup", "10", "number of iterations before benchmark the kernel")
+        .insert("repeat", "10", "number of iterations to benchmark the kernel")
         .insert("deterministic",
                 "0",
                 "if set to 1 will use multi-buffer reduction strategy for dq, atomic opeartion "
