@@ -301,7 +301,7 @@ def e2e_moe_kernel(
 
         if use_fp8_w8a8:
             if IS_BLOCKSCALEQ:
-                k_start = k * BLOCK_SIZE_K2 + offs_k2[None, :]
+                k_start = k * BLOCK_SIZE_K2
                 offs_ks = (k_start + offs_k2) // group_k
                 w2_scale = tl.load(w2_scale_ptrs + offs_ks * stride_w2sk)
                 out = tl.dot_scaled(acc, acc_scale, "e4m3", w2, w2_scale, "e4m3")
