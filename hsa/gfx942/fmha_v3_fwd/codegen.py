@@ -29,13 +29,13 @@ struct fwd_kernel_param {
 };
 """
 
-FMHA_FWD_KERNEL_SELECT_MAP = r"""
-// key: DataType_HDim_MaskType_kIsSEQPad_kIsHDPad_kStoreLSE_GPUArch_BF16Cvt_kIsGroupMode
-static std::unordered_map<std::string, fwd_kernel_param> fwd_kernel_select_map = {
-    {"FmhaFwdBf16_128_0_false_false_1_gfx942_1_0", {"fmha_fwd_hd128_bf16_rtna", "fwd_hd128_bf16_rtna.co", 256, 32}}
-};
+# FMHA_FWD_KERNEL_SELECT_MAP = r"""
+# // key: DataType_HDim_MaskType_kIsSEQPad_kIsHDPad_kStoreLSE_GPUArch_BF16Cvt_kIsGroupMode
+# static std::unordered_map<std::string, fwd_kernel_param> fwd_kernel_select_map = {
+#     {"FmhaFwdBf16_128_0_false_false_1_gfx942_1_0", {"fmha_fwd_hd128_bf16_rtna", "fwd_hd128_bf16_rtna.co", 256, 32}}
+# };
 
-"""
+# """
 
 FMHA_FWD_API = """
 
@@ -59,6 +59,7 @@ class fmha_fwd_v3_kernel
             // TODO: return with error
             return;
         }
+        std::cout << ", filename: " << (AITER_ASM_DIR + hsaco).c_str() << ",kernel_funx name is: " << kernel_func_name.c_str() << std::flush;
         HIP_CALL(hipModuleLoad(&module, (AITER_ASM_DIR + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_func_name.c_str()));
     }

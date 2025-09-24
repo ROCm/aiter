@@ -30,7 +30,7 @@ It is a very important thing to extract and analyze all the requirements from a 
 
 #### Notice
 
-- the kernel will be different with different v3_bf16_cvt parameter on the MI300 or MI308. Please Confirm whether this parameter need to be consifered.
+- the kernel will be different with different v3_bf16_cvt parameter on the MI300 or MI308. Please Confirm whether this parameter need to be considered.
 
 - The supported functions are generally automatically inherited and cannot be lost. For example, the mask type previously supported 0,1,2, but now only 0,2 are supported. It is necessary to clarify the inheritance. The batch mode supports 0,1,2, and the newly added group mode only supports 0,2.
 
@@ -74,7 +74,7 @@ It is a very important thing to extract and analyze all the requirements from a 
 
 #### 2.2.1.2 Convert the `.s` file of the kernel to the `.co` file in aiter through script
 
-##### 1. Put the following script in the hsaco_to_hex directory, replace the content of `target_str` `arch_version`和`file_map`, and the execute the script to automatically generate the co file.
+##### 1. Put the following script in the hsaco_to_hex directory, replace the content of `target_str` `arch_version`和`file_map`, and then execute the script to automatically generate the co file.
 
 https://github.com/niels-zhang/poc_kl/blob/0528ac8e40f7a6ec847d1a6439c75ffb4a6025b8/mi300/fmha_fwd_asm/hsaco_to_hex/modify_kernel_name.py
 
