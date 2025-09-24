@@ -6,6 +6,7 @@ from .fwd_decode import attention_forward_decode_triton_impl
 from .bwd import attention_backward_triton_impl
 from .utils import DEBUG, USE_EXP2, BWD_MODE, PHILOX_SEED, PHILOX_OFFSET, is_fp8
 
+
 def fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -242,11 +243,22 @@ def fwd(
     if out is None:
         out_dtype = torch.float32 if is_fp8(q) else q.dtype
         if layout == "bshd":
-            out = torch.zeros(q.shape[0], q.shape[1], q.shape[2], v.shape[-1], dtype=out_dtype, device=q.device)
+            out = torch.zeros(
+                q.shape[0],
+                q.shape[1],
+                q.shape[2],
+                v.shape[-1],
+                dtype=out_dtype,
+                device=q.device,
+            )
         elif layout == "thd":
-            out = torch.zeros(q.shape[0], q.shape[1], v.shape[-1], dtype=out_dtype, device=q.device)
+            out = torch.zeros(
+                q.shape[0], q.shape[1], v.shape[-1], dtype=out_dtype, device=q.device
+            )
         else:
-            raise ValueError(f"Unsupported layout: {layout}. Only 'bshd' and 'thd' layouts are supported.")
+            raise ValueError(
+                f"Unsupported layout: {layout}. Only 'bshd' and 'thd' layouts are supported."
+            )
     else:
         out = out.zero_()
 
@@ -265,7 +277,11 @@ def fwd(
                 expected_q_heads = q.shape[2]
                 expected_kv_heads = k.shape[2]
             else:  # thd layout
-                expected_batch = (len(cu_seqlens_q_local) - 1) if cu_seqlens_q_local is not None else 1
+                expected_batch = (
+                    (len(cu_seqlens_q_local) - 1)
+                    if cu_seqlens_q_local is not None
+                    else 1
+                )
                 expected_q_heads = q.shape[1]
                 expected_kv_heads = k.shape[1]
 
@@ -284,7 +300,6 @@ def fwd(
                 and v_descale.shape[0] == expected_batch
                 and v_descale.shape[1] == expected_kv_heads
             ), f"v_descale expected shape ({expected_batch}, {expected_kv_heads}) got {tuple(v_descale.shape)}"
-
 
     # Handle causal mask
     causal_flag = bool(causal)

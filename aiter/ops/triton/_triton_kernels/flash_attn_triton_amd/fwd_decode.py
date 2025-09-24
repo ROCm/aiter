@@ -9,8 +9,9 @@ from .utils import (
     get_shape_and_strides_from_layout,
     apply_rotary,
     is_cdna,
-    is_fp8
+    is_fp8,
 )
+
 
 def get_cdna_autotune_configs():
     return [

@@ -206,6 +206,83 @@ def _dequantize_bshd(x: torch.Tensor, descale: torch.Tensor | None) -> torch.Ten
     )
 
 
+def _dequantize_varlen_thd(
+    x: torch.Tensor,
+    descale: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
+    """Dequantize (or just widen) a concatenated varlen tensor of shape [T, H, D].
+
+    This mirrors `_dequantize_bshd` semantics but for variable-length packed sequences.
+
+    Arguments:
+      x: FP8 (required) tensor with shape [total_tokens, heads, dim]. Always widened to fp32.
+      descale: Optional (B,H) or (B,G) scaling factors (per-head or grouped). If None, we
+               simply return widened fp32 tensor.
+      cu_seqlens: Cumulative sequence lengths (int32/int64) of shape [B+1]; required when
+                  descale is provided so we can map tokens -> batch rows of descale.
+
+    Behavior:
+      * Always widens FP8 to float32 first.
+      * If `descale` is None returns widened tensor.
+      * Validates tensor ranks & basic shape consistency; raises ValueError on mismatch.
+      * Supports grouped scaling when H % G == 0.
+    """
+    is_fp8 = x.dtype in get_fp8_dtypes()
+    if not is_fp8:
+        raise TypeError(
+            f"_dequantize_varlen_thd expects an FP8 tensor; got {x.dtype}. "
+            "This helper should only be used for FP8 debug save path."
+        )
+    x_fp = x.float()  # widen first
+    if descale is None:
+        return x_fp
+    if x_fp.dim() != 3:
+        raise ValueError(
+            f"_dequantize_varlen_thd expected x to have 3 dims (T,H,D); got shape {tuple(x_fp.shape)}"
+        )
+    if cu_seqlens is None:
+        raise ValueError(
+            "cu_seqlens must be provided when descale is not None for varlen dequantization"
+        )
+    if descale.dim() != 2:
+        raise ValueError(
+            f"_dequantize_varlen_thd expected descale to have 2 dims (B,H or B,G); got shape {tuple(descale.shape)}"
+        )
+    T, H, D = x_fp.shape
+    B = cu_seqlens.shape[0] - 1
+    if descale.shape[0] != B:
+        raise ValueError(
+            f"Batch mismatch: descale batch {descale.shape[0]} vs cu_seqlens implies B={B}"
+        )
+    head_or_groups = descale.shape[1]
+    if head_or_groups != H and (H % head_or_groups) != 0:
+        raise ValueError(
+            "Incompatible descale second dim: neither equals number of heads nor divides it "
+            f"(H={H}, descale second dim={head_or_groups})."
+        )
+    out = x_fp
+    grouped = head_or_groups != H
+    group_size = H // head_or_groups if grouped else 1
+    # Iterate sequences to broadcast correct descales (cost acceptable for debug path)
+    for b in range(B):
+        start = int(cu_seqlens[b].item())
+        end = int(cu_seqlens[b + 1].item())
+        if start == end:
+            continue  # empty sequence
+        if not grouped:
+            out[start:end] *= descale[b].view(1, H, 1)
+        else:
+            expanded = (
+                descale[b]
+                .unsqueeze(-1)
+                .repeat(1, group_size)  # (G, group_size)
+                .view(H)
+            )
+            out[start:end] *= expanded.view(1, H, 1)
+    return out
+
+
 class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
     @staticmethod
     def forward(
@@ -459,9 +536,10 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
         )
         # Varlen FP8 save: same policy—widen and optionally scale (shape mismatches just widen).
         if FP8_DEQUANTIZED_BACKWARD and q.dtype in get_fp8_dtypes():
-            q_save = _dequantize_bshd(q, q_descale)
-            k_save = _dequantize_bshd(k, k_descale)
-            v_save = _dequantize_bshd(v, v_descale)
+            # Use varlen-aware dequantization (q,k,v packed as [T,H,D])
+            q_save = _dequantize_varlen_thd(q, q_descale, cu_seqlens_q)
+            k_save = _dequantize_varlen_thd(k, k_descale, cu_seqlens_k)
+            v_save = _dequantize_varlen_thd(v, v_descale, cu_seqlens_k)
         else:
             q_save, k_save, v_save = q, k, v
         ctx.save_for_backward(q_save, k_save, v_save, out, softmax_lse)

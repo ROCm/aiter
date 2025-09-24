@@ -554,6 +554,7 @@ def generate_varlen_kv_packed(
         x.requires_grad_()
         return x, cu_seqlens, max_seqlen
 
+
 def input_helper(
     BATCH: int,
     HQ: int,
@@ -1349,6 +1350,7 @@ def write_dropout_mask(x, tensor_name="tensor"):
                                 writer.writerow(row_data)
                 else:
                     writer.writerows(dropout_mask)
+
 
 # -------------------------------
 # Rotary

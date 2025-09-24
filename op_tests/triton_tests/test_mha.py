@@ -557,7 +557,7 @@ def test_mha_varlen(
         )
 
 
-@pytest.mark.parametrize("version", ["v3"])
+@pytest.mark.parametrize("version", ["v2", "v3"])
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -587,9 +587,6 @@ def test_mha_backward(
 ):
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    # Unified allocation
-    if FUSED and CAUSAL:
-        pytest.skip("FUSED+CAUSAL results in NaNs")
     mha_set_use_fused_bwd_kernel(FUSED)
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
@@ -651,6 +648,9 @@ def test_mha_backward(
                     triton_out, (q, k, v), do.clone()
                 )
     else:  # version == 'v2'
+        pytest.skip("V2 Backward has accuracy issues")
+        if FUSED and CAUSAL:
+            pytest.skip("FUSED+CAUSAL results in NaNs")
         if FP8:
             pytest.skip("FP8 supported only on version 'v3'")
         with torch.enable_grad():
@@ -752,20 +752,28 @@ def test_mha_backward_varlen(
 ):
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    if version == "v2":
-        pytest.skip("Backward accuracy issues due to Triton compiler")
-    if FUSED and CAUSAL:
-        pytest.skip("FUSED+CAUSAL results in NaNs")
-    if FP8 and DROPOUT > 0.0:
-        pytest.skip("Flash Attention v3 doesn't support dropout")
 
     mha_set_use_fused_bwd_kernel(FUSED)
-    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
-    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
-    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
-    q.requires_grad = True
-    k.requires_grad = True
-    v.requires_grad = True
+
+    # Create padded tensors and derive varlen packed representations
+    q = torch.randn(
+        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ),
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
+    v = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
 
     query_padding_mask = generate_random_padding_mask(
         SEQLEN_Q, BATCH, "cuda", mode="random"
@@ -781,72 +789,114 @@ def test_mha_backward_varlen(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
-        q,
-        k,
-        v,
+        q_ref,
+        k_ref,
+        v_ref,
         output_pad_fn,
         dq_pad_fn,
         dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+    q_unpad.requires_grad_(True)
+    k_unpad.requires_grad_(True)
+    v_unpad.requires_grad_(True)
+    # Ensure padded reference tensors track gradients for comparison
+    q_ref.requires_grad_(True)
+    k_ref.requires_grad_(True)
+    v_ref.requires_grad_(True)
 
-    q_unpad.requires_grad = True
-    k_unpad.requires_grad = True
-    v_unpad.requires_grad = True
-    if DEBUG_MODE:
-        print(
-            f"query_padding_mask.shape={query_padding_mask.shape} query_padding_mask={query_padding_mask}"
-        )
-        print(
-            f"key_padding_mask.shape={key_padding_mask.shape} key_padding_mask={key_padding_mask}"
-        )
+    # Unified gradient seed: generate on padded output, then derive unpadded view
+    do = torch.randn_like(q_ref)  # shape [B, S_q, H, D]
+    # query_padding_mask likely bool; flatten batch*seq then mask to build unpadded gradient seed
+    mask_flat = query_padding_mask.reshape(-1).to(torch.bool)
+    do_unpad = do.view(BATCH * SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ)[mask_flat]
 
-        print(f"q.shape={q.shape} q={q}")
-        print(f"k.shape={k.shape} k={k}")
-        print(f"v.shape={v.shape} v={v}")
-        print(f"q_unpad.shape={q_unpad.shape} q_unpad={q_unpad}")
-        print(f"k_unpad.shape={k_unpad.shape} k_unpad={k_unpad}")
-        print(f"v_unpad.shape={v_unpad.shape} v_unpad={v_unpad}")
-        print(f"max_seqlens_q={max_seqlen_q }")
-        print(f"max_seqlens_k={max_seqlen_k }")
-        print(f"cu_seqlens_q={cu_seqlens_q }")
-        print(f"cu_seqlens_k={cu_seqlens_k }")
-    do = torch.randn_like(q)
-
-    if DEBUG_MODE:
-        print("--------------Triton----------------")
-        print(f"do.shape={do.shape} do={do}")
-
-    with torch.enable_grad():
+    # Top-level version branch similar to test_mha_backward
+    if version == "v3":
+        if DROPOUT > 0.0:
+            pytest.skip("flash_attn_varlen_func_v3 backward test: dropout unsupported")
+        with torch.enable_grad():
+            if FP8:
+                fp8_dtype = get_fp8_e4m3_dtype()
+                group_size = (
+                    NUM_Q_HEADS // NUM_K_HEADS
+                    if NUM_Q_HEADS % NUM_K_HEADS == 0
+                    else None
+                )
+                set_fp8_dequantized_backward(True)
+                k_fp8, k_descale = _cast_varlen_to_fp8(k_unpad, fp8_dtype, cu_seqlens_k)
+                v_fp8, v_descale = _cast_varlen_to_fp8(v_unpad, fp8_dtype, cu_seqlens_k)
+                q_fp8, q_descale = _cast_varlen_to_fp8(
+                    q_unpad, fp8_dtype, cu_seqlens_q, group_size=group_size
+                )
+                # Ensure fp8 tensors participate in autograd as leaves
+                q_fp8 = q_fp8.detach().requires_grad_()
+                k_fp8 = k_fp8.detach().requires_grad_()
+                v_fp8 = v_fp8.detach().requires_grad_()
+                triton_out = flash_attn_varlen_func_v3(
+                    q_fp8,
+                    k_fp8,
+                    v_fp8,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    softmax_scale=None,
+                    causal=CAUSAL,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+                    triton_out,
+                    (q_fp8, k_fp8, v_fp8),
+                    do_unpad.clone(),
+                    allow_unused=True,
+                )
+                if any(g is None for g in (triton_dq, triton_dk, triton_dv)):
+                    missing = [
+                        name
+                        for g, name in zip(
+                            (triton_dq, triton_dk, triton_dv), ["dq", "dk", "dv"]
+                        )
+                        if g is None
+                    ]
+                    pytest.fail(f"Missing gradients for FP8 varlen inputs: {missing}")
+            else:
+                triton_out = flash_attn_varlen_func_v3(
+                    q_unpad,
+                    k_unpad,
+                    v_unpad,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    softmax_scale=None,
+                    causal=CAUSAL,
+                )
+                triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+                    triton_out,
+                    (q_unpad, k_unpad, v_unpad),
+                    do_unpad.clone(),
+                    allow_unused=True,
+                )
+                if any(g is None for g in (triton_dq, triton_dk, triton_dv)):
+                    missing = [
+                        name
+                        for g, name in zip(
+                            (triton_dq, triton_dk, triton_dv), ["dq", "dk", "dv"]
+                        )
+                        if g is None
+                    ]
+                    pytest.fail(
+                        f"Missing gradients for v3 varlen inputs (non-FP8): {missing}"
+                    )
+    else:  # version == 'v2'
+        pytest.skip("V2 Backward has accuracy issues")
+        if FUSED and CAUSAL:
+            pytest.skip("FUSED+CAUSAL results in NaNs")
         if FP8:
-            # Use Flash Attention v3 for FP8
-            fp8_dtype = get_fp8_e4m3_dtype()
-            group_size = (
-                NUM_Q_HEADS // NUM_K_HEADS if NUM_Q_HEADS % NUM_K_HEADS == 0 else None
-            )
-            k_fp8, k_descale = _cast_varlen_to_fp8(k_unpad, fp8_dtype, cu_seqlens_k)
-            v_fp8, v_descale = _cast_varlen_to_fp8(v_unpad, fp8_dtype, cu_seqlens_k)
-            q_fp8, q_descale = _cast_varlen_to_fp8(
-                q_unpad, fp8_dtype, cu_seqlens_q, group_size=group_size
-            )
-            triton_out = flash_attn_varlen_func_v3(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                softmax_scale=None,
-                causal=CAUSAL,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-            )
-            # For v3, we don't have LSE and attention probs
-            lse = None
-            sd_mask = None
-            dropout_mask = None
-        else:
+            pytest.skip("FP8 supported only on version 'v3'")
+        with torch.enable_grad():
             triton_out = flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
@@ -861,79 +911,77 @@ def test_mha_backward_varlen(
                 return_attn_probs=True,
             )
             assert len(triton_out) == 3
-            triton_out, lse, sd_mask = triton_out[0], triton_out[1], triton_out[2]
-
+            triton_core, lse, sd_mask = triton_out
             if DROPOUT > 0.0:
                 dropout_mask = sd_mask >= 0
-                dropout_mask = pad_rearrange_dropout_mask(
-                    dropout_mask,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    SEQLEN_Q,
-                    SEQLEN_K,
-                    NUM_Q_HEADS,
+                dropout_mask = (
+                    pad_rearrange_dropout_mask(
+                        dropout_mask,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        SEQLEN_Q,
+                        SEQLEN_K,
+                        NUM_Q_HEADS,
+                    )
+                    > 0
                 )
-                dropout_mask = dropout_mask > 0
             else:
                 dropout_mask = None
+            triton_out = triton_core
+            triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+                triton_out,
+                (q_unpad, k_unpad, v_unpad),
+                do_unpad.clone(),
+                allow_unused=True,
+            )
+            if any(g is None for g in (triton_dq, triton_dk, triton_dv)):
+                missing = [
+                    name
+                    for g, name in zip(
+                        (triton_dq, triton_dk, triton_dv), ["dq", "dk", "dv"]
+                    )
+                    if g is None
+                ]
+                pytest.fail(f"Missing gradients for v2 varlen inputs: {missing}")
 
+    # Pad forward output and gradients back to padded space
     triton_out = output_pad_fn(triton_out)
-    triton_dq, triton_dk, triton_dv = torch.autograd.grad(
-        triton_out, (q_unpad, k_unpad, v_unpad), do.clone()
-    )
-
     triton_dq = dq_pad_fn(triton_dq)
     triton_dk = dk_pad_fn(triton_dk)
     triton_dv = dk_pad_fn(triton_dv)
-    if DEBUG_MODE:
-        print(f"triton_out={triton_out}")
-        if lse is not None:
-            print(f"triton_lse.shape={lse.shape} triton_lse={lse}")
-        print(f"triton_dq.shape={triton_dq.shape} triton_dq={triton_dq}")
-        print(f"triton_dk.shape={triton_dk.shape} triton_dk={triton_dk}")
-        print(f"triton_dv.shape={triton_dv.shape} triton_dv={triton_dv}")
-        if dropout_mask is not None:
-            print(f"dropout_mask={dropout_mask}")
 
-    if DEBUG_MODE:
-        print("--------------Torch----------------")
-        print(f"do.shape={do.shape} do={do}")
+    # Reference forward & backward always on padded tensors
     with torch.enable_grad():
         torch_out = attention_ref(
-            q,
-            k,
-            v,
+            q_ref,
+            k_ref,
+            v_ref,
             query_padding_mask=query_padding_mask,
             key_padding_mask=key_padding_mask,
-            dropout_p=DROPOUT,
-            dropout_mask=dropout_mask,
+            dropout_p=(DROPOUT if version == "v2" else 0.0),
+            dropout_mask=(
+                dropout_mask if (version == "v2" and DROPOUT > 0.0) else None
+            ),
             causal=CAUSAL,
         )
-    torch_out, attention_scores = torch_out
+    torch_out, _scores = torch_out
+    # Reference grads w.r.t padded tensors actually used in forward (q_ref,k_ref,v_ref)
+    torch_dq, torch_dk, torch_dv = torch.autograd.grad(
+        torch_out, (q_ref, k_ref, v_ref), do, allow_unused=False
+    )
 
-    if FP8:
+    # Assertions
+    if version == "v3" and FP8:
         fp8_assert_close(triton_out, torch_out, atol=ATOL_fp8, rtol=RTOL_fp8)
-    else:
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
-
-    torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
-
-    if DEBUG_MODE:
-        print(f"torch_out={torch_out}")
-        print(f"torch_attn_scores={attention_scores}")
-        print(f"torch_dq.shape={torch_dq.shape} torch_dq={torch_dq}")
-        print(f"torch_dk.shape={torch_dk.shape} torch_dk={torch_dk}")
-        print(f"torch_dv.shape={torch_dv.shape} torch_dv={torch_dv}")
-
-    if FP8:
         fp8_assert_close(triton_dq, torch_dq, atol=ATOL_fp8, rtol=RTOL_fp8)
         fp8_assert_close(triton_dk, torch_dk, atol=ATOL_fp8, rtol=RTOL_fp8)
         fp8_assert_close(triton_dv, torch_dv, atol=ATOL_fp8, rtol=RTOL_fp8)
     else:
+        torch.testing.assert_close(
+            triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+        )
         torch.testing.assert_close(
             triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
         )

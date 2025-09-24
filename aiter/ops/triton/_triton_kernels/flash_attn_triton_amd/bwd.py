@@ -18,6 +18,7 @@ from .utils import (
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
 tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
 
+
 def get_autotune_configs():
     if False:
         if is_cdna():
@@ -2426,7 +2427,6 @@ def _bwd_kernel_fused_atomics_dq_noncausal(
         tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
 
 
-
 # This function computes delta given output Out and gradient DO
 # Here is the I/O shape:
 # Out: (batch, nhead_q, max_seqlens_q, headDim)
@@ -3872,6 +3872,7 @@ def is_contiguous(x, name):
         print(f"{name} is not contiguous")
         return x.contiguous()
 
+
 DEBUG_TRITON: bool = False
 DEBUG_TRITON_DETAIL: bool = False
 
@@ -4147,9 +4148,7 @@ def attention_backward_triton_split_fused_no_atomics_impl(
         stride_descale_do_z = descale_do.stride(0) if descale_do is not None else None
 
         if DEBUG:
-            print(
-                f"FP8 path triggered (FP8_OUTPUT={FP8_OUTPUT})"
-            )
+            print(f"FP8 path triggered (FP8_OUTPUT={FP8_OUTPUT})")
     else:
         FP8_MAX = None
         FP8_OUTPUT = False
@@ -4177,11 +4176,17 @@ def attention_backward_triton_split_fused_no_atomics_impl(
         # Shape expected by interface varlen backward: (Hq, Total_Q)
         total_q, _, _ = q.shape
         delta = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
-        stride_delta_b, stride_delta_h, stride_delta_m = (0, delta.stride(0), delta.stride(1))
+        stride_delta_b, stride_delta_h, stride_delta_m = (
+            0,
+            delta.stride(0),
+            delta.stride(1),
+        )
     else:
         # Shape expected by dense backward: (B, Hq, Sq)
         seqlen_q = q.shape[1]
-        delta = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+        delta = torch.zeros(
+            (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
+        )
         stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
 
     pre_grid = lambda META: (

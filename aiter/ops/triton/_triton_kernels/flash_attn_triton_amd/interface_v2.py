@@ -118,19 +118,21 @@ def fwd(
     assert out.shape == q.shape, f"[fwd] out shape {out.shape} != q shape {q.shape}"
     # softmax_lse: (B, Hq, Sq)
     expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
-    assert softmax_lse.shape == expected_lse_shape, (
-        f"[fwd] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
-    )
-    assert softmax_lse.dtype == torch.float32, (
-        f"[fwd] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
-    )
+    assert (
+        softmax_lse.shape == expected_lse_shape
+    ), f"[fwd] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
+    assert (
+        softmax_lse.dtype == torch.float32
+    ), f"[fwd] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
     if return_softmax:
         # sd_mask: (B, Hq, Sq, Sk)
         assert sd_mask is not None, "[fwd] return_softmax=True but sd_mask is None"
         assert sd_mask.dim() == 4, f"[fwd] sd_mask dim {sd_mask.dim()} != 4"
-        assert sd_mask.shape[0] == q.shape[0] and sd_mask.shape[1] == q.shape[2] and sd_mask.shape[2] == q.shape[1], (
-            f"[fwd] sd_mask leading dims {sd_mask.shape[:3]} mismatch (B,Hq,Sq) {(q.shape[0], q.shape[2], q.shape[1])}"
-        )
+        assert (
+            sd_mask.shape[0] == q.shape[0]
+            and sd_mask.shape[1] == q.shape[2]
+            and sd_mask.shape[2] == q.shape[1]
+        ), f"[fwd] sd_mask leading dims {sd_mask.shape[:3]} mismatch (B,Hq,Sq) {(q.shape[0], q.shape[2], q.shape[1])}"
     else:
         assert sd_mask is None, "[fwd] return_softmax=False but sd_mask is not None"
 
@@ -248,9 +250,9 @@ def bwd(
     assert dv.shape == v.shape, f"[bwd] dv shape {dv.shape} != v shape {v.shape}"
     # delta (softmax_d) : (B, Hq, Sq)
     expected_delta_shape = (q.shape[0], q.shape[2], q.shape[1])
-    assert delta.shape == expected_delta_shape, (
-        f"[bwd] delta shape {delta.shape} != {expected_delta_shape}"
-    )
+    assert (
+        delta.shape == expected_delta_shape
+    ), f"[bwd] delta shape {delta.shape} != {expected_delta_shape}"
     return dq, dk, dv, delta
 
 
@@ -377,27 +379,33 @@ def varlen_fwd(
         print("sd_mask:", sd_mask, sd_mask.shape if sd_mask is not None else None)
     # --- Assertions ---
     # out: (Total_Q, Hq, D)
-    assert out.shape == q.shape, f"[varlen_fwd] out shape {out.shape} != q shape {q.shape}"
+    assert (
+        out.shape == q.shape
+    ), f"[varlen_fwd] out shape {out.shape} != q shape {q.shape}"
     # softmax_lse: (Hq, Total_Q)
     expected_lse_shape = (q.shape[1], q.shape[0])
-    assert softmax_lse.shape == expected_lse_shape, (
-        f"[varlen_fwd] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
-    )
-    assert softmax_lse.dtype == torch.float32, (
-        f"[varlen_fwd] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
-    )
+    assert (
+        softmax_lse.shape == expected_lse_shape
+    ), f"[varlen_fwd] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
+    assert (
+        softmax_lse.dtype == torch.float32
+    ), f"[varlen_fwd] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
     if return_softmax:
         # sd_mask expected: (B, Hq, max_seqlen_q, max_seqlen_k)
-        assert sd_mask is not None, "[varlen_fwd] return_softmax=True but sd_mask is None"
+        assert (
+            sd_mask is not None
+        ), "[varlen_fwd] return_softmax=True but sd_mask is None"
         assert sd_mask.dim() == 4, f"[varlen_fwd] sd_mask dim {sd_mask.dim()} != 4"
-        assert sd_mask.shape[0] == (len(cu_seqlens_q) - 1), (
-            f"[varlen_fwd] sd_mask batch {sd_mask.shape[0]} != {len(cu_seqlens_q)-1}"
-        )
-        assert sd_mask.shape[1] == q.shape[1], (
-            f"[varlen_fwd] sd_mask nheads {sd_mask.shape[1]} != {q.shape[1]}"
-        )
+        assert sd_mask.shape[0] == (
+            len(cu_seqlens_q) - 1
+        ), f"[varlen_fwd] sd_mask batch {sd_mask.shape[0]} != {len(cu_seqlens_q)-1}"
+        assert (
+            sd_mask.shape[1] == q.shape[1]
+        ), f"[varlen_fwd] sd_mask nheads {sd_mask.shape[1]} != {q.shape[1]}"
     else:
-        assert sd_mask is None, "[varlen_fwd] return_softmax=False but sd_mask is not None"
+        assert (
+            sd_mask is None
+        ), "[varlen_fwd] return_softmax=False but sd_mask is not None"
     return out, softmax_lse, sd_mask, rng_state
 
 
@@ -525,9 +533,9 @@ def varlen_bwd(
     assert dk.shape == k.shape, f"[varlen_bwd] dk shape {dk.shape} != k shape {k.shape}"
     assert dv.shape == v.shape, f"[varlen_bwd] dv shape {dv.shape} != v shape {v.shape}"
     expected_delta_shape = (q.shape[1], q.shape[0])  # (Hq, Total_Q)
-    assert delta.shape == expected_delta_shape, (
-        f"[varlen_bwd] delta shape {delta.shape} != {expected_delta_shape}"
-    )
+    assert (
+        delta.shape == expected_delta_shape
+    ), f"[varlen_bwd] delta shape {delta.shape} != {expected_delta_shape}"
     return dq, dk, dv, delta
 
 
@@ -599,8 +607,16 @@ def fwd_kvcache(
         if isinstance(cache_seqlens, int)
         else cache_seqlens
     )
-    window_left = int(window_size_left.item()) if isinstance(window_size_left, torch.Tensor) else window_size_left
-    window_right = int(window_size_right.item()) if isinstance(window_size_right, torch.Tensor) else window_size_right
+    window_left = (
+        int(window_size_left.item())
+        if isinstance(window_size_left, torch.Tensor)
+        else window_size_left
+    )
+    window_right = (
+        int(window_size_right.item())
+        if isinstance(window_size_right, torch.Tensor)
+        else window_size_right
+    )
 
     k_new = k
     v_new = v
@@ -645,12 +661,14 @@ def fwd_kvcache(
         print("out:", out, out.shape)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
     # --- Assertions ---
-    assert out.shape == q.shape, f"[fwd_kvcache] out shape {out.shape} != q shape {q.shape}"
+    assert (
+        out.shape == q.shape
+    ), f"[fwd_kvcache] out shape {out.shape} != q shape {q.shape}"
     expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
-    assert softmax_lse.shape == expected_lse_shape, (
-        f"[fwd_kvcache] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
-    )
-    assert softmax_lse.dtype == torch.float32, (
-        f"[fwd_kvcache] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
-    )
+    assert (
+        softmax_lse.shape == expected_lse_shape
+    ), f"[fwd_kvcache] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
+    assert (
+        softmax_lse.dtype == torch.float32
+    ), f"[fwd_kvcache] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
     return out, softmax_lse

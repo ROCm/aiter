@@ -15,7 +15,7 @@ from .utils import (
     is_fp8,
     is_rdna,
     create_dropout_mask,
-    apply_rotary
+    apply_rotary,
 )
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
