@@ -36,7 +36,8 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           float softmax_scale,
                                           float logits_soft_cap,
                                           float p_dropout,
-                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                          std::string q_dtype_str)
 {
     // q: (total_q, nheads, d)
     // k: (total_k, nheads_k, d)
@@ -76,7 +77,6 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     ck_tile::index_t nhead_stride_bias = 0;
     ck_tile::index_t batch_stride_bias = 0;
 
-    std::string q_dtype_str = q.dtype() == torch::kFloat16 ? "fp16" : "bf16";
     bias_enum bias_type = bias_.has_value() ? bias_enum::elementwise_bias :
         (alibi_slopes_.has_value() ? bias_type = bias_enum::alibi : bias_enum::no_bias);
 
@@ -588,7 +588,8 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     softmax_scale,
                     logits_soft_cap,
                     p_dropout,
-                    drop_seed_offset);
+                    drop_seed_offset,
+                    q_dtype_str);
 
             float t = aiter::mha_fwd(args, stream_config);
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
