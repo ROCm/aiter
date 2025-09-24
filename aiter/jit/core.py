@@ -595,7 +595,11 @@ def compile_ops(
                         sub_t = typing.get_args(expected_type)
 
                         if origin is None:
-                            if not isinstance(arg, expected_type):
+                            if not isinstance(arg, expected_type) and not (
+                                # aiter_enum can be int
+                                "aiter_enum" in str(expected_type)
+                                and isinstance(arg, int)
+                            ):
                                 raise TypeError(
                                     f"{el} needs to be {expected_type} but got {type(arg)}"
                                 )
