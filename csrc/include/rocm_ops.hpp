@@ -369,6 +369,28 @@
           py::arg("kernelId") = 0,       \
           py::arg("splitK")   = 0);
 
+#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_PYBIND \
+    m.def("gemm_a8w8_blockscale_bpreshuffle",   \
+          &gemm_a8w8_blockscale_bpreshuffle,    \
+          "fp8 blockscale bpreshuffle gemm",    \
+          py::arg("XQ"),                        \
+          py::arg("WQ"),                        \
+          py::arg("x_scale"),                   \
+          py::arg("w_scale"),                   \
+          py::arg("Out"));
+
+#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
+    m.def("gemm_a8w8_blockscale_bpreshuffle_tune",   \
+          &gemm_a8w8_blockscale_bpreshuffle_tune,    \
+          "gemm_a8w8_blockscale_bpreshuffle_tune",   \
+          py::arg("XQ"),                             \
+          py::arg("WQ"),                             \
+          py::arg("x_scale"),                        \
+          py::arg("w_scale"),                        \
+          py::arg("Out"),                            \
+          py::arg("kernelId") = 0,                   \
+          py::arg("splitK")   = 0);
+
 #define GEMM_A4W4_BLOCKSCALE_TUNE_PYBIND \
     m.def("gemm_a4w4_blockscale_tune",   \
           &gemm_a4w4_blockscale_tune,    \
@@ -1086,7 +1108,8 @@
           py::arg("out_dtype") = std::nullopt,                                     \
           py::arg("scaleA")    = std::nullopt,                                     \
           py::arg("scaleB")    = std::nullopt,                                     \
-          py::arg("scaleOut")  = std::nullopt);                                     \
+          py::arg("scaleOut")  = std::nullopt,                                      \
+          py::arg("bpreshuffle")  = std::nullopt);                                     \
     m.def("hipb_findallsols",                                                      \
           &hipb_findallsols,                                                       \
           "hipb_findallsols",                                                      \
@@ -1118,7 +1141,8 @@
         .value("No", ActivationType::No)                 \
         .value("Silu", ActivationType::Silu)             \
         .value("Gelu", ActivationType::Gelu)             \
-        .export_values();
-
+        .export_values();                                \
+    pybind11::implicitly_convertible<int, QuantType>();  \
+    pybind11::implicitly_convertible<int, ActivationType>();
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));

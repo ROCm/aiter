@@ -5,7 +5,7 @@ import os
 import sys
 import shutil
 
-from setuptools import setup
+from setuptools import Distribution, setup
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
@@ -120,7 +120,7 @@ if IS_ROCM:
         prebuid_thread_num = 5
         prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         max_jobs = os.environ.get("MAX_JOBS")
-        if max_jobs != None and max_jobs.isdigit():
+        if max_jobs is not None and max_jobs.isdigit():
             prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
@@ -181,7 +181,7 @@ class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         max_jobs = getMaxJobs()
         max_jobs_env = os.environ.get("MAX_JOBS")
-        if max_jobs_env != None:
+        if max_jobs_env is not None:
             try:
                 max_processes = int(max_jobs_env)
                 # too large value
@@ -205,6 +205,12 @@ setup_requires = [
 ]
 if PREBUILD_KERNELS == 1:
     setup_requires.append("pandas")
+
+
+class ForcePlatlibDistribution(Distribution):
+    def has_ext_modules(self):
+        return True
+
 
 setup(
     name=PACKAGE_NAME,
@@ -230,6 +236,7 @@ setup(
         "psutil",
     ],
     setup_requires=setup_requires,
+    distclass=ForcePlatlibDistribution,
 )
 
 if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
