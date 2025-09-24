@@ -77,10 +77,9 @@ jobs:
     needs: build_vllm_image
     strategy:
       matrix:
-        models: [
-          'mistralai/Mixtral-8x7B-Instruct-v0.1',
-          'deepseek-ai/DeepSeek-R1',
-        ]
+        model:
+          - 'mistralai/Mixtral-8x7B-Instruct-v0.1'
+          - 'deepseek-ai/DeepSeek-R1'
         
     steps:
       - name: Checkout vLLM repo with retry
@@ -110,11 +109,11 @@ jobs:
       - name: Run benchmarks
         run: |
           set -x -o pipefail
-          echo "Starting benchmark for model: ${model}"
+          echo "Starting benchmark for model: ${{ matrix.model }}"
 
-          logFile="result_$(echo "${model}" | sed 's/\//_/g').log"
+          logFile="result_$(echo '${{ matrix.model }}' | sed 's/\//_/g').log"
 
-          if [[ "${model}" == *DeepSeek* ]]; then
+          if [[ "${{ matrix.model }}" == *DeepSeek* ]]; then
               extraArgs="--block-size 1"
           else
               extraArgs=""
@@ -124,9 +123,9 @@ jobs:
               --ulimit core=0:0 --ulimit memlock=-1:-1 --ulimit stack=67108864 --cap-add=SYS_PTRACE \
               --network=host --security-opt seccomp=unconfined --shm-size=16G \
               -e HF_TOKEN=${{ secrets.HF_TOKEN }} -e VLLM_ROCM_USE_AITER=1 \
-              rocm/aiter-ci:${{ env.COMMIT_SHA }} python -m vllm.entrypoints.cli.main bench latency \
-              --model ${model} \
+              rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} python -m vllm.entrypoints.cli.main bench latency \
+              --model "${{ matrix.model }}" \
               --batch-size 123 --input-len 456 --output-len 78 \
               --num-iters-warmup 3 --num-iters 10 \
               -tp 8 --load-format dummy ${extraArgs} |& tee ${logFile}
-          grep "Avg latency:" result.log | awk '{print $3}'
+          grep "Avg latency:" ${logFile} | awk '{print $3}'
