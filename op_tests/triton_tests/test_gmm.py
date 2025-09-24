@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
+
 # Imports.
 # ------------------------------------------------------------------------------
 
@@ -14,9 +15,11 @@ from torch import Tensor
 # pytest
 import pytest
 
-# AITER: GMM utility functions
+# AITER: GMM defaults and utility functions
 from aiter.ops.triton.utils.gmm_common import (
+    SUPPORTED_DTYPES_STR,
     DTYPE,
+    dtype_from_str,
     check_input_device_dtype,
     gen_gmm_tensors,
     get_gmm_shape,
@@ -66,24 +69,10 @@ REAL_SHAPES: list[tuple[int, int, int, int]] = [
 TEST_SHAPES: list[tuple[int, int, int, int]] = TEST_ONLY_SHAPES + REAL_SHAPES
 
 
-# Data types.
-
-# Supported data types, as strings.
-SUPPORTED_DTYPES_STR: set[str] = {"fp16", "bf16"}
-
 # Input and output types.
+
 INPUT_DTYPES_STR: set[str] = {"i" + dtype_str for dtype_str in SUPPORTED_DTYPES_STR}
 OUTPUT_DTYPES_STR: set[str] = {"o" + dtype_str for dtype_str in SUPPORTED_DTYPES_STR}
-
-
-# Convert string data type to PyTorch data type.
-def dtype_from_str(dtype_str: str) -> torch.dtype:
-    dtype_str = dtype_str.strip().lower()
-    dtype_str = dtype_str[1:] if dtype_str[0] in {"i", "o"} else dtype_str
-    assert (
-        dtype_str in SUPPORTED_DTYPES_STR
-    ), "String data type isn't in set of supported string data types."
-    return {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
 
 
 # Transpositions.
