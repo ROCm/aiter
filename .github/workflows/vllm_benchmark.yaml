@@ -81,6 +81,7 @@ jobs:
 
   vllm_benchmark:
     runs-on: aiter-8gpu-runner
+    needs: build_vllm_image
     strategy:
       matrix:
         models: [
