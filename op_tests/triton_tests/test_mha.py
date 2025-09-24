@@ -617,9 +617,7 @@ def test_mha_backward(
                 set_fp8_dequantized_backward(True)
                 k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
                 v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
-                q_fp8, q_descale = _quantize_bshd(
-                    q, fp8_dtype, group_size=group_size
-                )
+                q_fp8, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
                 triton_out = flash_attn_func_v3(
                     q_fp8,
                     k_fp8,
@@ -1078,12 +1076,8 @@ def test_mha_kvcache(
         fp8_dtype = get_fp8_e4m3_dtype()
         group_size = nheads // nheads_k if nheads % nheads_k == 0 else None
         if page_size is None:
-            k_cache_kernel, k_descale = _quantize_bshd(
-                k_cache_for_kernel, fp8_dtype
-            )
-            v_cache_kernel, v_descale = _quantize_bshd(
-                v_cache_for_kernel, fp8_dtype
-            )
+            k_cache_kernel, k_descale = _quantize_bshd(k_cache_for_kernel, fp8_dtype)
+            v_cache_kernel, v_descale = _quantize_bshd(v_cache_for_kernel, fp8_dtype)
         else:
             # Cast logical contiguous tensors then map back to block layout
             k_cache_fp8_logical, k_descale = _quantize_bshd(k_cache, fp8_dtype)

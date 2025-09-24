@@ -373,15 +373,9 @@ def run_benchmark(custom, args):
                         )
 
                     fp8_dtype = get_fp8_e4m3_dtype()
-                    q_fp8, q_descale = _quantize_thd(
-                        q_input, fp8_dtype, cu_seqlens_q
-                    )
-                    k_fp8, k_descale = _quantize_thd(
-                        k_input, fp8_dtype, cu_seqlens_k
-                    )
-                    v_fp8, v_descale = _quantize_thd(
-                        v_input, fp8_dtype, cu_seqlens_k
-                    )
+                    q_fp8, q_descale = _quantize_thd(q_input, fp8_dtype, cu_seqlens_q)
+                    k_fp8, k_descale = _quantize_thd(k_input, fp8_dtype, cu_seqlens_k)
+                    v_fp8, v_descale = _quantize_thd(v_input, fp8_dtype, cu_seqlens_k)
 
                     return flash_attn_varlen_func_v3(
                         q_fp8,

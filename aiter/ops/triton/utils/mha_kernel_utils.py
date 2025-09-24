@@ -16,6 +16,7 @@ def _compute_fp8_scaling_factors(x, fp8_max: tl.constexpr):
     descale_x = x_amax / fp8_max
     return scale_x, descale_x
 
+
 def _quantize_bshd(
     x: torch.Tensor,
     fp8_dtype,
@@ -281,5 +282,3 @@ def _dequantize_varlen_thd(
             )
             out[start:end] *= expanded.view(1, H, 1)
     return out
-
-

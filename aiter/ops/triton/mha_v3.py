@@ -6,7 +6,10 @@ from typing import Optional, Tuple
 import torch
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
-from aiter.ops.triton.utils.mha_kernel_utils import _dequantize_bshd, _dequantize_varlen_thd
+from aiter.ops.triton.utils.mha_kernel_utils import (
+    _dequantize_bshd,
+    _dequantize_varlen_thd,
+)
 
 FP8_DEQUANTIZED_BACKWARD = False
 
@@ -18,6 +21,7 @@ def set_fp8_dequantized_backward(value: bool):
     """
     global FP8_DEQUANTIZED_BACKWARD
     FP8_DEQUANTIZED_BACKWARD = bool(value)
+
 
 class _FlashAttnV3Func(torch.autograd.Function):
     @staticmethod
