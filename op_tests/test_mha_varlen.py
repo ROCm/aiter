@@ -66,7 +66,7 @@ def run_torch(
         reorder_ops=reorder_ops,
     )
 
-    if dout == None:
+    if dout is None:
         return out
     else:
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)

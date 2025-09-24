@@ -56,7 +56,7 @@ def run_torch(
         reorder_ops=reorder_ops,
     )
 
-    if dout == None:
+    if dout is None:
         return out
     elif bias is not None:
         dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
@@ -117,7 +117,7 @@ def run_ck(
     else:
         dropout_mask = None
 
-    if dout == None:
+    if dout is None:
         return out, dropout_mask
     elif bias is not None:
         dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
