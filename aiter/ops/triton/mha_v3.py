@@ -6,16 +6,8 @@ from typing import Optional, Tuple
 import torch
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
-from aiter.ops.triton.utils.types import get_fp8_dtypes
 
-# Global toggle: when enabled and FP8 descale factors are provided, we store the
-# dequantized representations (q * q_descale, etc.) instead of the raw FP8 tensors
-# in the autograd context for potential future backward experimentation and easier
-# numerical debugging. Forward behavior / outputs are unaffected.
-# NOTE: This does NOT enable FP8 backward; it only changes what is saved.
 FP8_DEQUANTIZED_BACKWARD = False
-
-
 def set_fp8_dequantized_backward(value: bool):
     """Enable storing dequantized FP8 tensors (q/k/v * descale) in ctx instead of raw FP8.
 
@@ -168,7 +160,7 @@ def _dequantize_bshd(x: torch.Tensor, descale: torch.Tensor | None) -> torch.Ten
 
     Returns: float32 tensor (widened and optionally scaled) when successful.
     """
-    is_fp8 = x.dtype in get_fp8_dtypes()
+    is_fp8 = x.dtype in (torch.float8_e5m2, torch.float8_e5m2fnuz, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
     if not is_fp8:
         raise TypeError(
             f"_dequantize_bshd expects an FP8 tensor; got {x.dtype}. "
@@ -228,7 +220,7 @@ def _dequantize_varlen_thd(
       * Validates tensor ranks & basic shape consistency; raises ValueError on mismatch.
       * Supports grouped scaling when H % G == 0.
     """
-    is_fp8 = x.dtype in get_fp8_dtypes()
+    is_fp8 = x.dtype in (torch.float8_e5m2, torch.float8_e5m2fnuz, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
     if not is_fp8:
         raise TypeError(
             f"_dequantize_varlen_thd expects an FP8 tensor; got {x.dtype}. "
@@ -323,7 +315,6 @@ class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
         if sm_margin != 0:
             raise NotImplementedError("sm_margin != 0 not supported in AMD Triton v3")
 
-        # Forward: basic path (no varlen / kv-cache parameters used here)
         out, softmax_lse = flash_attn_3.fwd(
             q,
             k,
@@ -361,9 +352,7 @@ class _FlashAttnV3Func(torch.autograd.Function):  # Backend (native) path
             sm_margin,
         )
 
-        # FP8 save strategy (debug/experimental): widen FP8 -> fp32 then (optionally) apply descale.
-        # If toggle disabled or not FP8 we store originals. Scaling is only for debug/backward R&D.
-        if FP8_DEQUANTIZED_BACKWARD and q.dtype in get_fp8_dtypes():
+        if FP8_DEQUANTIZED_BACKWARD and q.dtype in (torch.float8_e5m2, torch.float8_e5m2fnuz, torch.float8_e4m3fn, torch.float8_e4m3fnuz ):
             q_save = _dequantize_bshd(q, q_descale)
             k_save = _dequantize_bshd(k, k_descale)
             v_save = _dequantize_bshd(v, v_descale)
@@ -534,9 +523,8 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
             None,  # pack_gqa
             sm_margin,
         )
-        # Varlen FP8 save: same policy—widen and optionally scale (shape mismatches just widen).
-        if FP8_DEQUANTIZED_BACKWARD and q.dtype in get_fp8_dtypes():
-            # Use varlen-aware dequantization (q,k,v packed as [T,H,D])
+
+        if FP8_DEQUANTIZED_BACKWARD and q.dtype in (torch.float8_e5m2, torch.float8_e5m2fnuz, torch.float8_e4m3fn, torch.float8_e4m3fnuz ):
             q_save = _dequantize_varlen_thd(q, q_descale, cu_seqlens_q)
             k_save = _dequantize_varlen_thd(k, k_descale, cu_seqlens_k)
             v_save = _dequantize_varlen_thd(v, v_descale, cu_seqlens_k)
