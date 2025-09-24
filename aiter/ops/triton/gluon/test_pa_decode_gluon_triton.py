@@ -296,6 +296,15 @@ def run_triton(
     )
     return output, result
 
+def asm_V_shuffle(VC):
+    # [num_blocks, num_kv_heads, head_size, block_size]
+    x = 16 // VC.element_size()
+    num_blocks, num_kv_heads, head_size, block_size = VC.shape
+    VC = VC.view(num_blocks, num_kv_heads, head_size, block_size // x, x)
+    # [num_blocks, num_kv_heads, block_size/X, head_size, X]
+    VC = VC.permute(0, 1, 3, 2, 4).contiguous()
+    return VC
+
 def run_gluon(
     output: torch.Tensor,       # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
     query: torch.Tensor,        # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
@@ -318,7 +327,7 @@ def run_gluon(
         output,
         query,
         key_cache,
-        value_cache,
+        asm_V_shuffle(value_cache),
         seq_lens,
         block_tables,
         attn_scale,
