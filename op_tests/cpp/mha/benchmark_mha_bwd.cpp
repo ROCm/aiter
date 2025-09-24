@@ -14,23 +14,7 @@
 #include <utility>
 #include <vector>
 
-// template <typename T>
-// std::ostream& operator<<(std::ostream& os, const std::vector<T>& v)
-// {
-//     using size_type = typename std::vector<T>::size_type;
-
-//     os << "[";
-//     for(size_type idx = 0; idx < v.size(); ++idx)
-//     {
-//         if(0 < idx)
-//         {
-//             os << ", ";
-//         }
-//         os << v[idx];
-//     }
-//     return os << "]";
-// }
-
+// This function is copied from ck commit 4d041837ade7ae01900a0442d939f80b723b1631
 std::vector<int32_t> to_seqstarts_(ck_tile::span<const int32_t> seqlens)
 {
     std::vector<int32_t> seqstarts = {0};
