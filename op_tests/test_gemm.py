@@ -150,7 +150,6 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     }
 
 
-
 def get_boundary_test_cases(cu_count, aligned_k):
     """
     Generate a list of boundary test cases (m, n, k) for the GEMM kernel.
@@ -360,7 +359,7 @@ def test_normal_gemm():
     for dtype in [dtypes.fp16, dtypes.bf16][-1:]:
         for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32][-1:]:
             for m in [64, 48, 128, 192, 256, 384, 448, 512][:]:
-                df_asm.append(test_gemm(dtype, m, 128, 5120, otype=otype))
+                df_asm.append(test_gemm(dtype, m, 256, 5120, otype=otype))
         # # qkv_proj
         # for (m, n, k) in [(4096, 1280, 8192),
         #                   (128, 1280, 8192),
@@ -383,7 +382,7 @@ def test_normal_gemm():
         #     test_gemm(dtype, m, n, k)
     df_asm = pd.DataFrame(df_asm)
     aiter.logger.info(f"summary:\n{df_asm}")
-    
+
     df.append(ret1)
     ret2 = test_gemm(dtypes.bf16, 128, 32, 8192)
     df.append(ret2)
@@ -413,7 +412,6 @@ def test_normal_gemm():
     # for (m, n, k) in [(1, 19392, 8192),
     #                   (128, 19392, 8192)]:
     #     test_gemm(dtype, m, n, k)
-
 
 
 def test_skinny_gemm():
