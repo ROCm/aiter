@@ -178,15 +178,15 @@ def e2e_moe_kernel(
 
     if use_fp8_w8a8:
         if IS_BLOCKSCALEQ:
-            a_scale_ptrs = A_scale + (offs_token // top_k) * stride_asm
+            a_scale_ptrs = A_scale + (offs_token[:, None] // top_k) * stride_asm
             offs_w1_i0_sn = i0 // group_n
             offs_w1_i1_sn = i1 // group_n
 
             w1_i0_scale_ptrs = (
-                W1_scale + off_experts * stride_w1se + offs_w1_i0_sn * stride_w1sn
+                W1_scale + off_experts * stride_w1se + offs_w1_i0_sn[None, :] * stride_w1sn
             )
             w1_i1_scale_ptrs = (
-                W1_scale + off_experts * stride_w1se + offs_w1_i1_sn * stride_w1sn
+                W1_scale + off_experts * stride_w1se + offs_w1_i1_sn[None, :] * stride_w1sn
             )
         else:
             a_scale = tl.load(A_scale)
@@ -220,10 +220,10 @@ def e2e_moe_kernel(
                 k_start = k * BLOCK_SIZE_K1
                 offs_ks = (k_start + offs_k1) // group_k
                 a_scale = tl.load(
-                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                    a_scale_ptrs + offs_ks[None, :] * stride_ask, mask=token_mask[:, None], other=0.0
                 )
-                w1_i0_scale = tl.load(w1_i0_scale_ptrs + offs_ks * stride_w1sk)
-                w1_i1_scale = tl.load(w1_i1_scale_ptrs + offs_ks * stride_w1sk)
+                w1_i0_scale = tl.load(w1_i0_scale_ptrs + offs_ks[:, None] * stride_w1sk)
+                w1_i1_scale = tl.load(w1_i1_scale_ptrs + offs_ks[:, None] * stride_w1sk)
 
                 silu_acc += tl.dot_scaled(a, a_scale, "e4m3", w1_i0, w1_i0_scale, "e4m3")
                 mul_acc += tl.dot_scaled(a, a_scale, "e4m3", w1_i1, w1_i1_scale, "e4m3")
