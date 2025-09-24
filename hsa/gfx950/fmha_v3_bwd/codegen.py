@@ -2416,7 +2416,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                     }
                                 }
                             }
-                            else if((t.is_group_mode == true) && (t.mask_type == mask_enum::mask_top_left)){
+                            else if(t.is_group_mode == true){
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<64, FmhaBwdBf16, true, true, false>;
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, true, true, false, false, 0>;
                                 if(t.mask_type == mask_enum::mask_top_left){
