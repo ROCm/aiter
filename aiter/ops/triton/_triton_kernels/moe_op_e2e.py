@@ -255,7 +255,7 @@ def e2e_moe_kernel(
 
     # TODO online quantization for acc
     if use_fp8_w8a8:
-        acc_scale = 1.0
+        acc_scale = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_HALF), 1, dtype=tl.float32)
     
     acc = acc.to(dtype)
     
@@ -299,14 +299,17 @@ def e2e_moe_kernel(
 
         if use_fp8_w8a8:
             if IS_BLOCKSCALEQ:
-                k_start = k * BLOCK_SIZE_K2
+                k_start = k * BLOCK_SIZE_K2 + offs_k2[None, :]
                 offs_ks = k_start // group_k
 
                 w2_scale = tl.load(w2_scale_ptrs + offs_ks * stride_w2sk)
-                tl.static_print("acc", acc)
-                tl.static_print("w2", w2)
-                tl.static_print("w2_scale", w2_scale)
-                out = tl.dot(acc, w2) * acc_scale * w2_scale[None, :]
+                # tl.static_print("acc", acc)
+                # tl.static_print("w2", w2)
+                # tl.static_print("w2_scale", w2_scale)
+                # out = tl.dot(acc, w2) * acc_scale * w2_scale[None, :]
+                out = tl.dot_scaled(acc, acc_scale, "e4m3", w2, w2_scale, "e4m3")
+                # out = tl.dot(acc, w2)
+                # out = tl.dot(acc, w2)
             else:
                 out = tl.dot(acc, w2)
         else:
