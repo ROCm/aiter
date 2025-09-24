@@ -17,11 +17,10 @@ from aiter.ops.triton.mha_v3 import (
     flash_attn_func as flash_attn_func_v3,
     flash_attn_varlen_func as flash_attn_varlen_func_v3,
     flash_attn_with_kvcache as flash_attn_with_kvcache_v3,
-    _cast_to_fp8,
-    _cast_varlen_to_fp8,
     set_fp8_dequantized_backward,
 )
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype, get_fp8_dtypes
+from aiter.ops.triton.utils.mha_kernel_utils import _quantize_bshd, _quantize_thd
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     generate_random_padding_mask,
@@ -173,9 +172,9 @@ def test_mha(
             group_size = (
                 NUM_Q_HEADS // NUM_K_HEADS if NUM_Q_HEADS % NUM_K_HEADS == 0 else None
             )
-            k_fp8, k_descale = _cast_to_fp8(k, fp8_dtype, "bshd")
-            v_fp8, v_descale = _cast_to_fp8(v, fp8_dtype, "bshd")
-            q_fp8, q_descale = _cast_to_fp8(q, fp8_dtype, "bshd", group_size=group_size)
+            k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
+            v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
+            q_fp8, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
             triton_out = flash_attn_func_v3(
                 q_fp8,
                 k_fp8,
@@ -439,9 +438,9 @@ def test_mha_varlen(
             group_size = (
                 NUM_Q_HEADS // NUM_K_HEADS if NUM_Q_HEADS % NUM_K_HEADS == 0 else None
             )
-            k_fp8, k_descale = _cast_varlen_to_fp8(k_unpad, fp8_dtype, cu_seqlens_k)
-            v_fp8, v_descale = _cast_varlen_to_fp8(v_unpad, fp8_dtype, cu_seqlens_k)
-            q_fp8, q_descale = _cast_varlen_to_fp8(
+            k_fp8, k_descale = _quantize_thd(k_unpad, fp8_dtype, cu_seqlens_k)
+            v_fp8, v_descale = _quantize_thd(v_unpad, fp8_dtype, cu_seqlens_k)
+            q_fp8, q_descale = _quantize_thd(
                 q_unpad, fp8_dtype, cu_seqlens_q, group_size=group_size
             )
             triton_out = flash_attn_varlen_func_v3(
@@ -616,10 +615,10 @@ def test_mha_backward(
                     else None
                 )
                 set_fp8_dequantized_backward(True)
-                k_fp8, k_descale = _cast_to_fp8(k, fp8_dtype, "bshd")
-                v_fp8, v_descale = _cast_to_fp8(v, fp8_dtype, "bshd")
-                q_fp8, q_descale = _cast_to_fp8(
-                    q, fp8_dtype, "bshd", group_size=group_size
+                k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
+                v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
+                q_fp8, q_descale = _quantize_bshd(
+                    q, fp8_dtype, group_size=group_size
                 )
                 triton_out = flash_attn_func_v3(
                     q_fp8,
@@ -823,9 +822,9 @@ def test_mha_backward_varlen(
                     else None
                 )
                 set_fp8_dequantized_backward(True)
-                k_fp8, k_descale = _cast_varlen_to_fp8(k_unpad, fp8_dtype, cu_seqlens_k)
-                v_fp8, v_descale = _cast_varlen_to_fp8(v_unpad, fp8_dtype, cu_seqlens_k)
-                q_fp8, q_descale = _cast_varlen_to_fp8(
+                k_fp8, k_descale = _quantize_thd(k_unpad, fp8_dtype, cu_seqlens_k)
+                v_fp8, v_descale = _quantize_thd(v_unpad, fp8_dtype, cu_seqlens_k)
+                q_fp8, q_descale = _quantize_thd(
                     q_unpad, fp8_dtype, cu_seqlens_q, group_size=group_size
                 )
                 # Ensure fp8 tensors participate in autograd as leaves
@@ -1079,16 +1078,16 @@ def test_mha_kvcache(
         fp8_dtype = get_fp8_e4m3_dtype()
         group_size = nheads // nheads_k if nheads % nheads_k == 0 else None
         if page_size is None:
-            k_cache_kernel, k_descale = _cast_to_fp8(
-                k_cache_for_kernel, fp8_dtype, "bshd"
+            k_cache_kernel, k_descale = _quantize_bshd(
+                k_cache_for_kernel, fp8_dtype
             )
-            v_cache_kernel, v_descale = _cast_to_fp8(
-                v_cache_for_kernel, fp8_dtype, "bshd"
+            v_cache_kernel, v_descale = _quantize_bshd(
+                v_cache_for_kernel, fp8_dtype
             )
         else:
             # Cast logical contiguous tensors then map back to block layout
-            k_cache_fp8_logical, k_descale = _cast_to_fp8(k_cache, fp8_dtype, "bshd")
-            v_cache_fp8_logical, v_descale = _cast_to_fp8(v_cache, fp8_dtype, "bshd")
+            k_cache_fp8_logical, k_descale = _quantize_bshd(k_cache, fp8_dtype)
+            v_cache_fp8_logical, v_descale = _quantize_bshd(v_cache, fp8_dtype)
             nblocks_total = page_table.shape[1]
             S = k_cache_fp8_logical.shape[1]
             full_blocks_tokens = nblocks_total * page_size
@@ -1121,7 +1120,7 @@ def test_mha_kvcache(
             v_blocks_flat = v_blocks_ordered.reshape(-1, page_size, nheads_k, d)
             k_cache_kernel[flat_indices] = k_blocks_flat
             v_cache_kernel[flat_indices] = v_blocks_flat
-        q_kernel, q_descale = _cast_to_fp8(q, fp8_dtype, "bshd", group_size=group_size)
+        q_kernel, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
     else:
         k_cache_kernel = k_cache_for_kernel
         v_cache_kernel = v_cache_for_kernel

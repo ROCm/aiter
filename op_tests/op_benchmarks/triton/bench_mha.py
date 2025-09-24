@@ -12,9 +12,8 @@ from aiter.ops.triton.mha import (
 from aiter.ops.triton.mha_v3 import (
     flash_attn_func as flash_attn_func_v3,
     flash_attn_varlen_func as flash_attn_varlen_func_v3,
-    _cast_to_fp8,
-    _cast_varlen_to_fp8,
 )
+from aiter.ops.triton.utils.mha_kernel_utils import _quantize_bshd, _quantize_thd
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     generate_random_padding_mask,
@@ -374,13 +373,13 @@ def run_benchmark(custom, args):
                         )
 
                     fp8_dtype = get_fp8_e4m3_dtype()
-                    q_fp8, q_descale = _cast_varlen_to_fp8(
+                    q_fp8, q_descale = _quantize_thd(
                         q_input, fp8_dtype, cu_seqlens_q
                     )
-                    k_fp8, k_descale = _cast_varlen_to_fp8(
+                    k_fp8, k_descale = _quantize_thd(
                         k_input, fp8_dtype, cu_seqlens_k
                     )
-                    v_fp8, v_descale = _cast_varlen_to_fp8(
+                    v_fp8, v_descale = _quantize_thd(
                         v_input, fp8_dtype, cu_seqlens_k
                     )
 
@@ -427,9 +426,9 @@ def run_benchmark(custom, args):
                         )
 
                     fp8_dtype = get_fp8_e4m3_dtype()
-                    q_fp8, q_descale = _cast_to_fp8(q_input, fp8_dtype, "bshd")
-                    k_fp8, k_descale = _cast_to_fp8(k_input, fp8_dtype, "bshd")
-                    v_fp8, v_descale = _cast_to_fp8(v_input, fp8_dtype, "bshd")
+                    q_fp8, q_descale = _quantize_bshd(q_input, fp8_dtype)
+                    k_fp8, k_descale = _quantize_bshd(k_input, fp8_dtype)
+                    v_fp8, v_descale = _quantize_bshd(v_input, fp8_dtype)
 
                     return flash_attn_func_v3(
                         q_fp8,
