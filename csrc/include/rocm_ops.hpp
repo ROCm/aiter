@@ -602,7 +602,8 @@
           py::arg("x_scale")        = std::nullopt,  \
           py::arg("w_scale")        = std::nullopt,  \
           py::arg("exp_bias")       = std::nullopt,  \
-          py::arg("block_m")        = 32);           \
+          py::arg("block_m")        = 32,            \
+          py::arg("kernel_id")      = -1);           \
                                                      \
                                                      \
     m.def("cktile_moe_gemm2",                        \
@@ -621,7 +622,8 @@
           py::arg("x_scale")        = std::nullopt,  \
           py::arg("w_scale")        = std::nullopt,  \
           py::arg("exp_bias")       = std::nullopt,  \
-          py::arg("block_m")        = 32);           \
+          py::arg("block_m")        = 32,            \
+          py::arg("kernel_id")      = -1);           \
 
 
 #define MHA_VARLEN_FWD_PYBIND                     \

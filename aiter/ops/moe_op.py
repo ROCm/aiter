@@ -310,6 +310,7 @@ def moe_cktile2stages_gemm1_ck(
     w_scale             : Optional[Tensor] = None,
     exp_bias            : Optional[Tensor] = None,
     block_m             : Optional[int] = 32,
+    kernel_id           : Optional[int] = -1,
 ) -> Tensor: ...
 
 def moe_cktile2stages_gemm1(
@@ -327,8 +328,9 @@ def moe_cktile2stages_gemm1(
     w_scale             : Optional[Tensor] = None,
     exp_bias            : Optional[Tensor] = None,
     block_m             : Optional[int] = 32,
+    kernel_id           : Optional[int] = -1,
 ):
-    return moe_cktile2stages_gemm1_ck(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias, block_m)
+    return moe_cktile2stages_gemm1_ck(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias, block_m, kernel_id)
 
 @compile_ops("module_moe_cktile2stages",  fc_name="cktile_moe_gemm2")
 def moe_cktile2stages_gemm2_ck(
@@ -346,6 +348,7 @@ def moe_cktile2stages_gemm2_ck(
     w_scale             : Optional[Tensor] = None,
     exp_bias            : Optional[Tensor] = None,
     block_m             : Optional[int] = 32,
+    kernel_id           : Optional[int] = -1,
 ) -> Tensor: ...
 
 def moe_cktile2stages_gemm2(
@@ -363,8 +366,86 @@ def moe_cktile2stages_gemm2(
     w_scale             : Optional[Tensor] = None,
     exp_bias            : Optional[Tensor] = None,
     block_m             : Optional[int] = 32,
+    kernel_id           : Optional[int] = -1,
 ):
-    return moe_cktile2stages_gemm2_ck(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias, block_m)
+    return moe_cktile2stages_gemm2_ck(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias, block_m, kernel_id)
+
+
+@compile_ops("module_moe_cktile2stages_tune",  fc_name="cktile_moe_gemm1")
+def moe_cktile2stages_gemm1_ck_tune(
+    XQ                  : Tensor,
+    WQ                  : Tensor,
+    Y                   : Tensor,
+    sorted_ids          : Tensor,
+    sorted_expert_ids   : Tensor,
+    max_token_ids       : Tensor,
+    topk                : int,
+    n_padded_zeros      : Optional[int] = 0,
+    k_padded_zeros      : Optional[int] = 0,
+    topk_weight         : Optional[Tensor] = None,
+    x_scale             : Optional[Tensor] = None,
+    w_scale             : Optional[Tensor] = None,
+    exp_bias            : Optional[Tensor] = None,
+    block_m             : Optional[int] = 32,
+    kernel_id           : Optional[int] = -1,
+) -> Tensor: ...
+
+def moe_cktile2stages_gemm1_tune(
+    XQ                  : Tensor,
+    WQ                  : Tensor,
+    Y                   : Tensor,
+    sorted_ids          : Tensor,
+    sorted_expert_ids   : Tensor,
+    max_token_ids       : Tensor,
+    topk                : int,
+    n_padded_zeros      : Optional[int] = 0,
+    k_padded_zeros      : Optional[int] = 0,
+    topk_weight         : Optional[Tensor] = None,
+    x_scale             : Optional[Tensor] = None,
+    w_scale             : Optional[Tensor] = None,
+    exp_bias            : Optional[Tensor] = None,
+    block_m             : Optional[int] = 32,
+    kernel_id           : Optional[int] = -1,
+):
+    return moe_cktile2stages_gemm1_ck_tune(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias, block_m, kernel_id)
+
+@compile_ops("module_moe_cktile2stages_tune",  fc_name="cktile_moe_gemm2")
+def moe_cktile2stages_gemm2_ck_tune(
+    XQ                  : Tensor,
+    WQ                  : Tensor,
+    Y                   : Tensor,
+    sorted_ids          : Tensor,
+    sorted_expert_ids   : Tensor,
+    max_token_ids       : Tensor,
+    topk                : int,
+    n_padded_zeros      : Optional[int] = 0,
+    k_padded_zeros      : Optional[int] = 0,
+    topk_weight         : Optional[Tensor] = None,
+    x_scale             : Optional[Tensor] = None,
+    w_scale             : Optional[Tensor] = None,
+    exp_bias            : Optional[Tensor] = None,
+    block_m             : Optional[int] = 32,
+    kernel_id           : Optional[int] = -1,
+) -> Tensor: ...
+
+def moe_cktile2stages_gemm2_tune(
+    XQ                  : Tensor,
+    WQ                  : Tensor,
+    Y                   : Tensor,
+    sorted_ids          : Tensor,
+    sorted_expert_ids   : Tensor,
+    max_token_ids       : Tensor,
+    topk                : int,
+    n_padded_zeros      : Optional[int] = 0,
+    k_padded_zeros      : Optional[int] = 0,
+    topk_weight         : Optional[Tensor] = None,
+    x_scale             : Optional[Tensor] = None,
+    w_scale             : Optional[Tensor] = None,
+    exp_bias            : Optional[Tensor] = None,
+    block_m             : Optional[int] = 32,
+    kernel_id           : Optional[int] = -1,
+):
+    return moe_cktile2stages_gemm2_ck_tune(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias, block_m, kernel_id)
 
 
 dtype2str_dict = {

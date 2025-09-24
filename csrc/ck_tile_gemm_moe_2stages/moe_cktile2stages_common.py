@@ -98,47 +98,102 @@ a8w8_gemm2_kernels_list= {
 
 # gemm1 out:bf16/fp16 AB:bf16/fp4
 a16w4_gemm1_kernels_list_gfx950= {
-    #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N|| BlockPerCU|
-    0: kernelInstance(       1,        256,       16,        128,       256,           16,         16,          32,          1,           4,          2,),
-    # 5: kernelInstance(       1,        256,       16,        512,       256,           16,         16,          32,          1,           4,          4,),
-    1: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          32,          1,           4,          2,),
-    3: kernelInstance(       1,        256,       64,        256,       256,           16,         16,          32,          1,           4,          1,),
-    4: kernelInstance(       1,        256,      128,        256,       256,           16,         16,          32,          1,           4,          1,),
+    #   kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N|| BlockPerCU|
+    #default kernel
+    1:  kernelInstance(       1,        256,       16,        128,       256,           16,         16,          32,          1,           4,          2,),
+    13: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          32,          1,           4,          2,),
+    22: kernelInstance(       1,        256,       64,        256,       256,           16,         16,          32,          1,           4,          1,),
+    32: kernelInstance(       1,        256,      128,        256,       256,           16,         16,          32,          1,           4,          1,),
 }
 # gemm2 out:bf16/fp16 AB:bf16/fp4
 a16w4_gemm2_kernels_list_gfx950= {
-    #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
-    0: kernelInstance(       2,        256,       16,        128,       256,           16,         16,          32,          1,        4,            2,),
-    # 5: kernelInstance(       2,        256,       16,        512,       256,           16,         16,          32,          1,        4,            4,),
-    1: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          32,          1,        4,            2,),
-    3: kernelInstance(       2,        256,       64,        256,       256,           16,         16,          32,          1,        4,            1,),
-    4: kernelInstance(       2,        256,      128,        256,       256,           16,         16,          32,          1,        4,            1,),
-    # 4: kernelInstance(       2,        256,      256,        256,       256,           16,         16,          32,          1,        4,),
-    # 4: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          32,          1,        4,),
+    #   kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
+    1:  kernelInstance(       2,        256,       16,        128,       256,           16,         16,          32,          1,        4,            2,),
+    13: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          32,          1,        4,            2,),
+    22: kernelInstance(       2,        256,       64,        256,       256,           16,         16,          32,          1,        4,            1,),
+    32: kernelInstance(       2,        256,      128,        256,       256,           16,         16,          32,          1,        4,            1,),
 }
+
+
+tune_a16w4_gemm1_kernels_list_gfx950= {
+    #   kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N|| BlockPerCU|
+    #default kernel
+    0:  kernelInstance(       1,        256,       16,        128,       256,           16,         16,          32,          1,           4,          1,),
+    1:  kernelInstance(       1,        256,       16,        128,       256,           16,         16,          32,          1,           4,          2,),
+    # 2:  kernelInstance(       1,        256,       16,        128,       256,           16,         16,          32,          1,           4,          4,),
+    # 3:  kernelInstance(       1,        256,       16,        256,       256,           16,         16,          32,          1,           4,          1,),
+    # 4:  kernelInstance(       1,        256,       16,        256,       256,           16,         16,          32,          1,           4,          2,),
+    # 5:  kernelInstance(       1,        256,       16,        512,       256,           16,         16,          32,          1,           4,          1,),
+    # 6:  kernelInstance(       1,        256,       16,        512,       256,           16,         16,          32,          1,           4,          2,),
+    # 10: kernelInstance(       1,        256,       32,        128,       256,           16,         16,          32,          1,           4,          1,),
+    # 11: kernelInstance(       1,        256,       32,        128,       256,           16,         16,          32,          1,           4,          2,),
+    # 12: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          32,          1,           4,          1,),
+    13: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          32,          1,           4,          2,),
+    # 14: kernelInstance(       1,        256,       32,        512,       256,           16,         16,          32,          1,           4,          1,),
+    # 15: kernelInstance(       1,        256,       32,        512,       256,           16,         16,          32,          1,           4,          2,),
+    # 20: kernelInstance(       1,        256,       64,        128,       256,           16,         16,          32,          1,           4,          1,),
+    # 21: kernelInstance(       1,        256,       64,        128,       256,           16,         16,          32,          1,           4,          2,),
+    22: kernelInstance(       1,        256,       64,        256,       256,           16,         16,          32,          1,           4,          1,),
+    # 23: kernelInstance(       1,        256,       64,        256,       256,           16,         16,          32,          1,           4,          2,),
+    # 24: kernelInstance(       1,        256,       64,        512,       256,           16,         16,          32,          1,           4,          1,),
+    # 25: kernelInstance(       1,        256,       64,        512,       256,           16,         16,          32,          1,           4,          2,),
+    # 30: kernelInstance(       1,        256,      128,        128,       256,           16,         16,          32,          1,           4,          1,),
+    # 31: kernelInstance(       1,        256,      128,        128,       256,           16,         16,          32,          1,           4,          2,),
+    32: kernelInstance(       1,        256,      128,        256,       256,           16,         16,          32,          1,           4,          1,),
+    # 33: kernelInstance(       1,        256,      128,        256,       256,           16,         16,          32,          1,           4,          2,), #LDS exceed
+    # 40: kernelInstance(       1,        256,      256,        128,       256,           16,         16,          32,          1,           4,          1,), #LDS exceed
+    # 41: kernelInstance(       1,        256,      256,        256,       256,           16,         16,          32,          1,           4,          1,), #LDS exceed
+}
+
+tune_a16w4_gemm2_kernels_list_gfx950= {
+    #   kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N|| BlockPerCU|
+    #default kernel
+    0:  kernelInstance(       2,        256,       16,        128,       256,           16,         16,          32,          1,           4,          1,),
+    1:  kernelInstance(       2,        256,       16,        128,       256,           16,         16,          32,          1,           4,          2,),
+    # 2:  kernelInstance(       2,        256,       16,        128,       256,           16,         16,          32,          1,           4,          4,),
+    # 3:  kernelInstance(       2,        256,       16,        256,       256,           16,         16,          32,          1,           4,          1,),
+    # 4:  kernelInstance(       2,        256,       16,        256,       256,           16,         16,          32,          1,           4,          2,),
+    # 5:  kernelInstance(       2,        256,       16,        512,       256,           16,         16,          32,          1,           4,          1,),
+    # 6:  kernelInstance(       2,        256,       16,        512,       256,           16,         16,          32,          1,           4,          2,),
+    # 10: kernelInstance(       2,        256,       32,        128,       256,           16,         16,          32,          1,           4,          1,),
+    # 11: kernelInstance(       2,        256,       32,        128,       256,           16,         16,          32,          1,           4,          2,),
+    # 12: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          32,          1,           4,          1,),
+    13: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          32,          1,           4,          2,),
+    # 14: kernelInstance(       2,        256,       32,        512,       256,           16,         16,          32,          1,           4,          1,),
+    # 15: kernelInstance(       2,        256,       32,        512,       256,           16,         16,          32,          1,           4,          2,),
+    # 20: kernelInstance(       2,        256,       64,        128,       256,           16,         16,          32,          1,           4,          1,),
+    # 21: kernelInstance(       2,        256,       64,        128,       256,           16,         16,          32,          1,           4,          2,),
+    22: kernelInstance(       2,        256,       64,        256,       256,           16,         16,          32,          1,           4,          1,),
+    # 23: kernelInstance(       2,        256,       64,        256,       256,           16,         16,          32,          1,           4,          2,),
+    # 24: kernelInstance(       2,        256,       64,        512,       256,           16,         16,          32,          1,           4,          1,),
+    # 25: kernelInstance(       2,        256,       64,        512,       256,           16,         16,          32,          1,           4,          2,),
+    # 30: kernelInstance(       2,        256,      128,        128,       256,           16,         16,          32,          1,           4,          1,),
+    # 31: kernelInstance(       2,        256,      128,        128,       256,           16,         16,          32,          1,           4,          2,),
+    32: kernelInstance(       2,        256,      128,        256,       256,           16,         16,          32,          1,           4,          1,),
+    # 33: kernelInstance(       2,        256,      128,        256,       256,           16,         16,          32,          1,           4,          2,), #LDS exceed
+    # 40: kernelInstance(       2,        256,      256,        128,       256,           16,         16,          32,          1,           4,          1,), #LDS exceed
+    # 41: kernelInstance(       2,        256,      256,        256,       256,           16,         16,          32,          1,           4,          1,), #LDS exceed
+}
+
 
 # fmt: on
 gemm1_kernels_dict = {
     "a8w8_gfx950": a8w8_gemm1_kernels_list_gfx950,
     "a8w8": a8w8_gemm1_kernels_list,
     "a16w4_gfx950": a16w4_gemm1_kernels_list_gfx950,
+    "tune_a16w4_gfx950": tune_a16w4_gemm1_kernels_list_gfx950,
 }
 
 gemm2_kernels_dict = {
     "a8w8_gfx950": a8w8_gemm2_kernels_list_gfx950,
     "a8w8": a8w8_gemm2_kernels_list,
-    "a16w4_gfx950": a16w4_gemm2_kernels_list_gfx950
+    "a16w4_gfx950": a16w4_gemm2_kernels_list_gfx950,
+    "tune_a16w4_gfx950": tune_a16w4_gemm2_kernels_list_gfx950,
 }
 
 
-a8w8_gfx950_heuristic_dispatch= """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "moe_cktile2stages.h"
 
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
-{{
+a8w8_gfx950_heuristic_dispatch= ("""
     // Apply shape heuristics to find a suitable kernel implementation.
     if (block_m == 32)
     {{
@@ -156,18 +211,7 @@ MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
     //{{
     //    return {(1, 6)}<ADataType, BDataType, AccDataType, CDataType>;
     //}}
-    else
-    {{
-        TORCH_CHECK(
-            false,
-            "Unsupported block_m value for moe_geem1 heuristic dispatch: ",
-            block_m);
-    }}
-}}
-
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
-{{
+""", """
     // Apply shape heuristics to find a suitable kernel implementation.
     if (block_m == 32)
     {{
@@ -185,79 +229,46 @@ MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
     //{{
     //    return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
     //}}
-    else
-    {{
-        TORCH_CHECK(
-            false,
-            "Unsupported block_m value for moe_gemm1 heuristic dispatch: ",
-            block_m);
-    }}
-}}
-"""
 
-a16w4_gfx950_heuristic_dispatch= """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "moe_cktile2stages.h"
+""")
 
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
-{{
+a16w4_gfx950_heuristic_dispatch= ("""
     // Apply shape heuristics to find a suitable kernel implementation.
     if (block_m == 16)
-    {{
-        return {(1, 0)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 32)
     {{
         return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
+    else if (block_m == 32)
+    {{
+        return {(1, 13)}<ADataType, BDataType, AccDataType, CDataType>;
+    }}
     else if (block_m == 64)
     {{
-        return {(1, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(1, 22)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
     else if (block_m == 128)
     {{
-        return {(1, 4)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(1, 32)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
-    else
-    {{
-        TORCH_CHECK(
-            false,
-            "Unsupported block_m value for moe_geem1 heuristic dispatch: ",
-            block_m);
-    }}
-}}
-
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
-{{
+    """, """
     // Apply shape heuristics to find a suitable kernel implementation.
     if (block_m == 16)
     {{
-        return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
     else if (block_m == 32)
     {{
-        return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(2, 13)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
     else if (block_m == 64)
     {{
-        return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(2, 22)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
     else if (block_m == 128)
     {{
-        return {(2, 4)}<ADataType, BDataType, AccDataType, CDataType>;
+        return {(2, 32)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
-    else
-    {{
-        TORCH_CHECK(
-            false,
-            "Unsupported block_m value for moe_gemm2 heuristic dispatch: ",
-            block_m);
-    }}
-}}
-"""
+""")
 
 heuristic_dispatch_dict = {
     "a8w8_gfx950": a8w8_gfx950_heuristic_dispatch,
@@ -280,6 +291,7 @@ def get_gemm1_kernels_list(
     QuantType: str = "none",
     ActOP: str = "silu",
     MulRoutedWeight: bool = False,
+    istune: bool = False,
 ) -> list:
     arch = get_gfx()
     if Adtype.lower() in bit8_list and Bdtype.lower() in bit8_list and Adtype == Bdtype:
@@ -291,6 +303,8 @@ def get_gemm1_kernels_list(
         tag = "a16w4_gfx950"
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
+    if istune:
+        tag = "tune_" + tag
     kernels_list = gemm1_kernels_dict[tag]
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
@@ -316,6 +330,7 @@ def get_gemm2_kernels_list(
     QuantType: str = "",
     ActOP: str = "",
     MulRoutedWeight: bool = True,
+    istune: bool = False,
 ) -> list:
     arch = get_gfx()
     if Adtype in bit8_list and Bdtype in bit8_list and Adtype == Bdtype:
@@ -327,6 +342,8 @@ def get_gemm2_kernels_list(
         tag = "a16w4_gfx950"
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
+    if istune:
+        tag = "tune_" + tag
     kernels_list = gemm2_kernels_dict[tag]
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
@@ -346,6 +363,8 @@ def get_gemm2_kernels_list(
     return tag, kernels_list
 
 def get_heuristic_dispatch_template(tag):
+    if tag.startswith("tune"):
+        return ("", "")
     if (tag not in heuristic_dispatch_dict.keys()):
         raise ValueError(f"Unsupported type for heuristic_dispatch: {tag}")
     return heuristic_dispatch_dict[tag]

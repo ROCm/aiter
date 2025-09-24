@@ -12,7 +12,8 @@ class cktile_moe_2stage_gemm_codegen:
     def __init__(
         self, 
         working_path, 
-        ab_dtype,
+        a_dtype,
+        b_dtype,
         acc_dtype,
         c_dtype,
         quant_type,
@@ -23,7 +24,8 @@ class cktile_moe_2stage_gemm_codegen:
         self.impl_path      = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
         self.istune         = istune
-        self.ab_dtype       = ab_dtype.lower()
+        self.a_dtype        = a_dtype.lower()
+        self.b_dtype        = b_dtype.lower()
         self.acc_dtype      = acc_dtype.lower()
         self.c_dtype        = c_dtype.lower()
         self.quant_type     = quant_type
@@ -209,7 +211,7 @@ template torch::Tensor
                     f"{name}_a{a_type}_b{b_type}_acc{acc_type}_C{c_type}.cpp",
                 )
             ).write_text(intsance)
-        if (k.QuantType == "1x32") and (self.ab_dtype in ["bf16", "fp16"]):
+        if (k.QuantType == "1x32") and (self.a_dtype in ["bf16", "fp16"]):
             for CDtype in ["bf16", "fp16"]:
                 fill_template(k.name, CDtype, "pk_fp4", self.acc_dtype, CDtype)
         else:
@@ -229,7 +231,35 @@ template torch::Tensor
 
     '''genarete heuristic dispatch'''
     def gen_heuristic_dispatch(self, tag, kernels_dict):
-        HEURISTIC_template =  get_heuristic_dispatch_template(tag)
+        heuristic_dispatc_Template = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#include "moe_cktile2stages.h"
+
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
+{{{{
+    {gemm1_dispatch_str}
+    TORCH_CHECK(
+    false,
+    "Unsupported block_m value for moe_gemm1 heuristic dispatch: ",
+    block_m);
+}}}}
+
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
+{{{{
+    {gemm2_dispatch_str}
+    TORCH_CHECK(
+    false,
+    "Unsupported block_m value for moe_gemm2 heuristic dispatch: ",
+    block_m);
+}}}}"""
+        gemm1_str, gemm2_str =  get_heuristic_dispatch_template(tag)
+        HEURISTIC_template = heuristic_dispatc_Template.format(
+            gemm1_dispatch_str = gemm1_str,
+            gemm2_dispatch_str = gemm2_str,
+        )
         # print(HEURISTIC_template)
        
         def validate_and_format(template: str, mapping: dict) -> str:
@@ -264,42 +294,61 @@ template torch::Tensor
 
     '''generate lookup.h linking MNK/datatype to specific instance'''
     def gen_lookup_dict(self, kernels_dict):
-        LOOKUP_head = """#pragma once
+        LOOKUP_main = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#include "moe_cktile2stages.h"
 
-// #ifdef USE_ROCM
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+std::unordered_map<int, MoeKernel> kernalIdMapGemm1 = {{
+    {idMap_gemm1_str}
+}};
 
-#define GENERATE_LOOKUP_TABLE(ABTYPE, ACCTYPE, CTYPE)                                                                           \\
-   {                                                                                                                            \\"""
-
-        LOOKUP_template = """
-            {{{MNK},                                                      \\
-            {kernel_name}<ABTYPE, ACCTYPE, CTYPE>}},                      \\"""
-
-        LOOKUP_end = """
-   }
-
-// #endif // USE_ROCM
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+std::unordered_map<int, MoeKernel> kernalIdMapGemm2 = {{
+    {idMap_gemm2_str}
+}};
 """
+        Template_id_str = """{{{id_str}, {k_name_str}<ADataType, BDataType, AccDataType, CDataType>}}"""
         with open(os.path.join(self.working_path, "moe_cktile2stages_lookup.h"), "w") as f:
-            f.write(LOOKUP_head)
-            for mnk, k in kernels_dict.items():
-                print( ":", k.name)
-                # if not tunning, tuned mnk = {stage, m, n, k}
-                if not self.istune and (isinstance(mnk, tuple) and (len(mnk) == 4) and mnk[1] > 0):
-                    f.write(
-                        LOOKUP_template.format(
-                            MNK="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
-                            kernel_name=k.name,
-                        )
+            idMap_gemm1 = ""
+            idMap_gemm2 = ""
+            for id, k in kernels_dict.items():
+                if (id[0] == 1):
+                    if (idMap_gemm1 != ""):
+                        idMap_gemm1 += ",\n"
+                    idMap_gemm1 += Template_id_str.format(
+                        id_str = id[1],
+                        k_name_str = k.name,
                     )
-                # if tunning, mnk = -1,-2.....
-                elif self.istune and isinstance(mnk, int):
-                    f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
-            f.write(LOOKUP_end)
+                if (id[0] == 2):
+                    if (idMap_gemm2 != ""):
+                        idMap_gemm2 += ",\n"
+                    idMap_gemm2 += Template_id_str.format(
+                        id_str = id[1],
+                        k_name_str = k.name,
+                    )
+            f.write(
+                LOOKUP_main.format(
+                    idMap_gemm1_str = idMap_gemm1,
+                    idMap_gemm2_str = idMap_gemm2,
+                )
+            )
+                # print( ":", k.name)
+                # if not tunning, tuned mnk = {stage, m, n, k}
+                # if not self.istune and (isinstance(mnk, tuple) and (len(mnk) == 4) and mnk[1] > 0):
+                #     f.write(
+                #         LOOKUP_template.format(
+                #             MNK="{"
+                #             + (", ").join(map(lambda x: str(x), list(mnk)))
+                #             + "}",
+                #             kernel_name=k.name,
+                #         )
+                #     )
+                # # if tunning, mnk = -1,-2.....
+                # elif self.istune and isinstance(mnk, int):
+                #     f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
+            # f.write(LOOKUP_end)
 
     '''generate manifest.h for instance header'''
     def gen_manifest_head(self, kernels_dict):
@@ -343,7 +392,27 @@ torch::Tensor
             f.write(MAINFEST_end)
 
     '''generate all instances and headers'''
-    def gen_instances(self, tag, kernels_dict):
+    def gen_instances(self):
+        #gen all instances for gemm1 and gemm2
+        _, gemm1_kernel_list = get_gemm1_kernels_list(
+            self.a_dtype,
+            self.b_dtype,
+            self.quant_type,
+            self.activation,
+            self.mul_routed_weight_stage == 1,
+            self.istune,
+        )
+        tag, gemm2_kernel_list = get_gemm2_kernels_list(
+            self.a_dtype,
+            self.b_dtype,
+            self.quant_type,
+            "",
+            self.mul_routed_weight_stage == 2,
+            self.istune,
+        )
+        #merge gemm1/gemm2 dict with key = {stage, key}
+        kernels_dict = {**{(1, key): value for key, value in gemm1_kernel_list.items()},
+                        **{(2, key): value for key, value in gemm2_kernel_list.items()}}
         if os.path.exists(self.impl_path):
             shutil.rmtree(self.impl_path)
         os.mkdir(self.impl_path)
@@ -351,7 +420,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for mnk, k in kernels_dict.items():
+        for id, k in kernels_dict.items():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)
@@ -377,6 +446,7 @@ torch::Tensor
 #     return tune_dict
 
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate ck_tile 2stage gemm instance.")
 
@@ -396,6 +466,15 @@ if __name__ == "__main__":
         default="aiter/configs/a8w8_tuned_gemm.csv",
         required=False,
         help="tune_file include the result after run gemm_a8w8_tune.py",
+    )
+
+    parser.add_argument(
+        "-tune",
+        "--tune",
+        action='store_true',
+        default=False,
+        required=False,
+        help="is this run a tunning process",
     )
 
     parser.add_argument(
@@ -421,7 +500,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-c",
         "--c_dtype",
-        default="b16",
+        default="bf16",
         required=False,
         type=str,
         choices=["f16", "b16"],
@@ -466,90 +545,26 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # # build all
-    # if args.b_dtype is None:
-    #     # quanted moe
-    #     b_quant_dtypes = ["f8"]
-    #     c_dtypes = ["f16", "b16"]
-    #     acts = ["silu"] #, "gelu"]
-    #     general_quant_l = ["per_tensor", "per_token"]
-    #     for b_dtype, c_dtype, act, quant in itertools.product(
-    #         b_quant_dtypes, c_dtypes, acts, general_quant_l
-    #     ):
-    #         a_dtype = b_dtype
-    #         codegen = cktile_moe_2stage_gemm_codegen(
-    #             args.working_path,
-    #             a_dtype,
-    #             b_dtype,
-    #             c_dtype,
-    #             quant,
-    #             act,
-    #         )
-    #         codegen.generate_instance_and_lookUpTable()
-
-    #     # no-quant moe
-    #     b_quant_dtypes = [
-    #         "f16",
-    #         "b16",
-    #     ]
-    #     for (
-    #         b_dtype,
-    #         act,
-    #     ) in itertools.product(b_quant_dtypes, acts):
-    #         c_dtype = a_dtype = b_dtype
-
-    #         codegen = cktile_moe_2stage_gemm_codegen(
-    #             args.working_path,
-    #             a_dtype,
-    #             b_dtype,
-    #             c_dtype,
-    #             "no",
-    #             act,
-    #         )
-    #         codegen.generate_instance_and_lookUpTable()
-    # else:
-
 
     #single UT
-    # a_type = "fp8"
-    # b_type = "fp8"
-    # quant_type = "per_token"
+    # args.a_type = "fp8"
+    # args.b_type = "fp8"
+    # args.quant_type = "per_token"
     
-    a_type = "bf16"
-    b_type = "fp4"
-    quant_type = "1x32"
+    args.a_dtype = "bf16"
+    args.b_dtype = "fp4"
+    args.quant_type = "1x32"
 
-
-    acc_type = "float"
-    c_type ="bf16"
-    act_type = "silu"
     codegen = cktile_moe_2stage_gemm_codegen(
         args.working_path,
-        a_type,
-        acc_type,
-        c_type,
-        quant_type,
-        act_type,
-        2,
-        False
+        args.a_dtype,
+        args.b_dtype,
+        "float",
+        args.c_dtype,
+        args.quant_type,
+        args.activation,
+        args.mul_routed_weight_stage,
+        args.tune
     )
-    #gen all instances for gemm1 and gemm2
-    _, gemm1_kernel_list = get_gemm1_kernels_list(
-        a_type,
-        b_type,
-        quant_type,
-        act_type,
-        False,
-    )
-    tag, gemm2_kernel_list = get_gemm2_kernels_list(
-        a_type,
-        b_type,
-        quant_type,
-        "",
-        True,
-    )
-    #merge gemm1/gemm2 dict with key = {stage, key}
-    kernel_dict_merge = {**{(1, key): value for key, value in gemm1_kernel_list.items()},
-                         **{(2, key): value for key, value in gemm2_kernel_list.items()}}
-    # print(kernel_dict_merge)
-    codegen.gen_instances(tag, kernel_dict_merge)
+
+    codegen.gen_instances()

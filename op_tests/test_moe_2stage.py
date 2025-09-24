@@ -140,6 +140,7 @@ def cktile_moe_stage1(
     Activation=ActivationType.Silu,
     quant_type=aiter.QuantType.No,
     sorted_weights=None,  # [max_num_tokens_padded]
+    kernel_id = -1,
 ):
     token_num = hidden_states.shape[0]
     _, n1, k1 = w1.shape
@@ -166,6 +167,7 @@ def cktile_moe_stage1(
         w1_scale,
         exp_bias1,
         block_size,
+        kernel_id,
     )
     return out
 
@@ -187,7 +189,8 @@ def cktile_moe_stage2(
     Activation=ActivationType.Silu,
     quant_type=aiter.QuantType.No,
     sorted_weights=None,  # [max_num_tokens_padded]
-    zeros_out = False
+    zeros_out = False,
+    kernel_id = -1,
 ):
     token_num = hidden_states.shape[0]
     D = w2.shape[1]
@@ -216,6 +219,7 @@ def cktile_moe_stage2(
         w2_scale,
         exp_bias2,
         block_size,
+        kernel_id,
     )
     return out
 
@@ -315,7 +319,7 @@ def test_fmoe(
     M, _ = topk_ids.shape
 
     # BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
-    BLOCK_SIZE_M = 32 if M > 1024 else 16
+    BLOCK_SIZE_M = 16 #32 if M > 1024 else 16
     if qType == aiter.QuantType.per_128x128:
         BLOCK_SIZE_M = 64
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
@@ -505,6 +509,7 @@ def test_fmoe(
         actType,
         quant_type=qType,
         sorted_weights=sorted_weights if doweight_stage1 else None,
+        kernel_id = -1,
         # needTrace=True,
         # num_iters=2,
         # num_warmup=0,
@@ -626,6 +631,7 @@ def test_fmoe(
         actType,
         quant_type,
         sorted_weights if not doweight_stage1 else None,
+        kernel_id = -1,
         # needTrace=True,
         # num_iters=2,
         # num_warmup=0,
@@ -648,13 +654,14 @@ def test_fmoe(
         actType,
         quant_type,
         sorted_weights if not doweight_stage1 else None,
-        True
+        True,
+        kernel_id = -1,
     )
 
     checkAllclose(
         out2_ref,
         out2_ck,
-        rtol=0.05,
+        rtol=5e-2, atol=1e-2,
         msg=f"[perf]  ck_moe_stage2:{us2:>8.2f} us, {token*model_dim*inter_dim*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
     # diff = torch.abs(out2_ref - out2_ck)
@@ -713,22 +720,22 @@ torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
-# l_dim = [(512, 256)]
+# l_dim = [(512, 512)]
 l_dim = [(3072, 3072)]
 l_tokenNum = [
-    # 1,
-    # 2,
-    # 4,
-    # 8,
+    1,
+    2,
+    4,
+    8,
     16,
     32,
     64,
     128,
     256,
-    # 1024,
-    # 2048,
-    # 3072,
-    # 4096,
+    1024,
+    2048,
+    3072,
+    4096,
     8192,
     # 163840,
 ]

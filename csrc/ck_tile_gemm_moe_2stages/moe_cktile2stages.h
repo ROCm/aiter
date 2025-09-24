@@ -49,7 +49,8 @@ cktile_moe_gemm1(torch::Tensor& XQ,
                  std::optional<torch::Tensor> x_scale     = std::nullopt,
                  std::optional<torch::Tensor> w_scale     = std::nullopt,
                  std::optional<torch::Tensor> exp_bias    = std::nullopt,
-                 std::optional<int> block_m               = 32);
+                 std::optional<int> block_m               = 32,
+                 std::optional<int> kernel_id             = -1);
 
 __attribute__((visibility("default"))) torch::Tensor
 cktile_moe_gemm2(torch::Tensor& XQ,
@@ -65,4 +66,5 @@ cktile_moe_gemm2(torch::Tensor& XQ,
                  std::optional<torch::Tensor> x_scale     = std::nullopt,
                  std::optional<torch::Tensor> w_scale     = std::nullopt,
                  std::optional<torch::Tensor> exp_bias    = std::nullopt,
-                 std::optional<int> block_m               = 32);
+                 std::optional<int> block_m               = 32,
+                 std::optional<int> kernel_id             = -1);

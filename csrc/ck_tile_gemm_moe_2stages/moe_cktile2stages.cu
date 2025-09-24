@@ -1,19 +1,40 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages_common.cuh"
-#include "moe_cktile2stages_lookup.h"
 #include "moe_cktile2stages_manifest.h"
+#include "moe_cktile2stages_lookup.h"
 #include "moe_cktile2stages_heuristic_dispatch.h"
 #include <cmath>
 #include "py_itfs_common.h"
 
+template <typename kernalMap>
+MoeKernel lookupById(int key, kernalMap kernelMap) {
+    auto it = kernelMap.find(key);
+    if (it != kernelMap.end()) {
+        return it->second;
+    } else {
+        throw std::out_of_range("Key not found in kernel map: " + std::to_string(key));
+    }
+}
+
+
 template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType, int stage = 1>
-MoeKernel moe_dispatch(int M, int N, int K, int block_m)
+MoeKernel moe_dispatch(int M, int N, int K, int block_m, int kernel_id)
 {
   // For a given shape, either find the best kernel via lookup or heuristic.
   // For many small M shapes, we bucket them to the next largest kernel.
   // This is fine since kernels are padded anyway.
-
+  
+    if (kernel_id >= 0){
+        if (stage == 1){
+            return lookupById(kernel_id, kernalIdMapGemm1<ADataType, BDataType, AccDataType, CDataType>);
+        }
+        else
+        {
+            return lookupById(kernel_id, kernalIdMapGemm2<ADataType, BDataType, AccDataType, CDataType>);   
+        }
+    }
+  // if pass kernel
   // static const auto lookup = [&]
   // {
   //   return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(ABDataType, AccDataType, CDataType)};
@@ -71,7 +92,8 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
                         std::optional<torch::Tensor> x_scale,
                         std::optional<torch::Tensor> w_scale,
                         std::optional<torch::Tensor> exp_bias,
-                        std::optional<int> block_m)
+                        std::optional<int> block_m,
+                        std::optional<int> kernel_id)
 {
             
     TORCH_CHECK(Y.dtype() == at::ScalarType::BFloat16 || Y.dtype() == at::ScalarType::Half,
@@ -84,6 +106,7 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
     int N = WQ.size(1);
     int K = XQ.size(-1);
     int MPerBlock = block_m.value();
+    int KernelId = kernel_id.value();
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(Y));
     at::cuda::getCurrentCUDAStream().stream();
@@ -97,22 +120,22 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
     {
     //     if (Y.dtype() == at::ScalarType::Half)
     //     {
-    //        moe_dispatch<fp8, fp8, float, fp16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
+    //        moe_dispatch<fp8, fp8, float, fp16, 1>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
     //     }
         // if (Y.dtype() == at::ScalarType::BFloat16)
         // {
-        //     moe_dispatch<fp8, fp8, float, bf16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
+        //     moe_dispatch<fp8, fp8, float, bf16, 1>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
         // }
     }
     else if ((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) && (WQ.dtype() == at::ScalarType::Byte)) //a16w4
     {
-        // if (Y.dtype() == at::ScalarType::Half)
-        // {
-        //    moe_dispatch<fp16, pk_fp4, float, fp16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
-        // }
-        if (Y.dtype() == at::ScalarType::BFloat16)
+        if (Y.dtype() == at::ScalarType::Half)
         {
-            moe_dispatch<bf16, pk_fp4, float, bf16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
+            moe_dispatch<fp16, pk_fp4, float, fp16, 1>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
+        }
+        else if (Y.dtype() == at::ScalarType::BFloat16)
+        {
+            moe_dispatch<bf16, pk_fp4, float, bf16, 1>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
         }
     }
     else
@@ -135,12 +158,14 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
                         std::optional<torch::Tensor> x_scale,
                         std::optional<torch::Tensor> w_scale,
                         std::optional<torch::Tensor> exp_bias,
-                        std::optional<int> block_m)
+                        std::optional<int> block_m,
+                        std::optional<int> kernel_id)
 {
     int M = XQ.size(0) * XQ.size(1);
     int N = WQ.size(1);
     int K = XQ.size(-1);
     int MPerBlock = block_m.value();
+    int KernelId = kernel_id.value();
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(Y));
     at::cuda::getCurrentCUDAStream().stream();
@@ -154,22 +179,22 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
     {
     //     if (Y.dtype() == at::ScalarType::Half)
     //     {
-    //        moe_dispatch<fp8, fp8, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
+    //        moe_dispatch<fp8, fp8, float, fp16, 2>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
     //     }
         // if (Y.dtype() == at::ScalarType::BFloat16)
         // {
-        //     moe_dispatch<fp8, fp8, float, bf16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
+        //     moe_dispatch<fp8, fp8, float, bf16, 2>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
         // }
     }
     else if ((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) && (WQ.dtype() == at::ScalarType::Byte)) //a16w4
     {
         if (Y.dtype() == at::ScalarType::Half)
         {
-           moe_dispatch<fp16, pk_fp4, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
+            moe_dispatch<fp16, pk_fp4, float, fp16, 2>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
         }
-        if (Y.dtype() == at::ScalarType::BFloat16)
+        else if (Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<bf16, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
+            moe_dispatch<bf16, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
         }
     }
     else

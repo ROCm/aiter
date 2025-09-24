@@ -16,7 +16,7 @@ def worker(
     ref=None,
     rtol=1e-2,
     atol=1e-2,
-    printLog=False,
+    printLog=True,
     tol_err_ratio=0.05,
 ):
     from aiter.test_common import run_perftest
