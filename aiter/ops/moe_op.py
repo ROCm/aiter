@@ -19,7 +19,17 @@ def topk_softmax(
     token_expert_indices: Tensor,
     gating_output: Tensor,
     need_renorm: bool,
-): ...
+) -> None: ...
+
+
+@compile_ops("module_moe_asm")
+def topk_softmax_asm(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    need_renorm: bool,
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -168,22 +178,22 @@ def fmoe_fp8_blockscale_g1u1(
 
 @compile_ops("module_moe_asm")
 def moe_stage1_g1u1(
-    input: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    sorted_expert_ids: torch.Tensor,
-    num_valid_ids: torch.Tensor,
-    out: torch.Tensor,
+    input: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
     inter_dim: int,
     kernelName: str,
     block_m: int,
     ksplit: int = 0,
-    activation: ActivationType = ActivationType.Silu,
-    quant_type: QuantType = QuantType.No,
-    a1_scale: Optional[torch.Tensor] = None,
-    w1_scale: Optional[torch.Tensor] = None,
-    sorted_weights: Optional[torch.Tensor] = None,
+    activation: Optional[Enum] = ActivationType.Silu.value,
+    quant_type: Optional[Enum] = QuantType.No.value,
+    a1_scale: Optional[Tensor] = None,
+    w1_scale: Optional[Tensor] = None,
+    sorted_weights: Optional[Tensor] = None,
 ) -> None: ...
 
 
