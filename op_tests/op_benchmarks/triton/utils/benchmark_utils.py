@@ -19,6 +19,11 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
 
 
 def get_evaluation_unit(metric):
+    """
+    Utility function for returning associated units with metrics used throughout
+    the Triton kernel benchmark scripts.
+    """
+    
     evaluation_metric_to_unit = {
         "throughput": "TFLOPS",
         "time": "ms",
@@ -34,7 +39,24 @@ def get_evaluation_unit(metric):
         raise NotImplementedError(f"{metric} is not supported")
 
 
-def get_evaluation_label(metric, space=False, prefix=None):
+def get_evaluation_label(metric, space=False, prefix=None, only_unit=[]):
+    """
+    Utility function for returning a column label given the evaluation metric
+    
+    Args:
+        metric (str): User-provided metric to produce a label for
+        space (bool): Whether to use a space or hyphen delimiter
+        prefix (Optional[str]): Optional prefix to append to the label
+        only_unit (List[str]): List of metrics for which only units are included in the label
+                               (ex: 'TFLOPS' instead of 'Throughput_(TFLOPS)')
+                               (ex: 'fwd(TFLOPS)' instead of 'fwd_Throughput_(TFLOPS)')
+    """
+    
+    if metric in only_unit:
+        if prefix:
+            return f"{prefix}({get_evaluation_unit(metric)})"
+        else:
+            return get_evaluation_unit(metric)
     if space:
         return (
             (prefix + " " if prefix else "")
@@ -54,6 +76,10 @@ def get_evaluation_label(metric, space=False, prefix=None):
 
 
 def get_torch_activation_from_str(activation: str):
+    """
+    Utility function for returning PyTorch analogues for the given activation function.
+    """
+    
     mapping = {
         "gelu": F.gelu,
         "gelu_tanh": partial(F.gelu, approximate="tanh"),
@@ -98,7 +124,7 @@ def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
 
     if not args.bench_torch:
         line_vals = [get_evaluation_unit(args.metric)]
-        line_names = [get_evaluation_label(args.metric)]
+        line_names = [get_evaluation_label(args.metric, only_unit="throughput")]
     else:
         line_vals = ["triton", "torch"]
         line_names = [
