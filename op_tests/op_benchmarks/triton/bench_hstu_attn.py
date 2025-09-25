@@ -61,7 +61,9 @@ def run_benchmark(args):
 
     ylabel = get_evaluation_label(args.metric, space=True)
 
-    line_names = [get_evaluation_label(args.metric, only_unit=(args.metric == "throughput"))]
+    line_names = [
+        get_evaluation_label(args.metric, only_unit=(args.metric == "throughput"))
+    ]
     line_vals = [get_evaluation_unit(args.metric)]
     modes = [args.mode]
     if args.mode == "both":

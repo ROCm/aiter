@@ -32,14 +32,14 @@ def run_benchmark(args, x_vals_list):
     Runs benchmark given the --model argument.
     """
     x_names = ["M", "N", "K"]
-    
-    line_names = [get_evaluation_label
-        ("time"),
+
+    line_names = [
+        get_evaluation_label("time"),
         get_evaluation_label("throughput", only_unit=True),
         get_evaluation_label("bandwidth"),
     ]
     line_vals = ["time", "throughput", "bandwidth"]
-    
+
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,

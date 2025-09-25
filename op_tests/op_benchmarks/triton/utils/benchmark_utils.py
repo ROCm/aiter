@@ -23,7 +23,7 @@ def get_evaluation_unit(metric):
     Utility function for returning associated units with metrics used throughout
     the Triton kernel benchmark scripts.
     """
-    
+
     evaluation_metric_to_unit = {
         "throughput": "TFLOPS",
         "time": "ms",
@@ -42,7 +42,7 @@ def get_evaluation_unit(metric):
 def get_evaluation_label(metric, space=False, prefix=None, only_unit=False):
     """
     Utility function for returning a column label given the evaluation metric
-    
+
     Args:
         metric (str): User-provided metric to produce a label for
         space (bool): Whether to use a space or hyphen delimiter
@@ -51,7 +51,7 @@ def get_evaluation_label(metric, space=False, prefix=None, only_unit=False):
                                (ex: 'TFLOPS' instead of 'Throughput_(TFLOPS)')
                                (ex: 'fwd(TFLOPS)' instead of 'fwd_Throughput_(TFLOPS)')
     """
-    
+
     if only_unit:
         if prefix:
             return f"{prefix}({get_evaluation_unit(metric)})"
@@ -79,7 +79,7 @@ def get_torch_activation_from_str(activation: str):
     """
     Utility function for returning PyTorch analogues for the given activation function.
     """
-    
+
     mapping = {
         "gelu": F.gelu,
         "gelu_tanh": partial(F.gelu, approximate="tanh"),
@@ -124,7 +124,9 @@ def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
 
     if not args.bench_torch:
         line_vals = [get_evaluation_unit(args.metric)]
-        line_names = [get_evaluation_label(args.metric, only_unit=(args.metric == "throughput"))]
+        line_names = [
+            get_evaluation_label(args.metric, only_unit=(args.metric == "throughput"))
+        ]
     else:
         line_vals = ["triton", "torch"]
         line_names = [
