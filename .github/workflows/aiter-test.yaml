@@ -72,9 +72,9 @@ jobs:
       - name: Tests
         run: |
           set -ex
-          if ${{ matrix.runner }} == 'aiter-1gpu-runner'; then
+          if [ ${{ matrix.runner }} == 'aiter-1gpu-runner' ]; then
             echo "Running Standard Tests..."
-          elif ${{ matrix.runner }} == 'aiter-8gpu-runner'; then
+          elif [ ${{ matrix.runner }} == 'aiter-8gpu-runner' ]; then
             echo "Running Multi-GPU Tests..."
             export MULTIGPU=TRUE
           else
