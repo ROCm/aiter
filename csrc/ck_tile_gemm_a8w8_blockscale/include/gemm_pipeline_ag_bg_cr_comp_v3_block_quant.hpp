@@ -407,7 +407,7 @@ struct GemmPipelineAgBgCrComp_block_quant : public BaseGemmPipelineAgBgCrComp_bl
 
             // ------------------------------------------------------------------------------------
             // Definitions of all needed tiles
-            int b_blcok_stride=0;
+            int b_block_stride=0;
             // A/B tiles in LDS
             auto&& [a_lds_block, b_lds_block] = Base::GetABLdsTensorViews(p_smem);
 
@@ -553,7 +553,7 @@ struct GemmPipelineAgBgCrComp_block_quant : public BaseGemmPipelineAgBgCrComp_bl
                         constexpr auto i_j_idx = make_tuple(idx0, idx1);
                         constexpr auto i_idx   = make_tuple(idx0, p_idx0);
                         
-                        acc_block_tile(i_j_idx) = type_convert<CDataType>((type_convert<float>(acc_block_tile(i_j_idx))) * a_scale_block_tile(i_idx)*(*(b_per_block_scale+b_blcok_stride)));
+                        acc_block_tile(i_j_idx) = type_convert<CDataType>((type_convert<float>(acc_block_tile(i_j_idx))) * a_scale_block_tile(i_idx)*(*(b_per_block_scale+b_block_stride)));
                         c_block_tile(i_j_idx) +=acc_block_tile(i_j_idx);
                     });
                 });
@@ -565,7 +565,7 @@ struct GemmPipelineAgBgCrComp_block_quant : public BaseGemmPipelineAgBgCrComp_bl
                     __builtin_amdgcn_sched_barrier(0);
 
                     i += 1;
-                    b_blcok_stride +=1;
+                    b_block_stride +=1;
                 } while(i < (num_loop - 1));
             }
             tile_elementwise_inout([](auto& c) { c = 0; }, acc_block_tile);
@@ -591,7 +591,7 @@ struct GemmPipelineAgBgCrComp_block_quant : public BaseGemmPipelineAgBgCrComp_bl
                     sweep_tile_span(c_block[number<1>{}], [&](auto idx1) {
                         constexpr auto i_j_idx = make_tuple(idx0, idx1);
                       
-                        acc_block_tile(i_j_idx) = type_convert<CDataType>((type_convert<float>(acc_block_tile(i_j_idx))) * a_scale_block_tile(i_idx)*(*(b_per_block_scale+b_blcok_stride)));
+                        acc_block_tile(i_j_idx) = type_convert<CDataType>((type_convert<float>(acc_block_tile(i_j_idx))) * a_scale_block_tile(i_idx)*(*(b_per_block_scale+b_block_stride)));
                         c_block_tile(i_j_idx) +=acc_block_tile(i_j_idx);
                     });
                 });
@@ -611,12 +611,12 @@ struct GemmPipelineAgBgCrComp_block_quant : public BaseGemmPipelineAgBgCrComp_bl
                         constexpr auto i_j_idx = make_tuple(idx0, idx1);
                         constexpr auto i_idx   = make_tuple(idx0,p_idx0);
                        
-                        acc_block_tile(i_j_idx) = type_convert<CDataType>((type_convert<float>(acc_block_tile(i_j_idx))) * a_scale_block_tile[i_idx]*(*(b_per_block_scale+b_blcok_stride)));
+                        acc_block_tile(i_j_idx) = type_convert<CDataType>((type_convert<float>(acc_block_tile(i_j_idx))) * a_scale_block_tile[i_idx]*(*(b_per_block_scale+b_block_stride)));
                         c_block_tile(i_j_idx) +=acc_block_tile(i_j_idx);
                     });
                 });
                
-                b_blcok_stride +=1;
+                b_block_stride +=1;
                 block_sync_lds();
 
                 if constexpr(is_a_col_major)
@@ -654,7 +654,7 @@ struct GemmPipelineAgBgCrComp_block_quant : public BaseGemmPipelineAgBgCrComp_bl
                         constexpr auto i_j_idx = make_tuple(idx0, idx1);
                         constexpr auto i_idx   = make_tuple(idx0,p_idx0);
                        
-                        acc_block_tile(i_j_idx) = type_convert<CDataType>((type_convert<float>(acc_block_tile(i_j_idx))) * a_scale_block_tile[i_idx]*(*(b_per_block_scale+b_blcok_stride)));
+                        acc_block_tile(i_j_idx) = type_convert<CDataType>((type_convert<float>(acc_block_tile(i_j_idx))) * a_scale_block_tile[i_idx]*(*(b_per_block_scale+b_block_stride)));
                         c_block_tile(i_j_idx) +=acc_block_tile(i_j_idx);
                     });
                 });
