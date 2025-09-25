@@ -12,7 +12,6 @@ from aiter.test_mha_common import (
 )
 import pytest
 import argparse
-import time
 import os
 
 
@@ -141,13 +140,29 @@ def run_ck(
     "d,d_v",
     [
         (32, 32),
+        (40, 40),
+        (59, 59),
+        (64, 64),
+        (96, 96),
+        (111, 111),
         (128, 128),
+        (160, 160),
+        (192, 192),
     ],
 )
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
         (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
         (512, 512),
     ],
 )
@@ -418,11 +433,7 @@ if __name__ == "__main__":
     )
 
     if args.pytest:
-        start = time.time()
         this_file = os.path.realpath(__file__)
         print(this_file)
         ret = pytest.main([this_file])
-        print(
-            f"the pytest {this_file} cost : {(time.time() - start)}s, the ret is {ret}"
-        )
         assert ret == 0
