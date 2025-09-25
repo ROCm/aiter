@@ -70,7 +70,9 @@ def run_gemm_a8w8_asm(
     )
 
 
-def generate_data(m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8, is_asm = False, device="cuda"):
+def generate_data(
+    m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8, is_asm=False, device="cuda"
+):
     torch.manual_seed(seed)
     x = torch.randn((m, k), dtype=dtype, device=device)
     weight = torch.randn((n, k), dtype=dtype, device=device)
@@ -79,25 +81,12 @@ def generate_data(m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8, is_asm
     bias_f32 = None
     if is_asm:
         weight_shuffle = shuffle_weight(weight, layout=(32, 16))
-        bias = torch.zeros(1,n, dtype=dtype, device=device)#torch.rand([1, n], dtype=dtype, device=device) 
+        bias = torch.zeros(1, n, dtype=dtype, device=device)
         bias_f32 = bias.to(dtypes.fp32)
     else:
         weight_shuffle = shuffle_weight(weight, layout=(16, 16))
     out = torch.empty(m, n, dtype=dtype, device=device)
     return x, weight_shuffle, x_scale, w_scale, out, weight, bias_f32
-
-
-def generate_data_asm(m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.i8, device="cuda"):
-    torch.manual_seed(seed)
-    x = torch.randn((m, k), dtype=dtype, device=device)
-    weight = torch.randn((n, k), dtype=dtype, device=device)
-    x, x_scale = aiter.pertoken_quant(x, quant_dtype=q_dtype_w)
-    weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=q_dtype_w)
-    weight_shuffle = shuffle_weight(weight, layout=(32, 16))
-    bias = torch.rand([1, n], dtype=dtype, device=device) 
-    bias_f32 = bias.to(dtypes.fp32)
-    out = torch.empty(m, n, dtype=dtype, device=device)
-    return x, weight, weight_shuffle, x_scale, w_scale, out, bias_f32
 
 
 class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
@@ -118,6 +107,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         if kernelId < 0 or kernelId > len(kernels_list):
             return None
         return kernels_list[kernelId].name
+
     def get_asm_kernels(self, file):
         if not os.path.exists(file):
             print(f"ASM kernel list file not exist: {file}")
@@ -134,6 +124,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             .to_dict()
         )
         return kernel_dict
+
     def get_asm_gemm_i8_tasks(self, info_keys, useSplitK, kernel_id_start, seed=0):
         total_kernel_nums = 0
         task = []
@@ -143,14 +134,14 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         asm_kernel_list_csv = f"{get_asm_dir()}/i8gemm/i8gemm_bf16_perTokenI8.csv"
         asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
         asm_tiles = [key for key in asm_kernels.keys()]
-        
+
         gemm_asm_data_idx = [0, 1, 2, 3, 4, 6]  # input index in generate_data
         torch_data_idx = [0, 5, 2, 3, 6]
         asm_kernels_id = kernel_id_start
         for key in asm_tiles:
             tile_m, tile_n, splitk = key
             if tile_m != 192:
-                 continue
+                continue
             maxsplitK = 8 if useSplitK else 1
             kernelName = asm_kernels.get((tile_m, tile_n, splitk), [])
             if len(kernelName) == 0:
@@ -279,9 +270,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             )
 
             task.extend(
-                self.get_asm_gemm_i8_tasks(
-                    info_keys, useSplitK, kernels_num + 1, seed
-                )
+                self.get_asm_gemm_i8_tasks(info_keys, useSplitK, kernels_num + 1, seed)
             )
 
             total_kernel_nums = len(task)
@@ -298,7 +287,8 @@ if __name__ == "__main__":
     ## use default key and resultList
     key = ["cu_num", "M", "N", "K", "q_dtype_w"]
     tuner = GemmA8W8BpreShuffleTuner(
-        "GemmA8W8BpreShuffleTuner", key=key,
+        "GemmA8W8BpreShuffleTuner",
+        key=key,
         description="gen API for gemm a8w8 bpreshuffle kernel",
     )
 
