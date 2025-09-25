@@ -3,7 +3,7 @@
 
 from torch import Tensor, Generator
 from typing import List, Optional, Tuple, Any
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
+from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
@@ -1352,10 +1352,8 @@ def _flash_attn_backward(
     is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
 ) -> torch.Tensor:
+    # rtna & rtz are deprecated in gfx950
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
-        logger.warning(
-            "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
-        )
         how_v3_bf16_cvt = 0
 
     # can_impl_fmha_v3_bwd should before maybe_contiguous to get pure dout, q, k, v, out
