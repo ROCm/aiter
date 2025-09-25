@@ -241,6 +241,7 @@ def get_module_custom_op(md_name: str) -> None:
             __mds[md_name] = importlib.import_module(md_name)
         else:
             __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+        logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
     return
 
 
