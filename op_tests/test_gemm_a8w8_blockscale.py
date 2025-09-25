@@ -66,7 +66,7 @@ def test_gemm(dtype, m, n, k, preshuffle=False):
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
     
-    # 准备输入数据
+    # Prepare input data
     x = (torch.rand((m, k), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
     weight = (torch.rand((n, k), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
     x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda")
