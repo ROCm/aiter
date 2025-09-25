@@ -74,6 +74,62 @@ def gmm(
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
 ) -> Tensor:
+    """
+    Perform Group Matrix Multiplication (GMM): out = lhs @ rhs
+
+    lhs rows are divided into G groups. Each group of lhs rows is matrix multiplied with a plane of
+    rhs 3D tensor and then stored in a slice of out. In PyTorch parlance, it can be implemented as
+    follows for a given group g:
+        out[group_start:group_end, :] = lhs[group_start:group_end, :] @ rhs[g]
+
+    The size of each group, and their respective start and end positions are specified by
+    group_sizes tensor. For instance, suppose that group_sizes = [3, 2, 4, 1]. In this particular
+    case we have 4 groups. The 1st group starts at 0 and ends at 2, the second group starts at 3 and
+    ends at 4, the third group starts at 5 and ends at 8, and the fourth and final group consists of
+    just the 10th (last) row of lhs.
+
+    Parameters
+    ----------
+    lhs : torch.Tensor
+        Left-hand side 2D input tensor. Shape: (M, K).
+        lhs data type must be torch.float16 or torch.bfloat16, and must match rhs data type.
+        lhs must be on the same device of rhs and group_sizes.
+    rhs : torch.Tensor
+        Right-hand side 3D input tensor. Shape: (G, K, N).
+        rhs data type must be torch.float16 or torch.bfloat16, and must match lhs data type.
+        rhs must be on the same device of lhs and group_sizes.
+    group_sizes : torch.Tensor
+        1D input tensor describing group sizes. Shape: (G,).
+        group_sizes data type must be torch.int32 and all its elements must be non-negative.
+        group_sizes must be on the same device of lhs and rhs.
+    preferred_element_type : torch.dtype, optional
+        Desired data type for output tensor. Default is torch.bfloat16.
+        Supported output types are torch.float16 and torch.bfloat16.
+    existing_out : torch.Tensor or None, optional
+        Preallocated output tensor. Default is None.
+        If provided, results are written into this tensor. Otherwise, a new output tensor is
+        allocated.
+        If provided then it must have shape (M, N), its data type must match preferred_element_type
+        and it must be on the same device of other input tensors.
+
+    Returns
+    -------
+    torch.Tensor
+        The computed output 2D tensor. Shape: (M, N).
+        Output tensor data type is given by preferred_element_type.
+        If existing_out is provided then existing_out is also returned.
+
+    Implementation Notes
+    --------------------
+    - GMM is implemented with a persistent Triton kernel.
+    - lhs must be row-major (lhs.stride() == (K, 1)).
+    - rhs can be row-major (rhs.stride() == (K * N, N, 1)) or column-major (rhs.stride() ==
+      (K * N, 1, K)). If rhs is row-major then kernel parameter TRANS_RHS == False, this is useful
+      for implementing forward pass. If rhs is column-major then kernel parameter TRANS_RHS == True,
+      this is useful for computing the lhs derivative in the backward pass, while fusing the
+      transposition.
+    - out must be row-major (out.stride() == (N, 1)).
+    """
     check_input_device_dtype(lhs, rhs, group_sizes)
 
     M, K, N, G = get_gmm_shape(lhs, rhs, group_sizes)
