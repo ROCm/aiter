@@ -193,7 +193,7 @@ def model_benchmark_configs(args):
     config_file = args.model_configs
     configs = get_model_configs(
         config_path=config_file,
-        models="llama3,deepseek" if args.model == None else args.model,
+        models="llama3,deepseek" if args.model is None else args.model,
     )
     fa_configs = []
     BS = args.b if args.b else 1024

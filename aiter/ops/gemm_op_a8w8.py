@@ -324,10 +324,11 @@ def gemm_a8w8_ASM(
     if (
         x_scale.dtype == dtypes.fp32
         and w_scale.dtype == dtypes.fp32
-        and (asm_config := get_ASMGEMM_config(m, n, k, bias != None, dtype)) != None
+        and (asm_config := get_ASMGEMM_config(m, n, k, bias is not None, dtype))
+        is not None
     ):
         assert (
-            bias != None
+            bias is not None
         ), "Use asm gemm must give bias, please give a \
             bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
         splitK = asm_config["splitK"]

@@ -1454,7 +1454,7 @@ def _get_num_workers(verbose: bool) -> Optional[int]:
             file=sys.stderr,
         )
     prebuild_thread_num = os.environ.get("PREBUILD_THREAD_NUM")
-    if prebuild_thread_num != None:
+    if prebuild_thread_num is not None:
         max_jobs = int(max_jobs) / int(prebuild_thread_num)
     return int(max_jobs)
 
