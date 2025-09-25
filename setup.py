@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
-import sys
 import shutil
+import sys
 
 from setuptools import Distribution, setup
 
@@ -16,7 +16,10 @@ from jit.utils.cpp_extension import (
     BuildExtension,
     IS_HIP_EXTENSION,
 )
-from multiprocessing import Pool
+from concurrent.futures import ThreadPoolExecutor
+
+from jit import core
+from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 PACKAGE_NAME = "aiter"
@@ -120,12 +123,12 @@ if IS_ROCM:
         prebuid_thread_num = 5
         prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         max_jobs = os.environ.get("MAX_JOBS")
-        if max_jobs != None and max_jobs.isdigit():
+        if max_jobs is not None and max_jobs.isdigit():
             prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-        with Pool(processes=prebuid_thread_num) as pool:
-            pool.map(build_one_module, all_opts_args_build)
+        with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
+            list(executor.map(build_one_module, all_opts_args_build))
 
         ck_batched_gemm_folders = [
             f"{this_dir}/csrc/{name}/include"
@@ -181,7 +184,7 @@ class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         max_jobs = getMaxJobs()
         max_jobs_env = os.environ.get("MAX_JOBS")
-        if max_jobs_env != None:
+        if max_jobs_env is not None:
             try:
                 max_processes = int(max_jobs_env)
                 # too large value
@@ -229,7 +232,7 @@ setup(
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     install_requires=[
-        "pybind11>=2.13,<3",
+        "pybind11>=2.13",
         # "ninja",
         "pandas",
         "einops",
