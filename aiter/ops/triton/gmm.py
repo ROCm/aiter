@@ -218,6 +218,65 @@ def ptgmm(
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
 ) -> Tensor:
+    """
+    Perform a Group Matrix Multiplication (GMM) variant: out = lhs @ rhs
+
+    lhs columns and rhs rows are divided into G groups. Each group of lhs is matrix multiplied with
+    the respective group of rhs and then stored in a plane of the output 3D tensor. In PyTorch
+    parlance, it can be implemented as follows for a given group g:
+        out[g] = lhs[:, group_start:group_end] @ rhs[group_start:group_end, :]
+
+    The 't' in the operator name derives from MaxText implementation
+    (https://github.com/AI-Hypercomputer/maxtext/blob/main/src/MaxText/kernels/megablox/gmm.py),
+    which served as the initial inspiration for this one. TGMM differs from GMM in terms of tensor
+    shapes. GMM does (M, K) @ (G, K, N) = (M, N) while TGMM does (K, M) @ (M, N) = (G, K, N).
+
+    The 'p' in the operator name means that it is implemented with a persistent kernel. There is
+    also the non-persistent variation, which is implemented with a regular kernel. Please take a
+    look at nptgmm operator. Both ptgmm and nptgmm implement the same computation, choosing one or
+    the other is a matter of performance for the target workload.
+
+    Parameters
+    ----------
+    lhs : torch.Tensor
+        Left-hand side 2D input tensor. Shape: (K, M).
+        lhs data type must be torch.float16 or torch.bfloat16, and must match rhs data type.
+        lhs must be on the same device of rhs and group_sizes.
+    rhs : torch.Tensor
+        Right-hand side 2D input tensor. Shape: (M, N).
+        rhs data type must be torch.float16 or torch.bfloat16, and must match lhs data type.
+        rhs must be on the same device of lhs and group_sizes.
+    group_sizes : torch.Tensor
+        1D input tensor describing group sizes. Shape: (G,).
+        group_sizes data type must be torch.int32 and all its elements must be non-negative.
+        group_sizes must be on the same device of lhs and rhs.
+    preferred_element_type : torch.dtype, optional
+        Desired data type for output tensor. Default is torch.bfloat16.
+        Supported output types are torch.float16 and torch.bfloat16.
+    existing_out : torch.Tensor or None, optional
+        Preallocated output tensor. Default is None.
+        If provided, results are written into this tensor. Otherwise, a new output tensor is
+        allocated.
+        If provided then it must have shape (G, K, N), its data type must match
+        preferred_element_type and it must be on the same device of other input tensors.
+
+    Returns
+    -------
+    torch.Tensor
+        The computed output 3D tensor. Shape: (G, K, N).
+        Output tensor data type is given by preferred_element_type.
+        If existing_out is provided then existing_out is also returned.
+
+    Implementation Notes
+    --------------------
+    - PTGMM is implemented with a persistent Triton kernel.
+    - lhs can be row-major (lhs.stride() == (M, 1)) or column-major (lhs.stride() == (1, K)). If lhs
+      is row-major then kernel parameter TRANS_LHS == False. If lhs is column-major then kernel
+      parameter TRANS_LHS == True, this is useful for computing the rhs derivative in the backward
+      pass, while fusing the transposition.
+    - rhs must be row-major (rhs.stride() == (N, 1)).
+    - out must be row-major (out.stride() == (K * N, N, 1)).
+    """
     check_input_device_dtype(lhs, rhs, group_sizes)
 
     M, K, N, G = get_tgmm_shape(lhs, rhs, group_sizes)
@@ -306,6 +365,65 @@ def nptgmm(
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
 ) -> Tensor:
+    """
+    Perform a Group Matrix Multiplication (GMM) variant: out = lhs @ rhs
+
+    lhs columns and rhs rows are divided into G groups. Each group of lhs is matrix multiplied with
+    the respective group of rhs and then stored in a plane of the output 3D tensor. In PyTorch
+    parlance, it can be implemented as follows for a given group g:
+        out[g] = lhs[:, group_start:group_end] @ rhs[group_start:group_end, :]
+
+    The 't' in the operator name derives from MaxText implementation
+    (https://github.com/AI-Hypercomputer/maxtext/blob/main/src/MaxText/kernels/megablox/gmm.py),
+    which served as the initial inspiration for this one. TGMM differs from GMM in terms of tensor
+    shapes. GMM does (M, K) @ (G, K, N) = (M, N) while TGMM does (K, M) @ (M, N) = (G, K, N).
+
+    The 'np' in the operator name means that it is implemented with a non-persistent, i.e. regular
+    kernel. There is also the persistent variation, which is implemented with a persistent kernel.
+    Please take a look at ptgmm operator. Both nptgmm and ptgmm implement the same computation,
+    choosing one or the other is a matter of performance for the target workload.
+
+    Parameters
+    ----------
+    lhs : torch.Tensor
+        Left-hand side 2D input tensor. Shape: (K, M).
+        lhs data type must be torch.float16 or torch.bfloat16, and must match rhs data type.
+        lhs must be on the same device of rhs and group_sizes.
+    rhs : torch.Tensor
+        Right-hand side 2D input tensor. Shape: (M, N).
+        rhs data type must be torch.float16 or torch.bfloat16, and must match lhs data type.
+        rhs must be on the same device of lhs and group_sizes.
+    group_sizes : torch.Tensor
+        1D input tensor describing group sizes. Shape: (G,).
+        group_sizes data type must be torch.int32 and all its elements must be non-negative.
+        group_sizes must be on the same device of lhs and rhs.
+    preferred_element_type : torch.dtype, optional
+        Desired data type for output tensor. Default is torch.bfloat16.
+        Supported output types are torch.float16 and torch.bfloat16.
+    existing_out : torch.Tensor or None, optional
+        Preallocated output tensor. Default is None.
+        If provided, results are written into this tensor. Otherwise, a new output tensor is
+        allocated.
+        If provided then it must have shape (G, K, N), its data type must match
+        preferred_element_type and it must be on the same device of other input tensors.
+
+    Returns
+    -------
+    torch.Tensor
+        The computed output 3D tensor. Shape: (G, K, N).
+        Output tensor data type is given by preferred_element_type.
+        If existing_out is provided then existing_out is also returned.
+
+    Implementation Notes
+    --------------------
+    - NPTGMM is implemented with a non-persistent regular Triton kernel.
+    - lhs can be row-major (lhs.stride() == (M, 1)) or column-major (lhs.stride() == (1, K)). If lhs
+      is row-major then kernel parameter TRANS_LHS == False. If lhs is column-major then kernel
+      parameter TRANS_LHS == True, this is useful for computing the rhs derivative in the backward
+      pass, while fusing the transposition.
+    - rhs must be row-major (rhs.stride() == (N, 1)).
+    - out must be row-major (out.stride() == (K * N, N, 1)).
+    """
     check_input_device_dtype(lhs, rhs, group_sizes)
 
     M, K, N, G = get_tgmm_shape(lhs, rhs, group_sizes)
