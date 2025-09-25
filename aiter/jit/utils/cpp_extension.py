@@ -12,19 +12,19 @@ import os
 import re
 import shlex
 import shutil
-import setuptools
 import subprocess
 import sys
 import sysconfig
 import warnings
-from packaging.version import Version
-from setuptools.command.build_ext import build_ext
+from typing import Dict, List, Optional, Tuple, Union
 
-from file_baton import FileBaton
+import setuptools
 from _cpp_extension_versioner import ExtensionVersioner
+from file_baton import FileBaton
 from hipify import hipify_python
 from hipify.hipify_python import GeneratedFileCleaner
-from typing import Dict, List, Optional, Union, Tuple
+from packaging.version import Version
+from setuptools.command.build_ext import build_ext
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
@@ -111,9 +111,10 @@ def _find_rocm_home() -> Optional[str]:
             fallback_path = "/opt/rocm"
             if os.path.exists(fallback_path):
                 rocm_home = fallback_path
-    # if rocm_home and torch.version.hip is None:
-    #     print(f"No ROCm runtime is found, using ROCM_HOME='{rocm_home}'",
-    #           file=sys.stderr)
+    if rocm_home is None:
+        print(
+            f"No ROCm runtime is found, using ROCM_HOME='{rocm_home}'", file=sys.stderr
+        )
     return rocm_home
 
 
@@ -1084,7 +1085,7 @@ def _get_pybind11_abi_build_flags():
 
     abi_cflags = []
     for pname in ["COMPILER_TYPE", "STDLIB", "BUILD_ABI"]:
-        pval = getattr(torch._C, f"_PYBIND11_{pname}")
+        pval = getattr(torch._C, f"_PYBIND11_{pname}", None)
         if pval is not None:
             abi_cflags.append(f'-DPYBIND11_{pname}=\\"{pval}\\"')
     return abi_cflags
@@ -1454,7 +1455,7 @@ def _get_num_workers(verbose: bool) -> Optional[int]:
             file=sys.stderr,
         )
     prebuild_thread_num = os.environ.get("PREBUILD_THREAD_NUM")
-    if prebuild_thread_num != None:
+    if prebuild_thread_num is not None:
         max_jobs = int(max_jobs) / int(prebuild_thread_num)
     return int(max_jobs)
 
