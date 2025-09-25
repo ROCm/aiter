@@ -384,7 +384,7 @@ def test_flash_attn_varlen_func(
 
 
 l_dtype = ["bf16", "fp16"]
-l_dim = [96, 128]
+l_dim = [32, 40, 59, 64, 96, 111, 128, 160, 192]
 l_mha_type = ["mha", "mqa", "gqa"]
 l_causal = [False, True]
 l_local = [False, True]
@@ -461,17 +461,18 @@ if __name__ == "__main__":
         "--causal",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="""Causal attention, default is True.
+        help="""Causal attention, default is None.
     -c or --causal    # enable causal attention
     --no-causal       # disable causal attention""",
     )
     parser.add_argument(
         "-l",
         "--local",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=None,
-        help="""Local attention. default is False.
-    e.g. -l or --local    # enable local attention""",
+        help="""Local attention. default is None.
+        e.g. -l or --local    # enable local attention
+        --no-local        # disable local attention""",
     )
     parser.add_argument(
         "-bt",
@@ -485,7 +486,7 @@ if __name__ == "__main__":
         "--deterministic",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="""Deterministic attention, default is True.
+        help="""Deterministic attention, default is None.
     -det or --deterministic    # enable deterministic attention
     --no-deterministic         # disable deterministic attention""",
     )

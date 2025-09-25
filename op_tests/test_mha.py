@@ -305,12 +305,12 @@ def test_flash_attn_output(
 
 
 l_dtype = ["bf16", "fp16"]
-l_dim = [96, 128]
+l_dim = [32, 40, 59, 64, 96, 111, 128, 160, 192]
 l_mha_type = ["mha", "mqa", "gqa"]
 l_causal = [False, True]
 l_local = [False, True]
-l_seq_q = [203, 512]
-l_seq_k = [107, 512]
+l_seq_q = [108, 256, 512]
+l_seq_k = [256, 512, 1024]
 l_deterministic = [False, True]
 
 parser = argparse.ArgumentParser(
@@ -376,18 +376,20 @@ parser.add_argument(
 parser.add_argument(
     "-c",
     "--causal",
-    action="store_true",
+    action=argparse.BooleanOptionalAction,
     default=None,
-    help="""Causal attention. Default is False.
-    -c or --causal    # enable causal attention""",
+    help="""Causal attention. Default is None.
+    -c or --causal    # enable causal attention
+    --no-causal       # disable causal attention""",
 )
 parser.add_argument(
     "-l",
     "--local",
-    action="store_true",
+    action=argparse.BooleanOptionalAction,
     default=None,
-    help="""Local attention. Default is False.
-    -l or --local    # enable local attention""",
+    help="""Local attention. Default is None.
+        e.g. -l or --local    # enable local attention
+        --no-local        # disable local attention""",
 )
 parser.add_argument(
     "-bt",
@@ -400,9 +402,11 @@ parser.add_argument(
 parser.add_argument(
     "-det",
     "--deterministic",
-    action="store_true",
-    help="""Deterministic attention. Default is False.
-    -det or --deterministic    # enable deterministic attention""",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="""Deterministic attention. Default is None.
+    -det or --deterministic    # enable deterministic attention
+    --no-deterministic         # disable deterministic attention""",
 )
 parser.add_argument(
     "-m",
