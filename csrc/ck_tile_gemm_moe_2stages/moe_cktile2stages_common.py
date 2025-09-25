@@ -259,10 +259,6 @@ MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
     {{
         return {(1, 3)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
-    //else if (block_m == 128)
-    //{{
-    //    return {(1, 4)}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
     else
     {{
         TORCH_CHECK(
@@ -288,10 +284,6 @@ MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
     {{
         return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
     }}
-    //else if (block_m == 128)
-    //{{
-    //return {(2, 4)}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
     else
     {{
         TORCH_CHECK(
