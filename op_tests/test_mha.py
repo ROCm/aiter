@@ -274,7 +274,9 @@ def test_flash_attn_output(
         upcast=False,
         reorder_ops=True,
     )
-
+    print(
+        f"batch_size: {batch_size}, nheads: {nheads}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, d: {d}, d_v: {d_v}, dropout_p: {dropout_p}, causal: {causal}, local: {local}, bias_type: {bias_type}, deterministic: {deterministic}, mha_type: {mha_type}, dtype: {dtype}"
+    )
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
