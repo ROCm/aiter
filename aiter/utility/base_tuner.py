@@ -231,6 +231,7 @@ class TunerCommon:
     def run(self, args, fast_mode=False):
         """tuner run function"""
         self.pre_process(args)
+        print(self.untunedf)
         if args.verbose:
             logger.info(f"args: {args}")
         if len(self.untunedf) == 0:
@@ -313,7 +314,7 @@ class GemmCommonTuner(TunerCommon):
         info, time, err_ratio = results
         if time == -1:
             return -1, -1
-        cu_num, m, n, k = info[0]
+        cu_num, m, n, k, *rest = info[0]
         flop = m * n * k * 2
         tflops = round(flop / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes

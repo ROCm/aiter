@@ -6,6 +6,7 @@ import pandas as pd
 import argparse
 import shutil
 import torch
+from aiter import dtypes
 from gemm_a8w8_bpreshuffle_common import (
     kernelInstance,
     kernels_list,
@@ -129,8 +130,8 @@ template torch::Tensor
 
         if self.istune:
             Path(
-                os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
-            ).write_text(INSTANCE_dFP32_eFP16)
+                os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
+            ).write_text(INSTANCE_dFP32_eBF16)
         else:
             Path(
                 os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
@@ -235,6 +236,7 @@ def get_tune_dict(tune_dict_csv):
             device_properties = torch.cuda.get_device_properties(gpu)
             cu_num = device_properties.multi_processor_count
             tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
+            tune_df = tune_df[tune_df["q_dtype_w"] == dtypes.fp8].reset_index()
         for i in range(len(tune_df)):
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]
