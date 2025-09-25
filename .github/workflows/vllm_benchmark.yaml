@@ -79,6 +79,7 @@ jobs:
     runs-on: aiter-8gpu-runner
     needs: build_vllm_image
     strategy:
+      fail-fast: false
       matrix:
         model:
           - 'mistralai/Mixtral-8x7B-Instruct-v0.1'
