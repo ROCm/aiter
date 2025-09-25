@@ -42,6 +42,14 @@ from aiter.ops.triton.gmm import (
 # ------------------------------------------------------------------------------
 
 
+# GMM variants.
+
+GMM_TYPES: set[str] = {"gmm", "ptgmm", "nptgmm"}
+
+DEFAULT_GMM: str = "gmm"
+assert DEFAULT_GMM in GMM_TYPES, "Default GMM type isn't in set of GMM variants."
+
+
 # Real shapes, used by real models.
 # fmt: off
 REAL_SHAPES: list[tuple[int, int, int, int]] = [
@@ -55,8 +63,27 @@ REAL_SHAPES: list[tuple[int, int, int, int]] = [
 # fmt: on
 
 
+# Benchmark metrics.
+
+METRICS: set[str] = {"time", "throughput", "bandwidth"}
+
+DEFAULT_METRIC: str = "throughput"
+assert (
+    DEFAULT_METRIC in METRICS
+), "Default benchmark metric isn't in set of supported metrics."
+
+METRIC_UNITS: dict[str, str] = {
+    "time": "ms",
+    "throughput": "tflops",
+    "bandwidth": "gbps",
+}
+assert (
+    METRIC_UNITS.keys() == METRICS
+), "Mismatch between available benchmark metrics and respective units."
+
+
 def select_triton_kernel(gmm_type: str):
-    assert gmm_type in {"gmm", "ptgmm", "tgmm"}, "Invalid GMM type."
+    assert gmm_type in GMM_TYPES, "Invalid GMM type."
     if gmm_type == "gmm":
         desc, gen_tensors, kernel_wrapper = (
             "GMM",
@@ -92,16 +119,21 @@ def benchmark_gmm(
     rng_seed: int = RNG_SEED,
     num_group_sizes: int = NUM_GROUP_SIZES,
     unif_group_sizes: bool = False,
+    metric: str = DEFAULT_METRIC,
 ) -> None:
+    assert gmm_type in GMM_TYPES, "Invalid GMM type."
+    assert metric in METRICS, "Invalid benchmark metric."
+
     desc, gen_tensors, kernel_wrapper = select_triton_kernel(gmm_type)
 
     in_dtype_str = str_from_dtype(in_dtype)
     out_dtype_str = str_from_dtype(out_dtype)
     dtypes_desc = f"i{in_dtype_str}_o{out_dtype_str}"
     layout_desc = (
-        "".join("c" if trans else "r" for trans in (trans_lhs, trans_rhs)) + "r"
+        "".join("t" if trans else "n" for trans in (trans_lhs, trans_rhs)) + "n"
     )
-    triton_provider = f"triton_{gmm_type}_perf_{dtypes_desc}_{layout_desc}"
+    unit = METRIC_UNITS[metric]
+    triton_provider = f"triton_{gmm_type}_{dtypes_desc}_{layout_desc}_{unit}"
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -112,12 +144,10 @@ def benchmark_gmm(
             line_names=[triton_provider],
             plot_name=triton_provider,
             args={},
-            ylabel="TFLOPS",
+            ylabel=unit,
         )
     )
     def benchmark(M: int, K: int, N: int, G: int, provider: str):
-        assert "triton" in provider, f"Provider isn't triton, it's {provider}."
-
         logging.info("    (M, K, N, G) = (%d, %d, %d, %d)", M, K, N, G)
 
         lhs, rhs, multiple_group_sizes, out = gen_tensors(
@@ -135,10 +165,11 @@ def benchmark_gmm(
         )
 
         quantiles = [0.5, 0.2, 0.8]
-        p50_s_sum = 0.0
-        p20_s_sum = 0.0
-        p80_s_sum = 0.0
+        p50_ms_sum = 0.0
+        p20_ms_sum = 0.0
+        p80_ms_sum = 0.0
         tops_sum = 0.0
+        gb_sum = 0.0
 
         for group_sizes in multiple_group_sizes:
             logging.debug(
@@ -155,28 +186,75 @@ def benchmark_gmm(
                 ),
                 quantiles=quantiles,
             )
-            p50_s_sum += 1e-3 * p50_ms
-            p20_s_sum += 1e-3 * p20_ms
-            p80_s_sum += 1e-3 * p80_ms
-            tops_sum += torch.sum(1e-12 * 2 * group_sizes * N * K).item()
 
+            # Aggregate time, in milliseconds.
+            p50_ms_sum += p50_ms
+            p20_ms_sum += p20_ms
+            p80_ms_sum += p80_ms
+
+            m = torch.sum(group_sizes).item()
+
+            # Aggregate operations, in TOps. The math is the same for GMM and TGMM.
+            tops_sum += 1e-12 * 2 * m * N * K
+
+            # Aggregate memory, in GB.
+            if "tgmm" in gmm_type:
+                # TGMM case.
+                read_bytes = K * m * lhs.element_size() + m * N * rhs.element_size()
+                write_bytes = G * K * N * out.element_size()
+            else:
+                # GMM case.
+                read_bytes = m * K * lhs.element_size() + G * K * N * rhs.element_size()
+                write_bytes = m * N * out.element_size()
+            gb_sum += 1e-9 * (read_bytes + write_bytes)
+
+        # Compute milliseconds: milliseconds of all group sizes / number of group sizes.
+        p50_ms = round(p50_ms_sum / G, 4)
+        p20_ms = round(p20_ms_sum / G, 4)
+        p80_ms = round(p80_ms_sum / G, 4)
+
+        # Compute total seconds.
+        p50_s_sum = 1e-3 * p50_ms_sum
+        p20_s_sum = 1e-3 * p20_ms_sum
+        p80_s_sum = 1e-3 * p80_ms_sum
+
+        # Compute TFLOPS: TOps of all group sizes / seconds of all group sizes.
         p50_tflops = round(tops_sum / p50_s_sum, 2)
         p20_tflops = round(tops_sum / p80_s_sum, 2)
         p80_tflops = round(tops_sum / p20_s_sum, 2)
 
-        logging.info("      TOps (number of ops): %f", tops_sum)
-        logging.info("      Time (s): p50 = %f", p50_s_sum)
+        # Compute GB/s: GB of all group sizes / seconds of all group sizes.
+        p50_gbps = round(gb_sum / p50_s_sum, 2)
+        p20_gbps = round(gb_sum / p80_s_sum, 2)
+        p80_gbps = round(gb_sum / p20_s_sum, 2)
+
+        logging.info(
+            "      ms: p20 = %7.4f, p50 = %7.4f, p80 = %7.4f",
+            p20_ms,
+            p50_ms,
+            p80_ms,
+        )
         logging.info(
             "      TFLOPS: p20 = %6.2f, p50 = %6.2f, p80 = %6.2f",
             p20_tflops,
             p50_tflops,
             p80_tflops,
         )
+        logging.info(
+            "      GB/s: p20 = %6.2f, p50 = %6.2f, p80 = %6.2f",
+            p20_gbps,
+            p50_gbps,
+            p80_gbps,
+        )
 
-        return p50_tflops, p20_tflops, p80_tflops
+        if metric == "time":
+            return p50_ms, p20_ms, p80_ms
+        if metric == "throughput":
+            return p50_tflops, p20_tflops, p80_tflops
+        if metric == "bandwidth":
+            return p50_gbps, p20_gbps, p80_gbps
 
     logging.info("Benchmarking Triton %s kernel:", desc)
-
     logging.info(
         "  input_type = %s, output_type = %s, rng_seed = %d",
         in_dtype_str,
@@ -192,6 +270,11 @@ def benchmark_gmm(
         "  num_group_sizes = %d, unif_group_sizes = %s",
         num_group_sizes,
         unif_group_sizes,
+    )
+    logging.info(
+        "  metric = %s (in %s)",
+        metric,
+        unit,
     )
     benchmark.run(show_plots=False, print_data=True)
 
@@ -268,9 +351,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gmm-type",
         type=str.lower,
-        choices={"gmm", "ptgmm", "nptgmm"},
-        default="gmm",
-        help="GMM variant to run: GMM, persistent TGMM, non-persistent TGMM",
+        choices=GMM_TYPES,
+        default=DEFAULT_GMM,
+        help=f"GMM variant to run: GMM, persistent TGMM, non-persistent TGMM (default: {DEFAULT_GMM})",
     )
 
     # Data type
@@ -310,6 +393,15 @@ def parse_args() -> argparse.Namespace:
         "--unif-group-sizes",
         action="store_true",
         help="evenly distributes tokens among all groups",
+    )
+
+    # Benchmark metric
+    parser.add_argument(
+        "--metric",
+        type=str.lower,
+        choices=METRICS,
+        default=DEFAULT_METRIC,
+        help=f"benchmark metric (default: {DEFAULT_METRIC})",
     )
 
     # Other arguments
@@ -352,6 +444,7 @@ def main() -> None:
         rng_seed=args.rng_seed,
         num_group_sizes=args.num_group_sizes,
         unif_group_sizes=args.unif_group_sizes,
+        metric=args.metric,
     )
 
 
