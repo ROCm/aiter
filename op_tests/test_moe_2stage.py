@@ -390,31 +390,30 @@ def test_fmoe(
     #     out2_ck,
     #     msg=f"ck_moe_2stages:{us:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     # )
+    if dtype == dtypes.bf16:
+        out2_aiter, us_fuse = run_perftest(
+            fused_moe,
+            input,
+            w1_qt_aiter,
+            w2_qt_aiter,
+            topk_weights,
+            topk_ids,
+            w1_scale=fp4_utils.e8m0_shuffle(
+                w1_scale
+            ),  # e8m0_shuffle will do nothing if it's a fp32
+            w2_scale=fp4_utils.e8m0_shuffle(w2_scale),
+            quant_type=qType,
+            activation=actType,
+            doweight_stage1=doweight_stage1,
+        )
 
-    # if dtype == dtypes.bf16:
-    #     out2_aiter, us_fuse = run_perftest(
-    #         fused_moe,
-    #         input,
-    #         w1_qt_aiter,
-    #         w2_qt_aiter,
-    #         topk_weights,
-    #         topk_ids,
-    #         w1_scale=fp4_utils.e8m0_shuffle(
-    #             w1_scale
-    #         ),  # e8m0_shuffle will do nothing if it's a fp32
-    #         w2_scale=fp4_utils.e8m0_shuffle(w2_scale),
-    #         quant_type=qType,
-    #         activation=actType,
-    #         doweight_stage1=doweight_stage1,
-    #     )
+        err = checkAllclose(
+            out2_ref,
+            out2_aiter,
+            msg=f"aiter_all_stages:{us_fuse:>8.2f} us......",
+        )
 
-    #     err = checkAllclose(
-    #         out2_ref,
-    #         out2_aiter,
-    #         msg=f"aiter_all_stages:{us_fuse:>8.2f} us......",
-    #     )
-
-    #     return {"us": us_fuse, "err": err}
+        return {"us": us_fuse, "err": err}
 
 
 l_dtype = ["bf16"]

@@ -545,7 +545,7 @@ def get_2stage_cfgs(
             in fused_moe_1stage_dict[get_gfx()]
         ):
             if q_type == QuantType.per_1x128:
-                run_1stage = True and (inter_dim % 256 == 0)
+                run_1stage = False and (inter_dim % 256 == 0)
             elif q_type == QuantType.per_Token and q_dtype_w in [dtypes.i8, dtypes.fp8]:
                 run_1stage = token > 32
             elif q_type != QuantType.per_1x32:
@@ -554,7 +554,7 @@ def get_2stage_cfgs(
             BLOCK_SIZE_M
             if run_1stage
             else (
-                64
+                16
                 if q_type == QuantType.per_1x128
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
@@ -613,11 +613,28 @@ def get_2stage_cfgs(
         )
 
     # TODO: remove when stage2 support more size
-    tmpList = [32, 64, 128]
+    tmpList = [16, 32, 64, 128]
     if block_m not in tmpList:
         tag = ""
         block_m = ([el for el in tmpList if block_m < el] + [128])[0]
-
+    #tmp
+    return MOEMetadata(
+            functools.partial(
+                aiter.ck_moe_stage1_fwd,
+                kernelName=kernelName1,
+                activation=activation,
+                quant_type=q_type,
+            ),
+            functools.partial(
+                aiter.ck_moe_stage2_fwd,
+                kernelName=kernelName2,
+                activation=activation,
+                quant_type=q_type,
+            ),
+            block_m,
+            ksplit,
+            run_1stage,
+        )
     return MOEMetadata(
         functools.partial(
             asm_stage1,
