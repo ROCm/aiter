@@ -155,7 +155,7 @@ def create_benchmark_configs(custom, args):
         else:
             line_vals = ["bwd"]
 
-    line_names = [get_evaluation_label(args.metric, prefix=val) for val in line_vals]
+    line_names = [get_evaluation_label(args.metric, prefix=val, only_unit=(args.metric == "throughput")) for val in line_vals]
 
     configs.append(
         triton.testing.Benchmark(

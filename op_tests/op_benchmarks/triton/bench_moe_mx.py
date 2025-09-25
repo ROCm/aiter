@@ -53,7 +53,7 @@ def run_benchmark(args):
 
     line_names = [
         get_evaluation_label("time"),
-        get_evaluation_label("throughput"),
+        get_evaluation_label("throughput", only_unit=True),
         get_evaluation_label("bandwidth"),
     ]
     line_vals = ["time", "throughput", "bandwidth"]

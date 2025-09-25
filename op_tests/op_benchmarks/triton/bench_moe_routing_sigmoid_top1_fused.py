@@ -1,3 +1,4 @@
+import argparse
 from functools import partial
 
 import torch
@@ -7,10 +8,8 @@ from aiter.ops.triton.moe_routing_sigmoid_top1_fused import (
     _routing_sigmoid_top1_kernel,
     routing_sigmoid_top1,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
-)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_available_models,
     get_model_configs,
     get_caller_name_no_ext,
     get_evaluation_label,
@@ -33,24 +32,30 @@ def run_benchmark(args, x_vals_list):
     Runs benchmark given the --model argument.
     """
     x_names = ["M", "N", "K"]
-
-    ylabel = get_evaluation_label(args.metric, space=True)
-    line_names = [get_evaluation_label(args.metric)]
-    line_vals = [get_evaluation_unit(args.metric)]
+    
+    line_names = [get_evaluation_label
+        ("time"),
+        get_evaluation_label("throughput", only_unit=True),
+        get_evaluation_label("bandwidth"),
+    ]
+    line_vals = ["time", "throughput", "bandwidth"]
+    
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
-        line_arg="unit",
+        line_arg="metric",
         line_vals=line_vals,
         line_names=line_names,
-        styles=[("green", "-")],  # match line names to colors
-        ylabel=ylabel,
+        styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
+        ylabel=f"{get_evaluation_label("time", space=True)} / "
+        + f"{get_evaluation_label("throughput", space=True)} / "
+        + f"{get_evaluation_label("bandwidth", space=True)}",
         plot_name=get_caller_name_no_ext(),
-        args={"metric": args.metric},
+        args={},
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_routing_layer(M, N, K, **kwargs):
+    def bench_routing_layer(M, N, K, metric, **kwargs):
         dtype = torch.bfloat16
         device = "cuda"
         x = torch.randn((M, K), dtype=dtype, device=device)
@@ -65,16 +70,16 @@ def run_benchmark(args, x_vals_list):
         ms = triton.testing.do_bench(
             lambda: routing_sigmoid_top1(x, w, TOPK), warmup=25, rep=100
         )
-        if args.metric == "time":
+        if metric == "time":
             return ms
-        elif args.metric == "throughput":
+        elif metric == "throughput":
             tflops = flops / ms * 1e-9
             return tflops
-        elif args.metric == "bandwidth":
+        elif metric == "bandwidth":
             bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
             return bandwidth
         else:
-            raise ValueError("Unknown metric: " + args.metric)
+            raise ValueError("Unknown metric: " + metric)
 
     bench_routing_layer.run(save_path="." if args.o else None, print_data=True)
 
@@ -153,7 +158,24 @@ def benchmark_decode():
 
 
 def parse_args():
-    parser = get_parser(kernel_name="Routing Sigmoid Top1")
+    parser = argparse.ArgumentParser(
+        prog="Benchmark Routing Sigmoid Top1",
+        allow_abbrev=False,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    available_models = get_available_models()
+    model_help = (
+        "Model name to benchmark. Select from: ["
+        + ", ".join(available_models)
+        + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
+    )
+    parser.add_argument(
+        "--model-configs",
+        type=str,
+        default="utils/model_configs.json",
+        help="Model config json file.",
+    )
+    parser.add_argument("--model", type=str, help=model_help)
     parser.add_argument("-M", type=int, default=1024)
     parser.add_argument("-K", type=int, default=5120)
     parser.add_argument("-N", type=int, default=128)

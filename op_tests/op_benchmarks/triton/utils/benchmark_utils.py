@@ -39,7 +39,7 @@ def get_evaluation_unit(metric):
         raise NotImplementedError(f"{metric} is not supported")
 
 
-def get_evaluation_label(metric, space=False, prefix=None, only_unit=[]):
+def get_evaluation_label(metric, space=False, prefix=None, only_unit=False):
     """
     Utility function for returning a column label given the evaluation metric
     
@@ -47,12 +47,12 @@ def get_evaluation_label(metric, space=False, prefix=None, only_unit=[]):
         metric (str): User-provided metric to produce a label for
         space (bool): Whether to use a space or hyphen delimiter
         prefix (Optional[str]): Optional prefix to append to the label
-        only_unit (List[str]): List of metrics for which only units are included in the label
+        only_unit (bool): Whether only units are included in the label
                                (ex: 'TFLOPS' instead of 'Throughput_(TFLOPS)')
                                (ex: 'fwd(TFLOPS)' instead of 'fwd_Throughput_(TFLOPS)')
     """
     
-    if metric in only_unit:
+    if only_unit:
         if prefix:
             return f"{prefix}({get_evaluation_unit(metric)})"
         else:
@@ -124,7 +124,7 @@ def get_gemm_shape_benchmark_object(plot_name, args, x_names=None):
 
     if not args.bench_torch:
         line_vals = [get_evaluation_unit(args.metric)]
-        line_names = [get_evaluation_label(args.metric, only_unit="throughput")]
+        line_names = [get_evaluation_label(args.metric, only_unit=(args.metric == "throughput"))]
     else:
         line_vals = ["triton", "torch"]
         line_names = [
