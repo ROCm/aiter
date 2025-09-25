@@ -567,6 +567,9 @@ MANUAL_SCHEMA_OPS = [
     "_ActivationType",
     "_QuantType",
     "init_custom_ar",
+    "greedy_sample",
+    "random_sample",
+    "mixed_sample"
 ]
 
 NONE_WRAPPED_OP = [
