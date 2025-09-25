@@ -7,19 +7,19 @@ import sys
 import os
 import random
 import aiter
+import pandas as pd
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter.ops.shuffle import shuffle_weight
 from aiter import hipb_mm, hipb_create_extension
 from functools import lru_cache
 from aiter.jit.utils.chip_info import get_gfx
-import pandas as pd
 
 # pd.set_option('display.max_rows', 500)
 # pd.set_option('display.max_columns', 100)
 # pd.set_option('display.width', 1000)
-
-# TEST_NUM_ITERS = 10
+torch.set_printoptions(sci_mode=False)
+# torch.set_printoptions(threshold=float("inf"))
 TEST_NUM_ITERS = 100
 
 if 1:
@@ -57,6 +57,11 @@ def run_torch(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
+def run_bf16gemm_asm(x, weight, out_asm, otype=dtypes.fp32, bias=None):
+    return aiter.gemm_a16w16_asm(x, weight, out_asm, bias)
+
+
+@perftest()
 def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
     return tgemm.mm(x, weight, bias, otype, scaleA, scaleB)
 
@@ -85,6 +90,7 @@ def init_hipblas():
 
 @benchmark()
 def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
+    ret = {}
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
     weight = torch.rand(n, k, dtype=otype, device="cuda").to(dtype)
@@ -96,6 +102,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         scaleA = torch.tensor(scaleA, dtype=dtypes.fp32, device="cuda")
     if scaleB is not None:
         scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
+
     (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
     (b, *_), avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
     if (
@@ -113,6 +120,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     else:
         c = None
         avg_c = None
+
     assert (
         a.dtype == b.dtype
     ), f"Expected a.dtype == b.dtype, but a={a.dtype}, b={b.dtype}, input dtype={dtype}"
@@ -123,6 +131,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         assert (
             b.dtype == otype
         ), f"b={b.dtype}, expected output dtype={otype}, input dtype={dtype}"
+
         if c is not None:
             assert (
                 c.dtype == otype
@@ -344,6 +353,36 @@ def test_normal_gemm():
         scaleA=0.5,
         scaleB=0.5,
     )
+
+    test_gemm(dtypes.bf16, 128, 32, 8192)
+    df_asm = []
+    for dtype in [dtypes.fp16, dtypes.bf16][-1:]:
+        for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32][-1:]:
+            for m in [64, 48, 128, 192, 256, 384, 448, 512][:]:
+                df_asm.append(test_gemm(dtype, m, 256, 5120, otype=otype))
+        # # qkv_proj
+        # for (m, n, k) in [(4096, 1280, 8192),
+        #                   (128, 1280, 8192),
+        #                   (128, 1024, 8192),
+        #                   (128, 128, 8192),
+        #                   ]:
+        #     test_gemm(dtype, m, n, k)
+        # # attn_out
+        # for (m, n, k) in [(4096, 8192, 1024),
+        #                   (128, 8192, 1024)]:
+        #     test_gemm(dtype, m, n, k)
+        # test_gemm(dtype, 128, 1024, 8192)
+        # # gating
+        # for (m, n, k) in [(4096, 32, 8192),
+        #                   (128, 32, 8192)]:
+        #     test_gemm(dtype, m, n, k)
+        # # gating
+        # for (m, n, k) in [(1, 19392, 8192),
+        #                   (128, 19392, 8192)]:
+        #     test_gemm(dtype, m, n, k)
+    df_asm = pd.DataFrame(df_asm)
+    aiter.logger.info(f"summary:\n{df_asm}")
+
     df.append(ret1)
     ret2 = test_gemm(dtypes.bf16, 128, 32, 8192)
     df.append(ret2)
@@ -431,5 +470,5 @@ def test_skinny_gemm():
         aiter.logger.info(f"skinny summary:\n{df}")
 
 
-# test_normal_gemm()
-test_skinny_gemm()
+test_normal_gemm()
+# test_skinny_gemm()
