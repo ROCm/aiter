@@ -13,7 +13,7 @@ from operator import itemgetter
 import time
 from aiter import dtypes
 
-
+INVALID_TIME = -1
 class TunerCommon:
     ARG_DEFAULTS = {
         "verbose": False,
@@ -50,8 +50,8 @@ class TunerCommon:
         self.untunedf = None
         self.name = name
         self.topk = 1
-        self.success = []
-        self.failed = []
+        self.success = pd.DataFrame(columns=self.columns)
+        self.failed = pd.DataFrame(columns=self.columns)
 
     def get_arg_defaults(self):
         """get default arguments"""
@@ -206,7 +206,7 @@ class TunerCommon:
         """ for shapes already tuned, we update the result inplace"""
         key_columns = self.keys
         df_updates = df_updates.loc[:, self.columns]
-        print(df_updates)
+        # print(df_updates)
         df_old["_tmp_key"] = df_old[key_columns].apply(tuple, axis=1)
         df_updates["_tmp_key"] = df_updates[key_columns].apply(tuple, axis=1)
         matched_keys = df_updates[df_updates["_tmp_key"].isin(df_old["_tmp_key"])][
@@ -271,7 +271,9 @@ class TunerCommon:
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio)
                 for info_ex, us, max_err_ratio in sorted_time
-                if max_err_ratio <= tol_err_ratio and us != -1 and us != float("inf")
+                if max_err_ratio <= tol_err_ratio
+                and us != INVALID_TIME
+                and us != float("inf")
             ]
             if len(filtered_time) == 0:
                 logger.error(
@@ -288,10 +290,7 @@ class TunerCommon:
             ]
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")
-                best_config = [((info_key, *sorted_time[0][0]), -1, 1.0)]
-                self.failed.append(info_key)
-            else:
-                self.success.append(info_key)
+                best_config = [((info_key, *sorted_time[0][0]), INVALID_TIME, 1.0)]
 
             bestConfigs.extend(best_config)
         resultdf = self.result_to_df(bestConfigs)
@@ -415,11 +414,10 @@ class GemmCommonTuner(TunerCommon):
         resultdf = pd.DataFrame(columns=self.columns)
         for el in results:
             info, time, err_ratio = el
-            print(info, time, err_ratio)
             keys, kernelId, splitK, kernelName = info
             kernelName = (
                 "None"
-                if time == -1
+                if time == INVALID_TIME
                 else self.getKernelName(kernelId) if kernelName == "" else kernelName
             )
             tflops, bw = self.calculate(el)
@@ -447,8 +445,12 @@ class GemmCommonTuner(TunerCommon):
     def result_to_csv(self, resultdf, file, concat=False):
         """post process of tuning results"""
         old_df = self.get_tuned_gemm_list(file)
-        self.failed = resultdf[resultdf["us"] == -1]
-        self.success = resultdf[resultdf["us"] != -1]
+        self.failed = pd.concat(
+            [self.failed, resultdf[resultdf["us"] == INVALID_TIME]], ignore_index=True
+        )
+        self.success = pd.concat(
+            [self.success, resultdf[resultdf["us"] != INVALID_TIME]], ignore_index=True
+        )
         update_tunedf = self.success
         if not concat:
             resultdf = self.update_tunedf(old_df, update_tunedf)
