@@ -10,8 +10,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes
-from aiter import paged_attn as ops
+from aiter import dtypes, pertoken_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 torch.set_default_device("cuda")
@@ -476,7 +475,6 @@ def test_pa_mtp(
     )
     ret["us_asm_fp8"] = us_aiter_asm
     ret["err fp8"] = err
-
 
     out_hip, us_hip = run_aiter_hip(
         query,

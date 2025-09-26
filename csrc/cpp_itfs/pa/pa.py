@@ -1,8 +1,9 @@
-from jinja2 import Template
-from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR
 import ctypes
 import math
 
+from jinja2 import Template
+
+from csrc.cpp_itfs.utils import AITER_CORE_DIR, compile_template_op
 
 MD_NAME = "pa"
 
@@ -76,7 +77,9 @@ def paged_attention_rocm(
     q_scale=None,
 ):
     import torch
+
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
+
     dtype_map = {
         torch.bfloat16: "__hip_bfloat16",
         torch.float16: "_Float16",
