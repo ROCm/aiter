@@ -1,6 +1,9 @@
 import argparse
+import concurrent.futures
 import os
+import time
 import shutil
+import signal
 from pathlib import Path
 import json
 from aiter.jit.core import (
@@ -88,6 +91,17 @@ def main():
         action="store_true",
         help="Force rebuild all modules regardless of modification status",
     )
+    parser.add_argument(
+        "--enable-parallel",
+        action="store_true",
+        help="Enable parallel build",
+    )
+    parser.add_argument(
+        "--parallelism",
+        type=int,
+        default=16,
+        help="Number of parallel jobs for building modules",
+    )
     args = parser.parse_args()
 
     # Use provided modules or default set
@@ -111,8 +125,10 @@ def main():
         # "module_moe_ck2stages",
     ]
     print(f"modules_to_build: {modules_to_build}")
+    start_time = time.time()
     # Load module configurations
     config_path = Path(__file__).resolve().parents[1] / "jit/optCompilerConfig.json"
+    enable_parallel = args.enable_parallel
     with open(config_path, "r") as f:
         opt_config = json.load(f)
         valid_modules = [m for m in modules_to_build if m in opt_config]
@@ -127,6 +143,23 @@ def main():
         if not valid_modules:
             print("No modules to build. All requested modules are up-to-date.")
             return
+
+        def signal_handler(signum, frame):
+            print(f"\nInterrupt signal received, shutting down thread pool...")
+            if 'executor' in locals():
+                executor.shutdown(cancel_futures=True, wait=False)
+
+        if enable_parallel:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.parallelism)
+            future_to_task = {}
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
+
+        def submit_task(func, module_name, *args, **kwargs):
+            future_to_task.update(
+                {
+                    executor.submit(func, module_name, *args, **kwargs) : module_name
+                })
 
         print(f"Building {len(valid_modules)} modules...")
         for module_name in valid_modules:
@@ -177,10 +210,35 @@ def main():
                             f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}"
                         )
                         variant_args["blob_gen_cmd"] = blob_gen_cmd
-                        build_module(rt_module_name, **variant_args)
+                        if enable_parallel:
+                            submit_task(build_module, rt_module_name, **variant_args)
+                        else:
+                            build_module(rt_module_name, **variant_args)
             else:
-                build_module(module_name, **filtered_args)
+                if enable_parallel:
+                    submit_task(build_module, module_name, **filtered_args)
+                else:
+                    build_module(module_name, **filtered_args)
 
+        if enable_parallel:
+            success_count = 0
+            failure_count = 0
+            for future in concurrent.futures.as_completed(future_to_task):
+                module_name = future_to_task[future]
+                try:
+                    future.result()
+                    success_count += 1
+                except Exception as e:
+                    failure_count += 1
+                    error_msg = f"Module {module_name} build failed an exception: {e}"
+                    print(error_msg)
+            executor.shutdown(cancel_futures=True, wait=False)
+            print(f"Total tasks: {len(future_to_task)}")
+            print(f"Success: {success_count}")
+            print(f"Failure: {failure_count}")
+
+    end_time = time.time()
+    print(f"Total time: {end_time - start_time:.2f} seconds")
     # Copy built kernels to output directory
     copy_built_kernels(args.out_dir, valid_modules)
     print(f"AOT kernels saved to: {args.out_dir}")
