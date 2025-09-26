@@ -1400,7 +1400,7 @@ def _flash_attn_backward(
         ret &= bias is None
         ret &= dbias is None
         ret &= dropout_p == 0.0
-        ret &= not deterministic
+        ret &= not deterministic or is_950_1block
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
