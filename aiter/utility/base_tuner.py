@@ -192,9 +192,13 @@ class TunerCommon:
         else:
             # retune shapes that are in both untune_file and tune_file
             untunedf = self.get_untuned_gemm_list(args.untune_file)
+            if "cu_num" not in untunedf.columns:
+                untunedf["cu_num"] = self.get_cu_num()
+            else:
+                untunedf = untunedf[untunedf["cu_num"] == self.get_cu_num()]
             self.untunedf = untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
-            self.untunedf["cu_num"] = self.get_cu_num()
+
             untunedf_cols = self.untunedf.columns
             mask = (
                 self.tunedf[untunedf_cols]
