@@ -1385,7 +1385,14 @@ def _flash_attn_backward(
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     # only 1 block when sk <= 256, thus deterministic
-    is_950_1block = get_gfx() == "gfx950" and seqlen_k <= 256 and hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0 and not swa
+    is_950_1block = (
+        get_gfx() == "gfx950"
+        and seqlen_k <= 256
+        and hdim_q > 64
+        and hdim_q <= 128
+        and hdim_q % 8 == 0
+        and not swa
+    )
 
     def can_impl_fmha_v3_bwd_gfx950():
         ret = get_gfx() == "gfx950"
