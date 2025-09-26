@@ -1027,7 +1027,7 @@
 
 #define LAYERNORM_PYBIND \
     m.def("layernorm2d_hip",                                      \
-          &layernorm2d,                                           \
+          &layernorm2d_hip,                                           \
           py::arg("input"),                                       \
           py::arg("weight"),                                      \
           py::arg("bias"),                                        \

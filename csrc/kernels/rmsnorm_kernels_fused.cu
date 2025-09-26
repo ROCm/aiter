@@ -36,9 +36,9 @@ template <typename DTYPE,
           int HIDDEN_SIZE,
           int WIDTH,
           int blockDim,
-          bool RESIDUAL_OUT,
-          bool DO_SMOOTH_QUANT,
-          bool NO_QUANT_OUT,
+          // bool RESIDUAL_OUT,
+          // bool DO_SMOOTH_QUANT,
+          // bool NO_QUANT_OUT,
           typename ACC_DTYPE,
           typename QUANT_DTYPE>
 __global__ void fused_add_smooth_quant_rms_norm_kernel(RMSNormParameter params)

@@ -142,7 +142,7 @@ def layernorm2d_with_add_smoothquant_asm(
 
 
 @compile_ops("module_layernorm")
-def layernorm_hip(
+def layernorm2d_hip(
     input: Tensor,
     # normalized_shape: List[int],
     weight: Optional[Tensor] = None,
