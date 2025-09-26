@@ -5,12 +5,51 @@
 # Imports.
 # ------------------------------------------------------------------------------
 
+# Python standard library
+import functools
+import json
+import os.path
+
 # Triton
 import triton
 import triton.language as tl
 
 # AITER
+from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton import arch_info
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
+
+# Kernel config.
+# ------------------------------------------------------------------------------
+
+
+@functools.lru_cache()
+def get_config(gmm_type: str, M: int, K: int, N: int, G: int) -> dict[str, int]:
+    assert gmm_type in {
+        "gmm",
+        "ptgmm",
+        "nptgmm",
+    }, f"'{gmm_type}' is an invalid GMM variant."
+    if not hasattr(get_config, "_config_dict"):
+        config_filename = os.path.join(
+            AITER_TRITON_CONFIGS_PATH, f"{arch_info.get_device()}-GMM.json"
+        )
+        assert os.path.exists(config_filename) and os.path.isfile(
+            config_filename
+        ), f"'{config_filename}' isn't an existent file."
+        with open(config_filename, "r") as config_file:
+            get_config._config_dict = json.load(config_file)
+            assert all(
+                gmm_type in get_config._config_dict
+                for gmm_type in {"gmm", "ptgmm", "nptgmm"}
+            ), "Not all GMM variants are present in the configuration file."
+    # TODO: Fine tune GMM kernels and use (M, K, N, G) shape to query the best
+    #       config in the dictionary.
+    assert (
+        "default" in get_config._config_dict[gmm_type]
+    ), "Default configuration is absent."
+    return get_config._config_dict[gmm_type]["default"]
 
 
 # Common code shared by GMM and TGMM kernels.

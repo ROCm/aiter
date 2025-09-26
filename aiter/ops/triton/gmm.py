@@ -12,9 +12,6 @@ from torch import Tensor
 # Triton
 import triton
 
-# AITER: general utility functions
-from aiter.ops.triton.utils.device_info import get_num_sms
-
 # AITER: GMM utility functions
 from aiter.ops.triton.utils.gmm_common import (
     DTYPE,
@@ -33,6 +30,7 @@ from aiter.ops.triton._triton_kernels.gmm import (
     gmm_kernel,
     tgmm_persistent_kernel,
     tgmm_non_persistent_kernel,
+    get_config,
 )
 
 
@@ -73,6 +71,7 @@ def gmm(
     group_sizes: Tensor,
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
+    config: dict[str, int] | None = None,
 ) -> Tensor:
     """
     Perform Group Matrix Multiplication (GMM): out = lhs @ rhs
@@ -111,6 +110,9 @@ def gmm(
         allocated.
         If provided then it must have shape (M, N), its data type must match preferred_element_type
         and it must be on the same device of other input tensors.
+    config : dict[str, int] or None, optional
+        Optional dictionary with kernel metaparameters. If absent, config will be queried from
+        internal tuning database.
 
     Returns
     -------
@@ -144,16 +146,25 @@ def gmm(
 
     trans_rhs, _ = get_gmm_transposition(lhs, rhs, out)
 
-    # TODO: Read best config from JSON file.
-    config = {
-        "BLOCK_SIZE_M": 256,
-        "BLOCK_SIZE_K": 64,
-        "BLOCK_SIZE_N": 256,
-        "GROUP_SIZE": 1,
-        "GRID_DIM": get_num_sms(),
-        "num_warps": 8,
-        "num_stages": 1,
-    }
+    if config is None:
+        config = get_config("gmm", M, K, N, G)
+
+    assert all(
+        key in config
+        and isinstance(config[key], int)
+        and (
+            is_power_of_2(config[key])
+            if key.startswith("BLOCK_SIZE_")
+            else config[key] > 0
+        )
+        for key in {
+            "BLOCK_SIZE_M",
+            "BLOCK_SIZE_K",
+            "BLOCK_SIZE_N",
+            "GROUP_SIZE",
+            "GRID_DIM",
+        }
+    ), "Invalid GMM kernel config."
 
     grid = _gmm_grid(
         N,
@@ -217,6 +228,7 @@ def ptgmm(
     group_sizes: Tensor,
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
+    config: dict[str, int] | None = None,
 ) -> Tensor:
     """
     Perform a Group Matrix Multiplication (GMM) variant: out = lhs @ rhs
@@ -259,6 +271,9 @@ def ptgmm(
         allocated.
         If provided then it must have shape (G, K, N), its data type must match
         preferred_element_type and it must be on the same device of other input tensors.
+    config : dict[str, int] or None, optional
+        Optional dictionary with kernel metaparameters. If absent, config will be queried from
+        internal tuning database.
 
     Returns
     -------
@@ -292,16 +307,25 @@ def ptgmm(
 
     trans_lhs, _ = get_tgmm_transposition(lhs, rhs, out)
 
-    # TODO: Read best config from JSON file.
-    config = {
-        "BLOCK_SIZE_M": 64,
-        "BLOCK_SIZE_K": 256,
-        "BLOCK_SIZE_N": 256,
-        "GROUP_SIZE": 1,
-        "GRID_DIM": get_num_sms(),
-        "num_warps": 8,
-        "num_stages": 1,
-    }
+    if config is None:
+        config = get_config("ptgmm", M, K, N, G)
+
+    assert all(
+        key in config
+        and isinstance(config[key], int)
+        and (
+            is_power_of_2(config[key])
+            if key.startswith("BLOCK_SIZE_")
+            else config[key] > 0
+        )
+        for key in {
+            "BLOCK_SIZE_M",
+            "BLOCK_SIZE_K",
+            "BLOCK_SIZE_N",
+            "GROUP_SIZE",
+            "GRID_DIM",
+        }
+    ), "Invalid PTGMM kernel config."
 
     grid = _ptgmm_grid(
         K,
@@ -364,6 +388,7 @@ def nptgmm(
     group_sizes: Tensor,
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
+    config: dict[str, int] | None = None,
 ) -> Tensor:
     """
     Perform a Group Matrix Multiplication (GMM) variant: out = lhs @ rhs
@@ -406,6 +431,9 @@ def nptgmm(
         allocated.
         If provided then it must have shape (G, K, N), its data type must match
         preferred_element_type and it must be on the same device of other input tensors.
+    config : dict[str, int] or None, optional
+        Optional dictionary with kernel metaparameters. If absent, config will be queried from
+        internal tuning database.
 
     Returns
     -------
@@ -439,15 +467,24 @@ def nptgmm(
 
     trans_lhs, _ = get_tgmm_transposition(lhs, rhs, out)
 
-    # TODO: Read best config from JSON file.
-    config = {
-        "BLOCK_SIZE_M": 64,
-        "BLOCK_SIZE_K": 256,
-        "BLOCK_SIZE_N": 256,
-        "GROUP_SIZE": 1,
-        "num_warps": 8,
-        "num_stages": 1,
-    }
+    if config is None:
+        config = get_config("nptgmm", M, K, N, G)
+
+    assert all(
+        key in config
+        and isinstance(config[key], int)
+        and (
+            is_power_of_2(config[key])
+            if key.startswith("BLOCK_SIZE_")
+            else config[key] > 0
+        )
+        for key in {
+            "BLOCK_SIZE_M",
+            "BLOCK_SIZE_K",
+            "BLOCK_SIZE_N",
+            "GROUP_SIZE",
+        }
+    ), "Invalid NPTGMM kernel config."
 
     grid = _nptgmm_grid(
         K,
