@@ -418,7 +418,7 @@ if __name__ == "__main__":
         "-d",
         type=int,
         nargs="?",
-        default=128,
+        default=64,
         help="""Dimension of query&key.
     e.g. -d 128""",
     )
@@ -426,7 +426,7 @@ if __name__ == "__main__":
         "-dv",
         type=int,
         nargs="?",
-        default=128,
+        default=64,
         help="""Dimension of value.
     e.g. -dv 128""",
     )
@@ -476,7 +476,7 @@ if __name__ == "__main__":
         "-det",
         "--deterministic",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="""Deterministic attention, default is True.
     -det or --deterministic    # enable deterministic attention
     --no-deterministic         # disable deterministic attention""",

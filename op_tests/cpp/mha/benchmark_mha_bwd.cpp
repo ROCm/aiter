@@ -501,7 +501,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                   << " MByte memory workspace allocated" << std::endl;
     }
 
-    auto fmha_args = [&]() {
+    auto mha_args = [&]() {
         assert(nhead % nhead_k == 0);
         /// NOTE: we broadcast bias from [1, 1, seqlen_q, seqlen_k] to [batch, nhead, seqlen_q,
         ///       seqlen_k] in this example, hence both the 'batch_stride_bias' &
@@ -558,7 +558,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
             }
         }();
 
-        return fmha_bwd_args{q_buf.GetDeviceBuffer(),
+        return aiter::mha_bwd_args{q_buf.GetDeviceBuffer(),
                              k_buf.GetDeviceBuffer(),
                              v_buf.GetDeviceBuffer(),
                              bias.type == bias_enum::alibi ? alibi_slope_buf.GetDeviceBuffer()
@@ -631,21 +631,22 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              static_cast<ck_tile::index_t>(mask.type),
                              p_drop,
                              p_undrop,
-                             drop_seed_offset};
+                             drop_seed_offset,
+                             data_type,
+                             mode == mode_enum::group,
+                             mask.type,
+                             bias.type,
+                             use_dbias,
+                             s_randval,
+                             deterministic,
+                             bwd_v3,
+                             v3_atomic_fp32,
+                             v3_bf16_cvt,
+                             nullptr,
+                             nullptr};
     }();
 
-    float ave_time = aiter::mha_bwd(fmha_args,
-                                    stream_config,
-                                    data_type,
-                                    mode == mode_enum::group,
-                                    mask.type,
-                                    bias.type,
-                                    use_dbias,
-                                    s_randval,
-                                    deterministic,
-                                    bwd_v3,
-                                    v3_atomic_fp32,
-                                    v3_bf16_cvt);
+    float ave_time = aiter::mha_bwd(mha_args, stream_config);
     if(ave_time < 0)
     {
         std::cout << ", not supported yet" << std::flush << std::endl;
@@ -882,18 +883,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
 
     ck_tile::stream_config stream_config_v{
         nullptr, true, 0, 0, 1, arg_parser.get_str("timer") == std::string("gpu")};
-    aiter::mha_bwd(fmha_args,
-                   stream_config_v,
-                   data_type,
-                   mode == mode_enum::group,
-                   mask.type,
-                   bias.type,
-                   use_dbias,
-                   s_randval,
-                   deterministic,
-                   bwd_v3,
-                   v3_atomic_fp32,
-                   v3_bf16_cvt);
+    aiter::mha_bwd(mha_args, stream_config_v);
 
     dq_buf.FromDevice(dq_host.data());
     dk_buf.FromDevice(dk_host.data());

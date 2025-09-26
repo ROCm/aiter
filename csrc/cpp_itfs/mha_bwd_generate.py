@@ -60,18 +60,6 @@ mha_bwd_traits get_mha_bwd_traits(int head_size_q,
 // share with varlen(group mode) api
 float mha_bwd(mha_bwd_args args,
               const ck_tile::stream_config& stream_config,
-              std::string q_dtype_str,
-              bool is_group_mode,
-              mask_enum mask_type,
-              bias_enum bias_type,
-              bool has_dbias,
-              bool is_store_randval,
-              bool deterministic,
-              bool use_ext_asm,
-              bool is_v3_atomic_fp32,
-              int how_v3_bf16_cvt,
-              const void* seqlen_q_padded,
-              const void* seqlen_k_padded,
               bool is_v3_api_check)
 {{
     int head_size_q = args.hdim_q;
@@ -80,17 +68,17 @@ float mha_bwd(mha_bwd_args args,
     // bool enable_ailib = args.alibi_slopes_ptr == nullptr;
     auto traits = get_mha_bwd_traits(head_size_q,
                                      head_size_v,
-                                     q_dtype_str,
-                                     is_group_mode,
-                                     mask_type,
-                                     bias_type,
-                                     has_dbias,
+                                     args.q_dtype_str,
+                                     args.is_group_mode,
+                                     args.mask_type_enum,
+                                     args.bias_type,
+                                     args.has_dbias,
                                      has_dropout,
-                                     is_store_randval,
-                                     deterministic,
-                                     use_ext_asm,
-                                     is_v3_atomic_fp32,
-                                     how_v3_bf16_cvt);
+                                     args.is_store_randval,
+                                     args.deterministic,
+                                     args.use_ext_asm,
+                                     args.is_v3_atomic_fp32,
+                                     args.how_v3_bf16_cvt);
     float t = -1;
     {F_dispatch}
     return t;
@@ -103,9 +91,9 @@ V2_API = "t = fmha_bwd(traits, args, stream_config);"
 
 V3_MULTI_TARGET_API = """
     if (get_gpu_arch() == "gfx942") {
-        t = gfx942::fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded, is_v3_api_check);
+        t = gfx942::fmha_bwd_v3(traits, args, stream_config, is_v3_api_check);
     } else if (get_gpu_arch() == "gfx950") {
-        t = gfx950::fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded, is_v3_api_check);
+        t = gfx950::fmha_bwd_v3(traits, args, stream_config, is_v3_api_check);
     } else {
         std::cout << "No supported GPU arch found!" << std::endl;
         return -1;
@@ -116,7 +104,7 @@ V3_MULTI_TARGET_API = """
 def get_v3_api():
     gfx_list = get_gfx_list()
     if len(gfx_list) == 1:
-        return f"t = {gfx_list[0]}::fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded, is_v3_api_check);"
+        return f"t = {gfx_list[0]}::fmha_bwd_v3(traits, args, stream_config, is_v3_api_check);"
     else:
         return V3_MULTI_TARGET_API
 

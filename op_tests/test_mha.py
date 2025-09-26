@@ -341,7 +341,7 @@ parser.add_argument(
     "-qk",
     "--d_qk",
     type=int,
-    default=128,
+    default=64,
     help="""Dimension of query and key. Default is 128.
     e.g.: -qk 256""",
 )
@@ -349,7 +349,7 @@ parser.add_argument(
     "-v",
     "--d_v",
     type=int,
-    default=128,
+    default=64,
     help="""Dimension of value. Default is 128.
     e.g.: -v 256""",
 )
