@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import os
+
+import pandas as pd
+import pytest
 import torch
+
 import aiter
 from aiter import dtypes
+from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
     attention_ref,
     attn_bias_from_alibi_slopes,
     ck_randval_to_dropout_mask,
     convert_flash_attn_S_to_softmax,
 )
-from aiter.test_common import benchmark, run_perftest
-import pytest
-import argparse
-import os
-import pandas as pd
 
 results = []
 
@@ -126,11 +128,25 @@ def run_ck(
     if dout == None:
         return out, dropout_mask, None, None, None, None, us_fwd
     elif bias is not None:
-        dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
+        (dq, dk, dv, dbias), us_bwd = run_perftest(
+            torch.autograd.grad,
+            out,
+            (q, k, v, bias),
+            dout,
+            retain_graph=True,
+            num_rotate_args=1,
+        )
         return out, dropout_mask, dq, dk, dv, dbias, us_fwd
     else:
-        dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, dropout_mask, dq, dk, dv, None, us_fwd
+        (dq, dk, dv), us_bwd = run_perftest(
+            torch.autograd.grad,
+            out,
+            (q, k, v),
+            dout,
+            retain_graph=True,
+            num_rotate_args=1,
+        )
+        return out, dropout_mask, dq, dk, dv, None, (us_fwd, us_bwd)
 
 
 @benchmark()
@@ -199,7 +215,7 @@ def run_flash_attn_output(
         requires_grad=True,
     )
 
-    out, dropout_mask, dq, dk, dv, dbias, us_fwd = run_ck(
+    out, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd) = run_ck(
         q,
         k,
         v,
@@ -269,6 +285,7 @@ def run_flash_attn_output(
         assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
     ret = {}
     ret["fwd_us"] = us_fwd
+    ret["bwd_us"] = us_bwd
     fwd_flop = nheads * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
     dtype_bytes = torch.finfo(dtype).bits // 8
     fwd_num_bytes = (
