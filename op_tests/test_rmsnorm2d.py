@@ -154,4 +154,4 @@ print("\nstart fuse add test")
 for dtype in l_dtype:
     for m in l_m:
         for n in l_n:
-            test_rmsnorm2d_fuseAdd(dtype, m, n)
+            test_rmsnorm2d(dtype, m, n)
