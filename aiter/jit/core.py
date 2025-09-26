@@ -1,27 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import re
-import os
-import sys
-import shutil
-import time
-import types
-import importlib
 import functools
-import traceback
-from typing import List, Optional, Callable, Any
-import logging
+import importlib
 import json
+import logging
 import multiprocessing
-from packaging.version import parse, Version
+import os
+import re
+import shutil
+import sys
+import time
+import traceback
+import types
+from typing import Any, Callable, List, Optional
+
+from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from torch_guard import torch_compile_guard, is_torch_equal_or_newer  # noqa: E402
+from chip_info import get_gfx
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
-from chip_info import get_gfx
+from torch_guard import is_torch_equal_or_newer, torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
@@ -174,7 +175,7 @@ def check_and_set_ninja_worker():
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
     max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
     max_jobs_env = os.environ.get("MAX_JOBS")
-    if max_jobs_env != None:
+    if max_jobs_env is not None:
         try:
             max_processes = int(max_jobs_env)
             # too large value
@@ -240,6 +241,7 @@ def get_module_custom_op(md_name: str) -> None:
             __mds[md_name] = importlib.import_module(md_name)
         else:
             __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+        logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
     return
 
 
@@ -532,7 +534,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
 
                 return all_ops_list, d_all_ops
             # no find opt_name in json.
-            elif data.get(ops_name) == None:
+            elif data.get(ops_name) is None:
                 logger.warning(
                     "Not found this operator ("
                     + ops_name
@@ -597,8 +599,9 @@ SPECIAL_OPS_MUTATES_ARGS = {}
 
 def generate_schema(func) -> str:
     import inspect
+    from typing import List, Optional, Union, get_args, get_origin
+
     import torch
-    from typing import Optional, Union, List, get_origin, get_args
 
     sig = inspect.signature(func)
     parameters = []
@@ -783,52 +786,52 @@ def compile_ops(
                 op = getattr(module, loadName)
             else:
                 return None
-            activation_index = 0
-            quant_index = 0
-            activation_list = [
-                "fmoe_g1u1",
-                "fmoe_int8_g1u0",
-                "fmoe_g1u1_tkw1",
-                "fmoe_fp8_blockscale_g1u1",
-                "moe_stage1_g1u1",
-            ]
-            quant_list = ["moe_stage1_g1u1"]
 
             def check_args():
                 get_asm_dir()
                 import inspect
-                import typing
                 import re
+                import typing
+
                 import torch
+
+                enum_types = ["ActivationType", "QuantType"]
 
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
+                    for el in enum_types:
+                        doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {
                         "List": List,
                         "Optional": Optional,
                         "torch": torch,
+                        "typing": typing,
                     }
-                    exec(f"from aiter import*\ndef {doc_str}: pass", namespace)
+                    exec(
+                        f"from aiter import*\ndef {doc_str}: pass",
+                        namespace,
+                    )
                     foo = namespace[doc_str.split("(")[0]]
                     sig = inspect.signature(foo)
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
-                    if loadName in activation_list:
-                        return True
-                    if loadName in quant_list:
-                        return True
                     callargs = inspect.getcallargs(func, *args, **kwargs)
                     for el, arg in callargs.items():
                         expected_type = ann[el]
+                        got_type = type(arg)
                         origin = typing.get_origin(expected_type)
                         sub_t = typing.get_args(expected_type)
 
                         if origin is None:
-                            if not isinstance(arg, expected_type):
+                            if not isinstance(arg, expected_type) and not (
+                                # aiter_enum can be int
+                                any(el in str(expected_type) for el in enum_types)
+                                and isinstance(arg, int)
+                            ):
                                 raise TypeError(
-                                    f"{el} needs to be {expected_type} but got {type(arg)}"
+                                    f"{loadName}: {el} needs to be {expected_type} but got {got_type}"
                                 )
                         elif origin is list:
                             if (
@@ -836,12 +839,12 @@ def compile_ops(
                                 # or not all(isinstance(i, sub_t) for i in arg)
                             ):
                                 raise TypeError(
-                                    f"{el} needs to be List[{sub_t}] but got {arg}"
+                                    f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                 )
-                        elif origin is typing.Union:
+                        elif origin is typing.Union or origin is types.UnionType:
                             if arg is not None and not isinstance(arg, sub_t):
                                 raise TypeError(
-                                    f"{el} needs to be Optional[{sub_t}] but got {arg}"
+                                    f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
                                 )
                         else:
                             raise TypeError(f"Unsupported type: {expected_type}")
@@ -863,42 +866,16 @@ def compile_ops(
 
                 log_args(func, *args, **kwargs)
 
-            import inspect
-
-            sig = inspect.signature(func)
-            params = list(sig.parameters.keys())
-            if loadName in activation_list:
-                activation_index = params.index("activation")
-                args_list = list(args)
-                from aiter import ActivationType, QuantType
-
-                if len(args_list) > activation_index and isinstance(
-                    args_list[activation_index], int
-                ):
-                    args_list[activation_index] = ActivationType(
-                        args_list[activation_index]
-                    )
-                    args = tuple(args_list)
-
-            if loadName in quant_list:
-                quant_index = params.index("quant_type")
-                args_list = list(args)
-                from aiter import ActivationType, QuantType
-
-                if len(args_list) > quant_index and isinstance(
-                    args_list[quant_index], int
-                ):
-                    args_list[quant_index] = QuantType(args_list[quant_index])
-                    args = tuple(args_list)
             return op(*args, **kwargs)
 
         if func.__name__ in NONE_WRAPPED_OP:
             return wrapper
 
         def wrapper_register(func):
+            import inspect
+
             import torch
             import torch.library
-            import inspect
             from torch.library import Library
 
             global aiter_lib
@@ -915,14 +892,23 @@ def compile_ops(
                     # for pytorch 2.4
                     import torch._custom_op.impl
 
+                    # torch 2.4 not support mutates "unknown" for inplace all param
+                    if mutates_args == "unknown":
+                        mutates_args = []
+
+                        for param_name, param in sig.parameters.items():
+                            if param.annotation == torch.Tensor:
+                                mutates_args.append(param_name)
+
                     sig = torch._custom_op.impl.infer_schema(func, mutates_args)
                 schema = f"{sig}"
             return schema
 
         schema = wrapper_register(func)
 
-        import torch
         import inspect
+
+        import torch
 
         sig = inspect.signature(func)
         input_is_tensor = False
@@ -986,8 +972,8 @@ def compile_ops(
         custom_func = outer_wrapper
         fake_func = abstract_impl
         if not input_is_tensor:
-            custom_func = abstract_impl_dummy
-            fake_func = outer_wrapper_dummy
+            custom_func = outer_wrapper_dummy
+            fake_func = abstract_impl_dummy
 
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
             if is_torch_equal_or_newer("2.8.0"):
