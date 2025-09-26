@@ -36,7 +36,7 @@ jobs:
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Download the vLLM nightly image
+      - name: Download the vLLM base image
         run: |
           docker pull ${{ env.BASE_IMAGE }}
       
@@ -47,6 +47,8 @@ jobs:
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
 
           RUN git clone ${{ env.GITHUB_REPO_URL}} /aiter && \\
               cd /aiter && \\
@@ -79,6 +81,7 @@ jobs:
     runs-on: aiter-8gpu-runner
     needs: build_vllm_image
     strategy:
+      fail-fast: false
       matrix:
         model:
           - 'mistralai/Mixtral-8x7B-Instruct-v0.1'
