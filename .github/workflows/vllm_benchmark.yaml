@@ -55,6 +55,7 @@ jobs:
               git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
               git submodule sync && git submodule update --init --recursive && \\
               python3 setup.py develop
+          RUN cd /aiter && ls -all && ls -all .eggs
 
           RUN pip show pybind11
 
