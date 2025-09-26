@@ -70,6 +70,13 @@ def run_asm(input, weight, bias, eps, residual=None):
     return output, residual_out
 
 
+class ComputeGBps:
+    def __init__(self, total_bytes):
+        self.total_bytes = total_bytes
+    def __call__(self, time_us):
+        return self.total_bytes / time_us / 1000
+
+
 def test_layernorm2d(dtype, m, n):
     dim = (m, n)
     input = torch.randn(dim, dtype=dtype, device="cuda")
@@ -79,8 +86,10 @@ def test_layernorm2d(dtype, m, n):
     q, k, v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
     input = k
     (a, *_), avg_a = run_torch(input, weight, bias, 1e-5)
+    cgbps = ComputeGBps(input.nbytes + weight.nbytes + bias.nbytes + a.nbytes)
     (b, *_), avg_b = run_ck(input, weight, bias, 1e-5)
     msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    msg += f"\n[throughput] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {cgbps(avg_a):<8.2f} GBps, ck avg: {cgbps(avg_b):<8.2f} GBps"
     checkAllclose(a, b, msg=msg)
 
 
