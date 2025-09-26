@@ -631,9 +631,12 @@ def input_helper_e2e(
     if fp8_w8a8:
         w1, _, w1_scale = quantize_fp8(w1, dim=(0,), block_shape=block_shape)
         w2, _, w2_scale = quantize_fp8(w2, dim=(0,), block_shape=block_shape)
+        # w1_scale = w1_scale.to(torch.uint8)
+        # w2_scale = w2_scale.to(torch.uint8)
         if block_shape is not None:
             block_shape_k = block_shape[1]
             a, _, a_scale = quantize_fp8_a(a, block_shape_k)
+            # a_scale = a_scale.to(torch.uint8)
 
     if int8_w8a16:
         w1, _, w1_scale = quantize_int8(w1, dim=(0,))

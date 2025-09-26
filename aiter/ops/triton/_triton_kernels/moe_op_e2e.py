@@ -67,7 +67,7 @@ def e2e_moe_kernel(
     dtype: tl.constexpr,
     compute_dtype: tl.constexpr,
     out_dtype: tl.constexpr,
-    IS_BLOCKSCALEQ: tl.constexpr = True
+    IS_BLOCKSCALEQ: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -126,12 +126,6 @@ def e2e_moe_kernel(
     else:
         return
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
 
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
@@ -142,6 +136,9 @@ def e2e_moe_kernel(
 
     offs_k1 = tl.arange(0, BLOCK_SIZE_K1)
     offs_k2 = tl.arange(0, BLOCK_SIZE_K2)
+
+    offs_sk1 = tl.arange(0, BLOCK_SIZE_K1) // group_k
+    offs_sk2 = tl.arange(0, BLOCK_SIZE_K2) // group_k
 
     BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2 # TODO: quarantee that BLOCK_SIZE_HALF*2=BLOCK_SIZE_N
     offs_i0 = tl.arange(0, BLOCK_SIZE_HALF)
@@ -177,22 +174,19 @@ def e2e_moe_kernel(
     # IS_BLOCKSCALEQ: tl.constexpr = (group_k > 0) & (group_n > 0)
 
     if use_fp8_w8a8:
-        if IS_BLOCKSCALEQ:
-            a_scale_ptrs = A_scale + (offs_token[:, None] // top_k) * stride_asm
-            offs_w1_i0_sn = i0 // group_n
-            offs_w1_i1_sn = i1 // group_n
+        a_scale_ptrs = A_scale + (offs_token[:, None] // top_k * stride_asm) 
+        offs_w1_i0_sn = i0 // group_n
+        offs_w1_i1_sn = i1 // group_n
 
-            w1_i0_scale_ptrs = (
-                W1_scale + off_experts * stride_w1se + offs_w1_i0_sn[None, :] * stride_w1sn
-            )
-            w1_i1_scale_ptrs = (
-                W1_scale + off_experts * stride_w1se + offs_w1_i1_sn[None, :] * stride_w1sn
-            )
-        else:
-            a_scale = tl.load(A_scale)
-            w1_scale = tl.load(W1_scale + off_experts)
+        w1_i0_scale_ptrs = (
+            W1_scale + off_experts * stride_w1se + offs_w1_i0_sn[None, :] * stride_w1sn 
+        )
+        w1_i1_scale_ptrs = (
+            W1_scale + off_experts * stride_w1se + offs_w1_i1_sn[None, :] * stride_w1sn 
+        )
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K1)):
+    num_k1 = tl.cdiv(K, BLOCK_SIZE_K1)
+    for k in tl.range(0, num_k1): 
         # Masking ensures we don't load from invalid tokens or indices
         if EVEN_K:
             a = tl.load(a_ptrs, mask=(token_mask[:, None]), other=0.0)
@@ -216,52 +210,47 @@ def e2e_moe_kernel(
             )
         
         if use_fp8_w8a8:
-            if IS_BLOCKSCALEQ:
-                k_start = k * BLOCK_SIZE_K1
-                offs_ks = (k_start + offs_k1) // group_k
-                a_scale = tl.load(
-                    a_scale_ptrs + offs_ks[None, :] * stride_ask, mask=token_mask[:, None], other=0.0
-                )
-                w1_i0_scale = tl.load(w1_i0_scale_ptrs + offs_ks[:, None] * stride_w1sk)
-                w1_i1_scale = tl.load(w1_i1_scale_ptrs + offs_ks[:, None] * stride_w1sk)
-
-                silu_acc += tl.dot_scaled(a, a_scale, "e4m3", w1_i0, w1_i0_scale, "e4m3")
-                mul_acc += tl.dot_scaled(a, a_scale, "e4m3", w1_i1, w1_i1_scale, "e4m3")
-                # silu_acc += tl.dot(a, w1_i0) * a_scale[:, None] * w1_i0_scale[None, :]
-                # mul_acc += tl.dot(a, w1_i1) * a_scale[:, None] * w1_i1_scale[None, :]
-            else:
-                mul_acc = tl.dot(a, w1_i1, acc=mul_acc)
-                silu_acc = tl.dot(a, w1_i0, acc=silu_acc)
-        else:        
+            start_k = k * BLOCK_SIZE_K1 // group_k
+            w1_i0_scale = tl.load(w1_i0_scale_ptrs + start_k * stride_w1sk)
+            w1_i1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk)
+            a_scale = tl.load(a_scale_ptrs + start_k * stride_ask, mask=token_mask[:, None], other=0.0)
+            silu_acc_scales = a_scale * w1_i0_scale
+            mul_acc_scales = a_scale * w1_i1_scale
+            
+            silu_acc_dot = tl.dot(a, w1_i0)
+            silu_acc_add = silu_acc_dot * silu_acc_scales
+            tl.static_print("silu_acc_dot", silu_acc_dot)
+            tl.static_print("silu_acc_scales", silu_acc_scales)
+            tl.static_print("silu_acc_add", silu_acc_add)
+            
+            silu_acc += silu_acc_dot * silu_acc_scales
+            mul_acc += tl.dot(a, w1_i1) * mul_acc_scales
+        else:
             mul_acc = tl.dot(a, w1_i1, acc=mul_acc)
             silu_acc = tl.dot(a, w1_i0, acc=silu_acc)
+     
 
         a_ptrs += BLOCK_SIZE_K1 * stride_ak
         w1_ptrs_i0 += BLOCK_SIZE_K1 * stride_w1k
         w1_ptrs_i1 += BLOCK_SIZE_K1 * stride_w1k
+        if use_fp8_w8a8:
+            w1_i0_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_w1sk
+            w1_i1_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_w1sk
+            a_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_ask
     
-    if use_fp8_w8a8:
-        if IS_BLOCKSCALEQ:
-            silu_acc = silu_acc.to(compute_dtype)
-            mul_acc = mul_acc.to(compute_dtype)
-        else:
-            silu_acc = (silu_acc * a_scale * w1_scale).to(compute_dtype)
-            mul_acc = (mul_acc * a_scale * w1_scale).to(compute_dtype)
-    else:
-        silu_acc = silu_acc.to(compute_dtype)
-        mul_acc = mul_acc.to(compute_dtype)
+    silu_acc = silu_acc.to(compute_dtype)
+    mul_acc = mul_acc.to(compute_dtype)
 
 
     silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
     acc = silu_acc * mul_acc
 
-    # TODO online quantization for acc
     if use_fp8_w8a8:
-        acc_scale = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_HALF), 1, dtype=tl.float32)
+        acc = acc.to(tl.bfloat16)
+    else:
+        acc = acc.to(W2.type.element_ty)
     
-    acc = acc.to(dtype)
-    
-    offs_w2n = tl.arange(0, BLOCK_SIZE_N // 2) + pid_n * (BLOCK_SIZE_N // 2)
+    offs_w2n = tl.arange(0, BLOCK_SIZE_HALF) + pid_n * (BLOCK_SIZE_HALF)
 
     w2_ptrs = (
         W2
@@ -270,18 +259,16 @@ def e2e_moe_kernel(
     )
 
     if use_fp8_w8a8:
-        if IS_BLOCKSCALEQ:
-            offs_w2_sn = offs_w2n // group_n
-            w2_scale_ptrs = (
-                W2_scale + off_experts * stride_w2se + offs_w2_sn[:, None] * stride_w2sn
-            )
-        else:
-            w2_scale = tl.load(W2_scale + off_experts)
+        offs_w2_sn = offs_w2n // group_n
+        w2_scale_ptrs = (
+            W2_scale + off_experts * stride_w2se + offs_w2_sn[:, None] * stride_w2sn + offs_sk2[None,:] * stride_w2sk
+        )
+
     
     out_ptrs = Out + stride_cm * offs_token[:, None] + offs_k2[None, :]
 
     num_k = tl.cdiv(K, BLOCK_SIZE_K2)
-    for k in tl.range(0, num_k, num_stages=atomic_num_stages):
+    for k in tl.range(0, num_k):
 
         if EVEN_K:
             w2 = tl.load(
@@ -300,13 +287,10 @@ def e2e_moe_kernel(
             )
 
         if use_fp8_w8a8:
-            if IS_BLOCKSCALEQ:
-                k_start = k * BLOCK_SIZE_K2
-                offs_ks = (k_start + offs_k2) // group_k
-                w2_scale = tl.load(w2_scale_ptrs + offs_ks * stride_w2sk)
-                out = tl.dot_scaled(acc, acc_scale, "e4m3", w2, w2_scale, "e4m3")
-            else:
-                out = tl.dot(acc, w2)
+            w2_scale = tl.load(w2_scale_ptrs).to(tl.bfloat16)
+            w2 = (w2 * w2_scale).to(tl.bfloat16)
+            out = tl.dot(acc, w2)
+            w2_scale_ptrs += BLOCK_SIZE_K2 // group_k * stride_w2sk
         else:
             out = tl.dot(acc, w2)
 
@@ -316,13 +300,8 @@ def e2e_moe_kernel(
             )
             out = out * moe_weight[:, None]
 
-        if use_fp8_w8a8:
-            if IS_BLOCKSCALEQ:
-                out = out.to(out_dtype)
-            else:
-                out = (out * acc_scale * w2_scale).to(out_dtype)
-        else:
-            out = out.to(out_dtype)
+
+        out = out.to(out_dtype)
 
 
         if EVEN_K:
@@ -343,7 +322,6 @@ def e2e_moe_kernel(
                 sem="relaxed",
                 scope="cta",
             )
-            
 
 
 @triton.jit

@@ -81,9 +81,6 @@ def e2e_moe(
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
-    print("use_fp8_w8a8",use_fp8_w8a8)
-    print("a_scale",A_scale)
-
     if use_fp8_w8a8:
         assert W1_scale is not None
         assert W2_scale is not None
@@ -232,6 +229,7 @@ def e2e_moe(
             dtype=torch_to_triton_dtype[dtype], # input dtype, mma dtype
             compute_dtype=torch_to_triton_dtype[torch.float32], # activation dtype
             out_dtype=torch_to_triton_dtype[out_dtype],
+            IS_BLOCKSCALEQ=use_fp8_w8a8 and (block_shape is not None),
             **config,
         )
 
