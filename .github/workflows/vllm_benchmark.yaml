@@ -47,7 +47,6 @@ jobs:
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
-          RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
           RUN git clone ${{ env.GITHUB_REPO_URL}} /aiter && \\
@@ -55,6 +54,8 @@ jobs:
               git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
               git submodule sync && git submodule update --init --recursive && \\
               python3 setup.py develop
+
+          RUN pip show pybind11
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
@@ -129,7 +130,7 @@ jobs:
               --ulimit core=0:0 --ulimit memlock=-1:-1 --ulimit stack=67108864 --cap-add=SYS_PTRACE \
               --network=host --security-opt seccomp=unconfined --shm-size=16G \
               -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} -e VLLM_ROCM_USE_AITER=1 \
-              rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} python -m vllm.entrypoints.cli.main bench latency \
+              rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} pip show pybind11 || python -m vllm.entrypoints.cli.main bench latency \
               --model "${{ matrix.model }}" \
               --batch-size 123 --input-len 456 --output-len 78 \
               --num-iters-warmup 3 --num-iters 10 \
