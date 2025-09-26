@@ -681,7 +681,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             for(size_t i = 0; i < vec_size; i++)
             {
                 gating[i] = ck_tile::type_convert<float>(tmp[i]);
-                gating[i] = 1.0f / (1.0f + expf(-gating[i]));
+                gating[i] = __builtin_amdgcn_rcpf(1.0f + expf(-gating[i]));
                 if constexpr(isBiased)
                 {
                     tmp2_f32[i] = ck_tile::type_convert<float>(tmp2[i]);
@@ -690,9 +690,6 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                 gating[i] = ::isnan(gating[i]) ? -INFINITY : gating[i];
             }
             scores_vec[e] = gating;
-            // if constexpr (isBiased)  {
-            //     reinterpret_cast<f32vec*>(bias)[e] = tmp2_f32;
-            // }
         }
         __syncthreads();
     }
@@ -750,15 +747,15 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                 return 0;
         }();
         const int lane_id = threadIdx.x % THREAD_PER_GRP;
-        for(int g = threadIdx.x / THREAD_PER_GRP; g < NUM_GRP; g += blockDim.x / THREAD_PER_GRP)
+        int g = threadIdx.x / THREAD_PER_GRP;
         {
             float max1 = -INFINITY, max2 = -INFINITY;
             const int start = g * experts_per_group;
             const int end   = experts_per_group / vec_size;
             f32vec* sc      = reinterpret_cast<f32vec*>(scores + start);
 
-            for(int e = lane_id; e < end; e += THREAD_PER_GRP)
             {
+                int e = lane_id;
                 auto s_vec = sc[e];
                 for(int j = 0; j < vec_size; j++)
                 {
@@ -976,7 +973,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             if(need_renorm)
             {
                 sum    = multithread_reduce(topk_v, [&](auto x_, auto y_) { return x_ + y_; }, 8);
-                topk_v = topk_v * routed_scaling_factor / sum;
+                topk_v = topk_v *  routed_scaling_factor * __builtin_amdgcn_rcpf(sum);
             }
             topk_weights[token_idx * stride_tk + threadIdx.x] = topk_v;
             topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_i;
