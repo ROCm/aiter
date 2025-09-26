@@ -112,63 +112,53 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
 
-            if tunedf[
-                (tunedf["B"] == B)
-                & (tunedf["M"] == M)
-                & (tunedf["N"] == N)
-                & (tunedf["K"] == K)
-                & (tunedf["cu_num"] == cu_num)
-            ].empty:
-                kernels_num = len(kernels_list)
+            kernels_num = len(kernels_list)
 
-                print(
-                    f"******************tune B:{B} X M:{M} X N:{N} X K{K}*******************"
-                )
-                # kernelId, splitK, time = tune_batched_gemm(B, M, N, K, useSplitK)
-                total_kernel_nums = 0
-                for i in range(kernels_num):
-                    kernel = kernels_list[i]
-                    maxsplitK = (
-                        aiter.compute_batched_gemm_SplitK(
-                            B,
-                            M,
-                            N,
-                            K,
-                            kernel.MPerBLOCK,
-                            kernel.NPerBLOCK,
-                            kernel.KPerBLOCK,
-                        )
-                        if useSplitK
-                        else 0
+            print(
+                f"******************tune B:{B} X M:{M} X N:{N} X K{K}*******************"
+            )
+            # kernelId, splitK, time = tune_batched_gemm(B, M, N, K, useSplitK)
+            total_kernel_nums = 0
+            for i in range(kernels_num):
+                kernel = kernels_list[i]
+                maxsplitK = (
+                    aiter.compute_batched_gemm_SplitK(
+                        B,
+                        M,
+                        N,
+                        K,
+                        kernel.MPerBLOCK,
+                        kernel.NPerBLOCK,
+                        kernel.KPerBLOCK,
                     )
-                    for splitK in range(maxsplitK + 1):
-                        info = ((cu_num, B, M, N, K), i, splitK, "")
-                        task.append(
+                    if useSplitK
+                    else 0
+                )
+                for splitK in range(maxsplitK + 1):
+                    info = ((cu_num, B, M, N, K), i, splitK, "")
+                    task.append(
+                        (
+                            info,
+                            generate_data,
+                            (B, M, N, K),
+                            kernel_instance_test,
                             (
-                                info,
-                                generate_data,
-                                (B, M, N, K),
-                                kernel_instance_test,
-                                (
-                                    [0, 1, 2, 3, 4],
-                                    i,
-                                    splitK,
-                                ),  # [0, 1, 2, 3, 4] is index of paramters for kernel_instance_test in generate_data
-                                {},
-                                run_torch,
-                                ([0, 1, 2, 3],),
-                                {},
-                                None,
-                                1e-2,
-                                1e-2,
-                            )
+                                [0, 1, 2, 3, 4],
+                                i,
+                                splitK,
+                            ),  # [0, 1, 2, 3, 4] is index of paramters for kernel_instance_test in generate_data
+                            {},
+                            run_torch,
+                            ([0, 1, 2, 3],),
+                            {},
+                            None,
+                            1e-2,
+                            1e-2,
                         )
-                        total_kernel_nums = total_kernel_nums + 1
+                    )
+                    total_kernel_nums = total_kernel_nums + 1
 
-                tasks_data.append((total_kernel_nums, ()))
-            else:
-                print(f"B:{B}, M:{M}, N:{N}, K{K} is in tuned batched_gemm, skip!!!")
-                print()
+            tasks_data.append((total_kernel_nums, ()))
         ret = []
         if task:
             shape_grouped = False
