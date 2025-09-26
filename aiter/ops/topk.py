@@ -61,9 +61,9 @@ def biased_grouped_topk(
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
 ):
-    # token_num = gating_output.shape[0]
-    # cu_num = get_cu_num()
-    if True:  # token_num <= cu_num * 212:
+    token_num = gating_output.shape[0]
+    cu_num = get_cu_num()
+    if token_num <= cu_num * 212:
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
