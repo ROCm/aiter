@@ -47,7 +47,7 @@ jobs:
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
-          RUN pip show pybind11
+          RUN pip pybind11
 
           RUN git clone ${{ env.GITHUB_REPO_URL}} /aiter && \\
               cd /aiter && \\
@@ -55,7 +55,7 @@ jobs:
               git submodule sync && git submodule update --init --recursive && \\
               python3 setup.py develop
 
-          RUN pip show pybind11
+          RUN pip pybind11
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
