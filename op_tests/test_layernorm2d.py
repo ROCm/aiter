@@ -38,7 +38,8 @@ def run_torch(input, weight, bias, eps, residual=None, x_bias=None):
 def run_ck(input, weight, bias, eps, residual=None, x_bias=None):
     if residual is None:
         residual_out = None
-        output = aiter.layer_norm(input, weight, bias, eps, x_bias)
+        # output = aiter.layer_norm(input, weight, bias, eps, x_bias)
+        output = aiter.layernorm_hip(input, weight, bias, eps, x_bias)
         # output = torch.empty_like(input)
         # aiter.layernorm2d_fwd(
         #     output,
@@ -146,8 +147,9 @@ else:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_layernorm2d(dtype, m, n)
-for dtype in l_dtype:
-    test_layernorm2d_fuseAdd(dtype, args.m, args.n)
+test_layernorm2d(dtypes.bf16, 32*1024, 8192)
+# for dtype in l_dtype:
+#     test_layernorm2d_fuseAdd(dtype, args.m, args.n)
 
 
 # print('\nstart fuse add test')

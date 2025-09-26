@@ -1023,3 +1023,13 @@
           py::arg("epsilon"),                                                                      \
           py::arg("out_before_quant")            = std::nullopt,                                   \
           py::arg("use_model_sensitive_rmsnorm") = 0);
+
+
+#define LAYERNORM_PYBIND \
+    m.def("layernorm2d_hip",                                      \
+          &layernorm2d,                                           \
+          py::arg("input"),                                       \
+          py::arg("weight"),                                      \
+          py::arg("bias"),                                        \
+          py::arg("epsilon") = 1e-5f,                             \
+          py::arg("x_bias")  = std::nullopt);                      \
