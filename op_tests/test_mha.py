@@ -10,9 +10,13 @@ from aiter.test_mha_common import (
     ck_randval_to_dropout_mask,
     convert_flash_attn_S_to_softmax,
 )
+from aiter.test_common import benchmark, run_perftest
 import pytest
 import argparse
 import os
+import pandas as pd
+
+results = []
 
 
 def run_torch(
@@ -83,18 +87,20 @@ def run_ck(
     return_lse=True,
     return_attn_probs=False,
 ):
-    out, _, S_dmask = aiter.flash_attn_func(
+    (out, _, S_dmask), us_fwd = run_perftest(
+        aiter.flash_attn_func,
         q,
         k,
         v,
         dropout_p,
-        causal=causal,
-        window_size=window_size,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        return_lse=return_lse,
-        return_attn_probs=return_attn_probs,
+        None,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        deterministic,
+        return_lse,
+        return_attn_probs,
     )
 
     if dropout_p > 0.0:
@@ -117,56 +123,18 @@ def run_ck(
     else:
         dropout_mask = None
 
-    if dout is None:
-        return out, dropout_mask
+    if dout == None:
+        return out, dropout_mask, None, None, None, None, us_fwd
     elif bias is not None:
         dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
-        return out, dropout_mask, dq, dk, dv, dbias
+        return out, dropout_mask, dq, dk, dv, dbias, us_fwd
     else:
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, dropout_mask, dq, dk, dv, None
+        return out, dropout_mask, dq, dk, dv, None, us_fwd
 
 
-@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("deterministic", [False])
-@pytest.mark.parametrize("bias_type", ["no"])
-@pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("dropout_p", [0.0])
-@pytest.mark.parametrize("batch_size", [5])
-@pytest.mark.parametrize("nheads", [6])
-@pytest.mark.parametrize(
-    "d,d_v",
-    [
-        (32, 32),
-        (40, 40),
-        (59, 59),
-        (64, 64),
-        (96, 96),
-        (111, 111),
-        (128, 128),
-        (160, 160),
-        (192, 192),
-    ],
-)
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        (113, 203),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (512, 256),
-        (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (2048, 2048),
-        (512, 512),
-    ],
-)
-def test_flash_attn_output(
+@benchmark()
+def run_flash_attn_output(
     batch_size,
     nheads,
     seqlen_q,
@@ -231,7 +199,7 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
-    out, dropout_mask, dq, dk, dv, dbias = run_ck(
+    out, dropout_mask, dq, dk, dv, dbias, us_fwd = run_ck(
         q,
         k,
         v,
@@ -299,6 +267,99 @@ def test_flash_attn_output(
         print(f"dBias Pytorch max diff: {(dbias_pt - dbias_ref).abs().max().item()}")
         dbias_tol = max(10 * (dbias_pt - dbias_ref).abs().max().item(), 0.01)
         assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
+    ret = {}
+    ret["fwd_us"] = us_fwd
+    fwd_flop = nheads * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+    dtype_bytes = torch.finfo(dtype).bits // 8
+    fwd_num_bytes = (
+        dtype_bytes * seqlen_q * d
+        + dtype_bytes * seqlen_k * d
+        + dtype_bytes * seqlen_k * d_v
+        + dtype_bytes * seqlen_q * d_v
+    )
+    ret["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
+    ret["fwd_gb_per_sec"] = (fwd_num_bytes) / 1.0e3 / us_fwd
+    return ret
+
+
+@pytest.fixture(scope="session")
+def result_collector():
+    collected = []
+    yield collected
+    df = pd.DataFrame(collected)
+    aiter.logger.info(f"mha summary:\n{df}")
+
+
+@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("bias_type", ["no"])
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dropout_p", [0.0])
+@pytest.mark.parametrize("batch_size", [5])
+@pytest.mark.parametrize("nheads", [6])
+@pytest.mark.parametrize(
+    "d,d_v",
+    [
+        (32, 32),
+        (40, 40),
+        (59, 59),
+        (64, 64),
+        (111, 111),
+        (128, 128),
+        (160, 160),
+        (192, 192),
+    ],
+)
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
+        (512, 512),
+    ],
+)
+def test_flash_attn_output(
+    batch_size,
+    nheads,
+    seqlen_q,
+    seqlen_k,
+    d,
+    d_v,
+    dropout_p,
+    causal,
+    local,
+    bias_type,
+    deterministic,
+    mha_type,
+    dtype,
+    result_collector,
+):
+    result = run_flash_attn_output(
+        batch_size,
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        d,
+        d_v,
+        dropout_p,
+        causal,
+        local,
+        bias_type,
+        deterministic,
+        mha_type,
+        dtype,
+    )
+    result_collector.append(result)
 
 
 parser = argparse.ArgumentParser(
@@ -416,7 +477,7 @@ parser.add_argument(
 if __name__ == "__main__":
     args = parser.parse_args()
     dtype = dtypes.d_dtypes[args.dtype]
-    test_flash_attn_output(
+    ret = run_flash_attn_output(
         args.batch_size,
         args.nheads,
         args.seqlen_q,
@@ -431,9 +492,11 @@ if __name__ == "__main__":
         args.mha_type,
         dtype,
     )
+    df = pd.DataFrame([ret])
+    aiter.logger.info(f"mha:\n{df}")
 
     if args.pytest:
         this_file = os.path.realpath(__file__)
         print(this_file)
-        ret = pytest.main([this_file])
+        ret = pytest.main(["-s", this_file])
         assert ret == 0
