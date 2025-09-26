@@ -58,6 +58,7 @@ jobs:
           RUN cd /aiter && ls -all && ls -all .eggs
 
           ENV PYTHONPATH=/aiter/.eggs:$PYTHONPATH
+          RUN echo $PYTHONPATH
 
           RUN pip show pybind11
 
