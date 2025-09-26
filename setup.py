@@ -11,11 +11,6 @@ from setuptools import Distribution, setup
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/aiter/")
-from jit import core
-from jit.utils.cpp_extension import (
-    BuildExtension,
-    IS_HIP_EXTENSION,
-)
 from concurrent.futures import ThreadPoolExecutor
 
 from jit import core
@@ -232,7 +227,7 @@ setup(
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     install_requires=[
-        "pybind11>=2.13",
+        "pybind11>=3.0.1",
         # "ninja",
         "pandas",
         "einops",
