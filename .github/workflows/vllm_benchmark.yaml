@@ -57,6 +57,8 @@ jobs:
               python3 setup.py develop
           RUN cd /aiter && ls -all && ls -all .eggs
 
+          ENV PYTHONPATH=/aiter/.eggs:$PYTHONPATH
+
           RUN pip show pybind11
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
