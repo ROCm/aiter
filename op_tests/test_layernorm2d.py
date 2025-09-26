@@ -147,7 +147,7 @@ else:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_layernorm2d(dtype, m, n)
 for dtype in l_dtype:
-    test_layernorm2d_fuseAdd(dtype, args.m, args.n)
+    test_layernorm2d(dtype, args.m, args.n)
 
 
 # print('\nstart fuse add test')
