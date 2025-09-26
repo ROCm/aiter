@@ -14,6 +14,8 @@ import time
 from aiter import dtypes
 
 INVALID_TIME = -1
+
+
 class TunerCommon:
     ARG_DEFAULTS = {
         "verbose": False,
