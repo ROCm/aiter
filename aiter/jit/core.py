@@ -241,6 +241,7 @@ def get_module_custom_op(md_name: str) -> None:
             __mds[md_name] = importlib.import_module(md_name)
         else:
             __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+        logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
     return
 
 
@@ -794,10 +795,12 @@ def compile_ops(
 
                 import torch
 
+                enum_types = ["ActivationType", "QuantType"]
+
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
-                    for el in ["ActivationType", "QuantType"]:
+                    for el in enum_types:
                         doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {
                         "List": List,
@@ -824,7 +827,7 @@ def compile_ops(
                         if origin is None:
                             if not isinstance(arg, expected_type) and not (
                                 # aiter_enum can be int
-                                "aiter_enum" in str(expected_type)
+                                any(el in str(expected_type) for el in enum_types)
                                 and isinstance(arg, int)
                             ):
                                 raise TypeError(
