@@ -183,6 +183,14 @@ auto get_elimit<FmhaBwdBf16>(ck_tile::index_t hdim_q, ck_tile::index_t hdim_v)
     return ck_tile::make_tuple(rtol, atol);
 }
 
+template <>
+auto get_elimit<FmhaBwdFp32>(ck_tile::index_t hdim_q, ck_tile::index_t hdim_v)
+{
+    double rtol = 1e-5;
+    double atol = 3e-6;
+    return ck_tile::make_tuple(rtol, atol);
+}
+
 template <typename DataTypeConfig>
 bool run(const ck_tile::ArgParser& arg_parser)
 {
@@ -1078,6 +1086,10 @@ int main(int argc, char* argv[])
     else if(data_type == "bf16")
     {
         return run<FmhaBwdBf16>(arg_parser) ? 0 : -2;
+    }
+    else if(data_type == "fp32")
+    {
+        return run<FmhaBwdFp32>(arg_parser) ? 0 : -2;
     }
 
     return -3;
