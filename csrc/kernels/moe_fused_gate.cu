@@ -186,8 +186,7 @@ __device__ void moe_fused_gate_impl(void* input,
 #pragma unroll
     for(int ii = 0; ii < params.VPT; ++ii)
     {
-        row_chunk[ii] = 1.0f / (1.0f + expf(-row_chunk[ii]));
-        row_chunk[ii] = ::isnan(row_chunk[ii]) ? 0 : row_chunk[ii];
+        row_chunk[ii] = ::isnan(row_chunk[ii]) ? 0.0f : (1.0f / (1.0f + expf(-row_chunk[ii])));
     }
     // __syncthreads();
 
