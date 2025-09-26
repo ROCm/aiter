@@ -98,7 +98,7 @@ run_group_mode_tests() {
 # Current native gfx950 kernels has seqlen restriction
 run_gfx950_bwd_v3() {
     for prec in "bf16" "fp16" ; do
-    for mask in 0 1 ; do
+    for mask in 0 1 2 ; do
     for v3_atomic_fp32 in 1 0 ; do
     for batch in 1 3 ; do
     for head in 2 4 ; do
@@ -122,7 +122,7 @@ run_gfx950_bwd_v3() {
 
 run_gfx950_group_bwd_v3() {
     for prec in "bf16" "fp16" ; do
-    for mask in 0 1 ; do
+    for mask in 0 1 2 ; do
     for v3_atomic_fp32 in 0 1 ; do
     for seqlen in 63 127 200 377 546 718; do
     for hdim in 80 96 120 128 ; do

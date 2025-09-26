@@ -803,6 +803,7 @@ def compile_ops(
                         "List": List,
                         "Optional": Optional,
                         "torch": torch,
+                        "typing": typing,
                     }
                     exec(
                         f"from aiter import*\ndef {doc_str}: pass",
@@ -837,7 +838,7 @@ def compile_ops(
                                 raise TypeError(
                                     f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                 )
-                        elif origin is typing.Union:
+                        elif origin is typing.Union or origin is types.UnionType:
                             if arg is not None and not isinstance(arg, sub_t):
                                 raise TypeError(
                                     f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"

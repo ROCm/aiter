@@ -14,21 +14,76 @@
 #include <utility>
 #include <vector>
 
-template <typename T>
-std::ostream& operator<<(std::ostream& os, const std::vector<T>& v)
+// This function is copied from ck commit 4d041837ade7ae01900a0442d939f80b723b1631
+std::vector<int32_t> to_seqstarts_(ck_tile::span<const int32_t> seqlens)
 {
-    using size_type = typename std::vector<T>::size_type;
-
-    os << "[";
-    for(size_type idx = 0; idx < v.size(); ++idx)
+    std::vector<int32_t> seqstarts = {0};
+    for(int32_t seqlen : seqlens)
     {
-        if(0 < idx)
-        {
-            os << ", ";
-        }
-        os << v[idx];
+        seqstarts.push_back(seqstarts.back() + seqlen);
     }
-    return os << "]";
+    assert(seqstarts.size() == seqlens.size() + 1);
+    return seqstarts;
+}
+
+std::vector<int32_t> generate_seqlens(mode_enum mode,
+                                      unsigned count,
+                                      int32_t seqlen_avg,
+                                      int32_t seqlen_min = -1, // if not negative, clamp min
+                                      int32_t seqlen_max = -1, // if not negative, clamp max
+                                      std::optional<unsigned> seed = std::nullopt)
+{
+    assert(0 < count);
+
+    seqlen_min = (0 < seqlen_min ? seqlen_min : 1);
+    seqlen_max = (0 < seqlen_max ? seqlen_max : std::numeric_limits<int32_t>::max());
+    assert(seqlen_min <= seqlen_max);
+
+    std::vector<int32_t> seqlens(count, std::clamp(seqlen_avg, seqlen_min, seqlen_max));
+
+    if(mode == mode_enum::group && 1 < count)
+    {
+        using size_type = std::vector<int32_t>::size_type;
+
+        std::mt19937 random_engine(seed.has_value() ? *seed : std::random_device{}());
+        std::uniform_int_distribution<size_type> idx_dist(0, count - 1);
+        auto next_idx = std::bind(idx_dist, std::ref(random_engine));
+
+        std::uniform_int_distribution<size_type> step_dist(1, count - 1);
+        auto next_step = std::bind(step_dist, std::ref(random_engine));
+
+        for(unsigned repeat = seqlen_avg * (count / 2); 0 < repeat; --repeat)
+        {
+            const size_type to_decrease = next_idx();
+            // make sure each elements of seqlens is in range [seqlen_min, seqlen_max]
+            if(seqlens[to_decrease] == seqlen_min)
+            {
+                continue;
+            }
+
+            const size_type to_increase = (to_decrease + next_step()) % count;
+
+            if(seqlens[to_increase] >= seqlen_max)
+            {
+                continue;
+            }
+
+            --seqlens[to_decrease];
+            ++seqlens[to_increase];
+        }
+    }
+
+    return seqlens;
+}
+
+std::vector<int32_t> generate_seqstarts(mode_enum mode,
+                                        unsigned count,
+                                        int32_t seqlen_avg,
+                                        int32_t seqlen_min           = -1,
+                                        int32_t seqlen_max           = -1,
+                                        std::optional<unsigned> seed = std::nullopt)
+{
+    return to_seqstarts_(generate_seqlens(mode, count, seqlen_avg, seqlen_min, seqlen_max, seed));
 }
 
 auto create_args(int argc, char* argv[])
