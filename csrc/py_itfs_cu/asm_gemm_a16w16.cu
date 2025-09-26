@@ -93,11 +93,13 @@ get_heuristic_kernel(int M,
                     int max_split = num_cu / pure_tg_num;
                     for(int i = max_split; i >= 1; i--)
                     {
-                        if(K % (i * 64) == 0)
+                        if(K % 64 == 0)
                         {
                             split_K = i;
                             break;
                         }
+                        else
+                            TORCH_CHECK(false, __func__, " Kdim must be divisible by 64 !!!");
                     }
                 }
             }
