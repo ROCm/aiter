@@ -48,6 +48,7 @@ jobs:
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
           RUN pip show pybind11
+          RUN echo $PYTHONPATH
 
           RUN git clone ${{ env.GITHUB_REPO_URL}} /aiter && \\
               cd /aiter && \\
