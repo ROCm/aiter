@@ -141,7 +141,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_test \
-          MULTI_GPU=TRUE ./.github/scripts/aiter_test.sh
+          export MULTIGPU=TRUE && ./.github/scripts/aiter_test.sh
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
