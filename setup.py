@@ -116,10 +116,12 @@ if IS_ROCM:
 
         # step 1, build *.cu -> module*.so
         prebuid_thread_num = 5
-        prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
+        # Respect MAX_JOBS environment variable, fallback to auto-calculation
         max_jobs = os.environ.get("MAX_JOBS")
-        if max_jobs is not None and max_jobs.isdigit():
+        if max_jobs is not None and max_jobs.isdigit() and int(max_jobs) > 0:
             prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
+        else:
+            prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
@@ -177,20 +179,22 @@ shutil.copytree("csrc", "aiter_meta/csrc")
 
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
-        max_jobs = getMaxJobs()
+        # Respect MAX_JOBS environment variable, fallback to auto-calculation
         max_jobs_env = os.environ.get("MAX_JOBS")
-        if max_jobs_env is not None:
-            try:
-                max_processes = int(max_jobs_env)
-                # too large value
-                if max_processes > max_jobs:
-                    os.environ["MAX_JOBS"] = str(max_jobs)
-            # error value
-            except ValueError:
-                os.environ["MAX_JOBS"] = str(max_jobs)
-        # none value
-        else:
+        if max_jobs_env is None:
+            # Only calculate max_jobs if MAX_JOBS is not set
+            max_jobs = getMaxJobs()
             os.environ["MAX_JOBS"] = str(max_jobs)
+        else:
+            # Validate the provided MAX_JOBS value
+            try:
+                int(max_jobs_env)
+                if int(max_jobs_env) <= 0:
+                    raise ValueError("MAX_JOBS must be a positive integer")
+            except ValueError:
+                # If invalid, fallback to auto-calculation
+                max_jobs = getMaxJobs()
+                os.environ["MAX_JOBS"] = str(max_jobs)
 
         super().__init__(*args, **kwargs)
 
