@@ -70,6 +70,7 @@ def query_sol_core(
 ) -> int:
     global solids, solMap, soltype
     # soltype = None
+    solution_idx = 0
     cu_count = get_cu_num()
     if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
         if (
