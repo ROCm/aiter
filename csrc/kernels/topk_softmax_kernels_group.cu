@@ -30,6 +30,10 @@
 #define AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE_USE_INLINE_ASM 1
 #endif
 
+#ifndef C_LOG2E
+#define C_LOG2E 1.44269504088896340736 // log2(e)
+#endif
+
 #define WARP_SIZE 64
 namespace aiter {
 namespace impl {
@@ -673,10 +677,12 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
     using vec_i                   = ck_tile::ext_vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
 
+    f32vec gating;
     if constexpr(!isSoftmax)
     {
         auto const* input_ptr = gating_output + token_idx * num_experts;
-        for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
+        // for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
+        int e = threadIdx.x;
         {
             vec_i tmp = reinterpret_cast<vec_i const*>(input_ptr)[e];
             vec_i tmp2;
@@ -685,12 +691,13 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             {
                 tmp2 = reinterpret_cast<vec_i const*>(correction_bias)[e];
             }
-            f32vec gating;
+            
 #pragma unroll
             for(size_t i = 0; i < vec_size; i++)
             {
                 gating[i] = ck_tile::type_convert<float>(tmp[i]);
-                gating[i] = __builtin_amdgcn_rcpf(1.0f + expf(-gating[i]));
+                // gating[i] = __builtin_amdgcn_rcpf(1.0f + expf(-gating[i]));
+                gating[i] = __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * gating[i]));
                 if constexpr(isBiased)
                 {
                     tmp2_f32[i] = ck_tile::type_convert<float>(tmp2[i]);
@@ -700,7 +707,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             }
             scores_vec[e] = gating;
         }
-        __syncthreads();
+        //__syncthreads();
     }
     else
     {
@@ -758,19 +765,22 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         const int lane_id = threadIdx.x % THREAD_PER_GRP;
         int g = threadIdx.x / THREAD_PER_GRP;
         {
-            float max1 = -INFINITY, max2 = -INFINITY;
+            float max1, max2;
             const int start = g * experts_per_group;
             const int end   = experts_per_group / vec_size;
-            f32vec* sc      = reinterpret_cast<f32vec*>(scores + start);
+            //f32vec* sc      = reinterpret_cast<f32vec*>(scores + start);
 
             {
                 int e = lane_id;
-                auto s_vec = sc[e];
-                for(int j = 0; j < vec_size; j++)
+                //auto s_vec = sc[e];
+                auto s_vec = gating;
+                max1 = s_vec[0];
+                max2 = -INFINITY;
+#pragma unroll
+                for(int j = 1; j < vec_size; j++)
                 {
                     auto s_tmp = s_vec[j];
-                    max2       = dev_max_(s_tmp, max2);
-                    max2       = s_tmp > max1 ? max1 : max2;
+                    max2       = dev_med3_(s_tmp, max1, max2);
                     max1       = dev_max_(s_tmp, max1);
                 }
             }
@@ -801,15 +811,15 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                         __builtin_amdgcn_mov_dpp(
                             __builtin_bit_cast(int, max2), dpp_i, row_mask, bank_mask, bound_ctrl));
 
-                    max2 = dev_max_(remote_max_1, max2);
-                    max2 = remote_max_1 > max1 ? max1 : max2;
+                    max2 = dev_max_(remote_max_2, max2);
+                    max2 = dev_med3_(remote_max_1, max1, max2);
                     max1 = dev_max_(remote_max_1, max1);
-                    max2 = dev_max_(max2, remote_max_2);
                 });
             }
             // not all lanes store the correct result!
             group_score_ = max1 + max2;
         }
+        // scores_vec[threadIdx.x] = gating;
     }
     else
     {
