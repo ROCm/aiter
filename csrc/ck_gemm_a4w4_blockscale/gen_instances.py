@@ -13,7 +13,7 @@ from gemm_a4w4_blockscale_common import (
     kernels_list,
 )
 
-from aiter.ops.gemm_op_a4w4 import AITER_CONFIG_GEMM_A4W4
+from aiter.jit.core import AITER_CONFIG_GEMM_A4W4
 
 """
 

@@ -11,7 +11,12 @@ from torch import Tensor
 
 from aiter import logger
 
-from ..jit.core import AITER_LOG_TUNED_CONFIG, AITER_ROOT_DIR, compile_ops
+from ..jit.core import (
+    AITER_CONFIG_GEMM_A4W4,
+    AITER_LOG_TUNED_CONFIG,
+    AITER_ROOT_DIR,
+    compile_ops,
+)
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..ops.gemm_op_common import get_padded_m
 
@@ -27,12 +32,6 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
     ## to make sure the precision is not lost, max is 4
     # return min(splitK, 4)
     return 3
-
-
-AITER_CONFIG_GEMM_A4W4 = os.getenv(
-    "AITER_CONFIG_GEMM_A4W4",
-    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
-)
 
 
 @functools.lru_cache(maxsize=1024)
