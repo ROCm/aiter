@@ -21,6 +21,15 @@
 #include <hipcub/util_type.hpp>
 #include <torch/all.h>
 
+#ifndef AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE
+#define AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE 0
+#endif
+
+// rocm 6.4.1 has compiler problem that can't generate proper dependency for ds_permute
+#ifndef AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE_USE_INLINE_ASM
+#define AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE_USE_INLINE_ASM 1
+#endif
+
 #define WARP_SIZE 64
 namespace aiter {
 namespace impl {
@@ -950,6 +959,67 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             cumsum_cnt[i] = s[i] == pivot ? cnt_ : cumsum_cnt[i];
         }
 
+#if AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE
+        float topk_vs[final_score_vec];
+        int topk_is[final_score_vec];
+#if AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE_USE_INLINE_ASM
+        {
+            int remote_lane_id_0 = (s[0] >= pivot && cumsum_cnt[0] <= topk) ?  ((cumsum_cnt[0] - 1) << 2) : (topk << 2);
+            int remote_lane_id_1 = (s[1] >= pivot && cumsum_cnt[1] <= topk) ?  ((cumsum_cnt[1] - 1) << 2) : (topk << 2);
+            asm volatile(
+                "ds_permute_b32 %[v_topk_v_0], %[v_lane_id_0], %[v_src_v_0]\n"
+                "ds_permute_b32 %[v_topk_v_1], %[v_lane_id_1], %[v_src_v_1]\n"
+                "ds_permute_b32 %[v_topk_i_0], %[v_lane_id_0], %[v_src_i_0]\n"
+                "ds_permute_b32 %[v_topk_i_1], %[v_lane_id_1], %[v_src_i_1]\n"
+                "s_waitcnt lgkmcnt(0)\n"
+                :
+                [v_topk_v_0]"+v"(topk_vs[0]),
+                [v_topk_i_0]"+v"(topk_is[0]),
+                [v_topk_v_1]"+v"(topk_vs[1]),
+                [v_topk_i_1]"+v"(topk_is[1]),
+                [v_lane_id_0]"+v"(remote_lane_id_0),
+                [v_lane_id_1]"+v"(remote_lane_id_1),
+                [v_src_v_0]"+v"(s[0]),
+                [v_src_v_1]"+v"(s[1]),
+                [v_src_i_0]"+v"(e[0]),
+                [v_src_i_1]"+v"(e[1])
+                :
+                :
+            );
+        }
+#else
+        ck_tile::static_for<0, final_score_vec, 1>{}([&](auto i_){
+            constexpr int i = i_.value;
+
+            int remote_lane_id = (s[i] >= pivot && cumsum_cnt[i] <= topk) ?  ((cumsum_cnt[i] - 1) << 2) : (topk << 2);
+            int s_ = __builtin_bit_cast(int, s[i]);
+            int e_ = __builtin_bit_cast(int, e[i]);
+            topk_vs[i] = __builtin_bit_cast(float,
+                    __builtin_amdgcn_ds_permute(remote_lane_id, s_));
+            topk_is[i] = __builtin_bit_cast(int,
+                    __builtin_amdgcn_ds_permute(remote_lane_id, e_));
+            // printf("[%2d:%d] remote:%d valid:%d topk_vs:%f, topk_is:%d (s:%f, e:%d)\n", threadIdx.x, i, remote_lane_id >> 2,  (s[i] >= pivot && cumsum_cnt[i] <= topk)? 1 : 0, 
+            //   topk_vs[i],  topk_is[i]  , s[i], e[i]);
+        });
+#endif
+        float topk_v = topk_vs[0] + topk_vs[1];
+        int topk_i = topk_is[0] + topk_is[1];
+
+        if(threadIdx.x < topk)
+        {
+            if constexpr(isBiased)
+            {
+                topk_v -= ck_tile::type_convert<float>(correction_bias[topk_i]);
+            }
+            if(need_renorm)
+            {
+                sum    = multithread_reduce(topk_v, [&](auto x_, auto y_) { return x_ + y_; }, 8);
+                topk_v = topk_v *  routed_scaling_factor * __builtin_amdgcn_rcpf(sum);
+            }
+            topk_weights[token_idx * stride_tk + threadIdx.x] = topk_v;
+            topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_i;
+        }
+#else
         for(int i = 0; i < final_score_vec; i++)
         {
             if(s[i] >= pivot && cumsum_cnt[i] <= topk)
@@ -978,6 +1048,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             topk_weights[token_idx * stride_tk + threadIdx.x] = topk_v;
             topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_i;
         }
+#endif
     }
 }
 } // namespace aiter
