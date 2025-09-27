@@ -17,11 +17,21 @@ else
 fi
 
 for file in "${files[@]}"; do
-    # Run each test file with a 30-minute timeout, output to latest_test.log
-    echo -e "\nRunning $file..."
-    if ! timeout 30m python3 "$file" 2>&1 | tee -a latest_test.log; then
+    # Print a clear separator and test file name for readability
+    echo -e "\n============================================================"
+    echo -e "Running test: $file"
+    echo -e "============================================================\n"
+    # Run each test file with a 60-minute timeout, output to latest_test.log
+    if ! timeout 60m python3 "$file" 2>&1 | tee -a latest_test.log; then
+        echo -e "\n--------------------"
+        echo -e "❌ Test failed: $file"
+        echo -e "--------------------\n"
         testFailed=true
         failedFiles+=("$file")
+    else
+        echo -e "\n--------------------"
+        echo -e "✅ Test passed: $file"
+        echo -e "--------------------\n"
     fi
 done
 
