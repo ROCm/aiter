@@ -48,10 +48,11 @@ def get_GEMM_config(M: int, N: int, K: int):
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         config = get_GEMM_config.gemm_dict.get((cu_num, padded_M, N, K), None)
-        if AITER_LOG_TUNED_CONFIG and config is not None:
-            logger.info(
-                f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM or asmGEMM, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
-            )
+        if config is not None:
+            if AITER_LOG_TUNED_CONFIG:
+                logger.info(
+                    f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM or asmGEMM, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
+                )
             break
     else:
         logger.info(
