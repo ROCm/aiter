@@ -31,9 +31,9 @@ aiter_lib = None
 
 def mp_lock(
     lockPath: str,
-    MainFunc: callable,
-    FinalFunc: callable = None,
-    WaitFunc: callable = None,
+    MainFunc: Callable,
+    FinalFunc: Optional[Callable] = None,
+    WaitFunc: Optional[Callable] = None,
 ):
     """
     Using FileBaton for multiprocessing.
@@ -65,6 +65,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
+AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
 
 find_aiter = importlib.util.find_spec("aiter")
 if find_aiter is not None:

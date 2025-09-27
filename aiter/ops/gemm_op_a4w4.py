@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+import os
+from typing import Optional
+
+import pandas as pd
 import torch
 from torch import Tensor
-from typing import Optional
+
 from aiter import logger
-from ..jit.core import (
-    compile_ops,
-    AITER_ROOT_DIR,
-)
-from ..jit.utils.chip_info import get_cu_num
-from ..jit.utils.chip_info import get_gfx
-import functools
-import pandas as pd
+
+from ..jit.core import AITER_LOG_TUNED_CONFIG, AITER_ROOT_DIR, compile_ops
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..ops.gemm_op_common import get_padded_m
 
 
@@ -29,12 +29,16 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
     return 3
 
 
+AITER_CONFIG_GEMM_A4W4 = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
+)
+
+
 @functools.lru_cache(maxsize=1024)
 def get_GEMM_config(M: int, N: int, K: int):
     if not hasattr(get_GEMM_config, "gemm_dict"):
-        gemm_dict = pd.read_csv(
-            f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv"
-        ).drop_duplicates()
+        gemm_dict = pd.read_csv(AITER_CONFIG_GEMM_A4W4).drop_duplicates()
         get_GEMM_config.gemm_dict = gemm_dict.set_index(
             ["cu_num", "M", "N", "K"]
         ).to_dict("index")
@@ -44,12 +48,12 @@ def get_GEMM_config(M: int, N: int, K: int):
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         config = get_GEMM_config.gemm_dict.get((cu_num, padded_M, N, K), None)
-        if config is not None:
+        if AITER_LOG_TUNED_CONFIG and config is not None:
             logger.info(
                 f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM or asmGEMM, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
             )
             break
-    if config is None:
+    else:
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in CKGEMM or asmGEMM, will use default config!"
         )
