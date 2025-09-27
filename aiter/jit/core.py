@@ -13,7 +13,8 @@ import sys
 import time
 import traceback
 import types
-from typing import Any, Callable, List, Optional
+import typing
+from typing import Any, Callable, List, Optional, Union, get_args, get_origin
 
 from packaging.version import Version, parse
 
@@ -31,9 +32,9 @@ aiter_lib = None
 
 def mp_lock(
     lockPath: str,
-    MainFunc: callable,
-    FinalFunc: callable = None,
-    WaitFunc: callable = None,
+    MainFunc: Callable,
+    FinalFunc: Optional[Callable] = None,
+    WaitFunc: Optional[Callable] = None,
 ):
     """
     Using FileBaton for multiprocessing.
@@ -65,6 +66,14 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
+AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
+
+# config_env start here
+AITER_CONFIG_GEMM_A4W4 = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
+)
+# config_env end here
 
 find_aiter = importlib.util.find_spec("aiter")
 if find_aiter is not None:
@@ -599,7 +608,6 @@ SPECIAL_OPS_MUTATES_ARGS = {}
 
 def generate_schema(func) -> str:
     import inspect
-    from typing import List, Optional, Union, get_args, get_origin
 
     import torch
 
@@ -791,7 +799,6 @@ def compile_ops(
                 get_asm_dir()
                 import inspect
                 import re
-                import typing
 
                 import torch
 
