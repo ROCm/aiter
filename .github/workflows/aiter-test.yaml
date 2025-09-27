@@ -16,11 +16,7 @@ env:
 
 jobs:
   standard:
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [aiter-1gpu-runner, aiter-8gpu-runner]
+    runs-on: aiter-1gpu-runner
 
     steps:
       - name: Checkout code
@@ -72,14 +68,6 @@ jobs:
       - name: Tests
         run: |
           set -ex
-          if [ ${{ matrix.runner }} == 'aiter-1gpu-runner' ]; then
-            echo "Running Standard Tests..."
-          elif [ ${{ matrix.runner }} == 'aiter-8gpu-runner' ]; then
-            echo "Running Multi-GPU Tests..."
-            export MULTIGPU=TRUE
-          else
-            echo "Running Other Tests..."
-          fi
           docker exec \
           -w /workspace \
           aiter_test \
@@ -97,3 +85,72 @@ jobs:
         run: |
           docker rm -f aiter_test || true
 
+  multi-gpu:
+    runs-on: aiter-8gpu-runner
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Sync submodules
+        run: |
+          set -e
+          if [[ ${{ github.ref }} == "main" ]]; then
+            git submodule sync --remote
+          else
+            git submodule sync
+          fi
+          git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Clean up Rocm processes
+        run: |
+          rocm-smi
+          rocm-smi --showpids
+          echo 'Cleaning up ROCm processes...'
+          rocm-smi --showpids | awk '{if($1 ~ /^[0-9]+$/) print $1}' | xargs -r sudo kill -9 || true
+          rocm-smi
+          rocm-smi --showpids
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: aiter_test"
+          docker run -dt \
+          --device=/dev/dri \
+          --device=/dev/kfd \
+          --shm-size=16G \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name aiter_test \
+          ${{ env.DOCKER_IMAGE }}
+
+      - name: Setup-Triton
+        run: |
+          set -ex
+          echo "Setuping Triton..."
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          ./.github/scripts/build_triton.sh
+      
+      - name: Tests
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          MULTI_GPU=TRUE ./.github/scripts/aiter_test.sh
+
+      - name: Upload test logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-logs
+          path: latest_test.log
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f aiter_test || true
