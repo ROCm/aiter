@@ -238,7 +238,7 @@ class PagedAttention:
         alibi_slopes: Optional[torch.Tensor],
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
-        q_scale: Optional[torch.Tensor],
+        q_scale: Optional[torch.Tensor] = None,
         tp_rank: int = 0,
         blocksparse_local_blocks: int = 0,
         blocksparse_vert_stride: int = 0,
