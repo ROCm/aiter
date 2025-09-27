@@ -13,9 +13,9 @@ template = """// SPDX-License-Identifier: MIT
 #pragma once
 #include <unordered_map>
 
-#define ADD_CFG(q_type, kv_type, gqa, mtp, msk, hp, path, name, co)         \\
+#define ADD_CFG(q_type, kv_type, gqa, mtp, msk, hp, block_size, path, name, co)         \\
     {                                         \\
-        name, { name, path co, q_type, kv_type, gqa, mtp, msk, hp }         \\
+        name, { name, path co, q_type, kv_type, gqa, mtp, msk, hp, block_size }         \\
     }
 
 struct AsmPaConfig
@@ -28,6 +28,7 @@ struct AsmPaConfig
     int mtp;
     int msk;
     int hp;
+    int block_size;
 };
 
 using CFG = std::unordered_map<std::string, AsmPaConfig>;
@@ -52,8 +53,8 @@ if __name__ == "__main__":
     for el in glob.glob(f"{this_dir}/*.csv"):
         df = pd.read_csv(el)
         cfg = [
-            f'ADD_CFG("{qType}", "{kvType}",{Gqa:>4}, {Mtp:>2}, {Msk:>2},{Hp:>2},"pa/", "{Name}", "{Co}"),'
-            for qType, kvType, Gqa, Mtp, Msk, Hp, Name, Co in df.values
+            f'ADD_CFG("{qType}", "{kvType}",{Gqa:>4}, {Mtp:>2}, {Msk:>2}, {Hp:>2}, {blkSz:>2}, "pa/", "{Name}", "{Co}"),'
+            for qType, kvType, Gqa, Mtp, Msk, Hp, blkSz, Name, Co in df.values
         ]
         filename = os.path.basename(el)
         cfgname = filename.split(".")[0]
