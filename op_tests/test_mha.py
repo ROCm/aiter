@@ -27,6 +27,8 @@ def run_torch(
     window_size=(-1, -1),  # -1 means infinite context window,
     upcast=True,
     reorder_ops=False,
+    query_padding_mask=None,
+    key_padding_mask=None,
 ):
     (_, seqlen_q, _, _) = q.shape
     (_, seqlen_k, _, _) = k.shape
@@ -44,8 +46,8 @@ def run_torch(
         q,
         k,
         v,
-        None,
-        None,
+        query_padding_mask,
+        key_padding_mask,
         attn_bias,
         dropout_p,
         dropout_mask,
@@ -81,19 +83,24 @@ def run_ck(
     deterministic=False,
     return_lse=True,
     return_attn_probs=False,
+    cu_seqlens_q=None,
+    cu_seqlens_kv=None,
 ):
     out, _, S_dmask = aiter.flash_attn_func(
         q,
         k,
         v,
         dropout_p,
-        causal=causal,
-        window_size=window_size,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        return_lse=return_lse,
-        return_attn_probs=return_attn_probs,
+        None,  # softmax_scale
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        deterministic,
+        return_lse,
+        return_attn_probs,
+        cu_seqlens_q,
+        cu_seqlens_kv,
     )
 
     if dropout_p > 0.0:
@@ -301,6 +308,250 @@ def test_flash_attn_output(
         assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
 
 
+@pytest.mark.parametrize(
+    "padding_scenario",
+    ["mixed", "q_only", "k_only", "no_padding", "q_len_1", "k_len_1"],
+)
+@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("deterministic", [True, False])
+@pytest.mark.parametrize("bias_type", ["no"])
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dropout_p", [0.0])  # Keep dropout 0 for padding test clarity
+@pytest.mark.parametrize("batch_size", [4])
+@pytest.mark.parametrize("nheads", [6])
+@pytest.mark.parametrize(
+    "d,d_v",
+    [
+        (32, 32),
+        (40, 40),
+        (59, 59),
+        (64, 64),
+        # (96, 96), # Skip (96, 96) cases due to a known issue in CK.
+        (111, 111),
+        (128, 128),
+        (160, 160),
+        (192, 192),
+        (224, 224),
+        (256, 256),
+    ],
+)
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
+    ],
+)
+def test_flash_attn_seq_padding(
+    padding_scenario,
+    batch_size,
+    nheads,
+    seqlen_q,
+    seqlen_k,
+    d,
+    d_v,
+    dropout_p,
+    causal,
+    local,
+    bias_type,
+    deterministic,
+    mha_type,
+    dtype,
+):
+
+    torch.random.manual_seed(0)
+    torch.cuda.empty_cache()
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    assert nheads % nheads_k == 0
+    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+
+    if bias_type == "bias":
+        pytest.skip("Padding test does not include elementwise bias.")
+
+    # Test forward pass only
+    return_lse = True
+    return_attn_probs = True
+
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=False
+    )
+    k = torch.randn(
+        batch_size,
+        seqlen_k,
+        nheads_k,
+        d,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=False,
+    )
+    v = torch.randn(
+        batch_size,
+        seqlen_k,
+        nheads_k,
+        d_v,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=False,
+    )
+
+    # 1. Generate padding masks and cu_seqlens based on padding_type
+    # The convention for padding masks in attention_ref is True = valid data, False = padded
+    q_seqlens = [seqlen_q] * batch_size
+    k_seqlens = [seqlen_k] * batch_size
+
+    if padding_scenario == "q_only":
+        for i in range(batch_size // 2):
+            q_seqlens[i] = seqlen_q // 2
+    elif padding_scenario == "k_only":
+        for i in range(batch_size // 2):
+            k_seqlens[i] = seqlen_k // 2
+    elif padding_scenario == "mixed":  # was "q_and_k"
+        for i in range(batch_size // 2):
+            q_seqlens[i] = seqlen_q // 2
+            k_seqlens[i] = seqlen_k // 2
+    elif padding_scenario == "no_padding":
+        pass  # lengths remain full
+    elif padding_scenario == "q_len_1":
+        q_seqlens = [1] * batch_size
+    elif padding_scenario == "k_len_1":
+        k_seqlens = [1] * batch_size
+
+    query_padding_mask = (
+        torch.arange(seqlen_q, device="cuda")[None, :]
+        < torch.tensor(q_seqlens, device="cuda")[:, None]
+    )
+    key_padding_mask = (
+        torch.arange(seqlen_k, device="cuda")[None, :]
+        < torch.tensor(k_seqlens, device="cuda")[:, None]
+    )
+
+    q_seqlens_tensor = torch.tensor(q_seqlens, dtype=torch.int32, device="cuda")
+    k_seqlens_tensor = torch.tensor(k_seqlens, dtype=torch.int32, device="cuda")
+
+    cu_seqlens_q = torch.nn.functional.pad(
+        q_seqlens_tensor.cumsum(0, dtype=torch.int32), (1, 0)
+    )
+    cu_seqlens_kv = torch.nn.functional.pad(
+        k_seqlens_tensor.cumsum(0, dtype=torch.int32), (1, 0)
+    )
+
+    alibi_slopes = None
+    if bias_type == "alibi":
+        alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=dtypes.fp32)
+
+    # 2. Run CK with cu_seqlens (forward pass only)
+    out, _ = run_ck(
+        q,
+        k,
+        v,
+        None,
+        alibi_slopes,
+        None,
+        dropout_p,
+        causal,
+        window_size,
+        deterministic,
+        return_lse,
+        return_attn_probs,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+    )
+
+    # 3. Run Torch with padding_mask (forward pass only)
+    out_ref = run_torch(
+        q,
+        k,
+        v,
+        None,
+        alibi_slopes,
+        None,
+        dropout_p,
+        None,
+        causal,
+        window_size,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+    )
+
+    out_pt = run_torch(
+        q,
+        k,
+        v,
+        None,
+        alibi_slopes,
+        None,
+        dropout_p,
+        None,
+        causal,
+        window_size,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        upcast=False,
+    )
+
+    # Mask the output for correct comparison
+    output_mask = torch.zeros_like(out, dtype=torch.bool)
+    for i in range(batch_size):
+        output_mask[i, q_seqlens[i] :, :, :] = True
+
+    out_masked = out.masked_fill(output_mask, 0.0)
+    out_ref_masked = out_ref.masked_fill(output_mask, 0.0)
+    out_pt_masked = out_pt.masked_fill(output_mask, 0.0)
+
+    print(
+        f"\nPadding Test ({padding_scenario}) | Output max diff: {(out_masked - out_ref_masked).abs().max().detach().item()}"
+    )
+
+    # Add visualization for debugging
+    print("--- Debugging Output Mismatch ---")
+    # Print a small slice of the first sequence, first head
+    print("Aiter output slice:\n", out_masked[0, :5, 0, :5])
+    print("Torch ref output slice:\n", out_ref_masked[0, :5, 0, :5])
+    print("Difference slice:\n", (out_masked - out_ref_masked).abs()[0, :5, 0, :5])
+    print("---------------------------------")
+
+    # --- Begin Error Location Analysis ---
+    diff_tensor = (out_masked - out_ref_masked).abs()
+    max_diff_val = diff_tensor.max().item()
+
+    print(f"\nMax difference value is: {max_diff_val}")
+
+    # Find and print coordinates of max difference
+    max_diff_indices = torch.unravel_index(torch.argmax(diff_tensor), diff_tensor.shape)
+    b, s_q, h, d_idx = max_diff_indices
+    print(
+        f"Coordinates of max difference (batch, seq_q, head, dim): {tuple(x.item() for x in max_diff_indices)}"
+    )
+    # Check the padding status at this specific query position
+    is_q_padded = not query_padding_mask[b, s_q].item()
+    print(
+        f"Is the query token at position {s_q} in batch {b} a padded token? {'Yes' if is_q_padded else 'No'}, actual length: {q_seqlens[b]}"
+    )
+
+    # Also check the original values at the point of maximum difference
+    print(f"Value at aiter_out at max_diff_coords: {out_masked[max_diff_indices]}")
+    print(f"Value at torch_ref at max_diff_coords: {out_ref_masked[max_diff_indices]}")
+    # --- End Error Location Analysis ---
+
+    print(f"Output max diff: {(out_masked - out_ref_masked).abs().max().item()}")
+    print(
+        f"Output Pytorch max diff: {(out_pt_masked - out_ref_masked).abs().max().item()}"
+    )
+    out_tol = max(2 * (out_pt_masked - out_ref_masked).abs().max().item(), 0.01)
+    diff = (out_masked - out_ref_masked).abs().max().item()
+    assert diff <= out_tol
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -406,6 +657,7 @@ parser.add_argument(
     help="""Data type.
     e.g.: -d bf16""",
 )
+
 if __name__ == "__main__":
     args = parser.parse_args()
     dtype = dtypes.d_dtypes[args.dtype]
@@ -420,6 +672,23 @@ if __name__ == "__main__":
         args.causal,
         args.local,
         args.bias_type,
+        args.deterministic,
+        args.mha_type,
+        dtype,
+    )
+
+    test_flash_attn_seq_padding(
+        "mixed",
+        args.batch_size,
+        args.nheads,
+        args.seqlen_q,
+        args.seqlen_k,
+        args.d_qk,
+        args.d_v,
+        args.dropout_p,
+        args.causal,
+        args.local,
+        args.bias_type if args.bias_type != "bias" else "no",
         args.deterministic,
         args.mha_type,
         dtype,
