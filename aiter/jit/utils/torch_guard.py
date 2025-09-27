@@ -99,13 +99,9 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
             out = torch.empty(1, device=device)
             if not return_non_tensor:
                 return func(*args, **kwargs)
-            default_value = None
-            if return_annotation is int:
-                default_value = 0
-            elif return_annotation is bool:
-                default_value = True
-            elif return_annotation is float:
-                default_value = 0.0
+            default_values = {int: 0, bool: True, float: 0.0}
+
+            default_value = default_values.get(return_annotation, None)
             return out, default_value
 
         if is_torch_equal_or_newer("2.8.0"):
