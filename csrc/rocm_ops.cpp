@@ -30,6 +30,7 @@
 #include "pos_encoding.h"
 #include "quant.h"
 #include "quick_all_reduce.h"
+#include "ck_tile_gemm_bf16.h"
 #include "rmsnorm.h"
 #include "rocsolgemm.cuh"
 #include "rope.h"
@@ -91,6 +92,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     GEMM_A4W4_BLOCKSCALE_PYBIND;
     GEMM_A8W8_BLOCKSCALE_PYBIND;
     AITER_OPERATOR_PYBIND;
+    CK_TILE_GEMM_BF16_PYBIND;
     AITER_UNARY_PYBIND;
     CUSTOM_ALL_REDUCE_PYBIND;
     QUICK_ALL_REDUCE_PYBIND;
