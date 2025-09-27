@@ -13,7 +13,8 @@ import sys
 import time
 import traceback
 import types
-from typing import Any, Callable, List, Optional
+import typing
+from typing import Any, Callable, List, Optional, Union, get_args, get_origin
 
 from packaging.version import Version, parse
 
@@ -600,7 +601,6 @@ SPECIAL_OPS_MUTATES_ARGS = {}
 
 def generate_schema(func) -> str:
     import inspect
-    from typing import List, Optional, Union, get_args, get_origin
 
     import torch
 
@@ -792,7 +792,6 @@ def compile_ops(
                 get_asm_dir()
                 import inspect
                 import re
-                import typing
 
                 import torch
 
