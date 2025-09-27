@@ -4,8 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton._triton_kernels.gemm_a16w16_atomic import (
     _gemm_a16_w16_atomic_kernel,
     _get_config,
@@ -46,12 +44,6 @@ def gemm_a16w16_atomic(
 
     if config is None:
         config = _get_config(M, N, K)
-    # For compatability reasons, these keys may not exist in the config
-    # TODO: This needs to be embedded in the configs later
-    if "NUM_KSPLIT" not in config:
-        config["NUM_KSPLIT"] = 1
-    if "cache_modifier" not in config:
-        config["cache_modifier"] = ""
 
     if y is None:
         # atomic add requires 0 tensor
@@ -65,9 +57,7 @@ def gemm_a16w16_atomic(
         * triton.cdiv(N, META["BLOCK_SIZE_N"])
         * META["NUM_KSPLIT"],
     )
-    # NOTE: if k split doesnt divide K evenly, this will waste compute
-    SPLITK_BLOCK_SIZE = triton.cdiv(K, config["NUM_KSPLIT"])
-    config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
+
     _gemm_a16_w16_atomic_kernel[grid](
         x,
         w,
