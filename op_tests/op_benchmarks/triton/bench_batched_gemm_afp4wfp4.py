@@ -2,8 +2,13 @@ import sys
 import torch
 import triton
 import math
+from aiter.ops.triton.batched_gemm_afp4wfp4 import (
+    batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,
+)
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 from op_tests.triton_tests.test_batched_gemm_afp4wfp4 import (
     generate_batched_gemm_afp4wfp4_inputs,
+    run_torch,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
@@ -11,20 +16,23 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_ff_args,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_benchmark_object,
-    get_shape_benchmark_object,
+    get_gemm_model_benchmark_object,
+    get_gemm_shape_benchmark_object,
     batched_model_benchmark_shapes,
     print_vgpr,
     get_caller_name_no_ext,
 )
-from aiter.ops.triton.batched_gemm_afp4wfp4 import (
-    batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,
-)
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
 def bench_gemm_fn(
-    batch: int, M: int, N: int, K: int, metric: str, layout: str, model_name=None
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    model_name=None,
+    use_torch: bool = False,
 ):
     c_dtype = torch.bfloat16
     x, w, x_scale, w_scale, y = generate_batched_gemm_afp4wfp4_inputs(
@@ -48,11 +56,18 @@ def bench_gemm_fn(
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: batched_gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, y),
-        warmup=25,
-        rep=100,
-    )
+    if use_torch:
+        ms = triton.testing.do_bench(
+            lambda: run_torch(x, w, x_scale, w_scale, c_dtype),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
+    else:
+        ms = triton.testing.do_bench(
+            lambda: batched_gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, y),
+            warmup=25,
+            rep=100,
+        )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -68,7 +83,7 @@ def bench_gemm_fn(
 
 
 def run_model_benchmark(args):
-    benchmark = get_model_benchmark_object(
+    benchmark = get_gemm_model_benchmark_object(
         plot_name=get_caller_name_no_ext(),
         args=args,
         x_names=["model_name", "M", "hidden_dim", "intermediate_dim", "batch"],
@@ -77,36 +92,47 @@ def run_model_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_afp4wfp4(
-        M, hidden_dim, intermediate_dim, batch, metric, layer, model_name=None, **kwargs
+        M,
+        hidden_dim,
+        intermediate_dim,
+        batch,
+        metric,
+        provider,
+        model_name=None,
+        **kwargs,
     ):
-        if layer == "fc1":
+        if provider[1] == "fc1":
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
             else:
                 N, K = intermediate_dim * 2, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
-        elif layer == "fc2":
+        elif provider[1] == "fc2":
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
+        return bench_gemm_fn(
+            batch, M, N, K, metric, args.layout, use_torch=(provider[0] == "torch")
+        )
 
     bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
-    benchmark = get_shape_benchmark_object(
+    benchmark = get_gemm_shape_benchmark_object(
         plot_name=get_caller_name_no_ext(),
         args=args,
         x_names=["batch", "M", "N", "K"],
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_afp4wfp4(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
+    def bench_batched_gemm_afp4wfp4(batch, M, N, K, metric, provider, **kwargs):
+        return bench_gemm_fn(
+            batch, M, N, K, metric, layout=args.layout, use_torch=(provider == "torch")
+        )
 
     bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 

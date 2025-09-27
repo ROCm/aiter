@@ -5,16 +5,17 @@ import random
 import triton
 
 from aiter.ops.triton.pa_prefill import context_attention_fwd
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_dtype_bytes,
     get_caller_name_no_ext,
     print_vgpr,
+    get_evaluation_label,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_pa_prefill import (
     seed_everything,
-    STR_DTYPE_TO_TORCH_DTYPE,
 )
 
 
@@ -86,7 +87,7 @@ def input_helper(
     if kv_cache_dtype == "auto":
         cache_dtype = dtype
     else:
-        cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]
+        cache_dtype = str_to_torch_dtype[kv_cache_dtype]
     k_cache = torch.zeros(
         cache_size, block_size, num_kv_heads, head_size, dtype=cache_dtype
     )
@@ -211,8 +212,12 @@ def run_benchmark(args):
 
     model_name = "paged-attn-decode"
 
-    line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
-    line_vals = ["time", "tflops", "bandwidth"]
+    line_names = [
+        get_evaluation_label("time"),
+        get_evaluation_label("throughput", only_unit=True),
+        get_evaluation_label("bandwidth"),
+    ]
+    line_vals = ["time", "throughput", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
@@ -221,7 +226,9 @@ def run_benchmark(args):
         line_vals=line_vals,
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
-        ylabel="ms / TFLOPS / GB/s",
+        ylabel=f"{get_evaluation_label("time", space=True)} / "
+        + f"{get_evaluation_label("throughput", space=True)} / "
+        + f"{get_evaluation_label("bandwidth", space=True)}",
         plot_name=get_caller_name_no_ext(),
         args={},
     )
@@ -239,7 +246,7 @@ def run_benchmark(args):
         if kv_cache_dtype == "auto":
             torch_kv_cache_dtype = dtype
         else:
-            torch_kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]
+            torch_kv_cache_dtype = str_to_torch_dtype[kv_cache_dtype]
 
         num_queries_per_kv = HQ // HK
 
@@ -330,7 +337,7 @@ def run_benchmark(args):
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
             return ms
-        elif metric == "tflops":
+        elif metric == "throughput":
             return tflops
         elif metric == "bandwidth":
             return bandwidth

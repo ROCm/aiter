@@ -20,6 +20,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     print_vgpr,
     get_caller_name_no_ext,
+    get_evaluation_label,
 )
 
 
@@ -137,31 +138,29 @@ def create_benchmark_configs(custom, args):
             plot_name = f"fused-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
-    if args.metric == "time":
-        unit = "ms"
-    elif args.metric == "throughput":
-        unit = "TFLOPS"
-    elif args.metric == "bandwidth":
-        unit = "GB/s"
-    else:
-        raise ValueError("Unknown metric: " + args.metric)
-
     if mode == "bwd":
         if args.fused_bwd:
-            line_vals = [f"fused-bwd({unit})"]
+            line_vals = ["fused-bwd"]
         else:
-            line_vals = [f"fused-bwd({unit})", f"bwd({unit})"]
+            line_vals = ["fused-bwd", "bwd"]
     else:
-        line_vals = [f"fwd({unit})"]
+        line_vals = ["fwd"]
 
     if args.bench_torch:
-        line_vals = [f"Triton({unit})", f"Torch({unit})"]
+        line_vals = ["triton", "torch"]
 
     if args.test_mode:
         if args.fused_bwd:
-            line_vals = [f"fused-bwd({unit})"]
+            line_vals = ["fused-bwd"]
         else:
-            line_vals = [f"bwd({unit})"]
+            line_vals = ["bwd"]
+
+    line_names = [
+        get_evaluation_label(
+            args.metric, prefix=val, only_unit=(args.metric == "throughput")
+        )
+        for val in line_vals
+    ]
 
     configs.append(
         triton.testing.Benchmark(
@@ -169,9 +168,9 @@ def create_benchmark_configs(custom, args):
             x_vals=x_vals_list,
             line_arg="provider",
             line_vals=line_vals,
-            line_names=line_vals,
+            line_names=line_names,
             styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
-            ylabel=unit,
+            ylabel=get_evaluation_label(args.metric, space=True),
             plot_name=plot_name,
             args=extra_args,
         )
@@ -459,9 +458,9 @@ def run_benchmark(custom, args):
             + total_num_tokens_q * HQ * D_HEAD * output_bytes
         )
         # return ms
-        if "ms" in provider:
+        if args.metric == "time":
             return ms
-        elif "TFLOPS" in provider:
+        elif args.metric == "throughput":
             return total_flops / ms * 1e-9
         else:  # GB/s
             return mem / ms * 1e-6

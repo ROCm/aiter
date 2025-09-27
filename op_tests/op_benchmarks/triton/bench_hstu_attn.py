@@ -13,6 +13,8 @@ from op_tests.triton_tests.test_hstu_attn import (
     get_bytes,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_evaluation_label,
+    get_evaluation_unit,
     print_vgpr,
     get_caller_name_no_ext,
 )
@@ -57,22 +59,12 @@ def run_benchmark(args):
     else:
         x_val_list = get_x_values()
 
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "throughput":
-        ylabel = "Throughput (TFLOPS)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GBs)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
+    ylabel = get_evaluation_label(args.metric, space=True)
 
-    evaluation_metric_to_unit = {
-        "throughput": "TFLOPS",
-        "time": "Time_(ms)",
-        "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
-    }
-    line_names = [evaluation_metric_to_unit[args.metric]]
-    line_vals = line_names
+    line_names = [
+        get_evaluation_label(args.metric, only_unit=(args.metric == "throughput"))
+    ]
+    line_vals = [get_evaluation_unit(args.metric)]
     modes = [args.mode]
     if args.mode == "both":
         modes = ["fwd", "bwd"]
