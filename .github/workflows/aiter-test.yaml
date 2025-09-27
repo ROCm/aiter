@@ -16,7 +16,11 @@ env:
 
 jobs:
   standard:
-    runs-on: aiter-1gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [aiter-1gpu-runner] # TODO: add mi35x runner
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout code
@@ -86,7 +90,11 @@ jobs:
           docker rm -f aiter_test || true
 
   multi-gpu:
-    runs-on: aiter-8gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [aiter-8gpu-runner] # TODO: add mi35x runner
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout code
