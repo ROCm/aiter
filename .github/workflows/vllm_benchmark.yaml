@@ -88,6 +88,9 @@ jobs:
           - 'deepseek-ai/DeepSeek-R1'
         
     steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+        
       - name: Checkout vLLM repo with retry
         uses: nick-fields/retry@v2
         with:
@@ -105,12 +108,7 @@ jobs:
       
       - name: Clean up Rocm processes
         run: |
-          rocm-smi
-          rocm-smi --showpids
-          echo 'Cleaning up ROCm processes...'
-          rocm-smi --showpids | awk '{if($1 ~ /^[0-9]+$/) print $1}' | xargs -r sudo kill -9 || true
-          rocm-smi
-          rocm-smi --showpids
+          ./.github/scripts/clean_up_rocm.sh
 
       - name: Run benchmarks
         run: |
@@ -135,6 +133,11 @@ jobs:
               --num-iters-warmup 3 --num-iters 10 \
               -tp 8 --load-format dummy ${extraArgs} |& tee ${logFile}
           grep "Avg latency:" ${logFile} | awk '{print $3}'
+  
+      - name: Clean up Rocm processes
+        if: always()
+        run: |
+          ./.github/scripts/clean_up_rocm.sh
 
   skip-job:
     if: ${{ github.event.pull_request.head.repo.fork }}
