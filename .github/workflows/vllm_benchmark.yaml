@@ -36,7 +36,7 @@ jobs:
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Download the vLLM nightly image
+      - name: Download the vLLM base image
         run: |
           docker pull ${{ env.BASE_IMAGE }}
       
@@ -47,6 +47,8 @@ jobs:
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
 
           RUN git clone ${{ env.GITHUB_REPO_URL}} /aiter && \\
               cd /aiter && \\
@@ -79,12 +81,16 @@ jobs:
     runs-on: aiter-8gpu-runner
     needs: build_vllm_image
     strategy:
+      fail-fast: false
       matrix:
         model:
           - 'mistralai/Mixtral-8x7B-Instruct-v0.1'
           - 'deepseek-ai/DeepSeek-R1'
         
     steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+        
       - name: Checkout vLLM repo with retry
         uses: nick-fields/retry@v2
         with:
@@ -102,12 +108,7 @@ jobs:
       
       - name: Clean up Rocm processes
         run: |
-          rocm-smi
-          rocm-smi --showpids
-          echo 'Cleaning up ROCm processes...'
-          rocm-smi --showpids | awk '{if($1 ~ /^[0-9]+$/) print $1}' | xargs -r sudo kill -9 || true
-          rocm-smi
-          rocm-smi --showpids
+          ./.github/scripts/clean_up_rocm.sh
 
       - name: Run benchmarks
         run: |
@@ -132,6 +133,11 @@ jobs:
               --num-iters-warmup 3 --num-iters 10 \
               -tp 8 --load-format dummy ${extraArgs} |& tee ${logFile}
           grep "Avg latency:" ${logFile} | awk '{print $3}'
+  
+      - name: Clean up Rocm processes
+        if: always()
+        run: |
+          ./.github/scripts/clean_up_rocm.sh
 
   skip-job:
     if: ${{ github.event.pull_request.head.repo.fork }}

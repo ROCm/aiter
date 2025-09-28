@@ -241,6 +241,7 @@ def get_module_custom_op(md_name: str) -> None:
             __mds[md_name] = importlib.import_module(md_name)
         else:
             __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+        logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
     return
 
 
@@ -352,10 +353,12 @@ def build_module(
         if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
 
-        import torch
+        if not torch_exclude:
+            import torch
 
-        if hasattr(torch, "float4_e2m1fn_x2"):
-            flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
+
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
@@ -794,15 +797,18 @@ def compile_ops(
 
                 import torch
 
+                enum_types = ["ActivationType", "QuantType"]
+
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
-                    for el in ["ActivationType", "QuantType"]:
+                    for el in enum_types:
                         doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {
                         "List": List,
                         "Optional": Optional,
                         "torch": torch,
+                        "typing": typing,
                     }
                     exec(
                         f"from aiter import*\ndef {doc_str}: pass",
@@ -823,7 +829,7 @@ def compile_ops(
                         if origin is None:
                             if not isinstance(arg, expected_type) and not (
                                 # aiter_enum can be int
-                                "aiter_enum" in str(expected_type)
+                                any(el in str(expected_type) for el in enum_types)
                                 and isinstance(arg, int)
                             ):
                                 raise TypeError(
@@ -837,7 +843,7 @@ def compile_ops(
                                 raise TypeError(
                                     f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                 )
-                        elif origin is typing.Union:
+                        elif origin is typing.Union or origin is types.UnionType:
                             if arg is not None and not isinstance(arg, sub_t):
                                 raise TypeError(
                                     f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
