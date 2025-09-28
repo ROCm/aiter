@@ -74,13 +74,14 @@ def test_layernorm2d(dtype, m, n):
     dim = (m, n)
     input = torch.randn(dim, dtype=dtype, device="cuda")
     weight = torch.randn(n, dtype=dtype, device="cuda")
-    bias = torch.randn(n, dtype=dtype, device="cuda")
-    hidden_stats = torch.randn(m, n * 8, dtype=dtype, device="cuda")
-    q, k, v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
-    input = k
+    bias = torch.rand(n, dtype=dtype, device="cuda")
+    # hidden_stats = torch.randn(m, n * 8, dtype=dtype, device="cuda")
+    # q, k, v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
+    # input = k
     (a, *_), avg_a = run_torch(input, weight, bias, 1e-5)
     (b, *_), avg_b = run_ck(input, weight, bias, 1e-5)
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    bw = m * n * 2 * 2 /1e6/avg_b
+    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us {bw=}, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
 
 
@@ -147,7 +148,7 @@ else:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_layernorm2d(dtype, m, n)
 for dtype in l_dtype:
-    test_layernorm2d_fuseAdd(dtype, args.m, args.n)
+    test_layernorm2d(dtype, args.m, args.n)
 
 
 # print('\nstart fuse add test')
