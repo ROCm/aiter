@@ -4,4 +4,4 @@ psutil
 matplotlib
 pyyaml
 einops
-pybind11>=2.13
+pybind11>=3.0.1

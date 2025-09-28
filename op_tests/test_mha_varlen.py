@@ -88,6 +88,8 @@ def run_ck(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
+    cu_seqlens_q_padded=None,
+    cu_seqlens_k_padded=None,
 ):
     (
         q_unpad,
@@ -104,6 +106,8 @@ def run_ck(
         dq_pad_fn,
         dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+    batch_size = q.shape[0]
+
     if bias is not None:
         # TODO - implement generate_bias() to unpad
         total_q = q_unpad.shape[0]
@@ -131,6 +135,8 @@ def run_ck(
         deterministic=deterministic,
         return_lse=return_lse,
         return_attn_probs=return_attn_probs,
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        cu_seqlens_k_padded=cu_seqlens_k_padded,
     )
 
     if type(outputs) is tuple:
@@ -171,6 +177,94 @@ def run_ck(
         dk = dk_pad_fn(dk_unpad)
         dv = dk_pad_fn(dv_unpad)
         return out, dropout_mask, dq, dk, dv
+
+
+def run_ck_seq_padding(
+    q,
+    k,
+    v,
+    q_actual_lens,
+    k_actual_lens,
+    q_padded_lens,
+    k_padded_lens,
+    deterministic=False,
+    causal=False,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+):
+    """Run CK varlen forward with physically padded inputs."""
+
+    device = q.device
+    dtype = q.dtype
+    batch_size = q.size(0)
+    nheads = q.size(2)
+    d = q.size(3)
+    d_v = v.size(3)
+
+    assert len(q_actual_lens) == batch_size
+    assert len(k_actual_lens) == batch_size
+    assert len(q_padded_lens) == batch_size
+    assert len(k_padded_lens) == batch_size
+
+    q_actual = torch.tensor(q_actual_lens, dtype=torch.int32, device=device)
+    k_actual = torch.tensor(k_actual_lens, dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.nn.functional.pad(
+        q_actual.cumsum(0, dtype=torch.int32), (1, 0)
+    )
+    cu_seqlens_k = torch.nn.functional.pad(
+        k_actual.cumsum(0, dtype=torch.int32), (1, 0)
+    )
+
+    q_padded = torch.tensor(q_padded_lens, dtype=torch.int32, device=device)
+    k_padded = torch.tensor(k_padded_lens, dtype=torch.int32, device=device)
+    cu_seqlens_q_padded = torch.nn.functional.pad(
+        q_padded.cumsum(0, dtype=torch.int32), (1, 0)
+    )
+    cu_seqlens_k_padded = torch.nn.functional.pad(
+        k_padded.cumsum(0, dtype=torch.int32), (1, 0)
+    )
+
+    def _flatten(tensor, padded_lens):
+        pieces = []
+        for i in range(batch_size):
+            pieces.append(tensor[i, : padded_lens[i]])
+        return torch.cat(pieces, dim=0)
+
+    q_flat = _flatten(q, q_padded_lens)
+    k_flat = _flatten(k, k_padded_lens)
+    v_flat = _flatten(v, k_padded_lens)
+
+    outputs = aiter.flash_attn_varlen_func(
+        q_flat,
+        k_flat,
+        v_flat,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max(q_actual_lens),
+        max(k_actual_lens),
+        dropout_p=0.0,
+        causal=causal,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_lse=False,
+        return_attn_probs=False,
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        cu_seqlens_k_padded=cu_seqlens_k_padded,
+    )
+
+    out_flat = outputs[0] if isinstance(outputs, tuple) else outputs
+
+    out_batches = []
+    for i in range(batch_size):
+        start = int(cu_seqlens_q_padded[i].item())
+        end = int(cu_seqlens_q_padded[i + 1].item())
+        keep = q_actual_lens[i]
+        out_batch = torch.zeros(q.size(1), nheads, d_v, dtype=dtype, device=device)
+        out_batch[:keep] = out_flat[start : start + keep]
+        out_batches.append(out_batch)
+
+    return torch.stack(out_batches, dim=0)
 
 
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
@@ -356,10 +450,12 @@ def test_flash_attn_varlen_func(
         reorder_ops=True,
     )
 
-    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-    print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
-    out_tol = max(4 * (out_pt - out_ref).abs().max().item(), 0.01)
-    # assert (out - out_ref).abs().max().item() <= out_tol
+    out_diff = (out - out_ref).abs().max().item()
+    ref_diff = (out_pt - out_ref).abs().max().item()
+    print(f"Output max diff: {out_diff}")
+    print(f"Output Pytorch max diff: {ref_diff}")
+    out_tol = max(4 * ref_diff, 0.01)
+    assert out_diff <= out_tol, f"forward diff {out_diff} exceeds tolerance {out_tol}"
 
     # TODO: Support varlen bwd for bias
     if bias_type == "bias":
@@ -380,6 +476,185 @@ def test_flash_attn_varlen_func(
         assert (dq - dq_ref).abs().max().item() <= dq_tol
         assert (dk - dk_ref).abs().max().item() <= dk_tol
         assert (dv - dv_ref).abs().max().item() <= dv_tol
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("deterministic", [True, False])
+@pytest.mark.parametrize(
+    "padding_scenario",
+    ["mixed", "q_only", "k_only", "no_padding", "q_len_1", "k_len_1"],
+)
+@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
+@pytest.mark.parametrize(
+    "d,d_v",
+    [
+        (32, 32),
+        (40, 40),
+        (59, 59),
+        (64, 64),
+        (96, 96),
+        (111, 111),
+        (128, 128),
+        (160, 160),
+        (192, 192),
+        (224, 224),
+        (256, 256),
+    ],
+)
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
+    ],
+)
+@pytest.mark.parametrize("local", [False, True])
+def test_varlen_flash_attn_seq_padding(
+    batch_size,
+    mha_type,
+    deterministic,
+    padding_scenario,
+    dtype,
+    d,
+    d_v,
+    seqlen_q,
+    seqlen_k,
+    local,
+):
+    """End-to-end check that CK group-mode varlen path respects padded tokens."""
+    torch.random.manual_seed(0)
+
+    nheads = 9
+    device = "cuda"
+
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    if nheads % nheads_k != 0:
+        pytest.skip("nheads must be divisible by nheads_k")
+
+    # Dynamically generate padding configurations
+    q_padded_lens = torch.randint(seqlen_q // 2, seqlen_q + 1, (batch_size,)).tolist()
+    q_actual_lens = [
+        torch.randint(max(1, l // 2), l + 1, (1,)).item() for l in q_padded_lens
+    ]
+    k_padded_lens = torch.randint(seqlen_k // 2, seqlen_k + 1, (batch_size,)).tolist()
+    k_actual_lens = [
+        torch.randint(max(1, l // 2), l + 1, (1,)).item() for l in k_padded_lens
+    ]
+
+    if padding_scenario == "q_only":
+        k_actual_lens = k_padded_lens
+    elif padding_scenario == "k_only":
+        q_actual_lens = q_padded_lens
+    elif padding_scenario == "no_padding":
+        q_actual_lens = q_padded_lens
+        k_actual_lens = k_padded_lens
+    elif padding_scenario == "q_len_1":
+        q_actual_lens = [1] * batch_size
+    elif padding_scenario == "k_len_1":
+        k_actual_lens = [1] * batch_size
+
+    q_s = max(q_padded_lens)
+    k_s = max(k_padded_lens)
+    window_size = (-1, -1) if not local else torch.randint(0, k_s, (2,))
+
+    q = torch.zeros(batch_size, q_s, nheads, d, device=device, dtype=dtype)
+    k = torch.zeros(batch_size, k_s, nheads_k, d, device=device, dtype=dtype)
+    v = torch.zeros(batch_size, k_s, nheads_k, d_v, device=device, dtype=dtype)
+
+    for i in range(batch_size):
+        q[i, : q_actual_lens[i]] = torch.randn(
+            q_actual_lens[i], nheads, d, device=device, dtype=dtype
+        )
+        k[i, : k_actual_lens[i]] = torch.randn(
+            k_actual_lens[i], nheads_k, d, device=device, dtype=dtype
+        )
+        v[i, : k_actual_lens[i]] = torch.randn(
+            k_actual_lens[i], nheads_k, d_v, device=device, dtype=dtype
+        )
+
+    query_padding_mask = torch.arange(q_s, device=device).unsqueeze(0).expand(
+        batch_size, -1
+    ) < torch.tensor(q_actual_lens, device=device).unsqueeze(1)
+    key_padding_mask = torch.arange(k_s, device=device).unsqueeze(0).expand(
+        batch_size, -1
+    ) < torch.tensor(k_actual_lens, device=device).unsqueeze(1)
+
+    out_ck = run_ck_seq_padding(
+        q,
+        k,
+        v,
+        q_actual_lens,
+        k_actual_lens,
+        q_padded_lens,
+        k_padded_lens,
+        deterministic,
+        causal=True,
+        window_size=window_size,
+    )
+
+    out_ref = run_torch(
+        q,
+        k,
+        v,
+        query_padding_mask,
+        key_padding_mask,
+        bias=None,
+        alibi_slopes=None,
+        dout=None,
+        dropout_p=0.0,
+        dropout_mask=None,
+        causal=True,
+        window_size=window_size,
+    )
+
+    out_pt = run_torch(
+        q,
+        k,
+        v,
+        query_padding_mask,
+        key_padding_mask,
+        bias=None,
+        alibi_slopes=None,
+        dout=None,
+        dropout_p=0.0,
+        dropout_mask=None,
+        causal=True,
+        window_size=window_size,
+        upcast=False,
+        reorder_ops=True,
+    )
+
+    query_mask = (
+        (
+            torch.arange(q.shape[1], device=device).unsqueeze(0)
+            < torch.tensor(q_actual_lens, device=device).unsqueeze(1)
+        )
+        .unsqueeze(-1)
+        .unsqueeze(-1)
+    )
+
+    out_ck_masked = out_ck.masked_fill(~query_mask, 0.0)
+    out_ref_masked = out_ref.masked_fill(~query_mask, 0.0)
+    out_pt_masked = out_pt.masked_fill(~query_mask, 0.0)
+
+    out_diff = (out_ck_masked - out_ref_masked).abs().max().item()
+    ref_diff = (out_pt_masked - out_ref_masked).abs().max().item()
+
+    out_tol = max(4 * ref_diff, 0.01)
+
+    print(
+        f"\nGroup Mode Test (bs={batch_size}, {mha_type}, {padding_scenario}, {dtype}, local={local}) | Max diff: {out_diff} | Ref diff: {ref_diff} | Tol: {out_tol}"
+    )
+    assert out_diff <= out_tol
 
 
 if __name__ == "__main__":
@@ -517,4 +792,17 @@ if __name__ == "__main__":
         args.deterministic,
         args.mha_type,
         dtype,
+    )
+
+    test_varlen_flash_attn_seq_padding(
+        args.batch_size,
+        args.mha_type,
+        args.deterministic,
+        "mixed",
+        dtype,
+        args.d,
+        args.dv,
+        seqlen_q,
+        seqlen_k,
+        args.local,
     )
