@@ -59,7 +59,7 @@ jobs:
       - name: Setup-Triton
         run: |
           set -ex
-          echo "Setuping Triton..."
+          echo "Setting up Triton..."
           docker exec \
           -w /workspace \
           aiter_test \
@@ -107,13 +107,7 @@ jobs:
           git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Clean up Rocm processes
-        run: |
-          rocm-smi
-          rocm-smi --showpids
-          echo 'Cleaning up ROCm processes...'
-          rocm-smi --showpids | awk '{if($1 ~ /^[0-9]+$/) print $1}' | xargs -r sudo kill -9 || true
-          rocm-smi
-          rocm-smi --showpids
+        run: ./.github/scripts/cleanup_rocm.sh
 
       - name: Run the container
         run: |
