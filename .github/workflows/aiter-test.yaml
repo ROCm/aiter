@@ -40,7 +40,6 @@ jobs:
         run: |
           ./.github/scripts/clean_up_rocm.sh
 
-
       - name: Run the container
         run: |
           set -ex
@@ -84,6 +83,11 @@ jobs:
         if: always()
         run: |
           docker rm -f aiter_test || true
+  
+      - name: Clean up Rocm processes
+        if: always()
+        run: |
+          ./.github/scripts/clean_up_rocm.sh
 
   multi-gpu:
     strategy:
@@ -107,7 +111,7 @@ jobs:
           git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Clean up Rocm processes
-        run: ./.github/scripts/cleanup_rocm.sh
+        run: ./.github/scripts/clean_up_rocm.sh
 
       - name: Run the container
         run: |
