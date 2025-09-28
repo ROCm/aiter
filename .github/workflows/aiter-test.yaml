@@ -81,7 +81,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: standart-test-logs
+          name: standard-test-logs
           path: latest_test.log
 
       - name: Cleanup container
@@ -137,7 +137,7 @@ jobs:
       - name: Setup-Triton
         run: |
           set -ex
-          echo "Setuping Triton..."
+          echo "Setting up Triton..."
           docker exec \
           -w /workspace \
           aiter_test \
