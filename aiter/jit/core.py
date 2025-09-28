@@ -355,6 +355,7 @@ def build_module(
 
         if not torch_exclude:
             import torch
+
             if hasattr(torch, "float4_e2m1fn_x2"):
                 flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
 
