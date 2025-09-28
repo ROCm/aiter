@@ -29,7 +29,7 @@ jobs:
       - name: Sync submodules
         run: |
           set -e
-          if [[ ${{ github.ref }} == "main" ]]; then
+          if [[ ${{ github.ref }} == "refs/heads/main" ]]; then
             git submodule sync --remote
           else
             git submodule sync
