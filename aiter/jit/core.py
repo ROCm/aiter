@@ -241,6 +241,7 @@ def get_module_custom_op(md_name: str) -> None:
             __mds[md_name] = importlib.import_module(md_name)
         else:
             __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+        logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
     return
 
 
@@ -352,10 +353,12 @@ def build_module(
         if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
 
-        import torch
+        if not torch_exclude:
+            import torch
 
-        if hasattr(torch, "float4_e2m1fn_x2"):
-            flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
+
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
@@ -785,16 +788,6 @@ def compile_ops(
                 op = getattr(module, loadName)
             else:
                 return None
-            activation_index = 0
-            quant_index = 0
-            activation_list = [
-                "fmoe_g1u1",
-                "fmoe_int8_g1u0",
-                "fmoe_g1u1_tkw1",
-                "fmoe_fp8_blockscale_g1u1",
-                "moe_stage1_g1u1",
-            ]
-            quant_list = ["moe_stage1_g1u1"]
 
             def check_args():
                 get_asm_dir()
@@ -804,34 +797,43 @@ def compile_ops(
 
                 import torch
 
+                enum_types = ["ActivationType", "QuantType"]
+
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
+                    for el in enum_types:
+                        doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {
                         "List": List,
                         "Optional": Optional,
                         "torch": torch,
+                        "typing": typing,
                     }
-                    exec(f"from aiter import*\ndef {doc_str}: pass", namespace)
+                    exec(
+                        f"from aiter import*\ndef {doc_str}: pass",
+                        namespace,
+                    )
                     foo = namespace[doc_str.split("(")[0]]
                     sig = inspect.signature(foo)
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
-                    if loadName in activation_list:
-                        return True
-                    if loadName in quant_list:
-                        return True
                     callargs = inspect.getcallargs(func, *args, **kwargs)
                     for el, arg in callargs.items():
                         expected_type = ann[el]
+                        got_type = type(arg)
                         origin = typing.get_origin(expected_type)
                         sub_t = typing.get_args(expected_type)
 
                         if origin is None:
-                            if not isinstance(arg, expected_type):
+                            if not isinstance(arg, expected_type) and not (
+                                # aiter_enum can be int
+                                any(el in str(expected_type) for el in enum_types)
+                                and isinstance(arg, int)
+                            ):
                                 raise TypeError(
-                                    f"{el} needs to be {expected_type} but got {type(arg)}"
+                                    f"{loadName}: {el} needs to be {expected_type} but got {got_type}"
                                 )
                         elif origin is list:
                             if (
@@ -839,12 +841,12 @@ def compile_ops(
                                 # or not all(isinstance(i, sub_t) for i in arg)
                             ):
                                 raise TypeError(
-                                    f"{el} needs to be List[{sub_t}] but got {arg}"
+                                    f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                 )
-                        elif origin is typing.Union:
+                        elif origin is typing.Union or origin is types.UnionType:
                             if arg is not None and not isinstance(arg, sub_t):
                                 raise TypeError(
-                                    f"{el} needs to be Optional[{sub_t}] but got {arg}"
+                                    f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
                                 )
                         else:
                             raise TypeError(f"Unsupported type: {expected_type}")
