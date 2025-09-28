@@ -131,7 +131,7 @@ def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
 class GemmA4W4BlockScaleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
-        "tune_file": f"aiter/configs/{AITER_CONFIG_GEMM_A4W4}.csv",
+        "tune_file": f"{AITER_CONFIG_GEMM_A4W4}",
         "untune_file": "aiter/configs/a4w4_blockscale_untuned_gemm.csv",
     }
 

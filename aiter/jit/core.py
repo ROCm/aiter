@@ -73,6 +73,37 @@ AITER_CONFIG_GEMM_A4W4 = os.getenv(
     "AITER_CONFIG_GEMM_A4W4",
     f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
 )
+AITER_CONFIG_GEMM_A8W8 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
+)
+AITER_CONFIG_FMOE = os.getenv(
+    "AITER_CONFIG_FMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
+    "AITER_CONFIG_A8W8_BATCHED_GEMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv",
+)
+
+AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
+    "AITER_CONFIG_BATCHED_GEMM_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
+)
 # config_env end here
 
 find_aiter = importlib.util.find_spec("aiter")

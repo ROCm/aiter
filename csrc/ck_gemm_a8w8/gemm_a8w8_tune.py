@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
-from aiter.test_common import perftest
+from aiter.jit.core import AITER_CONFIG_GEMM_A8W8
 from aiter.utility.base_tuner import GemmCommonTuner
 from gemm_a8w8_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
@@ -81,7 +81,7 @@ def run_gemm_a8w8(x, weight, x_scale, w_scale, out, kernelId, splitK):
 class GemmA8W8Tuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         "verbose": False,
-        "tune_file": "aiter/configs/a8w8_tuned_gemm.csv",
+        "tune_file": f"{AITER_CONFIG_GEMM_A8W8}",
         "untune_file": "aiter/configs/a8w8_untuned_gemm.csv",
         "errRatio": 0.05,
         "batch": 100,
