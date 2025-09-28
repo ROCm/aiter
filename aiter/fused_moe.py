@@ -97,10 +97,8 @@ def fused_moe(
     moe_sorting_dispatch_policy=0,
     dtype=None,
     # following for cktile support
-    n_pad_zeros=0,
-    k_pad_zeros=0,
-    n_pad_zeros2=0,
-    k_pad_zeros2=0,
+    hidden_pad=0,
+    intermediate_pad=0,
     bias1=None,
     bias2=None,
 ):
@@ -140,10 +138,8 @@ def fused_moe(
         isG1U1,
         activation,
         doweight_stage1,
-        n_pad_zeros,
-        k_pad_zeros,
-        n_pad_zeros2,
-        k_pad_zeros2,
+        hidden_pad,
+        intermediate_pad,
         bias1,
         bias2,
     )
@@ -212,10 +208,8 @@ def fused_moe(
             a2_scale=a2_scale,
             num_local_tokens=num_local_tokens,
             # following for cktile support
-            n_pad_zeros=n_pad_zeros,
-            k_pad_zeros=k_pad_zeros,
-            n_pad_zeros2=n_pad_zeros2,
-            k_pad_zeros2=k_pad_zeros2,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
             bias1=bias1,
             bias2=bias2,
         )
@@ -391,10 +385,8 @@ def get_2stage_cfgs(
     use_g1u1,
     activation,
     doweight_stage1,
-    n_pad_zeros,
-    k_pad_zeros,
-    n_pad_zeros2,
-    k_pad_zeros2,
+    hidden_pad,
+    intermediate_pad,
     bias1,
     bias2,
 ):
@@ -512,14 +504,14 @@ def get_2stage_cfgs(
         return MOEMetadata(
         functools.partial(
             cktile_moe_stage1,
-            n_pad_zeros=n_pad_zeros,
-            k_pad_zeros=k_pad_zeros,
+            n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
+            k_pad_zeros=hidden_pad // 128 * 128,
             bias1=bias1,
         ),
         functools.partial(
             cktile_moe_stage2,
-            n_pad_zeros=n_pad_zeros2,
-            k_pad_zeros=k_pad_zeros2,
+            n_pad_zeros=hidden_pad // 64 * 64,
+            k_pad_zeros=intermediate_pad // 128 * 128,
             bias2=bias2,
         ),
         block_m,
@@ -604,10 +596,8 @@ def fused_moe_2stages(
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
     # following for cktile support
-    n_pad_zeros=0,
-    k_pad_zeros=0,
-    n_pad_zeros2=0,
-    k_pad_zeros2=0,
+    hidden_pad=0,
+    intermediate_pad=0,
     bias1=None,
     bias2=None,
 ):
@@ -632,10 +622,8 @@ def fused_moe_2stages(
         isG1U1,
         activation,
         doweight_stage1,
-        n_pad_zeros,
-        k_pad_zeros,
-        n_pad_zeros2,
-        k_pad_zeros2,
+        hidden_pad,
+        intermediate_pad,
         bias1,
         bias2,
     )

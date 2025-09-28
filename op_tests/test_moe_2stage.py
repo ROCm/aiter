@@ -288,14 +288,18 @@ def test_fmoe(
     WQDType,
     use_g1u1=False,
     doweight_stage1=False,
+    hidden_pad=0,
+    intermediate_pad=0,
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = aiter.get_torch_quant(qType)
     # torch_act = aiter.get_torch_act(actType)
     input = torch.randn((token, model_dim), dtype=dtype)
-    npad0 = 192
-    kpad0 = 128
+    npad0 = intermediate_pad // 64 * 64
+    kpad0 = hidden_pad // 128 * 128
+    npad0_gemm2 = hidden_pad // 64 * 64
+    kpad0_gemm2 = intermediate_pad // 128 * 128
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
         w1[:,:,-kpad0:] = 0
@@ -306,8 +310,8 @@ def test_fmoe(
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
-    w2[:,:,-kpad0:] = 0
-    w2[:,-npad0:,:] = 0
+    w2[:,:,-kpad0_gemm2:] = 0
+    w2[:,-npad0_gemm2:,:] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
@@ -690,8 +694,8 @@ def test_fmoe(
         exp_bias2_aiter,
         dtype,
         topk,
-        npad0,
-        kpad0,
+        npad0_gemm2,
+        kpad0_gemm2,
         BLOCK_SIZE_M,
         actType,
         quant_type,
@@ -712,8 +716,8 @@ def test_fmoe(
         exp_bias2_aiter,
         dtype,
         topk,
-        npad0,
-        kpad0,
+        npad0_gemm2,
+        kpad0_gemm2,
         BLOCK_SIZE_M,
         actType,
         quant_type,
@@ -726,7 +730,6 @@ def test_fmoe(
         out2_ck,
         msg=f"[perf]  ck_moe_stage2:{us2:>8.2f} us, {token*model_dim*inter_dim*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
-    print(f'[DEBUG  ] fused_moe start. {exp_bias1_aiter.dtype=}, {exp_bias1_aiter.shape=}')
     out_fused = fused_moe(a1_qt,
     w1_qt_aiter,
     w2_qt_aiter,  # [expert(local_expert:EP), dim, inter_dim]
@@ -747,13 +750,10 @@ def test_fmoe(
     moe_sorting_dispatch_policy=0,
     dtype=None,
     # following for cktile support
-    n_pad_zeros=192,
-    k_pad_zeros=128,
-    n_pad_zeros2=192,
-    k_pad_zeros2=128,
+    intermediate_pad=intermediate_pad,
+    hidden_pad=hidden_pad,
     bias1=exp_bias1_aiter,
     bias2=exp_bias2_aiter,)
-    print(f'[DEBUG  ] fused_moe end.')
     checkAllclose(
         out_fused,
         out2_ck,
@@ -822,11 +822,11 @@ l_tokenNum = [
     # 2,
     # 4,
     # 8,
-    # 16,
-    # 32,
-    # 64,
-    # 128,
-    # 256,
+    16,
+    32,
+    64,
+    128,
+    256,
     # 1024,
     # 2048,
     # 3072,
@@ -845,6 +845,8 @@ l_quant = [
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
+l_hidden_pad = [0, 65, 129]
+l_intermediate_pad = [0, 65, 191]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -963,7 +965,9 @@ for (
     (quant_type, aq_dtype, wq_dtype),
     (model_dim, inter_dim),
     doweight_stage1,
-) in itertools.product(l_dtype, l_act, l_quant, l_dim, l_doweight_stage1):
+    hidden_pad,
+    intermediate_pad,
+) in itertools.product(l_dtype, l_act, l_quant, l_dim, l_doweight_stage1, l_hidden_pad, l_intermediate_pad):
     df = []
     for m in l_tokenNum:
         ret = test_fmoe(
@@ -979,6 +983,8 @@ for (
             wq_dtype,
             use_g1u1=True,
             doweight_stage1=doweight_stage1,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
         )
         df.append(ret)
     df = pd.DataFrame(df)
