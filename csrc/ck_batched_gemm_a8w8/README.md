@@ -17,7 +17,7 @@ You can find the results of the tuning in `aiter/configs/a8w8_tuned_batched_gemm
 4. Build tuned kernels and test:
 Test the performance, modify the test instance in `op_tests/test_batched_gemm_a8w8.py` and run it, please wait a few minutes as it will build batched_gemm_a8w8 tuned kernels in `aiter/configs/a8w8_tuned_batched_gemm.csv` via jit:
 `python3 op_tests/test_batched_gemm_a8w8.py`
-If you have built batched_gemm_a8w8 kernels brefore tuning new GEMM shapes, please add `AITER_REBUILD=1` before your test cmd, such as `AITER_REBUILD=1 python3 op_tests/test_batched_gemm_a8w8.py`. It will rebuild kernels from `aiter/configs/a8w8_tuned_batched_gemm.csv`.
+If you have built batched_gemm_a8w8 kernels brefore tuning new GEMM shapes, please add `AITER_REBUILD=1` before your test cmd, such as `AITER_REBUILD=1 python3 op_tests/test_batched_gemm_a8w8.py`. It will rebuild kernels from `AITER_CONFIG_A8W8_BATCHED_GEMM` the default one will be `aiter/configs/a8w8_tuned_batched_gemm.csv`.
 
 
 ## More

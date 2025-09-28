@@ -35,6 +35,7 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
         out = out.to(bias) + bias
     return out.to(dtype)
 
+
 def run_gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
     aiter.gemm_a8w8_bpreshuffle_tune(
         x, weight, x_scale, w_scale, out, kernel_id, splitK
