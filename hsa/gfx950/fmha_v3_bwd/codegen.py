@@ -226,6 +226,7 @@ template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,  
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        0,       true,      0,     true,    true,        true, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd192_fp16_a32_psskddv_group_recompile"; };
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        1,       true,      0,     true,    true,        true, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd192_fp16_causal_a32_psskddv_group_recompile"; };
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        3,       true,      0,     true,    true,        true, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd192_fp16_causal_br_a32_psskddv_group_recompile"; };
+template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp32,        0,       true,      0,     true,   false,       false, GPUArch::gfx950>> { static constexpr const char * kernel_name = "fmha_bwd_hd128_fp32_pssk"; };
 
 // ########################################################|HDim|    DataType| MaskType|kIsAtomic32|BF16Cvt|kIsSEQPad|kIsHDPad|kIsGroupMode|         GPUArch|
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_< 64, FmhaBwdBf16,        0,      false,      0,    false,   false,        false,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd64_bf16_a16_rtne.co"; };
@@ -316,6 +317,7 @@ template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,   
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        0,       true,      0,     true,    true,         true,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd192_fp16_a32_psskddv_group.co"; };
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        1,       true,      0,     true,    true,         true,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd192_fp16_causal_a32_psskddv_group.co"; };
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        3,       true,      0,     true,    true,         true,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd192_fp16_causal_br_a32_psskddv_group.co"; };
+template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp32,        0,       true,      0,     true,   false,        false,   GPUArch::gfx950>> { static constexpr const char * file_name = "bwd_hd128_fp32_pssk.co"; };
 
 // ########################################################|HDim|    DataType| MaskType|kIsAtomic32|BF16Cvt|kIsSEQPad|kIsHDPad|kIsGroupMode|         GPUArch|
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_< 64, FmhaBwdBf16,        0,      false,      0,    false,   false,         false, GPUArch::gfx950>> { static constexpr int ts_qo = 32; static constexpr int ts_kv = 192; };
@@ -406,6 +408,7 @@ template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,    
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        0,       true,      0,     true,    true,          true, GPUArch::gfx950>> { static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; };
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        1,       true,      0,     true,    true,          true, GPUArch::gfx950>> { static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; };
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        3,       true,      0,     true,    true,          true, GPUArch::gfx950>> { static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; };
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp32,        0,       true,      0,     true,   false,         false, GPUArch::gfx950>> { static constexpr int ts_qo = 16; static constexpr int ts_kv = 128; };
 
 namespace gfx950{
 class fmha_dq_shuffle_kernel
@@ -618,6 +621,38 @@ class fmha_bwd_v3_kernel
 
     void
     launch_kernel(fmha_bwd_v3_traits fmha_v3_traits, fmha_bwd_v3_args_gfx950 args, const ck_tile::stream_config& s) const
+    {
+        size_t arg_size = sizeof(args);
+        void* config[]  = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
+                           &args,
+                           HIP_LAUNCH_PARAM_BUFFER_SIZE,
+                           &arg_size,
+                           HIP_LAUNCH_PARAM_END};
+
+        int bdx = 256;
+        int gdx = (fmha_v3_traits.sk + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
+        int gdy = fmha_v3_traits.h;
+        int gdz = fmha_v3_traits.b;
+        if(fmha_v3_traits.mask > 0)
+        {
+            int num_tg = (fmha_v3_traits.sk + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
+            gdx        = (num_tg % 2) ? (num_tg / 2 + 1) : (num_tg / 2);
+        }
+        HIP_CALL(hipModuleLaunchKernel(kernel_func,
+                                       gdx,
+                                       gdy,
+                                       gdz,
+                                       bdx,
+                                       1,
+                                       1,
+                                       0,
+                                       s.stream_id_,
+                                       NULL,
+                                       reinterpret_cast<void**>(&config)));
+    }
+
+    void
+    launch_kernel(fmha_bwd_v3_traits fmha_v3_traits, fmha_bwd_v3_fp32_args args, const ck_tile::stream_config& s) const
     {
         size_t arg_size = sizeof(args);
         void* config[]  = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
@@ -1185,6 +1220,64 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
     );
 }
 
+template <typename dq_dk_dv_v3_traits_>
+float fmha_bwd_v3_fp32_(const ck_tile::stream_config& s, fmha_bwd_args a)
+{
+    if(s.log_level_ > 0)
+        std::cout << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name << std::flush;
+    fmha_bwd_v3_fp32_args args;
+    args.ptr_dq   = a.dq_ptr;
+    args.ptr_dk   = a.dk_ptr;
+    args.ptr_dv   = a.dv_ptr;
+    args.ptr_q    = a.q_ptr;
+    args.ptr_k    = a.k_ptr;
+    args.ptr_v    = a.v_ptr;
+    args.ptr_do   = a.do_ptr;
+    args.ptr_lse  = a.lse_ptr;
+    args.ptr_o    = a.o_ptr;
+    args.scalar   = a.scale;
+    args.log2e    = ck_tile::log2e_v<float>;
+    args.ratio    = a.nhead_q / a.nhead_k;
+    args.seqlen_q = a.seqlen_q;
+    args.seqlen_k = a.seqlen_k;
+    args.head_dim = a.hdim_q;
+    args.nhead_q  = a.nhead_q;
+    args.Hs_q     = a.nhead_stride_q * 4;
+    args.BAs_q    = a.batch_stride_q * 4;
+    args.Seqs_q   = a.stride_q * 4;
+    args.Hs_k     = a.nhead_stride_k * 4;
+    args.BAs_k    = a.batch_stride_k * 4;
+    args.Seqs_k   = a.stride_k * 4;
+    args.Hs_v     = a.nhead_stride_v * 4;
+    args.BAs_v    = a.batch_stride_v * 4;
+    args.Seqs_v   = a.stride_v * 4;
+    args.Hs_do    = a.nhead_stride_do * 4;
+    args.BAs_do   = a.batch_stride_do * 4;
+    args.Seqs_do  = a.stride_do * 4;
+    args.Hs_dk    = a.nhead_stride_dk * 4;
+    args.BAs_dk   = a.batch_stride_dk * 4;
+    args.Seqs_dk  = a.stride_dk * 4;
+    args.Hs_dv    = a.nhead_stride_dv * 4;
+    args.BAs_dv   = a.batch_stride_dv * 4;
+    args.Seqs_dv  = a.stride_dv * 4;
+    args.Hs_dq    = a.nhead_stride_dq * 4;
+    args.BAs_dq   = a.batch_stride_dq * 4;
+    args.Seqs_dq  = a.stride_dq * 4;
+
+    auto traits = fmha_bwd_v3_traits{a.batch,
+                                      a.nhead_q,
+                                      a.seqlen_q,
+                                      a.seqlen_k,
+                                      a.hdim_q,
+                                      a.mask_type,
+                                      FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
+                                      FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv};
+    static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::kernel_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::file_name); // static here is for thread safety.
+    return ck_tile::launch_kernel(s,
+        [=](const ck_tile::stream_config& s_){ impl.launch_kernel(traits, args, s_); },
+    );
+}
+
 float fmha_bwd_v3(mha_bwd_traits t,
                   fmha_bwd_args a,
                   const ck_tile::stream_config& s,
@@ -1477,8 +1570,8 @@ float fmha_bwd_v3(mha_bwd_traits t,
                     }
                 }
             }
-            else if ((a.hdim_q > 64) && (a.hdim_q <= 128) && (a.hdim_q % 8 == 0) && (a.nhead_stride_dq_acc >= a.stride_dq_acc /*dq_acc only support BHSD*/)){
-                if (t.data_type.compare("fp16") == 0){
+            else if ((a.hdim_q > 64) && (a.hdim_q <= 128) && (a.hdim_q % 8 == 0)){
+                if (t.data_type.compare("fp16") == 0 && (a.nhead_stride_dq_acc >= a.stride_dq_acc /*dq_acc only support BHSD*/)){
                     if (t.is_group_mode == false){
                         if (t.mask_type == mask_enum::no_mask) {
                             if (t.is_v3_atomic_fp32 == true){
@@ -1771,7 +1864,7 @@ float fmha_bwd_v3(mha_bwd_traits t,
                         }
                     }
                 }
-                else if(t.data_type.compare("bf16") == 0){
+                else if(t.data_type.compare("bf16") == 0 && (a.nhead_stride_dq_acc >= a.stride_dq_acc /*dq_acc only support BHSD*/)){
                     if (t.is_group_mode == false){
                         if (t.mask_type == mask_enum::no_mask) {
                             if (t.is_v3_atomic_fp32 == true){
@@ -2157,6 +2250,18 @@ float fmha_bwd_v3(mha_bwd_traits t,
                                 r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a, is_v3_api_check, seqlen_q_padded, seqlen_k_padded);
                                 return r;
                             }
+                        }
+                    }
+                }
+                else if(t.data_type.compare("fp32") == 0){
+                    if((t.is_group_mode == false) && (t.mask_type == mask_enum::no_mask)){
+                        if(a.hdim_q == 128){
+                            if (is_v3_api_check) {
+                                return r;
+                            }
+                            using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp32, false, true, 0, true, false, false, GPUArch::gfx950>;
+                            r = fmha_bwd_v3_fp32_<dq_dk_dv_v3_traits_>(s, a);
+                            return r;
                         }
                     }
                 }

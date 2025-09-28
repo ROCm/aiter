@@ -372,6 +372,75 @@ struct __attribute__((packed)) fmha_bwd_dq_shuffle_args
     p3 _p13;
 };
 
+struct __attribute__((packed)) fmha_bwd_v3_fp32_args
+{
+    void* ptr_dq;
+    void* ptr_dk;
+    void* ptr_dv;
+    const void* ptr_q;
+    const void* ptr_k;
+    const void* ptr_v;
+    const void* ptr_do;
+    const void* ptr_lse;
+    const void* ptr_o;
+    float scalar;
+    p1 _p0;
+    float log2e;
+    p1 _p1;
+    unsigned int ratio;
+    p1 _p2;
+    unsigned int seqlen_q;
+    p1 _p3;
+    unsigned int seqlen_k;
+    p1 _p4;
+    unsigned int head_dim;
+    p1 _p5;
+    unsigned int nhead_q;
+    p1 _p6;
+    unsigned int Hs_q;
+    p1 _p7;
+    unsigned int BAs_q;
+    p1 _p8;
+    unsigned int Seqs_q;
+    p1 _p9;
+    unsigned int Hs_k;
+    p1 _p10;
+    unsigned int BAs_k;
+    p1 _p11;
+    unsigned int Seqs_k;
+    p1 _p12;
+    unsigned int Hs_v;
+    p1 _p13;
+    unsigned int BAs_v;
+    p1 _p14;
+    unsigned int Seqs_v;
+    p1 _p15;
+    unsigned int Hs_do;
+    p1 _p16;
+    unsigned int BAs_do;
+    p1 _p17;
+    unsigned int Seqs_do;
+    p1 _p18;
+    unsigned int Hs_dk;
+    p1 _p19;
+    unsigned int BAs_dk;
+    p1 _p20;
+    unsigned int Seqs_dk;
+    p1 _p21;
+    unsigned int Hs_dv;
+    p1 _p22;
+    unsigned int BAs_dv;
+    p1 _p23;
+    unsigned int Seqs_dv;
+    p1 _p24;
+    unsigned int Hs_dq;
+    p1 _p25;
+    unsigned int BAs_dq;
+    p1 _p26;
+    unsigned int Seqs_dq;
+    p1 _p27;
+};
+
 struct fmha_bwd_v3_traits
 {
     int b;
