@@ -54,7 +54,7 @@ def get_CKBatchedGEMM_config(
 ):
     if not hasattr(get_CKBatchedGEMM_config, "ck_batched_gemm_dict"):
         ck_batched_gemm_dict = pd.read_csv(
-            f"{AITER_CONFIG_BF16_BATCHED_GEMM}"
+            AITER_CONFIG_BF16_BATCHED_GEMM
         ).drop_duplicates()
         get_CKBatchedGEMM_config.ck_batched_gemm_dict = ck_batched_gemm_dict.set_index(
             ["B", "M", "N", "K"]

@@ -8,6 +8,7 @@ import shutil
 from batched_gemm_bf16_common import kernelInstance, kernels_list, default_kernels_dict
 from aiter.jit.core import AITER_CONFIG_BF16_BATCHED_GEMM
 
+
 class batched_gemm_bf16_fwd_codegen:
     def __init__(self, working_path, istune=False):
         self.working_path = working_path
