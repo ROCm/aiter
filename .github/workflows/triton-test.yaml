@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -25,12 +26,7 @@ jobs:
 
       - name: Clean up Rocm processes
         run: |
-          rocm-smi
-          rocm-smi --showpids
-          echo 'Cleaning up ROCm processes...'
-          rocm-smi --showpids | awk '{if($1 ~ /^[0-9]+$/) print $1}' | xargs -r sudo kill -9 || true
-          rocm-smi
-          rocm-smi --showpids
+          ./.github/scripts/clean_up_rocm.sh
 
       - name: Run the container
         run: |
@@ -64,12 +60,14 @@ jobs:
           -w /workspace \
           triton_test \
           pip install pytest
+
       - name: Triton Tests
         run: |
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
           docker exec -w /workspace triton_test pytest -v ${{ env.TRITON_TEST }} --junitxml=test-reports/triton.xml
+
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()
@@ -81,3 +79,8 @@ jobs:
         if: always()
         run: |
           docker rm -f triton_test || true
+
+      - name: Clean up Rocm processes
+        if: always()
+        run: |
+          ./.github/scripts/clean_up_rocm.sh
