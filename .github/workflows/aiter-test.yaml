@@ -38,12 +38,8 @@ jobs:
 
       - name: Clean up Rocm processes
         run: |
-          rocm-smi
-          rocm-smi --showpids
-          echo 'Cleaning up ROCm processes...'
-          rocm-smi --showpids | awk '{if($1 ~ /^[0-9]+$/) print $1}' | xargs -r sudo kill -9 || true
-          rocm-smi
-          rocm-smi --showpids
+          ./.github/scripts/clean_up_rocm.sh
+
 
       - name: Run the container
         run: |
@@ -163,3 +159,8 @@ jobs:
         if: always()
         run: |
           docker rm -f aiter_test || true
+
+      - name: Clean up Rocm processes
+        if: always()
+        run: |
+          ./.github/scripts/clean_up_rocm.sh
