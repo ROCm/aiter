@@ -1032,6 +1032,7 @@
         .value("No", ActivationType::No)                 \
         .value("Silu", ActivationType::Silu)             \
         .value("Gelu", ActivationType::Gelu)             \
+        .value("Swiglu", ActivationType::Swiglu)         \
         .export_values();
 
  #define GEMM_COMMON_PYBIND          \

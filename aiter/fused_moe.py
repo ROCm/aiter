@@ -96,6 +96,13 @@ def fused_moe(
     num_local_tokens: Optional[torch.tensor] = None,
     moe_sorting_dispatch_policy=0,
     dtype=None,
+    # following for cktile support
+    n_pad_zeros=0,
+    k_pad_zeros=0,
+    n_pad_zeros2=0,
+    k_pad_zeros2=0,
+    bias1=None,
+    bias2=None,
 ):
     """user API"""
     M, topk = topk_ids.shape
@@ -133,6 +140,12 @@ def fused_moe(
         isG1U1,
         activation,
         doweight_stage1,
+        n_pad_zeros,
+        k_pad_zeros,
+        n_pad_zeros2,
+        k_pad_zeros2,
+        bias1,
+        bias2,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -198,6 +211,13 @@ def fused_moe(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             num_local_tokens=num_local_tokens,
+            # following for cktile support
+            n_pad_zeros=n_pad_zeros,
+            k_pad_zeros=k_pad_zeros,
+            n_pad_zeros2=n_pad_zeros2,
+            k_pad_zeros2=k_pad_zeros2,
+            bias1=bias1,
+            bias2=bias2,
         )
 
 
@@ -371,6 +391,12 @@ def get_2stage_cfgs(
     use_g1u1,
     activation,
     doweight_stage1,
+    n_pad_zeros,
+    k_pad_zeros,
+    n_pad_zeros2,
+    k_pad_zeros2,
+    bias1,
+    bias2,
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -482,7 +508,24 @@ def get_2stage_cfgs(
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
-
+    if dtype in [dtypes.bf16, dtypes.fp16] and q_type == QuantType.per_1x32:
+        return MOEMetadata(
+        functools.partial(
+            cktile_moe_stage1,
+            n_pad_zeros=n_pad_zeros,
+            k_pad_zeros=k_pad_zeros,
+            bias1=bias1,
+        ),
+        functools.partial(
+            cktile_moe_stage2,
+            n_pad_zeros=n_pad_zeros2,
+            k_pad_zeros=k_pad_zeros2,
+            bias2=bias2,
+        ),
+        block_m,
+        ksplit,
+        False,
+    )
     if (
         "ck" in kernelName1
         or q_dtype_w
@@ -560,6 +603,13 @@ def fused_moe_2stages(
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
+    # following for cktile support
+    n_pad_zeros=0,
+    k_pad_zeros=0,
+    n_pad_zeros2=0,
+    k_pad_zeros2=0,
+    bias1=None,
+    bias2=None,
 ):
 
     quant_func = get_quant(quant_type)
@@ -582,9 +632,19 @@ def fused_moe_2stages(
         isG1U1,
         activation,
         doweight_stage1,
+        n_pad_zeros,
+        k_pad_zeros,
+        n_pad_zeros2,
+        k_pad_zeros2,
+        bias1,
+        bias2,
     )
-
-    if quant_type == QuantType.per_1x32:
+    if quant_type == QuantType.per_1x32 \
+            and dtype in [dtypes.bf16, dtypes.fp16]:
+        assert activation == ActivationType.Swiglu, "only swiglu support for fp4+bf16/fp16"
+        a1 = hidden_states.to(dtype)
+        a1_scale = None
+    elif quant_type == QuantType.per_1x32:
         a1, a1_scale = quant_func(
             hidden_states,
             scale=a1_scale,
@@ -623,7 +683,6 @@ def fused_moe_2stages(
             dtype=dtype,
             device=device,
         )
-
     a2 = metadata.stage1(
         a1,
         w1,
@@ -639,7 +698,10 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
 
-    if quant_type == QuantType.per_1x32:
+    if quant_type == QuantType.per_1x32 \
+            and dtype in [dtypes.bf16, dtypes.fp16]:
+        a2_scale = None
+    elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
         a2, a2_scale = quant_func(
             a2,
@@ -1019,6 +1081,101 @@ def torch_moe_stage2(
     if doweight:
         out = out * topk_weights.view(token_num, -1, 1)
     return out.sum(1).to(dtype)
+
+
+def cktile_moe_stage1(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    block_m,
+    a1_scale,
+    w1_scale,
+    sorted_weights=None,
+    n_pad_zeros=0,
+    k_pad_zeros=0,
+    bias1=None,
+):
+    token_num = hidden_states.shape[0]
+    _, n1, k1 = w1.shape
+    _, k2, n2 = w2.shape
+    D = n2 if k2 == k1 else n2*2 #bit4 format
+    # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
+
+    if w1.dtype is torch.uint32:
+        D = D * 8
+    out = torch.empty((token_num, topk, D), dtype=hidden_states.dtype, device=hidden_states.device)
+    # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
+    aiter.moe_cktile2stages_gemm1(
+        hidden_states,
+        w1,
+        out,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        topk,
+        n_pad_zeros,
+        k_pad_zeros,
+        sorted_weights,
+        a1_scale,
+        w1_scale,
+        bias1,
+        block_m,
+    )
+    return out
+    
+
+def cktile_moe_stage2(
+    a2,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    w2_scale,
+    a2_scale,
+    block_m,
+    sorted_weights=None,
+    zeros_out=False,
+    n_pad_zeros=0,
+    k_pad_zeros=0,
+    bias2=None,
+):
+    token_num = a2.shape[0]
+    D = w2.shape[1]
+    # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
+
+    # out = torch.empty(
+    #     (token_num, D),
+    #     dtype=a2.dtype,
+    #     device=a2.device,
+    # )
+    # if zeros_out:
+    #     out.fill_(0)
+    # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
+    aiter.moe_cktile2stages_gemm2(
+        a2,
+        w2,
+        out,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        topk,
+        n_pad_zeros,
+        k_pad_zeros,
+        sorted_weights,
+        a2_scale,
+        w2_scale,
+        bias2,
+        block_m,
+    )
+    return out
 
 
 def fused_topk(

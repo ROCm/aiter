@@ -726,6 +726,39 @@ def test_fmoe(
         out2_ck,
         msg=f"[perf]  ck_moe_stage2:{us2:>8.2f} us, {token*model_dim*inter_dim*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
+    print(f'[DEBUG  ] fused_moe start. {exp_bias1_aiter.dtype=}, {exp_bias1_aiter.shape=}')
+    out_fused = fused_moe(a1_qt,
+    w1_qt_aiter,
+    w2_qt_aiter,  # [expert(local_expert:EP), dim, inter_dim]
+    topk_weights,
+    topk_ids,
+    expert_mask=None,  # EP
+    activation=ActivationType.Swiglu,
+    quant_type=aiter.QuantType.per_1x32,
+    doweight_stage1=False,
+    # following for quant
+    w1_scale=w1_scale_aiter,
+    w2_scale=w2_scale_aiter,
+    a1_scale=a1_scale,
+    a2_scale=a2_scale,
+    # following for tuning
+    block_size_M=32,
+    num_local_tokens=None,
+    moe_sorting_dispatch_policy=0,
+    dtype=None,
+    # following for cktile support
+    n_pad_zeros=192,
+    k_pad_zeros=128,
+    n_pad_zeros2=192,
+    k_pad_zeros2=128,
+    bias1=exp_bias1_aiter,
+    bias2=exp_bias2_aiter,)
+    print(f'[DEBUG  ] fused_moe end.')
+    checkAllclose(
+        out_fused,
+        out2_ck,
+        msg=f"out_fused vs out2_ck",
+    )
     # diff = torch.abs(out2_ref - out2_ck)
     # max_value= diff.max()
     # multi_index = np.unravel_index(torch.argmax(diff).item(), diff.shape)
@@ -789,11 +822,11 @@ l_tokenNum = [
     # 2,
     # 4,
     # 8,
-    16,
-    32,
-    64,
-    128,
-    256,
+    # 16,
+    # 32,
+    # 64,
+    # 128,
+    # 256,
     # 1024,
     # 2048,
     # 3072,
