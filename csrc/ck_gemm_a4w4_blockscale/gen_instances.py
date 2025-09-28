@@ -262,7 +262,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f",
         "--tune_file",
-        default=f"aiter/configs/{AITER_CONFIG_GEMM_A4W4}.csv",
+        default=AITER_CONFIG_GEMM_A4W4,
         required=False,
         help="tune_file include the result after run gemm_a4w4_tune.py",
     )

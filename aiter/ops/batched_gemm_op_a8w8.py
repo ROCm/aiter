@@ -9,6 +9,7 @@ import pandas as pd
 from ..jit.core import (
     compile_ops,
     AITER_ROOT_DIR,
+    AITER_CONFIG_A8W8_BATCHED_GEMM,
 )
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
@@ -64,7 +65,7 @@ def get_CKBatchedGEMM_config(
 ):
     if not hasattr(get_CKBatchedGEMM_config, "ck_batched_gemm_dict"):
         ck_batched_gemm_dict = pd.read_csv(
-            f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv"
+            f"{AITER_CONFIG_A8W8_BATCHED_GEMM}"
         ).drop_duplicates()
         get_CKBatchedGEMM_config.ck_batched_gemm_dict = ck_batched_gemm_dict.set_index(
             ["B", "M", "N", "K"]

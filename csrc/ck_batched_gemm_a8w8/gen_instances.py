@@ -6,6 +6,7 @@ import pandas as pd
 import argparse
 import shutil
 from batched_gemm_a8w8_common import kernelInstance, kernels_list, default_kernels_dict
+from aiter.jit.core import AITER_CONFIG_A8W8_BATCHED_GEMM
 
 
 class batched_gemm_a8w8_fwd_codegen:
@@ -283,7 +284,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f",
         "--tune_file",
-        default="aiter/configs/a8w8_tuned_batched_gemm.csv",
+        default=AITER_CONFIG_A8W8_BATCHED_GEMM,
         required=False,
         help="tune_file include the result after run batched_gemm_a8w8_tune.py",
     )

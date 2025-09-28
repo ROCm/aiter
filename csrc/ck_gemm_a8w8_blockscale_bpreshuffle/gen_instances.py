@@ -12,6 +12,7 @@ from gemm_a8w8_blockscale_bpreshuffle_common import (
     kernelInstance,
     kernels_list,
 )
+from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE
 
 """
 
@@ -269,7 +270,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f",
         "--tune_file",
-        default="aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+        default=AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
         required=False,
         help="tune_file include the result after run gemm_a8w8_tune.py",
     )

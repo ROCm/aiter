@@ -6,7 +6,7 @@ import pandas as pd
 import argparse
 import shutil
 from batched_gemm_bf16_common import kernelInstance, kernels_list, default_kernels_dict
-
+from aiter.jit.core import AITER_CONFIG_BF16_BATCHED_GEMM
 
 class batched_gemm_bf16_fwd_codegen:
     def __init__(self, working_path, istune=False):
@@ -266,7 +266,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f",
         "--tune_file",
-        default="aiter/configs/bf16_tuned_batched_gemm.csv",
+        default=AITER_CONFIG_BF16_BATCHED_GEMM,
         required=False,
         help="tune_file include the result after run batched_gemm_bf16_tune.py",
     )

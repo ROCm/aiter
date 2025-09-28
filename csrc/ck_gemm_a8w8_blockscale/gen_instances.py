@@ -11,7 +11,7 @@ from gemm_a8w8_blockscale_common import (
     kernels_list,
     default_kernels_dict,
 )
-
+from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
 
 """
 
@@ -263,7 +263,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f",
         "--tune_file",
-        default="aiter/configs/a8w8_blockscale_tuned_gemm.csv",
+        default=AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
         required=False,
         help="tune_file include the result after run gemm_a8w8_tune.py",
     )
