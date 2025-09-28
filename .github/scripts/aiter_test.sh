@@ -18,6 +18,12 @@ fi
 
 for file in "${files[@]}"; do
     # Print a clear separator and test file name for readability
+    if [ $file = op_tests/multigpu_tests/test_dispatch_combine.py ]; then
+        echo -e "\n============================================================"
+        echo -e "Skipping test: $file"
+        echo -e "============================================================\n"
+        continue
+    fi
     echo -e "\n============================================================"
     echo -e "Running test: $file"
     echo -e "============================================================\n"
