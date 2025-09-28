@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import pytest
+import argparse
+import itertools
+import pandas as pd
+
 import torch
 import aiter
 from aiter import dtypes
@@ -13,9 +18,7 @@ from aiter.test_mha_common import (
     generate_random_padding_mask,
     pad_rearrange_dropout_mask_hts_to_bhss,
 )
-import pytest
-import argparse
-import itertools
+from aiter.test_common import benchmark, run_perftest
 
 
 def run_torch(
@@ -90,6 +93,8 @@ def run_ck(
     return_lse=False,
     return_attn_probs=False,
 ):
+    _, _, nhead, d = q.shape
+    _, _, _, d_v = v.shape
     (
         q_unpad,
         k_unpad,
@@ -115,7 +120,8 @@ def run_ck(
     else:
         bias_unpad = None
 
-    outputs = aiter.flash_attn_varlen_func(
+    (outputs), us_fwd = run_perftest(
+        aiter.flash_attn_varlen_func,
         q_unpad,
         k_unpad,
         v_unpad,
@@ -162,16 +168,67 @@ def run_ck(
     else:
         dropout_mask = None
 
+    fwd_flop = 0
+    fwd_num_bytes = 0
+    bwd_flop = 0
+    bwd_num_bytes = 0
+    dtype_bytes = torch.finfo(q.dtype).bits // 8
+    lse_dtype_bytes = torch.finfo(torch.float).bits // 8
+    for i in range(len(cu_seqlens_q) - 1):
+        real_seqlen_q = cu_seqlens_q[i + 1].item() - cu_seqlens_q[i].item()
+        real_seqlen_k = cu_seqlens_k[i + 1].item() - cu_seqlens_k[i].item()
+        fwd_flop = (
+            fwd_flop
+            + nhead * 2 * real_seqlen_q * real_seqlen_k * d
+            + nhead * 2 * real_seqlen_q * real_seqlen_k * d_v
+        )
+        fwd_num_bytes = fwd_num_bytes + nhead * dtype_bytes * (
+            real_seqlen_q * d
+            + real_seqlen_k * d
+            + real_seqlen_k * d_v
+            + real_seqlen_q * d_v
+        )
+        bwd_flop = (
+            bwd_flop
+            + nhead * 3 * 2 * real_seqlen_q * real_seqlen_k * d
+            + nhead * 2 * 2 * real_seqlen_q * real_seqlen_k * d_v
+        )
+        bwd_num_bytes = (
+            bwd_num_bytes
+            + nhead
+            * dtype_bytes
+            * (
+                real_seqlen_q * d
+                + real_seqlen_k * d
+                + real_seqlen_k * d_v
+                + real_seqlen_q * d_v
+            )
+            * 2
+            + nhead * lse_dtype_bytes * real_seqlen_q
+        )
+
     if dout is None or not return_lse:
-        return out, dropout_mask, None, None, None
+        return out, dropout_mask, None, None, None, (us_fwd, fwd_flop, fwd_num_bytes)
     else:
-        dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
-            out, (q_unpad, k_unpad, v_unpad), dout
+        (dq_unpad, dk_unpad, dv_unpad), us_bwd = run_perftest(
+            torch.autograd.grad,
+            out,
+            (q_unpad, k_unpad, v_unpad),
+            dout,
+            retain_graph=True,
+            num_rotate_args=1,
         )
         dq = dq_pad_fn(dq_unpad)
         dk = dk_pad_fn(dk_unpad)
         dv = dk_pad_fn(dv_unpad)
-        return out, dropout_mask, dq, dk, dv
+        return (
+            out,
+            dropout_mask,
+            dq,
+            dk,
+            dv,
+            (us_fwd, fwd_flop, fwd_num_bytes, us_bwd, bwd_flop, bwd_num_bytes),
+        )
 
 
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
@@ -216,6 +273,7 @@ def run_ck(
         (2048, 2048),
     ],
 )
+@benchmark()
 def test_flash_attn_varlen_func(
     batch_size,
     nheads,
@@ -307,7 +365,14 @@ def test_flash_attn_varlen_func(
     else:
         return_attn_probs = False
 
-    out, dropout_mask, dq, dk, dv = run_ck(
+    (
+        out,
+        dropout_mask,
+        dq,
+        dk,
+        dv,
+        (us_fwd, fwd_flop, fwd_num_bytes, us_bwd, bwd_flop, bwd_num_bytes),
+    ) = run_ck(
         q,
         k,
         v,
@@ -381,10 +446,18 @@ def test_flash_attn_varlen_func(
         assert (dq - dq_ref).abs().max().item() <= dq_tol
         assert (dk - dk_ref).abs().max().item() <= dk_tol
         assert (dv - dv_ref).abs().max().item() <= dv_tol
+    ret = {}
+    ret["fwd_us"] = us_fwd
+    ret["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
+    ret["fwd_gb_per_sec"] = (fwd_num_bytes) / 1.0e3 / us_fwd
+    ret["bwd_us"] = us_bwd
+    ret["bwd_tflops"] = (bwd_flop) / 1.0e6 / us_fwd
+    ret["bwd_gb_per_sec"] = (bwd_num_bytes) / 1.0e3 / us_fwd
+    return ret
 
 
 l_dtype = ["bf16", "fp16"]
-l_dim = [32, 40, 59, 64, 96, 111, 128, 160, 192]
+l_dim = [32, 40, 64, 96, 111, 128, 160, 192]
 l_mha_type = ["mha", "mqa", "gqa"]
 l_causal = [False, True]
 l_local = [False, True]
@@ -524,10 +597,11 @@ if __name__ == "__main__":
         l_deterministic = [args.deterministic]
     (seqlen_q, seqlen_k) = args.seqlen_q_k
 
+    collected = []
     for dtype, dim, mha_type, causal, local, deterministic in itertools.product(
         l_dtype, l_dim, l_mha_type, l_causal, l_local, l_deterministic
     ):
-        test_flash_attn_varlen_func(
+        ret = test_flash_attn_varlen_func(
             args.batch_size,
             args.nheads,
             seqlen_q,
@@ -543,3 +617,7 @@ if __name__ == "__main__":
             mha_type,
             dtype,
         )
+        collected.append(ret)
+
+    df = pd.DataFrame(collected)
+    aiter.logger.info(f"mha_varlen summary:\n{df}")

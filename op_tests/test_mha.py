@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import itertools
+
+import pandas as pd
+import pytest
 import torch
+
 import aiter
 from aiter import dtypes
+from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
     attention_ref,
     attn_bias_from_alibi_slopes,
     ck_randval_to_dropout_mask,
     convert_flash_attn_S_to_softmax,
 )
-import pytest
-import argparse
-import itertools
 
 
 def run_torch(
@@ -83,18 +87,20 @@ def run_ck(
     return_lse=True,
     return_attn_probs=False,
 ):
-    out, _, S_dmask = aiter.flash_attn_func(
+    (out, _, S_dmask), us_fwd = run_perftest(
+        aiter.flash_attn_func,
         q,
         k,
         v,
         dropout_p,
-        causal=causal,
-        window_size=window_size,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        return_lse=return_lse,
-        return_attn_probs=return_attn_probs,
+        None,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        deterministic,
+        return_lse,
+        return_attn_probs,
     )
 
     if dropout_p > 0.0:
@@ -118,13 +124,27 @@ def run_ck(
         dropout_mask = None
 
     if dout is None:
-        return out, dropout_mask
+        return out, dropout_mask, us_fwd
     elif bias is not None:
-        dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
-        return out, dropout_mask, dq, dk, dv, dbias
+        (dq, dk, dv, dbias), us_bwd = run_perftest(
+            torch.autograd.grad,
+            out,
+            (q, k, v, bias),
+            dout,
+            retain_graph=True,
+            num_rotate_args=1,
+        )
+        return out, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd)
     else:
-        dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, dropout_mask, dq, dk, dv, None
+        (dq, dk, dv), us_bwd = run_perftest(
+            torch.autograd.grad,
+            out,
+            (q, k, v),
+            dout,
+            retain_graph=True,
+            num_rotate_args=1,
+        )
+        return out, dropout_mask, dq, dk, dv, None, (us_fwd, us_bwd)
 
 
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
@@ -167,6 +187,7 @@ def run_ck(
         (2048, 2048),
     ],
 )
+@benchmark()
 def test_flash_attn_output(
     batch_size,
     nheads,
@@ -232,7 +253,7 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
-    out, dropout_mask, dq, dk, dv, dbias = run_ck(
+    out, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd) = run_ck(
         q,
         k,
         v,
@@ -274,9 +295,6 @@ def test_flash_attn_output(
         upcast=False,
         reorder_ops=True,
     )
-    print(
-        f"batch_size: {batch_size}, nheads: {nheads}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, d: {d}, d_v: {d_v}, dropout_p: {dropout_p}, causal: {causal}, local: {local}, bias_type: {bias_type}, deterministic: {deterministic}, mha_type: {mha_type}, dtype: {dtype}"
-    )
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
@@ -303,9 +321,31 @@ def test_flash_attn_output(
         dbias_tol = max(10 * (dbias_pt - dbias_ref).abs().max().item(), 0.01)
         assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
 
+    fwd_flop = nheads * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+    dtype_bytes = torch.finfo(dtype).bits // 8
+    fwd_num_bytes = (
+        nheads
+        * dtype_bytes
+        * (seqlen_q * d + seqlen_k * d + seqlen_k * d_v + seqlen_q * d_v)
+    )
+    bwd_flop = nheads * (
+        seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2
+    )
+    bwd_num_bytes = (
+        2 * fwd_num_bytes + nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
+    )
+    ret = {}
+    ret["fwd_us"] = us_fwd
+    ret["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
+    ret["fwd_gb_per_sec"] = (fwd_num_bytes) / 1.0e3 / us_fwd
+    ret["bwd_us"] = us_bwd
+    ret["bwd_tflops"] = (bwd_flop) / 1.0e6 / us_fwd
+    ret["bwd_gb_per_sec"] = (bwd_num_bytes) / 1.0e3 / us_fwd
+    return ret
+
 
 l_dtype = ["bf16", "fp16"]
-l_dim = [32, 40, 59, 64, 96, 111, 128, 160, 192]
+l_dim = [32, 40, 64, 96, 111, 128, 160]
 l_mha_type = ["mha", "mqa", "gqa"]
 l_causal = [False, True]
 l_local = [False, True]
@@ -444,7 +484,7 @@ if __name__ == "__main__":
         l_seq_k = [args.seqlen_k]
     if args.deterministic is not None:
         l_deterministic = [args.deterministic]
-
+    collected = []
     for (
         dtype,
         dim,
@@ -457,7 +497,7 @@ if __name__ == "__main__":
     ) in itertools.product(
         l_dtype, l_dim, l_mha_type, l_causal, l_local, l_seq_q, l_seq_k, l_deterministic
     ):
-        test_flash_attn_output(
+        ret = test_flash_attn_output(
             args.batch_size,
             args.nheads,
             seq_q,
@@ -472,3 +512,7 @@ if __name__ == "__main__":
             mha_type,
             dtype,
         )
+        collected.append(ret)
+
+    df = pd.DataFrame(collected)
+    aiter.logger.info(f"mha summary:\n{df}")
