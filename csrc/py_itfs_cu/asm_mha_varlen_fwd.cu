@@ -101,9 +101,13 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
+                         nullptr,
+                         nullptr,
                          cu_seqlens_q.data_ptr(), // seqstart_q
                          cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k
                          seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_kpads
+                         nullptr,
+                         nullptr,
                          total_q,
                          total_k,
                          b,

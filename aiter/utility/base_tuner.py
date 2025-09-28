@@ -13,6 +13,8 @@ from operator import itemgetter
 import time
 from aiter import dtypes
 
+INVALID_TIME = -1
+
 
 class TunerCommon:
     ARG_DEFAULTS = {
@@ -50,6 +52,8 @@ class TunerCommon:
         self.untunedf = None
         self.name = name
         self.topk = 1
+        self.success = pd.DataFrame(columns=self.columns)
+        self.failed = pd.DataFrame(columns=self.columns)
 
     def get_arg_defaults(self):
         """get default arguments"""
@@ -151,6 +155,11 @@ class TunerCommon:
         """calculate TFLOPS and bandwidth"""
         pass
 
+    @abstractmethod
+    def result_to_df(self, rets):
+        """transfer results to dataframe"""
+        pass
+
     def get_untuned_gemm_list(self, untuned_gemm_file):
         assert os.path.exists(
             untuned_gemm_file
@@ -183,9 +192,13 @@ class TunerCommon:
         else:
             # retune shapes that are in both untune_file and tune_file
             untunedf = self.get_untuned_gemm_list(args.untune_file)
+            if "cu_num" not in untunedf.columns:
+                untunedf["cu_num"] = self.get_cu_num()
+            else:
+                untunedf = untunedf[untunedf["cu_num"] == self.get_cu_num()]
             self.untunedf = untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
-            self.untunedf["cu_num"] = self.get_cu_num()
+
             untunedf_cols = self.untunedf.columns
             mask = (
                 self.tunedf[untunedf_cols]
@@ -199,7 +212,7 @@ class TunerCommon:
         """ for shapes already tuned, we update the result inplace"""
         key_columns = self.keys
         df_updates = df_updates.loc[:, self.columns]
-        print(df_updates)
+        # print(df_updates)
         df_old["_tmp_key"] = df_old[key_columns].apply(tuple, axis=1)
         df_updates["_tmp_key"] = df_updates[key_columns].apply(tuple, axis=1)
         matched_keys = df_updates[df_updates["_tmp_key"].isin(df_old["_tmp_key"])][
@@ -242,8 +255,9 @@ class TunerCommon:
         """post process, post process all results to return topk results"""
         rets = list(rets)
         if args.profile_file != "":
-            print("len of results: ", len(rets))
-            self.result_to_csv(sorted(rets, key=itemgetter(0)), args.profile_file, True)
+            profiledf = self.result_to_df(sorted(rets, key=itemgetter(0)))
+            profiledf.to_csv(args.profile_file, index=False, na_rep="Null")
+            # self.result_to_csv(sorted(rets, key=itemgetter(0)), args.profile_file, True)
         if fast_mode or topk == -1:
             return rets
         best_time = -1
@@ -263,12 +277,15 @@ class TunerCommon:
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio)
                 for info_ex, us, max_err_ratio in sorted_time
-                if max_err_ratio <= tol_err_ratio and us != -1 and us != float("inf")
+                if max_err_ratio <= tol_err_ratio
+                and us != INVALID_TIME
+                and us != float("inf")
             ]
             if len(filtered_time) == 0:
                 logger.error(
                     f"error: no valid candidate found for {info_key}, please check the result or errRatio in all result file running with --profile_file"
                 )
+
             if len(filtered_time) < topk:
                 topk = len(filtered_time)
                 print(f"choose {topk} kernels")
@@ -279,9 +296,11 @@ class TunerCommon:
             ]
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")
-                best_config = [((info_key, *sorted_time[0][0]), -1, 1.0)]
+                best_config = [((info_key, *sorted_time[0][0]), INVALID_TIME, 1.0)]
+
             bestConfigs.extend(best_config)
-        return bestConfigs
+        resultdf = self.result_to_df(bestConfigs)
+        return resultdf
 
     @abstractmethod
     def result_to_csv(self, results, file, concat=False):
@@ -339,6 +358,12 @@ class TunerCommon:
                 f"error in batch {processed_batches} of {total_batches}: {str(e)}",
                 exc_info=True,
             )
+        finally:
+            logger.info("============= Tuning results Summary: ==============")
+            logger.info("Successfully tuned shapes:")
+            print(self.success)
+            logger.info("Failed tuned shapes:")
+            print(self.failed)
 
 
 class GemmCommonTuner(TunerCommon):
@@ -391,20 +416,19 @@ class GemmCommonTuner(TunerCommon):
         )
         return tflops, bw
 
-    def result_to_csv(self, results, file, concat=False):
-        """post process of tuning results"""
-        old_df = self.get_tuned_gemm_list(file)
+    def result_to_df(self, results):
         resultdf = pd.DataFrame(columns=self.columns)
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName = info
             kernelName = (
                 "None"
-                if time == "nan"
+                if time == INVALID_TIME
                 else self.getKernelName(kernelId) if kernelName == "" else kernelName
             )
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
+
             if len(results) == self.topk:
                 print(
                     f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
@@ -422,10 +446,22 @@ class GemmCommonTuner(TunerCommon):
             )
             temp = pd.DataFrame(key_dict)
             resultdf = pd.concat([resultdf, temp], ignore_index=True)
+        return resultdf
+
+    def result_to_csv(self, resultdf, file, concat=False):
+        """post process of tuning results"""
+        old_df = self.get_tuned_gemm_list(file)
+        self.failed = pd.concat(
+            [self.failed, resultdf[resultdf["us"] == INVALID_TIME]], ignore_index=True
+        )
+        self.success = pd.concat(
+            [self.success, resultdf[resultdf["us"] != INVALID_TIME]], ignore_index=True
+        )
+        update_tunedf = self.success
         if not concat:
-            resultdf = self.update_tunedf(old_df, resultdf)
+            resultdf = self.update_tunedf(old_df, update_tunedf)
         else:
-            resultdf = pd.concat([old_df, resultdf], ignore_index=True)
+            resultdf = pd.concat([old_df, update_tunedf], ignore_index=True)
         resultdf.to_csv(file, index=False, na_rep="Null")
 
     def update_tflops_bw(self, file):
