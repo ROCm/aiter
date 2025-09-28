@@ -35,13 +35,16 @@ def ref_masked_attention(
     scale: float,
     dtype,
     is_causal=True,
-    is_fp8=False,
+    is_fp8_q=False,
+    is_fp8_kvc=False,
     q_scale=None,
     kv_scale=None,
 ) -> torch.Tensor:
 
-    if is_fp8:
-        scale *= q_scale * kv_scale
+    if is_fp8_q:
+        scale *= q_scale
+    if is_fp8_kvc:
+        scale *= kv_scale
 
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     if is_causal:
@@ -61,7 +64,7 @@ def ref_masked_attention(
 
     l = attn_weights_exp.sum(-1)
 
-    if is_fp8:
+    if is_fp8_q:
         attn_weights_fp8 = attn_weights_exp.to(torch.float8_e4m3fnuz)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
 
@@ -69,7 +72,7 @@ def ref_masked_attention(
 
     out = out / l.transpose(0, 1).unsqueeze(-1)
 
-    if is_fp8:
+    if is_fp8_kvc:
         out *= kv_scale
     return out.to(dtype), lse
 
@@ -88,10 +91,13 @@ def torch_mla_extend(
     q_scale=None,
     kv_scale=None,
 ):
-    is_fp8 = q.dtype == torch.float8_e4m3fnuz
+    is_fp8_q = q.dtype == torch.float8_e4m3fnuz
+    is_fp8_kvc = kvc_cache.dtype == torch.float8_e4m3fnuz
 
-    if is_fp8:
+    if is_fp8_q:
         q = q.to(torch.float)
+
+    if is_fp8_kvc:
         kvc_cache = kvc_cache.to(torch.float)
 
     qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
@@ -113,7 +119,8 @@ def torch_mla_extend(
             sm_scale,
             dtype,
             is_causal=is_causal,
-            is_fp8=is_fp8,
+            is_fp8_q=is_fp8_q,
+            is_fp8_kvc=is_fp8_kvc,
             q_scale=q_scale,
             kv_scale=kv_scale,
         )
@@ -294,12 +301,13 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        return err, us_asm_decode
+        return err, us_asm_decode, flops, bytes
 
     err = None
     us_asm_decode = 10000000000
     if nhead == 16:
-        err, us_asm_decode = test_absorb_decode()
+        err, us_asm_decode, flops, bytes = test_absorb_decode()
+        print("us_asm_decode:", us_asm_decode)
 
     def test_absorb_decode_fp8():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -358,7 +366,7 @@ def test_mla(
         bytes = (
             total_kv * nhead_kv * qk_head_dim
             + total_q * nhead * (qk_head_dim + v_head_dim)
-        ) * (torch.finfo(dtype).bits // 8)
+        ) * 1
         err = checkAllclose(
             out_ref,
             out_asm,
@@ -369,19 +377,81 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        return err, err_fp8, us_asm_decode
+        return err, err_fp8, us_asm_decode, flops, bytes
 
-    err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8 = test_absorb_decode_fp8()
+    err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8, flops_fp8, bytes_fp8 = test_absorb_decode_fp8()
+    print("us_asm_decode_fp8:", us_asm_decode_fp8)
+
+    def test_absorb_decode_bf16_fp8():
+        kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+        out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
+
+        kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
+        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
+
+        out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
+            q,
+            kv_buffer_fp8,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype=dtype,
+            is_causal=True,
+            q_scale=None,
+            kv_scale=kv_scale,
+        )
+
+        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+            aiter.mla.mla_decode_fwd,
+            q,
+            kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
+            out_asm,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_qo,
+            sm_scale,
+            q_scale=None,
+            kv_scale=kv_scale,
+            work_meta_data=work_meta_data,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+        )
+
+        cal_diff(out_ref, out_asm, "out", True)
+
+        # print(f"{out_ref.view(total_q, -1)=}")
+        # print(f"{out_asm.view(total_q, -1)=}")
+        # checkAllclose(logits_ref, attn_logits,
+        #               msg=f'attn_logits [golden vs aiter_asm]')
+        # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
+        flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+        bytes = total_kv * nhead_kv * qk_head_dim * 1 + (total_q * nhead * (qk_head_dim + v_head_dim)) * (torch.finfo(dtype).bits // 8)
+        err = checkAllclose(
+            out_ref,
+            out_asm,
+            msg=f"mla_decode-absorb_bf16_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
+        return err, us_asm_decode, flops, bytes
+
+    err_bf16_fp8_fp32, us_asm_decode_bf16_fp8, flops_bf16_fp8, bytes_bf16_fp8 = test_absorb_decode_bf16_fp8()
+    print("us_asm_decode_bf16_fp8:", us_asm_decode_bf16_fp8)
 
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")
     # checkAllclose(logits_ref, attn_logits,
     #               msg=f'attn_logits [golden vs aiter_asm]')
     # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
-    flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
-    bytes = (
-        total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
-    ) * (torch.finfo(dtype).bits // 8)
+    # flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+
+    # bytes = total_kv * nhead_kv * qk_head_dim * 1 + (total_q * nhead * (qk_head_dim + v_head_dim)) * (torch.finfo(dtype).bits // 8)
 
     return {
         "decode:flops": flops,
@@ -393,8 +463,12 @@ def test_mla(
         "decode_fp8:err vs fp32": err_fp8_fp32,
         "decode_fp8:err vs fp8": err_fp8_fp8,
         "decode_fp8:asm_576": us_asm_decode_fp8,
-        "decode_fp8:TFLOPS": flops / us_asm_decode_fp8 / 1e6,
-        "decode_fp8:TB/s": bytes / us_asm_decode_fp8 / 1e6,
+        "decode_fp8:TFLOPS": flops_fp8 / us_asm_decode_fp8 / 1e6,
+        "decode_fp8:TB/s": bytes_fp8 / us_asm_decode_fp8 / 1e6,
+        "decode_bf16_fp8:err vs fp32": err_bf16_fp8_fp32,
+        "decode_bf16_fp8:asm_576": us_asm_decode_bf16_fp8,
+        "decode_bf16_fp8:TFLOPS": flops_bf16_fp8 / us_asm_decode_bf16_fp8 / 1e6,
+        "decode_bf16_fp8:TB/s": bytes_bf16_fp8 / us_asm_decode_bf16_fp8 / 1e6,
     }
 
 
@@ -404,7 +478,7 @@ qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16"]
-l_kv_dtype = ["bf16"]
+l_kv_dtype = ["bf16", "fp8"]
 list_nhead = [(16, 2)]
 
 parser = argparse.ArgumentParser(
@@ -465,7 +539,7 @@ parser.add_argument(
     "-kvd",
     "--kv_dtype",
     type=str,
-    choices=["bf16"],
+    choices=["bf16", "fp8"],
     nargs="*",
     default=["bf16"],
     help="""Data type of KV.
@@ -508,6 +582,10 @@ l_kv_dtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
 if args.nhead is not None:
     list_nhead = [args.nhead]
 
+print(list_dtype)
+print(l_kv_dtype)
+print(list_nhead)
+
 for nhead, mtp in list_nhead:
     df = []
     for dtype, kvtype, ctx_len, batch_size in itertools.product(
@@ -527,6 +605,8 @@ for nhead, mtp in list_nhead:
             varlen=True,
             mtp=mtp,
         )
+        for key, value in ret.items():
+            print(f"{key}: {value}")
         df.append(ret)
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")

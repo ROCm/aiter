@@ -171,10 +171,20 @@ void mla_decode_stage1_asm_fwd(
                 if(max_seqlen_q <= 4)
                 {
                     sub_Q = 128;
-                    static AiterAsmKernel impl_a16w16_bf16_ps(
-                        "_ZN5aiter42mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_psE",
-                        "/mla/mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_ps.co");
-                    impl_ptr = &impl_a16w16_bf16_ps;
+                    if (KV.dtype() == at::ScalarType::BFloat16) {
+                        static AiterAsmKernel impl_a16w16_bf16_ps(
+                            "_ZN5aiter42mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_psE",
+                            "/mla/mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_ps.co");
+                        impl_ptr = &impl_a16w16_bf16_ps;
+                    } else if (KV.dtype() == at::ScalarType::Float8_e4m3fnuz) {
+                        assert(kv_scale.has_value());
+                        assert(kv_scale.value().data_ptr() != nullptr);
+                        args.ptr_KVSCALE = kv_scale.value().data_ptr();
+                        static AiterAsmKernel impl_a16w8_bf16_ps(
+                            "_ZN5aiter42mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_psE",
+                            "/mla/mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_ps.co");
+                        impl_ptr = &impl_a16w8_bf16_ps;
+                    }
                 }
             }
             else if(max_seqlen_q == 1)
