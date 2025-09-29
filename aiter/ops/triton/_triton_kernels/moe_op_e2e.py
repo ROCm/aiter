@@ -47,8 +47,8 @@ def e2e_moe_kernel(
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
     num_valid_tokens,
-    group_n,
-    group_k,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
     EM: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -141,6 +141,9 @@ def e2e_moe_kernel(
     offs_sk2 = tl.arange(0, BLOCK_SIZE_K2) // group_k
 
     BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2 # TODO: quarantee that BLOCK_SIZE_HALF*2=BLOCK_SIZE_N
+
+    
+
     offs_i0 = tl.arange(0, BLOCK_SIZE_HALF)
     offs_i1 = tl.arange(0, BLOCK_SIZE_HALF) + N // 2
 
@@ -250,7 +253,11 @@ def e2e_moe_kernel(
     )
 
     if use_fp8_w8a8:
-        offs_w2_sn = offs_w2n // group_n
+        # offs_w2_sn = offs_w2n // group_n
+        # instead load only the necessary and broadcast. 
+        num_scales_along_n: tl.constexpr = BLOCK_SIZE_HALF // group_n
+        offs_scales_n = tl.arange(0, num_scales_along_n)
+        offs_w2_sn = pid_n * (BLOCK_SIZE_HALF) + offs_scales_n * BLOCK_SIZE_HALF
         w2_scale_ptrs = (
             W2_scale + off_experts * stride_w2se + offs_w2_sn[:, None] * stride_w2sn + offs_sk2[None,:] * stride_w2sk
         )
@@ -278,7 +285,10 @@ def e2e_moe_kernel(
             )
 
         if use_fp8_w8a8:
-            w2_scale = tl.load(w2_scale_ptrs + k * BLOCK_SIZE_K2 // group_k * stride_w2sk).to(tl.bfloat16)
+            w2_scales = tl.load(w2_scale_ptrs + k * BLOCK_SIZE_K2 // group_k * stride_w2sk).to(tl.bfloat16) # (BLOCK_SIZE_HALF//group_n, BLOCK_SIZE_K2)
+            w2_scales = w2_scales.reshape((num_scales_along_n, 1, BLOCK_SIZE_K2))
+            w2_scales = tl.broadcast_to(w2_scales, (num_scales_along_n, group_n, BLOCK_SIZE_K2))  
+            w2_scale = w2_scales.reshape((num_scales_along_n * group_n, BLOCK_SIZE_K2)) 
             w2 = (w2 * w2_scale).to(tl.bfloat16)
             out = tl.dot(acc, w2)
         else:

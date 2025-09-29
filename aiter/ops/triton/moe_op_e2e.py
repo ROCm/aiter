@@ -183,6 +183,7 @@ def e2e_moe(
         # Out = Out.to(torch.float32) if dtype == torch.bfloat16 else Out
 
         SKINNY = config["BLOCK_SIZE_N"] >= N
+        # num_scales_along_n = config["BLOCK_SIZE_N"] // (2 * block_shape[0])
 
         e2e_moe_kernel[grid](
             A,
