@@ -570,7 +570,7 @@ MANUAL_SCHEMA_OPS = [
     "greedy_sample",
     "random_sample",
     "mixed_sample",
-    "exponential"
+    "exponential",
 ]
 
 NONE_WRAPPED_OP = [

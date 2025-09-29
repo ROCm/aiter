@@ -35,7 +35,7 @@ def test_greedy_sample(M, N, dtype=torch.bfloat16):
     o_a, us_a = run_perftest(run_greedy_sample, input)
     o_b, us_b = run_perftest(run_aiter_greedy_sample, input)
     err = checkAllclose(o_a.to(torch.int), o_b, atol=0, rtol=0)
-    return {"orign_us": us_a, "aiter_us": us_b, "aiter_err": err}
+    return {"origin_us": us_a, "aiter_us": us_b, "aiter_err": err}
 
 
 def run_random_sample(input, temperatures, eps):
@@ -71,7 +71,7 @@ def test_random_sample(M, N, dtype=torch.bfloat16, eps=1e-6):
     o_a, us_a = run_perftest(run_random_sample, input, temperatures, eps)
     o_b, us_b = run_perftest(run_aiter_random_sample, input, temperatures, eps)
     err = checkAllclose(o_a.to(torch.int), o_b, atol=0, rtol=0)
-    return {"orign_us": us_a, "aiter_us": us_b, "aiter_err": err}
+    return {"origin_us": us_a, "aiter_us": us_b, "aiter_err": err}
 
 
 def run_mixed_sample(input, temperatures, eps):
@@ -109,7 +109,7 @@ def test_mixed_sample(M, N, dtype=torch.bfloat16, eps=1e-6):
         run_aiter_mixed_sample, input, temperatures, eps, num_iters=2, num_warmup=0
     )
     err = checkAllclose(o_a.to(torch.int), o_b, atol=0, rtol=0)
-    return {"orign_us": us_a, "aiter_us": us_b, "aiter_err": err}
+    return {"origin_us": us_a, "aiter_us": us_b, "aiter_err": err}
 
 
 d_sample = {
@@ -181,12 +181,12 @@ if len(args.sample_type) > 0:
 
 list_sample_func = [d_sample[key] for key in args.sample_type if key in d_sample.keys()]
 
-df = []
 for test_func in list_sample_func:
+    df = []
     for dtype in list_dtype:
         for n in l_n:
             for m in l_m:
                 ret = test_func(m, n, dtype)
                 df.append(ret)
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+    df = pd.DataFrame(df)
+    aiter.logger.info(f"summary:\n{df}")
