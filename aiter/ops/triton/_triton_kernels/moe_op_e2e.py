@@ -142,7 +142,6 @@ def e2e_moe_kernel(
 
     BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2 # TODO: quarantee that BLOCK_SIZE_HALF*2=BLOCK_SIZE_N
 
-    
 
     offs_i0 = tl.arange(0, BLOCK_SIZE_HALF)
     offs_i1 = tl.arange(0, BLOCK_SIZE_HALF) + N // 2
@@ -152,9 +151,12 @@ def e2e_moe_kernel(
     # offset for mul_acc
     i1 = pid_n * BLOCK_SIZE_HALF + offs_i1
 
+    i0s = pid_n * (BLOCK_SIZE_HALF // group_n) + tl.arange(0, BLOCK_SIZE_HALF // group_n)
+    # offset for mul_acc
+    i1s = pid_n * (BLOCK_SIZE_HALF // group_n) + tl.arange(0, BLOCK_SIZE_HALF // group_n) + ((N // group_n) // 2)
     # TODO: add EVEN_N and pid_n is not last pid_n so no need for masking conditions
     # same mask applicable to both silu and mul acc
-    mask_w1n = i0 < (N//2)
+    mask_w1n = i0 < (N // 2)
 
     a_ptrs = A + (
         offs_token[:, None] // top_k * stride_am + offs_k1[None, :] * stride_ak
@@ -178,14 +180,12 @@ def e2e_moe_kernel(
 
     if use_fp8_w8a8:
         a_scale_ptrs = A_scale + (offs_token[:, None] // top_k * stride_asm) 
-        offs_w1_i0_sn = i0 // group_n
-        offs_w1_i1_sn = i1 // group_n
 
         w1_i0_scale_ptrs = (
-            W1_scale + off_experts * stride_w1se + offs_w1_i0_sn[None, :] * stride_w1sn 
+            W1_scale + off_experts * stride_w1se + i0s[None, :] * stride_w1sn 
         )
         w1_i1_scale_ptrs = (
-            W1_scale + off_experts * stride_w1se + offs_w1_i1_sn[None, :] * stride_w1sn 
+            W1_scale + off_experts * stride_w1se + i1s[None, :] * stride_w1sn 
         )
 
     num_k1 = tl.cdiv(K, BLOCK_SIZE_K1)
@@ -214,9 +214,21 @@ def e2e_moe_kernel(
         
         if use_fp8_w8a8:
             start_k = k * BLOCK_SIZE_K1 // group_k
+
             w1_i0_scale = tl.load(w1_i0_scale_ptrs + start_k * stride_w1sk)
             w1_i1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk)
+
+            # TODO maybe made a generic broadcast function?
+            w1_i0_scale = w1_i0_scale.reshape(1, ((BLOCK_SIZE_N // 2) // group_n), 1)
+            w1_i0_scale = w1_i0_scale.broadcast_to(1, ((BLOCK_SIZE_N // 2) // group_n), group_n)
+            w1_i0_scale = w1_i0_scale.reshape(1, ((BLOCK_SIZE_N // 2)))
+
+            w1_i1_scale = w1_i1_scale.reshape(1, ((BLOCK_SIZE_N // 2) // group_n), 1)
+            w1_i1_scale = w1_i1_scale.broadcast_to(1, ((BLOCK_SIZE_N // 2) // group_n), group_n)
+            w1_i1_scale = w1_i1_scale.reshape(1, ((BLOCK_SIZE_N // 2)))
+
             a_scale = tl.load(a_scale_ptrs + start_k * stride_ask, mask=token_mask[:, None], other=0.0)
+            
             silu_acc += tl.dot(a, w1_i0) * a_scale * w1_i0_scale
             mul_acc += tl.dot(a, w1_i1) * a_scale * w1_i1_scale
         else:
