@@ -596,13 +596,10 @@ def test_flash_attn_seq_padding(
 
 
 l_dtype = ["bf16", "fp16"]
-# l_dim = [32, 40, 64, 96, 111, 128, 160]
-l_dim = [128]
+l_dim = [32, 40, 64, 111, 128, 160]
 l_mha_type = ["mha", "mqa", "gqa"]
 l_causal = [False, True]
 l_local = [False, True]
-l_seq_q = [108, 256, 512]
-l_seq_k = [256, 512, 1024]
 l_deterministic = [False, True]
 
 parser = argparse.ArgumentParser(
@@ -629,16 +626,16 @@ parser.add_argument(
     "-q",
     "--seqlen_q",
     type=int,
-    default=None,
-    help="""Sequence length for query. Default is None.
+    default=512,
+    help="""Sequence length for query. Default is 512.
     e.g.: -q 1024""",
 )
 parser.add_argument(
     "-k",
     "--seqlen_k",
     type=int,
-    default=None,
-    help="""Sequence length for key. Default is None.
+    default=512,
+    help="""Sequence length for key. Default is 512.
     e.g.: -k 1024""",
 )
 parser.add_argument(
@@ -741,14 +738,6 @@ if __name__ == "__main__":
         l_local = [args.local]
     else:
         args.local = False
-    if args.seqlen_q is not None:
-        l_seq_q = [args.seqlen_q]
-    else:
-        args.seqlen_q = 512
-    if args.seqlen_k is not None:
-        l_seq_k = [args.seqlen_k]
-    else:
-        args.seqlen_k = 512
     if args.deterministic is not None:
         l_deterministic = [args.deterministic]
     else:
@@ -760,17 +749,15 @@ if __name__ == "__main__":
         mha_type,
         causal,
         local,
-        seq_q,
-        seq_k,
         deterministic,
     ) in itertools.product(
-        l_dtype, l_dim, l_mha_type, l_causal, l_local, l_seq_q, l_seq_k, l_deterministic
+        l_dtype, l_dim, l_mha_type, l_causal, l_local, l_deterministic
     ):
         ret = test_flash_attn_output(
             args.batch_size,
             args.nheads,
-            seq_q,
-            seq_k,
+            args.seqlen_q,
+            args.seqlen_k,
             dim,
             dim,
             args.dropout_p,

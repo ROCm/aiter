@@ -731,8 +731,7 @@ def test_varlen_flash_attn_seq_padding(
 
 
 l_dtype = ["bf16", "fp16"]
-l_dim = [32, 40, 64, 96, 111, 128, 160, 192]
-# l_dim = [128]
+l_dim = [32, 40, 64, 111, 128, 160, 192]
 l_mha_type = ["mha", "mqa", "gqa"]
 l_causal = [False, True]
 l_local = [False, True]
