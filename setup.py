@@ -174,6 +174,7 @@ if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
 ## link "3rdparty", "hsa", "csrc" into "aiter_meta"
 shutil.copytree("3rdparty", "aiter_meta/3rdparty")
 shutil.copytree("hsa", "aiter_meta/hsa")
+shutil.copytree("gradlib", "aiter_meta/gradlib")
 shutil.copytree("csrc", "aiter_meta/csrc")
 
 
