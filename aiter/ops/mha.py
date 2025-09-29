@@ -1285,9 +1285,7 @@ def can_impl_fmha_v3_bwd(
         # bwd_hd64_fp16_causal_a32_pssk
         # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret = hdim_q == 64 and is_v3_atomic_fp32 == True
-        ret &= nmask or (
-            mask and seqlen_q == seqlen_k
-        )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
+        ret &= not swa
 
         return ret
 
@@ -1340,9 +1338,9 @@ def can_impl_fmha_v3_bwd(
         ret &= hdim_q > 64 and hdim_q <= 192
         ret &= (
             nmask
-            or (mask and seqlen_q == seqlen_k)
+            or mask
             or (swa and hdim_q > 64 and hdim_q <= 128)
-        )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
+        )
 
         return ret
 
@@ -1425,7 +1423,6 @@ def _flash_attn_backward(
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
-        ret &= nmask or (mask and seqlen_q == seqlen_k)
 
         return ret
 
@@ -1903,6 +1900,7 @@ def _flash_attn_varlen_backward(
     nmask = (
         causal == False and window_size_left == -1 and window_size_right == -1
     )  # no mask
+    swa = (window_size_left > 0) or (window_size_right > 0)
 
     def pssk():
         # only for hd64 a32 causal/no causal, fp16/bf16-rtne/rtna/rtz cases
@@ -1929,7 +1927,6 @@ def _flash_attn_varlen_backward(
             is_v3_atomic_fp32 == True
         )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret &= hdim_q == 64 or hdim_q == 128
-        ret &= nmask  # TODO: or (mask and mask_type == mask_enum::mask_top_left)
 
         return ret
 
@@ -1946,7 +1943,6 @@ def _flash_attn_varlen_backward(
             is_v3_atomic_fp32 == True
         )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret &= hdim_q >= 64 and hdim_q <= 192
-        ret &= nmask  # TODO: or (mask and mask_type == mask_enum::mask_top_left)
 
         return ret
 
@@ -1960,7 +1956,7 @@ def _flash_attn_varlen_backward(
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
-        ret &= mask or nmask
+        ret &= not swa
         ret &= pssk() or psskddv()
 
         return ret
@@ -1975,7 +1971,7 @@ def _flash_attn_varlen_backward(
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
-        ret &= nmask
+        ret &= not swa
 
         return ret
 
