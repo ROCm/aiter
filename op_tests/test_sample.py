@@ -10,11 +10,16 @@ from aiter import dtypes, greedy_sample, random_sample
 import argparse
 
 torch.set_default_device("cuda")
+torch.manual_seed(1)
+torch.cuda.manual_seed_all(1)
+g_gpu = torch.Generator(device="cuda").manual_seed(42)
+state_gpu = torch.cuda.get_rng_state()
 
 
 def run_greedy_sample(input):
-    # _, sampled_tokens = topk(input, 1)
-    sampled_tokens = torch.argmax(input, dim=-1)
+    input = input.to(torch.float)
+    _, sampled_tokens = topk(input, 1)
+    # sampled_tokens = torch.argmax(input, dim=-1)
     return sampled_tokens.view(-1)
 
 
@@ -27,36 +32,43 @@ def run_aiter_greedy_sample(input):
 @benchmark()
 def test_greedy_sample(M, N, dtype=torch.bfloat16):
     input = torch.randn(M, N, device="cuda", dtype=dtype)
-    o_a, us_a = run_perftest(run_greedy_sample, input, num_iters=10)
+    o_a, us_a = run_perftest(run_greedy_sample, input)
     o_b, us_b = run_perftest(run_aiter_greedy_sample, input)
     err = checkAllclose(o_a.to(torch.int), o_b, atol=0, rtol=0)
     return {"orign_us": us_a, "aiter_us": us_b, "aiter_err": err}
 
 
 def run_random_sample(input, temperatures, eps):
-    input.div_(temperatures.unsqueeze(dim=1))
-    probs = softmax(input)
-    logits = probs.div_(torch.empty_like(probs).exponential_(1) + eps)
-    # _, sampled_tokens = topk(logits, 1)
-    sampled_tokens = torch.argmax(logits, dim=-1)
+    logits = input.to(torch.float)
+    logits = logits.div_(temperatures.unsqueeze(dim=1))
+    probs = softmax(logits)
+    torch.cuda.set_rng_state(state_gpu)
+    exponential = torch.empty_like(probs)
+    aiter.exponential(exponential, lambd=1.0, eps=eps)
+    # exponential = torch.empty_like(probs).exponential_(1) + eps
+    logits = probs.div_(exponential)
+    _, sampled_tokens = topk(logits, 1)
+    # sampled_tokens = torch.argmax(logits, dim=-1)
 
     return sampled_tokens.view(-1)
 
 
 def run_aiter_random_sample(input, temperatures, eps):
     sampled_tokens = torch.empty(input.size(0), dtype=torch.int32, device="cuda")
-    aiter.random_sample(sampled_tokens, input, temperatures, eps)
+    torch.cuda.set_rng_state(state_gpu)
+    aiter.random_sample(sampled_tokens, input, temperatures, lambd=1.0, eps=eps)
     return sampled_tokens
 
 
 @benchmark()
 def test_random_sample(M, N, dtype=torch.bfloat16, eps=1e-6):
+    eps = 1000
     input = torch.randn(M, N, device="cuda", dtype=dtype)
     temperatures = torch.rand(M, device="cuda", dtype=torch.float)
     temperatures = torch.where(
         temperatures < 0.3, torch.ones_like(temperatures), temperatures
     )
-    o_a, us_a = run_perftest(run_random_sample, input, temperatures, eps, num_iters=5)
+    o_a, us_a = run_perftest(run_random_sample, input, temperatures, eps)
     o_b, us_b = run_perftest(run_aiter_random_sample, input, temperatures, eps)
     err = checkAllclose(o_a.to(torch.int), o_b, atol=0, rtol=0)
     return {"orign_us": us_a, "aiter_us": us_b, "aiter_err": err}
@@ -68,7 +80,11 @@ def run_mixed_sample(input, temperatures, eps):
     greedy_tokens = torch.argmax(logits, dim=-1)
     logits.div_(temperatures.unsqueeze(dim=1))
     probs = softmax(logits)
-    sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1) + eps)
+    torch.cuda.set_rng_state(state_gpu)
+    exponential = torch.empty_like(probs)
+    aiter.exponential(exponential, lambd=1.0, eps=eps)
+    # exponential = torch.empty_like(probs).exponential_(1) + eps
+    sample_tokens = probs.div_(exponential)
     # _, sample_tokens = topk(sample_tokens, 1)
     sample_tokens = torch.argmax(sample_tokens, dim=-1)
     return torch.where(temperatures == 0, greedy_tokens, sample_tokens)
@@ -76,7 +92,8 @@ def run_mixed_sample(input, temperatures, eps):
 
 def run_aiter_mixed_sample(input, temperatures, eps):
     sampled_tokens = torch.empty(input.size(0), dtype=torch.int32, device="cuda")
-    aiter.mixed_sample(sampled_tokens, input, temperatures, eps)
+    torch.cuda.set_rng_state(state_gpu)
+    aiter.mixed_sample(sampled_tokens, input, temperatures, lambd=1.0, eps=eps)
     return sampled_tokens
 
 
@@ -88,7 +105,9 @@ def test_mixed_sample(M, N, dtype=torch.bfloat16, eps=1e-6):
         temperatures < 0.3, torch.zeros_like(temperatures), temperatures
     )
     o_a, us_a = run_perftest(run_mixed_sample, input, temperatures, eps, num_iters=5)
-    o_b, us_b = run_perftest(run_aiter_mixed_sample, input, temperatures, eps)
+    o_b, us_b = run_perftest(
+        run_aiter_mixed_sample, input, temperatures, eps, num_iters=2, num_warmup=0
+    )
     err = checkAllclose(o_a.to(torch.int), o_b, atol=0, rtol=0)
     return {"orign_us": us_a, "aiter_us": us_b, "aiter_err": err}
 
@@ -100,7 +119,7 @@ d_sample = {
 }
 
 list_dtype = ["bf16"]
-l_n = [129280, 151936][1:]
+l_n = [129280, 151936][-1:]
 l_m = [1, 8, 16, 32, 64, 128, 192, 256, 512]
 import pandas as pd
 

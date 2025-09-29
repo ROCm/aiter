@@ -569,7 +569,8 @@ MANUAL_SCHEMA_OPS = [
     "init_custom_ar",
     "greedy_sample",
     "random_sample",
-    "mixed_sample"
+    "mixed_sample",
+    "exponential"
 ]
 
 NONE_WRAPPED_OP = [

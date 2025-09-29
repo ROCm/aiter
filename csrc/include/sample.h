@@ -21,4 +21,8 @@ void mixed_sample(torch::Tensor& out,
                   float lambd                            = 1.0,
                   std::optional<at::Generator> generator = std::nullopt,
                   float eps                              = 1e-10);
+void exponential(torch::Tensor& out,
+                 float lambd                            = 1.0,
+                 std::optional<at::Generator> generator = std::nullopt,
+                 float eps                              = 1e-10);
 } // namespace aiter

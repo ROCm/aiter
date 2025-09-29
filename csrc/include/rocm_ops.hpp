@@ -1112,6 +1112,12 @@
           py::arg("temperature"),                                                    \
           py::arg("lambd")     = 1.0,                                                \
           py::arg("generator") = std::nullopt,                                       \
+          py::arg("eps")       = 1e-10);                                                   \
+    m.def("exponential",                                                             \
+          &aiter::exponential,                                                       \
+          py::arg("out"),                                                            \
+          py::arg("lambd")     = 1.0,                                                \
+          py::arg("generator") = std::nullopt,                                       \
           py::arg("eps")       = 1e-10);
 
 #define HIPBSOLGEMM_PYBIND                                                         \

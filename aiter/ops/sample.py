@@ -34,3 +34,12 @@ def mixed_sample(
     generator: Optional[Generator] = None,
     eps: float = 1e-10,
 ) -> None: ...
+
+
+@compile_ops("module_sample")
+def exponential(
+    out: Tensor,
+    lambd: float = 1,
+    generator: Optional[Generator] = None,
+    eps: float = 1e-10,
+) -> None: ...
