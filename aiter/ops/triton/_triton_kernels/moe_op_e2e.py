@@ -220,8 +220,8 @@ def e2e_moe_kernel(
             silu_acc += tl.dot(a, w1_i0) * a_scale * w1_i0_scale
             mul_acc += tl.dot(a, w1_i1) * a_scale * w1_i1_scale
         else:
-            mul_acc = tl.dot(a, w1_i1, acc=mul_acc) * a_scale * w1_i0_scale
-            silu_acc = tl.dot(a, w1_i0, acc=silu_acc) * a_scale * w1_i1_scale
+            mul_acc = tl.dot(a, w1_i1, acc=mul_acc) 
+            silu_acc = tl.dot(a, w1_i0, acc=silu_acc) 
      
 
         a_ptrs += BLOCK_SIZE_K1 * stride_ak
@@ -285,11 +285,11 @@ def e2e_moe_kernel(
             )
 
         if use_fp8_w8a8:
-            w2_scales = tl.load(w2_scale_ptrs + k * BLOCK_SIZE_K2 // group_k * stride_w2sk).to(tl.bfloat16) # (BLOCK_SIZE_HALF//group_n, BLOCK_SIZE_K2)
+            w2_scales = tl.load(w2_scale_ptrs + k * BLOCK_SIZE_K2 // group_k * stride_w2sk) # (BLOCK_SIZE_HALF//group_n, BLOCK_SIZE_K2)
             w2_scales = w2_scales.reshape((num_scales_along_n, 1, BLOCK_SIZE_K2))
             w2_scales = tl.broadcast_to(w2_scales, (num_scales_along_n, group_n, BLOCK_SIZE_K2))  
             w2_scale = w2_scales.reshape((num_scales_along_n * group_n, BLOCK_SIZE_K2)) 
-            w2 = (w2 * w2_scale).to(tl.bfloat16)
+            w2 = (w2.to(tl.float32) * w2_scale.to(tl.float32)).to(tl.bfloat16)
             out = tl.dot(acc, w2)
         else:
             out = tl.dot(acc, w2)
