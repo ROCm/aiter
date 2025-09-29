@@ -1131,7 +1131,8 @@ class FmoeTuner(TunerCommon):
             use_g1u1,
             doweight_stage1,
         ) = key
-
+        if us == self.INVALID_TIME:
+            return -1, -1
         flop = 0
         data_bytes = 0
         stage = ""
@@ -1644,6 +1645,7 @@ class FmoeTuner(TunerCommon):
     def result_to_csv(self, results, file, concat=False):
         old_tunedf = self.get_tuned_gemm_list(file)
         resultdf = self.update_tunedf(old_tunedf, results)
+        self.success = pd.concat([self.success, results], ignore_index=True)
         resultdf["run_1stage"] = resultdf["run_1stage"].astype(int)
         if results is not None:
             resultdf = resultdf.astype(str).drop_duplicates(
@@ -1682,10 +1684,10 @@ class FmoeTuner(TunerCommon):
             ) = key
             profileDF = []
             for (stage, kernelName, block_m), us, err in rets:
-                if us == float("inf"):
-                    continue
-                if err > args.errRatio:
-                    continue
+                # if us == float("inf"):
+                #    continue
+                # if err > args.errRatio:
+                #    continue
                 tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))
                 profileDF.append(
                     [
@@ -1707,15 +1709,12 @@ class FmoeTuner(TunerCommon):
                         0,
                         us,
                         kernelName,
-                        f"{err:.1%}",
+                        err,
                         tflops,
                         bw,
                     ]
                 )
-            if len(profileDF) == 0:
-                print(
-                    f"no valid candidate found for {key}, please check the time or errRatio in all result file running with --profile_file"
-                )
+
             profileDF = pd.DataFrame(
                 profileDF,
                 columns=["stage"]
@@ -1724,6 +1723,7 @@ class FmoeTuner(TunerCommon):
                 + ["block_m", "ksplit", "us", "kernelName", "err", "tflops", "bw"],
             )
             prorfiles.append(profileDF)
+
             profileDF = profileDF.sort_values("us").drop_duplicates(
                 ["stage", "block_m"], keep="first"
             )
@@ -1804,8 +1804,50 @@ class FmoeTuner(TunerCommon):
             )
             profileDF["run_1stage"] = 0
             profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
-            if profileDF.shape[0] == 0:
-                print("no moe solution can pass for ", self.keys)
+            ## remove invalid candidate
+            profileDF = profileDF[
+                (profileDF["err1"] < args.errRatio)
+                & (profileDF["err2"] < args.errRatio)
+            ]
+            profileDF = profileDF[
+                (profileDF["us1"] != float("inf")) & (profileDF["us2"] != float("-inf"))
+            ]
+            if len(profileDF) == 0:
+                print(
+                    f"no valid candidate found for {key}, please check the time or errRatio in all result file running with --profile_file"
+                )
+                ret = []
+                ret.append(
+                    [
+                        cu_num,
+                        token,
+                        model_dim,
+                        inter_dim,
+                        expert,
+                        topk,
+                        act_type,
+                        dtype,
+                        q_dtype_a,
+                        q_dtype_w if q_dtype_w != torch.int4 else "torch.int4",
+                        q_type,
+                        use_g1u1,
+                        doweight_stage1,
+                        0,
+                        0,
+                        self.INVALID_TIME,
+                        None,
+                        1,
+                        self.INVALID_TIME,
+                        None,
+                        1,
+                        self.INVALID_TIME,
+                        0,
+                        -1,
+                        -1,
+                    ]
+                )
+                failedf = pd.DataFrame(ret, columns=self.columns)
+                self.failed = pd.concat([self.failed, failedf], axis=0)
                 continue
             profileDF["total_us"] = round(profileDF["us1"] + profileDF["us2"], 4)
             results = profileDF.apply(
@@ -1825,6 +1867,8 @@ class FmoeTuner(TunerCommon):
             profileDF["tflops"] = results[0]
             profileDF["bw"] = results[1]
             profileDF.drop(["tflops1", "tflops2", "bw1", "bw2"], axis=1, inplace=True)
+            profileDF["err1"] = profileDF["err1"].apply(lambda x: f"{x:.1%}")
+            profileDF["err2"] = profileDF["err2"].apply(lambda x: f"{x:.1%}")
             best_one = profileDF.loc[profileDF["total_us"].idxmin()].copy()
             print(
                 f"Tuning result for {key} is {best_one['block_m'] ,best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'],  best_one['run_1stage']} {best_one['total_us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
@@ -1837,15 +1881,17 @@ class FmoeTuner(TunerCommon):
             bests.append(best_one)
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
+            profile_result["err"] = profile_result["err"].apply(lambda x: f"{x:.1%}")
             old_profile = self.get_tuned_gemm_list(
                 args.profile_file, profile_result.columns.tolist()
             )
 
             profile_result = pd.concat([old_profile, profile_result])
             profile_result.to_csv(args.profile_file, index=False)
+        if len(bests) > 0:
             return pd.concat(bests, axis=1).T
         else:
-            return None
+            return pd.DataFrame()
 
     def pre_process(self, args):
         if args.all:
