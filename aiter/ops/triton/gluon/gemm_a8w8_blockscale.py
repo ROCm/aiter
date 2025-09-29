@@ -65,6 +65,7 @@ def _gemm_a8w8_blockscale_kernel(
     GRID_MN: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     cache_modifier: gl.constexpr,
+    cdna_version: gl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called direcgly. Call gemm_a8w8_blockscale function
@@ -82,7 +83,6 @@ def _gemm_a8w8_blockscale_kernel(
     *scale_k = (K + GROUP_K - 1) // GROUP_K
     **scale_n = (N + GROUP_N - 1) // GROUP_N
     """
-
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
@@ -119,7 +119,7 @@ def _gemm_a8w8_blockscale_kernel(
         order=[0, 1],
     )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4,
+        version=cdna_version,
         instr_shape=[16, 16],
         transposed=True,
         warps_per_cta=[NUM_WARPS // 2, 2],
@@ -427,10 +427,10 @@ def _get_config(
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
-        if int(dev.split("MI")[1].replace("X", "")) < 350:
-            raise ValueError(
-                "Gluon implementation is not supported on this device (requires CDNA4)."
-            )
+        # if int(dev.split("MI")[1].replace("X", "")) < 350:
+        #     raise ValueError(
+        #         "Gluon implementation is not supported on this device (requires CDNA4)."
+        #     )
         _get_config._config_dict = {}
         fpath = (
             f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE.json"
@@ -541,6 +541,9 @@ def gemm_a8w8_blockscale(
         y_pp = None
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
+    dev = arch_info.get_device()
+    cdna_version = 3 if int(dev.split("MI")[1].replace("X", "")) < 350 else 4
+        
     grid = lambda META: (  # noqa: E731
         (
             META["NUM_KSPLIT"]
@@ -570,6 +573,7 @@ def gemm_a8w8_blockscale(
         w_scale.stride(1),
         NUM_WARPS=config["num_warps"],
         **config,
+        cdna_version=cdna_version,
     )
 
     if config["NUM_KSPLIT"] > 1:

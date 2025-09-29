@@ -12,6 +12,7 @@ from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
+from aiter.test_common import checkAllclose, benchmark, perftest, run_perftest
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
@@ -37,7 +38,7 @@ def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
 
     return out.to(dtype)
 
-
+@perftest()
 def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None, impl=None):
     return impl(x, weight, x_scale, w_scale, dtype, y)
 
@@ -215,6 +216,8 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
         impl = triton_gemm_a8w8_blockscale
     else:
         raise ValueError(f"Unknown implementation: {impl}")
-    b = run_triton(x, weight, x_scale, w_scale, dtype, y, impl)
-
+    b,us = run_triton(x, weight, x_scale, w_scale, dtype, y, impl)
+    flops = 2 * M * N * K / 1e6 / us
+    bw = (M * N * 2 +  M * K + N * K) / 1e6 / us
+    print(f"{us=}, {flops=}, {bw=}")
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
