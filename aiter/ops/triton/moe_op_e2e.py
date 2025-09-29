@@ -234,4 +234,4 @@ def e2e_moe(
             **config,
         )
 
-    return Out.to(dtype)
+    return Out.to(out_dtype)
