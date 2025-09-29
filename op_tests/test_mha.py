@@ -493,7 +493,7 @@ def test_flash_attn_seq_padding(
         alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=dtypes.fp32)
 
     # 2. Run CK with cu_seqlens (forward pass only)
-    out, _ = run_ck(
+    out, _, _ = run_ck(
         q,
         k,
         v,
