@@ -94,60 +94,51 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
             kernels_num = len(kernels_list)
-            if tunedf[
-                (tunedf["B"] == B)
-                & (tunedf["M"] == M)
-                & (tunedf["N"] == N)
-                & (tunedf["K"] == K)
-                & (tunedf["cu_num"] == cu_num)
-            ].empty:
-                print(f"tuning B:{B}, M:{M}, N:{N}, K:{K}")
-                # kernelId, splitK, time = tune_batched_gemm(B, M, N, K, useSplitK)
-                total_kernel_nums = 0
-                for i in range(kernels_num):
-                    kernel = kernels_list[i]
-                    maxsplitK = (
-                        aiter.compute_batched_gemm_SplitK(
-                            B,
-                            M,
-                            N,
-                            K,
-                            kernel.MPerBLOCK,
-                            kernel.NPerBLOCK,
-                            kernel.KPerBLOCK,
-                        )
-                        if useSplitK
-                        else 0
-                    )
-                    for splitK in range(maxsplitK + 1):
-                        info = ((cu_num, B, M, N, K), i, splitK, "")
-                        task.append(
-                            (
-                                info,
-                                generate_data,
-                                (B, M, N, K),
-                                run_batched_gemm,
-                                (
-                                    [0, 1, 2],
-                                    i,
-                                    splitK,
-                                ),  # [0, 1, 2] is index of paramters for run_batched_gemm in generate_data
-                                {},
-                                run_torch,
-                                ([0, 1],),
-                                {},
-                                None,
-                                1e-2,
-                                1e-2,
-                            )
-                        )
-                        total_kernel_nums = total_kernel_nums + 1
 
-                tasks_data.append((total_kernel_nums, ()))
-            else:
-                print(f"B:{B}, M:{M}, N:{N}, K{K} is in tuned batched_gemm, skip!!!")
-                print()
-                print()
+            print(f"tuning B:{B}, M:{M}, N:{N}, K:{K}")
+            # kernelId, splitK, time = tune_batched_gemm(B, M, N, K, useSplitK)
+            total_kernel_nums = 0
+            for i in range(kernels_num):
+                kernel = kernels_list[i]
+                maxsplitK = (
+                    aiter.compute_batched_gemm_SplitK(
+                        B,
+                        M,
+                        N,
+                        K,
+                        kernel.MPerBLOCK,
+                        kernel.NPerBLOCK,
+                        kernel.KPerBLOCK,
+                    )
+                    if useSplitK
+                    else 0
+                )
+                for splitK in range(maxsplitK + 1):
+                    info = ((cu_num, B, M, N, K), i, splitK, "")
+                    task.append(
+                        (
+                            info,
+                            generate_data,
+                            (B, M, N, K),
+                            run_batched_gemm,
+                            (
+                                [0, 1, 2],
+                                i,
+                                splitK,
+                            ),  # [0, 1, 2] is index of paramters for run_batched_gemm in generate_data
+                            {},
+                            run_torch,
+                            ([0, 1],),
+                            {},
+                            None,
+                            1e-2,
+                            1e-2,
+                        )
+                    )
+                    total_kernel_nums = total_kernel_nums + 1
+
+            tasks_data.append((total_kernel_nums, ()))
+
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)

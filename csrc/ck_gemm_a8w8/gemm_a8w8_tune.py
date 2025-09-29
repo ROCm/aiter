@@ -123,51 +123,44 @@ class GemmA8W8Tuner(GemmCommonTuner):
             K = untunedf.loc[i, "K"]
             kernels_num = len(kernels_list)
             seed = seed + 1
-            if tunedf[
-                (tunedf["M"] == M)
-                & (tunedf["N"] == N)
-                & (tunedf["K"] == K)
-                & (tunedf["cu_num"] == cu_num)
-            ].empty:
-                total_kernel_nums = 0
-                for i in range(kernels_num):
-                    kernel = kernels_list[i]
-                    maxsplitK = (
-                        aiter.compute_gemm_SplitK(
-                            M,
-                            N,
-                            K,
-                            kernel.MPerBLOCK,
-                            kernel.NPerBLOCK,
-                            kernel.KPerBLOCK,
-                        )
-                        if useSplitK
-                        else 0
-                    )
-                    for splitK in range(maxsplitK + 1):
-                        info = ((cu_num, M, N, K), i, splitK, "")
-                        task.append(
-                            (
-                                info,
-                                generate_data,
-                                (M, N, K, seed),
-                                run_gemm_a8w8,
-                                (gemm_a8w8_data_idx, i, splitK),
-                                {},
-                                gemm_a8w8_ref,
-                                (ref_data_idx,),
-                                {},
-                                None,
-                                1e-2,
-                                1e-2,
-                            )
-                        )
-                        total_kernel_nums = total_kernel_nums + 1
 
-                tasks_data.append((total_kernel_nums, ()))
-            else:
-                print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
-                print()
+            total_kernel_nums = 0
+            for i in range(kernels_num):
+                kernel = kernels_list[i]
+                maxsplitK = (
+                    aiter.compute_gemm_SplitK(
+                        M,
+                        N,
+                        K,
+                        kernel.MPerBLOCK,
+                        kernel.NPerBLOCK,
+                        kernel.KPerBLOCK,
+                    )
+                    if useSplitK
+                    else 0
+                )
+                for splitK in range(maxsplitK + 1):
+                    info = ((cu_num, M, N, K), i, splitK, "")
+                    task.append(
+                        (
+                            info,
+                            generate_data,
+                            (M, N, K, seed),
+                            run_gemm_a8w8,
+                            (gemm_a8w8_data_idx, i, splitK),
+                            {},
+                            gemm_a8w8_ref,
+                            (ref_data_idx,),
+                            {},
+                            None,
+                            1e-2,
+                            1e-2,
+                        )
+                    )
+                    total_kernel_nums = total_kernel_nums + 1
+
+            tasks_data.append((total_kernel_nums, ()))
+
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
