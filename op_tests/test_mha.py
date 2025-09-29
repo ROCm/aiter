@@ -346,8 +346,8 @@ def test_flash_attn_output(
     ret["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
     ret["fwd_gb_per_sec"] = (fwd_num_bytes) / 1.0e3 / us_fwd
     ret["bwd_us"] = us_bwd
-    ret["bwd_tflops"] = (bwd_flop) / 1.0e6 / us_fwd
-    ret["bwd_gb_per_sec"] = (bwd_num_bytes) / 1.0e3 / us_fwd
+    ret["bwd_tflops"] = (bwd_flop) / 1.0e6 / us_bwd
+    ret["bwd_gb_per_sec"] = (bwd_num_bytes) / 1.0e3 / us_bwd
     return ret
 
 
