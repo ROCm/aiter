@@ -73,7 +73,7 @@ def paged_attention_rocm(
     fp8_out_scale=None,
     partition_size=256,
     mtp=1,
-    q_scale=None,
+    query_scale=None,
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
@@ -178,8 +178,8 @@ def paged_attention_rocm(
         torch.cuda.current_stream(query.device),
     )
     q_scale_ptr = (
-        ctypes.cast(q_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
-        if q_scale is not None
+        ctypes.cast(query_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if query_scale is not None
         else ctypes.POINTER(ctypes.c_float)()
     )
     k_scale_ptr = (
