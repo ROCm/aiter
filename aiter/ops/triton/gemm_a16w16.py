@@ -9,6 +9,7 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton._triton_kernels.gemm_a16w16 import (
     _gemm_a16_w16_kernel,
+    _gemm_a16w16_reduce_kernel,
     _get_config,
 )
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
