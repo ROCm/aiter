@@ -94,6 +94,7 @@ def get_pid():
     time.sleep(3)
     return mp.current_process().pid
 
+
 def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
     group_task = [tasks] if not isinstance(tasks, list) else tasks
     kernels_num, (input_data) = in_data
