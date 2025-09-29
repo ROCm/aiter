@@ -181,12 +181,12 @@ if len(args.sample_type) > 0:
 
 list_sample_func = [d_sample[key] for key in args.sample_type if key in d_sample.keys()]
 
-df = []
 for test_func in list_sample_func:
+    df = []
     for dtype in list_dtype:
         for n in l_n:
             for m in l_m:
                 ret = test_func(m, n, dtype)
                 df.append(ret)
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+    df = pd.DataFrame(df)
+    aiter.logger.info(f"summary:\n{df}")
