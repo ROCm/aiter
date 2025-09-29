@@ -271,14 +271,14 @@ def torch_e2e_moe(
     
     if fp8_w8a8 and blockshape is not None:
         # dequantize
-        a_scale = a_scale.reshape(M, 1, K // blockshape_k)
-        a = a.to(torch.float32) * a_scale.broadcast_to(M, blockshape_k, K // blockshape_k).reshape(M, K)
+        a_scale = a_scale.reshape(M, K // blockshape_k, 1)
+        a = a.to(torch.float32) * a_scale.broadcast_to(M, K // blockshape_k, blockshape_k).reshape(M, K)
 
-        w1_scale = w1_scale.reshape(E, 1, N // blockshape_n, 1, K // blockshape_k)
-        w1 = w1.to(torch.float32) * w1_scale.broadcast_to(E, blockshape_n, N // blockshape_n, blockshape_k, K // blockshape_k).reshape(E, N, K)
+        w1_scale = w1_scale.reshape(E, N // blockshape_n, 1, K // blockshape_k, 1)
+        w1 = w1.to(torch.float32) * w1_scale.broadcast_to(E, N // blockshape_n, blockshape_n, K // blockshape_k, blockshape_k).reshape(E, N, K)
 
-        w2_scale = w2_scale.reshape(E, 1, K // blockshape_k, 1, (N // 2) // blockshape_n)
-        w2 = w2.to(torch.float32) * w2_scale.broadcast_to(E, blockshape_k, K // blockshape_k, blockshape_n, (N // 2) // blockshape_n).reshape(E, K, (N // 2))
+        w2_scale = w2_scale.reshape(E, K // blockshape_k, 1, (N // 2) // blockshape_n, 1)
+        w2 = w2.to(torch.float32) * w2_scale.broadcast_to(E, K // blockshape_k, blockshape_k, (N // 2) // blockshape_n, blockshape_n).reshape(E, K, (N // 2))
 
         a = a.to(torch.bfloat16)
         w1 = w1.to(torch.bfloat16)
