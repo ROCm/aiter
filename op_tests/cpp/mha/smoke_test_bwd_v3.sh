@@ -39,7 +39,7 @@ run_batch_mode_tests() {
         continue
     fi
 
-    $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=$hdim -s=$sq-s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=$v3_bf16_cvt -mode=0 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=$hdim -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=$v3_bf16_cvt -mode=0 -kname=$KNAME $COMMON_ARGS
 
     done
     done
