@@ -12,10 +12,6 @@ from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.read_json_configs import build_triton_configs_from_json
-
-fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/updated_BF16_configs.json"
-updated_configs = build_triton_configs_from_json(fpath)
 
 _LOGGER = AiterTritonLogger()
 
