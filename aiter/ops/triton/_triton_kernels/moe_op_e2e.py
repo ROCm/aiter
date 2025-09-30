@@ -175,11 +175,7 @@ def e2e_moe_kernel(
 
     if use_fp8_w8a8:
         num_scales_along_n: tl.constexpr = (BLOCK_SIZE_HALF + group_n - 1) // group_n
-        # num_scales_along_k1: tl.constexpr = tl.cdiv(BLOCK_SIZE_K1, group_k)
-        num_scales_along_k1  = (BLOCK_SIZE_K1 + group_k - 1) // group_k
-        assert num_scales_along_k1 == 1, "BLOCK_SIZE_K1 must be <= group_k when using fp8" 
         num_scales_along_k2: tl.constexpr = (BLOCK_SIZE_K2 + group_k - 1) // group_k
-
 
     offs_i0 = tl.arange(0, BLOCK_SIZE_HALF)
     offs_i1 = tl.arange(0, BLOCK_SIZE_HALF) + N // 2
