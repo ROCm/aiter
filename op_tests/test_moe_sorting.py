@@ -44,7 +44,7 @@ def moe_sorting_native(
     sorted_expert_ids_begin = 0
     skip_expert_num = 0
     for expertId in range(num_experts):
-        if expert_mask != None and expert_mask[expertId] == 0:
+        if expert_mask is not None and expert_mask[expertId] == 0:
             skip_expert_num += 1
             continue
         token_id, topk_id = torch.where(topk_ids == expertId)

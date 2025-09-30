@@ -103,61 +103,53 @@ class Gemma8W8BPreShuffleTuner(GemmCommonTuner):
             kernels_num = len(kernels_list)
             gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
             ref_data_idx = [0, 5, 2, 3]
-            if tunedf[
-                (tunedf["M"] == M)
-                & (tunedf["N"] == N)
-                & (tunedf["K"] == K)
-                & (tunedf["cu_num"] == cu_num)
-            ].empty:
-                seed = seed + 1
-                total_kernel_nums = 0
-                for i in range(kernels_num):
-                    kernel = kernels_list[i]
-                    maxsplitK = (
-                        aiter.compute_gemm_SplitK(
-                            M,
-                            N,
-                            K,
-                            kernel.MPerBLOCK,
-                            kernel.NPerBLOCK,
-                            kernel.KPerBLOCK,
-                        )
-                        if useSplitK
-                        else 0
-                    )
-                    for splitK in range(maxsplitK + 1):
-                        info = ((cu_num, M, N, K), i, splitK, "")
-                        task.append(
-                            (
-                                info,
-                                generate_data,
-                                (M, N, K, seed),
-                                run_gemm_a8w8_bpreshuffle,
-                                (
-                                    gemm_a8w8_idx,
-                                    i,
-                                    splitK,
-                                ),
-                                {},
-                                run_torch,
-                                (
-                                    ref_data_idx,
-                                    None,
-                                    dtypes.fp16,
-                                ),
-                                {},
-                                None,
-                                1e-2,
-                                0.1,
-                            )
-                        )
-                        total_kernel_nums = total_kernel_nums + 1
 
-                tasks_data.append((total_kernel_nums, ()))
-            else:
-                print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
-                print()
-                print()
+            seed = seed + 1
+            total_kernel_nums = 0
+            for i in range(kernels_num):
+                kernel = kernels_list[i]
+                maxsplitK = (
+                    aiter.compute_gemm_SplitK(
+                        M,
+                        N,
+                        K,
+                        kernel.MPerBLOCK,
+                        kernel.NPerBLOCK,
+                        kernel.KPerBLOCK,
+                    )
+                    if useSplitK
+                    else 0
+                )
+                for splitK in range(maxsplitK + 1):
+                    info = ((cu_num, M, N, K), i, splitK, "")
+                    task.append(
+                        (
+                            info,
+                            generate_data,
+                            (M, N, K, seed),
+                            run_gemm_a8w8_bpreshuffle,
+                            (
+                                gemm_a8w8_idx,
+                                i,
+                                splitK,
+                            ),
+                            {},
+                            run_torch,
+                            (
+                                ref_data_idx,
+                                None,
+                                dtypes.fp16,
+                            ),
+                            {},
+                            None,
+                            1e-2,
+                            0.1,
+                        )
+                    )
+                    total_kernel_nums = total_kernel_nums + 1
+
+            tasks_data.append((total_kernel_nums, ()))
+
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)

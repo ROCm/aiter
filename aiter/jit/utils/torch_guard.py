@@ -95,6 +95,15 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
                 return func(*args, **kwargs)
             return out, func(*args, **kwargs)
 
+        def fake_impl(dummy_tensor, *args, **kwargs):
+            out = torch.empty(1, device=device)
+            if not return_non_tensor:
+                return func(*args, **kwargs)
+            default_values = {int: 0, bool: True, float: 0.0}
+
+            default_value = default_values.get(return_annotation, None)
+            return out, default_value
+
         if is_torch_equal_or_newer("2.8.0"):
             tags = ()
         else:
@@ -104,7 +113,7 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
         my_lib.define(op_name + schema_str, tags=tags)
         my_lib.impl(op_name, custom_impl, dispatch_key="CUDA")
         my_lib.impl(op_name, custom_impl, dispatch_key="CPU")
-        my_lib._register_fake(op_name, custom_impl)
+        my_lib._register_fake(op_name, fake_impl)
 
         return outer_wrapper
 
