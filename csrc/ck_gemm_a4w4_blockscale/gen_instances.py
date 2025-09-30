@@ -1,19 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import argparse
 import os
-import shutil
 from pathlib import Path
-
 import pandas as pd
+import argparse
+import shutil
 import torch
 from gemm_a4w4_blockscale_common import (
-    default_kernels_dict,
     kernelInstance,
     kernels_list,
+    default_kernels_dict,
 )
 
-from aiter.jit.core import AITER_CONFIG_GEMM_A4W4
 
 """
 
@@ -262,7 +260,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f",
         "--tune_file",
-        default=AITER_CONFIG_GEMM_A4W4,
+        default="aiter/configs/a4w4_blockscale_tuned_gemm.csv",
         required=False,
         help="tune_file include the result after run gemm_a4w4_tune.py",
     )

@@ -7,7 +7,6 @@ import argparse
 import shutil
 import torch
 from gemm_a8w8_common import kernelInstance, kernels_list, default_kernels_dict
-from aiter.jit.core import AITER_CONFIG_GEMM_A8W8
 
 
 class gemm_a8w8_fwd_codegen:
@@ -316,7 +315,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f",
         "--tune_file",
-        default=AITER_CONFIG_GEMM_A8W8,
+        default="aiter/configs/a8w8_tuned_gemm.csv",
         required=False,
         help="tune_file include the result after run gemm_a8w8_tune.py",
     )
