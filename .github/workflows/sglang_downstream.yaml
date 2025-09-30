@@ -16,7 +16,7 @@ jobs:
     name: sglang integration
     runs-on: aiter-1gpu-runner
     env:
-      SGL_BRANCH: v0.5.1
+      SGL_BRANCH: v0.5.2
       GPU_ARCH: gfx942
 
     steps:
@@ -75,7 +75,6 @@ jobs:
           sglang_aiter_test:ci
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
 
       - name: Install wget
         run: sudo apt-get update && sudo apt-get install -y wget
