@@ -18,7 +18,6 @@ jobs:
     env:
       SGL_BRANCH: v0.5.1
       GPU_ARCH: gfx942
-      # HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
 
     steps:
       - name: Checkout aiter repo
@@ -76,6 +75,7 @@ jobs:
           sglang_aiter_test:ci
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
 
       - name: Install wget
         run: sudo apt-get update && sudo apt-get install -y wget
