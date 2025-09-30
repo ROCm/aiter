@@ -12,7 +12,7 @@ from torch import Tensor
 from aiter import logger
 
 from ..jit.core import (
-    AITER_CONFIG_GEMM_A4W4,
+    AITER_CONFIG_GEMM_A4W4_FILE,
     AITER_LOG_TUNED_CONFIG,
     AITER_ROOT_DIR,
     compile_ops,
@@ -37,7 +37,7 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 @functools.lru_cache(maxsize=1024)
 def get_GEMM_config(M: int, N: int, K: int):
     if not hasattr(get_GEMM_config, "gemm_dict"):
-        gemm_dict = pd.read_csv(AITER_CONFIG_GEMM_A4W4).drop_duplicates()
+        gemm_dict = pd.read_csv(AITER_CONFIG_GEMM_A4W4_FILE).drop_duplicates()
         get_GEMM_config.gemm_dict = gemm_dict.set_index(
             ["cu_num", "M", "N", "K"]
         ).to_dict("index")
@@ -50,7 +50,7 @@ def get_GEMM_config(M: int, N: int, K: int):
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
-                    f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM or asmGEMM, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
+                    f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIG_GEMM_A4W4_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
                 )
             break
     else:

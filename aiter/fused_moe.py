@@ -3,6 +3,7 @@
 
 import functools
 import os
+import sys
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -15,8 +16,7 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
 from aiter import logger
 from aiter.jit.core import (
-    AITER_ROOT_DIR,
-    AITER_CONFIG_FMOE,
+    AITER_CONFIG_FMOE_FILE,
     PY,
     bd_dir,
     get_asm_dir,
@@ -28,7 +28,6 @@ from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 BLOCK_SIZE_M = 32
-
 
 def moe_sorting(
     topk_ids,
@@ -487,8 +486,8 @@ def get_2stage_cfgs(
         return cfg_2stages
 
     global cfg_2stages
-    config_path = os.path.dirname(AITER_CONFIG_FMOE)
-    tune_file = f"{AITER_CONFIG_FMOE}"
+    config_path = os.path.dirname(AITER_CONFIG_FMOE_FILE)
+    tune_file = AITER_CONFIG_FMOE_FILE
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
@@ -673,7 +672,6 @@ def fused_moe_2stages(
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
 ):
-
     quant_func = get_quant(quant_type)
 
     token_num, _ = hidden_states.shape
