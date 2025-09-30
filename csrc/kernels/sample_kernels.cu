@@ -17,11 +17,10 @@
 namespace aiter {
 const int warpSize = 64;
 template <typename DTYPE_I,
-          int BlockSize     = 256,
-          int WarpSize      = 64,
-          int VecSize       = 4,
-          bool NeedSum      = false,
-          bool NeedLoadTemp = false,
+          int BlockSize = 256,
+          int WarpSize  = 64,
+          int VecSize   = 4,
+          bool NeedSum  = false,
           typename dist_t,
           typename transform_t>
 __device__ void random_sample_impl(const DTYPE_I* input,
@@ -65,6 +64,7 @@ __device__ void random_sample_impl(const DTYPE_I* input,
         vec_pre = buffer_i.template get<vec_i>(k, 0, true);
         k += vec_stride;
     }
+    temperature = max(temperature, 1e-5f);
     temperature = 1.0f / temperature;
 
     auto loop = [&]() {
@@ -81,7 +81,9 @@ __device__ void random_sample_impl(const DTYPE_I* input,
         {
             vec_cur_f[i] = expf(vec_cur_f[i] - new_max_softmax);
         }
-        float ratio = expf(max_softmax - new_max_softmax);
+        float ratio      = expf(max_softmax - new_max_softmax);
+        thread_kvp.value = thread_kvp.value * ratio;
+        max_softmax      = new_max_softmax;
         if constexpr(NeedSum)
         {
             float new_sum_softmax = sum_softmax * ratio;
@@ -91,8 +93,6 @@ __device__ void random_sample_impl(const DTYPE_I* input,
             }
             sum_softmax = new_sum_softmax;
         }
-        thread_kvp.value = thread_kvp.value * ratio;
-        max_softmax      = new_max_softmax;
 
         for(int i = 0; i < vec_size_i; i++)
         {
