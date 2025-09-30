@@ -295,15 +295,13 @@ def torch_e2e_moe(
     else:
         w1_indexed = w1[topk_ids]
 
-
-
     intermidiate = torch.einsum(
         "mek,menk->men", a_expanded.to(dtype), w1_indexed.to(dtype)
     )
 
     if fp8_w8a8:        
         if blockshape is not None:
-            pass
+            intermidiate = intermidiate.to(torch.float32)
         else:
             intermidiate = intermidiate * w1_scale[topk_ids].unsqueeze(-1)
             intermidiate = intermidiate * a_scale
@@ -1327,9 +1325,9 @@ def test_moe_e2e(
         blockshape=blockshape
     )
 
-    # if DEBUG_MODE:
-    print(f"triton_out={triton_out}")
-    print(f"torch_out={torch_out}")
+    if DEBUG_MODE:
+        print(f"triton_out={triton_out}")
+        print(f"torch_out={torch_out}")
 
     # Validate correctness
     torch.testing.assert_close(triton_out, torch_out, atol=2e-1, rtol=2e-1)

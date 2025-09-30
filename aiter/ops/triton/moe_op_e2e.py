@@ -227,7 +227,6 @@ def e2e_moe(
             NUM_XCDS=get_num_xcds(),
             SKINNY=SKINNY,
             dtype=torch_to_triton_dtype[dtype], # input dtype, mma dtype
-            compute_dtype=torch_to_triton_dtype[torch.float32], # activation dtype
             out_dtype=torch_to_triton_dtype[out_dtype],
             **config,
         )
