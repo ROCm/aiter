@@ -315,7 +315,7 @@ def e2e_moe_kernel(
             if num_scales_along_k2 > 1: # singleton dimension get automatic broadcast
                 w2_scale = group_broadcast(w2_scale, num_scales_along_n * group_n, num_scales_along_k2, group_k, 1)
 
-            w2 = (w2.to(tl.float32) * w2_scale.to(tl.float32)).to(tl.bfloat16)
+            w2 = (w2.to(tl.float32) * w2_scale.to(tl.float32)).to(out_dtype)
             out = tl.dot(acc, w2)
         else:
             out = tl.dot(acc, w2)
