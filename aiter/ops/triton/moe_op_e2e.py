@@ -180,10 +180,28 @@ def e2e_moe(
         )
         dtype = W1.dtype # input dtype
         out_dtype = Out.dtype
-        # Out = Out.to(torch.float32) if dtype == torch.bfloat16 else Out
-
+        # if the intermediate token dimension is small enough, we can try to fit the whole thing in shared memory
         SKINNY = config["BLOCK_SIZE_N"] >= N
-        # num_scales_along_n = config["BLOCK_SIZE_N"] // (2 * block_shape[0])
+        
+        if block_shape is not None:
+            if len(block_shape) == 2:
+                group_n = block_shape[0]
+                group_k = block_shape[1]
+            elif len(block_shape) == 1:
+                group_n = block_shape[0]
+                group_k = group_n
+            else:
+                raise ValueError("block_shape must be of length 1 or 2")
+        else:
+            group_n = 0
+            group_k = 0
+
+        assert config["BLOCK_SIZE_N"] % 2 == 0, "BLOCK_SIZE_N must be even"
+        BLOCK_SIZE_HALF = config["BLOCK_SIZE_N"] // 2
+        if use_fp8_w8a8 and block_shape is not None:
+            assert (BLOCK_SIZE_HALF <= group_n) or (BLOCK_SIZE_HALF % group_n == 0), "BLOCK_SIZE_N//2 must be multiple of group_n or <= group_n"
+            assert config["BLOCK_SIZE_K1"] <= group_k, "BLOCK_SIZE_K1 must strictly be <= group_k"
+            assert (config["BLOCK_SIZE_K2"] <= group_k) or (config["BLOCK_SIZE_K2"] % group_k == 0), "BLOCK_SIZE_K2 must be multiple of group_k or <= group_k"
 
         e2e_moe_kernel[grid](
             A,
@@ -216,8 +234,7 @@ def e2e_moe(
             expert_ids,
             num_tokens_post_padded,
             topk_ids.numel(),
-            block_shape[0] if block_shape is not None else 0,
-            block_shape[1] if block_shape is not None else 0, # group n and k
+            group_n, group_k,
             EM,
             N,
             K,
