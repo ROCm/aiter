@@ -12,6 +12,7 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.shuffle import shuffle_weight
 
+
 def shuffle_scales(scales: torch.Tensor):
     scales_shuffled = scales.clone()
     sm, sn = scales_shuffled.shape
@@ -36,7 +37,9 @@ def generate_gemm_afp4wfp4_inputs(
     shuffle_scales_fg=False,
 ):
     if shuffle_weight_fg:
-        assert shuffle_scales_fg, "weight shuffling is only supported with scale shuffling"
+        assert (
+            shuffle_scales_fg
+        ), "weight shuffling is only supported with scale shuffling"
 
     torch.manual_seed(5)
     if isinstance(dtype, str):
@@ -215,7 +218,10 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
-@pytest.mark.parametrize("shuffle_scales_fg, shuffle_weight_fg", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(
+    "shuffle_scales_fg, shuffle_weight_fg",
+    [(False, False), (True, False), (True, True)],
+)
 def test_gemm_afp4_wfp4(
     M: int, N: int, K: int, dtype, layout, output, shuffle_scales_fg, shuffle_weight_fg
 ):

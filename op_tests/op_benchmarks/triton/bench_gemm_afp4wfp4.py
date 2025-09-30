@@ -22,10 +22,18 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
+
 def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, shuffle: bool):
     c_dtype = torch.bfloat16
     x, _, w, _, _, x_scale, w_scale, _, y = generate_gemm_afp4wfp4_inputs(
-        M, N, K, c_dtype, layout=layout, output=True, shuffle_scales_fg=shuffle, shuffle_weight_fg=shuffle
+        M,
+        N,
+        K,
+        c_dtype,
+        layout=layout,
+        output=True,
+        shuffle_scales_fg=shuffle,
+        shuffle_weight_fg=shuffle,
     )
     # flops
     flops = 2.0 * M * N * K
@@ -40,7 +48,7 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, shuffle: boo
     if shuffle:
         ms = triton.testing.do_bench(
             lambda: gemm_afp4wfp4_preshuffled_weight_scales(
-                x, w, x_scale, w_scale, c_dtype, y#, config=config
+                x, w, x_scale, w_scale, c_dtype, y  # , config=config
             ),
             warmup=25,
             rep=100,

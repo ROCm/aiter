@@ -522,7 +522,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
                     .permute(0, 5, 3, 1, 4, 2, 6)
                     .reshape(BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                 )
-    
+
             b_scales = (
                 tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
                 .reshape(

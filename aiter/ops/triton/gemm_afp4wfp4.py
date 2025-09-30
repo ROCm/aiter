@@ -383,9 +383,13 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if M < 32:
-        assert config["BLOCK_SIZE_M"] <= 16, "for M < 32, BLOCK_SIZE_M must be 16 or less as x_scale are assumed to be un-shuffled"
+        assert (
+            config["BLOCK_SIZE_M"] <= 16
+        ), "for M < 32, BLOCK_SIZE_M must be 16 or less as x_scale are assumed to be un-shuffled"
     else:
-        assert config["BLOCK_SIZE_M"] >= 32, "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
+        assert (
+            config["BLOCK_SIZE_M"] >= 32
+        ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
     grid = lambda META: (  # noqa: E731
         (
