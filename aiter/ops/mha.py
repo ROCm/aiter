@@ -1336,11 +1336,7 @@ def can_impl_fmha_v3_bwd(
         # bwd_hd192_bf16_causal_a32_rtz_psskddv
         ret = is_v3_atomic_fp32 == True
         ret &= hdim_q > 64 and hdim_q <= 192
-        ret &= (
-            nmask
-            or mask
-            or (swa and hdim_q > 64 and hdim_q <= 128)
-        )
+        ret &= nmask or mask or (swa and hdim_q > 64 and hdim_q <= 128)
 
         return ret
 
