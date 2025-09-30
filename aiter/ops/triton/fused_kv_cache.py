@@ -26,7 +26,6 @@ def fused_qk_rope_cosine_cache_llama(
     apply_scale: bool = True,
     offs: torch.Tensor = None,
     q_out: torch.Tensor = None,
-    k_out: torch.Tensor = None,
     output_zeros: bool = True,
     zeros_out: torch.Tensor = None,
 ):
@@ -50,7 +49,6 @@ def fused_qk_rope_cosine_cache_llama(
 
     Returns:
     - q_out: same shape as input q.
-    - k_out: same shape as input k.
     - key_cache: same shape as input key_cache (inplace).
     - value_cache: same shape as input value_cache (inplace).
     - zeros_out: same shape as input q.
@@ -104,17 +102,6 @@ def fused_qk_rope_cosine_cache_llama(
     if q_out is None:
         q_out = torch.empty((t, qh, d), dtype=q.dtype, device=q.device)
 
-    if zeros_out is not None:
-        tz, qhz, dz = zeros_out.shape
-        assert (
-            t == tz and qh == qhz and d == dz
-        ), f"q and zeros shape mismatch {q.shape=} {zeros_out.shape=}"
-        output_zeros = True
-    elif output_zeros:
-        zeros_out = torch.empty((t, qh, d), dtype=q.dtype, device=q.device)
-    else:
-        zeros_out = None
-
     n_pid = t * qh + (t_slot - t) * kh
     grid = (n_pid, 1, 1)
     _fused_qk_rope_cosine_cache_llama_kernel_llama[grid](
@@ -129,7 +116,6 @@ def fused_qk_rope_cosine_cache_llama(
         value_cache,
         slot_mapping,
         q_out,
-        k_out,
         zeros_out,
         t,
         t_slot,
@@ -139,9 +125,6 @@ def fused_qk_rope_cosine_cache_llama(
         cos.stride(0),
         cos.stride(-1),
         *q_out.stride(),
-        0,
-        0,
-        0,
         key_cache.stride(0) if not flash_layout else key_cache.stride(0),
         key_cache.stride(1) if not flash_layout else key_cache.stride(2),
         key_cache.stride(2) if not flash_layout else key_cache.stride(3),
@@ -169,10 +152,6 @@ def fused_qk_rope_cosine_cache_llama(
         HAVE_POS=(offs is not None),
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         HAVE_V_SCALE=(v_scale is not None and apply_scale),
-        HAVE_ZEROS=output_zeros,
         num_warps=1,
     )
-
-    if zeros_out is not None:
-        return q_out, k_out, key_cache, value_cache, zeros_out
-    return q_out, k_out, key_cache, value_cache
+    return q_out, key_cache, value_cache

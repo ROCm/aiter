@@ -47,7 +47,6 @@ def _fused_qk_rope_cosine_cache_llama_kernel_llama(
     value_cache_ptr,
     slot_mapping_ptr,
     q_out_ptr,
-    k_out_ptr,
     zeros_out_ptr,
     T,
     T_slot,
@@ -65,9 +64,6 @@ def _fused_qk_rope_cosine_cache_llama_kernel_llama(
     q_out_stride_t,
     q_out_stride_h,
     q_out_stride_d,
-    k_out_stride_t,
-    k_out_stride_h,
-    k_out_stride_d,
     key_cache_stride_t,
     key_cache_stride_h,
     key_cache_stride_d,
@@ -95,7 +91,6 @@ def _fused_qk_rope_cosine_cache_llama_kernel_llama(
     HAVE_POS: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
     HAVE_V_SCALE: tl.constexpr = False,
-    HAVE_ZEROS: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
 
@@ -146,16 +141,6 @@ def _fused_qk_rope_cosine_cache_llama_kernel_llama(
             + d_pe_offs * q_out_stride_d
         )
         tl.store(q_out_ptrs, q_pe.to(q_out_ptr.dtype.element_ty))
-
-        if HAVE_ZEROS:
-            z = tl.zeros((BLOCK_D_pe,), dtype=zeros_out_ptr.dtype.element_ty)
-            zeros_out_ptrs = (
-                zeros_out_ptr
-                + pid_t * zeros_out_stride_t
-                + pid_hq * zeros_out_stride_h
-                + d_pe_offs * zeros_out_stride_d
-            )
-            tl.store(zeros_out_ptrs, z)
 
         if pid_hq % QH_PER_KH == 0:
             pid_slot = tl.load(slot_mapping_ptr + pid_t).to(tl.int64)
