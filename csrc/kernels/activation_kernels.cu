@@ -74,10 +74,37 @@ __global__ void scaled_act_and_mul_kernel(fp8_type* __restrict__ out,        // 
     {
         auto x = buffer_x.template get<vec_i>(idx, 0, true);
         auto y = buffer_y.template get<vec_i>(idx, 0, true);
-        for(size_t j = 0; j < VEC_SIZE_I; j++)
+        // Optimized version using v_pk_mul_f32 for paired operations
+        for(size_t j = 0; j < VEC_SIZE_I; j += 2)
         {
-            float r = ACT_FN(x[j]) * ck_tile::type_convert<float>(y[j]) * scale;
-            out[token_idx * d + idx + j] = ck_tile::type_convert<fp8_type>(r);
+            if(j + 1 < VEC_SIZE_I)
+            {
+                // Process two elements at once using packed multiplication
+                float act_x0 = ACT_FN(x[j]);
+                float act_x1 = ACT_FN(x[j + 1]);
+                float y0     = ck_tile::type_convert<float>(y[j]);
+                float y1     = ck_tile::type_convert<float>(y[j + 1]);
+
+                float2 act_vals   = {act_x0, act_x1};
+                float2 y_vals     = {y0, y1};
+                float2 scale_vals = {scale, scale};
+                float2 result;
+
+                // Use v_pk_mul_f32 for packed multiplication
+                asm volatile("v_pk_mul_f32 %0, %1, %2\n\t" // result = act_vals * y_vals
+                             "v_pk_mul_f32 %0, %0, %3"     // result = result * scale_vals
+                             : "=v"(result)
+                             : "v"(act_vals), "v"(y_vals), "v"(scale_vals));
+
+                out[token_idx * d + idx + j]     = ck_tile::type_convert<fp8_type>(result.x);
+                out[token_idx * d + idx + j + 1] = ck_tile::type_convert<fp8_type>(result.y);
+            }
+            else
+            {
+                // Handle remaining single element
+                float r = ACT_FN(x[j]) * ck_tile::type_convert<float>(y[j]) * scale;
+                out[token_idx * d + idx + j] = ck_tile::type_convert<fp8_type>(r);
+            }
         }
     }
 }
