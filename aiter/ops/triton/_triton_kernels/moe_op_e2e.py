@@ -266,10 +266,6 @@ def e2e_moe_kernel(
         a_ptrs += BLOCK_SIZE_K1 * stride_ak
         w1_ptrs_i0 += BLOCK_SIZE_K1 * stride_w1k
         w1_ptrs_i1 += BLOCK_SIZE_K1 * stride_w1k
-        if use_fp8_w8a8:
-            w1_i0_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_w1sk
-            w1_i1_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_w1sk
-            a_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_ask
     
     silu_acc = _silu_exp2(silu_acc)
     acc = (silu_acc * mul_acc).to(out_dtype)

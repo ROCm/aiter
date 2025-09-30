@@ -94,7 +94,7 @@ def e2e_moe(
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
             
-            assert ((config["BLOCK_SIZE_K1"] + block_k - 1) // block_k) == 1, "BLOCK_SIZE_K1 must be <= group_k when using fp8"
+            assert config["BLOCK_SIZE_K1"] <= block_k, "BLOCK_SIZE_K1 must be <= group_k when using fp8"
             
             #A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
