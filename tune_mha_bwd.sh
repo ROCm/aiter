@@ -44,9 +44,10 @@ debug = False
 if debug:
     print("Generating configs....")
 
-block_sizes = [2**n for n in range(4, 8)]
+block_sizes = [2**n for n in range(5, 8)]
 num_warps_range = [2**n for n in range(1, 4)]
 num_stages_range = list(range(1, 4))
+waves_per_eu_range = [0, 1]
 
 for i, config in enumerate(
     itertools.product(
@@ -56,17 +57,18 @@ for i, config in enumerate(
         block_sizes,  # block_n2
         num_warps_range,  # num_warps
         num_stages_range,  # num_stages
+        waves_per_eu_range,  # waves_per_eu
     )
 ):
-    block_m1, block_n1, block_m2, block_n2, num_warps, num_stages = config
-    config_name = f"{i:04d}__BM1_{block_m1:03d}__BN1_{block_n1:03d}__BM2_{block_m2:03d}__BN2_{block_n2:03d}__NW_{num_warps}__NS_{num_stages}"
+    block_m1, block_n1, block_m2, block_n2, num_warps, num_stages, waves_per_eu = config
+    config_name = f"{i:04d}__BM1_{block_m1:03d}__BN1_{block_n1:03d}__BM2_{block_m2:03d}__BN2_{block_n2:03d}__NW_{num_warps}__NS_{num_stages}__WE_{waves_per_eu}"
     config_dict = {
         "BLOCK_M1": block_m1,
         "BLOCK_N1": block_n1,
         "BLOCK_M2": block_m2,
         "BLOCK_N2": block_n2,
         "BLK_SLICE_FACTOR": 2,
-        "waves_per_eu": 1,
+        "waves_per_eu": waves_per_eu,
         "matrix_instr_nonkdim": 16,
         "num_warps": num_warps,
         "num_ctas": 1,
