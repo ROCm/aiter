@@ -127,8 +127,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     constexpr int QKHE_PER_FETCH =
         CONTIGUOUS_KV_ELEMS_16B_LOAD *
         ROWS_PER_WARP; // each fetch across a warp fetches these many elements
-    constexpr int QK_SIZE_RATIO =
-        sizeof(scalar_t) / sizeof(cache_t); // 1 for 16bit types, 2 for 8bit types
+    constexpr int QK_SIZE_RATIO = sizeof(scalar_t) / sizeof(cache_t); // 1 for 16bit types, 2 for 8bit types
     constexpr int QKHELOOP = HEAD_SIZE_PER_LOOP / QKHE_PER_FETCH; // 4xQKHE_16B across
                                                                   // warp
 
@@ -137,7 +136,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                                   // be fetched per lane for 8 bit cache types :
                                   // QK_SIZE_RATIO changes for this
 
-    constexpr int CONTIGUOUS_SCALAR_ELEMS_16B = 8;
+    constexpr int CONTIGUOUS_SCALAR_ELEMS_16B = 16 / sizeof(scalar_t);
 
     constexpr int TOKENS_PER_WARP =
         T_PAR_SIZE / NWARPS; // sub partition of tokens per warp for qk calculation
@@ -201,7 +200,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                 {
 
                     const scalar_t* q_fetch_ptr   = q_ptr + qhead_element;
-                    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
+                    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto || std::is_same<scalar_t, uint8_t>::value)
                     {
                         const _B16x8* q_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(q_fetch_ptr);
                         _B16x8 tmp                    = *q_fetch_ptr_16B;
@@ -215,23 +214,26 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                     }
                     else
                     {
-                        if constexpr(std::is_same<scalar_t, uint8_t>::value){
-                            const _B16x4* q_fetch_ptr_8B = reinterpret_cast<const _B16x4*>(q_fetch_ptr);
-                            _B16x4 tmp                    = *q_fetch_ptr_8B;
-                            const int offset1 = lane16id / 4; // 16 contiguous chunks of head elems are spread across 4x4lanes
-                            shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][lane4id][local_qhead_idx][0] = tmp;
-                        } else {
-                            for (int i = 0; i < 2; i++) {
-                                const _B16x8* q_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(q_fetch_ptr);
-                                _B16x8 tmp                    = *q_fetch_ptr_16B;
-                                const int head_elem = lane16id * 2 + i; // element id in _B16x4 terms
-                                const int offset3   = head_elem % 4;
-                                const int offset2   = (head_elem / 4) % 4;
-                                const int offset1   = head_elem / 4 / 4;
-                                shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][offset2]
-                                            [local_qhead_idx][offset3] = tmp.xy[i];
-                            }
+                //         if constexpr(std::is_same<scalar_t, uint8_t>::value){
+                //             const _B16x8* q_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(q_fetch_ptr);
+                //             _B16x8 tmp                    = *q_fetch_ptr_16B;
+                //             const int offset1 = lane16id / 4; // 16 contiguous chunks of head elems are spread across 4x4lanes
+                //             shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][lane4id]
+                //             [local_qhead_idx][0] = tmp.xy[0];
+                // shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][lane4id]
+                //             [local_qhead_idx][1] = tmp.xy[1];
+                //         } else {
+                        for (int i = 0; i < 2; i++) {
+                            const _B16x8* q_fetch_ptr_16B = reinterpret_cast<const _B16x8*>(q_fetch_ptr);
+                            _B16x8 tmp                    = *q_fetch_ptr_16B;
+                            const int head_elem = lane16id * 2 + i; // element id in _B16x4 terms
+                            const int offset3   = head_elem % 4;
+                            const int offset2   = (head_elem / 4) % 4;
+                            const int offset1   = head_elem / 4 / 4;
+                            shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][offset2]
+                                        [local_qhead_idx][offset3] = tmp.xy[i];
                         }
+                        // }
                     }
                 }
             }
@@ -242,7 +244,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     {
         for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
         {
-            for(int i = 0; i < sizeof(scalar_t); i++)
+            for(int i = 0; i < 2; i++)
             {
                 for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
                 {
@@ -392,9 +394,10 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                                 total_num_heads + global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP;
                 
                 q_scale =
-                    q_scale_ptr != nullptr && q_scale_idx < total_num_heads
+                    q_scale_ptr != nullptr && (global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP) < total_num_heads
                         ? *(q_scale_ptr + q_scale_idx)
                         : float(1.0);
+
             }
 
             for(int token_depth = 0; token_depth < TLOOP; token_depth++)
@@ -435,13 +438,13 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
 
                             for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
                             {
-                                for(int i = 0; i < sizeof(scalar_t); i++){
+                                for(int i = 0; i < 2; i++){
                                     _T8x8 Ktmp8x8, Qtmp8x8;
                                     Ktmp8x8.b8x8 = Ktmp8x16.xy[i];
                                     if constexpr(std::is_same<scalar_t, uint8_t>::value) {
                                         Qtmp8x8.b8x8 = *reinterpret_cast<_B8x8*>(&Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i]);
                                     } else {
-                                        for(int i = 0; i < sizeof(scalar_t); i++)
+                                        for(int i = 0; i < 2; i++)
                                         {
                                             scalar_t* qptr = reinterpret_cast<scalar_t*>(
                                                 &Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio]
@@ -468,7 +471,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                         }
                     }
                 }
-
                 d_out[gqa_ratio_loop][mtp][token_depth] *= scale * q_scale;
 
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
@@ -540,6 +542,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
             {
                 qk_max[gqa_ratio_loop][mtp] = fmaxf(qk_max[gqa_ratio_loop][mtp],
                                                     __shfl_xor(qk_max[gqa_ratio_loop][mtp], mask));
+
             }
 
             for(int token_depth = 0; token_depth < TLOOP; token_depth++)
