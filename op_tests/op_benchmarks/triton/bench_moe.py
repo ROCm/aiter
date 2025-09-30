@@ -185,7 +185,7 @@ def fused_moe(
             routed_weight=routed_weight,
             dtype=dtype,
             fp8_w8a8=fp8_w8a8,
-            block_shape=block_shape,
+            blockshape=block_shape,
             int8_w8a16=int8_w8a16,
         )
 
