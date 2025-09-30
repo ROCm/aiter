@@ -1068,17 +1068,13 @@ def test_mha_backward_varlen(
 
 # Run with:
 # pytest -s op_tests/triton_tests/test_mha.py::test_mha_backward_with_pe
-# @pytest.mark.skip(reason="This feature is under development")
 @pytest.mark.parametrize("BATCH", [1])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    # [(4096, 4096)],
-    [(18, 18)],
+    [(4096, 4096)],
 )
-# @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 128)])
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1)])
-# @pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 128)])
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128)])
 def test_mha_backward_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
@@ -1221,13 +1217,9 @@ def test_mha_backward_with_pe(
             triton_dq=torch_to_np(triton_dq),
         )
 
-    # dQ is failing miserably:
-    # Mismatched elements: 74487946 / 100663296 (74.0%)
-    # Greatest absolute difference: 3.3515625 at index (0, 1, 21, 62) (up to 0.01 allowed)
-    # Greatest relative difference: inf at index (0, 9, 22, 76) (up to 0.01 allowed)
-    # torch.testing.assert_close(
-    #     triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-    # )
+    torch.testing.assert_close(
+        triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
 
     torch.testing.assert_close(
         triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
@@ -1254,6 +1246,3 @@ def test_mha_backward_with_pe(
     # * there are a lot of mismatches when running with real GPU!
 
     # import pdb; pdb.set_trace()
-    torch.testing.assert_close(
-        triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-    )
