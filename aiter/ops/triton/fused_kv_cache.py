@@ -26,8 +26,6 @@ def fused_qk_rope_cosine_cache_llama(
     apply_scale: bool = True,
     offs: torch.Tensor = None,
     q_out: torch.Tensor = None,
-    output_zeros: bool = True,
-    zeros_out: torch.Tensor = None,
 ):
     """
     Perform RoPE on q and k and along the last dimension and copy k and v in to key_cache and value_cache inplace
@@ -51,7 +49,6 @@ def fused_qk_rope_cosine_cache_llama(
     - q_out: same shape as input q.
     - key_cache: same shape as input key_cache (inplace).
     - value_cache: same shape as input value_cache (inplace).
-    - zeros_out: same shape as input q.
     """
     _LOGGER.info(
         f"FUSED_QK_ROPE_COSINE_CACHE_LLAMA: q={tuple(q.shape)} k={tuple(k.shape)} "
@@ -116,7 +113,6 @@ def fused_qk_rope_cosine_cache_llama(
         value_cache,
         slot_mapping,
         q_out,
-        zeros_out,
         t,
         t_slot,
         *q.stride(),
@@ -134,9 +130,6 @@ def fused_qk_rope_cosine_cache_llama(
         value_cache.stride(1) if not flash_layout else value_cache.stride(2),
         value_cache.stride(2) if not flash_layout else value_cache.stride(3),
         value_cache.stride(3) if not flash_layout else value_cache.stride(1),
-        zeros_out.stride(0) if zeros_out is not None else 0,
-        zeros_out.stride(1) if zeros_out is not None else 0,
-        zeros_out.stride(2) if zeros_out is not None else 0,
         k_scale_ptr=k_scale,
         v_scale_ptr=v_scale,
         QH_PER_KH=qh // kh,
