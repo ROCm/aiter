@@ -147,28 +147,53 @@ def get_optimal_moe_e2e_config(
             else:
                 config = configs["large_M"]
     else:
-        # default config
-        # we fit the whole token intermediate representation in registers in order to fuse the two gemms
+        
         if persistent:
-            config = {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N1": 128,
-                "BLOCK_SIZE_K1": 64,
-                "BLOCK_SIZE_K2": 64,
-            }
+            if dtype == torch.float32:
+                config = {
+                    "BLOCK_SIZE_M": 32,
+                    "BLOCK_SIZE_N1": 64,
+                    "BLOCK_SIZE_K1": 32,
+                    "BLOCK_SIZE_K2": 32,
+                }
+            else:
+                config = {
+                    "BLOCK_SIZE_M": 64,
+                    "BLOCK_SIZE_N1": 128,
+                    "BLOCK_SIZE_K1": 64,
+                    "BLOCK_SIZE_K2": 64,
+                }
         else:
-            config = {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 512,
-                "BLOCK_SIZE_K1": 32,
-                "BLOCK_SIZE_K2": 64,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 2,
-                "waves_per_eu": 1,
-                "matrix_instr_nonkdim": 16,
-                "kpack": 1,
-            }
+            if dtype == torch.float32:
+                # default config
+                # we fit the whole token intermediate representation in registers in order to fuse the two gemms
+                config = {
+                    "BLOCK_SIZE_M": 16,
+                    "BLOCK_SIZE_N": 512,
+                    "BLOCK_SIZE_K1": 16,
+                    "BLOCK_SIZE_K2": 16,
+                    "GROUP_SIZE_M": 1,
+                    "num_warps": 4,
+                    "num_stages": 1,
+                    "waves_per_eu": 1,
+                    "matrix_instr_nonkdim": 16,
+                    "kpack": 1,
+                }
+            else:
+                # default config
+                # we fit the whole token intermediate representation in registers in order to fuse the two gemms
+                config = {
+                    "BLOCK_SIZE_M": 32,
+                    "BLOCK_SIZE_N": 512,
+                    "BLOCK_SIZE_K1": 32,
+                    "BLOCK_SIZE_K2": 64,
+                    "GROUP_SIZE_M": 1,
+                    "num_warps": 4,
+                    "num_stages": 2,
+                    "waves_per_eu": 1,
+                    "matrix_instr_nonkdim": 16,
+                    "kpack": 1,
+                }
 
     return config
 

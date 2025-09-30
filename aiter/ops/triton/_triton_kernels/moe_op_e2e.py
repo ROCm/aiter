@@ -6,9 +6,41 @@ import triton.language as tl
 
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
+
+@triton.jit
+def group_broadcast(x, xM: tl.constexpr, xN: tl.constexpr, group_size: tl.constexpr, broadcast_dim: tl.constexpr):
+    """
+    Broadcasts the input tensor `x` along the specified dimension `broadcast_dim`
+    in groups of size `group_size`.
+
+    Parameters:
+    - x: Input tensor to be broadcasted.
+    - group_size: Size of each group for broadcasting.
+    - broadcast_dim: Dimension along which to perform the broadcasting.
+
+    Returns:
+    - A tensor with the same shape as `x`, but with values broadcasted
+      in groups along the specified dimension.
+    """
+    if broadcast_dim == 0:
+        assert xM > 0, "broadcast_dim must be specified"
+        if xM <= 1:
+            return x # singleton dimension, no need to broadcast
+        x = x.reshape(xM, 1, xN)
+        x = tl.broadcast_to(x, (xM, group_size, xN))
+        x = x.reshape(xM * group_size, xN)
+    else:
+        assert xN > 0, "broadcast_dim must be specified"
+        if xN <= 1:
+            return x # singleton dimension, no need to broadcast
+        x = x.reshape(xM, xN, 1)
+        x = tl.broadcast_to(x, (xM, xN, group_size))
+        x = x.reshape(xM, xN * group_size)
+    
+    return x
+
 # Source:
 # MoE Kernel adapted from VLLM
-
 @triton.heuristics(
     {
         "GRID_MN": lambda args: triton.cdiv(args["EM"], args["BLOCK_SIZE_M"])
@@ -61,13 +93,11 @@ def e2e_moe_kernel(
     BLOCK_SIZE_K2: tl.constexpr,  # outputs (EM, BLOCK_SIZE_K2)
     GROUP_SIZE_M: tl.constexpr,
     GRID_MN: tl.constexpr,
-    atomic_num_stages: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     SKINNY: tl.constexpr,
     dtype: tl.constexpr,
     compute_dtype: tl.constexpr,
     out_dtype: tl.constexpr,
-    IS_BLOCKSCALEQ: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -114,6 +144,10 @@ def e2e_moe_kernel(
         tl.assume(stride_w2se > 0)
         tl.assume(stride_w2sk > 0)
         tl.assume(stride_w2sn > 0)
+        tl.assume(stride_asm > 0)
+        tl.assume(stride_ask > 0)
+
+    
     pid = tl.program_id(axis=0)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
@@ -137,10 +171,17 @@ def e2e_moe_kernel(
     offs_k1 = tl.arange(0, BLOCK_SIZE_K1)
     offs_k2 = tl.arange(0, BLOCK_SIZE_K2)
 
-    offs_sk1 = tl.arange(0, BLOCK_SIZE_K1) // group_k
-    offs_sk2 = tl.arange(0, BLOCK_SIZE_K2) // group_k
+    # offs_sk1 = tl.arange(0, BLOCK_SIZE_K1) // group_k
+    # offs_sk2 = tl.arange(0, BLOCK_SIZE_K2) // group_k
 
     BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2 # TODO: quarantee that BLOCK_SIZE_HALF*2=BLOCK_SIZE_N
+
+    if use_fp8_w8a8:
+        num_scales_along_n: tl.constexpr = (BLOCK_SIZE_HALF + group_n - 1) // group_n
+        # num_scales_along_k1: tl.constexpr = tl.cdiv(BLOCK_SIZE_K1, group_k)
+        num_scales_along_k1  = (BLOCK_SIZE_K1 + group_k - 1) // group_k
+        assert num_scales_along_k1 == 1, "BLOCK_SIZE_K1 must be <= group_k when using fp8" 
+        num_scales_along_k2: tl.constexpr = (BLOCK_SIZE_K2 + group_k - 1) // group_k
 
 
     offs_i0 = tl.arange(0, BLOCK_SIZE_HALF)
@@ -175,8 +216,6 @@ def e2e_moe_kernel(
 
     silu_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=tl.float32)
     mul_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=tl.float32)
-
-    # IS_BLOCKSCALEQ: tl.constexpr = (group_k > 0) & (group_n > 0)
 
     if use_fp8_w8a8:
         a_scale_ptrs = A_scale + (offs_token[:, None] // top_k * stride_asm) 
@@ -218,14 +257,9 @@ def e2e_moe_kernel(
             w1_i0_scale = tl.load(w1_i0_scale_ptrs + start_k * stride_w1sk)
             w1_i1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk)
 
-            # TODO maybe made a generic broadcast function?
-            w1_i0_scale = w1_i0_scale.reshape(1, ((BLOCK_SIZE_N // 2) // group_n), 1)
-            w1_i0_scale = w1_i0_scale.broadcast_to(1, ((BLOCK_SIZE_N // 2) // group_n), group_n)
-            w1_i0_scale = w1_i0_scale.reshape(1, ((BLOCK_SIZE_N // 2)))
-
-            w1_i1_scale = w1_i1_scale.reshape(1, ((BLOCK_SIZE_N // 2) // group_n), 1)
-            w1_i1_scale = w1_i1_scale.broadcast_to(1, ((BLOCK_SIZE_N // 2) // group_n), group_n)
-            w1_i1_scale = w1_i1_scale.reshape(1, ((BLOCK_SIZE_N // 2)))
+            if num_scales_along_n > 1:
+                w1_i0_scale = group_broadcast(w1_i0_scale, 1, num_scales_along_n, group_n, 1)
+                w1_i1_scale = group_broadcast(w1_i1_scale, 1, num_scales_along_n, group_n, 1)
 
             a_scale = tl.load(a_scale_ptrs + start_k * stride_ask, mask=token_mask[:, None], other=0.0)
             
@@ -267,14 +301,13 @@ def e2e_moe_kernel(
     if use_fp8_w8a8:
         # offs_w2_sn = offs_w2n // group_n
         # instead load only the necessary and broadcast. 
-        num_scales_along_n: tl.constexpr = BLOCK_SIZE_HALF // group_n
-        offs_scales_n = tl.arange(0, num_scales_along_n)
-        offs_w2_sn = pid_n * (BLOCK_SIZE_HALF) + offs_scales_n * BLOCK_SIZE_HALF
+        offs_w2_sn = pid_n * (BLOCK_SIZE_HALF) // group_n + tl.arange(0, num_scales_along_n)
         w2_scale_ptrs = (
             W2_scale + off_experts * stride_w2se + offs_w2_sn[:, None] * stride_w2sn
         )
+        w2_scale_ptrs += (tl.arange(0, num_scales_along_k2)[None, :]) * stride_w2sk
+        # w2_scale_ptrs: (num_scales_along_n, num_scales_along_k2)
 
-    
     out_ptrs = Out + stride_cm * offs_token[:, None] + offs_k2[None, :]
 
     num_k = tl.cdiv(K, BLOCK_SIZE_K2)
@@ -297,10 +330,14 @@ def e2e_moe_kernel(
             )
 
         if use_fp8_w8a8:
-            w2_scales = tl.load(w2_scale_ptrs + k * BLOCK_SIZE_K2 // group_k * stride_w2sk) # (BLOCK_SIZE_HALF//group_n, BLOCK_SIZE_K2)
-            w2_scales = w2_scales.reshape((num_scales_along_n, 1))
-            w2_scales = tl.broadcast_to(w2_scales, (num_scales_along_n, group_n))  
-            w2_scale = w2_scales.reshape((num_scales_along_n * group_n, 1)) 
+            w2_scale = tl.load(w2_scale_ptrs + k * BLOCK_SIZE_K2 // group_k * stride_w2sk) # (BLOCK_SIZE_HALF//group_n, BLOCK_SIZE_K2)
+            # w2_scales = w2_scales.reshape((num_scales_along_n, 1, -1))
+            # w2_scales = tl.broadcast_to(w2_scales, (num_scales_along_n, group_n, -1))  
+            # w2_scale = w2_scales.reshape((num_scales_along_n * group_n, -1))  # (BLOCK_SIZE_HALF, BLOCK_SIZE_K2)
+            w2_scale = group_broadcast(w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0)            
+            if num_scales_along_k2 > 1:
+                w2_scale = group_broadcast(w2_scale, num_scales_along_n * group_n, num_scales_along_k2, group_k, 1)
+
             w2 = (w2.to(tl.float32) * w2_scale.to(tl.float32)).to(tl.bfloat16)
             out = tl.dot(acc, w2)
         else:
@@ -334,7 +371,6 @@ def e2e_moe_kernel(
                 sem="relaxed",
                 scope="cta",
             )
-
 
 
 @triton.jit

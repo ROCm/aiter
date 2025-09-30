@@ -224,13 +224,11 @@ def e2e_moe(
             EVEN_K,
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             use_fp8_w8a8=use_fp8_w8a8,
-            atomic_num_stages=atomic_num_stages,
             NUM_XCDS=get_num_xcds(),
             SKINNY=SKINNY,
             dtype=torch_to_triton_dtype[dtype], # input dtype, mma dtype
             compute_dtype=torch_to_triton_dtype[torch.float32], # activation dtype
             out_dtype=torch_to_triton_dtype[out_dtype],
-            IS_BLOCKSCALEQ=use_fp8_w8a8 and (block_shape is not None),
             **config,
         )
 
