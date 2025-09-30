@@ -1327,9 +1327,9 @@ def test_moe_e2e(
         blockshape=blockshape
     )
 
-    # if DEBUG_MODE:
-    print(f"triton_out={triton_out}")
-    print(f"torch_out={torch_out}")
+    if DEBUG_MODE:
+        print(f"triton_out={triton_out}")
+        print(f"torch_out={torch_out}")
 
     # Validate correctness
     torch.testing.assert_close(triton_out, torch_out, atol=2e-1, rtol=2e-1)

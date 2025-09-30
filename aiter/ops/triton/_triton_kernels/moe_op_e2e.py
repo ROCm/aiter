@@ -301,7 +301,8 @@ def e2e_moe_kernel(
     if use_fp8_w8a8:
         # offs_w2_sn = offs_w2n // group_n
         # instead load only the necessary and broadcast. 
-        offs_w2_sn = pid_n * (BLOCK_SIZE_HALF) // group_n + tl.arange(0, num_scales_along_n)
+        offs_w2_sn = pid_n * (BLOCK_SIZE_HALF) // group_n + tl.arange(0, num_scales_along_n) 
+        # ... + tl.arange(0, num_scales_along_n) * group_n // group_n = ... + tl.arange(0, num_scales_along_n)
         w2_scale_ptrs = (
             W2_scale + off_experts * stride_w2se + offs_w2_sn[:, None] * stride_w2sn
         )
@@ -330,10 +331,7 @@ def e2e_moe_kernel(
             )
 
         if use_fp8_w8a8:
-            w2_scale = tl.load(w2_scale_ptrs + k * BLOCK_SIZE_K2 // group_k * stride_w2sk) # (BLOCK_SIZE_HALF//group_n, BLOCK_SIZE_K2)
-            # w2_scales = w2_scales.reshape((num_scales_along_n, 1, -1))
-            # w2_scales = tl.broadcast_to(w2_scales, (num_scales_along_n, group_n, -1))  
-            # w2_scale = w2_scales.reshape((num_scales_along_n * group_n, -1))  # (BLOCK_SIZE_HALF, BLOCK_SIZE_K2)
+            w2_scale = tl.load(w2_scale_ptrs + k * BLOCK_SIZE_K2 // group_k * stride_w2sk) # (num_scales_along_n, num_scales_along_k2)
             w2_scale = group_broadcast(w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0)            
             if num_scales_along_k2 > 1:
                 w2_scale = group_broadcast(w2_scale, num_scales_along_n * group_n, num_scales_along_k2, group_k, 1)
