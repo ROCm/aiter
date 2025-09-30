@@ -478,9 +478,8 @@ __global__ void exponential_kernel(DTYPE_O* output,
         {
             float u      = transform_func((&rand.x)[i]) + eps;
             vec_cur[i]   = ck_tile::type_convert<DTYPE_O>(u);
-            ptr_o[k + i] = vec_cur[i];
         }
-        // buffer_o.template set(k, 0, true, vec_cur.template get_as<DTYPE_STORE>());
+        buffer_o.template set(k, 0, true, vec_cur.template get_as<DTYPE_STORE>());
     }
 }
 

@@ -62,7 +62,6 @@ def run_aiter_random_sample(input, temperatures, eps):
 
 @benchmark()
 def test_random_sample(M, N, dtype=torch.bfloat16, eps=1e-6):
-    eps = 1000
     input = torch.randn(M, N, device="cuda", dtype=dtype)
     temperatures = torch.rand(M, device="cuda", dtype=torch.float)
     temperatures = torch.where(
