@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.fused_kv_cache import (
-    _fused_qk_rope_cosine_cache_llama_kernel_llama,
+    _fused_qk_rope_cosine_cache_llama_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -101,7 +101,7 @@ def fused_qk_rope_cosine_cache_llama(
 
     n_pid = t * qh + (t_slot - t) * kh
     grid = (n_pid, 1, 1)
-    _fused_qk_rope_cosine_cache_llama_kernel_llama[grid](
+    _fused_qk_rope_cosine_cache_llama_kernel[grid](
         q,
         k,
         v,

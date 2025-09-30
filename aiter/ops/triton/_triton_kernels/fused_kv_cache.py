@@ -35,7 +35,7 @@ def _unit_rope(
 
 
 @triton.jit
-def _fused_qk_rope_cosine_cache_llama_kernel_llama(
+def _fused_qk_rope_cosine_cache_llama_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
