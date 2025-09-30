@@ -81,6 +81,7 @@ def e2e_moe(
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
+
     if use_fp8_w8a8:
         assert W1_scale is not None
         assert W2_scale is not None
@@ -92,6 +93,9 @@ def e2e_moe(
             #TODO: Add support for per token group quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
+            
+            assert ((config["BLOCK_SIZE_K1"] + block_k - 1) // block_k) == 1, "BLOCK_SIZE_K1 must be <= group_k when using fp8"
+            
             #A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(W1.shape[-2], block_n) == W1_scale.shape[-2]
@@ -244,7 +248,6 @@ def e2e_moe(
             NUM_XCDS=get_num_xcds(),
             SKINNY=SKINNY,
             dtype=torch_to_triton_dtype[dtype], # input dtype, mma dtype
-            compute_dtype=torch_to_triton_dtype[torch.float32], # activation dtype
             out_dtype=torch_to_triton_dtype[out_dtype],
             **config,
         )

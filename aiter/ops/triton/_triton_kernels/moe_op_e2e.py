@@ -3,6 +3,7 @@
 
 import triton
 import triton.language as tl
+from .activation import _silu_exp2
 
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
@@ -96,7 +97,6 @@ def e2e_moe_kernel(
     NUM_XCDS: tl.constexpr,
     SKINNY: tl.constexpr,
     dtype: tl.constexpr,
-    compute_dtype: tl.constexpr,
     out_dtype: tl.constexpr,
 ):
     """
@@ -171,18 +171,11 @@ def e2e_moe_kernel(
     offs_k1 = tl.arange(0, BLOCK_SIZE_K1)
     offs_k2 = tl.arange(0, BLOCK_SIZE_K2)
 
-    # offs_sk1 = tl.arange(0, BLOCK_SIZE_K1) // group_k
-    # offs_sk2 = tl.arange(0, BLOCK_SIZE_K2) // group_k
-
     BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2 # TODO: quarantee that BLOCK_SIZE_HALF*2=BLOCK_SIZE_N
 
     if use_fp8_w8a8:
-        num_scales_along_n: tl.constexpr = (BLOCK_SIZE_HALF) // group_n
-        # num_scales_along_k1: tl.constexpr = tl.cdiv(BLOCK_SIZE_K1, group_k)
-        num_scales_along_k1: tl.constexpr  = (BLOCK_SIZE_K1) // group_k
-        assert num_scales_along_k1 <= 1, "BLOCK_SIZE_K1 must be <= group_k when using fp8" 
-        num_scales_along_k2: tl.constexpr = (BLOCK_SIZE_K2) // group_k
-
+        num_scales_along_n: tl.constexpr = (BLOCK_SIZE_HALF + group_n - 1) // group_n
+        num_scales_along_k2: tl.constexpr = (BLOCK_SIZE_K2 + group_k - 1) // group_k
 
     offs_i0 = tl.arange(0, BLOCK_SIZE_HALF)
     offs_i1 = tl.arange(0, BLOCK_SIZE_HALF) + N // 2
@@ -277,18 +270,9 @@ def e2e_moe_kernel(
             w1_i1_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_w1sk
             a_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_ask
     
-    silu_acc = silu_acc.to(compute_dtype)
-    mul_acc = mul_acc.to(compute_dtype)
+    silu_acc = _silu_exp2(silu_acc)
+    acc = (silu_acc * mul_acc).to(out_dtype)
 
-
-    silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
-    acc = silu_acc * mul_acc
-
-    if use_fp8_w8a8:
-        acc = acc.to(tl.bfloat16)
-    else:
-        acc = acc.to(W2.type.element_ty)
-    
     offs_w2n = tl.arange(0, BLOCK_SIZE_HALF) + pid_n * (BLOCK_SIZE_HALF)
 
     w2_ptrs = (
