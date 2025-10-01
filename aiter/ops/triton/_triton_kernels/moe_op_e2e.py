@@ -255,8 +255,8 @@ def e2e_moe_kernel(
 
             a_scale = tl.load(a_scale_ptrs + start_k * stride_ask, mask=token_mask[:, None], other=0.0)
             
-            silu_acc += tl.dot(a, w1_i0) * a_scale * w1_i0_scale
-            mul_acc += tl.dot(a, w1_i1) * a_scale * w1_i1_scale
+            silu_acc += tl.dot(a, w1_i0, out_dtype=tl.float32) * a_scale * w1_i0_scale
+            mul_acc += tl.dot(a, w1_i1, out_dtype=tl.float32) * a_scale * w1_i1_scale
         else:
             mul_acc = tl.dot(a, w1_i1, acc=mul_acc) 
             silu_acc = tl.dot(a, w1_i0, acc=silu_acc) 
@@ -267,7 +267,10 @@ def e2e_moe_kernel(
         w1_ptrs_i1 += BLOCK_SIZE_K1 * stride_w1k
     
     silu_acc = _silu_exp2(silu_acc)
-    acc = (silu_acc * mul_acc).to(out_dtype)
+    if use_fp8_w8a8:
+        acc = (silu_acc * mul_acc).to(tl.bfloat16)
+    else:
+        acc = (silu_acc * mul_acc).to(dtype)
 
     offs_w2n = tl.arange(0, BLOCK_SIZE_HALF) + pid_n * (BLOCK_SIZE_HALF)
 
@@ -279,7 +282,7 @@ def e2e_moe_kernel(
 
     if use_fp8_w8a8:
         # offs_w2_sn = offs_w2n // group_n
-        # instead load only the necessary and broadcast. 
+        # instead load only the unique scaling factors and broadcast. 
         offs_w2_sn = pid_n * (BLOCK_SIZE_HALF) // group_n + tl.arange(0, num_scales_along_n) 
         # ... + tl.arange(0, num_scales_along_n) * group_n // group_n = ... + tl.arange(0, num_scales_along_n)
         w2_scale_ptrs = (
@@ -315,7 +318,7 @@ def e2e_moe_kernel(
             if num_scales_along_k2 > 1: # singleton dimension get automatic broadcast
                 w2_scale = group_broadcast(w2_scale, num_scales_along_n * group_n, num_scales_along_k2, group_k, 1)
 
-            w2 = (w2.to(tl.float32) * w2_scale.to(tl.float32)).to(out_dtype)
+            w2 = (w2.to(tl.float32) * w2_scale.to(tl.float32)).to(tl.bfloat16)
             out = tl.dot(acc, w2)
         else:
             out = tl.dot(acc, w2)
@@ -326,9 +329,7 @@ def e2e_moe_kernel(
             )
             out = out * moe_weight[:, None]
 
-
         out = out.to(out_dtype)
-
 
         if EVEN_K:
             c_mask = token_mask[:, None]
@@ -339,7 +340,6 @@ def e2e_moe_kernel(
             # Skinny means that we can fit the whole intermediate representation of a token in register memory (i.e. N <= BLOCK_SIZE_N). 
             # Thus we don't need atomics, as there is only workgroup updating the output tile.
             tl.store(out_ptrs + k * BLOCK_SIZE_K2, out, mask=c_mask)
-        
         else:
             tl.atomic_add(
                 out_ptrs + k * BLOCK_SIZE_K2,
