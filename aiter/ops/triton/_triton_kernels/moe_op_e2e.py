@@ -65,7 +65,7 @@ def e2e_moe_kernel(
     stride_w2e,
     stride_w2n,
     stride_w2k,
-    stride_cm,
+    stride_om,
     stride_asm,
     stride_ask,
     stride_w1se,
@@ -136,7 +136,7 @@ def e2e_moe_kernel(
     tl.assume(stride_w2e > 0)
     tl.assume(stride_w2n > 0)
     tl.assume(stride_w2k > 0)
-    tl.assume(stride_cm > 0)
+    tl.assume(stride_om > 0)
     if use_fp8_w8a8:
         tl.assume(stride_w1se > 0)
         tl.assume(stride_w1sn > 0)
@@ -166,12 +166,11 @@ def e2e_moe_kernel(
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m)
-    # TODO: add off_experts=-1 return condition
 
     offs_k1 = tl.arange(0, BLOCK_SIZE_K1)
     offs_k2 = tl.arange(0, BLOCK_SIZE_K2)
 
-    BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2 # TODO: quarantee that BLOCK_SIZE_HALF*2=BLOCK_SIZE_N
+    BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
 
     if use_fp8_w8a8:
         num_scales_along_n: tl.constexpr = (BLOCK_SIZE_HALF + group_n - 1) // group_n
@@ -220,7 +219,7 @@ def e2e_moe_kernel(
         )
 
     num_k1 = tl.cdiv(K, BLOCK_SIZE_K1)
-    for k in tl.range(0, num_k1): 
+    for k1 in tl.range(0, num_k1): 
         # Masking ensures we don't load from invalid tokens or indices
         if EVEN_K:
             a = tl.load(a_ptrs, mask=(token_mask[:, None]), other=0.0)
@@ -229,22 +228,22 @@ def e2e_moe_kernel(
         else:
             a = tl.load(
                 a_ptrs,
-                mask=(token_mask[:, None] & (offs_k1[None, :] < K - k * BLOCK_SIZE_K1)),
+                mask=(token_mask[:, None] & (offs_k1[None, :] < K - k1 * BLOCK_SIZE_K1)),
                 other=0.0,
             )
             w1_i0 = tl.load(
                 w1_ptrs_i0,
-                mask=(offs_k1[:, None] < K - k * BLOCK_SIZE_K1) & mask_w1n[None, :],
+                mask=(offs_k1[:, None] < K - k1 * BLOCK_SIZE_K1) & mask_w1n[None, :],
                 other=0.0,
             )
             w1_i1 = tl.load(
                 w1_ptrs_i1,
-                mask=(offs_k1[:, None] < K - k * BLOCK_SIZE_K1) & mask_w1n[None, :],
+                mask=(offs_k1[:, None] < K - k1 * BLOCK_SIZE_K1) & mask_w1n[None, :],
                 other=0.0,
             )
         
         if use_fp8_w8a8:
-            start_k = k * BLOCK_SIZE_K1 // group_k
+            start_k = k1 * BLOCK_SIZE_K1 // group_k
 
             w1_i0_scale = tl.load(w1_i0_scale_ptrs + start_k * stride_w1sk)
             w1_i1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk)
@@ -291,29 +290,29 @@ def e2e_moe_kernel(
         w2_scale_ptrs += (tl.arange(0, num_scales_along_k2)[None, :]) * stride_w2sk
         # w2_scale_ptrs: (num_scales_along_n, num_scales_along_k2)
 
-    out_ptrs = Out + stride_cm * offs_token[:, None] + offs_k2[None, :]
+    out_ptrs = Out + stride_om * offs_token[:, None] + offs_k2[None, :]
 
-    num_k = tl.cdiv(K, BLOCK_SIZE_K2)
-    for k in tl.range(0, num_k):
+    num_k2 = tl.cdiv(K, BLOCK_SIZE_K2)
+    for k2 in tl.range(0, num_k2, num_stages=1):
 
         if EVEN_K:
             w2 = tl.load(
-                w2_ptrs + k * BLOCK_SIZE_K2 * stride_w2k,
+                w2_ptrs + k2 * BLOCK_SIZE_K2 * stride_w2k,
                 mask=(offs_w2n[:, None] < N // 2),
                 other=0.0,
             )
         else:
             w2 = tl.load(
-                w2_ptrs + k * BLOCK_SIZE_K2 * stride_w2k,
+                w2_ptrs + k2 * BLOCK_SIZE_K2 * stride_w2k,
                 mask=(
                     (offs_w2n[:, None] < N // 2)
-                    & ((offs_k2 + k * BLOCK_SIZE_K2)[None, :] < K)
+                    & ((offs_k2 + k2 * BLOCK_SIZE_K2)[None, :] < K)
                 ),
                 other=0.0,
             )
 
         if use_fp8_w8a8:
-            w2_scale = tl.load(w2_scale_ptrs + k * BLOCK_SIZE_K2 // group_k * stride_w2sk) # (num_scales_along_n, num_scales_along_k2)
+            w2_scale = tl.load(w2_scale_ptrs + k2 * BLOCK_SIZE_K2 // group_k * stride_w2sk) # (num_scales_along_n, num_scales_along_k2)
             w2_scale = group_broadcast(w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0)            
             if num_scales_along_k2 > 1: # singleton dimension get automatic broadcast
                 w2_scale = group_broadcast(w2_scale, num_scales_along_n * group_n, num_scales_along_k2, group_k, 1)
@@ -334,15 +333,15 @@ def e2e_moe_kernel(
         if EVEN_K:
             c_mask = token_mask[:, None]
         else:
-            c_mask = token_mask[:, None] & ((offs_k2 + k * BLOCK_SIZE_K2)[None, :] < K)
+            c_mask = token_mask[:, None] & ((offs_k2 + k2 * BLOCK_SIZE_K2)[None, :] < K)
 
         if SKINNY:
             # Skinny means that we can fit the whole intermediate representation of a token in register memory (i.e. N <= BLOCK_SIZE_N). 
             # Thus we don't need atomics, as there is only workgroup updating the output tile.
-            tl.store(out_ptrs + k * BLOCK_SIZE_K2, out, mask=c_mask)
+            tl.store(out_ptrs + k2 * BLOCK_SIZE_K2, out, mask=c_mask)
         else:
             tl.atomic_add(
-                out_ptrs + k * BLOCK_SIZE_K2,
+                out_ptrs + k2 * BLOCK_SIZE_K2,
                 out.to(dtype),
                 mask=c_mask,
                 sem="relaxed",

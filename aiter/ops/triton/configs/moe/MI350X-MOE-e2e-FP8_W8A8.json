@@ -3,11 +3,11 @@
     "BLOCK_SIZE_M": 32,
     "BLOCK_SIZE_N": 512,
     "BLOCK_SIZE_K1": 128,
-    "BLOCK_SIZE_K2": 256,
+    "BLOCK_SIZE_K2": 512,
     "GROUP_SIZE_M": 1,
     "num_warps": 8,
     "num_stages": 2,
-    "waves_per_eu": 1,
+    "waves_per_eu": 2,
     "matrix_instr_nonkdim": 16,
     "kpack": 1
   },
