@@ -246,9 +246,9 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
     expt_data = routing_data.expt_data
     block_m = config["block_m"]
     expt_hist = None if expt_data is None else expt_data.hist
-    expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[block_m][-1]
+    expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad(block_m)[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
-    expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map[block_m]
+    expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map(block_m)
     # spmd grid
     if expt_block_pid_map is not None:
         grid_m = routing_data.n_blocks(M, config["block_m"])

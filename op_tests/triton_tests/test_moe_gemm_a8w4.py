@@ -168,14 +168,14 @@ class Case:
 def test_op(m, n, k, do_gather, do_scatter, has_y_gammas, apply_swiglu, fused_quant, 
             n_expts_tot, n_expts_act, act_dtype_str, weight_dtype_str, hbm_swizzling, device="cuda"):
 
-    if "float8" in act_dtype_str and "mx" in weight_dtype_str and not get_arch() == "gfx950":
+    if "float8" in act_dtype_str and "mx" in weight_dtype_str and get_arch() != "gfx950":
         pytest.skip("float8 x mx only supported on CDNA4")
 
-    if "float8_e4m3fnuz" in (weight_dtype_str, act_dtype_str) and not get_arch() == "gfx942":
+    if "float8_e4m3fnuz" in (weight_dtype_str, act_dtype_str) and get_arch() != "gfx942":
         pytest.skip("float8_e4m3fnuz only tested on AMD CDNA3 Platform")
 
     if hbm_swizzling:
-        if not get_arch() == "gfx950":
+        if get_arch() != "gfx950":
             pytest.skip("Scale preshuffling on AMD GPU has not been emulated on non-CDNA4 arch yet.")
         if "mx" not in weight_dtype_str:
             pytest.skip("Non-scale swizzling not supported on CDNA4 yet")
