@@ -3,7 +3,7 @@
 
 import triton
 import triton.language as tl
-from .activation import _silu_exp2
+from .activation import _silu_exp2, _gelu_tanh
 
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
@@ -25,15 +25,16 @@ def group_broadcast(x, xM: tl.constexpr, xN: tl.constexpr, group_size: tl.conste
     """
     if broadcast_dim == 0:
         assert xM > 0, "broadcast_dim must be specified"
-        if xM <= 1:
-            return x # singleton dimension, no need to broadcast
+        # TODO: complains about inconsistent return types if uncommented
+        # if xM <= 1:
+        #     return x # singleton dimension, no need to broadcast
         x = x.reshape(xM, 1, xN)
         x = tl.broadcast_to(x, (xM, group_size, xN))
         x = x.reshape(xM * group_size, xN)
     else:
         assert xN > 0, "broadcast_dim must be specified"
-        if xN <= 1:
-            return x # singleton dimension, no need to broadcast
+        # if xN <= 1:
+        #     return x # singleton dimension, no need to broadcast
         x = x.reshape(xM, xN, 1)
         x = tl.broadcast_to(x, (xM, xN, group_size))
         x = x.reshape(xM, xN * group_size)
@@ -90,6 +91,7 @@ def e2e_moe_kernel(
     use_fp8_w8a8: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_WN: tl.constexpr,
     BLOCK_SIZE_K1: tl.constexpr,  # original block_size_k
     BLOCK_SIZE_K2: tl.constexpr,  # outputs (EM, BLOCK_SIZE_K2)
     GROUP_SIZE_M: tl.constexpr,
@@ -98,6 +100,8 @@ def e2e_moe_kernel(
     SKINNY: tl.constexpr,
     dtype: tl.constexpr,
     out_dtype: tl.constexpr,
+    use_silu: tl.constexpr = False,
+    use_gelu: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -170,21 +174,19 @@ def e2e_moe_kernel(
     offs_k1 = tl.arange(0, BLOCK_SIZE_K1)
     offs_k2 = tl.arange(0, BLOCK_SIZE_K2)
 
-    BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
 
     if use_fp8_w8a8:
-        num_scales_along_n: tl.constexpr = (BLOCK_SIZE_HALF + group_n - 1) // group_n
+        num_scales_along_n: tl.constexpr = (BLOCK_SIZE_WN + group_n - 1) // group_n
         num_scales_along_k2: tl.constexpr = (BLOCK_SIZE_K2 + group_k - 1) // group_k
 
-    offs_i0 = tl.arange(0, BLOCK_SIZE_HALF)
-    offs_i1 = tl.arange(0, BLOCK_SIZE_HALF) + N // 2
-
+    offs_wn = tl.arange(0, BLOCK_SIZE_WN)
     # offset for silu_acc
-    i0 = pid_n * BLOCK_SIZE_HALF + offs_i0
+    i0 = pid_n * BLOCK_SIZE_WN + offs_wn
     # offset for mul_acc
-    i1 = pid_n * BLOCK_SIZE_HALF + offs_i1
+    if use_silu:
+        offs_wn_mul = offs_wn + N // 2
+        i1 = pid_n * BLOCK_SIZE_WN + offs_wn_mul
 
-    
     # TODO: add EVEN_N and pid_n is not last pid_n so no need for masking conditions
     # same mask applicable to both silu and mul acc
     mask_w1n = i0 < (N // 2)
@@ -198,33 +200,37 @@ def e2e_moe_kernel(
         + (offs_k1[:, None] * stride_w1k + i0[None, :] * stride_w1n)
     )
 
-    w1_ptrs_i1 = (
-        W1
-        + off_experts * stride_w1e
-        + (offs_k1[:, None] * stride_w1k + i1[None, :] * stride_w1n)
-    )
+    if use_silu:
+        w1_ptrs_i1 = (
+            W1
+            + off_experts * stride_w1e
+            + (offs_k1[:, None] * stride_w1k + i1[None, :] * stride_w1n)
+        )
 
-    silu_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=tl.float32)
-    mul_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_WN), dtype=tl.float32)
+    if use_silu:
+        mul_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_WN), dtype=tl.float32)
 
     if use_fp8_w8a8:
         a_scale_ptrs = A_scale + (offs_token[:, None] // top_k * stride_asm) 
-        i0s = pid_n * (BLOCK_SIZE_HALF // group_n) + tl.arange(0, num_scales_along_n)
-        i1s = i0s + ((N // 2) // group_n)
+        i0s = pid_n * (BLOCK_SIZE_WN // group_n) + tl.arange(0, num_scales_along_n)
+        
         w1_i0_scale_ptrs = (
             W1_scale + off_experts * stride_w1se + i0s[None, :] * stride_w1sn 
         )
-        w1_i1_scale_ptrs = (
-            W1_scale + off_experts * stride_w1se + i1s[None, :] * stride_w1sn 
-        )
+        if use_silu:
+            i1s = i0s + ((N // 2) // group_n)
+            w1_i1_scale_ptrs = (
+                W1_scale + off_experts * stride_w1se + i1s[None, :] * stride_w1sn 
+            )
 
     num_k1 = tl.cdiv(K, BLOCK_SIZE_K1)
     for k1 in tl.range(0, num_k1): 
-        # Masking ensures we don't load from invalid tokens or indices
         if EVEN_K:
             a = tl.load(a_ptrs, mask=(token_mask[:, None]), other=0.0)
             w1_i0 = tl.load(w1_ptrs_i0, mask=mask_w1n[None, :], other=0.0)
-            w1_i1 = tl.load(w1_ptrs_i1, mask=mask_w1n[None, :], other=0.0)
+            if use_silu:
+                w1_i1 = tl.load(w1_ptrs_i1, mask=mask_w1n[None, :], other=0.0)
         else:
             a = tl.load(
                 a_ptrs,
@@ -236,42 +242,53 @@ def e2e_moe_kernel(
                 mask=(offs_k1[:, None] < K - k1 * BLOCK_SIZE_K1) & mask_w1n[None, :],
                 other=0.0,
             )
-            w1_i1 = tl.load(
-                w1_ptrs_i1,
-                mask=(offs_k1[:, None] < K - k1 * BLOCK_SIZE_K1) & mask_w1n[None, :],
-                other=0.0,
-            )
+            if use_silu:
+                w1_i1 = tl.load(
+                    w1_ptrs_i1,
+                    mask=(offs_k1[:, None] < K - k1 * BLOCK_SIZE_K1) & mask_w1n[None, :],
+                    other=0.0,
+                )
         
         if use_fp8_w8a8:
             start_k = k1 * BLOCK_SIZE_K1 // group_k
 
             w1_i0_scale = tl.load(w1_i0_scale_ptrs + start_k * stride_w1sk)
-            w1_i1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk)
-
             if num_scales_along_n > 1: # singleton dimension get automatic broadcast
                 w1_i0_scale = group_broadcast(w1_i0_scale, 1, num_scales_along_n, group_n, 1)
-                w1_i1_scale = group_broadcast(w1_i1_scale, 1, num_scales_along_n, group_n, 1)
+
+            if use_silu:
+                w1_i1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk)
+                if num_scales_along_n > 1: # singleton dimension get automatic broadcast
+                    w1_i1_scale = group_broadcast(w1_i1_scale, 1, num_scales_along_n, group_n, 1)
 
             a_scale = tl.load(a_scale_ptrs + start_k * stride_ask, mask=token_mask[:, None], other=0.0)
             
-            silu_acc += tl.dot(a, w1_i0, out_dtype=tl.float32) * a_scale * w1_i0_scale
-            mul_acc += tl.dot(a, w1_i1, out_dtype=tl.float32) * a_scale * w1_i1_scale
+            acc += tl.dot(a, w1_i0, out_dtype=tl.float32) * a_scale * w1_i0_scale
+            if use_silu:
+                mul_acc += tl.dot(a, w1_i1, out_dtype=tl.float32) * a_scale * w1_i1_scale
         else:
-            mul_acc = tl.dot(a, w1_i1, acc=mul_acc) 
-            silu_acc = tl.dot(a, w1_i0, acc=silu_acc) 
+            acc = tl.dot(a, w1_i0, acc=acc) 
+            if use_silu:
+                mul_acc = tl.dot(a, w1_i1, acc=mul_acc) 
      
 
         a_ptrs += BLOCK_SIZE_K1 * stride_ak
         w1_ptrs_i0 += BLOCK_SIZE_K1 * stride_w1k
-        w1_ptrs_i1 += BLOCK_SIZE_K1 * stride_w1k
+        if use_silu:
+            w1_ptrs_i1 += BLOCK_SIZE_K1 * stride_w1k
     
-    silu_acc = _silu_exp2(silu_acc)
-    if use_fp8_w8a8:
-        acc = (silu_acc * mul_acc).to(tl.bfloat16)
-    else:
-        acc = (silu_acc * mul_acc).to(dtype)
+    if use_silu:
+        acc = _silu_exp2(acc)
+        acc = (acc * mul_acc)
+    elif use_gelu:
+        acc = _gelu_tanh(acc)
 
-    offs_w2n = tl.arange(0, BLOCK_SIZE_HALF) + pid_n * (BLOCK_SIZE_HALF)
+    if use_fp8_w8a8:
+        acc = acc.to(tl.bfloat16)
+    else:
+        acc = acc.to(dtype)
+
+    offs_w2n = tl.arange(0, BLOCK_SIZE_WN) + pid_n * (BLOCK_SIZE_WN)
 
     w2_ptrs = (
         W2
@@ -282,7 +299,7 @@ def e2e_moe_kernel(
     if use_fp8_w8a8:
         # offs_w2_sn = offs_w2n // group_n
         # instead load only the unique scaling factors and broadcast. 
-        offs_w2_sn = pid_n * (BLOCK_SIZE_HALF) // group_n + tl.arange(0, num_scales_along_n) 
+        offs_w2_sn = pid_n * (BLOCK_SIZE_WN) // group_n + tl.arange(0, num_scales_along_n) 
         # ... + tl.arange(0, num_scales_along_n) * group_n // group_n = ... + tl.arange(0, num_scales_along_n)
         w2_scale_ptrs = (
             W2_scale + off_experts * stride_w2se + offs_w2_sn[:, None] * stride_w2sn
@@ -313,9 +330,12 @@ def e2e_moe_kernel(
 
         if use_fp8_w8a8:
             w2_scale = tl.load(w2_scale_ptrs + k2 * BLOCK_SIZE_K2 // group_k * stride_w2sk) # (num_scales_along_n, num_scales_along_k2)
-            w2_scale = group_broadcast(w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0)            
-            if num_scales_along_k2 > 1: # singleton dimension get automatic broadcast
-                w2_scale = group_broadcast(w2_scale, num_scales_along_n * group_n, num_scales_along_k2, group_k, 1)
+            if num_scales_along_n > 1: # singleton dimension get automatic broadcast
+                w2_scale = group_broadcast(w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0)            
+                if num_scales_along_k2 > 1: # singleton dimension get automatic broadcast
+                    w2_scale = group_broadcast(w2_scale, num_scales_along_n * group_n, num_scales_along_k2, group_k, 1)
+            elif num_scales_along_k2 > 1: # singleton dimension get automatic broadcast
+                w2_scale = group_broadcast(w2_scale, 1, num_scales_along_k2, group_k, 1)
 
             w2 = (w2.to(tl.float32) * w2_scale.to(tl.float32)).to(tl.bfloat16)
             out = tl.dot(acc, w2)

@@ -207,6 +207,12 @@ def e2e_moe(
             assert config["BLOCK_SIZE_K1"] <= group_k, "BLOCK_SIZE_K1 must strictly be <= group_k"
             assert (config["BLOCK_SIZE_K2"] <= group_k) or (config["BLOCK_SIZE_K2"] % group_k == 0), "BLOCK_SIZE_K2 must be multiple of group_k or <= group_k"
 
+        use_silu = False
+        if use_silu:
+            BLOCK_SIZE_WN = config["BLOCK_SIZE_N"] // 2 # silu activation halves the intermediate representation size
+        else:
+            BLOCK_SIZE_WN = config["BLOCK_SIZE_N"]
+
         e2e_moe_kernel[grid](
             A,
             W1,
@@ -249,6 +255,9 @@ def e2e_moe(
             SKINNY=SKINNY,
             dtype=torch_to_triton_dtype[dtype], # input dtype, mma dtype
             out_dtype=torch_to_triton_dtype[out_dtype],
+            use_silu=use_silu,
+            use_gelu=False,
+            BLOCK_SIZE_WN=BLOCK_SIZE_WN,
             **config,
         )
 
