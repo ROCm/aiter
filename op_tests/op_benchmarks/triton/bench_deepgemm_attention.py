@@ -99,7 +99,11 @@ def kernel_fp8_paged_mqa_logits_stage1(
     for context_idx in range(0, context_length, ChunkK):
         context_kv_idx = tl.load(kv_indices + context_start + context_idx + tl.arange(0, ChunkK))
 
-        k = tl.load(KV_buffer + context_kv_idx[:, None] * stride_k_seq + tl.arange(0, HiddenDim)[None, :])
+        k = tl.load(
+            KV_buffer + context_kv_idx[:, None] * stride_k_seq + tl.arange(0, HiddenDim)[None, :],
+            mask=(context_idx + tl.arange(0, ChunkK) < context_length)[:, None],
+            other=0.0,
+        )
 
         o = tl.dot(q, k.T)
         o = tl.maximum(o, 0.0)
@@ -168,7 +172,7 @@ def test_deepgemm_fp8_paged_mqa_logits():
     for batch_size, next_n in [(4, 1), (2, 2)]:
         for heads, index_dim in [(32, 128)]:
             for avg_kv in (2048,):
-                var_ratio = 0.0
+                var_ratio = 0.2
                 context_lens = torch.randint(int((1 - var_ratio) * avg_kv), int(((1 + var_ratio)) * avg_kv) + 1, (batch_size,)).cuda().to(torch.int32)
                 prefix_sum_context_lens = torch.zeros((batch_size + 1,), device="cuda", dtype=torch.int32)
                 prefix_sum_context_lens[1:] = torch.cumsum(context_lens, dim=0)
