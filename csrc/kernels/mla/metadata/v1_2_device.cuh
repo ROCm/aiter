@@ -4,7 +4,10 @@
 #include "v1_comm.cuh"
 
 
-template <int32_t kPackedQoLenPerWg_, bool kQoSplits_, int32_t kUniSeqlenQo_>
+template <int32_t kPackedQoLenPerWg_,
+          bool kQoSplits_,
+          int32_t kUniSeqlenQo_,
+          bool kIsSparse_ = false>
 struct FlashMlaKernelTrait
 {
     static constexpr int32_t kPackedQoLenPerWg       = kPackedQoLenPerWg_;
@@ -15,6 +18,7 @@ struct FlashMlaKernelTrait
     // >=  1: read from FlashMlaKernelTrait::kUniSeqlenQo
     static constexpr int32_t kUniSeqlenQo            = kUniSeqlenQo_;
     static constexpr int32_t kFixedOverheadNumBlocks = 16;
+    static constexpr int32_t kIsSparse               = kIsSparse_;
 };
 
 template <typename Traits>
@@ -94,7 +98,8 @@ __global__ void kn_get_mla_metadata_v1_2(
 {
     extern __shared__ uint8_t p_smem[];
     int32_t* p_lds_seqlens_qo = reinterpret_cast<int32_t*>(p_smem);
-    int32_t* p_lds_seqlens_kv_indptr = p_lds_seqlens_qo + params.num_batches;
+    int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + params.num_batches;
+    int32_t* p_lds_kv_indptr  = p_lds_seqlens_kv + params.num_batches;
 
     QoState<Traits> qo_state(params.uni_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
 
@@ -105,9 +110,19 @@ __global__ void kn_get_mla_metadata_v1_2(
     int32_t sum_blocks = 0;
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
-        const int32_t kv_end = params.p_seqlens_kv_indptr[bid + 1];
-        const int32_t seqlen_kv = kv_end - params.p_seqlens_kv_indptr[bid];
-        p_lds_seqlens_kv_indptr[bid] = kv_end;
+        int32_t kv_end = params.p_seqlens_kv_indptr[bid + 1];
+        int32_t seqlen_kv = kv_end - params.p_seqlens_kv_indptr[bid];
+        if constexpr (Traits::kIsSparse)
+        {
+            seqlen_kv = min(seqlen_kv, params.topk);
+            p_lds_seqlens_kv[bid] = seqlen_kv;
+            // p_lds_kv_indptr[bid] = (bid + 1) * params.topk;
+        }
+        else
+        {
+            p_lds_kv_indptr[bid] = kv_end;
+        }
+
         const int32_t num_blocks =
             integer_divide_ceil_power2(seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
         sum_blocks += num_blocks;
@@ -138,7 +153,7 @@ __global__ void kn_get_mla_metadata_v1_2(
     int32_t curr_n_split_idx = 0;   // #cu parts used to handle current batch
 
     int32_t curr_kv_begin  = 0;
-    int32_t curr_kv_end    = p_lds_seqlens_kv_indptr[0];
+    int32_t curr_kv_end    = Traits::kIsSparse ? p_lds_seqlens_kv[0] : p_lds_kv_indptr[0];
     int32_t curr_kv_seqlen = curr_kv_end - curr_kv_begin;
 
     int32_t num_works = 0;
@@ -255,9 +270,18 @@ __global__ void kn_get_mla_metadata_v1_2(
                 {
                     curr_kv_block = 0;
                     curr_n_split_idx = 0;
-                    curr_kv_begin  = curr_kv_end;
-                    curr_kv_end    = p_lds_seqlens_kv_indptr[curr_batch];
-                    curr_kv_seqlen = curr_kv_end - curr_kv_begin;
+                    if constexpr (Traits::kIsSparse)
+                    {
+                        curr_kv_begin  = curr_batch * params.topk;
+                        curr_kv_seqlen = p_lds_seqlens_kv[curr_batch];
+                        curr_kv_end    = curr_kv_begin + curr_kv_seqlen;
+                    }
+                    else
+                    {
+                        curr_kv_begin  = curr_kv_end;
+                        curr_kv_end    = p_lds_kv_indptr[curr_batch];
+                        curr_kv_seqlen = curr_kv_end - curr_kv_begin;
+                    }
                 }
             }
             else
@@ -316,6 +340,42 @@ __global__ void kn_get_mla_metadata_v1_2(
         params.p_reduce_indptr[i] = last_reduce_indptr;
     }
 }
+#define MLA_UNI_SEQLEN_QO_CASE(UNI_SEQLEN_QO)                        \
+    case UNI_SEQLEN_QO: \
+    {   \
+        constexpr int32_t kUniSeqlenQo = UNI_SEQLEN_QO; \
+        using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>; \
+        kn_get_mla_metadata_v1_2<Traits> \
+            <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params); \
+        break; \
+    } \
+
+#define MLA_UNI_SEQLEN_DISPATCHER()                        \
+    switch (uni_seqlen_qo) \
+    { \
+        MLA_UNI_SEQLEN_QO_CASE(1); \
+        MLA_UNI_SEQLEN_QO_CASE(2); \
+        MLA_UNI_SEQLEN_QO_CASE(3); \
+        MLA_UNI_SEQLEN_QO_CASE(4); \
+        default: \
+        { \
+            if (uni_seqlen_qo > 0) \
+            { \
+                constexpr int32_t kUniSeqlenQo = 0; \
+                using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>; \
+                kn_get_mla_metadata_v1_2<Traits> \
+                    <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params); \
+            } \
+            else \
+            { \
+                constexpr int32_t kUniSeqlenQo = -1;  \
+                using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>; \
+                kn_get_mla_metadata_v1_2<Traits> \
+                    <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params); \
+            } \
+            break; \
+        } \
+    }
 
 void get_mla_metadata_v1_2_device(
     const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
@@ -326,6 +386,7 @@ void get_mla_metadata_v1_2_device(
     const int32_t        kv_granularity,
     const int32_t        max_seqlen_qo,
     const int32_t        uni_seqlen_qo,
+    const int32_t        topk,
     torch::Tensor&       work_metadata_ptrs,
     torch::Tensor&       work_info_set,
     torch::Tensor&       work_indptr,
@@ -361,122 +422,38 @@ void get_mla_metadata_v1_2_device(
     params.kv_granularity_log2  = __builtin_ctz(kv_granularity);
     params.uni_seqlen_qo        = uni_seqlen_qo;
     params.is_causal            = is_causal;
+    params.topk                 = topk;
 
     // launch kernel
     const dim3 grid = dim3(1, 1, 1);
     const int32_t num_thr = dev_prop.warpSize; // only use 1 warp for simplicity
+
     if ((max_seqlen_qo > 0) && (max_seqlen_qo * num_heads_per_head_k <= kPackedQoLenPerWg))
     {
         constexpr bool kQoSplits = false;
-        switch (uni_seqlen_qo)
+        if (topk == -1)
         {
-        case 1:
-        {
-            constexpr int32_t kUniSeqlenQo = 1;
-            using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>;
-            kn_get_mla_metadata_v1_2<Traits>
-                <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
-            break;
+            constexpr bool kIsSparse = false;
+            MLA_UNI_SEQLEN_DISPATCHER();
         }
-        case 2:
+        else
         {
-            constexpr int32_t kUniSeqlenQo = 2;
-            using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>;
-            kn_get_mla_metadata_v1_2<Traits>
-                <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
-            break;
-        }
-        case 3:
-        {
-            constexpr int32_t kUniSeqlenQo = 3;
-            using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>;
-            kn_get_mla_metadata_v1_2<Traits>
-                <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
-            break;
-        }
-        case 4:
-        {
-            constexpr int32_t kUniSeqlenQo = 4;
-            using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>;
-            kn_get_mla_metadata_v1_2<Traits>
-                <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
-            break;
-        }
-        default:
-            if (uni_seqlen_qo > 0)
-            {
-                // 0 means read the fixed value from params.
-                constexpr int32_t kUniSeqlenQo = 0;
-                using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>;
-                kn_get_mla_metadata_v1_2<Traits>
-                    <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
-            }
-            else
-            {
-                // -1 means read the values from seqlens_qo_indptr
-                constexpr int32_t kUniSeqlenQo = -1;
-                using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>;
-                kn_get_mla_metadata_v1_2<Traits>
-                    <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
-            }
-            break;
+            constexpr bool kIsSparse = true;
+            MLA_UNI_SEQLEN_DISPATCHER();
         }
     }
     else
     {
         constexpr bool kQoSplits = true;
-        switch (uni_seqlen_qo)
+        if (topk == -1)
         {
-        case 1:
-        {
-            constexpr int32_t kUniSeqlenQo = 1;
-            using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>;
-            kn_get_mla_metadata_v1_2<Traits>
-                <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
-            break;
+            constexpr bool kIsSparse = false;
+            MLA_UNI_SEQLEN_DISPATCHER();
         }
-        case 2:
+        else
         {
-            constexpr int32_t kUniSeqlenQo = 2;
-            using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>;
-            kn_get_mla_metadata_v1_2<Traits>
-                <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
-            break;
-        }
-        case 3:
-        {
-            constexpr int32_t kUniSeqlenQo = 3;
-            using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>;
-            kn_get_mla_metadata_v1_2<Traits>
-                <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
-            break;
-        }
-        case 4:
-        {
-            constexpr int32_t kUniSeqlenQo = 4;
-            using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>;
-            kn_get_mla_metadata_v1_2<Traits>
-                <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
-            break;
-        }
-        default:
-            if (uni_seqlen_qo > 0)
-            {
-                // 0 means read the fixed value from params.
-                constexpr int32_t kUniSeqlenQo = 0;
-                using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>;
-                kn_get_mla_metadata_v1_2<Traits>
-                    <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
-            }
-            else
-            {
-                // -1 means read the values from seqlens_qo_indptr
-                constexpr int32_t kUniSeqlenQo = -1;
-                using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>;
-                kn_get_mla_metadata_v1_2<Traits>
-                    <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
-            }
-            break;
+            constexpr bool kIsSparse = true;
+            MLA_UNI_SEQLEN_DISPATCHER();
         }
     }
 }
