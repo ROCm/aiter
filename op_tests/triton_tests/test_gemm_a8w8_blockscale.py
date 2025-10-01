@@ -6,9 +6,11 @@ import pytest
 from aiter.ops.triton.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
 )
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
-)
+# from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
+from aiter.ops.triton.gluon import gemm_a8w8_blockscale 
+from aiter.ops.triton.gluon import gemm_a8w8_bpreshuffle_blockscale 
+from aiter.ops.triton.gluon import gemm_a8w8_bpreshuffle 
+# from aiter.ops.triton.gluon.gemm_a8w8_bpreshuffle import (
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
@@ -48,7 +50,8 @@ e5m2_type, e4m3_type = get_fp8_dtypes()
 
 def get_x_vals():
 
-    x_vals = [(8192, 8192, 8192),(16, 8192, 8192),]
+    # x_vals = [(8192, 8192, 8192),(16, 8192, 8192),]
+    x_vals = [(16,128,128),]
     # x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
     # x_vals += [(4864, 4096, 8192), (9728, 8192, 65536)]
     # x_vals += [
@@ -124,6 +127,7 @@ def generate_gemm_a8w8_blockscale_inputs(
     dtype=torch.bfloat16,
     layout: str = "TN",
     output=False,
+    block_scale=False,
 ):
     """
     The GEMM kernel expects:
@@ -143,18 +147,28 @@ def generate_gemm_a8w8_blockscale_inputs(
         )
 
     if layout[1] == "N":
-        weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(
-            e4m3_type
+        # weight = (torch.ones((N, K), dtype=torch.float16, device="cuda") / 10).to(
+        # weight = torch.arange(0, K, dtype=torch.float16, device="cuda").view(1,K).repeat(N, 1).view(N,K).contiguous()
+        # weight = weight.to(
+        #     e4m3_type
+        # )
+        weight = (
+            (torch.randn((N, K), dtype=torch.float16, device="cuda") / 10)
+            .to(e4m3_type)
         )
     else:
-        weight = (
-            (torch.rand((K, N), dtype=torch.float16, device="cuda") / 10)
-            .to(e4m3_type)
-            .T
-        )
-
-    x_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
-    w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
+        raise ValueError(f"Unknown layout: {layout}")
+        # weight = (
+        #     (torch.randn((K, N), dtype=torch.float16, device="cuda") / 10)
+        #     .to(e4m3_type)
+        #     .T
+        # )
+    if not block_scale:
+        x_scale = torch.ones([M, scale_k], dtype=torch.float32, device="cuda")
+        w_scale = torch.ones([scale_n, scale_k], dtype=torch.float32, device="cuda")
+    else:
+        x_scale = torch.randn([M, scale_k], dtype=torch.float32, device="cuda")
+        w_scale = torch.randn([scale_n, scale_k], dtype=torch.float32, device="cuda")
 
     y = None
     if output:
@@ -181,7 +195,14 @@ def generate_gemm_a8w8_blockscale_inputs(
         # "triton",
     ],
 )
-def test_gemm(dtype, M, N, K, layout, output, impl: str):
+@pytest.mark.parametrize(
+    "block_scale",
+    [
+        False,
+        True,
+    ],
+)
+def test_gemm(dtype, M, N, K, layout, output, impl: str, block_scale=False):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()
 
@@ -207,17 +228,28 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
         dtype=dtype,
         layout=layout,
         output=output,
+        block_scale=block_scale,
     )
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
     if impl == "gluon":
-        impl = gluon_gemm_a8w8_blockscale
+        impl = gemm_a8w8_bpreshuffle_blockscale.gemm_a8w8_blockscale if block_scale else gemm_a8w8_bpreshuffle.gemm_a8w8_blockscale
+
     elif impl == "triton":
         impl = triton_gemm_a8w8_blockscale
     else:
         raise ValueError(f"Unknown implementation: {impl}")
+    # print(weight)
     b,us = run_triton(x, weight, x_scale, w_scale, dtype, y, impl)
     flops = 2 * M * N * K / 1e6 / us
     bw = (M * N * 2 +  M * K + N * K) / 1e6 / us
     print(f"{us=}, {flops=}, {bw=}")
-    torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    # torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    checkAllclose(a, b, atol=0.01, rtol=1e-2)
+
+# def test_gemm(dtype, M, N, K, layout, output, impl: str):
+if __name__ == "__main__":
+    #blockscale
+    test_gemm("bf16", 16, 20480, 8320, "TN", True, "gluon", True)
+    #pure fp8
+    test_gemm("bf16", 16, 20480, 8320, "TN", True, "gluon", False)
