@@ -81,7 +81,9 @@ def fp8_assert_close(
     max_abs_idx = torch.argmax(abs_diff).item()
     max_rel_idx = torch.argmax(rel_diff).item()
 
-    flat_to_idx = lambda flat_idx, shape: np.unravel_index(flat_idx, shape)
+    flat_to_idx = lambda flat_idx, shape: np.unravel_index(
+        flat_idx, shape
+    )  # noqa: E731
 
     max_abs_pos = flat_to_idx(max_abs_idx, tensor_a.shape)
     max_rel_pos = flat_to_idx(max_rel_idx, tensor_a.shape)
