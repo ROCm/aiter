@@ -56,7 +56,11 @@ def persistent_lean_attention(
     if config is None:
         config = _get_config(causal=causal, batch_size=batch_size)
     sm_count = arch_info.get_num_sms()
-    total_programs = program_count if program_count is not None else sm_count * config["SM_CNT_FACTOR"]
+    total_programs = (
+        program_count
+        if program_count is not None
+        else sm_count * config["SM_CNT_FACTOR"]
+    )
 
     return _persistent_lean_attention(
         q=q,
@@ -186,7 +190,9 @@ def _persistent_lean_attention(
         print(f"max_output_tile_cnt={max_output_tile_cnt}")
 
     # Clamp to buffer capacity to avoid deadlocks
-    max_supported = min(int(Mp.shape[0]), int(Lp.shape[0]), int(Op.shape[0]), int(locks.numel()))
+    max_supported = min(
+        int(Mp.shape[0]), int(Lp.shape[0]), int(Op.shape[0]), int(locks.numel())
+    )
     total_programs = min(total_programs, max_supported)
 
     # Recompute schedule with clamped total_programs to keep splits consistent
@@ -222,7 +228,12 @@ def _persistent_lean_attention(
         raise ValueError(
             f"Lp must have at least [total_programs, BLOCK_M] >= [{total_programs}, {BLOCK_M}], got {tuple(Lp.shape)}"
         )
-    if not (Op.dim() == 3 and Op.shape[0] >= total_programs and Op.shape[1] >= N_CTX_Q and Op.shape[2] >= HEAD_DIM_PADDED):
+    if not (
+        Op.dim() == 3
+        and Op.shape[0] >= total_programs
+        and Op.shape[1] >= N_CTX_Q
+        and Op.shape[2] >= HEAD_DIM_PADDED
+    ):
         raise ValueError(
             f"Op must have shape[0] >= total_programs, rows >= N_CTX_Q, cols >= HEAD_DIM_PADDED; got {tuple(Op.shape)} while required first dim >= {total_programs}, rows >= {N_CTX_Q}, cols >= {HEAD_DIM_PADDED}"
         )
