@@ -26,7 +26,7 @@ def matmul_launch_metadata(grid, kernel, args):
         ret["name"] += "_bias"
     if args["APPLY_SWIGLU"]:
         ret["name"] += "_swiglu"
-    if args["quant_static_scale"] is not None:
+    if args["Quant_static_scale"] is not None:
         ret["name"] += "_quant"
 
     fM = n_tokens
@@ -122,7 +122,7 @@ def _compute_quant(tensor, scale):
 @triton.jit
 def _downcast_to_static_fp8(x_ptr, stride_x_m, stride_x_n,
                       y_ptr, stride_y_m, stride_y_n,
-                      scale,
+                      scale_ptr,
                       M, N,
                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
 
@@ -150,7 +150,7 @@ def _downcast_to_static_fp8(x_ptr, stride_x_m, stride_x_n,
 
     x = tl.load(x_ptr + offs_x, mask=mask_xy)
 
-    y = _compute_quant(x, scale)
+    y = _compute_quant(x, tl.load(scale_ptr))
 
     tl.store(y_ptr + offs_y, y, mask=mask_xy)
 
@@ -216,7 +216,7 @@ def _moe_gemm_a8w4(
              XMxScale, stride_x_mx_m, stride_x_mx_k,
              W, stride_w_e, stride_w_k, stride_w_n,
              WMxScale, stride_w_mx_e, stride_w_mx_k, stride_w_mx_n,
-             x_static_scale, quant_static_scale,
+             X_static_scale, Quant_static_scale,
              B, stride_b_e, # Bias
              Gammas,
              N, K, # shapes
@@ -403,8 +403,8 @@ def _moe_gemm_a8w4(
         WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
 
     # scalar fp8 scale
-    if x_static_scale is not None:
-        acc = acc * x_static_scale
+    if X_static_scale is not None:
+        acc = acc * tl.load(X_static_scale)
     # bias
     offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
     offs_y_n = BLOCK_N * pid_n + tl.arange(0, BLOCK_N)
@@ -429,8 +429,8 @@ def _moe_gemm_a8w4(
         gammas = tl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
         out *= gammas[:, None]
     # quant
-    if quant_static_scale is not None:
-        out = _compute_quant(out, quant_static_scale)
+    if Quant_static_scale is not None:
+        out = _compute_quant(out, tl.load(Quant_static_scale))
     # write-back
     Y += start_m * stride_y_m
     offs_y_m = offs_m

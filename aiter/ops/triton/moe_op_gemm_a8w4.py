@@ -114,7 +114,7 @@ def swizzle_scales(data):
     return data.transpose(-1, -2)
 
 
-def downcast_to_static_fp8(x: torch.Tensor, scale: float):
+def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
     M, N = x.shape
     y = torch.empty((M, N), dtype=torch.float8_e4m3fn, device="cuda")
 

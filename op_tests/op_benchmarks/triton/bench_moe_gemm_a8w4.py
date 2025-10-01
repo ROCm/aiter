@@ -11,7 +11,7 @@ import argparse
 from triton_kernels.routing import routing
 from triton_kernels.matmul_ogs import matmul_ogs, PrecisionConfig, FlexCtx
 from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4, swizzle_scales, downcast_to_static_fp8
-from triton_kernels.target_info import get_cdna_version
+from aiter.ops.triton.utils.arch_info import get_arch
 import tempfile
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
 from triton_kernels.numerics import InFlexData
@@ -84,11 +84,11 @@ def quantize(x, dtype):
         return x, InFlexData(), None
     elif dtype == "fp8":
         scale = x.abs().max().item() / 448.0
-        fp8e4_dtype = torch.float8_e4m3fn if get_cdna_version() != 3 else torch.float8_e4m3fnuz
+        fp8e4_dtype = torch.float8_e4m3fn if get_arch() != "gfx942" else torch.float8_e4m3fnuz
         x = x.to(fp8e4_dtype)
         return x, None, scale
     elif dtype == "mx8":
-        fp8e4_dtype = torch.float8_e4m3fn if get_cdna_version() != 3 else torch.float8_e4m3fnuz
+        fp8e4_dtype = torch.float8_e4m3fn if get_arch() != "gfx942" else torch.float8_e4m3fnuz
         x, scale = downcast_to_mxfp(x, fp8e4_dtype, axis=1)
         return x, None, scale
     else:
@@ -126,12 +126,14 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     x_dtype_str = x_dtype
     x_dtype = torch.float8_e4m3fn
     # special treatment of fp8_e4m3 on AMD CDNA3 because it uses fp8_e4m3fnuz
-    if x_dtype == torch.float8_e4m3fn and get_cdna_version() == 3:
+    if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
         x_dtype = torch.float8_e4m3fnuz
 
     reps = 100
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
     xg = x
+    if x_dtype_str == "fp8":
+        static_scale = torch.tensor(1e-4, device=dev)
     # run layer
     fpath = Path(tempfile.mktemp())
     proton.start(str(fpath), hook="triton")
@@ -139,9 +141,9 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
         logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
         if x_dtype_str == "fp8":
-            x = downcast_to_static_fp8(x, 1e-4)
-            x = moe_gemm_a8w4(x, w1, None, w1_scale, 1e-4, 1e-4, b1, rdata, gather_indx=gather_indx, swizzle_mx_scale=swizzle_mx_scale1, out_dtype=x_dtype, apply_swiglu=True)
-            x = moe_gemm_a8w4(x, w2, None, w2_scale, 1e-4, None, b2, rdata, scatter_indx=scatter_indx, swizzle_mx_scale=swizzle_mx_scale2)
+            x = downcast_to_static_fp8(x, static_scale)
+            x = moe_gemm_a8w4(x, w1, None, w1_scale, static_scale, static_scale, b1, rdata, gather_indx=gather_indx, swizzle_mx_scale=swizzle_mx_scale1, out_dtype=x_dtype, apply_swiglu=True)
+            x = moe_gemm_a8w4(x, w2, None, w2_scale, static_scale, None, b2, rdata, scatter_indx=scatter_indx, swizzle_mx_scale=swizzle_mx_scale2)
         else:
             assert x_dtype_str == "mx8"
             x, _, x_scale = quantize(x, x_dtype_str)

@@ -14,7 +14,7 @@ from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4, moe_gemm_torch, swi
 # numerics utilities
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, upcast_from_mxfp
 # target-specific utilities
-from triton_kernels.target_info import is_hip_cdna3, is_hip_cdna4
+from aiter.ops.triton.utils.arch_info import get_arch
 
 # ---------------
 # initialize data
@@ -168,14 +168,14 @@ class Case:
 def test_op(m, n, k, do_gather, do_scatter, has_y_gammas, apply_swiglu, fused_quant, 
             n_expts_tot, n_expts_act, act_dtype_str, weight_dtype_str, hbm_swizzling, device="cuda"):
 
-    if "float8" in act_dtype_str and "mx" in weight_dtype_str and not is_hip_cdna4():
+    if "float8" in act_dtype_str and "mx" in weight_dtype_str and not get_arch() == "gfx950":
         pytest.skip("float8 x mx only supported on CDNA4")
 
-    if "float8_e4m3fnuz" in (weight_dtype_str, act_dtype_str) and not is_hip_cdna3():
+    if "float8_e4m3fnuz" in (weight_dtype_str, act_dtype_str) and not get_arch() == "gfx942":
         pytest.skip("float8_e4m3fnuz only tested on AMD CDNA3 Platform")
 
     if hbm_swizzling:
-        if not is_hip_cdna4():
+        if not get_arch() == "gfx950":
             pytest.skip("Scale preshuffling on AMD GPU has not been emulated on non-CDNA4 arch yet.")
         if "mx" not in weight_dtype_str:
             pytest.skip("Non-scale swizzling not supported on CDNA4 yet")
@@ -218,7 +218,7 @@ def test_op(m, n, k, do_gather, do_scatter, has_y_gammas, apply_swiglu, fused_qu
         rmstol = None
     else:
         x_mx_scales_tri = None
-        x_static_scale = x_tri.abs().max().item() / 448.0 
+        x_static_scale = x_tri.abs().max().float() / 448.0 
         x_tri = downcast_to_static_fp8(x_tri, x_static_scale)
         out_dtype = torch.float8_e4m3fn
         maxtol = 4e-1
@@ -227,7 +227,7 @@ def test_op(m, n, k, do_gather, do_scatter, has_y_gammas, apply_swiglu, fused_qu
 
     ref_y = moe_gemm_torch(x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu)
     if not act_mxfp8 and fused_quant:
-        quant_static_scale = ref_y.abs().max().item() / 448.0 
+        quant_static_scale = ref_y.abs().max().float() / 448.0 
     else:
         quant_static_scale = None
     tri_y = moe_gemm_a8w4(x_tri, w_tri, x_mx_scales_tri, w_scale_tri, x_static_scale, quant_static_scale, bias_tri, rdata, gindx, sindx, gammas, swizzle_mx_scale, out_dtype, apply_swiglu)
