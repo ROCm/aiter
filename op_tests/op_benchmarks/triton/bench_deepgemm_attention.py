@@ -81,11 +81,18 @@ def kernel_fp8_paged_mqa_logits_stage1(
     num_block_q_head = tl.cdiv(heads_num, ChunkQ)
 
     pid_q_head, remain_pid = pid % num_block_q_head, pid // num_block_q_head
-    pid_batch, pid_next_n = remain_pid // next_n, remain_pid % next_n
+    pid_next_n, remain_pid = remain_pid % next_n, remain_pid // next_n
+    pid_batch, pid_split_kv = remain_pid % batch_size, remain_pid // batch_size
 
     context_start = tl.load(prefix_sum_context_lens + pid_batch)
     context_end = tl.load(prefix_sum_context_lens + pid_batch + 1)
+
     context_length = context_end - context_start
+    context_chunk_num = tl.cdiv(context_length, ChunkK)
+    split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)
+
+    split_context_start = (pid_split_kv * split_context_chunk_num) * ChunkK
+    split_context_length = min(context_length - split_context_start, split_context_chunk_num * ChunkK)
 
     q = tl.load(
         Q_buffer
@@ -96,12 +103,13 @@ def kernel_fp8_paged_mqa_logits_stage1(
     )
     scale_weight = tl.load(weights + (pid_batch * next_n + pid_next_n) * stride_w_batch + pid_q_head * ChunkQ + tl.arange(0, ChunkQ))
 
-    for context_idx in range(0, context_length, ChunkK):
-        context_kv_idx = tl.load(kv_indices + context_start + context_idx + tl.arange(0, ChunkK))
+    for context_idx in range(split_context_start, split_context_start + split_context_length, ChunkK):
+        mask_kv = context_idx + tl.arange(0, ChunkK) < context_length
+        context_kv_idx = tl.load(kv_indices + context_start + context_idx + tl.arange(0, ChunkK), mask=mask_kv, other=0)
 
         k = tl.load(
             KV_buffer + context_kv_idx[:, None] * stride_k_seq + tl.arange(0, HiddenDim)[None, :],
-            mask=(context_idx + tl.arange(0, ChunkK) < context_length)[:, None],
+            mask=mask_kv[:, None],
             other=0.0,
         )
 
@@ -136,12 +144,11 @@ def triton_fp8_paged_mqa_logits_stage1(
         "ChunkQ": 32,
         "ChunkK": 64,
         "HiddenDim": hidden_dim,
-        "SplitKV": 1,
+        "SplitKV": 5,
     }
     assert heads % config["ChunkQ"] == 0
-    assert config["SplitKV"] == 1, "support later for performance"
 
-    grid = (batch_size * next_n * (heads // config["ChunkQ"]),)
+    grid = (batch_size * next_n * (heads // config["ChunkQ"] * config["SplitKV"]),)
     kernel_fp8_paged_mqa_logits_stage1[grid](
         batch_size,
         next_n,
