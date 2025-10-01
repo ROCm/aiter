@@ -791,13 +791,17 @@ def test_mha_backward_varlen(
 # pytest op_tests/triton_tests/test_mha.py -k with_pe
 
 
-@pytest.mark.parametrize("BATCH", [1])
+@pytest.mark.parametrize("BATCH", [1, 3])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(4096, 4096), (2048, 2048), (1024, 1024)],
+    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (16, 48), (4096, 4096)],
 )
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 128), (64, 64), (32, 32)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128), (96, 32), (48, 16)])
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (4, 4), (2, 1), (128, 128)]
+)
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(48, 32), (128, 64), (192, 128)])
+@pytest.mark.parametrize("DROPOUT", [0.0, 0.25])
+@pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
@@ -806,21 +810,14 @@ def test_mha_with_pe(
     NUM_K_HEADS: int,
     HEAD_SZ_QK: int,
     HEAD_SZ_V: int,
+    DROPOUT: float,
+    CAUSAL: bool,
 ):
-    DUMP_TENSORS: bool = False
-
     device: str = "cuda"
-    dtype: torch.dtype = torch.float16
-    # |_ bfloat16 dtype didn't change anything
-    # |_ float32 dtype reduces greatest absolute difference to 1.078116774559021.
-    DROPOUT: float = 0
-    dropout_mask: torch.Tensor | None = None
-    RETURN_LSE: bool = DUMP_TENSORS
-    RETURN_SOFTMAX: bool = DUMP_TENSORS
-    CAUSAL: bool = True
+    dtype: torch.dtype = torch.bfloat16
 
-    torch.manual_seed(20)
     torch.cuda.empty_cache()
+    torch.manual_seed(20)
     q = torch.randn(
         (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
     )
@@ -837,59 +834,25 @@ def test_mha_with_pe(
         v,
         dropout_p=DROPOUT,
         causal=CAUSAL,
-        return_lse=RETURN_LSE,
-        return_attn_probs=RETURN_SOFTMAX,
+        return_lse=DROPOUT > 0.0,
+        return_attn_probs=DROPOUT > 0.0,
     )
-    if RETURN_LSE:
-        assert len(triton_out) > 1
-        triton_lse = triton_out[1]
-        # triton_lse.shape should be (BATCH, NUM_Q_HEADS, SEQLEN_Q)
-        # triton_lse.dtype should be float32.
-    if RETURN_SOFTMAX:
-        if RETURN_LSE:
-            assert len(triton_out) == 3
-            triton_sd_mask = triton_out[2]
-        else:
-            assert len(triton_out) == 2
-            triton_sd_mask = triton_out[1]
-        # triton_sd_mask.shape should be (BATCH, NUM_Q_HEADS, SEQLEN_Q, SEQLEN_K),
-        # triton_sd_mask.dtype should be float32
-    if RETURN_SOFTMAX or RETURN_LSE:
-        triton_out = triton_out[0]
 
-    torch_out, torch_attn = attention_ref(
+    if DROPOUT > 0.0:
+        assert len(triton_out) == 3
+        dropout_mask = triton_out[2] >= 0
+        triton_out = triton_out[0]
+    else:
+        dropout_mask = None
+
+    torch_out, _ = attention_ref(
         q,
         k,
         v,
         dropout_p=DROPOUT,
         dropout_mask=dropout_mask,
         causal=CAUSAL,
-        # upcast=False,
-        # |_ avoiding upcast didn't change anything
     )
-    # torch_attn.shape should be (BATCH, NUM_Q_HEADS, SEQLEN_Q, SEQLEN_K),
-    # torch_attn.dtype should be float16
-
-    if DUMP_TENSORS:
-        import numpy as np
-
-        def torch_to_np(x: torch.Tensor) -> np.ndarray:
-            return x.detach().cpu().numpy()
-
-        np.savez_compressed(
-            f"b{BATCH}_sq{SEQLEN_Q}_sk{SEQLEN_K}_hq{NUM_Q_HEADS}_hk{NUM_K_HEADS}_dqk{HEAD_SZ_QK}_d{HEAD_SZ_V}.npz",
-            q=torch_to_np(q),
-            k=torch_to_np(k),
-            v=torch_to_np(v),
-            triton_out=torch_to_np(triton_out),
-            triton_lse=torch_to_np(triton_lse),
-            triton_sd_mask=torch_to_np(triton_sd_mask),
-            torch_out=torch_to_np(torch_out),
-            torch_attn=torch_to_np(torch_attn),
-        )
-        # print(f"triton_lse => {triton_lse.dtype} {triton_lse.shape}")
-        # print(f"triton_sd_mask => {triton_sd_mask.dtype} {triton_sd_mask.shape}")
-        # print(f"torch_attn => {torch_attn.dtype} {torch_attn.shape}")
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
