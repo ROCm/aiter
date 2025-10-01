@@ -25,18 +25,17 @@ def group_broadcast(x, xM: tl.constexpr, xN: tl.constexpr, group_size: tl.conste
     """
     if broadcast_dim == 0:
         assert xM > 0, "broadcast_dim must be specified"
-        if xM <= 1:
-            return x # singleton dimension, no need to broadcast
-        x = x.reshape(xM, 1, xN)
-        x = tl.broadcast_to(x, (xM, group_size, xN))
-        x = x.reshape(xM * group_size, xN)
+        if xM > 1:
+            x = x.reshape(xM, 1, xN)
+            x = tl.broadcast_to(x, (xM, group_size, xN))
+            x = x.reshape(xM * group_size, xN)
+        # else: singleton dimension, no need to broadcast
     else:
         assert xN > 0, "broadcast_dim must be specified"
-        if xN <= 1:
-            return x # singleton dimension, no need to broadcast
-        x = x.reshape(xM, xN, 1)
-        x = tl.broadcast_to(x, (xM, xN, group_size))
-        x = x.reshape(xM, xN * group_size)
+        if xN > 1:
+            x = x.reshape(xM, xN, 1)
+            x = tl.broadcast_to(x, (xM, xN, group_size))
+            x = x.reshape(xM, xN * group_size)
     
     return x
 
@@ -172,19 +171,19 @@ def e2e_moe_kernel(
 
     BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
 
-    if use_fp8_w8a8:
+    # how many scaling factors along block dimensions. Needed for broadcasting
+    if use_fp8_w8a8: 
         num_scales_along_n: tl.constexpr = (BLOCK_SIZE_HALF + group_n - 1) // group_n
         num_scales_along_k2: tl.constexpr = (BLOCK_SIZE_K2 + group_k - 1) // group_k
+        num_scales_along_k1: tl.constexpr = (BLOCK_SIZE_K1 + group_k - 1) // group_k
+        tl.static_assert(num_scales_along_k1 == 1, "BLOCK_SIZE_K1 must be <= group_k")
 
     offs_i0 = tl.arange(0, BLOCK_SIZE_HALF)
     offs_i1 = tl.arange(0, BLOCK_SIZE_HALF) + N // 2
-
     # offset for silu_acc
     i0 = pid_n * BLOCK_SIZE_HALF + offs_i0
     # offset for mul_acc
     i1 = pid_n * BLOCK_SIZE_HALF + offs_i1
-
-    
     # TODO: add EVEN_N and pid_n is not last pid_n so no need for masking conditions
     # same mask applicable to both silu and mul acc
     mask_w1n = i0 < (N // 2)
@@ -248,9 +247,9 @@ def e2e_moe_kernel(
             w1_i0_scale = tl.load(w1_i0_scale_ptrs + start_k * stride_w1sk)
             w1_i1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk)
 
-            if num_scales_along_n > 1: # singleton dimension get automatic broadcast
-                w1_i0_scale = group_broadcast(w1_i0_scale, 1, num_scales_along_n, group_n, 1)
-                w1_i1_scale = group_broadcast(w1_i1_scale, 1, num_scales_along_n, group_n, 1)
+            # if num_scales_along_n > 1: # singleton dimension get automatic broadcast
+            w1_i0_scale = group_broadcast(w1_i0_scale, 1, num_scales_along_n, group_n, 1)
+            w1_i1_scale = group_broadcast(w1_i1_scale, 1, num_scales_along_n, group_n, 1)
 
             a_scale = tl.load(a_scale_ptrs + start_k * stride_ask, mask=token_mask[:, None], other=0.0)
             
@@ -314,8 +313,11 @@ def e2e_moe_kernel(
         if use_fp8_w8a8:
             w2_scale = tl.load(w2_scale_ptrs + k2 * BLOCK_SIZE_K2 // group_k * stride_w2sk) # (num_scales_along_n, num_scales_along_k2)
             w2_scale = group_broadcast(w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0)            
-            if num_scales_along_k2 > 1: # singleton dimension get automatic broadcast
+            # broadcasted shape along n depends on if num_scales_along_n > 1 or not. Singleton dimension does not need broadcasting.
+            if num_scales_along_n > 1:
                 w2_scale = group_broadcast(w2_scale, num_scales_along_n * group_n, num_scales_along_k2, group_k, 1)
+            else:
+                w2_scale = group_broadcast(w2_scale, 1, num_scales_along_k2, group_k, 1)
 
             w2 = (w2.to(tl.float32) * w2_scale.to(tl.float32)).to(tl.bfloat16)
             out = tl.dot(acc, w2)

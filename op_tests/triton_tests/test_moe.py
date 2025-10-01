@@ -684,7 +684,7 @@ def input_helper_e2e(
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
     moe_config_func = get_optimal_moe_e2e_config_func(
-        dtype, use_fp8_w8a8=fp8_w8a8, persistent=persistent
+        N, dtype, use_fp8_w8a8=fp8_w8a8, persistent=persistent
     )
 
     config = moe_config_func(M)
@@ -1114,24 +1114,16 @@ def test_fused_moe_gelu(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-# TODO (64, 7186, 128, 2, 8), (64, 3584, 128, 2, 8), (4, 4, 8, 1, 2), (64, 1792, 128, 2, 8), (64, 64, 128, 2, 8) don't work because of the percision issue with atomics
 @pytest.mark.parametrize(
     "M, N, K, top_k, E",
     [
         (32, 512, 7168, 8, 512),
-        # (16, 768, 2048, 8, 128),
-        # (128, 768, 2048, 8, 128),
-        # (512, 768, 2048, 8, 128),
-        # (16, 14336, 1, 2, 4),
-        # (1, 14336, 128, 2, 4),
-        # (3, 14336, 128, 2, 4),
-        # (16, 14336, 128, 1, 4),
-        # (16, 14336, 128, 1, 1),
-        # (1, 1024, 16384, 1, 2),
+        (256, 512, 7168, 8, 512),
+        (4096, 512, 7168, 8, 512),
+        # TODO test more shapes
     ],
 )
 @pytest.mark.parametrize("routed_weight", [False, True])
-# @pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False), (True, False), (False, True)]) #TODO: Accuracy issues with fp8
 @pytest.mark.parametrize("fp8_w8a8, int8_w8a16", [(True, False)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("blockshape_n, blockshape_k", [(128, 128)])
@@ -1246,9 +1238,6 @@ def test_moe_e2e(
         int8_w8a16,
         blockshape=blockshape
     )
-    print("torch_out", torch_out.dtype)
-    print("triton_out", triton_out.dtype)
-
 
     if DEBUG_MODE:
         print(f"triton_out={triton_out}")
@@ -1256,8 +1245,3 @@ def test_moe_e2e(
 
     # Validate correctness
     torch.testing.assert_close(triton_out, torch_out, atol=2e-1, rtol=2e-1)
-
-
-
-if __name__ == "__main__":
-    test_moe_e2e(32, 512, 7168, 8, 512, False, True, False, 128, 128, False, torch.bfloat16)
