@@ -8,6 +8,7 @@ import torch
 
 import triton
 import triton.language as tl
+from aiter.test_common import checkAllclose, perftest, benchmark
 
 
 def ref_fp8_paged_mqa_logits_stage1(
@@ -179,28 +180,33 @@ def test_deepgemm_fp8_paged_mqa_logits():
     for batch_size, next_n in [(4, 1), (2, 2)]:
         for heads, index_dim in [(32, 128)]:
             for avg_kv in (2048,):
-                var_ratio = 0.2
+                var_ratio = 0.4
                 context_lens = torch.randint(int((1 - var_ratio) * avg_kv), int(((1 + var_ratio)) * avg_kv) + 1, (batch_size,)).cuda().to(torch.int32)
                 prefix_sum_context_lens = torch.zeros((batch_size + 1,), device="cuda", dtype=torch.int32)
                 prefix_sum_context_lens[1:] = torch.cumsum(context_lens, dim=0)
 
                 print(context_lens)
                 print(prefix_sum_context_lens)
+
                 q = torch.randn(
                     (batch_size, next_n, heads, index_dim),
                     device="cuda",
-                    dtype=torch.bfloat16,
+                    dtype=torch.float32,
                 )
                 kv_cache = torch.randn(
                     (max_model_len, 1, index_dim),
                     device="cuda",
-                    dtype=torch.bfloat16,
+                    dtype=torch.float32,
                 )
                 weights = torch.randn(
                     (batch_size * next_n, heads),
                     device="cuda",
                     dtype=torch.float32,
                 )
+                qk_datatype = torch.float8_e4m3fnuz
+
+                q_fp8 = q.to(qk_datatype)
+                kv_cache_fp8 = kv_cache.to(qk_datatype)
 
                 kv_indices = torch.zeros(prefix_sum_context_lens[-1], device="cuda", dtype=torch.int32)
                 for i in range(batch_size):
@@ -208,18 +214,14 @@ def test_deepgemm_fp8_paged_mqa_logits():
                     kv_indices[prefix_sum_context_lens[i] : prefix_sum_context_lens[i + 1]] = torch.randperm(max_model_len, device="cuda")[:ctx_len]
 
                 ref_qk = ref_fp8_paged_mqa_logits_stage1(
-                    q,
-                    kv_cache,
+                    # convert qk type back to float32 to make sure reference use the same data in calculation
+                    q_fp8.to(torch.float32),
+                    kv_cache_fp8.to(torch.float32),
                     weights,
                     prefix_sum_context_lens,
                     kv_indices,
                     max_model_len,
                 )
-
-                # q_fp8 = q.to(torch.float8_e4m3fn)
-                # kv_cache_fp8 = kv_cache.to(torch.float8_e4m3fn)
-                q_fp8 = q.to(torch.bfloat16)
-                kv_cache_fp8 = kv_cache.to(torch.bfloat16)
 
                 out_qk = torch.full(
                     (heads, batch_size * next_n, max_model_len),
@@ -237,8 +239,8 @@ def test_deepgemm_fp8_paged_mqa_logits():
                 out_qk = out_qk.masked_fill(~mask, 0)
                 ref_qk = ref_qk.masked_fill(~mask, 0)
 
-                result_match = torch.allclose(out_qk, ref_qk, atol=1e-2, rtol=1e-2)
-                print(result_match)
+                aiter_match = checkAllclose(out_qk, ref_qk, atol=1e-2, rtol=1e-2)
+                print(aiter_match)
 
 
 if __name__ == "__main__":
