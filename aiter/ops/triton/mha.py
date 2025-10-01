@@ -1246,7 +1246,7 @@ class _FlashAttnFunc(torch.autograd.Function):
                 bias=bias,
                 alibi_slopes=alibi_slopes,
                 return_lse=return_lse,
-                return_softmax=return_softmax,  # and dropout_p > 0,
+                return_softmax=return_softmax and dropout_p > 0,
                 max_seqlen_q=q.shape[1],
                 max_seqlen_k=k.shape[1],
                 config=config,
