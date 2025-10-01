@@ -14,12 +14,9 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter import hipb_mm, hipb_create_extension
 from functools import lru_cache
 from aiter.jit.utils.chip_info import get_gfx
+import argparse
 
-# pd.set_option('display.max_rows', 500)
-# pd.set_option('display.max_columns', 100)
-# pd.set_option('display.width', 1000)
-torch.set_printoptions(sci_mode=False)
-# torch.set_printoptions(threshold=float("inf"))
+# TEST_NUM_ITERS = 10
 TEST_NUM_ITERS = 100
 
 if 1:
@@ -57,17 +54,18 @@ def run_torch(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
-def run_bf16gemm_asm(x, weight, out_asm, otype=dtypes.fp32, bias=None):
-    return aiter.gemm_a16w16_asm(x, weight, out_asm, bias)
-
-
-@perftest()
 def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
     return tgemm.mm(x, weight, bias, otype, scaleA, scaleB)
 
 
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_bf16gemm_asm(
+    x, weight, out_asm, otype=dtypes.fp32, bias=None, splitK=None, kernelName=None
+):
+    return aiter.gemm_a16w16_asm(x, weight, out_asm, bias, splitK, kernelName)
+
+
 def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
-    ret = {}
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
     weight = torch.rand(n, k, dtype=otype, device="cuda").to(dtype)
@@ -79,7 +77,6 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         scaleA = torch.tensor(scaleA, dtype=dtypes.fp32, device="cuda")
     if scaleB is not None:
         scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
-
     (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
     (b, *_), avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
 
@@ -96,6 +93,22 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
+
+    #### asm a16w16 gemm -- huan
+    ### run bf16gemm_f32 asm
+    if (
+        dtype == dtypes.bf16
+        and otype == dtypes.fp32
+        and (k % 64 == 0)
+        and (n % 64 == 0)
+        and bias == None
+    ):
+        # wshuffle = shuffle_weight(weight, layout=(16, 16))
+        # out_asm = torch.empty((m + 191) // 192 * 192, n, dtype=otype)
+        out_asm = torch.empty(m, n, dtype=otype, device=x.device)
+        (c, *_), avg_c = run_bf16gemm_asm(x, weight, out_asm, otype=dtypes.fp32)
+        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_c-1:<5.1%}"
+        checkAllclose(b, c, msg=msg)
 
 
 def get_boundary_test_cases(cu_count, aligned_k):
@@ -300,40 +313,6 @@ def test_normal_gemm():
         scaleA=0.5,
         scaleB=0.5,
     )
-
-    test_gemm(dtypes.bf16, 128, 32, 8192)
-    df_asm = []
-    for dtype in [dtypes.fp16, dtypes.bf16][-1:]:
-        for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32][-1:]:
-            for m in [64, 48, 128, 192, 256, 384, 448, 512][:]:
-                df_asm.append(test_gemm(dtype, m, 256, 5120, otype=otype))
-        # # qkv_proj
-        # for (m, n, k) in [(4096, 1280, 8192),
-        #                   (128, 1280, 8192),
-        #                   (128, 1024, 8192),
-        #                   (128, 128, 8192),
-        #                   ]:
-        #     test_gemm(dtype, m, n, k)
-        # # attn_out
-        # for (m, n, k) in [(4096, 8192, 1024),
-        #                   (128, 8192, 1024)]:
-        #     test_gemm(dtype, m, n, k)
-        # test_gemm(dtype, 128, 1024, 8192)
-        # # gating
-        # for (m, n, k) in [(4096, 32, 8192),
-        #                   (128, 32, 8192)]:
-        #     test_gemm(dtype, m, n, k)
-        # # gating
-        # for (m, n, k) in [(1, 19392, 8192),
-        #                   (128, 19392, 8192)]:
-        #     test_gemm(dtype, m, n, k)
-    df_asm = pd.DataFrame(df_asm)
-    aiter.logger.info(f"summary:\n{df_asm}")
-
-    df.append(ret1)
-    ret2 = test_gemm(dtypes.bf16, 128, 32, 8192)
-    df.append(ret2)
-
     test_gemm(dtypes.bf16, 128, 32, 8192)
     for dtype in [dtypes.fp16, dtypes.bf16]:
         for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
@@ -404,5 +383,91 @@ def test_skinny_gemm():
                     test_gemm(dtype, m, n, k, otype=otype)
 
 
-test_normal_gemm()
-# test_skinny_gemm()
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of a16w16_gemm_test",
+)
+parser.add_argument(
+    "-t",
+    "--test",
+    type=str,
+    nargs="*",
+    choices=["normal", "skinny", "diy"],
+    default=["skinny"],
+    help="""Select test to run.
+If run custom tests with -t diy and other arguments..
+    e.g.: -t skinny
+          or -t normal
+          or -t diy    # pls set other args""",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=dtypes.str2Dtype,
+    # choices=["bf16", "fp16", "fp8"],
+    default=[torch.bfloat16],
+    help="""Data type. Support "bf16", "fp16", "fp8".
+    e.g.: -d bf16
+          or -d bf16,fp16    # Multiple comma-separated argus supported.""",
+)
+parser.add_argument(
+    "-mnk",
+    type=dtypes.str2tuple,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Shape of mnk.
+    e.g. -mnk 128,32,8192""",
+)
+parser.add_argument(
+    "-b",
+    "--bias",
+    action="store_true",
+    help="""bias of GEMM. Default is False.
+    -b or --bias    # enable Bias""",
+)
+parser.add_argument(
+    "-o",
+    "--otype",
+    type=dtypes.str2Dtype,
+    default=[torch.float32],
+    help="""Data type of output.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-sa",
+    "--scale_a",
+    type=float,
+    default=None,
+    help="""Scale A.
+    e.g.: -sa 0.5""",
+)
+parser.add_argument(
+    "-sb",
+    "--scale_b",
+    type=float,
+    default=None,
+    help="""Scale B.
+    e.g.: -sb 0.5""",
+)
+args = parser.parse_args()
+
+for test in args.test:
+    if test == "skinny":
+        test_skinny_gemm()
+    elif test == "normal":
+        test_normal_gemm()
+    elif test == "diy":
+        for dtype in args.dtype:
+            for otype in args.otype:
+                for m, n, k in [args.mnk]:
+                    test_gemm(
+                        dtype,
+                        m,
+                        n,
+                        k,
+                        bias=args.bias,
+                        otype=otype,
+                        scaleA=args.scale_a,
+                        scaleB=args.scale_b,
+                    )
