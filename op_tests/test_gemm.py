@@ -100,7 +100,8 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         dtype == dtypes.bf16
         and otype == dtypes.fp32
         and (k % 64 == 0)
-        and (n % 64 == 0)
+        and (n == 256)
+        and (k == 5120 or k == 7168)
         and bias == None
     ):
         # wshuffle = shuffle_weight(weight, layout=(16, 16))
