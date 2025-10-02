@@ -316,11 +316,11 @@ def gemm_a16w16(
     N, K = w.shape
     w = w.T
 
-    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
-
     if config is None:
         config = _get_config(M, N, K)
+
+    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
