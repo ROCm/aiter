@@ -237,7 +237,7 @@ def reference_torch(
 
 
 def chunk_input(
-    cache_seqlens, q, block_table, blocked_k, abs_indices, indices_in_kvcache
+    cache_seqlens, q, block_table, blocked_k, abs_indices, indices_in_kvcache, dtype=torch.bfloat16
 ):
     q_new = q.reshape(-1, q.shape[2], q.shape[3])
     abs_indices = abs_indices.reshape(-1, abs_indices.shape[2])
@@ -259,9 +259,9 @@ def chunk_input(
         max_q_len,
         cache_seqlens,
         max_kv_len,
-        q_new,
+        q_new.to(dtype),
         block_table,
-        blocked_k,
+        blocked_k.to(dtype),
         abs_indices,
         indices_in_kvcache,
     )
