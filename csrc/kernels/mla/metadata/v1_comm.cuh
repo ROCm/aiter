@@ -61,6 +61,7 @@ struct MlaMetadataV1KernelParameter
     int32_t        kv_granularity;
     int32_t        kv_granularity_log2;
     int32_t        uni_seqlen_qo;
+    int32_t        topk;
     bool           is_causal;
 };
 
