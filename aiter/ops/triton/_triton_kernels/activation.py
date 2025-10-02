@@ -10,7 +10,7 @@ def _silu(x):
 
 @triton.jit
 def _silu_exp2(x):
-    return x / (1.0 + tl.exp2(-(x.to(tl.float32) * 1.44269504089)))
+    return x / (1.0 + tl.exp2(-(x * 1.44269504089)))
 
 
 @triton.jit
