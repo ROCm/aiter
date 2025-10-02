@@ -24,6 +24,7 @@ if REF_BY_TRITON:
 else:
     from aiter import flash_attn_func
 
+
 def run_torch(
     q,
     k,
@@ -223,13 +224,12 @@ if __name__ == "__main__":
         ProblemSize(1, (16,), (16384,), (128,), MaskType.BOTH),
         ProblemSize(1, (64,), (16384,), (128,), MaskType.BOTH),
         ProblemSize(1, (16, 1), (65536,), (128,), MaskType.BOTH),
+        ProblemSize(1, (40,), (37200,), (128,), MaskType.BOTH),
     ]
 
     l_dtypes = [dtypes.bf16]
 
-    for dtype, problem_size in itertools.product(
-        l_dtypes, problem_sizes
-    ):
+    for dtype, problem_size in itertools.product(l_dtypes, problem_sizes):
         batch_size = problem_size.batch_size
         nheads, nheads_k = (
             problem_size.nheads_qk
