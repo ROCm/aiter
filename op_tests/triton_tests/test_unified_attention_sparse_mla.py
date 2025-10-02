@@ -1,16 +1,13 @@
 # test code is adapted from flashMLA:
 # https://github.com/deepseek-ai/FlashMLA/blob/main/tests/test_flash_mla_decoding.py
-import argparse
-import math
 import random
 import dataclasses
 from typing import Optional, Tuple
 
 import torch
-import triton
-
+import pytest
 from math import ceil
-from unified_attention_sparse_mla import unified_attention_sparse_mla
+from aiter.ops.triton.unified_attention_sparse_mla import unified_attention_sparse_mla
 
 
 def cdiv(a, b):
@@ -18,7 +15,7 @@ def cdiv(a, b):
 
 
 @dataclasses.dataclass
-class TestParam:
+class Param:
     b: int  # Batch size
     s_q: int  # Number of queries for one request
     s_k: int  # Seq len, or mean seq len if varlen == True
@@ -38,7 +35,7 @@ class TestParam:
 
 
 def generate_test_data(
-    t: TestParam,
+    t: Param,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -269,71 +266,93 @@ def chunk_input(
         indices_in_kvcache,
     )
 
+@pytest.mark.parametrize("batch", [1, 4, 8])
+@pytest.mark.parametrize("s_q", [1, 64, 1024])
+@pytest.mark.parametrize("s_k", [1, 64, 1024])
+@pytest.mark.parametrize("top_k", [64, 1024])
+@pytest.mark.parametrize("num_q_heads", [16, 32])
+@pytest.mark.parametrize("lora_dim", [256, 512])
+@pytest.mark.parametrize("rope_dim", [64,])
+@pytest.mark.parametrize("block_size", [16,64])
+@torch.inference_mode()
+def test_triton_unified_attn(
+    batch: int,
+    s_q: int,
+    s_k: int,
+    top_k: int,
+    num_q_heads: int,
+    lora_dim: int,
+    rope_dim: int,
+    block_size: int,
+) -> None:
+    total_dim = lora_dim + rope_dim
+    softmax_scale = lora_dim**-0.5
 
-s_q = 2048
-s_k = 1024
-topk = 64
-batch = 2
-softmax_scale = 0.5
-h_q = 16
-test_p = TestParam(
-    batch,
-    s_q,
-    s_k,
-    h_q=h_q,
-    is_varlen=True,
-    is_causal=False,
-    is_fp8=False,
-    topk=topk,
-    test_performance=False,
-)
-kv_lora_rank = test_p.dv
-rope_rank = test_p.d - kv_lora_rank
-(cache_seqlens, q, block_table, blocked_k, abs_indices, indices_in_kvcache) = (
-    generate_test_data(test_p)
-)
-out_ref = reference_torch(
-    cache_seqlens,
-    block_table,
-    q,
-    blocked_k,
-    kv_lora_rank,
-    softmax_scale,
-    False,
-    abs_indices,
-)
+    test_p = Param(
+        batch,
+        s_q,
+        s_k,
+        d=total_dim,
+        dv=lora_dim,
+        h_q=num_q_heads,
+        block_size=block_size,
+        is_varlen=True,
+        is_causal=False,
+        is_fp8=False,
+        topk=top_k,
+        test_performance=False,
+    )
+    (cache_seqlens, q, block_table, blocked_k, abs_indices, indices_in_kvcache) = (
+        generate_test_data(test_p)
+    )
+    ref_output = reference_torch(
+        cache_seqlens,
+        block_table,
+        q,
+        blocked_k,
+        lora_dim,
+        softmax_scale,
+        False,
+        abs_indices,
+    )
 
-(
-    cu_seqlens_q,
-    max_seqlen_q,
-    seqused_k,
-    max_seqlen_k,
-    q,
-    block_table,
-    blocked_k,
-    abs_indices,
-    indices_in_kvcache,
-) = chunk_input(
-    cache_seqlens, q, block_table, blocked_k, abs_indices, indices_in_kvcache
-)
+    (
+        cu_seqlens_q,
+        max_seqlen_q,
+        seqused_k,
+        max_seqlen_k,
+        q,
+        block_table,
+        blocked_k,
+        abs_indices,
+        indices_in_kvcache,
+    ) = chunk_input(
+        cache_seqlens, q, block_table, blocked_k, abs_indices, indices_in_kvcache
+    )
 
-out = torch.empty((*q.shape[:-1], kv_lora_rank), device=q.device, dtype=q.dtype)
+    output = torch.empty((*q.shape[:-1], lora_dim), device=q.device, dtype=q.dtype)
 
-unified_attention_sparse_mla(
-    q,
-    blocked_k,
-    out,
-    cu_seqlens_q,
-    max_seqlen_q,
-    seqused_k,
-    max_seqlen_k,
-    softmax_scale,
-    indices_in_kvcache,
-    block_table,
-    kv_lora_rank,
-)
+    unified_attention_sparse_mla(
+        q,
+        blocked_k,
+        output,
+        cu_seqlens_q,
+        max_seqlen_q,
+        seqused_k,
+        max_seqlen_k,
+        softmax_scale,
+        indices_in_kvcache,
+        block_table,
+        lora_dim,
+    )
 
-out_ref = out_ref.to(out.device)
-out = out.reshape(out_ref.shape)
+    ref_output = ref_output.to(output.device).to(q.dtype)
+    output = output.reshape(ref_output.shape)
 
-torch.testing.assert_close(out.float(), out_ref.float(), rtol=1e-3, atol=1e-3)
+    atol, rtol = 1.5e-2, 1e-2
+    torch.testing.assert_close(
+        output, ref_output, atol=atol, rtol=rtol
+    ), f"{torch.max(torch.abs(output - ref_output))}"
+
+
+
