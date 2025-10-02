@@ -77,7 +77,7 @@ def kernel_unified_attention_sparse_mla_2d(
     ALL_DECODE: tl.constexpr = False,
 ):
     """
-    TODO(cagri): 
+    TODO(cagri):
     -- Cleanup needed for variables related to num_queries_per_kv
     -- Masking can be simplified
     -- Tests fail when all topk indices are all -1, not likely to be the case in practice probably?
