@@ -73,8 +73,8 @@ def test_gemm(dtype, m, n, k, preshuffle=False):
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if preshuffle else weight
     run_func = run_gemm_bpreshuffle_ck if preshuffle else run_gemm_ck
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
-
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}"
+    tflops = 2 * m * n * k / (avg_b) / 1e6
+    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}, tflops:{tflops:<8.2f}"
     failed = checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
     return {"us": avg_b, "failed": failed}
@@ -128,8 +128,8 @@ def test_gemm_asm(dtype, m, n, k):
 
     a, avg_a = run_torch2(x, weight, x_scale_trans, w_scale_trans, dtype)
     b, avg_b = run_asm(x, flat_weight, x_scale, w_scale, dtype)
-
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, asm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}"
+    tflops = 2 * m * n * k / (avg_b) / 1e6
+    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, asm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}, tflops:{tflops:<8.2f}"
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
 

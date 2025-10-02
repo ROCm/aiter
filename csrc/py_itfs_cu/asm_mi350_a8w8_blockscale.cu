@@ -64,7 +64,7 @@ torch::Tensor mi350_a8w8_blockscale_asm(
     torch::Tensor &WQ,      // [N, K] -> [N/128, K*128]
     torch::Tensor &x_scale, // [K/128, M]
     torch::Tensor &w_scale, // [K/128, N/128]
-    torch::Tensor &out      // Out:[M, N] fp16
+    torch::Tensor &out      // Out:[M, N] bf16
 )
 {
     int TileM = 128;
@@ -77,7 +77,7 @@ torch::Tensor mi350_a8w8_blockscale_asm(
    if (m <= 32)
        TileM = 32;
     TORCH_CHECK(out.dtype() == torch::ScalarType::BFloat16,
-                "mi350 a8w8 blockscale asm only support Half output now!");
+                "mi350 a8w8 blockscale asm only support BFloat16 output now!");
     TORCH_CHECK(n % TileN == 0 && k % TileK == 0, 
                 "mi350 a8w8 blockscale asm only suuport 128x256x128 tile now!");
     TORCH_CHECK(m >= 16,

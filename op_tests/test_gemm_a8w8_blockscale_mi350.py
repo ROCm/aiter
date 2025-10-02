@@ -3,6 +3,7 @@
 
 import torch
 import torch.nn.functional as F
+import itertools
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest, benchmark
@@ -86,10 +87,12 @@ def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest()
-def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    # return aiter.flatmm_a8w8_blockscale_ASM(x, weight, x_scale, w_scale, dtype)
-    return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, True)
+def run_asm(x, weight, x_scale, w_scale, out):
+    return aiter.mi350_a8w8_blockscale_ASM(x, weight, x_scale, w_scale, out)
 
+@perftest()
+def run_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+    return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, True)
 
 @benchmark()
 def test_gemm_asm_mi350(dtype, m, n, k):
@@ -112,7 +115,8 @@ def test_gemm_asm_mi350(dtype, m, n, k):
     w_scale_trans = torch.transpose(w_scale, 0, 1).contiguous()
     flat_weight = shuffle_weight(weight, layout=(16, 16))
     a, avg_a = run_torch2(x, weight, x_scale_trans, w_scale_trans, dtypes.bf16)
-    b, avg_b = run_asm(x, flat_weight, x_scale, w_scale_trans, dtype)
+    out = torch.rand((m, n), dtype=dtypes.bf16, device="cuda")
+    b, avg_b = run_asm(x, flat_weight, x_scale, w_scale_trans, out)
     a = a.to(dtypes.fp32)
     b = b.to(dtypes.fp32)
     tflops = 2 * m * n * k / (avg_b) / 1e6
@@ -178,36 +182,41 @@ if args.m is not None:
 if args.nk is not None:
     l_nk = [args.nk]
 
-for dtype in [dtypes.bf16]:
-    # deepseek-r1
-    for m in [
-        16,
-        17,
-        31,
-        33,
-        127,
-        129,
-        32,
-        64,
-        128,
-        256,
-        512,
-        1024,
-        1536,
-        2048,
-        4096,
-        8192,
-        16384,
-        20480,
-    ]:
-        for n, k in [
-            (1536, 7168),
-            (3072, 1536),
-            (7168, 2048),
-            (4608, 7168),
-            (7168, 2304),
-            (512, 7168),
-            (4096, 512),
-        ][1:2]:
-            test_gemm_asm_mi350(dtype, m, n, k)
-            break
+for dtype, m, (n, k) in itertools.product(l_dtype, l_m, l_nk):
+    ret = test_gemm_asm_mi350(dtype, m, n, k)
+    # this essentially only runs one test and exit
+    break
+
+# for dtype in [dtypes.bf16]:
+#     # deepseek-r1
+#     for m in [
+#         16,
+#         17,
+#         31,
+#         33,
+#         127,
+#         129,
+#         32,
+#         64,
+#         128,
+#         256,
+#         512,
+#         1024,
+#         1536,
+#         2048,
+#         4096,
+#         8192,
+#         16384,
+#         20480,
+#     ]:
+#         for n, k in [
+#             (1536, 7168),
+#             (3072, 1536),
+#             (7168, 2048),
+#             (4608, 7168),
+#             (7168, 2304),
+#             (512, 7168),
+#             (4096, 512),
+#         ][1:2]:
+#             test_gemm_asm_mi350(dtype, m, n, k)
+#             break
