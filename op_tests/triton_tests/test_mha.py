@@ -81,9 +81,9 @@ def fp8_assert_close(
     max_abs_idx = torch.argmax(abs_diff).item()
     max_rel_idx = torch.argmax(rel_diff).item()
 
-    flat_to_idx = lambda flat_idx, shape: np.unravel_index(
+    flat_to_idx = lambda flat_idx, shape: np.unravel_index(  # noqa: E731
         flat_idx, shape
-    )  # noqa: E731
+    )
 
     max_abs_pos = flat_to_idx(max_abs_idx, tensor_a.shape)
     max_rel_pos = flat_to_idx(max_rel_idx, tensor_a.shape)
@@ -815,6 +815,7 @@ def test_mha_with_pe(
     DROPOUT: float,
     CAUSAL: bool,
 ):
+    HAS_DROPOUT: bool = DROPOUT > 0.0
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
 
@@ -836,13 +837,13 @@ def test_mha_with_pe(
         v,
         dropout_p=DROPOUT,
         causal=CAUSAL,
-        return_lse=DROPOUT > 0.0,
-        return_attn_probs=DROPOUT > 0.0,
+        return_lse=HAS_DROPOUT,
+        return_attn_probs=HAS_DROPOUT,
     )
 
-    if DROPOUT > 0.0:
+    if HAS_DROPOUT:
         assert len(triton_out) == 3
-        dropout_mask = triton_out[2] >= 0
+        dropout_mask = triton_out[2] > 0
         triton_out = triton_out[0]
     else:
         dropout_mask = None
@@ -859,16 +860,17 @@ def test_mha_with_pe(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("BATCH", [1])
+@pytest.mark.parametrize("BATCH", [1, 3])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(4096, 4096)],
+    [(1, 1), (2, 2), (4, 1), (1, 4), (16, 16), (32, 16), (64, 128), (4096, 4096)],
 )
-@pytest.mark.parametrize("DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.0, True, True)])
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128)])
-@pytest.mark.parametrize("CAUSAL", [True])
-@pytest.mark.parametrize("FP8", [False])
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (4, 4), (16, 4), (128, 128)]
+)
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (96, 64), (192, 128)])
+@pytest.mark.parametrize("DROPOUT", [0.0, 0.17])
+@pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_varlen_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
@@ -878,30 +880,25 @@ def test_mha_varlen_with_pe(
     HEAD_SZ_QK: int,
     HEAD_SZ_V: int,
     DROPOUT: float,
-    RETURN_LSE: bool,
-    RETURN_SOFTMAX: bool,
     CAUSAL: bool,
-    FP8: bool,
-    dtype=torch.float16,
 ):
-    torch.set_printoptions(threshold=10000)
+    HAS_DROPOUT: bool = DROPOUT > 0.0
+    device: str = "cuda"
+    dtype: torch.dtype = torch.bfloat16
+
     torch.cuda.empty_cache()
-    torch.manual_seed(20)
+    torch.manual_seed(77)
     q = torch.randn(
-        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK), device="cuda", dtype=dtype
+        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
     )
     k = torch.randn(
-        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_QK), device="cuda", dtype=dtype
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
     )
     v = torch.randn(
-        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_V), device="cuda", dtype=dtype
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_V), device=device, dtype=dtype
     )
-    query_padding_mask = generate_random_padding_mask(
-        SEQLEN_Q, BATCH, "cuda", mode="random"
-    )
-    key_padding_mask = generate_random_padding_mask(
-        SEQLEN_K, BATCH, "cuda", mode="random"
-    )
+    query_padding_mask = generate_random_padding_mask(SEQLEN_Q, BATCH, device)
+    key_padding_mask = generate_random_padding_mask(SEQLEN_K, BATCH, device)
     (
         q_unpad,
         k_unpad,
@@ -914,96 +911,46 @@ def test_mha_varlen_with_pe(
         k,
         v,
         output_pad_fn,
-        dq_pad_fn,
-        dk_pad_fn,
-    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+        _,
+        _,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask)
 
-    if DEBUG_MODE:
-        print(
-            f"query_padding_mask.shape={query_padding_mask.shape} query_padding_mask={query_padding_mask}"
-        )
-        print(
-            f"key_padding_mask.shape={key_padding_mask.shape} key_padding_mask={key_padding_mask}"
-        )
+    triton_out = flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=DROPOUT,
+        causal=CAUSAL,
+        return_lse=HAS_DROPOUT,
+        return_attn_probs=HAS_DROPOUT,
+    )
 
-        print(f"q.shape={q.shape} q={q}")
-        print(f"k.shape={k.shape} k={k}")
-        print(f"v.shape={v.shape} v={v}")
-        print(f"q_unpad.shape={q_unpad.shape} q_unpad={q_unpad}")
-        print(f"k_unpad.shape={k_unpad.shape} k_unpad={k_unpad}")
-        print(f"v_unpad.shape={v_unpad.shape} v_unpad={v_unpad}")
-        print(f"max_seqlens_q={max_seqlen_q }")
-        print(f"max_seqlens_k={max_seqlen_k }")
-        print(f"cu_seqlens_q={cu_seqlens_q }")
-        print(f"cu_seqlens_k={cu_seqlens_k }")
-    if FP8:
-        triton_out = flash_attn_varlen_fp8_func(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
-        )
-    else:
-        triton_out = flash_attn_varlen_func(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
-        )
-
-    if RETURN_LSE:
-        assert len(triton_out) > 1
-        lse = triton_out[1]
-        if DEBUG_MODE:
-            print(f"lse.shape={lse.shape}, lse={lse}")
-
-    dropout_mask = None
-    if DROPOUT > 0.0 and RETURN_SOFTMAX:
-        if RETURN_LSE:
-            assert len(triton_out) == 3
-            sd_mask = triton_out[2]
-        else:
-            assert len(triton_out) == 2
-            sd_mask = triton_out[1]
-        dropout_mask = sd_mask >= 0
-        dropout_mask = pad_rearrange_dropout_mask(
-            dropout_mask,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            SEQLEN_Q,
-            SEQLEN_K,
-            NUM_Q_HEADS,
-        )
-        dropout_mask = dropout_mask > 0
-        if DEBUG_MODE:
-            # print(f"sd_mask.shape={sd_mask.shape}, sd_mask={sd_mask}")
-            print(
-                f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
+    if HAS_DROPOUT:
+        assert len(triton_out) == 3
+        dropout_mask = (
+            pad_rearrange_dropout_mask(
+                triton_out[2] > 0,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                SEQLEN_Q,
+                SEQLEN_K,
+                NUM_Q_HEADS,
             )
-    if RETURN_SOFTMAX or RETURN_LSE:
-        triton_out = output_pad_fn(triton_out[0])
+            > 0
+        )
+        triton_out = triton_out[0]
     else:
-        triton_out = output_pad_fn(triton_out)
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+        dropout_mask = None
 
-    torch_out = attention_ref(
+    triton_out = output_pad_fn(triton_out)
+
+    torch_out, _ = attention_ref(
         q,
         k,
         v,
@@ -1013,22 +960,8 @@ def test_mha_varlen_with_pe(
         dropout_mask=dropout_mask,
         causal=CAUSAL,
     )
-    torch_out, attention_scores = torch_out
 
-    if DEBUG_MODE:
-        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
-        print(
-            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
-        )
-
-    if FP8:
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=0.25, rtol=10
-        )  # Lower tolerance for FP8
-    else:
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("BATCH", [1])
