@@ -266,14 +266,20 @@ def chunk_input(
         indices_in_kvcache,
     )
 
+
 @pytest.mark.parametrize("batch", [1, 4, 8])
 @pytest.mark.parametrize("s_q", [1, 64, 1024])
 @pytest.mark.parametrize("s_k", [1, 64, 1024])
 @pytest.mark.parametrize("top_k", [64, 1024])
 @pytest.mark.parametrize("num_q_heads", [16, 32])
 @pytest.mark.parametrize("lora_dim", [256, 512])
-@pytest.mark.parametrize("rope_dim", [64,])
-@pytest.mark.parametrize("block_size", [16,64])
+@pytest.mark.parametrize(
+    "rope_dim",
+    [
+        64,
+    ],
+)
+@pytest.mark.parametrize("block_size", [16, 64])
 @torch.inference_mode()
 def test_triton_unified_attn(
     batch: int,
@@ -353,6 +359,3 @@ def test_triton_unified_attn(
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
     ), f"{torch.max(torch.abs(output - ref_output))}"
-
-
-
