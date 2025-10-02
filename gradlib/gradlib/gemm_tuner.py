@@ -26,6 +26,7 @@ from aiter import dtypes
 import pandas as pd
 
 from GemmTuner import GemmTuner
+import time
 
 aiter.rocb_create_extension()
 aiter.hipb_create_extension()
@@ -159,6 +160,12 @@ if __name__ == "__main__":
         " regardless of what was used"
         " to collect the shapes",
     )
+    parser.add_argument(
+        "--errRatio",
+        type=float,
+        default=0.01,
+        help="tolerable error ratio, default 0.01.",
+    )
     args = parser.parse_args()
 
     if args.outdtype is None:
@@ -166,7 +173,9 @@ if __name__ == "__main__":
     indtype = get_dtype(args.indtype)
     outdtype = get_dtype(args.outdtype)
 
-    gtuner = GemmTuner(indtype, outdtype, args.tuned_file, args.rocblas_decode, args.mp)
+    gtuner = GemmTuner(
+        indtype, outdtype, args.tuned_file, args.rocblas_decode, args.mp, args.errRatio
+    )
     nsets = [i * args.batch_size for i in args.nsets]
     if args.input_file:
         print(f">>> Loading {args.input_file}")
@@ -209,5 +218,7 @@ if __name__ == "__main__":
         for n in sorted(nsets):
             for m, k in mksets:
                 gtuner.add_gemm(m, n, k, indtype=dtype)
-
+    start_time = time.time()
     gtuner.find_best_sols()
+    end_time = time.time()
+    print(f"Tuning time is : {end_time - start_time} s")

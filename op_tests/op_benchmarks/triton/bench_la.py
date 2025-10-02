@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import sys
 import torch
 import triton
 
-from aiter.ops.triton.lean_atten import persistent_lean_attention
+from aiter.ops.triton.lean_atten import (
+    _persistent_lean_attention,
+)
+
 
 configs = []
 configs.append(
@@ -75,14 +78,14 @@ configs.append(
                 8192,
                 [8192],
                 128,
-                304,
+                912,
                 torch.float16,
                 128,
                 64,
-                1,
+                2,
                 4,
             ),  # Causal=1,
-            (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 1, 4),
+            (True, 2, 64, 2048, [2048, 2048], 128, 608, torch.float16, 128, 64, 2, 4),
         ],
         line_arg="provider",
         line_vals=["triton"],
@@ -114,6 +117,7 @@ def bench_lean_attention(
     provider,
     device="cuda",
 ):
+
     assert batch == len(n_ctx)
 
     try:
@@ -155,9 +159,10 @@ def bench_lean_attention(
     Op = torch.empty((total_programs, n_ctx_q, d), device=q.device, dtype=torch.float32)
 
     locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
+    XCD_REMAP = True
 
     # Triton LeanAttention output
-    fn = lambda: persistent_lean_attention(  # noqa: E731
+    fn = lambda: _persistent_lean_attention(  # noqa: E731
         q,
         k,
         v,
@@ -169,6 +174,7 @@ def bench_lean_attention(
         total_programs,
         BLOCK_M,
         BLOCK_N,
+        XCD_REMAP,
         causal,
         batch,
         sm_scale,

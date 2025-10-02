@@ -14,7 +14,23 @@ from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
 
 
-@compile_ops("module_batched_gemm_a8w8", fc_name="batched_gemm_a8w8")
+def gen_batched_gemm_a8w8_fake_tensors(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    bias: Optional[Tensor] = None,
+    splitK: int = 0,
+) -> Tensor:
+    return out
+
+
+@compile_ops(
+    "module_batched_gemm_a8w8",
+    fc_name="batched_gemm_a8w8",
+    gen_fake=gen_batched_gemm_a8w8_fake_tensors,
+)
 def batched_gemm_a8w8(
     XQ: Tensor,
     WQ: Tensor,
@@ -22,8 +38,8 @@ def batched_gemm_a8w8(
     w_scale: Tensor,
     out: Tensor,
     bias: Optional[Tensor] = None,
-    splitK=0,
-): ...
+    splitK: int = 0,
+) -> Tensor: ...
 
 
 @functools.lru_cache(maxsize=1024)
@@ -54,7 +70,7 @@ def get_CKBatchedGEMM_config(
             ["B", "M", "N", "K"]
         ).to_dict("index")
     config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get((B, M, N, K), None)
-    if config != None:
+    if config is not None:
         mnk = config["kernelName"].split("_")[3].split("x")[1:]
         config["tile_m"] = int(mnk[0])
         config["tile_n"] = int(mnk[1])
@@ -81,8 +97,8 @@ def batched_gemm_a8w8_CK(
     n = WQ.shape[1]
     k = XQ.shape[2]
     ck_config = get_CKBatchedGEMM_config(b, m, n, k)
-    if splitK == None:
-        if ck_config != None:
+    if splitK is None:
+        if ck_config is not None:
             splitK = ck_config["splitK"]
         else:
             splitK = 0
@@ -90,7 +106,23 @@ def batched_gemm_a8w8_CK(
     return batched_gemm_a8w8(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
 
 
-@compile_ops("module_batched_gemm_a8w8_tune", fc_name="batched_gemm_a8w8_tune")
+def gen_batched_gemm_a8w8_tune_fake_tensors(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    kernelId: int,
+    splitK: int = 0,
+) -> Tensor:
+    return out
+
+
+@compile_ops(
+    "module_batched_gemm_a8w8_tune",
+    fc_name="batched_gemm_a8w8_tune",
+    gen_fake=gen_batched_gemm_a8w8_tune_fake_tensors,
+)
 def batched_gemm_a8w8_tune(
     XQ: Tensor,
     WQ: Tensor,
@@ -98,5 +130,5 @@ def batched_gemm_a8w8_tune(
     w_scale: Tensor,
     out: Tensor,
     kernelId: int,
-    splitK=0,
-): ...
+    splitK: int = 0,
+) -> Tensor: ...

@@ -51,7 +51,7 @@ using float32_t  = float;
 template <typename T>
 __device__ inline bool cmp_gt(const T& a, const T& b)
 {
-    if constexpr(std::is_same<T, float16_t>::value || std::is_same<T, bfloat16_t>::value)
+    if constexpr(std::is_same<T, bfloat16_t>::value)
     {
         // at::Half (or float16_t in our native case) causes ambiguity, so we cast to float.
         return ck_tile::type_convert<float>(a) > ck_tile::type_convert<float>(b);
@@ -100,6 +100,7 @@ __device__ void moe_fused_gate_impl(void* input,
                                     int64_t topk,
                                     int64_t num_fused_shared_experts,
                                     double routed_scaling_factor,
+                                    int32_t out_stride,
                                     Params params)
 {
     int tidx           = threadIdx.x;
@@ -185,7 +186,7 @@ __device__ void moe_fused_gate_impl(void* input,
 #pragma unroll
     for(int ii = 0; ii < params.VPT; ++ii)
     {
-        row_chunk[ii] = 1.0f / (1.0f + expf(-row_chunk[ii]));
+        row_chunk[ii] = ::isnan(row_chunk[ii]) ? 0.0f : (1.0f / (1.0f + expf(-row_chunk[ii])));
     }
     // __syncthreads();
 
@@ -321,7 +322,7 @@ __device__ void moe_fused_gate_impl(void* input,
         //     }
 
         int thread_to_clear_in_group = expert / params.VPT;
-        int64_t idx                  = topk * thread_row + k_idx;
+        int64_t idx                  = out_stride * thread_row + k_idx;
 
         if(thread_group_idx == thread_to_clear_in_group)
         {
@@ -362,7 +363,7 @@ __device__ void moe_fused_gate_impl(void* input,
 
     if(thread_group_idx == 0 && num_fused_shared_experts > 0)
     {
-        int64_t last_idx = topk * thread_row + topk_excluding_share_expert_fusion;
+        int64_t last_idx = out_stride * thread_row + topk_excluding_share_expert_fusion;
 
         // Use round-robin to select expert
         int64_t expert_offset = thread_row % num_fused_shared_experts;
@@ -391,7 +392,7 @@ __device__ void moe_fused_gate_impl(void* input,
 #pragma unroll
         for(int ii = 0; ii < topk; ++ii)
         {
-            int64_t const idx = topk * thread_row + ii;
+            int64_t const idx = out_stride * thread_row + ii;
             output_ptr[idx]   = scores[ii] / output_sum;
         }
     }
@@ -431,7 +432,8 @@ __global__ void moe_fused_gate_kernel(void* input,
                                       int64_t topk_group,
                                       int64_t topk,
                                       int64_t num_fused_shared_experts,
-                                      double routed_scaling_factor)
+                                      double routed_scaling_factor,
+                                      int32_t out_stride)
 {
     KernelParams<VPT, NUM_EXPERTS, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA>
         params;
@@ -444,6 +446,7 @@ __global__ void moe_fused_gate_kernel(void* input,
                            topk,
                            num_fused_shared_experts,
                            routed_scaling_factor,
+                           out_stride,
                            params);
 }
 
@@ -471,7 +474,8 @@ __global__ void moe_fused_gate_kernel(void* input,
                                                                  topk_group,                  \
                                                                  topk,                        \
                                                                  num_fused_shared_experts,    \
-                                                                 routed_scaling_factor);      \
+                                                                 routed_scaling_factor,       \
+                                                                 out_stride);                 \
         dispatched = true;                                                                    \
     } while(0)
 
@@ -499,7 +503,8 @@ __global__ void moe_fused_gate_kernel_dynamic(void* input,
                                               int64_t topk_group,
                                               int64_t topk,
                                               int64_t num_fused_shared_experts,
-                                              double routed_scaling_factor)
+                                              double routed_scaling_factor,
+                                              int32_t out_stride)
 {
     KernelParamsDynamic params;
     params.NUM_EXPERTS = num_experts;            // e.g, for deepseek v3, this is 256
@@ -520,6 +525,7 @@ __global__ void moe_fused_gate_kernel_dynamic(void* input,
                            topk,
                            num_fused_shared_experts,
                            routed_scaling_factor,
+                           out_stride,
                            params);
 }
 
@@ -536,11 +542,14 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
                                        int64_t num_fused_shared_experts,
                                        double routed_scaling_factor)
 {
-    int64_t num_rows    = input.size(0);
-    int32_t num_experts = input.size(1);
-    auto options        = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    auto output         = topk_weights;
-    auto indices        = topk_ids;
+    int64_t num_rows     = input.size(0);
+    int32_t num_experts  = input.size(1);
+    auto options         = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto output          = topk_weights;
+    auto indices         = topk_ids;
+    const int out_stride = topk_ids.stride(0);
+    TORCH_CHECK(topk_weights.stride(0) == out_stride,
+                "topk_weights and topk_ids must have the same stride in dim 0");
 
     // Compute grid dimensions based on runtime value for num_expert_group.
     int64_t rows_per_warp = std::max<int64_t>(1, WARP_SIZE / num_expert_group);
@@ -663,7 +672,8 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
                                                                      topk_group,
                                                                      topk,
                                                                      num_fused_shared_experts,
-                                                                     routed_scaling_factor);
+                                                                     routed_scaling_factor,
+                                                                     out_stride);
         }
         else if(input.scalar_type() == at::kHalf)
         {
@@ -678,7 +688,8 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
                                                                      topk_group,
                                                                      topk,
                                                                      num_fused_shared_experts,
-                                                                     routed_scaling_factor);
+                                                                     routed_scaling_factor,
+                                                                     out_stride);
         }
         else if(input.scalar_type() == at::kFloat)
         {
@@ -693,7 +704,8 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
                                                                      topk_group,
                                                                      topk,
                                                                      num_fused_shared_experts,
-                                                                     routed_scaling_factor);
+                                                                     routed_scaling_factor,
+                                                                     out_stride);
         }
         else
         {

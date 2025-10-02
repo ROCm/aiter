@@ -17,7 +17,10 @@
             "f'{AITER_CSRC_DIR}/kernels/activation_kernels.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "'-DCK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{AITER_CSRC_DIR}/include/ck_tile'"
@@ -140,11 +143,35 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_quick_all_reduce": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/quick_all_reduce_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/quick_all_reduce.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_custom": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_pybind.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/custom.cu'",
             "f'{AITER_CSRC_DIR}/kernels/custom_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_gemm_common": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_common_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -196,6 +223,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'",
             "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale.cu'"
         ],
         "flags_extra_cc": [],
@@ -208,10 +236,28 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv'"
     },
+    "module_gemm_a8w8_blockscale_bpreshuffle": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/include'",
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_bpreshuffle_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-mllvm -greedy-reverse-local-assignment=1'",
+            "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv'"
+    },
     "module_gemm_a4w4_blockscale": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/include'",
             "f'{AITER_CSRC_DIR}/pybind/gemm_a4w4_blockscale_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
             "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/gemm_a4w4_blockscale.cu'"
         ],
         "flags_extra_cc": [],
@@ -229,6 +275,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/include'",
             "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_bpreshuffle_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle.cu'"
         ],
         "flags_extra_cc": [],
@@ -276,6 +323,18 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_gemm_mi350_a8w8_blockscale_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mi350_a8w8_blockscale.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/asm_mi350_a8w8_blockscale_asm_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_moe_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_op_pybind.cu'",
@@ -284,7 +343,8 @@
             "f'{AITER_CSRC_DIR}/kernels/moe_fused_gate.cu'",
             "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_2stage.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_2stage.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topksoftmax.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -293,7 +353,10 @@
             "f'{AITER_CSRC_DIR}/include/ck_tile'"
         ],
         "verbose": "False",
-        "blob_gen_cmd": "f'{get_asm_dir()}/fmoe_2stages/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": [
+            "f'{get_asm_dir()}/fmoe_2stages/codegen.py --output_dir {{}}'",
+            "f'{get_asm_dir()}/fmoe/codegen.py --output_dir {{}}'"
+        ]
     },
     "module_moe_ck2stages": {
         "srcs": [
@@ -312,13 +375,13 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'",
             "'-mllvm --slp-threshold=-32'",
-            "'-mllvm --misched-bottomup=1'"
+            "'-mllvm --misched-prera-direction=bottomup' if int(torch.version.hip.split('.')[0]) >= 7 else '-mllvm --misched-bottomup=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
         "hip_clang_path": "os.environ.get('GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH')",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py --working_path {{}}'"
     },
     "module_moe_sorting": {
         "srcs": [
@@ -449,6 +512,19 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune'"
     },
+    "module_gemm_a8w8_blockscale_bpreshuffle_tune": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_bpreshuffle_tune_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle_tune.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/include'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gen_instances.py --working_path {{}} --tune'"
+    },
     "module_gemm_a4w4_blockscale_tune": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/gemm_a4w4_blockscale_tune_pybind.cu'",
@@ -523,6 +599,22 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_sample": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/sample_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/sample_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/ck_tile'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_rope_general_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/rope_general_fwd_pybind.cu'",
@@ -580,7 +672,7 @@
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_v3_fwd_kernel_generate.py --output_dir {{}}'"
+            "f'{get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}'"
         ]
     },
     "module_mha_fwd": {
@@ -599,6 +691,7 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
@@ -621,6 +714,7 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
@@ -666,7 +760,8 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_v3_bwd_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{get_asm_dir()}/fmha_v3_bwd/codegen.py --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 2 --output_dir {{}}'"
         ]
     },
@@ -686,8 +781,29 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_v3_bwd_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{get_asm_dir()}/fmha_v3_bwd/codegen.py --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 2 --output_dir {{}}'"
+        ]
+    },
+    "module_fmha_v3_varlen_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_varlen_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_varlen_fwd_asm_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}'",
+            "f'{get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}'"
         ]
     },
     "module_mha_bwd": {
@@ -706,6 +822,7 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
@@ -727,6 +844,7 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
@@ -753,14 +871,14 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 5 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_v3_fwd_kernel_generate.py --output_dir {{}}'"
+            "f'{get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}'"
         ]
     },
     "libmha_bwd": {
         "srcs": [],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 0)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -772,7 +890,8 @@
         "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_v3_bwd_kernel_generate.py --receipt 1 --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{get_asm_dir()}/fmha_v3_bwd/codegen.py --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },

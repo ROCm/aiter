@@ -44,7 +44,7 @@ def moe_sorting_native(
     sorted_expert_ids_begin = 0
     skip_expert_num = 0
     for expertId in range(num_experts):
-        if expert_mask != None and expert_mask[expertId] == 0:
+        if expert_mask is not None and expert_mask[expertId] == 0:
             skip_expert_num += 1
             continue
         token_id, topk_id = torch.where(topk_ids == expertId)
@@ -227,8 +227,8 @@ parser.add_argument(
     "--padding",
     type=int,
     default=None,
-    help="""Number of padding token.
-    e.g.: -t 0""",
+    help="""Padding token.
+    e.g.: -p 0""",
 )
 parser.add_argument(
     "-dp",
@@ -238,8 +238,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="""Number of padding token.
-    e.g.: -t 0""",
+    help="""Dispatch policy.
+    e.g.: -dp 0""",
 )
 parser.add_argument(
     "-em",

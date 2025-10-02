@@ -11,12 +11,15 @@ def f32_to_mxfp4(x):
     FP4_EBITS, FP4_MBITS = 2, 1
     x = _f32_to_floatx_unpacked(x.float(), FP4_EBITS, FP4_MBITS)
     x = pack_uint4(x)
-    # x = x.view(dtypes.fp4x2) # to(fp32) for this datatype gives all 0 for torch...
-    x = x.view(torch.uint8)
+    x = x.view(dtypes.fp4x2)  # to(fp32) for this datatype gives all 0 for torch...
+    # x = x.view(torch.uint8)
     return x
 
 
 def mxfp4_to_f32(x):
+    if x.dtype == torch.float4_e2m1fn_x2:
+        x = x.view(torch.uint8)
+
     # 2 because we pack fp4 in uint8.
     x = x.repeat_interleave(2, dim=-1)
     x[..., ::2] = x[..., ::2] & 0xF

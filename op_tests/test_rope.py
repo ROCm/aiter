@@ -1273,17 +1273,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no_check",
         action="store_true",
-        help="Do not check correctness of ops. Default: False.",
+        help="""Do not check correctness of ops. Default: False.
+    --no_check    # True""",
     )
     parser.add_argument(
         "--compare",
         action="store_true",
-        help="Compare with legacy implementation. Default: False",
+        help="""Compare with legacy implementation. Default: False
+    --compare    # True""",
     )
     parser.add_argument(
         "--compare_check",
         action="store_true",
-        help="Check correctness when compare with legacy implementation. Default: False",
+        help="""Check correctness when compare with legacy implementation. Default: False
+    --compare_check    # True""",
     )
     parser.add_argument(
         "-d",
@@ -1304,7 +1307,7 @@ if __name__ == "__main__":
         type=dtypes.str2bool,
         help="""Transpose output. Default: (False, True).
     e.g.: -t f   # for False
-    e.g.: -t t   # for True""",
+       or -t t   # for True""",
     )
     parser.add_argument(
         "-b",
@@ -1378,7 +1381,8 @@ if __name__ == "__main__":
         choices=list(d_rs.keys()),
         nargs="*",
         help="""Rotate style. Default is all combinations of neox and gptj.
-    e.g.: -rs neox""",
+    e.g.: -rs neox
+          or -rs gptj""",
     )
     d_rr = {
         # [0]: rotary percentage, [1]: reuse front part, [2]: nope first
@@ -1397,8 +1401,12 @@ if __name__ == "__main__":
         nargs="*",
         choices=list(d_rr.keys()),
         help="""Rotary percentage and reuse front part. Default is all combinations of:
-(1.0, True, False), (1.0, False, False), (0.5, False, False), (0.5, True, False), (0.5, True, True), (0.5, False, True).
-    e.g.: -rr 0  # for (1.0, True, False)""",
+    e.g.: -rr 0     # for (1.0, True, False)
+          or -rr 1  # for (1.0, False, False)
+          or -rr 2  # for (0.5, False, False)
+          or -rr 3  # for (0.5, True, False)
+          or -rr 4  # for (0.5, True, True)
+          or -rr 5  # for (0.5, False, True)""",
     )
 
     args = parser.parse_args()

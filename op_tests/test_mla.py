@@ -472,7 +472,7 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="""Number of heads.
+    help="""Number of nhead and mtp.
     e.g.: -n 16,1""",
 )
 

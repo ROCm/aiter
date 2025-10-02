@@ -147,7 +147,11 @@ def test_fmoe(
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
 
     score = torch.randn((token, E), dtype=dtype)
+    # rand
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    # sequence
+    # topk_ids_list = [[((i * topk) + j)% E for j in range(topk)] for i in range(token)]
+    # topk_ids = torch.tensor(topk_ids_list, device=topk_ids.device, dtype=topk_ids.dtype)
 
     M, _ = topk_ids.shape
 
@@ -432,7 +436,7 @@ l_quant = [
     (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
     (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test
+    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True]
@@ -485,7 +489,7 @@ parser.add_argument(
     2: aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8  # a8w8
     3: aiter.QuantType.per_Token, dtypes.fp8, torch.int4  # a8w4
     4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
-    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test""",
+    5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8""",
 )
 
 parser.add_argument(

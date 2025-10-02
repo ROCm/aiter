@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "mha_fwd.h"
 #include "ck_tile/host.hpp"
 #include "ck_tile/ref/naive_attention.hpp"
+#include "mha_fwd.h"
 #include "rotary.hpp"
 #include "utils.hpp"
 
@@ -16,22 +16,6 @@
 #include <utility>
 #include <vector>
 
-template <typename T>
-std::ostream& operator<<(std::ostream& os, const std::vector<T>& v)
-{
-    using size_type = typename std::vector<T>::size_type;
-
-    os << "[";
-    for(size_type idx = 0; idx < v.size(); ++idx)
-    {
-        if(0 < idx)
-        {
-            os << ", ";
-        }
-        os << v[idx];
-    }
-    return os << "]";
-}
 
 auto create_args(int argc, char* argv[])
 {
@@ -130,8 +114,11 @@ auto create_args(int argc, char* argv[])
                 "# of splits for key/value. 0 to determine actual number by heuristic")
         .insert("page_block_size", "0", "paged-kvcache block size. 0 means not use paged-kvcahe")
         .insert("cache_batch_idx", "0", "whether to use index map to the kvcache")
-        .insert("warmup", "5", "number of iterations before benchmark the kernel")
-        .insert("repeat", "20", "number of iterations to benchmark the kernel")
+        .insert("warmup", "10", "number of iterations before benchmark the kernel")
+        .insert("repeat", "10", "number of iterations to benchmark the kernel")
+        .insert("v3_bf16_cvt",
+                "1",
+                "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
         .insert("fwd_v3", "0", "if set to 1, some cases will call the fwd v3 kernel");
 
     bool result = arg_parser.parse(argc, argv);
@@ -179,8 +166,8 @@ int num_splits_heuristic(int batch_nhead_mblocks, int num_SMs, int num_n_blocks,
     {
         return 1;
     }
-    int max_splits_tmp           = std::min(max_splits, num_SMs);
-    max_splits               = std::min(max_splits_tmp, num_n_blocks);
+    int max_splits_tmp   = std::min(max_splits, num_SMs);
+    max_splits           = std::min(max_splits_tmp, num_n_blocks);
     float max_efficiency = 0.f;
     std::vector<float> efficiency;
     efficiency.reserve(max_splits);
@@ -277,11 +264,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
         return false;
     }
 
-    std::optional<uint32_t> seed = arg_parser.get_uint32("seed");
-    if(*seed == 0)
-    {
-        seed.reset();
-    }
+    std::mt19937 random_engine(arg_parser.get_uint32("seed") != 0 ? arg_parser.get_uint32("seed")
+                                                                  : std::random_device{}());
+    auto next_seed = [&random_engine]() { return static_cast<unsigned int>(random_engine()); };
 
     ck_tile::index_t hdim_q = arg_parser.get_int("d");
     ck_tile::index_t hdim_v = arg_parser.get_int("d_v");
@@ -297,7 +282,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     }
     if(seqlen_knew < 0)
     {
-        seqlen_knew = randint<ck_tile::index_t>(1, arg_parser.get_int("s"), seed);
+        seqlen_knew = randint<ck_tile::index_t>(1, arg_parser.get_int("s"), random_engine);
     }
 
     ck_tile::index_t rotary_dim = arg_parser.get_int("rotary_dim");
@@ -380,13 +365,14 @@ bool run(const ck_tile::ArgParser& arg_parser)
     const bool use_kvcache = (need_append_kvcache || use_cache_batch_idx || 0 < page_block_size);
 
     auto [seqlen_qs, seqlen_ks, seqlen_kpads] =
-        decode_seqlen(mode,
-                      batch,
-                      arg_parser.get_str("s"),
-                      arg_parser.get_str("s_k"),
-                      arg_parser.get_str("s_kpad"),
-                      /*seqlen_k_min=*/0 < seqlen_knew ? seqlen_knew : 0,
-                      need_append_kvcache);
+        generate_missing_seqlens(mode,
+                                 batch,
+                                 arg_parser.get_int_vec("s"),
+                                 arg_parser.get_int_vec("s_k"),
+                                 arg_parser.get_int_vec("s_kpad"),
+                                 /*seqlen_k_min=*/0 < seqlen_knew ? seqlen_knew : 0,
+                                 need_append_kvcache,
+                                 random_engine);
     // compute kvcache seqlen_k (before appending knew/vnew)
     auto cache_seqlen_ks = seqlen_ks;
     std::transform(cache_seqlen_ks.begin(),
@@ -465,6 +451,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     int stream_repeat = arg_parser.get_int("repeat");
     bool kname        = arg_parser.get_bool("kname");
     bool fwd_v3       = arg_parser.get_bool("fwd_v3");
+    int v3_bf16_cvt   = arg_parser.get_int("v3_bf16_cvt");
 
     ck_tile::stream_config stream_config{nullptr,
                                          true,
@@ -626,7 +613,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
             : std::array<ck_tile::index_t, 2>{1, 1});
 
     auto [rotary_cos_host, rotary_sin_host] = generate_rotary_cos_sin<KDataType>(
-        std::max(shape_seqlen_q, shape_seqlen_k), rotary_dim, seed);
+        std::max(shape_seqlen_q, shape_seqlen_k), rotary_dim, next_seed());
 
     ck_tile::HostTensor<LSEDataType> lse_acc_host(
         1 < num_splits || use_kvcache
@@ -663,39 +650,39 @@ bool run(const ck_tile::ArgParser& arg_parser)
 
     if(init_method == "ui" || init_method == "0")
     {
-        ck_tile::FillUniformDistributionIntegerValue<QDataType>{-3.f, 3.f, seed}(q_host);
-        ck_tile::FillUniformDistributionIntegerValue<KDataType>{-3.f, 3.f, seed}(k_host);
-        ck_tile::FillUniformDistributionIntegerValue<KDataType>{-3.f, 3.f, seed}(knew_host);
-        ck_tile::FillUniformDistributionIntegerValue<VDataType>{-3.f, 3.f, seed}(v_host);
-        ck_tile::FillUniformDistributionIntegerValue<VDataType>{-3.f, 3.f, seed}(vnew_host);
-        ck_tile::FillUniformDistributionIntegerValue<BiasDataType>{-3.f, 3.f, seed}(bias_host);
+        ck_tile::FillUniformDistributionIntegerValue<QDataType>{-3.f, 3.f, next_seed()}(q_host);
+        ck_tile::FillUniformDistributionIntegerValue<KDataType>{-3.f, 3.f, next_seed()}(k_host);
+        ck_tile::FillUniformDistributionIntegerValue<KDataType>{-3.f, 3.f, next_seed()}(knew_host);
+        ck_tile::FillUniformDistributionIntegerValue<VDataType>{-3.f, 3.f, next_seed()}(v_host);
+        ck_tile::FillUniformDistributionIntegerValue<VDataType>{-3.f, 3.f, next_seed()}(vnew_host);
+        ck_tile::FillUniformDistributionIntegerValue<BiasDataType>{-3.f, 3.f, next_seed()}(bias_host);
     }
     else if(init_method == "ni")
     {
-        ck_tile::FillNormalDistributionIntegerValue<QDataType>{-3.f, 3.f, seed}(q_host);
-        ck_tile::FillNormalDistributionIntegerValue<KDataType>{-3.f, 3.f, seed}(k_host);
-        ck_tile::FillNormalDistributionIntegerValue<KDataType>{-3.f, 3.f, seed}(knew_host);
-        ck_tile::FillNormalDistributionIntegerValue<VDataType>{-3.f, 3.f, seed}(v_host);
-        ck_tile::FillNormalDistributionIntegerValue<VDataType>{-3.f, 3.f, seed}(vnew_host);
-        ck_tile::FillNormalDistributionIntegerValue<BiasDataType>{-3.f, 3.f, seed}(bias_host);
+        ck_tile::FillNormalDistributionIntegerValue<QDataType>{-3.f, 3.f, next_seed()}(q_host);
+        ck_tile::FillNormalDistributionIntegerValue<KDataType>{-3.f, 3.f, next_seed()}(k_host);
+        ck_tile::FillNormalDistributionIntegerValue<KDataType>{-3.f, 3.f, next_seed()}(knew_host);
+        ck_tile::FillNormalDistributionIntegerValue<VDataType>{-3.f, 3.f, next_seed()}(v_host);
+        ck_tile::FillNormalDistributionIntegerValue<VDataType>{-3.f, 3.f, next_seed()}(vnew_host);
+        ck_tile::FillNormalDistributionIntegerValue<BiasDataType>{-3.f, 3.f, next_seed()}(bias_host);
     }
     else if(init_method == "uf" || init_method == "1")
     {
-        ck_tile::FillUniformDistribution<QDataType>{0.f, 1.f, seed}(q_host);
-        ck_tile::FillUniformDistribution<KDataType>{0.f, 1.f, seed}(k_host);
-        ck_tile::FillUniformDistribution<KDataType>{0.f, 1.f, seed}(knew_host);
-        ck_tile::FillUniformDistribution<VDataType>{0.f, 1.f, seed}(v_host);
-        ck_tile::FillUniformDistribution<VDataType>{0.f, 1.f, seed}(vnew_host);
-        ck_tile::FillUniformDistribution<BiasDataType>{0.f, 1.f, seed}(bias_host);
+        ck_tile::FillUniformDistribution<QDataType>{0.f, 1.f, next_seed()}(q_host);
+        ck_tile::FillUniformDistribution<KDataType>{0.f, 1.f, next_seed()}(k_host);
+        ck_tile::FillUniformDistribution<KDataType>{0.f, 1.f, next_seed()}(knew_host);
+        ck_tile::FillUniformDistribution<VDataType>{0.f, 1.f, next_seed()}(v_host);
+        ck_tile::FillUniformDistribution<VDataType>{0.f, 1.f, next_seed()}(vnew_host);
+        ck_tile::FillUniformDistribution<BiasDataType>{0.f, 1.f, next_seed()}(bias_host);
     }
     else if(init_method == "nf")
     {
-        ck_tile::FillNormalDistribution<QDataType>{0.f, 3.f, seed}(q_host);
-        ck_tile::FillNormalDistribution<KDataType>{0.f, 3.f, seed}(k_host);
-        ck_tile::FillNormalDistribution<KDataType>{0.f, 3.f, seed}(knew_host);
-        ck_tile::FillNormalDistribution<VDataType>{0.f, 3.f, seed}(v_host);
-        ck_tile::FillNormalDistribution<VDataType>{0.f, 3.f, seed}(vnew_host);
-        ck_tile::FillNormalDistribution<BiasDataType>{0.f, 3.f, seed}(bias_host);
+        ck_tile::FillNormalDistribution<QDataType>{0.f, 3.f, next_seed()}(q_host);
+        ck_tile::FillNormalDistribution<KDataType>{0.f, 3.f, next_seed()}(k_host);
+        ck_tile::FillNormalDistribution<KDataType>{0.f, 3.f, next_seed()}(knew_host);
+        ck_tile::FillNormalDistribution<VDataType>{0.f, 3.f, next_seed()}(v_host);
+        ck_tile::FillNormalDistribution<VDataType>{0.f, 3.f, next_seed()}(vnew_host);
+        ck_tile::FillNormalDistribution<BiasDataType>{0.f, 3.f, next_seed()}(bias_host);
     }
     else if(init_method == "tf" || init_method == "2")
     {
@@ -709,16 +696,16 @@ bool run(const ck_tile::ArgParser& arg_parser)
     else if(init_method == "ufq" || init_method == "uf:q" ||
             init_method == "3") // suitable for fp8 quantization
     {
-        ck_tile::FillUniformDistribution<QDataType>{-q_dtype_max, q_dtype_max, seed}(q_host);
-        ck_tile::FillUniformDistribution<KDataType>{-k_dtype_max, k_dtype_max, seed}(k_host);
-        ck_tile::FillUniformDistribution<KDataType>{-k_dtype_max, k_dtype_max, seed}(knew_host);
-        ck_tile::FillUniformDistribution<VDataType>{-v_dtype_max, v_dtype_max, seed}(v_host);
-        ck_tile::FillUniformDistribution<VDataType>{-v_dtype_max, v_dtype_max, seed}(vnew_host);
+        ck_tile::FillUniformDistribution<QDataType>{-q_dtype_max, q_dtype_max, next_seed()}(q_host);
+        ck_tile::FillUniformDistribution<KDataType>{-k_dtype_max, k_dtype_max, next_seed()}(k_host);
+        ck_tile::FillUniformDistribution<KDataType>{-k_dtype_max, k_dtype_max, next_seed()}(knew_host);
+        ck_tile::FillUniformDistribution<VDataType>{-v_dtype_max, v_dtype_max, next_seed()}(v_host);
+        ck_tile::FillUniformDistribution<VDataType>{-v_dtype_max, v_dtype_max, next_seed()}(vnew_host);
 
         // bias_fp8 = qscale_bias * bias_fp32
         float qscale_bias = (q_dtype_max / range_q) * (k_dtype_max / range_k);
         // Assume bias is in [-1.f, 1.f] in original fp32
-        ck_tile::FillUniformDistribution<BiasDataType>{-qscale_bias, qscale_bias, seed}(bias_host);
+        ck_tile::FillUniformDistribution<BiasDataType>{-qscale_bias, qscale_bias, next_seed()}(bias_host);
     }
     if(bias.type == bias_enum::alibi)
     {
@@ -738,8 +725,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
             }
         }
     }
-    iota_shuffle(block_table_host.begin(), block_table_host.end(), 0);
-    iota_shuffle(cache_batch_idx_host.begin(), cache_batch_idx_host.end(), 0);
+    iota_shuffle(block_table_host.begin(), block_table_host.end(), 0, random_engine);
+    iota_shuffle(cache_batch_idx_host.begin(), cache_batch_idx_host.end(), 0, random_engine);
 
     ck_tile::DeviceMem q_buf(q_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem k_buf(k_host.get_element_space_size_in_bytes());
@@ -962,7 +949,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
             args.seqlen_k_ptr = ((mode == mode_enum::batch && use_kvcache) || 0 <= k_paddings_[0]
                                      ? seqlen_k_buf.GetDeviceBuffer()
                                      : nullptr);
-
             args.seqlen_k     = shape_seqlen_k; // unused in group mode (or kvcache enabled)
             args.max_seqlen_q = max_seqlen_q;
 
@@ -1051,7 +1037,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
 #endif
         aiter::mha_fwd_args fmha_args;
         init_args(fmha_args);
-
         return aiter::mha_fwd(fmha_args,
                               stream_config,
                               data_type,
@@ -1059,7 +1044,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
                               mask.type,
                               bias.type,
                               lse,
-                              fwd_v3);
+                              fwd_v3,
+                              v3_bf16_cvt);
     }();
 
     if(fwd_ave_time < 0.0f)

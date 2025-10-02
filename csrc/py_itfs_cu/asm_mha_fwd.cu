@@ -10,7 +10,7 @@
 
 namespace aiter {
 namespace torch_itfs {
-fmha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
+mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                                    bool has_dropout_randval,
                                    const mask_info &mask,
                                    // sizes
@@ -85,16 +85,20 @@ fmha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
-    return fmha_fwd_args{q.data_ptr(),
+    return mha_fwd_args{q.data_ptr(),
                          k.data_ptr(),
                          v.data_ptr(),
                          bias_ptr,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
+                         nullptr, // cu_seqlen_q_ptr
+                         nullptr, // cu_seqlen_kv_ptr
                          nullptr, // seqstart_q
                          nullptr, // seqstart_k
-                         nullptr,
+                         nullptr, // seqlen_k_ptr
+                         nullptr, // seqstart_padded_q_ptr
+                         nullptr, // seqstart_padded_k_ptr
                          seqlen_q,
                          seqlen_k,
                          b,

@@ -3,6 +3,7 @@
 
 # user interface
 
+from typing import List
 import torch
 from ..jit.core import (
     compile_ops,
@@ -32,12 +33,32 @@ def grouped_topk(
     num_expert_group: int,
     topk_group: int,
     need_renorm: bool,
-    scoring_func: str = "softmax",
+    is_softmax: bool = True,
     routed_scaling_factor: float = 1.0,
-): ...
+) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+def gen_moe_fused_gate_fake_tensor(
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    n_share_experts_fusion: int,
+    routed_scaling_factor: float = 1.0,
+) -> List[torch.Tensor]:
+    output = torch.empty_like(
+        topk_weights, dtype=topk_weights.dtype, device=topk_weights.device
+    )
+
+    indices = torch.empty_like(topk_ids, dtype=topk_ids.dtype, device=topk_ids.device)
+
+    return [output, indices]
+
+
+@compile_ops("module_moe_asm", gen_fake=gen_moe_fused_gate_fake_tensor)
 def moe_fused_gate(
     input: torch.Tensor,
     bias: torch.Tensor,
@@ -48,7 +69,7 @@ def moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> list[torch.Tensor]: ...
+) -> List[torch.Tensor]: ...
 
 
 def biased_grouped_topk(
@@ -63,7 +84,7 @@ def biased_grouped_topk(
 ):
     token_num = gating_output.shape[0]
     cu_num = get_cu_num()
-    if token_num <= cu_num * 16 or not topk_ids.is_contiguous():
+    if token_num <= cu_num * 212:
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
@@ -98,6 +119,7 @@ def biased_grouped_topk_torch(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
+    return_score: bool = False,
 ):
     scores = gating_output.to(dtypes.fp32).sigmoid()
     num_token = scores.shape[0]
@@ -128,7 +150,10 @@ def biased_grouped_topk_torch(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
+    if return_score:
+        return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32), scores
+    else:
+        return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
 
 
 # this one copied from sglang

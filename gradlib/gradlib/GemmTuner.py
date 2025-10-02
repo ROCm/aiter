@@ -60,6 +60,45 @@ def call_rocb_mm(inp, w, solidx):
     return aiter.rocb_mm(inp, w, solidx)
 
 
+def generate_data(
+    m, n, k, indtype, outdtype, scaleAB, seed=0, bias=None, device="cuda:0"
+):
+    torch.manual_seed(seed)
+    inp = torch.randn((m, k), device=device).to(indtype)
+    weights = torch.randn((n, k), device=device).to(indtype)
+    # blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device=device)
+    bias = torch.randn(n, device=device).to(outdtype) if bias else None
+    scale_half = torch.tensor(0.5, dtype=dtypes.fp32, device=device)
+    scale_one = torch.tensor(1, dtype=dtypes.fp32, device=device)
+    scale = scale_half if scaleAB else scale_one
+    return (inp, weights, weights.t(), bias, scale)
+
+
+def get_gemm_ref(inp, weights, bias, scale, indtype, outdtype):
+    scaleA = scale
+    scaleB = scale
+    if indtype == dtypes.fp8:
+        try:
+            ref = torch._scaled_mm(
+                inp,
+                weights.t(),
+                bias=bias,
+                scale_a=scaleA,
+                scale_b=scaleB,
+                out_dtype=outdtype,
+            )
+        except RuntimeError:
+            ref = (
+                F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32)) * scaleA * scaleB
+            )
+            ref = (ref.to(outdtype) + bias) if bias is not None else ref.to(outdtype)
+        if type(ref) is tuple and len(ref) == 2:
+            ref = ref[0]
+    else:
+        ref = F.linear(inp, weights, bias).to(outdtype)
+    return ref
+
+
 rtol = 1e-5
 atol = 1
 
@@ -81,6 +120,7 @@ class Gemm:
         scaleAB=False,
         rocblas_decode=False,
         mp=1,
+        err_ratio=0.01,
     ):
         self.m = m
         self.k = k
@@ -91,8 +131,9 @@ class Gemm:
         self.scaleAB = scaleAB
         self.use_rocblas = indtype == outdtype and str(indtype) != "dtypes.fp8"
         self.nb = CACHE_INVALIDATE_BUFFERS
-        self.inp = torch.randn((self.m, self.k), device="cuda").to(self.indtype)
-        self.weights = torch.randn((self.n, self.k), device="cuda").to(self.indtype)
+        (self.inp, self.weights, _, self.bias, scaleA) = generate_data(
+            m, n, k, indtype, outdtype, scaleAB, 0, bias
+        )
         self.blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device="cuda")
         self.topn = 20  # number of top solutions from each source
         self.hipb_sols = []
@@ -100,7 +141,7 @@ class Gemm:
         self.rtol = 1e-2
         self.atol = 1e-2
         self.ref = self.get_gemm_ref()
-        self.check_err_ratio = 0.01
+        self.check_err_ratio = err_ratio
         self.start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
         # prefer hipblaslt unless rocblas time is less than this
@@ -108,6 +149,30 @@ class Gemm:
         self.hipb_prefer_ratio = 0.995
         self.rocblas_decode = rocblas_decode
         self.mp = mp
+        self.inbpe = self.inp.element_size()
+        self.outbpe = self.ref.element_size()
+
+    def calculate_perf(
+        self,
+        results,
+        inbpe,
+        outbpe,
+    ):
+        """calculate TFLOPS and bandwidth"""
+        ### gemm flops,bw
+        info, time, err_ratio = results
+        if time == -1:
+            return -1, -1
+        print("info is ", info)
+        cu_num, m, n, k = info[0]
+        flops = m * n * k * 2
+        tflops = round(flops / (time * 1000000), 2)
+
+        bw = round(
+            (m * k * inbpe + n * k * inbpe + m * n * outbpe) / (time * 1e-6) / 1e9,
+            2,
+        )
+        return tflops, bw
 
     def find_hipblas_sols(self):
         sols = aiter.hipb_findallsols(
@@ -194,16 +259,18 @@ class Gemm:
             task.append(
                 (
                     info,
+                    generate_data,
+                    (self.m, self.n, self.k, self.indtype, self.outdtype, self.scaleAB),
                     call_hipb_mm,
-                    (solidx, self.outdtype),
+                    ([0, 2, 3, 4, 4], solidx, self.outdtype),
                     {
                         "num_warmup": warmi,
                         "num_iters": coldi,
                     },
-                    None,
-                    (),
+                    get_gemm_ref if fast_mode == 0 else None,
+                    ([0, 1, 3, 4], self.indtype, self.outdtype),
                     {},
-                    self.ref if fast_mode == 0 else None,
+                    None,  # self.ref if fast_mode == 0 else None,
                     self.rtol,
                     self.atol,
                 )
@@ -211,13 +278,7 @@ class Gemm:
         in_data = [
             (
                 len(solutions),
-                (
-                    self.inp,
-                    self.weights.t(),
-                    self.bias if self.bias is not None else None,
-                    scaleA,
-                    scaleB,
-                ),
+                (),
             )
         ]
         ret = mp_tuner(task, in_data, self.mp, fast_mode == 1)
@@ -227,6 +288,7 @@ class Gemm:
                 if err_ratio > self.check_err_ratio:
                     continue
             gtimes[solidx] = us / 1000.0
+
         self.hipb_gtimedf = pd.DataFrame.from_dict(
             gtimes, orient="index", columns=["gtimems"]
         ).sort_values(by="gtimems")
@@ -272,21 +334,26 @@ class Gemm:
             task.append(
                 (
                     info,
+                    generate_data,
+                    (self.m, self.n, self.k, self.indtype, self.outdtype, False),
                     call_rocb_mm,
-                    (solidx,),
+                    (
+                        [0, 2],
+                        solidx,
+                    ),
                     {
                         "num_warmup": warmi,
                         "num_iters": coldi,
                     },
-                    None,
-                    (),
+                    get_gemm_ref if fast_mode == 0 else None,
+                    ([0, 1, 3, 4], self.indtype, self.outdtype),
                     {},
-                    self.ref if fast_mode == 0 else None,
+                    None,  # self.ref if fast_mode == 0 else None,
                     self.rtol,
                     self.atol,
                 )
             )
-        in_data = [(len(solutions), (self.inp, self.weights.t()))]
+        in_data = [(len(solutions), ())]
         ret = mp_tuner(task, in_data, self.mp, fast_mode == 1)
         for info, us, err_ratio in ret:
             solidx = info[1]
@@ -369,17 +436,38 @@ class Gemm:
 
 class GemmTuner:
 
-    def __init__(self, indtype, outdtype, tuned_file=None, rocblas_decode=False, mp=1):
+    def __init__(
+        self,
+        indtype,
+        outdtype,
+        tuned_file=None,
+        rocblas_decode=False,
+        mp=1,
+        err_ratio=0.01,
+    ):
         self.gemm_problems = pd.DataFrame(columns=["M", "N", "K", "bias"])
         self.indtype = indtype
         self.outdtype = outdtype
         self.rocblas_decode = rocblas_decode
         self.tuned_file = tuned_file
         self.mp = mp
-        if Path(tuned_file).is_file():
-            self.tuned_shapes = pd.read_csv(tuned_file)
+
+        tuned_file_path = Path(tuned_file)
+        if tuned_file_path.exists():
+            self.tuned_shapes = (
+                pd.read_csv(tuned_file) if tuned_file_path.is_file() else None
+            )
         else:
             self.tuned_shapes = None
+            with open(tuned_file, "w") as tf:
+                tf.write(
+                    "M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,soltimes,kernelName,tflops, bw\n"
+                )
+
+        gpu = torch.cuda.current_device()
+        device_properties = torch.cuda.get_device_properties(gpu)
+        cu_num = device_properties.multi_processor_count
+        self.cu_num = cu_num
 
     def add_gemm(self, m, n, k, indtype, bias=False, outdtype=None, scaleAB=False):
         assert indtype is not None
@@ -387,7 +475,8 @@ class GemmTuner:
         assert outdtype is not None
         if self.tuned_shapes is None or (
             self.tuned_shapes[
-                (self.tuned_shapes["M"] == m)
+                (self.tuned_shapes["cu_num"] == self.cu_num)
+                & (self.tuned_shapes["M"] == m)
                 & (self.tuned_shapes["N"] == n)
                 & (self.tuned_shapes["K"] == k)
                 & (self.tuned_shapes["bias"] == bias)
@@ -414,11 +503,11 @@ class GemmTuner:
 
     def find_best_sols(self):
         df = self.gemm_problems
-        soldf = pd.DataFrame(columns=["libtype", "solidx", "soltimes", "kernelName"])
         for i in range(len(df)):
             ds = df.loc[i, :]
             indtype = ds["dtype"]
             outdtype = ds["outdtype"]
+
             gemmobj = Gemm(
                 ds["M"],
                 ds["N"],
@@ -429,23 +518,34 @@ class GemmTuner:
                 scaleAB=ds["scaleAB"],
                 rocblas_decode=self.rocblas_decode,
                 mp=self.mp,
+                err_ratio=0.01,
             )
             gemmobj.find_fastest_solution()
-            soldf.loc[i, "libtype"] = gemmobj.best_libtype
-            soldf.loc[i, "solidx"] = gemmobj.best_solidx
-            soldf.loc[i, "soltimes"] = round(gemmobj.best_soltime * 1000, 2)
-            soldf.loc[i, "kernelName"] = (
+
+            soltimes = round(gemmobj.best_soltime * 1000, 2)
+            kernal_name = (
                 aiter.getHipblasltKernelName(int(gemmobj.best_solidx))
                 if gemmobj.best_libtype == "hipblaslt"
-                else ""
+                else "rocblas"
             )
+            ret = (
+                ((self.cu_num, ds["M"], ds["N"], ds["K"]), int(gemmobj.best_solidx)),
+                soltimes,
+                gemmobj.check_err_ratio,
+            )
+            tflops, bw = gemmobj.calculate_perf(
+                ret,
+                gemmobj.inbpe,
+                gemmobj.outbpe,
+            )
+            with open(self.tuned_file, "a") as tf:
+                tf.write(
+                    f"{ds['M']},{ds['N']},{ds['K']},{ds['bias']},{indtype},{outdtype},{ds['scaleAB']},"
+                    f"{self.cu_num},{gemmobj.best_libtype},{int(gemmobj.best_solidx)},{soltimes},{kernal_name},{tflops},{bw}\n"
+                )
 
             del gemmobj
             torch.cuda.empty_cache()
 
-        finaldf = pd.concat([self.gemm_problems, soldf], axis=1)
-        if self.tuned_shapes is not None:
-            finaldf = pd.concat([finaldf, self.tuned_shapes])
-        finaldf["solidx"] = finaldf["solidx"].convert_dtypes("int64")
-        finaldf.to_csv(self.tuned_file, index=False)
+        finaldf = pd.read_csv(self.tuned_file)
         print(finaldf)
