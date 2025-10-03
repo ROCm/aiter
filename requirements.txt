@@ -3,5 +3,6 @@ pytest
 psutil
 matplotlib
 pyyaml
+openpyxl
 einops
 pybind11>=3.0.1
