@@ -789,7 +789,7 @@ def test_fmoe(
             msg=f"aiter_all_stages:{us_fuse:>8.2f} us......",
         )
 
-    return {"fused_moe(us)": 0}
+    return {"fused_moe(us)": us_fuse}
 seed = 1
 torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
@@ -802,36 +802,36 @@ l_tokenNum = [
     # 2,
     # 4,
     # 8,
-    # 16,
-    # 32,
-    # 64,
-    # 128,
-    # 256,
-    # 1024,
-    # 2048,
-    # 3072,
-    # 4096,
+    16,
+    32,
+    64,
+    128,
+    256,
+    1024,
+    2048,
+    3072,
+    4096,
     8192,
     # 163840,
 ]
 l_act_quant = [
-    # (aiter.ActivationType.Silu, aiter.QuantType.No, None, None), # a16w16
-    # (aiter.ActivationType.Silu, aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.ActivationType.Silu, aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.ActivationType.Silu, aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
-    (aiter.ActivationType.Silu, aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    # (aiter.ActivationType.Silu, aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.ActivationType.Swiglu, aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2), # a16w4  
+    (aiter.ActivationType.Silu, aiter.QuantType.No, None, None), # a16w16
+    (aiter.ActivationType.Silu, aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.ActivationType.Silu, aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.ActivationType.Silu, aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
+    # (aiter.ActivationType.Silu, aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
+    (aiter.ActivationType.Silu, aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.ActivationType.Swiglu, aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2), # a16w4  
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu, aiter.ActivationType.Swiglu][:1]
 l_quant = [
-    # (aiter.QuantType.No, None, None), # a16w16
-    # (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
-    (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2), # a16w4
+    (aiter.QuantType.No, None, None), # a16w16
+    (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
+    # (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
+    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2), # a16w4
     
 ]
 l_doweight_stage1 = [False, True][:1]

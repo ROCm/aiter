@@ -627,7 +627,6 @@ def fused_moe_2stages(
         bias1,
         bias2,
     )
-    print(f'[DEBUG] {quant_type=}, {dtype=}, {w1.dtype=}')
     if quant_type == QuantType.per_1x32 \
             and dtype in [dtypes.bf16, dtypes.fp16] \
             and w1.dtype == torch.uint8 \
