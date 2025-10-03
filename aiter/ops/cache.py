@@ -10,11 +10,13 @@ MD_NAME = "module_cache"
 
 
 @compile_ops("module_cache")
-def swap_blocks(src: Tensor, dst: Tensor, block_mapping: Tensor): ...
+def swap_blocks(src: Tensor, dst: Tensor, block_mapping: Tensor) -> None: ...
 
 
 @compile_ops("module_cache")
-def copy_blocks(key_caches: Tensor, value_caches: Tensor, block_mapping: Tensor): ...
+def copy_blocks(
+    key_caches: Tensor, value_caches: Tensor, block_mapping: Tensor
+) -> None: ...
 
 
 @compile_ops("module_cache")
@@ -41,7 +43,7 @@ def reshape_and_cache_flash(
     kv_cache_dtype: str,
     k_scale: Tensor,
     v_scale: Tensor,
-): ...
+) -> None: ...
 
 
 @compile_ops("module_cache")
@@ -54,7 +56,7 @@ def reshape_and_cache_with_pertoken_quant(
     v_dequant_scales: Tensor,
     slot_mapping: Tensor,
     asm_layout: bool,
-): ...
+) -> None: ...
 
 
 @compile_ops("module_cache")
@@ -67,7 +69,7 @@ def reshape_and_cache_with_block_quant(
     v_dequant_scales: Tensor,
     slot_mapping: Tensor,
     asm_layout: bool,
-): ...
+) -> None: ...
 
 
 @compile_ops("module_cache")
@@ -81,4 +83,4 @@ def reshape_and_cache_with_block_quant_for_asm_pa(
     slot_mapping: Tensor,
     asm_layout: bool,
     ori_block_size: int = 128,  # [128/256]
-): ...
+) -> None: ...
