@@ -5,7 +5,7 @@ import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from aiter.test_common import perftest
+from aiter.jit.core import AITER_CONFIG_BF16_BATCHED_GEMM
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter import dtypes
 from batched_gemm_bf16_common import kernels_list
@@ -41,7 +41,7 @@ def generate_data(b, m, n, k, device="cuda"):
 class BatchedGemmBf16Tuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         "verbose": False,
-        "tune_file": "aiter/configs/bf16_tuned_batched_gemm.csv",
+        "tune_file": f"{AITER_CONFIG_BF16_BATCHED_GEMM}",
         "untune_file": "aiter/configs/bf16_untuned_batched_gemm.csv",
         "errRatio": 0.05,
         "batch": 100,

@@ -9,7 +9,7 @@ import time
 import os
 import sys
 from aiter import QuantType
-from aiter.jit.core import get_asm_dir, AITER_CSRC_DIR
+from aiter.jit.core import get_asm_dir, AITER_CSRC_DIR, AITER_CONFIG_FMOE
 from aiter.fused_moe import (
     fused_topk,
     moe_sorting,
@@ -47,7 +47,7 @@ class FmoeTuner(TunerCommon):
 
     ARG_DEFAULTS = {
         "verbose": False,
-        "tune_file": "aiter/configs/tuned_fmoe.csv",
+        "tune_file": f"{AITER_CONFIG_FMOE}",
         "untune_file": "aiter/configs/untuned_fmoe.csv",
         "errRatio": 0.5,
         "batch": 100,

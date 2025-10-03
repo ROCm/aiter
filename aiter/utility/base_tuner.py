@@ -173,6 +173,8 @@ class TunerCommon:
         return filtered_df
 
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
+        path_list = tuned_gemm_file.split(os.pathsep) if tuned_gemm_file else []
+        assert len(path_list) <= 1, f"tuning to multiple files is not supported"
         if os.path.exists(tuned_gemm_file):
             column_order = pd.read_csv(tuned_gemm_file, nrows=0).columns.tolist()
             tunedf = pd.read_csv(tuned_gemm_file)
