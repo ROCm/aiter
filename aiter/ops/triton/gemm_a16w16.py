@@ -64,6 +64,7 @@ def _gemm_a16_w16_kernel(
     activation: tl.constexpr,
     use_activation: tl.constexpr,
     ADD_BIAS: tl.constexpr,
+    SKIP_REDUCE: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -113,11 +114,14 @@ def _gemm_a16_w16_kernel(
         )
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
-        if ADD_BIAS and NUM_KSPLIT == 1:
-            accumulator = tl.load(bias_ptr + offs_bn).to(dtype=acc_dtype)
-            accumulator = tl.broadcast_to(
-                accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
-            )
+        if ADD_BIAS:
+            if NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0):
+                accumulator = tl.load(bias_ptr + offs_bn).to(dtype=acc_dtype)
+                accumulator = tl.broadcast_to(
+                    accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
+                )
+            else:
+                accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         else:
             accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
@@ -356,6 +360,7 @@ def gemm_a16w16(
         activation=_get_activation_from_str(activation) if activation else "",
         use_activation=activation is not None,
         ADD_BIAS=(bias is not None),
+        SKIP_REDUCE=skip_reduce,
         **config,
     )
 
