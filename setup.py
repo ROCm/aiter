@@ -201,6 +201,7 @@ class NinjaBuildExtension(BuildExtension):
 
 
 setup_requires = [
+    "pybind11>=3.0.1",
     "packaging",
     "psutil",
     "ninja",
