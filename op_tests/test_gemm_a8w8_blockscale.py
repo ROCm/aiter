@@ -54,6 +54,9 @@ def run_gemm_bpreshuffle_ck(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf1
     return aiter.gemm_a8w8_blockscale_bpreshuffle(
         x, weightshuffle, x_scale, w_scale, dtype
     )
+@perftest()
+def run_gemm_ck_tile(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+    return aiter.gemm_a8w8_blockscale_ck_tile(x, weight, x_scale, w_scale, dtype)
 
 
 @benchmark()
@@ -62,23 +65,35 @@ def test_gemm(dtype, m, n, k, preshuffle=False):
     block_shape_n, block_shape_k = block_shape
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
+    
+    # Prepare input data
     x = (torch.rand((m, k), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
     weight = (torch.rand((n, k), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
     x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
+    
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     gemm_x_scale = x_scale_t if preshuffle else x_scale
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if preshuffle else weight
+    
     run_func = run_gemm_bpreshuffle_ck if preshuffle else run_gemm_ck
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
-
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}"
-    failed = checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
-
-    return {"us": avg_b, "failed": failed}
-
+    c, avg_c = run_gemm_ck_tile(x, weight, x_scale, w_scale, dtype)
+    
+    msg_ck = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us,   ck_uplift: {avg_a/avg_b -1:<5.1%}"
+    msg_ck_tile = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us,  ck_tile avg: {avg_c:<8.2f} us,   ck_tile_uplift: {avg_a/avg_c -1:<5.1%}"
+    
+    failed_ck = checkAllclose(a, b, msg="a,b: " + msg_ck, rtol=1e-2, atol=0.01)
+    failed_ck_tile = checkAllclose(a, c, msg="a,c: " + msg_ck_tile, rtol=1e-2, atol=0.01)
+    
+    return {
+        "ck_us": avg_b,
+        "ck_tile_us": avg_c,
+        "failed_ck": failed_ck,
+        "failed_ck_tile": failed_ck_tile
+    }
 
 @perftest(num_iters=5)
 def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
@@ -204,6 +219,12 @@ for dtype, m, (n, k), preshuffle in itertools.product(l_dtype, l_m, l_nk, l_pres
     ret = test_gemm(dtype, m, n, k, preshuffle)
     df.append(ret)
 df = pd.DataFrame(df)
+
+pd.set_option('display.max_columns', None)
+pd.set_option('display.max_rows', None)
+pd.set_option('display.width', 1000)
+pd.set_option('display.max_colwidth', None)
+
 aiter.logger.info(f"summary:\n{df}")
 # for dtype in [dtypes.fp16]:
 #     # deepseek-r1
@@ -211,5 +232,17 @@ aiter.logger.info(f"summary:\n{df}")
 #         for (n, k) in [(1536,7168), (3072,1536), (7168, 256), (7168, 2048), (4608, 7168), (7168, 2304), (512, 7168), (4096, 512)][1:2]:
 #             test_gemm_asm(dtype, m, n, k)
 #             break
-if df["failed"].any():
-    print("Failed cases:", df[df["failed"] > 0], sep="\n")
+any_failed = False
+
+if 'failed_ck' in df.columns:
+    if df["failed_ck"].any():
+        print("CK failed cases:", df[df["failed_ck"] > 0], sep="\n")
+        any_failed = True
+
+if 'failed_ck_tile' in df.columns:
+    if df["failed_ck_tile"].any():
+        print("CK Tile failed cases:", df[df["failed_ck_tile"] > 0], sep="\n")
+        any_failed = True
+
+if not any_failed:
+    print("All test cases passed successfully!")
