@@ -243,8 +243,8 @@ def e2e_moe_kernel(
         if use_fp8_w8a8:
             start_k = k1 * BLOCK_SIZE_K1 // group_k
             mask_w1sn = i0s < (N // 2 // group_n)
-            w1_i0_scale = tl.load(w1_i0_scale_ptrs + start_k * stride_w1sk, mask=mask_w1sn, other=0.0)
-            w1_i1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk, mask=mask_w1sn, other=0.0)
+            w1_i0_scale = tl.load(w1_i0_scale_ptrs + start_k * stride_w1sk, mask=mask_w1sn[None, :], other=0.0)
+            w1_i1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk, mask=mask_w1sn[None, :], other=0.0)
 
             # if num_scales_along_n > 1: # singleton dimension get automatic broadcast
             w1_i0_scale = group_broadcast(w1_i0_scale, 1, num_scales_along_n, group_n, 1)
@@ -281,6 +281,7 @@ def e2e_moe_kernel(
         # offs_w2_sn = offs_w2n // group_n
         # instead load only the unique scaling factors and broadcast. 
         offs_w2_sn = pid_n * (BLOCK_SIZE_HALF) // group_n + tl.arange(0, num_scales_along_n) 
+        mask_w2_sn = (offs_w2_sn < (N // 2 // group_n))
         # ... + tl.arange(0, num_scales_along_n) * group_n // group_n = ... + tl.arange(0, num_scales_along_n)
         w2_scale_ptrs = (
             W2_scale + off_experts * stride_w2se + offs_w2_sn[:, None] * stride_w2sn
@@ -310,7 +311,10 @@ def e2e_moe_kernel(
             )
 
         if use_fp8_w8a8:
-            w2_scale = tl.load(w2_scale_ptrs + k2 * BLOCK_SIZE_K2 // group_k * stride_w2sk) # (num_scales_along_n, num_scales_along_k2)
+            w2_scale_kmask = (tl.arange(0, num_scales_along_k2) < (K // group_k - k2 * BLOCK_SIZE_K2 // group_k))
+            w2_scale_mask = mask_w2_sn[:, None] & w2_scale_kmask[None, :]
+            w2_scale = tl.load(w2_scale_ptrs + k2 * BLOCK_SIZE_K2 // group_k * stride_w2sk,
+                            mask=w2_scale_mask, other=0.0) # (num_scales_along_n, num_scales_along_k2)
             w2_scale = group_broadcast(w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0)            
             # broadcasted shape along n depends on if num_scales_along_n > 1 or not. Singleton dimension does not need broadcasting.
             if num_scales_along_n > 1:

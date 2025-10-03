@@ -1183,7 +1183,6 @@ def test_moe_e2e(
         a,
         w1,
         w2,
-        intermediate,
         triton_out,
         a_scale,
         w1_scale,
