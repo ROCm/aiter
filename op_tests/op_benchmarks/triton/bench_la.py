@@ -16,7 +16,8 @@ configs.append(
         x_names=[
             "causal",
             "batch",
-            "h",
+            "hq",
+            "hk",
             "n_ctx_q",
             "n_ctx",
             "d",
@@ -28,64 +29,77 @@ configs.append(
             "num_warps",
         ],
         x_vals=[
-            (False, 2, 64, 16, [65536, 65536], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 64, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 64, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-            (False, 1, 64, 16, [524288], 64, 912, torch.float16, 16, 64, 2, 4),
-            (False, 2, 96, 16, [32768, 32768], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 96, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 96, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-            (False, 1, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
-            (False, 1, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),  #
-            (False, 1, 128, 16, [32768], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 128, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 128, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-            (False, 1, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-            (False, 1, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
-            (
-                False,
-                3,
-                64,
-                16,
-                [4096, 32768, 65536],
-                128,
-                912,
-                torch.float16,
-                16,
-                128,
-                2,
-                4,
-            ),
-            (
-                False,
-                8,
-                64,
-                16,
-                [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536],
-                128,
-                912,
-                torch.float16,
-                16,
-                128,
-                2,
-                4,
-            ),
-            (
-                True,
-                1,
-                64,
-                8192,
-                [8192],
-                128,
-                912,
-                torch.float16,
-                128,
-                64,
-                2,
-                4,
-            ),  # Causal=1,
-            (True, 2, 64, 2048, [2048, 2048], 128, 608, torch.float16, 128, 64, 2, 4),
+            # (False, 2, 64, 64, 16, [65536, 65536], 128, 912, torch.float16, 16, 128, 2, 4),
+            # (False, 1, 64, 64, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
+            # (False, 1, 64, 64, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
+            # (False, 1, 64, 64, 16, [524288], 64, 912, torch.float16, 16, 64, 2, 4),
+            # (False, 2, 96, 96, 16, [32768, 32768], 128, 912, torch.float16, 16, 128, 2, 4),
+            # (False, 1, 96, 96, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
+            # (False, 1, 96, 96, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
+            # (False, 1, 96, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
+            # (False, 1, 96, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
+            # (False, 1, 96, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),  #
+            # (False, 1, 128, 128, 16, [32768], 128, 912, torch.float16, 16, 128, 2, 4),
+            # (False, 1, 128, 128, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
+            # (False, 1, 128, 128, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
+            # (False, 1, 128, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
+            # (False, 1, 128, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
+            # (
+            #     False,
+            #     3,
+            #     64,
+            #     64,
+            #     16,
+            #     [4096, 32768, 65536],
+            #     128,
+            #     912,
+            #     torch.float16,
+            #     16,
+            #     128,
+            #     2,
+            #     4,
+            # ),
+            # (
+            #     False,
+            #     8,
+            #     64,
+            #     64,
+            #     16,
+            #     [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536],
+            #     128,
+            #     912,
+            #     torch.float16,
+            #     16,
+            #     128,
+            #     2,
+            #     4,
+            # ),
+            # (
+            #     True,
+            #     1,
+            #     64,
+            #     64,
+            #     8192,
+            #     [8192],
+            #     128,
+            #     912,
+            #     torch.float16,
+            #     128,
+            #     64,
+            #     2,
+            #     4,
+            # ),  # Causal=1,
+            # (True, 2, 64, 64, 2048, [2048, 2048], 128, 608, torch.float16, 128, 64, 2, 4),
+            # Diff here
+            (True, 1, 32, 8, 8192, [8192], 128, 608, torch.float16, 128, 64, 2, 4),
+            (True, 1, 64, 8, 8192, [8192], 128, 608, torch.float16, 128, 64, 2, 4),
+            (True, 1, 128, 8, 8192, [8192], 128, 608, torch.float16, 128, 64, 2, 4),
+            (True, 1, 32, 16, 1024, [1024], 128, 608, torch.float16, 128, 64, 2, 4),
+            (True, 1, 64, 16, 1024, [1024], 128, 608, torch.float16, 128, 64, 2, 4),
+            (True, 1, 128, 16, 1024, [1024], 128, 608, torch.float16, 128, 64, 2, 4),
+            (True, 1, 32, 32, 2048, [2048], 128, 608, torch.float16, 128, 64, 2, 4),
+            (True, 1, 64, 32, 2048, [2048], 128, 608, torch.float16, 128, 64, 2, 4),
+            (True, 1, 128, 32, 2048, [2048], 128, 608, torch.float16, 128, 64, 2, 4),
         ],
         line_arg="provider",
         line_vals=["triton"],
@@ -104,7 +118,8 @@ configs.append(
 def bench_lean_attention(
     causal,
     batch,
-    h,
+    hq,
+    hk,
     n_ctx_q,
     n_ctx,
     d,
@@ -143,13 +158,13 @@ def bench_lean_attention(
     sm_scale = 0.5
 
     # Allocate Tensors
-    q = torch.empty((n_ctx_q * batch, h, d), dtype=init_dtype, device="cuda").normal_(
+    q = torch.empty((n_ctx_q * batch, hq, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
-    k = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
+    k = torch.empty((sum_n_ctx, hk, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
-    v = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
+    v = torch.empty((sum_n_ctx, hk, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
 
