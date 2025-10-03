@@ -26,8 +26,13 @@ def model_benchmark_configs(args):
     M = args.M if args.M else 4096  # check size
     # M, K, N, E, top_k
     for model_name, config in configs.items():
-        if not all(key in config for key in ["moe_intermediate_size", "hidden_size", "num_expert", "top_k"]):
-            print(f"Missing MoE keys ('moe_intermediate_size', 'hidden_size', 'num_expert', 'top_k') in model configuration for {model_name}: skipping this model.")
+        if not all(
+            key in config
+            for key in ["moe_intermediate_size", "hidden_size", "num_expert", "top_k"]
+        ):
+            print(
+                f"Missing MoE keys ('moe_intermediate_size', 'hidden_size', 'num_expert', 'top_k') in model configuration for {model_name}: skipping this model."
+            )
         else:
             N1 = config["moe_intermediate_size"]
             K1 = config["hidden_size"]
@@ -59,10 +64,12 @@ def fused_moe(
     block_shape=None,
     has_zp=True,
     silu_fused=False,
-    e2e_fused=False
+    e2e_fused=False,
 ):
     moe_fn = triton_moe_silu if silu_fused else triton_moe
-    block_shape_k = 128 if (block_shape == None or not block_shape[1]) else block_shape[1]
+    block_shape_k = (
+        128 if (block_shape == None or not block_shape[1]) else block_shape[1]
+    )
 
     if e2e_fused:
         (
@@ -89,7 +96,7 @@ def fused_moe(
             dtype=dtype,
             fp8_w8a8=fp8_w8a8,
             blockshape=block_shape,
-            int8_w8a16=int8_w8a16
+            int8_w8a16=int8_w8a16,
         )
 
         fn = lambda: triton_e2e_moe(
@@ -210,7 +217,9 @@ def fused_moe(
             config=config,
         )
 
-    return fn, len(torch.unique(expert_ids))  # second value for memory bandwidth calculation
+    return fn, len(
+        torch.unique(expert_ids)
+    )  # second value for memory bandwidth calculation
 
 
 def run_benchmark(args):
@@ -258,7 +267,12 @@ def run_benchmark(args):
         line_names = ["Time_(ms)"]
         line_vals = ["time"]
     else:
-        line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)", "Arithmetic_Intensity_(Flops/Byte)"]
+        line_names = [
+            "Time_(ms)",
+            "TFLOPS",
+            "Bandwidth_(GB/s)",
+            "Arithmetic_Intensity_(Flops/Byte)",
+        ]
         line_vals = ["time", "tflops", "bandwidth", "ai"]
 
     benchmark = triton.testing.Benchmark(
@@ -306,7 +320,7 @@ def run_benchmark(args):
             block_shape=block_shape,
             has_zp=has_zp,
             silu_fused=silu_fused,
-            e2e_fused=e2e_fused
+            e2e_fused=e2e_fused,
         )
         # num_expert_loaded: len(torch.unique(expert_ids))
         # max_expert_loaded = min(E, top_k * M)
@@ -370,11 +384,20 @@ def parse_args():
     parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-M", type=int, default=0, help="num tokens")
     parser.add_argument("-N", type=int, default=0, help="intermediate dimension")
-    parser.add_argument("-K", type=int, default=0, help="hidden dimension (input/output dimension of moe)")
-    parser.add_argument("-TopK", type=int, default=0, help="topk experts chosen per token")
+    parser.add_argument(
+        "-K",
+        type=int,
+        default=0,
+        help="hidden dimension (input/output dimension of moe)",
+    )
+    parser.add_argument(
+        "-TopK", type=int, default=0, help="topk experts chosen per token"
+    )
     parser.add_argument("-E", type=int, default=0, help="number of experts")
 
-    parser.add_argument('-block_shape', nargs=2, type=int, default=None, help='block shape n and k')
+    parser.add_argument(
+        "-block_shape", nargs=2, type=int, default=None, help="block shape n and k"
+    )
 
     parser.add_argument("-routed_weight", action="store_true", default=False)
     parser.add_argument("-int8_w8a16", action="store_true", default=False)

@@ -129,8 +129,7 @@ def get_optimal_moe_config_func(
 
 @functools.lru_cache
 def get_e2e_moe_configs(
-    N: Optional[int],
-    dtype: Optional[str]
+    N: Optional[int], dtype: Optional[str]
 ) -> Optional[Dict[int, Any]]:
     # First look up if an optimized configuration is available in the configs
     # directory for the specific N and dtype
@@ -165,7 +164,6 @@ def get_e2e_moe_configs(
     )
 
     return None
-
 
 
 def get_optimal_moe_e2e_config(
@@ -211,6 +209,4 @@ def get_optimal_moe_e2e_config_func(
     dtype: torch.dtype,
     use_fp8_w8a8: Optional[bool] = False,
 ):
-    return functools.partial(
-        get_optimal_moe_e2e_config, N, dtype, use_fp8_w8a8
-    )
+    return functools.partial(get_optimal_moe_e2e_config, N, dtype, use_fp8_w8a8)

@@ -10,9 +10,7 @@ from aiter.ops.triton.moe_op import (
     fused_moe as triton_moe,
     moe_set_use_persistent_kernel as triton_moe_set_use_persistent_kernel,
 )
-from aiter.ops.triton.moe_op_e2e import (
-    e2e_moe as triton_e2e_moe
-)
+from aiter.ops.triton.moe_op_e2e import e2e_moe as triton_e2e_moe
 from aiter.ops.triton.moe_op_silu_fused import (
     fused_moe_silu as triton_moe_silu,
     moe_set_use_persistent_kernel as triton_moe_silu_set_use_persistent_kernel,
@@ -257,7 +255,7 @@ def torch_e2e_moe(
     dtype,
     fp8_w8a8,
     int8_w8a16,
-    blockshape=None
+    blockshape=None,
 ):
     if blockshape is not None:
         blockshape_n, blockshape_k = blockshape
@@ -267,17 +265,25 @@ def torch_e2e_moe(
 
     M, top_k, _ = c.shape
     E, N, K = w1.shape
-    
+
     if fp8_w8a8 and blockshape is not None:
         # dequantize
         a_scale = a_scale.reshape(M, K // blockshape_k, 1)
-        a = a.to(torch.float32) * a_scale.broadcast_to(M, K // blockshape_k, blockshape_k).reshape(M, K)
+        a = a.to(torch.float32) * a_scale.broadcast_to(
+            M, K // blockshape_k, blockshape_k
+        ).reshape(M, K)
 
         w1_scale = w1_scale.reshape(E, N // blockshape_n, 1, K // blockshape_k, 1)
-        w1 = w1.to(torch.float32) * w1_scale.broadcast_to(E, N // blockshape_n, blockshape_n, K // blockshape_k, blockshape_k).reshape(E, N, K)
+        w1 = w1.to(torch.float32) * w1_scale.broadcast_to(
+            E, N // blockshape_n, blockshape_n, K // blockshape_k, blockshape_k
+        ).reshape(E, N, K)
 
-        w2_scale = w2_scale.reshape(E, K // blockshape_k, 1, (N // 2) // blockshape_n, 1)
-        w2 = w2.to(torch.float32) * w2_scale.broadcast_to(E, K // blockshape_k, blockshape_k, (N // 2) // blockshape_n, blockshape_n).reshape(E, K, (N // 2))
+        w2_scale = w2_scale.reshape(
+            E, K // blockshape_k, 1, (N // 2) // blockshape_n, 1
+        )
+        w2 = w2.to(torch.float32) * w2_scale.broadcast_to(
+            E, K // blockshape_k, blockshape_k, (N // 2) // blockshape_n, blockshape_n
+        ).reshape(E, K, (N // 2))
 
         a = a.to(torch.bfloat16)
         w1 = w1.to(torch.bfloat16)
@@ -298,7 +304,7 @@ def torch_e2e_moe(
         "mek,menk->men", a_expanded.to(dtype), w1_indexed.to(dtype)
     )
 
-    if fp8_w8a8:        
+    if fp8_w8a8:
         if blockshape is not None:
             intermediate = intermediate.to(torch.float32)
         else:
@@ -351,8 +357,7 @@ def torch_e2e_moe(
 
 
 def quantize_fp8(
-    tensor: torch.Tensor, dim=(),
-    blockshape=None
+    tensor: torch.Tensor, dim=(), blockshape=None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     use_block_scale = blockshape != None and len(blockshape) == 2
     use_dim_quantization = dim != None and len(dim) == 2
@@ -374,9 +379,13 @@ def quantize_fp8(
         e, n, k = tensor.shape
         # Reshape to merge the second and third dimensions (n direction)
         # and the fourth and fifth dimensions (k direction)
-        tensor = tensor.reshape(e, n // blockshape_n, blockshape_n, k // blockshape_k, blockshape_k)
+        tensor = tensor.reshape(
+            e, n // blockshape_n, blockshape_n, k // blockshape_k, blockshape_k
+        )
         tensor = tensor.permute(0, 2, 4, 1, 3)
-        tensor = tensor.reshape(e, blockshape_n * blockshape_k, n // blockshape_n, k // blockshape_k)
+        tensor = tensor.reshape(
+            e, blockshape_n * blockshape_k, n // blockshape_n, k // blockshape_k
+        )
         max_vals = torch.max(tensor, 1, keepdim=True).values
     else:
         quantize_dim = [i for i in range(tensor.dim()) if i not in dim]
@@ -393,7 +402,9 @@ def quantize_fp8(
     tensor_quantized = tensor.to(fp8_type)
 
     if use_block_scale:
-        tensor_quantized = tensor_quantized.reshape(e, blockshape_n, blockshape_k, n // blockshape_n, k // blockshape_k)
+        tensor_quantized = tensor_quantized.reshape(
+            e, blockshape_n, blockshape_k, n // blockshape_n, k // blockshape_k
+        )
         tensor_quantized = tensor_quantized.permute(0, 3, 1, 4, 2)
         tensor_quantized = tensor_quantized.reshape(e, n, k)
         scale = scale.reshape(e, n // blockshape_n, k // blockshape_k)
@@ -404,8 +415,7 @@ def quantize_fp8(
 
 
 def quantize_fp8_a(
-    a: torch.Tensor,
-    blockshape_k=1
+    a: torch.Tensor, blockshape_k=1
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M, K = a.shape
     dev = arch_info.get_device()
@@ -678,9 +688,7 @@ def input_helper_e2e(
     softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
-    moe_config_func = get_optimal_moe_e2e_config_func(
-        N, dtype, use_fp8_w8a8=fp8_w8a8
-    )
+    moe_config_func = get_optimal_moe_e2e_config_func(N, dtype, use_fp8_w8a8=fp8_w8a8)
 
     config = moe_config_func(M)
 
@@ -1112,12 +1120,12 @@ def test_fused_moe_gelu(
 @pytest.mark.parametrize(
     "M, N, K, top_k, E",
     [
-        (3, 512, 2048, 10, 512), # qwen3next
-        #(333, 512, 2048, 10, 512),
-        #(3333, 512, 2048, 10, 512),
-        (3, 768, 2048, 8, 128), # qwen3
-        #(333, 768, 2048, 8, 128), 
-        #(3333, 768, 2048, 8, 128),
+        (3, 512, 2048, 10, 512),  # qwen3next
+        # (333, 512, 2048, 10, 512),
+        # (3333, 512, 2048, 10, 512),
+        (3, 768, 2048, 8, 128),  # qwen3
+        # (333, 768, 2048, 8, 128),
+        # (3333, 768, 2048, 8, 128),
     ],
 )
 @pytest.mark.parametrize("routed_weight", [False])
@@ -1164,7 +1172,7 @@ def test_moe_e2e(
         dtype=dtype,
         fp8_w8a8=fp8_w8a8,
         int8_w8a16=int8_w8a16,
-        blockshape=blockshape
+        blockshape=blockshape,
     )
 
     if DEBUG_MODE:
@@ -1178,9 +1186,9 @@ def test_moe_e2e(
         print(f"expert_ids.shape={expert_ids.shape}")
         print(f"expert_ids={expert_ids}")
         print(f"num_tokens_post_padded={num_tokens_post_padded}")
-    
+
     print(f"num_tokens_post_padded={num_tokens_post_padded}")
-    
+
     # onekernel solution
     triton_out = triton_e2e_moe(
         a,
@@ -1218,7 +1226,7 @@ def test_moe_e2e(
         dtype,
         fp8_w8a8,
         int8_w8a16,
-        blockshape=blockshape
+        blockshape=blockshape,
     )
 
     if DEBUG_MODE:
