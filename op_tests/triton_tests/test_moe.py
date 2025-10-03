@@ -11,8 +11,7 @@ from aiter.ops.triton.moe_op import (
     moe_set_use_persistent_kernel as triton_moe_set_use_persistent_kernel,
 )
 from aiter.ops.triton.moe_op_e2e import (
-    e2e_moe as triton_e2e_moe,
-    moe_set_use_persistent_kernel as triton_e2e_moe_set_use_persistent_kernel,
+    e2e_moe as triton_e2e_moe
 )
 from aiter.ops.triton.moe_op_silu_fused import (
     fused_moe_silu as triton_moe_silu,
@@ -650,7 +649,6 @@ def input_helper_e2e(
     dtype,
     fp8_w8a8: bool,
     int8_w8a16: bool,
-    persistent: bool,
     blockshape=None,
 ):
     assert not (fp8_w8a8 and int8_w8a16)
@@ -665,12 +663,9 @@ def input_helper_e2e(
     if fp8_w8a8:
         w1, _, w1_scale = quantize_fp8(w1, dim=(0,), blockshape=blockshape)
         w2, _, w2_scale = quantize_fp8(w2, dim=(0,), blockshape=blockshape)
-        # w1_scale = w1_scale.to(torch.uint8)
-        # w2_scale = w2_scale.to(torch.uint8)
         if blockshape is not None:
             blockshape_k = blockshape[1]
             a, _, a_scale = quantize_fp8_a(a, blockshape_k)
-            # a_scale = a_scale.to(torch.uint8)
 
     if int8_w8a16:
         w1, _, w1_scale = quantize_int8(w1, dim=(0,))
@@ -684,7 +679,7 @@ def input_helper_e2e(
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
     moe_config_func = get_optimal_moe_e2e_config_func(
-        N, dtype, use_fp8_w8a8=fp8_w8a8, persistent=persistent
+        N, dtype, use_fp8_w8a8=fp8_w8a8
     )
 
     config = moe_config_func(M)
@@ -1127,8 +1122,6 @@ def test_fused_moe_gelu(
 @pytest.mark.parametrize("fp8_w8a8, int8_w8a16", [(True, False)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("blockshape_n, blockshape_k", [(128, 128)])
-# @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("persistent", [False])
 def test_moe_e2e(
     M: int,
     N: int,
@@ -1140,22 +1133,10 @@ def test_moe_e2e(
     int8_w8a16: bool,
     blockshape_n: int,
     blockshape_k: int,
-    persistent: bool,
     dtype,
 ):
     torch.manual_seed(20)
     torch.set_printoptions(threshold=100000)
-    if persistent:
-        triton_e2e_moe_set_use_persistent_kernel(True)
-    else:
-        triton_e2e_moe_set_use_persistent_kernel(False)
-
-    intermediate = None
-    if persistent:
-        intermediate = torch.zeros(
-            (M * top_k, N // 2), dtype=torch.float32, device="cuda"
-        )
-
     blockshape = (blockshape_n, blockshape_k)
     (
         a,
@@ -1181,7 +1162,6 @@ def test_moe_e2e(
         dtype=dtype,
         fp8_w8a8=fp8_w8a8,
         int8_w8a16=int8_w8a16,
-        persistent=persistent,
         blockshape=blockshape
     )
 

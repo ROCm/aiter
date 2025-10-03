@@ -11,26 +11,14 @@ from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton._triton_kernels.moe_op_e2e import (
-    e2e_moe_kernel,
-    e2e_moe_persistent_kernel,
+    e2e_moe_kernel
 )
 
 _LOGGER = AiterTritonLogger()
 
-# Source:
-# MoE Kernel adapted from VLLM
-
 _PADDING_SIZE = 0
 
 _MOE_A_QUANT_FUNC = dynamic_per_tensor_quant_fp8_i8
-
-_USE_MOE_PERSISTENT_KERNEL = False
-
-
-def moe_set_use_persistent_kernel(value: bool):
-    global _USE_MOE_PERSISTENT_KERNEL
-    _USE_MOE_PERSISTENT_KERNEL = value
-
 
 def moe_set_padding_size(size: int):
     """
@@ -53,7 +41,6 @@ def e2e_moe(
     A: torch.Tensor,
     W1: torch.Tensor,
     W2: torch.Tensor,
-    Intermediate: torch.Tensor,
     Out: torch.Tensor,
     A_scale: Optional[torch.Tensor],
     W1_scale: Optional[torch.Tensor],
@@ -119,137 +106,80 @@ def e2e_moe(
     K = A.shape[1] - _PADDING_SIZE
     EVEN_K = K % config["BLOCK_SIZE_K1"] == 0
 
-    if EM > 1024:
-        atomic_num_stages = 2
-    else:
-        atomic_num_stages = 1
-
     stride_om = Out.stride(1)
-    if _USE_MOE_PERSISTENT_KERNEL:
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count * 2
-        # TODO add N_split support to get more parallelism
-        grid = lambda META: (  # noqa: E731
-            min(NUM_SMS, triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])),
-        )
-        stride_im = Intermediate.stride(0)
-        EVEN_N = (N // 2) % config["BLOCK_SIZE_N2"] == 0
 
-        e2e_moe_persistent_kernel[grid](
-            A,
-            W1,
-            W2,
-            Intermediate,
-            Out,
-            A_scale,
-            W1_scale,
-            W2_scale,
-            A.stride(0),
-            A.stride(1),
-            W1.stride(0),
-            W1.stride(1),
-            W1.stride(2),
-            W2.stride(0),
-            W2.stride(2),
-            W2.stride(1),
-            stride_om,
-            W1_scale.stride(0) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
-            W1_scale.stride(1) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
-            W2_scale.stride(0) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
-            W1_scale.stride(1) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
-            stride_im,
-            top_k,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            topk_ids.numel(),
-            EM,
-            N,
-            K,
-            EVEN_K,
-            EVEN_N,
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            NUM_SMS=NUM_SMS,
-            NUM_XCDS=get_num_xcds(),
-            **config,
-        )
-
-        return Out
-    else:
-        grid = lambda META: (  # noqa: E731
-            triton.cdiv(EM, META["BLOCK_SIZE_M"])
-            * triton.cdiv(W1.shape[1], META["BLOCK_SIZE_N"]),
-        )
-        dtype = W1.dtype # input dtype
-        out_dtype = Out.dtype
-        # if the intermediate token dimension is small enough, we can try to fit the whole thing in shared memory
-        SKINNY = config["BLOCK_SIZE_N"] >= N
-        
-        if block_shape is not None:
-            if len(block_shape) == 2:
-                group_n = block_shape[0]
-                group_k = block_shape[1]
-            elif len(block_shape) == 1:
-                group_n = block_shape[0]
-                group_k = group_n
-            else:
-                raise ValueError("block_shape must be of length 1 or 2")
+    grid = lambda META: (  # noqa: E731
+        triton.cdiv(EM, META["BLOCK_SIZE_M"])
+        * triton.cdiv(W1.shape[1], META["BLOCK_SIZE_N"]),
+    )
+    dtype = W1.dtype # input dtype
+    out_dtype = Out.dtype
+    # if the intermediate token dimension is small enough, we can try to fit the whole thing in shared memory
+    SKINNY = config["BLOCK_SIZE_N"] >= N
+    
+    if block_shape is not None:
+        if len(block_shape) == 2:
+            group_n = block_shape[0]
+            group_k = block_shape[1]
+        elif len(block_shape) == 1:
+            group_n = block_shape[0]
+            group_k = group_n
         else:
-            group_n = 0
-            group_k = 0
+            raise ValueError("block_shape must be of length 1 or 2")
+    else:
+        group_n = 0
+        group_k = 0
 
-        assert config["BLOCK_SIZE_N"] % 2 == 0, "BLOCK_SIZE_N must be even"
-        BLOCK_SIZE_HALF = config["BLOCK_SIZE_N"] // 2
-        if use_fp8_w8a8 and block_shape is not None:
-            assert (BLOCK_SIZE_HALF <= group_n) or (BLOCK_SIZE_HALF % group_n == 0), "BLOCK_SIZE_N//2 must be multiple of group_n or <= group_n"
-            assert config["BLOCK_SIZE_K1"] <= group_k, "BLOCK_SIZE_K1 must strictly be <= group_k"
-            assert (config["BLOCK_SIZE_K2"] <= group_k) or (config["BLOCK_SIZE_K2"] % group_k == 0), "BLOCK_SIZE_K2 must be multiple of group_k or <= group_k"
+    assert config["BLOCK_SIZE_N"] % 2 == 0, "BLOCK_SIZE_N must be even"
+    BLOCK_SIZE_HALF = config["BLOCK_SIZE_N"] // 2
+    if use_fp8_w8a8 and block_shape is not None:
+        assert (BLOCK_SIZE_HALF <= group_n) or (BLOCK_SIZE_HALF % group_n == 0), "BLOCK_SIZE_N//2 must be multiple of group_n or <= group_n"
+        assert config["BLOCK_SIZE_K1"] <= group_k, "BLOCK_SIZE_K1 must strictly be <= group_k"
+        assert (config["BLOCK_SIZE_K2"] <= group_k) or (config["BLOCK_SIZE_K2"] % group_k == 0), "BLOCK_SIZE_K2 must be multiple of group_k or <= group_k"
 
-        e2e_moe_kernel[grid](
-            A,
-            W1,
-            W2,
-            Out,
-            A_scale,
-            W1_scale,
-            W2_scale,
-            A.stride(0),
-            A.stride(1),
-            W1.stride(0),
-            W1.stride(1),
-            W1.stride(2),
-            W2.stride(0),
-            W2.stride(2),
-            W2.stride(1),
-            stride_om,
-            A_scale.stride(0) if A_scale is not None else 0,
-            A_scale.stride(1) if A_scale is not None else 0,
-            W1_scale.stride(0) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
-            W1_scale.stride(1) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
-            W1_scale.stride(2) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
-            W2_scale.stride(0) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
-            W1_scale.stride(1) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
-            W2_scale.stride(2) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
-            top_k,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            topk_ids.numel(),
-            group_n, group_k,
-            EM,
-            N,
-            K,
-            EVEN_K,
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
-            use_fp8_w8a8=use_fp8_w8a8,
-            NUM_XCDS=get_num_xcds(),
-            SKINNY=SKINNY,
-            dtype=torch_to_triton_dtype[dtype], # input dtype, mma dtype
-            out_dtype=torch_to_triton_dtype[out_dtype],
-            **config,
-        )
+    e2e_moe_kernel[grid](
+        A,
+        W1,
+        W2,
+        Out,
+        A_scale,
+        W1_scale,
+        W2_scale,
+        A.stride(0),
+        A.stride(1),
+        W1.stride(0),
+        W1.stride(1),
+        W1.stride(2),
+        W2.stride(0),
+        W2.stride(2),
+        W2.stride(1),
+        stride_om,
+        A_scale.stride(0) if A_scale is not None else 0,
+        A_scale.stride(1) if A_scale is not None else 0,
+        W1_scale.stride(0) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
+        W1_scale.stride(1) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
+        W1_scale.stride(2) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
+        W2_scale.stride(0) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
+        W1_scale.stride(1) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
+        W2_scale.stride(2) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
+        top_k,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_ids.numel(),
+        group_n, group_k,
+        EM,
+        N,
+        K,
+        EVEN_K,
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        use_fp8_w8a8=use_fp8_w8a8,
+        NUM_XCDS=get_num_xcds(),
+        SKINNY=SKINNY,
+        dtype=torch_to_triton_dtype[dtype], # input dtype, mma dtype
+        out_dtype=torch_to_triton_dtype[out_dtype],
+        **config,
+    )
 
     return Out.to(out_dtype)

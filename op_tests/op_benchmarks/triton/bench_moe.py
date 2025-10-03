@@ -89,16 +89,13 @@ def fused_moe(
             dtype=dtype,
             fp8_w8a8=fp8_w8a8,
             blockshape=block_shape,
-            int8_w8a16=int8_w8a16,
-            persistent=False,
+            int8_w8a16=int8_w8a16
         )
 
-        # intermediate is none for persistent mode
         fn = lambda: triton_e2e_moe(
             a,
             w1,
             w2,
-            None,
             triton_out,
             a_scale,
             w1_scale,

@@ -130,8 +130,7 @@ def get_optimal_moe_config_func(
 @functools.lru_cache
 def get_e2e_moe_configs(
     N: Optional[int],
-    dtype: Optional[str],
-    persistent: Optional[bool] = False,
+    dtype: Optional[str]
 ) -> Optional[Dict[int, Any]]:
     # First look up if an optimized configuration is available in the configs
     # directory for the specific N and dtype
@@ -174,11 +173,10 @@ def get_optimal_moe_e2e_config(
     dtype: torch.dtype,
     # blockscale fp8
     use_fp8_w8a8: Optional[bool] = False,
-    persistent: Optional[bool] = False,
     M: int = 1,
 ):
     dtype_str = get_config_dtype_str(dtype, use_fp8_w8a8=use_fp8_w8a8)
-    configs = get_e2e_moe_configs(N, dtype_str, persistent=persistent)
+    configs = get_e2e_moe_configs(N, dtype_str)
     if configs is not None:
         if configs:
             if M < M_THRESHOLD_SMALL:
@@ -191,16 +189,18 @@ def get_optimal_moe_e2e_config(
         if dtype == torch.float32:
             config = {
                 "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N1": 64,
+                "BLOCK_SIZE_N": 32,
                 "BLOCK_SIZE_K1": 32,
                 "BLOCK_SIZE_K2": 32,
+                "GROUP_SIZE_M": 1,
             }
         else:
             config = {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N1": 128,
-                "BLOCK_SIZE_K1": 64,
-                "BLOCK_SIZE_K2": 64,
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K1": 128,
+                "BLOCK_SIZE_K2": 128,
+                "GROUP_SIZE_M": 1,
             }
 
     return config
@@ -210,8 +210,7 @@ def get_optimal_moe_e2e_config_func(
     N: int,
     dtype: torch.dtype,
     use_fp8_w8a8: Optional[bool] = False,
-    persistent: Optional[bool] = False,
 ):
     return functools.partial(
-        get_optimal_moe_e2e_config, N, dtype, use_fp8_w8a8, persistent
+        get_optimal_moe_e2e_config, N, dtype, use_fp8_w8a8
     )
