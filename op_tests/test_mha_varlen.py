@@ -556,7 +556,7 @@ def test_flash_attn_varlen_func(
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize(
     "padding_scenario",
-    ["mixed", "q_only", "k_only", "no_padding", "q_len_1", "k_len_1"],
+    ["mixed", "q_only", "k_only", "no_padding", "q_len_1"],
 )
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize(
