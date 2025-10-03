@@ -22,9 +22,10 @@ from typing import Optional
 from bisect import bisect_right
 import triton
 import triton.language as tl
-from aiter.ops.triton._triton_kernels.lean_atten import la_persistent
+from aiter.ops.triton._triton_kernels.lean_atten import la_persistent, _get_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils._triton import arch_info
 
 _LOGGER = AiterTritonLogger()
 
@@ -232,10 +233,10 @@ def _persistent_lean_attention(
         Op.dim() == 3
         and Op.shape[0] >= total_programs
         and Op.shape[1] >= N_CTX_Q
-        and Op.shape[2] >= HEAD_DIM_PADDED
+        and Op.shape[2] >= HEAD_DIM_K
     ):
         raise ValueError(
-            f"Op must have shape[0] >= total_programs, rows >= N_CTX_Q, cols >= HEAD_DIM_PADDED; got {tuple(Op.shape)} while required first dim >= {total_programs}, rows >= {N_CTX_Q}, cols >= {HEAD_DIM_PADDED}"
+            f"Op must have shape[0] >= total_programs, rows >= N_CTX_Q, cols >= HEAD_DIM_K; got {tuple(Op.shape)} while required first dim >= {total_programs}, rows >= {N_CTX_Q}, cols >= {HEAD_DIM_K}"
         )
     if not (locks.numel() >= total_programs):
         raise ValueError(
@@ -290,7 +291,7 @@ def _persistent_lean_attention(
         Op.stride(2),  # head_dim
         HEADS_PER_XCD=HEADS_PER_XCD,
         HEAD_DIM_ORIG=HEAD_DIM_K,
-        HEAD_DIM=HEAD_DIM_PADDED,
+        HEAD_DIM=HEAD_DIM_K,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         MASKED_BLOCKS=MASKED_BLOCKS,
@@ -357,8 +358,7 @@ def get_num_splits_and_buffer_sizes(
     num_m_blocks = (max_seqlen_q + BLOCK_M - 1) // BLOCK_M
     num_n_blocks = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
 
-    # TODO: Support Grouped-Query Attention
-    max_seqlen_q = max_seqlen_q * num_heads // num_heads_k
+    # Schedule over Q heads; K/V heads are mapped inside the kernel via gqa_group_size
 
     # print(f"block_m: {BLOCK_M}, block_n: {BLOCK_N} ")
     # print(f"num_m_block: {num_m_blocks}, num_n_block: {num_n_blocks} ")
@@ -379,11 +379,11 @@ def get_num_splits_and_buffer_sizes(
         # Decode or Not Causal
         tiles_per_head = num_m_blocks * num_n_blocks
 
-    # Schedule CTAs over Q heads; map to K/V heads inside the kernel via gqa_group_size
+    # Total tiles across all Q heads
     if XCD_REMAP:
         total_tiles = tiles_per_head * (num_heads // NUM_XCDS)
     else:
-        total_tiles = tiles_per_head * num_heads  # Total tiles across all Q heads
+        total_tiles = tiles_per_head * num_heads
 
     # StreamK Lean has as many threadblocks as SMs
     # This should be a function of tile size and number of scratchpad space
