@@ -92,7 +92,7 @@ def fused_moe(
         )
 
         # intermediate is none for persistent mode
-        return lambda: triton_e2e_moe(
+        fn = lambda: triton_e2e_moe(
             a,
             w1,
             w2,
@@ -114,7 +114,7 @@ def fused_moe(
             config=config,
         )
 
-    if int4_w4a16:
+    elif int4_w4a16:
         (
             a,
             b,
@@ -140,7 +140,7 @@ def fused_moe(
             has_zp=has_zp,
         )
 
-        return lambda: moe_fn(  # noqa: E731
+        fn = lambda: moe_fn(  # noqa: E731
             a,
             b,
             triton_out_silu if silu_fused else triton_out,
@@ -189,7 +189,7 @@ def fused_moe(
             int8_w8a16=int8_w8a16,
         )
 
-        return lambda: moe_fn(
+        fn = lambda: moe_fn(
             a,
             b,
             triton_out_silu if silu_fused else triton_out,
@@ -210,6 +210,8 @@ def fused_moe(
             block_shape=block_shape,
             config=config,
         )
+
+    return fn, len(torch.unique(expert_ids))  # second value for memory bandwidth calculation
 
 
 def run_benchmark(args):
@@ -291,26 +293,7 @@ def run_benchmark(args):
             a_bytes = b_bytes = c_bytes = torch.tensor([], dtype=dtype).element_size()
         # TODO add the int4 case
 
-        max_expert_loaded = min(E, top_k * M)
-        # (M, K) memory load for A (E,  N,  K) for B not (top_k,  N,  K) because we are in total bringing in all expert matrices into the chip from memory. It's just that not all multiply the same A.
-        mem_read = (M * K) * a_bytes + (max_expert_loaded * N * K) * b_bytes
-
-        mem_write = (M * top_k * N) * c_bytes
-        if silu_fused:
-            mem = mem_read + (mem_write // 2)
-            flops += M * top_k * N
-        elif e2e_fused:
-            flops += 2.0 * M * top_k * K * (N // 2)
-            flops += M * top_k * N
-            # The weight is applied on the gemm product which has the shape of (M, top_k, N)
-            if routed_weight:
-                flops += M * top_k * (N // 2)
-            mem_read_expert2 = (max_expert_loaded * (N // 2) * K) * b_bytes
-            mem = mem_read + mem_read_expert2 + (M * top_k * K) * c_bytes
-        else:
-            mem = mem_read + mem_write
-
-        fn = fused_moe(
+        fn, num_expert_loaded = fused_moe(
             M,
             N,
             K,
@@ -326,6 +309,27 @@ def run_benchmark(args):
             silu_fused=silu_fused,
             e2e_fused=e2e_fused
         )
+        # num_expert_loaded: len(torch.unique(expert_ids))
+        max_expert_loaded = min(E, top_k * M)
+        # print("num_expert_loaded:", num_expert_loaded, "max_expert_loaded:", max_expert_loaded)
+        
+        # (M, K) memory load for A (E,  N,  K) for B not (top_k,  N,  K) because we are in total bringing in all expert matrices into the chip from memory. It's just that not all multiply the same A.
+        mem_read = (M * K) * a_bytes + (num_expert_loaded * N * K) * b_bytes
+
+        mem_write = (M * top_k * N) * c_bytes
+        if silu_fused:
+            mem = mem_read + (mem_write // 2)
+            flops += M * top_k * N
+        elif e2e_fused:
+            flops += 2.0 * M * top_k * K * (N // 2)
+            flops += M * top_k * N
+            # The weight is applied on the gemm product which has the shape of (M, top_k, N)
+            if routed_weight:
+                flops += M * top_k * (N // 2)
+            mem_read_expert2 = (num_expert_loaded * (N // 2) * K) * b_bytes
+            mem = mem_read + mem_read_expert2 + (M * top_k * K) * c_bytes
+        else:
+            mem = mem_read + mem_write
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
 
