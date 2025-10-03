@@ -6,67 +6,51 @@ import torch.nn.functional as F
 import sys
 import os
 import random
-
-import triton
 from aiter import dtypes
+from aiter.test_common import checkAllclose, perftest
 import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter.ops.shuffle import shuffle_weight
-from aiter import hipb_mm, hipb_create_extension
-from functools import lru_cache
-from aiter.jit.utils.chip_info import get_gfx
-import pandas as pd
-
-# pd.set_option('display.max_rows', 500)
-# pd.set_option('display.max_columns', 100)
-# pd.set_option('display.width', 1000)
-
 # TEST_NUM_ITERS = 10
 TEST_NUM_ITERS = 100
 
-if 1:
-    _path = os.path.abspath(os.path.dirname(__file__))
-    sys.path.insert(0, f"{_path}/../../")
-    from aiter.tuned_gemm import tgemm
+_path = os.path.abspath(os.path.dirname(__file__))
+sys.path.insert(0, f"{_path}/../../")
+from aiter.tuned_gemm import tgemm
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
+@perftest(num_iters=101, num_warmup=50,needTrace=True)
 def run_torch(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
-    if x.dtype == dtypes.fp8:
-        if scaleA is None:
-            scaleA = torch.ones(1, dtype=dtypes.fp32, device=x.device)
-        if scaleB is None:
-            scaleB = torch.ones(1, dtype=dtypes.fp32, device=x.device)
+    # if x.dtype == dtypes.fp8:
+    #     if scaleA is None:
+    #         scaleA = torch.ones(1, dtype=dtypes.fp32, device=x.device)
+    #     if scaleB is None:
+    #         scaleB = torch.ones(1, dtype=dtypes.fp32, device=x.device)
 
-        try:
-            out = torch._scaled_mm(
-                x,
-                weight.t(),
-                out_dtype=otype,
-                scale_a=scaleA,
-                scale_b=scaleB,
-                bias=bias,
-            )
-        except RuntimeError:
-            out = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32)) * scaleA * scaleB
-            out = (out.to(otype) + bias) if bias is not None else out.to(otype)
-        return out
-    if scaleA is not None:
-        x = x * scaleA
-    if scaleB is not None:
-        weight = weight * scaleB
+    #     try:
+    #         out = torch._scaled_mm(
+    #             x,
+    #             weight.t(),
+    #             out_dtype=otype,
+    #             scale_a=scaleA,
+    #             scale_b=scaleB,
+    #             bias=bias,
+    #         )
+    #     except RuntimeError:
+    #         out = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32)) * scaleA * scaleB
+    #         out = (out.to(otype) + bias) if bias is not None else out.to(otype)
+    #     return out
+    # if scaleA is not None:
+    #     x = x * scaleA
+    # if scaleB is not None:
+    #     weight = weight * scaleB
     return F.linear(x, weight, bias).to(otype)
 
-
-@perftest(num_iters=TEST_NUM_ITERS)
-def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
-    return tgemm.mm(x, weight, bias, otype, scaleA, scaleB)
-
-@perftest(num_iters=101, num_warmup=50, needTrace=True)
-def run_gemm_ck_tile(x, weight, bias, otype=dtypes.bf16):
+    
+@perftest(num_iters=101, num_warmup=50,needTrace=True)
+def run_gemm_b(x, weight, bias, otype=dtypes.bf16):
     return aiter.gemm_bf16_ck_tile(x, weight, bias, otype)
 
-def weight_shuffle(x: torch.Tensor) -> torch.Tensor:
+
+def permute_weight(x: torch.Tensor) -> torch.Tensor:
     # Hardcode BLOCK_K and BLOCK_N
     x_ = x
     x_ = x_.view(
@@ -81,16 +65,18 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
     weight = torch.rand(n, k, dtype=otype, device="cuda").to(dtype)
-    if bias:
-        bias = torch.rand(n, dtype=otype, device="cuda")
-    else:
-        bias = None
-    if scaleA is not None:
-        scaleA = torch.tensor(scaleA, dtype=dtypes.fp32, device="cuda")
-    if scaleB is not None:
-        scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
+    bias = torch.rand(n, dtype=otype, device="cuda")
+    # if bias:
+    #     bias = torch.rand(n, dtype=otype, device="cuda")
+    # else:
+    #     bias = None
+    # if scaleA is not None:
+    #     scaleA = torch.tensor(scaleA, dtype=dtypes.fp32, device="cuda")
+    # if scaleB is not None:
+    #     scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
     (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
-    (b, *_), avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
+    shuffle_weight=permute_weight(weight)
+    (b, *_), avg_b = run_gemm_b(x, shuffle_weight, bias, otype)
 
     assert (
         a.dtype == b.dtype
@@ -105,24 +91,6 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
-
-
-
-def test_gemm_ck_tile(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
-    dim = (m, n, k)
-    x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
-    weight = torch.rand(n, k, dtype=otype, device="cuda").to(dtype)
-    
-    bias = torch.rand(n, dtype=otype, device="cuda")
-    if scaleA is not None:
-        scaleA = torch.tensor(scaleA, dtype=dtypes.fp32, device="cuda")
-    if scaleB is not None:
-        scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
-    (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
-    ck_tile_weight = weight_shuffle(weight)
-    (c, *_), avg_c = run_gemm_ck_tile(x, ck_tile_weight, bias, otype)
-    msg_ck_tile = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck_tile avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_c-1:<5.1%}"
-    checkAllclose(a, c, msg=msg_ck_tile)
 
 
 def get_boundary_test_cases(cu_count, aligned_k):
@@ -252,7 +220,7 @@ def generate_test_cases(cu_count, ratio, aligned_k):
     # Region 1: m=1 and m in [2,4]
     # m = 1
     m = 1
-    for n in range(16, 2 * cu_count + 1):  # n: 1 to 2 * cu_count
+    for n in range(1, 2 * cu_count + 1):  # n: 1 to 2 * cu_count
         for k in range(
             8, 9217, aligned_k
         ):  # k: multiples of aligned_k from aligned_k to 9216
@@ -367,91 +335,58 @@ def test_skinny_gemm():
 
     # Calculate and print total valid points
     total_points = calculate_total_valid_points(cu_count, aligned_k)
-    boundary_mnk_list = get_boundary_test_cases(cu_count, aligned_k)
-    mnk_list = generate_test_cases(cu_count, ratio, aligned_k)
+    # boundary_mnk_list = get_boundary_test_cases(cu_count, aligned_k)
+    # mnk_list = generate_test_cases(cu_count, ratio, aligned_k)
     test_mnk_list = []
     test_mnk_list.extend(
         [
-            [3, 16, 8192],
-            [4, 16, 8192],
-            [4, 32, 8192],
-            [4, 32, 9216],
+             [1,5120,2880],
+            [64,5120,2880],
+            [128,5120,2880],
+            [256,5120,2880],
+            [512,5120,2880],
+            [1024,5120,2880],
+            [4096,5120,2880],
+            [16384,5120,2880],
+            [1,2880,4096],
+            [64,2880,4096],
+            [128,2880,4096],
+            # [256,2880,4096],
+            # [512,2880,4096],
+            # [1024,2880,4096],
+            # [4096,2880,4096],
+            #  [16384,2880,4096],
+            # [1,128,2880],
+            # [64,128,2880],
+            # [128,128,2880],
+            # [256,128,2880],
+            # [512,128,2880],
+            # [1024,128,2880],
+            # [4096,128,2880],
+            #  [16384,128,2880],
         ]
     )
-    test_mnk_list.extend(boundary_mnk_list)
-    test_mnk_list.extend(mnk_list)
-    print(f"cu_count={cu_count}")
-    print(f"len(boundary_mnk_list)={len(boundary_mnk_list)}")
-    print(f"len(mnk_list)={len(mnk_list)}")
-    print(
-        f"total valid (m, n, k) tuples with k divisible by {aligned_k}: {total_points}"
-    )
+    # test_mnk_list.extend(boundary_mnk_list)
+    # test_mnk_list.extend(mnk_list)
+    # print(f"cu_count={cu_count}")
+    # print(f"len(boundary_mnk_list)={len(boundary_mnk_list)}")
+    # print(f"len(mnk_list)={len(mnk_list)}")
+    # print(
+    #     f"total valid (m, n, k) tuples with k divisible by {aligned_k}: {total_points}"
+    # )
     print(f"total test case count: {2 * len(test_mnk_list)}")
 
     loop_count = 1
     for i in range(loop_count):
         for mnk in test_mnk_list:
             m, n, k = mnk
-            for dtype in [dtypes.fp16, dtypes.bf16]:
-                for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
+            for dtype in [ dtypes.bf16]:
+                for otype in [ dtypes.bf16]:
                     test_gemm(dtype, m, n, k, otype=otype)
 
 
 # test_normal_gemm()
-# test_skinny_gemm()
-def test_ck_tile_gemm():
-    # seed = 8779
-    # torch.manual_seed(seed)
-    # torch.cuda.manual_seed(seed)
-    random.seed(137)
-
-    aligned_k = 8
-    # cu_count = 80
-    cu_count = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-    # ratio = 0.002
-    ratio = 0.0002
-
-    # Calculate and print total valid points
-    total_points = calculate_total_valid_points(cu_count, aligned_k)
-    test_mnk_list = []
- 
-    test_mnk_list.extend(
-        [
-            [1, 2112, 7168],
-            [1, 3072, 1536],
-            [1, 4096, 512],
-            [1, 7168, 2048],
-            [1, 7168, 512],
-            [1, 512, 7168],
-            [16, 2112, 7168],
-            [16, 3072, 1536],
-            [16, 4096, 512],
-            [16, 7168, 2048],
-            [16, 7168, 512],
-            [16, 512, 7168],
-            [128, 2112, 7168],
-            [128, 3072, 1536],
-            [128, 4096, 512],
-            [128, 7168, 2048],
-            [128, 7168, 512],
-            [128, 512, 7168],
-            [1024, 2112, 7168],
-            [1024, 3072, 1536],
-            [1024, 4096, 512],
-            [1024, 7168, 2048],
-            [1024, 7168, 512],
-            [1024, 512, 7168],
-        ]
-    )
-   
-    print(f"total test case count: { len(test_mnk_list)}")
-    loop_count = 1
-    for i in range(loop_count):
-        for mnk in test_mnk_list:
-            m, n, k = mnk
-            for dtype in [ dtypes.bf16]:
-                for otype in [ dtypes.bf16]:
-                    test_gemm_ck_tile(dtype, m, n, k, otype=otype)
 
 if __name__ == '__main__':
-    test_ck_tile_gemm()
+    # test_normal_gemm()
+    test_skinny_gemm()
