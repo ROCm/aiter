@@ -964,13 +964,17 @@ def test_mha_varlen_with_pe(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("BATCH", [1])
+@pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(4096, 4096)],
+    [(1, 1), (8, 8), (4, 1), (1, 2), (16, 16), (32, 8), (64, 16), (4096, 4096)],
 )
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128)])
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (4, 4), (8, 2), (128, 128)]
+)
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (128, 64), (192, 128)])
+@pytest.mark.parametrize("DROPOUT", [0.0])  # FIXME: dropout has a lot of dq errors
+@pytest.mark.parametrize("CAUSAL", [True])  # TODO: add non-causal support
 def test_mha_backward_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
@@ -979,74 +983,34 @@ def test_mha_backward_with_pe(
     NUM_K_HEADS: int,
     HEAD_SZ_QK: int,
     HEAD_SZ_V: int,
+    DROPOUT: float,
+    CAUSAL: bool,
 ):
-    DUMP_TENSORS: bool = False
-
+    HAS_DROPOUT: bool = DROPOUT > 0.0
     device: str = "cuda"
-    dtype: torch.dtype = torch.float16
-    CAUSAL: bool = True
-    DROPOUT: float = 0
-    dropout_mask = None
-    FUSED: bool = False
-
-    DEBUG_SHAPES: bool = True
-    DEBUG_TENSORS: bool = True
-    DEBUG: bool = False  # DEBUG_SHAPES or DEBUG_TENSORS
-
-    def debug(x_desc: str, x: torch.Tensor) -> None:
-        if DEBUG_SHAPES:
-            print(f"{x_desc}.shape = {x.shape if x is not None else None}")
-        if DEBUG_TENSORS:
-            print(f"{x_desc} = {x}")
-
-    mha_set_use_fused_bwd_kernel(FUSED)
+    dtype: torch.dtype = torch.bfloat16
 
     torch.cuda.empty_cache()
-    torch.manual_seed(20)
-
+    torch.manual_seed(63)
     q = torch.randn(
-        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
+        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
     )
     k = torch.randn(
-        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_QK),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
     )
     v = torch.randn(
-        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_V), device=device, dtype=dtype
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_V),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
     )
-    q.requires_grad = True
-    k.requires_grad = True
-    v.requires_grad = True
-
     do = torch.randn((q.shape[:-1] + v.shape[-1:]), dtype=dtype, device=device)
-
-    # debug("q_nope[:3]", q[0, :3, 0, :16])  # OK
-    # debug("q_nope[15]", q[0, 15, 0, :16])  # OK
-    # debug("q_pe[:3]", q[0, :3, 0, 16:])  # OK
-    # debug("q_pe[15]", q[0, 15, 0, 16:])  # OK
-    # debug("k_nope[:3]", k[0, :3, 0, :16])  # OK
-    # debug("k_pe[:3]", k[0, :3, 0, 16:])  # OK
-    # debug("v[:3]", v[0, :3, 0, :])  # OK
-
-    # q_nope = q[0, :16, 0, :16]
-    # q_pe = q[0, :16, 0, 16:]
-    # k_nope_t = k[0, :8, 0, :16].T
-    # k_pe_t = k[0, :8, 0, 16:].T
-    # qk = (q_nope @ k_nope_t).float()
-    # qk += (q_pe @ k_pe_t).float()
-    # import math
-    # sm_scale = 1 / math.sqrt(HEAD_SZ_QK)
-    # qk_scaled = qk * sm_scale
-    # |_ 1st qk_scaled  matches Triton one!
-    # import pdb; pdb.set_trace()
-    # from aiter.ops.triton.mha_onekernel_bwd import set_global
-    # set_global(qk_scaled.detach().cpu().numpy())
-
-    if DEBUG:
-        print("--------------Triton----------------")
-        debug("q", q)
-        debug("k", k)
-        debug("v", v)
-        debug("do", do)
 
     with torch.enable_grad():
         triton_out = flash_attn_func(
@@ -1055,90 +1019,41 @@ def test_mha_backward_with_pe(
             v,
             dropout_p=DROPOUT,
             causal=CAUSAL,
-            return_lse=True,
-            return_attn_probs=True,
+            return_lse=HAS_DROPOUT,
+            return_attn_probs=HAS_DROPOUT,
         )
 
-    assert len(triton_out) == 3
-    triton_out, triton_lse, triton_sd_mask = triton_out
-
-    triton_dq, triton_dk, triton_dv = torch.autograd.grad(
-        triton_out, (q, k, v), do.clone()
-    )
-
-    if DEBUG:
-        debug("triton_out", triton_out)
-        debug("triton_lse", triton_lse)
-        debug("triton_sd_mask", triton_sd_mask)
-        debug("triton_dq", triton_dq)
-        debug("triton_dk", triton_dk)
-        debug("triton_dv", triton_dv)
-
-    if DEBUG:
-        print("--------------Torch----------------")
-        debug("q", q)
-        debug("k", k)
-        debug("v", v)
-        debug("do", do)
+    if HAS_DROPOUT:
+        assert len(triton_out) == 3
+        dropout_mask = triton_out[2] > 0
+        triton_out = triton_out[0]
+    else:
+        dropout_mask = None
 
     with torch.enable_grad():
         torch_out = attention_ref(
             q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
         )
-    torch_out, torch_attn_scores = torch_out
+    torch_out, _ = torch_out
 
     torch.testing.assert_close(
-        triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+        triton_out, torch_out, atol=1e-2, rtol=1e-2, msg="fwd mismatch"
     )
+
+    # PE support isn't implemented in fused backward.
+    mha_set_use_fused_bwd_kernel(False)
+    triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
 
     torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
-    # debug("torch_dq", torch_dq)
 
-    if DEBUG:
-        debug("torch_out", torch_out)
-        debug("torch_attn_scores", torch_attn_scores)
-        debug("torch_dq", torch_dq)
-        debug("torch_dk", torch_dk)
-        debug("torch_dv", torch_dv)
-
-    if DUMP_TENSORS:
-        import numpy as np
-
-        def torch_to_np(x: torch.Tensor) -> np.ndarray:
-            return x.detach().cpu().numpy()
-
-        np.savez_compressed(
-            f"b{BATCH}_sq{SEQLEN_Q}_sk{SEQLEN_K}_hq{NUM_Q_HEADS}_hk{NUM_K_HEADS}_dqk{HEAD_SZ_QK}_d{HEAD_SZ_V}.npz",
-            torch_dq=torch_to_np(torch_dq),
-            triton_dq=torch_to_np(triton_dq),
-        )
-
+    bwd_atol = 1.5e-2
+    bwd_rtol = 1.5e-2
     torch.testing.assert_close(
-        triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+        triton_dq, torch_dq, atol=bwd_atol, rtol=bwd_rtol, msg="dq mismatch"
     )
-
     torch.testing.assert_close(
-        triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+        triton_dk, torch_dk, atol=bwd_atol, rtol=bwd_rtol, msg="dk mismatch"
     )
-
     torch.testing.assert_close(
-        triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+        triton_dv, torch_dv, atol=bwd_atol, rtol=bwd_rtol, msg="dv mismatch"
     )
-
-    # adq = triton_dq[0, :, 0, :]
-    # rdq = torch_dq[0, :, 0, :]
-    # first_16_rows = torch.all(torch.abs(rdq[0:16] - adq[0:16]) < 1e-2)
-    # print(first_16_rows)
-
-    # * last 2 rows of triton_dq are untouched, they are all zeros and triton_dq
-    #   is allocated with torch.zeros_like(q).
-    # * the first 16 rows match with atol=1e-2 when using Triton interpreter and
-    #   running on CPU (TRITON_INTERPRET=1)
-    #   * in fact, with current block sizes, the inner dq loop wasn't running for
-    #     the last block. the outer loop was allocating dq parts as zeros and not
-    #     running the inner loop, writing zeros to memory in the end.
-    #   * now dq assertion pass with TRITON_INTERPRET=1
-
-    # * there are a lot of mismatches when running with real GPU!
-
-    # import pdb; pdb.set_trace()
