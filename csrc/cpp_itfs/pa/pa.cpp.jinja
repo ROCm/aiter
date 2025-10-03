@@ -42,14 +42,15 @@ FUNCTION_DEFINE
 
     float* exp_sums_ptr   = reinterpret_cast<float*>(exp_sums_ptr_);
     float* max_logits_ptr = reinterpret_cast<float*>(max_logits_ptr_);
-    {{dtype}}* tmp_out_ptr =
-        reinterpret_cast<{{dtype}}*>(tmp_out_ptr_);
+    {{out_dtype}}* tmp_out_ptr =
+        reinterpret_cast<{{out_dtype}}*>(tmp_out_ptr_);
 
     constexpr int NTHR = 256;
     dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
     dim3 block(NTHR);
 
-    paged_attention_ll4mi_QKV_mfma16_kernel<{{dtype}},                       
+    paged_attention_ll4mi_QKV_mfma16_kernel<{{dtype}},
+                                            {{out_dtype}},                       
                                             {{kv_dtype}},
                                             {% if fp8_kv_dtype == 'auto' %}
                                             vllm::Fp8KVCacheDataType::kAuto,
@@ -85,7 +86,7 @@ FUNCTION_DEFINE
 
     dim3 reduce_grid(num_heads, num_seqs, {{mtp}});
     dim3 reduce_block(head_size);
-    paged_attention_ll4mi_reduce_kernel<{{dtype}}, {{out_dtype}}, head_size, head_size, PARTITION_SIZE, {{npar_loops}}> 
+    paged_attention_ll4mi_reduce_kernel<{{out_dtype}}, {{out_dtype}}, head_size, head_size, PARTITION_SIZE, {{npar_loops}}> 
     <<<reduce_grid, reduce_block, 0, reinterpret_cast<hipStream_t>(stream)>>>(reinterpret_cast<{{out_dtype}}*>(out_ptr),                                        
                                                                               exp_sums_ptr,        
                                                                               max_logits_ptr,                                 

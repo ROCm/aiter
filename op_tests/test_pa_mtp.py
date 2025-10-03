@@ -10,8 +10,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes
-from aiter import paged_attn as ops
+from aiter import dtypes, paged_attn, pertoken_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 torch.set_default_device("cuda")
@@ -197,8 +196,6 @@ def pertoken_quant_kvcache_symm(
         .contiguous()
     )
 
-    from aiter import pertoken_quant
-
     k_quant, k_scale_asm = pertoken_quant(k_cache_permute, quant_dtype=quant_dtype)
     v_quant, v_scale_asm = pertoken_quant(v_cache_permute, quant_dtype=quant_dtype)
 
@@ -271,7 +268,7 @@ def run_aiter_hip(
     k_scale=None,
     v_scale=None,
 ):
-    return aiter.paged_attn.PagedAttention.forward_decode(
+    return paged_attn.PagedAttention.forward_decode(
         query,
         k_cache,
         v_cache,
@@ -302,6 +299,7 @@ def run_aiter_hip(
     scale,
     k_scale=None,
     v_scale=None,
+    q_scale=None,
 ):
     return aiter.paged_attn.PagedAttention.forward_decode(
         query,
@@ -316,6 +314,7 @@ def run_aiter_hip(
         None,
         k_scale,
         v_scale,
+        q_scale=q_scale,
         mtp=max_qlen,
     )
 
