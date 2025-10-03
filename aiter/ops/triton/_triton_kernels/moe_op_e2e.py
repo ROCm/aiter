@@ -242,9 +242,9 @@ def e2e_moe_kernel(
         
         if use_fp8_w8a8:
             start_k = k1 * BLOCK_SIZE_K1 // group_k
-
-            w1_i0_scale = tl.load(w1_i0_scale_ptrs + start_k * stride_w1sk)
-            w1_i1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk)
+            mask_w1sn = i0s < (N // 2 // group_n)
+            w1_i0_scale = tl.load(w1_i0_scale_ptrs + start_k * stride_w1sk, mask=mask_w1sn, other=0.0)
+            w1_i1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk, mask=mask_w1sn, other=0.0)
 
             # if num_scales_along_n > 1: # singleton dimension get automatic broadcast
             w1_i0_scale = group_broadcast(w1_i0_scale, 1, num_scales_along_n, group_n, 1)

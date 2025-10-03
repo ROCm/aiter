@@ -25,20 +25,22 @@ def model_benchmark_configs(args):
     moe_configs = []
     M = args.M if args.M else 4096  # check size
     # M, K, N, E, top_k
-
     for model_name, config in configs.items():
-        N1 = config["intermediate_size"]
-        K1 = config["hidden_size"]
-        if no_bench_stage2:
-            N2 = config["hidden_size"]
-            K2 = config["intermediate_size"] // 2
+        if not all(key in config for key in ["moe_intermediate_size", "hidden_size", "num_expert", "top_k"]):
+            print(f"Missing MoE keys ('moe_intermediate_size', 'hidden_size', 'num_expert', 'top_k') in model configuration for {model_name}: skipping this model.")
+        else:
+            N1 = config["moe_intermediate_size"]
+            K1 = config["hidden_size"]
+            if no_bench_stage2:
+                N2 = config["hidden_size"]
+                K2 = config["moe_intermediate_size"] // 2
 
-        E = config["num_expert"]
-        top_k = config["top_k"]
+            E = config["num_expert"]
+            top_k = config["top_k"]
 
-        moe_configs.append((model_name, M, N1, K1, E, top_k))
-        if no_bench_stage2:
-            moe_configs.append((model_name, M, N2, K2, E, top_k))
+            moe_configs.append((model_name, M, N1, K1, E, top_k))
+            if no_bench_stage2:
+                moe_configs.append((model_name, M, N2, K2, E, top_k))
 
     return moe_configs
 
@@ -310,10 +312,8 @@ def run_benchmark(args):
             e2e_fused=e2e_fused
         )
         # num_expert_loaded: len(torch.unique(expert_ids))
-        max_expert_loaded = min(E, top_k * M)
+        # max_expert_loaded = min(E, top_k * M)
         # print("num_expert_loaded:", num_expert_loaded, "max_expert_loaded:", max_expert_loaded)
-        
-        # (M, K) memory load for A (E,  N,  K) for B not (top_k,  N,  K) because we are in total bringing in all expert matrices into the chip from memory. It's just that not all multiply the same A.
         mem_read = (M * K) * a_bytes + (num_expert_loaded * N * K) * b_bytes
 
         mem_write = (M * top_k * N) * c_bytes
@@ -321,7 +321,9 @@ def run_benchmark(args):
             mem = mem_read + (mem_write // 2)
             flops += M * top_k * N
         elif e2e_fused:
+            # second gemm
             flops += 2.0 * M * top_k * K * (N // 2)
+            # silu
             flops += M * top_k * N
             # The weight is applied on the gemm product which has the shape of (M, top_k, N)
             if routed_weight:
