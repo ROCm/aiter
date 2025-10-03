@@ -500,7 +500,7 @@ def get_2stage_cfgs(
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
-    if dtype in [dtypes.bf16, dtypes.fp16] and q_type == QuantType.per_1x32:
+    if dtype in [dtypes.bf16, dtypes.fp16] and q_type == QuantType.per_1x32 and activation == ActivationType.Swiglu:
         return MOEMetadata(
         functools.partial(
             cktile_moe_stage1,
@@ -514,7 +514,7 @@ def get_2stage_cfgs(
             k_pad_zeros=intermediate_pad // 128 * 128,
             bias2=bias2,
         ),
-        block_m,
+        16 if token < 2048 else 32,
         ksplit,
         False,
     )
@@ -627,9 +627,11 @@ def fused_moe_2stages(
         bias1,
         bias2,
     )
+    print(f'[DEBUG] {quant_type=}, {dtype=}, {w1.dtype=}')
     if quant_type == QuantType.per_1x32 \
-            and dtype in [dtypes.bf16, dtypes.fp16]:
-        assert activation == ActivationType.Swiglu, "only swiglu support for fp4+bf16/fp16"
+            and dtype in [dtypes.bf16, dtypes.fp16] \
+            and w1.dtype == torch.uint8 \
+            and activation == ActivationType.Swiglu:
         a1 = hidden_states.to(dtype)
         a1_scale = None
     elif quant_type == QuantType.per_1x32:
@@ -687,7 +689,8 @@ def fused_moe_2stages(
     )
 
     if quant_type == QuantType.per_1x32 \
-            and dtype in [dtypes.bf16, dtypes.fp16]:
+            and dtype in [dtypes.bf16, dtypes.fp16] \
+            and w1.dtype == torch.uint8:
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
