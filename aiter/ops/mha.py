@@ -3,7 +3,7 @@
 
 from torch import Tensor, Generator
 from typing import Optional, Tuple, Any
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
+from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
@@ -1376,10 +1376,8 @@ def _flash_attn_backward(
     is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
 ) -> torch.Tensor:
+    # rtna & rtz are deprecated in gfx950
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
-        logger.warning(
-            "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
-        )
         how_v3_bf16_cvt = 0
 
     # can_impl_fmha_v3_bwd should before maybe_contiguous to get pure dout, q, k, v, out
@@ -1408,6 +1406,17 @@ def _flash_attn_backward(
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
     mask = causal and window_size_left == -1  # causal mask
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
+    swa = (window_size_left > 0) or (window_size_right > 0)
+
+    # only 1 block when sk <= 256, thus deterministic
+    is_950_1block = (
+        get_gfx() == "gfx950"
+        and seqlen_k <= 256
+        and hdim_q > 64
+        and hdim_q <= 128
+        and hdim_q % 8 == 0
+        and not swa
+    )
 
     def can_impl_fmha_v3_bwd_gfx950():
         ret = get_gfx() == "gfx950"
@@ -1415,7 +1424,7 @@ def _flash_attn_backward(
         ret &= bias is None
         ret &= dbias is None
         ret &= dropout_p == 0.0
-        ret &= not deterministic
+        ret &= not deterministic or is_950_1block
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
@@ -1446,8 +1455,8 @@ def _flash_attn_backward(
             causal,
             window_size_left,
             window_size_right,
-            deterministic,
-            is_v3_atomic_fp32,
+            False if is_950_1block else deterministic,
+            False if is_950_1block else is_v3_atomic_fp32,
             how_v3_bf16_cvt,
             dq,
             dk,
