@@ -14,6 +14,7 @@ from aiter.ops.triton._triton_kernels.mha_fused_bwd import (
     _bwd_kernel_dkdvdq_noncausal,
     _get_config,
 )
+from aiter.ops.triton.utils.device_info import get_num_xcds
 
 
 _LOGGER = AiterTritonLogger()
