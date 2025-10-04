@@ -47,13 +47,17 @@ def fp8_mqa_logits_kernel(
         + d_inds[None, None, :] * stride_q_d
     )
 
-    q_block = tl.load(q_ptrs, mask=q_mask[:, None, None], other=0.0)
+    q_block = tl.load(
+        q_ptrs, mask=q_mask[:, None, None], other=0.0, cache_modifier=".cg"
+    )
     q_block = tl.reshape(q_block, (BLOCK_Q * NUM_HEADS, HEAD_SIZE))
 
     w_ptrs = (
         weights_ptr + row_offsets[:, None] * stride_w_s + h_inds[None, :] * stride_w_h
     )
-    w_block = tl.load(w_ptrs, mask=q_mask[:, None], other=0.0).to(tl.float32)
+    w_block = tl.load(w_ptrs, mask=q_mask[:, None], other=0.0, cache_modifier=".cg").to(
+        tl.float32
+    )
 
     # Load start/end for each row in this block
     start_inds = tl.load(cu_start_ptr + row_offsets, mask=q_mask, other=seq_len_kv)
