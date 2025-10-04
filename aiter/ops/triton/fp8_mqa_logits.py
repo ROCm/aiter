@@ -129,7 +129,6 @@ def fp8_mqa_logits(
     weights,
     cu_starts,
     cu_ends,
-    logits,
 ):
     """
     Q:           [seq_len, NUM_HEADS, HEAD_SIZE], dtype float8
@@ -138,6 +137,8 @@ def fp8_mqa_logits(
     weights:     [seq_len, NUM_HEADS], dtype float32
     cu_starts:   [seq_len], dtype int32
     cu_ends:     [seq_len], dtype int32
+
+    Returns:
     logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
     """
     # TODO (cagri): double check what value to put for causally masked logits, 0 or -inf?
@@ -146,6 +147,10 @@ def fp8_mqa_logits(
     BLOCK_KV = 64
     seq_len, num_heads, head_size = Q.shape
     seq_len_kv = KV.shape[0]
+    # Initialize with -inf because of causal masking
+    logits = torch.full((seq_len, seq_len_kv), 
+                        fill_value=-float('inf'), 
+                        dtype=torch.float32, device=Q.device)
 
     stride_q_s, stride_q_h, stride_q_d = Q.stride()
     stride_kv_s, stride_kv_d = KV.stride()
@@ -177,3 +182,5 @@ def fp8_mqa_logits(
         num_warps=4,
         num_stages=2,
     )
+
+    return logits

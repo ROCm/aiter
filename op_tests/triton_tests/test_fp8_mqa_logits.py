@@ -118,8 +118,7 @@ def test_fp8_mqa_logits(
         q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
     )
 
-    logits = torch.zeros_like(ref_logits) - float("inf")
-    fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, logits)
+    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke)
 
     ref_neginf_mask = ref_logits == float("-inf")
     neginf_mask = logits == float("-inf")
