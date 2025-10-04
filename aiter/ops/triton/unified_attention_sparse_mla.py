@@ -171,6 +171,10 @@ def kernel_unified_attention_sparse_mla_2d(
         # map positions to block id and in-block offset
         physical_block_idx = topk_pos // BLOCK_SIZE
         slot = topk_pos % BLOCK_SIZE
+        # Compute S = scale * (q_rope k_rope + q_lora k_lora)
+        # q_rope: (BLOCK_M, ROPE_RANK) k_rope: (ROPE_RANK, TILE_SIZE)
+        # q_lora: (BLOCK_M, KV_LORA_RANK) k_lora: (KV_LORA_RANK, TILE_SIZE)
+        S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
         # load k in two parts
         # K_rope: (ROPE_RANK, TILE_SIZE)
         k_rope_ptrs = (
@@ -186,7 +190,7 @@ def kernel_unified_attention_sparse_mla_2d(
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
-
+        S += scale * tl.dot(Q_rope, K_rope)
         # K_lora: (KV_LORA_RANK, TILE_SIZE)
         k_lora_ptrs = (
             key_cache_ptr
@@ -202,11 +206,7 @@ def kernel_unified_attention_sparse_mla_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        # Compute S = scale * (q_rope k_rope + q_lora k_lora)
-        # q_rope: (BLOCK_M, ROPE_RANK) k_rope: (ROPE_RANK, TILE_SIZE)
-        # q_lora: (BLOCK_M, KV_LORA_RANK) k_lora: (KV_LORA_RANK, TILE_SIZE)
-        S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
-        S += scale * (tl.dot(Q_rope, K_rope) + tl.dot(Q_lora, K_lora))
+        S += scale * tl.dot(Q_lora, K_lora)
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & valid_t[None, :],
