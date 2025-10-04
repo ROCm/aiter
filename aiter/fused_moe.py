@@ -29,6 +29,7 @@ from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 BLOCK_SIZE_M = 32
 
+
 def moe_sorting(
     topk_ids,
     topk_weights,

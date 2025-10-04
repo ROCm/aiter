@@ -70,10 +70,11 @@ def get_CKBatchedGEMM_config(
         ck_batched_gemm_dict = pd.read_csv(
             AITER_CONFIG_A8W8_BATCHED_GEMM_FILE
         ).drop_duplicates()
-        cu_num = get_cu_num()
+
         get_CKBatchedGEMM_config.ck_batched_gemm_dict = ck_batched_gemm_dict.set_index(
             ["cu_num", "B", "M", "N", "K"]
         ).to_dict("index")
+    cu_num = get_cu_num()
     config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get(
         (cu_num, B, M, N, K), None
     )
