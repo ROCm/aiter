@@ -208,6 +208,7 @@ def test_flash_attn_output(
     deterministic,
     mha_type,
     dtype,
+    fwd_only,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -258,21 +259,36 @@ def test_flash_attn_output(
         dtype=dtype,
         requires_grad=True,
     )
-
-    out, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd) = run_ck(
-        q,
-        k,
-        v,
-        attn_bias,
-        alibi_slopes,
-        dout,
-        dropout_p,
-        causal,
-        window_size,
-        deterministic,
-        return_lse,
-        return_attn_probs,
-    )
+    if fwd_only:
+        out, dropout_mask, us_fwd = run_ck(
+            q,
+            k,
+            v,
+            attn_bias,
+            alibi_slopes,
+            None,
+            dropout_p,
+            causal,
+            window_size,
+            deterministic,
+            return_lse,
+            return_attn_probs,
+        )
+    else:
+        out, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd) = run_ck(
+            q,
+            k,
+            v,
+            attn_bias,
+            alibi_slopes,
+            dout,
+            dropout_p,
+            causal,
+            window_size,
+            deterministic,
+            return_lse,
+            return_attn_probs,
+        )
 
     out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
         q,
@@ -307,20 +323,21 @@ def test_flash_attn_output(
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
     assert (out - out_ref).abs().max().item() <= out_tol
 
-    print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-    print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-    print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-    print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-    print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-    print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+    if not fwd_only:
+        print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+        print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+        print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+        print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+        print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+        print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
 
-    dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
-    dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
-    dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
+        dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
+        dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
+        dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
 
-    assert (dq - dq_ref).abs().max().item() <= dq_tol
-    assert (dk - dk_ref).abs().max().item() <= dk_tol
-    assert (dv - dv_ref).abs().max().item() <= dv_tol
+        assert (dq - dq_ref).abs().max().item() <= dq_tol
+        assert (dk - dk_ref).abs().max().item() <= dk_tol
+        assert (dv - dv_ref).abs().max().item() <= dv_tol
 
     if attn_bias is not None:
         print(f"dBias max diff: {(dbias - dbias_ref).abs().max().item()}")
@@ -345,9 +362,10 @@ def test_flash_attn_output(
     ret["fwd_us"] = us_fwd
     ret["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
     ret["fwd_gb_per_sec"] = (fwd_num_bytes) / 1.0e3 / us_fwd
-    ret["bwd_us"] = us_bwd
-    ret["bwd_tflops"] = (bwd_flop) / 1.0e6 / us_bwd
-    ret["bwd_gb_per_sec"] = (bwd_num_bytes) / 1.0e3 / us_bwd
+    if not fwd_only:
+        ret["bwd_us"] = us_bwd
+        ret["bwd_tflops"] = (bwd_flop) / 1.0e6 / us_bwd
+        ret["bwd_gb_per_sec"] = (bwd_num_bytes) / 1.0e3 / us_bwd
     return ret
 
 
@@ -597,6 +615,7 @@ def test_flash_attn_seq_padding(
 
 l_dtype = ["bf16", "fp16"]
 l_dim = [32, 40, 64, 111, 128, 160]
+l_v_dim = [None]
 l_mha_type = ["mha", "mqa", "gqa"]
 l_causal = [False, True]
 l_local = [False, True]
@@ -713,6 +732,11 @@ parser.add_argument(
     help="""Data type.
     e.g.: -d bf16""",
 )
+parser.add_argument(
+    "--fwd_only",
+    action="store_true",
+    help="Only run forward pass.",
+)
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -726,6 +750,10 @@ if __name__ == "__main__":
         l_dim = [args.d_qk]
     else:
         args.d_qk = 128
+    if args.d_v is not None:
+        l_v_dim = [args.d_v]
+    else:
+        args.d_v = 128
     if args.mha_type is not None:
         l_mha_type = [args.mha_type]
     else:
@@ -745,21 +773,22 @@ if __name__ == "__main__":
     collected = []
     for (
         dtype,
-        dim,
+        dim_qk,
+        dim_v,
         mha_type,
         causal,
         local,
         deterministic,
     ) in itertools.product(
-        l_dtype, l_dim, l_mha_type, l_causal, l_local, l_deterministic
+        l_dtype, l_dim, l_v_dim, l_mha_type, l_causal, l_local, l_deterministic
     ):
         ret = test_flash_attn_output(
             args.batch_size,
             args.nheads,
             args.seqlen_q,
             args.seqlen_k,
-            dim,
-            dim,
+            dim_qk,
+            dim_v if dim_v is not None else dim_qk,
             args.dropout_p,
             causal,
             local,
@@ -767,6 +796,7 @@ if __name__ == "__main__":
             deterministic,
             mha_type,
             dtype,
+            args.fwd_only,
         )
         collected.append(ret)
 
