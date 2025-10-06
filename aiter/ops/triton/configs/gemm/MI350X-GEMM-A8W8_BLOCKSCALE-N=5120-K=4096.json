@@ -1,5 +1,5 @@
 {
-  "any": {
+  "small": {
     "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 32,
     "BLOCK_SIZE_K": 128,
@@ -9,6 +9,30 @@
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 16,
     "cache_modifier": ".ca",
-    "NUM_KSPLIT": 1
+    "NUM_KSPLIT": 1   
+  },
+  "medium_M2000" : {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 256,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 1,
+    "NUM_KSPLIT": 1,
+    "num_warps": 4,
+    "num_stages": 1,
+    "waves_per_eu": 2,
+    "matrix_instr_nonkdim": 32,
+    "cache_modifier": ".ca"
+  },
+  "medium_M6017" : {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 256,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 1,
+    "NUM_KSPLIT": 1,
+    "num_warps": 4,
+    "num_stages": 1,
+    "waves_per_eu": 2,
+    "matrix_instr_nonkdim": 32,
+    "cache_modifier": ".ca"
   }
 }
