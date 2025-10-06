@@ -110,29 +110,26 @@ def e2e_moe_kernel(
     token and expert matrices.
 
     Key Parameters:
-    - a: The input tensor representing tokens with shape (*, K), where '*' can
-        be any shape representing batches and K is the feature dimension of
-        each token.
-    - w1: The stacked MOE weight tensor with shape (E, N, K), where E is
-        the number of experts, K is the input feature dimension, and N is
-        the output feature dimension.
-    - w2: The stacked MOE weight tensor with shape (E, K, N // 2), where E is
-        the number of experts, K is the input feature dimension, and N is
-        the output feature dimension.
-    - c: The output cache tensor with shape (M, topk, K), where M is the
-        total number of tokens post padding, topk is the number of times
-        each token is repeated, and N is the output feature dimension.
-    - sorted_token_ids: a tensor containing the sorted indices of tokens,
-        repeated topk times and arranged by the expert index they are
-        assigned to.
+    - A: The input tensor representing tokens with shape (M, K).
+    - W1: The first layer weight tensor with shape (E, N, K).
+    - W2: The second layer weight tensor with shape (E, K, N // 2). 
+        N // 2 represents the size of the intermediate token after the gated activation.
+    - Out: The output tensor with shape (M, topk, K).
+    - sorted_token_ids: a tensor with shape (max_num_tokens_padded). Contains ids for the top k repeated tokens + delimiter tokens + padding tokens. 
+        Delimiter tokens are for aligning to BLOCK_SIZE_M loading, and padding tokens to pad to static size 
+        max_num_tokens_padded=topk * M + E * (BLOCK_SIZE_M – 1). Static size needed for cuda graph.
+        It assumes the worst case where each expert will occupy multiple full rows
+        and exactly one row that only has one non-padding value. 
     - expert_ids: a tensor containing the indices of the expert for each
         block. It determines which expert matrix from B should be used for
-        each block in a.
-    This kernel performs the multiplication of a token by its corresponding
-    expert matrix as determined by `expert_ids`. The sorting of
-    `sorted_token_ids` by expert index and padding ensures divisibility by
-    BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
-    multiplication across different blocks processed by the same expert.
+        each block in a. length is ceiling division of max_num_tokens_padded and BLOCK_SIZE_M.
+
+    Sizes:
+    - M: number of tokens
+    - E: number of experts
+    - K: hidden size
+    - N: moe intermediate size
+    - topk: number of experts the token is routed to
     """
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
@@ -347,7 +344,7 @@ def e2e_moe_kernel(
             w2_scale = group_broadcast(
                 w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0
             )
-            # broadcasted shape along n depends on if num_scales_along_n > 1 or not. Singleton dimension does not need broadcasting.
+            # broadcasted shape along n depends on if num_scales_along_n > 1 or not as singleton dimension not get broadcasted.
             if num_scales_along_n > 1:
                 w2_scale = group_broadcast(
                     w2_scale,

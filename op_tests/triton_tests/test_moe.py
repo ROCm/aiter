@@ -1229,9 +1229,9 @@ def test_moe_e2e(
         blockshape=blockshape,
     )
 
-    if DEBUG_MODE:
-        print(f"triton_out={triton_out}")
-        print(f"torch_out={torch_out}")
+    # if DEBUG_MODE:
+    print(f"triton_out={triton_out.flatten()[:50]}")
+    print(f"torch_out={torch_out.flatten()[:50]}")
 
     # Validate correctness
     torch.testing.assert_close(triton_out, torch_out, atol=2e-1, rtol=2e-1)
@@ -1241,6 +1241,10 @@ def test_moe_e2e(
 #     print("Debug mode is on")
 if __name__ == "__main__":
     # passes
-    test_moe_e2e(3, 512, 2048, 10, 512, False, True, False, 128, 128, torch.bfloat16)
+    print("Testing shape:  test_moe_e2e(3, 512, 2048, 10, 512, False, True, False, 128, 128, torch.bfloat16)")
+    test_moe_e2e(3, 512, 4096, 10, 512, False, True, False, 128, 128, torch.bfloat16)
+    print("Passes")
     # does not pass
+    print("Testing shape:  test_moe_e2e(33, 512, 2048, 10, 512, False, True, False, 128, 128, torch.bfloat16)")
     test_moe_e2e(33, 512, 2048, 10, 512, False, True, False, 128, 128, torch.bfloat16)
+    print("Passes")
