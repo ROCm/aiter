@@ -23,13 +23,6 @@ tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYT
 tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
 
 
-_MY_GLOBAL= None
-
-def set_global(x):
-    global _MY_GLOBAL
-    _MY_GLOBAL = x
-
-
 # This function computes delta given output Out and gradient DO
 # Here is the I/O shape:
 # Out: (batch, nhead_q, max_seqlens_q, headDim)
@@ -165,7 +158,6 @@ def _bwd_dkdv_inner(
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
-    # print(f"dkdv_inner => BLOCK_M={BLOCK_M}, BLOCK_N={BLOCK_N}")
     # if HEAD_DIM is padded
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
     HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
@@ -393,23 +385,19 @@ def _bwd_dq_inner(
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
-    # print(f"dq_inner => BLOCK_M2={BLOCK_M2}, BLOCK_N2={BLOCK_N2}")
-    # import pdb; pdb.set_trace()
     # if HEAD_DIM is padded
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
     HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
     PADDED_PE_HEAD: tl.constexpr = ACTUAL_PE_HEAD_DIM != PE_HEAD_DIM
-    delta_qk = seqlen_q - seqlen_k  # 0
-    offs_m = start_m + tl.arange(0, BLOCK_M2)  # 1D array [0, 15]
-    offs_n = start_n + tl.arange(0, BLOCK_N2)  # 1D array [0, 7]
-    offs_k = tl.arange(0, HEAD_DIM)  # 1D array [0, 15]
+    delta_qk = seqlen_q - seqlen_k
+    offs_m = start_m + tl.arange(0, BLOCK_M2)
+    offs_n = start_n + tl.arange(0, BLOCK_N2)
+    offs_k = tl.arange(0, HEAD_DIM)
     if HAS_PE:
         offs_k_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
-        # |_ 1D array [16, 31]
 
     # mask to make sure not OOB of seqlen_q
     mask_m = offs_m < seqlen_q
-    # |_ all True, 16 Trues
 
     kT_ptrs = K + offs_n[None, :] * stride_kn + offs_k[:, None] * stride_kk
     if HAS_PE:
@@ -419,38 +407,31 @@ def _bwd_dq_inner(
     Di = tl.load(Delta + offs_m * stride_deltam, mask=mask_m, other=0.0)
     # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
-    curr_n = start_n  # 0
-    step_n = BLOCK_N2  # 8
+    curr_n = start_n
+    step_n = BLOCK_N2
     curr_philox_offset = batch_philox_offset
     curr_dropout_offset = dropout_offset
     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
-    # print(f"dq_inner => num_steps={num_steps}")
-    for blk_idx in range(num_steps):  # range(2), i.e. [0, 1]
+    for blk_idx in range(num_steps):
         if DEBUG_TRITON:
             print(f"iter {blk_idx}: curr_n = {curr_n}")  # noqa: E701
         offs_n = curr_n + tl.arange(0, BLOCK_N2)
-        # |_ iter 0: [0, 7], iter 1: [0, 15]
         # end_n is needed because the end of causal True might not be perfectly
         # aligned with the end of the block
         mask_n = offs_n < end_n
-        # |_ iter 0 and 1: 8 Trues
         if DEBUG_TRITON_DETAIL:
             print(
                 f"start_n = {start_n}, end_n = {end_n}, offs_n: {offs_n.shape}\n{offs_n}"
             )  # noqa: E701
         if DEBUG_TRITON_DETAIL:
             print(f"mask_n: {mask_n.shape}\n{mask_n}")  # noqa: E701
-        mask_kT = mask_n[None, :]  # iter 0 and 1: 2D, all Trues, shape=(1, 8)
+        mask_kT = mask_n[None, :]
         mask_mn = mask_m[:, None] & (offs_n[None, :] < end_n)
-        # |_ iter 0 and 1: 2D, shape=(16, 8), all Trues
         if PADDED_HEAD:
             mask_kT &= offs_k[:, None] < ACTUAL_HEAD_DIM
 
-        # import pdb; pdb.set_trace()
         kT = tl.load(kT_ptrs, mask=mask_kT, other=0.0)
-        # |_ shape=(16, 8)=(HEAD_SIZE, SEQ_LEN), seems to be OK, loading transposed
         vT = tl.load(vT_ptrs, mask=mask_kT, other=0.0)
-        # |_ shape=(16, 8)=(HEAD_SIZE, SEQ_LEN), seems to be OK, loading transposed
 
         if HAS_PE:
             if PADDED_PE_HEAD:
@@ -458,9 +439,7 @@ def _bwd_dq_inner(
                 # ^^^ TODO: should we use ACTUAL_HEAD_DIM + ACTUAL_PE_HEAD_DIM?
             else:
                 mask_kT_pe = mask_kT
-                # |_ shape=(1, 8), iter 0: all Trues
             kT_pe = tl.load(kT_pe_ptrs, mask=mask_kT_pe, other=0.0)
-            # |_ shape(16, 8)=(HEAD_SIZE_PE, SEQ_LEN), seems to be OK, loading transposed
 
         if ENABLE_DROPOUT:
             # NOTE: dropout is transposed because it is used to mask pT
@@ -488,10 +467,7 @@ def _bwd_dq_inner(
             qk = tl.dot(q, kT)
             if HAS_PE:
                 qk += tl.dot(q_pe, kT_pe)
-        # 1st dot product seems to be OK!
         qk_scaled = qk * sm_scale
-        # |_ sm_scale matches, i.e. 1/sqrt(32)
-        # |_ qk_scaled matches! np.max(np.abs(_MY_GLOBAL - qk_scaled.handle.data)) = 0.0007760525
 
         if USE_ALIBI:
             relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
@@ -500,11 +476,8 @@ def _bwd_dq_inner(
 
         if DEBUG_TRITON_DETAIL:
             print(f"qk scaled: {qk.shape}\n", qk_scaled)  # noqa: E701
-        # import pdb; pdb.set_trace()
-        if USE_EXP2:  # follow exp2 path
-            # m.shape=(16,1), computed by fwd
+        if USE_EXP2:
             p = tl.math.exp2(qk_scaled * RCP_LN2 - m * RCP_LN2)
-            # |_ shape=(16, 8)
         else:
             p = tl.math.exp(qk_scaled - m)
 
@@ -518,13 +491,10 @@ def _bwd_dq_inner(
             dp = tl.dot(do, vT) * descale_do * descale_v
         else:
             dp = tl.dot(do, vT)
-            # |_(16,16) @ (16,8) = (16,8)
         if ENABLE_DROPOUT:
             dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
         delta_i = Di[:, None]
-        # |_ Di.shape=(16), delta_i.shape=(16, 1)
         ds = p * (dp - delta_i)
-        # |_ ds.shape=(16, 8)
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         if IS_FP8:
@@ -542,12 +512,8 @@ def _bwd_dq_inner(
                 )
         else:
             dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
-            # |_ dq is all zeros on iter 0.
-            # print("dq_inner => updated dq")
             if HAS_PE:
                 dq_pe += tl.dot(ds.to(kT_pe.type.element_ty), tl.trans(kT_pe))
-                # |_ dq_pe is all zeros on iter 0.
-                # print("dq_inner => updated dq_pe")
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
@@ -734,17 +700,16 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         stride_ah = stride_ah_in
 
     # program ids
-    # import pdb; pdb.set_trace()
-    hkid = tl.program_id(0)  # 0
-    pid = tl.program_id(1)  # 0
-    bid = tl.program_id(2)  # 0
+    hkid = tl.program_id(0)
+    pid = tl.program_id(1)
+    bid = tl.program_id(2)
     if DEBUG_TRITON:
         print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")  # noqa: E701
     # figure out varlen start and end
     q_start = 0
     k_start = 0
-    seqlen_q = max_seqlen_q  # 18
-    seqlen_k = max_seqlen_k  # 18
+    seqlen_q = max_seqlen_q
+    seqlen_k = max_seqlen_k
     if IS_VARLEN:
         # Compute actual sequence lengths
         q_start = tl.load(cu_seqlens_q + bid)
@@ -754,7 +719,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         seqlen_q = q_end - q_start
         seqlen_k = k_end - k_start
 
-    delta_qk = seqlen_q - seqlen_k  # 0
+    delta_qk = seqlen_q - seqlen_k
     if DEBUG_TRITON:
         print(f"delta_qk = {delta_qk}")  # noqa: E701
 
@@ -762,11 +727,9 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
     PADDED_PE_HEAD: tl.constexpr = ACTUAL_PE_HEAD_DIM != PE_HEAD_DIM
     offs_d = tl.arange(0, HEAD_DIM)
-    # |_ 1D array [0, 15]
     if HAS_PE:
         offs_d_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
-        # |_ 1D array [16, 31]
-    GROUP_SIZE: tl.constexpr = HQ // HK  # 1
+    GROUP_SIZE: tl.constexpr = HQ // HK
 
     # align the delta_qk
     start_n = pid * BLOCK_N1
@@ -1040,15 +1003,14 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             tl.store(DK + adj_dk + offs_dk_pe, dk_pe, mask=mask_kv_pe)
 
     # This part does dq
-    # import pdb; pdb.set_trace()
-    start_m = pid * BLOCK_M2  # 0 * 16 == 0
-    if start_m < seqlen_q:  # 0 < 18 == True
+    start_m = pid * BLOCK_M2
+    if start_m < seqlen_q:
         # seqlen_q > seqlen_k, no need to process these tile for dq
         if DEBUG_TRITON:
             print(
                 f"end_n = start_m + BLOCK_M = {start_m} + {BLOCK_M2} = {start_m + BLOCK_M2}"
             )  # noqa: E701
-        if start_m + BLOCK_M2 < delta_qk:  # 0 + 16 < 0 == False
+        if start_m + BLOCK_M2 < delta_qk:
             if DEBUG_TRITON:
                 print(
                     f"start_m + BLOCK_M2 = {start_m} + {BLOCK_M2} = {start_m + BLOCK_M2} < delta_qk of {delta_qk}"
@@ -1056,10 +1018,8 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             return
 
         offs_m = start_m + tl.arange(0, BLOCK_M2)
-        # |_ 1D array [0, 15]
         # Mask for loading K and V
         mask_q = offs_m[:, None] < seqlen_q
-        # |_ 2D array, shape=(16, 1), 16 Trues
         if PADDED_HEAD:
             mask_d = offs_d < ACTUAL_HEAD_DIM
             mask_q &= mask_d[None, :]
@@ -1070,33 +1030,29 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 mask_q_pe = mask_q & mask_d_pe[None, :]
             else:
                 mask_q_pe = mask_q
-                # |_ 2D array, shape=(16, 1), 16 Trues
         offs_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        # |_ 2D shape=(16, 16), it seems to be correct (first 16 cols of q, inc 32)
         if HAS_PE:
             offs_q_pe = offs_m[:, None] * stride_qm + offs_d_pe[None, :] * stride_qd
-            # |_ 2D shape=(16, 16), it seems to be correct (last 16 cols of q, inc 32)
         offs_do = offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
         # NOTE: don't assume that the strides for k and v are the same!
         K += bid * stride_kb + hkid * stride_kh + k_start * stride_kn
         V += bid * stride_vb + hkid * stride_vh + k_start * stride_vn
-        # |_ K and V aren't incremented, it's 0
 
         # If MQA / GQA, set the K and V head offsets appropriately.
-        for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):  # range(0, 1)
+        for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
             # seqlen_q < seqlen_k: delta_qk more kv tokens are added at the front
             #   for every M-tile
             end_n = start_m + BLOCK_M2 - delta_qk
             # clamp end_n at [0, seqlen_k]
-            end_n = max(min(end_n, seqlen_k), 0)  # 16
+            end_n = max(min(end_n, seqlen_k), 0)
             if DEBUG_TRITON:
                 print(f"delta_qk: {delta_qk}; end_n: {end_n}")  # noqa: E701
             # offset input and output tensor by batch and Q/K heads
-            adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm  # 0
-            adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom  # 0
+            adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
+            adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
             adj_delta = (
                 bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam
-            )  # 0
+            )
             Delta_ptr = Delta + adj_delta
 
             if USE_ALIBI:
@@ -1116,26 +1072,19 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 dropout_offset = (
                     Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
                 )
-            # import pdb; pdb.set_trace()
             q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
-            # |_ 2D shape=(16, 16)
-            # |_ first 3 rows: p q.handle.data[:3]
-            # |_ last 3 rows: p q.handle.data[-3:]
-            # |_ loading OK!
             if HAS_PE:
                 q_pe = tl.load(Q + adj_q + offs_q_pe, mask=mask_q_pe, other=0.0)
-                # |_ 2D shape=(16, 16)
-                # |_ loading OK!
             else:
                 q_pe = None
             do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
             m = tl.load(M + adj_delta + offs_m * stride_deltam, mask=offs_m < seqlen_q)
             m = m[:, None]
 
-            MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR  # 8
+            MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
             # start can only be 0 at minimum
             start_n = max(end_n - BLOCK_M2, 0)
-            num_steps = tl.cdiv(end_n - start_n, MASK_BLOCK_N2)  # 2
+            num_steps = tl.cdiv(end_n - start_n, MASK_BLOCK_N2)
 
             if IS_FP8:
                 descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
@@ -1145,14 +1094,11 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             else:
                 descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
-            dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)  # (16, 16) shape
-            # print("bwd_causal => zero dq")
+            dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
             if HAS_PE:
-                dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)  # (16, 16) shape
-                # print("bwd_causal => zero dq_pe")
+                dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
             else:
                 dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
-            # import pdb; pdb.set_trace()
             dq, dq_pe = _bwd_dq_inner(
                 dq,
                 dq_pe,
@@ -1203,7 +1149,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
-            # import pdb; pdb.set_trace()
             end_n -= num_steps * MASK_BLOCK_N2
             num_steps = tl.cdiv(end_n, BLOCK_N2)
             start_n = max(end_n - num_steps * BLOCK_N2, 0)
@@ -1265,19 +1210,13 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
             dq *= sm_scale
-            # import pdb; pdb.set_trace()
-            # |_ dq[0:16, :] matches torch_dq before store!
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
-            # print("bwd_causal => store dq")
             if HAS_PE:
                 offs_dq_pe = (
                     offs_m[:, None] * stride_dqm + offs_d_pe[None, :] * stride_dqd
                 )
                 dq_pe *= sm_scale
-                # import pdb; pdb.set_trace()
-                # |_ dq_pe[0:16, :] matches torch_dq before store!
                 tl.store(DQ + adj_dq + offs_dq_pe, dq_pe, mask=mask_q_pe)
-                # print("bwd_causal => store dq_pe")
             # end of GQA/MQA of dq
 
 
@@ -1905,14 +1844,11 @@ def flash_attn_onekernel_backward(
     seqlen = max(max_seqlen_q, max_seqlen_k)
 
     config_onekernel = config["onekernel"]
-    # {'BLOCK_M1': 64, 'BLOCK_N1': 64, 'BLOCK_M2': 16, 'BLOCK_N2': 16, 'BLK_SLICE_FACTOR': 2}
-    # import pdb; pdb.set_trace()
     grid = (
-        num_k_heads,  # 1
-        triton.cdiv(seqlen, config_onekernel["BLOCK_N1"]),  # cdiv(18, 64) == 1
-        batch, # 1
+        num_k_heads,
+        triton.cdiv(seqlen, config_onekernel["BLOCK_N1"]),
+        batch,
     )
-    # single workgroup
 
     if causal:
         bwd_kernel_causal[grid](
