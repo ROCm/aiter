@@ -973,8 +973,10 @@ def test_mha_varlen_with_pe(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (4, 4), (8, 2), (128, 128)]
 )
 @pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (128, 64), (192, 128)])
-@pytest.mark.parametrize("DROPOUT", [0.0])  # FIXME: dropout has a lot of dq errors
-@pytest.mark.parametrize("CAUSAL", [True])  # TODO: add non-causal support
+@pytest.mark.parametrize(
+    "DROPOUT", [0.0, 0.13]
+)  # FIXME: dropout has a lot of dq errors
+@pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_backward_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
@@ -987,6 +989,14 @@ def test_mha_backward_with_pe(
     CAUSAL: bool,
 ):
     HAS_DROPOUT: bool = DROPOUT > 0.0
+
+    # Causal + Dropout use case is disabled in `test_mha_backward` and `test_mha_backward_varlen`.
+    # FIXME: We should fix it in the base implementation before adding PE to the mix.
+    if CAUSAL and HAS_DROPOUT:
+        pytest.skip(
+            "Causal + Dropout use case isn't supported in backward with Positional Encoding."
+        )
+
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
 
