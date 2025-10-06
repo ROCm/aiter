@@ -1,17 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import itertools
+
+import pandas as pd
+import pytest
 import torch
+
 import aiter
 from aiter import dtypes
+from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
     attention_ref,
     attn_bias_from_alibi_slopes,
     ck_randval_to_dropout_mask,
     convert_flash_attn_S_to_softmax,
 )
-import pytest
-import argparse
 
 
 def run_torch(
@@ -86,7 +91,8 @@ def run_ck(
     cu_seqlens_q=None,
     cu_seqlens_kv=None,
 ):
-    out, _, S_dmask = aiter.flash_attn_func(
+    (out, _, S_dmask), us_fwd = run_perftest(
+        aiter.flash_attn_func,
         q,
         k,
         v,
@@ -124,13 +130,27 @@ def run_ck(
         dropout_mask = None
 
     if dout is None:
-        return out, dropout_mask
+        return out, dropout_mask, us_fwd
     elif bias is not None:
-        dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
-        return out, dropout_mask, dq, dk, dv, dbias
+        (dq, dk, dv, dbias), us_bwd = run_perftest(
+            torch.autograd.grad,
+            out,
+            (q, k, v, bias),
+            dout,
+            retain_graph=True,
+            num_rotate_args=1,
+        )
+        return out, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd)
     else:
-        dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, dropout_mask, dq, dk, dv, None
+        (dq, dk, dv), us_bwd = run_perftest(
+            torch.autograd.grad,
+            out,
+            (q, k, v),
+            dout,
+            retain_graph=True,
+            num_rotate_args=1,
+        )
+        return out, dropout_mask, dq, dk, dv, None, (us_fwd, us_bwd)
 
 
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
@@ -173,6 +193,7 @@ def run_ck(
         (2048, 2048),
     ],
 )
+@benchmark()
 def test_flash_attn_output(
     batch_size,
     nheads,
@@ -238,7 +259,7 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
-    out, dropout_mask, dq, dk, dv, dbias = run_ck(
+    out, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd) = run_ck(
         q,
         k,
         v,
@@ -306,6 +327,28 @@ def test_flash_attn_output(
         print(f"dBias Pytorch max diff: {(dbias_pt - dbias_ref).abs().max().item()}")
         dbias_tol = max(10 * (dbias_pt - dbias_ref).abs().max().item(), 0.01)
         assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
+
+    fwd_flop = nheads * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+    dtype_bytes = torch.finfo(dtype).bits // 8
+    fwd_num_bytes = (
+        nheads
+        * dtype_bytes
+        * (seqlen_q * d + seqlen_k * d + seqlen_k * d_v + seqlen_q * d_v)
+    )
+    bwd_flop = nheads * (
+        seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2
+    )
+    bwd_num_bytes = (
+        2 * fwd_num_bytes + nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
+    )
+    ret = {}
+    ret["fwd_us"] = us_fwd
+    ret["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
+    ret["fwd_gb_per_sec"] = (fwd_num_bytes) / 1.0e3 / us_fwd
+    ret["bwd_us"] = us_bwd
+    ret["bwd_tflops"] = (bwd_flop) / 1.0e6 / us_bwd
+    ret["bwd_gb_per_sec"] = (bwd_num_bytes) / 1.0e3 / us_bwd
+    return ret
 
 
 @pytest.mark.parametrize(
@@ -450,7 +493,7 @@ def test_flash_attn_seq_padding(
         alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=dtypes.fp32)
 
     # 2. Run CK with cu_seqlens (forward pass only)
-    out, _ = run_ck(
+    out, _, _ = run_ck(
         q,
         k,
         v,
@@ -552,6 +595,13 @@ def test_flash_attn_seq_padding(
     assert diff <= out_tol
 
 
+l_dtype = ["bf16", "fp16"]
+l_dim = [32, 40, 64, 111, 128, 160]
+l_mha_type = ["mha", "mqa", "gqa"]
+l_causal = [False, True]
+l_local = [False, True]
+l_deterministic = [False, True]
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -568,8 +618,8 @@ parser.add_argument(
     "-n",
     "--nheads",
     type=int,
-    default=5,
-    help="""Number of heads. Default is 5.
+    default=6,
+    help="""Number of heads. Default is 6.
     e.g.: -n 8""",
 )
 parser.add_argument(
@@ -592,8 +642,8 @@ parser.add_argument(
     "-qk",
     "--d_qk",
     type=int,
-    default=128,
-    help="""Dimension of query and key. Default is 128.
+    default=None,
+    help="""Dimension of query and key. Default is None.
     e.g.: -qk 256""",
 )
 parser.add_argument(
@@ -615,16 +665,20 @@ parser.add_argument(
 parser.add_argument(
     "-c",
     "--causal",
-    action="store_true",
-    help="""Causal attention. Default is False.
-    -c or --causal    # enable causal attention""",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="""Causal attention. Default is None.
+    -c or --causal    # enable causal attention
+    --no-causal       # disable causal attention""",
 )
 parser.add_argument(
     "-l",
     "--local",
-    action="store_true",
-    help="""Local attention. Default is False.
-    -l or --local    # enable local attention""",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="""Local attention. Default is None.
+        e.g. -l or --local    # enable local attention
+        --no-local        # disable local attention""",
 )
 parser.add_argument(
     "-bt",
@@ -637,15 +691,17 @@ parser.add_argument(
 parser.add_argument(
     "-det",
     "--deterministic",
-    action="store_true",
-    help="""Deterministic attention. Default is False.
-    -det or --deterministic    # enable deterministic attention""",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="""Deterministic attention. Default is None.
+    -det or --deterministic    # enable deterministic attention
+    --no-deterministic         # disable deterministic attention""",
 )
 parser.add_argument(
     "-m",
     "--mha_type",
     type=str,
-    default="mha",
+    default=None,
     help="""Type of multi-head attention.
     e.g.: -m mha""",
 )
@@ -653,29 +709,69 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=str,
-    default="bf16",
+    default=None,
     help="""Data type.
     e.g.: -d bf16""",
 )
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    dtype = dtypes.d_dtypes[args.dtype]
-    test_flash_attn_output(
-        args.batch_size,
-        args.nheads,
-        args.seqlen_q,
-        args.seqlen_k,
-        args.d_qk,
-        args.d_v,
-        args.dropout_p,
-        args.causal,
-        args.local,
-        args.bias_type,
-        args.deterministic,
-        args.mha_type,
+    if args.dtype is not None:
+        l_dtype = [dtypes.d_dtypes[args.dtype]]
+    else:
+        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+        args.dtype = "bf16"
+
+    if args.d_qk is not None:
+        l_dim = [args.d_qk]
+    else:
+        args.d_qk = 128
+    if args.mha_type is not None:
+        l_mha_type = [args.mha_type]
+    else:
+        args.mha_type = "mha"
+    if args.causal is not None:
+        l_causal = [args.causal]
+    else:
+        args.causal = False
+    if args.local is not None:
+        l_local = [args.local]
+    else:
+        args.local = False
+    if args.deterministic is not None:
+        l_deterministic = [args.deterministic]
+    else:
+        args.deterministic = False
+    collected = []
+    for (
         dtype,
-    )
+        dim,
+        mha_type,
+        causal,
+        local,
+        deterministic,
+    ) in itertools.product(
+        l_dtype, l_dim, l_mha_type, l_causal, l_local, l_deterministic
+    ):
+        ret = test_flash_attn_output(
+            args.batch_size,
+            args.nheads,
+            args.seqlen_q,
+            args.seqlen_k,
+            dim,
+            dim,
+            args.dropout_p,
+            causal,
+            local,
+            args.bias_type,
+            deterministic,
+            mha_type,
+            dtype,
+        )
+        collected.append(ret)
+
+    df = pd.DataFrame(collected)
+    aiter.logger.info(f"mha summary:\n{df}")
 
     test_flash_attn_seq_padding(
         "mixed",
