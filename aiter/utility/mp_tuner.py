@@ -95,45 +95,6 @@ def get_pid():
     return mp.current_process().pid
 
 
-def post_process(rets, fast_mode=False, tol_err_ratio=0.05):
-    if fast_mode:
-        return rets
-    best_time = -1
-    from operator import itemgetter
-
-    sorted_rets = tuple(sorted(rets, key=itemgetter(0)))
-    cur_info = sorted_rets[0][0]
-    bestConfigs = []
-    best_config = [cur_info, -1, 1.0]
-    for info, us, max_err_ratio in sorted_rets:
-        # print(f"{info=}, {us=}, {max_err_ratio=}")
-        if max_err_ratio > tol_err_ratio:
-            continue
-        if info[0] == cur_info[0]:
-            if best_time < 0 or us < best_time:
-                best_config = [info, us, max_err_ratio]
-                best_time = us
-        else:
-            if best_config[0][1] == -1:
-                print(f"No kernel can be used for {info}")
-                best_config[1] = "nan"
-                best_config[-1] = max_err_ratio
-            bestConfigs.append(tuple(best_config))
-            best_time = us
-            cur_info = info
-            best_config = [info, us, max_err_ratio]
-    if (
-        best_config[0][1] == -1
-        or best_config[1] == float("inf")
-        or best_config[2] > tol_err_ratio
-    ):
-        print(f"No kernel can be used for {info}")
-        best_config[1] = "nan"
-        best_config[-1] = best_config[2]
-    bestConfigs.append(tuple(best_config))
-    return bestConfigs
-
-
 def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
     group_task = [tasks] if not isinstance(tasks, list) else tasks
     kernels_num, (input_data) = in_data
