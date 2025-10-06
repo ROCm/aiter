@@ -60,6 +60,7 @@ def e2e_moe_kernel(
     W1,
     W2,
     Out,
+    Intermediate,
     A_scale,
     W1_scale,
     W2_scale,
@@ -72,6 +73,8 @@ def e2e_moe_kernel(
     stride_w2n,
     stride_w2k,
     stride_om,
+    stride_ok,
+    stride_im,
     stride_asm,
     stride_ask,
     stride_w1se,
@@ -96,14 +99,15 @@ def e2e_moe_kernel(
     use_fp8_w8a8: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K1: tl.constexpr,  # original block_size_k
-    BLOCK_SIZE_K2: tl.constexpr,  # outputs (EM, BLOCK_SIZE_K2)
+    BLOCK_SIZE_K1: tl.constexpr,
+    BLOCK_SIZE_K2: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     GRID_MN: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     SKINNY: tl.constexpr,
     dtype: tl.constexpr,
     out_dtype: tl.constexpr,
+    return_intermediate: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -167,7 +171,7 @@ def e2e_moe_kernel(
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
 
-    off_experts = tl.load(expert_ids_ptr + pid_m)
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
 
     offs_k1 = tl.arange(0, BLOCK_SIZE_K1)
     offs_k2 = tl.arange(0, BLOCK_SIZE_K2)
@@ -181,8 +185,8 @@ def e2e_moe_kernel(
         num_scales_along_k1: tl.constexpr = (BLOCK_SIZE_K1 + group_k - 1) // group_k
         tl.static_assert(num_scales_along_k1 == 1, "BLOCK_SIZE_K1 must be <= group_k")
 
-    offs_i0 = tl.arange(0, BLOCK_SIZE_HALF)
-    offs_i1 = tl.arange(0, BLOCK_SIZE_HALF) + N // 2
+    offs_i0 = tl.arange(0, BLOCK_SIZE_HALF).to(tl.int64)
+    offs_i1 = (tl.arange(0, BLOCK_SIZE_HALF) + N // 2).to(tl.int64)
     # offset for silu_acc
     i0 = pid_n * BLOCK_SIZE_HALF + offs_i0
     # offset for mul_acc
@@ -282,11 +286,19 @@ def e2e_moe_kernel(
         w1_ptrs_i0 += BLOCK_SIZE_K1 * stride_w1k
         w1_ptrs_i1 += BLOCK_SIZE_K1 * stride_w1k
 
+    # gated activation
     silu_acc = _silu_exp2(silu_acc)
+    acc = (silu_acc * mul_acc)
+    if return_intermediate:
+        offs_in = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_HALF)
+        i_ptrs = Intermediate + stride_im * offs_token[:, None] + offs_in[None, :]
+        i_mask = token_mask[:, None] & (offs_in[None, :] < N // 2)
+        tl.store(i_ptrs, acc.to(out_dtype), mask=i_mask)
+    
     if use_fp8_w8a8:
-        acc = (silu_acc * mul_acc).to(tl.bfloat16)
+        acc = acc.to(tl.bfloat16)
     else:
-        acc = (silu_acc * mul_acc).to(dtype)
+        acc = acc.to(dtype)
 
     offs_w2n = tl.arange(0, BLOCK_SIZE_HALF) + pid_n * (BLOCK_SIZE_HALF)
 
@@ -310,7 +322,7 @@ def e2e_moe_kernel(
         w2_scale_ptrs += (tl.arange(0, num_scales_along_k2)[None, :]) * stride_w2sk
         # w2_scale_ptrs: (num_scales_along_n, num_scales_along_k2)
 
-    out_ptrs = Out + stride_om * offs_token[:, None] + offs_k2[None, :]
+    out_ptrs = Out + stride_om * offs_token[:, None] + offs_k2[None, :] * stride_ok
 
     num_k2 = tl.cdiv(K, BLOCK_SIZE_K2)
     for k2 in tl.range(0, num_k2, num_stages=1):
@@ -372,15 +384,15 @@ def e2e_moe_kernel(
         if EVEN_K:
             c_mask = token_mask[:, None]
         else:
-            c_mask = token_mask[:, None] & ((offs_k2 + k2 * BLOCK_SIZE_K2)[None, :] < K)
+            c_mask = token_mask[:, None] & (offs_k2[None, :] <  (K - k2 * BLOCK_SIZE_K2 * stride_ok) )
 
         if SKINNY:
             # Skinny means that we can fit the whole intermediate representation of a token in register memory (i.e. N <= BLOCK_SIZE_N).
             # Thus we don't need atomics, as there is only workgroup updating the output tile.
-            tl.store(out_ptrs + k2 * BLOCK_SIZE_K2, out, mask=c_mask)
+            tl.store(out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok, out, mask=c_mask, cache_modifier=".wt")
         else:
             tl.atomic_add(
-                out_ptrs + k2 * BLOCK_SIZE_K2,
+                out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok,
                 out,
                 mask=c_mask,
                 sem="relaxed",

@@ -55,6 +55,7 @@ def e2e_moe(
     use_int8_w8a16: bool,
     block_shape: Optional[List[int]] = None,
     config: Optional[Dict[str, Any]] = None,
+    return_intermediate: Optional[bool] = False,
 ) -> None:
     """
     #TODO: Add doc
@@ -100,26 +101,34 @@ def e2e_moe(
         # and we can skip some invalid blocks.
         EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
 
+    M = A.shape[0]
     N = W1.shape[1]
     K = A.shape[1] - _PADDING_SIZE
     EVEN_K = K % config["BLOCK_SIZE_K1"] == 0
 
-    stride_om = Out.stride(1)
+    pid_m = (EM + config["BLOCK_SIZE_M"] - 1) // config["BLOCK_SIZE_M"]
+    pid_n = (N + config["BLOCK_SIZE_N"] - 1) // config["BLOCK_SIZE_N"]
+    grid = (pid_m * pid_n,)
 
-    grid = lambda META: (  # noqa: E731
-        triton.cdiv(EM, META["BLOCK_SIZE_M"])
-        * triton.cdiv(W1.shape[1], META["BLOCK_SIZE_N"]),
-    )
+
     dtype = W1.dtype  # input dtype
     out_dtype = Out.dtype
     # if the intermediate token dimension is small enough, we can try to fit the whole thing in shared memory
-    SKINNY = config["BLOCK_SIZE_N"] >= N
+    SKINNY = pid_n == 1
+
+    if return_intermediate:
+        Intermediate = torch.zeros(
+            (M, top_k, N // 2), dtype=torch.float32, device="cuda"
+        )
+    else:
+        Intermediate = None   
 
     e2e_moe_kernel[grid](
         A,
         W1,
         W2,
         Out,
+        Intermediate,
         A_scale,
         W1_scale,
         W2_scale,
@@ -131,7 +140,9 @@ def e2e_moe(
         W2.stride(0),
         W2.stride(2),
         W2.stride(1),
-        stride_om,
+        Out.stride(1),
+        Out.stride(2),
+        Intermediate.stride(1) if return_intermediate else 0,
         A_scale.stride(0) if A_scale is not None else 0,
         A_scale.stride(1) if A_scale is not None else 0,
         W1_scale.stride(0) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
@@ -159,6 +170,7 @@ def e2e_moe(
         dtype=torch_to_triton_dtype[dtype],  # input dtype, mma dtype
         out_dtype=torch_to_triton_dtype[out_dtype],
         **config,
+        return_intermediate=return_intermediate,
     )
 
-    return Out.to(out_dtype)
+    return Out.to(out_dtype), Intermediate
