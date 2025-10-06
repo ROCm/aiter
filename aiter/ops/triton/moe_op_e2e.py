@@ -75,15 +75,12 @@ def e2e_moe(
             A_scale = torch.zeros(1, device=A.device, dtype=torch.float32)
             A, A_scale = _MOE_A_QUANT_FUNC(output, A, A_scale)
         else:
-            # TODO: Add support for per token group quantization
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
 
             assert (
                 config["BLOCK_SIZE_K1"] <= block_k
             ), "BLOCK_SIZE_K1 must be <= group_k when using fp8"
-
-            # A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(W1.shape[-2], block_n) == W1_scale.shape[-2]
             assert triton.cdiv(W1.shape[-1], block_k) == W1_scale.shape[-1]
@@ -93,6 +90,7 @@ def e2e_moe(
         assert A_scale is None
         assert W1_scale is None
         assert W2_scale is None
+        block_n, block_k = 0, 0
 
     EM = sorted_token_ids.shape[0]
     if A.shape[0] < config["BLOCK_SIZE_M"]:
@@ -116,32 +114,6 @@ def e2e_moe(
     out_dtype = Out.dtype
     # if the intermediate token dimension is small enough, we can try to fit the whole thing in shared memory
     SKINNY = config["BLOCK_SIZE_N"] >= N
-
-    if block_shape is not None:
-        if len(block_shape) == 2:
-            group_n = block_shape[0]
-            group_k = block_shape[1]
-        elif len(block_shape) == 1:
-            group_n = block_shape[0]
-            group_k = group_n
-        else:
-            raise ValueError("block_shape must be of length 1 or 2")
-    else:
-        group_n = 0
-        group_k = 0
-
-    assert config["BLOCK_SIZE_N"] % 2 == 0, "BLOCK_SIZE_N must be even"
-    BLOCK_SIZE_HALF = config["BLOCK_SIZE_N"] // 2
-    if use_fp8_w8a8 and block_shape is not None:
-        assert (BLOCK_SIZE_HALF <= group_n) or (
-            BLOCK_SIZE_HALF % group_n == 0
-        ), "BLOCK_SIZE_N//2 must be multiple of group_n or <= group_n"
-        assert (
-            config["BLOCK_SIZE_K1"] <= group_k
-        ), "BLOCK_SIZE_K1 must strictly be <= group_k"
-        assert (config["BLOCK_SIZE_K2"] <= group_k) or (
-            config["BLOCK_SIZE_K2"] % group_k == 0
-        ), "BLOCK_SIZE_K2 must be multiple of group_k or <= group_k"
 
     e2e_moe_kernel[grid](
         A,
@@ -174,8 +146,8 @@ def e2e_moe(
         expert_ids,
         num_tokens_post_padded,
         topk_ids.numel(),
-        group_n,
-        group_k,
+        block_n,
+        block_k,
         EM,
         N,
         K,

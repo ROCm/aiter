@@ -381,7 +381,7 @@ def e2e_moe_kernel(
         else:
             tl.atomic_add(
                 out_ptrs + k2 * BLOCK_SIZE_K2,
-                out.to(dtype),
+                out,
                 mask=c_mask,
                 sem="relaxed",
                 scope="cta",
