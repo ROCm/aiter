@@ -15,41 +15,39 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
-def run_model_benchmark(args, impl):
-    pass
-
-
-def get_x_vals():
-    x_vals = [
-        (1, 1280),
-        (32, 1280),
-        (64, 1280),
-        (128, 1280),
-        (192, 1280),
-        (256, 1280),
-        (320, 1280),
-        (512, 1280),
-        (1024, 1280),
-        (2048, 1280),
-        (4096, 1280),
-        (8192, 1280),
-        (16384, 1280),
+def get_x_vals(dim=0):
+    if dim == 0:   
+        x_vals = [
+            (1, 8192),
+            (32, 8192),
+            (64, 8192),
+            (128, 8192),
+            (192, 8192),
+            (256, 8192),
+            (320, 8192),
+            (512, 8192),
+            (1024, 8192),
+            (2048, 8192),
+            (4096, 8192),
+            (8192, 8192),
+            (16384, 8192),
     ]
-    x_vals = [
-        (8192, 1),
-        (8192, 32),
-        (8192, 64),
-        (8192, 128),
-        (8192, 192),
-        (8192, 256),
-        (8192, 320),
-        (8192, 512),
-        (8192, 1024),
-        (8192, 2048),
-        (8192, 4096),
-        (8192, 8192),
-        (8192, 16384),
-    ]
+    elif dim == 1:
+        x_vals = [
+            (8192, 1),
+            (8192, 32),
+            (8192, 64),
+            (8192, 128),
+            (8192, 192),
+            (8192, 256),
+            (8192, 320),
+            (8192, 512),
+            (8192, 1024),
+            (8192, 2048),
+            (8192, 4096),
+            (8192, 8192),
+            (8192, 16384),
+        ]
     return x_vals
 
 
@@ -63,7 +61,7 @@ def run_shape_benchmark(args, impl):
                 f"Incompatible --shape provided: {args.shape}. Expected a shape that matches {x_names}."
             )
     else:
-        x_vals_list = get_x_vals()
+        x_vals_list = get_x_vals(dim=(1 if args.N else 0))
     
     if args.metric == "time":
         ylabel = "Time_(ms)"
@@ -128,32 +126,28 @@ def run_benchmark(args, defaults):
         impl = gluon_softmax
     else:
         impl = triton_softmax
-        
-    if args.model:
-        unsupported_args = []
-        for arg in unsupported_args:
-            if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
-                    f"Argument '{arg}' is not supported for benchmarking with the --model flag."
-                )
-        run_model_benchmark(args, impl)
-    else:
-        unsupported_args = []
-        for arg in unsupported_args:
-            if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
-                    f"Argument '{arg}' is not supported for benchmarking with the --model flag."
-                )
-        run_shape_benchmark(args, impl)
+
+    unsupported_args = []
+    for arg in unsupported_args:
+        if getattr(args, arg, None) != getattr(defaults, arg, None):
+            raise Exception(
+                f"Argument '{arg}' is not supported for benchmarking with the --model flag."
+            )
+    run_shape_benchmark(args, impl)
 
 
 def parse_args():
-    parser = get_parser(kernel_name="Softmax")
+    parser = argparse.ArgumentParser(
+        prog=f"Benchmark Softmax",
+        allow_abbrev=False,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
-        "-M",
-        type=int,
-        default=4096,
-        help="M dim of model benchmark if only one model is under test",
+        "--metric",
+        type=str,
+        choices=["time", "throughput", "bandwidth"],
+        default="throughput",
+        help="metric to plot",
     )
     parser.add_argument(
         "--shape",
@@ -175,6 +169,11 @@ def parse_args():
         "-gluon",
         action="store_true",
         help="Use Gluon implementation (experimental, requires latest Triton from main)",
+    )
+    parser.add_argument(
+        "-N",
+        action="store_true",
+        help=f"Benchmark shapes with increasing N dimension, with M = {get_x_vals(dim=1)[0][0]}"
     )
     args = parser.parse_args()
     defaults = parser.parse_args([])
