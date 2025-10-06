@@ -84,8 +84,7 @@ def fp8_mqa_logits_kernel(
             + kv_col_offsets[None, :] * stride_kv_s
             + d_inds[:, None] * stride_kv_d
         )
-        kv_load_mask = (d_inds[:, None] < HEAD_SIZE) & kv_col_mask[None, :]
-        kv_block = tl.load(kv_ptrs, mask=kv_load_mask, other=0.0)
+        kv_block = tl.load(kv_ptrs, mask=kv_col_mask[None, :], other=0.0)
         # [BLOCK_Q*NUM_HEADS, BLOCK_KV] = [BLOCK_Q*NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
         scores = tl.dot(q_block, kv_block, input_precision="ieee").to(tl.float32)
 
@@ -144,9 +143,12 @@ def fp8_mqa_logits(
     # TODO (cagri): double check what value to put for causally masked logits, 0 or -inf?
     # TODO (cagri): Tune/optimize
     BLOCK_Q = 1
-    BLOCK_KV = 64
+    BLOCK_KV = 128
     seq_len, num_heads, head_size = Q.shape
     seq_len_kv = KV.shape[0]
+    # TODO (cagri): Currently assuming num_heads and head_size is power of 2.
+    assert (num_heads & (num_heads - 1) == 0), "num q. heads should be power of 2."
+    assert (head_size & (head_size - 1) == 0), "head size should be power of 2."
     # Initialize with -inf because of causal masking
     logits = torch.full((seq_len, seq_len_kv), 
                         fill_value=-float('inf'), 
@@ -181,6 +183,7 @@ def fp8_mqa_logits(
         BLOCK_KV=BLOCK_KV,
         num_warps=4,
         num_stages=2,
+        waves_per_eu=2,
     )
 
     return logits
