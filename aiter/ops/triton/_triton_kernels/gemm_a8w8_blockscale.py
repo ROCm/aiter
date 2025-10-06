@@ -276,4 +276,21 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    return _get_config._config_dict[key]["any"]
+    cfg = _get_config._config_dict[key]
+    # Select config based on M
+    def get_key_for_M(m):
+        if m < 2000:
+            return "small"
+        elif m < 6017:
+            return "medium_M2000"
+        else:
+            return "medium_M6017"
+    
+    key_m = get_key_for_M(M)
+    if key_m in cfg:
+        return cfg[key_m]
+    elif "any" in cfg:
+        return cfg["any"]
+    else:
+        raise KeyError(f"No configuration found for M={M}, N={N}, K={K}")
+
