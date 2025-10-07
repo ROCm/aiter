@@ -245,7 +245,7 @@ def torch_e2e_moe(
     a,
     w1,
     w2,
-    c,
+    out,
     a_scale,
     w1_scale,
     w2_scale,
@@ -257,41 +257,20 @@ def torch_e2e_moe(
     int8_w8a16,
     blockshape=None,
 ):
+    out_dtype = out.dtype
+    
     if blockshape is not None:
         blockshape_n, blockshape_k = blockshape
 
     if fp8_w8a8 and a_scale is None:
         a, _, a_scale = quantize_fp8_a(a, blockshape_k=blockshape_k)
 
-    M, top_k, _ = c.shape
+    M, top_k, _ = out.shape
     E, N, K = w1.shape
 
-    if fp8_w8a8 and blockshape is not None:
-        # dequantize
-        a_scale = a_scale.reshape(M, K // blockshape_k, 1)
-        a = a.to(torch.float32) * a_scale.broadcast_to(
-            M, K // blockshape_k, blockshape_k
-        ).reshape(M, K)
-
-        w1_scale = w1_scale.reshape(E, N // blockshape_n, 1, K // blockshape_k, 1)
-        w1 = w1.to(torch.float32) * w1_scale.broadcast_to(
-            E, N // blockshape_n, blockshape_n, K // blockshape_k, blockshape_k
-        ).reshape(E, N, K)
-
-        w2_scale = w2_scale.reshape(
-            E, K // blockshape_k, 1, (N // 2) // blockshape_n, 1
-        )
-        w2 = w2.to(torch.float32) * w2_scale.broadcast_to(
-            E, K // blockshape_k, blockshape_k, (N // 2) // blockshape_n, blockshape_n
-        ).reshape(E, K, (N // 2))
-
-        a = a.to(torch.bfloat16)
-        w1 = w1.to(torch.bfloat16)
-        w2 = w2.to(torch.bfloat16)
-
-    # Repeat a -> (M, top_k, K)
+    # Expand a: (M, K) -> (M, top_k, K)
     a_expanded = a.unsqueeze(1).repeat(1, top_k, 1)
-    # (M, top_k, N, K)
+
     if fp8_w8a8:
         if blockshape is not None:
             w1_indexed = w1[topk_ids]
@@ -299,10 +278,45 @@ def torch_e2e_moe(
             w1_indexed = w1.half()[topk_ids]
     else:
         w1_indexed = w1[topk_ids]
+    # w1_indexed: (M*top_k, N, K)
 
-    intermediate = torch.einsum(
-        "mek,menk->men", a_expanded.to(dtype), w1_indexed.to(dtype)
-    )
+    if fp8_w8a8 and blockshape is not None:
+        sK = K // blockshape_k
+        sN = N // blockshape_n
+
+        a_expanded = a_expanded.to(torch.float32).reshape(
+            -1, sK, blockshape_k
+        )  # (M*top_k, sK, blockshape_k)
+
+        w1_indexed = w1_indexed.to(torch.float32).reshape(
+            -1, N, sK, blockshape_k
+        )  # (M*top_k, sN, blockshape_n, sK, blockshape_k)
+
+        # keep sK dimension in result for scaling
+        intermediate_fp8 = torch.einsum(
+            "Mab, MNab -> MaN", a_expanded, w1_indexed
+        )  
+        # (M*top_k, sN, blockshape_n, sK)
+        a_scale_expanded = (
+            a_scale.unsqueeze(1)
+            .repeat(1, top_k, 1)
+            .reshape(-1, sK)
+            .unsqueeze(-1)  # (M*top_k, sK, 1)
+        )
+        w1_scale_expanded = w1_scale[topk_ids.flatten()].permute(0, 2, 1).repeat_interleave(blockshape_n, dim=2)
+        # (M*top_k, sK, N)
+
+        # combined scales
+        scale_matrix = a_scale_expanded * w1_scale_expanded
+        # (M*top_k, sK, N)
+
+        # apply scales, then reduce over sK
+        intermediate = (intermediate_fp8 * scale_matrix).sum(dim=1).reshape(-1, N)  
+        # (M*top_k, N)
+    else:    
+        intermediate = torch.einsum(
+            "mek,menk->men", a_expanded.to(dtype), w1_indexed.to(dtype)
+        )
 
     intermediate = intermediate.to(torch.float32)
 
@@ -315,15 +329,6 @@ def torch_e2e_moe(
         intermediate = intermediate * w1_scale[topk_ids].unsqueeze(-1)
         intermediate = intermediate.to(dtype)
 
-    if fp8_w8a8:
-        if blockshape is not None:
-            w2_indexed = w2[topk_ids]
-        else:
-            w2_indexed = w2.half()[topk_ids]
-    else:
-        w2_indexed = w2[topk_ids]
-    # w2_indexed = w2[topk_ids]
-
     # silu_out = torch.zeros([M * top_k, N // 2], dtype=a.dtype, device=a.device)
     silu_out = torch_silu_and_mul_ref(intermediate.view(-1, N))
 
@@ -334,25 +339,43 @@ def torch_e2e_moe(
             pass
         else:
             silu_out, _, silu_out_scale = quantize_fp8(silu_out)
+    
+    
+    if fp8_w8a8 and blockshape is not None:
+        # dequantize w2
+        w2_scale = w2_scale.reshape(
+            E, K // blockshape_k, 1, (N // 2) // blockshape_n, 1
+        )
+        w2 = w2.to(torch.float32) * w2_scale.broadcast_to(
+            E, K // blockshape_k, blockshape_k, (N // 2) // blockshape_n, blockshape_n
+        ).reshape(E, K, (N // 2))
 
-    c = torch.einsum("mek,menk->men", silu_out.to(dtype), w2_indexed.to(dtype))
+        w2 = w2.to(torch.bfloat16)
+    
+    if fp8_w8a8:
+        if blockshape is not None:
+            w2_indexed = w2[topk_ids]
+        else:
+            w2_indexed = w2.half()[topk_ids]
+    else:
+        w2_indexed = w2[topk_ids]
+
+    out = torch.einsum("mek,menk->men", silu_out.to(torch.float32), w2_indexed.to(torch.float32))
 
     if fp8_w8a8:
         if blockshape is not None:
             pass
         else:
-            c = c * w2_scale[topk_ids].unsqueeze(-1)
-            c = c * silu_out_scale
-            c = c.to(dtype)
+            out = out * w2_scale[topk_ids].unsqueeze(-1)
+            out = out * silu_out_scale
 
     if int8_w8a16:
-        c = c * w2_scale[topk_ids].unsqueeze(-1)
-        c = c.to(dtype)
+        out = out * w2_scale[topk_ids].unsqueeze(-1)
 
     if routed_weight:
-        c *= topk_weights.unsqueeze(-1)
+        out *= topk_weights.unsqueeze(-1)
 
-    return c, silu_out
+    return out.to(out_dtype), silu_out
 
 
 def quantize_fp8(
@@ -1120,11 +1143,11 @@ def test_fused_moe_gelu(
     "M, N, K, top_k, E",
     [
         (3, 512, 2048, 10, 512),  # qwen3next
-        # (333, 512, 2048, 10, 512),
-        # (3333, 512, 2048, 10, 512),
+        (333, 512, 2048, 10, 512),
+        (1033, 512, 2048, 10, 512),
         (3, 768, 2048, 8, 128),  # qwen3
-        # (333, 768, 2048, 8, 128),
-        # (3333, 768, 2048, 8, 128),
+        (333, 768, 2048, 8, 128),
+        (1033, 768, 2048, 8, 128), # TODO: add other shapes
     ],
 )
 @pytest.mark.parametrize("routed_weight", [False])
@@ -1186,8 +1209,6 @@ def test_moe_e2e(
         print(f"expert_ids={expert_ids}")
         print(f"num_tokens_post_padded={num_tokens_post_padded}")
 
-    print(f"num_tokens_post_padded={num_tokens_post_padded}")
-
     # onekernel solution
     triton_out, triton_intermediate = triton_e2e_moe(
         a,
@@ -1229,38 +1250,27 @@ def test_moe_e2e(
         blockshape=blockshape,
     )
 
-    print("Comparing intermediate results")
+    # print("Comparing intermediate results")
     
-    print("triton_intermediate", triton_intermediate.dtype)
-    print("torch_intermediate", torch_intermediate.dtype)
+    # print("triton_intermediate", triton_intermediate.dtype)
+    # print("torch_intermediate", torch_intermediate.dtype)
 
     torch.testing.assert_close(triton_intermediate, torch_intermediate, atol=2e-1, rtol=2e-1)
-    print("Intermediate tensors match!")
+    # print("Intermediate tensors match!")
 
-    # if DEBUG_MODE:
-    # print(f"triton_out={triton_out.flatten()[:50]}")
-    # print(f"torch_out={torch_out.flatten()[:50]}")
+    # print("triton_out", triton_out.dtype)
+    # print("torch_out", torch_out.dtype)
 
     # Validate correctness
-    print("Comparing output results")
+    # print("Comparing output results")
     torch.testing.assert_close(triton_out, torch_out, atol=2e-1, rtol=2e-1)
 
 
 # if DEBUG_MODE:
 #     print("Debug mode is on")
 if __name__ == "__main__":
-    
-    print("Silu fused test: test_fused_moe(33, 512, 2048, 10, 512, False, False, False, False, True, torch.bfloat16)")
-    test_fused_moe(33, 512, 2048, 10, 512, False, False, False, False, True, torch.bfloat16)
-    print("Passes")
-
     # does not pass
     print("Testing shape:  test_moe_e2e(33, 512, 2048, 10, 512, False, False, False, 0, 0, torch.bfloat16)")
-    test_moe_e2e(33, 512, 2048, 10, 512, False, False, False, 0, 0, torch.bfloat16)
-    print("Passes")
+    test_moe_e2e(33, 512, 2048, 10, 512, False, True, False, 128, 128, torch.bfloat16)
     
-    # # passes
-    # print("Testing shape:  test_moe_e2e(3, 512, 2048, 10, 512, False, True, False, 128, 128, torch.bfloat16)")
-    # test_moe_e2e(3, 512, 4096, 10, 512, False, False, False, 128, 128, torch.bfloat16)
-    # print("Passes")
     
