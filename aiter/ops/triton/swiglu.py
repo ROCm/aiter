@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton._triton_kernels._swiglu import _swiglu
+from aiter.ops.triton._triton_kernels.swiglu import _swiglu
 
 def swiglu(x, W, V, b, c, BLOCK_SIZE_M, BLOCK_SIZE_N):
     """

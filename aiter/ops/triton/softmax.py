@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.softmax import _softmax_kernel_online
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton._triton_kernels.softmax2 import _softmax_kernel
 
 _LOGGER = AiterTritonLogger()
 
@@ -49,3 +50,20 @@ def softmax(x):
     )
 
     return y
+
+def softmax2(x):
+    n_rows, n_cols = x.shape
+    
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(n_cols))
+    y = torch.empty_like(x)
+
+    grid = lambda meta: (n_rowss,)
+    _softmax_kernel[grid](
+        y,
+        x,
+        n_rows,
+        n_cols,
+        BLOCK_SIZE
+    )
+    
