@@ -31,11 +31,13 @@ def _softmax_kernel_online(
     row_start = gl.program_id(0)
     row_idx = row_start
     
+    # FIXME: For some reason, this value leads to bad
+    # performance for very large N
     cols_per_thread: gl.constexpr = triton.cdiv(
         BLOCK_SIZE, gl.num_warps() * 64
     )
     blocked_cols: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[cols_per_thread],
+        size_per_thread=[8], # Value chosen by Triton compiler
         threads_per_warp=[64],
         warps_per_cta=[gl.num_warps()],
         order=[0],
