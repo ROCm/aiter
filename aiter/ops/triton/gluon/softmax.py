@@ -91,10 +91,12 @@ def _softmax_kernel_online(
         
         # subtract, exponentiate and divide by sum
         softmax_output = gl.exp(row_block - m) / row_sum
+        softmax_output = softmax_output.to(output_ptr.type.element_ty)
         
         # store in output array
-        output_ptrs = output_row_start_ptr + col_offsets
-        gl.store(output_ptrs, softmax_output, mask=mask)
+        gl.amd.cdna4.buffer_store(
+            stored_value=softmax_output, ptr=output_row_start_ptr, offsets=col_offsets, mask=mask, cache=".cg"
+        )
 
 
 def softmax(x):
