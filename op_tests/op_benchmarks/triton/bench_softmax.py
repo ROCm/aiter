@@ -118,9 +118,7 @@ def run_shape_benchmark(args, impl):
 
 
 def run_benchmark(args, defaults):
-    assert not (args.shape and args.model) or not (
-        args.shape and args.M
-    ), "User can specify --shape or --model MODEL -M VAL exclusively"
+    assert not (args.shape and args.N), "User can specify --shape or -N exclusively"
     
     if args.gluon:
         impl = gluon_softmax

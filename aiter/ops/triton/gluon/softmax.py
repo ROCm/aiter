@@ -35,10 +35,10 @@ def _softmax_kernel_online(
         BLOCK_SIZE, gl.num_warps() * 64
     )
     blocked_cols: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, cols_per_thread],
-        threads_per_warp=[1, 64],
-        warps_per_cta=[1, gl.num_warps()],
-        order=[1, 0],
+        size_per_thread=[cols_per_thread],
+        threads_per_warp=[64],
+        warps_per_cta=[gl.num_warps()],
+        order=[0],
     )
     
     # loop 1: find the max and sum of each row
@@ -49,7 +49,7 @@ def _softmax_kernel_online(
     # iterate through blocks of columns
     for b in tl.range(0, n_cols, BLOCK_SIZE):
         # get column offsets from row starting pointer
-        col_offsets = b + gl.arange(0, BLOCK_SIZE, layout=gl.SliceLayout(0, blocked_cols))
+        col_offsets = b + gl.arange(0, BLOCK_SIZE, layout=blocked_cols)
         
         # create mask to ensure in-bounds offsets
         mask = col_offsets < n_cols
@@ -81,7 +81,7 @@ def _softmax_kernel_online(
     # loop 2: divide each row by respective norms
     output_row_start_ptr = output_ptr + row_idx * output_row_stride
     for b in tl.range(0, n_cols, BLOCK_SIZE):
-        col_offsets = b + gl.arange(0, BLOCK_SIZE, layout=gl.SliceLayout(0, blocked_cols))
+        col_offsets = b + gl.arange(0, BLOCK_SIZE, layout=blocked_cols)
         mask = col_offsets < n_cols
         row_block = gl.amd.cdna4.buffer_load(
             ptr=row_start_ptr, offsets=col_offsets, mask=mask, other=-float("inf"), cache=".cg"
