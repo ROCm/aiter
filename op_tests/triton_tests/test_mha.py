@@ -1232,6 +1232,8 @@ def test_mha_backward_varlen_with_pe(
     )
 
     # Triton backward
+    # PE support isn't implemented in fused backward.
+    mha_set_use_fused_bwd_kernel(False)
     triton_dq, triton_dk, triton_dv = torch.autograd.grad(
         triton_out, (q_unpad, k_unpad, v_unpad), do
     )
