@@ -109,8 +109,18 @@ __global__ void kn_get_mla_metadata_v1_2(
     int32_t sum_blocks = 0;
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
-        int32_t kv_end = params.p_seqlens_kv_indptr[bid + 1];
-        int32_t seqlen_kv = kv_end - params.p_seqlens_kv_indptr[bid];
+        int bid_ori = [&]() {
+            if constexpr (!Traits::kIsSparse)
+            {
+                return bid;
+            }
+            else
+            {
+                return bid / params.ori_seqlen_qo;
+            }
+        }();
+        int32_t kv_end = params.p_seqlens_kv_indptr[bid_ori + 1];
+        int32_t seqlen_kv = kv_end - params.p_seqlens_kv_indptr[bid_ori];
         if constexpr (Traits::kIsSparse)
         {
             seqlen_kv = min(seqlen_kv, params.topk);
@@ -357,8 +367,18 @@ __global__ void kn_get_mla_metadata_v1_2_no_split(
     int32_t sum_blocks = 0;
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
-        int32_t kv_end = params.p_seqlens_kv_indptr[bid + 1];
-        int32_t seqlen_kv = kv_end - params.p_seqlens_kv_indptr[bid];
+        int bid_ori = [&]() {
+            if constexpr (!Traits::kIsSparse)
+            {
+                return bid;
+            }
+            else
+            {
+                return bid / params.ori_seqlen_qo;
+            }
+        }();
+        int32_t kv_end = params.p_seqlens_kv_indptr[bid_ori + 1];
+        int32_t seqlen_kv = kv_end - params.p_seqlens_kv_indptr[bid_ori];
         if constexpr (Traits::kIsSparse)
         {
             seqlen_kv = min(seqlen_kv, params.topk);
@@ -518,7 +538,7 @@ __global__ void kn_get_mla_metadata_v1_2_no_split(
     }
 
 #define MLA_UNI_SEQLEN_DISPATCHER(...)                        \
-    switch (uni_seqlen_qo) \
+    switch (params.uni_seqlen_qo) \
     { \
         MLA_UNI_SEQLEN_QO_CASE(1, __VA_ARGS__); \
         MLA_UNI_SEQLEN_QO_CASE(2, __VA_ARGS__); \
@@ -526,7 +546,7 @@ __global__ void kn_get_mla_metadata_v1_2_no_split(
         MLA_UNI_SEQLEN_QO_CASE(4, __VA_ARGS__); \
         default: \
         { \
-            if (uni_seqlen_qo > 0) \
+            if (params.uni_seqlen_qo > 0) \
             { \
                 constexpr int32_t kUniSeqlenQo = 0; \
                 using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>; \
@@ -606,6 +626,9 @@ void get_mla_metadata_v1_2_device(
         }
         else
         {
+            params.num_batches = uni_seqlen_qo * params.num_batches;
+            params.uni_seqlen_qo = 1;
+            params.ori_seqlen_qo = uni_seqlen_qo;
             constexpr bool kIsSparse = true;
             MLA_UNI_SEQLEN_DISPATCHER(
                 kn_get_mla_metadata_v1_2_no_split<Traits>
@@ -626,6 +649,9 @@ void get_mla_metadata_v1_2_device(
         }
         else
         {
+            params.num_batches = uni_seqlen_qo * params.num_batches;
+            params.uni_seqlen_qo = 1;
+            params.ori_seqlen_qo = uni_seqlen_qo;
             constexpr bool kIsSparse = true;
             MLA_UNI_SEQLEN_DISPATCHER(
                 kn_get_mla_metadata_v1_2<Traits>

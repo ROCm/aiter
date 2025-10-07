@@ -128,13 +128,16 @@ def torch_mla_extend(
 
 def generate_topk_kv(
     kv_indptr: torch.Tensor,
+    qo_len : int = 1,
     NUM_TOPK_TOKENS: int = 2048,
 ):
     batch_size = kv_indptr.shape[0] - 1
+    batch_size = batch_size * qo_len
     token_indices = torch.empty([batch_size, NUM_TOPK_TOKENS], dtype=torch.int32)
     for i in range(batch_size):
-        kv_end = kv_indptr[i + 1]
-        kv_start = kv_indptr[i]
+        i_ori = i // qo_len
+        kv_end = kv_indptr[i_ori + 1]
+        kv_start = kv_indptr[i_ori]
         kv_len = kv_end - kv_start
 
         if kv_len < NUM_TOPK_TOKENS:
@@ -148,17 +151,20 @@ def generate_topk_kv(
 def sparse_kv_indptr_to_dense(
     kv_indptr: torch.Tensor,
     converted_indices: torch.Tensor,
+    qo_len: int = 1,
     NUM_TOPK_TOKENS: int = 2048,
 ):
     new_kv_indptr = [0]
     indices_list  = []
     batch_size = kv_indptr.shape[0] - 1
+    batch_size = qo_len * batch_size
     for i in range(batch_size):
-        kv_len = kv_indptr[i + 1] - kv_indptr[i]
+        i_ori = i // qo_len
+        kv_len = kv_indptr[i_ori + 1] - kv_indptr[i_ori]
         kv_len = min(kv_len, NUM_TOPK_TOKENS)
         indices_list.append(converted_indices[i, :kv_len])
         new_kv_indptr.append(kv_len + new_kv_indptr[i])
-    return torch.tensor(new_kv_indptr, dtype=torch.int32), torch.concat(indices_list)
+    return torch.arange(0, batch_size + 1, dtype=torch.int32), torch.tensor(new_kv_indptr, dtype=torch.int32), torch.concat(indices_list)
 
 
 @triton.jit
@@ -171,11 +177,12 @@ def _convert_req_index_to_global_index_kernel(
     BLOCK_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     # strides (in elements)
-    bt_stride0,
-    ti_stride0,
-    ti_stride1,
-    out_stride0,
-    out_stride1,
+    bt_stride0: tl.constexpr,
+    ti_stride0: tl.constexpr,
+    ti_stride1: tl.constexpr,
+    out_stride0: tl.constexpr,
+    out_stride1: tl.constexpr,
+    qo_len: tl.constexpr,
 ):
     # program_id(0) -> token_id (row)
     # program_id(1) -> tile index along columns
@@ -184,10 +191,11 @@ def _convert_req_index_to_global_index_kernel(
 
     # Each program covers BLOCK_N consecutive columns
     indice_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+    batch_id = token_id // qo_len
 
     # Load request id for this token (no mask: grid is exact)
-    kv_start = tl.load(kv_indptr + token_id)
-    kv_end = tl.load(kv_indptr + token_id + 1)
+    kv_start = tl.load(kv_indptr + batch_id)
+    kv_end = tl.load(kv_indptr + batch_id + 1)
     kv_len = kv_end - kv_start
 
     # Load token indices for this tile
@@ -208,6 +216,8 @@ def _convert_req_index_to_global_index_kernel(
                    mask=valid_block,
                    other=0)
 
+    # base = 0
+
     # If token == -1 OR block_id OOB, output -1; else base * BLOCK_SIZE + offset
     out_val = tl.where(is_invalid_tok | (~valid_block), -1,
                        base * BLOCK_SIZE + inblock_off)
@@ -221,6 +231,7 @@ def triton_convert_req_index_to_global_index(
     kv_indptr: torch.Tensor,      # int32 [num_tokens + 1]
     kv_indices: torch.Tensor,     # int32 [total_kv_seqlen]
     token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    qo_len : int = 1,
     BLOCK_SIZE: int = 1,          # page_block_size = 1 for now
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,  # tile width along columns
@@ -242,7 +253,9 @@ def triton_convert_req_index_to_global_index(
         f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by" \
         f"BLOCK_N ({BLOCK_N})"
 
-    num_tokens = kv_indptr.shape[0] - 1
+    num_batches = kv_indptr.shape[0] - 1
+    num_tokens = token_indices.shape[0]
+
     # num_requests, max_num_blocks_per_req = block_table.shape
     max_num_blocks_per_req = 65536 * 32
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
@@ -275,6 +288,7 @@ def triton_convert_req_index_to_global_index(
         ti_stride1,
         out_stride0,
         out_stride1,
+        qo_len,
     )
     return out
 
@@ -307,7 +321,7 @@ def test_mla(
     if varlen:
         for i in range(batch_size):
             # seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
-            seq_lens_kv[i] = random.uniform(5, ctx_lens)
+            seq_lens_kv[i] = random.uniform(6, ctx_lens)
             seq_lens_qo[i] = max(
                 min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
             )
@@ -379,14 +393,15 @@ def test_mla(
         dtype=torch.int32,
         device="cuda",
     ).fill_(-1)
+    reduce_batch_size = batch_size * mtp
     reduce_indptr = torch.empty(
-        [batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
+        [reduce_batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
     )
     reduce_final_map = torch.empty(
-        [batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
+        [reduce_batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
     )
     reduce_partial_map = torch.empty(
-        [batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
+        [reduce_batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
     )
 
     split_params = {
@@ -413,28 +428,30 @@ def test_mla(
     )
 
     def test_sparse_mla_bf16():
-        token_indices = generate_topk_kv(kv_indptr)
+        token_indices = generate_topk_kv(kv_indptr, mtp)
         converted_indices = triton_convert_req_index_to_global_index(
             kv_indptr,
             kv_indices,
             token_indices,
+            mtp,
         )
 
-        new_kv_indptr, new_indices = sparse_kv_indptr_to_dense(
+        new_qo_indptr, new_kv_indptr, new_indices = sparse_kv_indptr_to_dense(
             kv_indptr,
             converted_indices,
+            mtp,
         ) 
 
         out_ref, lse_ref = torch_mla_extend(
             q,
             kv_buffer,
-            qo_indptr,
+            new_qo_indptr,
             new_kv_indptr,
             new_indices,
             sm_scale,
             kv_lora_rank,
             qk_rope_head_dim,
-            is_causal=True,
+            is_causal=False,
             dtype=dtype,
         )
 
@@ -448,9 +465,10 @@ def test_mla(
             out_asm,
             qo_indptr,
             kv_indptr,
+            # new_kv_indptr,
             converted_indices.view(-1),
             kv_last_page_lens,
-            max_seqlen_qo,
+            1,
             sm_scale,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
