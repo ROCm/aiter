@@ -121,7 +121,7 @@ def e2e_moe(
             (M, top_k, N // 2), dtype=torch.float32, device="cuda"
         )
     else:
-        Intermediate = None   
+        Intermediate = None
 
     e2e_moe_kernel[grid](
         A,
