@@ -104,6 +104,7 @@ void get_mla_metadata_v1(
     int32_t kv_granularity = 16;
     int32_t max_seqlen_qo  = -1;
     int32_t uni_seqlen_qo  = -1;
+    int32_t topk           = -1;
     bool    fast_mode      = false;
 
     if (split_params.has_value())
@@ -127,6 +128,11 @@ void get_mla_metadata_v1(
         if (split_params->find("fast_mode") != split_params->end())
         {
             fast_mode = split_params->find("fast_mode")->second != 0;
+        }
+
+        if (split_params->find("topk") != split_params->end())
+        {
+            topk = split_params->find("topk")->second;
         }
     }
 
@@ -152,6 +158,7 @@ void get_mla_metadata_v1(
             kv_granularity,
             max_seqlen_qo,
             uni_seqlen_qo,
+            topk,
             work_metadata_ptrs,
             work_info_set,
             work_indptr,
