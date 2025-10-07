@@ -1,15 +1,15 @@
 {
   "small": {
-    "BLOCK_SIZE_M": 64,
-    "BLOCK_SIZE_N": 32,
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 128,
-    "GROUP_SIZE_M": 5,
-    "num_warps": 4,
-    "num_stages": 5,
-    "waves_per_eu": 2,
+    "GROUP_SIZE_M": 1,
+    "NUM_KSPLIT": 32,
+    "num_warps": 8,
+    "num_stages": 1,
+    "waves_per_eu": 1,
     "matrix_instr_nonkdim": 16,
-    "cache_modifier": ".ca",
-    "NUM_KSPLIT": 1   
+    "cache_modifier": ".ca"
   },
   "medium_M2000" : {
     "BLOCK_SIZE_M": 64,
@@ -27,7 +27,7 @@
     "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K": 128,
-    "GROUP_SIZE_M": 1,
+    "GROUP_SIZE_M": 2,
     "NUM_KSPLIT": 1,
     "num_warps": 4,
     "num_stages": 1,
