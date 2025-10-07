@@ -9,7 +9,7 @@ import triton
 from enum import Enum, auto
 import math
 from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
-from aiter.ops.triton._moe_op_gemm_a8w4 import _moe_gemm_a8w4, _reduce_grouped, _downcast_to_static_fp8
+from aiter.ops.triton._moe_op_gemm_a8w4_gluon import _moe_gemm_a8w4_gluon, _reduce_grouped, _downcast_to_static_fp8
 
 
 # -----------------------------------------------------------------------------
@@ -192,7 +192,7 @@ def reduce_grouped(x: torch.Tensor, indx: torch.Tensor, out: torch.Tensor,
 # Triton Implementation
 # -----------------------------------------------------------------------------
 
-def moe_gemm_a8w4(x, w, x_scales, w_scales, 
+def moe_gemm_a8w4_gluon(x, w, x_scales, w_scales, 
                x_static_scale = None, quant_static_scale = None,
                bias = None,
                routing_data: RoutingData | None = None,
@@ -257,7 +257,7 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    kernel = _moe_gemm_a8w4[(grid,)](
+    kernel = _moe_gemm_a8w4_gluon[(grid,)](
         y, y.stride(0), y.stride(1), y.stride(2),
         x, x.stride(0), x.stride(1),
         x_scales, stride_x_mx_m, stride_x_mx_k,
