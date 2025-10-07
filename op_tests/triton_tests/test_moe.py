@@ -281,17 +281,15 @@ def torch_e2e_moe(
     # w1_indexed: (M*top_k, N, K)
 
     if fp8_w8a8 and blockshape is not None:
+        # Emulate the fp8 blockscale matmul
         sK = K // blockshape_k
-        sN = N // blockshape_n
-
+        # sN = N // blockshape_n
         a_expanded = a_expanded.to(torch.float32).reshape(
             -1, sK, blockshape_k
         )  # (M*top_k, sK, blockshape_k)
-
         w1_indexed = w1_indexed.to(torch.float32).reshape(
             -1, N, sK, blockshape_k
         )  # (M*top_k, sN, blockshape_n, sK, blockshape_k)
-
         # keep sK dimension in result for scaling
         intermediate_fp8 = torch.einsum(
             "Mab, MNab -> MaN", a_expanded, w1_indexed
@@ -305,11 +303,9 @@ def torch_e2e_moe(
         )
         w1_scale_expanded = w1_scale[topk_ids.flatten()].permute(0, 2, 1).repeat_interleave(blockshape_n, dim=2)
         # (M*top_k, sK, N)
-
         # combined scales
         scale_matrix = a_scale_expanded * w1_scale_expanded
         # (M*top_k, sK, N)
-
         # apply scales, then reduce over sK
         intermediate = (intermediate_fp8 * scale_matrix).sum(dim=1).reshape(-1, N)  
         # (M*top_k, N)
@@ -318,20 +314,18 @@ def torch_e2e_moe(
             "mek,menk->men", a_expanded.to(dtype), w1_indexed.to(dtype)
         )
 
-    intermediate = intermediate.to(torch.float32)
-
     if fp8_w8a8 and blockshape is None:
-            intermediate = intermediate * w1_scale[topk_ids].unsqueeze(-1)
-            intermediate = intermediate * a_scale
-            intermediate = intermediate.to(dtype)
+        intermediate = intermediate * w1_scale[topk_ids].unsqueeze(-1)
+        intermediate = intermediate * a_scale
+        intermediate = intermediate.to(dtype)
 
     if int8_w8a16:
         intermediate = intermediate * w1_scale[topk_ids].unsqueeze(-1)
         intermediate = intermediate.to(dtype)
 
-    # silu_out = torch.zeros([M * top_k, N // 2], dtype=a.dtype, device=a.device)
-    silu_out = torch_silu_and_mul_ref(intermediate.view(-1, N))
 
+    intermediate = intermediate.to(torch.float32)
+    silu_out = torch_silu_and_mul_ref(intermediate.view(-1, N))
     silu_out = silu_out.view(M, top_k, N // 2)
 
     if fp8_w8a8:
