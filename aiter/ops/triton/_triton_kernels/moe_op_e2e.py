@@ -279,8 +279,8 @@ def e2e_moe_kernel(
             silu_acc += tl.dot(a, w1_i0, out_dtype=tl.float32) * a_scale * w1_i0_scale
             mul_acc += tl.dot(a, w1_i1, out_dtype=tl.float32) * a_scale * w1_i1_scale
         else:
-            mul_acc = tl.dot(a, w1_i1, acc=mul_acc)
             silu_acc = tl.dot(a, w1_i0, acc=silu_acc)
+            mul_acc = tl.dot(a, w1_i1, acc=mul_acc)
 
         a_ptrs += BLOCK_SIZE_K1 * stride_ak
         w1_ptrs_i0 += BLOCK_SIZE_K1 * stride_w1k
@@ -289,6 +289,7 @@ def e2e_moe_kernel(
     # gated activation
     silu_acc = _silu_exp2(silu_acc)
     acc = (silu_acc * mul_acc)
+    
     if return_intermediate:
         offs_in = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_HALF)
         i_ptrs = Intermediate + stride_im * offs_token[:, None] + offs_in[None, :]
@@ -314,7 +315,7 @@ def e2e_moe_kernel(
         offs_w2_sn = (pid_n * BLOCK_SIZE_HALF) // group_n + tl.arange(
             0, num_scales_along_n
         )
-        mask_w2_sn = offs_w2_sn < ((N // 2) // group_n)
+        w2_scale_nmask = offs_w2_sn < ((N // 2) // group_n)
         # ... + tl.arange(0, num_scales_along_n) * group_n // group_n = ... + tl.arange(0, num_scales_along_n)
         w2_scale_ptrs = (
             W2_scale + off_experts * stride_w2se + offs_w2_sn[:, None] * stride_w2sn
@@ -326,7 +327,6 @@ def e2e_moe_kernel(
 
     num_k2 = tl.cdiv(K, BLOCK_SIZE_K2)
     for k2 in tl.range(0, num_k2, num_stages=1):
-
         if EVEN_K:
             w2 = tl.load(
                 w2_ptrs + k2 * BLOCK_SIZE_K2 * stride_w2k,
@@ -347,7 +347,7 @@ def e2e_moe_kernel(
             w2_scale_kmask = tl.arange(0, num_scales_along_k2) < (
                 (K // group_k) - (k2 * BLOCK_SIZE_K2) // group_k
             )
-            w2_scale_mask = mask_w2_sn[:, None] & w2_scale_kmask[None, :]
+            w2_scale_mask = w2_scale_nmask[:, None] & w2_scale_kmask[None, :]
             w2_scale = tl.load(
                 w2_scale_ptrs + (k2 * BLOCK_SIZE_K2) // group_k * stride_w2sk,
                 mask=w2_scale_mask,
@@ -379,22 +379,22 @@ def e2e_moe_kernel(
             )
             out = out * moe_weight[:, None]
 
-        out = out.to(out_dtype)
-
         if EVEN_K:
-            c_mask = token_mask[:, None]
+            out_mask = token_mask[:, None]
         else:
-            c_mask = token_mask[:, None] & (offs_k2[None, :] <  (K - k2 * BLOCK_SIZE_K2 * stride_ok) )
+            out_mask = token_mask[:, None] & (offs_k2[None, :] <  (K - k2 * BLOCK_SIZE_K2 * stride_ok) )
 
         if SKINNY:
-            # Skinny means that we can fit the whole intermediate representation of a token in register memory (i.e. N <= BLOCK_SIZE_N).
-            # Thus we don't need atomics, as there is only workgroup updating the output tile.
-            tl.store(out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok, out, mask=c_mask, cache_modifier=".wt")
+            # Skinny means that there is only one pid along N (i.e. BLOCK_SIZE_N >= N).
+            # Thus we don't need atomics, as there is only workgroup updating a output location.
+            out = out.to(out_dtype)
+            tl.store(out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok, out, mask=out_mask)
         else:
+            out = out.to(tl.float32)  # atomics need to be done in fp32
             tl.atomic_add(
                 out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok,
                 out,
-                mask=c_mask,
+                mask=out_mask,
                 sem="relaxed",
                 scope="cta",
             )

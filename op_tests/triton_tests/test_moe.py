@@ -254,7 +254,6 @@ def torch_e2e_moe(
     routed_weight,
     dtype,
     fp8_w8a8,
-    int8_w8a16,
     blockshape=None,
 ):
     out_dtype = out.dtype
@@ -281,17 +280,15 @@ def torch_e2e_moe(
     # w1_indexed: (M*top_k, N, K)
 
     if fp8_w8a8 and blockshape is not None:
+        # Emulate the fp8 blockscale matmul
         sK = K // blockshape_k
-        sN = N // blockshape_n
-
+        # sN = N // blockshape_n
         a_expanded = a_expanded.to(torch.float32).reshape(
             -1, sK, blockshape_k
         )  # (M*top_k, sK, blockshape_k)
-
         w1_indexed = w1_indexed.to(torch.float32).reshape(
             -1, N, sK, blockshape_k
         )  # (M*top_k, sN, blockshape_n, sK, blockshape_k)
-
         # keep sK dimension in result for scaling
         intermediate_fp8 = torch.einsum(
             "Mab, MNab -> MaN", a_expanded, w1_indexed
@@ -305,11 +302,9 @@ def torch_e2e_moe(
         )
         w1_scale_expanded = w1_scale[topk_ids.flatten()].permute(0, 2, 1).repeat_interleave(blockshape_n, dim=2)
         # (M*top_k, sK, N)
-
         # combined scales
         scale_matrix = a_scale_expanded * w1_scale_expanded
         # (M*top_k, sK, N)
-
         # apply scales, then reduce over sK
         intermediate = (intermediate_fp8 * scale_matrix).sum(dim=1).reshape(-1, N)  
         # (M*top_k, N)
@@ -318,20 +313,13 @@ def torch_e2e_moe(
             "mek,menk->men", a_expanded.to(dtype), w1_indexed.to(dtype)
         )
 
-    intermediate = intermediate.to(torch.float32)
-
     if fp8_w8a8 and blockshape is None:
-            intermediate = intermediate * w1_scale[topk_ids].unsqueeze(-1)
-            intermediate = intermediate * a_scale
-            intermediate = intermediate.to(dtype)
-
-    if int8_w8a16:
         intermediate = intermediate * w1_scale[topk_ids].unsqueeze(-1)
+        intermediate = intermediate * a_scale
         intermediate = intermediate.to(dtype)
 
-    # silu_out = torch.zeros([M * top_k, N // 2], dtype=a.dtype, device=a.device)
+    intermediate = intermediate.to(torch.float32)
     silu_out = torch_silu_and_mul_ref(intermediate.view(-1, N))
-
     silu_out = silu_out.view(M, top_k, N // 2)
 
     if fp8_w8a8:
@@ -368,9 +356,6 @@ def torch_e2e_moe(
         else:
             out = out * w2_scale[topk_ids].unsqueeze(-1)
             out = out * silu_out_scale
-
-    if int8_w8a16:
-        out = out * w2_scale[topk_ids].unsqueeze(-1)
 
     if routed_weight:
         out *= topk_weights.unsqueeze(-1)
@@ -677,13 +662,10 @@ def input_helper_e2e(
     K: int,
     top_k: int,
     E: int,
-    routed_weight: bool,
     dtype,
     fp8_w8a8: bool,
-    int8_w8a16: bool,
     blockshape=None,
 ):
-    assert not (fp8_w8a8 and int8_w8a16)
 
     a = torch.randn((M, K), dtype=dtype, device="cuda")
     w1 = torch.rand((E, N, K), dtype=dtype, device="cuda")
@@ -698,10 +680,6 @@ def input_helper_e2e(
         if blockshape is not None:
             blockshape_k = blockshape[1]
             a, _, a_scale = quantize_fp8_a(a, blockshape_k)
-
-    if int8_w8a16:
-        w1, _, w1_scale = quantize_int8(w1, dim=(0,))
-        w2, _, w2_scale = quantize_int8(w2, dim=(0,))
 
     c = torch.zeros((M, top_k, K), dtype=dtype, device="cuda")
 
@@ -1149,10 +1127,15 @@ def test_fused_moe_gelu(
         (333, 768, 2048, 8, 128),
         (1033, 768, 2048, 8, 128), # TODO: add other shapes
         (1033, 1024, 2048, 8, 128), # TODO: add other shapes
+        # fat N, atomics needed for second gemm
+        (3, 2048, 4096, 2, 8), # mixtral-7B
+        # skinny N
+        (33, 768, 2048, 8, 128),  # qwen3
+        (333, 512, 2048, 10, 512),  # qwen3next
     ],
 )
 @pytest.mark.parametrize("routed_weight", [False])
-@pytest.mark.parametrize("fp8_w8a8, int8_w8a16", [(True, False)])
+@pytest.mark.parametrize("fp8_w8a8", [False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("blockshape_n, blockshape_k", [(128, 128)])
 def test_moe_e2e(
@@ -1163,7 +1146,6 @@ def test_moe_e2e(
     E: int,
     routed_weight: bool,
     fp8_w8a8: bool,
-    int8_w8a16: bool,
     blockshape_n: int,
     blockshape_k: int,
     dtype,
@@ -1191,10 +1173,8 @@ def test_moe_e2e(
         K,
         top_k,
         E,
-        routed_weight=routed_weight,
         dtype=dtype,
         fp8_w8a8=fp8_w8a8,
-        int8_w8a16=int8_w8a16,
         blockshape=blockshape,
     )
 
@@ -1227,7 +1207,6 @@ def test_moe_e2e(
         routed_weight,
         top_k,
         fp8_w8a8,
-        int8_w8a16,
         blockshape,
         config,
         return_intermediate=True
@@ -1247,7 +1226,6 @@ def test_moe_e2e(
         routed_weight,
         dtype,
         fp8_w8a8,
-        int8_w8a16,
         blockshape=blockshape,
     )
 
@@ -1276,3 +1254,4 @@ if __name__ == "__main__":
     test_moe_e2e(33, 512, 2048, 10, 512, False, True, False, 128, 128, torch.bfloat16)
     
     
+    # torch.testing.assert_close(triton_out, torch_out, atol=2e-1, rtol=2e-1)

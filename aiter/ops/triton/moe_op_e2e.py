@@ -52,7 +52,6 @@ def e2e_moe(
     mul_routed_weight: bool,
     top_k: int,
     use_fp8_w8a8: bool,
-    use_int8_w8a16: bool,
     block_shape: Optional[List[int]] = None,
     config: Optional[Dict[str, Any]] = None,
     return_intermediate: Optional[bool] = False,
@@ -116,6 +115,9 @@ def e2e_moe(
     # if the intermediate token dimension is small enough, we can try to fit the whole thing in shared memory
     SKINNY = pid_n == 1
 
+    if not SKINNY:
+        Out = Out.to(torch.float32) # atomics need to be done in fp32
+
     if return_intermediate:
         Intermediate = torch.zeros(
             (M, top_k, N // 2), dtype=torch.float32, device="cuda"
@@ -167,8 +169,8 @@ def e2e_moe(
         use_fp8_w8a8=use_fp8_w8a8,
         NUM_XCDS=get_num_xcds(),
         SKINNY=SKINNY,
-        dtype=torch_to_triton_dtype[dtype],  # input dtype, mma dtype
-        out_dtype=torch_to_triton_dtype[out_dtype],
+        dtype=torch_to_triton_dtype[dtype],  # mma dtype
+        out_dtype=torch_to_triton_dtype[out_dtype] if SKINNY else torch_to_triton_dtype[torch.float32], # atomics need to be done in fp32
         **config,
         return_intermediate=return_intermediate,
     )
