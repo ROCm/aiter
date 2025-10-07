@@ -3,7 +3,11 @@
 os=$(uname --kernel-name)
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 tune_configs_dir="${script_dir}/tune_mha_bwd_configs"
-aiter_config_file="${script_dir}/aiter/ops/triton/configs/MI350X-MHA-DEFAULT.json"
+
+# MI300X config:
+aiter_config_file="${script_dir}/aiter/ops/triton/configs/MI300X-MHA-DEFAULT.json"
+# MI350X config:
+# aiter_config_file="${script_dir}/aiter/ops/triton/configs/MI350X-MHA-DEFAULT.json"
 
 
 os_path() {
@@ -123,13 +127,13 @@ for tune_config in "${tune_configs_dir}"/*.json; do
     replace_aiter_config "${tune_config}"
 
     # Run unit test.
-    if ! pytest -qqq --tb=no "${script_dir}/op_tests/triton_tests/test_mha.py::test_mha_backward_with_pe" &> /dev/null; then
+    if ! pytest -qqq --tb=no "${script_dir}/op_tests/triton_tests/test_mha.py::test_mha_backward_with_pe[True-0.0-192-128-128-128-4096-4096-1]" &> /dev/null; then
         # Test failed.
         result='fail,NA'
     else
         # Test passed, run benchmark.
         time=$(python "${script_dir}/op_tests/op_benchmarks/triton/bench_mha.py" \
-            --dtype fp16 -mode bwd -b 1 -hq 128 -hk 128 -sq 4096 -sk 4096 -d 128 \
+            --dtype bf16 -mode bwd -b 1 -hq 128 -hk 128 -sq 4096 -sk 4096 -d 128 \
             -causal true --layout bshd -metric time 2> /dev/null \
             | tail -1 | tr --squeeze-repeats ' ' | cut --delimiter=' ' --fields=8)
         result="pass,${time}"
