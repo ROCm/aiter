@@ -374,7 +374,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     {
         for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
         {
-            float q_scale = float(1.0);
+            float q_scale = 1.0;
             if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto) {
                 if constexpr(QUANT_METHOD == vllm::Fp8QuantMethod::kPerTensor)
                 {
@@ -624,16 +624,15 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     constexpr bool LOGITS_RTZ_CONVERSION = false;
 
     // write logits to shared mem
-    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
+    for(int token_depth = 0; token_depth < TLOOP; token_depth++)
     {
-        for(int token_depth = 0; token_depth < TLOOP; token_depth++)
+        for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
         {
-            for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
+            for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
             {
-                for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
+                d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
+                if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
                 {
-                    d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
-
                     if constexpr(LOGITS_RTZ_CONVERSION)
                     {
                         // use rtz conversion for better performance, with negligible impact on
@@ -648,22 +647,9 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                                      [rowid] = from_floatx4<output_t>(
                                          d_out[gqa_ratio_loop][mtp][token_depth]);
                     }
-                }
-            }
-        }
-    }
-    else
-    {
-        int rowid_8x8 = rowid / 2;
-        int offset    = rowid % 2;
-
-        for(int token_depth = 0; token_depth < TLOOP; token_depth++)
-        {
-            for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
-            {
-                for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
-                {
-                    d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
+                } else {
+                    int rowid_8x8 = rowid / 2;
+                    int offset    = rowid % 2;
                     // cast _B16x4* to _B8x8*
                     _T8x8& logits_8x8 =
                         *reinterpret_cast<_T8x8*>(&shared_logits[gqa_ratio_loop][0][mtp][warpid]
