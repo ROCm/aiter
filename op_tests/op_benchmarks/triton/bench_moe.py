@@ -92,11 +92,9 @@ def fused_moe(
             K,
             top_k,
             E,
-            routed_weight=routed_weight,
             dtype=dtype,
             fp8_w8a8=fp8_w8a8,
             blockshape=block_shape,
-            int8_w8a16=int8_w8a16,
         )
 
         fn = lambda: triton_e2e_moe(
@@ -115,7 +113,6 @@ def fused_moe(
             routed_weight,
             top_k,
             fp8_w8a8,
-            int8_w8a16,
             block_shape=block_shape,
             config=config,
         )

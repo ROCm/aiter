@@ -379,8 +379,6 @@ def e2e_moe_kernel(
             )
             out = out * moe_weight[:, None]
 
-        out = out.to(out_dtype)
-
         if EVEN_K:
             out_mask = token_mask[:, None]
         else:
@@ -389,8 +387,10 @@ def e2e_moe_kernel(
         if SKINNY:
             # Skinny means that there is only one pid along N (i.e. BLOCK_SIZE_N >= N).
             # Thus we don't need atomics, as there is only workgroup updating a output location.
+            out = out.to(out_dtype)
             tl.store(out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok, out, mask=out_mask)
         else:
+            out = out.to(tl.float32)  # atomics need to be done in fp32
             tl.atomic_add(
                 out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok,
                 out,
