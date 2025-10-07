@@ -27,18 +27,17 @@ def _softmax_kernel_online(
     n_rows,
     n_cols,
     BLOCK_SIZE: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
 ):
     row_start = gl.program_id(0)
     row_idx = row_start
     
     cols_per_thread: gl.constexpr = triton.cdiv(
-        BLOCK_SIZE, NUM_WARPS * 64
+        BLOCK_SIZE, gl.num_warps() * 64
     )
     blocked_cols: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, cols_per_thread],
         threads_per_warp=[1, 64],
-        warps_per_cta=[1, NUM_WARPS],
+        warps_per_cta=[1, gl.num_warps()],
         order=[1, 0],
     )
     
@@ -116,6 +115,10 @@ def softmax(x):
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(n_cols))
     y = torch.empty_like(x)
+    
+    waves_per_eu = 2
+    num_warps = 8
+    num_stages = 2
 
     num_programs = n_rows
 
@@ -128,7 +131,9 @@ def softmax(x):
         n_rows,
         n_cols,
         BLOCK_SIZE,
-        NUM_WARPS=4,
+        # waves_per_eu=waves_per_eu,
+        num_warps=num_warps,
+        # num_stages=num_stages,
     )
 
     return y
