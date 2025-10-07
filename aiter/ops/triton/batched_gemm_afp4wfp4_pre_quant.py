@@ -10,6 +10,7 @@ from aiter.ops.triton._triton_kernels.batched_gemm_afp4wfp4_pre_quant import (
     _batched_gemm_afp4_wfp4_pre_quant_reduce_kernel,
     _batched_gemm_afp4_wfp4_pre_quant_kernel,
     _get_config,
+    get_splitk
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
