@@ -62,17 +62,22 @@ def torch_moe_ref(
     topk_ids,
     topk_weights,
     routed_weight,
-    sorted_token_ids,
-    expert_ids,
-    num_tokens_post_padded,
     dtype,
     fp8_w8a8,
     int8_w8a16,
     int4_w4a16,
     gelu=False,
+    blockshape=None,
 ):
+    use_block_scale = (blockshape is not None) and (len(blockshape) == 2)
+    if use_block_scale:
+        blockshape_n, blockshape_k = blockshape
+    
     if fp8_w8a8:
-        a, _, a_scale = quantize_fp8(a)
+        if use_block_scale:
+            a, _, a_scale = quantize_fp8_a(a, blockshape_k=blockshape_k)
+        else:
+            a, _, a_scale = quantize_fp8(a)
 
     M, top_k, N = c.shape
     _, K = a.shape
@@ -103,11 +108,44 @@ def torch_moe_ref(
     a_expanded = a.unsqueeze(1).repeat(1, top_k, 1)
     # (M, top_k, N, K)
     if fp8_w8a8:
-        b_indexed = b.half()[topk_ids]
+        if use_block_scale:
+            b_indexed = b[topk_ids]
+        else:
+            b_indexed = b.half()[topk_ids]
     else:
         b_indexed = b[topk_ids]
 
-    c = torch.einsum("mek,menk->men", a_expanded.to(dtype), b_indexed.to(dtype))
+    if fp8_w8a8 and use_block_scale:
+        # Emulate the fp8 blockscale matmul
+        sK = K // blockshape_k
+        # sN = N // blockshape_n
+        a_expanded = a_expanded.to(torch.float32).reshape(
+            -1, sK, blockshape_k
+        )  # (M*top_k, sK, blockshape_k)
+        b_indexed = b_indexed.to(torch.float32).reshape(
+            -1, N, sK, blockshape_k
+        )  # (M*top_k, sN, blockshape_n, sK, blockshape_k)
+        # keep sK dimension in result for scaling
+        c_fp8 = torch.einsum(
+            "Mab, MNab -> MaN", a_expanded, b_indexed
+        )  
+        # (M*top_k, sN, blockshape_n, sK)
+        a_scale_expanded = (
+            a_scale.unsqueeze(1)
+            .repeat(1, top_k, 1)
+            .reshape(-1, sK)
+            .unsqueeze(-1)  # (M*top_k, sK, 1)
+        )
+        b_scale_expanded = b_scale[topk_ids.flatten()].permute(0, 2, 1).repeat_interleave(blockshape_n, dim=2)
+        # (M*top_k, sK, N)
+        # combined scales
+        scale_matrix = a_scale_expanded * b_scale_expanded
+        # (M*top_k, sK, N)
+        # apply scales, then reduce over sK
+        c = (c_fp8 * scale_matrix).sum(dim=1).reshape(-1, N)  
+        # (M*top_k, N)
+    else:
+        c = torch.einsum("mek,menk->men", a_expanded.to(dtype), b_indexed.to(dtype))
 
     if routed_weight:
         c *= topk_weights.unsqueeze(-1)
@@ -115,7 +153,7 @@ def torch_moe_ref(
     if not routed_weight and gelu:
         c = 0.5 * c * (1.0 + torch.tanh(0.7978845608 * (c + 0.044715 * c * c * c)))
 
-    if fp8_w8a8:
+    if fp8_w8a8 and not use_block_scale:
         c = c * b_scale[topk_ids].unsqueeze(-1)
         c = c * a_scale
         c = c.to(dtype)
@@ -241,14 +279,11 @@ def torch_moe_align_block_size_ref(
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
-def torch_e2e_moe(
+def torch_moe_gemm2(
     a,
-    w1,
-    w2,
-    out,
-    a_scale,
-    w1_scale,
-    w2_scale,
+    b,
+    c,
+    b_scale,
     topk_ids,
     topk_weights,
     routed_weight,
@@ -256,111 +291,46 @@ def torch_e2e_moe(
     fp8_w8a8,
     blockshape=None,
 ):
-    out_dtype = out.dtype
-    
-    if blockshape is not None:
+    use_block_scale = (blockshape is not None) and (len(blockshape) == 2)
+    if use_block_scale:
         blockshape_n, blockshape_k = blockshape
 
-    if fp8_w8a8 and a_scale is None:
-        a, _, a_scale = quantize_fp8_a(a, blockshape_k=blockshape_k)
+    out_dtype = c.dtype
+    
+    E, K, N_HALF = b.shape
 
-    M, top_k, _ = out.shape
-    E, N, K = w1.shape
-
-    # Expand a: (M, K) -> (M, top_k, K)
-    a_expanded = a.unsqueeze(1).repeat(1, top_k, 1)
-
-    if fp8_w8a8:
-        if blockshape is not None:
-            w1_indexed = w1[topk_ids]
-        else:
-            w1_indexed = w1.half()[topk_ids]
-    else:
-        w1_indexed = w1[topk_ids]
-    # w1_indexed: (M*top_k, N, K)
-
-    if fp8_w8a8 and blockshape is not None:
-        # Emulate the fp8 blockscale matmul
-        sK = K // blockshape_k
-        # sN = N // blockshape_n
-        a_expanded = a_expanded.to(torch.float32).reshape(
-            -1, sK, blockshape_k
-        )  # (M*top_k, sK, blockshape_k)
-        w1_indexed = w1_indexed.to(torch.float32).reshape(
-            -1, N, sK, blockshape_k
-        )  # (M*top_k, sN, blockshape_n, sK, blockshape_k)
-        # keep sK dimension in result for scaling
-        intermediate_fp8 = torch.einsum(
-            "Mab, MNab -> MaN", a_expanded, w1_indexed
-        )  
-        # (M*top_k, sN, blockshape_n, sK)
-        a_scale_expanded = (
-            a_scale.unsqueeze(1)
-            .repeat(1, top_k, 1)
-            .reshape(-1, sK)
-            .unsqueeze(-1)  # (M*top_k, sK, 1)
-        )
-        w1_scale_expanded = w1_scale[topk_ids.flatten()].permute(0, 2, 1).repeat_interleave(blockshape_n, dim=2)
-        # (M*top_k, sK, N)
-        # combined scales
-        scale_matrix = a_scale_expanded * w1_scale_expanded
-        # (M*top_k, sK, N)
-        # apply scales, then reduce over sK
-        intermediate = (intermediate_fp8 * scale_matrix).sum(dim=1).reshape(-1, N)  
-        # (M*top_k, N)
-    else:    
-        intermediate = torch.einsum(
-            "mek,menk->men", a_expanded.to(dtype), w1_indexed.to(dtype)
-        )
-
-    if fp8_w8a8 and blockshape is None:
-        intermediate = intermediate * w1_scale[topk_ids].unsqueeze(-1)
-        intermediate = intermediate * a_scale
-        intermediate = intermediate.to(dtype)
-
-    intermediate = intermediate.to(torch.float32)
-    silu_out = torch_silu_and_mul_ref(intermediate.view(-1, N))
-    silu_out = silu_out.view(M, top_k, N // 2)
-
-    if fp8_w8a8:
-        if blockshape is not None:
-            pass
-        else:
-            silu_out, _, silu_out_scale = quantize_fp8(silu_out)
+    if fp8_w8a8 and not use_block_scale:
+        a, _, a_scale = quantize_fp8(a)
     
     
-    if fp8_w8a8 and blockshape is not None:
+    if fp8_w8a8 and use_block_scale:
         # dequantize w2
-        w2_scale = w2_scale.reshape(
-            E, K // blockshape_k, 1, (N // 2) // blockshape_n, 1
+        b_scale = b_scale.reshape(
+            E, K // blockshape_k, 1, N_HALF // blockshape_n, 1
         )
-        w2 = w2.to(torch.float32) * w2_scale.broadcast_to(
-            E, K // blockshape_k, blockshape_k, (N // 2) // blockshape_n, blockshape_n
-        ).reshape(E, K, (N // 2))
+        b = b.to(torch.float32) * b_scale.broadcast_to(
+            E, K // blockshape_k, blockshape_k, N_HALF // blockshape_n, blockshape_n
+        ).reshape(E, K, N_HALF)
 
-        w2 = w2.to(torch.bfloat16)
+        b = b.to(torch.bfloat16)
     
     if fp8_w8a8:
         if blockshape is not None:
-            w2_indexed = w2[topk_ids]
+            b_indexed = b[topk_ids]
         else:
-            w2_indexed = w2.half()[topk_ids]
+            b_indexed = b.half()[topk_ids]
     else:
-        w2_indexed = w2[topk_ids]
+        b_indexed = b[topk_ids]
 
-    out = torch.einsum("mek,menk->men", silu_out.to(torch.bfloat16), w2_indexed.to(torch.bfloat16))
+    out = torch.einsum("mek,menk->men", a.to(torch.bfloat16), b_indexed.to(torch.bfloat16))
 
-    if fp8_w8a8:
-        if blockshape is not None:
-            pass
-        else:
-            out = out * w2_scale[topk_ids].unsqueeze(-1)
-            out = out * silu_out_scale
 
+    if fp8_w8a8 and not use_block_scale:
+        out = out * a_scale * b_scale
     if routed_weight:
         out *= topk_weights.unsqueeze(-1)
 
-    return out.to(out_dtype), silu_out
+    return out.to(out_dtype)
 
 
 def quantize_fp8(
@@ -837,9 +807,6 @@ def test_fused_moe(
         topk_ids,
         topk_weights,
         routed_weight,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
         dtype,
         fp8_w8a8,
         int8_w8a16,
@@ -972,9 +939,6 @@ def test_fused_moe_int4_w4a16(
         topk_ids,
         topk_weights,
         routed_weight,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
         dtype,
         False,
         False,
@@ -1100,9 +1064,6 @@ def test_fused_moe_gelu(
         topk_ids,
         topk_weights,
         routed_weight,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
         dtype,
         fp8_w8a8,
         int8_w8a16,
@@ -1213,36 +1174,45 @@ def test_moe_e2e(
     )
 
     torch_out = torch.empty_like(triton_out)
-    torch_out, torch_intermediate = torch_e2e_moe(
+    torch_intermediate = torch.empty_like(triton_intermediate)
+    torch_intermediate = torch_moe_ref(
         a,
         w1,
-        w2,
-        torch_out,
+        triton_intermediate,
         a_scale,
         w1_scale,
+        None,
+        None,
+        topk_ids,
+        topk_weights,
+        routed_weight,
+        dtype,
+        fp8_w8a8,
+        False,
+        False,
+        gelu=False,
+        blockshape=blockshape,
+    )
+    torch_intermediate = torch_intermediate.to(torch.float32)
+    torch_intermediate = torch_silu_and_mul_ref(torch_intermediate.view(-1, N))
+    torch_intermediate = torch_intermediate.view(M, top_k, N // 2)
+
+    torch_out = torch_moe_gemm2(
+        triton_intermediate,
+        # torch_intermediate,
+        w2,
+        torch_out,
         w2_scale,
         topk_ids,
         topk_weights,
         routed_weight,
         dtype,
         fp8_w8a8,
-        blockshape=blockshape,
+        blockshape=blockshape
     )
 
-    # print("Comparing intermediate results")
-    
-    # print("triton_intermediate", triton_intermediate.dtype)
-    # print("torch_intermediate", torch_intermediate.dtype)
 
-    # torch.testing.assert_close(triton_intermediate, torch_intermediate, atol=2e-1, rtol=2e-1)
-
-    # print("triton_out", triton_intermediate[314, 3, 90:100])
-    # print("torch_out", torch_intermediate[314, 3, 90:100])
-
-    # print("Intermediate tensors match!")
-
-    # Validate correctness
-    # print("Comparing output results")
+    torch.testing.assert_close(triton_intermediate, torch_intermediate, atol=2e-1, rtol=2e-1)
     torch.testing.assert_close(triton_out, torch_out, atol=2e-1, rtol=2e-1)
 
 
