@@ -72,7 +72,7 @@ def torch_moe_ref(
     use_block_scale = (blockshape is not None) and (len(blockshape) == 2)
     if use_block_scale:
         blockshape_n, blockshape_k = blockshape
-    
+
     if fp8_w8a8:
         if use_block_scale:
             a, _, a_scale = quantize_fp8_a(a, blockshape_k=blockshape_k)
@@ -126,9 +126,7 @@ def torch_moe_ref(
             -1, N, sK, blockshape_k
         )  # (M*top_k, sN, blockshape_n, sK, blockshape_k)
         # keep sK dimension in result for scaling
-        c_fp8 = torch.einsum(
-            "Mab, MNab -> MaN", a_expanded, b_indexed
-        )  
+        c_fp8 = torch.einsum("Mab, MNab -> MaN", a_expanded, b_indexed)
         # (M*top_k, sN, blockshape_n, sK)
         a_scale_expanded = (
             a_scale.unsqueeze(1)
@@ -136,13 +134,17 @@ def torch_moe_ref(
             .reshape(-1, sK)
             .unsqueeze(-1)  # (M*top_k, sK, 1)
         )
-        b_scale_expanded = b_scale[topk_ids.flatten()].permute(0, 2, 1).repeat_interleave(blockshape_n, dim=2)
+        b_scale_expanded = (
+            b_scale[topk_ids.flatten()]
+            .permute(0, 2, 1)
+            .repeat_interleave(blockshape_n, dim=2)
+        )
         # (M*top_k, sK, N)
         # combined scales
         scale_matrix = a_scale_expanded * b_scale_expanded
         # (M*top_k, sK, N)
         # apply scales, then reduce over sK
-        c = (c_fp8 * scale_matrix).sum(dim=1).reshape(-1, N)  
+        c = (c_fp8 * scale_matrix).sum(dim=1).reshape(-1, N)
         # (M*top_k, N)
     else:
         c = torch.einsum("mek,menk->men", a_expanded.to(dtype), b_indexed.to(dtype))
@@ -296,24 +298,21 @@ def torch_moe_gemm2(
         blockshape_n, blockshape_k = blockshape
 
     out_dtype = c.dtype
-    
+
     E, K, N_HALF = b.shape
 
     if fp8_w8a8 and not use_block_scale:
         a, _, a_scale = quantize_fp8(a)
-    
-    
+
     if fp8_w8a8 and use_block_scale:
         # dequantize w2
-        b_scale = b_scale.reshape(
-            E, K // blockshape_k, 1, N_HALF // blockshape_n, 1
-        )
+        b_scale = b_scale.reshape(E, K // blockshape_k, 1, N_HALF // blockshape_n, 1)
         b = b.to(torch.float32) * b_scale.broadcast_to(
             E, K // blockshape_k, blockshape_k, N_HALF // blockshape_n, blockshape_n
         ).reshape(E, K, N_HALF)
 
         b = b.to(torch.bfloat16)
-    
+
     if fp8_w8a8:
         if blockshape is not None:
             b_indexed = b[topk_ids]
@@ -322,8 +321,9 @@ def torch_moe_gemm2(
     else:
         b_indexed = b[topk_ids]
 
-    out = torch.einsum("mek,menk->men", a.to(torch.bfloat16), b_indexed.to(torch.bfloat16))
-
+    out = torch.einsum(
+        "mek,menk->men", a.to(torch.bfloat16), b_indexed.to(torch.bfloat16)
+    )
 
     if fp8_w8a8 and not use_block_scale:
         out = out * a_scale * b_scale
@@ -1086,10 +1086,10 @@ def test_fused_moe_gelu(
         (1033, 512, 2048, 10, 512),
         (3, 768, 2048, 8, 128),  # qwen3
         (333, 768, 2048, 8, 128),
-        (1033, 768, 2048, 8, 128), # TODO: add other shapes
-        (1033, 1024, 2048, 8, 128), # TODO: add other shapes
+        (1033, 768, 2048, 8, 128),  # TODO: add other shapes
+        (1033, 1024, 2048, 8, 128),  # TODO: add other shapes
         # fat N, atomics needed for second gemm
-        (3, 2048, 4096, 2, 8), # mixtral-7B
+        (3, 2048, 4096, 2, 8),  # mixtral-7B
         # skinny N
         (33, 768, 2048, 8, 128),  # qwen3
         (333, 512, 2048, 10, 512),  # qwen3next
@@ -1170,7 +1170,7 @@ def test_moe_e2e(
         fp8_w8a8,
         blockshape,
         config,
-        return_intermediate=True
+        return_intermediate=True,
     )
 
     # validate correctness by comparing to the outputs of two torch gemms
@@ -1208,7 +1208,7 @@ def test_moe_e2e(
         routed_weight,
         dtype,
         fp8_w8a8,
-        blockshape=blockshape
+        blockshape=blockshape,
     )
 
 
