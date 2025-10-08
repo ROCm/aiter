@@ -175,4 +175,7 @@ def e2e_moe(
         return_intermediate=return_intermediate,
     )
 
-    return Out.to(out_dtype), Intermediate
+    if return_intermediate:
+        return Out.to(out_dtype), Intermediate
+    else:
+        return Out.to(out_dtype)

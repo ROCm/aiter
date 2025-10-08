@@ -1173,8 +1173,7 @@ def test_moe_e2e(
         return_intermediate=True
     )
 
-    torch_out = torch.empty_like(triton_out)
-    torch_intermediate = torch.empty_like(triton_intermediate)
+    # validate correctness by comparing to the outputs of two torch gemms
     torch_intermediate = torch_moe_ref(
         a,
         w1,
@@ -1197,8 +1196,9 @@ def test_moe_e2e(
     torch_intermediate = torch_silu_and_mul_ref(torch_intermediate.view(-1, N))
     torch_intermediate = torch_intermediate.view(M, top_k, N // 2)
 
+    torch_out = torch.empty_like(triton_out)
     torch_out = torch_moe_gemm2(
-        triton_intermediate,
+        triton_intermediate, # (acceptable) precision errors from the first gemm accumulate here
         # torch_intermediate,
         w2,
         torch_out,
@@ -1212,16 +1212,5 @@ def test_moe_e2e(
     )
 
 
-    torch.testing.assert_close(triton_intermediate, torch_intermediate, atol=2e-1, rtol=2e-1)
-    torch.testing.assert_close(triton_out, torch_out, atol=2e-1, rtol=2e-1)
-
-
-# if DEBUG_MODE:
-#     print("Debug mode is on")
-if __name__ == "__main__":
-    # does not pass
-    print("Testing shape:  test_moe_e2e(33, 512, 2048, 10, 512, False, False, False, 0, 0, torch.bfloat16)")
-    test_moe_e2e(33, 512, 2048, 10, 512, False, True, False, 128, 128, torch.bfloat16)
-    
-    
-    # torch.testing.assert_close(triton_out, torch_out, atol=2e-1, rtol=2e-1)
+    torch.testing.assert_close(triton_intermediate, torch_intermediate, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
