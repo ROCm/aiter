@@ -2,7 +2,7 @@
 
 os=$(uname --kernel-name)
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-tune_configs_dir="${script_dir}/tune_mha_bwd_configs"
+tune_configs_dir="${script_dir}/tune_mha_fwd_configs"
 
 # MI300X config:
 aiter_config_file="${script_dir}/aiter/ops/triton/configs/MI300X-MHA-DEFAULT.json"
@@ -48,32 +48,26 @@ debug = False
 if debug:
     print("Generating configs....")
 
-block_sizes = [2**n for n in range(5, 8)]
+block_sizes = [2**n for n in range(5, 9)]
 num_warps_range = [2**n for n in range(1, 4)]
-num_stages_range = list(range(1, 4))
-waves_per_eu_range = [0, 1]
+num_stages_range = list(range(1, 5))
+waves_per_eu_range = list(range(0, 3))
 
 for i, config in enumerate(
     itertools.product(
-        block_sizes,  # block_m1
-        block_sizes,  # block_n1
-        block_sizes,  # block_m2
-        block_sizes,  # block_n2
+        block_sizes,  # block_m
+        block_sizes,  # block_n
         num_warps_range,  # num_warps
         num_stages_range,  # num_stages
         waves_per_eu_range,  # waves_per_eu
     )
 ):
-    block_m1, block_n1, block_m2, block_n2, num_warps, num_stages, waves_per_eu = config
-    config_name = f"{i:04d}__BM1_{block_m1:03d}__BN1_{block_n1:03d}__BM2_{block_m2:03d}__BN2_{block_n2:03d}__NW_{num_warps}__NS_{num_stages}__WE_{waves_per_eu}"
+    block_m, block_n, num_warps, num_stages, waves_per_eu = config
+    config_name = f"{i:04d}__BM_{block_m:03d}__BN_{block_n:03d}__NW_{num_warps}__NS_{num_stages}__WE_{waves_per_eu}"
     config_dict = {
-        "BLOCK_M1": block_m1,
-        "BLOCK_N1": block_n1,
-        "BLOCK_M2": block_m2,
-        "BLOCK_N2": block_n2,
-        "BLK_SLICE_FACTOR": 2,
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
         "waves_per_eu": waves_per_eu,
-        "matrix_instr_nonkdim": 16,
         "num_warps": num_warps,
         "num_ctas": 1,
         "num_stages": num_stages,
@@ -105,7 +99,7 @@ with open(r"${os_aiter_config_file}", "r") as aiter_config_file:
     aiter_config = json.load(aiter_config_file)
 if debug:
     print("AITER config:")
-    print(aiter_config["bkwd_onekernel"]["onekernel"])
+    print(aiter_config["fwd"]["default"])
 
 with open(r"${os_tune_config_file}", "r") as tune_config_file:
     tune_config = json.load(tune_config_file)
@@ -113,7 +107,9 @@ if debug:
     print("Tune config")
     print(tune_config)
 
-aiter_config["bkwd_onekernel"]["onekernel"] = tune_config
+aiter_config["fwd"]["default"] = tune_config
+if "pe" in aiter_config["fwd"]:
+    del aiter_config["fwd"]["pe"]
 with open(r"${os_aiter_config_file}", "w") as aiter_config_file:
     json.dump(aiter_config, aiter_config_file, indent=2)
 EOF
@@ -127,16 +123,15 @@ for tune_config in "${tune_configs_dir}"/*.json; do
     replace_aiter_config "${tune_config}"
 
     # Run unit test.
-    if ! pytest -qqq --tb=no "${script_dir}/op_tests/triton_tests/test_mha.py::test_mha_backward_with_pe[True-0.0-192-128-128-128-4096-4096-1]" &> /dev/null; then
+    if ! pytest -qqq --tb=no "${script_dir}/op_tests/triton_tests/test_mha.py::test_mha_with_pe[True-0.0-192-128-128-128-4096-4096-1]" &> /dev/null; then
         # Test failed.
         result='fail,NA'
     else
         # Test passed, run benchmark.
         time=$(python "${script_dir}/op_tests/op_benchmarks/triton/bench_mha.py" \
-            --dtype bf16 -mode bwd -b 1 -hq 128 -hk 128 -sq 4096 -sk 4096 -d 128 \
+            --dtype bf16 -mode fwd -b 1 -hq 128 -hk 128 -sq 4096 -sk 4096 -d 128 \
             -causal true --layout bshd -metric time 2> /dev/null \
-            | tail -1 | tr --squeeze-repeats ' ' | cut --delimiter=' ' --fields=8)
-        # TODO: Double check if --fields should be 7 given the benchmark script update.
+            | tail -1 | tr --squeeze-repeats ' ' | cut --delimiter=' ' --fields=7)
         result="pass,${time}"
     fi
 
