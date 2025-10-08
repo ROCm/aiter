@@ -18,17 +18,16 @@ def _swiglu(
     # in the spirit of FC1 layer :)
     pid = tl.program_id(0)
     start = x_ptr + pid * x_stride
-    for col in range(0, n_cols, B0):
+    for col in range(0, n_cols, B0):  # loop down columns to load in the row. could maybe do this with another axis?
         offsets = tl.arange(0, B0) + col  # ?
         total_offsets = offsets + start
         mask = offsets < n_cols
         # load row
         row = tl.load(total_offsets, mask=mask)
         # do a swish on the row -- x2 * sigmoid(x2) -- sigmoid = 1/(1+e^(-x))
-        swish = row * tl.sigmoid(row)  # element-wise multiplication, pretty sure you can do the * operator in triton? says in the docs magic operators are implemented
-        # multiply by original element
-        swish_lu = swish * row
+        # this is like torch
+        swiglu = row * tl.sigmoid(row) * row  # element-wise multiplication, pretty sure you can do the * operator in triton? says in the docs magic operators are implemented
         # store the result
-        out = out_ptr + offsets
-        tl.store(out, swish_lu, mask=mask)
-
+        out_row = out_ptr + pid * x_stride  # find the right row
+        out = out_row + offsets
+        tl.store(out, swiglu, mask=mask)

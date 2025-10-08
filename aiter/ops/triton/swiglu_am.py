@@ -13,7 +13,7 @@ def swiglu(x):
     """
     ripped from softmax, tests my implementation of swiglu according to how it would be in the FC1 layer
     """
-    _LOGGER.info(f"SOFTMAX: x={tuple(x.shape)}")
+    _LOGGER.info(f"swiglu: x={tuple(x.shape)}")
     n_rows, n_cols = x.shape
 
     MAX_FUSED_SIZE = 65536 // x.element_size()

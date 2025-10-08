@@ -36,3 +36,5 @@ def test_softmax(M, N, dtype):
 
     torch.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
     print("regular softmax has been asserted")
+
+test_softmax(8192, 8192, "fp16")
