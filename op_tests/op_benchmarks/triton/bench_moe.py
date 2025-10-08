@@ -68,7 +68,7 @@ def fused_moe(
 ):
     moe_fn = triton_moe_silu if silu_fused else triton_moe
     block_shape_k = (
-        128 if (block_shape == None or not block_shape[1]) else block_shape[1]
+        128 if (block_shape is None or not block_shape[1]) else block_shape[1]
     )
 
     if e2e_fused:
