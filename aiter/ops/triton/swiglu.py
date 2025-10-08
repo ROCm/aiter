@@ -1,8 +1,8 @@
 import torch
 import triton
 import triton.language as tl
-from _triton_kernels.swiglu import _swiglu_kernel
-from utils.logger import AiterTritonLogger
+from aiter.ops.triton._triton_kernels.swiglu import _swiglu_kernel
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -56,20 +56,3 @@ def swiglu(x, w):
     )
 
     return y
-
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    x = torch.randn(4, 4).cuda()
-    w = torch.randn(4, 8).cuda()
-    xw = x @ w
-    mid = w.shape[1] // 2
-    silu = torch.nn.SiLU()
-
-    y_torch = silu(xw[:, :mid]) * xw[:, mid:]
-    print(y_torch)
-
-    y_triton = swiglu(x, w)
-    print(y_triton)
-
-    print(torch.allclose(y_torch, y_triton))
