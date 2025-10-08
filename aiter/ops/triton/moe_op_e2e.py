@@ -109,14 +109,13 @@ def e2e_moe(
     pid_n = (N + config["BLOCK_SIZE_N"] - 1) // config["BLOCK_SIZE_N"]
     grid = (pid_m * pid_n,)
 
-
     dtype = W1.dtype  # input dtype
     out_dtype = Out.dtype
     # if the intermediate token dimension is small enough, we can try to fit the whole thing in shared memory
     SKINNY = pid_n == 1
 
     if not SKINNY:
-        Out = Out.to(torch.float32) # atomics need to be done in fp32
+        Out = Out.to(torch.float32)  # atomics need to be done in fp32
 
     if return_intermediate:
         Intermediate = torch.zeros(
@@ -170,7 +169,11 @@ def e2e_moe(
         NUM_XCDS=get_num_xcds(),
         SKINNY=SKINNY,
         dtype=torch_to_triton_dtype[dtype],  # mma dtype
-        out_dtype=torch_to_triton_dtype[out_dtype] if SKINNY else torch_to_triton_dtype[torch.float32], # atomics need to be done in fp32
+        out_dtype=(
+            torch_to_triton_dtype[out_dtype]
+            if SKINNY
+            else torch_to_triton_dtype[torch.float32]
+        ),  # atomics need to be done in fp32
         **config,
         return_intermediate=return_intermediate,
     )
