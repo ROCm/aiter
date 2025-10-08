@@ -970,6 +970,7 @@ def _attn_fwd(
 def _get_config(
     enable_dropout: bool,
     dtype: torch.dtype,
+    has_pe: bool = False,
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
@@ -979,7 +980,9 @@ def _get_config(
             config = json.load(file)
         _get_config._config_dict["default"] = config
 
-    if enable_dropout or dtype == torch.float32:
+    if has_pe and "pe" in _get_config._config_dict["default"]["fwd"]:
+        return _get_config._config_dict["default"]["fwd"]["pe"]
+    elif enable_dropout or dtype == torch.float32:
         return _get_config._config_dict["default"]["fwd"]["dropout_or_fp32"]
     else:
         return _get_config._config_dict["default"]["fwd"]["default"]
@@ -1108,7 +1111,7 @@ def _flash_attn_forward(
         dropout_mask = None
 
     if config is None:
-        config = _get_config(enable_dropout, q.dtype)
+        config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
 
     """
     # Tuned for MI300x

@@ -1836,7 +1836,11 @@ def flash_attn_onekernel_backward(
 
     seqlen = max(max_seqlen_q, max_seqlen_k)
 
-    config_onekernel = config["onekernel"]
+    config_onekernel = (
+        config["onekernel_pe"]
+        if (pe_head_dim > 0 and "onekernel_pe" in config)
+        else config["onekernel"]
+    )
     grid = (
         num_k_heads,
         triton.cdiv(seqlen, config_onekernel["BLOCK_N1"]),
