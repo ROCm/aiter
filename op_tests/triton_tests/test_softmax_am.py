@@ -1,6 +1,8 @@
+# rn this is ripped from softmax
+
 import torch
 import pytest
-from aiter.ops.triton.softmax import softmax
+from aiter.ops.triton.softmax_am import softmax
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
@@ -21,7 +23,7 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
         (1, 89999),
     ],
 )
-def test_softmax(M, N, dtype):
+def test_softmax_am(M, N, dtype):
     dtype = str_to_torch_dtype[dtype]
     torch.manual_seed(0)
     x = torch.randn(M, N, dtype=dtype, device="cuda")
@@ -35,4 +37,4 @@ def test_softmax(M, N, dtype):
         atol, rtol = 1e-5, 1e-5
 
     torch.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
-    print("regular softmax has been asserted")
+    print("softmax asserted")

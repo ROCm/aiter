@@ -1,6 +1,8 @@
+# rn this is ripped from regular softmax file
+
 import torch
 import pytest
-from aiter.ops.triton.softmax import softmax
+from aiter.ops.triton.swiglu_am import swiglu
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
@@ -21,12 +23,12 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
         (1, 89999),
     ],
 )
-def test_softmax(M, N, dtype):
+def test_swiglu(M, N, dtype):
     dtype = str_to_torch_dtype[dtype]
     torch.manual_seed(0)
     x = torch.randn(M, N, dtype=dtype, device="cuda")
-    y_triton = softmax(x)
-    y_torch = torch.softmax(x, axis=1)
+    y_triton = swiglu(x)
+    y_torch = torch.swiglu(x, axis=1)
 
     if dtype in (torch.float16, torch.bfloat16):
         atol, rtol = 1e-2, 1e-2
@@ -35,4 +37,4 @@ def test_softmax(M, N, dtype):
         atol, rtol = 1e-5, 1e-5
 
     torch.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
-    print("regular softmax has been asserted")
+    print("swiglu asserted")
