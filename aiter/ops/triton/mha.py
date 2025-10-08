@@ -1274,8 +1274,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
 
-        # TODO: replace by AITER logger
-        # print("Using fused backward kernel:", _USE_FUSED_BWD_KERNEL)
+        _LOGGER.debug(f"Using fused backward kernel: {_USE_FUSED_BWD_KERNEL}")
 
         if _USE_FUSED_BWD_KERNEL:
             flash_attn_fused_backward(
