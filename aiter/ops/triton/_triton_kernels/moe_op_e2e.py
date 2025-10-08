@@ -136,10 +136,10 @@ def e2e_moe_kernel(
     - topk: number of experts the token is routed to
     """
     # TODO:
+    # add gelu support
     # add int8, int4, fp4 support
     # consider non pow2 N (e.g. 768)
     # extensive tuning
-    
     
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
