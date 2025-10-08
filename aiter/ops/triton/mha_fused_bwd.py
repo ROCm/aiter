@@ -1052,6 +1052,10 @@ def flash_attn_fused_backward(
 ):
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
+    if q.shape[-1] == k.shape[-1] and k.shape[-1] > v.shape[-1]:
+        raise ValueError(
+            "'Fused' backward doesn't support Positional Encoding (PE). Please use 'one kernel' backward implementation for PE."
+        )
 
     IS_FP8 = _is_fp8(q)
     if IS_FP8:
