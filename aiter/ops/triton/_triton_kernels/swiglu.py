@@ -10,14 +10,16 @@ import triton.language as tl
 def _swiglu_kernel(
     input_ptr,
     output_ptr,
-    row_stride,
-    col_stride,
+    input_row_stride,
+    input_col_stride,
+    output_row_stride,
+    output_col_stride,
     n_rows,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    num_pid = tl.cdiv(n_cols // 2, BLOCK_SIZE)
+    num_pid = tl.cdiv(n_rows * n_cols // 2, BLOCK_SIZE * BLOCK_SIZE)
 
     # get row and column block index
     row_pid = pid // num_pid
@@ -33,20 +35,20 @@ def _swiglu_kernel(
 
     # get first half
     x1_offsets = (
-        row_range * row_stride
+        row_range * input_row_stride
         + row_pid * BLOCK_SIZE
-        + col_range * col_stride
+        + col_range * input_col_stride
         + col_pid * BLOCK_SIZE
     )
     x1 = tl.load(input_ptr + x1_offsets, mask)
 
     # get second half
     x2_offsets = (
-        row_range * row_stride
+        row_range * input_row_stride
         + row_pid * BLOCK_SIZE
-        + col_range * col_stride
+        + col_range * input_col_stride
         + col_pid * BLOCK_SIZE
-        + mid
+        + mid * input_col_stride
     )
     x2 = tl.load(input_ptr + x2_offsets, mask)
 
@@ -54,4 +56,10 @@ def _swiglu_kernel(
     result = tl.sigmoid(x1) * x1 * x2
 
     # store results
-    tl.store(output_ptr + x1_offsets, result, mask)
+    y_offsets = (
+        row_range * output_row_stride
+        + row_pid * BLOCK_SIZE
+        + col_range * output_col_stride
+        + col_pid * BLOCK_SIZE
+    )
+    tl.store(output_ptr + y_offsets, result, mask)
