@@ -336,8 +336,8 @@ def torch_moe_gemm2(
 def quantize_fp8(
     tensor: torch.Tensor, dim=(), blockshape=None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    use_block_scale = blockshape != None and len(blockshape) == 2
-    use_dim_quantization = dim != None and len(dim) == 2
+    use_block_scale = blockshape is not None and len(blockshape) == 2
+    use_dim_quantization = dim is not None and len(dim) == 2
 
     if use_block_scale:
         blockshape_n, blockshape_k = blockshape[0], blockshape[1]
