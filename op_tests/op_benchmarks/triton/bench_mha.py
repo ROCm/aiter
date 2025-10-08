@@ -114,14 +114,21 @@ def create_benchmark_configs(custom, args):
     hk = args.hq if not args.hk else args.hk
     sk = args.sq if not args.sk else args.sk
     head_size = 128 if not args.d else args.d
+    head_size_v = head_size if not args.dv else args.dv
     mode = args.mode
     x_names = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
     causal = args.causal
     varlen = args.layout == "thd"
 
     configs = []
-    plot_name = f"fused-attention-{mode}-D_HEAD-{head_size}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
-    extra_args = {"D_HEAD": head_size, "dtype": dtype, "causal": causal, "mode": mode}
+    plot_name = get_caller_name_no_ext()
+    extra_args = {
+        "D_HEAD": head_size,
+        "D_HEAD_V": head_size_v,
+        "dtype": dtype,
+        "causal": causal,
+        "mode": mode,
+    }
 
     if custom:
         x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
@@ -150,7 +157,7 @@ def create_benchmark_configs(custom, args):
         if args.fused_bwd:
             line_vals = [f"fused-bwd({unit})"]
         else:
-            line_vals = [f"fused-bwd({unit})", f"bwd({unit})"]
+            line_vals = [f"onekernel-bwd({unit})"]
     else:
         line_vals = [f"fwd({unit})"]
 
@@ -161,7 +168,7 @@ def create_benchmark_configs(custom, args):
         if args.fused_bwd:
             line_vals = [f"fused-bwd({unit})"]
         else:
-            line_vals = [f"bwd({unit})"]
+            line_vals = [f"onekernel-bwd({unit})"]
 
     configs.append(
         triton.testing.Benchmark(
@@ -190,6 +197,7 @@ def run_benchmark(custom, args):
         N_CTX_Q,
         N_CTX_K,
         D_HEAD,
+        D_HEAD_V,
         dtype,
         causal,
         mode,
@@ -208,13 +216,17 @@ def run_benchmark(custom, args):
         return_lse = True
         return_attn_probs = False
         varlen = args.layout == "thd"
+        has_pe = D_HEAD > D_HEAD_V
+        assert (
+            args.fp8 or has_pe
+        ), "Positional Encoding (PE) doesn't support FP8 data type."
+        assert not (
+            has_pe and provider == "fused-bwd"
+        ), "'Fused' backward implementation doesn't support Positional Encoding (PE)."
 
         global _USE_FUSED_BWD
-
         fused_backward = "fused-bwd" in provider
-
-        # FIXME: Dirty hack to disable fused benchmarking, since PE isn't implemented in fused.
-        mha_set_use_fused_bwd_kernel(False)
+        mha_set_use_fused_bwd_kernel(fused_backward)
 
         # Default softmax scale to match standard attention
         if sm_scale is None:
@@ -228,74 +240,125 @@ def run_benchmark(custom, args):
                 f"Testing kernel implementation <{provider}> against Torch with shape:"
             )
             print(
-                f"BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}, D_HEAD={D_HEAD}"
+                f"BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}, D_HEAD={D_HEAD}, D_HEAD_V={D_HEAD_V}"
             )
-            if varlen:
-                test_mha.test_mha(
-                    BATCH,
-                    N_CTX_Q,
-                    N_CTX_K,
-                    HQ,
-                    HK,
-                    D_HEAD,
-                    dropout,
-                    True,
-                    True,
-                    causal,
-                    args.fp8,
-                    dtype,
-                )
+            if not varlen:
+                if not has_pe:
+                    test_mha.test_mha(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        dropout,
+                        True,
+                        True,
+                        causal,
+                        args.fp8,
+                        dtype,
+                    )
+                else:
+                    test_mha.test_mha_with_pe(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        D_HEAD_V,
+                        dropout,
+                        causal,
+                    )
                 print("Forward test passed!")
-                test_mha.test_mha_backward_varlen(
-                    BATCH,
-                    N_CTX_Q,
-                    N_CTX_K,
-                    HQ,
-                    HK,
-                    D_HEAD,
-                    dropout,
-                    causal,
-                    args.fp8,
-                    dtype,
-                )
+                if not has_pe:
+                    test_mha.test_mha_backward_varlen(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        dropout,
+                        causal,
+                        args.fp8,
+                        dtype,
+                    )
+                else:
+                    test_mha.test_mha_backward_with_pe(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        D_HEAD_V,
+                        dropout,
+                        causal,
+                    )
                 print("Backward test passed!")
             else:
-                test_mha.test_mha_varlen(
-                    BATCH,
-                    N_CTX_Q,
-                    N_CTX_K,
-                    HQ,
-                    HK,
-                    D_HEAD,
-                    dropout,
-                    True,
-                    True,
-                    causal,
-                    args.fp8,
-                    dtype,
-                )
+                if not has_pe:
+                    test_mha.test_mha_varlen(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        dropout,
+                        True,
+                        True,
+                        causal,
+                        args.fp8,
+                        dtype,
+                    )
+                else:
+                    test_mha.test_mha_varlen_with_pe(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        D_HEAD_V,
+                        dropout,
+                        causal,
+                    )
                 print("Forward test passed!")
-                test_mha.test_mha_backward(
-                    BATCH,
-                    N_CTX_Q,
-                    N_CTX_K,
-                    HQ,
-                    HK,
-                    D_HEAD,
-                    dropout,
-                    causal,
-                    args.fp8,
-                    dtype,
-                )
+                if not has_pe:
+                    test_mha.test_mha_backward(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        dropout,
+                        causal,
+                        args.fp8,
+                        dtype,
+                    )
+                else:
+                    test_mha.test_mha_backward_varlen_with_pe(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        D_HEAD_V,
+                        dropout,
+                        causal,
+                    )
                 print("Backward test passed!")
 
             return 0
 
         # Generate base inputs
-        # FIXME: Dirty hack to hardcode (DQK, DV) = (192, 128).
-        q = torch.randn((BATCH, N_CTX_Q, HQ, 192), device=device, dtype=dtype)
-        k = torch.randn((BATCH, N_CTX_K, HK, 192), device=device, dtype=dtype)
-        v = torch.randn((BATCH, N_CTX_K, HK, 128), device=device, dtype=dtype)
+        q = torch.randn((BATCH, N_CTX_Q, HQ, D_HEAD), device=device, dtype=dtype)
+        k = torch.randn((BATCH, N_CTX_K, HK, D_HEAD), device=device, dtype=dtype)
+        v = torch.randn((BATCH, N_CTX_K, HK, D_HEAD_V), device=device, dtype=dtype)
         q.requires_grad = requires_grad
         k.requires_grad = requires_grad
         v.requires_grad = requires_grad
@@ -508,6 +571,7 @@ def parse_args():
         help="If specified, uses equal sequence lengths with thd layout, i.e t = b * sq",
     )
     parser.add_argument("-d", type=int, default=0)
+    parser.add_argument("-dv", type=int, default=0)
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-quantize_p", action="store_true", default=False)
@@ -574,17 +638,19 @@ def main():
     assert (
         args.layout == "thd" or not args.equal_seqlens or args.model
     ), "Equal sequence lengths arg must be used with the thd layout or a model config."
-    if args.hq or args.hk or args.d:
+    if args.hq or args.hk or args.d or args.dv:
         custom_config = True
+        if not args.dv:
+            args.dv = args.d
         assert (
-            args.b and args.hq and args.sq and args.d
+            args.b and args.hq and args.sq and args.d and args.dv
         ), "If custom config is specified, please provide \
                 all of batch, number of Q heads, Q sequence length \
                 and head size."
 
     if args.model:
         assert not (
-            args.hq or args.hk or args.d
+            args.hq or args.hk or args.d or args.dv
         ), "Specifying model fixes hq, hk and d already. Do not provide them!"
 
     assert (
