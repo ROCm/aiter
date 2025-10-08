@@ -140,7 +140,7 @@ def e2e_moe_kernel(
     # add int8, int4, fp4 support
     # consider non pow2 N (e.g. 768)
     # extensive tuning
-    
+
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
     tl.assume(stride_w1e > 0)
