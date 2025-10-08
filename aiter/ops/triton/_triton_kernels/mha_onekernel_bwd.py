@@ -543,6 +543,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
+    NUM_XCD: tl.constexpr,
+    NUM_SEQ_TILES: tl.constexpr,
+    CONTIGUOUS_XCD: tl.constexpr,
+    ORDER_HEAD_MAJOR: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
         stride_qb = tl.cast(stride_qb_in, tl.int64)
@@ -633,9 +637,38 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         stride_ah = stride_ah_in
 
     # program ids
-    hkid = tl.program_id(0)
-    pid = tl.program_id(1)
-    bid = tl.program_id(2)
+    #hkid = tl.program_id(0)
+    #pid = tl.program_id(1)
+    #bid = tl.program_id(2)
+    hkid_phys = tl.program_id(0)  # physical head id (round-robin across XCDs)
+    pid_phys  = tl.program_id(1)  # physical seq-tile id
+    bid       = tl.program_id(2)
+   
+    # --- NEW: contiguous-per-XCD head remap ---
+    # Map {0,8},{1,9},... style physical heads into contiguous XCD blocks:
+    #   XCD0 -> heads [0,1], XCD1 -> [2,3], ...
+    if CONTIGUOUS_XCD:
+        xcd_row = hkid_phys % NUM_XCD
+        col     = hkid_phys // NUM_XCD
+        heads_per_xcd_base = HK // NUM_XCD
+        rem = HK % NUM_XCD
+        start = xcd_row * heads_per_xcd_base + tl.minimum(xcd_row, rem)
+        hkid_rr = start + col
+    else:
+        hkid_rr = hkid_phys
+
+    # --- NEW: head-first sequencing ---
+    # Ensure all seq tiles for a head are visited before moving to the next head.
+    if ORDER_HEAD_MAJOR:
+        # Flatten physical schedule (pid-major, head-fastest), then reinterpret as head-major.
+        t    = pid_phys * HK + hkid_rr
+        hkid = t // NUM_SEQ_TILES
+        pid  = t %  NUM_SEQ_TILES
+    else:
+        hkid = hkid_rr
+        pid  = pid_phys
+
+
     if DEBUG_TRITON:
         print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")  # noqa: E701
     # figure out varlen start and end
@@ -1166,6 +1199,11 @@ def bwd_kernel_noncausal(
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
+    # --- NEW: head/XCD sequencing constexprs ---
+    NUM_XCD: tl.constexpr,
+    NUM_SEQ_TILES: tl.constexpr,
+    CONTIGUOUS_XCD: tl.constexpr,
+    ORDER_HEAD_MAJOR: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
         stride_qb = tl.cast(stride_qb_in, tl.int64)
@@ -1256,9 +1294,34 @@ def bwd_kernel_noncausal(
         stride_ah = stride_ah_in
 
     # program ids
-    hkid = tl.program_id(0)
-    pid = tl.program_id(1)
-    bid = tl.program_id(2)
+    #hkid = tl.program_id(0)
+    #pid = tl.program_id(1)
+    #bid = tl.program_id(2)
+
+    hkid_phys = tl.program_id(0)  # physical head id (round-robin across XCDs)
+    pid_phys  = tl.program_id(1)  # physical seq-tile id
+    bid       = tl.program_id(2)
+
+    # --- NEW: contiguous-per-XCD head remap ---
+    if CONTIGUOUS_XCD:
+        xcd_row = hkid_phys % NUM_XCD
+        col     = hkid_phys // NUM_XCD
+        heads_per_xcd_base   = HK // NUM_XCD
+        rem = HK % NUM_XCD
+        start = xcd_row * heads_per_xcd_base + tl.minimum(xcd_row, rem)
+        hkid_rr = start + col
+    else:
+        hkid_rr = hkid_phys
+
+    # --- NEW: head-first sequencing ---
+    if ORDER_HEAD_MAJOR:
+        t    = pid_phys * HK + hkid_rr
+        hkid = t // NUM_SEQ_TILES
+        pid  = t %  NUM_SEQ_TILES
+    else:
+        hkid = hkid_rr
+        pid  = pid_phys
+
     if DEBUG_TRITON:
         print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")  # noqa: E701
     # figure out varlen start and end

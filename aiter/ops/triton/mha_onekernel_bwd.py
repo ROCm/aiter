@@ -178,6 +178,9 @@ def flash_attn_onekernel_backward(
     seqlen = max(max_seqlen_q, max_seqlen_k)
 
     config_onekernel = config["onekernel"]
+
+    num_seq_tiles = triton.cdiv(seqlen, config_onekernel["BLOCK_N1"])
+
     grid = (
         num_k_heads,
         triton.cdiv(seqlen, config_onekernel["BLOCK_N1"]),
@@ -235,6 +238,11 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
+            # --- NEW: head/XCD sequencing constexprs ---
+            NUM_XCD=8,                         # adjust per device if needed
+            NUM_SEQ_TILES=num_seq_tiles,       # grid[1]
+            CONTIGUOUS_XCD=True,               # enable contiguous-per-XCD heads
+            ORDER_HEAD_MAJOR=True,             # enable head-major sequencing
             **config_onekernel,
         )
     else:
@@ -288,6 +296,11 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
+            # --- NEW: head/XCD sequencing constexprs ---
+            NUM_XCD=8,                         # adjust per device if needed
+            NUM_SEQ_TILES=num_seq_tiles,       # grid[1]
+            CONTIGUOUS_XCD=True,               # enable contiguous-per-XCD heads
+            ORDER_HEAD_MAJOR=True,             # enable head-major sequencing
             **config_onekernel,
         )
 

@@ -24,11 +24,18 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 
 def nonvarlen_benchmark_configs():
-    batch_sizes = [1, 4, 16]
-    N_HEADS = [16, 48]
-    seq_len_q = [1, 1024, 4096]
-    seq_len_k = [163, 8192]
-    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
+    batch_sizes = [1, 2]
+    #batch_sizes = [1]
+    #N_HEADS = [8, 16, 32, 64, 128]
+    N_HEADS = [128]
+    #seq_len_q = [8192, 32768, 131072]
+    seq_len_q = [8192, 32768, 131072]
+    #seq_len_q = [131072]
+    #seq_len_k = [8192, 32768, 131072]
+    seq_len_k = [8192, 32768, 131072]
+    #seq_len_k = [131072]
+    #configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
+    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_q))
     configs = [
         (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k)
         for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
@@ -150,7 +157,8 @@ def create_benchmark_configs(custom, args):
         if args.fused_bwd:
             line_vals = [f"fused-bwd({unit})"]
         else:
-            line_vals = [f"fused-bwd({unit})", f"bwd({unit})"]
+            #line_vals = [f"fused-bwd({unit})", f"bwd({unit})"]
+            line_vals = [f"bwd({unit})"]
     else:
         line_vals = [f"fwd({unit})"]
 

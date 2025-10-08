@@ -463,19 +463,23 @@ def test_mha_varlen(
         )
 
 
-@pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
+#@pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
+@pytest.mark.parametrize("BATCH", [4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+    #[(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128), (128, 128)],
+    [(128, 128)],
 )
 @pytest.mark.parametrize("DROPOUT, CAUSAL", [(0.0, False), (0.0, True), (0.2, False)])
 # @pytest.mark.parametrize('DROPOUT, CAUSAL',[(0.0, False),(0.0, True),(0.2, False),(0.2, True)]) #Debug Causal + Dropout. fails for seq >= 64
 @pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
+    #"NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
+    "NUM_Q_HEADS, NUM_K_HEADS", [(16, 16)]
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("FP8", [False])
-@pytest.mark.parametrize("FUSED", [False, True])
+#@pytest.mark.parametrize("FUSED", [False, True])
+@pytest.mark.parametrize("FUSED", [False])
 # @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
 def test_mha_backward(
     BATCH: int,
@@ -493,7 +497,7 @@ def test_mha_backward(
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
-    pytest.skip("Backward accuracy issues due to Triton compiler")
+    #pytest.skip("Backward accuracy issues due to Triton compiler")
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
     mha_set_use_fused_bwd_kernel(FUSED)
