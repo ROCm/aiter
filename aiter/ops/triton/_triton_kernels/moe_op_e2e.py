@@ -294,10 +294,7 @@ def e2e_moe_kernel(
         offs_in = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
         i_ptrs = Intermediate + stride_im * offs_token[:, None] + offs_in[None, :]
         i_mask = token_mask[:, None] & (offs_in[None, :] < N // 2)
-        if SKINNY:
-            tl.store(i_ptrs, acc.to(out_dtype), mask=i_mask)
-        else:
-            tl.atomic_add(i_ptrs, acc.to(out_dtype), mask=i_mask, sem="relaxed", scope="cta",)
+        tl.store(i_ptrs, acc.to(out_dtype), mask=i_mask)
 
     if use_fp8_w8a8:
         acc = acc.to(tl.bfloat16)
