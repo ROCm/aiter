@@ -107,9 +107,16 @@ def _gemm_a8w8_blockscale_kernel(
     threads_per_elem_kn: gl.constexpr = triton.cdiv(
         BLOCK_SIZE_K * BLOCK_SIZE_N // (NUM_WARPS * 64), 16
     )
+    # blocked_mk: gl.constexpr = gl.BlockedLayout(
+    #     size_per_thread=[threads_per_elem_mk, 16],
+    #     threads_per_warp=[1, 64],
+    #     warps_per_cta=[NUM_WARPS, 1],
+    #     order=[1, 0],
+    # )
+    
     blocked_mk: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[threads_per_elem_mk, 16],
-        threads_per_warp=[1, 64],
+        threads_per_warp=[64 // (BLOCK_SIZE_K // 16), BLOCK_SIZE_K // 16],
         warps_per_cta=[NUM_WARPS, 1],
         order=[1, 0],
     )

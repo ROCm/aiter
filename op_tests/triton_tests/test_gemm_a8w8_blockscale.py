@@ -233,7 +233,7 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str, block_scale=False):
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
     if impl == "gluon":
-        impl = gemm_a8w8_bpreshuffle_blockscale.gemm_a8w8_blockscale if block_scale else gemm_a8w8_bpreshuffle.gemm_a8w8_blockscale
+        impl = gemm_a8w8_bpreshuffle_blockscale.gemm_a8w8_blockscale if block_scale else gemm_a8w8_bpreshuffle.gemm_a8w8_ptpc
 
     elif impl == "triton":
         impl = triton_gemm_a8w8_blockscale
@@ -250,6 +250,10 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str, block_scale=False):
 # def test_gemm(dtype, M, N, K, layout, output, impl: str):
 if __name__ == "__main__":
     #blockscale
-    test_gemm("bf16", 16, 20480, 8320, "TN", True, "gluon", True)
+    # test_gemm("bf16", 16, 7168, 2048, "TN", True, "gluon", True)
     #pure fp8
-    test_gemm("bf16", 16, 20480, 8320, "TN", True, "gluon", False)
+    test_gemm("bf16", 16, 7168, 2048, "TN", True, "gluon", False)
+    # test_gemm("bf16", 16, 8192, 8192, "TN", True, "gluon", False)
+    # test_gemm("bf16", 8192, 8192, 8320, "TN", True, "gluon", False)
+    # test_gemm("bf16", 8192, 8192, 8320, "TN", True, "gluon", False)
+    # test_gemm("bf16", 8192, 4608, 7168, "TN", True, "gluon", False)

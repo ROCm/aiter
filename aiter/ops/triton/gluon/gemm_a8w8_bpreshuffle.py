@@ -27,7 +27,7 @@ from aiter.ops.shuffle import shuffle_weight
     }
 )
 @gluon.jit
-def _gemm_a8w8_blockscale_kernel(
+def _gemm_a8w8_ptpc(
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -104,21 +104,28 @@ def _gemm_a8w8_blockscale_kernel(
     threads_per_elem_mk: gl.constexpr = triton.cdiv(
         BLOCK_SIZE_M * BLOCK_SIZE_K // (NUM_WARPS * 64), 16
     )
-    threads_per_elem_kn: gl.constexpr = triton.cdiv(
-        BLOCK_SIZE_K * BLOCK_SIZE_N // (NUM_WARPS * 64), 16
-    )
+    # threads_per_elem_kn: gl.constexpr = triton.cdiv(
+    #     BLOCK_SIZE_K * BLOCK_SIZE_N // (NUM_WARPS * 64), 16
+    # )
+    # blocked_mk: gl.constexpr = gl.BlockedLayout(
+    #     size_per_thread=[threads_per_elem_mk, 16],
+    #     threads_per_warp=[1, 64],
+    #     warps_per_cta=[NUM_WARPS, 1],
+    #     order=[1, 0],
+    # )
+    
     blocked_mk: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[threads_per_elem_mk, 16],
-        threads_per_warp=[1, 64],
+        threads_per_warp=[64 // (BLOCK_SIZE_K // 16), BLOCK_SIZE_K // 16],
         warps_per_cta=[NUM_WARPS, 1],
         order=[1, 0],
     )
-    blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, threads_per_elem_kn],
-        threads_per_warp=[8, 8],
-        warps_per_cta=[1, NUM_WARPS],
-        order=[0, 1],
-    )
+    # blocked_kn: gl.constexpr = gl.BlockedLayout(
+    #     size_per_thread=[16, threads_per_elem_kn],
+    #     threads_per_warp=[8, 8],
+    #     warps_per_cta=[1, NUM_WARPS],
+    #     order=[0, 1],
+    # )
     blocked_kn_preshuffled: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[16, 1, 1, 1],
         threads_per_warp=[1, 16, 4, 1],
@@ -131,9 +138,9 @@ def _gemm_a8w8_blockscale_kernel(
         transposed=True,
         warps_per_cta=[1, NUM_WARPS],
     )
-    offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn)
-    )
+    # offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(
+    #     0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn)
+    # )
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[1, 0]
     )
@@ -448,7 +455,7 @@ def _get_config(
     return config
 
 
-def gemm_a8w8_blockscale(
+def gemm_a8w8_ptpc(
     x: torch.Tensor,
     w: torch.Tensor,
     x_scale: torch.Tensor,
@@ -499,10 +506,10 @@ def gemm_a8w8_blockscale(
     config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
     config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
 
-    if config["NUM_KSPLIT"] == 1:
-        assert (
-            config["GROUP_K"] == config["BLOCK_SIZE_K"]
-        ), f"GROUP_K: {config['GROUP_K']} must equal BLOCK_SIZE_K: {config['BLOCK_SIZE_K']} when not using KSPLIT"
+    # if config["NUM_KSPLIT"] == 1:
+    #     assert (
+    #         config["GROUP_K"] == config["BLOCK_SIZE_K"]
+    #     ), f"GROUP_K: {config['GROUP_K']} must equal BLOCK_SIZE_K: {config['BLOCK_SIZE_K']} when not using KSPLIT"
 
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
@@ -522,7 +529,7 @@ def gemm_a8w8_blockscale(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),
     )
-    _gemm_a8w8_blockscale_kernel[grid](
+    _gemm_a8w8_ptpc[grid](
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
