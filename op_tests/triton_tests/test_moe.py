@@ -1198,7 +1198,7 @@ def test_moe_e2e(
 
     torch_out = torch.empty_like(triton_out)
     torch_out = torch_moe_gemm2(
-        triton_intermediate, # (acceptable) precision errors from the first gemm accumulate here
+        triton_intermediate,  # (acceptable) precision errors from the first gemm accumulate here
         # torch_intermediate,
         w2,
         torch_out,
@@ -1211,6 +1211,7 @@ def test_moe_e2e(
         blockshape=blockshape,
     )
 
-
-    torch.testing.assert_close(triton_intermediate, torch_intermediate, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(
+        triton_intermediate, torch_intermediate, atol=1e-1, rtol=1e-1
+    )
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
