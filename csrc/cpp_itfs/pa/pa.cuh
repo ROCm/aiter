@@ -384,8 +384,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                 {
                     const int q_scale_idx = (query_start_off + mtp * MTP_PARALLEL_THREADS) *
                                     total_num_heads + global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP;
-                    bool is_valid = (global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP) < total_num_heads;
-                    float default_scale = 1.0;
+                    const bool is_valid = (global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP) < total_num_heads;
+                    const float default_scale = is_valid ? 1.0 : q_scale_ptr[0];
                     q_scale =
                         q_scale_ptr != nullptr && is_valid
                             ? *(q_scale_ptr + q_scale_idx)
@@ -510,7 +510,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     // calculate qk_max and exp_sum per warp and write to shared memory
     float qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD]  = {-FLT_MAX};
     float exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
-
+    // float q_scale[GQA_RATIO_LOOP][MTP_PER_THREAD] = {1.0f};
     for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
     {
         const int q_token_idx = warp_mtp_idx + mtp * MTP_PARALLEL_THREADS;
@@ -535,26 +535,49 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                 qk_max[gqa_ratio_loop][mtp] = fmaxf(qk_max[gqa_ratio_loop][mtp],
                                                     __shfl_xor(qk_max[gqa_ratio_loop][mtp], mask));
             }
-
+            // float q_scale = 1.0;
+            // if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto) {
+            //     if constexpr(QUANT_METHOD == vllm::Fp8QuantMethod::kPerTensor)
+            //     {
+            //         q_scale = q_scale_ptr != nullptr ? *q_scale_ptr : float(1.0);
+            //     }
+            //     else if constexpr(QUANT_METHOD == vllm::Fp8QuantMethod::kPerHead)
+            //     {
+            //         const int q_scale_idx = (query_start_off + mtp * MTP_PARALLEL_THREADS) *
+            //                         total_num_heads + global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP;
+            //         const bool is_valid = (global_qhead_idx + gqa_ratio_loop * GQA_RATIO_PER_LOOP) < total_num_heads;
+            //         const float default_scale = is_valid ? 1.0 : q_scale_ptr[0];
+            //         q_scale =
+            //             q_scale_ptr != nullptr && is_valid
+            //                 ? *(q_scale_ptr + q_scale_idx)
+            //                 : default_scale;
+            //     }
+            // }
+            // qk_max[gqa_ratio_loop][mtp] *= q_scale;
+            // d_out[gqa_ratio_loop][mtp][token_depth] *= q_scale;
             for(int token_depth = 0; token_depth < TLOOP; token_depth++)
             {
                 const int local_token_idx = qkout_token_idx + token_depth * 16;
                 for(int i = 0; i < 4; i++)
                 {
+                    const float diff = d_out[gqa_ratio_loop][mtp][token_depth][i] - qk_max[gqa_ratio_loop][mtp];
                     const float tmp                            = ((local_token_idx + i) <
                                        (context_len * (warp_mtp_idx + 1) - MTP + q_token_idx + 1))
-                                                                     ? __expf(d_out[gqa_ratio_loop][mtp][token_depth][i] -
-                                                   qk_max[gqa_ratio_loop][mtp])
+                                                                     ? __expf(diff)
                                                                      : 0.0f;
+
                     d_out[gqa_ratio_loop][mtp][token_depth][i] = tmp;
                     exp_sum[gqa_ratio_loop][mtp] += tmp;
                 }
             }
 
+
+            
             for(int mask = WARP_SIZE / 2; mask >= 16; mask /= 2)
             {
                 exp_sum[gqa_ratio_loop][mtp] += __shfl_xor(exp_sum[gqa_ratio_loop][mtp], mask);
             }
+
         }
     }
     __syncthreads(); // sync before writing to shared mem
@@ -592,12 +615,13 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
         {
             float warp_qk_max_exp[NWARPS];
+            // if((lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP) < GQA_RATIO){
             for(int w = 0; w < NWARPS; w++)
             {
                 warp_qk_max_exp[w] =
                     shared_mem[w * 16 * GQA_RATIO_LOOP * MTP_PER_THREAD +
-                               (lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP) * MTP_PER_THREAD +
-                               mtp];
+                            (lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP) * MTP_PER_THREAD +
+                            mtp];
                 partition_qk_max[gqa_ratio_loop][mtp] =
                     fmaxf(partition_qk_max[gqa_ratio_loop][mtp], warp_qk_max_exp[w]);
             }
@@ -608,12 +632,13 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                     __expf(warp_qk_max_exp[w] - partition_qk_max[gqa_ratio_loop][mtp]);
                 partition_exp_sum[gqa_ratio_loop][mtp] +=
                     shared_mem[NWARPS * 16 * GQA_RATIO_LOOP * MTP_PER_THREAD +
-                               w * 16 * GQA_RATIO_LOOP * MTP_PER_THREAD +
-                               (lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP) * MTP_PER_THREAD +
-                               mtp] *
+                            w * 16 * GQA_RATIO_LOOP * MTP_PER_THREAD +
+                            (lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP) * MTP_PER_THREAD +
+                            mtp] *
                     warp_qk_max_exp[w];
             }
-
+            // partition_qk_max[gqa_ratio_loop][mtp] *= q_scale[gqa_ratio_loop][mtp];
+            // }
             inv_sum_scale[gqa_ratio_loop][mtp] =
                 __fdividef(1.f, partition_exp_sum[gqa_ratio_loop][mtp] + 1e-6f) *
                 warp_qk_max_exp[warpid];
@@ -677,6 +702,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
             for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
             {
                 const int qhead_idx = lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP;
+                // if(qhead_idx < GQA_RATIO){
                 const int64_t offset =
                     static_cast<int64_t>(query_start_off + mtp * MTP_PARALLEL_THREADS) *
                         static_cast<int64_t>(total_num_heads) *
@@ -686,6 +712,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                     static_cast<int64_t>(partition_idx);
                 max_logits[offset] = partition_qk_max[gqa_ratio_loop][mtp];
                 exp_sums[offset]   = partition_exp_sum[gqa_ratio_loop][mtp];
+                // }
             }
         }
     }
