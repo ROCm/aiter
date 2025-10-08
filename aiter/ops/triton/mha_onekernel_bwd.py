@@ -1735,8 +1735,9 @@ def flash_attn_onekernel_backward(
 
     # get strides and shape
     if IS_VARLEN:
-        # Layout for q,k,v is thd ie [total tokens, num_head, head_dim(v)]
-        # TODO: double check if this comment is correct ^^^
+        # Layout is thd.
+        # q and k are [total_tokens, num_head, head_dim_qk].
+        # v is [total_tokens, num_head, head_dim_v].
         batch, seqlen_q, num_q_heads = (
             len(cu_seqlens_q) - 1,
             max_seqlen_q,
@@ -1753,8 +1754,9 @@ def flash_attn_onekernel_backward(
         dv_strides = (0, dv.stride(1), dv.stride(0), dv.stride(2))
         do_strides = (0, do.stride(1), do.stride(0), do.stride(2))
     else:
-        # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim(v)]
-        # TODO: double check if this comment is correct ^^^
+        # Layout is bshd.
+        # q and k are [batch, seq_len, num_head, head_dim_qk].
+        # v is [batch, seq_len, num_head, head_dim_v]
         batch, seqlen_q, num_q_heads = q.shape[:-1]
         _, num_k_heads = k.shape[1], k.shape[2]
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
