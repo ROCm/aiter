@@ -19,11 +19,11 @@ def _swiglu_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    num_pid = tl.cdiv(n_rows * n_cols // 2, BLOCK_SIZE * BLOCK_SIZE)
+    blocks_per_row = tl.cdiv(n_cols // 2, BLOCK_SIZE)
 
     # get row and column block index
-    row_pid = pid // num_pid
-    col_pid = pid % num_pid
+    row_pid = pid // blocks_per_row
+    col_pid = pid % blocks_per_row
 
     # get row and column ranges
     row_range = tl.arange(0, BLOCK_SIZE)[:, None]
@@ -36,30 +36,29 @@ def _swiglu_kernel(
     # get first half
     x1_offsets = (
         row_range * input_row_stride
-        + row_pid * BLOCK_SIZE
+        + row_pid * BLOCK_SIZE * input_row_stride
         + col_range * input_col_stride
-        + col_pid * BLOCK_SIZE
+        + col_pid * BLOCK_SIZE * input_col_stride
     )
     x1 = tl.load(input_ptr + x1_offsets, mask)
 
     # get second half
     x2_offsets = (
         row_range * input_row_stride
-        + row_pid * BLOCK_SIZE
-        + col_range * input_col_stride
-        + col_pid * BLOCK_SIZE
-        + mid * input_col_stride
+        + row_pid * BLOCK_SIZE * input_row_stride
+        + (col_range + mid) * input_col_stride
+        + col_pid * BLOCK_SIZE * input_col_stride
     )
     x2 = tl.load(input_ptr + x2_offsets, mask)
 
     # compute swiglu
-    result = tl.sigmoid(x1) * x1 * x2
+    y = tl.sigmoid(x1) * x1 * x2
 
     # store results
     y_offsets = (
         row_range * output_row_stride
-        + row_pid * BLOCK_SIZE
+        + row_pid * BLOCK_SIZE * output_row_stride
         + col_range * output_col_stride
-        + col_pid * BLOCK_SIZE
+        + col_pid * BLOCK_SIZE * output_col_stride
     )
-    tl.store(output_ptr + y_offsets, result, mask)
+    tl.store(output_ptr + y_offsets, y, mask)

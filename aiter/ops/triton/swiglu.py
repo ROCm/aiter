@@ -34,11 +34,13 @@ def swiglu(x, w):
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(n_cols // 2))
     y = torch.empty((n_rows, n_cols // 2)).cuda()
 
-    waves_per_eu = 1
-    num_warps = 1
-    num_stages = 1
+    waves_per_eu = 2
+    num_warps = 8
+    num_stages = 2
 
-    grid = lambda meta: (triton.cdiv(n_rows * n_cols // 2, BLOCK_SIZE * BLOCK_SIZE),)
+    grid = lambda meta: (
+        triton.cdiv(n_rows, BLOCK_SIZE) * triton.cdiv(n_cols // 2, BLOCK_SIZE),
+    )
     xw = x @ w
     _swiglu_kernel[grid](
         xw,
