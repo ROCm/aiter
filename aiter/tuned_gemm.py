@@ -33,9 +33,9 @@ bestsols = {}
 
 solids = {}
 
-solMap = ["torch", "hipblaslt", "rocblas", "skinny"]
+solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
 
-soltype = 0
+soltype = None
 
 
 @torch_compile_guard()
