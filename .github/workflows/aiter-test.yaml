@@ -28,13 +28,16 @@ jobs:
 
       - name: Sync submodules
         run: |
-          set -e
+          set -euo pipefail
           if [[ ${{ github.ref }} == "refs/heads/main" ]]; then
-            git submodule sync --remote
-          else
+            echo "It's main branch, syncing latest CK..."
             git submodule sync
+            git submodule update --init --recursive --remote --depth 1 --jobs 4
+          else
+            echo "It's a PR branch, syncing specific CK..."
+            git submodule sync
+            git submodule update --init --recursive --depth 1 --jobs 4
           fi
-          git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Clean up Rocm processes
         run: |
@@ -102,13 +105,16 @@ jobs:
 
       - name: Sync submodules
         run: |
-          set -e
-          if [[ ${{ github.ref }} == "main" ]]; then
-            git submodule sync --remote
-          else
+          set -euo pipefail
+          if [[ ${{ github.ref }} == "refs/heads/main" ]]; then
+            echo "It's main branch, syncing latest CK..."
             git submodule sync
+            git submodule update --init --recursive --remote --depth 1 --jobs 4
+          else
+            echo "It's a PR branch, syncing specific CK..."
+            git submodule sync
+            git submodule update --init --recursive --depth 1 --jobs 4
           fi
-          git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Clean up Rocm processes
         run: ./.github/scripts/clean_up_rocm.sh

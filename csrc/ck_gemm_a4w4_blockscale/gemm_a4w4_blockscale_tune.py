@@ -193,117 +193,106 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
 
-            if tunedf[
-                (tunedf["M"] == M)
-                & (tunedf["N"] == N)
-                & (tunedf["K"] == K)
-                & (tunedf["cu_num"] == cu_num)
-            ].empty:
-                total_kernel_nums = 0
-                seed = seed + 1
+            total_kernel_nums = 0
+            seed = seed + 1
 
-                for i in range(ck_kernels_num):
-                    kernel = kernels_list[i]
-                    maxsplitK = (
-                        aiter.compute_gemm_SplitK(
-                            M,
-                            N,
-                            K,
-                            kernel.MPerBLOCK,
-                            kernel.NPerBLOCK,
-                            kernel.KPerBLOCK,
-                        )
-                        if useSplitK
-                        else 0
+            for i in range(ck_kernels_num):
+                kernel = kernels_list[i]
+                maxsplitK = (
+                    aiter.compute_gemm_SplitK(
+                        M,
+                        N,
+                        K,
+                        kernel.MPerBLOCK,
+                        kernel.NPerBLOCK,
+                        kernel.KPerBLOCK,
                     )
-                    for splitK in range(maxsplitK + 1):
-                        info = ((cu_num, M, N, K), i, splitK, "")
-                        task.append(
-                            (
-                                info,
-                                generate_data,
-                                (M, N, K, seed),
-                                run_gemm_a4w4_blockscale,
-                                (
-                                    gemm_a4w4_data_idx,
-                                    i,
-                                    splitK,
-                                ),
-                                {
-                                    "num_warmup": 10,
-                                    "num_iters": 101,
-                                },
-                                run_torch,
-                                (
-                                    torch_data_idx,
-                                    dtypes.bf16,
-                                ),
-                                {},
-                                None,
-                                1e-2,
-                                0.01,
-                            )
-                        )
-                        total_kernel_nums = total_kernel_nums + 1
-                ### asm kernels
-                asm_kernels_id = ck_kernels_num + 1
-                asm_kernel_list_csv = (
-                    f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
+                    if useSplitK
+                    else 0
                 )
-                asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
-                asm_tiles = [key for key in asm_kernels.keys()]
-                for key in asm_tiles:
-                    tile_m, tile_n, splitk = key
-                    maxsplitK = (
-                        aiter.compute_gemm_SplitK(M, N, K, tile_m, tile_n, 256)
-                        if useSplitK
-                        else 0
-                    )
-                    kernelName = asm_kernels.get((tile_m, tile_n, splitk), [])
-                    if len(kernelName) == 0:
-                        print(f"no kernel name for ({tile_m}, {tile_n})!!!!")
-                        continue
-                    if splitk == 0:
-                        maxsplitK = 0
-                    for splitK in range(maxsplitK + 1):
-                        kernel_name = kernelName[0]
-                        info = ((cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
-                        task.append(
+                for splitK in range(maxsplitK + 1):
+                    info = ((cu_num, M, N, K), i, splitK, "")
+                    task.append(
+                        (
+                            info,
+                            generate_data,
+                            (M, N, K, seed),
+                            run_gemm_a4w4_blockscale,
                             (
-                                info,
-                                generate_data,
-                                (M, N, K, seed),
-                                run_gemm_a4w4_blockscale_asm,
-                                (
-                                    gemm_asm_data_idx,
-                                    kernel_name,
-                                    dtypes.bf16,
-                                    True,
-                                    splitK,
-                                ),
-                                {
-                                    "num_warmup": 10,
-                                    "num_iters": 101,
-                                },
-                                run_torch,
-                                (
-                                    torch_data_idx,
-                                    dtypes.bf16,
-                                ),
-                                {},
-                                None,
-                                1e-2,
-                                0.01,
-                            )
+                                gemm_a4w4_data_idx,
+                                i,
+                                splitK,
+                            ),
+                            {
+                                "num_warmup": 10,
+                                "num_iters": 101,
+                            },
+                            run_torch,
+                            (
+                                torch_data_idx,
+                                dtypes.bf16,
+                            ),
+                            {},
+                            None,
+                            1e-2,
+                            0.01,
                         )
-                        asm_kernels_id = asm_kernels_id + 1
+                    )
+                    total_kernel_nums = total_kernel_nums + 1
+            ### asm kernels
+            asm_kernels_id = ck_kernels_num + 1
+            asm_kernel_list_csv = f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
+            asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
+            asm_tiles = [key for key in asm_kernels.keys()]
+            for key in asm_tiles:
+                tile_m, tile_n, splitk = key
+                maxsplitK = (
+                    aiter.compute_gemm_SplitK(M, N, K, tile_m, tile_n, 256)
+                    if useSplitK
+                    else 0
+                )
+                kernelName = asm_kernels.get((tile_m, tile_n, splitk), [])
+                if len(kernelName) == 0:
+                    print(f"no kernel name for ({tile_m}, {tile_n})!!!!")
+                    continue
+                if splitk == 0:
+                    maxsplitK = 0
+                for splitK in range(maxsplitK + 1):
+                    kernel_name = kernelName[0]
+                    info = ((cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
+                    task.append(
+                        (
+                            info,
+                            generate_data,
+                            (M, N, K, seed),
+                            run_gemm_a4w4_blockscale_asm,
+                            (
+                                gemm_asm_data_idx,
+                                kernel_name,
+                                dtypes.bf16,
+                                True,
+                                splitK,
+                            ),
+                            {
+                                "num_warmup": 10,
+                                "num_iters": 101,
+                            },
+                            run_torch,
+                            (
+                                torch_data_idx,
+                                dtypes.bf16,
+                            ),
+                            {},
+                            None,
+                            1e-2,
+                            0.01,
+                        )
+                    )
+                    asm_kernels_id = asm_kernels_id + 1
 
-                        total_kernel_nums = total_kernel_nums + 1
-                tasks_in_data.append((total_kernel_nums, ()))
-            else:
-                print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
-                print()
-                print()
+                    total_kernel_nums = total_kernel_nums + 1
+            tasks_in_data.append((total_kernel_nums, ()))
+
         ret = []
         if task:
             ret = mp_tuner(task, tasks_in_data, mp_num, False, shape_grouped, errRatio)

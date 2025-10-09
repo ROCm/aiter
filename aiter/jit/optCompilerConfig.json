@@ -599,6 +599,22 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_sample": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/sample_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/sample_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/ck_tile'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_rope_general_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/rope_general_fwd_pybind.cu'",

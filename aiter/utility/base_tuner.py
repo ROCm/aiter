@@ -41,6 +41,7 @@ class TunerCommon:
         torch.float8_e4m3fnuz: 1,
         torch.float8_e4m3fn: 1,
     }
+    INVALID_TIME = -1
 
     def __init__(self, name, key, resultList, description=None):
         self.parser = argparse.ArgumentParser(description=description)
@@ -54,6 +55,9 @@ class TunerCommon:
         self.topk = 1
         self.success = pd.DataFrame(columns=self.columns)
         self.failed = pd.DataFrame(columns=self.columns)
+
+        self.remain_untuned = pd.DataFrame(columns=self.keys)
+        self.start_time = 0
 
     def get_arg_defaults(self):
         """get default arguments"""
@@ -205,11 +209,16 @@ class TunerCommon:
                 .apply(tuple, axis=1)
                 .isin(self.untunedf[untunedf_cols].apply(tuple, axis=1))
             )
+            if args.verbose:
+                logger.info(f"retuning {mask.sum()} shapes")
+                print(self.tunedf[mask])
             self.tunedf = self.tunedf[~mask]
 
     def update_tunedf(self, df_old, df_updates):
         """update tuned result to old df"""
         """ for shapes already tuned, we update the result inplace"""
+        if df_updates.empty:
+            return df_old
         key_columns = self.keys
         df_updates = df_updates.loc[:, self.columns]
         # print(df_updates)
@@ -257,7 +266,7 @@ class TunerCommon:
         if args.profile_file != "":
             profiledf = self.result_to_df(sorted(rets, key=itemgetter(0)))
             profiledf.to_csv(args.profile_file, index=False, na_rep="Null")
-            # self.result_to_csv(sorted(rets, key=itemgetter(0)), args.profile_file, True)
+
         if fast_mode or topk == -1:
             return rets
         best_time = -1
@@ -278,7 +287,7 @@ class TunerCommon:
                 (info_ex, round(us, 4), max_err_ratio)
                 for info_ex, us, max_err_ratio in sorted_time
                 if max_err_ratio <= tol_err_ratio
-                and us != INVALID_TIME
+                and us != self.INVALID_TIME
                 and us != float("inf")
             ]
             if len(filtered_time) == 0:
@@ -296,11 +305,30 @@ class TunerCommon:
             ]
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")
-                best_config = [((info_key, *sorted_time[0][0]), INVALID_TIME, 1.0)]
-
+                best_config = [((info_key, *sorted_time[0][0]), self.INVALID_TIME, 1.0)]
             bestConfigs.extend(best_config)
         resultdf = self.result_to_df(bestConfigs)
         return resultdf
+
+    def tune_summary(self, status):
+        """Summary of tuning results"""
+        logger.info("============= Tuning results Summary: ==============")
+        tuning_time = round(time.time() - self.tune_start_time, 4)
+        tunedf = pd.concat([self.success, self.failed])
+        logger.info(
+            f"Tuning {status}. tune {len(tunedf)} shapes, total tuning time is {tuning_time} seconds"
+        )
+        logger.info("Successfully tuned shapes:")
+        if not self.success.empty:
+            print(self.success)
+        logger.info("Failed shapes:")
+        print(self.failed)
+        mask = self.untunedf.apply(tuple, axis=1).isin(
+            tunedf[self.untunedf.columns].apply(tuple, axis=1)
+        )
+        self.remain_untuned = self.untunedf[~mask]
+        logger.info("untuned shapes:")
+        print(self.remain_untuned)
 
     @abstractmethod
     def result_to_csv(self, results, file, concat=False):
@@ -331,7 +359,8 @@ class TunerCommon:
         processed_batches = 0
         results = []
         topk = -1 if fast_mode else 1
-        start_time = time.time()
+        self.tune_start_time = time.time()
+        tuning_status = "Finished"
         try:
             for i in range(0, len(self.untunedf), batch_size):
                 batch = self.untunedf.iloc[i : i + batch_size].reset_index(drop=True)
@@ -345,25 +374,20 @@ class TunerCommon:
                     )
                 else:
                     logger.info("tune result is none or all shape is tuned!")
-            logger.info(
-                f"Tuning finished. tune {len(self.untunedf)} shapes, total tuning time is {round(time.time() - start_time,4)} seconds"
-            )
             self.sortResults(args.tune_file, args.sort, self.keys)
         except KeyboardInterrupt:
+            tuning_status = "Interrupted"
             logger.error(
                 f"interrupted by user, tuning stopped, {processed_batches-1} batches processed"
             )
         except Exception as e:
+            tuning_status = "Error"
             logger.error(
                 f"error in batch {processed_batches} of {total_batches}: {str(e)}",
                 exc_info=True,
             )
         finally:
-            logger.info("============= Tuning results Summary: ==============")
-            logger.info("Successfully tuned shapes:")
-            print(self.success)
-            logger.info("Failed tuned shapes:")
-            print(self.failed)
+            self.tune_summary(tuning_status)
 
 
 class GemmCommonTuner(TunerCommon):
@@ -397,6 +421,9 @@ class GemmCommonTuner(TunerCommon):
                 mask = self.untunedf.apply(tuple, axis=1).isin(
                     self.tunedf[untunedf_cols].apply(tuple, axis=1)
                 )
+                if args.verbose:
+                    logger.info("skiped tuned shapes:")
+                    print(self.untunedf[mask])
                 self.untunedf = self.untunedf[~mask]
 
     def calculate(self, results, bpes=(2, 2, 2)):
@@ -423,7 +450,7 @@ class GemmCommonTuner(TunerCommon):
             keys, kernelId, splitK, kernelName = info
             kernelName = (
                 "None"
-                if time == INVALID_TIME
+                if time == self.INVALID_TIME
                 else self.getKernelName(kernelId) if kernelName == "" else kernelName
             )
             tflops, bw = self.calculate(el)
@@ -452,10 +479,12 @@ class GemmCommonTuner(TunerCommon):
         """post process of tuning results"""
         old_df = self.get_tuned_gemm_list(file)
         self.failed = pd.concat(
-            [self.failed, resultdf[resultdf["us"] == INVALID_TIME]], ignore_index=True
+            [self.failed, resultdf[resultdf["us"] == self.INVALID_TIME]],
+            ignore_index=True,
         )
         self.success = pd.concat(
-            [self.success, resultdf[resultdf["us"] != INVALID_TIME]], ignore_index=True
+            [self.success, resultdf[resultdf["us"] != self.INVALID_TIME]],
+            ignore_index=True,
         )
         update_tunedf = self.success
         if not concat:
