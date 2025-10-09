@@ -79,7 +79,10 @@ def get_x_vals():
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activation):
+@pytest.mark.parametrize("skip_reduce", [True, False])
+def test_gemm_a16_w16_activation(
+    M: int, N: int, K: int, dtype, output, activation, skip_reduce
+):
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
         M,
         N,
@@ -106,6 +109,7 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
             out_dtype,
             y,
             activation=activation,
+            skip_reduce=skip_reduce,
         )
     else:
         triton_out = gemm_a16w16(
@@ -114,7 +118,11 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
             None,
             out_dtype,
             activation=activation,
+            skip_reduce=skip_reduce,
         )
+
+    if triton_out.dim() == 3:
+        triton_out = triton_out.sum(axis=0).to(dtype)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
@@ -122,7 +130,8 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
+@pytest.mark.parametrize("skip_reduce", [True, False])
+def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output, skip_reduce):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
@@ -132,9 +141,12 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
     torch_out = F.linear(x, w, bias=bias)
 
     if output:
-        triton_out = gemm_a16w16(x, w, bias, out_dtype, y)
+        triton_out = gemm_a16w16(x, w, bias, out_dtype, y, skip_reduce=skip_reduce)
     else:
-        triton_out = gemm_a16w16(x, w, bias, out_dtype)
+        triton_out = gemm_a16w16(x, w, bias, out_dtype, skip_reduce=skip_reduce)
+
+    if triton_out.dim() == 3:
+        triton_out = triton_out.sum(axis=0).to(dtype)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
@@ -143,7 +155,10 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_a16_w16_layout(M: int, N: int, K: int, dtype, layout, output):
+@pytest.mark.parametrize("skip_reduce", [True, False])
+def test_gemm_a16_w16_layout(
+    M: int, N: int, K: int, dtype, layout, output, skip_reduce
+):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
@@ -153,9 +168,12 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, dtype, layout, output):
     torch_out = F.linear(x, w, bias=None)
 
     if output:
-        triton_out = gemm_a16w16(x, w, None, out_dtype, y)
+        triton_out = gemm_a16w16(x, w, None, out_dtype, y, skip_reduce=skip_reduce)
     else:
-        triton_out = gemm_a16w16(x, w, None, out_dtype)
+        triton_out = gemm_a16w16(x, w, None, out_dtype, skip_reduce=skip_reduce)
+
+    if triton_out.dim() == 3:
+        triton_out = triton_out.sum(axis=0).to(dtype)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
