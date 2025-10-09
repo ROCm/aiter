@@ -462,11 +462,6 @@ class BuildExtension(build_ext):
                         extension.extra_compile_args[ext] = []
 
             self._add_compile_flag(extension, "-DTORCH_API_INCLUDE_EXTENSION_H")
-            # See note [Pybind11 ABI constants]
-            for name in ["COMPILER_TYPE", "STDLIB", "BUILD_ABI"]:
-                val = getattr(torch._C, f"_PYBIND11_{name}")
-                if val is not None:
-                    self._add_compile_flag(extension, f'-DPYBIND11_{name}="{val}"')
             self._define_torch_extension_name(extension)
             self._add_gnu_cpp_abi_flag(extension)
 
