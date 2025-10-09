@@ -86,6 +86,9 @@ jobs:
         model:
           - 'mistralai/Mixtral-8x7B-Instruct-v0.1'
           - 'deepseek-ai/DeepSeek-R1'
+        kv_cache_dtype:
+          - 'default'
+          - 'fp8'
         
     steps:
       - name: Checkout aiter repo
@@ -113,14 +116,18 @@ jobs:
       - name: Run benchmarks
         run: |
           set -x -o pipefail
-          echo "Starting benchmark for model: ${{ matrix.model }}"
+          echo "Starting benchmark for model: ${{ matrix.model }} with kv_cache_dtype: ${{ matrix.kv_cache_dtype }}"
 
-          logFile="result_$(echo '${{ matrix.model }}' | sed 's/\//_/g').log"
+          logFile="result_$(echo '${{ matrix.model }}' | sed 's/\//_/g')_kv_${{ matrix.kv_cache_dtype }}.log"
 
           if [[ "${{ matrix.model }}" == *DeepSeek* ]]; then
               extraArgs="--block-size 1"
           else
               extraArgs=""
+          fi
+
+          if [[ "${{ matrix.kv_cache_dtype }}" == "fp8" ]]; then
+              extraArgs="${extraArgs} --kv-cache-dtype fp8"
           fi
 
           docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
