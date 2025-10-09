@@ -18,7 +18,6 @@
 import os
 from pathlib import Path
 import pandas as pd
-import functools
 import torch
 import torch.nn.functional as F
 from aiter import hipb_create_extension, hipb_mm, getHipblasltKernelName
@@ -35,7 +34,8 @@ solids = {}
 
 solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
 
-soltype = None
+# soltype can not be None as default since torch.compile faketensor will not run query_sol
+soltype = 0
 
 
 @torch_compile_guard()
@@ -64,7 +64,7 @@ def load_best_sols_custom(tune_path: str) -> bool:
     return False
 
 
-@functools.lru_cache(maxsize=4096)
+# @functools.lru_cache(maxsize=4096)
 def query_sol_core(
     m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
 ) -> int:
@@ -72,6 +72,7 @@ def query_sol_core(
     # soltype = None
     solution_idx = 0
     cu_count = get_cu_num()
+    flag = False
     if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
         if (
             ((m == 1 and n <= 2 * cu_count) or (m > 1 and m <= 4 and n <= cu_count))
@@ -81,8 +82,11 @@ def query_sol_core(
             or (m > 8 and m <= 16 and n <= cu_count)
             and k <= 256
         ):
+            flag = True
             soltype, solution_idx = 3, 2
-    if soltype is None:
+
+    if flag is False:
+        # if soltype is None:
         soltype, solution_idx = solids.get(
             (int(m), n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
         )
