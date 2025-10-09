@@ -217,8 +217,8 @@ def run_benchmark(custom, args):
         return_attn_probs = False
         varlen = args.layout == "thd"
         has_pe = D_HEAD > D_HEAD_V
-        assert (
-            args.fp8 or has_pe
+        assert not (
+            args.fp8 and has_pe
         ), "Positional Encoding (PE) doesn't support FP8 data type."
         assert not (
             has_pe and "fused-bwd" in provider
