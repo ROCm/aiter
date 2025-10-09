@@ -51,7 +51,7 @@ using float32_t  = float;
 template <typename T>
 __device__ inline bool cmp_gt(const T& a, const T& b)
 {
-    if constexpr(std::is_same<T, float16_t>::value || std::is_same<T, bfloat16_t>::value)
+    if constexpr(std::is_same<T, bfloat16_t>::value)
     {
         // at::Half (or float16_t in our native case) causes ambiguity, so we cast to float.
         return ck_tile::type_convert<float>(a) > ck_tile::type_convert<float>(b);
@@ -186,7 +186,7 @@ __device__ void moe_fused_gate_impl(void* input,
 #pragma unroll
     for(int ii = 0; ii < params.VPT; ++ii)
     {
-        row_chunk[ii] = 1.0f / (1.0f + expf(-row_chunk[ii]));
+        row_chunk[ii] = ::isnan(row_chunk[ii]) ? 0.0f : (1.0f / (1.0f + expf(-row_chunk[ii])));
     }
     // __syncthreads();
 
@@ -548,6 +548,8 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     auto output          = topk_weights;
     auto indices         = topk_ids;
     const int out_stride = topk_ids.stride(0);
+    TORCH_CHECK(topk_weights.stride(0) == out_stride,
+                "topk_weights and topk_ids must have the same stride in dim 0");
 
     // Compute grid dimensions based on runtime value for num_expert_group.
     int64_t rows_per_warp = std::max<int64_t>(1, WARP_SIZE / num_expert_group);

@@ -13,13 +13,11 @@ concurrency:
 
 jobs:
   sglang:
-    if: ${{ !github.event.pull_request.head.repo.fork }}
     name: sglang integration
     runs-on: aiter-1gpu-runner
     env:
-      SGL_BRANCH: v0.5.1
+      SGL_BRANCH: v0.5.2
       GPU_ARCH: gfx942
-      HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
 
     steps:
       - name: Checkout aiter repo
@@ -102,10 +100,3 @@ jobs:
         if: always()
         run:
           docker exec -u root sglang_aiter_test bash -c "rm -rf /sglang-checkout/sgl-kernel; rm -rf /sglang-checkout/python"
-
-  skip-job:
-    if: ${{ github.event.pull_request.head.repo.fork }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Skip reason
-        run: echo "It's a fork repository, skipping tests."

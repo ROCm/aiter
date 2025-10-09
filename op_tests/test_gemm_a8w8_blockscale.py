@@ -197,7 +197,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--preshuffle",
-    nargs="+",
+    nargs="?",
     default=[True, False],
     help="weight preshuffle or not",
 )
