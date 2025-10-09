@@ -221,7 +221,7 @@ def run_benchmark(custom, args):
             args.fp8 or has_pe
         ), "Positional Encoding (PE) doesn't support FP8 data type."
         assert not (
-            has_pe and provider == "fused-bwd"
+            has_pe and "fused-bwd" in provider
         ), "'Fused' backward implementation doesn't support Positional Encoding (PE)."
 
         global _USE_FUSED_BWD
@@ -364,7 +364,7 @@ def run_benchmark(custom, args):
         v.requires_grad = requires_grad
 
         # FLOPS calculation variables
-        flops_per_matmul = 0
+        total_flops = 0.0
 
         # Input preparation
         if varlen:
@@ -407,9 +407,9 @@ def run_benchmark(custom, args):
                         if seqlen_q > seqlen_k
                         else (seqlen_q * seqlen_k - ((seqlen_q**2 - seqlen_q) / 2))
                     )
-                    flops_per_matmul += valid_out_elements * HQ * D_HEAD * 2
+                    total_flops += valid_out_elements * HQ * (D_HEAD + D_HEAD_V) * 2.0
                 else:
-                    flops_per_matmul += seqlen_q * seqlen_k * HQ * D_HEAD * 2
+                    total_flops += seqlen_q * seqlen_k * HQ * (D_HEAD + D_HEAD_V) * 2.0
         else:
             q_input, k_input, v_input = q, k, v
 
@@ -419,9 +419,13 @@ def run_benchmark(custom, args):
                     if N_CTX_Q > N_CTX_K
                     else (N_CTX_Q * N_CTX_K - ((N_CTX_Q**2 - N_CTX_Q) / 2))
                 )
-                flops_per_matmul = 2.0 * BATCH * HQ * valid_out_elements * D_HEAD
+                total_flops += (
+                    2.0 * BATCH * HQ * valid_out_elements * (D_HEAD + D_HEAD_V)
+                )
             else:
-                flops_per_matmul = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * D_HEAD
+                total_flops += (
+                    2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+                )
 
         # Benchmark mode
         if varlen:
@@ -506,12 +510,9 @@ def run_benchmark(custom, args):
 
         ms = triton.testing.do_bench(fn)
 
-        total_flops = 2 * flops_per_matmul
         if mode == "bwd":
             total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
 
-        input_bytes = q.element_size()
-        output_bytes = q.element_size()
         if varlen:
             total_num_tokens_q = cu_seqlens_q[-1].item()
             total_num_tokens_k = cu_seqlens_k[-1].item()
@@ -519,9 +520,14 @@ def run_benchmark(custom, args):
             total_num_tokens_q = BATCH * N_CTX_Q
             total_num_tokens_k = BATCH * N_CTX_K
         mem = (
-            total_num_tokens_q * HQ * D_HEAD * input_bytes
-            + 2 * total_num_tokens_k * HK * D_HEAD * input_bytes
-            + total_num_tokens_q * HQ * D_HEAD * output_bytes
+            # read q
+            total_num_tokens_q * HQ * D_HEAD * q.element_size()
+            # read k
+            + total_num_tokens_k * HK * D_HEAD * k.element_size()
+            # read v
+            + total_num_tokens_k * HK * D_HEAD_V * v.element_size()
+            # write output
+            + total_num_tokens_q * HQ * D_HEAD_V * q.element_size()
         )
         # return ms
         if "ms" in provider:
@@ -570,8 +576,13 @@ def parse_args():
         default=False,
         help="If specified, uses equal sequence lengths with thd layout, i.e t = b * sq",
     )
-    parser.add_argument("-d", type=int, default=0)
-    parser.add_argument("-dv", type=int, default=0)
+    parser.add_argument(
+        "-d",
+        type=int,
+        default=0,
+        help="Q and K head size, if -dv is absent then -d specifies V head size too",
+    )
+    parser.add_argument("-dv", type=int, default=0, help="optional V head size")
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-quantize_p", action="store_true", default=False)
