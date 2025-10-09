@@ -1033,7 +1033,7 @@ def fused_qk_rope_reshape_and_cache(
         ), f"q and zeros shape mismatch {q.shape=} {zeros_out.shape=}"
         output_zeros = True
     elif output_zeros:
-        zeros_out = torch.empty((t, qh, d), dtype=q.dtype, device=q.device)
+        zeros_out = torch.empty((t, qh, d), dtype=q_out.dtype, device=q.device)
     else:
         zeros_out = None
 
