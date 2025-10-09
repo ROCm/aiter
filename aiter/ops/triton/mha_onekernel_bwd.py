@@ -1836,9 +1836,11 @@ def flash_attn_onekernel_backward(
 
     seqlen = max(max_seqlen_q, max_seqlen_k)
 
+    # "onekernel_pe" is for Positional Encoding (PE) causal case, it's going to be
+    # used if present. Otherwise, fallback to default "onekernel" config.
     config_onekernel = (
         config["onekernel_pe"]
-        if (pe_head_dim > 0 and "onekernel_pe" in config)
+        if (pe_head_dim > 0 and causal and "onekernel_pe" in config)
         else config["onekernel"]
     )
     grid = (
