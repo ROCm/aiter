@@ -1,7 +1,3 @@
-# SiLU(x) = x * sigmoid(x), where sigmoid(x) = 1 / (1 + exp(-x))
-# SwiGLU(x) = SiLU(x1) * x2, where x1 and x2 are halves of x
-
-
 import triton
 import triton.language as tl
 

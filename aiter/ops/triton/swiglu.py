@@ -7,11 +7,10 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-def swiglu(x, w):
+def swiglu(x):
     """
-    Computes the SwiGLU of a 2D input tensor. It will first compute
-    a GEMM of the input 'x' with the weights 'w'. The output is then split
-    into two halves. The first half will be fed into the Swish activation
+    Computes the SwiGLU of a 2D input tensor. It will split the input 'x'
+    into two halves. The first half will be fed into a Swish activation
     function, then compute the Hadamard product with the second half.
 
     Key parameters:
@@ -19,14 +18,13 @@ def swiglu(x, w):
 
     Returns:
         torch.Tensor: A tensor of the shape of half the number of
-        columns as x@w.
+        columns as 'x'.
 
     Note:
-        - The input tensors 'x' and 'w' must reside on the GPU.
+        - The input tensor 'x' must reside on the GPU.
     """
-    _LOGGER.info(f"SWIGLU: x={tuple(x.shape)} w={tuple(w.shape)}")
-    n_rows, _ = x.shape
-    _, n_cols = w.shape
+    _LOGGER.info(f"SWIGLU: x={tuple(x.shape)}")
+    n_rows, n_cols = x.shape
 
     assert n_cols % 2 == 0, "Weight tensor 'w' must be a multiple of 2."
 
@@ -41,12 +39,11 @@ def swiglu(x, w):
     grid = lambda meta: (
         triton.cdiv(n_rows, BLOCK_SIZE) * triton.cdiv(n_cols // 2, BLOCK_SIZE),
     )
-    xw = x @ w
     _swiglu_kernel[grid](
-        xw,
+        x,
         y,
-        xw.stride(0),
-        xw.stride(1),
+        x.stride(0),
+        x.stride(1),
         y.stride(0),
         y.stride(1),
         n_rows,
