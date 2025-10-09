@@ -35,7 +35,8 @@ solids = {}
 
 solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
 
-soltype = None
+# We need to set is 0 as default, None will error in torch.compile fakeTensor execution
+soltype = 0
 
 
 @torch_compile_guard()
@@ -69,7 +70,7 @@ def query_sol_core(
     m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
 ) -> int:
     global solids, solMap, soltype
-    # soltype = None
+    soltype = None
     solution_idx = 0
     cu_count = get_cu_num()
     if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
