@@ -1,17 +1,18 @@
-import shutil
-import os
-import subprocess
-from jinja2 import Template
+import binascii
 import ctypes
-from packaging.version import parse, Version
+import hashlib
+import logging
+import os
+import shutil
+import subprocess
+import time
 from collections import OrderedDict
 from functools import lru_cache, partial
-import binascii
-import hashlib
-from aiter.jit.utils.file_baton import FileBaton
-import logging
-import time
 
+from jinja2 import Template
+from packaging.version import Version, parse
+
+from aiter.jit.utils.file_baton import FileBaton
 
 logger = logging.getLogger("aiter")
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -95,7 +96,7 @@ def get_hip_version():
 
 def validate_and_update_archs():
     archs = GPU_ARCH.split(";")
-    archs = [arch.strip() for arch in archs]
+    archs = [arch.strip().split(":")[0] for arch in archs]
     # List of allowed architectures
     allowed_archs = [
         "native",

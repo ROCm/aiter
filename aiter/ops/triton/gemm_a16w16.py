@@ -12,16 +12,10 @@ from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.read_json_configs import build_triton_configs_from_json
 
-fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/updated_BF16_configs.json"
-updated_configs = build_triton_configs_from_json(fpath)
+_LOGGER = AiterTritonLogger()
 
 
-@triton.autotune(
-    configs=updated_configs,
-    key=["next_M_2", "N", "K"],
-)
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -147,11 +141,13 @@ def _get_config(
                 _get_config._config_dict[key] = config
         else:
             key = "default"  # fall back to default config
+            return _get_config._config_dict["default"]["any"]
 
-    if M < 128 and "small" in _get_config._config_dict[key]:
-        return _get_config._config_dict[key]["small"]
-    else:
-        return _get_config._config_dict[key]["any"]
+    bounds = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    for bound in bounds:
+        if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key][f"M_LEQ_{bound}"]
+    return _get_config._config_dict[key]["any"]
 
 
 def gemm_a16w16(
@@ -176,15 +172,18 @@ def gemm_a16w16(
     - Y: The output matrix with shape (M, N).
     """
 
+    _LOGGER.info(f"GEMM_A16W16: x={tuple(x.shape)} w={tuple(w.shape)}")
+    # Shape checks
+    assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
+
     M, K = x.shape
     N, K = w.shape
     w = w.T
-
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    # if config is None:
-    #    config = _get_config(M, N, K)
+    if config is None:
+        config = _get_config(M, N, K)
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -205,6 +204,7 @@ def gemm_a16w16(
         y.stride(1),
         ADD_BIAS=(bias is not None),
         next_M_2=triton.next_power_of_2(M),
+        **config,
     )
 
     return y

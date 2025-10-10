@@ -475,7 +475,7 @@ def get_2stage_cfgs(
             in fused_moe_1stage_dict[get_gfx()]
         ):
             if q_type == QuantType.per_1x128:
-                run_1stage = True and (inter_dim % 256 == 0)
+                run_1stage = True and (inter_dim % 256 == 0) and (token > 31)
             elif q_type == QuantType.per_Token and q_dtype_w in [dtypes.i8, dtypes.fp8]:
                 run_1stage = token > 32
             else:
@@ -484,7 +484,7 @@ def get_2stage_cfgs(
             BLOCK_SIZE_M
             if run_1stage
             else (
-                64
+                16
                 if q_type == QuantType.per_1x128
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
@@ -528,6 +528,7 @@ def get_2stage_cfgs(
             torch.uint8,
         ]
         or (q_dtype_w == dtypes.fp8 and q_type == QuantType.per_1x128)
+        or (q_type == QuantType.per_1x128 and block_m == 16)
     ):
         return MOEMetadata(
             functools.partial(
@@ -929,7 +930,7 @@ def torch_moe_stage1(
         w1 = w1 * w1_scale.view(w1_scale.shape[0], -1, 1)
         hidden_states = hidden_states * a1_scale
     # per_128x128
-    elif quant_type == QuantType.per_128x128:
+    elif quant_type in [QuantType.per_128x128, QuantType.per_1x128]:
         w1_shape = w1.shape
         w1 = w1.view(
             w1.shape[0], w1.shape[1] // 128, 128, w1.shape[2] // 128, 128
@@ -1027,7 +1028,7 @@ def torch_moe_stage2(
     if quant_type in [QuantType.per_Token, QuantType.per_Tensor]:
         hidden_states = hidden_states * a2_scale.view(a2_scale.shape[0], -1, 1)
         w2 = w2 * w2_scale.view(w2_scale.shape[0], -1, 1)
-    elif quant_type == QuantType.per_128x128:
+    elif quant_type in [QuantType.per_128x128, QuantType.per_1x128]:
         a2_scale = a2_scale.view(hidden_states.shape[0], topk, -1, 1)
         a2_scale = a2_scale.repeat(1, 1, 1, 128).view(hidden_states.shape[0], topk, -1)
         hidden_states = hidden_states * a2_scale

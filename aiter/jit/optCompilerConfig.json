@@ -335,7 +335,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "hip_clang_path": "os.environ.get('GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH')",
+        "hip_clang_path": "os.environ.get('FLATMM_HIP_CLANG_PATH')",
         "blob_gen_cmd": "''"
     },
     "module_moe_cktile2stages": {
