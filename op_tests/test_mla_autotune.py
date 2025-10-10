@@ -283,7 +283,8 @@ def test_mla(
         [batch_size * cu_num], dtype=torch.int32, device="cuda"
     )
 
-    # [0]: fixed workload_limit_global. only valid when the fixed value is larger than 0.
+    # [0]: >0: fixed workload_limit_global.
+    #      other: default algorithm
     metadata_test_params = torch.tensor(
         [-1, -1, -1, -1], dtype=torch.int32, device="cuda"
     )
@@ -352,6 +353,7 @@ def test_mla(
     # print(f"workload_limit_global: {metadata_test_outputs[0][0].item()}")
 
     default_workload_limit_global = metadata_test_outputs[0][0].item()
+    touch_ugly = metadata_test_outputs[0][1].item() != 0
     workload_limit_global_min__ = max(
         int(math.ceil(default_workload_limit_global / 4 / 16) * 16), 16
     )
@@ -362,8 +364,9 @@ def test_mla(
     )
     workload_limit_global_max = int(math.ceil(workload_limit_global_max / 16) * 16) + 16
     print(
-        f"[metadata-autotune] workload_limit_global[default, min, max]=[{default_workload_limit_global}, {workload_limit_global_min}, {workload_limit_global_max}]"
+        f"[metadata-autotune] workload_limit_global[default, touch_ugly, min, max]=[{default_workload_limit_global}, {touch_ugly}, {workload_limit_global_min}, {workload_limit_global_max}]"
     )
+    # exit()
 
     def test_absorb_decode(check_quality):
         # troch implementation
