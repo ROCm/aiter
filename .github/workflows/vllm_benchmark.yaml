@@ -89,6 +89,9 @@ jobs:
         kv_cache_dtype:
           - 'default_kvcache'
           - 'fp8_kvcache'
+        exclude:
+          - model: 'deepseek-ai/DeepSeek-R1'
+            kv_cache_dtype: 'fp8_kvcache'
         
     steps:
       - name: Checkout aiter repo
