@@ -34,6 +34,7 @@
 #include "rocsolgemm.cuh"
 #include "rope.h"
 #include "smoothquant.h"
+#include "sample.h"
 #include <torch/extension.h>
 
 // #include "torch/mha_batch_prefill.h"
@@ -95,6 +96,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     CUSTOM_ALL_REDUCE_PYBIND;
     QUICK_ALL_REDUCE_PYBIND;
     CACHE_PYBIND;
+    SAMPLE_PYBIND;
     HIPBSOLGEMM_PYBIND;
     ROCSOLGEMM_PYBIND;
 }

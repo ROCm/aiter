@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
-import sys
 import shutil
+import sys
 
 from setuptools import Distribution, setup
 
@@ -11,12 +11,10 @@ from setuptools import Distribution, setup
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/aiter/")
+from concurrent.futures import ThreadPoolExecutor
+
 from jit import core
-from jit.utils.cpp_extension import (
-    BuildExtension,
-    IS_HIP_EXTENSION,
-)
-from multiprocessing import Pool
+from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 PACKAGE_NAME = "aiter"
@@ -118,14 +116,16 @@ if IS_ROCM:
 
         # step 1, build *.cu -> module*.so
         prebuid_thread_num = 5
-        prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
+        # Respect MAX_JOBS environment variable, fallback to auto-calculation
         max_jobs = os.environ.get("MAX_JOBS")
-        if max_jobs != None and max_jobs.isdigit():
+        if max_jobs is not None and max_jobs.isdigit() and int(max_jobs) > 0:
             prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
+        else:
+            prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-        with Pool(processes=prebuid_thread_num) as pool:
-            pool.map(build_one_module, all_opts_args_build)
+        with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
+            list(executor.map(build_one_module, all_opts_args_build))
 
         ck_batched_gemm_folders = [
             f"{this_dir}/csrc/{name}/include"
@@ -174,25 +174,28 @@ if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
 ## link "3rdparty", "hsa", "csrc" into "aiter_meta"
 shutil.copytree("3rdparty", "aiter_meta/3rdparty")
 shutil.copytree("hsa", "aiter_meta/hsa")
+shutil.copytree("gradlib", "aiter_meta/gradlib")
 shutil.copytree("csrc", "aiter_meta/csrc")
 
 
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
-        max_jobs = getMaxJobs()
+        # Respect MAX_JOBS environment variable, fallback to auto-calculation
         max_jobs_env = os.environ.get("MAX_JOBS")
-        if max_jobs_env != None:
-            try:
-                max_processes = int(max_jobs_env)
-                # too large value
-                if max_processes > max_jobs:
-                    os.environ["MAX_JOBS"] = str(max_jobs)
-            # error value
-            except ValueError:
-                os.environ["MAX_JOBS"] = str(max_jobs)
-        # none value
-        else:
+        if max_jobs_env is None:
+            # Only calculate max_jobs if MAX_JOBS is not set
+            max_jobs = getMaxJobs()
             os.environ["MAX_JOBS"] = str(max_jobs)
+        else:
+            # Validate the provided MAX_JOBS value
+            try:
+                int(max_jobs_env)
+                if int(max_jobs_env) <= 0:
+                    raise ValueError("MAX_JOBS must be a positive integer")
+            except ValueError:
+                # If invalid, fallback to auto-calculation
+                max_jobs = getMaxJobs()
+                os.environ["MAX_JOBS"] = str(max_jobs)
 
         super().__init__(*args, **kwargs)
 
@@ -229,7 +232,7 @@ setup(
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     install_requires=[
-        "pybind11>=2.13,<3",
+        "pybind11>=3.0.1",
         # "ninja",
         "pandas",
         "einops",
