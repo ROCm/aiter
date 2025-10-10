@@ -21,11 +21,11 @@ def _softmax_kernel_online(
 
     block_offset = tl.arange(0, BLOCK_SIZE) # size of block that threads will be working on
 
-    #for the max so far at that iteration
-    running_max = -float("inf")
-    #for how much we need to rescale
-    running_sum = 0
-    
+    #for the max so far at that iteration (initialize as fp32 tensor so type doesn't change during loop)
+    running_max = tl.full([1], -float("inf"), tl.float32)
+    #for how much we need to rescale (initialize as fp32 tensor to avoid type mismatch with later float ops)
+    running_sum = tl.zeros([1], tl.float32)
+
     #for i in tl.range(0, n_cols, BLOCK_SIZE):
     col_start = 0
 
@@ -40,22 +40,26 @@ def _softmax_kernel_online(
         
         tile_load_32 = tile_load.to(tl.float32) # incase of overflow since 16 may overflow
 
+        max_block = tl.max(tile_load_32,axis = 0) #getting the max of each block
 
-        max_block = tl.max(tile_load,axis = 0) #getting the max of each block
+        old_max = running_max # save the previous max before we update it (needed for proper rescaling)
+        new_max = tl.maximum(max_block, old_max) #placeholder for the new max so we can set the running max to at end of loop
 
-        new_max = tl.maximum(max_block, running_max) #placeholder for the new max so we can set the running max to at end of loop
+        # getting the rescale value based on the OLD max so that we can scale down the old sum correctly
+        rescale = tl.exp(old_max - new_max) 
 
-        running_max = new_max
-
-        rescale = tl.exp(running_max - new_max) # getting rescale value
-
-        tile_centered = tile_load - new_max # kinda normalizing the tile
+        # normalize (center) the current tile by subtracting the new max
+        tile_centered = tile_load_32 - new_max # kinda normalizing the tile
 
         exp_block = tl.exp(tile_centered) # exponentiating the values after max was subtracted
+        exp_block = tl.where(valid, exp_block, 0.0) # mask invalid threads so they don't contribute to the sum
 
         sum_block = tl.sum(exp_block, axis = 0) #summing the block again
 
-        running_sum = running_sum * sum_block + rescale #rescaling the old values
+        # properly rescale the old running sum to the new max and add the new block sum
+        running_sum = running_sum * rescale + sum_block # rescaling the old values properly
+
+        running_max = new_max # now actually update the running max
 
         col_start = col_start + BLOCK_SIZE # go to next tile
     
@@ -71,8 +75,9 @@ def _softmax_kernel_online(
         valid = col < n_cols #masking again
 
         tile_load = tl.load(row_start_ptr + col, mask=valid, other=-float("inf")) #loading in the tile, masking anything that needs to be masked
+        tile_load_32 = tile_load.to(tl.float32)
 
-        tile_centered = tile_load - running_max #kinda normalizing it again to prevent large values
+        tile_centered = tile_load_32 - running_max #kinda normalizing it again to prevent large values
 
         exp_val = tl.exp(tile_centered) # exponentiate the smaller values
 
@@ -83,26 +88,3 @@ def _softmax_kernel_online(
         tl.store(row_end_ptr + col, ntype, mask = valid) #storing the values
 
         col_start = col_start + BLOCK_SIZE #next tile
-        
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    
-
-
-
-    
