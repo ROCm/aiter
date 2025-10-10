@@ -378,7 +378,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="+",
     const=None,
-    default=[(128, 32, 8192)],
+    default=[(128, 32, 8192), (64, 256, 5120)],  # (64, 256, 5120) in tuned_gemm.csv
     help="""Shape of mnk.
     e.g. -mnk 128,32,8192""",
 )
