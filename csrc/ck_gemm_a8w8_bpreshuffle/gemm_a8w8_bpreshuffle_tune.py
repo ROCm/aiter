@@ -141,7 +141,6 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         return kernel_dict
 
     def get_asm_gemm_i8_tasks(self, info_keys, useSplitK, kernel_id_start, seed=0):
-        total_kernel_nums = 0
         task = []
         (cu_num, M, N, K, q_dtype_w) = info_keys
         if q_dtype_w != dtypes.i8:
@@ -155,15 +154,13 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         asm_kernels_id = kernel_id_start
         for key in asm_tiles:
             tile_m, tile_n, splitk = key
-            if tile_m != 192:
-                continue
             maxsplitK = 8 if useSplitK else 1
             kernelName = asm_kernels.get((tile_m, tile_n, splitk), [])
             if len(kernelName) == 0:
                 print(f"no kernel name for ({tile_m}, {tile_n})!!!!")
                 continue
             if splitk == 0:
-                maxsplitK = 0
+                maxsplitK = 1
             for splitK in range(1, maxsplitK + 1):
                 kernel_name = kernelName[0]
                 info = (info_keys, asm_kernels_id, splitK, kernel_name)
@@ -211,7 +208,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
         ref_data_idx = [0, 5, 2, 3, 6]
         tasks_ck = []
-        for i in range(3):
+        for i in range(kernels_num):
             kernel = kernels_list[i]
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
@@ -247,7 +244,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                         {},
                         None,
                         1e-2,
-                        0.1,
+                        0.01,
                     )
                 )
         return tasks_ck

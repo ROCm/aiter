@@ -264,8 +264,11 @@ class TunerCommon:
             logger.info(
                 f"Tuning finished. total tuning time is {round(time.time() - start_time,4)} seconds"
             )
-            tunedf = self.sortResults(pd.read_csv(args.tune_file), args.sort, self.keys)
-            tunedf.to_csv(args.tune_file, index=False, na_rep="Null")
+            if os.path.exists(args.tune_file):
+                tunedf = self.sortResults(
+                    pd.read_csv(args.tune_file), args.sort, self.keys
+                )
+                tunedf.to_csv(args.tune_file, index=False, na_rep="Null")
         except KeyboardInterrupt:
             logger.error(
                 f"interrupted by user, tuning stopped, {processed_batches-1} batches processed"
@@ -353,7 +356,10 @@ class GemmCommonTuner(TunerCommon):
                 }
             )
             temp = pd.DataFrame(key_dict)
-            resultdf = pd.concat([resultdf, temp], ignore_index=True)
+            if resultdf.empty:
+                resultdf = temp
+            else:
+                resultdf = pd.concat([resultdf, temp], ignore_index=True)
         resultdf.to_csv(file, index=False, na_rep="Null")
 
     def update_tflops_bw(self, file):
