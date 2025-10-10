@@ -113,7 +113,7 @@ jobs:
         if: always()
         with:
           name: standard-test-logs
-          path: latest_test.log
+          path: standard_test_${{ matrix.runner }}.log
 
       - name: Cleanup container
         if: always()
@@ -191,7 +191,7 @@ jobs:
         if: always()
         with:
           name: multigpu-test-logs
-          path: latest_test.log
+          path: multigpu_test_${{ matrix.runner }}.log
 
       - name: Cleanup container
         if: always()
