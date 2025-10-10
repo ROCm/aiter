@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <ATen/cuda/Exceptions.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 #ifdef USE_ROCM
@@ -61,8 +61,8 @@ void qr_open_handles(fptr_t _fa,
 void qr_all_reduce(fptr_t _fa, torch::Tensor& inp,
                    torch::Tensor& out, int64_t quant_level, bool cast_bf2half) {
   auto fa = reinterpret_cast<DeviceComms*>(_fa);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
-  auto stream = at::cuda::getCurrentHIPStreamMasqueradingAsCUDA();
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+  auto stream = at::hip::getCurrentHIPStream();
 
   TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
   TORCH_CHECK_EQ(inp.numel(), out.numel());

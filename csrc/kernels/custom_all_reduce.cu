@@ -14,9 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <ATen/cuda/Exceptions.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 #include "custom_all_reduce.cuh"
@@ -78,7 +77,7 @@ bool _is_weak_contiguous(torch::Tensor &t)
 }
 
 void _all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
-                 cudaStream_t stream, bool open_fp8_quant)
+                 hipStream_t stream, bool open_fp8_quant)
 {
   auto fa = reinterpret_cast<aiter::CustomAllreduce *>(_fa);
   TORCH_CHECK(_is_weak_contiguous(out));
@@ -126,8 +125,8 @@ void _all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
 
 void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, bool open_fp8_quant)
 {
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
-  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+  auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
   TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
   TORCH_CHECK_EQ(inp.numel(), out.numel());
   _all_reduce(_fa, inp, out, stream, open_fp8_quant);
@@ -136,8 +135,8 @@ void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, bool ope
 void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
                       torch::Tensor &out)
 {
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
-  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+  auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
 
   auto input_size = inp.numel() * inp.element_size();
   TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
@@ -204,11 +203,11 @@ torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor &inp)
 
 torch::Tensor allocate_meta_buffer(int64_t size)
 {
-  auto device_index = c10::cuda::current_device();
+  auto device_index = c10::hip::current_device();
   at::DeviceGuard device_guard(at::Device(at::DeviceType::CUDA, device_index));
   void *buffer;
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
-  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
   AT_CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
   AT_CUDA_CHECK(
       hipExtMallocWithFlags((void **)&buffer, size, hipDeviceMallocUncached));

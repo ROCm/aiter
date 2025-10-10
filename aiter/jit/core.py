@@ -755,7 +755,7 @@ def compile_ops(
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
                 torch_exclude = d_args["torch_exclude"]
-                hipify = d_args.get("hipify", True)
+                hipify = d_args.get("hipify", False)
                 hip_clang_path = d_args.get("hip_clang_path", None)
                 prev_hip_clang_path = None
                 if hip_clang_path is not None and os.path.exists(hip_clang_path):

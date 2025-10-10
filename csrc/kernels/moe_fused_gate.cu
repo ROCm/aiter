@@ -15,8 +15,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
+#include <ATen/hip/HIPContext.h>
+#include <hip/hip_runtime.h>
 #include <hipcub/hipcub.hpp>
 #include <stdio.h>
 #include <torch/all.h>
@@ -27,8 +27,8 @@
 #include "hip_compat.h"
 #include "hip_reduce.h"
 #include "vec_convert.h"
-#include <cub/cub.cuh>
-#include <cub/util_type.cuh>
+#include <hipcub/hipcub.hpp>
+#include <hipcub/util_type.hpp>
 
 /// Aligned array type
 template <typename T,
@@ -558,7 +558,7 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     int ROWS_PER_WARP     = std::max<int64_t>(1, WARP_SIZE / num_expert_group);
     size_t shared_mem_size =
         ((topk * sizeof(float) + topk * sizeof(int)) * ROWS_PER_WARP + 255) & ~255;
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
 
     // Check 1: Ensure that num_experts is a power of 2.

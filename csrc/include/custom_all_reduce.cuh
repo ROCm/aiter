@@ -1,6 +1,6 @@
 #pragma once
 /*
- * Copyright © Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <cuda_bf16.h>
 #endif
 #include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <iostream>
 #include <limits>
@@ -958,7 +958,7 @@ namespace aiter
       buffers_[self] = d_data;
     }
 
-    RankData *get_buffer_RD(cudaStream_t stream, void *input)
+    RankData *get_buffer_RD(hipStream_t stream, void *input)
     {
       RankData *ptrs;
       auto it = buffers_.find(input);
@@ -1035,7 +1035,7 @@ namespace aiter
      * should quant scale match hidden_dim when hidden_dim less than 128?
      * */
     template <typename T>
-    void runFp8QuantKernel(cudaStream_t stream, T* input, T* output, int size)
+    void runFp8QuantKernel(hipStream_t stream, T* input, T* output, int size)
     {
       RankData *ptrs = get_buffer_RD(stream, input);
       // 32 block 512 thread or 64 block 256 thread
@@ -1099,7 +1099,7 @@ namespace aiter
      * will cause contention on NVLink bus.
      */
     template <typename T>
-    void allreduce(cudaStream_t stream, T *input, T *output, int size,
+    void allreduce(hipStream_t stream, T *input, T *output, int size,
 #ifndef USE_ROCM
                    int threads = 512, int block_limit = 20){
 #else
@@ -1206,7 +1206,7 @@ namespace aiter
 /**
  * To inspect PTX/SASS, copy paste this header file to compiler explorer and add
  a template instantiation:
- * template void aiter::CustomAllreduce::allreduce<half>(cudaStream_t, half *,
+ * template void aiter::CustomAllreduce::allreduce<half>(hipStream_t, half *,
  half *, int, int, int);
 */
 } // namespace aiter

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "py_itfs_common.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 #include "moe_sorting_api.hpp"
@@ -29,8 +29,8 @@ void moe_sorting_fwd(torch::Tensor& topk_ids,          // [m, topk]
     auto dtype_str = torchDTypeToStr(topk_ids.dtype());
     int num_tokens = topk_ids.size(0);
     int topk       = topk_ids.size(1);
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(topk_ids));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(topk_ids));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     int workspace_size = moe_sorting_get_workspace_size(num_tokens, num_experts, topk, dispatch_policy);
     void* ws_ptr       = nullptr;

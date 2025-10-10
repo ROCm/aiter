@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <torch/all.h>
+ * @Script: topk_softmax_kernels_group.cu
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
-#include "attention_ragged.h"
-#include "attention_common.cuh"
+ * @Last Modified By: valarLip
+ * @Last Modified At: 2025-10-11 00:13:02
 
 #if defined(__HIPCC__) && \
     (defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__))
@@ -311,7 +311,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
     dim3 block(NTHR);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(query));
-    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     // mfma4 kernel is faster than mfma16 for gqa_ratio <= 4
     switch(gqa_ratio)

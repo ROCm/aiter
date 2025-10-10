@@ -9,7 +9,7 @@
 #include "vec_convert.h"
 #include <ATen/core/DistributionsHelper.h>
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
 #include <hiprand/hiprand.h>
 #include <hiprand/hiprand_kernel.h>
@@ -295,8 +295,8 @@ __global__ void mix_sample_kernel(const DTYPE_I* input,
 
 void greedy_sample(torch::Tensor& out, torch::Tensor& input)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     int M         = input.size(0);
     int N         = input.size(1);
@@ -324,8 +324,8 @@ void random_sample(torch::Tensor& out,
                    std::optional<at::Generator> generator = std::nullopt,
                    float eps                              = 1e-10)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     auto gen = get_generator_or_default<at::CUDAGeneratorImpl>(
         generator, at::cuda::detail::getDefaultCUDAGenerator());
@@ -385,8 +385,8 @@ void mixed_sample(torch::Tensor& out,
                   std::optional<at::Generator> generator = std::nullopt,
                   float eps                              = 1e-10)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     auto gen = get_generator_or_default<at::CUDAGeneratorImpl>(
         generator, at::cuda::detail::getDefaultCUDAGenerator());
@@ -488,8 +488,8 @@ void exponential(torch::Tensor& out,
                  std::optional<at::Generator> generator = std::nullopt,
                  float eps                              = 1e-10)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     auto gen = get_generator_or_default<at::CUDAGeneratorImpl>(
         generator, at::cuda::detail::getDefaultCUDAGenerator());
