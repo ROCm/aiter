@@ -144,7 +144,7 @@ def parse_args():
         "--metric",
         type=str,
         choices=["time", "throughput", "bandwidth"],
-        default="throughput",
+        default="bandwidth",
         help="metric to plot",
     )
     parser.add_argument(
