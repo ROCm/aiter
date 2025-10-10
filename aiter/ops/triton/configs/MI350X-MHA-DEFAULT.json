@@ -15,6 +15,14 @@
       "num_warps": 4,
       "num_ctas": 1,
       "num_stages": 1
+    },
+    "pe": {
+      "BLOCK_M": 256,
+      "BLOCK_N": 64,
+      "waves_per_eu": 2,
+      "num_warps": 8,
+      "num_ctas": 1,
+      "num_stages": 4
     }
   },
   "bkwd_fused" : {
