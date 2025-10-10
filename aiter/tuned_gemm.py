@@ -33,8 +33,9 @@ bestsols = {}
 
 solids = {}
 
-solMap = ["torch", "hipblaslt", "rocblas", "skinny"]
+solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
 
+# We need to set is 0 as default, None will error in torch.compile fakeTensor execution
 soltype = 0
 
 
@@ -69,7 +70,7 @@ def query_sol_core(
     m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
 ) -> int:
     global solids, solMap, soltype
-    # soltype = None
+    soltype = None
     solution_idx = 0
     cu_count = get_cu_num()
     if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
@@ -82,6 +83,7 @@ def query_sol_core(
             and k <= 256
         ):
             soltype, solution_idx = 3, 2
+
     if soltype is None:
         soltype, solution_idx = solids.get(
             (int(m), n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)

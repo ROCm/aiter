@@ -1099,6 +1099,31 @@
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
 
+#define SAMPLE_PYBIND                                                                \
+    m.def("greedy_sample", &aiter::greedy_sample, py::arg("out"), py::arg("input")); \
+    m.def("random_sample",                                                           \
+          &aiter::random_sample,                                                     \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("temperature"),                                                    \
+          py::arg("lambd")     = 1.0,                                                \
+          py::arg("generator") = std::nullopt,                                       \
+          py::arg("eps")       = 1e-10);                                                   \
+    m.def("mixed_sample",                                                            \
+          &aiter::mixed_sample,                                                      \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("temperature"),                                                    \
+          py::arg("lambd")     = 1.0,                                                \
+          py::arg("generator") = std::nullopt,                                       \
+          py::arg("eps")       = 1e-10);                                                   \
+    m.def("exponential",                                                             \
+          &aiter::exponential,                                                       \
+          py::arg("out"),                                                            \
+          py::arg("lambd")     = 1.0,                                                \
+          py::arg("generator") = std::nullopt,                                       \
+          py::arg("eps")       = 1e-10);
+
 #define HIPBSOLGEMM_PYBIND                                                         \
     m.def("hipb_create_extension", &hipb_create_extension, "create_extension");    \
     m.def("hipb_destroy_extension", &hipb_destroy_extension, "destroy_extension"); \
