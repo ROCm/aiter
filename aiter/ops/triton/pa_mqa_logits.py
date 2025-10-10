@@ -19,18 +19,23 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
     prefix_sum_context_lens: torch.Tensor,
     kv_indices: torch.Tensor,
     max_model_len: int,
+    ChunkK: int = 64,
+    SplitKV: int = 5,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
-    kv_cache_fp8, kv_cache_scale = kv_cache_fp8[..., :hidden_dim], kv_cache_fp8[..., hidden_dim:]
+    kv_cache_fp8, kv_cache_scale = (
+        kv_cache_fp8[..., :hidden_dim],
+        kv_cache_fp8[..., hidden_dim:],
+    )
     # Since the triton don't have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
     kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
 
     config = {
         "ChunkQ": heads,
-        "ChunkK": 64,
+        "ChunkK": ChunkK,
         "HiddenDim": hidden_dim,
-        "SplitKV": 5,
+        "SplitKV": SplitKV,
     }
 
     grid = (batch_size * next_n * config["SplitKV"],)
@@ -67,7 +72,10 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
     max_model_len: int,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
-    kv_cache_fp8, kv_cache_scale = kv_cache_fp8[..., :hidden_dim], kv_cache_fp8[..., hidden_dim:]
+    kv_cache_fp8, kv_cache_scale = (
+        kv_cache_fp8[..., :hidden_dim],
+        kv_cache_fp8[..., hidden_dim:],
+    )
     # Since the triton don't have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
     kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
@@ -116,7 +124,10 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, max_blk_len = kv_indices.size()
-    kv_cache_fp8, kv_cache_scale = kv_cache_fp8[..., :hidden_dim], kv_cache_fp8[..., hidden_dim:]
+    kv_cache_fp8, kv_cache_scale = (
+        kv_cache_fp8[..., :hidden_dim],
+        kv_cache_fp8[..., hidden_dim:],
+    )
     # Since the triton don't have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
     kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
@@ -163,19 +174,24 @@ def deepgemm_fp8_paged_mqa_logits(
     context_lens: torch.Tensor,
     kv_indices: torch.Tensor,
     max_model_len: int,
+    ChunkK: int = 64,
+    SplitKV: int = 5,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, max_blk_len = kv_indices.size()
-    kv_cache_fp8, kv_cache_scale = kv_cache_fp8[..., :hidden_dim], kv_cache_fp8[..., hidden_dim:]
+    kv_cache_fp8, kv_cache_scale = (
+        kv_cache_fp8[..., :hidden_dim],
+        kv_cache_fp8[..., hidden_dim:],
+    )
     # Since the triton don't have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
     kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
 
     config = {
         "ChunkQ": heads,
-        "ChunkK": 64,
+        "ChunkK": ChunkK,
         "HiddenDim": hidden_dim,
-        "SplitKV": 5,
+        "SplitKV": SplitKV,
     }
 
     grid = (batch_size * next_n * config["SplitKV"],)
