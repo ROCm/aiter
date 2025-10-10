@@ -44,12 +44,28 @@ CK_TILE_DEVICE auto get_cost_top(
 }
 
 template<int32_t kPackedQoLenPerWg_,
-         int32_t kMaxClusterSize_>
-struct MlaMetadataTraits
+         int32_t kMaxClusterSize_,
+         bool kQoSplits_ = false,
+         int32_t kUniSeqlenQo_ = -1,
+         bool kIsSparse_ = false>
+struct MlaMetadataV11Traits
 {
-    static constexpr int32_t kPackedQoLenPerWg  = kPackedQoLenPerWg_;
-    static constexpr int32_t kMaxClusterSize    = kMaxClusterSize_;
-    static constexpr int32_t kSplitTolerance    = 16;
+    static constexpr int32_t kPackedQoLenPerWg       = kPackedQoLenPerWg_;
+    static constexpr int32_t kPackedQoLenPerWg_log2  = __builtin_ctz(kPackedQoLenPerWg);
+    static constexpr int32_t kMaxClusterSize         = kMaxClusterSize_;
+    static constexpr int32_t kSplitTolerance         = 16;
+    static constexpr bool    kQoSplits               = kQoSplits_;
+    // <= -1: read from seqlens_qo_indptr
+    // ==  0: read from MlaMetadataV1KernelParameter::uni_seqlen_QO
+    // >=  1: read from MlaMetadataV11Traits::kUniSeqlenQo
+    static constexpr int32_t kUniSeqlenQo            = kUniSeqlenQo_;
+    static constexpr int32_t kIsSparse               = kIsSparse_;
+};
+
+struct MlaMetadataV11Coefficients
+{
+    float workloadLimitGlobal_0;
+    float workloadLimitGlobal_1;
 };
 
 // This version just follows Flashinfer
@@ -70,104 +86,28 @@ CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v0(
     return ck_tile::integer_least_multiple(limit, kv_granularity);
 }
 
-// This version estimate the total #workload (especially for estimating global #splits) plus an amplifier
 CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v1(
-    const int32_t avg_workload,
-    const int32_t var_workload,
-    const int32_t cluster_len_q,
-    const int32_t num_qo_tiles,
-    const int32_t num_clusters,
-    const int32_t kv_granularity)
+    const MlaMetadataV11Coefficients& coefs,
+    const int32_t                     num_batches,
+    const int32_t                     cum_workload,
+    const int32_t                     num_clusters,
+    const int32_t                     packed_seqlen_qo,
+    const int32_t                     kv_granularity)
 {
-    auto estimate_total_workload = [](
-        const int32_t avg_workload,
-        const int32_t var_workload,
-        const int32_t cluster_len_q,
-        const int32_t num_qo_tiles,
-        const int32_t num_clusters)
-    {
-        const int32_t qo_factor = cluster_len_q >> 2;
-        const float cv = sqrtf(float(var_workload)) / float(avg_workload); // coefficient of variation
-        const int32_t A = int32_t(12.0f - (2.0f * cv + 1.0f)) * qo_factor;
+    const int32_t split_overhead = 2 * cal_cost(packed_seqlen_qo, 1) - cal_cost(packed_seqlen_qo, 2);
+    const int32_t fixed_split_overhead = split_overhead * num_batches;
 
-        const int32_t workload_tot = (avg_workload + A) * num_qo_tiles;
+    int32_t limit;
 
-        return workload_tot;
-    };
+    const int32_t avg_workload = ck_tile::max(ck_tile::integer_divide_ceil(cum_workload - fixed_split_overhead, num_clusters), 1);
+    if (avg_workload <= 8) limit = 32;
+    else if (avg_workload <= 16) limit = 64;
+    else if (avg_workload <= 32) limit = 128;
+    else if (avg_workload <= 64) limit = 192;
+    else limit = avg_workload;
 
-    auto estimate_workload_per_cluster = [](
-        const int32_t workload_tot,
-        const int32_t cluster_len_q,
-        const int32_t num_qo_tiles,
-        const int32_t num_clusters)
-    {
-        // The following coefficients come from regression analysis. They may need to be changed with platform and MLA
-        // kernels.
-        const float workload_per_cluster_raw = float(workload_tot) / float(num_clusters);
-        const float factor = -0.00000113f * powf(num_qo_tiles, 3) +
-                              0.00025215f * powf(num_qo_tiles, 2) +
-                             -0.00546401f * float(num_qo_tiles) +
-                              0.40612956f;
-        const float amplifier = ck_tile::max(factor * num_clusters / num_qo_tiles, 1.0f);
-        const int32_t workload_per_cluster = int32_t(workload_per_cluster_raw * amplifier);
-
-        return workload_per_cluster;
-    };
-
-    const int32_t tot_workload_estimated =
-        estimate_total_workload(avg_workload, var_workload, cluster_len_q, num_qo_tiles, num_clusters);
-    const int32_t workload_per_cluster_estimated =
-        estimate_workload_per_cluster(tot_workload_estimated, cluster_len_q, num_qo_tiles, num_clusters);
-
-    return ck_tile::integer_least_multiple(workload_per_cluster_estimated, kv_granularity);
-}
-
-// Just calculate the final value from features of kv seqlens. All the coefficients comes from linear-regression
-// analysis.
-CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v2(
-    const int32_t num_clusters,
-    const int32_t num_batches,
-    const int32_t avg_workload,
-    const int32_t var_workload,
-    const int32_t kv_granularity)
-{
-    const float len = float(num_batches);
-    const float len_2 = len * len;
-    const float len_3 = len_2 * len;
-    const float len_4 = len_2 * len_2;
-    const float std = sqrtf(var_workload);
-    const float mean = float(avg_workload);
-    const float len_mean = len * mean;
-
-    float limit;
-    if (num_batches <= (num_clusters / 2))
-    {
-        constexpr float coef[] =
-            { 5.99938779e+01, -8.60897143e-01,  9.98730735e-02, -3.41580286e-03,
-              3.20742779e-02, -1.21532871e-03,  2.06024521e-05,  6.86938582e-04,
-             -2.06666512e-05,  4.66947341e-05, -2.76209318e+01,  1.71001402e+03,
-              1.14275189e+02, -9.70046247e+02, -7.45775345e+01 };
-        limit =
-            1.0          * coef[0]  + len             * coef[1]  + mean         * coef[2]  + std         * coef[3]  +
-            len_2        * coef[4]  + len_mean        * coef[5]  + len * std    * coef[6]  + len_3       * coef[7]  +
-            len_4        * coef[8]  + len_2 * mean    * coef[9]  + 1.0f / len   * coef[10] + 1.0f / mean * coef[11] +
-            1.0f / len_2 * coef[12] + 1.0f / len_mean * coef[13] + 1.0f / len_3 * coef[14];
-    }
-    else
-    {
-        constexpr float coef[] =
-            { 1.47512976e+03, -9.29222552e+01,  8.58853904e-03, -5.97940105e-04,
-              2.24873043e+00,  2.79397812e-03, -7.44154816e-05, -2.39139141e-02,
-              9.52088885e-05,  2.39891509e-06,  1.27530223e+02,  7.68369536e+03,
-              6.70734798e+00, -2.30288307e+05,  2.78653564e-01 };
-        limit =
-            1.0          * coef[0]  + len             * coef[1]  + mean         * coef[2]  + std         * coef[3]  +
-            len_2        * coef[4]  + len_mean        * coef[5]  + len * std    * coef[6]  + len_3       * coef[7]  +
-            len_4        * coef[8]  + len_2 * mean    * coef[9]  + 1.0f / len   * coef[10] + 1.0f / mean * coef[11] +
-            1.0f / len_2 * coef[12] + 1.0f / len_mean * coef[13] + 1.0f / len_3 * coef[14];
-    }
-
-    return ck_tile::integer_least_multiple(ck_tile::max(int32_t(limit), kv_granularity), kv_granularity);
+    const float amplifier = (num_batches * coefs.workloadLimitGlobal_0) + coefs.workloadLimitGlobal_1;
+    return ck_tile::integer_least_multiple(int32_t(limit + split_overhead * amplifier), kv_granularity);
 }
 
 template <typename Traits, bool kOnlyGatherWorkCount>
@@ -185,7 +125,7 @@ CK_TILE_DEVICE void generate_work(
     const int32_t       num_clusters,
     const int32_t       kv_granularity,
     const int32_t*      p_work_indptr,
-    const int32_t*      p_num_qo_clusters_indptr,
+    const int32_t*      p_lds_num_qo_clusters_indptr,
     int32_t*            p_loc_partial_outputs,
     int32_t*            p_num_partial_outputs,
     MlaWorkInfo*        p_work_info_set,
@@ -241,7 +181,7 @@ CK_TILE_DEVICE void generate_work(
                 work_info.kv_offset = kv_batch_end - work_info.kv_end;
                 if (split_kv)
                 {
-                    const int32_t global_cluster_q_idx = p_num_qo_clusters_indptr[batch_idx] + tile_idx;
+                    const int32_t global_cluster_q_idx = p_lds_num_qo_clusters_indptr[batch_idx] + tile_idx;
                     work_info.partial_qo_loc = *p_loc_partial_outputs;
                     if (p_reduce_partial_map[global_cluster_q_idx].q_start == -1)
                     {
@@ -279,26 +219,28 @@ CK_TILE_DEVICE void generate_work(
 template <typename Traits>
 __launch_bounds__(ck_tile::get_warp_size(), 1)
 __global__ void kn_get_mla_metadata_v1_1(
-    const MlaMetadataV1KernelParameter params)
+    const MlaMetadataV1KernelParameter params,
+    const MlaMetadataV11Coefficients   coefs)
 {
     extern __shared__ uint8_t p_smem[];
 
     const int32_t lane_idx = ck_tile::get_lane_id();
 
     // Step.0. Get sequence lengths of query/output and key/value for each batch.
-    int32_t* p_batch_idx = reinterpret_cast<int32_t*>(p_smem);
-    int32_t* p_qo_lens   = p_batch_idx + params.num_batches;
-    int32_t* p_kv_lens   = p_qo_lens + params.num_batches;
+    int32_t* p_lds_batch_idx = reinterpret_cast<int32_t*>(p_smem);
+    int32_t* p_lds_qo_lens   = p_lds_batch_idx + params.num_batches;
+    int32_t* p_lds_kv_lens   = p_lds_qo_lens + params.num_batches;
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
-        p_batch_idx[bid] = bid;
-        p_qo_lens[bid] = params.p_seqlens_qo_indptr[bid + 1] - params.p_seqlens_qo_indptr[bid];
-        p_kv_lens[bid] = params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid];
+        p_lds_batch_idx[bid] = bid;
+        p_lds_qo_lens[bid] = params.p_seqlens_qo_indptr[bid + 1] - params.p_seqlens_qo_indptr[bid];
+        p_lds_kv_lens[bid] = params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid];
     }
+    QoState<Traits> qo_state(params.uni_seqlen_qo, p_lds_qo_lens, params.p_seqlens_qo_indptr);
 
     // Step.1. Calculate the size of cluster and some related information. The size is the number of workgroups
     //         composing each cluster. The size is determined by average packed qo length.
-    const int32_t sum_qo_len = warp_sum(p_qo_lens, params.num_batches);
+    const int32_t sum_qo_len = warp_sum(p_lds_qo_lens, params.num_batches);
     const int32_t cluster_size =
     [&]() {
         const int32_t avg_qo_len = sum_qo_len / params.num_batches;
@@ -313,18 +255,18 @@ __global__ void kn_get_mla_metadata_v1_1(
     // Step.2.
     //   a. Get total valid (after causal masking) kv lengths and the maximun workload handled by each cluster
     //   b. Get a indptr array about #cluster for each batch in direction of qo.
-    int32_t* p_num_qo_clusters_indptr = p_kv_lens + params.num_batches;
+    int32_t* p_lds_num_qo_clusters_indptr = p_lds_kv_lens + params.num_batches;
     if (lane_idx == 0)
     {
-        p_num_qo_clusters_indptr[0] = 0;
+        p_lds_num_qo_clusters_indptr[0] = 0;
     }
 
     int32_t scan_base = 0;
     int32_t workload_sum = 0;
     int64_t workload_square_sum = 0;
     const int32_t num_loop_batch = ck_tile::integer_divide_ceil(params.num_batches, ck_tile::get_warp_size());
-    // lds pointed by p_qo_tiles will be reused by p_sort_workspace later
-    int32_t* p_qo_tiles  = p_num_qo_clusters_indptr + params.num_batches + 1;
+    // lds pointed by p_lds_qo_tiles will be reused by p_lds_sort_workspace later
+    int32_t* p_lds_qo_tiles  = p_lds_num_qo_clusters_indptr + params.num_batches + 1;
     for (int32_t loop_idx = 0; loop_idx < num_loop_batch; ++loop_idx)
     {
         const int32_t bid = lane_idx + loop_idx * ck_tile::get_warp_size();
@@ -333,11 +275,11 @@ __global__ void kn_get_mla_metadata_v1_1(
 
         if (bid < params.num_batches)
         {
-            const int32_t kv_len = p_kv_lens[bid];
-            const int32_t qo_len = p_qo_lens[bid];
+            const int32_t kv_len = p_lds_kv_lens[bid];
+            const int32_t qo_len = p_lds_qo_lens[bid];
             const int32_t packed_qo_len = qo_len * params.num_heads;
             num_qo_tiles = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
-            p_qo_tiles[bid] = num_qo_tiles;
+            p_lds_qo_tiles[bid] = num_qo_tiles;
             const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
 
             for (int32_t tid = 0; tid < num_qo_tiles; ++tid)
@@ -353,7 +295,7 @@ __global__ void kn_get_mla_metadata_v1_1(
         const int32_t global_sum_qo_tiles = prefix_sum_qo_tiles + scan_base;
         if (bid < params.num_batches)
         {
-            p_num_qo_clusters_indptr[bid + 1] = global_sum_qo_tiles;
+            p_lds_num_qo_clusters_indptr[bid + 1] = global_sum_qo_tiles;
         }
         scan_base = ck_tile::warp_shuffle(global_sum_qo_tiles, ck_tile::get_warp_size() - 1);
 
@@ -364,13 +306,16 @@ __global__ void kn_get_mla_metadata_v1_1(
     const int32_t num_qo_tiles = scan_base;
     const int32_t workload_avg = workload_sum / params.num_batches;
     const int32_t workload_var = workload_square_sum / params.num_batches - workload_avg * workload_avg;
-    const int32_t tot_qo_tiles = warp_sum(p_qo_tiles, params.num_batches);
+    const int32_t tot_qo_tiles = warp_sum(p_lds_qo_tiles, params.num_batches);
 
     const int32_t workload_limit_global =
-        params.num_heads == 16 ?
-            cal_workload_limit_global_v1(
-                workload_avg, workload_var, cluster_len_q, num_qo_tiles, num_clusters, params.kv_granularity) :
-            cal_workload_limit_global_v0(workload_sum, num_clusters, params.kv_granularity);
+        cal_workload_limit_global_v1(
+            coefs,
+            params.num_batches,
+            workload_sum,
+            num_clusters,
+            qo_state.is_unique() ? qo_state.get_seqlen(0) : cluster_len_q,
+            params.kv_granularity);
 #if PRINT_DBG
     if (lane_idx == 0)
     {
@@ -379,11 +324,11 @@ __global__ void kn_get_mla_metadata_v1_1(
 #endif
 
     // Step.3. Sort batch idx based on cost. High cost batch first.
-    int32_t *p_sort_workspace = p_num_qo_clusters_indptr + params.num_batches + 1; // will be reused later.
-    warp_sort(p_batch_idx, p_sort_workspace, p_qo_lens, p_kv_lens, params.num_batches);
+    int32_t *p_lds_sort_workspace = p_lds_num_qo_clusters_indptr + params.num_batches + 1; // will be reused later.
+    warp_sort(p_lds_batch_idx, p_lds_sort_workspace, p_lds_qo_lens, p_lds_kv_lens, params.num_batches);
 
     // Step.4.1. Initialize lds
-    int32_t* p_cost_heap = p_sort_workspace;
+    int32_t* p_cost_heap = p_lds_sort_workspace;
     int32_t* p_cluster_work_counter = p_cost_heap + num_clusters + 1;
     for (int32_t cid = lane_idx; cid < num_clusters; cid += ck_tile::get_warp_size())
     {
@@ -396,7 +341,7 @@ __global__ void kn_get_mla_metadata_v1_1(
     // Step.5.1. Get total work for each cluster
     for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
-        const int32_t bid                = p_batch_idx[idx];
+        const int32_t bid                = p_lds_batch_idx[idx];
         const int32_t qo_batch_start     = params.p_seqlens_qo_indptr[bid];
         const int32_t kv_batch_start     = params.p_seqlens_kv_indptr[bid];
         const int32_t kv_batch_end       = params.p_seqlens_kv_indptr[bid + 1];
@@ -416,7 +361,7 @@ __global__ void kn_get_mla_metadata_v1_1(
             generate_work<Traits, true>(
                 bid, tid, qo_len, tile_kv_len, qo_tile_len, packed_qo_tile_len, qo_batch_start, kv_batch_start,
                 kv_batch_end, workload_limit_global, num_clusters, params.kv_granularity, nullptr,
-                p_num_qo_clusters_indptr, nullptr, nullptr, nullptr, nullptr, nullptr, p_cost_heap,
+                p_lds_num_qo_clusters_indptr, nullptr, nullptr, nullptr, nullptr, nullptr, p_cost_heap,
                 p_cluster_work_counter);
         }
     }
@@ -459,7 +404,7 @@ __global__ void kn_get_mla_metadata_v1_1(
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
     for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
-        const int32_t bid                = p_batch_idx[idx];
+        const int32_t bid                = p_lds_batch_idx[idx];
         const int32_t qo_batch_start     = params.p_seqlens_qo_indptr[bid];
         const int32_t kv_batch_start     = params.p_seqlens_kv_indptr[bid];
         const int32_t kv_batch_end       = params.p_seqlens_kv_indptr[bid + 1];
@@ -486,7 +431,7 @@ __global__ void kn_get_mla_metadata_v1_1(
             generate_work<Traits, false>(
                 bid, tid, qo_len, tile_kv_len, qo_tile_len, packed_qo_tile_len, qo_batch_start, kv_batch_start,
                 kv_batch_end, workload_limit_global, num_clusters, params.kv_granularity, params.p_work_indptr,
-                p_num_qo_clusters_indptr, &loc_partial_outputs, &num_partial_outputs, p_work_info_set,
+                p_lds_num_qo_clusters_indptr, &loc_partial_outputs, &num_partial_outputs, p_work_info_set,
                 p_reduce_final_map, p_reduce_partial_map, p_cost_heap, p_cluster_work_counter);
         }
     }
@@ -557,7 +502,19 @@ __global__ void kn_get_mla_metadata_v1_1(
 #endif
 }
 
-template <typename Traits>
+template <int32_t kPackedQoLenPerWg, int32_t kMaxClusterSize, bool kQoSplits, int32_t kUniSeqlenQo, bool kIsSparse>
+void dispatch_mla_metadata_v1_1_device(
+    const MlaMetadataV1KernelParameter& params,
+    const MlaMetadataV11Coefficients& coefs,
+    const cudaStream_t stream,
+    const int32_t warp_size,
+    const int32_t lds_size)
+{
+    using Traits = MlaMetadataV11Traits<kPackedQoLenPerWg, kMaxClusterSize, kQoSplits, kUniSeqlenQo, kIsSparse>;
+    const dim3 grid = dim3(1, 1, 1);
+    kn_get_mla_metadata_v1_1<Traits><<<grid, warp_size, lds_size, stream>>>(params, coefs);
+}
+
 void get_mla_metadata_v1_1_device(
     const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
     const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
@@ -567,6 +524,8 @@ void get_mla_metadata_v1_1_device(
     const bool           no_redundant,
     const int32_t        kv_granularity,
     const int32_t        max_seqlen_qo,
+    const int32_t        uni_seqlen_qo,
+    const int32_t        topk,
     torch::Tensor&       work_metadata_ptrs,
     torch::Tensor&       work_info_set,
     torch::Tensor&       work_indptr,
@@ -574,6 +533,12 @@ void get_mla_metadata_v1_1_device(
     torch::Tensor&       reduce_final_map,
     torch::Tensor&       reduce_partial_map)
 {
+    // This default settings is for our ASM MLA decode kernel. This kernel supports num_heads=16 and qo size from 1
+    // to 4 without support to split qo for each workgroup. This means that kPackedQoLenPerWg should be 4*16=64 to
+    // prevent spliting in any case supported by it.
+    constexpr int32_t kPackedQoLenPerWg = 128;
+    constexpr int32_t kMaxClusterSize   = 1;
+
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     hipDevice_t dev;
@@ -588,7 +553,7 @@ void get_mla_metadata_v1_1_device(
     const int32_t lds_size_in_bytes = [&]()
     {
         const int32_t qo_tile_per_batch =
-            ck_tile::integer_divide_ceil(ck_tile::max(max_seqlen_qo, 1) * num_heads, Traits::kPackedQoLenPerWg);
+            ck_tile::integer_divide_ceil(ck_tile::max(max_seqlen_qo, 1) * num_heads, kPackedQoLenPerWg);
         const int32_t tot_qo_tiles      = num_batches * qo_tile_per_batch;
         // this is maximun #clusters
         const int32_t num_clusters = dev_prop.multiProcessorCount;
@@ -642,10 +607,21 @@ void get_mla_metadata_v1_1_device(
     params.num_cu               = num_cu;
     params.reduce_indptr_size   = reduce_indptr.size(0);
     params.kv_granularity       = kv_granularity;
+    params.uni_seqlen_qo        = uni_seqlen_qo;
+    params.topk                 = topk;
     params.is_causal            = is_causal;
 
+    MlaMetadataV11Coefficients coefs = {};
+    coefs.workloadLimitGlobal_0 = 0.006098f;
+    coefs.workloadLimitGlobal_1 = 1.16949f;
+
     // launch kernel
-    const dim3 grid = dim3(1, 1, 1);
-    const int32_t num_thr = dev_prop.warpSize; // only use 1 warp for simplicity
-    kn_get_mla_metadata_v1_1<Traits><<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
+    MLA_METADATA_DISPATCHER(
+        max_seqlen_qo * num_heads_per_head_k,
+        kPackedQoLenPerWg,
+        uni_seqlen_qo,
+        topk,
+        dispatch_mla_metadata_v1_1_device<kPackedQoLenPerWg, kMaxClusterSize, kQoSplits, kUniSeqlenQo, kIsSparse>(
+            params, coefs, stream, dev_prop.warpSize, dev_prop.maxSharedMemoryPerMultiProcessor)
+    );
 }

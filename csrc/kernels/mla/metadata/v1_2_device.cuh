@@ -8,87 +8,17 @@ template <int32_t kPackedQoLenPerWg_,
           bool kQoSplits_,
           int32_t kUniSeqlenQo_,
           bool kIsSparse_ = false>
-struct FlashMlaKernelTrait
+struct MlaMetadataV12Traits
 {
     static constexpr int32_t kPackedQoLenPerWg       = kPackedQoLenPerWg_;
     static constexpr int32_t kPackedQoLenPerWg_log2  = __builtin_ctz(kPackedQoLenPerWg);
     static constexpr bool    kQoSplits               = kQoSplits_;
     // <= -1: read from seqlens_qo_indptr
-    // ==  0: read from MlaMetadataV1KernelParameter::uni_seqlen_QO
-    // >=  1: read from FlashMlaKernelTrait::kUniSeqlenQo
+    // ==  0: read from MlaMetadataV1KernelParameter::uni_seqlen_qo
+    // >=  1: read from MlaMetadataV12Traits::kUniSeqlenQo
     static constexpr int32_t kUniSeqlenQo            = kUniSeqlenQo_;
     static constexpr int32_t kFixedOverheadNumBlocks = 16;
     static constexpr int32_t kIsSparse               = kIsSparse_;
-};
-
-template <typename Traits>
-class QoState
-{
-public:
-    CK_TILE_DEVICE explicit QoState(
-        const int32_t uni_seqlen_qo,
-        const int32_t* p_lds_seqlens_qo,
-        const int32_t* p_seqlens_qo_indptr) :
-        uni_seqlen_qo_(uni_seqlen_qo),
-        p_lds_seqlens_qo_(p_lds_seqlens_qo),
-        p_seqlens_qo_indptr_(p_seqlens_qo_indptr)
-    { }
-
-    CK_TILE_DEVICE int32_t get_seqlen(
-        const int32_t batch_idx)
-    {
-        if constexpr (Traits::kUniSeqlenQo == 0)
-        {
-            return uni_seqlen_qo_;
-        }
-        else if constexpr (Traits::kUniSeqlenQo <= -1)
-        {
-            return p_lds_seqlens_qo_[batch_idx];
-        }
-        else
-        {
-            return Traits::kUniSeqlenQo;
-        }
-    }
-
-    CK_TILE_DEVICE int32_t get_begin(
-        const int32_t batch_idx)
-    {
-        if constexpr (Traits::kUniSeqlenQo == 0)
-        {
-            return uni_seqlen_qo_ * batch_idx;
-        }
-        else if constexpr (Traits::kUniSeqlenQo <= -1)
-        {
-            return p_seqlens_qo_indptr_[batch_idx];
-        }
-        else
-        {
-            return Traits::kUniSeqlenQo * batch_idx;
-        }
-    }
-
-    CK_TILE_DEVICE int32_t get_end(
-        const int32_t batch_idx)
-    {
-        if constexpr (Traits::kUniSeqlenQo == 0)
-        {
-            return uni_seqlen_qo_ * (batch_idx + 1);
-        }
-        else if constexpr (Traits::kUniSeqlenQo <= -1)
-        {
-            return p_seqlens_qo_indptr_[batch_idx + 1];
-        }
-        else
-        {
-            return Traits::kUniSeqlenQo * (batch_idx + 1);
-        }
-    }
-
-private:
-    const int32_t uni_seqlen_qo_;
-    const int32_t* const p_lds_seqlens_qo_;
-    const int32_t* const p_seqlens_qo_indptr_;
 };
 
 template <typename Traits>
@@ -143,7 +73,7 @@ __global__ void kn_get_mla_metadata_v1_2(
     int32_t curr_n_split_idx = 0;   // #cu parts used to handle current batch
 
     int32_t curr_kv_begin  = 0;
-    // The size of 1st element equals to end of the 1st element.
+    // The size of 1st element equals to the end loc of the 1st element.
     int32_t curr_kv_end    = p_lds_seqlens_kv[0];
     int32_t curr_kv_seqlen = curr_kv_end - curr_kv_begin;
 
@@ -323,42 +253,17 @@ __global__ void kn_get_mla_metadata_v1_2(
     }
 }
 
-#define MLA_UNI_SEQLEN_QO_CASE(UNI_SEQLEN_QO)                        \
-    case UNI_SEQLEN_QO: \
-    {   \
-        constexpr int32_t kUniSeqlenQo = UNI_SEQLEN_QO; \
-        using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>; \
-        kn_get_mla_metadata_v1_2<Traits> \
-            <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params); \
-        break; \
-    } \
-
-#define MLA_UNI_SEQLEN_DISPATCHER()                        \
-    switch (uni_seqlen_qo) \
-    { \
-        MLA_UNI_SEQLEN_QO_CASE(1); \
-        MLA_UNI_SEQLEN_QO_CASE(2); \
-        MLA_UNI_SEQLEN_QO_CASE(3); \
-        MLA_UNI_SEQLEN_QO_CASE(4); \
-        default: \
-        { \
-            if (uni_seqlen_qo > 0) \
-            { \
-                constexpr int32_t kUniSeqlenQo = 0; \
-                using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>; \
-                kn_get_mla_metadata_v1_2<Traits> \
-                    <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params); \
-            } \
-            else \
-            { \
-                constexpr int32_t kUniSeqlenQo = -1;  \
-                using Traits = FlashMlaKernelTrait<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo>; \
-                kn_get_mla_metadata_v1_2<Traits> \
-                    <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params); \
-            } \
-            break; \
-        } \
-    }
+template <int32_t kPackedQoLenPerWg, bool kQoSplits, int32_t kUniSeqlenQo, bool kIsSparse>
+void dispatch_mla_metadata_v1_2_device(
+    const MlaMetadataV1KernelParameter& params,
+    const cudaStream_t stream,
+    const int32_t warp_size,
+    const int32_t lds_size)
+{
+    using Traits = MlaMetadataV12Traits<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>;
+    const dim3 grid = dim3(1, 1, 1);
+    kn_get_mla_metadata_v1_2<Traits><<<grid, warp_size, lds_size, stream>>>(params);
+}
 
 void get_mla_metadata_v1_2_device(
     const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
@@ -408,35 +313,12 @@ void get_mla_metadata_v1_2_device(
     params.topk                 = topk;
 
     // launch kernel
-    const dim3 grid = dim3(1, 1, 1);
-    const int32_t num_thr = dev_prop.warpSize; // only use 1 warp for simplicity
-
-    if ((max_seqlen_qo > 0) && (max_seqlen_qo * num_heads_per_head_k <= kPackedQoLenPerWg))
-    {
-        constexpr bool kQoSplits = false;
-        if (topk == -1)
-        {
-            constexpr bool kIsSparse = false;
-            MLA_UNI_SEQLEN_DISPATCHER();
-        }
-        else
-        {
-            constexpr bool kIsSparse = true;
-            MLA_UNI_SEQLEN_DISPATCHER();
-        }
-    }
-    else
-    {
-        constexpr bool kQoSplits = true;
-        if (topk == -1)
-        {
-            constexpr bool kIsSparse = false;
-            MLA_UNI_SEQLEN_DISPATCHER();
-        }
-        else
-        {
-            constexpr bool kIsSparse = true;
-            MLA_UNI_SEQLEN_DISPATCHER();
-        }
-    }
+    MLA_METADATA_DISPATCHER(
+        max_seqlen_qo * num_heads_per_head_k,
+        kPackedQoLenPerWg,
+        uni_seqlen_qo,
+        topk,
+        dispatch_mla_metadata_v1_2_device<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>(
+            params, stream, dev_prop.warpSize, dev_prop.maxSharedMemoryPerMultiProcessor)
+    );
 }
