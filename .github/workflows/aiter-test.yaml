@@ -112,8 +112,8 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: standard-test-logs
-          path: standard_test_${{ matrix.runner }}.log
+          name: standard-test-log-${{ matrix.runner }}
+          path: latest_test.log
 
       - name: Cleanup container
         if: always()
@@ -190,8 +190,8 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: multigpu-test-logs
-          path: multigpu_test_${{ matrix.runner }}.log
+          name: multigpu-test-${{ matrix.runner }}
+          path: latest_test.log
 
       - name: Cleanup container
         if: always()
