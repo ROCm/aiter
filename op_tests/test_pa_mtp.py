@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes
+from aiter import dtypes, paged_attn as ops
 from aiter import pertoken_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 
@@ -269,7 +269,7 @@ def run_aiter_hip(
     k_scale=None,
     v_scale=None,
 ):
-    return aiter.paged_attn.PagedAttention.forward_decode(
+    return ops.PagedAttention.forward_decode(
         query,
         k_cache,
         v_cache,
