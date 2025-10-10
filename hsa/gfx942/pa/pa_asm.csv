@@ -38,3 +38,4 @@ fp16,int8,8,1,0,0,16,_ZN5aiter41pa_fp16_pertokenInt8_gqa8_1tg_4w_mtp_msk0E,pa_fp
 bf16,fp8,10,0,0,0,1024,_ZN5aiter43pa_bf16_pertokenFp8_gqa10_1tg_4w_qlen1_msk1E,pa_bf16_pertokenFp8_gqa10_1tg_4w_qlen1_msk1.co
 bf16,fp8,10,12,1,0,1024,_ZN5aiter43pa_bf16_pertokenFp8_gqa10_1tg_4w_qlen2_msk1E,pa_bf16_pertokenFp8_gqa10_1tg_4w_qlen2_msk1.co
 bf16,fp8,10,13,1,0,1024,_ZN5aiter43pa_bf16_pertokenFp8_gqa10_1tg_4w_qlen3_msk1E,pa_bf16_pertokenFp8_gqa10_1tg_4w_qlen3_msk1.co
+bf16,fp8,10,14,1,0,1024,_ZN5aiter43pa_bf16_pertokenFp8_gqa10_1tg_4w_qlen4_msk1E,pa_bf16_pertokenFp8_gqa10_1tg_4w_qlen4_msk1.co
