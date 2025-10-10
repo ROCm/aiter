@@ -129,7 +129,7 @@ for tune_config in "${tune_configs_dir}"/*.json; do
     else
         # Test passed, run benchmark.
         time=$(python "${script_dir}/op_tests/op_benchmarks/triton/bench_mha.py" \
-            --dtype bf16 -mode fwd -b 1 -hq 128 -hk 128 -sq 4096 -sk 4096 -d 128 \
+            --dtype bf16 -mode fwd -b 1 -hq 128 -hk 128 -sq 4096 -sk 4096 -d 192 -dv 128 \
             -causal true --layout bshd -metric time 2> /dev/null \
             | tail -1 | tr --squeeze-repeats ' ' | cut --delimiter=' ' --fields=7)
         result="pass,${time}"
