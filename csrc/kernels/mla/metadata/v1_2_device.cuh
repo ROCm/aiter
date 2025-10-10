@@ -99,7 +99,6 @@ __global__ void kn_get_mla_metadata_v1_2(
     extern __shared__ uint8_t p_smem[];
     int32_t* p_lds_seqlens_qo = reinterpret_cast<int32_t*>(p_smem);
     int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + params.num_batches;
-    int32_t* p_lds_kv_indptr  = p_lds_seqlens_kv + params.num_batches;
 
     QoState<Traits> qo_state(params.uni_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
 
@@ -112,16 +111,7 @@ __global__ void kn_get_mla_metadata_v1_2(
     {
         int32_t kv_end = params.p_seqlens_kv_indptr[bid + 1];
         int32_t seqlen_kv = kv_end - params.p_seqlens_kv_indptr[bid];
-        if constexpr (Traits::kIsSparse)
-        {
-            seqlen_kv = min(seqlen_kv, params.topk);
-            p_lds_seqlens_kv[bid] = seqlen_kv;
-            // p_lds_kv_indptr[bid] = (bid + 1) * params.topk;
-        }
-        else
-        {
-            p_lds_kv_indptr[bid] = kv_end;
-        }
+        p_lds_seqlens_kv[bid] = Traits::kIsSparse ? min(seqlen_kv, params.topk) : seqlen_kv;
 
         const int32_t num_blocks =
             integer_divide_ceil_power2(seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
@@ -153,7 +143,8 @@ __global__ void kn_get_mla_metadata_v1_2(
     int32_t curr_n_split_idx = 0;   // #cu parts used to handle current batch
 
     int32_t curr_kv_begin  = 0;
-    int32_t curr_kv_end    = Traits::kIsSparse ? p_lds_seqlens_kv[0] : p_lds_kv_indptr[0];
+    // The size of 1st element equals to end of the 1st element.
+    int32_t curr_kv_end    = p_lds_seqlens_kv[0];
     int32_t curr_kv_seqlen = curr_kv_end - curr_kv_begin;
 
     int32_t num_works = 0;
@@ -270,18 +261,9 @@ __global__ void kn_get_mla_metadata_v1_2(
                 {
                     curr_kv_block = 0;
                     curr_n_split_idx = 0;
-                    if constexpr (Traits::kIsSparse)
-                    {
-                        curr_kv_begin  = curr_batch * params.topk;
-                        curr_kv_seqlen = p_lds_seqlens_kv[curr_batch];
-                        curr_kv_end    = curr_kv_begin + curr_kv_seqlen;
-                    }
-                    else
-                    {
-                        curr_kv_begin  = curr_kv_end;
-                        curr_kv_end    = p_lds_kv_indptr[curr_batch];
-                        curr_kv_seqlen = curr_kv_end - curr_kv_begin;
-                    }
+                    curr_kv_seqlen = p_lds_seqlens_kv[curr_batch];
+                    curr_kv_begin = Traits::kIsSparse ? curr_batch * params.topk : curr_kv_end;
+                    curr_kv_end = curr_kv_begin + curr_kv_seqlen;
                 }
             }
             else
@@ -340,6 +322,7 @@ __global__ void kn_get_mla_metadata_v1_2(
         params.p_reduce_indptr[i] = last_reduce_indptr;
     }
 }
+
 #define MLA_UNI_SEQLEN_QO_CASE(UNI_SEQLEN_QO)                        \
     case UNI_SEQLEN_QO: \
     {   \
