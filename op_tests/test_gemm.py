@@ -110,7 +110,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         # out_asm = torch.empty((m + 191) // 192 * 192, n, dtype=otype)
         out_asm = torch.empty(m, n, dtype=otype, device=x.device)
         (c, *_), avg_c = run_bf16gemm_asm(x, weight, out_asm, otype=dtypes.fp32)
-        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_c-1:<5.1%}"
+        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us, uplift: {avg_b/avg_c-1:<5.1%}"
         checkAllclose(b, c, msg=msg)
 
 
@@ -378,7 +378,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="+",
     const=None,
-    default=(128, 32, 8192),
+    default=[(128, 32, 8192)],
     help="""Shape of mnk.
     e.g. -mnk 128,32,8192""",
 )
@@ -429,7 +429,7 @@ for test in args.test:
         )
         for dtype in args.dtype:
             for otype in args.otype:
-                for m, n, k in [args.mnk]:
+                for m, n, k in args.mnk:
                     test_gemm(
                         dtype,
                         m,
