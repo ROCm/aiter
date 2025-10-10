@@ -262,7 +262,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
 
     if(selectedksplit > 1)
     {
-        out.zero_();
+        // out.zero_();
         int k_per_tg = Kdim / selectedksplit;
         gdz          = selectedksplit;
     }
