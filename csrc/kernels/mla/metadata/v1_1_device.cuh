@@ -233,8 +233,9 @@ __global__ void kn_get_mla_metadata_v1_1(
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
         p_lds_batch_idx[bid] = bid;
+        const int32_t raw_seqlen_kv = params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid];
+        p_lds_kv_lens[bid] = Traits::kIsSparse ? ck_tile::min(raw_seqlen_kv, params.topk) : raw_seqlen_kv;
         p_lds_qo_lens[bid] = params.p_seqlens_qo_indptr[bid + 1] - params.p_seqlens_qo_indptr[bid];
-        p_lds_kv_lens[bid] = params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid];
     }
     QoState<Traits> qo_state(params.uni_seqlen_qo, p_lds_qo_lens, params.p_seqlens_qo_indptr);
 
@@ -276,7 +277,7 @@ __global__ void kn_get_mla_metadata_v1_1(
         if (bid < params.num_batches)
         {
             const int32_t kv_len = p_lds_kv_lens[bid];
-            const int32_t qo_len = p_lds_qo_lens[bid];
+            const int32_t qo_len = qo_state.get_seqlen(bid);
             const int32_t packed_qo_len = qo_len * params.num_heads;
             num_qo_tiles = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
             p_lds_qo_tiles[bid] = num_qo_tiles;
@@ -342,11 +343,11 @@ __global__ void kn_get_mla_metadata_v1_1(
     for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
         const int32_t bid                = p_lds_batch_idx[idx];
-        const int32_t qo_batch_start     = params.p_seqlens_qo_indptr[bid];
-        const int32_t kv_batch_start     = params.p_seqlens_kv_indptr[bid];
-        const int32_t kv_batch_end       = params.p_seqlens_kv_indptr[bid + 1];
-        const int32_t kv_len             = kv_batch_end - kv_batch_start;
-        const int32_t qo_len             = params.p_seqlens_qo_indptr[bid + 1] - qo_batch_start;
+        const int32_t qo_len             = qo_state.get_seqlen(bid);
+        const int32_t qo_batch_start     = qo_state.get_begin(bid);
+        const int32_t kv_len             = p_lds_kv_lens[bid];
+        const int32_t kv_batch_start     = Traits::kIsSparse ? bid * params.topk : params.p_seqlens_kv_indptr[bid];
+        const int32_t kv_batch_end       = kv_batch_start + kv_len;
         const int32_t packed_qo_len      = qo_len * params.num_heads;
         const int32_t num_qo_tiles       = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
         const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
@@ -405,11 +406,11 @@ __global__ void kn_get_mla_metadata_v1_1(
     for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
         const int32_t bid                = p_lds_batch_idx[idx];
-        const int32_t qo_batch_start     = params.p_seqlens_qo_indptr[bid];
-        const int32_t kv_batch_start     = params.p_seqlens_kv_indptr[bid];
-        const int32_t kv_batch_end       = params.p_seqlens_kv_indptr[bid + 1];
-        const int32_t kv_len             = kv_batch_end - kv_batch_start;
-        const int32_t qo_len             = params.p_seqlens_qo_indptr[bid + 1] - qo_batch_start;
+        const int32_t qo_len             = qo_state.get_seqlen(bid);
+        const int32_t qo_batch_start     = qo_state.get_begin(bid);
+        const int32_t kv_len             = p_lds_kv_lens[bid];
+        const int32_t kv_batch_start     = Traits::kIsSparse ? bid * params.topk : params.p_seqlens_kv_indptr[bid];
+        const int32_t kv_batch_end       = kv_batch_start + kv_len;
         const int32_t packed_qo_len      = qo_len * params.num_heads;
         const int32_t num_qo_tiles       = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
         const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
