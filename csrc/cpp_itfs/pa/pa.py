@@ -180,17 +180,17 @@ def paged_attention_rocm(
     q_scale_ptr = (
         ctypes.cast(query_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
         if query_scale is not None
-        else ctypes.POINTER(ctypes.c_float)()
+        else ctypes.POINTER(ctypes.c_int)()
     )
     k_scale_ptr = (
         ctypes.cast(key_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
         if key_scale is not None
-        else ctypes.POINTER(ctypes.c_float)()
+        else ctypes.POINTER(ctypes.c_int)()
     )
     v_scale_ptr = (
         ctypes.cast(value_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
         if value_scale is not None
-        else ctypes.POINTER(ctypes.c_float)()
+        else ctypes.POINTER(ctypes.c_int)()
     )
 
     func(
