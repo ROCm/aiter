@@ -519,6 +519,7 @@ def run_benchmark(custom, args):
         else:
             total_num_tokens_q = BATCH * N_CTX_Q
             total_num_tokens_k = BATCH * N_CTX_K
+        # TODO: Is it right for backward? Backward reads do as well, and writes dq, dk and dv...
         mem = (
             # read q
             total_num_tokens_q * HQ * D_HEAD * q.element_size()
