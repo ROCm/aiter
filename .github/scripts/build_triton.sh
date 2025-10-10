@@ -16,7 +16,8 @@ git clone --depth=1 https://github.com/triton-lang/triton || true
 cd triton
 pip install -r python/requirements.txt
 pip install filecheck
-pip install .
+
+pip install . --timeout 600 
 
 # Display installed packages
 pip list
