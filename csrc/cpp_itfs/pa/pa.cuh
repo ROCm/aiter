@@ -594,7 +594,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
         {
             float warp_qk_max_exp[NWARPS];
-            // if((lane16id + gqa_ratio_loop * GQA_RATIO_PER_LOOP) < GQA_RATIO){
             for(int w = 0; w < NWARPS; w++)
             {
                 warp_qk_max_exp[w] =
@@ -616,8 +615,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                             mtp] *
                     warp_qk_max_exp[w];
             }
-            // partition_qk_max[gqa_ratio_loop][mtp] *= q_scale[gqa_ratio_loop][mtp];
-            // }
             inv_sum_scale[gqa_ratio_loop][mtp] =
                 __fdividef(1.f, partition_exp_sum[gqa_ratio_loop][mtp] + 1e-6f) *
                 warp_qk_max_exp[warpid];
