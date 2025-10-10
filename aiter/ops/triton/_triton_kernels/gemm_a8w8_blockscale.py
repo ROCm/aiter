@@ -54,6 +54,7 @@ def _gemm_a8w8_blockscale_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    TALL_N: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
@@ -79,17 +80,17 @@ def _gemm_a8w8_blockscale_kernel(
     For this kernel implementation, GROUP_K must equal BLOCK_K.
     """
 
-    tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bk > 0)
-    tl.assume(stride_bn > 0)
-    tl.assume(stride_ck > 0)
-    tl.assume(stride_cm > 0)
-    tl.assume(stride_cn > 0)
-    tl.assume(stride_ascale_m > 0)
-    tl.assume(stride_ascale_k > 0)
-    tl.assume(stride_bscale_k > 0)
-    tl.assume(stride_bscale_n > 0)
+    # tl.assume(stride_am > 0)
+    # tl.assume(stride_ak > 0)
+    # tl.assume(stride_bk > 0)
+    # tl.assume(stride_bn > 0)
+    # tl.assume(stride_ck > 0)
+    # tl.assume(stride_cm > 0)
+    # tl.assume(stride_cn > 0)
+    # tl.assume(stride_ascale_m > 0)
+    # tl.assume(stride_ascale_k > 0)
+    # tl.assume(stride_bscale_k > 0)
+    # tl.assume(stride_bscale_n > 0)
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
@@ -122,7 +123,10 @@ def _gemm_a8w8_blockscale_kernel(
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        pid_bn = pid_n * BLOCK_SIZE_N
+        pid_bn_end = pid_bn + BLOCK_SIZE_N - 1
+        offs_bn = (pid_bn + tl.arange(0, BLOCK_SIZE_N)) % N
+
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
@@ -135,12 +139,12 @@ def _gemm_a8w8_blockscale_kernel(
         a_scale_ptrs = (
             a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
         )
-        offs_b_scale_n = offs_bn // GROUP_N
-        b_scale_ptrs = (
+        offs_b_scale_n = pid_bn // GROUP_N
+        b_scale_ptrs_tall = (
             b_scale_ptr
             + offs_k_scale * stride_bscale_k
-            + offs_b_scale_n * stride_bscale_n
         )
+        b_scale_ptrs =  b_scale_ptrs_tall + offs_b_scale_n * stride_bscale_n
         offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
@@ -162,7 +166,16 @@ def _gemm_a8w8_blockscale_kernel(
 
             a_scale = tl.load(a_scale_ptrs)
             b_scale = tl.load(b_scale_ptrs)
+            b_scale = tl.full((BLOCK_SIZE_N,), b_scale, dtype=b_scale.dtype)
+            if pid_bn_end > N:
+                b_scale_tall = tl.load(b_scale_ptrs_tall)
+                b_scale = tl.where(
+                    offs_bn > TALL_N,
+                    b_scale,
+                    b_scale_tall,
+                )
 
+            # print(b_scale, tall_bn)
             # Perform dot operation and apply scale
             accumulator += (
                 tl.dot(a, b, input_precision="ieee")

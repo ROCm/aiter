@@ -88,6 +88,7 @@ def gemm_a8w8_blockscale(
     config["GROUP_N"] = triton.next_power_of_2(
         triton.cdiv(N, w_scale.shape[1])
     )  # scale_block_size_n
+    config["TALL_N"] = N % config["BLOCK_SIZE_N"]
 
     assert (
         config["GROUP_K"] == config["BLOCK_SIZE_K"]
