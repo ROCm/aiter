@@ -77,6 +77,7 @@ def paged_attention_rocm(
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
+
     dtype_map = {
         torch.bfloat16: "__hip_bfloat16",
         torch.float16: "_Float16",

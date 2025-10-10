@@ -164,9 +164,7 @@ def _use_rocm_custom_paged_attention(
 ) -> bool:
     # rocm custom page attention not support on navi (gfx1*)
     return (
-        not _ON_NAVI
-        and (gqa_ratio >= 1 and gqa_ratio <= 32)
-        and max_seq_len <= 65536
+        not _ON_NAVI and (gqa_ratio >= 1 and gqa_ratio <= 32) and max_seq_len <= 65536
     )
 
 
@@ -237,7 +235,7 @@ class PagedAttention:
         alibi_slopes: Optional[torch.Tensor],
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
-        q_scale: Optional[torch.Tensor]=None,
+        q_scale: Optional[torch.Tensor] = None,
         tp_rank: int = 0,
         blocksparse_local_blocks: int = 0,
         blocksparse_vert_stride: int = 0,

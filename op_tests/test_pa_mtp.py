@@ -285,7 +285,7 @@ def run_aiter_hip(
         v_scale,
         q_scale=q_scale,
         mtp=max_qlen,
-        output_dtype=output_dtype
+        output_dtype=output_dtype,
     )
 
 
@@ -463,7 +463,7 @@ def test_pa_mtp(
         k_scale_asm,
         v_scale_asm,
         q_scale,
-        output_dtype=dtype
+        output_dtype=dtype,
     )
     err = checkAllclose(
         out_ref,
