@@ -227,7 +227,7 @@ void LLGemm_Silu(void *in_a, void *in_b, void *out_c, const int M, const int K,
         <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(af4, bf4, c, d);
   }
 
-  cudaError_t err = cudaGetLastError();
-  if (cudaSuccess != err)
+  hipError_t err = hipGetLastError();
+  if (hipSuccess != err)
     throw std::runtime_error("CUDA kernel failed : " + std::to_string(err));
 }

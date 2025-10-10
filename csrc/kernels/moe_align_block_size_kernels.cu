@@ -20,6 +20,7 @@
 
 #include <ATen/ATen.h>
 
+#include "aiter_hip_common.h"
 #include "dispatch_utils.h"
 #include "hip_compat.h"
 
@@ -151,7 +152,7 @@ void moe_align_block_size(torch::Tensor topk_ids,
 
         // set dynamic shared mem
         auto kernel = vllm::moe_align_block_size_kernel<scalar_t>;
-        AT_CUDA_CHECK(
+        HIP_CALL(
             VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize((void*)kernel, shared_mem));
         kernel<<<1, num_experts, shared_mem, stream>>>(topk_ids.data_ptr<scalar_t>(),
                                                        sorted_token_ids.data_ptr<int32_t>(),

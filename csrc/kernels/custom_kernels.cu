@@ -2398,8 +2398,8 @@ void LLGemmZZ(void* in_a,
                                          reinterpret_cast<const _Float16*>(in_b),
                                          reinterpret_cast<_Float16*>(out_c));
     }
-    cudaError_t err = cudaGetLastError();
-    if(cudaSuccess != err)
+    hipError_t err = hipGetLastError();
+    if(hipSuccess != err)
         throw std::runtime_error("CUDA kernel failed : " + std::to_string(err));
 }
 
@@ -2475,8 +2475,8 @@ void MMGPUKernel(float* in_a,
     matrixMultiplyShared<<<dimGrid, dimBlock>>>(
         in_a, in_b, out_c, numARows, numAColumns, numBRows, numBColumns, numCRows, numCColumns);
 
-    cudaError_t err = cudaGetLastError();
-    if(cudaSuccess != err)
+    hipError_t err = hipGetLastError();
+    if(hipSuccess != err)
         throw std::runtime_error("CUDA kernel failed : " + std::to_string(err));
 }
 } // namespace aiter

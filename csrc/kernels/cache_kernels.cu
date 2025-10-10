@@ -31,7 +31,7 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& bl
     {
         TORCH_CHECK(src_device.index() == dst_device.index(),
                     "src and dst must be on the same GPU");
-        memcpy_type = cudaMemcpyDeviceToDevice;
+        memcpy_type = hipMemcpyDeviceToDevice;
     }
     else if(src_device.is_cuda() && dst_device.is_cpu())
     {
@@ -39,7 +39,7 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& bl
     }
     else if(src_device.is_cpu() && dst_device.is_cuda())
     {
-        memcpy_type = cudaMemcpyHostToDevice;
+        memcpy_type = hipMemcpyHostToDevice;
     }
     else
     {
@@ -65,7 +65,7 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& bl
         int64_t dst_block_number = block_mapping[i][1].item<int64_t>();
         int64_t src_offset       = src_block_number * block_size_in_bytes;
         int64_t dst_offset       = dst_block_number * block_size_in_bytes;
-        cudaMemcpyAsync(
+        hipMemcpyAsync(
             dst_ptr + dst_offset, src_ptr + src_offset, block_size_in_bytes, memcpy_type, stream);
     }
 }

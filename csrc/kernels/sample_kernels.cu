@@ -8,7 +8,7 @@
 #include "rocprim/rocprim.hpp"
 #include "vec_convert.h"
 #include <ATen/core/DistributionsHelper.h>
-#include <ATen/cuda/CUDAGraphsUtils.cuh>
+#include <ATen/hip/HIPGraphsUtils.cuh>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
 #include <hiprand/hiprand.h>
@@ -476,8 +476,8 @@ __global__ void exponential_kernel(DTYPE_O* output,
         vec_o vec_cur;
         for(int i = 0; i < vec_size_o; i++)
         {
-            float u      = transform_func((&rand.x)[i]) + eps;
-            vec_cur[i]   = ck_tile::type_convert<DTYPE_O>(u);
+            float u    = transform_func((&rand.x)[i]) + eps;
+            vec_cur[i] = ck_tile::type_convert<DTYPE_O>(u);
         }
         buffer_o.template set(k, 0, true, vec_cur.template get_as<DTYPE_STORE>());
     }
