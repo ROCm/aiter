@@ -305,43 +305,6 @@ def calculate_total_valid_points(cu_count, aligned_k):
     return total
 
 
-def test_normal_gemm():
-    test_gemm(
-        dtypes.fp8,
-        128,
-        768,
-        4096,
-        bias=False,
-        otype=dtypes.bf16,
-        scaleA=0.5,
-        scaleB=0.5,
-    )
-    test_gemm(dtypes.bf16, 128, 32, 8192)
-    for dtype in [dtypes.fp16, dtypes.bf16]:
-        for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
-            test_gemm(dtype, 128, 32, 8192, otype=otype)
-        # # qkv_proj
-        # for (m, n, k) in [(4096, 1280, 8192),
-        #                   (128, 1280, 8192),
-        #                   (128, 1024, 8192),
-        #                   (128, 128, 8192),
-        #                   ]:
-        #     test_gemm(dtype, m, n, k)
-        # # attn_out
-        # for (m, n, k) in [(4096, 8192, 1024),
-        #                   (128, 8192, 1024)]:
-        #     test_gemm(dtype, m, n, k)
-        # test_gemm(dtype, 128, 1024, 8192)
-        # # gating
-        # for (m, n, k) in [(4096, 32, 8192),
-        #                   (128, 32, 8192)]:
-        #     test_gemm(dtype, m, n, k)
-        # # gating
-        # for (m, n, k) in [(1, 19392, 8192),
-        #                   (128, 19392, 8192)]:
-        #     test_gemm(dtype, m, n, k)
-
-
 def test_skinny_gemm():
     # seed = 8779
     # torch.manual_seed(seed)
@@ -349,7 +312,6 @@ def test_skinny_gemm():
     random.seed(137)
 
     aligned_k = 8
-    # cu_count = 80
     cu_count = torch.cuda.get_device_properties(device="cuda").multi_processor_count
     # ratio = 0.002
     ratio = 0.0002
@@ -395,20 +357,18 @@ parser.add_argument(
     "--test",
     type=str,
     nargs="*",
-    choices=["normal", "skinny", "diy"],
-    default=["skinny"],
+    choices=["normal", "skinny"],
+    default=["normal"],
     help="""Select test to run.
-If run custom tests with -t diy and other arguments..
-    e.g.: -t skinny
-          or -t normal
-          or -t diy    # pls set other args""",
+    e.g.: -t normal    # default
+          or -t skinny""",
 )
 parser.add_argument(
     "-d",
     "--dtype",
     type=dtypes.str2Dtype,
     # choices=["bf16", "fp16", "fp8"],
-    default=[torch.bfloat16],
+    default=[torch.bfloat16, torch.float16],
     help="""Data type. Support "bf16", "fp16", "fp8".
     e.g.: -d bf16
           or -d bf16,fp16    # Multiple comma-separated argus supported.""",
@@ -416,9 +376,9 @@ parser.add_argument(
 parser.add_argument(
     "-mnk",
     type=dtypes.str2tuple,
-    nargs="?",
+    nargs="+",
     const=None,
-    default=None,
+    default=(128, 32, 8192),
     help="""Shape of mnk.
     e.g. -mnk 128,32,8192""",
 )
@@ -433,7 +393,7 @@ parser.add_argument(
     "-o",
     "--otype",
     type=dtypes.str2Dtype,
-    default=[torch.float32],
+    default=[None, torch.float16, torch.bfloat16, torch.float32],
     help="""Data type of output.
     e.g.: -d bf16""",
 )
@@ -456,11 +416,17 @@ parser.add_argument(
 args = parser.parse_args()
 
 for test in args.test:
-    if test == "skinny":
-        test_skinny_gemm()
-    elif test == "normal":
-        test_normal_gemm()
-    elif test == "diy":
+    if test == "normal":
+        test_gemm(
+            dtypes.fp8,
+            128,
+            768,
+            4096,
+            bias=False,
+            otype=dtypes.bf16,
+            scaleA=0.5,
+            scaleB=0.5,
+        )
         for dtype in args.dtype:
             for otype in args.otype:
                 for m, n, k in [args.mnk]:
@@ -474,3 +440,5 @@ for test in args.test:
                         scaleA=args.scale_a,
                         scaleB=args.scale_b,
                     )
+    elif test == "skinny":
+        test_skinny_gemm()
