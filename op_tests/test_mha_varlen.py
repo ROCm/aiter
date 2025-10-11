@@ -570,7 +570,7 @@ def test_flash_attn_varlen_func(
 
 
 @benchmark()
-def test_fa_varlen_func_benchmark(
+def flash_attn_varlen_func_benchmark(
     batch_size,
     nheads,
     seqlen_q,
@@ -949,7 +949,7 @@ if __name__ == "__main__":
     for dtype, dim, mha_type, causal, local, deterministic in itertools.product(
         l_dtype, l_dim, l_mha_type, l_causal, l_local, l_deterministic
     ):
-        ret = test_fa_varlen_func_benchmark(
+        ret = flash_attn_varlen_func_benchmark(
             args.batch_size,
             args.nheads,
             seqlen_q,

@@ -63,7 +63,7 @@ def run_torch(
         reorder_ops=reorder_ops,
     )
 
-    if dout == None:
+    if dout is None:
         return out, softmax_lse
     elif bias is not None:
         dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
@@ -388,7 +388,7 @@ def test_flash_attn_output(
 
 
 @benchmark()
-def test_fa_output_benchmark(
+def flash_attn_output_benchmark(
     batch_size,
     nheads,
     seqlen_q,
@@ -831,7 +831,7 @@ if __name__ == "__main__":
     ) in itertools.product(
         l_dtype, l_dim, l_mha_type, l_causal, l_local, l_deterministic
     ):
-        ret = test_fa_output_benchmark(
+        ret = flash_attn_output_benchmark(
             args.batch_size,
             args.nheads,
             args.seqlen_q,
