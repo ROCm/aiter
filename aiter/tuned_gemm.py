@@ -26,10 +26,18 @@ from aiter import rocb_create_extension, rocb_mm
 from aiter import logger, dtypes
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.jit.utils.chip_info import get_cu_num
+from aiter import gemm_a16w16_asm
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 bestsols = {}
+
+solids = {}
+
+solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
+
+# We need to set is 0 as default, None will error in torch.compile fakeTensor execution
+soltype = 0
 
 
 @torch_compile_guard()
@@ -44,12 +52,12 @@ def load_best_sols_custom(tune_path: str) -> bool:
                 lambda s: (
                     getHipblasltKernelName(s.solidx)
                     if s.libtype == "hipblaslt"
-                    else "rocblas"
+                    else s.kernelName
                 ),
                 axis=1,
             )
             pd.set_option("display.max_colwidth", 100)
-            assert hipblasltKernelNames.equals(bestsols["kernelName"].fillna("")), (
+            assert hipblasltKernelNames.equals(bestsols["kernelName"]), (
                 "error: gradlib tune gemm not match the current environment, need re-tune!!!\n"
                 + f"differece:\n{pd.concat([bestsols[['solidx','kernelName']], hipblasltKernelNames], axis=1)[hipblasltKernelNames != bestsols['kernelName'].fillna('')]}"
             )
@@ -59,39 +67,49 @@ def load_best_sols_custom(tune_path: str) -> bool:
 
 
 @functools.lru_cache(maxsize=4096)
-def query_sol(self, m, n, k, bias, dtype, otype, scaleAB=False):
+def query_sol_core(
+    m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
+) -> int:
+    global solids, solMap, soltype
+    soltype = None
+    solution_idx = 0
+    cu_count = get_cu_num()
+    if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
+        if (
+            ((m == 1 and n <= 2 * cu_count) or (m > 1 and m <= 4 and n <= cu_count))
+            and k <= 9216
+            or (m > 4 and m <= 8 and n <= cu_count)
+            and k <= 5120
+            or (m > 8 and m <= 16 and n <= cu_count)
+            and k <= 256
+        ):
+            soltype, solution_idx = 3, 2
+
+    if soltype is None:
+        soltype, solution_idx = solids.get(
+            (int(m), n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
+        )
+    solution_name = solMap[soltype]
+    logger.info(
+        f"using {solution_name} solution:{solution_idx} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
+    )
+    return solution_idx
+
+
+@torch_compile_guard()
+def query_sol(
+    m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
+) -> int:
     # if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
     #     if n > 8 and 0 < m <= 4:
     #         return 3, 0
     #     elif n % 4 == 0 and m == 1 and k <= 8192:
     #         return 3, 1
-    soltype = None
-    if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
-        if (
-            (
-                (m == 1 and n <= 2 * self.cu_count)
-                or (m > 1 and m <= 4 and n <= self.cu_count)
-            )
-            and k <= 9216
-            or (m > 4 and m <= 8 and n <= self.cu_count)
-            and k <= 5120
-            or (m > 8 and m <= 16 and n <= self.cu_count)
-            and k <= 256
-        ):
-            soltype, solidx = 3, 2
-    if soltype is None:
-        soltype, solidx = self.solids.get(
-            (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
-        )
-    solution_name = self.solMap[soltype]
-
-    logger.info(
-        f"using {solution_name} solution:{solidx} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
-    )
-    return soltype, solidx
+    return query_sol_core(m, n, k, bias, dtype, otype, scaleAB)
 
 
 class TunedGemm:
+    """bf16/fp16 with per tensor fp8 quant"""
 
     def __init__(self):
         self.extensions_created = False
@@ -99,7 +117,7 @@ class TunedGemm:
         self.untune_path = f"{this_dir}/configs/untuned_gemm.csv"
         self.tune_path = f"{this_dir}/configs/tuned_gemm.csv"
         self.bestsols = {}
-        self.solMap = ["torch", "hipblaslt", "rocblas", "skinny"]
+        self.solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
         self.cu_count = torch.cuda.get_device_properties(
             device="cuda"
         ).multi_processor_count
@@ -121,6 +139,7 @@ class TunedGemm:
             self.bestsols = bestsols
 
     def create_ds(self):
+        global solids
         df: pd.DataFrame = self.bestsols
         solds = {}
         for i in range(len(df)):
@@ -134,17 +153,17 @@ class TunedGemm:
                 ds["outdtype"],
                 ds["scaleAB"],
             )
-            if ds["libtype"] == "hipblaslt":
-                soltype = self.solMap.index(ds["libtype"])
-            elif ds["libtype"] == "rocblas":
+
+            if ds["libtype"] in ["hipblaslt", "rocblas", "asm"]:
                 soltype = self.solMap.index(ds["libtype"])
             solds[key] = (soltype, int(ds["solidx"]))
-        self.solids = solds
+        solids = solds
         self.solfuncs = [
             self.apply_torch_mm,
             self.apply_hipb_mm,
             self.apply_rocb_mm,
             self.apply_skinny,
+            self.apply_asm_mm,
         ]
 
     def apply_skinny(
@@ -274,6 +293,23 @@ class TunedGemm:
             out = out.to(otype)
         return out
 
+    def apply_asm_mm(
+        self,
+        inp,
+        weights,
+        solidx,
+        bias=None,
+        otype=None,
+        scale_a=None,
+        scale_b=None,
+        scale_c=None,
+    ):
+        # just support bf16gemm_outFp32
+        out_asm = torch.empty(
+            inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
+        )
+        return gemm_a16w16_asm(inp, weights, out_asm, bias)
+
     def mm(
         self,
         inp,
@@ -305,18 +341,17 @@ class TunedGemm:
         m, k = inp_view.shape
         n = weights.shape[0]
         use_bias = bias is not None
-        soltype, solidx = query_sol(
-            self,
+        solution_idx = query_sol(
             m=m,
             n=n,
             k=k,
             bias=use_bias,
-            dtype=inp.dtype,
-            otype=otype if otype is not None else inp.dtype,
+            dtype=str(inp.dtype),
+            otype=str(otype) if otype is not None else str(inp.dtype),
             scaleAB=scale_a is not None or scale_b is not None,
         )
         out = self.solfuncs[soltype](
-            inp_view, weights, solidx, bias, otype, scale_a, scale_b, scale_c
+            inp_view, weights, solution_idx, bias, otype, scale_a, scale_b, scale_c
         )
         if batched:
             out = out.view(*inp.shape[:-1], weights.shape[0])

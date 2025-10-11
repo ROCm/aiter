@@ -16,12 +16,15 @@ TOP_DIR=$(dirname "$SCRIPT_DIR")/../../
 
 if [ x"$FMA_API" = x"fwd" ] || [ x"$FMA_API" = x"fwd_v3" ] || [ x"$FMA_API" = x"" ] ; then
 echo "######## linking mha fwd"
+
+[ x"$FMA_API" = x"fwd_v3" ] && splitkv_api=0 || splitkv_api=1
+
 /opt/rocm/bin/hipcc  -I$TOP_DIR/3rdparty/composable_kernel/include \
                      -I$TOP_DIR/3rdparty/composable_kernel/example/ck_tile/01_fmha/ \
                      -I$TOP_DIR/csrc/include \
                      -std=c++20 -O3 \
                      -DUSE_ROCM=1 \
-                     -DCK_TILE_FMHA_FWD_SPLITKV_API=1 \
+                     -DCK_TILE_FMHA_FWD_SPLITKV_API=$splitkv_api \
                      --offload-arch=native \
                      -L $SCRIPT_DIR -lmha_fwd \
                      $SCRIPT_DIR/benchmark_mha_fwd.cpp -o benchmark_mha_fwd

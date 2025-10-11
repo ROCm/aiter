@@ -3,7 +3,7 @@
 
 # user interface
 
-from typing import List
+from typing import Tuple
 import torch
 from ..jit.core import (
     compile_ops,
@@ -48,7 +48,7 @@ def gen_moe_fused_gate_fake_tensor(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     output = torch.empty_like(
         topk_weights, dtype=topk_weights.dtype, device=topk_weights.device
     )
@@ -69,7 +69,7 @@ def moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> List[torch.Tensor]: ...
+) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def biased_grouped_topk(
@@ -84,7 +84,7 @@ def biased_grouped_topk(
 ):
     token_num = gating_output.shape[0]
     cu_num = get_cu_num()
-    if token_num <= cu_num * 16 or not topk_ids.is_contiguous():
+    if token_num <= cu_num * 212:
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
@@ -119,6 +119,7 @@ def biased_grouped_topk_torch(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
+    return_score: bool = False,
 ):
     scores = gating_output.to(dtypes.fp32).sigmoid()
     num_token = scores.shape[0]
@@ -149,7 +150,10 @@ def biased_grouped_topk_torch(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
+    if return_score:
+        return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32), scores
+    else:
+        return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
 
 
 # this one copied from sglang

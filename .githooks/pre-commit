@@ -23,7 +23,7 @@ else
 fi
 
 if [[ "$1" == "--reformat" ]]; then
-    files=$(git ls-files --exclude-standard)
+    files=$(git diff --name-only)
 else
     files=$(git diff-index --cached --name-only $against)
 fi
@@ -41,7 +41,7 @@ done
 
 # do the formatting
 for file in $files; do
-    if [[ -e $file ]] && echo $file | grep -Eq '\.c$|\.h$|\.hpp$|\.cpp$|\.cl$|\.in$|\.txt$|\.yaml$|\.sh$|\.py$|\.pl$|\.cmake$|\.md$|\.rst$|\.groovy$'; then
+    if [[ -e $file ]] && echo $file | grep -Eq '\.c$|\.h$|\.cuh$|\.hpp$|\.cpp$|\.cl$|\.h\.in$|\.hpp\.in$|\.cpp\.in$|\.py$'; then
         sed -i -e 's/[[:space:]]*$//' "$file" # Remove whitespace at end of lines
         sed -i -e '$a\' "$file" # Add missing newline to end of file
         # Convert UTF8 non-ASCII to ASCII
