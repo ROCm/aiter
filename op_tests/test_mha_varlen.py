@@ -366,7 +366,6 @@ def run_ck_seq_padding(
         (2048, 2048),
     ],
 )
-@benchmark()
 def test_flash_attn_varlen_func(
     batch_size,
     nheads,
@@ -549,6 +548,41 @@ def test_flash_attn_varlen_func(
     ret["bwd_tflops"] = (bwd_flop) / 1.0e6 / us_bwd
     ret["bwd_gb_per_sec"] = (bwd_num_bytes) / 1.0e3 / us_bwd
     return ret
+
+
+@benchmark()
+def test_fa_varlen_func_benchmark(
+    batch_size,
+    nheads,
+    seqlen_q,
+    seqlen_k,
+    d,
+    d_v,
+    min_seqlen_q,
+    dropout_p,
+    causal,
+    local,
+    bias_type,
+    deterministic,
+    mha_type,
+    dtype,
+):
+    return test_flash_attn_varlen_func(
+        batch_size=batch_size,
+        nheads=nheads,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        d=d,
+        d_v=d_v,
+        min_seqlen_q=min_seqlen_q,
+        dropout_p=dropout_p,
+        causal=causal,
+        local=local,
+        bias_type=bias_type,
+        deterministic=deterministic,
+        mha_type=mha_type,
+        dtype=dtype,
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -887,7 +921,7 @@ if __name__ == "__main__":
     for dtype, dim, mha_type, causal, local, deterministic in itertools.product(
         l_dtype, l_dim, l_mha_type, l_causal, l_local, l_deterministic
     ):
-        ret = test_flash_attn_varlen_func(
+        ret = test_fa_varlen_func_benchmark(
             args.batch_size,
             args.nheads,
             seqlen_q,
