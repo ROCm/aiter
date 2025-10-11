@@ -80,33 +80,22 @@ mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
 """
 
 FMHA_FWD_API = """
-float mha_fwd(mha_fwd_args args,
-              const ck_tile::stream_config& stream_config,
-              std::string q_dtype_str,
-              bool is_group_mode,
-              mask_enum mask_type,
-              bias_enum bias_type,
-              bool has_lse,
-              bool use_ext_asm,
-              int how_v3_bf16_cvt,
-              const void* seqstart_q_padding_ptr,
-              const void* seqstart_k_padding_ptr,
-              bool is_v3_api_check)
+float mha_fwd(mha_fwd_args args, const ck_tile::stream_config& stream_config, bool is_v3_api_check)
 {{
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
     auto traits = get_mha_fwd_traits(head_size_q,
                                      head_size_v,
-                                     q_dtype_str,
-                                     is_group_mode,
+                                     args.q_dtype_str,
+                                     args.is_group_mode,
                                      args.logits_soft_cap > 0.f,
-                                     mask_type,
-                                     bias_type,
-                                     has_lse,
+                                     args.mask_type_enum,
+                                     args.bias_type,
+                                     args.has_lse,
                                      has_dropout,
-                                     use_ext_asm,
-                                     how_v3_bf16_cvt,
+                                     args.use_ext_asm,
+                                     args.how_v3_bf16_cvt,
                                      args.min_seqlen_q != 0);
     float t = -1;
     {F_inner_dispatch}
@@ -165,9 +154,9 @@ V2_API = """t = fmha_fwd(traits, args, stream_config);"""
 
 V3_MULTI_TARGET_API = """
     if (get_gpu_arch() == "gfx942") {
-        t = gfx942::fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr, is_v3_api_check);
+        t = gfx942::fmha_fwd_v3(traits, args, stream_config, is_v3_api_check);
     } else if (get_gpu_arch() == "gfx950") {
-        t = gfx950::fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr, is_v3_api_check);
+        t = gfx950::fmha_fwd_v3(traits, args, stream_config, is_v3_api_check);
     } else {
         std::cout << "No supported GPU arch found!" << std::endl;
         return -1;
@@ -178,7 +167,7 @@ V3_MULTI_TARGET_API = """
 def get_v3_api():
     gfx_list = get_gfx_list()
     if len(gfx_list) == 1:
-        return f"t = {gfx_list[0]}::fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr, is_v3_api_check);"
+        return f"t = {gfx_list[0]}::fmha_fwd_v3(traits, args, stream_config, is_v3_api_check);"
     else:
         return V3_MULTI_TARGET_API
 
@@ -189,7 +178,7 @@ COMBINED_API = (
     V3_API
     + r"""
     if (t == -1 && !is_v3_api_check) {
-        if (seqstart_q_padding_ptr == nullptr && seqstart_k_padding_ptr == nullptr) {
+        if (args.seqstart_q_padding_ptr == nullptr && args.seqstart_k_padding_ptr == nullptr) {
             t = fmha_fwd(traits, args, stream_config);
         } else {
             std::cout << "\n this two args(seqstart_q_padding and seqstart_k_padding) currently not support on ck side!" << std::endl;

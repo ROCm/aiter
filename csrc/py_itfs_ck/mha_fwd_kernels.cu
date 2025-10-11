@@ -34,7 +34,8 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    float p_dropout,
                                    std::pair<uint64_t*, uint64_t*> drop_seed_offset,
                                    const std::optional<at::Tensor> &cu_seqlens_q_,
-                                   const std::optional<at::Tensor> &cu_seqlens_kv_)
+                                   const std::optional<at::Tensor> &cu_seqlens_kv_,
+                                   std::string q_dtype_str)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -70,6 +71,9 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
     void *bias_ptr = nullptr;
     ck_tile::index_t stride_bias = 0;
 
+    bias_enum bias_type = bias_.has_value() ? bias_enum::elementwise_bias :
+        alibi_slopes_.has_value() ? bias_type = bias_enum::alibi : bias_enum::no_bias;
+    
     if (bias_.has_value()) {
         auto bias = bias_.value();
         CHECK_DEVICE(bias);
@@ -142,7 +146,16 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          0,
                          p_dropout,
                          has_dropout_randval,
-                         drop_seed_offset};
+                         drop_seed_offset,
+                         q_dtype_str,
+                         false,
+                         mask.type,
+                         bias_type,
+                         has_lse,
+                         false,
+                         1,
+                         nullptr, // seqstart_q_padding_ptr
+                         nullptr}; // seqstart_k_padding_ptr
 }
 
 std::vector<at::Tensor>
@@ -228,8 +241,6 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     }
 
     TORCH_CHECK(!(bias_.has_value() && alibi_slopes_.has_value()), "cannot apply bias and alibi at the same time");
-    bias_enum bias_type = bias_.has_value() ? bias_enum::elementwise_bias :
-        alibi_slopes_.has_value() ? bias_type = bias_enum::alibi : bias_enum::no_bias;
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
@@ -330,16 +341,10 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                 p_dropout,
                 drop_seed_offset,
                 cu_seqlens_q_,
-                cu_seqlens_kv_);
+                cu_seqlens_kv_,
+                q_dtype_str);
 
-        float t = aiter::mha_fwd(args,
-                                 stream_config,
-                                 q_dtype_str,
-                                 false, // is_group_mode
-                                 mask.type,
-                                 bias_type,
-                                 has_lse,
-                                 false);
+        float t = aiter::mha_fwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {

@@ -39,7 +39,8 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           std::pair<uint64_t*, uint64_t*> drop_seed_offset,
                                           // optional padded physical seqstarts (including PAD)
                                           std::optional<const at::Tensor> &cu_seqlens_q_padded_,
-                                          std::optional<const at::Tensor> &cu_seqlens_k_padded_)
+                                          std::optional<const at::Tensor> &cu_seqlens_k_padded_,
+                                          std::string q_dtype_str)
 {
     // q: (total_q, nheads, d)
     // k: (total_k, nheads_k, d)
@@ -78,6 +79,9 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     ck_tile::index_t stride_bias = 0;
     ck_tile::index_t nhead_stride_bias = 0;
     ck_tile::index_t batch_stride_bias = 0;
+
+    bias_enum bias_type = bias_.has_value() ? bias_enum::elementwise_bias :
+        (alibi_slopes_.has_value() ? bias_type = bias_enum::alibi : bias_enum::no_bias);
 
     if (bias_.has_value()) {
         auto bias = bias_.value();
@@ -174,7 +178,16 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          min_seqlen_q,
                          p_dropout,
                          has_dropout_randval,
-                         drop_seed_offset};
+                         drop_seed_offset,
+                         q_dtype_str,
+                         true, // is_group_mode
+                         mask.type,
+                         bias_type,
+                         has_lse,
+                         false,
+                         1,
+                         nullptr, // seqstart_q_padding_ptr
+                         nullptr}; // seqstart_k_padding_ptr
 }
 
 fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
@@ -614,19 +627,10 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     p_dropout,
                     drop_seed_offset,
                     const_cast<std::optional<const at::Tensor>&>(cu_seqlens_q_padded_),
-                    const_cast<std::optional<const at::Tensor>&>(cu_seqlens_k_padded_));
+                    const_cast<std::optional<const at::Tensor>&>(cu_seqlens_k_padded_),
+                    q_dtype_str);
 
-            float t = aiter::mha_fwd(args,
-                                     stream_config,
-                                     q_dtype_str,
-                                     true, //is_group_mode
-                                     mask.type,
-                                     bias_type,
-                                     has_lse,
-                                     false, // use_ext_asm
-                                     1,     // how_v3_bf16_cvt
-                                     args.seqstart_padded_q_ptr,
-                                     args.seqstart_padded_k_ptr);
+            float t = aiter::mha_fwd(args, stream_config);
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
         }
     }
