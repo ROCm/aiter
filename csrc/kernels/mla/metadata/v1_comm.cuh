@@ -56,6 +56,7 @@ struct MlaMetadataV1KernelParameter
     const int32_t* p_seqlens_kv_indptr;
     int32_t        num_batches;
     int32_t        num_heads;
+    int32_t        num_heads_log2;
     int32_t        num_cu;
     int32_t        reduce_indptr_size;
     int32_t        kv_granularity;

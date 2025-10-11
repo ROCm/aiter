@@ -60,6 +60,8 @@ struct MlaMetadataV11Traits
     // >=  1: read from MlaMetadataV11Traits::kUniSeqlenQo
     static constexpr int32_t kUniSeqlenQo            = kUniSeqlenQo_;
     static constexpr int32_t kIsSparse               = kIsSparse_;
+
+    static constexpr bool kSortBatch = false;
 };
 
 struct MlaMetadataV11Coefficients
@@ -246,12 +248,13 @@ __global__ void kn_get_mla_metadata_v1_1(
     [&]() {
         const int32_t avg_qo_len = sum_qo_len / params.num_batches;
         const int32_t cluster_size =
-            ck_tile::integer_divide_ceil(avg_qo_len, Traits::kPackedQoLenPerWg);
+            integer_divide_ceil_power2(avg_qo_len, Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2);
         return ck_tile::min(cluster_size, Traits::kMaxClusterSize);
     }();
     // assert((params.num_cu % cluster_size) == 0);
     const int32_t num_clusters  = params.num_cu / cluster_size;
     const int32_t cluster_len_q = cluster_size * Traits::kPackedQoLenPerWg;
+    const int32_t cluster_len_q_log2 = __builtin_ctz(cluster_len_q);
 
     // Step.2.
     //   a. Get total valid (after causal masking) kv lengths and the maximun workload handled by each cluster
@@ -264,8 +267,7 @@ __global__ void kn_get_mla_metadata_v1_1(
 
     int32_t scan_base = 0;
     int32_t workload_sum = 0;
-    int64_t workload_square_sum = 0;
-    const int32_t num_loop_batch = ck_tile::integer_divide_ceil(params.num_batches, ck_tile::get_warp_size());
+    const int32_t num_loop_batch = integer_divide_ceil_power2(params.num_batches, ck_tile::get_warp_size(), __builtin_ctz(ck_tile::get_warp_size()));
     // lds pointed by p_lds_qo_tiles will be reused by p_lds_sort_workspace later
     int32_t* p_lds_qo_tiles  = p_lds_num_qo_clusters_indptr + params.num_batches + 1;
     for (int32_t loop_idx = 0; loop_idx < num_loop_batch; ++loop_idx)
@@ -279,7 +281,7 @@ __global__ void kn_get_mla_metadata_v1_1(
             const int32_t kv_len = p_lds_kv_lens[bid];
             const int32_t qo_len = qo_state.get_seqlen(bid);
             const int32_t packed_qo_len = qo_len * params.num_heads;
-            num_qo_tiles = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+            num_qo_tiles = integer_divide_ceil_power2(packed_qo_len, cluster_len_q, cluster_len_q_log2);
             p_lds_qo_tiles[bid] = num_qo_tiles;
             const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
 
@@ -301,12 +303,8 @@ __global__ void kn_get_mla_metadata_v1_1(
         scan_base = ck_tile::warp_shuffle(global_sum_qo_tiles, ck_tile::get_warp_size() - 1);
 
         workload_sum += aiter::warpReduce<aiter::AddFunctor, decltype(workload), ck_tile::get_warp_size()>(workload);
-        workload_square_sum +=
-            aiter::warpReduce<aiter::AddFunctor, decltype(workload), ck_tile::get_warp_size()>(workload * workload);
     }
     const int32_t num_qo_tiles = scan_base;
-    const int32_t workload_avg = workload_sum / params.num_batches;
-    const int32_t workload_var = workload_square_sum / params.num_batches - workload_avg * workload_avg;
     const int32_t tot_qo_tiles = warp_sum(p_lds_qo_tiles, params.num_batches);
 
     const int32_t workload_limit_global =
@@ -325,11 +323,14 @@ __global__ void kn_get_mla_metadata_v1_1(
 #endif
 
     // Step.3. Sort batch idx based on cost. High cost batch first.
-    int32_t *p_lds_sort_workspace = p_lds_num_qo_clusters_indptr + params.num_batches + 1; // will be reused later.
-    warp_sort(p_lds_batch_idx, p_lds_sort_workspace, p_lds_qo_lens, p_lds_kv_lens, params.num_batches);
+    if constexpr (Traits::kSortBatch)
+    {
+        int32_t *p_lds_sort_workspace = p_lds_num_qo_clusters_indptr + params.num_batches + 1; // will be reused later.
+        warp_sort(p_lds_batch_idx, p_lds_sort_workspace, p_lds_qo_lens, p_lds_kv_lens, params.num_batches);
+    }
 
     // Step.4.1. Initialize lds
-    int32_t* p_cost_heap = p_lds_sort_workspace;
+    int32_t* p_cost_heap = p_lds_qo_tiles;
     int32_t* p_cluster_work_counter = p_cost_heap + num_clusters + 1;
     for (int32_t cid = lane_idx; cid < num_clusters; cid += ck_tile::get_warp_size())
     {
@@ -340,18 +341,20 @@ __global__ void kn_get_mla_metadata_v1_1(
     // Step.5. Fill the output buffers except indptrs
 
     // Step.5.1. Get total work for each cluster
-    for (int32_t idx = 0; idx < params.num_batches; ++idx)
+    int32_t bid            = Traits::kSortBatch ? p_lds_batch_idx[0] : 0;
+    int32_t qo_len         = qo_state.get_seqlen(bid);
+    int32_t qo_batch_start = qo_state.get_begin(bid);
+    int32_t kv_len         = p_lds_kv_lens[bid];
+    int32_t kv_batch_start = Traits::kIsSparse ? bid * params.topk :
+                                                 (Traits::kSortBatch ? params.p_seqlens_kv_indptr[bid] : 0);
+    int32_t kv_batch_end   = kv_batch_start + kv_len;
+    int32_t idx = 0;
+    while (true)
     {
-        const int32_t bid                = p_lds_batch_idx[idx];
-        const int32_t qo_len             = qo_state.get_seqlen(bid);
-        const int32_t qo_batch_start     = qo_state.get_begin(bid);
-        const int32_t kv_len             = p_lds_kv_lens[bid];
-        const int32_t kv_batch_start     = Traits::kIsSparse ? bid * params.topk : params.p_seqlens_kv_indptr[bid];
-        const int32_t kv_batch_end       = kv_batch_start + kv_len;
         const int32_t packed_qo_len      = qo_len * params.num_heads;
-        const int32_t num_qo_tiles       = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t num_qo_tiles       = integer_divide_ceil_power2(packed_qo_len, cluster_len_q, cluster_len_q_log2);
         const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
-        const int32_t qo_tile_len        = ck_tile::integer_divide_ceil(packed_qo_tile_len, params.num_heads);
+        const int32_t qo_tile_len        = integer_divide_ceil_power2(packed_qo_tile_len, params.num_heads, params.num_heads_log2);
 
         for (int32_t tid = 0; tid < num_qo_tiles; ++tid)
         {
@@ -365,11 +368,25 @@ __global__ void kn_get_mla_metadata_v1_1(
                 p_lds_num_qo_clusters_indptr, nullptr, nullptr, nullptr, nullptr, nullptr, p_cost_heap,
                 p_cluster_work_counter);
         }
+
+        if (++idx < params.num_batches)
+        {
+            bid                = Traits::kSortBatch ? p_lds_batch_idx[idx] : idx;
+            qo_len             = qo_state.get_seqlen(bid);
+            qo_batch_start     = qo_state.get_begin(bid);
+            kv_len             = p_lds_kv_lens[bid];
+            kv_batch_start     = Traits::kIsSparse ? bid * params.topk : kv_batch_end;
+            kv_batch_end       = kv_batch_start + kv_len;
+        }
+        else
+        {
+            break;
+        }
     }
 
     // Step.5.2. Re-init cost heap and cumulative sum cluster_work_tot
     scan_base = 0;
-    const int32_t num_loop_clusters = ck_tile::integer_divide_ceil(num_clusters, ck_tile::get_warp_size());
+    const int32_t num_loop_clusters = integer_divide_ceil_power2(num_clusters, ck_tile::get_warp_size(), __builtin_ctz(ck_tile::get_warp_size()));
     for (int32_t loop_idx = 0; loop_idx < num_loop_clusters; ++loop_idx)
     {
         const int32_t cid = lane_idx + loop_idx * ck_tile::get_warp_size();
@@ -403,18 +420,21 @@ __global__ void kn_get_mla_metadata_v1_1(
     int32_t num_partial_outputs = 0;
     int32_t loc_partial_outputs = 0;
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
-    for (int32_t idx = 0; idx < params.num_batches; ++idx)
+
+    bid            = Traits::kSortBatch ? p_lds_batch_idx[0] : 0;
+    qo_len         = qo_state.get_seqlen(bid);
+    qo_batch_start = qo_state.get_begin(bid);
+    kv_len         = p_lds_kv_lens[bid];
+    kv_batch_start = Traits::kIsSparse ? bid * params.topk :
+                                         (Traits::kSortBatch ? params.p_seqlens_kv_indptr[bid] : 0);
+    kv_batch_end   = kv_batch_start + kv_len;
+    idx = 0;
+    while (true)
     {
-        const int32_t bid                = p_lds_batch_idx[idx];
-        const int32_t qo_len             = qo_state.get_seqlen(bid);
-        const int32_t qo_batch_start     = qo_state.get_begin(bid);
-        const int32_t kv_len             = p_lds_kv_lens[bid];
-        const int32_t kv_batch_start     = Traits::kIsSparse ? bid * params.topk : params.p_seqlens_kv_indptr[bid];
-        const int32_t kv_batch_end       = kv_batch_start + kv_len;
         const int32_t packed_qo_len      = qo_len * params.num_heads;
-        const int32_t num_qo_tiles       = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t num_qo_tiles       = integer_divide_ceil_power2(packed_qo_len, cluster_len_q, cluster_len_q_log2);
         const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
-        const int32_t qo_tile_len        = ck_tile::integer_divide_ceil(packed_qo_tile_len, params.num_heads);
+        const int32_t qo_tile_len        = integer_divide_ceil_power2(packed_qo_tile_len, params.num_heads, params.num_heads_log2);
 
 #if PRINT_DBG
         if (lane_idx == 0)
@@ -435,11 +455,25 @@ __global__ void kn_get_mla_metadata_v1_1(
                 p_lds_num_qo_clusters_indptr, &loc_partial_outputs, &num_partial_outputs, p_work_info_set,
                 p_reduce_final_map, p_reduce_partial_map, p_cost_heap, p_cluster_work_counter);
         }
+
+        if (++idx < params.num_batches)
+        {
+            bid                = Traits::kSortBatch ? p_lds_batch_idx[idx] : idx;
+            qo_len             = qo_state.get_seqlen(bid);
+            qo_batch_start     = qo_state.get_begin(bid);
+            kv_len             = p_lds_kv_lens[bid];
+            kv_batch_start     = Traits::kIsSparse ? bid * params.topk : kv_batch_end;
+            kv_batch_end       = kv_batch_start + kv_len;
+        }
+        else
+        {
+            break;
+        }
     }
 
     // Step.6. Output metadata for reduce kernel
     scan_base = 0;
-    const int32_t num_loop_reduce = ck_tile::integer_divide_ceil(tot_qo_tiles, ck_tile::get_warp_size());
+    const int32_t num_loop_reduce = integer_divide_ceil_power2(tot_qo_tiles, ck_tile::get_warp_size(), __builtin_ctz(ck_tile::get_warp_size()));
     for (int32_t loop_idx = 0; loop_idx < num_loop_reduce; ++loop_idx)
     {
         const int32_t global_cluster_q_idx = lane_idx + loop_idx * ck_tile::get_warp_size();
@@ -605,9 +639,11 @@ void get_mla_metadata_v1_1_device(
     params.p_seqlens_kv_indptr  = seqlens_kv_indptr.data_ptr<int32_t>();
     params.num_batches          = num_batches;
     params.num_heads            = num_heads;
+    params.num_heads_log2       = __builtin_ctz(num_heads);
     params.num_cu               = num_cu;
     params.reduce_indptr_size   = reduce_indptr.size(0);
     params.kv_granularity       = kv_granularity;
+    params.kv_granularity_log2  = __builtin_ctz(kv_granularity);
     params.uni_seqlen_qo        = uni_seqlen_qo;
     params.topk                 = topk;
     params.is_causal            = is_causal;
