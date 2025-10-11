@@ -67,21 +67,24 @@ struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
     }
 };
 
-using mha_fwd_args           = fmha_fwd_args;
+struct mha_fwd_args : public fmha_fwd_args
+{
+    std::string q_dtype_str;
+    bool is_group_mode;
+    mask_enum mask_type_enum;
+    bias_enum bias_type;
+    bool has_lse;
+    bool use_ext_asm;
+    int how_v3_bf16_cvt;
+    const void* seqstart_q_padding_ptr;
+    const void* seqstart_k_padding_ptr;
+};
+
 using mha_fwd_splitkv_args   = fmha_fwd_splitkv_args;
 using mha_batch_prefill_args = fmha_batch_prefill_args;
 
 __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      const ck_tile::stream_config& stream_config,
-                                                     std::string q_dtype_str,
-                                                     bool is_group_mode,
-                                                     mask_enum mask_type,
-                                                     bias_enum bias_type,
-                                                     bool has_lse,
-                                                     bool use_ext_asm,
-                                                     int how_v3_bf16_cvt                = 1,
-                                                     const void* seqstart_q_padding_ptr = nullptr,
-                                                     const void* seqstart_k_padding_ptr = nullptr,
                                                      bool is_v3_api_check = false);
 
 __attribute__((visibility("default"))) float
@@ -216,8 +219,6 @@ namespace gfx942 {
 float fmha_fwd_v3(mha_fwd_traits t,
                   mha_fwd_args a,
                   const ck_tile::stream_config& s,
-                  const void* seqstart_q_padding_ptr = nullptr,
-                  const void* seqstart_k_padding_ptr = nullptr,
                   bool is_v3_api_check = false);
 }
 
@@ -225,8 +226,6 @@ namespace gfx950 {
 float fmha_fwd_v3(mha_fwd_traits t,
                   mha_fwd_args a,
                   const ck_tile::stream_config& s,
-                  const void* seqstart_q_padding_ptr = nullptr,
-                  const void* seqstart_k_padding_ptr = nullptr,
                   bool is_v3_api_check = false);
 }
 } // namespace aiter
