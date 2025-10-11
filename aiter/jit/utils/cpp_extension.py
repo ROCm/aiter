@@ -1782,6 +1782,7 @@ def _write_ninja_file(
 
 
 def _is_cuda_file(path: str) -> bool:
+    return True
     valid_ext = [".cu", ".cuh"]
     if IS_HIP_EXTENSION:
         valid_ext.append(".hip")
