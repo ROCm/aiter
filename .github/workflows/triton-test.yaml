@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   triton:
-    runs-on: aiter-1gpu-runner
+    runs-on: mi300x-1gpu
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"
