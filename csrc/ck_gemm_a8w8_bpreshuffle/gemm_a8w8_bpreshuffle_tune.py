@@ -268,7 +268,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             M = untunedf.loc[i, "M"]
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
-            q_dtype_w = (untunedf.loc[i, "q_dtype_w"])
+            q_dtype_w = untunedf.loc[i, "q_dtype_w"]
             seed = seed + 1
             total_kernel_nums = 0
             kernels_num = len(kernels_list)
