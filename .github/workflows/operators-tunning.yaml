@@ -1,6 +1,10 @@
 name: Operators Tunning
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]  # Triggers on PRs targeting `main`
   workflow_dispatch:
 
 concurrency:
