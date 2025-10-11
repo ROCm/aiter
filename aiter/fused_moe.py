@@ -3,6 +3,7 @@
 
 import functools
 import os
+import sys
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -14,7 +15,13 @@ import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
 from aiter import logger
-from aiter.jit.core import AITER_ROOT_DIR, PY, bd_dir, get_asm_dir, mp_lock
+from aiter.jit.core import (
+    AITER_CONFIG_FMOE_FILE,
+    PY,
+    bd_dir,
+    get_asm_dir,
+    mp_lock,
+)
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.utility import fp4_utils
@@ -509,8 +516,8 @@ def get_2stage_cfgs(
         return cfg_2stages
 
     global cfg_2stages
-    config_path = f"{AITER_ROOT_DIR}/aiter/configs/"
-    tune_file = os.path.join(config_path, "tuned_fmoe.csv")
+    config_path = os.path.dirname(AITER_CONFIG_FMOE_FILE)
+    tune_file = AITER_CONFIG_FMOE_FILE
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
@@ -534,6 +541,11 @@ def get_2stage_cfgs(
 
     def MainFunc():
         with open(untune_file, "a") as f:
+            if os.path.getsize(untune_file) == 0:
+                f.write(
+                    "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
+                )
+
             q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
             f.write(
                 f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
@@ -690,7 +702,6 @@ def fused_moe_2stages(
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
 ):
-
     quant_func = get_quant(quant_type)
 
     token_num, _ = hidden_states.shape

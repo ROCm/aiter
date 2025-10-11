@@ -6,6 +6,7 @@ import os
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE
 from einops import rearrange
 from gemm_a8w8_blockscale_bpreshuffle_common import kernels_list
 
@@ -21,7 +22,7 @@ block_shape = (128, 128)
 class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
-        "tune_file": "aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+        "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}",
         "untune_file": "aiter/configs/a8w8_blockscale_bpreshuffle_untuned_gemm.csv",
     }
 

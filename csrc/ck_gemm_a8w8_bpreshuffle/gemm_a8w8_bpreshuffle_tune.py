@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
-from aiter.test_common import perftest
+from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.ops.shuffle import shuffle_weight
 from gemm_a8w8_bpreshuffle_common import kernels_list
@@ -36,14 +36,6 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
-@perftest()
-def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
-    aiter.gemm_a8w8_bpreshuffle_tune(
-        x, weight, x_scale, w_scale, out, kernel_id, splitK
-    )
-    return out
-
-
 def run_gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
     aiter.gemm_a8w8_bpreshuffle_tune(
         x, weight, x_scale, w_scale, out, kernel_id, splitK
@@ -65,7 +57,7 @@ def generate_data(m, n, k, seed, dtype=dtypes.fp16, device="cuda"):
 class Gemma8W8BPreShuffleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
-        "tune_file": "aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
+        "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE}",
         "untune_file": "aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv",
     }
 
