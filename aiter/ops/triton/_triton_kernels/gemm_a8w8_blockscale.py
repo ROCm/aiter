@@ -15,7 +15,8 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
 
 @triton.heuristics(
     {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "EVEN_K": lambda args: (args["K"] % (args["SPLITK_BLOCK_SIZE"]) == 0)
+        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0),
         "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
@@ -101,7 +102,7 @@ def _gemm_a8w8_blockscale_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        pid = remap_xcd(pid, GRID_MN)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
@@ -112,17 +113,14 @@ def _gemm_a8w8_blockscale_kernel(
     tl.assume(pid_n >= 0)
     tl.assume(pid_k >= 0)
 
-    if (pid_k * SPLITK_BLOCK_SIZE) < K:
-
-        # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
-        num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
-        # ^ Number of K blocks within our split-K partition
-
+    split_k_start = pid_k * SPLITK_BLOCK_SIZE
+    if split_k_start < K:
         # Create pointers for first block of A and B input matrices
         offs_k = tl.arange(0, BLOCK_SIZE_K)
-        offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
+        offs_k_split = split_k_start + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
@@ -130,8 +128,13 @@ def _gemm_a8w8_blockscale_kernel(
             offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         )
 
+        split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
+        k_span = split_k_end - split_k_start
+        num_k_iter = tl.cdiv(k_span, BLOCK_SIZE_K)
+        # ^ Number of K blocks within our split-K partition
+
         # Create pointers for the scales
-        offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
+        offs_k_scale = split_k_start // GROUP_K
         a_scale_ptrs = (
             a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
         )
@@ -146,7 +149,7 @@ def _gemm_a8w8_blockscale_kernel(
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        for k in range(num_k_iter):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -154,10 +157,10 @@ def _gemm_a8w8_blockscale_kernel(
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                    a_ptrs, mask=offs_k[None, :] < k_span - k * BLOCK_SIZE_K, other=0.0
                 )
                 b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                    b_ptrs, mask=offs_k[:, None] < k_span - k * BLOCK_SIZE_K, other=0.0
                 )
 
             a_scale = tl.load(a_scale_ptrs)
@@ -276,4 +279,20 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    return _get_config._config_dict[key]["any"]
+    # Copy to avoid mutating the cached config
+    config = dict(_get_config._config_dict[key]["any"])
+
+    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
+        K, config["NUM_KSPLIT"]
+    )  # How big each split_k partition is
+
+    # If block size is greater than split k size, shrink the block size
+    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
+        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
+            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
+    config["BLOCK_SIZE_K"] = max(
+        config["BLOCK_SIZE_K"], 16
+    )  # minimum block size is 16 for perf
+
+    return config
