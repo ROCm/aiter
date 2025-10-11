@@ -6,7 +6,7 @@ import pytest
 
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
-DEBUG_MODE = False
+DEBUG_MODE = True
 
 
 def torch_dynamic_mxfp4_quant(
@@ -37,6 +37,7 @@ def torch_dynamic_mxfp4_quant(
     MBITS_FP4 = 1
     max_normal = 6
     min_normal = 1
+    sign_mask = 1 << (EBITS_FP4 + MBITS_FP4)
 
     x_shape = x.shape
     if x.shape[-1] % MXFP4_QUANT_BLOCK_SIZE != 0:
@@ -109,7 +110,7 @@ def torch_dynamic_mxfp4_quant(
     denormal_x = qx_fp32 + denorm_mask_float
     denormal_x = denormal_x.view(torch.int32)
     denormal_x -= denorm_mask_int
-    denormal_x = denormal_x.view(torch.uint8)
+    denormal_x = denormal_x.to(torch.uint8)
 
     # Normal numbers
     normal_x = qx
@@ -129,9 +130,14 @@ def torch_dynamic_mxfp4_quant(
     e2m1_value = torch.where(denormal_mask, denormal_x, e2m1_value)
     e2m1_value = torch.where(normal_mask, normal_x, e2m1_value)
 
-    # add sign back
+    # # add sign back
     sign_lp = s >> (MBITS_F32 + EBITS_F32 - MBITS_FP4 - EBITS_FP4)
-    sign_lp = sign_lp.to(tl.uint8)
+    sign_lp = sign_lp.to(torch.uint8)
+    # Right shift of a negative signed integer can fill the least significant
+    # bits with either 1s or 0s, depending on the implementation. Since PyTorch
+    # doesn't have an uint32 dtype, we mask out these bits to get just the
+    # f4 sign bit
+    sign_lp = sign_lp & sign_mask
     e2m1_value = e2m1_value | sign_lp
 
     # Pack 2 4-bit values into 8-bit
