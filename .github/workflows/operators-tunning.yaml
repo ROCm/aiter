@@ -57,7 +57,7 @@ jobs:
           -w /workspace \
           operators_tunning_test \
           ./.github/scripts/build_triton.sh
-    
+
       - name: Show Computing Units
         run: |
           set -ex
@@ -67,6 +67,14 @@ jobs:
           operators_tunning_test \
           rocminfo | grep -i 'Compute Unit'
     
+      - name: Test Performance before tunning
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          operators_tunning_test \
+          python3 op_tests/test_batched_gemm_a8w8.py
+    
       - name: Operators Tunning Tests
         run: |
           set -ex
@@ -75,3 +83,11 @@ jobs:
           -w /workspace \
           operators_tunning_test \
           python3 csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py -i aiter/configs/a8w8_untuned_batched_gemm.csv -o aiter/configs/a8w8_tuned_batched_gemm.csv && cat aiter/configs/a8w8_tuned_batched_gemm.csv
+
+      - name: Test Performance after tunning
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          operators_tunning_test \
+          python3 op_tests/test_batched_gemm_a8w8.py
