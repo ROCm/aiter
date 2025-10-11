@@ -18,7 +18,7 @@ jobs:
       matrix:
         runner: [mi300x-1gpu] # TODO: add more runners
     name: Operators Tunning
-    runs-on: aiter-1gpu-runner
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout aiter repo
