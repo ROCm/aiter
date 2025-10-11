@@ -58,6 +58,15 @@ jobs:
           operators_tunning_test \
           ./.github/scripts/build_triton.sh
     
+      - name: Show Computing Units
+        run: |
+          set -ex
+          echo "Showing Computing Units..."
+          docker exec \
+          -w /workspace \
+          operators_tunning_test \
+          rocminfo | grep -i 'Compute Unit'
+    
       - name: Operators Tunning Tests
         run: |
           set -ex
