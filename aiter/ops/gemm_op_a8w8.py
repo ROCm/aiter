@@ -76,13 +76,10 @@ def gen_gemm_a8w8_asm_fake_tensors(
     x_scale: Tensor,  # A_scale:[M, 1] f32
     w_scale: Tensor,  # B_scale:[1, N] f32
     Out: Tensor,  # Out:[M, N] bf16
-    bias: Tensor,  # bias:[1, N] f32
-    sub_m: Optional[int] = 128,
-    sub_n: Optional[int] = 128,
-    pad_a: Optional[int] = 0,
-    pad_b: Optional[int] = 0,
-    pad_c: Optional[int] = 0,
-    splitK: Optional[int] = 0,
+    kernelName: str,
+    bias: Optional[Tensor],  # bias:[1, N] f32
+    bpreshuffle: Optional[bool] = True,
+    splitK: Optional[int] = None,
 ) -> torch.Tensor:
     return Out
 
@@ -98,13 +95,10 @@ def gemm_a8w8_asm(
     x_scale: Tensor,  # A_scale:[M, 1] f32
     w_scale: Tensor,  # B_scale:[1, N] f32
     Out: Tensor,  # Out:[M, N] bf16
-    bias: Tensor,  # bias:[1, N] f32
-    sub_m: Optional[int] = 128,
-    sub_n: Optional[int] = 128,
-    pad_a: Optional[int] = 0,
-    pad_b: Optional[int] = 0,
-    pad_c: Optional[int] = 0,
-    splitK: Optional[int] = 0,
+    kernelName: str,
+    bias: Optional[Tensor],  # bias:[1, N] f32
+    bpreshuffle: Optional[bool] = True,
+    splitK: Optional[int] = None,
 ) -> torch.Tensor: ...
 
 
@@ -251,30 +245,29 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
 
 
 @functools.lru_cache(maxsize=1024)
-def get_ASMGEMM_config(
+def get_bpreshuffle_GEMM_config(
     M: int,
     N: int,
     K: int,
-    bias: bool,
-    dtype: torch.dtype,
-    tuned_file="asm_a8w8_gemm.csv",
+    q_dtype_w: torch.dtype,
+    tuned_file="a8w8_bpreshuffle_tuned_gemm.csv",
 ):
-    if not hasattr(get_ASMGEMM_config, "asmgemm_dict"):
+    if not hasattr(get_bpreshuffle_GEMM_config, "bpreshuffle_gemm_dict"):
         asmGemmDictDf = pd.read_csv(
             f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file}"
         ).drop_duplicates()
-        asmGemmDictDf.bias = asmGemmDictDf.bias.apply(
-            lambda s: True if s in ["True", 1, "true"] else False
-        )
-        get_ASMGEMM_config.asmgemm_dict = asmGemmDictDf.set_index(
-            ["M", "N", "K", "bias", "outdtype"]
+        get_bpreshuffle_GEMM_config.bpreshuffle_gemm_dict = asmGemmDictDf.set_index(
+            ["cu_num", "M", "N", "K", "q_dtype_w"]
         ).to_dict("index")
-    config = get_ASMGEMM_config.asmgemm_dict.get((M, N, K, bias, str(dtype)), None)
+    cu_num = get_cu_num()
+    config = get_bpreshuffle_GEMM_config.bpreshuffle_gemm_dict.get(
+        (cu_num, M, N, K, str(q_dtype_w)), None
+    )
     if config is not None:
-        logger.info(f"shape M:{M}, N:{N}, K:{K} is tuned, in ASMGEMM !")
+        logger.info(f"shape M:{M}, N:{N}, K:{K} is tuned, in a8w8 bpreshuffle_GEMM !")
     else:
         logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in ASMGEMM, will use default config!"
+            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in a8w8 bpreshuffle_GEMM, will use default config!"
         )
     return config
 
@@ -321,20 +314,30 @@ def gemm_a8w8_ASM(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
+    kernelName = ""
     if (
         x_scale.dtype == dtypes.fp32
         and w_scale.dtype == dtypes.fp32
-        and (asm_config := get_ASMGEMM_config(m, n, k, bias is not None, dtype))
+        and (
+            asm_config := get_bpreshuffle_GEMM_config(
+                m, n, k, dtypes.i8, "a8w8_bpreshuffle_tuned_gemm.csv"
+            )
+        )
         is not None
     ):
         assert (
             bias is not None
         ), "Use asm gemm must give bias, please give a \
             bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
+        print("asm_config:", asm_config)
         splitK = asm_config["splitK"]
+        kernelName = asm_config["kernelName"]
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-        return gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, bias, splitK=splitK)
-    return None
+        return gemm_a8w8_asm(
+            XQ, WQ, x_scale, w_scale, Y, kernelName, bias, splitK=splitK
+        )
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    return gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, kernelName, bias, splitK=1)
 
 
 def gemm_a8w8_CK(
@@ -380,7 +383,7 @@ def gemm_a8w8_bpreshuffle(
     n = WQ.shape[0]
     k = XQ.shape[-1]
 
-    get_CKGEMM_config(m, n, k, "a8w8_bpreshuffle_tuned_gemm.csv")
+    get_bpreshuffle_GEMM_config(m, n, k, dtypes.fp8, "a8w8_bpreshuffle_tuned_gemm.csv")
     # if (
     #     ck_config is None
     #     and dtype == dtypes.bf16
