@@ -6,7 +6,7 @@ import pytest
 
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
-DEBUG_MODE = True
+DEBUG_MODE = False
 
 
 def torch_dynamic_mxfp4_quant(
@@ -130,7 +130,7 @@ def torch_dynamic_mxfp4_quant(
     e2m1_value = torch.where(denormal_mask, denormal_x, e2m1_value)
     e2m1_value = torch.where(normal_mask, normal_x, e2m1_value)
 
-    # # add sign back
+    # add sign back
     sign_lp = s >> (MBITS_F32 + EBITS_F32 - MBITS_FP4 - EBITS_FP4)
     sign_lp = sign_lp.to(torch.uint8)
     # Right shift of a negative signed integer can fill the least significant
