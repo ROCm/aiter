@@ -109,6 +109,9 @@ def torch_compile_guard(
             default_values = {int: 0, bool: True, float: 0.0}
 
             default_value = default_values.get(return_annotation, None)
+            if return_annotation is bool:
+                return out, func(*args, **kwargs)
+
             return out, default_value
 
         if is_torch_equal_or_newer("2.8.0"):
