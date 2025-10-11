@@ -7,6 +7,8 @@ from aiter.ops.triton.ff_a16w16_fused_ungated import ff_a16w16_fused_ungated
 from aiter.ops.triton.ff_a16w16 import ff_a16w16_gated, ff_a16w16_nogate
 from op_tests.triton_tests.ff_test_utils import (
     generate_ff_inputs,
+    run_torch_gated,
+    run_torch_ungated,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
@@ -15,14 +17,16 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 )
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_evaluation_unit,
+    get_evaluation_label,
     model_benchmark_shapes,
-    get_shape_benchmark_object,
+    get_gemm_shape_benchmark_object,
     print_vgpr,
 )
 import matplotlib.pyplot as plt
 
 
-def get_model_benchmark_object(
+def get_gemm_model_benchmark_object(
     plot_name,
     args,
     x_names=None,
@@ -36,22 +40,18 @@ def get_model_benchmark_object(
         x_names = ["M", "hidden_dim", "intermediate_dim", "model_name"]
     x_vals_list = model_benchmark_shapes(args)
 
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "throughput":
-        ylabel = "Throughput (TFLOPS)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GB/s)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
+    ylabel = get_evaluation_label(args.metric, space=True)
 
-    evaluation_metric_to_unit = {
-        "throughput": "TFLOPS",
-        "time": "Time_(ms)",
-        "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
-    }
-    line_names = [evaluation_metric_to_unit[args.metric]]
-    line_vals = line_names
+    line_names = []
+    line_vals = []
+    if not args.bench_torch:
+        line_names.append(get_evaluation_label(args.metric))
+        line_vals.append("triton")
+    else:
+        line_names.append(get_evaluation_label(args.metric, prefix="triton"))
+        line_vals.append("triton")
+        line_names.append(get_evaluation_label(args.metric, prefix="torch"))
+        line_vals.append("torch")
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     benchmark = triton.testing.Benchmark(
@@ -59,7 +59,7 @@ def get_model_benchmark_object(
         x_vals=x_vals_list,
         x_log=True,
         y_log=True,
-        line_arg="unit",
+        line_arg="provider",
         line_vals=line_vals,
         line_names=line_names,
         styles=[
@@ -81,6 +81,7 @@ def bench_fn(
     gating: bool,
     activation: str = None,
     e2e_fused: bool = False,
+    use_torch: bool = False,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
@@ -110,9 +111,8 @@ def bench_fn(
 
     # memory transfer
     if gating:
-        mem_read = (batch * intermediate_dim) * x.element_size() + (
-            hidden_dim * intermediate_dim * 2
-        ) * w1.element_size()
+        mem_read = (batch * intermediate_dim) * x.element_size()
+        +(hidden_dim * intermediate_dim * 2) * w1.element_size()
     else:
         mem_read = (
             batch * intermediate_dim * x.element_size()
@@ -126,11 +126,22 @@ def bench_fn(
     else:
         fn = ff_a16w16_gated if gating else ff_a16w16_nogate
 
-    ms = triton.testing.do_bench(
-        lambda: fn(x, w1, w2, c_dtype, y=y, activation=activation),
-        warmup=25,
-        rep=100,  # noqa: E731
-    )
+    if use_torch:
+        ms = triton.testing.do_bench(
+            lambda: (
+                run_torch_gated(x, w1, w2, intermediate_dim, activation)
+                if gating
+                else run_torch_ungated(x, w1, w2, activation)
+            ),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
+    else:
+        ms = triton.testing.do_bench(
+            lambda: fn(x, w1, w2, c_dtype, y=y, activation=activation),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -153,10 +164,12 @@ def run_model_benchmark(args):
         label = "E2E"
     else:
         label = "Act+Gate+GEMM" if not args.ungated else "Act+GEMM"
-    benchmark = get_model_benchmark_object(f"Fused FF A16W16 {label} Benchmark", args)
+    benchmark = get_gemm_model_benchmark_object(
+        f"Fused FF A16W16 {label} Benchmark", args
+    )
 
     @triton.testing.perf_report([benchmark])
-    def bench_a16w16(M, hidden_dim, intermediate_dim, metric, **kwargs):
+    def bench_a16w16(M, hidden_dim, intermediate_dim, metric, provider, **kwargs):
         intermediate_dim = math.ceil(intermediate_dim / args.tp)
 
         return bench_fn(
@@ -168,6 +181,7 @@ def run_model_benchmark(args):
             gating=not args.ungated,
             activation=args.activation,
             e2e_fused=args.e2e,
+            use_torch=(provider == "torch"),
         )
 
     bench_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -181,10 +195,12 @@ def run_shape_benchmark(args):
         label = "E2E"
     else:
         label = "Act+Gate+GEMM" if not args.ungated else "Act+GEMM"
-    benchmark = get_shape_benchmark_object(f"Fused FF A16W16 {label} Benchmark", args)
+    benchmark = get_gemm_shape_benchmark_object(
+        f"Fused FF A16W16 {label} Benchmark", args
+    )
 
     @triton.testing.perf_report([benchmark])
-    def bench_a16w16(M, N, K, metric, **kwargs):
+    def bench_a16w16(M, N, K, metric, provider, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
         return bench_fn(
@@ -196,6 +212,7 @@ def run_shape_benchmark(args):
             gating=not args.ungated,
             activation=args.activation,
             e2e_fused=args.e2e,
+            use_torch=(provider == "torch"),
         )
 
     bench_a16w16.run(save_path="." if args.o else None, print_data=True)

@@ -65,6 +65,21 @@ def generate_ff_inputs(
     return x, w1, w2, out_dtype, intermediate, y
 
 
+def run_torch_ungated(x, w1, w2, activation):
+    torch_out = F.linear(x, w1, bias=None)
+    if activation == "gelu" or activation == "gelu_tanh":
+        torch_out = F.gelu(torch_out, approximate="tanh")
+    elif activation == "silu" or activation == "silu_exp2":
+        torch_out = F.silu(torch_out)
+    elif activation == "relu":
+        torch_out = F.relu(torch_out)
+    elif activation is None:
+        pass
+    else:
+        raise Exception(f"Unsupported activation: {activation}")
+    return torch_out @ w2
+
+
 def ff_ungated_test(
     fn: callable,
     batch: int,
@@ -84,18 +99,7 @@ def ff_ungated_test(
         output=output,
         y_init=y_init,
     )
-    torch_out = F.linear(x, w1, bias=None)
-    if activation == "gelu" or activation == "gelu_tanh":
-        torch_out = F.gelu(torch_out, approximate="tanh")
-    elif activation == "silu" or activation == "silu_exp2":
-        torch_out = F.silu(torch_out)
-    elif activation == "relu":
-        torch_out = F.relu(torch_out)
-    elif activation is None:
-        pass
-    else:
-        raise Exception(f"Unsupported activation: {activation}")
-    torch_out = torch_out @ w2
+    torch_out = run_torch_ungated(x, w1, w2, activation)
 
     if output:
         triton_out = fn(
@@ -118,6 +122,23 @@ def ff_ungated_test(
     torch.testing.assert_close(triton_out, torch_out, atol=5e-2, rtol=5e-2)
 
 
+def run_torch_gated(x, w1, w2, intermediate_dim, activation):
+    torch_out = F.linear(x, w1, bias=None)
+    if activation == "gelu" or activation == "gelu_tanh":
+        gating = F.gelu(torch_out[:, :intermediate_dim], approximate="tanh")
+    elif activation == "silu" or activation == "silu_exp2":
+        gating = F.silu(torch_out[:, :intermediate_dim])
+    elif activation == "relu":
+        gating = F.relu(torch_out[:, :intermediate_dim])
+    elif activation is None:
+        gating = torch_out[:, :intermediate_dim]
+    else:
+        raise Exception(f"Unsupported activation: {activation}")
+    torch_y = torch_out[:, intermediate_dim:]
+    torch_intermediate = gating * torch_y
+    return torch_intermediate @ w2
+
+
 def ff_gated_test(
     fn: callable,
     batch: int,
@@ -137,20 +158,7 @@ def ff_gated_test(
         output=output,
         y_init=y_init,
     )
-    torch_out = F.linear(x, w1, bias=None)
-    if activation == "gelu" or activation == "gelu_tanh":
-        gating = F.gelu(torch_out[:, :intermediate_dim], approximate="tanh")
-    elif activation == "silu" or activation == "silu_exp2":
-        gating = F.silu(torch_out[:, :intermediate_dim])
-    elif activation == "relu":
-        gating = F.relu(torch_out[:, :intermediate_dim])
-    elif activation is None:
-        gating = torch_out[:, :intermediate_dim]
-    else:
-        raise Exception(f"Unsupported activation: {activation}")
-    torch_y = torch_out[:, intermediate_dim:]
-    torch_intermediate = gating * torch_y
-    torch_out = torch_intermediate @ w2
+    torch_out = run_torch_gated(x, w1, w2, intermediate_dim, activation)
 
     if output:
         triton_out = fn(
