@@ -214,7 +214,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
     const void *scaleA, const void *b, int ldb, const void *scaleB,
     const void *beta, void *c, int ldc, const void *scaleC, const void *bias,
     hipDataType intype, hipDataType outtype, hipStream_t &stream,
-    int solution_index = -1)
+    int solution_index = -1, bool bpreshuffle = false)
 {
   // TODO: flag is not supported for hipblasLt yet
   int flag{0};
@@ -235,6 +235,25 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matA, intype, k, m, lda));
   }
+  #if (HIPBLASLT_VERSION_MAJOR >= 1) || (HIPBLASLT_VERSION_MAJOR == 0 && HIPBLASLT_VERSION_MINOR >= 15)
+    if (bpreshuffle) 
+    {
+        hipblasLtOrder_t orderA;
+        if (scaleA != nullptr)
+            orderA = HIPBLASLT_ORDER_COL16_4R16;
+        else
+            orderA = HIPBLASLT_ORDER_COL16_4R8;
+
+        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matA, HIPBLASLT_MATRIX_LAYOUT_ORDER, &orderA, sizeof(orderA)));
+    }
+  #else
+      if (bpreshuffle)
+      {
+          std::cerr << "Warning: hipblasLt version lower than 0.15 does not support "
+                      "bpreshuffle. Please upgrade hipblasLt." << std::endl;
+      }
+  #endif
   if (op_B == HIPBLAS_OP_N)
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, k, n, ldb));
@@ -285,9 +304,9 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
   if (solution_index < 0)
   {
     // nvtxRangePushA("hipblasLtMatmulAlgoGetHeuristic");
-    std::cout
-        << "Warning! HipbSolId Gemm Fallback Path used for solution index <0"
-        << std::endl;
+    // std::cout
+    //     << "Warning! HipbSolId Gemm Fallback Path used for solution index <0"
+    //     << std::endl;
     if (cout_print)
     {
       std::cout << (op_A == HIPBLAS_OP_N ? "N" : "T")
@@ -330,8 +349,15 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
                       std::optional<c10::ScalarType> out_dtype,
                       std::optional<torch::Tensor> scaleA,
                       std::optional<torch::Tensor> scaleB,
-                      std::optional<torch::Tensor> scaleOut)
+                      std::optional<torch::Tensor> scaleOut, 
+                      std::optional<bool> bpreshuffle)
 {
+  bool bpreshuffle_flag = bpreshuffle.value_or(false);
+
+  int version;
+  hipblasLtGetVersion(hipblaslt_handle, &version);
+  TORCH_CHECK(!bpreshuffle_flag || version >= 1500, " to use bpreshuffle feature, hipblaslt version should be at least 1500.");
+
   auto mat1_strides{mat1.strides()};
   auto mat2_strides{mat2.strides()};
   auto mat1_sizes{mat1.sizes()};
@@ -437,7 +463,7 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
       transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k, &one, ptrA,
       mat1_ld, d_scaleA, ptrB, mat2_ld, d_scaleB, &zero, ptrC, result_ld,
       d_scaleOut, bias_ptr, hipblasInType, hipblasOutType, current_stream,
-      solution_index));
+      solution_index, bpreshuffle_flag));
 
   return result;
 }
@@ -602,7 +628,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("hipb_mm", &hipb_mm, "hipb_mm", py::arg("mat1"), py::arg("mat2"),
         py::arg("solution_index"), py::arg("bias") = std::nullopt,
         py::arg("out_dtype") = std::nullopt, py::arg("scaleA") = std::nullopt,
-        py::arg("scaleB") = std::nullopt, py::arg("scaleOut") = std::nullopt);
+        py::arg("scaleB") = std::nullopt, py::arg("scaleOut") = std::nullopt, 
+        py::arg("bpreshuffle")  = std::nullopt);
   m.def("hipb_findallsols", &hipb_findallsols, "hipb_findallsols",
         py::arg("mat1"), py::arg("mat2"), py::arg("bias") = std::nullopt,
         py::arg("out_dtype") = std::nullopt, py::arg("scaleA") = std::nullopt,

@@ -8,9 +8,15 @@ import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, perftest, benchmark
+from aiter import hipb_mm, hipb_create_extension
+from aiter.jit.utils.chip_info import get_gfx
 import pandas as pd
 import argparse
+from functools import lru_cache
 
+# pd.set_option('display.max_rows', 200)
+# pd.set_option('display.max_columns', 100)
+# pd.set_option('display.width', 1000)
 TEST_NUM_ITERS = 100
 
 
@@ -22,6 +28,23 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     if bias is not None:
         out = out.to(bias) + bias
     return out.to(dtype)
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
+    if scaleB is not None:
+        scaleB = scaleB.t()
+    return hipb_mm(
+        inp,
+        weights.t(),
+        solution_index=-1,
+        bias=None,
+        out_dtype=dtype,
+        scaleA=scaleA,
+        scaleB=scaleB,
+        scaleOut=None,
+        bpreshuffle=True,
+    )
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -48,6 +71,11 @@ def run_gemm_skinny(
     if bias is not None:
         out = out.to(bias) + bias
     return out.to(dtype)
+
+
+@lru_cache(maxsize=1)
+def init_hipblas():
+    hipb_create_extension()
 
 
 @benchmark()
@@ -93,6 +121,14 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         else:
             avg_d = None
 
+    if quantDtype != dtypes.i8 and get_gfx() == "gfx942":
+        init_hipblas()
+        e, avg_e = run_aiter_hip_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
+        e = e + bias
+        err_e = checkAllclose(a, e, msg="hipmm bpreshuffle: ", rtol=1e-2, atol=1e-2)
+    else:
+        avg_e = None
+        err_e = None
     return {
         "ck us": avg_b,
         "ck err": err_b,
@@ -100,6 +136,8 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         "ck bpreshuffle err": err_c,
         "asm us": avg_d,
         "asm err": err_d,
+        "hipmm bpreshuffle us": avg_e,
+        "hipmm bpreshuffle err": err_e,
     }
 
 
@@ -328,6 +366,14 @@ l_mnk_nm = [
     (4096, 8192, 1024),
     (8192, 8192, 1024),
     (16384, 8192, 1024),
+    # hipmm preshuffle
+    (16, 7424, 8192),
+    (32, 7424, 8192),
+    (48, 7424, 8192),
+    (64, 7424, 8192),
+    (4096, 7424, 8192),
+    (5120, 7424, 8192),
+    (8192, 7424, 8192),
 ]
 
 parser = argparse.ArgumentParser(
