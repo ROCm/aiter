@@ -143,7 +143,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
     def get_asm_gemm_i8_tasks(self, info_keys, useSplitK, kernel_id_start, seed=0):
         task = []
         (cu_num, M, N, K, q_dtype_w) = info_keys
-        if q_dtype_w != dtypes.i8:
+        if eval(q_dtype_w) != dtypes.i8:
             return task
         asm_kernel_list_csv = f"{get_asm_dir()}/i8gemm/i8gemm_bf16_perTokenI8.csv"
         asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
@@ -168,7 +168,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                     (
                         info,
                         generate_data,
-                        (M, N, K, seed, dtypes.bf16, q_dtype_w, True),
+                        (M, N, K, seed, dtypes.bf16, eval(q_dtype_w), True),
                         run_gemm_a8w8_asm,
                         (
                             gemm_asm_data_idx,
@@ -202,7 +202,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         seed,
     ):
         (cu_num, M, N, K, q_dtype_w) = info_keys
-        if q_dtype_w != dtypes.fp8:
+        if eval(q_dtype_w) != dtypes.fp8:
             return []
         kernels_num = len(kernels_list)
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
@@ -228,7 +228,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                     (
                         info,
                         generate_data,
-                        (M, N, K, seed, dtypes.bf16, q_dtype_w),
+                        (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
                         run_gemm_a8w8_bpreshuffle,
                         (
                             gemm_a8w8_idx,
@@ -268,7 +268,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             M = untunedf.loc[i, "M"]
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
-            q_dtype_w = eval(untunedf.loc[i, "q_dtype_w"])
+            q_dtype_w = (untunedf.loc[i, "q_dtype_w"])
             seed = seed + 1
             total_kernel_nums = 0
             kernels_num = len(kernels_list)

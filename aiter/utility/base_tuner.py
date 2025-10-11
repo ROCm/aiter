@@ -323,8 +323,10 @@ class TunerCommon:
             print(self.success)
         logger.info("Failed shapes:")
         print(self.failed)
+
+        tunedf_subset = tunedf[self.untunedf.columns].astype(self.untunedf.dtypes)
         mask = self.untunedf.apply(tuple, axis=1).isin(
-            tunedf[self.untunedf.columns].apply(tuple, axis=1)
+            tunedf_subset.apply(tuple, axis=1)
         )
         self.remain_untuned = self.untunedf[~mask]
         logger.info("untuned shapes:")
