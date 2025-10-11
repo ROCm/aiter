@@ -14,7 +14,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_pa_prefill import (
     seed_everything,
-    STR_DTYPE_TO_TORCH_DTYPE,
+    str_to_torch_dtype,
 )
 
 
@@ -86,7 +86,7 @@ def input_helper(
     if kv_cache_dtype == "auto":
         cache_dtype = dtype
     else:
-        cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]
+        cache_dtype = str_to_torch_dtype[kv_cache_dtype]
     k_cache = torch.zeros(
         cache_size, block_size, num_kv_heads, head_size, dtype=cache_dtype
     )
@@ -239,7 +239,7 @@ def run_benchmark(args):
         if kv_cache_dtype == "auto":
             torch_kv_cache_dtype = dtype
         else:
-            torch_kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]
+            torch_kv_cache_dtype = str_to_torch_dtype[kv_cache_dtype]
 
         num_queries_per_kv = HQ // HK
 

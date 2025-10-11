@@ -11,7 +11,7 @@ benchmarks:
   batched_gemm_afp4wfp4:
     input_columns: [batch, M, N, K]
     output_columns: [TFLOPS]
-  batch_extend_attention:
+  extend_attention:
     input_columns: [B, H, prefix, extend, kv_lora_rank, qk_rope_head_dim, v_head_dim, attn_impl]
     output_columns: [fwd_Time_(ms)]
   gemm_a8w8_blockscale:
