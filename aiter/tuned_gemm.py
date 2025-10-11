@@ -96,7 +96,14 @@ def query_sol_core(
     return solution_idx
 
 
-@torch_compile_guard()
+def query_sol_fake(
+    m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
+) -> int:
+    solution_idx = 0
+    return solution_idx
+
+
+@torch_compile_guard(gen_fake=query_sol_fake)
 def query_sol(
     m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
 ) -> int:
