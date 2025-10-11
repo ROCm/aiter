@@ -4,7 +4,7 @@
 #pragma once
 
 #include "dispatch_utils.h"
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 // =====================================================================================================================
 // Keyword interpretation
@@ -2670,7 +2670,7 @@ void dispatch_1c_sbhd_uncached(scalar_t* __restrict__ p_output,
                                const int32_t stride_o_h,
                                const int32_t stride_o_d)
 {
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
@@ -2761,7 +2761,7 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                const int32_t stride_oy_h,
                                const int32_t stride_oy_d)
 {
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h_x < 16 ? 4 : 8);
@@ -2870,7 +2870,7 @@ void dispatch_1c_sbhd_cached(scalar_t* __restrict__ p_output,
                              const int32_t stride_o_h,
                              const int32_t stride_o_d)
 {
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
@@ -2964,7 +2964,7 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                              const int32_t stride_oy_h,
                              const int32_t stride_oy_d)
 {
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h_x < 16 ? 4 : 8);
@@ -3076,7 +3076,7 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
                                       const int32_t stride_o_h,
                                       const int32_t stride_o_d)
 {
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
@@ -3177,7 +3177,7 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                       const int32_t stride_oy_h,
                                       const int32_t stride_oy_d)
 {
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h_x < 16 ? 4 : 8);
@@ -3295,7 +3295,7 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
                                        const int32_t stride_o_h,
                                        const int32_t stride_o_d)
 {
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
@@ -3400,7 +3400,7 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                        const int32_t stride_oy_h,
                                        const int32_t stride_oy_d)
 {
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h_x < 16 ? 4 : 8);
@@ -3516,7 +3516,7 @@ void dispatch_1c_thd_uncached(scalar_t* __restrict__ p_output,
                               const int32_t stride_o_h,
                               const int32_t stride_o_d)
 {
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const dim3 grid(size_max_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
@@ -3597,7 +3597,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                            const int32_t stride_o_h,
                            const int32_t stride_o_d)
 {
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const dim3 grid(img_height, img_width, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);

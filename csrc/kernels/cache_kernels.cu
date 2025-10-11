@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 #include "dispatch_utils.h"
@@ -26,20 +26,20 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& bl
 {
     torch::Device src_device = src.device();
     torch::Device dst_device = dst.device();
-    cudaMemcpyKind memcpy_type;
+    hipMemcpyKind memcpy_type;
     if(src_device.is_cuda() && dst_device.is_cuda())
     {
         TORCH_CHECK(src_device.index() == dst_device.index(),
                     "src and dst must be on the same GPU");
-        memcpy_type = cudaMemcpyDeviceToDevice;
+        memcpy_type = hipMemcpyDeviceToDevice;
     }
     else if(src_device.is_cuda() && dst_device.is_cpu())
     {
-        memcpy_type = cudaMemcpyDeviceToHost;
+        memcpy_type = hipMemcpyDeviceToHost;
     }
     else if(src_device.is_cpu() && dst_device.is_cuda())
     {
-        memcpy_type = cudaMemcpyHostToDevice;
+        memcpy_type = hipMemcpyHostToDevice;
     }
     else
     {
@@ -55,8 +55,8 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& bl
     char* dst_ptr = static_cast<char*>(dst.data_ptr());
 
     const int64_t block_size_in_bytes = src.element_size() * src[0].numel();
-    const at::cuda::OptionalCUDAGuard device_guard(src_device.is_cuda() ? src_device : dst_device);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(src_device.is_cuda() ? src_device : dst_device);
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     // NOTE(woosuk): This can be slow if the number of blocks is large.
     const int64_t num_blocks = block_mapping.size(0);
     for(size_t i = 0; i < num_blocks; i++)
@@ -65,7 +65,7 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& bl
         int64_t dst_block_number = block_mapping[i][1].item<int64_t>();
         int64_t src_offset       = src_block_number * block_size_in_bytes;
         int64_t dst_offset       = dst_block_number * block_size_in_bytes;
-        cudaMemcpyAsync(
+        hipMemcpyAsync(
             dst_ptr + dst_offset, src_ptr + src_offset, block_size_in_bytes, memcpy_type, stream);
     }
 }
@@ -149,8 +149,8 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
     const int numel_per_block = key_caches[0][0].numel();
     dim3 grid(num_layers, num_pairs);
     dim3 block(std::min(1024, numel_per_block));
-    const at::cuda::OptionalCUDAGuard device_guard(cache_device);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(cache_device);
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     VLLM_DISPATCH_FLOATING_AND_BYTE_TYPES(key_caches[0].scalar_type(), "copy_blocks_kernel", ([&] {
                                               aiter::copy_blocks_kernel<scalar_t>
                                                   <<<grid, block, 0, stream>>>(
@@ -1034,8 +1034,8 @@ void reshape_and_cache(
 
     dim3 grid(num_tokens);
     dim3 block(std::min(num_heads * head_size, 512));
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(key));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     if(asm_layout)
     {
@@ -1092,8 +1092,8 @@ void reshape_and_cache_flash(
 
     dim3 grid(num_tokens);
     dim3 block(std::min(num_heads * head_size, 512));
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(key));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype, CALL_RESHAPE_AND_CACHE_FLASH);
 }
@@ -1262,8 +1262,8 @@ void reshape_and_cache_with_pertoken_quant(
 
     dim3 grid(num_tokens, num_heads);
     dim3 block(64);
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(key));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     using dequant_scale_t = float; // should align with k_dequant_scales/v_dequant_scales dtype
 
@@ -1343,8 +1343,8 @@ void reshape_and_cache_with_block_quant(
 
     dim3 grid(batch_size, (seq_len + block_size - 1) / block_size + 1, num_heads);
     dim3 block(blockDimx);
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(key));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     using dequant_scale_t = float; // should align with k_dequant_scales/v_dequant_scales dtype
 
@@ -1432,8 +1432,8 @@ void reshape_and_cache_with_block_quant_for_asm_pa(
     int blockDimx = (ori_block_size + 255) / 256 * 256;
     dim3 grid(batch_size, (seq_len + ori_block_size - 1) / ori_block_size + 1, num_heads);
     dim3 block(blockDimx);
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(key));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     using dequant_scale_t = float; // should align with k_dequant_scales/v_dequant_scales dtype
 

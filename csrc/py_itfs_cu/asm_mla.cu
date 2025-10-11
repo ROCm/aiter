@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
@@ -98,8 +98,8 @@ void mla_decode_stage1_asm_fwd(
     // std::cout << "s_log2_plen: " << args.s_log2_plen << std::endl;
     // std::cout << "ptr_QTP: " << args.ptr_QTP << std::endl;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     AiterAsmKernel* impl_ptr = nullptr;
     TORCH_CHECK(Q.is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
@@ -203,8 +203,8 @@ void mla_prefill_asm_fwd(
     args.s_Bs        = stride_Page;
     args.s_log2_plen = log2_page;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     AiterAsmKernel* impl_ptr = nullptr;
     TORCH_CHECK(Q.is_contiguous(), __func__, ":only support Q.is_contiguous() for now");

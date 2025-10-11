@@ -3,8 +3,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
 #include "moe_op.h"
 #include "asm_moe_2stage_configs.hpp"
@@ -163,8 +163,8 @@ void moe_stage1_g1u1(
     std::optional<torch::Tensor> sorted_weights = std::nullopt // [max_num_tokens_padded], do_weight==true need
 )
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     CFG *config_map = get_cfg(input, out, w1, quant_type, sorted_weights.has_value());
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;

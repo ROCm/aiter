@@ -1,5 +1,5 @@
 /*
- * Copyright © Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,19 +16,15 @@
  */
 #pragma once
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "hip_compat.h"
 #include "dispatch_utils.h"
 #include <torch/torch.h>
 
-#ifdef USE_ROCM
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 typedef __hip_bfloat16 nv_bfloat16;
-#else
-#include <cuda_bf16.h>
-#endif
-#include <cuda_fp16.h>
 
 namespace aiter
 {
@@ -1268,7 +1264,7 @@ struct BinaryOperationPattern<1, Operation, _T0, _T1>
     const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
     const dim3 grid_dim(grid_x, 1, 1);
     const dim3 block_dim(256, 1, 1);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     bool types_match = typeid(_T0) == typeid(_T1);
 
     if (order_flag)
@@ -1310,7 +1306,7 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
       N = shape[0] * shape[1] * shape[2];
       K = shape[3];
     }
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     bool types_match = typeid(_T0) == typeid(_T1);
 
     const uint32_t rows = 8;
@@ -1457,7 +1453,7 @@ struct BinaryOperationPattern<3, Operation, _T0, _T1>
     int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
     const dim3 grid_dim(grid_x, 1, 1);
     const dim3 block_dim(256, 1, 1);
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     bool types_match = typeid(_T0) == typeid(_T1);
     constexpr int rows = 8;
     int vec_size = 16 / output.element_size();
@@ -1529,7 +1525,7 @@ struct BinaryOperationPattern<5, Operation, _T0, _T1>
     int num_elements = output.numel();
     int vec_size = 16 / output.element_size();
     constexpr uint32_t row = 8;
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     bool types_match = typeid(_T0) == typeid(_T1);
 
     // optimize kernel
@@ -1607,7 +1603,7 @@ struct BinaryOperationPattern<6, Operation, _T0, _T1>
     int num_elements = output.numel();
     int vec_size = 16 / output.element_size();
     constexpr uint32_t row = 8;
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     bool types_match = typeid(_T0) == typeid(_T1);
 
     // optimize kernel
@@ -1686,7 +1682,7 @@ struct BinaryOperationPattern<7, Operation, _T0, _T1>
     int num_elements = output.numel();
     int vec_size = 16 / output.element_size();
     constexpr uint32_t row = 8;
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     bool types_match = typeid(_T0) == typeid(_T1);
 
     // optimize kernel
@@ -1857,7 +1853,7 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
       }
     }
 
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     bool types_match = typeid(_T0) == typeid(_T1);
     int vec = 16 / output.element_size();
     hipDevice_t dev;

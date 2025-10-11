@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
@@ -485,7 +485,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    at::cuda::CUDAGuard device_guard{q.device()};
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
     bool has_lse = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
@@ -532,7 +532,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     std::optional<const at::Tensor> seqlens_k = std::nullopt;
 
     if (max_seqlen_k > 0) {
-        auto stream = at::cuda::getCurrentHIPStream().stream();
+        auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
         if (paged_KV)

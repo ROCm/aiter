@@ -3,8 +3,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
 #include "hip_float8.h"
 
@@ -101,8 +101,8 @@ torch::Tensor mi350_a8w8_blockscale_asm(
     args.Cs = n * 2;
     args.splitk = 0;
     args.activation = 0;
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(XQ));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(XQ));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     // printf("ptr_X: %p\n", args.ptr_X);
     // printf("ptr_GU: %p\n", args.ptr_GU);
     // printf("ptr_XQ: %p\n", args.ptr_XQ);

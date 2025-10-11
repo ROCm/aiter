@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
-#include "attention_ragged.h"
-#include "attention_common.cuh"
-
-#if defined(__HIPCC__) && \
-    (defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__))
+#if defined(__HIPCC__) && (defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || \
+                           defined(__gfx942__) || defined(__gfx950__))
 #define __HIP__MI3XX_MI250__
 #endif
 
@@ -75,9 +71,37 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     {
         return;
     }
-    const int64_t query_loc = static_cast<int64_t>(seq_idx);
+    const int64_t query_loc    = static_cast<int64_t>(seq_idx);
     const int* block_table_seq = kv_page_indices + kv_indptr[seq_idx];
-    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, AttentionVariant>(block_table_seq, query_loc, context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, k_scale_ptr, v_scale_ptr, variant);
+    _paged_attention_kernel<scalar_t,
+                            cache_t,
+                            KV_DTYPE,
+                            BLOCK_SIZE,
+                            HEAD_SIZE,
+                            NUM_THREADS,
+                            ALIBI_ENABLED,
+                            GQA_RATIO,
+                            AttentionVariant>(block_table_seq,
+                                              query_loc,
+                                              context_len,
+                                              partition_start_token_idx,
+                                              q,
+                                              k_cache,
+                                              v_cache,
+                                              scale,
+                                              alibi_slopes,
+                                              q_stride,
+                                              kv_block_stride,
+                                              kv_head_stride,
+                                              kv_seq_stride,
+                                              exp_sums,
+                                              max_logits,
+                                              out,
+                                              logits_soft_cap,
+                                              logits_soft_cap_rcp,
+                                              k_scale_ptr,
+                                              v_scale_ptr,
+                                              variant);
 }
 
 // Grid: (num_heads, num_seqs).
@@ -116,11 +140,22 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
         context_len = kv_indptr[seq_idx + 1] - kv_indptr[seq_idx];
     }
     const int64_t query_loc = static_cast<int64_t>(seq_idx);
-    _paged_attention_ll4mi_reduce_kernel<scalar_t, OUTT, HEAD_SIZE, NUM_THREADS, PARTITION_SIZE, NPAR_LOOPS>(query_loc, context_len, out, exp_sums, max_logits, tmp_out, max_num_partitions, fp8_out_scale_ptr);
+    _paged_attention_ll4mi_reduce_kernel<scalar_t,
+                                         OUTT,
+                                         HEAD_SIZE,
+                                         NUM_THREADS,
+                                         PARTITION_SIZE,
+                                         NPAR_LOOPS>(query_loc,
+                                                     context_len,
+                                                     out,
+                                                     exp_sums,
+                                                     max_logits,
+                                                     tmp_out,
+                                                     max_num_partitions,
+                                                     fp8_out_scale_ptr);
 }
 
 #else // !defined(__HIP__MI3XX_MI250__) TODO: Add NAVI support
-
 
 template <typename scalar_t,
           typename cache_t,
@@ -180,10 +215,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
     const int* __restrict__ kv_last_page_lens, // [num_seqs]
     const int block_size,
     const int max_num_partitions,
-    const float* __restrict__ fp8_out_scale_ptr)
-{
-    UNREACHABLE_CODE
-}
+    const float* __restrict__ fp8_out_scale_ptr){UNREACHABLE_CODE}
 
 #endif // defined(__HIP__MI3XX_MI250__) TODO: Add NAVI support
 
@@ -234,7 +266,6 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
                                                    BLOCK_SIZE,            \
                                                    max_num_partitions,    \
                                                    fp8_out_scale_ptr);
-
 
 template <typename T,
           typename KVT,
@@ -311,7 +342,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
     dim3 block(NTHR);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(query));
-    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     // mfma4 kernel is faster than mfma16 for gqa_ratio <= 4
     switch(gqa_ratio)
@@ -354,8 +385,8 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     default: TORCH_CHECK(false, "Unsupported npar_loops: ", npar_loops); break;
     }
 }
-  
-#define CALL_CUSTOM_LAUNCHER(                                                                \
+
+#define CALL_CUSTOM_LAUNCHER(                                                                   \
     T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, ALIBI_ENABLED, LOGITS_SOFT_CAP_ENABLED) \
     paged_attention_custom_launcher<T,                                                          \
                                     KVT,                                                        \
@@ -398,7 +429,6 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     {                                                                                  \
         TORCH_CHECK(false, "logits_soft_cap must be non-negative");                    \
     }
-
 
 #define CALL_CUSTOM_LAUNCHER_ALIBI(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE)            \
     if(alibi_slopes)                                                                              \

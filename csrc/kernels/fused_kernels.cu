@@ -1,6 +1,6 @@
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
+ * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,10 +14,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <stdexcept>
 #include <algorithm>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#include <stdexcept>
 
 constexpr int WARP_SIZE = 64;
 
@@ -192,7 +193,7 @@ __global__ void LLGemm_Silu_kernel(float4 *af4, __half2 *bf4, _Float16 *c,
 // define the kernel calling code:
 // template <typename T>
 void LLGemm_Silu(void *in_a, void *in_b, void *out_c, const int M, const int K,
-                 cudaStream_t stream, const int rows_per_block = 4)
+                 hipStream_t stream, const int rows_per_block = 4)
 {
   float4 *af4 = reinterpret_cast<float4 *>(in_a);
   auto *bf4 = reinterpret_cast<__half2 *>(in_b);
@@ -227,7 +228,7 @@ void LLGemm_Silu(void *in_a, void *in_b, void *out_c, const int M, const int K,
         <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(af4, bf4, c, d);
   }
 
-  cudaError_t err = cudaGetLastError();
-  if (cudaSuccess != err)
+  hipError_t err = hipGetLastError();
+  if (hipSuccess != err)
     throw std::runtime_error("CUDA kernel failed : " + std::to_string(err));
 }

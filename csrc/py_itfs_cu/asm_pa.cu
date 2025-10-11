@@ -3,8 +3,8 @@
 #include "aiter_hip_common.h"
 #include "asm_pa_configs.hpp"
 #include "py_itfs_common.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
@@ -156,8 +156,8 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     //           << " kv_nheads:" << args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs
     //           << " KVs:" << args.KVs << std::endl;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     std::string q_type;
     std::string kv_type;
