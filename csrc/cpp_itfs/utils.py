@@ -65,6 +65,17 @@ clean:
 """
 )
 
+library_built = False
+
+
+def has_checked_fs():
+    return library_built and AITER_REBUILD == 0
+
+
+def set_library_built():
+    global library_built
+    library_built = True
+
 
 def mp_lock(
     lock_path: str,
@@ -250,6 +261,14 @@ def get_default_func_name(md_name, args: tuple):
 
 
 def not_built(folder):
+    # This function is executed during forward pass for each attention layer.
+    # Checking filesystem is very expensive especially when we have multiple
+    # processes (such as TP8) checking mostly at the same time.
+    # Here we assume that the server only serves one model during its life time,
+    # so we only need to jit compile once and can void fs check in the future
+    # unless AITER_REBUILD is set to force always checking and try rebuilding
+    if has_checked_fs():
+        return False
     return not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so")
 
 
@@ -279,6 +298,7 @@ def compile_template_op(
         src_file = src_template.render(func_name=func_name, **kwargs)
         logger.info(f"compile_template_op {func_name = } with {locals()}...")
         compile_lib(src_file, folder, includes, sources, cxxflags)
+    set_library_built()
     return run_lib(func_name, folder)
 
 
