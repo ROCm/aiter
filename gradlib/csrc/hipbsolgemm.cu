@@ -235,26 +235,25 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matA, intype, k, m, lda));
   }
-  if ((HIPBLASLT_VERSION_MAJOR >= 1) || 
-      (HIPBLASLT_VERSION_MAJOR == 0 && HIPBLASLT_VERSION_MINOR >= 15))
-  {
-      if (bpreshuffle) 
-      {
-          hipblasLtOrder_t orderA;
-          if (scaleA != nullptr)
-              orderA = HIPBLASLT_ORDER_COL16_4R16;
-          else
-              orderA = HIPBLASLT_ORDER_COL16_4R8;
+  #if (HIPBLASLT_VERSION_MAJOR >= 1) || (HIPBLASLT_VERSION_MAJOR == 0 && HIPBLASLT_VERSION_MINOR >= 15)
+    if (bpreshuffle) 
+    {
+        hipblasLtOrder_t orderA;
+        if (scaleA != nullptr)
+            orderA = HIPBLASLT_ORDER_COL16_4R16;
+        else
+            orderA = HIPBLASLT_ORDER_COL16_4R8;
 
-          CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutSetAttribute(
-              matA, HIPBLASLT_MATRIX_LAYOUT_ORDER, &orderA, sizeof(orderA)));
+        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matA, HIPBLASLT_MATRIX_LAYOUT_ORDER, &orderA, sizeof(orderA)));
+    }
+  #else
+      if (bpreshuffle)
+      {
+          std::cerr << "Warning: hipblasLt version lower than 0.15 does not support "
+                      "bpreshuffle. Please upgrade hipblasLt." << std::endl;
       }
-  }
-  else if (bpreshuffle)
-  {
-      std::cerr << "Warning: hipblasLt version lower than 0.15 does not support "
-                  "bpreshuffle. Please upgrade hipblasLt." << std::endl;
-  }
+  #endif
   if (op_B == HIPBLAS_OP_N)
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, k, n, ldb));
