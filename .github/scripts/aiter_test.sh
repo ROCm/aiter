@@ -18,36 +18,52 @@ fi
 
 for file in "${files[@]}"; do
     # Print a clear separator and test file name for readability
-    if [ "$file" = "op_tests/multigpu_tests/test_dispatch_combine.py" ]; then
-        echo -e "\n============================================================"
-        echo -e "Skipping test: $file"
-        echo -e "============================================================\n"
+    {
+        echo
+        echo "============================================================"
+        echo "Running test: $file"
+        echo "============================================================"
+        echo
+    } | tee -a latest_test.log
+    if [ "$file" = "op_tests/multigpu_tests/test_dispatch_combine.py" ] || [ "$file" = "op_tests/multigpu_tests/test_communication.py" ]; then
+        {
+            echo "Skipping test: $file"
+            echo "============================================================"
+            echo
+        } | tee -a latest_test.log
         continue
     fi
-    echo -e "\n============================================================"
-    echo -e "Running test: $file"
-    echo -e "============================================================\n"
     # Run each test file with a 60-minute timeout, output to latest_test.log
     if ! timeout 60m python3 "$file" 2>&1 | tee -a latest_test.log; then
-        echo -e "\n--------------------"
-        echo -e "❌ Test failed: $file"
-        echo -e "--------------------\n"
+        {
+            echo
+            echo "--------------------"
+            echo "❌ Test failed: $file"
+            echo "--------------------"
+            echo
+        } | tee -a latest_test.log
         testFailed=true
         failedFiles+=("$file")
     else
-        echo -e "\n--------------------"
-        echo -e "✅ Test passed: $file"
-        echo -e "--------------------\n"
+        {
+            echo
+            echo "--------------------"
+            echo "✅ Test passed: $file"
+            echo "--------------------"
+            echo
+        } | tee -a latest_test.log
     fi
 done
 
 if [ "$testFailed" = true ]; then
-    echo "Failed test files:"
-    for f in "${failedFiles[@]}"; do
-        echo "  $f"
-    done
+    {
+        echo "Failed test files:"
+        for f in "${failedFiles[@]}"; do
+            echo "  $f"
+        done
+    } | tee -a latest_test.log
     exit 1
 else
-    echo "All tests passed."
+    echo "All tests passed." | tee -a latest_test.log
     exit 0
 fi
