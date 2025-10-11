@@ -3,6 +3,7 @@
 from packaging import version
 from packaging.version import Version
 import importlib
+from typing import Any, Callable, Optional
 
 
 aiter_lib = None
@@ -32,7 +33,11 @@ def _is_torch_equal_or_newer(torch_version: str, target: str) -> bool:
     return torch_version >= version.parse(target)
 
 
-def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
+def torch_compile_guard(
+    mutates_args: list[str] = [],
+    device: str = "cpu",
+    gen_fake: Optional[Callable[..., Any]] = None,
+):
     def decorator(func):
         try:
             import torch
@@ -98,6 +103,8 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
         def fake_impl(dummy_tensor, *args, **kwargs):
             out = torch.empty(1, device=device)
             if not return_non_tensor:
+                if gen_fake is not None:
+                    return gen_fake(*args, **kwargs)
                 return func(*args, **kwargs)
             default_values = {int: 0, bool: True, float: 0.0}
 

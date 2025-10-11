@@ -26,6 +26,7 @@ from aiter import rocb_create_extension, rocb_mm
 from aiter import logger, dtypes
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.jit.utils.chip_info import get_cu_num
+from aiter import gemm_a16w16_asm
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -33,8 +34,9 @@ bestsols = {}
 
 solids = {}
 
-solMap = ["torch", "hipblaslt", "rocblas", "skinny"]
+solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
 
+# We need to set is 0 as default, None will error in torch.compile fakeTensor execution
 soltype = 0
 
 
@@ -50,12 +52,12 @@ def load_best_sols_custom(tune_path: str) -> bool:
                 lambda s: (
                     getHipblasltKernelName(s.solidx)
                     if s.libtype == "hipblaslt"
-                    else "rocblas"
+                    else s.kernelName
                 ),
                 axis=1,
             )
             pd.set_option("display.max_colwidth", 100)
-            assert hipblasltKernelNames.equals(bestsols["kernelName"].fillna("")), (
+            assert hipblasltKernelNames.equals(bestsols["kernelName"]), (
                 "error: gradlib tune gemm not match the current environment, need re-tune!!!\n"
                 + f"differece:\n{pd.concat([bestsols[['solidx','kernelName']], hipblasltKernelNames], axis=1)[hipblasltKernelNames != bestsols['kernelName'].fillna('')]}"
             )
@@ -69,7 +71,7 @@ def query_sol_core(
     m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
 ) -> int:
     global solids, solMap, soltype
-    # soltype = None
+    soltype = None
     solution_idx = 0
     cu_count = get_cu_num()
     if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
@@ -82,6 +84,7 @@ def query_sol_core(
             and k <= 256
         ):
             soltype, solution_idx = 3, 2
+
     if soltype is None:
         soltype, solution_idx = solids.get(
             (int(m), n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
@@ -106,6 +109,7 @@ def query_sol(
 
 
 class TunedGemm:
+    """bf16/fp16 with per tensor fp8 quant"""
 
     def __init__(self):
         self.extensions_created = False
@@ -113,6 +117,7 @@ class TunedGemm:
         self.untune_path = f"{this_dir}/configs/untuned_gemm.csv"
         self.tune_path = f"{this_dir}/configs/tuned_gemm.csv"
         self.bestsols = {}
+        self.solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
         self.cu_count = torch.cuda.get_device_properties(
             device="cuda"
         ).multi_processor_count
@@ -148,10 +153,9 @@ class TunedGemm:
                 ds["outdtype"],
                 ds["scaleAB"],
             )
-            if ds["libtype"] == "hipblaslt":
-                soltype = solMap.index(ds["libtype"])
-            elif ds["libtype"] == "rocblas":
-                soltype = solMap.index(ds["libtype"])
+
+            if ds["libtype"] in ["hipblaslt", "rocblas", "asm"]:
+                soltype = self.solMap.index(ds["libtype"])
             solds[key] = (soltype, int(ds["solidx"]))
         solids = solds
         self.solfuncs = [
@@ -159,6 +163,7 @@ class TunedGemm:
             self.apply_hipb_mm,
             self.apply_rocb_mm,
             self.apply_skinny,
+            self.apply_asm_mm,
         ]
 
     def apply_skinny(
@@ -287,6 +292,23 @@ class TunedGemm:
         if otype is not None:
             out = out.to(otype)
         return out
+
+    def apply_asm_mm(
+        self,
+        inp,
+        weights,
+        solidx,
+        bias=None,
+        otype=None,
+        scale_a=None,
+        scale_b=None,
+        scale_c=None,
+    ):
+        # just support bf16gemm_outFp32
+        out_asm = torch.empty(
+            inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
+        )
+        return gemm_a16w16_asm(inp, weights, out_asm, bias)
 
     def mm(
         self,

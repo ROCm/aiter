@@ -121,7 +121,36 @@ def fused_moe(
     )
 
 
-@torch_compile_guard()
+def fused_moe_fake(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+    w2: torch.Tensor,  # [expert(local_expert:EP), dim, inter_dim]
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_mask: Optional[torch.Tensor] = None,  # EP
+    activation: int = ActivationType.Silu.value,
+    quant_type: int = QuantType.No.value,
+    doweight_stage1: bool = False,
+    # following for quant
+    w1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
+    w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
+    a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
+    a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    # following for tuning
+    block_size_M: int = -1,
+    num_local_tokens: Optional[torch.Tensor] = None,
+    moe_sorting_dispatch_policy: bool = 0,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    device = topk_ids.device
+    M, topk = topk_ids.shape
+    dtype = hidden_states.dtype if dtype is None else dtype
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
+    return moe_buf
+
+
+@torch_compile_guard(gen_fake=fused_moe_fake)
 def fused_moe_(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
