@@ -34,7 +34,7 @@ namespace aiter {
 //   auto M = in_a.size(0);
 //   auto K = in_a.size(1);
 //   LLGemm_Silu(in_a.data_ptr(), in_b.data_ptr(), out_c.data_ptr(), M, K,
-//               at::hip::getCurrentHIPStream, rows_per_block);
+//               at::hip::getCurrentHIPStream(), rows_per_block);
 // }
 
 void LLGemm1(void* in_a,
@@ -69,7 +69,7 @@ void LLMM1(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c, const int64_t 
             out_c.data_ptr(),
             M,
             K,
-            at::hip::getCurrentHIPStream,
+            at::hip::getCurrentHIPStream(),
             rows_per_block,
             in_b.scalar_type());
 }
@@ -103,7 +103,7 @@ void wvSpltK(at::Tensor& in_a,
               M,
               K,
               N,
-              at::hip::getCurrentHIPStream,
+              at::hip::getCurrentHIPStream(),
               CuCount,
               in_b.scalar_type());
 }
@@ -137,7 +137,7 @@ void wv_splitk_small_fp16_bf16_wrapper(at::Tensor& in_a,
                               M,
                               K,
                               N,
-                              at::hip::getCurrentHIPStream,
+                              at::hip::getCurrentHIPStream(),
                               CuCount,
                               in_b.scalar_type());
 }
@@ -182,7 +182,7 @@ void wvSplitKQ(at::Tensor& in_a,
                K,
                Kp,
                N,
-               at::hip::getCurrentHIPStream,
+               at::hip::getCurrentHIPStream(),
                CuCount,
                in_a.scalar_type(),
                out_c.scalar_type());
@@ -206,7 +206,7 @@ void LLZZ(at::Tensor in_a, at::Tensor in_b, at::Tensor out_c, const int64_t soli
              out_c.data_ptr(),
              M,
              K,
-             at::hip::getCurrentHIPStream,
+             at::hip::getCurrentHIPStream(),
              solidx);
 }
 // instantiate the CPP template for T=float:
@@ -239,6 +239,6 @@ void MMCustomGPU(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c)
                 matB_sizes[1],
                 matO_sizes[0],
                 matO_sizes[1],
-                at::hip::getCurrentHIPStream);
+                at::hip::getCurrentHIPStream());
 }
 } // namespace aiter

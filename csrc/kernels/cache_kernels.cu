@@ -26,7 +26,7 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& bl
 {
     torch::Device src_device = src.device();
     torch::Device dst_device = dst.device();
-    cudaMemcpyKind memcpy_type;
+    hipMemcpyKind memcpy_type;
     if(src_device.is_cuda() && dst_device.is_cuda())
     {
         TORCH_CHECK(src_device.index() == dst_device.index(),
@@ -35,7 +35,7 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& bl
     }
     else if(src_device.is_cuda() && dst_device.is_cpu())
     {
-        memcpy_type = cudaMemcpyDeviceToHost;
+        memcpy_type = hipMemcpyDeviceToHost;
     }
     else if(src_device.is_cpu() && dst_device.is_cuda())
     {

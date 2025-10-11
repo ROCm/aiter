@@ -22,13 +22,9 @@
 #include "dispatch_utils.h"
 #include <torch/torch.h>
 
-#ifdef USE_ROCM
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 typedef __hip_bfloat16 nv_bfloat16;
-#else
-#include <cuda_bf16.h>
-#endif
-#include <cuda_fp16.h>
 
 namespace aiter
 {

@@ -283,7 +283,7 @@ def build_module(
     is_python_module,
     is_standalone,
     torch_exclude,
-    hipify=True,
+    hipify=False,
     prebuild=0,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"

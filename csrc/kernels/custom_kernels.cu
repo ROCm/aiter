@@ -2,10 +2,10 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "hip_compat.h"
 #include <ATen/hip/HIPContext.h>
-#include <algorithm>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#include <algorithm>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <stdexcept>
 #include <torch/all.h>

@@ -14,10 +14,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <hip/hip_runtime.h>
-#include <cuda_fp16.h>
-#include <stdexcept>
 #include <algorithm>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#include <stdexcept>
 
 constexpr int WARP_SIZE = 64;
 
