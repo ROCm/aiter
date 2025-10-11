@@ -15,20 +15,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <ATen/hip/HIPContext.h>
-#include <hip/hip_runtime.h>
-#include <hipcub/hipcub.hpp>
-#include <stdio.h>
-#include <torch/all.h>
-
-#include <cfloat>
-#include <type_traits>
-
 #include "hip_compat.h"
 #include "hip_reduce.h"
 #include "vec_convert.h"
+#include <ATen/hip/HIPContext.h>
+#include <cfloat>
+#include <hip/hip_runtime.h>
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
+#include <stdio.h>
+#include <torch/all.h>
+#include <type_traits>
 
 /// Aligned array type
 template <typename T,
