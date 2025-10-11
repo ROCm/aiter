@@ -235,20 +235,26 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matA, intype, k, m, lda));
   }
-  if (bpreshuffle) 
+  if ((HIPBLASLT_VERSION_MAJOR >= 1) || 
+      (HIPBLASLT_VERSION_MAJOR == 0 && HIPBLASLT_VERSION_MINOR >= 15))
   {
-    hipblasLtOrder_t orderA;
-    if (scaleA != nullptr)
-    {
-        orderA = HIPBLASLT_ORDER_COL16_4R16;
-    }
-    else
-    {
-        orderA = HIPBLASLT_ORDER_COL16_4R8;
-    }
-    CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutSetAttribute(
-        matA, HIPBLASLT_MATRIX_LAYOUT_ORDER, &orderA, sizeof(orderA)));
-  }  
+      if (bpreshuffle) 
+      {
+          hipblasLtOrder_t orderA;
+          if (scaleA != nullptr)
+              orderA = HIPBLASLT_ORDER_COL16_4R16;
+          else
+              orderA = HIPBLASLT_ORDER_COL16_4R8;
+
+          CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutSetAttribute(
+              matA, HIPBLASLT_MATRIX_LAYOUT_ORDER, &orderA, sizeof(orderA)));
+      }
+  }
+  else if (bpreshuffle)
+  {
+      std::cerr << "Warning: hipblasLt version lower than 0.15 does not support "
+                  "bpreshuffle. Please upgrade hipblasLt." << std::endl;
+  }
   if (op_B == HIPBLAS_OP_N)
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, k, n, ldb));
@@ -299,9 +305,9 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
   if (solution_index < 0)
   {
     // nvtxRangePushA("hipblasLtMatmulAlgoGetHeuristic");
-    std::cout
-        << "Warning! HipbSolId Gemm Fallback Path used for solution index <0"
-        << std::endl;
+    // std::cout
+    //     << "Warning! HipbSolId Gemm Fallback Path used for solution index <0"
+    //     << std::endl;
     if (cout_print)
     {
       std::cout << (op_A == HIPBLAS_OP_N ? "N" : "T")
