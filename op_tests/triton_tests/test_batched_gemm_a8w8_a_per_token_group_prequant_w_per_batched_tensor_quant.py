@@ -7,8 +7,8 @@ import pytest
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
-from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
-from aiter.ops.triton.utils.types import str_to_torch_dtype
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 from typing import Union
 
 
