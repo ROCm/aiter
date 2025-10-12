@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  BUILD_DOCKER_IMAGE: "rocm/pytorch:latest"
+  BUILD_DOCKER_IMAGE: "rocm/dev-ubuntu-22.04:7.0-complete"
 
 jobs:
   build_whl_package:
