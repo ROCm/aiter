@@ -99,7 +99,21 @@ def query_sol_core(
 def query_sol_fake(
     m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
 ) -> int:
+    global solids, solMap, soltype
+    # soltype = None
     solution_idx = 0
+    cu_count = get_cu_num()
+    if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
+        if (
+            ((m == 1 and n <= 2 * cu_count) or (m > 1 and m <= 4 and n <= cu_count))
+            and k <= 9216
+            or (m > 4 and m <= 8 and n <= cu_count)
+            and k <= 5120
+            or (m > 8 and m <= 16 and n <= cu_count)
+            and k <= 256
+        ):
+            soltype, solution_idx = 3, 2
+
     return solution_idx
 
 
