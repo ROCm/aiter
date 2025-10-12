@@ -1,0 +1,34 @@
+name: Aiter Release Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version'
+        required: false
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_whl_package:
+    runs-on: aiter-k8s-build
+  
+    steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+      
+      - name: Sync submodules
+        run: |
+          set -e
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+      
+      - name: Build aiter whl packages
+        run: |
+          PREBUILD_KERNELS=1 GPU_ARCHS="gfx942;gfx950" python3 setup.py bdist_wheel
+          ls dist/*.whl
+        
