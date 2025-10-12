@@ -41,12 +41,22 @@ jobs:
           --name aiter_build \
           ${{ env.BUILD_DOCKER_IMAGE }}
 
-      - name: Build aiter whl packages
+      - name: Install Dependencies
+        run: |
+          set -e
+          echo "Install Dependencies"
+          docker exec \
+          -w /workspace \
+          aiter_build \
+          pip install -r requirements.txt 
+          
+      - name: Build Relase Package
         run: |
           set -e
           echo "Building aiter whl packages..."
           docker exec \
           -w /workspace \
           aiter_build \
-          pip install -r requirements.txt && pip install setuptools && PREBUILD_KERNELS=1 GPU_ARCHS="gfx942;gfx950" python3 setup.py bdist_wheel && ls dist/*.whl
+          pip install -r requirements.txt 
+          PREBUILD_KERNELS=1 GPU_ARCHS="gfx942;gfx950" python3 setup.py bdist_wheel && ls dist/*.whl
           
