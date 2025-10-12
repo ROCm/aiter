@@ -106,10 +106,10 @@ def torch_compile_guard(
                 if gen_fake is not None:
                     return gen_fake(*args, **kwargs)
                 return func(*args, **kwargs)
-            default_values = {int: 0, bool: True, float: 0.0}
 
-            default_value = default_values.get(return_annotation, None)
-            return out, default_value
+            if gen_fake is not None:
+                return out, gen_fake(*args, **kwargs)
+            return out, func(*args, **kwargs)
 
         if is_torch_equal_or_newer("2.8.0"):
             tags = ()
