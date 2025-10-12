@@ -198,7 +198,8 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
                 ret.append(f"{dst}/{newName}")
             shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
         else:
-            ret.append(f"{src}/{newName}")
+            if name.endswith(".cpp") or name.endswith(".cu"):
+                ret.append(f"{src}/{newName}")
 
     ret = []
     for el in els:
@@ -396,7 +397,10 @@ def build_module(
             f"{CK_DIR}/library/include",
         ]
         if not hipify:
-            extra_include_paths += [f"{AITER_CSRC_DIR}/include"] + extra_include
+            extra_include_paths += [
+                f"{AITER_CSRC_DIR}/include",
+                f"{op_dir}/blob",
+            ] + extra_include
             if not is_standalone:
                 extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
         else:
@@ -421,7 +425,7 @@ def build_module(
         try:
             _jit_compile(
                 md_name,
-                sources,
+                sorted(set(sources)),
                 extra_cflags=flags_cc,
                 extra_cuda_cflags=flags_hip,
                 extra_ldflags=extra_ldflags,
