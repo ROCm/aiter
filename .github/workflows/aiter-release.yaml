@@ -29,6 +29,7 @@ jobs:
       
       - name: Build aiter whl packages
         run: |
+          set -e
           PREBUILD_KERNELS=1 GPU_ARCHS="gfx942;gfx950" python3 setup.py bdist_wheel
           ls dist/*.whl
         
