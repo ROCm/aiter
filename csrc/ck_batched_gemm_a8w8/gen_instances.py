@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 
 import pandas as pd
+import torch
 from batched_gemm_a8w8_common import default_kernels_dict, kernelInstance, kernels_list
 
 
@@ -256,6 +257,12 @@ def get_tune_dict(tune_dict_csv):
     tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
         tune_df = pd.read_csv(tune_dict_csv)
+        if torch.cuda.is_available():
+            gpu = torch.cuda.current_device()
+            device_properties = torch.cuda.get_device_properties(gpu)
+            cu_num = device_properties.multi_processor_count
+            tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
+            print(tune_df)
         for i in range(len(tune_df)):
             B = tune_df.loc[i, "B"]
             M = tune_df.loc[i, "M"]
