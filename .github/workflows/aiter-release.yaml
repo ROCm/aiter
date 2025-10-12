@@ -33,13 +33,13 @@ jobs:
       - name: Run the container
         run: |
           set -ex
-          echo "Starting container: aiter_test"
+          echo "Starting container: aiter_build"
           docker run -dt \
           --shm-size=16G \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
-          --name aiter_test \
-          ${{ env.DOCKER_IMAGE }}
+          --name aiter_build \
+          ${{ env.BUILD_DOCKER_IMAGE }}
 
       - name: Build aiter whl packages
         run: |
