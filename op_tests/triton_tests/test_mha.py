@@ -179,7 +179,7 @@ def test_mha(
     torch_out = attention_ref(
         q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
     )
-    torch_out, attention_scores = torch_out
+    torch_out, attention_scores, _ = torch_out
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
         print(
@@ -445,7 +445,7 @@ def test_mha_varlen(
         dropout_mask=dropout_mask,
         causal=CAUSAL,
     )
-    torch_out, attention_scores = torch_out
+    torch_out, attention_scores, _ = torch_out
 
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
@@ -566,7 +566,7 @@ def test_mha_backward(
         torch_out = attention_ref(
             q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
         )
-    torch_out, attention_scores = torch_out
+    torch_out, attention_scores, _ = torch_out
 
     torch.testing.assert_close(
         triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
@@ -757,7 +757,7 @@ def test_mha_backward_varlen(
             dropout_mask=dropout_mask,
             causal=CAUSAL,
         )
-    torch_out, attention_scores = torch_out
+    torch_out, attention_scores, _ = torch_out
 
     torch.testing.assert_close(
         triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
