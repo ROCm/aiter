@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  BUILD_DOCKER_IMAGE: "rocm/dev-ubuntu-22.04:7.0-complete"
+  BUILD_DOCKER_IMAGE: "rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta"
 
 jobs:
   build_whl_package:
@@ -41,31 +41,31 @@ jobs:
           --name aiter_build \
           ${{ env.BUILD_DOCKER_IMAGE }}
 
-      - name: Install Python and other dependencies
-        run: |
-          set -e
-          echo "Install Python and other dependencies"
-          docker exec \
-          -e PYTHON_VERSION=3.12 \
-          -w /workspace \
-          aiter_build \
-          bash -c '
-            export DEBIAN_FRONTEND=noninteractive \
-            && apt-get update -y \
-            && apt-get install -y software-properties-common git curl sudo vim less libgfortran5 \
-            && for i in 1 2 3; do \
-                add-apt-repository -y ppa:deadsnakes/ppa && break || \
-                { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
-            done \
-            && apt-get update -y \
-            && apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
-               python${PYTHON_VERSION}-lib2to3 python-is-python3  \
-            && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
-            && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
-            && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
-            && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
-            && python3 --version && python3 -m pip --version
-          '
+      # - name: Install Python and other dependencies
+      #   run: |
+      #     set -e
+      #     echo "Install Python and other dependencies"
+      #     docker exec \
+      #     -e PYTHON_VERSION=3.12 \
+      #     -w /workspace \
+      #     aiter_build \
+      #     bash -c '
+      #       export DEBIAN_FRONTEND=noninteractive \
+      #       && apt-get update -y \
+      #       && apt-get install -y software-properties-common git curl sudo vim less libgfortran5 \
+      #       && for i in 1 2 3; do \
+      #           add-apt-repository -y ppa:deadsnakes/ppa && break || \
+      #           { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
+      #       done \
+      #       && apt-get update -y \
+      #       && apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
+      #          python${PYTHON_VERSION}-lib2to3 python-is-python3  \
+      #       && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
+      #       && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
+      #       && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
+      #       && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
+      #       && python3 --version && python3 -m pip --version
+      #     '
 
       - name: Install Dependencies
         run: |
