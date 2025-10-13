@@ -16,8 +16,7 @@ from aiter.ops.triton.mha import (
 from aiter.ops.triton.mha_v3 import (
     flash_attn_func as flash_attn_func_v3,
     flash_attn_varlen_func as flash_attn_varlen_func_v3,
-    flash_attn_with_kvcache as flash_attn_with_kvcache_v3,
-    set_fp8_dequantized_backward,
+    flash_attn_with_kvcache as flash_attn_with_kvcache_v3
 )
 from aiter.ops.triton.utils.mha_kernel_utils import _quantize_bshd, _quantize_thd
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
@@ -615,7 +614,6 @@ def test_mha_backward(
                     if NUM_Q_HEADS % NUM_K_HEADS == 0
                     else None
                 )
-                set_fp8_dequantized_backward(True)
                 k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
                 v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
                 q_fp8, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
@@ -825,7 +823,6 @@ def test_mha_backward_varlen(
                     if NUM_Q_HEADS % NUM_K_HEADS == 0
                     else None
                 )
-                set_fp8_dequantized_backward(True)
                 k_fp8, k_descale = _quantize_thd(k_unpad, fp8_dtype, cu_seqlens_k)
                 v_fp8, v_descale = _quantize_thd(v_unpad, fp8_dtype, cu_seqlens_k)
                 q_fp8, q_descale = _quantize_thd(

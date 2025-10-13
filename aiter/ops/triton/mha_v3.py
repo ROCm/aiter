@@ -11,18 +11,6 @@ from aiter.ops.triton.utils.mha_kernel_utils import (
     _dequantize_varlen_thd,
 )
 
-FP8_DEQUANTIZED_BACKWARD = False
-
-
-def set_fp8_dequantized_backward(value: bool):
-    """Enable storing dequantized FP8 tensors (q/k/v * descale) in ctx instead of raw FP8.
-
-    This is a debug / research aid; no gradients are produced for FP8 yet.
-    """
-    global FP8_DEQUANTIZED_BACKWARD
-    FP8_DEQUANTIZED_BACKWARD = bool(value)
-
-
 class _FlashAttnV3Func(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -100,19 +88,7 @@ class _FlashAttnV3Func(torch.autograd.Function):
             sm_margin,
         )
 
-        if FP8_DEQUANTIZED_BACKWARD and q.dtype in (
-            torch.float8_e5m2,
-            torch.float8_e5m2fnuz,
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        ):
-            q_save = _dequantize_bshd(q, q_descale)
-            k_save = _dequantize_bshd(k, k_descale)
-            v_save = _dequantize_bshd(v, v_descale)
-        else:
-            q_save, k_save, v_save = q, k, v
-
-        ctx.save_for_backward(q_save, k_save, v_save, out, softmax_lse)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, q_descale, k_descale, v_descale)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -123,7 +99,8 @@ class _FlashAttnV3Func(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
+        q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
+ 
         dq, dk, dv, _delta = flash_attn_3.bwd(
             dout,
             q,
@@ -147,6 +124,9 @@ class _FlashAttnV3Func(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         return (
             dq,  # q
@@ -277,18 +257,7 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
             sm_margin,
         )
 
-        if FP8_DEQUANTIZED_BACKWARD and q.dtype in (
-            torch.float8_e5m2,
-            torch.float8_e5m2fnuz,
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        ):
-            q_save = _dequantize_varlen_thd(q, q_descale, cu_seqlens_q)
-            k_save = _dequantize_varlen_thd(k, k_descale, cu_seqlens_k)
-            v_save = _dequantize_varlen_thd(v, v_descale, cu_seqlens_k)
-        else:
-            q_save, k_save, v_save = q, k, v
-        ctx.save_for_backward(q_save, k_save, v_save, out, softmax_lse)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, q_descale, k_descale, v_descale)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -303,7 +272,7 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
+        q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
         dq, dk, dv, _delta = flash_attn_3.bwd(
             dout,
             q,
@@ -327,6 +296,9 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         return (
             dq,

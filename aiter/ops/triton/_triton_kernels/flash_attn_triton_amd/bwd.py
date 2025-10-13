@@ -3891,6 +3891,9 @@ def attention_backward_triton_impl(
     dropout_p: float = 0.0,
     philox_seed: Optional[int] = None,
     philox_offset: Optional[int] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     use_exp2: bool = True,
     mode: Literal["fused", "fused_atomic", "split"] = "fused",
 ):
@@ -4104,28 +4107,45 @@ def attention_backward_triton_impl(
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
 
-        warnings.warn(
-            "FP8 tensors detected in backward pass. Backward pass supports FP8 inputs but "
-            "descaling factors will default to 1.0.",
-            UserWarning,
-        )
-
         # For GQA/MQA, q_descale should be shaped (batch, nheads_k) to match forward pass
-        descale_q = torch.ones(batch, nheads_k, dtype=torch.float32, device=q.device)
+        if q_descale is not None:
+            assert (
+                q_descale.shape[0] == batch and q_descale.shape[1] == nheads_k
+            ), f"q_descale shape {q_descale.shape} != expected {(batch, nheads_k)}"
+            assert q_descale.dtype == torch.float32, f"q_descale must be float32, got {q_descale.dtype}"
+            assert q_descale.device == q.device, f"q_descale must be on same device as q"
+        else:
+            q_descale = torch.ones(batch, nheads_k, dtype=torch.float32, device=q.device)
+        
+        if k_descale is not None:
+            assert (
+                k_descale.shape[0] == batch and k_descale.shape[1] == nheads_k
+            ), f"k_descale shape {k_descale.shape} != expected {(batch, nheads_k)}"
+            assert k_descale.dtype == torch.float32, f"k_descale must be float32, got {k_descale.dtype}"
+            assert k_descale.device == q.device, f"k_descale must be on same device as q"
+        else:
+            k_descale = torch.ones(batch, nheads_k, dtype=torch.float32, device=q.device)
 
-        descale_k = torch.ones(batch, nheads_k, dtype=torch.float32, device=q.device)
+        if v_descale is not None:
+            assert (
+                v_descale.shape[0] == batch and v_descale.shape[1] == nheads_k
+            ), f"v_descale shape {v_descale.shape} != expected {(batch, nheads_k)}"
+            assert v_descale.dtype == torch.float32, f"v_descale must be float32, got {v_descale.dtype}"
+            assert v_descale.device == q.device, f"v_descale must be on same device as q"
+        else:
+            v_descale = torch.ones(batch, nheads_k, dtype=torch.float32, device=q.device)
 
-        descale_v = torch.ones(batch, nheads_k, dtype=torch.float32, device=q.device)
+        assert q_descale is not None and k_descale is not None and v_descale is not None, "q_descale, k_descale, and v_descale must be provided for fp8 training"
 
-        stride_descale_q_z = descale_q.stride(0) if descale_q is not None else None
-        stride_descale_k_z = descale_k.stride(0) if descale_k is not None else None
-        stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
+        stride_descale_q_z = q_descale.stride(0)
+        stride_descale_k_z = k_descale.stride(0)
+        stride_descale_v_z = v_descale.stride(0)
 
         if DEBUG:
             print(f"FP8 path triggered in bwd.py")
     else:
         FP8_MAX = None
-        descale_q = descale_k = descale_v = None
+        q_descale = k_descale = v_descale = None
         stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = None
 
     # alibi setup
@@ -4300,9 +4320,9 @@ def attention_backward_triton_impl(
                 philox_seed,
                 philox_offset,
                 alibi_slopes,
-                descale_q,
-                descale_k,
-                descale_v,
+                q_descale,
+                k_descale,
+                v_descale,
                 HEAD_DIM_QK=HEAD_DIM_QK,
                 HEAD_DIM_V=HEAD_DIM_V,
                 ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
@@ -4387,9 +4407,9 @@ def attention_backward_triton_impl(
                 philox_seed,
                 philox_offset,
                 alibi_slopes,
-                descale_q,
-                descale_k,
-                descale_v,
+                q_descale,
+                k_descale,
+                v_descale,
                 HEAD_DIM_QK=HEAD_DIM_QK,
                 HEAD_DIM_V=HEAD_DIM_V,
                 ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
@@ -4482,9 +4502,9 @@ def attention_backward_triton_impl(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                descale_q,
-                descale_k,
-                descale_v,
+                q_descale,
+                k_descale,
+                v_descale,
                 NUM_Q_HEADS=nheads_q,
                 NUM_K_HEADS=nheads_k,
                 BATCH=batch,
@@ -4547,9 +4567,9 @@ def attention_backward_triton_impl(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                descale_q,
-                descale_k,
-                descale_v,
+                q_descale,
+                k_descale,
+                v_descale,
                 NUM_Q_HEADS=nheads_q,
                 NUM_K_HEADS=nheads_k,
                 BATCH=batch,
@@ -4621,9 +4641,9 @@ def attention_backward_triton_impl(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                descale_q,
-                descale_k,
-                descale_v,
+                q_descale,
+                k_descale,
+                v_descale,
                 NUM_Q_HEADS=nheads_q,
                 NUM_K_HEADS=nheads_k,
                 BLOCK_M=BLOCK_M1,
@@ -4686,9 +4706,9 @@ def attention_backward_triton_impl(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                descale_q,
-                descale_k,
-                descale_v,
+                q_descale,
+                k_descale,
+                v_descale,
                 NUM_Q_HEADS=nheads_q,
                 NUM_K_HEADS=nheads_k,
                 BLOCK_M=BLOCK_M2,
@@ -4753,9 +4773,9 @@ def attention_backward_triton_impl(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                descale_q,
-                descale_k,
-                descale_v,
+                q_descale,
+                k_descale,
+                v_descale,
                 NUM_Q_HEADS=nheads_q,
                 NUM_K_HEADS=nheads_k,
                 BLOCK_M=BLOCK_M1,
@@ -4819,9 +4839,9 @@ def attention_backward_triton_impl(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                descale_q,
-                descale_k,
-                descale_v,
+                q_descale,
+                k_descale,
+                v_descale,
                 NUM_Q_HEADS=nheads_q,
                 NUM_K_HEADS=nheads_k,
                 BLOCK_M=BLOCK_M2,
