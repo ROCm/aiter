@@ -1,0 +1,85 @@
+name: Aiter Release Package
+
+description: This workflow builds the Aiter Python package as a .whl file and uploads it as the artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Commit hash to build (leave empty to use current commit)'
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_DOCKER_IMAGE: "rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta"
+
+jobs:
+  build_whl_package:
+    runs-on: aiter-k8s-build
+  
+    steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+      
+      - name: Checkout to user-specified commit (if provided)
+        run: |
+          set -ex
+          if [ -n "${{ github.event.inputs.commit }}" ]; then
+            echo "Checking out to commit: ${{ github.event.inputs.commit }}"
+            git fetch --all
+            git checkout ${{ github.event.inputs.commit }}
+            git submodule update --init --recursive --depth 1 --jobs 4
+          else
+            echo "No commit input provided, using current commit: $(git rev-parse HEAD)"
+          fi
+
+      - name: Sync submodules
+        run: |
+          set -ex
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: aiter_build"
+          docker run -dt \
+          --shm-size=16G \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name aiter_build \
+          ${{ env.BUILD_DOCKER_IMAGE }}
+
+      - name: Install Dependencies
+        run: |
+          set -e
+          echo "Install Dependencies"
+          docker exec \
+          -w /workspace \
+          aiter_build \
+          pip install -r requirements.txt 
+          
+      - name: Build Aiter
+        run: |
+          set -e
+          echo "Building aiter whl packages..."
+          docker exec \
+          -w /workspace \
+          aiter_build \
+          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="gfx942;gfx950" python3 setup.py bdist_wheel && ls dist/*.whl'
+      
+      - name: Upload whl file as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-whl-packages
+          path: dist/*.whl
+          
+    
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f aiter_build || true
+          
