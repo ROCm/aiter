@@ -52,7 +52,9 @@ def _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
     split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)
 
     split_context_start = (pid_split_kv * split_context_chunk_num) * ChunkK
-    split_context_length = min(context_length - split_context_start, split_context_chunk_num * ChunkK)
+    split_context_length = min(
+        context_length - split_context_start, split_context_chunk_num * ChunkK
+    )
 
     q = tl.load(
         Q_buffer
@@ -61,14 +63,27 @@ def _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
         + ((pid_q_head * ChunkQ + tl.arange(0, ChunkQ)) * stride_q_heads)[:, None]
         + tl.arange(0, HiddenDim)[None, :],
     )
-    scale_weight = tl.load(weights + (pid_batch * next_n + pid_next_n) * stride_w_batch + pid_q_head * ChunkQ + tl.arange(0, ChunkQ))
+    scale_weight = tl.load(
+        weights
+        + (pid_batch * next_n + pid_next_n) * stride_w_batch
+        + pid_q_head * ChunkQ
+        + tl.arange(0, ChunkQ)
+    )
 
-    for context_idx in range(split_context_start, split_context_start + split_context_length, ChunkK):
+    for context_idx in range(
+        split_context_start, split_context_start + split_context_length, ChunkK
+    ):
         mask_kv = context_idx + tl.arange(0, ChunkK) < context_length
-        context_kv_idx = tl.load(kv_indices + context_start + context_idx + tl.arange(0, ChunkK), mask=mask_kv, other=0)
+        context_kv_idx = tl.load(
+            kv_indices + context_start + context_idx + tl.arange(0, ChunkK),
+            mask=mask_kv,
+            other=0,
+        )
 
         k = tl.load(
-            KV_buffer + context_kv_idx[:, None] * stride_k_seq + tl.arange(0, HiddenDim)[None, :],
+            KV_buffer
+            + context_kv_idx[:, None] * stride_k_seq
+            + tl.arange(0, HiddenDim)[None, :],
             mask=mask_kv[:, None],
             other=0.0,
         )
@@ -85,7 +100,8 @@ def _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
         tl.store(
             Out_buffer
             + (pid_batch * next_n + pid_next_n) * stride_out_batch
-            + (pid_q_head * ChunkQ + tl.arange(0, ChunkQ)[:, None, None]) * stride_out_heads
+            + (pid_q_head * ChunkQ + tl.arange(0, ChunkQ)[:, None, None])
+            * stride_out_heads
             + (context_idx + tl.arange(0, ChunkK)[None, None, :]),
             o[:, None, :],
         )
@@ -131,7 +147,9 @@ def _deepgemm_fp8_paged_mqa_logits_ragged_k(
     split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)
 
     split_context_start = (pid_split_kv * split_context_chunk_num) * ChunkK
-    split_context_length = min(context_length - split_context_start, split_context_chunk_num * ChunkK)
+    split_context_length = min(
+        context_length - split_context_start, split_context_chunk_num * ChunkK
+    )
 
     q = tl.load(
         Q_buffer
@@ -140,14 +158,27 @@ def _deepgemm_fp8_paged_mqa_logits_ragged_k(
         + ((pid_q_head * ChunkQ + tl.arange(0, ChunkQ)) * stride_q_heads)[:, None]
         + tl.arange(0, HiddenDim)[None, :],
     )
-    scale_weight = tl.load(weights + (pid_batch * next_n + pid_next_n) * stride_w_batch + pid_q_head * ChunkQ + tl.arange(0, ChunkQ))
+    scale_weight = tl.load(
+        weights
+        + (pid_batch * next_n + pid_next_n) * stride_w_batch
+        + pid_q_head * ChunkQ
+        + tl.arange(0, ChunkQ)
+    )
 
-    for context_idx in range(split_context_start, split_context_start + split_context_length, ChunkK):
+    for context_idx in range(
+        split_context_start, split_context_start + split_context_length, ChunkK
+    ):
         mask_kv = context_idx + tl.arange(0, ChunkK) < context_length
-        context_kv_idx = tl.load(kv_indices + context_start + context_idx + tl.arange(0, ChunkK), mask=mask_kv, other=0)
+        context_kv_idx = tl.load(
+            kv_indices + context_start + context_idx + tl.arange(0, ChunkK),
+            mask=mask_kv,
+            other=0,
+        )
 
         k = tl.load(
-            KV_buffer + context_kv_idx[:, None] * stride_k_seq + tl.arange(0, HiddenDim)[None, :],
+            KV_buffer
+            + context_kv_idx[:, None] * stride_k_seq
+            + tl.arange(0, HiddenDim)[None, :],
             mask=mask_kv[:, None],
             other=0.0,
         )
@@ -162,7 +193,12 @@ def _deepgemm_fp8_paged_mqa_logits_ragged_k(
         o = tl.where(mask[None, :], o, float("-inf"))
 
         logits = tl.reduce(o, axis=0, combine_fn=_sum_combine)
-        tl.store(OutLogits_buffer + (pid_batch * next_n + pid_next_n) * stride_out_batch + (context_idx + tl.arange(0, ChunkK)), logits)
+        tl.store(
+            OutLogits_buffer
+            + (pid_batch * next_n + pid_next_n) * stride_out_batch
+            + (context_idx + tl.arange(0, ChunkK)),
+            logits,
+        )
 
 
 @triton.jit
@@ -205,7 +241,9 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
     split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)
 
     split_context_start = (pid_split_kv * split_context_chunk_num) * ChunkK
-    split_context_length = min(context_length - split_context_start, split_context_chunk_num * ChunkK)
+    split_context_length = min(
+        context_length - split_context_start, split_context_chunk_num * ChunkK
+    )
 
     q = tl.load(
         Q_buffer
@@ -214,14 +252,27 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
         + ((pid_q_head * ChunkQ + tl.arange(0, ChunkQ)) * stride_q_heads)[:, None]
         + tl.arange(0, HiddenDim)[None, :],
     )
-    scale_weight = tl.load(weights + (pid_batch * next_n + pid_next_n) * stride_w_batch + pid_q_head * ChunkQ + tl.arange(0, ChunkQ))
+    scale_weight = tl.load(
+        weights
+        + (pid_batch * next_n + pid_next_n) * stride_w_batch
+        + pid_q_head * ChunkQ
+        + tl.arange(0, ChunkQ)
+    )
 
-    for context_idx in range(split_context_start, split_context_start + split_context_length, ChunkK):
+    for context_idx in range(
+        split_context_start, split_context_start + split_context_length, ChunkK
+    ):
         mask_kv = context_idx + tl.arange(0, ChunkK) < context_length
-        context_kv_idx = tl.load(kv_indices + pid_batch * max_blk_len + context_idx + tl.arange(0, ChunkK), mask=mask_kv, other=0)
+        context_kv_idx = tl.load(
+            kv_indices + pid_batch * max_blk_len + context_idx + tl.arange(0, ChunkK),
+            mask=mask_kv,
+            other=0,
+        )
 
         k = tl.load(
-            KV_buffer + context_kv_idx[:, None] * stride_k_seq + tl.arange(0, HiddenDim)[None, :],
+            KV_buffer
+            + context_kv_idx[:, None] * stride_k_seq
+            + tl.arange(0, HiddenDim)[None, :],
             mask=mask_kv[:, None],
             other=0.0,
         )
@@ -238,7 +289,8 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
         tl.store(
             Out_buffer
             + (pid_batch * next_n + pid_next_n) * stride_out_batch
-            + (pid_q_head * ChunkQ + tl.arange(0, ChunkQ)[:, None, None]) * stride_out_heads
+            + (pid_q_head * ChunkQ + tl.arange(0, ChunkQ)[:, None, None])
+            * stride_out_heads
             + (context_idx + tl.arange(0, ChunkK)[None, None, :]),
             o[:, None, :],
         )
@@ -283,7 +335,9 @@ def _deepgemm_fp8_paged_mqa_logits(
     split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)
 
     split_context_start = (pid_split_kv * split_context_chunk_num) * ChunkK
-    split_context_length = min(context_length - split_context_start, split_context_chunk_num * ChunkK)
+    split_context_length = min(
+        context_length - split_context_start, split_context_chunk_num * ChunkK
+    )
 
     q = tl.load(
         Q_buffer
@@ -292,14 +346,27 @@ def _deepgemm_fp8_paged_mqa_logits(
         + ((pid_q_head * ChunkQ + tl.arange(0, ChunkQ)) * stride_q_heads)[:, None]
         + tl.arange(0, HiddenDim)[None, :],
     )
-    scale_weight = tl.load(weights + (pid_batch * next_n + pid_next_n) * stride_w_batch + pid_q_head * ChunkQ + tl.arange(0, ChunkQ))
+    scale_weight = tl.load(
+        weights
+        + (pid_batch * next_n + pid_next_n) * stride_w_batch
+        + pid_q_head * ChunkQ
+        + tl.arange(0, ChunkQ)
+    )
 
-    for context_idx in range(split_context_start, split_context_start + split_context_length, ChunkK):
+    for context_idx in range(
+        split_context_start, split_context_start + split_context_length, ChunkK
+    ):
         mask_kv = context_idx + tl.arange(0, ChunkK) < context_length
-        context_kv_idx = tl.load(kv_indices + pid_batch * max_blk_len + context_idx + tl.arange(0, ChunkK), mask=mask_kv, other=0)
+        context_kv_idx = tl.load(
+            kv_indices + pid_batch * max_blk_len + context_idx + tl.arange(0, ChunkK),
+            mask=mask_kv,
+            other=0,
+        )
 
         k = tl.load(
-            KV_buffer + context_kv_idx[:, None] * stride_k_seq + tl.arange(0, HiddenDim)[None, :],
+            KV_buffer
+            + context_kv_idx[:, None] * stride_k_seq
+            + tl.arange(0, HiddenDim)[None, :],
             mask=mask_kv[:, None],
             other=0.0,
         )
@@ -314,4 +381,9 @@ def _deepgemm_fp8_paged_mqa_logits(
         o = tl.where(mask[None, :], o, float("-inf"))
 
         logits = tl.reduce(o, axis=0, combine_fn=_sum_combine)
-        tl.store(OutLogits_buffer + (pid_batch * next_n + pid_next_n) * stride_out_batch + (context_idx + tl.arange(0, ChunkK)), logits)
+        tl.store(
+            OutLogits_buffer
+            + (pid_batch * next_n + pid_next_n) * stride_out_batch
+            + (context_idx + tl.arange(0, ChunkK)),
+            logits,
+        )
