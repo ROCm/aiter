@@ -82,6 +82,7 @@ cu_num,M,N,K,q_dtype_w,kernelId,splitK,us,kernelName,tflops,bw,errRatio
 80,112,7168,2304,torch.float8_e4m3fnuz,119,0,21.7835,a8w8_bpreshuffle_256x32x128x256_16x16_16x16_16x16x1_16x16x1_1x16x1x16_8x8x1_1x2_intrawave_v1,169.82,843.7,0.0
 80,128,512,7168,torch.float8_e4m3fnuz,19,0,12.3367,a8w8_bpreshuffle_256x16x64x512_16x16_16x16_32x8x1_32x8x1_1x16x1x16_4x4x1_1x1_intrawave_v2,76.16,382.48,0.0
 80,128,576,7168,torch.float8_e4m3fnuz,25,0,12.3755,a8w8_bpreshuffle_256x16x64x512_16x16_16x16_32x8x1_32x8x1_1x16x1x16_4x4x1_1x1_intrawave_v2,85.41,419.68,0.0
+80,128,1280,8192,torch.float8_e4m3fnuz,6,0,20.0,a8w8_bpreshuffle_256x16x128x512_16x16_16x16_32x8x1_32x8x1_1x16x1x16_8x8x1_1x2_intrawave_v1,134.22,593.1,0.0
 80,128,1536,7168,torch.float8_e4m3fnuz,112,0,22.8955,a8w8_bpreshuffle_256x32x64x256_16x16_16x16_16x16x1_16x16x1_1x32x1x8_8x8x1_2x1_intrawave_v1,123.11,538.13,0.0
 80,128,2112,7168,torch.float8_e4m3fnuz,114,0,24.5755,a8w8_bpreshuffle_256x64x64x256_16x16_16x16_16x16x1_16x16x1_1x32x1x8_8x8x1_2x1_intrawave_v3,157.7,675.35,0.0
 80,128,3072,1536,torch.float8_e4m3fnuz,112,0,11.1838,a8w8_bpreshuffle_256x32x64x256_16x16_16x16_16x16x1_16x16x1_1x32x1x8_8x8x1_2x1_intrawave_v1,108.01,509.81,0.0
@@ -698,3 +699,4 @@ cu_num,M,N,K,q_dtype_w,kernelId,splitK,us,kernelName,tflops,bw,errRatio
 80,4096,1280,8192,torch.int8,161,1,251.3328,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_192x128E,341.78,216.95,0.0021
 80,8192,1280,8192,torch.int8,161,1,496.6916,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_192x128E,345.89,198.45,0.0016
 80,16384,1280,8192,torch.int8,161,1,906.8273,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_192x128E,378.9,205.82,0.0021
+80,192,8192,5120,torch.int8,161,1,60.0426,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_192x128E,268.25,767.32,0.0026

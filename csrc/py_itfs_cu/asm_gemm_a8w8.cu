@@ -187,7 +187,7 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
 
     if(config_map->empty())
     {
-        TORCH_CHECK(false, __func__, " no kernel support a4w4 for this gpu arch");
+        TORCH_CHECK(false, __func__, " no kernel support a8w8 for this gpu arch");
     }
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 

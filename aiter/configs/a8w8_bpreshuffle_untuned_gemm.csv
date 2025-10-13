@@ -273,7 +273,7 @@ M,N,K,q_dtype_w
 16384,7168,2304,torch.float8_e4m3fnuz
 16384,512,7168,torch.float8_e4m3fnuz
 16384,7168,256,torch.float8_e4m3fnuz
-32768,4096,512, torch.float8_e4m3fnuz
+32768,4096,512,torch.float8_e4m3fnuz
 32768,2112,7168,torch.float8_e4m3fnuz
 32768,4608,7168,torch.float8_e4m3fnuz
 32768,7168,2304,torch.float8_e4m3fnuz
@@ -315,3 +315,4 @@ M,N,K,q_dtype_w
 4096,1280,8192,torch.int8
 8192,1280,8192,torch.int8
 16384,1280,8192,torch.int8
+192,1280,5120,torch.int8

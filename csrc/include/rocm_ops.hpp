@@ -306,7 +306,7 @@
 #define GEMM_A8W8_ASM_PYBIND                                            \
     m.def("gemm_a8w8_asm",                                              \
           &gemm_a8w8_asm,                                               \
-          "Asm gemm a8w8 ,  weight should be shuffle to layout(16,16)", \
+          "Asm gemm a8w8 ,  weight should be shuffle to layout(32,16)", \
           py::arg("XQ"),                                                \
           py::arg("WQ"),                                                \
           py::arg("x_scale"),                                           \
