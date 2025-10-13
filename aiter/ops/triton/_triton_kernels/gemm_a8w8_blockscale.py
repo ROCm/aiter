@@ -131,7 +131,7 @@ def _gemm_a8w8_blockscale_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        pid = remap_xcd(pid, GRID_MN)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
@@ -152,7 +152,9 @@ def _gemm_a8w8_blockscale_kernel(
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        pid_bn = pid_n * BLOCK_SIZE_N
+        pid_bn_last = pid_bn + BLOCK_SIZE_N - 1
+        offs_bn = (pid_bn + tl.arange(0, BLOCK_SIZE_N)) % N
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
@@ -164,6 +166,12 @@ def _gemm_a8w8_blockscale_kernel(
         offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
         a_scale_ptrs = (
             a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
+        )
+        offs_b_scale_n_full = pid_bn // GROUP_N
+        b_scale_ptrs_full = (
+            b_scale_ptr
+            + offs_k_scale * stride_bscale_k
+            + offs_b_scale_n_full * stride_bscale_n
         )
         offs_b_scale_n = offs_bn // GROUP_N
         b_scale_ptrs = (
@@ -180,25 +188,36 @@ def _gemm_a8w8_blockscale_kernel(
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
-                a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                a = tl.load(a_ptrs, mask=offs_am[:, None] < M, other=0.0)
+                b = tl.load(b_ptrs, cache_modifier=cache_modifier, mask=offs_bn[None, :] < N, other=0.0)
             else:
                 a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K and offs_am[:, None] < M, other=0.0
                 )
                 b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K and offs_bn[None, :] < N, other=0.0
                 )
 
-            a_scale = tl.load(a_scale_ptrs)
-            b_scale = tl.load(b_scale_ptrs)
+            a_scale = tl.load(a_scale_ptrs, mask=offs_am < M)
+            # b_scale = tl.load(b_scale_ptrs, mask=offs_bn < N)
 
-            # Perform dot operation and apply scale
-            accumulator += (
-                tl.dot(a, b, input_precision="ieee")
-                * a_scale[:, None]
-                * b_scale[None, :]
-            )
+            if pid_bn_last >= N:
+                b_scales = tl.load(b_scale_ptrs, mask=offs_bn < N)
+                # b_scale = tl.load(b_scale_ptrs)
+                # Perform dot operation and apply scale
+                accumulator += (
+                    tl.dot(a, b, input_precision="ieee")
+                    * a_scale[:, None]
+                    * b_scales[None, :]
+                )
+            else:
+                b_scale = tl.load(b_scale_ptrs_full)
+                # Perform dot operation and apply scale
+                accumulator += (
+                    tl.dot(a, b, input_precision="ieee")
+                    * a_scale[:, None]
+                    * b_scale
+                )
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -209,12 +228,13 @@ def _gemm_a8w8_blockscale_kernel(
             # offs_ks = k_nxt - k_cur
             a_scale_ptrs += offs_ks_step * stride_ascale_k
             b_scale_ptrs += offs_ks_step * stride_bscale_k
+            b_scale_ptrs_full += offs_ks_step * stride_bscale_k
 
         c = accumulator.to(c_ptr.type.element_ty)
 
         # Write back the block of the output matrix C with masks.
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = (
             c_ptr
             + stride_cm * offs_cm[:, None]
