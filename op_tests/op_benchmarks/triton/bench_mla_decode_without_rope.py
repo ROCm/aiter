@@ -346,10 +346,10 @@ def run_benchmark(args: argparse.Namespace):
         v_input_fp8 = v_input.to(torch.float8_e4m3fnuz)
         # ms = triton.testing.do_bench(
         _, us = run_perftest(
-            # lambda: decode_attention_fwd_grouped(
-                # q_fp8.reshape(-1, H * 2, 576),
-                # k_input_fp8,
-                # v_input_fp8,
+        # lambda: decode_attention_fwd_grouped(
+        #     q_fp8.reshape(-1, H * 2, 576),
+        #     k_input_fp8,
+        #     v_input_fp8,
             decode_attention_fwd_grouped,
             q.reshape(-1, H * (mtp + 1), 576),
             k_input,

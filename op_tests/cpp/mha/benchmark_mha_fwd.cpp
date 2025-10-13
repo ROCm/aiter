@@ -965,6 +965,10 @@ bool run(const ck_tile::ArgParser& arg_parser)
 
             args.seqlen_k     = shape_seqlen_k; // unused in group mode (or kvcache enabled)
             args.max_seqlen_q = max_seqlen_q;
+#if !CK_TILE_FMHA_FWD_SPLITKV_API
+            args.min_seqlen_q = 0;
+#endif
+
 
             args.scale_s = scale_s;
             args.scale_p = scale_p;

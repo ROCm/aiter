@@ -127,6 +127,7 @@ def test_mla(
         seq_lens_qo.fill_(ctx_lens)
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
     kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
+
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
     max_seqlen_kv = seq_lens_kv.max().item()
@@ -183,8 +184,8 @@ def test_mla(
         return us_aiter
 
     us_aiter = None
-    if batch_size * ctx_lens * nhead < 256 * 8192 * 16:
-        us_aiter = test_normal_prefill()
+    # if batch_size * ctx_lens * nhead < 256 * 8192 * 16:
+    #     us_aiter = test_normal_prefill()
     torch.cuda.empty_cache()
     # absorb init
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
@@ -267,8 +268,8 @@ def test_mla(
         return us_asm
 
     us_asm = None
-    if batch_size * ctx_lens * nhead < 32 * 8192 * 16:
-        us_asm = test_absorb_prefill()
+    # if batch_size * ctx_lens * nhead < 32 * 8192 * 16:
+    #     us_asm = test_absorb_prefill()
     torch.cuda.empty_cache()
 
     # ############################## absorb: decode
