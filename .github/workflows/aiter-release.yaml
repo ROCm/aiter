@@ -1,6 +1,6 @@
 name: Aiter Release Package
 
-description: This workflow builds the Aiter Python package as a .whl file and upload it as the artifact.
+description: This workflow builds the Aiter Python package as a .whl file and uploads it as the artifact.
 
 on:
   workflow_dispatch:
