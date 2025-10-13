@@ -82,6 +82,7 @@ def paged_attention_rocm(
         torch.bfloat16: "__hip_bfloat16",
         torch.float16: "_Float16",
         torch.float8_e4m3fnuz: "uint8_t",
+        torch.float8_e4m3fn: "uint8_t"
     }
 
     warpSize = torch.cuda.get_device_properties(out.device).warp_size
