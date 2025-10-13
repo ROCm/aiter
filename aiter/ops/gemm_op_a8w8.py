@@ -267,10 +267,12 @@ def get_bpreshuffle_GEMM_config(
     )
     if config is not None:
         if AITER_LOG_TUNED_CONFIG:
-            logger.info(f"shape M:{M}, N:{N}, K:{K} is tuned, in a8w8 bpreshuffle_GEMM !")
+            logger.info(
+                f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w} is tuned, in {tuned_file}!"
+            )
     else:
         logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in a8w8 bpreshuffle_GEMM, will use default config!"
+            f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
         )
     return config
 
@@ -323,7 +325,7 @@ def gemm_a8w8_ASM(
         and w_scale.dtype == dtypes.fp32
         and (
             asm_config := get_bpreshuffle_GEMM_config(
-                m, n, k, dtypes.i8, "a8w8_bpreshuffle_tuned_gemm.csv"
+                m, n, k, dtypes.i8, AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
             )
         )
         is not None
@@ -385,7 +387,9 @@ def gemm_a8w8_bpreshuffle(
     n = WQ.shape[0]
     k = XQ.shape[-1]
 
-    get_bpreshuffle_GEMM_config(m, n, k, dtypes.fp8, AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE)
+    get_bpreshuffle_GEMM_config(
+        m, n, k, dtypes.fp8, AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+    )
     # if (
     #     ck_config is None
     #     and dtype == dtypes.bf16
