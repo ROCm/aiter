@@ -792,10 +792,12 @@ def test_mha_backward_varlen(
 @pytest.mark.parametrize("BATCH", [1, 3])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(128, 128), (32, 16), (16, 48), (4096, 4096)],
+    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (16, 48), (4096, 4096)],
 )
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (2, 1), (128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(128, 64), (192, 128)])
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (4, 4), (2, 1), (128, 128)]
+)
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(48, 32), (128, 64), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.25])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_with_pe(
@@ -844,7 +846,7 @@ def test_mha_with_pe(
         dropout_mask = None
 
     # Torch
-    torch_out, _, _ = attention_ref(
+    torch_out, _ = attention_ref(
         q,
         k,
         v,
@@ -860,10 +862,12 @@ def test_mha_with_pe(
 @pytest.mark.parametrize("BATCH", [1, 3])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(16, 16), (32, 16), (64, 128), (4096, 4096)],
+    [(1, 1), (2, 2), (4, 1), (1, 4), (16, 16), (32, 16), (64, 128), (4096, 4096)],
 )
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 4), (128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(96, 64), (192, 128)])
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (4, 4), (16, 4), (128, 128)]
+)
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (96, 64), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.17])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_varlen_with_pe(
@@ -946,7 +950,7 @@ def test_mha_varlen_with_pe(
     triton_out = output_pad_fn(triton_out)
 
     # Torch
-    torch_out, _, _ = attention_ref(
+    torch_out, _ = attention_ref(
         q,
         k,
         v,
@@ -964,11 +968,13 @@ def test_mha_varlen_with_pe(
 @pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(16, 16), (32, 8), (64, 16), (2048, 2048)],
+    [(1, 1), (8, 8), (4, 1), (1, 2), (16, 16), (32, 8), (64, 16), (4096, 4096)],
 )
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 2), (128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (192, 128)])
-@pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (4, 4), (8, 2), (128, 128)]
+)
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (128, 64), (192, 128)])
+@pytest.mark.parametrize("DROPOUT", [0.0, 0.13])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_backward_with_pe(
     BATCH: int,
@@ -989,6 +995,9 @@ def test_mha_backward_with_pe(
         pytest.skip(
             "Causal + Dropout use case isn't supported in backward with Positional Encoding."
         )
+
+    if (SEQLEN_Q, SEQLEN_K) == (4096, 4096) and HAS_DROPOUT:
+        pytest.skip("Dropout with large sequence length raises torch.OutOfMemoryError.")
 
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
@@ -1036,7 +1045,7 @@ def test_mha_backward_with_pe(
 
     # Torch forward
     with torch.enable_grad():
-        torch_out, _, _ = attention_ref(
+        torch_out, _ = attention_ref(
             q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
         )
 
@@ -1087,11 +1096,13 @@ def test_mha_backward_with_pe(
 @pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(8, 8), (32, 8), (16, 64), (64, 64)],
+    [(1, 1), (8, 8), (4, 1), (1, 2), (16, 16), (32, 8), (64, 16), (4096, 4096)],
 )
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 2), (128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (192, 128)])
-@pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (4, 4), (8, 2), (128, 128)]
+)
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (128, 64), (192, 128)])
+@pytest.mark.parametrize("DROPOUT", [0.0, 0.15])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_backward_varlen_with_pe(
     BATCH: int,
@@ -1112,6 +1123,9 @@ def test_mha_backward_varlen_with_pe(
         pytest.skip(
             "Causal + Dropout use case isn't supported in backward with Positional Encoding."
         )
+
+    if (SEQLEN_Q, SEQLEN_K) == (4096, 4096) and HAS_DROPOUT:
+        pytest.skip("Dropout with large sequence length raises torch.OutOfMemoryError.")
 
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
@@ -1196,7 +1210,7 @@ def test_mha_backward_varlen_with_pe(
 
     # Torch forward
     with torch.enable_grad():
-        torch_out, _, _ = attention_ref(
+        torch_out, _ = attention_ref(
             q,
             k,
             v,
