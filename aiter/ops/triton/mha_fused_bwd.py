@@ -272,7 +272,6 @@ def flash_attn_fused_backward(
             FP8_MAX=FP8_MAX,
             NUM_SMS=NUM_SMS,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
-            NUM_XCD=get_num_xcds(),
             **config_dkdvdq,
         )
 

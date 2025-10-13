@@ -846,7 +846,7 @@ def test_mha_with_pe(
         dropout_mask = None
 
     # Torch
-    torch_out, _ = attention_ref(
+    torch_out, _, _ = attention_ref(
         q,
         k,
         v,
@@ -950,7 +950,7 @@ def test_mha_varlen_with_pe(
     triton_out = output_pad_fn(triton_out)
 
     # Torch
-    torch_out, _ = attention_ref(
+    torch_out, _, _ = attention_ref(
         q,
         k,
         v,
@@ -995,6 +995,9 @@ def test_mha_backward_with_pe(
         pytest.skip(
             "Causal + Dropout use case isn't supported in backward with Positional Encoding."
         )
+
+    if (SEQLEN_Q, SEQLEN_K) == (4096, 4096) and HAS_DROPOUT:
+        pytest.skip("Dropout with large sequence length raises torch.OutOfMemoryError.")
 
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
@@ -1042,7 +1045,7 @@ def test_mha_backward_with_pe(
 
     # Torch forward
     with torch.enable_grad():
-        torch_out, _ = attention_ref(
+        torch_out, _, _ = attention_ref(
             q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
         )
 
@@ -1207,7 +1210,7 @@ def test_mha_backward_varlen_with_pe(
 
     # Torch forward
     with torch.enable_grad():
-        torch_out, _ = attention_ref(
+        torch_out, _, _ = attention_ref(
             q,
             k,
             v,
