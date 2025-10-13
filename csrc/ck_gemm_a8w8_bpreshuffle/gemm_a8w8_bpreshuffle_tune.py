@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
-from aiter.test_common import perftest
+from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.ops.shuffle import shuffle_weight
 from gemm_a8w8_bpreshuffle_common import kernels_list
@@ -107,7 +107,7 @@ def generate_data_asm(
 class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
-        "tune_file": "aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
+        "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE}",
         "untune_file": "aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv",
     }
 
