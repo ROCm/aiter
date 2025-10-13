@@ -50,6 +50,7 @@ jobs:
           -w /workspace \
           aiter_build \
           bash -c '
+            export DEBIAN_FRONTEND=noninteractive \
             apt-get update -y \
             && apt-get install -y software-properties-common git curl sudo vim less libgfortran5 \
             && for i in 1 2 3; do \
