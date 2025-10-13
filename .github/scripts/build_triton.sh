@@ -20,7 +20,7 @@ git clone --depth=1 https://github.com/triton-lang/triton || true
 cd triton
 pip install -r python/requirements.txt
 pip install filecheck
-pip install .
+MAX_JOBS=64 pip install .
 
 echo
 echo "==== Show installed packages ===="
