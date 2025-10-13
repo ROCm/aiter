@@ -3,8 +3,8 @@ name: Aiter Release Package
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Release version'
+      commit:
+        description: 'Commit hash to build (leave empty to use current commit)'
         required: false
   pull_request:
     branches: [main]
@@ -24,12 +24,24 @@ jobs:
       - name: Checkout aiter repo
         uses: actions/checkout@v4
       
+      - name: Checkout to user-specified commit (if provided)
+        run: |
+          set -ex
+          if [ -n "${{ github.event.inputs.commit }}" ]; then
+            echo "Checking out to commit: ${{ github.event.inputs.commit }}"
+            git fetch --all
+            git checkout ${{ github.event.inputs.commit }}
+            git submodule update --init --recursive --depth 1 --jobs 4
+          else
+            echo "No commit input provided, using current commit: $(git rev-parse HEAD)"
+          fi
+
       - name: Sync submodules
         run: |
-          set -e
+          set -ex
           git submodule sync
           git submodule update --init --recursive --depth 1 --jobs 4
-        
+
       - name: Run the container
         run: |
           set -ex
@@ -41,32 +53,6 @@ jobs:
           --name aiter_build \
           ${{ env.BUILD_DOCKER_IMAGE }}
 
-      # - name: Install Python and other dependencies
-      #   run: |
-      #     set -e
-      #     echo "Install Python and other dependencies"
-      #     docker exec \
-      #     -e PYTHON_VERSION=3.12 \
-      #     -w /workspace \
-      #     aiter_build \
-      #     bash -c '
-      #       export DEBIAN_FRONTEND=noninteractive \
-      #       && apt-get update -y \
-      #       && apt-get install -y software-properties-common git curl sudo vim less libgfortran5 \
-      #       && for i in 1 2 3; do \
-      #           add-apt-repository -y ppa:deadsnakes/ppa && break || \
-      #           { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
-      #       done \
-      #       && apt-get update -y \
-      #       && apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
-      #          python${PYTHON_VERSION}-lib2to3 python-is-python3  \
-      #       && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
-      #       && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
-      #       && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
-      #       && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
-      #       && python3 --version && python3 -m pip --version
-      #     '
-
       - name: Install Dependencies
         run: |
           set -e
@@ -76,7 +62,7 @@ jobs:
           aiter_build \
           pip install -r requirements.txt 
           
-      - name: Build Relase Package
+      - name: Build Aiter
         run: |
           set -e
           echo "Building aiter whl packages..."
@@ -84,4 +70,16 @@ jobs:
           -w /workspace \
           aiter_build \
           bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="gfx942;gfx950" python3 setup.py bdist_wheel && ls dist/*.whl'
+      
+      - name: Upload whl file as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-whl-packages
+          path: dist/*.whl
+          
+    
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f aiter_build || true
           
