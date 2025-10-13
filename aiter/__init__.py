@@ -26,7 +26,17 @@ def getLogger():
             )
         console_handler.setFormatter(formatter)
         console_handler.setLevel(logging.INFO)
+
         logger.addHandler(console_handler)
+        if hasattr(torch._dynamo.config, "ignore_logger_methods"):
+            torch._dynamo.config.ignore_logger_methods = (
+                logging.Logger.info,
+                logging.Logger.warning,
+                logging.Logger.debug,
+                logger.warning,
+                logger.info,
+                logger.debug,
+            )
 
     return logger
 
@@ -43,6 +53,7 @@ from .ops.enum import *
 from .ops.norm import *
 from .ops.quant import *
 from .ops.gemm_op_a8w8 import *
+from .ops.gemm_op_a16w16 import *
 from .ops.gemm_op_a4w4 import *
 from .ops.batched_gemm_op_a8w8 import *
 from .ops.batched_gemm_op_bf16 import *
@@ -51,6 +62,7 @@ from .ops.activation import *
 from .ops.attention import *
 from .ops.custom import *
 from .ops.custom_all_reduce import *
+from .ops.quick_all_reduce import *
 from .ops.moe_op import *
 from .ops.moe_sorting import *
 from .ops.pos_encoding import *
@@ -62,4 +74,5 @@ from .ops.topk import *
 from .ops.mha import *
 from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
+from .ops.sample import *
 from . import mla

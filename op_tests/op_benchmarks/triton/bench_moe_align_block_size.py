@@ -2,6 +2,8 @@ import triton
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
+    get_caller_name_no_ext,
+    print_vgpr,
 )
 from op_tests.triton_tests.test_moe_align_block_size import input_helper
 import torch
@@ -12,7 +14,7 @@ import sys
 
 def model_benchmark_configs(args):
     config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models="mistral")
+    configs = get_model_configs(config_path=config_file, models="mixtral")
     moe_configs = []
     M = args.M if args.M else 4096  # check size
     # M, K, N, E, top_k
@@ -59,7 +61,7 @@ def run_benchmark(custom, args):
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k"]
 
-    line_names = ["Time (ms)", "Bandwidth (GB/s)"]
+    line_names = ["Time_(ms)", "Bandwidth_(GB/s)"]
     line_vals = ["time", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
@@ -70,7 +72,7 @@ def run_benchmark(custom, args):
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-")],
         ylabel="ms / GB/s",
-        plot_name="moe-align-block-size",
+        plot_name=get_caller_name_no_ext(),
         args={},
     )
 
@@ -95,14 +97,12 @@ def run_benchmark(custom, args):
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
             return ms
-        # elif metric == 'tflops':
-        #     return tflops
         elif metric == "bandwidth":
             return bandwidth
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_moe_align_block_size.run(save_path=".", print_data=True)
+    bench_moe_align_block_size.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -122,9 +122,13 @@ def parse_args():
         + ", ".join(available_models)
         + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
     )
-    parser.add_argument("-model", type=str, default=None, help=model_help)
+    parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-M", type=int, default=0, help="M dimension")
     parser.add_argument("-block_size", type=int, default=128)
+    parser.add_argument("-print_vgpr", action="store_true", default=False)
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
     args = parser.parse_args()
     return args
 
@@ -144,6 +148,14 @@ def main():
     # If user provides all M,K,N,E,top_k we consider it custom
     if args.M and args.K and args.N and args.E and args.top_k:
         custom_config = True
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+
+        def fun():
+            return run_benchmark(custom_config, args)
+
+        print_vgpr(fun, get_caller_name_no_ext())
+        return 0
     run_benchmark(custom_config, args)
 
 

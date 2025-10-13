@@ -3,7 +3,7 @@
 
 import torch
 import aiter
-from aiter.test_common import checkAllclose, benchmark, perftest
+from aiter.test_common import checkAllclose, benchmark, perftest, run_perftest
 from aiter import dtypes
 from aiter.utility import fp4_utils
 from aiter.ops.shuffle import shuffle_weight
@@ -13,7 +13,9 @@ import pandas as pd
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 SCALE_GROUP_SIZE = 32
-pd.set_option("display.max_columns", 200)
+pd.set_option("display.max_columns", 30)
+pd.set_option("display.width", 1000)
+pd.set_option("display.max_colwidth", 30)
 
 
 @perftest(num_iters=5)
@@ -55,13 +57,30 @@ def run_gemm_asm(
     x_scale,
     w_scale,
     out,
+    kernelName="",
     bias=None,
     dtype=dtypes.bf16,
     bpreshuffle=True,
+    log2_k_split=None,
 ):
-    return aiter.gemm_a4w4_asm(
-        x, weightshuffle, x_scale, w_scale, out, bias, bpreshuffle=bpreshuffle
+    # if log2_k_split is not None and log2_k_split > 0:
+    #     out_reset = torch.zeros(
+    #         (out.shape[0] + 31) // 32 * 32, out.shape[1], dtype=dtype
+    #     )
+    #     out = out_reset
+
+    aiter.gemm_a4w4_asm(
+        x,
+        weightshuffle,
+        x_scale,
+        w_scale,
+        out,
+        kernelName,
+        bias,
+        bpreshuffle=bpreshuffle,
+        log2_k_split=log2_k_split,
     )
+    return out
 
 
 @benchmark()
@@ -70,6 +89,7 @@ def test_gemm(dtype, M, N, K):
 
     if get_gfx() not in ["gfx950"]:
         return
+    ret = {}
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
     x = torch.randn((M, K), dtype=dtype)
     w = torch.randn((N, K), dtype=dtype)
@@ -79,71 +99,67 @@ def test_gemm(dtype, M, N, K):
     w, w_scales_shuffle = quant_func(w, shuffle=True)
     wshuffle = shuffle_weight(w, layout=(16, 16))
     out1 = torch.empty(M, N, dtype=dtype)
-    out2 = torch.empty((M + 255) // 256 * 256, N, dtype=dtype)
-    out3 = torch.empty((M + 255) // 256 * 256, N, dtype=dtype)
+    out2 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
+    out3 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
     bias_f32 = None
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
-
     a, avg_a = run_torch(x, w, x_scales, w_scales, dtype)
-    b, avg_b = run_triton(x, w.T, x_scales, w_scales, out1, dtype)
+    # b, avg_b = run_triton(x, w.T, x_scales, w_scales, out1, dtype)
+    # b, avg_b = a, 0
+    # err_b = checkAllclose(a, b, msg="triton        ")
 
-    err0 = checkAllclose(a, b, msg="triton        ")
-    avg_c = None
-    tflops_c = None
-    tbs_c = None
-    c, avg_c = run_gemm_asm(
+    c, us = run_perftest(
+        aiter.gemm_a4w4,
         x,
         wshuffle,
         x_scales_shuffle,
         w_scales_shuffle,
         out2,
-        bias_f32,
         bpreshuffle=True,
     )
-    err1 = checkAllclose(a, c[:M], msg="asm_bshuffle  ")
-    tflops_c = M * N * K * 2 / avg_c / 1e6
-    tbs_c = (x.nbytes + w.nbytes) / avg_c / 1e6
+    err = checkAllclose(a, c[:M], msg="unified api")
+    ret["us"] = us
+    ret["TFLOPS"] = M * N * K * 2 / us / 1e6
+    ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
+    ret["err"] = err
 
-    avg_c2 = None
-    tflops_c2 = None
-    tbs_c2 = None
-    c2, avg_c2 = run_gemm_asm(
-        x, w, x_scales_shuffle, w_scales_shuffle, out2, bias_f32, bpreshuffle=False
-    )
-    err1_ = checkAllclose(a, c2[:M], msg="asm_NObshuffle ")
-    tflops_c2 = M * N * K * 2 / avg_c2 / 1e6
-    tbs_c2 = (x.nbytes + w.nbytes) / avg_c2 / 1e6
+    # kernelName = ""  # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
+    # log2_k_split = 1
+    # d, us = run_gemm_asm(
+    #     x,
+    #     wshuffle,
+    #     x_scales_shuffle,
+    #     w_scales_shuffle,
+    #     out3,
+    #     kernelName,
+    #     bias_f32,
+    #     bpreshuffle=True,
+    #     log2_k_split=log2_k_split,
+    # )
+    # err = checkAllclose(a, d[:M], msg=f"asm {kernelName} log2_k_split_{log2_k_split}")
+    # tag = "asm_dbg"
+    # ret[f"us {tag}"] = us
+    # ret[f"TFLOPS {tag}"] = M * N * K * 2 / us / 1e6
+    # ret[f"TB/s {tag}"] = (x.nbytes + w.nbytes) / us / 1e6
+    # ret[f"err {tag}"] = err
 
-    avg_d = None
-    tflops_d = None
-    tbs_d = None
-    d, avg_d = run_gemm_ck(x, wshuffle, x_scales_shuffle, w_scales_shuffle, out3)
-    err2 = checkAllclose(a, d[:M], msg="ck            ")
-    tflops_d = M * N * K * 2 / avg_d / 1e6
-    tbs_d = (x.nbytes + w.nbytes) / avg_d / 1e6
+    # e, us = run_gemm_ck(x, wshuffle, x_scales_shuffle, w_scales_shuffle, out3)
+    # err = checkAllclose(a, e[:M], msg="ck            ")
+    # tag = "ck"
+    # ret[f"us {tag}"] = us
+    # ret[f"TFLOPS {tag}"] = M * N * K * 2 / us / 1e6
+    # ret[f"TB/s {tag}"] = (x.nbytes + w.nbytes) / us / 1e6
+    # ret[f"err {tag}"] = err
 
-    return {
-        "triton": avg_b,
-        "asm bpreshuffle": avg_c,
-        "asm no bpreshuffle": avg_c2,
-        "ck": avg_d,
-        "triton err": err0,
-        "asm bpreshuffle err": err1,
-        "asm no bpreshuffle err": err1_,
-        "ck err": err2,
-        "asm bpreshuffle TFLPOS": tflops_c,
-        "asm no bpreshuffle TFLPOS": tflops_c2,
-        "ck TFLPOS": tflops_d,
-        "asm bpreshuffle TB/s": tbs_c,
-        "asm no bpreshuffle TB/s": tbs_c2,
-        "ck TB/s": tbs_d,
-    }
+    return ret
 
 
 l_dtype = ["bf16"]
 l_mnk = [
     # pure_compute
+    (256, 2048, 8192),
+    (2048, 8192, 8192),
     (16384, 16384, 16384),
     (32768, 106496, 16384),
     (32768, 16384, 53248),
@@ -193,11 +209,27 @@ l_mnk = [
     (4096, 8192, 1024),
     (8192, 8192, 1024),
     (16384, 8192, 1024),
-    # for asm
-    (16384, 16384, 16384),
-    (32768, 32768, 32768),
-    (51200, 18432, 16384),
-    (51200, 16384, 16384),
+    # tune
+    (1552, 8192, 8192),
+    (1664, 8192, 8192),
+    (1792, 8192, 8192),
+    (1920, 8192, 8192),
+    (3072, 8192, 8192),
+    (1552, 10240, 8192),
+    (1664, 10240, 8192),
+    (1792, 10240, 8192),
+    (1920, 10240, 8192),
+    (3072, 10240, 8192),
+    (1552, 57344, 8192),
+    (1664, 57344, 8192),
+    (1792, 57344, 8192),
+    (1920, 57344, 8192),
+    (3072, 57344, 8192),
+    (1552, 8192, 28672),
+    (1664, 8192, 28672),
+    (1792, 8192, 28672),
+    (1920, 8192, 28672),
+    (3072, 8192, 28672),
 ]
 
 parser = argparse.ArgumentParser(
@@ -222,7 +254,7 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="""shape of mnk.
+    help="""Shape of mnk.
     e.g. -mnk 1280,8192,1024""",
 )
 

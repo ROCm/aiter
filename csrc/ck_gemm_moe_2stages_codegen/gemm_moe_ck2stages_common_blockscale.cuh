@@ -83,10 +83,9 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     static constexpr ck::index_t Scale_Block_M = 1;
     static constexpr ck::index_t Scale_Block_N = 128;
     static constexpr ck::index_t Scale_Block_K = 128;
-
     using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemmBlockScale
         // clang-format off
-          <     Row,  Col,  DsLayout, ELayout, 
+          <     Row,  Col,  DsLayout, ELayout,
                 A0DataType, A1DataType, B0DataType, B1DataType, DsDataType, EDataType, AccDataType, CShuffleDataType,
                 AElementOp,  BElementOp, CDEElementOp,       GemmSpec,
                 BLOCKSIZE,  Scale_Block_M, Scale_Block_N, Scale_Block_K,
@@ -218,7 +217,6 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     constexpr auto StrideDs = std::array<ck::index_t, NumDTensor>{0};
 
     static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
-
     // static constexpr ck::index_t BLOCKSIZE = 256;
     static constexpr ck::index_t WAVES = BLOCKSIZE / 64;
     static constexpr ck::index_t MNPerXDL = 16;
@@ -245,7 +243,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
         // clang-format off
             < Row, Col, DsLayout, ELayout,
               A0DataType, A1DataType, B0DataType, B1DataType, DsDataType, EDataType, AccDataType, CShuffleDataType,
-              AElementOp,  BElementOp, CDEElementOp,   GemmSpec,   
+              AElementOp,  BElementOp, CDEElementOp,   GemmSpec,
               256,  Scale_Block_M, Scale_Block_N, Scale_Block_K,
               MPerBlock,   128,    128,
               AK1,   BK1,
@@ -264,8 +262,8 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
 
     // do GEMM
     auto device_op = DeviceOpInstance{};
-    const void* a2_scale_ptr = *a2_scale; 
-    const void* w2_scale_ptr = *w2_scale;  
+    const void* a2_scale_ptr = *a2_scale;
+    const void* w2_scale_ptr = *w2_scale;
 
     auto invoker = device_op.MakeInvoker();
     auto argument =

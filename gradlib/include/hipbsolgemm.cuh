@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 // #ifdef __gfx908__
 // // Uncomment ifdef and endif only if you need to undef the HIP_HALF ops below
 // just for gfx908 and not for others
@@ -41,7 +41,7 @@ void hipb_destroy_extension();
 torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
                       const int solution_index,
                       std::optional<torch::Tensor> bias = std::nullopt,
-                      std::optional<py::object> out_dtype = std::nullopt,
+                      std::optional<c10::ScalarType> out_dtype = std::nullopt,
                       std::optional<torch::Tensor> scaleA = std::nullopt,
                       std::optional<torch::Tensor> scaleB = std::nullopt,
                       std::optional<torch::Tensor> scaleOut = std::nullopt);
@@ -49,7 +49,7 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
 std::vector<int> hipb_findallsols(
     const torch::Tensor &mat1, const torch::Tensor &mat2,
     std::optional<torch::Tensor> bias = std::nullopt,
-    std::optional<py::object> out_dtype = std::nullopt,
+    std::optional<c10::ScalarType> out_dtype = std::nullopt,
     std::optional<torch::Tensor> scaleA = std::nullopt,
     std::optional<torch::Tensor> scaleB = std::nullopt,
     std::optional<torch::Tensor> scaleC = std::nullopt);

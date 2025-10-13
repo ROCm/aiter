@@ -36,7 +36,8 @@ fmha_bwd_args get_asm_fmha_varlen_bwd_args(const mask_info &mask,
                                           at::Tensor dv,
                                           float softmax_scale,
                                           float p_dropout,
-                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                          bool is_v3_atomic_fp32)
 {
     ck_tile::index_t total_q = q.size(0);
     ck_tile::index_t total_k = k.size(0);
@@ -89,12 +90,23 @@ fmha_bwd_args get_asm_fmha_varlen_bwd_args(const mask_info &mask,
     ck_tile::index_t stride_dv = dv.stride(0);
     ck_tile::index_t nhead_stride_dv = dv.stride(1);
 
-    // TODO: layout of this?
-    // dq_acc: (split, total_q, nheads, hdim_v)
-    ck_tile::index_t split_stride_dq_acc = dq_acc.stride(0);
-    ck_tile::index_t batch_stride_dq_acc = 0;
-    ck_tile::index_t nhead_stride_dq_acc = dq_acc.stride(1);
-    ck_tile::index_t stride_dq_acc = dq_acc.stride(2);
+    ck_tile::index_t split_stride_dq_acc;
+    ck_tile::index_t batch_stride_dq_acc;
+    ck_tile::index_t nhead_stride_dq_acc;
+    ck_tile::index_t stride_dq_acc;
+    // For atomic32, dq_acc layout is (1, num_heads, total_q, head_size_v)
+    // For atomic16, dq_acc layout is (1, batch_size, num_heads, (max_seqlen_q + 15) / 16 * 16, 128)
+    if (is_v3_atomic_fp32) {
+        split_stride_dq_acc = dq_acc.stride(0);
+        batch_stride_dq_acc = 0;
+        nhead_stride_dq_acc = dq_acc.stride(1);
+        stride_dq_acc = dq_acc.stride(2);
+    } else {
+        split_stride_dq_acc = dq_acc.stride(0);
+        batch_stride_dq_acc = dq_acc.stride(1);
+        nhead_stride_dq_acc = dq_acc.stride(2);
+        stride_dq_acc = dq_acc.stride(3);
+    }
 
     float p_undrop = 1.0 - p_dropout;
 
@@ -186,14 +198,18 @@ fmha_bwd_args get_asm_fmha_varlen_bwd_args(const mask_info &mask,
 }
 
 std::vector<at::Tensor>
-fmha_v3_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
-                   const at::Tensor &q,            // [total_q, hq, d_q]
-                   const at::Tensor &k,            // [total_k, hk, d_q]
-                   const at::Tensor &v,            // [total_k, hk, d_v]
-                   const at::Tensor &out,          // [total_q, hq, d_v]
-                   const at::Tensor &softmax_lse,  // [b, hq, sq]
-                   const at::Tensor &cu_seqlens_q, // [b+1]
-                   const at::Tensor &cu_seqlens_k, // [b+1]
+fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v]
+                   const at::Tensor &q,                     // [total_q, hq, d_q]
+                   const at::Tensor &k,                     // [total_k, hk, d_q]
+                   const at::Tensor &v,                     // [total_k, hk, d_v]
+                   const at::Tensor &out,                   // [total_q, hq, d_v]
+                   const at::Tensor &softmax_lse,           // [b, hq, sq]
+                   const at::Tensor &cu_seqlens_q,          // [b+1]
+                   const at::Tensor &cu_seqlens_k,          // [b+1]
+                // FIXME: this two args currently not support on ck side
+                //        and has no host code on aiter side
+                //    const at::Tensor& cu_seqlens_q_padded,   // [b+1]
+                //    const at::Tensor& cu_seqlens_k_padded,   // [b+1]
                    const int max_seqlen_q,
                    const int max_seqlen_k,
                    const float p_dropout,
@@ -321,7 +337,13 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
     at::Tensor dq_accum;
 
     if (!deterministic) {
-        dq_accum = torch::zeros({1, num_heads, total_q, head_size_v}, opts.dtype(at::kFloat));
+        if (is_v3_atomic_fp32) {
+            dq_accum = torch::zeros({1, num_heads, total_q, head_size_v}, opts.dtype(at::kFloat));
+        } else {
+            // When atomic16, padding dq_accum seqlen to 16x of max_seqlen_q, head dim to 128
+            // In this case, dq_accum could have any layout, we set it to be `bhsd`
+            dq_accum = torch::zeros({1, batch_size, num_heads, (max_seqlen_q + 15) / 16 * 16, 128}, opts.dtype(q_dtype));
+        }
     } else {
         const ck_tile::index_t kN0 = head_size_q <= 128 ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(max_seqlen_k, kN0);
@@ -397,7 +419,8 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                 dv_expanded,
                 softmax_scale,
                 p_dropout,
-                drop_seed_offset);
+                drop_seed_offset,
+                is_v3_atomic_fp32);
 
         float t = aiter::mha_bwd(args,
                                  stream_config,

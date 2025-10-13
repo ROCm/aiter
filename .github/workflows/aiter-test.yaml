@@ -1,0 +1,204 @@
+name: Aiter Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]  # Triggers on PRs targeting `main`
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOCKER_IMAGE: "rocm/pytorch:latest"
+
+jobs:
+  define-runners:
+    runs-on: ubuntu-latest
+    outputs:
+      standard_runners: ${{ steps.machines.outputs.standard_runners }}
+      multigpu_runners: ${{ steps.machines.outputs.multigpu_runners }}
+
+    steps:
+      - name: Define whether runs on MI35X
+        id: machines
+        run: |
+          set -euo pipefail
+          pr_title="${{ github.event.pull_request.title }}"
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "It's main branch, running tests on MI300 and MI35X..."
+            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+          elif echo "$pr_title" | grep -qi "mi35x"; then
+            echo "PR title contains 'MI35X', running tests on MI300 and MI35X..."
+            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "Not main branch and PR title does not contain mi35x, only running on MI300..."
+            echo 'standard_runners=["aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
+          fi
+          echo "$GITHUB_OUTPUT"
+    
+      - name: Show output variable
+        run: |
+          echo "Standard: ${{ steps.machines.outputs.standard_runners }}"
+          echo "Multipe: ${{ steps.machines.outputs.multigpu_runners }}"
+
+  standard:
+    needs: define-runners
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.define-runners.outputs.standard_runners) }}
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Sync submodules
+        run: |
+          set -euo pipefail
+          if [[ ${{ github.ref }} == "refs/heads/main" ]]; then
+            echo "It's main branch, syncing latest CK..."
+            git submodule sync
+            git submodule update --init --recursive --remote --depth 1 --jobs 4
+          else
+            echo "It's a PR branch, syncing specific CK..."
+            git submodule sync
+            git submodule update --init --recursive --depth 1 --jobs 4
+          fi
+
+      - name: Clean up Rocm processes
+        run: |
+          ./.github/scripts/clean_up_rocm.sh
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: aiter_test"
+          docker run -dt \
+          --device=/dev/dri \
+          --device=/dev/kfd \
+          --shm-size=16G \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name aiter_test \
+          ${{ env.DOCKER_IMAGE }}
+
+      - name: Setup-Triton
+        run: |
+          set -ex
+          echo "Setting up Triton..."
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          ./.github/scripts/build_triton.sh
+      
+      - name: Tests
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          ./.github/scripts/aiter_test.sh 
+      
+      - name: Upload test logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: standard-test-log-${{ matrix.runner }}
+          path: latest_test.log
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f aiter_test || true
+  
+      - name: Clean up Rocm processes
+        if: always()
+        run: |
+          ./.github/scripts/clean_up_rocm.sh
+
+  multi-gpu:
+    needs: define-runners
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.define-runners.outputs.multigpu_runners) }}
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Sync submodules
+        run: |
+          set -euo pipefail
+          if [[ ${{ github.ref }} == "refs/heads/main" ]]; then
+            echo "It's main branch, syncing latest CK..."
+            git submodule sync
+            git submodule update --init --recursive --remote --depth 1 --jobs 4
+          else
+            echo "It's a PR branch, syncing specific CK..."
+            git submodule sync
+            git submodule update --init --recursive --depth 1 --jobs 4
+          fi
+
+      - name: Clean up Rocm processes
+        run: ./.github/scripts/clean_up_rocm.sh
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: aiter_test"
+          docker run -dt \
+          --device=/dev/dri \
+          --device=/dev/kfd \
+          --shm-size=16G \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name aiter_test \
+          ${{ env.DOCKER_IMAGE }}
+
+      - name: Setup-Triton
+        run: |
+          set -ex
+          echo "Setting up Triton..."
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          ./.github/scripts/build_triton.sh
+      
+      - name: Tests
+        run: |
+          set -ex
+          docker exec \
+          -e MULTIGPU=TRUE \
+          -w /workspace \
+          aiter_test \
+          ./.github/scripts/aiter_test.sh
+
+      - name: Upload test logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: multigpu-test-${{ matrix.runner }}
+          path: latest_test.log
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f aiter_test || true
+
+      - name: Clean up Rocm processes
+        if: always()
+        run: |
+          ./.github/scripts/clean_up_rocm.sh

@@ -5,7 +5,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "gemm_moe_ck2stages_lookup.h"
 #include "gemm_moe_ck2stages.h"
-#include "gemm_moe_ck2stages_heuristic_dispatch.hpp"
+#include "ck2stages_moe_stage1_heuristic_dispatch.hpp"
+#include "ck2stages_moe_stage2_heuristic_dispatch.hpp"
+#include "moe_ck.h"
 #include <cmath>
 
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
@@ -13,7 +15,7 @@ using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 // API for user aiter.ck_moe_stage1(...)
 
 template <int stage = 1>
-MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim)
+MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant_type, bool mul_routed_weight)
 {
     static const auto lookup = []
     {
@@ -32,11 +34,11 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim)
     }
     if constexpr (stage == 1)
     {
-        return moe_stage1_heuristic_dispatch(block_m);
+        return moe_stage1_heuristic_dispatch(block_m, x_dtype, w_dtype, y_dtype, act_op, quant_type, mul_routed_weight);
     }
     else
     {
-        return moe_stage2_heuristic_dispatch(block_m, inter_dim);
+        return moe_stage2_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, 0, quant_type, mul_routed_weight);
     }
 }
 
@@ -52,7 +54,9 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                    std::optional<torch::Tensor> w1_scale = std::nullopt, // [e, 1, n], gate(up) scale
                    std::optional<torch::Tensor> a1_scale = std::nullopt, // [m, 1], token scale
                    std::optional<int> block_m = 32,
-                   std::optional<torch::Tensor> sorted_weights = std::nullopt)
+                   std::optional<torch::Tensor> sorted_weights = std::nullopt,
+                   int quant_type = 0,
+                   int activation = 0)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
     at::cuda::getCurrentCUDAStream().stream();
@@ -77,18 +81,21 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     void *out_ptr = out.data_ptr();
     void *w1_scale_ptr = w1_scale.has_value() ? w1_scale.value().data_ptr() : nullptr;
     void *a1_scale_ptr = a1_scale.has_value() ? a1_scale.value().data_ptr() : nullptr;
+    bool MulRoutedWeight = sorted_weights.has_value();
     if (!hidden_states_ptr || !w1_ptr || !w2_ptr || !sorted_token_ids_ptr || !sorted_expert_ids_ptr || !num_valid_ids_ptr || !out_ptr)
     {
         std::cerr << "detect null ptr !" << std::endl;
         return;
     }
 
-    if (hidden_states.dtype() == at::ScalarType::Byte && w1.dtype() == at::ScalarType::Byte)
+    if (hidden_states.dtype() == torch_fp4x2 && w1.dtype() == torch_fp4x2)
     {
         K *= 2;
     }
 
-    auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N);
+    activation = !activation;
+
+    auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight);
 
     kernel(at::cuda::getCurrentCUDAStream().stream(),
            tokens, sorted_size, N, K, topk,
@@ -107,7 +114,9 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                    std::optional<torch::Tensor> w2_scale = std::nullopt, // [e, 1, n], gate(up) scale
                    std::optional<torch::Tensor> a2_scale = std::nullopt, // [m, 1], token scale
                    std::optional<int> block_m = 32,
-                   std::optional<torch::Tensor> sorted_weights = std::nullopt)
+                   std::optional<torch::Tensor> sorted_weights = std::nullopt,
+                   int quant_type = 0,
+                   int activation = 0)
 {
     TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
                 "Out dtype only support BFloat16/Float16!")
@@ -129,16 +138,20 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     void *out_ptr = out.data_ptr();
     void *w2_scale_ptr = w2_scale.has_value() ? w2_scale.value().data_ptr() : nullptr;
     void *a2_scale_ptr = a2_scale.has_value() ? a2_scale.value().data_ptr() : nullptr;
+    bool MulRoutedWeight = sorted_weights.has_value();
+
     if (!inter_states_ptr || !w1_ptr || !w2_ptr || !sorted_token_ids_ptr || !sorted_expert_ids_ptr || !num_valid_ids_ptr || !out_ptr)
     {
         std::cerr << "detect null ptr !" << std::endl;
         return;
     }
-    if (inter_states.dtype() == at::ScalarType::Byte && w2.dtype() == at::ScalarType::Byte)
+    if (inter_states.dtype() == torch_fp4x2 && w2.dtype() == torch_fp4x2)
     {
         K *= 2;
     }
-    auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K);
+
+    activation = !activation;
+    auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight);
 
     kernel(at::cuda::getCurrentCUDAStream().stream(),
            tokens, sorted_size, N, K, topk,

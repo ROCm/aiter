@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
 from aiter import dtypes
+from aiter.test_common import checkAllclose
 
 # from ater.test_common import checkAllclose, perftest
 from torch.profiler import profile, ProfilerActivity
@@ -53,5 +54,6 @@ with profile(
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
 print(torch.equal(result, output))
+checkAllclose(result, output, msg="sigmoid")
 print("result:", result)
 print("output:", output)

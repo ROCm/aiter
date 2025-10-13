@@ -385,7 +385,7 @@ def run_aiter_asm(
     num_kv_heads,
     scale,
     alibi_slopes,
-    max_num_blocks,
+    block_tables_stride0,
     k_scale=None,
     v_scale=None,
     high_precision=0,
@@ -396,7 +396,7 @@ def run_aiter_asm(
         v_cache,
         block_tables,
         seq_lens,
-        max_num_blocks,
+        block_tables_stride0,
         K_QScale=k_scale,
         V_QScale=v_scale,
         out_=None,
@@ -577,7 +577,7 @@ def test_paged_attention(
             num_kv_heads,
             scale,
             alibi_slopes,
-            max_num_blocks_per_seq,
+            block_tables.stride(0),
         )
 
         checkAllclose(
@@ -634,6 +634,14 @@ def test_paged_attention(
             )
             k_scale_asm.fill_(k_scale_.item())
             v_scale_asm.fill_(v_scale_.item())
+            k_scale_hip_ = torch.empty(
+                num_blocks * block_size, num_kv_heads, dtype=dtypes.fp32, device=device
+            )
+            v_scale_hip_ = torch.empty(
+                num_blocks * block_size, num_kv_heads, dtype=dtypes.fp32, device=device
+            )
+            k_scale_hip_.fill_(k_scale_.item())
+            v_scale_hip_.fill_(v_scale_.item())
 
             out_aiter, time_aiter = run_aiter(
                 query,
@@ -646,8 +654,8 @@ def test_paged_attention(
                 num_kv_heads,
                 scale,
                 alibi_slopes,
-                k_scale_,
-                v_scale_,
+                k_scale_hip_,
+                v_scale_hip_,
             )
             checkAllclose(
                 out_golden,
@@ -687,7 +695,7 @@ def test_paged_attention(
                 num_kv_heads,
                 scale,
                 alibi_slopes,
-                max_num_blocks_per_seq,
+                block_tables.stride(0),
                 k_scale_asm,
                 v_scale_asm,
             )
@@ -718,7 +726,7 @@ def test_paged_attention(
                         num_kv_heads,
                         scale,
                         alibi_slopes,
-                        max_num_blocks_per_seq,
+                        block_tables.stride(0),
                         k_scale_asm,
                         v_scale_asm,
                         high_precision,
