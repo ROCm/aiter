@@ -1,13 +1,13 @@
 name: Aiter Release Package
 
+description: This workflow builds the Aiter Python package as a .whl file and upload it as the artifact.
+
 on:
   workflow_dispatch:
     inputs:
       commit:
         description: 'Commit hash to build (leave empty to use current commit)'
         required: false
-  pull_request:
-    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
