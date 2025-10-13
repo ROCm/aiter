@@ -115,6 +115,14 @@ if __name__ == "__main__":
         help="Tuning on multiple GPUs using multiple processes",
     )
     parser.add_argument(
+        "-k",
+        "--splitK",
+        action="store_true",
+        required=False,
+        help="Use splitK kernels",
+    )
+
+    parser.add_argument(
         "--tp",
         type=int,
         default=os.getenv("GTUNE_TP", 1),
@@ -174,7 +182,7 @@ if __name__ == "__main__":
     outdtype = get_dtype(args.outdtype)
 
     gtuner = GemmTuner(
-        indtype, outdtype, args.tuned_file, args.rocblas_decode, args.mp, args.errRatio
+        indtype, outdtype, args.tuned_file, args.rocblas_decode, args.mp, args.errRatio#, args.splitK
     )
     nsets = [i * args.batch_size for i in args.nsets]
     if args.input_file:
