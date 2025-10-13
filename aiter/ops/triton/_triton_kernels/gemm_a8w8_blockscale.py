@@ -43,6 +43,45 @@ _gemm_a8w8_blockscale_reduce_repr = make_kernel_repr(
 )
 
 
+
+@triton.jit
+def group_broadcast(
+    x,
+    xM: tl.constexpr,
+    xN: tl.constexpr,
+    group_size: tl.constexpr,
+    broadcast_dim: tl.constexpr,
+):
+    """
+    Broadcasts the input tensor `x` along the specified dimension `broadcast_dim`
+    in groups of size `group_size`.
+
+    Parameters:
+    - x: Input tensor to be broadcasted.
+    - group_size: Size of each group for broadcasting.
+    - broadcast_dim: Dimension along which to perform the broadcasting.
+
+    Returns:
+    - A tensor with the same shape as `x`, but with values broadcasted
+      in groups along the specified dimension.
+    """
+    if broadcast_dim == 0:
+        assert xM > 0, "broadcast_dim must be specified"
+        if xM > 1:
+            x = x.reshape(xM, 1, xN)
+            x = tl.broadcast_to(x, (xM, group_size, xN))
+            x = x.reshape(xM * group_size, xN)
+        # else: singleton dimension, no need to broadcast
+    else:
+        assert xN > 0, "broadcast_dim must be specified"
+        if xN > 1:
+            x = x.reshape(xM, xN, 1)
+            x = tl.broadcast_to(x, (xM, xN, group_size))
+            x = x.reshape(xM, xN * group_size)
+
+    return x
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -153,8 +192,7 @@ def _gemm_a8w8_blockscale_kernel(
         offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         pid_bn = pid_n * BLOCK_SIZE_N
-        pid_bn_last = pid_bn + BLOCK_SIZE_N - 1
-        offs_bn = (pid_bn + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_bn = (pid_bn + tl.arange(0, BLOCK_SIZE_N))
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
@@ -167,18 +205,15 @@ def _gemm_a8w8_blockscale_kernel(
         a_scale_ptrs = (
             a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
         )
-        offs_b_scale_n_full = pid_bn // GROUP_N
-        b_scale_ptrs_full = (
-            b_scale_ptr
-            + offs_k_scale * stride_bscale_k
-            + offs_b_scale_n_full * stride_bscale_n
-        )
-        offs_b_scale_n = offs_bn // GROUP_N
+        num_unique_scales_along_bn: tl.constexpr = (BLOCK_SIZE_N + GROUP_N - 1) // GROUP_N
+        num_unique_scales_along_n: tl.constexpr = (N + GROUP_N - 1) // GROUP_N
+        offs_b_scale_n = (
+            pid_n * BLOCK_SIZE_N // GROUP_N + tl.arange(0, num_unique_scales_along_bn)
+        ) % num_unique_scales_along_n
         b_scale_ptrs = (
-            b_scale_ptr
-            + offs_k_scale * stride_bscale_k
-            + offs_b_scale_n * stride_bscale_n
+            b_scale_ptr + offs_k_scale * stride_bscale_k + offs_b_scale_n * stride_bscale_n
         )
+
         offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
@@ -197,28 +232,21 @@ def _gemm_a8w8_blockscale_kernel(
                 b = tl.load(
                     b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K and offs_bn[None, :] < N, other=0.0
                 )
-
             a_scale = tl.load(a_scale_ptrs, mask=offs_am < M)
-            # b_scale = tl.load(b_scale_ptrs, mask=offs_bn < N)
+            b_scale = tl.load(b_scale_ptrs)
+            b_scale = group_broadcast(
+                b_scale,
+                xM=1,
+                xN=num_unique_scales_along_bn,
+                group_size=GROUP_N,
+                broadcast_dim=1,
+            )
 
-            if pid_bn_last >= N:
-                b_scales = tl.load(b_scale_ptrs, mask=offs_bn < N)
-                # b_scale = tl.load(b_scale_ptrs)
-                # Perform dot operation and apply scale
-                accumulator += (
-                    tl.dot(a, b, input_precision="ieee")
-                    * a_scale[:, None]
-                    * b_scales[None, :]
-                )
-            else:
-                b_scale = tl.load(b_scale_ptrs_full)
-                # Perform dot operation and apply scale
-                accumulator += (
-                    tl.dot(a, b, input_precision="ieee")
-                    * a_scale[:, None]
-                    * b_scale
-                )
-
+            accumulator += (
+                tl.dot(a, b, input_precision="ieee")
+                * a_scale[:, None]
+                * b_scale
+            )
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
             b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -228,7 +256,6 @@ def _gemm_a8w8_blockscale_kernel(
             # offs_ks = k_nxt - k_cur
             a_scale_ptrs += offs_ks_step * stride_ascale_k
             b_scale_ptrs += offs_ks_step * stride_bscale_k
-            b_scale_ptrs_full += offs_ks_step * stride_bscale_k
 
         c = accumulator.to(c_ptr.type.element_ty)
 
