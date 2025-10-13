@@ -42,7 +42,7 @@ def _gelu_tanh(x):
     return 0.5 * x * (1.0 + _tanh(inner))
 
 
-@tl.constexpr_function
+@triton.jit
 def _get_activation_from_str(activation: str):
     mapping = {
         "gelu": _gelu,

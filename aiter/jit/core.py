@@ -572,6 +572,7 @@ def compile_ops(
                 import typing
                 import re
                 import torch
+                
 
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
@@ -582,7 +583,9 @@ def compile_ops(
                         "List": List,
                         "Optional": Optional,
                         "torch": torch,
+                        "typing": typing,
                     }
+                    print(f'>>> my doc_str {doc_str}')
                     exec(
                         f"from aiter import*\ndef {doc_str}: pass",
                         namespace,
@@ -616,7 +619,7 @@ def compile_ops(
                                 raise TypeError(
                                     f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                 )
-                        elif origin is typing.Union:
+                        elif origin is typing.Union or origin is types.UnionType:
                             if arg is not None and not isinstance(arg, sub_t):
                                 raise TypeError(
                                     f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
