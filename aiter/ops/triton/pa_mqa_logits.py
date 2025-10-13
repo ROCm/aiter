@@ -8,12 +8,14 @@ from aiter.ops.triton._triton_kernels.pa_mqa_logits import (
     _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
     _deepgemm_fp8_paged_mqa_logits,
     _deepgemm_fp8_paged_mqa_logits_ragged_k,
+    _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k,
 )
 
 
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
     q_fp8: torch.Tensor,  # dtype = float8
     kv_cache_fp8: torch.Tensor,  # dtype = float8
+    kv_cache_scale,
     weights: torch.Tensor,  # dtype = float32
     out_logits: torch.Tensor,  # dtype = float32
     prefix_sum_context_lens: torch.Tensor,
@@ -23,13 +25,6 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
     SplitKV: int = 5,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
-    kv_cache_fp8, kv_cache_scale = (
-        kv_cache_fp8[..., :hidden_dim],
-        kv_cache_fp8[..., hidden_dim:],
-    )
-    # Since triton doesn't have have the reinterpret_cast, we slice the scale out and view it as float
-    kv_cache_scale = kv_cache_scale.view(torch.float32)
-    kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
 
     config = {
         "ChunkQ": heads,
@@ -39,7 +34,7 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
     }
 
     grid = (batch_size * next_n * config["SplitKV"],)
-    _deepgemm_fp8_paged_mqa_logits_ragged_k[grid](
+    dump_kernel = _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k[grid](
         batch_size,
         next_n,
         heads,
@@ -60,6 +55,11 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
         max_model_len,
         **config,
     )
+
+    for k, v in dump_kernel.asm.items():
+        if type(v) is str:
+            with open(f"kernel_{k}.s", "w") as f:
+                f.write(v)
 
 
 def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
@@ -168,7 +168,8 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
 
 def deepgemm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,  # dtype = float8
-    kv_cache_fp8: torch.Tensor,  # dtype = float8 [num_blocks, 1, 1, D+4]
+    kv_cache_fp8: torch.Tensor,  # dtype = float8
+    kv_cache_scale,
     weights: torch.Tensor,  # dtype = float32
     out_logits: torch.Tensor,  # dtype = float32
     context_lens: torch.Tensor,
@@ -179,13 +180,6 @@ def deepgemm_fp8_paged_mqa_logits(
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, max_blk_len = kv_indices.size()
-    kv_cache_fp8, kv_cache_scale = (
-        kv_cache_fp8[..., :hidden_dim],
-        kv_cache_fp8[..., hidden_dim:],
-    )
-    # Since triton doesn't have the reinterpret_cast, we slice the scale out and view it as float
-    kv_cache_scale = kv_cache_scale.view(torch.float32)
-    kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
 
     config = {
         "ChunkQ": heads,
@@ -195,7 +189,7 @@ def deepgemm_fp8_paged_mqa_logits(
     }
 
     grid = (batch_size * next_n * config["SplitKV"],)
-    _deepgemm_fp8_paged_mqa_logits[grid](
+    dump_kernel = _deepgemm_fp8_paged_mqa_logits[grid](
         batch_size,
         next_n,
         heads,
