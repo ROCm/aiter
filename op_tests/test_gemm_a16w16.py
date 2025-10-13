@@ -86,6 +86,7 @@ def aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
 def init_hipblas():
     hipb_create_extension()
 
+
 def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
