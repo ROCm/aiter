@@ -15,7 +15,7 @@ from gemm_a8w8_bpreshuffle_common import (
 )
 
 aiter_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, f"{aiter_dir}/aiter/")
+sys.path.insert(0, f"{aiter_dir}/")
 from aiter.utility import dtypes
 
 """
