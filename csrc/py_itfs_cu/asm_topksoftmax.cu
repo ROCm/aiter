@@ -2,8 +2,8 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "py_itfs_common.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 struct __attribute__((packed)) KernelArgs
@@ -122,8 +122,8 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
             topk);
     }
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     uint gdx = (num_tokens + SUBM - 1) / SUBM;
     TORCH_CHECK(gdx >> 31 == 0, "num_tokens too large: ", num_tokens);

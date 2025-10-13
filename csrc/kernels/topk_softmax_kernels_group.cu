@@ -1258,7 +1258,7 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
                              );
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
-    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     LAUNCH_KERNEL()
 }
@@ -1292,7 +1292,7 @@ void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
                              ~255;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
-    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     LAUNCH_KERNEL()
 }

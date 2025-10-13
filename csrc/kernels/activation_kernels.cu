@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/extension.h>
 
 #include <cmath>
@@ -164,8 +164,8 @@ static constexpr int nextPow2(unsigned int num)
     num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;                \
     dim3 grid(num_tokens);                                                                 \
     dim3 block(num_wave * 64);                                                             \
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));                      \
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();                          \
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));                      \
+    const hipStream_t stream = at::hip::getCurrentHIPStream();                          \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "act_and_mul_kernel", [&] {       \
         using input_dtype = typename t2ck<scalar_t>::type;                                 \
         AITER_DISPATCH_CASE_VEC_SIZE(                                                      \
@@ -186,8 +186,8 @@ static constexpr int nextPow2(unsigned int num)
     num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;                 \
     dim3 grid(num_tokens);                                                                  \
     dim3 block(num_wave * 64);                                                              \
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));                       \
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();                           \
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));                       \
+    const hipStream_t stream = at::hip::getCurrentHIPStream();                           \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_act_and_mul_kernel", [&] { \
         using input_dtype = typename t2ck<scalar_t>::type;                                  \
         AITER_DISPATCH_CASE_VEC_SIZE(                                                       \
@@ -253,8 +253,8 @@ __global__ void activation_kernel(scalar_t* __restrict__ out,         // [..., d
     int64_t num_tokens = input.numel() / d;                                                        \
     dim3 grid(num_tokens);                                                                         \
     dim3 block(std::min(d, 1024));                                                                 \
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));                              \
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();                                  \
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));                              \
+    const hipStream_t stream = at::hip::getCurrentHIPStream();                                  \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "activation_kernel", [&] {                \
         aiter::activation_kernel<scalar_t, KERNEL<scalar_t>>                                       \
             <<<grid, block, 0, stream>>>(out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), d); \

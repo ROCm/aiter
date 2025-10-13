@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 // #ifdef __gfx908__
 // // Uncomment ifdef and endif only if you need to undef the HIP_HALF ops below just for gfx908 and not for others
 // // below lines enable hip float to half conversion which are disabled by default in hip_fp16.h
@@ -56,11 +56,11 @@ namespace
 {
   rocblas_handle r_handle;
 
-  /*thread_local*/ cudaStream_t weight_stream;
+  /*thread_local*/ hipStream_t weight_stream;
   // BUG: DLM has event and stream on different devices error
   // In multi-GPU scenerio, do names defined in this namespace exist on all devices?
   // C++ keyword: thread_local <- maybe this can help?
-  /*thread_local*/ cudaEvent_t event;
+  /*thread_local*/ hipEvent_t event;
 
   // hipBLASLt
   hipblasLtHandle_t hipblaslt_handle;

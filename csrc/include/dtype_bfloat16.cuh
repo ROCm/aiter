@@ -1,11 +1,11 @@
 /*
- * Copyright © Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
  * Adapted from
  * https://github.com/NVIDIA/FasterTransformer/blob/release/v5.3_tag/src/fastertransformer/kernels/decoder_masked_multihead_attention/decoder_masked_multihead_attention_template.hpp
  * and
  * https://github.com/NVIDIA/FasterTransformer/blob/release/v5.3_tag/src/fastertransformer/kernels/decoder_masked_multihead_attention_utils.h
- * Copyright (c) 2023, The vLLM team.
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (C) 2023-2025, The vLLM team.
+ * Copyright (C) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,16 +24,10 @@
 #include "attention_generic.cuh"
 #include "dtype_float32.cuh"
 
-#ifndef USE_ROCM
-  #include <cuda_bf16.h>
-  #include <cuda_fp16.h>
-#else
-  #include <hip/hip_bf16.h>
-  #include <hip/hip_fp16.h>
-
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 typedef __hip_bfloat162 __nv_bfloat162;
 typedef __hip_bfloat16 __nv_bfloat16;
-#endif
 
 #include <stdint.h>
 

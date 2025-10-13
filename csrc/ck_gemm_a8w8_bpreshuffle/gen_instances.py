@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import os
-from pathlib import Path
-import pandas as pd
 import argparse
+import os
 import shutil
+from pathlib import Path
+
+import pandas as pd
 import torch
 from gemm_a8w8_bpreshuffle_common import (
+    default_kernels_dict,
     kernelInstance,
     kernels_list,
-    default_kernels_dict,
 )
-
 
 """
 
@@ -111,7 +111,7 @@ torch::Tensor
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "{name}.cuh"
+#include "impl/{name}.cuh"
 
 template torch::Tensor
 {name}<{dtypes}>(

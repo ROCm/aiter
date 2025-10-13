@@ -41,6 +41,28 @@ soltype = 0
 
 
 @torch_compile_guard()
+def create_ds_custom() -> None:
+    global solids, bestsols, solMap
+    df: pd.DataFrame = bestsols
+    solids = {}
+    for i in range(len(df)):
+        ds = df.iloc[i]
+        key = (
+            ds["M"],
+            ds["N"],
+            ds["K"],
+            ds["bias"],
+            ds["dtype"],
+            ds["outdtype"],
+            ds["scaleAB"],
+        )
+
+        if ds["libtype"] in ["hipblaslt", "rocblas", "asm"]:
+            soltype_ = solMap.index(ds["libtype"])
+        solids[key] = (soltype_, int(ds["solidx"]))
+
+
+@torch_compile_guard()
 def load_best_sols_custom(tune_path: str) -> bool:
     global bestsols
     cu_count = get_cu_num()
@@ -160,25 +182,7 @@ class TunedGemm:
             self.bestsols = bestsols
 
     def create_ds(self):
-        global solids
-        df: pd.DataFrame = self.bestsols
-        solds = {}
-        for i in range(len(df)):
-            ds = df.iloc[i]
-            key = (
-                ds["M"],
-                ds["N"],
-                ds["K"],
-                ds["bias"],
-                ds["dtype"],
-                ds["outdtype"],
-                ds["scaleAB"],
-            )
-
-            if ds["libtype"] in ["hipblaslt", "rocblas", "asm"]:
-                soltype = self.solMap.index(ds["libtype"])
-            solds[key] = (soltype, int(ds["solidx"]))
-        solids = solds
+        create_ds_custom()
         self.solfuncs = [
             self.apply_torch_mm,
             self.apply_hipb_mm,

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "gemm_moe_ck2stages_lookup.h"
 #include "gemm_moe_ck2stages.h"
 #include "ck2stages_moe_stage1_heuristic_dispatch.hpp"
@@ -58,8 +58,8 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                    int quant_type = 0,
                    int activation = 0)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
-    at::cuda::getCurrentCUDAStream().stream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
+    at::hip::getCurrentHIPStream();
 
     TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
                 "Out dtype only support BFloat16/Float16!")
@@ -97,7 +97,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
 
     auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight);
 
-    kernel(at::cuda::getCurrentCUDAStream().stream(),
+    kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
            hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr);
 }
@@ -153,7 +153,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     activation = !activation;
     auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight);
 
-    kernel(at::cuda::getCurrentCUDAStream().stream(),
+    kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
            inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr);
 }

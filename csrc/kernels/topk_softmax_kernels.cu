@@ -23,17 +23,12 @@
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
 #include "vec_convert.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
-#ifndef USE_ROCM
-#include <cub/cub.cuh>
-#include <cub/util_type.cuh>
-#else
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
-#endif
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -59,7 +54,7 @@ template <typename DTYPE, int TPB>
 __launch_bounds__(TPB) __global__
     void moeSoftmax(const DTYPE* input, const bool* finished, float* output, const int num_cols)
 {
-    using BlockReduce = cub::BlockReduce<float, TPB>;
+    using BlockReduce = hipcub::BlockReduce<float, TPB>;
     __shared__ typename BlockReduce::TempStorage tmpStorage;
 
     __shared__ float normalizing_factor;
@@ -67,7 +62,7 @@ __launch_bounds__(TPB) __global__
 
     const int thread_row_offset = blockIdx.x * num_cols;
 
-    cub::Sum sum;
+    hipcub::Sum sum;
     float threadData(-FLT_MAX);
 
     // Don't touch finished rows.
@@ -82,7 +77,7 @@ __launch_bounds__(TPB) __global__
         threadData    = max(static_cast<float>(input[idx]), threadData);
     }
 
-    const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, cub::Max());
+    const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, hipcub::Max());
     if(threadIdx.x == 0)
     {
         float_max = maxElem;
@@ -126,12 +121,12 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
                                                const bool need_renorm)
 {
 
-    using cub_kvp     = cub::KeyValuePair<int, float>;
-    using BlockReduce = cub::BlockReduce<cub_kvp, TPB>;
+    using cub_kvp     = hipcub::KeyValuePair<int, float>;
+    using BlockReduce = hipcub::BlockReduce<cub_kvp, TPB>;
     __shared__ typename BlockReduce::TempStorage tmpStorage;
 
     cub_kvp thread_kvp;
-    cub::ArgMax arg_max;
+    hipcub::ArgMax arg_max;
 
     const int num_rows  = gridDim.x;
     const int block_row = blockIdx.x;
@@ -491,7 +486,7 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                      const int output_stride,
                                      const int indices_stride,
                                      const bool need_renorm,
-                                     cudaStream_t stream)
+                                     hipStream_t stream)
 {
     static constexpr std::size_t MAX_BYTES_PER_LDG = 32;
 
@@ -562,7 +557,7 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
                                      const int topk_weights_stride,
                                      const int topk_id_stride,
                                      const bool need_renorm,
-                                     cudaStream_t stream)
+                                     hipStream_t stream)
 {
     static constexpr int WARPS_PER_TB = 8;
     switch(num_experts)
@@ -637,8 +632,8 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk]
     const bool needs_workspace   = !is_pow_2 || num_experts > 256;
     const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     torch::Tensor softmax_workspace =
         torch::empty({workspace_size}, gating_output.options().dtype(torch::kFloat32));
     VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "topk_softmax", [&] {
@@ -669,8 +664,8 @@ void moe_sum(torch::Tensor& input,  // [num_tokens, topk, hidden_size]
     dim3 grid(num_tokens);
     dim3 block(std::min(hidden_size, 1024));
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(output));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     switch(topk)
     {

@@ -3,9 +3,9 @@
 # generate kernel instances to speed up compilation
 
 import argparse
-from pathlib import Path
-from typing import List, Any
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, List
 
 
 def get_if_str(idx, total, last_else=True):
@@ -54,7 +54,7 @@ class BinaryOpCodegen:
 template <typename Op, typename T0, typename T1>
 void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output)
 {
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
   int dim = input.dim();
 
   bool is_support = false;
