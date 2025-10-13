@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Dict
 import functools
 import json
-import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 
 

@@ -7,12 +7,8 @@ import triton
 import triton.language as tl
 
 import aiter.ops.triton.utils.types as types
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.mha_fused_bwd import flash_attn_fused_backward
-from aiter.ops.triton.utils.mha_kernel_utils import _compute_fp8_scaling_factors
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton._triton_kernels.mha import _attn_fwd, _get_config

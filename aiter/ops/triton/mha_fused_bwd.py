@@ -4,7 +4,6 @@
 from typing import Optional, Dict
 import torch
 import triton
-import triton.language as tl
 
 from aiter.ops.triton.utils.types import _is_fp8
 from aiter.ops.triton.utils.logger import AiterTritonLogger
