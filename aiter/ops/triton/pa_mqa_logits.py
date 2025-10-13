@@ -27,7 +27,7 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
         kv_cache_fp8[..., :hidden_dim],
         kv_cache_fp8[..., hidden_dim:],
     )
-    # Since the triton don't have the reinterpret_cast, we slice the scale out and view it as float
+    # Since triton doesn't have have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
     kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
 
@@ -76,7 +76,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
         kv_cache_fp8[..., :hidden_dim],
         kv_cache_fp8[..., hidden_dim:],
     )
-    # Since the triton don't have the reinterpret_cast, we slice the scale out and view it as float
+    # Since triton doesn't have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
     kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
 
@@ -128,7 +128,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         kv_cache_fp8[..., :hidden_dim],
         kv_cache_fp8[..., hidden_dim:],
     )
-    # Since the triton don't have the reinterpret_cast, we slice the scale out and view it as float
+    # Since triton doesn't have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
     kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
 
@@ -183,7 +183,7 @@ def deepgemm_fp8_paged_mqa_logits(
         kv_cache_fp8[..., :hidden_dim],
         kv_cache_fp8[..., hidden_dim:],
     )
-    # Since the triton don't have the reinterpret_cast, we slice the scale out and view it as float
+    # Since triton doesn't have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
     kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
 
