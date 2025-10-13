@@ -53,6 +53,7 @@ from .ops.enum import *
 from .ops.norm import *
 from .ops.quant import *
 from .ops.gemm_op_a8w8 import *
+from .ops.gemm_op_a16w16 import *
 from .ops.gemm_op_a4w4 import *
 from .ops.batched_gemm_op_a8w8 import *
 from .ops.batched_gemm_op_bf16 import *
@@ -73,4 +74,5 @@ from .ops.topk import *
 from .ops.mha import *
 from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
+from .ops.sample import *
 from . import mla

@@ -193,7 +193,6 @@ def run_ck(
         (2048, 2048),
     ],
 )
-@benchmark()
 def test_flash_attn_output(
     batch_size,
     nheads,
@@ -349,6 +348,39 @@ def test_flash_attn_output(
     ret["bwd_tflops"] = (bwd_flop) / 1.0e6 / us_bwd
     ret["bwd_gb_per_sec"] = (bwd_num_bytes) / 1.0e3 / us_bwd
     return ret
+
+
+@benchmark()
+def test_fa_output_benchmark(
+    batch_size,
+    nheads,
+    seqlen_q,
+    seqlen_k,
+    d,
+    d_v,
+    dropout_p,
+    causal,
+    local,
+    bias_type,
+    deterministic,
+    mha_type,
+    dtype,
+):
+    return test_flash_attn_output(
+        batch_size,
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        d,
+        d_v,
+        dropout_p,
+        causal,
+        local,
+        bias_type,
+        deterministic,
+        mha_type,
+        dtype,
+    )
 
 
 @pytest.mark.parametrize(
@@ -753,7 +785,7 @@ if __name__ == "__main__":
     ) in itertools.product(
         l_dtype, l_dim, l_mha_type, l_causal, l_local, l_deterministic
     ):
-        ret = test_flash_attn_output(
+        ret = test_fa_output_benchmark(
             args.batch_size,
             args.nheads,
             args.seqlen_q,

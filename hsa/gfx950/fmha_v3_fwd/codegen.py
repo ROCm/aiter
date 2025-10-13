@@ -226,7 +226,7 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
                     }
                 }
                 else {
-                    if (t.mask_type == mask_enum::mask_bottom_right) {
+                    if (t.mask_type == mask_enum::mask_bottom_right && ((a.window_size_left == -1) && (a.window_size_right == 0))) {
                         if (t.has_lse == false) {
                             using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 0, GPUArch::gfx950, 1, true>;
                             if (is_v3_api_check) {

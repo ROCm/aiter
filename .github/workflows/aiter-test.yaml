@@ -15,17 +15,50 @@ env:
   DOCKER_IMAGE: "rocm/pytorch:latest"
 
 jobs:
+  define-runners:
+    runs-on: ubuntu-latest
+    outputs:
+      standard_runners: ${{ steps.machines.outputs.standard_runners }}
+      multigpu_runners: ${{ steps.machines.outputs.multigpu_runners }}
+
+    steps:
+      - name: Define whether runs on MI35X
+        id: machines
+        run: |
+          set -euo pipefail
+          pr_title="${{ github.event.pull_request.title }}"
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "It's main branch, running tests on MI300 and MI35X..."
+            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+          elif echo "$pr_title" | grep -qi "mi35x"; then
+            echo "PR title contains 'MI35X', running tests on MI300 and MI35X..."
+            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "Not main branch and PR title does not contain mi35x, only running on MI300..."
+            echo 'standard_runners=["aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
+          fi
+          echo "$GITHUB_OUTPUT"
+    
+      - name: Show output variable
+        run: |
+          echo "Standard: ${{ steps.machines.outputs.standard_runners }}"
+          echo "Multipe: ${{ steps.machines.outputs.multigpu_runners }}"
+
   standard:
+    needs: define-runners
     strategy:
       fail-fast: false
       matrix:
-        runner: [aiter-1gpu-runner] # TODO: add mi35x runner
+        runner: ${{ fromJSON(needs.define-runners.outputs.standard_runners) }}
     runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
+      
       - name: Sync submodules
         run: |
           set -euo pipefail
@@ -79,7 +112,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: standard-test-logs
+          name: standard-test-log-${{ matrix.runner }}
           path: latest_test.log
 
       - name: Cleanup container
@@ -93,10 +126,11 @@ jobs:
           ./.github/scripts/clean_up_rocm.sh
 
   multi-gpu:
+    needs: define-runners
     strategy:
       fail-fast: false
       matrix:
-        runner: [aiter-8gpu-runner] # TODO: add mi35x runner
+        runner: ${{ fromJSON(needs.define-runners.outputs.multigpu_runners) }}
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -156,7 +190,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: multigpu-test-logs
+          name: multigpu-test-${{ matrix.runner }}
           path: latest_test.log
 
       - name: Cleanup container
