@@ -29,7 +29,7 @@ def _quantize_bshd(
         - x (torch.Tensor): shape [batch, seq_len, heads, dim]
     Returns:
         - x_fp8 (torch.Tensor): FP8 tensor with the same shape as x
-        - descale_factor (torch.Tensor): tensor of shape [batch, heads]
+        - descale_factor (torch.Tensor): float32 tensor of shape [batch, heads] or [batch, groups]
     """
     if len(x.shape) != 4:
         raise ValueError(
@@ -48,7 +48,7 @@ def _quantize_bshd(
         # This does NOT create a differentiable path back to x; gradients stop at the cast.
         if x.requires_grad:
             x_fp8.requires_grad_(True)
-        descale_factor = x_abs_max / fp8_max
+        descale_factor = (x_abs_max / fp8_max).float()  # Always float32 for numerical stability
         return x_fp8, descale_factor
     # Grouped path
     if nheads % group_size != 0:
@@ -66,7 +66,7 @@ def _quantize_bshd(
     x_fp8 = x_scaled.to(fp8_dtype).view(batch, seqlen, nheads, dim)
     if x.requires_grad:
         x_fp8.requires_grad_(True)
-    descale_factor = x_abs_max_group / fp8_max  # (B, ngroups)
+    descale_factor = (x_abs_max_group / fp8_max).float()  # (B, ngroups) - Always float32 for numerical stability
     return x_fp8, descale_factor
 
 
@@ -83,7 +83,7 @@ def _quantize_thd(
         - x (torch.Tensor): shape [total_seq_len, heads, dim]
     Returns:
         - x_fp8 (torch.Tensor): shape [total_seq_len, heads, dim]
-        - descale_factors (torch.Tensor): shape [batch, heads]
+        - descale_factors (torch.Tensor): float32 tensor of shape [batch, heads] or [batch, groups]
     """
     # validate tensor shape
     if len(x.shape) != 3:
@@ -116,7 +116,7 @@ def _quantize_thd(
             x_abs_max = x_slice.abs().amax(dim=(0, 2))  # (heads)
             x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
             scale_i = fp8_max / x_abs_max
-            descale_i = x_abs_max / fp8_max
+            descale_i = (x_abs_max / fp8_max).float()  # Always float32 for numerical stability
             descale_factors[i, :] = descale_i
             scale_reshape = scale_i.view(1, num_heads, 1)
             x_fp8[start:end] = (x_slice * scale_reshape).to(fp8_dtype)
@@ -126,7 +126,7 @@ def _quantize_thd(
             x_abs_max_group = xg.abs().amax(dim=(0, 2, 3))  # (ngroups)
             x_abs_max_group = torch.maximum(x_abs_max_group, x.new_tensor(clamp_val))
             scale_group = fp8_max / x_abs_max_group
-            descale_group = x_abs_max_group / fp8_max
+            descale_group = (x_abs_max_group / fp8_max).float()  # Always float32 for numerical stability
             descale_factors[i, :] = descale_group
             scale_group_reshape = scale_group.view(1, ngroups, 1, 1)
             x_fp8[start:end] = (
