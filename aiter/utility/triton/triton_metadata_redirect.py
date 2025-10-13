@@ -10,7 +10,7 @@ metadata file paths during compilation. It allows redirecting .json and
 
 Example usage0 for jit:
     from aiter.utility.triton_metadata_redirect import with_custom_metadata_path
-    
+
     @with_custom_metadata_path("/custom/path")
     @triton.jit
     def my_kernel(...):
@@ -33,11 +33,13 @@ import triton.compiler.compiler as triton_compiler
 # Use thread-local storage to avoid multi-threading race conditions
 _thread_local = threading.local()
 
+
 def _get_thread_registry():
     """Get the registry for the current thread"""
-    if not hasattr(_thread_local, 'replacement_registry'):
+    if not hasattr(_thread_local, "replacement_registry"):
         _thread_local.replacement_registry = {}
     return _thread_local.replacement_registry
+
 
 # Lock to ensure patching happens only once
 _patch_lock = threading.Lock()
@@ -57,7 +59,7 @@ def _ensure_patched():
                 # Find kernel name from metadata group
                 kernel_name = None
                 for key in metadata_group:
-                    if key.endswith('.json'):
+                    if key.endswith(".json"):
                         kernel_name = key[:-5]  # Remove '.json' suffix
                         break
 
@@ -66,8 +68,12 @@ def _ensure_patched():
                     registry = _get_thread_registry()
                     if kernel_name in registry:
                         dir = registry[kernel_name]
-                        metadata_group[kernel_name + ".json"] = os.path.join(dir, f"{kernel_name}.json")
-                        metadata_group[kernel_name + ".hsaco"] = os.path.join(dir, f"{kernel_name}.hsaco")
+                        metadata_group[kernel_name + ".json"] = os.path.join(
+                            dir, f"{kernel_name}.json"
+                        )
+                        metadata_group[kernel_name + ".hsaco"] = os.path.join(
+                            dir, f"{kernel_name}.hsaco"
+                        )
 
                 # Call the original initialization method
                 _original_compiled_kernel_init(self, src, metadata_group, hash)
@@ -76,6 +82,7 @@ def _ensure_patched():
             triton_compiler.CompiledKernel.__init__ = _replacement_init
             _patched = True
 
+
 # Ensure patching is done when module is loaded
 _ensure_patched()
 
@@ -83,9 +90,9 @@ _ensure_patched()
 class AOTMetadataContext:
     """
     Context manager for AOT compilation with custom metadata paths
-    
+
     Uses thread-local storage to avoid multi-threading race conditions.
-    
+
     Example usage:
         with AOTMetadataContext("kernel_name", "/custom/path"):
             kernel = compile_kernel(...)
@@ -123,16 +130,18 @@ class AOTMetadataContext:
         # Don't suppress exceptions
         return False
 
+
 def with_custom_metadata_path(dir):
     """
     Decorator to register a kernel for metadata path replacement
-    
-    This decorator uses thread-local storage to ensure consistency 
+
+    This decorator uses thread-local storage to ensure consistency
     with the context manager approach.
-    
+
     Args:
         dir: Directory path where kernel metadata files should be stored
     """
+
     def decorator(func: Callable) -> Callable:
         # Save the original function
         original_func = func
@@ -147,6 +156,7 @@ def with_custom_metadata_path(dir):
         registry = _get_thread_registry()
         registry[original_func.__name__] = dir
 
+        # Add decorator markers
         wrapper._with_custom_metadata_path_applied = True
         wrapper._metadata_directory = dir
 
@@ -154,4 +164,3 @@ def with_custom_metadata_path(dir):
         return original_func
 
     return decorator
-
