@@ -13,7 +13,8 @@ import sys
 import time
 import traceback
 import types
-from typing import Any, Callable, List, Optional
+import typing
+from typing import Any, Callable, List, Optional, Union, get_args, get_origin
 
 from packaging.version import Version, parse
 
@@ -31,9 +32,9 @@ aiter_lib = None
 
 def mp_lock(
     lockPath: str,
-    MainFunc: callable,
-    FinalFunc: callable = None,
-    WaitFunc: callable = None,
+    MainFunc: Callable,
+    FinalFunc: Optional[Callable] = None,
+    WaitFunc: Optional[Callable] = None,
 ):
     """
     Using FileBaton for multiprocessing.
@@ -65,6 +66,97 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
+AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
+
+# config_env start here
+AITER_CONFIG_GEMM_A4W4 = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
+)
+AITER_CONFIG_FMOE = os.getenv(
+    "AITER_CONFIG_FMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
+    "AITER_CONFIG_A8W8_BATCHED_GEMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv",
+)
+
+AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
+    "AITER_CONFIG_BATCHED_GEMM_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
+)
+## merge config files
+##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
+import pandas as pd
+
+
+def update_config_files(file_path: str, merge_name: str):
+    path_list = file_path.split(os.pathsep) if file_path else []
+    if len(path_list) <= 1:
+        return file_path
+    df_list = []
+    df_list.append(pd.read_csv(path_list[0]))
+    for i, path in enumerate(path_list[1:]):
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            ## check columns
+            assert (
+                df.columns.tolist() == df_list[0].columns.tolist()
+            ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
+
+            df_list.append(df)
+        else:
+            print(f"path {i+1}: {path} (not exist)")
+    merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+    merge_df = merge_df.drop_duplicates(keep="last")
+    new_file_path = f"/tmp/{merge_name}.csv"
+    merge_df.to_csv(new_file_path, index=False)
+    return new_file_path
+
+
+AITER_CONFIG_GEMM_A4W4_FILE = update_config_files(
+    AITER_CONFIG_GEMM_A4W4, "a4w4_blockscale_tuned_gemm"
+)
+AITER_CONFIG_GEMM_A8W8_FILE = update_config_files(
+    AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
+)
+AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE = update_config_files(
+    AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE, "a8w8_bpreshuffle_tuned_gemm"
+)
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE = update_config_files(
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE, "a8w8_blockscale_tuned_gemm"
+)
+AITER_CONFIG_FMOE_FILE = update_config_files(AITER_CONFIG_FMOE, "tuned_fmoe")
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE = update_config_files(
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
+    "a8w8_blockscale_bpreshuffle_tuned_gemm",
+)
+AITER_CONFIG_A8W8_BATCHED_GEMM_FILE = update_config_files(
+    AITER_CONFIG_A8W8_BATCHED_GEMM, "a8w8_tuned_batched_gemm"
+)
+AITER_CONFIG_BF16_BATCHED_GEMM_FILE = update_config_files(
+    AITER_CONFIG_BF16_BATCHED_GEMM, "bf16_tuned_batched_gemm"
+)
+# config_env end here
 
 find_aiter = importlib.util.find_spec("aiter")
 if find_aiter is not None:
@@ -605,7 +697,6 @@ SPECIAL_OPS_MUTATES_ARGS = {}
 
 def generate_schema(func) -> str:
     import inspect
-    from typing import List, Optional, Union, get_args, get_origin
 
     import torch
 
@@ -797,7 +888,6 @@ def compile_ops(
                 get_asm_dir()
                 import inspect
                 import re
-                import typing
 
                 import torch
 
