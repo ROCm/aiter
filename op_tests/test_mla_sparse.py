@@ -227,12 +227,12 @@ def triton_convert_req_index_to_global_index(
 ):
     """
     out[token_id, indice_id] =
-        block_table[req_id[token_id], 
+        block_table[req_id[token_id],
             token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_SIZE
         + token_indices[token_id, indice_id] % BLOCK_SIZE
 
     Only when token_indices[token_id, indice_id] == -1 do we output -1.
-    For safety, we also output -1 if the derived block_id would be 
+    For safety, we also output -1 if the derived block_id would be
         out-of-bounds.
     """
     assert kv_indices.dtype == torch.int32
@@ -258,7 +258,7 @@ def triton_convert_req_index_to_global_index(
     ti_stride0, ti_stride1 = token_indices_c.stride()
     out_stride0, out_stride1 = out.stride()
 
-    # Exact 2D grid: tokens × column tiles
+    # Exact 2D grid: tokens x column tiles
     grid = (num_tokens, tiles_per_row)
 
     _convert_req_index_to_global_index_kernel[grid](
@@ -389,14 +389,6 @@ def test_mla(
         [batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
     )
 
-    split_params = {
-        "kv_granularity": max(page_size, 16),
-        "max_seqlen_qo": max_seqlen_qo,
-        "uni_seqlen_qo": mtp,
-        "fast_mode": 1,
-        "topk": 2048,
-    }
-
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
@@ -409,7 +401,11 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        split_params=split_params,
+        kv_granularity=max(page_size, 16),
+        max_seqlen_qo=int(max_seqlen_qo),
+        uni_seqlen_qo=mtp,
+        fast_mode=True,
+        topk=2048,
     )
 
 
@@ -424,7 +420,7 @@ def test_mla(
         new_kv_indptr, new_indices = sparse_kv_indptr_to_dense(
             kv_indptr,
             converted_indices,
-        ) 
+        )
 
         out_ref, lse_ref = torch_mla_extend(
             q,

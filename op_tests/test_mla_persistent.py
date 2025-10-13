@@ -241,13 +241,6 @@ def test_mla(
         [batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
     )
 
-    split_params = {
-        "kv_granularity": max(page_size, 16),
-        "max_seqlen_qo": max_seqlen_qo,
-        "uni_seqlen_qo": mtp,
-        "fast_mode": 1,
-    }
-
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
@@ -260,7 +253,10 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        split_params=split_params,
+        kv_granularity=max(page_size, 16),
+        max_seqlen_qo=int(max_seqlen_qo),
+        uni_seqlen_qo=mtp,
+        fast_mode=True,
     )
 
     def test_absorb_decode():

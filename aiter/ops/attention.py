@@ -292,6 +292,7 @@ def mla_decode_stage1_asm_fwd(
     # [batch_size]
     kv_last_page_lens: torch.Tensor,
     num_kv_splits_indptr: Optional[torch.Tensor],
+    work_metadata: Optional[torch.Tensor],
     work_indptr: Optional[torch.Tensor],
     work_info_set: Optional[torch.Tensor],
     max_seqlen_q: int,
@@ -362,22 +363,27 @@ def get_mla_metadata_v1(
     reduce_indptr: torch.Tensor,
     reduce_final_map: torch.Tensor,
     reduce_partial_map: torch.Tensor,
-    split_params: Optional[dict[str, int]] = None,
-):
+    kv_granularity: int = 16,
+    max_seqlen_qo: int = -1,
+    uni_seqlen_qo: int = -1,
+    fast_mode: bool = True,
+    topk: int = -1,
+) -> None:
     """
     Inputs:
         cumulated seqlens of q/o: (batch_size + 1), dtype torch.int32.
         cumulated seqlens of k/v: (batch_size + 1), dtype torch.int32.
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
-        is_causal: whether causal mask is enabled.
-        split_params: detailed settings for spliting. all of them are optional.
-            kv_granularity: default=16. the granularity on kv sequence length when cutting batch.
-            max_seqlen_qo: default=-1. used to check lds usage and save time. value less than 1 means unknown.
-            uni_seqlen_qo: default=-1. sequence length of qo is uniform across batches. value less than 1 means the
+        is_causal: Whether causal mask is enabled.
+        Options: Detailed settings for spliting. all of them are optional.
+            kv_granularity: default=16. The granularity on kv sequence length when cutting batch.
+            max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
+            uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
                            length is not fixed.
-            fast_mode: default=0. a non-zero value means user want metadata become as fast as possible. Note that fast
+            fast_mode: default=True. Whether user wants metadata become as fast as possible. Note that fast
                        mode may lead to bad overall performance.
+            topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
     Outputs:
         [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
                                                     work_info.
@@ -450,4 +456,4 @@ def mla_reduce_v1(
     reduce_partial_map: torch.Tensor,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
-): ...
+) -> None: ...

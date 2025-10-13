@@ -97,44 +97,13 @@ void get_mla_metadata_v1(
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
     torch::Tensor&       reduce_partial_map,
-    std::optional<std::map<std::string, int32_t>> split_params)
+    const int32_t        kv_granularity,
+    const int32_t        max_seqlen_qo,
+    const int32_t        uni_seqlen_qo,
+    const bool           fast_mode,
+    const int32_t        topk)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
-
-    int32_t kv_granularity = 16;
-    int32_t max_seqlen_qo  = -1;
-    int32_t uni_seqlen_qo  = -1;
-    int32_t topk           = -1;
-    bool    fast_mode      = false;
-
-    if (split_params.has_value())
-    {
-        if (split_params->find("kv_granularity") != split_params->end())
-        {
-            kv_granularity = split_params->find("kv_granularity")->second;
-        }
-
-        if (split_params->find("max_seqlen_qo") != split_params->end())
-        {
-            max_seqlen_qo = split_params->find("max_seqlen_qo")->second;
-        }
-
-        if (split_params->find("uni_seqlen_qo") != split_params->end())
-        {
-            uni_seqlen_qo = split_params->find("uni_seqlen_qo")->second;
-            max_seqlen_qo = (uni_seqlen_qo > 0) ? uni_seqlen_qo : max_seqlen_qo;
-        }
-
-        if (split_params->find("fast_mode") != split_params->end())
-        {
-            fast_mode = split_params->find("fast_mode")->second != 0;
-        }
-
-        if (split_params->find("topk") != split_params->end())
-        {
-            topk = split_params->find("topk")->second;
-        }
-    }
 
     TORCH_CHECK((kv_granularity & (kv_granularity - 1)) == 0,
                 __func__, ": kv_granularity Must be power of 2!");

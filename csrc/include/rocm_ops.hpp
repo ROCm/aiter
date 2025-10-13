@@ -1209,7 +1209,11 @@
           py::arg("reduce_indptr"),                     \
           py::arg("reduce_final_map"),                  \
           py::arg("reduce_partial_map"),                \
-          py::arg("split_params") = std::nullopt);      \
+          py::arg("kv_granularity") = 16,               \
+          py::arg("max_seqlen_qo") = -1,                \
+          py::arg("uni_seqlen_qo") = -1,                \
+          py::arg("fast_mode") = true,                  \
+          py::arg("topk") = -1);                        \
     m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
 
 #define MLA_REDUCE_PYBIND                             \
