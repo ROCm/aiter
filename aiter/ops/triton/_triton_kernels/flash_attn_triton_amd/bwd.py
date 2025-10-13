@@ -4112,30 +4112,50 @@ def attention_backward_triton_impl(
             assert (
                 q_descale.shape[0] == batch and q_descale.shape[1] == nheads_k
             ), f"q_descale shape {q_descale.shape} != expected {(batch, nheads_k)}"
-            assert q_descale.dtype == torch.float32, f"q_descale must be float32, got {q_descale.dtype}"
-            assert q_descale.device == q.device, f"q_descale must be on same device as q"
+            assert (
+                q_descale.dtype == torch.float32
+            ), f"q_descale must be float32, got {q_descale.dtype}"
+            assert (
+                q_descale.device == q.device
+            ), f"q_descale must be on same device as q"
         else:
-            q_descale = torch.ones(batch, nheads_k, dtype=torch.float32, device=q.device)
-        
+            q_descale = torch.ones(
+                batch, nheads_k, dtype=torch.float32, device=q.device
+            )
+
         if k_descale is not None:
             assert (
                 k_descale.shape[0] == batch and k_descale.shape[1] == nheads_k
             ), f"k_descale shape {k_descale.shape} != expected {(batch, nheads_k)}"
-            assert k_descale.dtype == torch.float32, f"k_descale must be float32, got {k_descale.dtype}"
-            assert k_descale.device == q.device, f"k_descale must be on same device as q"
+            assert (
+                k_descale.dtype == torch.float32
+            ), f"k_descale must be float32, got {k_descale.dtype}"
+            assert (
+                k_descale.device == q.device
+            ), f"k_descale must be on same device as q"
         else:
-            k_descale = torch.ones(batch, nheads_k, dtype=torch.float32, device=q.device)
+            k_descale = torch.ones(
+                batch, nheads_k, dtype=torch.float32, device=q.device
+            )
 
         if v_descale is not None:
             assert (
                 v_descale.shape[0] == batch and v_descale.shape[1] == nheads_k
             ), f"v_descale shape {v_descale.shape} != expected {(batch, nheads_k)}"
-            assert v_descale.dtype == torch.float32, f"v_descale must be float32, got {v_descale.dtype}"
-            assert v_descale.device == q.device, f"v_descale must be on same device as q"
+            assert (
+                v_descale.dtype == torch.float32
+            ), f"v_descale must be float32, got {v_descale.dtype}"
+            assert (
+                v_descale.device == q.device
+            ), f"v_descale must be on same device as q"
         else:
-            v_descale = torch.ones(batch, nheads_k, dtype=torch.float32, device=q.device)
+            v_descale = torch.ones(
+                batch, nheads_k, dtype=torch.float32, device=q.device
+            )
 
-        assert q_descale is not None and k_descale is not None and v_descale is not None, "q_descale, k_descale, and v_descale must be provided for fp8 training"
+        assert (
+            q_descale is not None and k_descale is not None and v_descale is not None
+        ), "q_descale, k_descale, and v_descale must be provided for fp8 training"
 
         stride_descale_q_z = q_descale.stride(0)
         stride_descale_k_z = k_descale.stride(0)

@@ -6,10 +6,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
-from aiter.ops.triton.utils.mha_kernel_utils import (
-    _dequantize_bshd,
-    _dequantize_varlen_thd,
-)
+
 
 class _FlashAttnV3Func(torch.autograd.Function):
     @staticmethod
@@ -88,7 +85,9 @@ class _FlashAttnV3Func(torch.autograd.Function):
             sm_margin,
         )
 
-        ctx.save_for_backward(q, k, v, out, softmax_lse, q_descale, k_descale, v_descale)
+        ctx.save_for_backward(
+            q, k, v, out, softmax_lse, q_descale, k_descale, v_descale
+        )
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -100,7 +99,7 @@ class _FlashAttnV3Func(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
         q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
- 
+
         dq, dk, dv, _delta = flash_attn_3.bwd(
             dout,
             q,
@@ -257,7 +256,9 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
             sm_margin,
         )
 
-        ctx.save_for_backward(q, k, v, out, softmax_lse, q_descale, k_descale, v_descale)
+        ctx.save_for_backward(
+            q, k, v, out, softmax_lse, q_descale, k_descale, v_descale
+        )
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size

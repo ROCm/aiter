@@ -16,7 +16,7 @@ from aiter.ops.triton.mha import (
 from aiter.ops.triton.mha_v3 import (
     flash_attn_func as flash_attn_func_v3,
     flash_attn_varlen_func as flash_attn_varlen_func_v3,
-    flash_attn_with_kvcache as flash_attn_with_kvcache_v3
+    flash_attn_with_kvcache as flash_attn_with_kvcache_v3,
 )
 from aiter.ops.triton.utils.mha_kernel_utils import _quantize_bshd, _quantize_thd
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
