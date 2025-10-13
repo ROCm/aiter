@@ -79,7 +79,9 @@ def _attn_fwd_inner(
     l_i,
     m_i,
     q,
+    q_pe,
     k_ptrs,
+    k_pe_ptrs,
     v_ptrs,
     stride_kn,
     stride_vk,
@@ -107,6 +109,7 @@ def _attn_fwd_inner(
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DMODEL_POW2: tl.constexpr,
+    BLOCK_DMODEL_PE: tl.constexpr,  # it's zero or a power of 2
     SM_SCALE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     MASK_STEPS: tl.constexpr,
@@ -115,12 +118,17 @@ def _attn_fwd_inner(
     PADDED_HEAD: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    ENABLE_PIPELINING: tl.constexpr,
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
+    HAS_PE: tl.constexpr = BLOCK_DMODEL_PE > 0
 
     # loop over k, v, and update accumulator
 
-    for start_n in range(block_min, block_max, BLOCK_N):
+    num_stages: tl.constexpr = (
+        None if ENABLE_PIPELINING else 1
+    )  # Set num_stages==1 if we want to disable pipelining
+    for start_n in tl.range(block_min, block_max, BLOCK_N, num_stages=num_stages):
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         if MASK_STEPS:
@@ -129,6 +137,14 @@ def _attn_fwd_inner(
             k_offs_n = None
         k_offs_k = None if not PADDED_HEAD else tl.arange(0, BLOCK_DMODEL_POW2)
         k = _load_fn(k_ptrs, k_offs_k, k_offs_n, BLOCK_DMODEL, seqlen_k)
+        if HAS_PE:
+            k_pe = _load_fn(
+                k_pe_ptrs,
+                None,
+                k_offs_n,
+                (BLOCK_DMODEL + BLOCK_DMODEL_PE),
+                seqlen_k,
+            )
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # We start from end of seqlen_k so only the first iteration would need
@@ -163,6 +179,8 @@ def _attn_fwd_inner(
             qk += tl.dot(q, k) * descale_q * descale_k
         else:
             qk += tl.dot(q, k)
+            if HAS_PE:
+                qk += tl.dot(q_pe, k_pe)
 
         if IS_CAUSAL:
             causal_boundary = start_n + offs_n_causal
@@ -229,6 +247,8 @@ def _attn_fwd_inner(
             acc += tl.dot(p.to(v.type.element_ty), v)
 
         k_ptrs += BLOCK_N * stride_kn
+        if HAS_PE:
+            k_pe_ptrs += BLOCK_N * stride_kn
         v_ptrs += BLOCK_N * stride_vk
         if RETURN_SCORES:
             sd_mask_ptrs += BLOCK_N * stride_sn
@@ -296,6 +316,7 @@ def _attn_fwd(
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DMODEL_POW2: tl.constexpr,
+    BLOCK_DMODEL_PE: tl.constexpr,  # it's zero or a power of 2
     RETURN_SCORES: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     IS_FP8: tl.constexpr,
@@ -321,6 +342,9 @@ def _attn_fwd(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
+    HAS_PE: tl.constexpr = BLOCK_DMODEL_PE > 0
+    if HAS_PE:
+        offs_pe = BLOCK_DMODEL + tl.arange(0, BLOCK_DMODEL_PE)
 
     # NOTE:
     # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
@@ -394,6 +418,38 @@ def _attn_fwd(
         stride_lse_z = stride_lse_z_in
         stride_lse_h = stride_lse_h_in
         stride_lse_m = stride_lse_m_in
+
+    tl.assume(stride_qz_in >= 0)
+    tl.assume(stride_qh_in >= 0)
+    tl.assume(stride_qm_in >= 0)
+    tl.assume(stride_qk_in >= 0)
+    tl.assume(stride_kz_in >= 0)
+    tl.assume(stride_kh_in >= 0)
+    tl.assume(stride_kn_in >= 0)
+    tl.assume(stride_kk_in >= 0)
+    tl.assume(stride_vz_in >= 0)
+    tl.assume(stride_vh_in >= 0)
+    tl.assume(stride_vn_in >= 0)
+    tl.assume(stride_vk_in >= 0)
+    if IS_FP8:
+        tl.assume(stride_descale_q_z_in >= 0)
+        tl.assume(stride_descale_k_z_in >= 0)
+        tl.assume(stride_descale_v_z_in >= 0)
+        tl.assume(stride_oz_in >= 0)
+        tl.assume(stride_oh_in >= 0)
+        tl.assume(stride_om_in >= 0)
+        tl.assume(stride_on_in >= 0)
+        tl.assume(stride_alibi_z_in >= 0)
+        tl.assume(stride_alibi_h_in >= 0)
+    # NOTE: philox offset is need in dropout pointer calculations
+    tl.assume(philox_offset_base_in >= 0)
+    tl.assume(stride_sd_z_in >= 0)
+    tl.assume(stride_sd_h_in >= 0)
+    tl.assume(stride_sd_m_in >= 0)
+    tl.assume(stride_sd_n_in >= 0)
+    tl.assume(stride_lse_z_in >= 0)
+    tl.assume(stride_lse_h_in >= 0)
+    tl.assume(stride_lse_m_in >= 0)
 
     if VARLEN:
         cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
@@ -479,6 +535,17 @@ def _attn_fwd(
         + offs_d[None, :] * stride_qk
     )
     q_ptrs = q_ptr + q_offs
+    if HAS_PE:
+        q_pe_offs = (
+            off_z * stride_qz
+            + off_q_head * stride_qh
+            + cu_seqlens_q_start * stride_qm
+            + offs_m[:, None] * stride_qm
+            + offs_pe[None, :] * stride_qk
+        )
+        q_pe_ptrs = q_ptr + q_pe_offs
+    else:
+        q_pe_ptrs = None
 
     k_offs = (
         off_z * stride_kz
@@ -488,6 +555,17 @@ def _attn_fwd(
         + offs_n[None, :] * stride_kn
     )
     k_ptrs = k_ptr + k_offs
+    if HAS_PE:
+        k_pe_offs = (
+            off_z * stride_kz
+            + off_k_head * stride_kh
+            + cu_seqlens_k_start * stride_kn
+            + offs_pe[:, None] * stride_kk
+            + offs_n[None, :] * stride_kn
+        )
+        k_pe_ptrs = k_ptr + k_pe_offs
+    else:
+        k_pe_ptrs = None
 
     v_offs = (
         off_z * stride_vz
@@ -545,6 +623,11 @@ def _attn_fwd(
     else:
         q_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < BLOCK_DMODEL)
     q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+    if HAS_PE:
+        q_pe = tl.load(q_pe_ptrs, mask=q_mask, other=0.0)
+    else:
+        q_pe = None
+
     if IS_FP8:
         descale_q = tl.load(descale_q_ptr + off_z * stride_descale_q_z + off_q_head)
         descale_k = tl.load(descale_k_ptr + off_z * stride_descale_k_z + off_k_head)
@@ -584,7 +667,9 @@ def _attn_fwd(
             l_i,
             m_i,
             q,
+            q_pe,
             k_ptrs,
+            k_pe_ptrs,
             v_ptrs,
             stride_kn,
             stride_vn,
@@ -612,6 +697,7 @@ def _attn_fwd(
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE,
             sm_scale,
             False,
             MASK_STEPS=False,
@@ -620,6 +706,7 @@ def _attn_fwd(
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            ENABLE_PIPELINING=True,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -631,6 +718,8 @@ def _attn_fwd(
         else:
             offs_n_causal = 0
         k_ptrs += n_full_blocks * BLOCK_N * stride_kn
+        if HAS_PE:
+            k_pe_ptrs += n_full_blocks * BLOCK_N * stride_kn
         v_ptrs += n_full_blocks * BLOCK_N * stride_vn
         if RETURN_SCORES:
             s_dmask_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
@@ -641,7 +730,9 @@ def _attn_fwd(
             l_i,
             m_i,
             q,
+            q_pe,
             k_ptrs,
+            k_pe_ptrs,
             v_ptrs,
             stride_kn,
             stride_vn,
@@ -669,6 +760,7 @@ def _attn_fwd(
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE,
             sm_scale,
             IS_CAUSAL,
             MASK_STEPS=True,
@@ -677,6 +769,7 @@ def _attn_fwd(
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            ENABLE_PIPELINING=False,
         )
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -759,6 +852,7 @@ def _attn_fwd(
 def _get_config(
     enable_dropout: bool,
     dtype: torch.dtype,
+    has_pe: bool = False,
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
@@ -768,7 +862,9 @@ def _get_config(
             config = json.load(file)
         _get_config._config_dict["default"] = config
 
-    if enable_dropout or dtype == torch.float32:
+    if has_pe and "pe" in _get_config._config_dict["default"]["fwd"]:
+        return _get_config._config_dict["default"]["fwd"]["pe"]
+    elif enable_dropout or dtype == torch.float32:
         return _get_config._config_dict["default"]["fwd"]["dropout_or_fp32"]
     else:
         return _get_config._config_dict["default"]["fwd"]["default"]
