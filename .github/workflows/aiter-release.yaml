@@ -80,10 +80,7 @@ jobs:
           set -e
           echo "Building aiter whl packages..."
           docker exec \
-          -e PREBUILD_KERNELS=1 \
-          -e GPU_ARCHS="gfx942;gfx950" \
           -w /workspace \
           aiter_build \
-          python3 setup.py bdist_wheel
-          docker exec -w /workspace aiter_build ls dist/*.whl
+          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="gfx942;gfx950" python3 setup.py bdist_wheel && ls dist/*.whl'
           
