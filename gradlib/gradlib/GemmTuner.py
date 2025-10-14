@@ -455,7 +455,6 @@ class Gemm:
             solutions = self.rocb_top_sols
         task = []
         gtimes = {}
-        print("roblas solutions: ", solutions)
         for solidx in solutions:
             info = (
                 (self.m, self.n, self.k, False, self.indtype, self.outdtype, False),

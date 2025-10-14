@@ -27,6 +27,8 @@ from aiter import logger, dtypes
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter import gemm_a16w16_asm
+from typing import Dict, Any
+
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -35,6 +37,8 @@ bestsols = {}
 solids = {}
 
 solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
+
+asm_solMap = {}
 
 # We need to set is 0 as default, None will error in torch.compile fakeTensor execution
 soltype = 0
@@ -59,7 +63,7 @@ def create_ds_custom() -> None:
 
         if ds["libtype"] in ["hipblaslt", "rocblas", "asm"]:
             soltype_ = solMap.index(ds["libtype"])
-        solids[key] = (soltype_, int(ds["solidx"]))
+        solids[key] = (soltype_, int(ds["solidx"]), int(ds["splitK"]), ds["kernelName"])
 
 
 @torch_compile_guard()
@@ -92,9 +96,11 @@ def load_best_sols_custom(tune_path: str) -> bool:
 def query_sol_core(
     m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
 ) -> int:
-    global solids, solMap, soltype
+    global solids, solMap, soltype, asm_solMap
     soltype = None
     solution_idx = 0
+    splitK = 0
+    kernelName = ""
     cu_count = get_cu_num()
     if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
         if (
@@ -108,12 +114,14 @@ def query_sol_core(
             soltype, solution_idx = 3, 2
 
     if soltype is None:
-        soltype, solution_idx = solids.get(
-            (int(m), n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
+        (soltype, solution_idx, splitK, kernelName) = solids.get(
+            (int(m), n, k, bias, str(dtype), str(otype), scaleAB), (0, 0, 0, "")
         )
+        asm_solMap[solution_idx] = (splitK, kernelName)
+        logger.info(f"{m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=} found in tuned_gemm.csv")
     solution_name = solMap[soltype]
     logger.info(
-        f"using {solution_name} solution:{solution_idx} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
+        f"using {solution_name} solution:{solution_idx}, {splitK} {kernelName} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
     )
     return solution_idx
 
@@ -322,18 +330,16 @@ class TunedGemm:
         self,
         inp,
         weights,
-        solidx,
         bias=None,
         otype=None,
-        scale_a=None,
-        scale_b=None,
-        scale_c=None,
+        splitK=None,
+        KernelName=None,
     ):
         # just support bf16gemm_outFp32
         out_asm = torch.empty(
             inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
         )
-        return gemm_a16w16_asm(inp, weights, out_asm, bias)
+        return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName)
 
     def mm(
         self,
@@ -375,9 +381,16 @@ class TunedGemm:
             otype=str(otype) if otype is not None else str(inp.dtype),
             scaleAB=scale_a is not None or scale_b is not None,
         )
-        out = self.solfuncs[soltype](
-            inp_view, weights, solution_idx, bias, otype, scale_a, scale_b, scale_c
-        )
+        #splitK = result_dict.get("splitK", None)
+        #kernelName = result_dict.get("kernelName", None)
+        #solution_idx = result_dict.get("solution_idx", 0)
+        if solMap[soltype] == "asm":
+            splitK, kernelName = asm_solMap[solution_idx]
+            out = self.apply_asm_mm(inp_view, weights, bias, otype, splitK, kernelName)
+        else:
+            out = self.solfuncs[soltype](
+                inp_view, weights, solution_idx, bias, otype, scale_a, scale_b, scale_c
+            )
         if batched:
             out = out.view(*inp.shape[:-1], weights.shape[0])
         if otype is not None:
