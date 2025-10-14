@@ -520,6 +520,33 @@
           py::arg("alibi_slopes") = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
+#define MHA_VARLEN_FWD_ASM_PYBIND                 \
+    m.def("fmha_v3_varlen_fwd",                   \
+          &aiter::torch_itfs::fmha_v3_varlen_fwd, \
+          py::arg("q"),                           \
+          py::arg("k"),                           \
+          py::arg("v"),                           \
+          py::arg("cu_seqlens_q"),                \
+          py::arg("cu_seqlens_k"),                \
+          py::arg("max_seqlen_q"),                \
+          py::arg("max_seqlen_k"),                \
+          py::arg("min_seqlen_q"),                \
+          py::arg("dropout_p"),                   \
+          py::arg("softmax_scale"),               \
+          py::arg("logits_soft_cap"),             \
+          py::arg("zero_tensors"),                \
+          py::arg("is_causal"),                   \
+          py::arg("window_size_left"),            \
+          py::arg("window_size_right"),           \
+          py::arg("return_softmax_lse"),          \
+          py::arg("return_dropout_randval"),      \
+          py::arg("how_v3_bf16_cvt"),             \
+          py::arg("out")          = std::nullopt, \
+          py::arg("block_table")  = std::nullopt, \
+          py::arg("bias")         = std::nullopt, \
+          py::arg("alibi_slopes") = std::nullopt, \
+          py::arg("gen")          = std::nullopt);
+
 #define MHA_VARLEN_BWD_PYBIND                     \
     m.def("mha_varlen_bwd",                       \
           &aiter::torch_itfs::mha_varlen_bwd,     \
@@ -558,11 +585,14 @@
           py::arg("num_valid_ids"),                  \
           py::arg("out"),                            \
           py::arg("topk"),                           \
-          py::arg("kernelName"),                     \
+          py::arg("kernelName")     = "",            \
           py::arg("w1_scale")       = std::nullopt,  \
           py::arg("a1_scale")       = std::nullopt,  \
           py::arg("block_m")        = 32,            \
-          py::arg("sorted_weights") = std::nullopt); \
+          py::arg("sorted_weights") = std::nullopt,  \
+          py::arg("quant_type") = 0,                 \
+          py::arg("activation") = 0);                \
+                                                     \
                                                      \
     m.def("ck_moe_stage2",                           \
           &ck_moe_stage2,                            \
@@ -574,11 +604,14 @@
           py::arg("num_valid_ids"),                  \
           py::arg("out"),                            \
           py::arg("topk"),                           \
-          py::arg("kernelName"),                     \
+          py::arg("kernelName")     = "",            \
           py::arg("w2_scale")       = std::nullopt,  \
           py::arg("a2_scale")       = std::nullopt,  \
           py::arg("block_m")        = 32,            \
-          py::arg("sorted_weights") = std::nullopt);
+          py::arg("sorted_weights") = std::nullopt,  \
+          py::arg("quant_type") = 0,                 \
+          py::arg("activation") = 0);                \
+
 
 
 #define MOE_CKTILE_2STAGES_PYBIND                    \
@@ -836,7 +869,7 @@
           py::arg("input"),                                       \
           py::arg("weight"),                                      \
           py::arg("bias"),                                        \
-          py::arg("epsilon"),                                     \
+          py::arg("epsilon") = 1e-5f,                             \
           py::arg("x_bias") = std::nullopt);                      \
     m.def("layernorm2d_fwd_with_add",                             \
           &layernorm2d_with_add,                                  \

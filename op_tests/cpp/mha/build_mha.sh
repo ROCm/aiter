@@ -3,7 +3,7 @@
 #!/bin/bash
 
 if [ $# -ge 1 ] ; then
-    FMA_API=$1  # build fwd/bwd
+    FMA_API=$1  # build fwd/bwd/fwd_v3/bwd_v3
 else
     FMA_API=""  # build all
 fi
@@ -14,7 +14,7 @@ python3 compile.py --api=$FMA_API
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TOP_DIR=$(dirname "$SCRIPT_DIR")/../../
 
-if [ x"$FMA_API" = x"fwd" ] || [ x"$FMA_API" = x"" ] ; then
+if [ x"$FMA_API" = x"fwd" ] || [ x"$FMA_API" = x"fwd_v3" ] || [ x"$FMA_API" = x"" ] ; then
 echo "######## linking mha fwd"
 /opt/rocm/bin/hipcc  -I$TOP_DIR/3rdparty/composable_kernel/include \
                      -I$TOP_DIR/3rdparty/composable_kernel/example/ck_tile/01_fmha/ \
@@ -27,7 +27,7 @@ echo "######## linking mha fwd"
                      $SCRIPT_DIR/benchmark_mha_fwd.cpp -o benchmark_mha_fwd
 fi
 
-if [ x"$FMA_API" = x"bwd" ] || [ x"$FMA_API" = x"" ] ; then
+if [ x"$FMA_API" = x"bwd" ] || [ x"$FMA_API" = x"bwd_v3" ] || [ x"$FMA_API" = x"" ] ; then
 echo "######## linking mha bwd"
 /opt/rocm/bin/hipcc  -I$TOP_DIR/3rdparty/composable_kernel/include \
                      -I$TOP_DIR/3rdparty/composable_kernel/example/ck_tile/01_fmha/ \

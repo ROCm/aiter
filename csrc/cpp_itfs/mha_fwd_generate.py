@@ -3,14 +3,29 @@
 # generate kernel instances to speed up compilation
 
 import argparse
+import sys
+import os
 from pathlib import Path
 from typing import Optional
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
+if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
+    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter/jit/utils")  # pip install mode
+else:
+    AITER_CORE_DIR = os.path.abspath(
+        f"{this_dir}/../../aiter/jit/utils"
+    )  # develop mode
+sys.path.insert(0, AITER_CORE_DIR)
+
+from chip_info import get_gfx_list  # noqa: E402
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
 AITER_API_FILENAME = "mha_fwd.cpp"
 
 AITER_CPP_API = """#include "mha_fwd.h"
+#include <iostream>
 
 namespace aiter {{
 mha_fwd_traits get_mha_fwd_traits(int head_size_q,
@@ -23,6 +38,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                                   bool has_lse,
                                   bool has_dropout,
                                   bool use_ext_asm,
+                                  int how_v3_bf16_cvt = 1,
                                   bool skip_min_seqlen_q = false)
 {{
     return mha_fwd_traits(head_size_q,
@@ -35,6 +51,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                           has_lse,
                           has_dropout,
                           use_ext_asm,
+                          how_v3_bf16_cvt,
                           skip_min_seqlen_q);
 }}
 
@@ -70,7 +87,10 @@ float mha_fwd(mha_fwd_args args,
               mask_enum mask_type,
               bias_enum bias_type,
               bool has_lse,
-              bool use_ext_asm)
+              bool use_ext_asm,
+              int how_v3_bf16_cvt,
+              const void* seqstart_q_padding_ptr,
+              const void* seqstart_k_padding_ptr)
 {{
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
@@ -85,6 +105,7 @@ float mha_fwd(mha_fwd_args args,
                                      has_lse,
                                      has_dropout,
                                      use_ext_asm,
+                                     how_v3_bf16_cvt,
                                      args.min_seqlen_q != 0);
     float t = -1;
     {F_inner_dispatch}
@@ -141,11 +162,40 @@ float mha_batch_prefill(mha_batch_prefill_args args,
 
 V2_API = """t = fmha_fwd(traits, args, stream_config);"""
 
-V3_API = """t = fmha_fwd_v3(traits, args, stream_config);"""
-
-COMBINED_API = """t = fmha_fwd_v3(traits, args, stream_config);
-    if (t == -1) { t = fmha_fwd(traits, args, stream_config); }
+V3_MULTI_TARGET_API = """
+    if (get_gpu_arch() == "gfx942") {
+        t = gfx942::fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+    } else if (get_gpu_arch() == "gfx950") {
+        t = gfx950::fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+    } else {
+        std::cout << "No supported GPU arch found!" << std::endl;
+        return -1;
+    }
 """
+
+
+def get_v3_api():
+    gfx_list = get_gfx_list()
+    if len(gfx_list) == 1:
+        return f"t = {gfx_list[0]}::fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr);"
+    else:
+        return V3_MULTI_TARGET_API
+
+
+V3_API = get_v3_api()
+
+COMBINED_API = (
+    V3_API
+    + r"""
+    if (t == -1) {
+        if (seqstart_q_padding_ptr == nullptr && seqstart_k_padding_ptr == nullptr) {
+            t = fmha_fwd(traits, args, stream_config);
+        } else {
+            std::cout << "\n this two args(seqstart_q_padding and seqstart_k_padding) currently not support on ck side!" << std::endl;
+        }
+    }
+"""
+)
 
 API_MAP = {
     1: FMHA_FWD_API.format(F_inner_dispatch=V3_API),
