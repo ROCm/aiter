@@ -118,6 +118,7 @@ def _attention_inner(
     HEAD_DIM: tl.constexpr,
     local_iter,
     local_iter_end,
+    use_64_indexing: tl.constexpr,
 ):
     """
     Performs attention calculation for an (maybe partial) output tile
@@ -164,9 +165,16 @@ def _attention_inner(
         l_i = l_i * alpha + l_ij
         m_i = m_ij.to(m_i.dtype)
 
-        # update k/v pointer
-        v_ptrs += BLOCK_N * stride_vn
-        k_ptrs += BLOCK_N * stride_kn
+        # update k/v pointer with optional 64-bit indexing to avoid overflow
+        if use_64_indexing:
+            BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
+            stride_kn64 = tl.full((), stride_kn, tl.int64)
+            stride_vn64 = tl.full((), stride_vn, tl.int64)
+            v_ptrs += BLOCK_N64 * stride_vn64
+            k_ptrs += BLOCK_N64 * stride_kn64
+        else:
+            v_ptrs += BLOCK_N * stride_vn
+            k_ptrs += BLOCK_N * stride_kn
     return m_i, l_i, acc
 
 
@@ -347,6 +355,7 @@ def la_persistent(
                 tiles_per_head=tiles_per_head,
                 num_splits=num_splits,
                 gqa_group_size=gqa_group_size,
+                use_64_indexing=use_64_indexing,
             )
 
 
@@ -400,6 +409,7 @@ def la_persistent_inner(
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
     gqa_group_size: tl.constexpr,
+    use_64_indexing: tl.constexpr,
 ):
 
     tl.assume(stride_qm > 0)  # n_ctx_q
@@ -571,6 +581,7 @@ def la_persistent_inner(
         HEAD_DIM=HEAD_DIM,
         local_iter=local_iter,
         local_iter_end=local_iter_end,
+        use_64_indexing=use_64_indexing,
     )
 
     # initialize pointer to m and l
