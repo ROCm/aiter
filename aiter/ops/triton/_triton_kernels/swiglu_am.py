@@ -23,9 +23,13 @@ def _swiglu(
         total_offsets = offsets + start
         mask = offsets < n_cols
         # load row
-        row = tl.load(total_offsets, mask=mask)
+        row = tl.load(total_offsets, mask=mask, other=-float("inf"))
         # do a swish on the row -- x2 * sigmoid(x2) -- sigmoid = 1/(1+e^(-x))
         # this is like torch
+        if row.dtype == tl.float16 or row.dtype == tl.bfloat16:
+            row = tl.cast(row, tl.float32)
+        #tl.device_print(row.dtype == tl.float16)
+        # sigmoid = 1 / (1 + tl.exp(-row))
         swiglu = row * tl.sigmoid(row) * row  # element-wise multiplication, pretty sure you can do the * operator in triton? says in the docs magic operators are implemented
         # store the result
         out_row = out_ptr + pid * x_stride  # find the right row

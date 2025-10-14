@@ -36,9 +36,13 @@ def test_swiglu(M, N, dtype):
     y_triton = swiglu(x)
     y_torch = torch_swiglu(x)
 
-    atol, rtol = 1e-5, 1e-5  # triton sigmoid apparently can't handle fp16
+    if dtype in (torch.float16, torch.bfloat16):
+        atol, rtol = 1e-2, 1e-2
+    else:
+        # float32 typically can be tighter
+        atol, rtol = 1e-5, 1e-5
 
     torch.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
     print("swiglu asserted")
 
-test_swiglu(8192, 8192, "fp32")
+test_swiglu(8192, 8192, "fp16")
