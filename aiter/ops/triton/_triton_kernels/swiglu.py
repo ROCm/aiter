@@ -36,7 +36,7 @@ def _swiglu_kernel(
         + col_range * input_col_stride
         + col_pid * BLOCK_SIZE * input_col_stride
     )
-    x1 = tl.load(input_ptr + x1_offsets, mask)
+    x1 = tl.load(input_ptr + x1_offsets, mask).to(tl.float32)
 
     # get second half
     x2_offsets = (
@@ -45,7 +45,7 @@ def _swiglu_kernel(
         + (col_range + mid) * input_col_stride
         + col_pid * BLOCK_SIZE * input_col_stride
     )
-    x2 = tl.load(input_ptr + x2_offsets, mask)
+    x2 = tl.load(input_ptr + x2_offsets, mask).to(tl.float32)
 
     # compute swiglu
     y = tl.sigmoid(x1) * x1 * x2

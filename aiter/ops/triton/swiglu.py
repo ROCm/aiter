@@ -14,8 +14,7 @@ def swiglu(x):
     function, then compute the Hadamard product with the second half.
 
     Key parameters:
-        x (torch.Tensor): A 2D input tensor. Must be fp32 or fp64
-        because `tl.sigmoid` does only support those dtypes.
+        x (torch.Tensor): A 2D input tensor.
 
     Returns:
         torch.Tensor: A tensor of the shape of half the number of
@@ -29,9 +28,9 @@ def swiglu(x):
 
     assert n_cols % 2 == 0, "Weight tensor 'w' must be a multiple of 2."
 
-    MAX_BLOCK_SIZE = 1024
+    MAX_BLOCK_SIZE = int(tl.TRITON_MAX_TENSOR_NUMEL**0.5)
     BLOCK_SIZE = min(MAX_BLOCK_SIZE, triton.next_power_of_2(n_cols // 2))
-    y = torch.empty((n_rows, n_cols // 2)).cuda()
+    y = torch.empty((n_rows, n_cols // 2), dtype=x.dtype).cuda()
 
     waves_per_eu = 2
     num_warps = 8
