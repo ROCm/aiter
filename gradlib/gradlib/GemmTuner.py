@@ -161,6 +161,7 @@ class Gemm:
         self.mp = mp
         self.inbpe = self.inp.element_size()
         self.outbpe = self.ref.element_size()
+        self.asm_map = {}
 
     def calculate_perf(
         self,
@@ -266,6 +267,7 @@ class Gemm:
             kernelName = asm_kernels[key][0]
             maxSplitK = 4  # if self.splitK else 1
             solidx = solidx + 1
+            self.asm_map[solidx] = kernelName
             for splitK in range(1, maxSplitK + 1):
                 info = (
                     (
@@ -280,6 +282,7 @@ class Gemm:
                     solidx,
                     splitK,
                     "asm",
+                    kernelName,
                 )
                 task_asm.append(
                     (
@@ -319,6 +322,7 @@ class Gemm:
         for info, us, err_ratio in ret:
             solidx = info[1]
             splitK = info[2]
+            kernelName = info[4]
             res_one=[]
             if err_ratio > self.check_err_ratio:
                 continue
@@ -326,14 +330,17 @@ class Gemm:
             gtimes["gtimems"] = us / 1000.0
             gtimes["splitK"] = splitK
             res_one.append(solidx)
-            res_one.append(us / 1000.0)
+            res_one.append(round(us / 1000.0, 4))
             res_one.append(splitK)
+            res_one.append(err_ratio)
+            res_one.append(kernelName)
             results.append(res_one)
 
-        self.asm_gtimedf = pd.DataFrame(results, columns=["solidx", "gtimems", "splitK"]).reset_index(drop=True).sort_values(by="gtimems")
+        self.asm_gtimedf = pd.DataFrame(results, columns=["solidx", "gtimems", "splitK", "err_ratio", "kernelName"])
         self.asm_gtimedf["libtype"] = "asm"
         print(self.asm_gtimedf)
-        self.asm_gtimedf.to_csv("/tmp/asm_gtimedf.csv")
+        self.asm_gtimedf.to_csv("/tmp/asm_gtimedf.csv", index=False)
+        self.asm_gtimedf = self.asm_gtimedf.sort_values(by="gtimems")
         print(">>> asm top solutions, Fast Mode", 0)
         print(self.asm_gtimedf.head(self.topn))
 
@@ -366,6 +373,7 @@ class Gemm:
                 solidx,
                 0,  # splitK
                 "hipblaslt",
+                "",
             )
             task.append(
                 (
@@ -397,18 +405,22 @@ class Gemm:
         for info, us, err_ratio in ret:
             res_one=[]
             solidx = info[1]
+            kernelName = info[4]
             if fast_mode == 0:
                 if err_ratio > self.check_err_ratio:
                     continue
             res_one.append(solidx)
-            res_one.append(us / 1000.0)
+            res_one.append(round(us / 1000.0, 4))
+            res_one.append(err_ratio)
+            res_one.append(kernelName)
+
             results.append(res_one)
-        self.hipb_gtimedf = pd.DataFrame(results, columns=["solidx", "gtimems"])
+        self.hipb_gtimedf = pd.DataFrame(results, columns=["solidx", "gtimems", "err_ratio", "kernelName"])
 
         self.hipb_gtimedf = self.hipb_gtimedf.sort_values(by="gtimems")
         self.hipb_gtimedf["libtype"] = "hipblaslt"
         
-        self.hipb_gtimedf.to_csv("/tmp/hipb_gtimedf.csv")
+        self.hipb_gtimedf.to_csv("/tmp/hipb_gtimedf.csv", index=False)
         print(">>> HipBlasLt top solutions, Fast Mode", fast_mode)
         print(self.hipb_gtimedf.head(self.topn))
         self.hipb_gtimedf["splitK"] = 0
@@ -443,12 +455,14 @@ class Gemm:
             solutions = self.rocb_top_sols
         task = []
         gtimes = {}
+        print("roblas solutions: ", solutions)
         for solidx in solutions:
             info = (
                 (self.m, self.n, self.k, False, self.indtype, self.outdtype, False),
                 solidx,
                 0,
                 "rocblas",
+                "rocblas"
             )
             task.append(
                 (
@@ -477,19 +491,21 @@ class Gemm:
         results = []
         for info, us, err_ratio in ret:
             solidx = info[1]
+            kernelName = info[4]
             ret_one = []
             if fast_mode == 0:
                 if err_ratio > self.check_err_ratio:
                     continue
             ret_one.append(solidx)
-            ret_one.append(us / 1000.0)
-            #gtimes[solidx] = us / 1000.0
+            ret_one.append(round(us / 1000.0, 4))
+            ret_one.append(err_ratio)
+            ret_one.append(kernelName)
             results.append(ret_one)
-        self.rocb_gtimedf = pd.DataFrame(results, columns=["solidx", "gtimems"])
+        self.rocb_gtimedf = pd.DataFrame(results, columns=["solidx", "gtimems", "err_ratio", "kernelName"])
         self.rocb_gtimedf = self.rocb_gtimedf.sort_values(by="gtimems")
         self.rocb_gtimedf["libtype"] = "rocblas"
         self.rocb_gtimedf["splitK"] = 0
-        self.rocb_gtimedf.to_csv("/tmp/rocb_gtimedf.csv")
+        self.rocb_gtimedf.to_csv("/tmp/rocb_gtimedf.csv", index=False)
         print(">>> Rocblas top solutions, Fast Mode", fast_mode, flush=True)
         print(self.rocb_gtimedf.head(self.topn), flush=True)
 
@@ -498,9 +514,9 @@ class Gemm:
             self.blob = self.blob + 0.00001
 
     def functional_get_topn_fastest(self):  
-        rocb_topn=self.hipb_gtimedf["gtimems"].head(self.topn).tolist()
+        rocb_topn=self.rocb_gtimedf["solidx"].head(self.topn).tolist()
         self.rocb_top_sols = rocb_topn
-        hipb_topn = self.hipb_gtimedf["gtimems"].head(self.topn).tolist()
+        hipb_topn = self.hipb_gtimedf["solidx"].head(self.topn).tolist()
         self.hipb_top_sols = hipb_topn
 
     def find_fastest_solution(self):
@@ -518,8 +534,8 @@ class Gemm:
         self.warmup()
         self.hipb_time_all_sols(fast_mode=0, top_sols=1)
         self.asm_gemm_all_solutions()
-        if len(self.rocb_gtimedf) > 0 and len(self.asm_gtimedf) > 0:
-            self.rocb_gtimedf = pd.concat(
+        #if len(self.rocb_gtimedf) > 0 and len(self.asm_gtimedf) > 0:
+        self.rocb_gtimedf = pd.concat(
                 [self.rocb_gtimedf, self.asm_gtimedf], ignore_index=False
             )
         # get best solution
@@ -529,43 +545,52 @@ class Gemm:
             best_rocb_time = self.rocb_gtimedf.gtimems.iloc[0]
             best_hipb_time = self.hipb_gtimedf.gtimems.iloc[0]
             best_asm_time = 100  # self.asm_gtimedf.gtimems.iloc[0]
+            self.best_kernelName = ""
             if best_rocb_time < best_hipb_time * self.hipb_prefer_ratio:
                 self.best_libtype = self.rocb_gtimedf.libtype.iloc[0]
-                self.best_solidx = self.rocb_gtimedf.index[0]
+                self.best_solidx = self.rocb_gtimedf.solidx.iloc[0]
                 self.best_soltime = best_rocb_time
                 self.best_splitK = self.rocb_gtimedf.splitK.iloc[0]
+                self.best_err_ratio = self.rocb_gtimedf.err_ratio.iloc[0]
+                self.best_kernelName = self.rocb_gtimedf.kernelName.iloc[0]
             else:
                 self.best_libtype = "hipblaslt"
-                self.best_solidx = self.hipb_gtimedf.index[0]
+                self.best_solidx = self.hipb_gtimedf.solidx.iloc[0]
                 self.best_soltime = best_hipb_time
                 self.best_splitK = self.hipb_gtimedf.splitK.iloc[0]
+                self.best_err_ratio = self.hipb_gtimedf.err_ratio.iloc[0]
             # self.check_gemm_ref(self.best_libtype,self.best_solidx)
         elif len(self.hipb_gtimedf) > 0:
             print(">>> Only hipblas solutions found!", flush=True)
             best_hipb_time = self.hipb_gtimedf.gtimems.iloc[0]
             self.best_libtype = "hipblaslt"
-            self.best_solidx = self.hipb_gtimedf.index[0]
+            self.best_solidx = self.hipb_gtimedf.solidx.iloc[0]
             self.best_soltime = best_hipb_time
             self.best_splitK = self.hipb_gtimedf.splitK.iloc[0]
+            self.best_err_ratio = self.hipb_gtimedf.err_ratio.iloc[0]
         elif len(self.rocb_gtimedf) > 0:
             print(">>> Only rocblas solutions found!", flush=True)
             best_rocb_time = self.rocb_gtimedf.gtimems.iloc[0]
             self.best_libtype = self.rocb_gtimedf.libtype.iloc[0]
-            self.best_solidx = self.rocb_gtimedf.index[0]
+            self.best_solidx = self.rocb_gtimedf.solidx.iloc[0]
             self.best_soltime = best_rocb_time
             self.best_splitK = self.rocb_gtimedf.splitK.iloc[0]
+            self.best_err_ratio = self.rocb_gtimedf.err_ratio.iloc[0]
+            self.best_kernelName = self.rocb_gtimedf.kernelName.iloc[0]
         else:
             print(">>> No rocblas or hipblas solutions found!", flush=True)
             self.best_libtype = "rocblas"
             self.best_solidx = 0
             self.best_soltime = 0
             self.best_splitK = 0
+            self.best_err_ratio = 0
         print(
             ">>> Fastest Solution is",
             self.best_libtype,
             self.best_solidx,
             self.best_soltime,
             self.best_splitK,
+            self.best_err_ratio,
             flush=True,
         )
 
@@ -597,7 +622,7 @@ class GemmTuner:
             self.tuned_shapes = None
             with open(tuned_file, "w") as tf:
                 tf.write(
-                    "M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,splitK,soltimes,kernelName,tflops,bw\n"
+                    "M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,splitK,soltimes,kernelName,err_ratio,tflops,bw\n"
                 )
 
         gpu = torch.cuda.current_device()
@@ -660,10 +685,11 @@ class GemmTuner:
 
             soltimes = round(gemmobj.best_soltime * 1000, 2)
             splitK = gemmobj.best_splitK
+            err_ratio = gemmobj.best_err_ratio
             kernal_name = (
                 aiter.getHipblasltKernelName(int(gemmobj.best_solidx))
                 if gemmobj.best_libtype == "hipblaslt"
-                else "rocblas"
+                else gemmobj.kernelName
             )
             ret = (
                 ((self.cu_num, ds["M"], ds["N"], ds["K"]), int(gemmobj.best_solidx)),
@@ -678,7 +704,7 @@ class GemmTuner:
             with open(self.tuned_file, "a") as tf:
                 tf.write(
                     f"{ds['M']},{ds['N']},{ds['K']},{ds['bias']},{indtype},{outdtype},{ds['scaleAB']},"
-                    f"{self.cu_num},{gemmobj.best_libtype},{int(gemmobj.best_solidx)},{int(splitK)},{int(soltimes)},{kernal_name},{tflops},{bw}\n"
+                    f"{self.cu_num},{gemmobj.best_libtype},{int(gemmobj.best_solidx)},{int(splitK)},{(soltimes)},{kernal_name},{err_ratio},{tflops},{bw}\n"
                 )
 
             del gemmobj
