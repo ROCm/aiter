@@ -73,7 +73,7 @@ jobs:
           docker exec \
           -w /workspace \
           operators_tunning_test \
-          ./github/scripts/op_tune.sh test
+          ./.github/scripts/op_tune.sh test
     
       - name: Operators Tunning Tests
         run: |
@@ -82,7 +82,7 @@ jobs:
           docker exec \
           -w /workspace \
           operators_tunning_test \
-          ./github/scripts/op_tune.sh tune
+          ./.github/scripts/op_tune.sh tune
       
       - name: Show the difference after tunning
         run: |
@@ -95,4 +95,4 @@ jobs:
           docker exec \
           -w /workspace \
           operators_tunning_test \
-          ./github/scripts/op_tune.sh test
+          ./.github/scripts/op_tune.sh test
