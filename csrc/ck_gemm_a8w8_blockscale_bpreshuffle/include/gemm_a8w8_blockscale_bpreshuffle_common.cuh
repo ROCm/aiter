@@ -13,9 +13,9 @@
 #include <numeric>
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/extension.h>
 
 #include "ck/ck.hpp"
@@ -159,7 +159,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_impl(torch::Tenso
 
     TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 
-    invoker.Run(argument, StreamConfig{at::cuda::getCurrentCUDAStream().stream()});
+    invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStream()});
     return Y;
 }
 

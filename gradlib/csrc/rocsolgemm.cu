@@ -56,11 +56,11 @@ namespace
 {
   rocblas_handle r_handle;
 
-  /*thread_local*/ cudaStream_t weight_stream;
+  /*thread_local*/ hipStream_t weight_stream;
   // BUG: DLM has event and stream on different devices error
   // In multi-GPU scenerio, do names defined in this namespace exist on all devices?
   // C++ keyword: thread_local <- maybe this can help?
-  /*thread_local*/ cudaEvent_t event;
+  /*thread_local*/ hipEvent_t event;
 
   // hipBLASLt
   hipblasLtHandle_t hipblaslt_handle;
