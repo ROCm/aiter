@@ -8,6 +8,8 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 // start to prepare the input and output buffer
 struct __attribute__((packed)) KernelArgs
