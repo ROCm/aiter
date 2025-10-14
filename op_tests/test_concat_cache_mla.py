@@ -10,6 +10,7 @@ import random
 import time
 from vllm import _custom_ops as ops
 
+
 @perftest()
 def run_aiter(
     kv_c,
@@ -23,7 +24,9 @@ def run_aiter(
         kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
     )
     return kv_cache
-@perftest()
+
+
+@perftest(3)
 def run_torch(
     kv_c,
     k_pe,
@@ -91,9 +94,6 @@ def test_concat_and_cache_mla(
     if kv_cache_dtype == "fp8":
         result_temp = kv_cache.to(torch.float32) * scale
         expected_temp = ref_kv_cache.to(torch.float32) * scale
-        #ops.convert_fp8(
-        #   expected_temp, ref_kv_cache, scale.item(), kv_dtype=kv_cache_dtype
-        #)
         checkAllclose(result_temp, expected_temp, atol=0.01, rtol=0.01)
     else:
         checkAllclose(kv_cache, ref_kv_cache)
@@ -101,10 +101,11 @@ def test_concat_and_cache_mla(
     ret["torch_us"] = ref_us
     return ret
 
+
 df = []
 kv_lora_rank = 128
 qk_rope_head_dim = 64
-l_num_tokens = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+l_num_tokens = [128, 256, 512, 1024, 2048, 4096]  # 8192, 16384
 block_size = 64
 dtype = torch.bfloat16
 device = "cuda"
@@ -135,7 +136,7 @@ parser.add_argument(
     "-blk",
     "--block_size",
     type=int,
-    default=1,
+    default=64,
     help="""Block size.
     e.g.: -blk 1""",
 )
@@ -188,14 +189,15 @@ for num_token in l_num_tokens:
     num_blocks = num_token // block_size
     for kv_cache_dtype in l_kv_cache_dtypes:
         ret = test_concat_and_cache_mla(
-                kv_lora_rank,
-                qk_rope_head_dim,
-                num_token,
-                block_size,
-                num_blocks,
-                dtype,
-                device,
-                kv_cache_dtype)
+            kv_lora_rank,
+            qk_rope_head_dim,
+            num_token,
+            block_size,
+            num_blocks,
+            dtype,
+            device,
+            kv_cache_dtype,
+        )
 
         df.append(ret)
 df = pd.DataFrame(df)

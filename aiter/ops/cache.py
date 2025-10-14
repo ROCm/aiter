@@ -93,5 +93,5 @@ def concat_and_cache_mla(
     kv_cache: Tensor,
     slot_mapping: Tensor,
     kv_cache_dtype: str,
-    scale: torch.Tensor,
+    scale: Tensor,
 ) -> None: ...

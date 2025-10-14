@@ -242,7 +242,13 @@
       "                     Tensor! kv_cache,"                                      \
       "                     Tensor slot_mapping,"                                   \
       "                     str kv_cache_dtype,"                                    \
-      "                     Tensor scale) -> ()");                                  \
+      "                     Tensor scale) -> ()",                                   \
+          py::arg("kv_c"),                                                        \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("kv_cache_dtype"),                                                \
+          py::arg("scale"));                                                        \
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
     m.def("init_custom_ar",                                                                    \

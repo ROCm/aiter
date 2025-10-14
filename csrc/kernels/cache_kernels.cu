@@ -1008,8 +1008,6 @@ __global__ void concat_and_cache_mla_kernel(
       if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
         dst[dst_idx] = src[src_idx];
       } else {
-        //dst[dst_idx] =
-        //  vllm::fp8::scaled_convert<cache_t, scalar_t, kv_dt>(src[src_idx], *scale);
         dst[dst_idx]= ck_tile::type_convert<cache_t>(
                 ck_tile::type_convert<float>(src[src_idx]) * inverted_kscale);
       }
@@ -1570,9 +1568,8 @@ void concat_and_cache_mla(
   int k_pe_stride = k_pe.stride(0);
   int block_stride = kv_cache.stride(0);
   int entry_stride = kv_cache.stride(1);
-
- const at::cuda::OptionalCUDAGuard device_guard(device_of(kv_c));
- const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+ const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(kv_c));
+ const hipStream_t stream = at::hip::getCurrentHIPStream();
 
   //if (kv_cache_dtype == "fp8_ds_mla") {
   //  dim3 grid(num_tokens);
