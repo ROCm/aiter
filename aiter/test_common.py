@@ -85,7 +85,6 @@ def perftest(
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
-            print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
             avg = get_trace_perf(prof, num_iters)
             return data, avg
 

@@ -40,9 +40,9 @@ def ref_masked_attention(
     is_fp8=False,
     q_scale=None,
     kv_scale=None,
-) -> torch.Tensor:
+):
 
-    if is_fp8:
+    if is_fp8 and q_scale is not None and kv_scale is not None:
         scale *= q_scale * kv_scale
 
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
@@ -71,7 +71,7 @@ def ref_masked_attention(
 
     out = out / l.transpose(0, 1).unsqueeze(-1)
 
-    if is_fp8:
+    if is_fp8 and kv_scale is not None:
         out *= kv_scale
     return out.to(dtype), lse
 
