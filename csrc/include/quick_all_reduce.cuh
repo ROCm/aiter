@@ -189,11 +189,11 @@ struct CodecQ4 : public CodecBase {
             int32_t int16_2 = (qw >> (i * 4)) & kMask000F;
             int16_t low = static_cast<int16_t>(int16_2 & 0xFFFF);
             int16_t high = static_cast<int16_t>((int16_2 >> 16) & 0xFFFF);
-            nv_bfloat16 bf_low = __float2bfloat16(static_cast<float>(low));
-            nv_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
+            __hip_bfloat16 bf_low = __float2bfloat16(static_cast<float>(low));
+            __hip_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
             nv_bfloat162 bf2 = __halves2bfloat162(bf_low, bf_high);
             int32_t packed_bf16 = *reinterpret_cast<int32_t*>(&bf2);
-            w[i] = packed_add<nv_bfloat16>(packed_bf16, kRangeMin);
+            w[i] = packed_add<__hip_bfloat16>(packed_bf16, kRangeMin);
           }
         }
       }
@@ -365,11 +365,11 @@ struct CodecQ6 : public CodecBase {
             int16_t low = static_cast<int16_t>(int16_2 & 0xFFFF);
             int16_t high = static_cast<int16_t>((int16_2 >> 16) & 0xFFFF);
 
-            nv_bfloat16 bf_low = __float2bfloat16(static_cast<float>(low));
-            nv_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
+            __hip_bfloat16 bf_low = __float2bfloat16(static_cast<float>(low));
+            __hip_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
             nv_bfloat162 bf2 = __halves2bfloat162(bf_low, bf_high);
             int32_t packed_bf16 = *reinterpret_cast<int32_t*>(&bf2);
-            w[i] = packed_add<nv_bfloat16>(packed_bf16, kRangeMin);
+            w[i] = packed_add<__hip_bfloat16>(packed_bf16, kRangeMin);
           }
         }
       }
@@ -534,7 +534,7 @@ struct CodecFP8 : public CodecBase {
                          : "v"(wf1[0]), "v"(wf1[1]));
           }
         } else {
-          nv_bfloat16* wbf = reinterpret_cast<nv_bfloat16*>(&w);
+          __hip_bfloat16* wbf = reinterpret_cast<__hip_bfloat16*>(&w);
           for (int i = 0; i < 2; i++) {
             fp32x2_t wf0_vec = __builtin_amdgcn_cvt_pk_f32_fp8(qw[i], 0);
             fp32x2_t wf1_vec = __builtin_amdgcn_cvt_pk_f32_fp8(qw[i], 1);
@@ -898,7 +898,7 @@ struct DeviceComms {
         TWOSHOT_DISPATCH(CodecFP)
         break;
     }
-    HIP_CHECK(cudaGetLastError());
+    HIP_CHECK(hipGetLastError());
     // Rotate the flag color.
     flag_color += divceil(N, grid);
   }

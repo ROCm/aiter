@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import os
-from pathlib import Path
-import pandas as pd
 import argparse
+import os
 import shutil
-from batched_gemm_a8w8_common import kernelInstance, kernels_list, default_kernels_dict
+from pathlib import Path
+
+import pandas as pd
+import torch
+from batched_gemm_a8w8_common import default_kernels_dict, kernelInstance, kernels_list
 
 
 class batched_gemm_a8w8_fwd_codegen:
@@ -126,7 +128,7 @@ torch::Tensor
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "{name}.cuh"
+#include "impl/{name}.cuh"
 
 template torch::Tensor
 {name}<{dtypes}>(
@@ -255,6 +257,12 @@ def get_tune_dict(tune_dict_csv):
     tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
         tune_df = pd.read_csv(tune_dict_csv)
+        if torch.cuda.is_available():
+            gpu = torch.cuda.current_device()
+            device_properties = torch.cuda.get_device_properties(gpu)
+            cu_num = device_properties.multi_processor_count
+            tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
+            print(tune_df)
         for i in range(len(tune_df)):
             B = tune_df.loc[i, "B"]
             M = tune_df.loc[i, "M"]

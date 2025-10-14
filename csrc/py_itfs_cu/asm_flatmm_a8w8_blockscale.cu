@@ -3,8 +3,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
 #include "hip_float8.h"
 
@@ -68,8 +68,8 @@ torch::Tensor flatmm_a8w8_blockscale_asm(
     args.intermediate_size = n;
     args.hidden_size = k;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(XQ));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(XQ));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     AiterAsmKernel *impl_ptr = nullptr;
     static AiterAsmKernel impl_kenrel("flatmm_uk_gfx9_f16f8_128x256x128_1x4x1_16x16x32", "flatmm_uk_gfx9_f16f8_128x256x128_1x4x1_16x16x32.co");

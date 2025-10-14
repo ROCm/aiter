@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "py_itfs_common.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 #include "rmsnorm2d_fwd.hpp"
@@ -26,8 +26,8 @@ void rmsnorm2d(
     int y_stride          = out.stride(0);
     int yr_stride         = -1;
     bool SaveRms          = false;
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     rmsnorm2d_fwd({dtype_str, // input precision
                    dtype_str, // output precision
@@ -90,8 +90,8 @@ void rmsnorm2d_with_add(
     int y_stride          = out.stride(0);
     int yr_stride         = residual_out.stride(0);
     bool SaveRms          = false;
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     rmsnorm2d_fwd({dtype_str, // input precision
                    dtype_str, // output precision
@@ -145,8 +145,8 @@ void rmsnorm2d_with_smoothquant(
     int y_stride                 = out.stride(0);
     int yr_stride                = -1;
     bool SaveRms                 = false;
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     rmsnorm2d_fwd({dtype_str,        // input precision
                    out_dtype_str,    // output precision
@@ -203,8 +203,8 @@ void rmsnorm2d_with_add_smoothquant(
     int y_stride                 = out.stride(0);
     int yr_stride                = residual_out.stride(0);
     bool SaveRms                 = false;
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     rmsnorm2d_fwd({dtype_str,        // input precision
                    out_dtype_str,    // output precision
@@ -257,8 +257,8 @@ void rmsnorm2d_with_dynamicquant(
     int y_stride                 = out.stride(0);
     int yr_stride                = -1;
     bool SaveRms                 = false;
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     rmsnorm2d_fwd({dtype_str,        // input precision
                    out_dtype_str,    // output precision
@@ -312,8 +312,8 @@ void rmsnorm2d_with_add_dynamicquant(
     int y_stride                 = out.stride(0);
     int yr_stride                = residual_out.stride(0);
     bool SaveRms                 = false;
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     rmsnorm2d_fwd({dtype_str,        // input precision
                    out_dtype_str,    // output precision
