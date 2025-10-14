@@ -519,17 +519,22 @@ def run_benchmark(custom, args):
         else:
             total_num_tokens_q = BATCH * N_CTX_Q
             total_num_tokens_k = BATCH * N_CTX_K
-        # TODO: Is it right for backward? Backward reads do as well, and writes dq, dk and dv...
-        mem = (
-            # read q
-            total_num_tokens_q * HQ * D_HEAD * q.element_size()
-            # read k
-            + total_num_tokens_k * HK * D_HEAD * k.element_size()
-            # read v
-            + total_num_tokens_k * HK * D_HEAD_V * v.element_size()
-            # write output
-            + total_num_tokens_q * HQ * D_HEAD_V * q.element_size()
-        )
+        q_size = total_num_tokens_q * HQ * D_HEAD * q.element_size()
+        k_size = total_num_tokens_k * HK * D_HEAD * k.element_size()
+        v_size = total_num_tokens_k * HK * D_HEAD_V * v.element_size()
+        o_size = total_num_tokens_q * HQ * D_HEAD_V * q.element_size()
+        if mode == "fwd":
+            # read q, k, v
+            mem_read = q_size + k_size + v_size
+            # write o
+            mem_write = o_size
+        else:
+            # read q, k, v, do
+            mem_read = q_size + k_size + v_size + o_size
+            # write dq, dk, dv
+            mem_write = q_size + k_size + v_size
+        mem = mem_read + mem_write
+
         # return ms
         if "ms" in provider:
             return ms
