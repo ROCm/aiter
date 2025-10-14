@@ -307,7 +307,7 @@ class Gemm:
                         self.atol,
                     )
                 )
-                
+
                 solutions = solutions + 1
         print(f"solutions is {solutions}")
         in_data = [
@@ -318,12 +318,12 @@ class Gemm:
         ]
         gtimes = {}
         ret = mp_tuner(task_asm, in_data, self.mp, False)
-        results=[]
+        results = []
         for info, us, err_ratio in ret:
             solidx = info[1]
             splitK = info[2]
             kernelName = info[4]
-            res_one=[]
+            res_one = []
             if err_ratio > self.check_err_ratio:
                 continue
             gtimes["solidx"] = solidx
@@ -336,14 +336,15 @@ class Gemm:
             res_one.append(kernelName)
             results.append(res_one)
 
-        self.asm_gtimedf = pd.DataFrame(results, columns=["solidx", "gtimems", "splitK", "err_ratio", "kernelName"])
+        self.asm_gtimedf = pd.DataFrame(
+            results, columns=["solidx", "gtimems", "splitK", "err_ratio", "kernelName"]
+        )
         self.asm_gtimedf["libtype"] = "asm"
         print(self.asm_gtimedf)
         self.asm_gtimedf.to_csv("/tmp/asm_gtimedf.csv", index=False)
         self.asm_gtimedf = self.asm_gtimedf.sort_values(by="gtimems")
         print(">>> asm top solutions, Fast Mode", 0)
         print(self.asm_gtimedf.head(self.topn))
-
 
     def hipb_time_all_sols(self, fast_mode=0, top_sols=0):
         coldi = 20
@@ -403,7 +404,7 @@ class Gemm:
         ret = mp_tuner(task, in_data, self.mp, fast_mode == 1)
         results = []
         for info, us, err_ratio in ret:
-            res_one=[]
+            res_one = []
             solidx = info[1]
             kernelName = info[4]
             if fast_mode == 0:
@@ -415,11 +416,13 @@ class Gemm:
             res_one.append(kernelName)
 
             results.append(res_one)
-        self.hipb_gtimedf = pd.DataFrame(results, columns=["solidx", "gtimems", "err_ratio", "kernelName"])
+        self.hipb_gtimedf = pd.DataFrame(
+            results, columns=["solidx", "gtimems", "err_ratio", "kernelName"]
+        )
 
         self.hipb_gtimedf = self.hipb_gtimedf.sort_values(by="gtimems")
         self.hipb_gtimedf["libtype"] = "hipblaslt"
-        
+
         self.hipb_gtimedf.to_csv("/tmp/hipb_gtimedf.csv", index=False)
         print(">>> HipBlasLt top solutions, Fast Mode", fast_mode)
         print(self.hipb_gtimedf.head(self.topn))
@@ -461,7 +464,7 @@ class Gemm:
                 solidx,
                 0,
                 "rocblas",
-                "rocblas"
+                "rocblas",
             )
             task.append(
                 (
@@ -500,7 +503,9 @@ class Gemm:
             ret_one.append(err_ratio)
             ret_one.append(kernelName)
             results.append(ret_one)
-        self.rocb_gtimedf = pd.DataFrame(results, columns=["solidx", "gtimems", "err_ratio", "kernelName"])
+        self.rocb_gtimedf = pd.DataFrame(
+            results, columns=["solidx", "gtimems", "err_ratio", "kernelName"]
+        )
         self.rocb_gtimedf = self.rocb_gtimedf.sort_values(by="gtimems")
         self.rocb_gtimedf["libtype"] = "rocblas"
         self.rocb_gtimedf["splitK"] = 0
@@ -512,8 +517,8 @@ class Gemm:
         for i in range(warmi):
             self.blob = self.blob + 0.00001
 
-    def functional_get_topn_fastest(self):  
-        rocb_topn=self.rocb_gtimedf["solidx"].head(self.topn).tolist()
+    def functional_get_topn_fastest(self):
+        rocb_topn = self.rocb_gtimedf["solidx"].head(self.topn).tolist()
         self.rocb_top_sols = rocb_topn
         hipb_topn = self.hipb_gtimedf["solidx"].head(self.topn).tolist()
         self.hipb_top_sols = hipb_topn
@@ -533,10 +538,10 @@ class Gemm:
         self.warmup()
         self.hipb_time_all_sols(fast_mode=0, top_sols=1)
         self.asm_gemm_all_solutions()
-        #if len(self.rocb_gtimedf) > 0 and len(self.asm_gtimedf) > 0:
+        # if len(self.rocb_gtimedf) > 0 and len(self.asm_gtimedf) > 0:
         self.rocb_gtimedf = pd.concat(
-                [self.rocb_gtimedf, self.asm_gtimedf], ignore_index=False
-            )
+            [self.rocb_gtimedf, self.asm_gtimedf], ignore_index=False
+        )
         # get best solution
         self.rocb_gtimedf = self.rocb_gtimedf.sort_values(by="gtimems")
         print("rocb_gtimedf", self.rocb_gtimedf)

@@ -182,7 +182,12 @@ if __name__ == "__main__":
     outdtype = get_dtype(args.outdtype)
 
     gtuner = GemmTuner(
-        indtype, outdtype, args.tuned_file, args.rocblas_decode, args.mp, args.errRatio#, args.splitK
+        indtype,
+        outdtype,
+        args.tuned_file,
+        args.rocblas_decode,
+        args.mp,
+        args.errRatio,  # , args.splitK
     )
     nsets = [i * args.batch_size for i in args.nsets]
     if args.input_file:

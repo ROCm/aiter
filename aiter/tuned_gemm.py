@@ -381,9 +381,6 @@ class TunedGemm:
             otype=str(otype) if otype is not None else str(inp.dtype),
             scaleAB=scale_a is not None or scale_b is not None,
         )
-        #splitK = result_dict.get("splitK", None)
-        #kernelName = result_dict.get("kernelName", None)
-        #solution_idx = result_dict.get("solution_idx", 0)
         if solMap[soltype] == "asm":
             splitK, kernelName = asm_solMap[solution_idx]
             out = self.apply_asm_mm(inp_view, weights, bias, otype, splitK, kernelName)
