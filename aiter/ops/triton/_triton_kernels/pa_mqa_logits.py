@@ -409,7 +409,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k(
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=3,
         instr_shape=[16, 16],
-        transposed=True,
+        transposed=False,
         warps_per_cta=[1, NumWarps],
     )
     mfma_layout_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=16)
