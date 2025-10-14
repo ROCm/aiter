@@ -86,9 +86,10 @@ class _FlashAttnV3Func(torch.autograd.Function):
         )
 
         # Dequantize inputs for high precision backward pass
-        q_hp = q.float() * q_descale if q_descale is not None else q
-        k_hp = k.float() * k_descale if k_descale is not None else k
-        v_hp = v.float() * v_descale if v_descale is not None else v
+        # Reshape descale from [batch, heads] to [batch, 1, heads, 1] for BSHD broadcasting
+        q_hp = q.float() * q_descale.unsqueeze(1).unsqueeze(3) if q_descale is not None else q
+        k_hp = k.float() * k_descale.unsqueeze(1).unsqueeze(3) if k_descale is not None else k
+        v_hp = v.float() * v_descale.unsqueeze(1).unsqueeze(3) if v_descale is not None else v
 
         ctx.save_for_backward(q_hp, k_hp, v_hp, out, softmax_lse)
         ctx.softmax_scale = softmax_scale
@@ -260,9 +261,10 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
         )
 
         # Dequantize inputs for high precision backward pass
-        q_hp = q.float() * q_descale if q_descale is not None else q
-        k_hp = k.float() * k_descale if k_descale is not None else k
-        v_hp = v.float() * v_descale if v_descale is not None else v
+        # Reshape descale from [batch, heads] to [batch, 1, heads, 1] for BSHD broadcasting
+        q_hp = q.float() * q_descale.unsqueeze(1).unsqueeze(3) if q_descale is not None else q
+        k_hp = k.float() * k_descale.unsqueeze(1).unsqueeze(3) if k_descale is not None else k
+        v_hp = v.float() * v_descale.unsqueeze(1).unsqueeze(3) if v_descale is not None else v
 
         ctx.save_for_backward(q_hp, k_hp, v_hp, out, softmax_lse)
         ctx.softmax_scale = softmax_scale
