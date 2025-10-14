@@ -281,13 +281,17 @@ def check_and_set_ninja_worker():
         os.environ["MAX_JOBS"] = str(max_jobs)
 
 
-def rename_cpp_to_cu(els, dst, recursive=False):
+def rename_cpp_to_cu(els, dst, hipify, recursive=False):
     def do_rename_and_mv(name, src, dst, ret):
         newName = name
-        if name.endswith(".cpp") or name.endswith(".cu"):
-            newName = name.replace(".cpp", ".cu")
-            ret.append(f"{dst}/{newName}")
-        shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
+        if hipify:
+            if name.endswith(".cpp") or name.endswith(".cu"):
+                newName = name.replace(".cpp", ".cu")
+                ret.append(f"{dst}/{newName}")
+            shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
+        else:
+            if name.endswith(".cpp") or name.endswith(".cu"):
+                ret.append(f"{src}/{newName}")
 
     ret = []
     for el in els:
@@ -298,7 +302,9 @@ def rename_cpp_to_cu(els, dst, recursive=False):
             for entry in os.listdir(el):
                 if os.path.isdir(f"{el}/{entry}"):
                     if recursive:
-                        ret += rename_cpp_to_cu([f"{el}/{entry}"], dst, recursive)
+                        ret += rename_cpp_to_cu(
+                            [f"{el}/{entry}"], dst, hipify, recursive
+                        )
                     continue
                 do_rename_and_mv(entry, el, dst, ret)
         else:
@@ -375,7 +381,7 @@ def build_module(
     is_python_module,
     is_standalone,
     torch_exclude,
-    hipify=True,
+    hipify=False,
     prebuild=0,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"
@@ -400,10 +406,12 @@ def build_module(
             os.remove(f"{get_user_jit_dir()}/{target_name}")
 
         if prebuild != 2:
-            sources = rename_cpp_to_cu(srcs, src_dir)
+            sources = rename_cpp_to_cu(srcs, src_dir, hipify)
         else:
             sources = rename_cpp_to_cu(
-                [get_user_jit_dir() + "/../../csrc/rocm_ops.cpp"], opbd_dir + "/srcs"
+                [get_user_jit_dir() + "/../../csrc/rocm_ops.cpp"],
+                src_dir,
+                hipify,
             )
 
         flags_cc = ["-O3", "-std=c++20"]
@@ -466,7 +474,7 @@ def build_module(
                 if AITER_LOG_MORE:
                     logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
                 os.system(f"{PY} {blob_gen_cmd.format(blob_dir)}")
-                sources += rename_cpp_to_cu([blob_dir], src_dir, recursive=True)
+                sources += rename_cpp_to_cu([blob_dir], src_dir, hipify, recursive=True)
             return sources
 
         if prebuild != 2:
@@ -476,30 +484,40 @@ def build_module(
             else:
                 sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
-        # TODO: Move all torch api into torch folder
-        old_bd_include_dir = f"{op_dir}/build/include"
-        os.makedirs(old_bd_include_dir, exist_ok=True)
-        rename_cpp_to_cu(
-            [f"{AITER_CSRC_DIR}/include"] + extra_include, old_bd_include_dir
-        )
-
-        if not is_standalone:
-            bd_include_dir = f"{op_dir}/build/include/torch"
-            os.makedirs(bd_include_dir, exist_ok=True)
-            rename_cpp_to_cu(
-                [f"{AITER_CSRC_DIR}/include/torch"] + extra_include, bd_include_dir
-            )
-
         extra_include_paths = [
             f"{CK_DIR}/include",
             f"{CK_DIR}/library/include",
-            f"{old_bd_include_dir}",
         ]
+        if not hipify:
+            extra_include_paths += [
+                f"{AITER_CSRC_DIR}/include",
+                f"{op_dir}/blob",
+            ] + extra_include
+            if not is_standalone:
+                extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
+        else:
+            old_bd_include_dir = f"{op_dir}/build/include"
+            extra_include_paths.append(old_bd_include_dir)
+            os.makedirs(old_bd_include_dir, exist_ok=True)
+            rename_cpp_to_cu(
+                [f"{AITER_CSRC_DIR}/include"] + extra_include,
+                old_bd_include_dir,
+                hipify,
+            )
+
+            if not is_standalone:
+                bd_include_dir = f"{op_dir}/build/include/torch"
+                os.makedirs(bd_include_dir, exist_ok=True)
+                rename_cpp_to_cu(
+                    [f"{AITER_CSRC_DIR}/include/torch"],
+                    bd_include_dir,
+                    hipify,
+                )
 
         try:
             _jit_compile(
                 md_name,
-                sources,
+                sorted(set(sources)),
                 extra_cflags=flags_cc,
                 extra_cuda_cflags=flags_hip,
                 extra_ldflags=extra_ldflags,
@@ -550,7 +568,7 @@ def build_module(
 
     def FinalFunc():
         logger.info(
-            f"finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s"
+            f"\033[32mfinish build [{md_name}], cost {time.perf_counter()-startTS:.1f}s \033[0m"
         )
 
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
@@ -846,7 +864,7 @@ def compile_ops(
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
                 torch_exclude = d_args["torch_exclude"]
-                hipify = d_args.get("hipify", True)
+                hipify = d_args.get("hipify", False)
                 hip_clang_path = d_args.get("hip_clang_path", None)
                 prev_hip_clang_path = None
                 if hip_clang_path is not None and os.path.exists(hip_clang_path):
