@@ -15,6 +15,7 @@
 * limitations under the License.
 """
 
+import functools
 import os
 import random
 from pathlib import Path
@@ -28,6 +29,7 @@ import torch.nn.functional as F
 from aiter.utility.mp_tuner import mp_tuner
 from functools import lru_cache
 from aiter.jit.core import get_asm_dir
+from aiter.jit.utils.chip_info import get_cu_num
 
 aiter.rocb_create_extension()
 aiter.hipb_create_extension()
@@ -66,6 +68,17 @@ def run_gemm_bf16_asm(inp, w, out, bias=None, splitK=None, kernelName=None):
         inp, w, out, bias=bias, splitK=splitK, kernelName=kernelName
     )
 
+@functools.lru_cache(maxsize=1024)
+def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int):
+    cu_num = get_cu_num()
+    tile_num = ((M + tile_m - 1) // tile_m) * ((N + tile_n - 1) // tile_n)
+    cusPerTile = cu_num / tile_num
+    splitK = 0
+    if  tile_num < cu_num:
+        splitK = int(cu_num / tile_num)
+    else:
+        splitK = 4 
+    return splitK
 
 def generate_data(
     m, n, k, indtype, outdtype, scaleAB, seed=0, bias=None, device="cuda:0"
@@ -265,7 +278,8 @@ class Gemm:
             tile_m, tile_n, pf = key
             print(f"ASM Tile - M: {tile_m}, N: {tile_n}, PF: {pf}")
             kernelName = asm_kernels[key][0]
-            maxSplitK = 4  # if self.splitK else 1
+            maxSplitK = compute_gemm_SplitK(self.m, self.n, self.k, tile_m, tile_n,256)  # if self.splitK else 1
+            print(f"MaxSplitK for tile ({tile_m}, {tile_n}, {pf}): {maxSplitK}")
             solidx = solidx + 1
             self.asm_map[solidx] = kernelName
             for splitK in range(1, maxSplitK + 1):
@@ -309,7 +323,6 @@ class Gemm:
                 )
 
                 solutions = solutions + 1
-        print(f"solutions is {solutions}")
         in_data = [
             (
                 solutions,
@@ -318,6 +331,7 @@ class Gemm:
         ]
         gtimes = {}
         ret = mp_tuner(task_asm, in_data, self.mp, False)
+        
         results = []
         for info, us, err_ratio in ret:
             solidx = info[1]
@@ -538,8 +552,14 @@ class Gemm:
         self.warmup()
         self.hipb_time_all_sols(fast_mode=0, top_sols=1)
         self.asm_gemm_all_solutions()
-        # if len(self.rocb_gtimedf) > 0 and len(self.asm_gtimedf) > 0:
-        self.rocb_gtimedf = pd.concat(
+        self.best_libtype = "asm"
+        self.best_solidx = self.asm_gtimedf.solidx.iloc[0]
+        self.best_soltime = self.asm_gtimedf.gtimems.iloc[0]
+        self.best_splitK = self.asm_gtimedf.splitK.iloc[0]
+        self.best_err_ratio = self.asm_gtimedf.err_ratio.iloc[0]
+        self.best_kernelName = self.asm_gtimedf.kernelName.iloc[0]
+        if len(self.rocb_gtimedf) > 0 or len(self.asm_gtimedf) > 0:
+            self.rocb_gtimedf = pd.concat(
             [self.rocb_gtimedf, self.asm_gtimedf], ignore_index=False
         )
         # get best solution
@@ -693,7 +713,7 @@ class GemmTuner:
             kernal_name = (
                 aiter.getHipblasltKernelName(int(gemmobj.best_solidx))
                 if gemmobj.best_libtype == "hipblaslt"
-                else gemmobj.kernelName
+                else gemmobj.best_kernelName
             )
             ret = (
                 ((self.cu_num, ds["M"], ds["N"], ds["K"]), int(gemmobj.best_solidx)),
