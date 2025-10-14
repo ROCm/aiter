@@ -16,9 +16,9 @@
  */
 #include <torch/all.h>
 #include <c10/core/ScalarType.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <cuda_runtime.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <hip/hip_runtime.h>
 #include "py_itfs_common.h"
 
 namespace aiter {
@@ -28,13 +28,13 @@ namespace aiter {
 
 // void LLGemm_Silu(void* in_a, void* in_b, void* out_c, const int M, const int
 // K,
-//                  cudaStream_t stream, const int rows_per_block);
+//                  hipStream_t stream, const int rows_per_block);
 // void LLMM_Silu(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c,
 //                const int64_t rows_per_block) {
 //   auto M = in_a.size(0);
 //   auto K = in_a.size(1);
 //   LLGemm_Silu(in_a.data_ptr(), in_b.data_ptr(), out_c.data_ptr(), M, K,
-//               at::cuda::getCurrentCUDAStream(), rows_per_block);
+//               at::hip::getCurrentHIPStream(), rows_per_block);
 // }
 
 void LLGemm1(void* in_a,
@@ -42,7 +42,7 @@ void LLGemm1(void* in_a,
              void* out_c,
              const int M,
              const int K,
-             cudaStream_t stream,
+             hipStream_t stream,
              const int rows_per_block          = 4,
              const c10::ScalarType scalar_type = c10::ScalarType::Half);
 // template <typename T>
@@ -63,13 +63,13 @@ void LLMM1(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c, const int64_t 
     TORCH_CHECK(in_b.dtype() == torch::kFloat16 || in_b.dtype() == torch::kBFloat16);
 
     // call the kernel function...
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(in_a));
     LLGemm1(in_a.data_ptr(),
             in_b.data_ptr(),
             out_c.data_ptr(),
             M,
             K,
-            at::cuda::getCurrentCUDAStream(),
+            at::hip::getCurrentHIPStream(),
             rows_per_block,
             in_b.scalar_type());
 }
@@ -80,7 +80,7 @@ void wvSplitK_(void* in_a,
                const int M,
                const int K,
                const int N,
-               cudaStream_t stream,
+               hipStream_t stream,
                const int CuCount                 = 1,
                const c10::ScalarType scalar_type = c10::ScalarType::Half);
 void wvSpltK(at::Tensor& in_a,
@@ -96,14 +96,14 @@ void wvSpltK(at::Tensor& in_a,
     TORCH_CHECK(K % 8 == 0, "k % 8 == 0");
     TORCH_CHECK(in_a.dtype() == torch::kFloat16 || in_a.dtype() == torch::kBFloat16);
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(in_a));
     wvSplitK_(in_a.data_ptr(),
               in_b.data_ptr(),
               out_c.data_ptr(),
               M,
               K,
               N,
-              at::cuda::getCurrentCUDAStream(),
+              at::hip::getCurrentHIPStream(),
               CuCount,
               in_b.scalar_type());
 }
@@ -114,7 +114,7 @@ void wv_splitk_small_fp16_bf16(void* in_a,
                                const int M,
                                const int K,
                                const int N,
-                               cudaStream_t stream,
+                               hipStream_t stream,
                                const int CuCount                 = 1,
                                const c10::ScalarType scalar_type = c10::ScalarType::Half);
 void wv_splitk_small_fp16_bf16_wrapper(at::Tensor& in_a,
@@ -130,14 +130,14 @@ void wv_splitk_small_fp16_bf16_wrapper(at::Tensor& in_a,
     TORCH_CHECK(K % 8 == 0, "k % 8 == 0");
     TORCH_CHECK(in_a.dtype() == torch::kFloat16 || in_a.dtype() == torch::kBFloat16);
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(in_a));
     wv_splitk_small_fp16_bf16(in_a.data_ptr(),
                               in_b.data_ptr(),
                               out_c.data_ptr(),
                               M,
                               K,
                               N,
-                              at::cuda::getCurrentCUDAStream(),
+                              at::hip::getCurrentHIPStream(),
                               CuCount,
                               in_b.scalar_type());
 }
@@ -151,7 +151,7 @@ void wvSplitKQ_(void* in_a,
                 const int K,
                 const int Kp,
                 const int N,
-                cudaStream_t stream,
+                hipStream_t stream,
                 const int CuCount                   = 1,
                 const c10::ScalarType a_scalar_type = c10::ScalarType::Float8_e4m3fnuz,
                 const c10::ScalarType c_scalar_type = c10::ScalarType::Half);
@@ -172,7 +172,7 @@ void wvSplitKQ(at::Tensor& in_a,
     auto scale_a_ptr = scale_a.data_ptr<float>();
     auto scale_b_ptr = scale_b.data_ptr<float>();
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(in_a));
     wvSplitKQ_(in_a.data_ptr(),
                in_b.data_ptr(),
                out_c.data_ptr(),
@@ -182,7 +182,7 @@ void wvSplitKQ(at::Tensor& in_a,
                K,
                Kp,
                N,
-               at::cuda::getCurrentCUDAStream(),
+               at::hip::getCurrentHIPStream(),
                CuCount,
                in_a.scalar_type(),
                out_c.scalar_type());
@@ -193,20 +193,20 @@ void LLGemmZZ(void* in_a,
               void* out_c,
               const int M,
               const int K,
-              cudaStream_t stream,
+              hipStream_t stream,
               const int solidx);
 
 void LLZZ(at::Tensor in_a, at::Tensor in_b, at::Tensor out_c, const int64_t solidx = 0)
 {
     auto M = in_a.size(0);
     auto K = in_a.size(1);
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(in_a));
     LLGemmZZ(in_a.data_ptr(),
              in_b.data_ptr(),
              out_c.data_ptr(),
              M,
              K,
-             at::cuda::getCurrentCUDAStream(),
+             at::hip::getCurrentHIPStream(),
              solidx);
 }
 // instantiate the CPP template for T=float:
@@ -222,14 +222,14 @@ void MMGPUKernel(float* in_a,
                  int numBColumns,
                  int numCRows,
                  int numCColumns,
-                 cudaStream_t stream);
+                 hipStream_t stream);
 
 void MMCustomGPU(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c)
 {
     auto matA_sizes{in_a.sizes()};
     auto matB_sizes{in_b.sizes()};
     auto matO_sizes{out_c.sizes()};
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(in_a));
     MMGPUKernel(in_a.data_ptr<float>(),
                 in_b.data_ptr<float>(),
                 out_c.data_ptr<float>(),
@@ -239,6 +239,6 @@ void MMCustomGPU(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c)
                 matB_sizes[1],
                 matO_sizes[0],
                 matO_sizes[1],
-                at::cuda::getCurrentCUDAStream());
+                at::hip::getCurrentHIPStream());
 }
 } // namespace aiter
