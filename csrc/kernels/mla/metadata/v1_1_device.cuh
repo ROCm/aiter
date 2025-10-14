@@ -565,6 +565,7 @@ void get_mla_metadata_v1_1_device(
     const int32_t num_batches = seqlens_qo_indptr.size(0) - 1;
     const int32_t num_cu      = dev_prop.multiProcessorCount;
     const int32_t num_heads   = num_heads_per_head_k * num_heads_k;
+    const bool is_sparse      = (topk >= 0);
 
     const int32_t lds_size_in_bytes = [&]()
     {
@@ -618,13 +619,14 @@ void get_mla_metadata_v1_1_device(
     params.p_reduce_partial_map = reduce_partial_map.data_ptr<int32_t>();
     params.p_seqlens_qo_indptr  = seqlens_qo_indptr.data_ptr<int32_t>();
     params.p_seqlens_kv_indptr  = seqlens_kv_indptr.data_ptr<int32_t>();
-    params.num_batches          = num_batches;
+    params.num_batches          = is_sparse ? (uni_seqlen_qo * num_batches) : num_batches;
     params.num_heads            = num_heads;
     params.num_cu               = num_cu;
     params.reduce_indptr_size   = reduce_indptr.size(0);
     params.kv_granularity       = kv_granularity;
     params.kv_granularity_log2  = __builtin_ctz(kv_granularity);
-    params.uni_seqlen_qo        = uni_seqlen_qo;
+    params.uni_seqlen_qo        = is_sparse ? 1 : uni_seqlen_qo;
+    params.ori_seqlen_qo        = is_sparse ? uni_seqlen_qo : 0; // not used in non-sparse attn
     params.topk                 = topk;
     params.is_causal            = is_causal;
 
@@ -637,7 +639,7 @@ void get_mla_metadata_v1_1_device(
     MLA_METADATA_DISPATCHER(
         max_seqlen_qo * num_heads_per_head_k,
         kPackedQoLenPerWg,
-        uni_seqlen_qo,
+        params.uni_seqlen_qo,
         topk,
         dispatch_mla_metadata_v1_1_device<kPackedQoLenPerWg, kMaxClusterSize, kQoSplits, kUniSeqlenQo, kIsSparse>(
             params, coefs, stream, dev_prop.warpSize, dev_prop.maxSharedMemoryPerMultiProcessor)

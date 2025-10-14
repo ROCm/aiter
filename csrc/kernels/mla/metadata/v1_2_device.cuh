@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -40,18 +39,9 @@ __global__ void kn_get_mla_metadata_v1_2(
     int32_t sum_blocks = 0;
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
-        int bid_ori = [&]() {
-            if constexpr (!Traits::kIsSparse)
-            {
-                return bid;
-            }
-            else
-            {
-                return bid / params.ori_seqlen_qo;
-            }
-        }();
-        int32_t kv_end = params.p_seqlens_kv_indptr[bid_ori + 1];
-        int32_t seqlen_kv = kv_end - params.p_seqlens_kv_indptr[bid_ori];
+        const int32_t bid_ori   = Traits::kIsSparse ? (bid / params.ori_seqlen_qo) : bid;
+        const int32_t kv_end    = params.p_seqlens_kv_indptr[bid_ori + 1];
+        const int32_t seqlen_kv = kv_end - params.p_seqlens_kv_indptr[bid_ori];
 
         p_lds_seqlens_kv[bid] = Traits::kIsSparse ? min(seqlen_kv, params.topk) : seqlen_kv;
 
@@ -304,6 +294,8 @@ void get_mla_metadata_v1_2_device(
     hipGetDeviceProperties(&dev_prop, dev);
 
     const int32_t num_clusters = dev_prop.multiProcessorCount / num_heads_k;
+    const int32_t num_batches  = seqlens_kv_indptr.size(0) - 1;
+    const bool is_sparse       = (topk >= 0);
 
     MlaMetadataV1KernelParameter params = {};
     params.p_work_metadata_ptrs = work_metadata_ptrs.data_ptr<uint64_t>();
@@ -314,13 +306,14 @@ void get_mla_metadata_v1_2_device(
     params.p_reduce_partial_map = reduce_partial_map.data_ptr<int32_t>();
     params.p_seqlens_qo_indptr  = seqlens_qo_indptr.data_ptr<int32_t>();
     params.p_seqlens_kv_indptr  = seqlens_kv_indptr.data_ptr<int32_t>();
-    params.num_batches          = seqlens_kv_indptr.size(0) - 1;
+    params.num_batches          = is_sparse ? (uni_seqlen_qo * num_batches) : num_batches;
     params.num_heads            = num_heads_k * num_heads_per_head_k;
     params.num_cu               = num_clusters;
     params.reduce_indptr_size   = reduce_indptr.size(0);
     params.kv_granularity       = kv_granularity;
     params.kv_granularity_log2  = __builtin_ctz(kv_granularity);
-    params.uni_seqlen_qo        = uni_seqlen_qo;
+    params.uni_seqlen_qo        = is_sparse ? 1 : uni_seqlen_qo;
+    params.ori_seqlen_qo        = is_sparse ? uni_seqlen_qo : 0; // not used in non-sparse attn
     params.is_causal            = is_causal;
     params.topk                 = topk;
 
@@ -328,7 +321,7 @@ void get_mla_metadata_v1_2_device(
     MLA_METADATA_DISPATCHER(
         max_seqlen_qo * num_heads_per_head_k,
         kPackedQoLenPerWg,
-        uni_seqlen_qo,
+        params.uni_seqlen_qo,
         topk,
         dispatch_mla_metadata_v1_2_device<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>(
             params, stream, dev_prop.warpSize, dev_prop.maxSharedMemoryPerMultiProcessor)

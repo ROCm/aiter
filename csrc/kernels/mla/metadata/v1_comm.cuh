@@ -304,7 +304,7 @@ private:
     }
 
 #define MLA_UNI_SEQLEN_DISPATCHER(UNI_SEQLEN_QO, ...)                                                   \
-    switch (params.uni_seqlen_qo)                                                                       \
+    switch (UNI_SEQLEN_QO)                                                                       \
     {                                                                                                   \
         MLA_UNI_SEQLEN_QO_CASE(1, __VA_ARGS__);                                                         \
         MLA_UNI_SEQLEN_QO_CASE(2, __VA_ARGS__);                                                         \
@@ -312,7 +312,7 @@ private:
         MLA_UNI_SEQLEN_QO_CASE(4, __VA_ARGS__);                                                         \
         default:                                                                                        \
         {                                                                                               \
-            if (params.uni_seqlen_qo > 0)                                                               \
+            if ((UNI_SEQLEN_QO) > 0)                                                               \
             {                                                                                           \
                 constexpr int32_t kUniSeqlenQo = 0;                                                     \
                 __VA_ARGS__;                                                                            \
@@ -330,16 +330,13 @@ private:
     if (((MAX_PACKED_SEQLEN_QO) > 0) && ((MAX_PACKED_SEQLEN_QO) <= PACKED_QO_LEN_PER_WG))               \
     {                                                                                                   \
         constexpr bool kQoSplits = false;                                                               \
-        if ((TOPK) == -1)                                                                               \
+        if ((TOPK) < 0)                                                                                 \
         {                                                                                               \
             constexpr bool kIsSparse = false;                                                           \
             MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                                    \
         }                                                                                               \
         else                                                                                            \
         {                                                                                               \
-            params.num_batches = uni_seqlen_qo * params.num_batches;                                    \
-            params.uni_seqlen_qo = 1;                                                                   \
-            params.ori_seqlen_qo = uni_seqlen_qo;                                                       \
             constexpr bool kIsSparse = true;                                                            \
             MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                                    \
         }                                                                                               \
@@ -347,16 +344,13 @@ private:
     else                                                                                                \
     {                                                                                                   \
         constexpr bool kQoSplits = true;                                                                \
-        if ((TOPK) == -1)                                                                               \
+        if ((TOPK) < 0)                                                                                 \
         {                                                                                               \
             constexpr bool kIsSparse = false;                                                           \
             MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                                    \
         }                                                                                               \
         else                                                                                            \
         {                                                                                               \
-            params.num_batches = uni_seqlen_qo * params.num_batches;                                    \
-            params.uni_seqlen_qo = 1;                                                                   \
-            params.ori_seqlen_qo = uni_seqlen_qo;                                                       \
             constexpr bool kIsSparse = true;                                                            \
             MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                                    \
         }                                                                                               \
