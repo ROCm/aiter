@@ -4,7 +4,8 @@
 #pragma once
 
 #include <torch/python.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
 #include "custom_all_reduce.cuh"
 #include "mla.h"

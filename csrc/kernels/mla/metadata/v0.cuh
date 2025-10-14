@@ -4,7 +4,7 @@
 #pragma once
 
 #include <torch/python.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
 #include "aiter_hip_common.h"
 
 CK_TILE_HOST_DEVICE float get_overhead(

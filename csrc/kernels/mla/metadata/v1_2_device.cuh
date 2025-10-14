@@ -210,7 +210,7 @@ __global__ void kn_get_mla_metadata_v1_2(
                         work_info.qo_end =
                             ck_tile::min(work_info.qo_start + qo_tile_size, qo_state.get_end(curr_batch));
                         work_info.kv_start = curr_kv_begin + (curr_kv_block * params.kv_granularity);
-                        work_info.kv_end = 
+                        work_info.kv_end =
                             ck_tile::min(work_info.kv_start + (consuming_blks * params.kv_granularity),
                             curr_kv_end - (num_qo_tiles - 1 - qo_tile_idx));
                         work_info.kv_offset = curr_kv_end - work_info.kv_end;
@@ -256,7 +256,7 @@ __global__ void kn_get_mla_metadata_v1_2(
 template <int32_t kPackedQoLenPerWg, bool kQoSplits, int32_t kUniSeqlenQo, bool kIsSparse>
 void dispatch_mla_metadata_v1_2_device(
     const MlaMetadataV1KernelParameter& params,
-    const cudaStream_t stream,
+    const hipStream_t stream,
     const int32_t warp_size,
     const int32_t lds_size)
 {
@@ -284,7 +284,7 @@ void get_mla_metadata_v1_2_device(
 {
     constexpr int32_t kPackedQoLenPerWg = 128;
 
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;

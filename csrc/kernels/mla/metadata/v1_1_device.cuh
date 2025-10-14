@@ -66,9 +66,9 @@ struct MlaMetadataV11Traits
 
 struct MlaMetadataV11Coefficients
 {
-    float workloadLimitGlobal_0;
-    float workloadLimitGlobal_1;
-    float workloadLimitGlobal_2;
+    float workload_limit_global_0;
+    float workload_limit_global_1;
+    float workload_limit_global_2;
 };
 
 // This version just follows Flashinfer
@@ -111,9 +111,9 @@ CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v1(
     else limit = avg_workload;
 
     const float split_amplifier =
-        num_batches  * coefs.workloadLimitGlobal_0 +
-        avg_workload * coefs.workloadLimitGlobal_1 +
-        coefs.workloadLimitGlobal_2;
+        num_batches  * coefs.workload_limit_global_0 +
+        avg_workload * coefs.workload_limit_global_1 +
+        coefs.workload_limit_global_2;
     return ck_tile::integer_least_multiple(
         int32_t(cal_cost(packed_seqlen_qo, limit) + split_overhead * split_amplifier),
         kv_granularity);
@@ -522,7 +522,7 @@ template <int32_t kPackedQoLenPerWg, int32_t kMaxClusterSize, bool kQoSplits, in
 void dispatch_mla_metadata_v1_1_device(
     const MlaMetadataV1KernelParameter& params,
     const MlaMetadataV11Coefficients& coefs,
-    const cudaStream_t stream,
+    const hipStream_t stream,
     const int32_t warp_size,
     const int32_t lds_size)
 {
@@ -555,7 +555,7 @@ void get_mla_metadata_v1_1_device(
     constexpr int32_t kPackedQoLenPerWg = 128;
     constexpr int32_t kMaxClusterSize   = 1;
 
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -629,9 +629,9 @@ void get_mla_metadata_v1_1_device(
     params.is_causal            = is_causal;
 
     MlaMetadataV11Coefficients coefs = {};
-    coefs.workloadLimitGlobal_0 = 0.01f;
-    coefs.workloadLimitGlobal_1 = 0.01f;
-    coefs.workloadLimitGlobal_2 = 10.0f;
+    coefs.workload_limit_global_0 = 0.01f;
+    coefs.workload_limit_global_1 = 0.01f;
+    coefs.workload_limit_global_2 = 10.0f;
 
     // launch kernel
     MLA_METADATA_DISPATCHER(

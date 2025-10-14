@@ -3,7 +3,8 @@
 
 #include <sstream>
 #include <torch/python.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
 #include "mla.h"
 
@@ -530,7 +531,7 @@ template <typename Traits, typename lse_t, typename out_t>
 void dispatch_mla_reduce_v1(
     const MlaReduceKernelV1Params& params,
     const int32_t                  num_cu,
-    const cudaStream_t&            stream)
+    const hipStream_t&             stream)
 {
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -566,8 +567,8 @@ void mla_reduce_v1(
     torch::Tensor&                      final_output,          //            [bs, h, dv]
     std::optional<torch::Tensor>&       final_lse)             // contiguous [bs, h]
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(final_output));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(final_output));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;

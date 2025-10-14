@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "v0.cuh"
-#include "v1_1_device.cuh"
-#include "v1_1_host.cuh"
-#include "v1_2_device.cuh"
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include "metadata/v0.cuh"
+#include "metadata/v1_1_device.cuh"
+#include "metadata/v1_1_host.cuh"
+#include "metadata/v1_2_device.cuh"
 
 // ===================================================================================================================
 // MLA Metadata V0
@@ -28,8 +29,8 @@ std::vector<torch::Tensor> get_mla_metadata_v0(
     TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
                 __func__, ": seqlens_kv_indptr's element type should be int!");
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -103,7 +104,7 @@ void get_mla_metadata_v1(
     const bool           fast_mode,
     const int32_t        topk)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
 
     TORCH_CHECK((kv_granularity & (kv_granularity - 1)) == 0,
                 __func__, ": kv_granularity Must be power of 2!");
@@ -165,7 +166,7 @@ std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(
     const bool           is_causal,
     const int32_t        kv_granularity)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
 
     // This default settings is for our ASM MLA decode kernel. This kernel supports num_heads=16 and qo size from 1 to 4
     // without support to split qo for each workgroup. This means that kPackedQoLenPerWg should be 4*16=64 to prevent
