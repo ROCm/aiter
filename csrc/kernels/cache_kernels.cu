@@ -973,6 +973,51 @@ __global__ void reshape_and_cache_with_block_quant_kernel_for_asmpa(
         }
     }
 }
+
+template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
+__global__ void concat_and_cache_mla_kernel(
+    const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
+    const scalar_t* __restrict__ k_pe,  // [num_tokens, pe_dim]
+    cache_t* __restrict__ kv_cache,  // [num_blocks, block_size, (kv_lora_rank
+                                     // + pe_dim)]
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const int block_stride,                    //
+    const int entry_stride,                    //
+    const int kv_c_stride,                     //
+    const int k_pe_stride,                     //
+    const int kv_lora_rank,                    //
+    const int pe_dim,                          //
+    const int block_size,                      //
+    const float* scale                         //
+) {
+  const int64_t token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  // NOTE: slot_idx can be -1 if the token is padded
+  if (slot_idx < 0) {
+    return;
+  }
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  const float inverted_kscale = 1.0f / *scale;
+  auto copy = [&](const scalar_t* __restrict__ src, cache_t* __restrict__ dst,
+                  int src_stride, int dst_stride, int size, int offset) {
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+      const int64_t src_idx = token_idx * src_stride + i;
+      const int64_t dst_idx =
+          block_idx * block_stride + block_offset * entry_stride + i + offset;
+      if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
+        dst[dst_idx] = src[src_idx];
+      } else {
+        dst[dst_idx]= ck_tile::type_convert<cache_t>(
+                ck_tile::type_convert<float>(src[src_idx]) * inverted_kscale);
+      }
+    }
+  };
+
+  copy(kv_c, kv_cache, kv_c_stride, block_stride, kv_lora_rank, 0);
+  copy(k_pe, kv_cache, k_pe_stride, block_stride, pe_dim, kv_lora_rank);
+}
+
 } // namespace aiter
 
 // KV_T is the stored data type of kv-cache.
@@ -1237,6 +1282,19 @@ void reshape_and_cache_flash(
                 ori_block_size);                                                                   \
     }
 
+// KV_T is the data type of key and value tensors.
+// CACHE_T is the stored data type of kv-cache.
+// KV_DTYPE is the real data type of kv-cache.
+#define CALL_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE)              \
+  aiter::concat_and_cache_mla_kernel<KV_T, CACHE_T, KV_DTYPE>            \
+      <<<grid, block, 0, stream>>>(                                     \
+          reinterpret_cast<KV_T*>(kv_c.data_ptr()),                     \
+          reinterpret_cast<KV_T*>(k_pe.data_ptr()),                     \
+          reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),              \
+          slot_mapping.data_ptr<int64_t>(), block_stride, entry_stride, \
+          kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,   \
+          reinterpret_cast<const float*>(scale.data_ptr()));
+
 namespace aiter {
 
 void reshape_and_cache_with_pertoken_quant(
@@ -1490,4 +1548,45 @@ void reshape_and_cache_with_block_quant_for_asm_pa(
         TORCH_CHECK(false, "Unsupported data type of kv cache: ", key_cache.dtype());
     }
 }
+
+void concat_and_cache_mla(
+    torch::Tensor& kv_c,          // [num_tokens, kv_lora_rank]
+    torch::Tensor& k_pe,          // [num_tokens, pe_dim]
+    torch::Tensor& kv_cache,      // [num_blocks, block_size, (kv_lora_rank +
+                                  // pe_dim)]
+    torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
+    const std::string& kv_cache_dtype, torch::Tensor& scale) {
+  int num_tokens = slot_mapping.size(0);
+  int kv_lora_rank = kv_c.size(1);
+  int pe_dim = k_pe.size(1);
+  int block_size = kv_cache.size(1);
+
+  TORCH_CHECK(kv_cache.size(2) == kv_lora_rank + pe_dim);
+  //TORCH_CHECK(kv_cache_dtype != "fp8");
+
+  int kv_c_stride = kv_c.stride(0);
+  int k_pe_stride = k_pe.stride(0);
+  int block_stride = kv_cache.stride(0);
+  int entry_stride = kv_cache.stride(1);
+ const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(kv_c));
+ const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+  //if (kv_cache_dtype == "fp8_ds_mla") {
+  //  dim3 grid(num_tokens);
+  //  // For the NoPE part, each tile of 128 elements is handled by half of one
+  //  // warp (16 threads). There are 4 total tiles, so 2 warps (64 threads).
+  //  // Lanes 0 and 16 of each warp write the scale values for that warp's tiles.
+  //  // The RoPE part (last 64 elements) is handled by another 1 warp (32
+  //  // threads). So in total, we use 3 warps (96 threads) per block.
+  //  dim3 block(96);
+  //  DISPATCH_BY_KV_CACHE_DTYPE(kv_c.dtype(), kv_cache_dtype,
+  //                             CALL_CONCAT_AND_CACHE_DS_MLA);
+  //} else {
+    dim3 grid(num_tokens);
+    dim3 block(std::min(kv_lora_rank, 512));
+    DISPATCH_BY_KV_CACHE_DTYPE(kv_c.dtype(), kv_cache_dtype,
+                               CALL_CONCAT_AND_CACHE_MLA);
+  //}
+}
+
 } // namespace aiter

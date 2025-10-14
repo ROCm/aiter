@@ -262,7 +262,6 @@ def get_tune_dict(tune_dict_csv):
             device_properties = torch.cuda.get_device_properties(gpu)
             cu_num = device_properties.multi_processor_count
             tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
-            print(tune_df)
         for i in range(len(tune_df)):
             B = tune_df.loc[i, "B"]
             M = tune_df.loc[i, "M"]
