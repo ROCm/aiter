@@ -3,8 +3,8 @@
 #include "aiter_hip_common.h"
 #include "asm_f4gemm_configs.hpp"
 #include "py_itfs_common.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <cmath>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
@@ -195,8 +195,8 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
     args.stride_ScaleB0 = B_scale.stride(0);
     args.log2_k_split   = 0;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     CFG* config_map           = get_cfg(A, out);
     using DictKey             = std::tuple<int, int, int, std::optional<int>, std::optional<bool>>;
     struct SimpleHash

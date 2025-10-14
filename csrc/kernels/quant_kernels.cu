@@ -7,7 +7,7 @@
 #include "quant_common.cuh"
 #include "rocprim/rocprim.hpp"
 #include "vec_convert.h"
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
 
 const int32_t BlockSize           = 256;
@@ -563,8 +563,8 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
     int rows       = input.numel() / cols;
     dim3 grid(rows);
     dim3 block(BlockSize);
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     if(out.dtype() == torch_fp8)
     {
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
@@ -632,8 +632,8 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
     int rows       = input.numel() / cols;
     dim3 grid(rows);
     dim3 block(BlockSize);
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     if(out.dtype() == torch_fp8)
     {
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
@@ -685,8 +685,8 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
     int const rows        = input.numel() / cols;
     int32_t* num_rows_ptr = num_rows.has_value() ? num_rows->data_ptr<int32_t>() : nullptr;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     if(cols == 32 || cols == 64 || cols == 128)
     {
@@ -826,8 +826,8 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
 
     TORCH_CHECK(cols % group_size == 0, __func__, " cols is not divisible by group_size");
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     int thread_data_size     = 32;
     int num_thread_per_group = group_size / thread_data_size;
@@ -924,8 +924,8 @@ void smooth_per_token_scaled_quant(
     int32_t input_stride0 = input.stride(0);
     int32_t input_stride1 = input.dim() > 2 ? input.stride(1) : cols;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     dim3 const grid(rows);
     dim3 const block(BlockSize);
@@ -1001,8 +1001,8 @@ void partial_transpose(torch::Tensor& out,         // [rows, d]
     int const rows        = input.numel() / cols;
     int32_t* num_rows_ptr = num_rows.data_ptr<int32_t>();
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     if(cols <= 1024)
     {
