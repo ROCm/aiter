@@ -226,9 +226,11 @@ class QoState
 public:
     CK_TILE_DEVICE explicit QoState(
         const int32_t uni_seqlen_qo,
+        const int32_t ori_seqlen_qo,
         const int32_t* p_lds_seqlens_qo,
         const int32_t* p_seqlens_qo_indptr) :
         uni_seqlen_qo_(uni_seqlen_qo),
+        ori_seqlen_qo_(ori_seqlen_qo),
         p_lds_seqlens_qo_(p_lds_seqlens_qo),
         p_seqlens_qo_indptr_(p_seqlens_qo_indptr)
     { }
@@ -247,7 +249,8 @@ public:
         }
         else if constexpr (Traits::kUniSeqlenQo <= -1)
         {
-            return p_lds_seqlens_qo_[batch_idx];
+            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : bid;
+            return p_lds_seqlens_qo_[bid];
         }
         else
         {
@@ -264,7 +267,8 @@ public:
         }
         else if constexpr (Traits::kUniSeqlenQo <= -1)
         {
-            return p_seqlens_qo_indptr_[batch_idx];
+            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : bid;
+            return p_seqlens_qo_indptr_[bid];
         }
         else
         {
@@ -281,7 +285,8 @@ public:
         }
         else if constexpr (Traits::kUniSeqlenQo <= -1)
         {
-            return p_seqlens_qo_indptr_[batch_idx + 1];
+            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : bid;
+            return p_seqlens_qo_indptr_[bid + 1];
         }
         else
         {
@@ -291,6 +296,7 @@ public:
 
 private:
     const int32_t uni_seqlen_qo_;
+    const int32_t ori_seqlen_qo_;
     const int32_t* const p_lds_seqlens_qo_;
     const int32_t* const p_seqlens_qo_indptr_;
 };

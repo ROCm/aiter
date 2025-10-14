@@ -241,15 +241,16 @@ __global__ void kn_get_mla_metadata_v1_1(
     int32_t* p_lds_kv_lens   = p_lds_qo_lens + params.num_batches;
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
+        const int32_t bid_ori = Traits::kIsSparse ? (bid / params.ori_seqlen_qo) : bid;
         if constexpr (Traits::kSortBatch)
         {
             p_lds_batch_idx[bid] = bid;
         }
-        const int32_t raw_seqlen_kv = params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid];
+        const int32_t raw_seqlen_kv = params.p_seqlens_kv_indptr[bid_ori + 1] - params.p_seqlens_kv_indptr[bid_ori];
         p_lds_kv_lens[bid] = Traits::kIsSparse ? ck_tile::min(raw_seqlen_kv, params.topk) : raw_seqlen_kv;
-        p_lds_qo_lens[bid] = params.p_seqlens_qo_indptr[bid + 1] - params.p_seqlens_qo_indptr[bid];
+        p_lds_qo_lens[bid] = params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
     }
-    QoState<Traits> qo_state(params.uni_seqlen_qo, p_lds_qo_lens, params.p_seqlens_qo_indptr);
+    QoState<Traits> qo_state(params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_qo_lens, params.p_seqlens_qo_indptr);
 
     // Step.1. Calculate the size of cluster and some related information. The size is the number of workgroups
     //         composing each cluster. The size is determined by average packed qo length.
@@ -419,8 +420,7 @@ __global__ void kn_get_mla_metadata_v1_1(
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
     for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
-        const int32_t bid                = Traits::kSortBatch ? p_lds_batch_idx[idx] : idx;
-        const int32_t qo_len             = qo_state.get_seqlen(bid);
+        const int32_t bid                = Traits::kSortBatch ? p_lds_batch_idx[idx] : idx;        const int32_t qo_len             = qo_state.get_seqlen(bid);
         const int32_t qo_batch_start     = qo_state.get_begin(bid);
         const int32_t kv_len             = p_lds_kv_lens[bid];
         const int32_t kv_batch_start     = Traits::kIsSparse ? bid * params.topk : params.p_seqlens_kv_indptr[bid];

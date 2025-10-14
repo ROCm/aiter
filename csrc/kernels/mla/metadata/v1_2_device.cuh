@@ -30,7 +30,7 @@ __global__ void kn_get_mla_metadata_v1_2(
     int32_t* p_lds_seqlens_qo = reinterpret_cast<int32_t*>(p_smem);
     int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + params.num_batches;
 
-    QoState<Traits> qo_state(params.uni_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+    QoState<Traits> qo_state(params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
 
     const int32_t lane_idx = ck_tile::get_lane_id();
 
@@ -51,7 +51,7 @@ __global__ void kn_get_mla_metadata_v1_2(
 
         if constexpr (Traits::kUniSeqlenQo == -1)
         {
-            p_lds_seqlens_qo[bid] = params.p_seqlens_qo_indptr[bid + 1] - params.p_seqlens_qo_indptr[bid];
+            p_lds_seqlens_qo[bid] = params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
         }
     }
 
