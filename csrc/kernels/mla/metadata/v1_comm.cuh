@@ -62,6 +62,7 @@ struct MlaMetadataV1KernelParameter
     int32_t        kv_granularity;
     int32_t        kv_granularity_log2;
     int32_t        uni_seqlen_qo;
+    int32_t        ori_seqlen_qo;
     int32_t        topk;
     bool           is_causal;
 };
@@ -303,7 +304,7 @@ private:
     }
 
 #define MLA_UNI_SEQLEN_DISPATCHER(UNI_SEQLEN_QO, ...)                                                   \
-    switch (UNI_SEQLEN_QO)                                                                              \
+    switch (params.uni_seqlen_qo)                                                                       \
     {                                                                                                   \
         MLA_UNI_SEQLEN_QO_CASE(1, __VA_ARGS__);                                                         \
         MLA_UNI_SEQLEN_QO_CASE(2, __VA_ARGS__);                                                         \
@@ -311,7 +312,7 @@ private:
         MLA_UNI_SEQLEN_QO_CASE(4, __VA_ARGS__);                                                         \
         default:                                                                                        \
         {                                                                                               \
-            if (uni_seqlen_qo > 0)                                                                      \
+            if (params.uni_seqlen_qo > 0)                                                               \
             {                                                                                           \
                 constexpr int32_t kUniSeqlenQo = 0;                                                     \
                 __VA_ARGS__;                                                                            \
@@ -336,6 +337,9 @@ private:
         }                                                                                               \
         else                                                                                            \
         {                                                                                               \
+            params.num_batches = uni_seqlen_qo * params.num_batches;                                    \
+            params.uni_seqlen_qo = 1;                                                                   \
+            params.ori_seqlen_qo = uni_seqlen_qo;                                                       \
             constexpr bool kIsSparse = true;                                                            \
             MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                                    \
         }                                                                                               \
@@ -350,6 +354,9 @@ private:
         }                                                                                               \
         else                                                                                            \
         {                                                                                               \
+            params.num_batches = uni_seqlen_qo * params.num_batches;                                    \
+            params.uni_seqlen_qo = 1;                                                                   \
+            params.ori_seqlen_qo = uni_seqlen_qo;                                                       \
             constexpr bool kIsSparse = true;                                                            \
             MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                                    \
         }                                                                                               \

@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -39,8 +40,19 @@ __global__ void kn_get_mla_metadata_v1_2(
     int32_t sum_blocks = 0;
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
-        int32_t kv_end = params.p_seqlens_kv_indptr[bid + 1];
-        int32_t seqlen_kv = kv_end - params.p_seqlens_kv_indptr[bid];
+        int bid_ori = [&]() {
+            if constexpr (!Traits::kIsSparse)
+            {
+                return bid;
+            }
+            else
+            {
+                return bid / params.ori_seqlen_qo;
+            }
+        }();
+        int32_t kv_end = params.p_seqlens_kv_indptr[bid_ori + 1];
+        int32_t seqlen_kv = kv_end - params.p_seqlens_kv_indptr[bid_ori];
+
         p_lds_seqlens_kv[bid] = Traits::kIsSparse ? min(seqlen_kv, params.topk) : seqlen_kv;
 
         const int32_t num_blocks =
