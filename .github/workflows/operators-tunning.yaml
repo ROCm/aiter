@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [mi300x-1gpu] # TODO: add more runners
+        runner: [aiter-mi355-1gpu] # TODO: add more runners
     name: Operators Tunning
     runs-on: ${{ matrix.runner }}
 
