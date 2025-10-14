@@ -85,13 +85,7 @@ class _FlashAttnV3Func(torch.autograd.Function):
             sm_margin,
         )
 
-        # Dequantize inputs for high precision backward pass
-        # Reshape descale from [batch, heads] to [batch, 1, heads, 1] for BSHD broadcasting
-        q_hp = q.float() * q_descale.unsqueeze(1).unsqueeze(3) if q_descale is not None else q
-        k_hp = k.float() * k_descale.unsqueeze(1).unsqueeze(3) if k_descale is not None else k
-        v_hp = v.float() * v_descale.unsqueeze(1).unsqueeze(3) if v_descale is not None else v
-
-        ctx.save_for_backward(q_hp, k_hp, v_hp, out, softmax_lse)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, q_descale, k_descale, v_descale)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -102,13 +96,13 @@ class _FlashAttnV3Func(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
-        q_hp, k_hp, v_hp, out, softmax_lse = ctx.saved_tensors
+        q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
 
         dq, dk, dv, _delta = flash_attn_3.bwd(
             dout,
-            q_hp,
-            k_hp,
-            v_hp,
+            q,
+            k,
+            v,
             out,
             softmax_lse,
             None,  # dq
@@ -127,9 +121,9 @@ class _FlashAttnV3Func(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         return (
             dq,  # q
@@ -260,13 +254,7 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
             sm_margin,
         )
 
-        # Dequantize inputs for high precision backward pass
-        # Reshape descale from [batch, heads] to [batch, 1, heads, 1] for BSHD broadcasting
-        q_hp = q.float() * q_descale.unsqueeze(1).unsqueeze(3) if q_descale is not None else q
-        k_hp = k.float() * k_descale.unsqueeze(1).unsqueeze(3) if k_descale is not None else k
-        v_hp = v.float() * v_descale.unsqueeze(1).unsqueeze(3) if v_descale is not None else v
-
-        ctx.save_for_backward(q_hp, k_hp, v_hp, out, softmax_lse)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, q_descale, k_descale, v_descale)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -281,12 +269,13 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
-        q_hp, k_hp, v_hp, out, softmax_lse = ctx.saved_tensors
+        q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
+        
         dq, dk, dv, _delta = flash_attn_3.bwd(
             dout,
-            q_hp,
-            k_hp,
-            v_hp,
+            q,
+            k,
+            v,
             out,
             softmax_lse,
             None,  # dq
@@ -305,9 +294,9 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         return (
             dq,
