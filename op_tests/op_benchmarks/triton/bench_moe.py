@@ -23,7 +23,7 @@ def model_benchmark_configs(args):
         config_path=config_file, models="mixtral" if args.model is None else args.model
     )
     moe_configs = []
-    M = args.M if args.M else 4096  # check size
+    M = args.M if args.M else 32  # check size
     # M, K, N, E, top_k
     for model_name, config in configs.items():
         if not all(
@@ -254,8 +254,13 @@ def run_benchmark(args):
         kernel_name = "_fused_moe_kernel_gptq_awq"
 
     # python3 op_tests/test_moe_blockscale.py -d bf16 -m 32 -dim 7168 -idim 512 -e 512 -k 8
-    if args.M and args.N and args.K and args.TopK and args.E:
-        x_vals_list = [("custom shape", args.M, args.N, args.K, args.E, args.TopK)]
+    if args.model is not None:
+        assert (args.N and args.K and args.E and args.TopK) == 0, (
+            "When -model is set, do not set -N, -K, -E or -TopK, as they are model specific."
+        )
+    
+    if args.N and args.K and args.TopK and args.E:
+        x_vals_list = [("custom shape", args.M if args.M else 32, args.N, args.K, args.E, args.TopK)]
     else:
         x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k"]
