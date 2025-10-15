@@ -142,7 +142,8 @@ class Gemm:
         rocblas_decode=False,
         mp=1,
         err_ratio=0.01,
-        splitK=None,
+        profile_file="",
+        #splitK=None,
     ):
         self.m = m
         self.k = k
@@ -164,7 +165,8 @@ class Gemm:
         self.atol = 1e-2
         self.ref = self.get_gemm_ref()
         self.check_err_ratio = err_ratio
-        self.splitK = splitK
+        self.splitK = None
+        self.profile_file = profile_file
         self.start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
         # prefer hipblaslt unless rocblas time is less than this
@@ -552,18 +554,28 @@ class Gemm:
         self.warmup()
         self.hipb_time_all_sols(fast_mode=0, top_sols=1)
         self.asm_gemm_all_solutions()
-        self.best_libtype = "asm"
-        self.best_solidx = self.asm_gtimedf.solidx.iloc[0]
-        self.best_soltime = self.asm_gtimedf.gtimems.iloc[0]
-        self.best_splitK = self.asm_gtimedf.splitK.iloc[0]
-        self.best_err_ratio = self.asm_gtimedf.err_ratio.iloc[0]
-        self.best_kernelName = self.asm_gtimedf.kernelName.iloc[0]
-        if len(self.rocb_gtimedf) > 0 or len(self.asm_gtimedf) > 0:
-            self.rocb_gtimedf = pd.concat(
-            [self.rocb_gtimedf, self.asm_gtimedf], ignore_index=False
+        if self.profile_file != "":
+            if os.path.exists(self.profile_file):
+                old_df = pd.read_csv(self.profile_file)
+            else:
+                old_df=pd.DataFrame(columns=["M","N","K","bias","dtype","outdtype","scaleAB","cu_num","libtype","solidx","splitK","soltimes","kernelName","err_ratio","tflops","bw"])
+            resultsdf = pd.concat([self.rocb_gtimedf, self.hipb_gtimedf, self.asm_gtimedf], ignore_index=True)
+            resultsdf["M"] = self.m
+            resultsdf["N"] = self.n
+            resultsdf["K"] = self.k
+            resultsdf["bias"] = self.bias
+            resultsdf["dtype"] = self.dtype
+            resultsdf["outdtype"] = self.outdtype
+            resultsdf["scaleAB"] = self.scaleAB
+            resultsdf["cu_num"] = get_cu_num()
+            resultsdf = pd.concat([old_df,resultsdf], index=True)
+            resultsdf.to_csv(self.profile_file, index=False)
+        if len(self.hipb_gtimedf) > 0 or len(self.asm_gtimedf) > 0:
+            self.hipb_gtimedf = pd.concat(
+            [self.hipb_gtimedf, self.asm_gtimedf], ignore_index=False
         )
         # get best solution
-        self.rocb_gtimedf = self.rocb_gtimedf.sort_values(by="gtimems")
+        self.hipb_gtimedf = self.hipb_gtimedf.sort_values(by="gtimems")
         print("rocb_gtimedf", self.rocb_gtimedf)
         if len(self.rocb_gtimedf) > 0 and len(self.hipb_gtimedf) > 0:
             best_rocb_time = self.rocb_gtimedf.gtimems.iloc[0]
@@ -585,7 +597,7 @@ class Gemm:
                 self.best_err_ratio = self.hipb_gtimedf.err_ratio.iloc[0]
             # self.check_gemm_ref(self.best_libtype,self.best_solidx)
         elif len(self.hipb_gtimedf) > 0:
-            print(">>> Only hipblas solutions found!", flush=True)
+            print(">>> Only hipblas or asm solutions found!", flush=True)
             best_hipb_time = self.hipb_gtimedf.gtimems.iloc[0]
             self.best_libtype = "hipblaslt"
             self.best_solidx = self.hipb_gtimedf.solidx.iloc[0]
@@ -602,7 +614,7 @@ class Gemm:
             self.best_err_ratio = self.rocb_gtimedf.err_ratio.iloc[0]
             self.best_kernelName = self.rocb_gtimedf.kernelName.iloc[0]
         else:
-            print(">>> No rocblas or hipblas solutions found!", flush=True)
+            print(">>> No rocblas or hipblas or asm solutions found!", flush=True)
             self.best_libtype = "rocblas"
             self.best_solidx = 0
             self.best_soltime = 0
@@ -629,6 +641,7 @@ class GemmTuner:
         rocblas_decode=False,
         mp=1,
         err_ratio=0.01,
+        profile_file="",
     ):
         self.gemm_problems = pd.DataFrame(columns=["M", "N", "K", "bias"])
         self.indtype = indtype
@@ -636,6 +649,8 @@ class GemmTuner:
         self.rocblas_decode = rocblas_decode
         self.tuned_file = tuned_file
         self.mp = mp
+        self.err_ratio = err_ratio
+        self.profile_file = profile_file
 
         tuned_file_path = Path(tuned_file)
         if tuned_file_path.exists():
@@ -703,7 +718,8 @@ class GemmTuner:
                 scaleAB=ds["scaleAB"],
                 rocblas_decode=self.rocblas_decode,
                 mp=self.mp,
-                err_ratio=0.01,
+                err_ratio=self.err_ratio,
+                profile_file=self.profile_file
             )
             gemmobj.find_fastest_solution()
 

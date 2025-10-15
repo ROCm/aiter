@@ -95,7 +95,7 @@ def load_best_sols_custom(tune_path: str) -> bool:
 @functools.lru_cache(maxsize=4096)
 def query_sol_core(
     m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
-) -> int:
+) -> torch.Tensor:
     global solids, solMap, soltype, asm_solMap
     soltype = None
     solution_idx = 0
@@ -117,18 +117,19 @@ def query_sol_core(
         (soltype, solution_idx, splitK, kernelName) = solids.get(
             (int(m), n, k, bias, str(dtype), str(otype), scaleAB), (0, 0, 0, "")
         )
-        asm_solMap[solution_idx] = (splitK, kernelName)
-        logger.info(f"{m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=} found in tuned_gemm.csv")
+        asm_solMap[solution_idx] = kernelName
+        if soltype > 0:
+            logger.info(f"{m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=} found in tuned_gemm.csv")
     solution_name = solMap[soltype]
     logger.info(
         f"using {solution_name} solution:{solution_idx}, {splitK} {kernelName} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
     )
-    return solution_idx
+    return torch.Tensor([solution_idx, splitK]).to(torch.int32)
 
 
 def query_sol_fake(
     m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
-) -> int:
+) -> torch.Tensor:
     global solids, solMap, soltype
     # soltype = None
     solution_idx = 0
@@ -144,13 +145,13 @@ def query_sol_fake(
         ):
             soltype, solution_idx = 3, 2
 
-    return solution_idx
+    return torch.Tensor([solution_idx, 0]).to(torch.int32)
 
 
 @torch_compile_guard(gen_fake=query_sol_fake)
 def query_sol(
     m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
-) -> int:
+) -> torch.Tensor:
     # if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
     #     if n > 8 and 0 < m <= 4:
     #         return 3, 0
@@ -372,7 +373,7 @@ class TunedGemm:
         m, k = inp_view.shape
         n = weights.shape[0]
         use_bias = bias is not None
-        solution_idx = query_sol(
+        result = query_sol(
             m=m,
             n=n,
             k=k,
@@ -381,8 +382,10 @@ class TunedGemm:
             otype=str(otype) if otype is not None else str(inp.dtype),
             scaleAB=scale_a is not None or scale_b is not None,
         )
-        if solMap[soltype] == "asm":
-            splitK, kernelName = asm_solMap[solution_idx]
+        solution_idx = result[0].item()
+        splitK = result[1].item()
+        if solMap[soltype] == "asm":         
+            kernelName = asm_solMap[solution_idx]
             out = self.apply_asm_mm(inp_view, weights, bias, otype, splitK, kernelName)
         else:
             out = self.solfuncs[soltype](

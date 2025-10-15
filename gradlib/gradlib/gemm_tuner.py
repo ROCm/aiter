@@ -26,6 +26,7 @@ from aiter import dtypes
 import pandas as pd
 
 from GemmTuner import GemmTuner
+from aiter.jit.core import AITER_CONFIG_GEMM_BF16
 import time
 
 aiter.rocb_create_extension()
@@ -99,7 +100,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tuned_file",
         type=str,
-        default=os.getenv("GTUNE_TUNED", "tuned.csv"),
+        default=os.getenv("GTUNE_TUNED", AITER_CONFIG_GEMM_BF16),
         help="output file for tuned gemm solutions",
     )
     parser.add_argument(
@@ -174,6 +175,12 @@ if __name__ == "__main__":
         default=0.01,
         help="tolerable error ratio, default 0.01.",
     )
+    parser.add_argument(
+        "-o2",
+        "--profile_file",
+        default="",
+        help="output: all tuning results stored in this file",
+    )
     args = parser.parse_args()
 
     if args.outdtype is None:
@@ -188,6 +195,7 @@ if __name__ == "__main__":
         args.rocblas_decode,
         args.mp,
         args.errRatio,  # , args.splitK
+        args.profile_file,
     )
     nsets = [i * args.batch_size for i in args.nsets]
     if args.input_file:
