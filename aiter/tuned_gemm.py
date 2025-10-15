@@ -119,7 +119,9 @@ def query_sol_core(
         )
         asm_solMap[solution_idx] = kernelName
         if soltype > 0:
-            logger.info(f"{m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=} found in tuned_gemm.csv")
+            logger.info(
+                f"{m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=} found in tuned_gemm.csv"
+            )
     solution_name = solMap[soltype]
     logger.info(
         f"using {solution_name} solution:{solution_idx}, {splitK} {kernelName} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
@@ -384,7 +386,7 @@ class TunedGemm:
         )
         solution_idx = result[0].item()
         splitK = result[1].item()
-        if solMap[soltype] == "asm":         
+        if solMap[soltype] == "asm":
             kernelName = asm_solMap[solution_idx]
             out = self.apply_asm_mm(inp_view, weights, bias, otype, splitK, kernelName)
         else:

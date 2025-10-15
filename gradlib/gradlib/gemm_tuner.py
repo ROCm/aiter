@@ -115,13 +115,6 @@ if __name__ == "__main__":
         default=torch.cuda.device_count(),
         help="Tuning on multiple GPUs using multiple processes",
     )
-    parser.add_argument(
-        "-k",
-        "--splitK",
-        action="store_true",
-        required=False,
-        help="Use splitK kernels",
-    )
 
     parser.add_argument(
         "--tp",
