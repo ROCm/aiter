@@ -3,8 +3,6 @@
 #include "aiter_hip_common.h"
 #include "asm_i8gemm_configs.hpp"
 #include "py_itfs_common.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
@@ -169,8 +167,8 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
     args.ldc = stride_c;
     args.ks  = ks;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     CFG* config_map           = get_cfg(A, out);
     using DictKey             = std::tuple<int, int, int, std::optional<int>, std::optional<bool>>;
     struct SimpleHash
