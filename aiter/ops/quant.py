@@ -139,6 +139,7 @@ def get_torch_quant(qType):
         QuantType.per_Token: pertoken_quant,
         QuantType.per_1x32: per_1x32_f4_quant,
         QuantType.per_1x128: per_block_quant_wrapper((1, 128))(pertoken_quant),
+        QuantType.per_128x128: per_block_quant_wrapper((1, 128))(pertoken_quant),
     }
 
     def raise_NotImplementedError(*a, **k):
