@@ -87,7 +87,7 @@ jobs:
       - name: Show the difference after tunning
         run: |
           set -ex
-          git diff --word-diff
+          git diff --color-words --word-diff=porcelain
 
       - name: Test Performance after tunning
         run: |

@@ -77,6 +77,6 @@ if [ "$tuneFailed" = true ]; then
     done
     exit 1
 else
-    echo "All tunes and tests passed." | tee -a latest_test.log
+    echo "All tunes/tests passed." 
     exit 0
 fi
