@@ -122,6 +122,7 @@ fmha_bwd_args get_asm_fmha_bwd_args(const mask_info &mask,
                          nullptr, // seqstart_q
                          nullptr, // seqstart_k
                          nullptr, // seqlen_k_ptr
+                         nullptr, // seqlen_q_ptr
                          seqlen_q,
                          seqlen_k,
                          b,
