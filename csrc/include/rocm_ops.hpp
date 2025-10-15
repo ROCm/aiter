@@ -237,18 +237,19 @@
           py::arg("slot_mapping"),                                                  \
           py::arg("asm_layout"),                                                    \
           py::arg("ori_block_size") = 128);                                         \
-      m.def("concat_and_cache_mla", &aiter::concat_and_cache_mla,                   \
-            "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"                        \
-      "                     Tensor! kv_cache,"                                      \
-      "                     Tensor slot_mapping,"                                   \
-      "                     str kv_cache_dtype,"                                    \
-      "                     Tensor scale) -> ()",                                   \
-          py::arg("kv_c"),                                                        \
+    m.def("concat_and_cache_mla",                                                   \
+          &aiter::concat_and_cache_mla,                                             \
+          "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"                          \
+          "                     Tensor! kv_cache,"                                  \
+          "                     Tensor slot_mapping,"                               \
+          "                     str kv_cache_dtype,"                                \
+          "                     Tensor scale) -> ()",                               \
+          py::arg("kv_c"),                                                          \
           py::arg("k_pe"),                                                          \
           py::arg("kv_cache"),                                                      \
           py::arg("slot_mapping"),                                                  \
           py::arg("kv_cache_dtype"),                                                \
-          py::arg("scale"));                                                        \
+          py::arg("scale"));
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
     m.def("init_custom_ar",                                                                    \
@@ -1114,7 +1115,18 @@
 
 #define ROPE_POS_FWD_PYBIND                                                                   \
     m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl);                 \
-    m.def("rope_cached_positions_2c_fwd_impl", &rope_cached_positions_2c_fwd_impl);           \
+    m.def("rope_cached_positions_2c_fwd_impl",                                                \
+          &rope_cached_positions_2c_fwd_impl,                                                 \
+          py::arg("output_x"),                                                                \
+          py::arg("output_y"),                                                                \
+          py::arg("input_x"),                                                                 \
+          py::arg("input_y"),                                                                 \
+          py::arg("cos"),                                                                     \
+          py::arg("sin"),                                                                     \
+          py::arg("positions"),                                                               \
+          py::arg("rotate_style"),                                                            \
+          py::arg("reuse_freqs_front_part"),                                                  \
+          py::arg("nope_first"));                                                             \
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
