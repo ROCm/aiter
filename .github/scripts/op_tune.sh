@@ -18,6 +18,11 @@ fi
 
 mode="$1"
 
+tuneFailed=false
+testFaile=false
+tuneFailedCmds=()
+testFailedFiles=()
+
 declare -a tune_jobs=(
   "csrc/ck_batched_gemm_a8w8:op_tests/test_batched_gemm_a8w8.py:python3 csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py -i aiter/configs/a8w8_untuned_batched_gemm.csv -o aiter/configs/a8w8_tuned_batched_gemm.csv"
   "csrc/ck_batched_gemm_bf16:op_tests/test_batched_gemm_bf16.py:python3 csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py -i aiter/configs/bf16_untuned_batched_gemm.csv -o aiter/configs/bf16_tuned_batched_gemm.csv"
@@ -39,6 +44,8 @@ for job in "${tune_jobs[@]}"; do
             echo "✅ Test PASSED: $test_path"
         else
             echo "❌ Test FAILED: $test_path"
+            testFailed=true
+            testFailedFiles+=($test_path)
         fi
     elif [ "$mode" == "tune" ]; then
         echo "Running tuning script: $tune_cmd"
@@ -46,6 +53,8 @@ for job in "${tune_jobs[@]}"; do
             echo "✅ Tuning PASSED: $tune_cmd"
         else
             echo "❌ Tuning FAILED: $tune_cmd"
+            tuneFailed=true
+            tuneFailedCmds+=($tune_cmd)
         fi
     else
         echo "Unknown mode: $mode"
@@ -54,3 +63,20 @@ for job in "${tune_jobs[@]}"; do
     echo "============================================================"
     echo
 done
+
+if [ "$tuneFailed" = true ]; then
+    echo "Failed tune commands:"
+    for c in "${tuneFailedCmd[@]}"; do
+        echo "  $c"
+    done
+    exit 1
+ elif [ "$testFailed" = true ]; then
+    echo "Failed test files:"
+    for f in "${testFailedFiles[@]}"; do
+        echo "  $f"
+    done
+    exit 1
+else
+    echo "All tunes and tests passed." | tee -a latest_test.log
+    exit 0
+fi
