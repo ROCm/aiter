@@ -681,6 +681,7 @@ MANUAL_SCHEMA_OPS = [
     "_QuantType",
     "init_custom_ar",
     "greedy_sample",
+    "random_sample_outer_exponential",
     "random_sample",
     "mixed_sample",
     "exponential",

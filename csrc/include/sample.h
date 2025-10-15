@@ -8,6 +8,12 @@ namespace aiter {
 
 void greedy_sample(torch::Tensor& out, torch::Tensor& input);
 
+void random_sample_outer_exponential(torch::Tensor& out,
+                                     torch::Tensor& input,
+                                     torch::Tensor& exponentials,
+                                     torch::Tensor& temperatures,
+                                     float eps = 1e-10);
+
 void random_sample(torch::Tensor& out,
                    torch::Tensor& input,
                    torch::Tensor& temperatures,
