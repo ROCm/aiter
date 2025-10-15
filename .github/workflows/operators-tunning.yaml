@@ -1,4 +1,4 @@
-name: Operators Tunning
+name: Operators Tuning
 
 on:
   push:
@@ -12,12 +12,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  operators_tunning:
+  operators_tuning:
     strategy:
       fail-fast: false
       matrix:
         runner: [aiter-1gpu-runner] # TODO: add more runners
-    name: Operators Tunning
+    name: Operators tuning
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -37,7 +37,7 @@ jobs:
       - name: Run the container
         run: |
           set -ex
-          echo "Starting container: operators_tunning_test"
+          echo "Starting container: operators_tuning_test"
           docker run -dt \
           --device=/dev/dri \
           --device=/dev/kfd \
@@ -46,7 +46,7 @@ jobs:
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
-          --name operators_tunning_test \
+          --name operators_tuning_test \
           rocm/pytorch:latest
 
       - name: Setup-Triton
@@ -55,7 +55,7 @@ jobs:
           echo "Setuping Triton..."
           docker exec \
           -w /workspace \
-          operators_tunning_test \
+          operators_tuning_test \
           ./.github/scripts/build_triton.sh
 
       - name: Show Computing Units
@@ -64,35 +64,35 @@ jobs:
           echo "Showing Computing Units..."
           docker exec \
           -w /workspace \
-          operators_tunning_test \
+          operators_tuning_test \
           rocminfo | grep -i 'Compute Unit'
     
-      - name: Test Performance before tunning
+      - name: Test Performance before tuning
         run: |
           set -ex
           docker exec \
           -w /workspace \
-          operators_tunning_test \
+          operators_tuning_test \
           ./.github/scripts/op_tune.sh test
     
-      - name: Operators Tunning Tests
+      - name: Operators tuning Tests
         run: |
           set -ex
-          echo "Running Operators Tunning Tests..."
+          echo "Running Operators tuning Tests..."
           docker exec \
           -w /workspace \
-          operators_tunning_test \
+          operators_tuning_test \
           ./.github/scripts/op_tune.sh tune
       
-      - name: Show the difference after tunning
+      - name: Show the difference after tuning
         run: |
           set -ex
           git diff --color-words --word-diff=porcelain
 
-      - name: Test Performance after tunning
+      - name: Test Performance after tuning
         run: |
           set -ex
           docker exec \
           -w /workspace \
-          operators_tunning_test \
+          operators_tuning_test \
           ./.github/scripts/op_tune.sh test
