@@ -19,7 +19,7 @@ fi
 mode="$1"
 
 tuneFailed=false
-testFaile=false
+testFailed=false
 tuneFailedCmds=()
 testFailedFiles=()
 
