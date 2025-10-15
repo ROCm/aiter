@@ -20,8 +20,8 @@ You can find the results of the tuning in `aiter/configs/a8w8_blockscale_bpreshu
     `cu_num` means the number of compute units, and it is used to distinguish between graphics.
 
 4. Build tuned kernels and test:
-Test the performance, modify the test instance in `op_tests/test_gemm_a8w8_blockscale_bpreshuffle.py` and run it, please wait a few minutes as it will build gemm_a8w8_blockscale_bpreshuffle tuned kernels in `aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv` via jit:
-`python3 op_tests/test_gemm_a8w8_blockscale_bpreshuffle.py`
+Test the performance, modify the test instance in `op_tests/test_gemm_a8w8_blockscale.py` and run it, please wait a few minutes as it will build gemm_a8w8_blockscale_bpreshuffle tuned kernels in `aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv` via jit:
+`python3 op_tests/test_gemm_a8w8_blockscale.py`
 If you have built gemm_a8w8 kernels brefore tuning new GEMM shapes, please add `AITER_REBUILD=1` before your test cmd, such as `AITER_REBUILD=1 python3 op_tests/test_gemm_a8w8_blockscale_bpreshuffle.py`. It will rebuild kernels from `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE` the default one will be `aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv`.
 
 ## More
