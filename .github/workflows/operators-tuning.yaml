@@ -96,3 +96,21 @@ jobs:
           -w /workspace \
           operators_tuning_test \
           ./.github/scripts/op_tune.sh test
+
+      - name: Upload tuned CSVs
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuned-csvs
+          path: aiter/configs/*.csv
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          set -ex
+          echo "Cleaning up..."
+          docker rm -f operators_tuning_test || true
+
+      - name: Clean up Rocm processes
+        if: always()
+        run: |
+          ./.github/scripts/clean_up_rocm.sh
