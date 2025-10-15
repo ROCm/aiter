@@ -65,7 +65,7 @@ class fmha_fwd_v3_kernel
 
         int tg_div = (fmha_v3_traits.mask != 0) ? 2 : 1;
 
-        int bdx = 512;
+        int bdx = (fmha_v3_traits.d == 192) ? 256 : 512;
         int gdx = ((fmha_v3_traits.s + fmha_v3_traits.ts_qo - 1) / fmha_v3_traits.ts_qo + tg_div - 1) / tg_div;
         int gdy = fmha_v3_traits.h;
         int gdz = fmha_v3_traits.b;
@@ -161,7 +161,12 @@ std::string get_masktype_symbol(mha_fwd_traits t, mha_fwd_args a) {
 }
 
 std::string get_headim_symbol(mha_fwd_args a) {
-    return ((a.hdim_q == 128)  && (a.hdim_q == a.hdim_v)) ? "128" : "-1";
+    if ((a.hdim_q == 128)  && (a.hdim_q == a.hdim_v)) {
+        return "128";
+    } else if ((a.hdim_q == 192)  && (a.hdim_v == 128)) {
+        return "192";
+    }
+    return "-1";
 }
 
 std::string get_fwd_select_key(mha_fwd_traits t, mha_fwd_args a) {

@@ -3,3 +3,7 @@ FmhaFwdBf16,128,0,false,false,1,gfx950,1,0,fmha_fwd_hd128_bf16,fwd_hd128_bf16.co
 FmhaFwdBf16,128,0,false,false,1,gfx950,1,1,fmha_fwd_hd128_bf16_group,fwd_hd128_bf16_group.co,256,32
 FmhaFwdBf16,128,1,false,false,1,gfx950,1,0,fmha_fwd_hd128_bf16_causal,fwd_hd128_bf16_causal.co,256,32
 FmhaFwdBf16,128,1,false,false,1,gfx950,1,1,fmha_fwd_hd128_bf16_causal_group,fwd_hd128_bf16_causal_group.co,256,32
+FmhaFwdBf16,192,0,false,false,1,gfx950,1,0,fmha_fwd_hd192_hd128_bf16,fwd_hd192_hd128_bf16.co,128,128
+FmhaFwdBf16,192,0,false,false,1,gfx950,1,1,fmha_fwd_hd192_hd128_bf16_group,fwd_hd192_hd128_bf16_group.co,128,128
+FmhaFwdBf16,192,1,false,false,1,gfx950,1,0,fmha_fwd_hd192_hd128_bf16_causal,fwd_hd192_hd128_bf16_causal.co,128,128
+FmhaFwdBf16,192,1,false,false,1,gfx950,1,1,fmha_fwd_hd192_hd128_bf16_causal_group,fwd_hd192_hd128_bf16_causal_group.co,128,128
