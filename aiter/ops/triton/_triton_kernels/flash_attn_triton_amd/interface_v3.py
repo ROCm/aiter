@@ -483,6 +483,9 @@ def bwd(
     softcap: float,
     deterministic: bool,
     sm_margin: int = 0,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Flash Attention v3 backward pass compatible interface for AMD Triton implementation.
@@ -632,6 +635,9 @@ def bwd(
         philox_offset=philox_offset,
         use_exp2=USE_EXP2,
         mode=BWD_MODE,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
 
     if DEBUG:
