@@ -58,9 +58,9 @@ def fwd(
         print("window_size_right:", window_size_right)
         print("softcap:", softcap)
         print("return_softmax:", return_softmax)
-    
+
     if out is None:
-        out = torch.zeros_like(q) 
+        out = torch.zeros_like(q)
     else:
         out.zero_()
 

@@ -19,7 +19,6 @@ from .utils import (
 )
 
 
-
 def get_fwd_configs(autotune: bool):
     configs = []
     keys = [
@@ -284,8 +283,12 @@ def _attn_fwd_no_mask(
         if ENABLE_DROPOUT:
             # Compute pointers for this block
             philox_base = philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
-            philox_ptrs = philox_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-            
+            philox_ptrs = (
+                philox_base
+                + offs_m[:, None] * stride_sm
+                + kv_offs_n[None, :] * stride_sn
+            )
+
             # compute dropout mask
             rng_output = tl.rand(philox_seed, philox_ptrs)
             dropout_mask = rng_output > dropout_p
@@ -294,10 +297,16 @@ def _attn_fwd_no_mask(
             if RETURN_SCORES:
                 sd_mask_value = tl.where(dropout_mask, p, -p)
                 sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-                sd_mask_ptrs = sd_mask_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-                
+                sd_mask_ptrs = (
+                    sd_mask_base
+                    + offs_m[:, None] * stride_sm
+                    + kv_offs_n[None, :] * stride_sn
+                )
+
                 # Compute mask for sd_mask storage
-                sd_store_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+                sd_store_mask = (offs_m[:, None] < seqlen_q) & (
+                    kv_offs_n[None, :] < seqlen_k
+                )
                 tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
 
             # apply dropout mask in place
@@ -305,10 +314,16 @@ def _attn_fwd_no_mask(
         elif RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
             sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-            sd_mask_ptrs = sd_mask_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-            
+            sd_mask_ptrs = (
+                sd_mask_base
+                + offs_m[:, None] * stride_sm
+                + kv_offs_n[None, :] * stride_sn
+            )
+
             # Compute mask for sd_mask storage
-            sd_store_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+            sd_store_mask = (offs_m[:, None] < seqlen_q) & (
+                kv_offs_n[None, :] < seqlen_k
+            )
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
 
         # -- update output accumulator --
@@ -595,8 +610,12 @@ def _attn_fwd_mask(
         if ENABLE_DROPOUT:
             # Compute pointers for this block
             philox_base = philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
-            philox_ptrs = philox_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-            
+            philox_ptrs = (
+                philox_base
+                + offs_m[:, None] * stride_sm
+                + kv_offs_n[None, :] * stride_sn
+            )
+
             # compute dropout mask
             rng_output = tl.rand(philox_seed, philox_ptrs)
             dropout_mask = rng_output > dropout_p
@@ -605,30 +624,46 @@ def _attn_fwd_mask(
             if RETURN_SCORES:
                 sd_mask_value = tl.where(dropout_mask, p, -p)
                 sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-                sd_mask_ptrs = sd_mask_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-                
+                sd_mask_ptrs = (
+                    sd_mask_base
+                    + offs_m[:, None] * stride_sm
+                    + kv_offs_n[None, :] * stride_sn
+                )
+
                 # Compute mask for sd_mask storage - include bounds check
-                sd_store_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-                
+                sd_store_mask = (offs_m[:, None] < seqlen_q) & (
+                    kv_offs_n[None, :] < seqlen_k
+                )
+
                 # Add causal mask if applicable to prevent writing to invalid positions
                 if IS_CAUSAL:
                     seqlen_delta_qk = seqlen_k - seqlen_q
-                    causal_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk)
+                    causal_constraint = kv_offs_n[None, :] <= (
+                        offs_m[:, None] + seqlen_delta_qk
+                    )
                     sd_store_mask = sd_store_mask & causal_constraint
-                
+
                 # Add sliding window mask if applicable
                 if USE_SLIDING_WINDOW:
                     seqlen_delta_qk = seqlen_k - seqlen_q
                     if WINDOW_SIZE_LEFT < 0:
                         # Only right window constraint
-                        window_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT)
+                        window_constraint = kv_offs_n[None, :] <= (
+                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
+                        )
                     else:
                         # Both left and right window constraints
-                        left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
-                        right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                        window_constraint = (kv_offs_n[None, :] >= left_bound) & (kv_offs_n[None, :] <= right_bound)
+                        left_bound = (
+                            offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
+                        )
+                        right_bound = (
+                            offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
+                        )
+                        window_constraint = (kv_offs_n[None, :] >= left_bound) & (
+                            kv_offs_n[None, :] <= right_bound
+                        )
                     sd_store_mask = sd_store_mask & window_constraint
-                
+
                 tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
 
             # apply dropout mask in place
@@ -636,30 +671,42 @@ def _attn_fwd_mask(
         elif RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
             sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-            sd_mask_ptrs = sd_mask_base + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-            
+            sd_mask_ptrs = (
+                sd_mask_base
+                + offs_m[:, None] * stride_sm
+                + kv_offs_n[None, :] * stride_sn
+            )
+
             # Compute mask for sd_mask storage - include bounds check
-            sd_store_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-            
+            sd_store_mask = (offs_m[:, None] < seqlen_q) & (
+                kv_offs_n[None, :] < seqlen_k
+            )
+
             # Add causal mask if applicable
             if IS_CAUSAL:
                 seqlen_delta_qk = seqlen_k - seqlen_q
-                causal_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk)
+                causal_constraint = kv_offs_n[None, :] <= (
+                    offs_m[:, None] + seqlen_delta_qk
+                )
                 sd_store_mask = sd_store_mask & causal_constraint
-            
+
             # Add sliding window mask if applicable
             if USE_SLIDING_WINDOW:
                 seqlen_delta_qk = seqlen_k - seqlen_q
                 if WINDOW_SIZE_LEFT < 0:
                     # Only right window constraint
-                    window_constraint = kv_offs_n[None, :] <= (offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT)
+                    window_constraint = kv_offs_n[None, :] <= (
+                        offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
+                    )
                 else:
                     # Both left and right window constraints
                     left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
                     right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                    window_constraint = (kv_offs_n[None, :] >= left_bound) & (kv_offs_n[None, :] <= right_bound)
+                    window_constraint = (kv_offs_n[None, :] >= left_bound) & (
+                        kv_offs_n[None, :] <= right_bound
+                    )
                 sd_store_mask = sd_store_mask & window_constraint
-            
+
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
 
         # -- update output accumulator --

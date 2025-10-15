@@ -14,6 +14,7 @@ from .utils import (
     get_arch,
 )
 
+
 def get_bwd_configs(autotune: bool):
     # keys
     preprocess_autotune_keys = [
@@ -385,15 +386,12 @@ def get_bwd_configs(autotune: bool):
     NON_CAUSAL_BLOCK_M1_OPTIONS = [16, 32, 64, 128]  # og: 32
     NON_CAUSAL_BLOCK_N1_M2_OPTIONS = [32, 64, 128, 256]  # og: 128
     NON_CAUSAL_BLOCK_N2_OPTIONS = [16, 32, 64, 128]  # og: 32
-    CAUSAL_BLOCK_M1_OPTIONS = [  # og: 32
-        32,
-        64
-    ]
+    CAUSAL_BLOCK_M1_OPTIONS = [32, 64]  # og: 32
     CAUSAL_BLOCK_N1_M2_OPTIONS = [32, 64, 128]  # og: 128
     CAUSAL_BLOCK_N2_OPTIONS = [32, 64]  # og: 32
     BLK_SLICE_FACTOR_OPTIONS = [2]  # og: 2
 
-    # ==================== sweep configs ================================ 
+    # ==================== sweep configs ================================
     preprocess_autotune_configs = []
     for pre_num_warps in PRE_NUM_WARPS_OPTIONS:
         for pre_num_stages in PRE_NUM_STAGES_OPTIONS:
@@ -414,81 +412,82 @@ def get_bwd_configs(autotune: bool):
     for num_warps in NUM_WARPS_OPTIONS:
         for num_stages in NUM_STAGES_OPTIONS:
             for waves in WAVES_PER_EU_OPTIONS:
-                    for m1 in CAUSAL_BLOCK_M1_OPTIONS:
-                        for n1 in CAUSAL_BLOCK_N1_M2_OPTIONS:
-                            m2 = n1
-                            for n2 in CAUSAL_BLOCK_N2_OPTIONS:
-                                # Ensure constraint
-                                assert (
-                                    n1 == m2
-                                ), f"BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})"
-                                
-                                # Skip configs where BLOCK_M2 % BLOCK_N2 != 0
-                                if m2 % n2 != 0:
-                                    continue
-                                
-                                # Skip configs where BLOCK_N1 % BLOCK_M1 != 0
-                                if n1 % m1 != 0:
-                                    continue
+                for m1 in CAUSAL_BLOCK_M1_OPTIONS:
+                    for n1 in CAUSAL_BLOCK_N1_M2_OPTIONS:
+                        m2 = n1
+                        for n2 in CAUSAL_BLOCK_N2_OPTIONS:
+                            # Ensure constraint
+                            assert (
+                                n1 == m2
+                            ), f"BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})"
 
-                                for blk_slice in BLK_SLICE_FACTOR_OPTIONS:
-                                    causal_autotune_configs.append(
-                                        triton.Config(
-                                            {
-                                                "BLOCK_M1": m1,
-                                                "BLOCK_N1": n1,
-                                                "BLOCK_M2": m2,
-                                                "BLOCK_N2": n2,
-                                                "BLK_SLICE_FACTOR": blk_slice,
-                                                "waves_per_eu": waves,
-                                            },
-                                            num_stages=num_stages,
-                                            num_warps=num_warps,
-                                        )
+                            # Skip configs where BLOCK_M2 % BLOCK_N2 != 0
+                            if m2 % n2 != 0:
+                                continue
+
+                            # Skip configs where BLOCK_N1 % BLOCK_M1 != 0
+                            if n1 % m1 != 0:
+                                continue
+
+                            for blk_slice in BLK_SLICE_FACTOR_OPTIONS:
+                                causal_autotune_configs.append(
+                                    triton.Config(
+                                        {
+                                            "BLOCK_M1": m1,
+                                            "BLOCK_N1": n1,
+                                            "BLOCK_M2": m2,
+                                            "BLOCK_N2": n2,
+                                            "BLK_SLICE_FACTOR": blk_slice,
+                                            "waves_per_eu": waves,
+                                        },
+                                        num_stages=num_stages,
+                                        num_warps=num_warps,
                                     )
+                                )
 
     noncausal_autotune_configs = []
     for num_warps in NUM_WARPS_OPTIONS:
         for num_stages in NUM_STAGES_OPTIONS:
             for waves in WAVES_PER_EU_OPTIONS:
-                    for m1 in NON_CAUSAL_BLOCK_M1_OPTIONS:
-                        for n1 in NON_CAUSAL_BLOCK_N1_M2_OPTIONS:
-                            m2 = n1
-                            for n2 in NON_CAUSAL_BLOCK_N2_OPTIONS:
-                                # Ensure constraint
-                                assert (
-                                    n1 == m2
-                                ), f"BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})"
-                                
-                                # Skip configs where BLOCK_M2 % BLOCK_N2 != 0
-                                if m2 % n2 != 0:
-                                    continue
-                                
-                                # Skip configs where BLOCK_N1 % BLOCK_M1 != 0
-                                if n1 % m1 != 0:
-                                    continue
-                                    
-                                for blk_slice in BLK_SLICE_FACTOR_OPTIONS:
-                                    noncausal_autotune_configs.append(
-                                        triton.Config(
-                                            {
-                                                "BLOCK_M1": m1,
-                                                "BLOCK_N1": n1,
-                                                "BLOCK_M2": m2,
-                                                "BLOCK_N2": n2,
-                                                "BLK_SLICE_FACTOR": blk_slice,
-                                                "waves_per_eu": waves,
-                                            },
-                                            num_stages=num_stages,
-                                            num_warps=num_warps,
-                                        )
+                for m1 in NON_CAUSAL_BLOCK_M1_OPTIONS:
+                    for n1 in NON_CAUSAL_BLOCK_N1_M2_OPTIONS:
+                        m2 = n1
+                        for n2 in NON_CAUSAL_BLOCK_N2_OPTIONS:
+                            # Ensure constraint
+                            assert (
+                                n1 == m2
+                            ), f"BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})"
+
+                            # Skip configs where BLOCK_M2 % BLOCK_N2 != 0
+                            if m2 % n2 != 0:
+                                continue
+
+                            # Skip configs where BLOCK_N1 % BLOCK_M1 != 0
+                            if n1 % m1 != 0:
+                                continue
+
+                            for blk_slice in BLK_SLICE_FACTOR_OPTIONS:
+                                noncausal_autotune_configs.append(
+                                    triton.Config(
+                                        {
+                                            "BLOCK_M1": m1,
+                                            "BLOCK_N1": n1,
+                                            "BLOCK_M2": m2,
+                                            "BLOCK_N2": n2,
+                                            "BLK_SLICE_FACTOR": blk_slice,
+                                            "waves_per_eu": waves,
+                                        },
+                                        num_stages=num_stages,
+                                        num_warps=num_warps,
                                     )
+                                )
 
     return (
         (preprocess_autotune_configs, preprocess_autotune_keys),
         (causal_autotune_configs, causal_autotune_keys),
         (noncausal_autotune_configs, noncausal_autotune_keys),
     )
+
 
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 (
