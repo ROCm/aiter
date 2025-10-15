@@ -25,6 +25,10 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                                           const at::Tensor v,
                                           const at::Tensor seqlens_q,
                                           const at::Tensor seqlens_k,
+                                          std::optional<const at::Tensor> &cu_seqlens_q_padded,
+                                          std::optional<const at::Tensor> &cu_seqlens_k_padded,
+                                          std::optional<const at::Tensor> &seqlen_q,
+                                          std::optional<const at::Tensor> &seqlen_k,
                                           std::optional<const at::Tensor> &alibi_slopes_,
                                           const at::Tensor out,
                                           const at::Tensor softmax_lse,
@@ -110,6 +114,25 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
         stride_alibi_slopes = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
+    const void* seqstart_k_ptr = nullptr;
+    const void* seqstart_q_ptr = nullptr;
+    const void* seqlen_k_ptr = nullptr;
+    const void* seqlen_q_ptr = nullptr;
+
+    if (cu_seqlens_k_padded.has_value()) {
+        seqstart_k_ptr = cu_seqlens_k_padded.value().data_ptr();
+        seqlen_k_ptr = seqlen_k.has_value() ? seqlen_k.value().data_ptr() : nullptr;
+    } else {
+        seqstart_k_ptr = seqlens_k.data_ptr();
+    }
+
+    if (cu_seqlens_q_padded.has_value()) {
+        seqstart_q_ptr = cu_seqlens_q_padded.value().data_ptr();
+        seqlen_q_ptr = seqlen_q.has_value() ? seqlen_q.value().data_ptr() : nullptr;
+    } else {
+        seqstart_q_ptr = seqlens_q.data_ptr();
+    }
+
     return fmha_bwd_args{q.data_ptr(),
                          k.data_ptr(),
                          v.data_ptr(),
@@ -124,9 +147,10 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          dv.data_ptr(),
                          nullptr, // dbias
                          dq_acc.data_ptr(), // dq_acc
-                         seqlens_q.data_ptr(), // seqstart_q
-                         seqlens_k.data_ptr(), // seqstart_k
-                         nullptr, // seqlen_k_ptr
+                         seqstart_q_ptr, // seqstart_q
+                         seqstart_k_ptr, // seqstart_k
+                         seqlen_q_ptr, // seqlen_q_ptr
+                         seqlen_k_ptr, // seqlen_k_ptr
                          total_q,
                          total_k,
                          b,
@@ -207,7 +231,10 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                std::optional<at::Tensor> dv_,                 // [total_k, hk, d_v]
                std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
                std::optional<const at::Tensor> rng_state_,
-               std::optional<at::Generator> gen_)
+               std::optional<at::Generator> gen_,
+               std::optional<const at::Tensor> cu_seqlens_q_padded, // [b+1]
+               std::optional<const at::Tensor> cu_seqlens_k_padded // [b+1]
+               )
 {
     if (is_causal) { window_size_right = 0; }
 
@@ -224,7 +251,14 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
     TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
-
+    if (cu_seqlens_q_padded.has_value()) {
+        TORCH_CHECK(cu_seqlens_q_padded.value().dtype() == torch::kInt32, "cu_seqlens_q_padded must have dtype int32");
+        CHECK_CONTIGUOUS(cu_seqlens_q_padded.value());
+    }
+    if (cu_seqlens_k_padded.has_value()) {
+        TORCH_CHECK(cu_seqlens_k_padded.value().dtype() == torch::kInt32, "cu_seqlens_k_padded must have dtype int32");
+        CHECK_CONTIGUOUS(cu_seqlens_k_padded.value());
+    }
     std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
@@ -314,7 +348,7 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
     auto opts = q.options();
-    auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+    auto softmax_d = torch::empty({batch_size, num_heads, total_q}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
 
     if (!deterministic) {
@@ -363,6 +397,20 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
     }
 
+    // Create seqlen tensors to avoid dangling pointers
+    auto make_lengths = [&](const at::Tensor& cu_seqlens, const char* name) {
+        TORCH_CHECK(cu_seqlens.dim() == 1, name, " must be 1D cumulative lengths");
+        TORCH_CHECK(
+            cu_seqlens.numel() == batch_size + 1,
+            name,
+            " must have size batch+1");
+        auto lengths = cu_seqlens.slice(/*dim=*/0, 1, torch::nullopt) - cu_seqlens.slice(/*dim=*/0, 0, cu_seqlens.size(0) - 1);
+        return lengths.contiguous();
+    };
+
+    std::optional<const at::Tensor> seqlen_q = cu_seqlens_q_padded.has_value() ? std::optional<const at::Tensor>(make_lengths(cu_seqlens_q, "cu_seqlens_q")) : std::nullopt;
+    std::optional<const at::Tensor> seqlen_k = cu_seqlens_k_padded.has_value() ? std::optional<const at::Tensor>(make_lengths(cu_seqlens_k, "cu_seqlens_k")) : std::nullopt;
+
     if (max_seqlen_q > 0) {
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
@@ -383,6 +431,10 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                cu_seqlens_q_padded,
+                cu_seqlens_k_padded,
+                seqlen_q,
+                seqlen_k,
                 alibi_slopes_,
                 out,
                 softmax_lse,

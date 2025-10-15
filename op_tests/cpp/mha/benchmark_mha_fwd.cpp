@@ -16,7 +16,6 @@
 #include <utility>
 #include <vector>
 
-
 auto create_args(int argc, char* argv[])
 {
     ck_tile::ArgParser arg_parser;
@@ -364,15 +363,18 @@ bool run(const ck_tile::ArgParser& arg_parser)
 #endif
     const bool use_kvcache = (need_append_kvcache || use_cache_batch_idx || 0 < page_block_size);
 
-    auto [seqlen_qs, seqlen_ks, seqlen_kpads] =
+    auto [seqlen_qs, seqlen_ks, seqlen_qpads, seqlen_kpads] =
         generate_missing_seqlens(mode,
                                  batch,
                                  arg_parser.get_int_vec("s"),
                                  arg_parser.get_int_vec("s_k"),
+                                 {}, // q_pad_val
                                  arg_parser.get_int_vec("s_kpad"),
                                  /*seqlen_k_min=*/0 < seqlen_knew ? seqlen_knew : 0,
                                  need_append_kvcache,
                                  random_engine);
+    ck_tile::ignore(seqlen_qpads);
+
     // compute kvcache seqlen_k (before appending knew/vnew)
     auto cache_seqlen_ks = seqlen_ks;
     std::transform(cache_seqlen_ks.begin(),
@@ -655,7 +657,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
         ck_tile::FillUniformDistributionIntegerValue<KDataType>{-3.f, 3.f, next_seed()}(knew_host);
         ck_tile::FillUniformDistributionIntegerValue<VDataType>{-3.f, 3.f, next_seed()}(v_host);
         ck_tile::FillUniformDistributionIntegerValue<VDataType>{-3.f, 3.f, next_seed()}(vnew_host);
-        ck_tile::FillUniformDistributionIntegerValue<BiasDataType>{-3.f, 3.f, next_seed()}(bias_host);
+        ck_tile::FillUniformDistributionIntegerValue<BiasDataType>{-3.f, 3.f, next_seed()}(
+            bias_host);
     }
     else if(init_method == "ni")
     {
@@ -664,7 +667,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
         ck_tile::FillNormalDistributionIntegerValue<KDataType>{-3.f, 3.f, next_seed()}(knew_host);
         ck_tile::FillNormalDistributionIntegerValue<VDataType>{-3.f, 3.f, next_seed()}(v_host);
         ck_tile::FillNormalDistributionIntegerValue<VDataType>{-3.f, 3.f, next_seed()}(vnew_host);
-        ck_tile::FillNormalDistributionIntegerValue<BiasDataType>{-3.f, 3.f, next_seed()}(bias_host);
+        ck_tile::FillNormalDistributionIntegerValue<BiasDataType>{-3.f, 3.f, next_seed()}(
+            bias_host);
     }
     else if(init_method == "uf" || init_method == "1")
     {
@@ -698,14 +702,17 @@ bool run(const ck_tile::ArgParser& arg_parser)
     {
         ck_tile::FillUniformDistribution<QDataType>{-q_dtype_max, q_dtype_max, next_seed()}(q_host);
         ck_tile::FillUniformDistribution<KDataType>{-k_dtype_max, k_dtype_max, next_seed()}(k_host);
-        ck_tile::FillUniformDistribution<KDataType>{-k_dtype_max, k_dtype_max, next_seed()}(knew_host);
+        ck_tile::FillUniformDistribution<KDataType>{-k_dtype_max, k_dtype_max, next_seed()}(
+            knew_host);
         ck_tile::FillUniformDistribution<VDataType>{-v_dtype_max, v_dtype_max, next_seed()}(v_host);
-        ck_tile::FillUniformDistribution<VDataType>{-v_dtype_max, v_dtype_max, next_seed()}(vnew_host);
+        ck_tile::FillUniformDistribution<VDataType>{-v_dtype_max, v_dtype_max, next_seed()}(
+            vnew_host);
 
         // bias_fp8 = qscale_bias * bias_fp32
         float qscale_bias = (q_dtype_max / range_q) * (k_dtype_max / range_k);
         // Assume bias is in [-1.f, 1.f] in original fp32
-        ck_tile::FillUniformDistribution<BiasDataType>{-qscale_bias, qscale_bias, next_seed()}(bias_host);
+        ck_tile::FillUniformDistribution<BiasDataType>{-qscale_bias, qscale_bias, next_seed()}(
+            bias_host);
     }
     if(bias.type == bias_enum::alibi)
     {

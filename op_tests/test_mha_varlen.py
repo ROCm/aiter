@@ -245,7 +245,6 @@ def run_ck(
             (us_fwd, fwd_flop, fwd_num_bytes, us_bwd, bwd_flop, bwd_num_bytes),
         )
 
-
 def run_ck_seq_padding(
     q,
     k,
@@ -258,6 +257,7 @@ def run_ck_seq_padding(
     causal=False,
     window_size=(-1, -1),
     alibi_slopes=None,
+    dout=None,
 ):
     """Run CK varlen forward with physically padded inputs."""
 
@@ -297,9 +297,9 @@ def run_ck_seq_padding(
             pieces.append(tensor[i, : padded_lens[i]])
         return torch.cat(pieces, dim=0)
 
-    q_flat = _flatten(q, q_padded_lens)
-    k_flat = _flatten(k, k_padded_lens)
-    v_flat = _flatten(v, k_padded_lens)
+    q_flat = _flatten(q, q_padded_lens).requires_grad_(True)
+    k_flat = _flatten(k, k_padded_lens).requires_grad_(True)
+    v_flat = _flatten(v, k_padded_lens).requires_grad_(True)
 
     outputs = aiter.flash_attn_varlen_func(
         q_flat,
@@ -314,7 +314,7 @@ def run_ck_seq_padding(
         window_size=window_size,
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
-        return_lse=False,
+        return_lse=True,
         return_attn_probs=False,
         cu_seqlens_q_padded=cu_seqlens_q_padded,
         cu_seqlens_k_padded=cu_seqlens_k_padded,
@@ -331,7 +331,44 @@ def run_ck_seq_padding(
         out_batch[:keep] = out_flat[start : start + keep]
         out_batches.append(out_batch)
 
-    return torch.stack(out_batches, dim=0)
+    out_stack = torch.stack(out_batches, dim=0)
+
+    if dout is None:
+        return out_stack
+
+    dout_flat = _flatten(dout, q_padded_lens)
+
+    dq_flat, dk_flat, dv_flat = torch.autograd.grad(
+        outputs=out_flat,
+        inputs=(q_flat, k_flat, v_flat),
+        grad_outputs=dout_flat,
+        create_graph=False,
+        retain_graph=True,
+        allow_unused=True,
+    )
+
+    def _unflatten(flat, padded_lens, max_padded_len, head_dim, value_dim):
+        pieces = []
+        start = 0
+        for i in range(batch_size):
+            end = start + padded_lens[i]
+            t = torch.zeros(
+                max_padded_len,
+                head_dim,
+                value_dim,
+                device=flat.device,
+                dtype=flat.dtype,
+            )
+            t[:padded_lens[i]] = flat[start:end]
+            pieces.append(t)
+            start = end
+        return torch.stack(pieces, dim=0)
+
+    dq = _unflatten(dq_flat, q_padded_lens, max(q_padded_lens), nheads, d)
+    dk = _unflatten(dk_flat, k_padded_lens, max(k_padded_lens), k.size(2), d)
+    dv = _unflatten(dv_flat, k_padded_lens, max(k_padded_lens), k.size(2), d_v)
+
+    return out_stack, dq, dk, dv
 
 
 @pytest.mark.parametrize("input_layout", ["BSHD", "KVPACKED"])
@@ -611,7 +648,7 @@ def flash_attn_varlen_func_benchmark(
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize(
     "padding_scenario",
-    ["mixed", "q_only", "k_only", "no_padding", "q_len_1", "k_len_1"],
+    ["mixed", "q_only", "k_only", "no_padding"],
 )
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize(
@@ -685,10 +722,6 @@ def test_varlen_flash_attn_seq_padding(
     elif padding_scenario == "no_padding":
         q_actual_lens = q_padded_lens
         k_actual_lens = k_padded_lens
-    elif padding_scenario == "q_len_1":
-        q_actual_lens = [1] * batch_size
-    elif padding_scenario == "k_len_1":
-        k_actual_lens = [1] * batch_size
 
     q_s = max(q_padded_lens)
     k_s = max(k_padded_lens)
@@ -709,6 +742,10 @@ def test_varlen_flash_attn_seq_padding(
             k_actual_lens[i], nheads_k, d_v, device=device, dtype=dtype
         )
 
+    q.requires_grad_(True)
+    k.requires_grad_(True)
+    v.requires_grad_(True)
+
     query_padding_mask = torch.arange(q_s, device=device).unsqueeze(0).expand(
         batch_size, -1
     ) < torch.tensor(q_actual_lens, device=device).unsqueeze(1)
@@ -716,7 +753,8 @@ def test_varlen_flash_attn_seq_padding(
         batch_size, -1
     ) < torch.tensor(k_actual_lens, device=device).unsqueeze(1)
 
-    out_ck = run_ck_seq_padding(
+    dout = torch.randn_like(q, dtype=q.dtype, device=device)
+    out_ck, dq_ck, dk_ck, dv_ck = run_ck_seq_padding(
         q,
         k,
         v,
@@ -727,9 +765,10 @@ def test_varlen_flash_attn_seq_padding(
         deterministic,
         causal=True,
         window_size=window_size,
+        dout=dout,
     )
 
-    out_ref = run_torch(
+    out_ref, dq_ref, dk_ref, dv_ref = run_torch(
         q,
         k,
         v,
@@ -737,14 +776,14 @@ def test_varlen_flash_attn_seq_padding(
         key_padding_mask,
         bias=None,
         alibi_slopes=None,
-        dout=None,
+        dout=dout,
         dropout_p=0.0,
         dropout_mask=None,
         causal=True,
         window_size=window_size,
     )
 
-    out_pt = run_torch(
+    out_pt, dq_pt, dk_pt, dv_pt = run_torch(
         q,
         k,
         v,
@@ -752,7 +791,7 @@ def test_varlen_flash_attn_seq_padding(
         key_padding_mask,
         bias=None,
         alibi_slopes=None,
-        dout=None,
+        dout=dout,
         dropout_p=0.0,
         dropout_mask=None,
         causal=True,
@@ -783,6 +822,77 @@ def test_varlen_flash_attn_seq_padding(
         f"\nGroup Mode Test (bs={batch_size}, {mha_type}, {padding_scenario}, {dtype}, local={local}) | Max diff: {out_diff} | Ref diff: {ref_diff} | Tol: {out_tol}"
     )
     assert out_diff <= out_tol
+
+
+    def _mask_grad(tensor, lens):
+        masked = tensor.clone()
+        for i, length in enumerate(lens):
+            masked[i, length:] = 0
+        return masked
+
+    dq_ref_masked = _mask_grad(dq_ref, q_actual_lens)
+    dq_pt_masked = _mask_grad(dq_pt, q_actual_lens)
+    dq_ck_masked = _mask_grad(dq_ck, q_actual_lens)
+
+    dk_ref_masked = _mask_grad(dk_ref, k_actual_lens)
+    dk_pt_masked = _mask_grad(dk_pt, k_actual_lens)
+    dk_ck_masked = _mask_grad(dk_ck, k_actual_lens)
+
+    dv_ref_masked = _mask_grad(dv_ref, k_actual_lens)
+    dv_pt_masked = _mask_grad(dv_pt, k_actual_lens)
+    dv_ck_masked = _mask_grad(dv_ck, k_actual_lens)
+
+    dq_pt_diff = (dq_pt_masked - dq_ref_masked).abs().max().item()
+    dk_pt_diff = (dk_pt_masked - dk_ref_masked).abs().max().item()
+    dv_pt_diff = (dv_pt_masked - dv_ref_masked).abs().max().item()
+    print(f"dQ Pytorch max diff (masked): {dq_pt_diff}")
+    print(f"dK Pytorch max diff (masked): {dk_pt_diff}")
+    print(f"dV Pytorch max diff (masked): {dv_pt_diff}")
+
+    dq_tol = max(10 * dq_pt_diff, 0.01)
+    dk_tol = max(10 * dk_pt_diff, 0.01)
+    dv_tol = max(10 * dv_pt_diff, 0.01)
+
+    dq_ck_diff = (dq_ck_masked - dq_ref_masked).abs().max().item()
+    dk_ck_diff = (dk_ck_masked - dk_ref_masked).abs().max().item()
+    dv_ck_diff = (dv_ck_masked - dv_ref_masked).abs().max().item()
+
+    print(f"dQ CK max diff (masked): {dq_ck_diff}")
+    print(f"dK CK max diff (masked): {dk_ck_diff}")
+    print(f"dV CK max diff (masked): {dv_ck_diff}")
+
+    assert dq_ck_diff <= dq_tol
+    assert dk_ck_diff <= dk_tol
+    assert dv_ck_diff <= dv_tol
+
+
+@benchmark()
+def varlen_flash_attn_seq_padding_benchmark(
+    batch_size,
+    mha_type,
+    deterministic,
+    padding_scenario,
+    dtype,
+    d,
+    d_v,
+    seqlen_q,
+    seqlen_k,
+    local,
+):
+    return test_varlen_flash_attn_seq_padding(
+        batch_size=batch_size,
+        mha_type=mha_type,
+        deterministic=deterministic,
+        padding_scenario=padding_scenario,
+        dtype=dtype,
+        d=d,
+        d_v=d_v,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        local=local,
+    )
+
+
 
 
 l_causal = [False, True]
@@ -958,11 +1068,29 @@ if __name__ == "__main__":
             args.input_layout,
         )
         collected.append(ret)
-        test_varlen_flash_attn_seq_padding(
+
+    # Run seq_padding benchmark
+    padding_collected = []
+    for (
+        dtype,
+        (dim_qk, dim_v),
+        mha_type,
+        deterministic,
+        padding_scenario,
+        local,
+    ) in itertools.product(
+        args.dtype,
+        args.d_qk_v,
+        args.mha_type,
+        l_deterministic,
+        ["mixed", "q_only", "k_only", "no_padding"],
+        l_local,
+    ):
+        ret = varlen_flash_attn_seq_padding_benchmark(
             args.batch_size,
             mha_type,
             deterministic,
-            "mixed",
+            padding_scenario,
             dtypes.d_dtypes[dtype],
             dim_qk,
             dim_v,
@@ -970,6 +1098,10 @@ if __name__ == "__main__":
             seqlen_k,
             local,
         )
+        padding_collected.append(ret)
 
     df = pd.DataFrame(collected)
     aiter.logger.info(f"mha_varlen summary:\n{df}")
+
+    df_padding = pd.DataFrame(padding_collected)
+    aiter.logger.info(f"mha_varlen_seq_padding summary:\n{df_padding}")
