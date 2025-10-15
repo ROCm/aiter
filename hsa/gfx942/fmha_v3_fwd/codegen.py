@@ -168,6 +168,8 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, mha_fwd_args a,
     if(s.log_level_ > 0)
         std::cout << ", " << FmhaFwdV3Name<fmha_fwd_kernel_selector>::fwd_v3_name << std::flush;
 
+    std::cout << ", " << FmhaFwdV3Name<fmha_fwd_kernel_selector>::fwd_v3_name << std::flush;
+
     int tune_opt = 5;
     if (a.mask_type != 0 && ((a.nhead_q % 8 != 0) || (a.seqlen_q > 16384))) //if num_head is not 8N, or seqlen is bigger than 16K, downgrade to 2and3
     {
