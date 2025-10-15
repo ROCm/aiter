@@ -3,8 +3,8 @@
 #include "aiter_hip_common.h"
 #include "asm_f4gemm_configs.hpp"
 #include "py_itfs_common.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <cmath>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
@@ -195,8 +195,8 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
     args.stride_ScaleB0 = B_scale.stride(0);
     args.log2_k_split   = 0;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     CFG* config_map           = get_cfg(A, out);
     using DictKey             = std::tuple<int, int, int, std::optional<int>, std::optional<bool>>;
     struct SimpleHash
@@ -257,10 +257,10 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
 
         if(cfg.splitK == 1)
         {
-            out.zero_();
             args.log2_k_split = selectedksplit;
             int k_num         = 1 << args.log2_k_split;
             TORCH_CHECK(Kdim % k_num == 0, __func__, " Kdim % (1 << args.log2_k_split) != 0 !");
+            if(k_num>1)out.zero_();
             int k_per_tg = Kdim / k_num;
             k_per_tg     = ((k_per_tg + 256 - 1) / 256) * 256;
             gdz          = (Kdim + k_per_tg - 1) / k_per_tg;

@@ -3,8 +3,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
 #include "moe_op.h"
 #include "asm_moe_2stage_configs.hpp"
@@ -76,21 +76,24 @@ static CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, Q
     else if ((inp.scalar_type() == torch_fp8) &&
              (w1.scalar_type() == torch_fp8) &&
              out.scalar_type() == at::ScalarType::BFloat16 &&
-             quant_type == QuantType::per_Token)
+             quant_type == QuantType::per_Token && 
+             !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenFp8_g1u1;
     }
     else if (inp.scalar_type() == at::ScalarType::Char &&
              w1.scalar_type() == at::ScalarType::Char &&
              out.scalar_type() == at::ScalarType::BFloat16 &&
-             quant_type == QuantType::per_Token)
+             quant_type == QuantType::per_Token && 
+             !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenInt8_g1u1;
     }
     else if ((inp.scalar_type() == torch_fp8) &&
              (w1.scalar_type() == torch_fp8) &&
              (out.scalar_type() == torch_fp8) &&
-             quant_type == QuantType::per_1x128)
+             quant_type == QuantType::per_1x128 && 
+             !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1;
     }
@@ -160,8 +163,8 @@ void moe_stage1_g1u1(
     std::optional<torch::Tensor> sorted_weights = std::nullopt // [max_num_tokens_padded], do_weight==true need
 )
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     CFG *config_map = get_cfg(input, out, w1, quant_type, sorted_weights.has_value());
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;

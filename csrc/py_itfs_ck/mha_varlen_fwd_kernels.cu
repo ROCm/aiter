@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
@@ -36,7 +36,10 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           float softmax_scale,
                                           float logits_soft_cap,
                                           float p_dropout,
-                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                          // optional padded physical seqstarts (including PAD)
+                                          std::optional<const at::Tensor> &cu_seqlens_q_padded_,
+                                          std::optional<const at::Tensor> &cu_seqlens_k_padded_)
 {
     // q: (total_q, nheads, d)
     // k: (total_k, nheads_k, d)
@@ -94,6 +97,31 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
     
+    // Validate padded seqstart arrays if provided: shape [b+1], 1D, contiguous, int32/int64, monotonic
+    auto validate_and_maybe_convert = [&](std::optional<const at::Tensor> &opt_seqstarts,
+                                          const char *name) -> const ck_tile::index_t* {
+        if (!opt_seqstarts.has_value()) return nullptr;
+        const at::Tensor &t = opt_seqstarts.value();
+        CHECK_DEVICE(t);
+        TORCH_CHECK(t.dim() == 1, name, " must be 1D");
+        TORCH_CHECK(t.numel() == b + 1, name, " must have length batch+1");
+        TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+        TORCH_CHECK(t.dtype() == torch::kInt32, name, " must be int32, actual: ", t.dtype());
+        auto ptr = reinterpret_cast<const ck_tile::index_t*>(t.data_ptr<int32_t>());
+        auto acc = t.index({0}).item<int32_t>();
+        TORCH_CHECK(acc == 0, name, " first element must be 0");
+        auto data_ptr32 = t.data_ptr<int32_t>();
+        for (int i = 1; i < t.numel(); ++i) {
+            int v = data_ptr32[i];
+            TORCH_CHECK(v >= acc, name, " must be non-decreasing");
+            acc = v;
+        }
+        return ptr;
+    };
+
+    const ck_tile::index_t *seqstart_padded_q_ptr = validate_and_maybe_convert(cu_seqlens_q_padded_, "cu_seqlens_q_padded");
+    const ck_tile::index_t *seqstart_padded_k_ptr = validate_and_maybe_convert(cu_seqlens_k_padded_, "cu_seqlens_k_padded");
+
     return mha_fwd_args{q.data_ptr(),
                          k.data_ptr(),
                          v.data_ptr(),
@@ -101,9 +129,13 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
+                         nullptr, // cu_seqlen_q_ptr (batch mode only)
+                         nullptr, // cu_seqlen_kv_ptr (batch mode only)
                          cu_seqlens_q.data_ptr(), // seqstart_q
                          cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k
                          seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_kpads
+                         seqstart_padded_q_ptr,
+                         seqstart_padded_k_ptr,
                          total_q,
                          total_k,
                          b,
@@ -317,20 +349,33 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                std::optional<const at::Tensor> block_table_,  // [hq] or [b, hq]
                std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
                std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-               std::optional<at::Generator> gen_)
+               std::optional<at::Generator> gen_,
+               std::optional<const at::Tensor> cu_seqlens_q_padded_, // [b+1] physical starts with PAD
+               std::optional<const at::Tensor> cu_seqlens_k_padded_) // [b+1]
 {
-    auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    auto q_dtype = q.scalar_type();
+    bool isQKVFp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
+
+    TORCH_CHECK(q_dtype == at::ScalarType::Half || q_dtype == at::ScalarType::BFloat16 || isQKVFp8,
+                "FlashAttention only support fp16, bf16 and fp8_e4m3 data type");
 
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+
+    std::string q_dtype_str;
+    if (q_dtype == at::ScalarType::Half)
+        q_dtype_str = "fp16";
+    else if (q_dtype == at::ScalarType::BFloat16)
+        q_dtype_str = "bf16";
+    else if (isQKVFp8)
+        q_dtype_str = "fp8bf16"; // only support bf16 out for fp8
+
+    // TODO - support descale
+
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     if (cu_seqlens_k.has_value()) {
         TORCH_CHECK(cu_seqlens_k.value().dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
     }
-
-    std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(cu_seqlens_q);
@@ -341,6 +386,9 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     at::Tensor block_table;
     const bool paged_KV = block_table_.has_value();
     if (paged_KV) {
+        if (cu_seqlens_q_padded_.has_value() || cu_seqlens_k_padded_.has_value()) {
+            TORCH_CHECK(false, "Paged KV (splitkv, pagekv) does not support sequence padding.");
+        }
         block_table = block_table_.value();
         CHECK_DEVICE(block_table);
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
@@ -423,21 +471,21 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         CHECK_SHAPE(cu_seqlens_k.value(), batch_size + 1);
     }
     auto opts = q.options();
-
+    auto out_type = isQKVFp8 ? at::ScalarType::BFloat16 : q_dtype;
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        TORCH_CHECK(out.dtype() == out_type, "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, total_q, num_heads, head_size_v);
     }
     else {
-        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
+        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(out_type));
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    at::cuda::CUDAGuard device_guard{q.device()};
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
     bool has_lse = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
@@ -482,9 +530,9 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
             aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
     }
     std::optional<const at::Tensor> seqlens_k = std::nullopt;
-    
+
     if (max_seqlen_k > 0) {
-        auto stream = at::cuda::getCurrentHIPStream().stream();
+        auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
         if (paged_KV)
@@ -493,7 +541,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
             num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size_v, 0, num_splits);
             TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
             TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
-        
+
             auto softmax_lse_accum = torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
             auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size_v}, opts.dtype(at::kFloat));
 
@@ -564,7 +612,9 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     softmax_scale,
                     logits_soft_cap,
                     p_dropout,
-                    drop_seed_offset);
+                    drop_seed_offset,
+                    const_cast<std::optional<const at::Tensor>&>(cu_seqlens_q_padded_),
+                    const_cast<std::optional<const at::Tensor>&>(cu_seqlens_k_padded_));
 
             float t = aiter::mha_fwd(args,
                                      stream_config,
@@ -573,7 +623,10 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                                      mask.type,
                                      bias_type,
                                      has_lse,
-                                     false);
+                                     false, // use_ext_asm
+                                     1,     // how_v3_bf16_cvt
+                                     args.seqstart_padded_q_ptr,
+                                     args.seqstart_padded_k_ptr);
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
         }
     }
@@ -582,7 +635,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
-    
+
     return {out, softmax_lse, p, rng_state};
 }
 

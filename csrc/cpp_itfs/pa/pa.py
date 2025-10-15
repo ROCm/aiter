@@ -1,8 +1,9 @@
-from jinja2 import Template
-from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR
 import ctypes
 import math
 
+from jinja2 import Template
+
+from csrc.cpp_itfs.utils import AITER_CORE_DIR, compile_template_op
 
 MD_NAME = "pa"
 
@@ -21,6 +22,8 @@ def compile(
     block_size: int,
     alibi_enabled: str,
     mtp: int = 1,
+    quant_method: str = "vllm::Fp8QuantMethod::kPerTensor",
+    v_shuffle: bool = False,
     folder: str = None,
 ):
     return compile_template_op(
@@ -44,6 +47,8 @@ def compile(
         block_size=block_size,
         alibi_enabled=alibi_enabled,
         mtp=mtp,
+        quant_method=quant_method,
+        v_shuffle=v_shuffle,
         folder=folder,
     )
 
@@ -64,44 +69,29 @@ def paged_attention_rocm(
     max_context_len,
     alibi_slopes,
     kv_cache_dtype,
-    k_scale,
-    v_scale,
+    key_scale=None,
+    value_scale=None,
     fp8_out_scale=None,
     partition_size=256,
     mtp=1,
-    q_scale=None,
+    query_scale=None,
 ):
     import torch
+
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
-    warpSize = torch.cuda.get_device_properties(out.device).warp_size
-    if kv_cache_dtype == "auto":
-        if query.dtype == torch.bfloat16:
-            dtype = "__hip_bfloat16"
-            kv_dtype = "__hip_bfloat16"
-        elif query.dtype == torch.float16:
-            dtype = "_Float16"
-            kv_dtype = "_Float16"
-        else:
-            raise ValueError(f"Unsupported data type: {query.dtype}")
-    elif kv_cache_dtype == "fp8" or kv_cache_dtype == "fp8_e4m3":
-        if query.dtype == torch.bfloat16:
-            dtype = "__hip_bfloat16"
-            kv_dtype = "uint8_t"
-        elif query.dtype == torch.float16:
-            dtype = "_Float16"
-            kv_dtype = "uint8_t"
-        else:
-            raise ValueError(f"Unsupported data type: {query.dtype}")
-    else:
-        raise ValueError(f"Unsupported kv_cache_dtype: {kv_cache_dtype}")
+    dtype_map = {
+        torch.bfloat16: "__hip_bfloat16",
+        torch.float16: "_Float16",
+        torch.float8_e4m3fnuz: "uint8_t",
+        torch.float8_e4m3fn: "uint8_t",
+    }
 
-    if out.dtype == torch.bfloat16:
-        out_dtype = "__hip_bfloat16"
-    elif out.dtype == torch.float16:
-        out_dtype = "_Float16"
-    else:
-        raise ValueError(f"Unsupported data type: {out.dtype}")
+    warpSize = torch.cuda.get_device_properties(out.device).warp_size
+
+    dtype = dtype_map[query.dtype]
+    kv_dtype = dtype_map[key_cache.dtype]
+    out_dtype = dtype_map[out.dtype]
 
     num_seqs = block_tables.size(0)
     num_heads = query.size(1)
@@ -113,6 +103,13 @@ def paged_attention_rocm(
     gqa_ratio = int(num_heads / num_kv_heads)
     max_num_partitions = int(math.ceil(max_context_len / partition_size))
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
+    v_shuffle = value_cache.dim() == 5
+
+    quant_method = "vllm::Fp8QuantMethod::kPerTensor"
+    if key_scale is not None:
+        if key_scale.numel() == (key_cache.size(0) * block_size * num_kv_heads):
+            quant_method = "vllm::Fp8QuantMethod::kPerHead"
+
     func = compile(
         gqa_ratio,
         head_size,
@@ -124,6 +121,8 @@ def paged_attention_rocm(
         block_size,
         "true" if alibi_slopes is not None else "false",
         mtp,
+        quant_method,
+        v_shuffle,
     )
 
     alibi_slopes_ptr = (
@@ -183,10 +182,21 @@ def paged_attention_rocm(
         torch.cuda.current_stream(query.device),
     )
     q_scale_ptr = (
-        ctypes.cast(q_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
-        if q_scale is not None
-        else ctypes.POINTER(ctypes.c_float)()
+        ctypes.cast(query_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if query_scale is not None
+        else ctypes.POINTER(ctypes.c_int)()
     )
+    k_scale_ptr = (
+        ctypes.cast(key_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if key_scale is not None
+        else ctypes.POINTER(ctypes.c_int)()
+    )
+    v_scale_ptr = (
+        ctypes.cast(value_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if value_scale is not None
+        else ctypes.POINTER(ctypes.c_int)()
+    )
+
     func(
         out_ptr,
         exp_sums_ptr,
@@ -208,8 +218,8 @@ def paged_attention_rocm(
         kv_head_stride,
         alibi_slopes_ptr,
         q_scale_ptr,
-        ctypes.cast(k_scale.data_ptr(), ctypes.POINTER(ctypes.c_float)),
-        ctypes.cast(v_scale.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+        k_scale_ptr,
+        v_scale_ptr,
         fp8_out_scale_ptr,
         stream,
     )

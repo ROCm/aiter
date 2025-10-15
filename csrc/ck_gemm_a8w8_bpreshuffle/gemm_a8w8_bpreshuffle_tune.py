@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
-from aiter.test_common import perftest
+from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.ops.shuffle import shuffle_weight
 from gemm_a8w8_bpreshuffle_common import kernels_list
@@ -36,14 +36,6 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
-@perftest()
-def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
-    aiter.gemm_a8w8_bpreshuffle_tune(
-        x, weight, x_scale, w_scale, out, kernel_id, splitK
-    )
-    return out
-
-
 def run_gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
     aiter.gemm_a8w8_bpreshuffle_tune(
         x, weight, x_scale, w_scale, out, kernel_id, splitK
@@ -65,7 +57,7 @@ def generate_data(m, n, k, seed, dtype=dtypes.fp16, device="cuda"):
 class Gemma8W8BPreShuffleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
-        "tune_file": "aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
+        "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE}",
         "untune_file": "aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv",
     }
 
@@ -103,61 +95,53 @@ class Gemma8W8BPreShuffleTuner(GemmCommonTuner):
             kernels_num = len(kernels_list)
             gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
             ref_data_idx = [0, 5, 2, 3]
-            if tunedf[
-                (tunedf["M"] == M)
-                & (tunedf["N"] == N)
-                & (tunedf["K"] == K)
-                & (tunedf["cu_num"] == cu_num)
-            ].empty:
-                seed = seed + 1
-                total_kernel_nums = 0
-                for i in range(kernels_num):
-                    kernel = kernels_list[i]
-                    maxsplitK = (
-                        aiter.compute_gemm_SplitK(
-                            M,
-                            N,
-                            K,
-                            kernel.MPerBLOCK,
-                            kernel.NPerBLOCK,
-                            kernel.KPerBLOCK,
-                        )
-                        if useSplitK
-                        else 0
-                    )
-                    for splitK in range(maxsplitK + 1):
-                        info = ((cu_num, M, N, K), i, splitK, "")
-                        task.append(
-                            (
-                                info,
-                                generate_data,
-                                (M, N, K, seed),
-                                run_gemm_a8w8_bpreshuffle,
-                                (
-                                    gemm_a8w8_idx,
-                                    i,
-                                    splitK,
-                                ),
-                                {},
-                                run_torch,
-                                (
-                                    ref_data_idx,
-                                    None,
-                                    dtypes.fp16,
-                                ),
-                                {},
-                                None,
-                                1e-2,
-                                0.1,
-                            )
-                        )
-                        total_kernel_nums = total_kernel_nums + 1
 
-                tasks_data.append((total_kernel_nums, ()))
-            else:
-                print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
-                print()
-                print()
+            seed = seed + 1
+            total_kernel_nums = 0
+            for i in range(kernels_num):
+                kernel = kernels_list[i]
+                maxsplitK = (
+                    aiter.compute_gemm_SplitK(
+                        M,
+                        N,
+                        K,
+                        kernel.MPerBLOCK,
+                        kernel.NPerBLOCK,
+                        kernel.KPerBLOCK,
+                    )
+                    if useSplitK
+                    else 0
+                )
+                for splitK in range(maxsplitK + 1):
+                    info = ((cu_num, M, N, K), i, splitK, "")
+                    task.append(
+                        (
+                            info,
+                            generate_data,
+                            (M, N, K, seed),
+                            run_gemm_a8w8_bpreshuffle,
+                            (
+                                gemm_a8w8_idx,
+                                i,
+                                splitK,
+                            ),
+                            {},
+                            run_torch,
+                            (
+                                ref_data_idx,
+                                None,
+                                dtypes.fp16,
+                            ),
+                            {},
+                            None,
+                            1e-2,
+                            0.1,
+                        )
+                    )
+                    total_kernel_nums = total_kernel_nums + 1
+
+            tasks_data.append((total_kernel_nums, ()))
+
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)

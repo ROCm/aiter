@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include "py_itfs_common.h"
 #include "mha_common.h"
-
 #include "mha_fwd.h"
+#include "py_itfs_common.h"
+#include <ATen/hip/HIPContext.h>
+#include <torch/all.h>
 
 namespace aiter {
 namespace torch_itfs {
@@ -297,7 +296,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    at::cuda::CUDAGuard device_guard{q.device()};
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
     bool has_lse     = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
@@ -350,7 +349,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
 
     if(max_seqlen_k > 0)
     {
-        auto stream = at::cuda::getCurrentHIPStream().stream();
+        auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);

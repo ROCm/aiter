@@ -12,7 +12,6 @@ from collections import OrderedDict
 from functools import lru_cache, partial
 import binascii
 import hashlib
-from aiter.jit.utils.file_baton import FileBaton
 import logging
 import time
 
@@ -41,7 +40,9 @@ AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 
 if AITER_REBUILD >= 1:
     subprocess.run(f"rm -rf {BUILD_DIR}/*", shell=True)
-os.makedirs(BUILD_DIR, exist_ok=True)
+
+if not os.path.exists(BUILD_DIR):
+    os.makedirs(BUILD_DIR, exist_ok=True)
 
 CK_DIR = os.environ.get("CK_DIR", f"{AITER_CORE_DIR}/3rdparty/composable_kernel")
 
@@ -74,6 +75,8 @@ def mp_lock(
     """
     Using FileBaton for multiprocessing.
     """
+    from aiter.jit.utils.file_baton import FileBaton
+
     baton = FileBaton(lock_path)
     if baton.try_acquire():
         try:
@@ -97,9 +100,19 @@ def get_hip_version():
     return parse(version.stdout.split()[-1].rstrip("-").replace("-", "+"))
 
 
+@lru_cache()
+def hip_flag_checker(flag_hip: str) -> bool:
+    ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
+    if ret == 0:
+        return True
+    else:
+        logger.warning(f"{flag_hip} is not supported by hipcc.")
+        return False
+
+
 def validate_and_update_archs():
     archs = GPU_ARCH.split(";")
-    archs = [arch.strip() for arch in archs]
+    archs = [arch.strip().split(":")[0] for arch in archs]
     # List of allowed architectures
     allowed_archs = [
         "native",
@@ -108,7 +121,6 @@ def validate_and_update_archs():
         "gfx941",
         "gfx942",
         "gfx950",
-        "gfx1100",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -163,8 +175,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
             "-D__HIP_PLATFORM_AMD__=1",
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
-            "-mllvm",
-            "--amdgpu-kernarg-preload-count=16",
+            "-mllvm --amdgpu-kernarg-preload-count=16",
             "-Wno-unused-result",
             "-Wno-switch-bool",
             "-Wno-vla-cxx-extension",
@@ -198,6 +209,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
             cxxflags += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         archs = validate_and_update_archs()
         cxxflags += [f"--offload-arch={arch}" for arch in archs]
+        cxxflags = [flag for flag in set(cxxflags) if hip_flag_checker(flag)]
         makefile_file = makefile_template.render(
             includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags
         )
@@ -265,6 +277,7 @@ def compile_template_op(
         if cxxflags is None:
             cxxflags = []
         src_file = src_template.render(func_name=func_name, **kwargs)
+        logger.info(f"compile_template_op {func_name = } with {locals()}...")
         compile_lib(src_file, folder, includes, sources, cxxflags)
     return run_lib(func_name, folder)
 

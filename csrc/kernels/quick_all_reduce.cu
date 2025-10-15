@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include <ATen/cuda/Exceptions.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 #ifdef USE_ROCM
@@ -61,8 +60,8 @@ void qr_open_handles(fptr_t _fa,
 void qr_all_reduce(fptr_t _fa, torch::Tensor& inp,
                    torch::Tensor& out, int64_t quant_level, bool cast_bf2half) {
   auto fa = reinterpret_cast<DeviceComms*>(_fa);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
-  auto stream = at::cuda::getCurrentHIPStreamMasqueradingAsCUDA();
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+  auto stream = at::hip::getCurrentHIPStream();
 
   TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
   TORCH_CHECK_EQ(inp.numel(), out.numel());
@@ -77,9 +76,9 @@ void qr_all_reduce(fptr_t _fa, torch::Tensor& inp,
                                 reinterpret_cast<half*>(out.data_ptr()),
                                 out.numel(), quant_level, stream);
     } else {
-      fa->allreduce<nv_bfloat16, false>(
-          reinterpret_cast<nv_bfloat16*>(inp.data_ptr()),
-          reinterpret_cast<nv_bfloat16*>(out.data_ptr()),
+      fa->allreduce<__hip_bfloat16, false>(
+          reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
+          reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
           out.numel(), quant_level, stream);
     }
   } else {
@@ -98,14 +97,14 @@ int64_t qr_max_size() {
     template struct AllReduceTwoshot<T, Codec<T, 4>, cast_bf2half>;          \
     template struct AllReduceTwoshot<T, Codec<T, 8>, cast_bf2half>;          \
 
-INSTANTIATE_FOR_WORLDSIZE(nv_bfloat16, CodecFP, false)
-INSTANTIATE_FOR_WORLDSIZE(nv_bfloat16, CodecQ4, false)
-INSTANTIATE_FOR_WORLDSIZE(nv_bfloat16, CodecQ6, false)
-INSTANTIATE_FOR_WORLDSIZE(nv_bfloat16, CodecFP8, false)
-INSTANTIATE_FOR_WORLDSIZE(nv_bfloat16, CodecFP, true)
-INSTANTIATE_FOR_WORLDSIZE(nv_bfloat16, CodecQ4, true)
-INSTANTIATE_FOR_WORLDSIZE(nv_bfloat16, CodecQ6, true)
-INSTANTIATE_FOR_WORLDSIZE(nv_bfloat16, CodecFP8, true)
+INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecFP, false)
+INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ4, false)
+INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ6, false)
+INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecFP8, false)
+INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecFP, true)
+INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ4, true)
+INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ6, true)
+INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecFP8, true)
 
 INSTANTIATE_FOR_WORLDSIZE(half, CodecFP, false)
 INSTANTIATE_FOR_WORLDSIZE(half, CodecQ4, false)
