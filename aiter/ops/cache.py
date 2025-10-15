@@ -84,3 +84,14 @@ def reshape_and_cache_with_block_quant_for_asm_pa(
     asm_layout: bool,
     ori_block_size: int = 128,  # [128/256]
 ) -> None: ...
+
+
+@compile_ops("module_cache")
+def concat_and_cache_mla(
+    kv_c: Tensor,
+    k_pe: Tensor,
+    kv_cache: Tensor,
+    slot_mapping: Tensor,
+    kv_cache_dtype: str,
+    scale: Tensor,
+) -> None: ...
