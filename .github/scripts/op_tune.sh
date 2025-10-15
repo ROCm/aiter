@@ -66,7 +66,7 @@ done
 
 if [ "$tuneFailed" = true ]; then
     echo "Failed tune commands:"
-    for c in "${tuneFailedCmd[@]}"; do
+    for c in "${tuneFailedCmds[@]}"; do
         echo "  $c"
     done
     exit 1
