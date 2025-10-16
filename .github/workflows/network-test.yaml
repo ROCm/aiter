@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [aiter-1gpu-runner, aiter-mi325-1gpu]
+        runner: [aiter-1gpu-runner, aiter-mi355-1gpu]
 
     runs-on: ${{ matrix.runner }}
 
@@ -24,7 +24,6 @@ jobs:
       - name: Docker pull image
         run: |
           set -ex
-          docker rmi rocm/pytorch:latest
           time docker pull rocm/pytorch:latest
 
       - name: Run the container
