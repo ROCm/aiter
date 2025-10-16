@@ -2,9 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor, Generator
-from typing import Optional, Tuple, Any
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
-from ..jit.utils.chip_info import get_gfx
+from typing import List, Optional, Tuple, Any
+from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
+from ..jit.utils.chip_info import get_gfx, get_cu_num
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 import torch
@@ -1786,9 +1786,12 @@ def _flash_attn_varlen_forward(
         ret = ret and (cu_seqlens_q_padded is None and cu_seqlens_k_padded is None)
         return ret
 
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    def can_impl_fmha_wholek_fwd():
+        ret = q.shape[0] * q.shape[1] / 128 <= get_cu_num() * 0.8
+        return ret
 
-    if can_impl_fmha_v3_fwd():
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    if can_impl_fmha_v3_fwd() and not can_impl_fmha_wholek_fwd():
         out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
             q,
             k,
