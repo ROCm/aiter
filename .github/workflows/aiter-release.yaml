@@ -76,8 +76,12 @@ jobs:
       
       - name: Install ninja
         run: |
-          sudo apt update
-          sudo apt install ninja-build
+          set -e
+          echo "Install Dependencies"
+          docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
+          sudo apt update && sudo apt install ninja-build
 
       - name: Build Aiter
         run: |
