@@ -1,6 +1,6 @@
 name: Aiter Release Package
 
-description: This workflow builds the Aiter Python package as a .whl file and uploads it as the artifact.
+description: This workflow builds the Aiter Python package as .whl files for Python 3.10 and 3.12, and uploads them as artifacts.
 
 on:
   workflow_dispatch:
@@ -8,22 +8,33 @@ on:
       commit:
         description: 'Commit hash to build (leave empty to use current commit)'
         required: false
+  pull_request:
+    branches: [main] # for test
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  BUILD_DOCKER_IMAGE: "rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta"
-
 jobs:
   build_whl_package:
     runs-on: aiter-k8s-build
-  
+
+    strategy:
+      matrix:
+        include:
+          - python_version: "3.10"
+            docker_image: "rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta"
+          - python_version: "3.12"
+            docker_image: "rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0"
+
+    env:
+      BUILD_DOCKER_IMAGE: ${{ matrix.docker_image }}
+      PYTHON_VERSION: ${{ matrix.python_version }}
+
     steps:
       - name: Checkout aiter repo
         uses: actions/checkout@v4
-      
+
       - name: Checkout to user-specified commit (if provided)
         run: |
           set -ex
@@ -45,12 +56,12 @@ jobs:
       - name: Run the container
         run: |
           set -ex
-          echo "Starting container: aiter_build"
+          echo "Starting container: aiter_build_${{ matrix.python_version }}"
           docker run -dt \
           --shm-size=16G \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
-          --name aiter_build \
+          --name aiter_build_${{ matrix.python_version }} \
           ${{ env.BUILD_DOCKER_IMAGE }}
 
       - name: Install Dependencies
@@ -59,27 +70,25 @@ jobs:
           echo "Install Dependencies"
           docker exec \
           -w /workspace \
-          aiter_build \
+          aiter_build_${{ matrix.python_version }} \
           pip install -r requirements.txt 
-          
+
       - name: Build Aiter
         run: |
           set -e
-          echo "Building aiter whl packages..."
+          echo "Building aiter whl packages for Python ${{ matrix.python_version }}..."
           docker exec \
           -w /workspace \
-          aiter_build \
+          aiter_build_${{ matrix.python_version }} \
           bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="gfx942;gfx950" python3 setup.py bdist_wheel && ls dist/*.whl'
-      
+
       - name: Upload whl file as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aiter-whl-packages
+          name: aiter-whl-packages-py${{ matrix.python_version }}
           path: dist/*.whl
-          
-    
+
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f aiter_build || true
-          
+          docker rm -f aiter_build_${{ matrix.python_version }} || true
