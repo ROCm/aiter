@@ -13,10 +13,39 @@ concurrency:
 
 jobs:
   network-test:
-    runs-on: aiter-1gpu-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [aiter-1gpu-runner, aiter-mi325-1gpu]
+
+    runs-on: ${{ matrix.runner }}
 
     steps:
+      - name: Docker pull image
+        run: |
+          set -ex
+          time docker pull rocm/pytorch:latest
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: network_test"
+          docker run -dt \
+          --device=/dev/dri \
+          --device=/dev/kfd \
+          --shm-size=16G \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name network_test \
+          rocm/pytorch:latest
+    
       - name: Install speedtest-cli and test network
         run: |
           set -ex
-          pip install --user speedtest-cli && export PATH=$PATH:~/.local/bin && python3 -m speedtest_cli --simple
+          echo "Installing speedtest-cli and testing network..."
+          docker exec \
+          -w /workspace \
+          network_test \
+          bash -c "pip install speedtest-cli && speedtest-cli --simple"
