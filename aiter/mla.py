@@ -9,6 +9,7 @@ from aiter import dtypes
 import triton
 import triton.language as tl
 import functools
+from aiter.jit.utils.chip_info import get_cu_num
 
 
 @triton.jit
@@ -147,6 +148,9 @@ def mla_decode_fwd(
         num_kv_splits, num_kv_splits_indptr, mgc = get_meta_param(
             None, kv_indptr, nhead, nhead_kv, max_seqlen_q
         )
+
+    if num_kv_splits is None:
+        num_kv_splits = get_cu_num()
 
     if nhead == 16 and max_seqlen_q == 1:
         # special case for 16 heads and max_seqlen_q == 1

@@ -428,45 +428,87 @@ __global__ void kn_mla_reduce_v1(
         params, head_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds_lse_scale);
 }
 
-#define MLA_MERGE_CASE(NUM_HEAD_C, OUTPUT_LSE_C, NO_REDUCE_FINAL_MAP_C, NAME, ...)                          \
+// NRFM: No Reduce Final Map
+#define MLA_MERGE_CASE(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, NAME, ...)                             \
     constexpr int32_t NumHeads  = (NUM_HEAD_C);                                                             \
+    constexpr int32_t HeadDim   = (HEAD_DIM_C);                                                             \
     constexpr bool    OutputLse = (OUTPUT_LSE_C);                                                           \
-    constexpr bool    NoReduceFinalMap = (NO_REDUCE_FINAL_MAP_C);                                           \
-    using Traits = MlaReduceKernelV1Traits<512, NumHeads, OutputLse, NoReduceFinalMap>;                     \
+    constexpr bool    NoReduceFinalMap = (NRFM_C);                                                          \
+    using Traits = MlaReduceKernelV1Traits<HeadDim, NumHeads, OutputLse, NoReduceFinalMap>;                 \
     __VA_ARGS__;
 
 #define MLA_MERGE_CASE_IF(NUM_HEAD, NUM_HEAD_C,                                                             \
+                          HEAD_DIM, HEAD_DIM_C,                                                             \
                           OUTPUT_LSE, OUTPUT_LSE_C,                                                         \
-                          NO_REDUCE_FINAL_MAP, NO_REDUCE_FINAL_MAP_C,                                       \
+                          NRFM, NRFM_C,                                                                     \
                           NAME, ...)                                                                        \
     if (((NUM_HEAD) == (NUM_HEAD_C)) &&                                                                     \
+        ((HEAD_DIM) == (HEAD_DIM_C)) &&                                                                     \
         ((OUTPUT_LSE) == (OUTPUT_LSE_C)) &&                                                                 \
-        ((NO_REDUCE_FINAL_MAP) == (NO_REDUCE_FINAL_MAP_C)))                                                 \
+        ((NRFM) == (NRFM_C)))                                                                               \
     {                                                                                                       \
-        MLA_MERGE_CASE(NUM_HEAD_C, OUTPUT_LSE_C, NO_REDUCE_FINAL_MAP_C, NAME, __VA_ARGS__)                  \
+        MLA_MERGE_CASE(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, NAME, __VA_ARGS__)                     \
     }
 
 #define MLA_MERGE_CASE_EF(NUM_HEAD, NUM_HEAD_C,                                                             \
+                          HEAD_DIM, HEAD_DIM_C,                                                             \
                           OUTPUT_LSE, OUTPUT_LSE_C,                                                         \
-                          NO_REDUCE_FINAL_MAP, NO_REDUCE_FINAL_MAP_C,                                       \
+                          NRFM, NRFM_C,                                                                     \
                           NAME, ...)                                                                        \
     else if (((NUM_HEAD) == (NUM_HEAD_C)) &&                                                                \
+             ((HEAD_DIM) == (HEAD_DIM_C)) &&                                                                \
              ((OUTPUT_LSE) == (OUTPUT_LSE_C)) &&                                                            \
-             ((NO_REDUCE_FINAL_MAP) == (NO_REDUCE_FINAL_MAP_C)))                                            \
+             ((NRFM) == (NRFM_C)))                                                                          \
     {                                                                                                       \
-        MLA_MERGE_CASE(NUM_HEAD_C, OUTPUT_LSE_C, NO_REDUCE_FINAL_MAP_C, NAME, __VA_ARGS__)                  \
+        MLA_MERGE_CASE(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, NAME, __VA_ARGS__)                     \
     }
 
-#define MLA_MERGE_ERROR(NUM_HEAD, OUTPUT_LSE, NO_REDUCE_FINAL_MAP, NAME)                                    \
+#define MLA_MERGE_ERROR(NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NAME)                                         \
     {                                                                                                       \
         std::stringstream ss;                                                                               \
         ss << "#heads: " << (NUM_HEAD)                                                                      \
+           << ", head dimension: " << (HEAD_DIM)                                                            \
            << ", Output LSE: " << (OUTPUT_LSE)                                                              \
-           << ", Has reduce final map: " << (NO_REDUCE_FINAL_MAP);                                          \
+           << ", Has reduce final map: " << (NRFM);                                                         \
         TORCH_CHECK(false, NAME " doesn't support the specified settings: ", ss.str().c_str(), ".");        \
     }
 
-#define DISPATCH_MLA_MERGE_KERNEL(LSE_TYPE, OUT_TYPE, NUM_HEAD, OUTPUT_LSE, NO_REDUCE_FINAL_MAP, NAME, ...) \
+#define MLA_MERGE_ROUTER(NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NAME, ...)                                   \
+    MLA_MERGE_CASE_IF(                                                                                      \
+        NUM_HEAD,  16, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true, NAME, __VA_ARGS__)                     \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,  16, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true, NAME, __VA_ARGS__)                     \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD, 128, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true, NAME, __VA_ARGS__)                     \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD, 128, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true, NAME, __VA_ARGS__)                     \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,  16, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,  16, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD, 128, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD, 128, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,  16, HEAD_DIM, 512, OUTPUT_LSE, true,  NRFM, true, NAME, __VA_ARGS__)                     \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,  16, HEAD_DIM, 512, OUTPUT_LSE, false, NRFM, true, NAME, __VA_ARGS__)                     \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD, 128, HEAD_DIM, 512, OUTPUT_LSE, true,  NRFM, true, NAME, __VA_ARGS__)                     \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD, 128, HEAD_DIM, 512, OUTPUT_LSE, false, NRFM, true, NAME, __VA_ARGS__)                     \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,  16, HEAD_DIM, 512, OUTPUT_LSE, true,  NRFM, false, NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,  16, HEAD_DIM, 512, OUTPUT_LSE, false, NRFM, false, NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD, 128, HEAD_DIM, 512, OUTPUT_LSE, true,  NRFM, false, NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD, 128, HEAD_DIM, 512, OUTPUT_LSE, false, NRFM, false, NAME, __VA_ARGS__)                    \
+    else MLA_MERGE_ERROR(NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NAME);                                       \
+
+#define DISPATCH_MLA_MERGE_KERNEL(LSE_TYPE, OUT_TYPE, NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NAME, ...)      \
     switch ((LSE_TYPE))                                                                                     \
     {                                                                                                       \
         case at::ScalarType::Float:                                                                         \
@@ -477,45 +519,13 @@ __global__ void kn_mla_reduce_v1(
                 case at::ScalarType::BFloat16:                                                              \
                 {                                                                                           \
                     using out_t = ck_tile::bf16_t;                                                          \
-                    MLA_MERGE_CASE_IF(                                                                      \
-                        NUM_HEAD,  16, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD,  16, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD, 128, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD, 128, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD,  16, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD,  16, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD, 128, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD, 128, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
-                    else MLA_MERGE_ERROR(NUM_HEAD, OUTPUT_LSE, NO_REDUCE_FINAL_MAP, NAME);                  \
+                    MLA_MERGE_ROUTER(NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NAME, __VA_ARGS__)               \
                 }                                                                                           \
                 break;                                                                                      \
                 case at::ScalarType::Half:                                                                  \
                 {                                                                                           \
                     using out_t = ck_tile::fp16_t;                                                          \
-                    MLA_MERGE_CASE_IF(                                                                      \
-                        NUM_HEAD,  16, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD,  16, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD, 128, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD, 128, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, true, NAME, __VA_ARGS__)     \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD,  16, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD,  16, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD, 128, OUTPUT_LSE, true,  NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
-                    MLA_MERGE_CASE_EF(                                                                      \
-                        NUM_HEAD, 128, OUTPUT_LSE, false, NO_REDUCE_FINAL_MAP, false, NAME, __VA_ARGS__)    \
-                    else MLA_MERGE_ERROR(NUM_HEAD, OUTPUT_LSE, NO_REDUCE_FINAL_MAP, NAME);                  \
+                    MLA_MERGE_ROUTER(NUM_HEAD, HEAD_DIM, OUTPUT_LSE, NRFM, NAME, __VA_ARGS__)               \
                 }                                                                                           \
                 break;                                                                                      \
                 default:                                                                                    \
@@ -579,6 +589,7 @@ void mla_reduce_v1(
     const bool no_reduce_final_map = (reduce_final_map.has_value() == false);
     const int32_t num_reduce_tile = reduce_indptr.size(0) - 1;
     const int32_t num_heads = partial_output.size(-2);
+    const int32_t head_dim = final_output.size(-1);
 
     if (num_reduce_tile > 0)
     {
@@ -600,6 +611,7 @@ void mla_reduce_v1(
             output_lse ? final_lse.value().scalar_type() : at::ScalarType::Float,
             final_output.scalar_type(),
             num_heads,
+            head_dim,
             output_lse,
             no_reduce_final_map,
             "kn_mla_reduce_v1",
