@@ -148,7 +148,6 @@ def mla_decode_fwd(
             None, kv_indptr, nhead, nhead_kv, max_seqlen_q
         )
 
-    num_kv_splits = 80
     if nhead == 16 and max_seqlen_q == 1:
         # special case for 16 heads and max_seqlen_q == 1
         logits = torch.empty(
