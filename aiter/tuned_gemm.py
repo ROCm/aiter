@@ -41,6 +41,28 @@ soltype = 0
 
 
 @torch_compile_guard()
+def create_ds_custom() -> None:
+    global solids, bestsols, solMap
+    df: pd.DataFrame = bestsols
+    solids = {}
+    for i in range(len(df)):
+        ds = df.iloc[i]
+        key = (
+            ds["M"],
+            ds["N"],
+            ds["K"],
+            ds["bias"],
+            ds["dtype"],
+            ds["outdtype"],
+            ds["scaleAB"],
+        )
+
+        if ds["libtype"] in ["hipblaslt", "rocblas", "asm"]:
+            soltype_ = solMap.index(ds["libtype"])
+        solids[key] = (soltype_, int(ds["solidx"]))
+
+
+@torch_compile_guard()
 def load_best_sols_custom(tune_path: str) -> bool:
     global bestsols
     cu_count = get_cu_num()
@@ -96,7 +118,28 @@ def query_sol_core(
     return solution_idx
 
 
-@torch_compile_guard()
+def query_sol_fake(
+    m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
+) -> int:
+    global solids, solMap, soltype
+    # soltype = None
+    solution_idx = 0
+    cu_count = get_cu_num()
+    if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
+        if (
+            ((m == 1 and n <= 2 * cu_count) or (m > 1 and m <= 4 and n <= cu_count))
+            and k <= 9216
+            or (m > 4 and m <= 8 and n <= cu_count)
+            and k <= 5120
+            or (m > 8 and m <= 16 and n <= cu_count)
+            and k <= 256
+        ):
+            soltype, solution_idx = 3, 2
+
+    return solution_idx
+
+
+@torch_compile_guard(gen_fake=query_sol_fake)
 def query_sol(
     m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
 ) -> int:
@@ -139,25 +182,7 @@ class TunedGemm:
             self.bestsols = bestsols
 
     def create_ds(self):
-        global solids
-        df: pd.DataFrame = self.bestsols
-        solds = {}
-        for i in range(len(df)):
-            ds = df.iloc[i]
-            key = (
-                ds["M"],
-                ds["N"],
-                ds["K"],
-                ds["bias"],
-                ds["dtype"],
-                ds["outdtype"],
-                ds["scaleAB"],
-            )
-
-            if ds["libtype"] in ["hipblaslt", "rocblas", "asm"]:
-                soltype = self.solMap.index(ds["libtype"])
-            solds[key] = (soltype, int(ds["solidx"]))
-        solids = solds
+        create_ds_custom()
         self.solfuncs = [
             self.apply_torch_mm,
             self.apply_hipb_mm,
