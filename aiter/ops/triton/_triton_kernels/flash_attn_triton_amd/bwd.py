@@ -2717,29 +2717,37 @@ def _bwd_dkdv_inner(
                 print(f"pT: {pT.shape}\n", pT)
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m * stride_delta_m, mask=mask_m)
-        
+
         # Compute dP and dS.
         # Note: v is fp8, do is fp32, so we need to scale do before casting to fp8
         if IS_FP8:
             if FP8_AUTO_DESCALE:
                 do_scale, do_descale = compute_fp8_scaling_factors(do, FP8_MAX)
-                dpT = tl.dot(v, tl.trans((do * do_scale).to(v.type.element_ty))) * descale_v * do_descale
+                dpT = (
+                    tl.dot(v, tl.trans((do * do_scale).to(v.type.element_ty)))
+                    * descale_v
+                    * do_descale
+                )
             else:
                 dpT = tl.dot(v, tl.trans(do.to(v.type.element_ty))) * descale_v
         else:
             dpT = tl.dot(v, tl.trans(do))
-        
+
         if ENABLE_DROPOUT:
             dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
-        
+
         # Compute dK
         if IS_FP8:
             if FP8_AUTO_DESCALE:
                 # Apply dynamic scaling to dsT before casting to FP8
                 dsT_scale, dsT_descale = compute_fp8_scaling_factors(dsT, FP8_MAX)
-                dk += tl.dot((dsT * dsT_scale).to(qT.type.element_ty), tl.trans(qT)) * descale_q * dsT_descale
+                dk += (
+                    tl.dot((dsT * dsT_scale).to(qT.type.element_ty), tl.trans(qT))
+                    * descale_q
+                    * dsT_descale
+                )
             else:
                 dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT)) * descale_q
         else:
@@ -2891,30 +2899,38 @@ def _bwd_dq_inner(
             causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
             mask = causal_mask & mask_mn
             p = tl.where(mask, p, 0.0)
-        
+
         # Compute dP and dS.
         # Note: do is fp32, vT is fp8, so we need to scale do before casting to fp8
         if IS_FP8:
             if FP8_AUTO_DESCALE:
                 do_scale, do_descale = compute_fp8_scaling_factors(do, FP8_MAX)
-                dp = tl.dot((do * do_scale).to(vT.type.element_ty), vT) * descale_v * do_descale
+                dp = (
+                    tl.dot((do * do_scale).to(vT.type.element_ty), vT)
+                    * descale_v
+                    * do_descale
+                )
             else:
                 dp = tl.dot(do.to(vT.type.element_ty), vT) * descale_v
         else:
             dp = tl.dot(do, vT)
-        
+
         if ENABLE_DROPOUT:
             dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
         delta_i = Di[:, None]
         ds = p * (dp - delta_i)
-        
+
         # Compute dQ
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         if IS_FP8:
             if FP8_AUTO_DESCALE:
                 # Apply dynamic scaling to ds before casting to FP8
                 ds_scale, ds_descale = compute_fp8_scaling_factors(ds, FP8_MAX)
-                dq += tl.dot((ds * ds_scale).to(kT.type.element_ty), tl.trans(kT)) * descale_k * ds_descale
+                dq += (
+                    tl.dot((ds * ds_scale).to(kT.type.element_ty), tl.trans(kT))
+                    * descale_k
+                    * ds_descale
+                )
             else:
                 dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT)) * descale_k
         else:
