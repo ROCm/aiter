@@ -172,13 +172,6 @@ def mla_decode_fwd(
     final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
 
     if num_kv_splits_indptr is not None:
-        if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):
-            return logits.view(total_s, nhead, v_head_dim), attn_lse
-        Lv = v_head_dim
-        BLOCK_DV = triton.next_power_of_2(Lv)
-        grid = (bs, nhead)
-        extra_kargs = {"waves_per_eu": 4}
-
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
@@ -196,6 +189,13 @@ def mla_decode_fwd(
             attn_lse,
             o,
         )
+
+        # if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):
+        #     return logits.view(total_s, nhead, v_head_dim), attn_lse
+        Lv = v_head_dim
+        BLOCK_DV = triton.next_power_of_2(Lv)
+        grid = (bs, nhead)
+        extra_kargs = {"waves_per_eu": 4}
 
         _fwd_kernel_stage2_asm[grid](
             logits,

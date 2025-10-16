@@ -42,12 +42,12 @@ __global__ void kn_get_mla_metadata_v0(
     const int32_t num_loops = ck_tile::integer_divide_ceil(num_batches, kWarpSize);
     for (int32_t i = 0; i < num_loops; ++i)
     {
-        const int32_t seqlen_idx = threadIdx.x + i * kWarpSize;
+        const int32_t bid = threadIdx.x + i * kWarpSize;
         int32_t splits = 0;
 
-        if (seqlen_idx < num_batches)
+        if (bid < num_batches)
         {
-            const int32_t seqlen = p_seqlens[seqlen_idx + 1] - p_seqlens[seqlen_idx];
+            const int32_t seqlen = p_seqlens[bid + 1] - p_seqlens[bid];
             float min_overhead   = std::numeric_limits<float>::max();
             #pragma unroll
             for (int32_t test_splits = 1; test_splits <= kMaxSplits; ++test_splits)
@@ -74,9 +74,9 @@ __global__ void kn_get_mla_metadata_v0(
 
         const int32_t global_scan = scan + base_scan;
 
-        if (seqlen_idx < num_batches)
+        if (bid < num_batches)
         {
-            p_num_kv_splits[seqlen_idx + 1] = global_scan;
+            p_num_kv_splits[bid + 1] = global_scan;
         }
 
         // update base_scan
