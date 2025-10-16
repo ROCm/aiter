@@ -16,12 +16,7 @@ jobs:
     runs-on: aiter-1gpu-runner
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          submodules: 'recursive'
-    
       - name: Install speedtest-cli and test network
         run: |
           set -ex
-          pip install speedtest-cli && python3 -m speedtest_cli --simple
+          pip install --user speedtest-cli && export PATH=$PATH:~/.local/bin && python3 -m speedtest_cli --simple
