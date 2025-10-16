@@ -7,6 +7,7 @@ from typing import Literal, Optional
 from .utils import (
     DEBUG,
     AUTOTUNE,
+    FP8_AUTO_DESCALE,
     compute_fp8_scaling_factors,
     get_cu_count,
     is_cdna,
@@ -2600,6 +2601,7 @@ def _bwd_dkdv_inner(
     USE_EXP2: tl.constexpr,  # activate exp2
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    FP8_AUTO_DESCALE: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -2700,6 +2702,7 @@ def _bwd_dkdv_inner(
             pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
         # Compute dV.
+        # Note: pT and do are both high precision, so no need for auto-descaling here
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
             dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
@@ -2711,21 +2714,31 @@ def _bwd_dkdv_inner(
                 print(f"pT: {pT.shape}\n", pT)
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m * stride_delta_m, mask=mask_m)
+        
         # Compute dP and dS.
+        # Note: v is fp8, do is fp32, so we need to scale do before casting to fp8
         if IS_FP8:
-            dpT = tl.dot(v, tl.trans(do.to(v.type.element_ty))) * descale_v
+            if FP8_AUTO_DESCALE:
+                do_scale, do_descale = compute_fp8_scaling_factors(do, FP8_MAX)
+                dpT = tl.dot(v, tl.trans((do * do_scale).to(v.type.element_ty))) * descale_v * do_descale
+            else:
+                dpT = tl.dot(v, tl.trans(do.to(v.type.element_ty))) * descale_v
         else:
             dpT = tl.dot(v, tl.trans(do))
+        
         if ENABLE_DROPOUT:
             dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
+        
+        # Compute dK
         if IS_FP8:
-            # Rewrite dk += dsT @ qT.T as dk += (qT @ dsT.T).T
-            # This puts FP8 tensor (qT) on LHS of dot product
-            # Cast the transposed dsT to FP8 to match qT's dtype
-            dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
-            dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
+            if FP8_AUTO_DESCALE:
+                # Apply dynamic scaling to dsT before casting to FP8
+                dsT_scale, dsT_descale = compute_fp8_scaling_factors(dsT, FP8_MAX)
+                dk += tl.dot((dsT * dsT_scale).to(qT.type.element_ty), tl.trans(qT)) * descale_q * dsT_descale
+            else:
+                dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT)) * descale_q
         else:
             dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
         # Increment pointers.
@@ -2784,6 +2797,7 @@ def _bwd_dq_inner(
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    FP8_AUTO_DESCALE: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -2874,23 +2888,32 @@ def _bwd_dq_inner(
             causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
             mask = causal_mask & mask_mn
             p = tl.where(mask, p, 0.0)
+        
         # Compute dP and dS.
+        # Note: do is fp32, vT is fp8, so we need to scale do before casting to fp8
         if IS_FP8:
-            dp = tl.dot(do.to(vT.type.element_ty), vT) * descale_v
+            if FP8_AUTO_DESCALE:
+                do_scale, do_descale = compute_fp8_scaling_factors(do, FP8_MAX)
+                dp = tl.dot((do * do_scale).to(vT.type.element_ty), vT) * descale_v * do_descale
+            else:
+                dp = tl.dot(do.to(vT.type.element_ty), vT) * descale_v
         else:
             dp = tl.dot(do, vT)
+        
         if ENABLE_DROPOUT:
             dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
         delta_i = Di[:, None]
         ds = p * (dp - delta_i)
-        # Compute dQ.
+        
+        # Compute dQ
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         if IS_FP8:
-            # Rewrite dq += ds @ kT.T as dq += (kT @ ds.T).T
-            # This puts FP8 tensor (kT) on LHS of dot product
-            # Cast the transposed ds to FP8 to match kT's dtype
-            ds_transposed = tl.trans(ds).to(kT.type.element_ty)
-            dq += tl.trans(tl.dot(kT, ds_transposed)) * descale_k
+            if FP8_AUTO_DESCALE:
+                # Apply dynamic scaling to ds before casting to FP8
+                ds_scale, ds_descale = compute_fp8_scaling_factors(ds, FP8_MAX)
+                dq += tl.dot((ds * ds_scale).to(kT.type.element_ty), tl.trans(kT)) * descale_k * ds_descale
+            else:
+                dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT)) * descale_k
         else:
             dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
         # Increment pointers.
@@ -2991,6 +3014,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    FP8_AUTO_DESCALE: tl.constexpr,
     USE_SEQUSED: tl.constexpr,  # Add flag for seqused
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
@@ -3207,6 +3231,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 USE_EXP2=USE_EXP2,
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
+                FP8_AUTO_DESCALE=FP8_AUTO_DESCALE,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
@@ -3267,6 +3292,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 USE_EXP2=USE_EXP2,
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
+                FP8_AUTO_DESCALE=FP8_AUTO_DESCALE,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
@@ -3413,6 +3439,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 USE_EXP2=USE_EXP2,
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
+                FP8_AUTO_DESCALE=FP8_AUTO_DESCALE,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
@@ -3468,6 +3495,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 USE_EXP2=USE_EXP2,
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
+                FP8_AUTO_DESCALE=FP8_AUTO_DESCALE,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
@@ -3570,6 +3598,7 @@ def bwd_kernel_fused_noncausal(
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    FP8_AUTO_DESCALE: tl.constexpr,
     USE_SEQUSED: tl.constexpr,  # Add flag for seqused
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
@@ -3733,6 +3762,7 @@ def bwd_kernel_fused_noncausal(
                 USE_EXP2=USE_EXP2,
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
+                FP8_AUTO_DESCALE=FP8_AUTO_DESCALE,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
@@ -3859,6 +3889,7 @@ def bwd_kernel_fused_noncausal(
                 USE_EXP2=USE_EXP2,
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
+                FP8_AUTO_DESCALE=FP8_AUTO_DESCALE,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
@@ -4371,6 +4402,7 @@ def attention_backward_triton_impl(
                 USE_EXP2=use_exp2,
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
+                FP8_AUTO_DESCALE=FP8_AUTO_DESCALE,
                 USE_SEQUSED=(
                     seqused_q is not None or seqused_k is not None
                 ),  # Add flag for seqused
@@ -4458,6 +4490,7 @@ def attention_backward_triton_impl(
                 USE_EXP2=use_exp2,
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
+                FP8_AUTO_DESCALE=FP8_AUTO_DESCALE,
                 USE_SEQUSED=(
                     seqused_q is not None or seqused_k is not None
                 ),  # Add flag for seqused

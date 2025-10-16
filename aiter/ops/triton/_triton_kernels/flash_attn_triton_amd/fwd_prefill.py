@@ -7,6 +7,7 @@ from typing import Literal, Optional
 from .utils import (
     DEBUG,
     AUTOTUNE,
+    FP8_AUTO_DESCALE,
     compute_alibi_block,
     compute_fp8_scaling_factors,
     get_arch,
@@ -195,7 +196,7 @@ def _attn_fwd_no_mask(
     v_descale,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    FP8_P_DESCALE: tl.constexpr,
+    FP8_AUTO_DESCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL_QK: tl.constexpr,
     BLOCK_DMODEL_V: tl.constexpr,
@@ -347,7 +348,7 @@ def _attn_fwd_no_mask(
         m_i = m_ij
 
         if IS_FP8:
-            if FP8_P_DESCALE:
+            if FP8_AUTO_DESCALE:
                 scale_p, descale_p = compute_fp8_scaling_factors(p, FP8_MAX)
                 acc += (
                     tl.dot((p * scale_p).to(v.type.element_ty), v)
@@ -400,7 +401,7 @@ def _attn_fwd_mask(
     v_descale,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    FP8_P_DESCALE: tl.constexpr,
+    FP8_AUTO_DESCALE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL_QK: tl.constexpr,
@@ -726,11 +727,11 @@ def _attn_fwd_mask(
         m_i = m_ij
 
         if IS_FP8:
-            if FP8_P_DESCALE:
-                scale_p, descale_p = compute_fp8_scaling_factors(p, FP8_MAX)
+            if FP8_AUTO_DESCALE:
+                p_scale, p_descale = compute_fp8_scaling_factors(p, FP8_MAX)
                 acc += (
-                    tl.dot((p * scale_p).to(v.type.element_ty), v)
-                    * descale_p
+                    tl.dot((p * p_scale).to(v.type.element_ty), v)
+                    * p_descale
                     * v_descale
                 )
             else:
@@ -1112,7 +1113,7 @@ def attn_fwd(
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    FP8_P_DESCALE: tl.constexpr,
+    FP8_AUTO_DESCALE: tl.constexpr,
     USE_SEQUSED: tl.constexpr,
 ):
     # set params
@@ -1345,7 +1346,7 @@ def attn_fwd(
             v_descale,
             IS_FP8,
             FP8_MAX,
-            FP8_P_DESCALE,
+            FP8_AUTO_DESCALE,
             IS_CAUSAL,
             BLOCK_M,
             BLOCK_DMODEL_QK,
@@ -1410,7 +1411,7 @@ def attn_fwd(
             v_descale,
             IS_FP8,
             FP8_MAX,
-            FP8_P_DESCALE,
+            FP8_AUTO_DESCALE,
             BLOCK_M,
             BLOCK_DMODEL_QK,
             BLOCK_DMODEL_V,
@@ -1477,7 +1478,7 @@ def attn_fwd(
             v_descale,
             IS_FP8,
             FP8_MAX,
-            FP8_P_DESCALE,
+            FP8_AUTO_DESCALE,
             IS_CAUSAL,  # Use actual causal flag
             BLOCK_M,
             BLOCK_DMODEL_QK,
@@ -2084,6 +2085,6 @@ def attention_forward_prefill_triton_impl(
         RETURN_SCORES=return_scores,
         IS_FP8=IS_FP8,
         FP8_MAX=FP8_MAX,
-        FP8_P_DESCALE=False,
+        FP8_AUTO_DESCALE=FP8_AUTO_DESCALE,
         USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
     )
