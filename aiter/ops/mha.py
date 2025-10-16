@@ -1112,8 +1112,8 @@ def _flash_attn_forward(
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_q == hdim_v)
-        ret = ret and (hdim_q == 128)
+        ret = ret and (hdim_v == 128)
+        ret = ret and (hdim_q == 128 or (get_gfx() == "gfx950" and hdim_q == 192))
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
@@ -1778,8 +1778,8 @@ def _flash_attn_varlen_forward(
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_q == hdim_v)
-        ret = ret and (hdim_q == 128)
+        ret = ret and (hdim_v == 128)
+        ret = ret and (hdim_q == 128 or (get_gfx() == "gfx950" and hdim_q == 192))
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
