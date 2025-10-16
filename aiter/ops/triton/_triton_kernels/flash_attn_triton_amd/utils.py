@@ -45,7 +45,7 @@ USE_EXP2 = True
 PHILOX_SEED = 0x1BF58
 PHILOX_OFFSET = 0x1D4B49
 SHAPE_EXPECTATIONS: Literal["exact", "rounded"] = "exact"
-FP8_AUTO_DESCALE = True
+FP8_AUTO_DESCALE = False
 
 
 # -------------------------------
