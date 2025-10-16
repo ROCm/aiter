@@ -36,8 +36,8 @@ def _softmax_kernel_online(
     buffer_size: gl.constexpr = 16
     threads_per_warp: gl.constexpr = 64
 
-    # FIXME: For some reason, this value leads to bad
-    # performance for very large N
+    # FIXME: need to use this value to set size_per_thread, just bounded by
+    # what can fit in the load buffer
     cols_per_thread: gl.constexpr = triton.cdiv(BLOCK_SIZE, gl.num_warps() * 64)
     blocked_cols: gl.constexpr = gl.BlockedLayout(
         # each thread should only be loading as many elements
