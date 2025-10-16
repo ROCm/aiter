@@ -29,7 +29,10 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   triton:
+<<<<<<< HEAD
     needs: [check-signal]
+=======
+>>>>>>> ed8af63d (Move triton from mi325 to mi355)
     runs-on: aiter-mi355-1gpu
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
