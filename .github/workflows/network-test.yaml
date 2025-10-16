@@ -24,4 +24,4 @@ jobs:
       - name: Install speedtest-cli and test network
         run: |
           set -ex
-          pip install speedtest-cli && speedtest-cli --simple
+          pip install speedtest-cli && python -m speedtest_cli --simple
