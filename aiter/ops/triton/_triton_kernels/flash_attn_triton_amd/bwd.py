@@ -1186,8 +1186,9 @@ def _bwd_kernel_fused_atomic_causal(
         #     num_steps = 0
 
         if IS_FP8:
+            # For MQA/GQA, q_descale uses the same indexing as k/v (head_k_idx)
             descale_q = tl.load(
-                descale_q_ptr + batch_idx * stride_descale_q_z + head_q_idx
+                descale_q_ptr + batch_idx * stride_descale_q_z + head_k_idx
             )
             descale_k = tl.load(
                 descale_k_ptr + batch_idx * stride_descale_k_z + head_k_idx
@@ -1497,8 +1498,9 @@ def _bwd_kernel_split_dkdv_causal(
             num_steps = 0
 
         if IS_FP8:
+            # For MQA/GQA, q_descale uses the same indexing as k/v (head_k_idx)
             descale_q = tl.load(
-                descale_q_ptr + batch_idx * stride_descale_q_z + head_q_idx
+                descale_q_ptr + batch_idx * stride_descale_q_z + head_k_idx
             )
             descale_k = tl.load(
                 descale_k_ptr + batch_idx * stride_descale_k_z + head_k_idx
@@ -1765,8 +1767,9 @@ def _bwd_kernel_split_dq_causal(
         num_steps = tl.cdiv(end_n - start_n, MASK_BLOCK_N)
 
         if IS_FP8:
+            # For MQA/GQA, q_descale uses the same indexing as k/v (head_k_idx)
             descale_q = tl.load(
-                descale_q_ptr + batch_idx * stride_descale_q_z + head_q_idx
+                descale_q_ptr + batch_idx * stride_descale_q_z + head_k_idx
             )
             descale_k = tl.load(
                 descale_k_ptr + batch_idx * stride_descale_k_z + head_k_idx
