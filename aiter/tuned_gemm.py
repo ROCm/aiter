@@ -27,8 +27,11 @@ from aiter import logger, dtypes
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter import gemm_a16w16_asm
-from typing import Dict, Any
-
+from aiter.ops.gemm_op_common import get_padded_m
+from aiter.jit.core import (
+    AITER_CONFIG_GEMM_BF16_FILE,
+    AITER_LOG_TUNED_CONFIG,
+)
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -114,14 +117,18 @@ def query_sol_core(
             soltype, solution_idx = 3, 2
 
     if soltype is None:
-        (soltype, solution_idx, splitK, kernelName) = solids.get(
-            (int(m), n, k, bias, str(dtype), str(otype), scaleAB), (0, 0, 0, "")
-        )
-        asm_solMap[solution_idx] = kernelName
-        if soltype > 0:
-            logger.info(
-                f"{m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=} found in tuned_gemm.csv"
+        for gl in [None, 0, 1]:
+            padded_m = m if gl is None else get_padded_m(m, n, k, gl)
+            (soltype, solution_idx, splitK, kernelName) = solids.get(
+                (padded_m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0, 0, "")
             )
+            if soltype > 0:
+                if AITER_LOG_TUNED_CONFIG:
+                    logger.info(
+                        f"shape is M:{m}, N:{n}, K:{k} {dtype=} {otype=} {bias=}, {scaleAB=}, found padded_M: {padded_m}, N:{n}, K:{k} is tuned on cu_num = {cu_count} in {AITER_CONFIG_GEMM_BF16_FILE} , kernel name is {kernelName}"
+                    )
+                break
+        asm_solMap[solution_idx] = kernelName
     solution_name = solMap[soltype]
     logger.info(
         f"using {solution_name} solution:{solution_idx}, {splitK} {kernelName} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
@@ -169,7 +176,7 @@ class TunedGemm:
         self.extensions_created = False
         self.save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
         self.untune_path = f"{this_dir}/configs/untuned_gemm.csv"
-        self.tune_path = f"{this_dir}/configs/tuned_gemm.csv"
+        self.tune_path = AITER_CONFIG_GEMM_BF16_FILE
         self.bestsols = {}
         self.solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
         self.cu_count = torch.cuda.get_device_properties(

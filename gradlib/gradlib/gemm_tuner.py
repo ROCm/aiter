@@ -26,7 +26,7 @@ from aiter import dtypes
 import pandas as pd
 
 from GemmTuner import GemmTuner
-from aiter.jit.core import AITER_CONFIG_GEMM_BF16
+from aiter.jit.core import AITER_CONFIG_GEMM_BF16_FILE
 import time
 
 aiter.rocb_create_extension()
@@ -100,7 +100,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tuned_file",
         type=str,
-        default=os.getenv("GTUNE_TUNED", AITER_CONFIG_GEMM_BF16),
+        default=os.getenv("GTUNE_TUNED", AITER_CONFIG_GEMM_BF16_FILE),
         help="output file for tuned gemm solutions",
     )
     parser.add_argument(
