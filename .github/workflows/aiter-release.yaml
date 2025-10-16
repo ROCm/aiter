@@ -20,6 +20,7 @@ jobs:
     runs-on: aiter-k8s-build
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - python_version: "3.10"
@@ -72,6 +73,11 @@ jobs:
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
           pip install -r requirements.txt 
+      
+      - name: Install ninja
+        run: |
+          sudo apt update
+          sudo apt install ninja-build
 
       - name: Build Aiter
         run: |
