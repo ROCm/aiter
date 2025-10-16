@@ -128,7 +128,7 @@ def torch_mla_extend(
 
 def generate_topk_kv(
     kv_indptr: torch.Tensor,
-    qo_len : int = 1,
+    qo_len: int = 1,
     NUM_TOPK_TOKENS: int = 2048,
 ):
     batch_size = kv_indptr.shape[0] - 1
@@ -143,7 +143,9 @@ def generate_topk_kv(
         if kv_len < NUM_TOPK_TOKENS:
             token_indices[i, :kv_len] = torch.arange(0, kv_len, dtype=torch.int32)
         else:
-            token_indices[i] = torch.randint(0, kv_len, (NUM_TOPK_TOKENS,), dtype=torch.int32)
+            token_indices[i] = torch.randint(
+                0, kv_len, (NUM_TOPK_TOKENS,), dtype=torch.int32
+            )
 
     return token_indices
 
@@ -155,7 +157,7 @@ def sparse_kv_indptr_to_dense(
     NUM_TOPK_TOKENS: int = 2048,
 ):
     new_kv_indptr = [0]
-    indices_list  = []
+    indices_list = []
     batch_size = kv_indptr.shape[0] - 1
     batch_size = qo_len * batch_size
     for i in range(batch_size):
@@ -164,7 +166,11 @@ def sparse_kv_indptr_to_dense(
         kv_len = min(kv_len, NUM_TOPK_TOKENS)
         indices_list.append(converted_indices[i, :kv_len])
         new_kv_indptr.append(kv_len + new_kv_indptr[i])
-    return torch.arange(0, batch_size + 1, dtype=torch.int32), torch.tensor(new_kv_indptr, dtype=torch.int32), torch.concat(indices_list)
+    return (
+        torch.arange(0, batch_size + 1, dtype=torch.int32),
+        torch.tensor(new_kv_indptr, dtype=torch.int32),
+        torch.concat(indices_list),
+    )
 
 
 @triton.jit
@@ -212,15 +218,16 @@ def _convert_req_index_to_global_index_kernel(
     # Guard block_table access
     valid_block = indice_id < kv_len
     # tl.device_print("offset", valid_block)
-    base = tl.load(kv_indices + kv_start + block_id * bt_stride0,
-                   mask=valid_block,
-                   other=0)
+    base = tl.load(
+        kv_indices + kv_start + block_id * bt_stride0, mask=valid_block, other=0
+    )
 
     # base = 0
 
     # If token == -1 OR block_id OOB, output -1; else base * BLOCK_SIZE + offset
-    out_val = tl.where(is_invalid_tok | (~valid_block), -1,
-                       base * BLOCK_SIZE + inblock_off)
+    out_val = tl.where(
+        is_invalid_tok | (~valid_block), -1, base * BLOCK_SIZE + inblock_off
+    )
 
     # Store results
     out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
@@ -228,11 +235,11 @@ def _convert_req_index_to_global_index_kernel(
 
 
 def triton_convert_req_index_to_global_index(
-    kv_indptr: torch.Tensor,      # int32 [num_tokens + 1]
-    kv_indices: torch.Tensor,     # int32 [total_kv_seqlen]
+    kv_indptr: torch.Tensor,  # int32 [num_tokens + 1]
+    kv_indices: torch.Tensor,  # int32 [total_kv_seqlen]
     token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
-    qo_len : int = 1,
-    BLOCK_SIZE: int = 1,          # page_block_size = 1 for now
+    qo_len: int = 1,
+    BLOCK_SIZE: int = 1,  # page_block_size = 1 for now
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,  # tile width along columns
 ):
@@ -249,9 +256,10 @@ def triton_convert_req_index_to_global_index(
     assert kv_indices.dtype == torch.int32
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
-    assert NUM_TOPK_TOKENS % BLOCK_N == 0, \
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by" \
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
         f"BLOCK_N ({BLOCK_N})"
+    )
 
     num_batches = kv_indptr.shape[0] - 1
     num_tokens = token_indices.shape[0]
@@ -395,13 +403,19 @@ def test_mla(
     ).fill_(-1)
     reduce_batch_size = batch_size * mtp
     reduce_indptr = torch.empty(
-        [reduce_batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
+        [reduce_batch_size * max_qo_tiles_per_batch + 1],
+        dtype=torch.int32,
+        device="cuda",
     )
     reduce_final_map = torch.empty(
-        [reduce_batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
+        [reduce_batch_size * max_qo_tiles_per_batch, 2],
+        dtype=torch.int32,
+        device="cuda",
     )
     reduce_partial_map = torch.empty(
-        [reduce_batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
+        [reduce_batch_size * max_qo_tiles_per_batch * cu_num],
+        dtype=torch.int32,
+        device="cuda",
     )
 
     meta = aiter.get_mla_metadata_v1(
@@ -422,7 +436,6 @@ def test_mla(
         fast_mode=True,
         topk=2048,
     )
-
 
     def test_sparse_mla_bf16():
         token_indices = generate_topk_kv(kv_indptr, mtp)
@@ -727,4 +740,3 @@ for nhead, mtp in list_nhead:
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")
     aiter.logger.info(f"summary:\n{df}")
-

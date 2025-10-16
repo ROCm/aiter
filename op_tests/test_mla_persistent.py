@@ -375,7 +375,9 @@ def test_mla(
         )
         return err, err_fp8, us_asm_decode, flops, bytes
 
-    err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8, flops_fp8, bytes_fp8 = test_absorb_decode_fp8()
+    err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8, flops_fp8, bytes_fp8 = (
+        test_absorb_decode_fp8()
+    )
     print("us_asm_decode_fp8:", us_asm_decode_fp8)
 
     def test_absorb_decode_bf16_fp8():
@@ -429,7 +431,9 @@ def test_mla(
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
         flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
-        bytes = total_kv * nhead_kv * qk_head_dim * 1 + (total_q * nhead * (qk_head_dim + v_head_dim)) * (torch.finfo(dtype).bits // 8)
+        bytes = total_kv * nhead_kv * qk_head_dim * 1 + (
+            total_q * nhead * (qk_head_dim + v_head_dim)
+        ) * (torch.finfo(dtype).bits // 8)
         err = checkAllclose(
             out_ref,
             out_asm,
@@ -437,7 +441,9 @@ def test_mla(
         )
         return err, us_asm_decode, flops, bytes
 
-    err_bf16_fp8_fp32, us_asm_decode_bf16_fp8, flops_bf16_fp8, bytes_bf16_fp8 = test_absorb_decode_bf16_fp8()
+    err_bf16_fp8_fp32, us_asm_decode_bf16_fp8, flops_bf16_fp8, bytes_bf16_fp8 = (
+        test_absorb_decode_bf16_fp8()
+    )
     print("us_asm_decode_bf16_fp8:", us_asm_decode_bf16_fp8)
 
     # print(f"{out_ref.view(total_q, -1)=}")
