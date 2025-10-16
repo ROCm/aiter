@@ -12,19 +12,19 @@ import os
 import re
 import shlex
 import shutil
-import setuptools
 import subprocess
 import sys
 import sysconfig
 import warnings
-from packaging.version import Version
-from setuptools.command.build_ext import build_ext
+from typing import Dict, List, Optional, Tuple, Union
 
-from file_baton import FileBaton
+import setuptools
 from _cpp_extension_versioner import ExtensionVersioner
+from file_baton import FileBaton
 from hipify import hipify_python
 from hipify.hipify_python import GeneratedFileCleaner
-from typing import Dict, List, Optional, Union, Tuple
+from packaging.version import Version
+from setuptools.command.build_ext import build_ext
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
@@ -111,9 +111,10 @@ def _find_rocm_home() -> Optional[str]:
             fallback_path = "/opt/rocm"
             if os.path.exists(fallback_path):
                 rocm_home = fallback_path
-    # if rocm_home and torch.version.hip is None:
-    #     print(f"No ROCm runtime is found, using ROCM_HOME='{rocm_home}'",
-    #           file=sys.stderr)
+    if rocm_home is None:
+        print(
+            f"No ROCm runtime is found, using ROCM_HOME='{rocm_home}'", file=sys.stderr
+        )
     return rocm_home
 
 
@@ -285,9 +286,10 @@ def check_compiler_ok_for_platform(compiler: str) -> bool:
         True if the compiler is gcc/g++ on Linux or clang/clang++ on macOS,
         and always True for Windows.
     """
-    which = subprocess.check_output(["which", compiler], stderr=subprocess.STDOUT)
-    # Use os.path.realpath to resolve any symlinks, in particular from 'c++' to e.g. 'g++'.
-    compiler_path = os.path.realpath(which.decode(*SUBPROCESS_DECODE_ARGS).strip())
+    compiler_path = os.path.realpath(shutil.which(compiler))
+    if not compiler_path:
+        return False
+
     # Check the compiler name
     if any(name in compiler_path for name in _accepted_compilers_for_platform()):
         return True
@@ -1084,7 +1086,7 @@ def _get_pybind11_abi_build_flags():
 
     abi_cflags = []
     for pname in ["COMPILER_TYPE", "STDLIB", "BUILD_ABI"]:
-        pval = getattr(torch._C, f"_PYBIND11_{pname}")
+        pval = getattr(torch._C, f"_PYBIND11_{pname}", None)
         if pval is not None:
             abi_cflags.append(f'-DPYBIND11_{pname}=\\"{pval}\\"')
     return abi_cflags
@@ -1780,6 +1782,7 @@ def _write_ninja_file(
 
 
 def _is_cuda_file(path: str) -> bool:
+    return True
     valid_ext = [".cu", ".cuh"]
     if IS_HIP_EXTENSION:
         valid_ext.append(".hip")

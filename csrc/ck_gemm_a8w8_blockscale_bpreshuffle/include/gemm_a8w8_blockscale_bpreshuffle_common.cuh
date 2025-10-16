@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #ifdef USE_ROCM
 
@@ -13,9 +13,9 @@
 #include <numeric>
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/extension.h>
 
 #include "ck/ck.hpp"
@@ -93,24 +93,24 @@ using DeviceGemmHelperF8BlockScaleBPreshuffle =
     ck::tensor_operation::device::DeviceGemmMultiD_BlockScale_Xdl_CShuffle_V3_BPreshuffle
     // clang-format off
          <A0Layout, B0Layout, DsLayout, ELayout,
-          A0DataType, AB1DataType, B0DataType, AB1DataType, DsDataType, EDataType, AccDataType, CShuffleDataType, 
+          A0DataType, AB1DataType, B0DataType, AB1DataType, DsDataType, EDataType, AccDataType, CShuffleDataType,
           AElementOp,  BElementOp, CDEElementOp, GemmSpec,
-          BlockSize, Scale_Block_M, Scale_Block_N, Scale_Block_K,  
-          MPerBlock, NPerBlock, KPerBlock, 
-          AK1, BK1, 
-          MPerXDL, NPerXDL, 
-          MXdlPerWave, NXdlPerWave, 
-          ABlockTransferThreadClusterLengths_AK0_M_AK1, 
-          S<1, 0, 2>, S<1, 0, 2>, 
-          2, AK1, AK1, 0, 
-          BBlockTransferThreadClusterLengths_BK0_N_BK1, 
-          S<1, 0, 2>, S<1, 0, 2>, 
-          2, BK1, BK1, 0, 
+          BlockSize, Scale_Block_M, Scale_Block_N, Scale_Block_K,
+          MPerBlock, NPerBlock, KPerBlock,
+          AK1, BK1,
+          MPerXDL, NPerXDL,
+          MXdlPerWave, NXdlPerWave,
+          ABlockTransferThreadClusterLengths_AK0_M_AK1,
+          S<1, 0, 2>, S<1, 0, 2>,
+          2, AK1, AK1, 0,
+          BBlockTransferThreadClusterLengths_BK0_N_BK1,
+          S<1, 0, 2>, S<1, 0, 2>,
+          2, BK1, BK1, 0,
           CSHUFFLE_MX_PER_WAVE_PERSHUFFLE,
-          CSHUFFLE_NX_PER_WAVE_PERSHUFFLE, 
-          CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock, 
-          CDEShuffleBlockTransferScalarPerVectors,  
-          BlkGemmPipeSched, 
+          CSHUFFLE_NX_PER_WAVE_PERSHUFFLE,
+          CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock,
+          CDEShuffleBlockTransferScalarPerVectors,
+          BlkGemmPipeSched,
           BlkGemmPipelineVer, A0DataType>;
 // clang-format on
 
@@ -159,7 +159,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_impl(torch::Tenso
 
     TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 
-    invoker.Run(argument, StreamConfig{at::cuda::getCurrentCUDAStream().stream()});
+    invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStream()});
     return Y;
 }
 

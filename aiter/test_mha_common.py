@@ -182,6 +182,7 @@ def generate_qkv(
     key_padding_mask=None,
     kvpacked=False,
     qkvpacked=False,
+    input_layout="BSHD",
 ):
     """
     Arguments:
@@ -190,6 +191,7 @@ def generate_qkv(
         v: (batch_size, seqlen_k, nheads_k, d_v)
         query_padding_mask: (batch_size, seqlen), bool
         key_padding_mask: (batch_size, seqlen), bool
+        input_layout: "BSHD", "BHSD", "SBHD"
     """
     assert not (kvpacked and qkvpacked)
     batch_size, seqlen_q, nheads, d = q.shape
@@ -197,6 +199,17 @@ def generate_qkv(
     _, _, _, d_v = v.shape
     assert k.shape == (batch_size, seqlen_k, nheads_k, d)
     assert v.shape == (batch_size, seqlen_k, nheads_k, d_v)
+
+    if input_layout == "BHSD":
+        # BSHD-->BHSD
+        q = q.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+    elif input_layout == "SBHD":
+        # BSHD-->SBHD
+        q = q.permute(1, 0, 2, 3).contiguous().permute(1, 0, 2, 3)
+        k = k.permute(1, 0, 2, 3).contiguous().permute(1, 0, 2, 3)
+        v = v.permute(1, 0, 2, 3).contiguous().permute(1, 0, 2, 3)
 
     if query_padding_mask is not None:
         q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(
@@ -237,25 +250,38 @@ def generate_qkv(
         max_seqlen_k = seqlen_k
 
     if qkvpacked:
-        assert (query_padding_mask == key_padding_mask).all()
-        assert nheads == nheads_k
+        assert (query_padding_mask == None and key_padding_mask == None) or (
+            query_padding_mask == key_padding_mask
+        ).all()
+        assert seqlen_q == seqlen_k
         assert d == d_v
-        qkv_unpad = torch.stack([q_unpad, k_unpad, v_unpad], dim=1)
-        qkv = torch.stack([q, k, v], dim=2)
+        qkv_unpad = torch.cat([q_unpad, k_unpad, v_unpad], dim=1)
+        qkv = torch.cat([q, k, v], dim=2)
         if query_padding_mask is not None:
             dqkv_pad_fn = lambda dqkv_unpad: pad_input(
                 dqkv_unpad, indices_q, batch_size, seqlen_q
             )
         else:
             dqkv_pad_fn = lambda dqkv_unpad: rearrange(
-                dqkv_unpad, "(b s) t h d -> b s t h d", b=batch_size
+                dqkv_unpad, "(b s) h d -> b s h d", b=batch_size
             )
+        q_unpad, k_unpad, v_unpad = torch.split(
+            qkv_unpad, [q_unpad.shape[1], k_unpad.shape[1], v_unpad.shape[1]], dim=1
+        )
+        q, k, v = torch.split(qkv, [q.shape[2], k.shape[2], v.shape[2]], dim=2)
         return (
-            qkv_unpad.detach().requires_grad_(),
+            q_unpad.detach().requires_grad_(),
+            k_unpad.detach().requires_grad_(),
+            v_unpad.detach().requires_grad_(),
             cu_seqlens_q,
+            cu_seqlens_k,
             max_seqlen_q,
-            qkv.detach().requires_grad_(),
+            max_seqlen_k,
+            q.detach().requires_grad_(),
+            k.detach().requires_grad_(),
+            v.detach().requires_grad_(),
             output_pad_fn,
+            dqkv_pad_fn,
             dqkv_pad_fn,
         )
     elif kvpacked:
@@ -269,17 +295,22 @@ def generate_qkv(
             )
         else:
             dkv_pad_fn = lambda dkv_unpad: rearrange(
-                dkv_unpad, "(b s) t h d -> b s t h d", b=batch_size
+                dkv_unpad, "(b s) h d -> b s h d", b=batch_size
             )
+
+        k_unpad, v_unpad = kv_unpad.unbind(dim=1)
+        k, v = kv.unbind(dim=2)
         return (
             q_unpad.detach().requires_grad_(),
-            kv_unpad.detach().requires_grad_(),
+            k_unpad.detach().requires_grad_(),
+            v_unpad.detach().requires_grad_(),
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
             q.detach().requires_grad_(),
-            kv.detach().requires_grad_(),
+            k.detach().requires_grad_(),
+            v.detach().requires_grad_(),
             output_pad_fn,
             dq_pad_fn,
             dkv_pad_fn,
@@ -384,6 +415,7 @@ def attention_ref(
     Output:
         output: (batch_size, seqlen_q, nheads, head_dim_v)
         attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
+        lse: (batch_size, nheads, seqlen_q), logsumexp of scores
     """
     if causal:
         window_size = (window_size[0], 0)
@@ -419,6 +451,7 @@ def attention_ref(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
+    lse = torch.logsumexp(scores, dim=-1).to(v.dtype)
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
     # Some rows might be completely masked out so we fill them with zero instead of NaN
     if window_size[0] >= 0 or window_size[1] >= 0:
@@ -441,4 +474,8 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
-    return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
+    return (
+        output.to(dtype=dtype_og),
+        attention.to(dtype=dtype_og),
+        lse.to(dtype=dtype_og),
+    )

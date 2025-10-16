@@ -2,8 +2,8 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "py_itfs_common.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 struct __attribute__((packed)) KernelArgs
@@ -36,7 +36,7 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
     const uint num_tokens  = gating_output.numel() / num_experts;
     const uint topk        = topk_weights.size(-1);
     const uint out_stride  = topk_weights.stride(0);
-    const uint SUBM        = 4;
+    const uint SUBM        = num_tokens < 10000 ? 4 : 12;
 
     KernelArgs args;
     size_t arg_size = sizeof(args);
@@ -53,40 +53,77 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
     AiterAsmKernel* impl_ptr = nullptr;
     if(num_experts == 128 && topk == 8)
     {
-        static AiterAsmKernel impl_topksoftmax_4x128x8("_ZN5aiter19topksoftmax_4x128x8E",
-                                                       "/topksoftmax/topksoftmax_4x128x8.co");
-        impl_ptr = &impl_topksoftmax_4x128x8;
+        if(SUBM == 4)
+        {
+            static AiterAsmKernel impl_topksoftmax_4x128x8("_ZN5aiter19topksoftmax_4x128x8E",
+                                                           "/topksoftmax/topksoftmax_4x128x8.co");
+            impl_ptr = &impl_topksoftmax_4x128x8;
+        }
+        else
+        {
+            static AiterAsmKernel impl_topksoftmax_12x128x8("_ZN5aiter20topksoftmax_12x128x8E",
+                                                            "/topksoftmax/topksoftmax_12x128x8.co");
+            impl_ptr = &impl_topksoftmax_12x128x8;
+        }
     }
     else if(num_experts == 256 && topk == 8)
     {
-        static AiterAsmKernel impl_topksoftmax_4x256x8("_ZN5aiter19topksoftmax_4x256x8E",
-                                                       "/topksoftmax/topksoftmax_4x256x8.co");
-        impl_ptr = &impl_topksoftmax_4x256x8;
+        if(SUBM == 4)
+        {
+            static AiterAsmKernel impl_topksoftmax_4x256x8("_ZN5aiter19topksoftmax_4x256x8E",
+                                                           "/topksoftmax/topksoftmax_4x256x8.co");
+            impl_ptr = &impl_topksoftmax_4x256x8;
+        }
+        else
+        {
+            static AiterAsmKernel impl_topksoftmax_12x256x8("_ZN5aiter20topksoftmax_12x256x8E",
+                                                            "/topksoftmax/topksoftmax_12x256x8.co");
+            impl_ptr = &impl_topksoftmax_12x256x8;
+        }
     }
     else if(num_experts == 128 && topk == 6)
     {
-        static AiterAsmKernel impl_topksoftmax_4x128x6("_ZN5aiter19topksoftmax_4x128x6E",
-                                                       "/topksoftmax/topksoftmax_4x128x6.co");
-        impl_ptr = &impl_topksoftmax_4x128x6;
+        if(SUBM == 4)
+        {
+            static AiterAsmKernel impl_topksoftmax_4x128x6("_ZN5aiter19topksoftmax_4x128x6E",
+                                                           "/topksoftmax/topksoftmax_4x128x6.co");
+            impl_ptr = &impl_topksoftmax_4x128x6;
+        }
+        else
+        {
+            static AiterAsmKernel impl_topksoftmax_12x128x6("_ZN5aiter20topksoftmax_12x128x6E",
+                                                            "/topksoftmax/topksoftmax_12x128x6.co");
+            impl_ptr = &impl_topksoftmax_12x128x6;
+        }
     }
     else if(num_experts == 256 && topk == 6)
     {
-        static AiterAsmKernel impl_topksoftmax_4x256x6("_ZN5aiter19topksoftmax_4x256x6E",
-                                                       "/topksoftmax/topksoftmax_4x256x6.co");
-        impl_ptr = &impl_topksoftmax_4x256x6;
+        if(SUBM == 4)
+        {
+            static AiterAsmKernel impl_topksoftmax_4x256x6("_ZN5aiter19topksoftmax_4x256x6E",
+                                                           "/topksoftmax/topksoftmax_4x256x6.co");
+            impl_ptr = &impl_topksoftmax_4x256x6;
+        }
+        else
+        {
+            static AiterAsmKernel impl_topksoftmax_12x256x6("_ZN5aiter20topksoftmax_12x256x6E",
+                                                            "/topksoftmax/topksoftmax_12x256x6.co");
+            impl_ptr = &impl_topksoftmax_12x256x6;
+        }
     }
     else
     {
-        TORCH_CHECK(false,
-                    __func__,
-                    " only support num_experts/topk in [128/6, 128/8, 256/6, 256/8], but get num_experts: ",
-                    num_experts,
-                    " , topk: ",
-                    topk);
+        TORCH_CHECK(
+            false,
+            __func__,
+            " only support num_experts/topk in [128/6, 128/8, 256/6, 256/8], but get num_experts: ",
+            num_experts,
+            " , topk: ",
+            topk);
     }
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     uint gdx = (num_tokens + SUBM - 1) / SUBM;
     TORCH_CHECK(gdx >> 31 == 0, "num_tokens too large: ", num_tokens);

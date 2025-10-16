@@ -1,6 +1,6 @@
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
+ * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,20 +15,16 @@
  * limitations under the License.
  */
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "hip_compat.h"
 #include "dispatch_utils.h"
 #include <torch/torch.h>
 #include <cmath>
 
-#ifdef USE_ROCM
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 typedef __hip_bfloat16 nv_bfloat16;
-#else
-#include <cuda_bf16.h>
-#endif
-#include <cuda_fp16.h>
 
 namespace aiter
 {
@@ -154,7 +150,7 @@ torch::Tensor unary_operation(torch::Tensor &input)
         void *buf_c = reinterpret_cast<void *>(output.data_ptr());
 
         void *buf_a = reinterpret_cast<void *>(input.data_ptr());
-        const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        const hipStream_t stream = at::hip::getCurrentHIPStream();
         int elements = N * K;
 
         constexpr uint32_t wg = 256;

@@ -1,21 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
+
 import torch
-from torch import Tensor
 import torch.distributed as dist
-from ..dist.parallel_state import (
-    ensure_model_parallel_initialized,
-    init_distributed_environment,
-    set_custom_all_reduce,
-    get_tp_group,
-    destroy_model_parallel,
-    destroy_distributed_environment,
-)
+from torch import Tensor
 
 # from ..dist.utils import get_open_port, get_distributed_init_method, get_ip
 import aiter
-import logging
+
+from ..dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    ensure_model_parallel_initialized,
+    get_tp_group,
+    init_distributed_environment,
+    set_custom_all_reduce,
+)
 
 logger = logging.getLogger("aiter")
 
@@ -63,7 +65,7 @@ def all_reduce_asm(inp: torch.Tensor):
             return torch.empty_like(inp)
     else:
         # note: outside of cuda graph context,
-        # custom allreduce incurs a cost of cudaMemcpy, which should
+        # custom allreduce incurs a cost of hipMemcpy, which should
         # be small(<=1% of overall latency) compared to the performance
         # gains of using custom kernels
         return aiter.all_reduce_asm_(

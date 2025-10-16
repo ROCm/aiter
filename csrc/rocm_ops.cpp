@@ -4,6 +4,7 @@
 #include "aiter_enum.h"
 #include "aiter_operator.h"
 #include "aiter_unary.h"
+#include "asm_gemm_a16w16.h"
 #include "asm_gemm_a4w4.h"
 #include "asm_gemm_a8w8.h"
 #include "attention.h"
@@ -34,6 +35,7 @@
 #include "rocsolgemm.cuh"
 #include "rope.h"
 #include "smoothquant.h"
+#include "sample.h"
 #include <torch/extension.h>
 
 // #include "torch/mha_batch_prefill.h"
@@ -71,6 +73,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     // BATCHED_GEMM_A8W8_TUNE_PYBIND;
     GEMM_A8W8_ASM_PYBIND;
     GEMM_A4W4_ASM_PYBIND;
+    GEMM_A16W16_ASM_PYBIND;
     ACTIVATION_PYBIND;
     ATTENTION_ASM_MLA_PYBIND;
     ATTENTION_CK_PYBIND;
@@ -95,6 +98,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     CUSTOM_ALL_REDUCE_PYBIND;
     QUICK_ALL_REDUCE_PYBIND;
     CACHE_PYBIND;
+    SAMPLE_PYBIND;
     HIPBSOLGEMM_PYBIND;
     ROCSOLGEMM_PYBIND;
 }

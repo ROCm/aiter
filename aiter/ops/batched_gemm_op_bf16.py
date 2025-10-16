@@ -9,9 +9,12 @@ import pandas as pd
 from ..jit.core import (
     compile_ops,
     AITER_ROOT_DIR,
+    AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
+    AITER_LOG_TUNED_CONFIG,
 )
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
+from aiter import logger
 
 
 def gen_batched_gemm_bf16_tune_fake_tensor(
@@ -53,17 +56,28 @@ def get_CKBatchedGEMM_config(
 ):
     if not hasattr(get_CKBatchedGEMM_config, "ck_batched_gemm_dict"):
         ck_batched_gemm_dict = pd.read_csv(
-            f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv"
+            AITER_CONFIG_BF16_BATCHED_GEMM_FILE
         ).drop_duplicates()
         get_CKBatchedGEMM_config.ck_batched_gemm_dict = ck_batched_gemm_dict.set_index(
-            ["B", "M", "N", "K"]
+            ["cu_num", "B", "M", "N", "K"]
         ).to_dict("index")
-    config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get((B, M, N, K), None)
+    cu_num = get_cu_num()
+    config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get(
+        (cu_num, B, M, N, K), None
+    )
     if config is not None:
+        if AITER_LOG_TUNED_CONFIG:
+            logger.info(
+                f"shape is B:{B}, M:{M}, N:{N}, K:{K} dtype is bf16, is tuned on cu_num = {cu_num} in {AITER_CONFIG_BF16_BATCHED_GEMM_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
+            )
         mnk = config["kernelName"].split("_")[2].split("x")[1:]
         config["tile_m"] = int(mnk[0])
         config["tile_n"] = int(mnk[1])
         config["tile_k"] = int(mnk[2])
+    else:
+        logger.info(
+            f"shape is B:{B}, M:{M}, N:{N}, K:{K} dtype is bf16, not found tuned config in CKGEMM, will use default config!"
+        )
     return config
 
 
