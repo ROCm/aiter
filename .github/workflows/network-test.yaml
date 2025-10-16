@@ -1,4 +1,4 @@
-name: Aiter Test
+name: Network Test
 
 on:
   push:
