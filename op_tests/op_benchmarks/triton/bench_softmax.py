@@ -92,7 +92,7 @@ def run_shape_benchmark(args, impl):
         x = torch.randn(M, N, dtype=dtype, device="cuda")
         
         # Memory transfer
-        mem_read = M * N * x.element_size()
+        mem_read = 2 * M * N * x.element_size()
         mem_write = M * N * x.element_size()
         mem = mem_read + mem_write
         

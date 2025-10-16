@@ -26,11 +26,15 @@ def _softmax_kernel_online(
     output_row_stride,
     n_rows,
     n_cols,
+    ELMT_SIZE: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
     NUM_STAGES: gl.constexpr,
 ):
     row_start = gl.program_id(0)
     row_idx = row_start
+    
+    buffer_size: gl.constexpr = 16
+    threads_per_warp: gl.constexpr = 64
     
     # FIXME: For some reason, this value leads to bad
     # performance for very large N
@@ -38,8 +42,8 @@ def _softmax_kernel_online(
         BLOCK_SIZE, gl.num_warps() * 64
     )
     blocked_cols: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[8], # Value chosen by Triton compiler
-        threads_per_warp=[64],
+        size_per_thread=[buffer_size // ELMT_SIZE],
+        threads_per_warp=[threads_per_warp],
         warps_per_cta=[gl.num_warps()],
         order=[0],
     )
@@ -168,6 +172,7 @@ def softmax(x):
         y.stride(0),
         n_rows,
         n_cols,
+        x.element_size(),
         BLOCK_SIZE,
         num_stages,
         waves_per_eu=waves_per_eu,
