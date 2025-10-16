@@ -100,7 +100,7 @@ def get_meta_param(num_kv_splits, kv_indptr, nhead, nhead_kv, max_seqlen_q):
         (kv_splits_indptr, max_splits) = aiter.get_mla_metadata_v0(
             kv_indptr, nhead // nhead_kv, nhead_kv
         )
-        num_kv_splits = max_splits.item()
+        num_kv_splits = max_splits
 
     get_mgc = {16: 16, 128: 16}
 
@@ -171,7 +171,7 @@ def mla_decode_fwd(
         (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
     )
     final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
-    
+
     if num_kv_splits_indptr is not None:
         if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):
             return logits.view(total_s, nhead, v_head_dim), attn_lse
