@@ -1,0 +1,27 @@
+name: Aiter Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]  # Triggers on PRs targeting `main`
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  triton:
+    runs-on: aiter-1gpu-runner
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+    
+      - name: Install speedtest-cli and test network
+        run: |
+          set -ex
+          pip install speedtest-cli && speedtest-cli --simple
