@@ -24,6 +24,7 @@ jobs:
       - name: Docker pull image
         run: |
           set -ex
+          docker rmi rocm/pytorch:latest
           time docker pull rocm/pytorch:latest
 
       - name: Run the container
