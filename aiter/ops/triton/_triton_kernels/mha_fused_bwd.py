@@ -788,6 +788,7 @@ def _bwd_kernel_dkdvdq_noncausal(
     FP8_MAX: tl.constexpr,
     NUM_SMS: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
+    NUM_XCD: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
         stride_qb = tl.cast(stride_qb_in, tl.int64)

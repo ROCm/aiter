@@ -6,11 +6,15 @@ import itertools
 import triton
 from aiter.ops.triton.mha import (
     flash_attn_func,
-    flash_attn_fp8_func,
     flash_attn_varlen_func,
-    flash_attn_varlen_fp8_func,
     mha_set_use_fused_bwd_kernel,
 )
+from aiter.ops.triton.mha_v3 import (
+    flash_attn_func as flash_attn_func_v3,
+    flash_attn_varlen_func as flash_attn_varlen_func_v3,
+)
+from aiter.ops.triton.utils.mha_kernel_utils import _quantize_bshd, _quantize_thd
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     generate_random_padding_mask,
     generate_qkv,
@@ -363,19 +367,29 @@ def run_benchmark(custom, args):
             if args.fp8:
 
                 def fn():
-                    return flash_attn_varlen_fp8_func(
-                        q_input,
-                        k_input,
-                        v_input,
+                    if dropout > 0.0 or return_lse or return_attn_probs:
+                        raise NotImplementedError(
+                            "flash_attn_varlen_func_v3 doesn't support dropout, return_lse, or return_attn_probs"
+                        )
+
+                    fp8_dtype = get_fp8_e4m3_dtype()
+                    q_fp8, q_descale = _quantize_thd(q_input, fp8_dtype, cu_seqlens_q)
+                    k_fp8, k_descale = _quantize_thd(k_input, fp8_dtype, cu_seqlens_k)
+                    v_fp8, v_descale = _quantize_thd(v_input, fp8_dtype, cu_seqlens_k)
+
+                    return flash_attn_varlen_func_v3(
+                        q_fp8,
+                        k_fp8,
+                        v_fp8,
                         cu_seqlens_q,
                         cu_seqlens_k,
                         max_seqlen_q,
                         max_seqlen_k,
-                        dropout_p=dropout,
                         softmax_scale=sm_scale,
                         causal=causal,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
                     )
 
             else:
@@ -400,15 +414,25 @@ def run_benchmark(custom, args):
             if args.fp8:
 
                 def fn():
-                    return flash_attn_fp8_func(
-                        q_input,
-                        k_input,
-                        v_input,
-                        dropout_p=dropout,
+                    if dropout > 0.0 or return_lse or return_attn_probs:
+                        raise NotImplementedError(
+                            "flash_attn_func (v3) doesn't support dropout, return_lse, or return_attn_probs"
+                        )
+
+                    fp8_dtype = get_fp8_e4m3_dtype()
+                    q_fp8, q_descale = _quantize_bshd(q_input, fp8_dtype)
+                    k_fp8, k_descale = _quantize_bshd(k_input, fp8_dtype)
+                    v_fp8, v_descale = _quantize_bshd(v_input, fp8_dtype)
+
+                    return flash_attn_func_v3(
+                        q_fp8,
+                        k_fp8,
+                        v_fp8,
                         softmax_scale=sm_scale,
                         causal=causal,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
                     )
 
             else:
