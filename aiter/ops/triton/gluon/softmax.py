@@ -34,7 +34,9 @@ def _softmax_kernel_online(
     row_start = gl.program_id(0)
     row_idx = row_start
 
-    gl.static_assert(SIZE_PER_THREAD <= triton.cdiv(BLOCK_SIZE, gl.num_warps() * THREADS_PER_WARP))
+    gl.static_assert(
+        SIZE_PER_THREAD <= triton.cdiv(BLOCK_SIZE, gl.num_warps() * THREADS_PER_WARP)
+    )
     blocked_cols: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[SIZE_PER_THREAD],
         threads_per_warp=[THREADS_PER_WARP],
@@ -169,10 +171,10 @@ def softmax(x):
     waves_per_eu = 2
     num_warps = 8
     num_stages = 2
-    
+
     buffer_size = 16
     threads_per_warp = 64
-    
+
     # each thread should only be loading as many elements
     # as can fit in the load buffer (determined by element size)
     cols_per_thread = triton.cdiv(BLOCK_SIZE, num_warps * threads_per_warp)

@@ -61,8 +61,6 @@ def run_shape_benchmark(args, impl):
 
     if args.metric == "time":
         ylabel = "Time_(ms)"
-    elif args.metric == "throughput":
-        ylabel = "TFLOPS"
     elif args.metric == "bandwidth":
         ylabel = "Bandwidth_(GB/s)"
     else:
@@ -88,18 +86,16 @@ def run_shape_benchmark(args, impl):
         x = torch.randn(M, N, dtype=dtype, device="cuda")
 
         # Memory transfer
-        mem_read = 2 * M * N * x.element_size()
-        mem_write = M * N * x.element_size()
+        mem_read = (
+            2 * M * N * x.element_size()
+        )  # one load in loop 1, one load in loop 2
+        mem_write = M * N * x.element_size()  # one write in loop 2
         mem = mem_read + mem_write
 
         ms = triton.testing.do_bench(lambda: impl(x), warmup=25, rep=100)
 
-        flops = M * (N + N + (N - 1))
         if metric == "time":
             return ms
-        elif metric == "throughput":
-            tflops = flops / ms * 1e-9
-            return tflops
         elif metric == "bandwidth":
             bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
             return bandwidth
@@ -135,7 +131,7 @@ def parse_args():
     parser.add_argument(
         "--metric",
         type=str,
-        choices=["time", "throughput", "bandwidth"],
+        choices=["time", "bandwidth"],
         default="bandwidth",
         help="metric to plot",
     )
