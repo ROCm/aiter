@@ -20,7 +20,9 @@ git clone --depth=1 https://github.com/triton-lang/triton || true
 cd triton
 pip install -r python/requirements.txt
 pip install filecheck
-MAX_JOBS=64 pip install .  -vv
+time pip download . -v
+time pip install . -v
+#MAX_JOBS=64 pip install .  -vv
 ls -all build
 find / -name "*.whl"
 
