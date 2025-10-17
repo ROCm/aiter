@@ -68,22 +68,35 @@ def load_best_sols_custom(tune_path: str) -> bool:
 
     return False
 
+_GEMMA16W16_CONFIG_CACHE = None
 
-@functools.lru_cache(maxsize=4096)
-def get_GEMM_config(
-    M: int, N: int, K: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
-):
-    if not hasattr(get_GEMM_config, "gemm_dict"):
-        gemm_dict = pd.read_csv(AITER_CONFIG_GEMM_BF16_FILE).drop_duplicates()
-        get_GEMM_config.gemm_dict = gemm_dict.set_index(
+
+@torch_compile_guard()
+def get_GEMM_A16W16_config_(tuned_file: str = None) -> None:
+    if tuned_file is None:
+        tuned_file = AITER_CONFIG_GEMM_BF16_FILE
+    global _GEMMA16W16_CONFIG_CACHE
+
+    if _GEMMA16W16_CONFIG_CACHE is None:
+        _GEMMA16W16_CONFIG_CACHE = {}
+    if os.path.exists(tuned_file):
+        gemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
+        _GEMMA16W16_CONFIG_CACHE = gemm_dict.set_index(
             ["cu_num", "M", "N", "K", "bias", "dtype", "outdtype", "scaleAB"]
         ).to_dict("index")
+    return None
+
+@functools.lru_cache(maxsize=4096)
+def get_GEMM_A16W16_config(
+    M: int, N: int, K: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
+):
+    get_GEMM_A16W16_config_(AITER_CONFIG_GEMM_BF16_FILE)
     cu_num = get_cu_num()
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        config = get_GEMM_config.gemm_dict.get(
+        config = _GEMMA16W16_CONFIG_CACHE.get(
             (cu_num, padded_M, N, K, bias, str(dtype), str(otype), scaleAB), None
         )
         if config is not None:
@@ -335,7 +348,7 @@ class TunedGemm:
         m, k = inp_view.shape
         n = weights.shape[0]
         use_bias = bias is not None
-        config = get_GEMM_config(
+        config = get_GEMM_A16W16_config(
             M=m,
             N=n,
             K=k,
