@@ -16,12 +16,13 @@ python3 setup.py develop
 echo
 echo "==== Install triton ===="
 pip uninstall -y triton || true
-#git clone --depth=1 https://github.com/triton-lang/triton || true
-#cd triton
-#pip install -r python/requirements.txt
-#pip install filecheck
-#MAX_JOBS=64 pip install .
-pip install triton
+git clone --depth=1 https://github.com/triton-lang/triton || true
+cd triton
+pip install -r python/requirements.txt
+pip install filecheck
+MAX_JOBS=64 pip install .
+ls -all
+find . -name "*.whl"
 
 echo
 echo "==== Show installed packages ===="
