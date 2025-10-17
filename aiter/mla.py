@@ -156,10 +156,10 @@ def mla_decode_fwd(
     total_kv = kv_indices.shape[0]
 
     if num_kv_splits_indptr is None and work_meta_data is None:
-        num_kv_splits, mgc = get_meta_param(
-            None, bs, total_kv, nhead, max_seqlen_q
+        num_kv_splits, mgc = get_meta_param(None, bs, total_kv, nhead, max_seqlen_q)
+        num_kv_splits_indptr = torch.arange(
+            0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device=device
         )
-        num_kv_splits_indptr = torch.arange(0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device=device)
 
     if num_kv_splits is None:
         num_kv_splits = get_cu_num()
