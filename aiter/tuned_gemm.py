@@ -68,6 +68,7 @@ def load_best_sols_custom(tune_path: str) -> bool:
 
     return False
 
+
 _GEMMA16W16_CONFIG_CACHE = None
 
 
@@ -85,6 +86,7 @@ def get_GEMM_A16W16_config_(tuned_file: str = None) -> None:
             ["cu_num", "M", "N", "K", "bias", "dtype", "outdtype", "scaleAB"]
         ).to_dict("index")
     return None
+
 
 @functools.lru_cache(maxsize=4096)
 def get_GEMM_A16W16_config(
