@@ -253,7 +253,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
             sink_ptr + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs),
             mask=(kv_head_idx * QUERY_GRP_SZ + q_grp_offs) < num_query_heads,
             other=float("-inf"),
-        ).to(dtype=tl.float32)
+        )
     # k_blk_offs[MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD]
     k_blk_offs = (
         kv_blk_nums[:, None, None, None] * stride_k_b
