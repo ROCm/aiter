@@ -41,11 +41,6 @@ jobs:
       PYTHON_VERSION: ${{ matrix.python_version }}
 
     steps:
-      - name: Check if build is enabled for this Python version
-        if: ${{ !matrix.build_enabled }}
-        run: |
-          echo "Build for Python ${{ matrix.python_version }} is disabled. Skipping job."
-          exit 0
 
       - name: Checkout aiter repo
         if: ${{ matrix.build_enabled }}
