@@ -15,41 +15,41 @@
 * limitations under the License.
 """
 
-import os
-from pathlib import Path
-import pandas as pd
 import functools
+import os
+from typing import Optional
+
+import pandas as pd
 import torch
 import torch.nn.functional as F
-from typing import Optional
 from torch import Tensor
-from aiter import hipb_create_extension, hipb_mm, getHipblasltKernelName
-from aiter import rocb_create_extension, rocb_mm
-from aiter import logger, dtypes
-from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.jit.utils.chip_info import get_cu_num
-from aiter import gemm_a16w16_asm
-from aiter.ops.gemm_op_common import get_padded_m
-from aiter.jit.core import (
-    AITER_CONFIG_GEMM_BF16_FILE,
-    AITER_LOG_TUNED_CONFIG,
+
+from aiter import (
+    dtypes,
+    gemm_a16w16_asm,
+    getHipblasltKernelName,
+    hipb_create_extension,
+    hipb_mm,
+    logger,
+    rocb_create_extension,
+    rocb_mm,
 )
+from aiter.jit.core import AITER_CONFIG_GEMM_BF16_FILE, AITER_LOG_TUNED_CONFIG
+from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.gemm_op_common import get_padded_m
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-bestsols = {}
 
 solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
 
-# We need to set is 0 as default, None will error in torch.compile fakeTensor execution
-soltype = 0
-
 
 def get_solfunc(soltype: int):
-    if soltype == 1:
-        return hipb_gemm
-    elif soltype == 0:
+    if soltype == 0:
         return torch_gemm
+    elif soltype == 1:
+        return hipb_gemm
     elif soltype == 2:
         return rocb_gemm
     elif soltype == 3:
@@ -58,92 +58,38 @@ def get_solfunc(soltype: int):
         return asm_gemm
 
 
-@torch_compile_guard()
-def load_best_sols_custom(tune_path: str) -> bool:
-    global bestsols
-    cu_count = get_cu_num()
-    if tune_path is not None and Path(tune_path).is_file():
-        bestsols = pd.read_csv(tune_path)
-        bestsols = bestsols[bestsols["cu_num"] == cu_count]
-        if len(bestsols) > 0 and "kernelName" in bestsols.columns:
-            hipblasltKernelNames = bestsols.apply(
-                lambda s: (
-                    getHipblasltKernelName(s.solidx)
-                    if s.libtype == "hipblaslt"
-                    else s.kernelName
-                ),
-                axis=1,
-            )
-            pd.set_option("display.max_colwidth", 100)
-            assert hipblasltKernelNames.equals(bestsols["kernelName"]), (
-                "error: gradlib tune gemm not match the current environment, need re-tune!!!\n"
-                + f"differece:\n{pd.concat([bestsols[['solidx','kernelName']], hipblasltKernelNames], axis=1)[hipblasltKernelNames != bestsols['kernelName'].fillna('')]}"
-            )
-            return True
-
-    return False
-
-
-_GEMMA16W16_CONFIG_CACHE = None
-
-
-@torch_compile_guard()
-def get_GEMM_A16W16_config_(tuned_file: str = None) -> None:
-    if tuned_file is None:
-        tuned_file = AITER_CONFIG_GEMM_BF16_FILE
-    global _GEMMA16W16_CONFIG_CACHE
-
-    if _GEMMA16W16_CONFIG_CACHE is None:
-        _GEMMA16W16_CONFIG_CACHE = {}
+@functools.lru_cache(maxsize=1)
+def get_GEMM_A16W16_config_():
+    tuned_file = AITER_CONFIG_GEMM_BF16_FILE
+    gemm_dict = {}
     if os.path.exists(tuned_file):
         gemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
-        _GEMMA16W16_CONFIG_CACHE = gemm_dict.set_index(
+        gemm_dict = gemm_dict.set_index(
             ["cu_num", "M", "N", "K", "bias", "dtype", "outdtype", "scaleAB"]
         ).to_dict("index")
-    return None
-
-
-def query_sol_fake(
-    m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
-) -> int:
-    global solids, solMap, soltype
-    # soltype = None
-    solution_idx = 0
-    cu_count = get_cu_num()
-    if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
-        if (
-            ((m == 1 and n <= 2 * cu_count) or (m > 1 and m <= 4 and n <= cu_count))
-            and k <= 9216
-            or (m > 4 and m <= 8 and n <= cu_count)
-            and k <= 5120
-            or (m > 8 and m <= 16 and n <= cu_count)
-            and k <= 256
-        ):
-            soltype, solution_idx = 3, 2
-
-    return solution_idx
+    return gemm_dict
 
 
 @functools.lru_cache(maxsize=4096)
 def get_GEMM_A16W16_config(
     M: int, N: int, K: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
 ):
-    get_GEMM_A16W16_config_(AITER_CONFIG_GEMM_BF16_FILE)
+    cfg = get_GEMM_A16W16_config_()
     cu_num = get_cu_num()
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        config = _GEMMA16W16_CONFIG_CACHE.get(
+        config = cfg.get(
             (cu_num, padded_M, N, K, bias, str(dtype), str(otype), scaleAB), None
         )
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 kernelName = config["kernelName"] if config["libtype"] == "asm" else ""
                 logger.info(
-                    f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIG_GEMM_BF16_FILE}, libtype is {config["libtype"]}, kernel name is {kernelName}"
+                    f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIG_GEMM_BF16_FILE}, libtype is {config['libtype']}, kernel name is {kernelName}"
                 )
-            break
+            return config
     if config is None:
         default_config = {}
         logger.info(
@@ -167,7 +113,7 @@ def get_GEMM_A16W16_config(
             default_config["libtype"] = "torch"
             default_config["solidx"] = 0
         logger.info(
-            f"using {default_config["libtype"]} solution:{default_config["solidx"]} for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}"
+            f"using {default_config['libtype']} solution:{default_config['solidx']} for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}"
         )
         return default_config
 
@@ -238,15 +184,14 @@ def gemm_a16w16(
 
 
 def skinny_gemm(
-    self,
-    inp,
-    weights,
-    solidx,
-    bias=None,
-    otype=None,
-    scale_a=None,
-    scale_b=None,
-    scale_c=None,
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
 ):
     import aiter as ops
 
@@ -254,7 +199,7 @@ def skinny_gemm(
         out = torch.empty(
             inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
         )
-        ops.wvSpltK(weights, inp, out, inp.shape[0], self.cu_count)
+        ops.wvSpltK(weights, inp, out, inp.shape[0], get_cu_num())
     elif solidx == 1:
         out = torch.empty(
             inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
@@ -264,21 +209,21 @@ def skinny_gemm(
         out = torch.empty(
             inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
         )
-        ops.wv_splitk_small_fp16_bf16(weights, inp, out, inp.shape[0], self.cu_count)
+        ops.wv_splitk_small_fp16_bf16(weights, inp, out, inp.shape[0], get_cu_num())
     if bias is not None:
         out += bias
     return out
 
 
 def hipb_gemm(
-    inp,
-    weights,
-    solidx,
-    bias=None,
-    otype=None,
-    scale_a=None,
-    scale_b=None,
-    scale_c=None,
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
 ):
     if otype is None:
         otype = inp.dtype
@@ -286,14 +231,14 @@ def hipb_gemm(
 
 
 def rocb_gemm(
-    inp,
-    weights,
-    solidx,
-    bias=None,
-    otype=None,
-    scale_a=None,
-    scale_b=None,
-    scale_c=None,
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
 ):
     assert (
         scale_a is None and scale_b is None and scale_c is None
@@ -305,38 +250,15 @@ def rocb_gemm(
 
 
 def torch_gemm(
-    inp,
-    weights,
-    solidx,
-    bias=None,
-    otype=None,
-    scale_a=None,
-    scale_b=None,
-    scale_c=None,
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
 ):
-    if int(os.environ.get("AITER_TUNE_GEMM", 0)) == 1:
-        m, k = inp.shape
-        n = weights.shape[0]
-        tuned_df = pd.DataFrame(
-            columns=["M", "N", "K", "bias", "dtype", "outdtype", "scaleAB"]
-        )
-        tuned_df = pd.concat(
-            [
-                tuned_df,
-                pd.DataFrame(
-                    {
-                        "M": [m],
-                        "N": [n],
-                        "K": [k],
-                        "bias": [bias is not None],
-                        "dtype": [inp.dtype],
-                        "outdtype": [otype],
-                        "scaleAB": [scale_a is not None or scale_b is not None],
-                    }
-                ),
-            ]
-        ).drop_duplicates()
-        tuned_df.to_csv(f"{this_dir}/configs/untuned_gemm.csv", index=False)
     if inp.dtype == dtypes.fp8:
         if scale_a is None:
             scale_a = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
@@ -388,39 +310,21 @@ class TunedGemm:
         self.save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
         self.untune_path = f"{this_dir}/configs/untuned_gemm.csv"
         self.tune_path = AITER_CONFIG_GEMM_BF16_FILE
-        self.bestsols = {}
-        self.solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
-        self.cu_count = torch.cuda.get_device_properties(
-            device="cuda"
-        ).multi_processor_count
-
-        # self.use_skinny = is_hip() and VLLM_USE_ROCM_SKINNY_GEMM and \
-        #     "gfx1" not in torch.cuda.get_device_properties('cuda').gcnArchName
-        self.use_skinny = True
-
-    def load_best_sols(self):
-        if load_best_sols_custom(self.tune_path):
-            global bestsols
-            self.bestsols = bestsols
 
     def mm(
         self,
-        inp,
-        weights,
-        bias=None,
-        otype=None,
-        scale_a=None,
-        scale_b=None,
-        scale_c=None,
+        inp: Tensor,
+        weights: Tensor,
+        bias: Optional[Tensor] = None,
+        otype: Optional[torch.dtype] = None,
+        scale_a: Optional[Tensor] = None,
+        scale_b: Optional[Tensor] = None,
+        scale_c: Optional[Tensor] = None,
     ):
-        # F.Linear can take a 3 dimensional input. vllm
-        # uses this for linear units. However, sampler
-        # will use torch.matmul with 2 dimensions only
         if self.extensions_created == False:
             rocb_create_extension()
             hipb_create_extension()
             self.extensions_created = True
-            self.load_best_sols()
         out = gemm_a16w16(
             inp,
             weights,
