@@ -103,6 +103,27 @@ def get_GEMM_A16W16_config_(tuned_file: str = None) -> None:
     return None
 
 
+def query_sol_fake(
+    m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
+) -> int:
+    global solids, solMap, soltype
+    # soltype = None
+    solution_idx = 0
+    cu_count = get_cu_num()
+    if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
+        if (
+            ((m == 1 and n <= 2 * cu_count) or (m > 1 and m <= 4 and n <= cu_count))
+            and k <= 9216
+            or (m > 4 and m <= 8 and n <= cu_count)
+            and k <= 5120
+            or (m > 8 and m <= 16 and n <= cu_count)
+            and k <= 256
+        ):
+            soltype, solution_idx = 3, 2
+
+    return solution_idx
+
+
 @functools.lru_cache(maxsize=4096)
 def get_GEMM_A16W16_config(
     M: int, N: int, K: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
@@ -153,12 +174,27 @@ def get_GEMM_A16W16_config(
     return config
 
 
-@torch_compile_guard()
+def gen_gemm_a16w16_fake_tensor(
+    A: Tensor,
+    B: Tensor,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
+) -> Tensor:
+    out = torch.empty(
+        A.view(-1, A.size(-1)).shape[0], B.shape[0], dtype=A.dtype, device=A.device
+    )
+    return out.view(*A.shape[:-1], B.shape[0])
+
+
+@torch_compile_guard(gen_fake=gen_gemm_a16w16_fake_tensor)
 def gemm_a16w16(
     A: Tensor,
     B: Tensor,
     bias: Optional[Tensor] = None,
-    otype: torch.dtype = None,
+    otype: Optional[torch.dtype] = None,
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
