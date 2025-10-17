@@ -722,7 +722,7 @@ def reduce_segments(
         mask=segm_mask[:, None] & dim_mask[None, :],
         other=0.0,
     )
-    segm_output *= tl.exp(segm_max - overall_max)[:, None]
+    segm_output *= tl.math.exp2((segm_max - overall_max) * RCP_LN2)[:, None]
     acc_sum = tl.sum(segm_output, axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
