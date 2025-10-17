@@ -1207,7 +1207,6 @@
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
 
 #define MLA_METADATA_PYBIND                             \
-    m.def("get_mla_metadata_v0", &get_mla_metadata_v0); \
     m.def("get_mla_metadata_v1",                        \
           &get_mla_metadata_v1,                         \
           "get_mla_metadata_v1",                        \

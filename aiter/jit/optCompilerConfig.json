@@ -906,7 +906,6 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_metadata_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/metadata.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v0.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_comm.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_1_device.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_1_host.cuh'",

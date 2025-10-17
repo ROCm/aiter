@@ -2,61 +2,9 @@
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include "metadata/v0.cuh"
 #include "metadata/v1_1_device.cuh"
 #include "metadata/v1_1_host.cuh"
 #include "metadata/v1_2_device.cuh"
-
-// ===================================================================================================================
-// MLA Metadata V0
-// ===================================================================================================================
-
-//
-// Get per batch kv split count for ASM MLA without persistent thread
-// group support.
-//
-// Returns
-//   [0] num_kv_splits:  (num_batches + 1), dtype torch.int32.
-//   [1] max_num_splits: (1), dtype torch.int32.
-//
-std::vector<torch::Tensor> get_mla_metadata_v0(
-    const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
-    const int32_t        num_heads_per_head_k,
-    const int32_t        num_heads_k)
-{
-    TORCH_CHECK(seqlens_kv_indptr.stride(0) == 1,
-                __func__, ": seqlens_kv_indptr should be continuous!");
-    TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
-                __func__, ": seqlens_kv_indptr's element type should be int!");
-
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-
-    hipDevice_t dev;
-    hipDeviceProp_t dev_prop;
-    HIP_CALL(hipGetDevice(&dev));
-    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-
-    const int32_t num_batches = seqlens_kv_indptr.size(0) - 1;
-
-    // declare outputs
-    auto num_kv_splits = torch::empty({num_batches + 1}, seqlens_kv_indptr.options());
-    auto max_num_splits = torch::empty({1}, seqlens_kv_indptr.options());
-
-    // launch kernel
-    const dim3 grid = dim3(1, 1, 1);
-    const int32_t num_thr = dev_prop.warpSize; // only use 1 warp for simplicity
-    kn_get_mla_metadata_v0<<<grid, num_thr, 0, stream>>>(
-        num_kv_splits.data_ptr<int32_t>(),
-        max_num_splits.data_ptr<int32_t>(),
-        seqlens_kv_indptr.data_ptr<int32_t>(),
-        dev_prop.multiProcessorCount,
-        num_batches,
-        num_heads_per_head_k,
-        num_heads_k);
-
-    return {num_kv_splits, max_num_splits};
-}
 
 // ===================================================================================================================
 // MLA Metadata V1

@@ -333,24 +333,6 @@ def mla_prefill_asm_fwd(
 
 
 @compile_ops("module_mla_metadata")
-def get_mla_metadata_v0(
-    seqlens: torch.Tensor,
-    num_heads_per_head_k: int,
-    num_heads_k: int,
-) -> Tuple[torch.Tensor, int]:
-    """
-    Arguments:
-        cumulated seqlens: (batch_size + 1), dtype torch.int32.
-        num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
-        num_heads_k: num_heads_k.
-    Returns:
-        cumulated num_kv_splits: (batch_size + 1), dtype torch.int32.
-        max_num_splits: (1), dtype torch.int32.
-    """
-    ...
-
-
-@compile_ops("module_mla_metadata")
 def get_mla_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     seqlens_kv_indptr: torch.Tensor,
