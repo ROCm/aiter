@@ -15,6 +15,8 @@ from aiter.ops.triton.utils.pid_preprocessing import (
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+import os
+from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 _LOGGER = AiterTritonLogger()
 
@@ -32,8 +34,6 @@ def set_use_gemm_splitk_bf16(value: bool):
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit
@@ -65,7 +65,6 @@ def _gemm_afp4_wfp4_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
@@ -84,6 +83,8 @@ def _gemm_afp4_wfp4_kernel(
     tl.assume(stride_ask > 0)
     tl.assume(stride_bsk > 0)
     tl.assume(stride_bsn > 0)
+
+    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
@@ -186,8 +187,6 @@ def _gemm_afp4_wfp4_kernel(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit
@@ -219,7 +218,6 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
@@ -238,6 +236,8 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
     tl.assume(stride_ask > 0)
     tl.assume(stride_bsk > 0)
     tl.assume(stride_bsn > 0)
+
+    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
@@ -389,8 +389,6 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit
@@ -422,7 +420,6 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
@@ -441,6 +438,8 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
     tl.assume(stride_ask > 0)
     tl.assume(stride_bsk > 0)
     tl.assume(stride_bsn > 0)
+
+    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
@@ -1071,28 +1070,57 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
         ),
     )
 
-    _gemm_afp4_wfp4_kernel_preshuffled_weight_scales[grid](
-        x,
-        w,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
-        x_scales,
-        w_scales,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        x_scales.stride(0),
-        x_scales.stride(1),
-        w_scales.stride(0),
-        w_scales.stride(1),
-        **config,
-    )
+    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_gemm_afp4_wfp4_kernel_preshuffled_weight_scales.fn.__name__}_M={M}-N={N}-K={K*2}"
+    if os.path.exists(metadata_pth):
+        with AOTMetadataContext(
+            _gemm_afp4_wfp4_kernel_preshuffled_weight_scales.fn.__name__,
+            f"{metadata_pth}",
+        ):
+            _gemm_afp4_wfp4_kernel_preshuffled_weight_scales[grid](
+                x,
+                w,
+                y if config["NUM_KSPLIT"] == 1 else y_pp,
+                x_scales,
+                w_scales,
+                M,
+                N,
+                K,
+                x.stride(0),
+                x.stride(1),
+                w.stride(0),
+                w.stride(1),
+                0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+                y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+                y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+                x_scales.stride(0),
+                x_scales.stride(1),
+                w_scales.stride(0),
+                w_scales.stride(1),
+                **config,
+            )
+    else:
+        _gemm_afp4_wfp4_kernel_preshuffled_weight_scales[grid](
+            x,
+            w,
+            y if config["NUM_KSPLIT"] == 1 else y_pp,
+            x_scales,
+            w_scales,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+            x_scales.stride(0),
+            x_scales.stride(1),
+            w_scales.stride(0),
+            w_scales.stride(1),
+            **config,
+        )
 
     if config["NUM_KSPLIT"] > 1:
         REDUCE_BLOCK_SIZE_M = 16
