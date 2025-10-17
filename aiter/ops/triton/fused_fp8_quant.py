@@ -1,10 +1,19 @@
+from typing import Optional
 import torch
 import triton
 import aiter
 from aiter.ops.triton._triton_kernels.fused_fp8_quant import (
     _fused_rms_fp8_group_quant_kernel,
     _fused_flatten_fp8_group_quant_kernel,
+    _fused_reduce_act_mul_fp8_group_quant,
 )
+from aiter.ops.triton._triton_kernels.activation import (
+    _get_activation_from_str,
+)
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
+
 
 fp8_dtype = aiter.dtypes.fp8
 
@@ -148,6 +157,16 @@ def fused_flatten_fp8_group_quant(
     group_size,
     dtype_quant=fp8_dtype,
 ):
+    """
+    Flatten the last two dimension of x and perform FP8 per-token group quantization along the last dimension
+
+    Key parameters:
+    - x: Matrix X with shape (M, N1, N2).
+
+    Returns:
+    - out: The output matrix with shape (M, N1 * N2).
+    - out_block_scales: The output matrix with shape (M, cdiv((N1 * N2), group_size)).
+    """
     M, N1, N2 = x.shape
 
     BLOCK_SIZE_N2 = max(triton.next_power_of_2(N2), group_size)
@@ -181,3 +200,127 @@ def fused_flatten_fp8_group_quant(
     )
 
     return out, out_block_scales
+
+
+def fused_reduce_act_mul_fp8_group_quant(
+    x: torch.Tensor,
+    activation: str = "silu",
+    x2: Optional[torch.Tensor] = None,
+    group_size=128,
+    dtype_quant=fp8_dtype,
+    dtype: Optional[float] = torch.bfloat16,
+):
+    """
+    Apply reduction along the first dimension and apply the activation function + per-token group quantization.
+    If x2 is provided, the only reduction along the first dimension is applied to x2
+
+    Args:
+        if x is 3-dim,
+            x: (SPK, M, 2*N1), dtype = fp32.
+            x2: (SPK, M, 2*N1), dtype = fp32.
+
+        if x is 2-dim,
+            x: (M, N2), dtype = fp16 or bf16.
+            x2 must be None
+            the kernel is essentially identical to aiter.ops.triton.activation.act_mul_and_fp8_group_quant
+
+        activation: activation function to apply before quantization.
+            - It splits the features into two parts and applies the activation to the first part.
+            - Then, it adds the results together before quantization.
+            - Supports the following activations:
+                - "silu"
+                - "gelu"
+                - "gelu_tanh"
+
+    Returns:
+        tuple: (y, y_scale), y2
+            y: (M, N1), dtype = dtype_quant
+            y_scale: (M, cdiv(N1, group_size)), dtype = fp32
+            y2: (M, N2), dtype = dtype
+    """
+    _LOGGER.info(f"FUSED_REDUCTION_ACT_MUL_FP8_GROUP_QUANT: x={tuple(x.shape)}")
+
+    assert (
+        x.dim() == 2 or x.dim() == 3
+    ), "The number of dimentions for x should be 2 or 3"
+    X_HAS_SPLITK = False
+    x_num_splitk = 1
+    N2 = 1
+    y2 = None
+    if x.dim() == 3:
+        x_num_splitk, M, N1 = x.shape
+        x_num_splitk, _, N2 = x2.shape
+        assert (
+            x.shape[0] == x2.shape[0] and x.shape[1] == x2.shape[1]
+        ), "The first two dimensions should be identical between x and x2"
+        assert (
+            x_num_splitk > 1
+        ), "x.shape[0] should be larger then 1 in x.dim() == 3 cases"
+        X_HAS_SPLITK = True
+        y2 = torch.empty((M, N2), dtype=dtype, device=x2.device)
+    else:
+        M, N1 = x.shape
+        assert x2 is None, "x2 should be None in x.dim() == 2 cases"
+
+    assert (
+        N1 % 2 == 0
+    ), "The last dimension for x1 should be multiple of 2 for acitvation and multiplication"
+    N1 = N1 // 2
+
+    y = torch.empty((M, N1), dtype=dtype_quant, device=x.device)
+    y_scale = torch.empty(
+        (M, (N1 + group_size - 1) // group_size),
+        dtype=torch.float32,
+        device=x.device,
+    )
+
+    BLOCK_SIZE_N1 = max(triton.next_power_of_2(N1), group_size)
+    BLOCK_SIZE_N2 = max(triton.next_power_of_2(N2), 32)
+    BLOCK_SIZE_M2 = 1 if M <= 128 else 4
+    X_MASK = N1 % BLOCK_SIZE_N1 != 0
+
+    DTYPE_MAX = (
+        torch.finfo(y.dtype).max
+        if torch.is_floating_point(y)
+        else torch.iinfo(y.dtype).max
+    )
+    num_pid = M
+    if X_HAS_SPLITK:
+        num_pid += triton.cdiv(M, BLOCK_SIZE_M2) * triton.cdiv(N2, BLOCK_SIZE_N2)
+    grid = (num_pid,)
+    _fused_reduce_act_mul_fp8_group_quant[grid](
+        x,
+        y,
+        y_scale,
+        x2,
+        y2,
+        M,
+        N1,
+        N2,
+        0 if not X_HAS_SPLITK else x.stride(0),
+        x.stride(0) if not X_HAS_SPLITK else x.stride(1),
+        x.stride(1) if not X_HAS_SPLITK else x.stride(2),
+        y.stride(0),
+        y.stride(1),
+        y_scale.stride(0),
+        y_scale.stride(1),
+        0 if not X_HAS_SPLITK else x2.stride(0),
+        0 if not X_HAS_SPLITK else x2.stride(1),
+        0 if not X_HAS_SPLITK else x2.stride(2),
+        0 if not X_HAS_SPLITK else y2.stride(0),
+        0 if not X_HAS_SPLITK else y2.stride(1),
+        ACTIVATION=_get_activation_from_str(activation) if activation else "",
+        BLOCK_SIZE_M2=BLOCK_SIZE_M2,
+        BLOCK_SIZE_N1=BLOCK_SIZE_N1,
+        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
+        QUANT_BLOCK_SIZE=group_size,
+        DTYPE_MAX=DTYPE_MAX,
+        DTYPE_MIN=-DTYPE_MAX,
+        X_HAS_SPLITK=X_HAS_SPLITK,
+        X_NUM_KSPLIT=x_num_splitk,
+        X_NUM_KSPLIT_POW2=triton.next_power_of_2(x_num_splitk),
+        X_MASK=X_MASK,
+        num_warps=1 if max(BLOCK_SIZE_N1, BLOCK_SIZE_N2) <= 512 else 4,
+    )
+
+    return (y, y_scale), y2
