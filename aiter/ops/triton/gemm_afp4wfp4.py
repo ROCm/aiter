@@ -16,6 +16,9 @@ from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
 )
 from .utils.core import AITER_TRITON_CONFIGS_PATH
 
+import os
+from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
+
 _LOGGER = AiterTritonLogger()
 
 global _USE_GEMM_SPLITK_BF16
@@ -400,28 +403,57 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
         ),
     )
 
-    _gemm_afp4_wfp4_kernel_preshuffled_weight_scales[grid](
-        x,
-        w,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
-        x_scales,
-        w_scales,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        x_scales.stride(0),
-        x_scales.stride(1),
-        w_scales.stride(0),
-        w_scales.stride(1),
-        **config,
-    )
+    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_gemm_afp4_wfp4_kernel_preshuffled_weight_scales.fn.__name__}_M={M}-N={N}-K={K*2}"
+    if os.path.exists(metadata_pth):
+        with AOTMetadataContext(
+            _gemm_afp4_wfp4_kernel_preshuffled_weight_scales.fn.__name__,
+            f"{metadata_pth}",
+        ):
+            _gemm_afp4_wfp4_kernel_preshuffled_weight_scales[grid](
+                x,
+                w,
+                y if config["NUM_KSPLIT"] == 1 else y_pp,
+                x_scales,
+                w_scales,
+                M,
+                N,
+                K,
+                x.stride(0),
+                x.stride(1),
+                w.stride(0),
+                w.stride(1),
+                0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+                y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+                y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+                x_scales.stride(0),
+                x_scales.stride(1),
+                w_scales.stride(0),
+                w_scales.stride(1),
+                **config,
+            )
+    else:
+        _gemm_afp4_wfp4_kernel_preshuffled_weight_scales[grid](
+            x,
+            w,
+            y if config["NUM_KSPLIT"] == 1 else y_pp,
+            x_scales,
+            w_scales,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+            x_scales.stride(0),
+            x_scales.stride(1),
+            w_scales.stride(0),
+            w_scales.stride(1),
+            **config,
+        )
 
     if config["NUM_KSPLIT"] > 1:
         REDUCE_BLOCK_SIZE_M = 16

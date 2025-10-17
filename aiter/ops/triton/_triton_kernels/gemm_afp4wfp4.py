@@ -16,8 +16,6 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit
@@ -49,7 +47,6 @@ def _gemm_afp4_wfp4_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
@@ -68,6 +65,8 @@ def _gemm_afp4_wfp4_kernel(
     tl.assume(stride_ask > 0)
     tl.assume(stride_bsk > 0)
     tl.assume(stride_bsn > 0)
+
+    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
@@ -170,8 +169,6 @@ def _gemm_afp4_wfp4_kernel(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit
@@ -203,7 +200,6 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
@@ -222,6 +218,8 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
     tl.assume(stride_ask > 0)
     tl.assume(stride_bsk > 0)
     tl.assume(stride_bsn > 0)
+
+    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
@@ -373,8 +371,6 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit
@@ -406,7 +402,6 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
@@ -425,6 +420,8 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
     tl.assume(stride_ask > 0)
     tl.assume(stride_bsk > 0)
     tl.assume(stride_bsn > 0)
+
+    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
