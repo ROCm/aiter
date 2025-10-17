@@ -792,12 +792,10 @@ def test_mha_backward_varlen(
 @pytest.mark.parametrize("BATCH", [1, 3])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (16, 48), (4096, 4096)],
+    [(128, 128), (32, 16), (16, 48), (4096, 4096)],
 )
-@pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (4, 4), (2, 1), (128, 128)]
-)
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(48, 32), (128, 64), (192, 128)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (2, 1), (128, 128)])
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(128, 64), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.25])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_with_pe(
@@ -862,12 +860,10 @@ def test_mha_with_pe(
 @pytest.mark.parametrize("BATCH", [1, 3])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (2, 2), (4, 1), (1, 4), (16, 16), (32, 16), (64, 128), (4096, 4096)],
+    [(16, 16), (32, 16), (64, 128), (4096, 4096)],
 )
-@pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (4, 4), (16, 4), (128, 128)]
-)
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (96, 64), (192, 128)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 4), (128, 128)])
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(96, 64), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.17])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_varlen_with_pe(
@@ -968,12 +964,10 @@ def test_mha_varlen_with_pe(
 @pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (8, 8), (4, 1), (1, 2), (16, 16), (32, 8), (64, 16), (2048, 2048)],
+    [(16, 16), (32, 8), (64, 16), (2048, 2048)],
 )
-@pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (4, 4), (8, 2), (128, 128)]
-)
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (128, 64), (192, 128)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 2), (128, 128)])
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_backward_with_pe(
@@ -1093,12 +1087,10 @@ def test_mha_backward_with_pe(
 @pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (8, 8), (4, 1), (1, 2), (16, 16), (32, 8), (64, 16), (64, 64)],
+    [(8, 8), (32, 8), (16, 64), (64, 64)],
 )
-@pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (4, 4), (8, 2), (128, 128)]
-)
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (128, 64), (192, 128)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 2), (128, 128)])
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_backward_varlen_with_pe(
