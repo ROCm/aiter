@@ -203,7 +203,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
 
     kv_blk_start = seq_part_idx * MAX_NUM_KV_BLKS
     qk_row_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
-    qk_col_offs = kv_blk_start + gl.arange(0, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, qk_mfma_layout))
+    qk_col_offs = seq_start_idx + gl.arange(0, SEQ_PARTITION_SZ, layout=gl.SliceLayout(0, qk_mfma_layout))
 
     # load alibi slopes[QUERY_GRP_SZ_POW2]
     if alibi_slopes is None:
@@ -319,6 +319,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         qk,
         float("-inf"),
     )
+    # if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 16:
+    #     print("qk:", qk_col_offs[None, :] < seq_len)
     # gl.static_print(qk.shape, qk_row_offs.shape, qk_col_offs.shape)
     max_logit_new = gl.max(qk, axis=1)
     max_logit_new = gl.where(max_logit_new > float("-inf"), max_logit_new, 0.0)
@@ -328,7 +330,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     if USE_SINKS:
         M = tl.math.exp2((gl.convert_layout(M[:, None], layout=qk_mfma_layout) - max_logit_new[:, None]) * log2e)
     p = tl.math.exp2((qk - max_logit_new[:, None]) * log2e)
+
     exp_sum = gl.sum(p, axis=1)
+
     p = p.to(compute_type)
 
     m_l_base_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
