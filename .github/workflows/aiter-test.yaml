@@ -34,7 +34,7 @@ jobs:
             echo 'multigpu_runners=["aiter-mi325-8gpu", "aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           else
             echo "Not main branch and PR title does not contain mi35x, only running on MI300..."
-            echo 'standard_runners=["aiter-mi355-1gpu""]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
             echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           fi
           echo "$GITHUB_OUTPUT"
