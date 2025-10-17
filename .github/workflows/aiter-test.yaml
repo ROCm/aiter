@@ -54,7 +54,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: ${{ fromJSON(needs.define-runners.outputs.standard_runners) }}
-        rocm_version: ["6.4.2", "7.0.x"]
+        rocm_version: ["6.4.2", "latest"]
     runs-on: ${{ matrix.runner }}
 
     steps:
