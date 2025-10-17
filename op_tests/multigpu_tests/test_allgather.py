@@ -32,6 +32,7 @@ logger = logging.getLogger("aiter")
 
 set_start_method("spawn", force=True)
 
+
 def run_allgather(tp_size, pp_size, rankID, x, withGraph=False, use_custom=False):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -80,7 +81,8 @@ def run_allgather(tp_size, pp_size, rankID, x, withGraph=False, use_custom=False
         torch.cuda.empty_cache()
     return out
 
-def call_ccl_allgather_naive(tp_size, pp_size, rankID, x, use_custom=True, loop_time = 1):
+
+def call_ccl_allgather_naive(tp_size, pp_size, rankID, x, use_custom=True, loop_time=1):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     # init
@@ -108,6 +110,7 @@ def call_ccl_allgather_naive(tp_size, pp_size, rankID, x, use_custom=True, loop_
         torch.cuda.empty_cache()
     return out
 
+
 def allgather_acctest(tp_size, pp_size, shape, dtype, use_custom=False):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -115,11 +118,14 @@ def allgather_acctest(tp_size, pp_size, shape, dtype, use_custom=False):
     rets = []
     input_list = []
     for i in range(tp_size):
-        input = torch.randn(shape, dtype=dtype, device='cuda')
+        input = torch.randn(shape, dtype=dtype, device="cuda")
         input_list.append(input)
         # print(input)
         rets.append(
-            pool.apply_async(call_ccl_allgather_naive, args=(tp_size, pp_size, i, input, use_custom, 1))
+            pool.apply_async(
+                call_ccl_allgather_naive,
+                args=(tp_size, pp_size, i, input, use_custom, 1),
+            )
             # pool.apply_async(call_aiter_allgather_naive, args=(tp_size, pp_size, i, input, 1))
         )
     pool.close()
@@ -135,8 +141,11 @@ def allgather_acctest(tp_size, pp_size, shape, dtype, use_custom=False):
     for i in ar_rslt:
         checkAllclose(ref, i.to(ref))
 
+
 @benchmark()
-def allgather_perftest(tp_size, pp_size, shape, dtype, withGraph=False, use_custom=False):
+def allgather_perftest(
+    tp_size, pp_size, shape, dtype, withGraph=False, use_custom=False
+):
     print(f"run perf test, use custom allgather {use_custom}")
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -148,7 +157,9 @@ def allgather_perftest(tp_size, pp_size, shape, dtype, withGraph=False, use_cust
         x = torch.randn(shape, dtype=dtype)
         input_list.append(x)
         rets.append(
-            pool.apply_async(run_allgather, args=(tp_size, pp_size, i, x, withGraph, use_custom))
+            pool.apply_async(
+                run_allgather, args=(tp_size, pp_size, i, x, withGraph, use_custom)
+            )
             # pool.apply_async(run_cu, args=(x, weight, eps, i))
         )
     pool.close()
@@ -163,6 +174,7 @@ def allgather_perftest(tp_size, pp_size, shape, dtype, withGraph=False, use_cust
         # print(cpu_rslt[out.device.index])
         checkAllclose(ref, out.to(ref), msg=msg)
         # checkAllclose(ref, out.to(ref), msg=msg)
+
 
 l_dtype = ["bf16"]
 l_shape = [
