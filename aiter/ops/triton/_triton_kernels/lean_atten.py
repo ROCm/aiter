@@ -114,15 +114,20 @@ def _attention_inner(
     offs_n,
     BLOCK_M,
     BLOCK_N,
-    HEAD_DIM,
+    HEAD_DIM_ORIG: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     local_iter,
     local_iter_end,
+    use_64_indexing: tl.constexpr,
 ):
     """
     Performs attention calculation for an (maybe partial) output tile
     """
+    # Define head-dimension mask for padded dims
+    offs_k_local = tl.arange(0, HEAD_DIM)
+    mask_k_cols_local = offs_k_local < HEAD_DIM_ORIG
     for l_iter in range(local_iter, local_iter_end):
-        k = tl.load(k_ptrs)
+        k = tl.load(k_ptrs, mask=mask_k_cols_local[:, None], other=0.0)
         qk = tl.dot(q, k) * qk_scale
 
         if causal:
@@ -152,7 +157,7 @@ def _attention_inner(
 
         # Update accumulator
         acc = acc * alpha[:, None]
-        v = tl.load(v_ptrs)
+        v = tl.load(v_ptrs, mask=mask_k_cols_local[None, :], other=0.0)
         acc += tl.dot(p.to(v.dtype), v)
 
         # Update stats
@@ -160,9 +165,16 @@ def _attention_inner(
         l_i = l_i * alpha + l_ij
         m_i = m_ij.to(m_i.dtype)
 
-        # update k/v pointer
-        v_ptrs += BLOCK_N * stride_vn
-        k_ptrs += BLOCK_N * stride_kn
+        # update k/v pointer with optional 64-bit indexing to avoid overflow
+        if use_64_indexing:
+            BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
+            stride_kn64 = tl.full((), stride_kn, tl.int64)
+            stride_vn64 = tl.full((), stride_vn, tl.int64)
+            v_ptrs += BLOCK_N64 * stride_vn64
+            k_ptrs += BLOCK_N64 * stride_kn64
+        else:
+            v_ptrs += BLOCK_N * stride_vn
+            k_ptrs += BLOCK_N * stride_kn
     return m_i, l_i, acc
 
 
@@ -222,10 +234,12 @@ def la_persistent(
     stride_om,  # n_ctx_q
     stride_oh,  # Head
     stride_on,  # head_dim
+    n_ctx_q_rows,
     stride_oph,  # total_programs
     stride_opm,  # n_ctx_q
     stride_opn,  # head_dim
     HEADS_PER_XCD: tl.constexpr,
+    HEAD_DIM_ORIG: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -243,6 +257,10 @@ def la_persistent(
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
     max_output_tile_cnt: tl.constexpr,
+    num_heads_q: tl.constexpr,
+    num_heads_k: tl.constexpr,
+    gqa_group_size: tl.constexpr,
+    use_64_indexing: tl.constexpr,
 ):
     if is_pod:
         current_pid = pod_pid
@@ -321,6 +339,7 @@ def la_persistent(
                 xcd_id=xcd_id,
                 HEADS_PER_XCD=HEADS_PER_XCD,
                 HEAD_DIM=HEAD_DIM,
+                HEAD_DIM_ORIG=HEAD_DIM_ORIG,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 MASKED_BLOCKS=MASKED_BLOCKS,
@@ -335,6 +354,8 @@ def la_persistent(
                 max_tiles_per_wg=max_tiles_per_wg,
                 tiles_per_head=tiles_per_head,
                 num_splits=num_splits,
+                gqa_group_size=gqa_group_size,
+                use_64_indexing=use_64_indexing,
             )
 
 
@@ -372,6 +393,7 @@ def la_persistent_inner(
     xcd_id,  # The XCD the pid belongs to
     HEADS_PER_XCD,
     HEAD_DIM: tl.constexpr,
+    HEAD_DIM_ORIG: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MASKED_BLOCKS: tl.constexpr,
@@ -386,6 +408,8 @@ def la_persistent_inner(
     max_tiles_per_wg: tl.constexpr,
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
+    gqa_group_size: tl.constexpr,
+    use_64_indexing: tl.constexpr,
 ):
 
     tl.assume(stride_qm > 0)  # n_ctx_q
@@ -478,10 +502,13 @@ def la_persistent_inner(
     # Q/K/V/O offsets calculation needs global head index.
     # When XCD_REMAP=False, xcd_id=0
     tile_head_idx_global = HEADS_PER_XCD * xcd_id + tile_head_idx
+    # Map Q head index to K/V head index via GQA grouping
+    tile_khead_idx_global = tile_head_idx_global // gqa_group_size
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, HEAD_DIM)
+    mask_k_cols = offs_k < HEAD_DIM_ORIG
 
     if causal:
         b_seq_size = tile_batch_idx * num_n_blocks
@@ -495,13 +522,13 @@ def la_persistent_inner(
 
     k_offs = (
         (b_seq_size + local_iter) * BLOCK_N * stride_kn
-        + tile_head_idx_global * stride_kh
+        + tile_khead_idx_global * stride_kh
         + offs_n[None, :] * stride_kn
         + offs_k[:, None] * stride_kk
     )
     v_offs = (
         (b_seq_size + local_iter) * BLOCK_N * stride_vn
-        + tile_head_idx_global * stride_vh
+        + tile_khead_idx_global * stride_vh
         + offs_n[:, None] * stride_vn
         + offs_k[None, :] * stride_vk
     )
@@ -531,7 +558,7 @@ def la_persistent_inner(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    q = tl.load(q_ptrs)
+    q = tl.load(q_ptrs, mask=mask_k_cols[None, :], other=0.0)
 
     m_i, l_i, acc = _attention_inner(
         q,
@@ -550,9 +577,11 @@ def la_persistent_inner(
         offs_n,
         BLOCK_M,
         BLOCK_N,
-        HEAD_DIM,
-        local_iter,
-        local_iter_end,
+        HEAD_DIM_ORIG=HEAD_DIM_ORIG,
+        HEAD_DIM=HEAD_DIM,
+        local_iter=local_iter,
+        local_iter_end=local_iter_end,
+        use_64_indexing=use_64_indexing,
     )
 
     # initialize pointer to m and l
@@ -732,8 +761,13 @@ def la_persistent_inner(
 
         acc0 = acc0 / l_i[:, None]
         acc1 = acc1 / l_i[:, None]
-        tl.store(o_ptrs0, acc0.to(Out.type.element_ty))
-        tl.store(o_ptrs1, acc1.to(Out.type.element_ty))
+        COLS_HALF: tl.constexpr = HEAD_DIM // 2
+        offs0 = tl.arange(0, COLS_HALF)
+        offs1 = tl.arange(0, COLS_HALF) + COLS_HALF
+        mask_cols0 = offs0 < HEAD_DIM_ORIG
+        mask_cols1 = offs1 < HEAD_DIM_ORIG
+        tl.store(o_ptrs0, acc0.to(Out.type.element_ty), mask=mask_cols0[None, :])
+        tl.store(o_ptrs1, acc1.to(Out.type.element_ty), mask=mask_cols1[None, :])
 
     # update iter
     iter = iter + (local_iter_end - local_iter)
