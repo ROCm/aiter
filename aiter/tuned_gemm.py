@@ -152,15 +152,17 @@ def get_GEMM_A16W16_config(
 
     return config
 
+
+@torch_compile_guard()
 def gemm_a16w16(
     A: Tensor,
     B: Tensor,
     bias: Optional[Tensor] = None,
-    otype=None,
+    otype: torch.dtype = None,
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
-):
+) -> Tensor:
     if A.dim() >= 3:
         try:
             inp_view = A.view(-1, A.size(-1))
@@ -360,13 +362,6 @@ class TunedGemm:
         #     "gfx1" not in torch.cuda.get_device_properties('cuda').gcnArchName
         self.use_skinny = True
 
-        if self.save_gemm == 1:
-            self.tuned_df = pd.DataFrame(
-                columns=["M", "N", "K", "bias", "dtype", "outdtype", "scaleAB"]
-            )
-        else:
-            self.tuned_df = None
-
     def load_best_sols(self):
         if load_best_sols_custom(self.tune_path):
             global bestsols
@@ -390,15 +385,6 @@ class TunedGemm:
             hipb_create_extension()
             self.extensions_created = True
             self.load_best_sols()
-        #if inp.dim() >= 3:
-        #    try:
-        #        inp_view = inp.view(-1, inp.size(-1))
-        #        batched = True
-        #    except RuntimeError:
-        #        return F.linear(inp, weights, bias)
-        #else:
-        #    inp_view = inp
-        #    batched = False
         out = gemm_a16w16(
             inp,
             weights,
@@ -408,10 +394,6 @@ class TunedGemm:
             scale_b=scale_b,
             scale_c=scale_c,
         )
-        #if batched:
-        #    out = out.view(*inp.shape[:-1], weights.shape[0])
-        #if otype is not None:
-        #    out = out.to(otype)
         return out
 
 
