@@ -201,7 +201,15 @@ void mla_decode_stage1_asm_fwd(
 
         if(gqa_ratio == 16)
         {
-            if(max_seqlen_q == 2)
+            if(max_seqlen_q == 1)
+            {
+                sub_Q = 128;
+                static AiterAsmKernel impl_fp8(
+                    "_ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE",
+                    "/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co");
+                impl_ptr = &impl_fp8;
+            }
+            else if(max_seqlen_q == 2)
             {
                 sub_Q = 128;
                 static AiterAsmKernel impl_fp8(
