@@ -140,6 +140,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: ${{ fromJSON(needs.define-runners.outputs.multigpu_runners) }}
+        rocm_version: ["6.4.2", "latest"]
     runs-on: ${{ matrix.runner }}
 
     steps:
