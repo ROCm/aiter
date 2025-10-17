@@ -17,6 +17,7 @@ show_help() {
 
 run_gfx950_fwd_v3() {
     echo "Start smoke test for gfx 950"
+    for head_dim in 128 192 ; do
     for mode in 0 1 ; do
     for i_perm in 0 1 ; do
     for o_perm in 0 1 ; do
@@ -25,16 +26,17 @@ run_gfx950_fwd_v3() {
     for seqlen_q in 127 192 301 512; do
     for seqlen_k in 512 700 1023; do
 
-    $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
-    $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
-    $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=$head_dim -d_v=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=$head_dim -d_v=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=$head_dim -d_v=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
 
     if [[ "$seqlen_q" = "$seqlen_k" ]] && [[ "$mode" = "0" ]]; then
-        $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=128 -s=$seqlen_q -s_k=$seqlen_q -iperm=$i_perm -operm=$o_perm -mask=1 -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
-        $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_q -iperm=$i_perm -operm=$o_perm -mask=1 -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
-        $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_q -iperm=$i_perm -operm=$o_perm -mask=1 -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+        $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=$head_dim -d_v=128 -s=$seqlen_q -s_k=$seqlen_q -iperm=$i_perm -operm=$o_perm -mask=1 -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+        $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=$head_dim -d_v=128 -s=$seqlen_q -s_k=$seqlen_q -iperm=$i_perm -operm=$o_perm -mask=1 -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+        $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=$head_dim -d_v=128 -s=$seqlen_q -s_k=$seqlen_q -iperm=$i_perm -operm=$o_perm -mask=1 -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
     fi
 
+    done
     done
     done
     done

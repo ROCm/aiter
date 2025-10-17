@@ -785,9 +785,6 @@ def test_varlen_flash_attn_seq_padding(
     assert out_diff <= out_tol
 
 
-l_dtype = ["bf16", "fp16"]
-l_dim = [32, 40, 64, 111, 128, 160, 192]
-l_mha_type = ["mha", "mqa", "gqa"]
 l_causal = [False, True]
 l_local = [False, True]
 l_deterministic = [False, True]
@@ -825,20 +822,20 @@ if __name__ == "__main__":
     e.g. -s 4,8""",
     )
     parser.add_argument(
-        "-d",
-        type=int,
-        nargs="?",
-        default=None,
-        help="""Dimension of query&key.
-    e.g. -d 128""",
-    )
-    parser.add_argument(
-        "-dv",
-        type=int,
-        nargs="?",
-        default=128,
-        help="""Dimension of value.
-    e.g. -dv 128""",
+        "-d_qk_v",
+        type=dtypes.str2tuple,
+        nargs="+",
+        default=[
+            (32, 32),
+            (40, 40),
+            (64, 64),
+            (111, 111),
+            (128, 128),
+            (160, 160),
+            (192, 192),
+        ],
+        help="""Dimension of query and key. Default is None.
+        e.g.: -qk_v 256,256""",
     )
     parser.add_argument(
         "-dp",
@@ -896,7 +893,9 @@ if __name__ == "__main__":
         "-mha",
         "--mha_type",
         type=str,
-        default=None,
+        nargs="+",
+        choices=["mha", "mqa", "gqa"],
+        default=["mha", "mqa", "gqa"],
         help="""Type of multi-head attention.
     e.g. -mha mha/mqa/gqa""",
     )
@@ -904,7 +903,9 @@ if __name__ == "__main__":
         "-dt",
         "--dtype",
         type=str,
-        default=None,
+        nargs="+",
+        choices=["bf16", "fp16"],
+        default=["bf16", "fp16"],
         help="""Data type.
     e.g.: -dt bf16""",
     )
@@ -912,6 +913,7 @@ if __name__ == "__main__":
         "-i",
         "--input_layout",
         type=str,
+        choices=["BSHD", "KVPACKED"],
         default="BSHD",
         help="""input_layout.
         e.g.: -i BSHD""",
@@ -919,43 +921,32 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     (seqlen_q, seqlen_k) = args.seqlen_q_k
-    if args.dtype is not None:
-        l_dtype = [dtypes.d_dtypes[args.dtype]]
-    else:
-        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-        args.dtype = "bf16"
-    if args.d is not None:
-        l_dim = [args.d]
-    else:
-        args.d = 128
-    if args.mha_type is not None:
-        l_mha_type = [args.mha_type]
-    else:
-        args.mha_type = "mha"
+
     if args.causal is not None:
         l_causal = [args.causal]
-    else:
-        args.causal = True
     if args.local is not None:
         l_local = [args.local]
-    else:
-        args.local = False
     if args.deterministic is not None:
         l_deterministic = [args.deterministic]
-    else:
-        args.deterministic = True
 
     collected = []
-    for dtype, dim, mha_type, causal, local, deterministic in itertools.product(
-        l_dtype, l_dim, l_mha_type, l_causal, l_local, l_deterministic
+    for (
+        dtype,
+        (dim_qk, dim_v),
+        mha_type,
+        causal,
+        local,
+        deterministic,
+    ) in itertools.product(
+        args.dtype, args.d_qk_v, args.mha_type, l_causal, l_local, l_deterministic
     ):
         ret = flash_attn_varlen_func_benchmark(
             args.batch_size,
             args.nheads,
             seqlen_q,
             seqlen_k,
-            dim,
-            dim,
+            dim_qk,
+            dim_v,
             args.min_seqlen_q,
             args.dropout_p,
             causal,
@@ -963,23 +954,22 @@ if __name__ == "__main__":
             args.bias_type,
             deterministic,
             mha_type,
-            dtype,
+            dtypes.d_dtypes[dtype],
             args.input_layout,
         )
         collected.append(ret)
+        test_varlen_flash_attn_seq_padding(
+            args.batch_size,
+            mha_type,
+            deterministic,
+            "mixed",
+            dtypes.d_dtypes[dtype],
+            dim_qk,
+            dim_v,
+            seqlen_q,
+            seqlen_k,
+            local,
+        )
 
     df = pd.DataFrame(collected)
     aiter.logger.info(f"mha_varlen summary:\n{df}")
-
-    test_varlen_flash_attn_seq_padding(
-        args.batch_size,
-        args.mha_type,
-        args.deterministic,
-        "mixed",
-        dtypes.d_dtypes[args.dtype],
-        args.d,
-        args.dv,
-        seqlen_q,
-        seqlen_k,
-        args.local,
-    )
