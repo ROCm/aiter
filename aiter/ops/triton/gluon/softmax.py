@@ -107,20 +107,20 @@ def _softmax_kernel_online(
     output_row_stride,
     n_rows,
     n_cols,
+    SIZE_PER_THREAD: gl.constexpr,
+    THREADS_PER_WARP: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
     NUM_STAGES: gl.constexpr,
 ):
     row_start = gl.program_id(0)
     row_idx = row_start
-    
-    # FIXME: For some reason, this value leads to bad
-    # performance for very large N
-    cols_per_thread: gl.constexpr = triton.cdiv(
-        BLOCK_SIZE, gl.num_warps() * 64
+
+    gl.static_assert(
+        SIZE_PER_THREAD <= triton.cdiv(BLOCK_SIZE, gl.num_warps() * THREADS_PER_WARP)
     )
     blocked_cols: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[8], # Value chosen by Triton compiler
-        threads_per_warp=[64],
+        size_per_thread=[SIZE_PER_THREAD],
+        threads_per_warp=[THREADS_PER_WARP],
         warps_per_cta=[gl.num_warps()],
         order=[0],
     )
@@ -130,7 +130,7 @@ def _softmax_kernel_online(
     read_idx = 0
     
     col_offsets_range = gl.arange(0, BLOCK_SIZE, layout=blocked_cols)
-    
+
     # loop 1: find the max and sum of each row
     m = -float("inf")
     row_sum = 0.0
@@ -214,10 +214,18 @@ def softmax(x):
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(n_cols))
     y = torch.empty_like(x)
-    
+
     waves_per_eu = 2
     num_warps = 8
     num_stages = 2
+
+    buffer_size = 16
+    threads_per_warp = 64
+
+    # each thread should only be loading as many elements
+    # as can fit in the load buffer (determined by element size)
+    cols_per_thread = triton.cdiv(BLOCK_SIZE, num_warps * threads_per_warp)
+    size_per_thread = min(cols_per_thread, buffer_size // x.element_size())
 
     num_programs = n_rows
 
@@ -229,6 +237,8 @@ def softmax(x):
         y.stride(0),
         n_rows,
         n_cols,
+        size_per_thread,
+        threads_per_warp,
         BLOCK_SIZE,
         num_stages,
         waves_per_eu=waves_per_eu,
@@ -236,4 +246,3 @@ def softmax(x):
     )
 
     return y
-

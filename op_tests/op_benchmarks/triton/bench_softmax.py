@@ -2,12 +2,8 @@ import argparse
 import sys
 import torch
 import triton
-from aiter.ops.triton.softmax import (
-    softmax as triton_softmax
-)
-from aiter.ops.triton.gluon.softmax import (
-    softmax as gluon_softmax
-)
+from aiter.ops.triton.softmax import softmax as triton_softmax
+from aiter.ops.triton.gluon.softmax import softmax as gluon_softmax
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
@@ -16,7 +12,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 
 def get_x_vals(dim=0):
-    if dim == 0:   
+    if dim == 0:
         x_vals = [
             (1, 8192),
             (32, 8192),
@@ -31,7 +27,7 @@ def get_x_vals(dim=0):
             (4096, 8192),
             (8192, 8192),
             (16384, 8192),
-    ]
+        ]
     elif dim == 1:
         x_vals = [
             (8192, 1),
@@ -62,16 +58,14 @@ def run_shape_benchmark(args, impl):
             )
     else:
         x_vals_list = get_x_vals(dim=(1 if args.N else 0))
-    
+
     if args.metric == "time":
         ylabel = "Time_(ms)"
-    elif args.metric == "throughput":
-        ylabel = "TFLOPS"
     elif args.metric == "bandwidth":
         ylabel = "Bandwidth_(GB/s)"
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
-    
+
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
@@ -85,29 +79,23 @@ def run_shape_benchmark(args, impl):
         plot_name=get_caller_name_no_ext(),
         args={"metric": args.metric},
     )
-    
+
     @triton.testing.perf_report([benchmark])
     def bench_softmax(M, N, metric, **kwargs):
         dtype = torch.bfloat16
         x = torch.randn(M, N, dtype=dtype, device="cuda")
-        
+
         # Memory transfer
-        mem_read = M * N * x.element_size()
-        mem_write = M * N * x.element_size()
+        mem_read = (
+            2 * M * N * x.element_size()
+        )  # one load in loop 1, one load in loop 2
+        mem_write = M * N * x.element_size()  # one write in loop 2
         mem = mem_read + mem_write
-        
-        ms = triton.testing.do_bench(
-            lambda: impl(x), 
-            warmup=25, 
-            rep=100
-        )
-        
-        flops = M * (N + N + (N - 1))
+
+        ms = triton.testing.do_bench(lambda: impl(x), warmup=25, rep=100)
+
         if metric == "time":
             return ms
-        elif metric == "throughput":
-            tflops = flops / ms * 1e-9
-            return tflops
         elif metric == "bandwidth":
             bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
             return bandwidth
@@ -119,7 +107,7 @@ def run_shape_benchmark(args, impl):
 
 def run_benchmark(args, defaults):
     assert not (args.shape and args.N), "User can specify --shape or -N exclusively"
-    
+
     if args.gluon:
         impl = gluon_softmax
     else:
@@ -143,7 +131,7 @@ def parse_args():
     parser.add_argument(
         "--metric",
         type=str,
-        choices=["time", "throughput", "bandwidth"],
+        choices=["time", "bandwidth"],
         default="bandwidth",
         help="metric to plot",
     )
@@ -171,7 +159,7 @@ def parse_args():
     parser.add_argument(
         "-N",
         action="store_true",
-        help=f"Benchmark shapes with increasing N dimension, with M = {get_x_vals(dim=1)[0][0]}"
+        help=f"Benchmark shapes with increasing N dimension, with M = {get_x_vals(dim=1)[0][0]}",
     )
     args = parser.parse_args()
     defaults = parser.parse_args([])
