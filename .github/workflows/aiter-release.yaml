@@ -1,6 +1,6 @@
 name: Aiter Release Package
 
-description: This workflow builds the Aiter Python package as a .whl file and uploads it as the artifact.
+description: This workflow builds the Aiter Python package as .whl files for Python 3.10 and 3.12, and uploads them as artifacts.
 
 on:
   workflow_dispatch:
@@ -8,23 +8,46 @@ on:
       commit:
         description: 'Commit hash to build (leave empty to use current commit)'
         required: false
+      build_py310:
+        description: 'Build with Python 3.10'
+        type: boolean
+        default: true
+      build_py312:
+        description: 'Build with Python 3.12'
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  BUILD_DOCKER_IMAGE: "rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta"
-
 jobs:
   build_whl_package:
     runs-on: aiter-k8s-build
-  
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python_version: "3.10"
+            docker_image: "rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta"
+            build_enabled: ${{ github.event.inputs.build_py310 == 'true' || github.event.inputs.build_py310 == true }}
+          - python_version: "3.12"
+            docker_image: "rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0"
+            build_enabled: ${{ github.event.inputs.build_py312 == 'true' || github.event.inputs.build_py312 == true }}
+
+    env:
+      BUILD_DOCKER_IMAGE: ${{ matrix.docker_image }}
+      PYTHON_VERSION: ${{ matrix.python_version }}
+
     steps:
+
       - name: Checkout aiter repo
+        if: ${{ matrix.build_enabled }}
         uses: actions/checkout@v4
-      
+
       - name: Checkout to user-specified commit (if provided)
+        if: ${{ matrix.build_enabled }}
         run: |
           set -ex
           if [ -n "${{ github.event.inputs.commit }}" ]; then
@@ -37,49 +60,62 @@ jobs:
           fi
 
       - name: Sync submodules
+        if: ${{ matrix.build_enabled }}
         run: |
           set -ex
           git submodule sync
           git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Run the container
+        if: ${{ matrix.build_enabled }}
         run: |
           set -ex
-          echo "Starting container: aiter_build"
+          echo "Starting container: aiter_build_${{ matrix.python_version }}"
           docker run -dt \
           --shm-size=16G \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
-          --name aiter_build \
+          --name aiter_build_${{ matrix.python_version }} \
           ${{ env.BUILD_DOCKER_IMAGE }}
 
       - name: Install Dependencies
+        if: ${{ matrix.build_enabled }}
         run: |
           set -e
           echo "Install Dependencies"
           docker exec \
           -w /workspace \
-          aiter_build \
+          aiter_build_${{ matrix.python_version }} \
           pip install -r requirements.txt 
-          
-      - name: Build Aiter
+      
+      - name: Install ninja
+        if: ${{ matrix.build_enabled }}
         run: |
           set -e
-          echo "Building aiter whl packages..."
+          echo "Install ninja"
           docker exec \
           -w /workspace \
-          aiter_build \
+          aiter_build_${{ matrix.python_version }} \
+          pip install ninja
+
+      - name: Build Aiter
+        if: ${{ matrix.build_enabled }}
+        run: |
+          set -e
+          echo "Building aiter whl packages for Python ${{ matrix.python_version }}..."
+          docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
           bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="gfx942;gfx950" python3 setup.py bdist_wheel && ls dist/*.whl'
-      
+
       - name: Upload whl file as artifact
+        if: ${{ matrix.build_enabled }}
         uses: actions/upload-artifact@v4
         with:
-          name: aiter-whl-packages
+          name: aiter-whl-packages-py${{ matrix.python_version }}
           path: dist/*.whl
-          
-    
+
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f aiter_build || true
-          
+          docker rm -f aiter_build_${{ matrix.python_version }} || true
