@@ -1,7 +1,15 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+from typing import Optional
 import torch
 import triton
 import triton.language as tl
 import aiter
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
+
 
 fp8_dtype = aiter.dtypes.fp8
 
@@ -237,6 +245,15 @@ def fused_rms_fp8_group_quant(
         out_res1_row_stride = out_res1.stride(0)
         out_res1_col_stride = out_res1.stride(1)
 
+    if BLOCK_SIZE_N <= 512:
+        num_warps = 1
+    elif BLOCK_SIZE_N <= 2048:
+        num_warps = 4
+    elif BLOCK_SIZE_N <= 4096:
+        num_warps = 8
+    else:
+        num_warps = 16
+
     DTYPE_MAX = (
         torch.finfo(out1_fp8.dtype).max
         if torch.is_floating_point(out1_fp8)
@@ -281,6 +298,7 @@ def fused_rms_fp8_group_quant(
         HAVE_SECOND_INPUT=(inp2 is not None),
         FIRST_INPUT_RES=(res1 is not None),
         FIRST_INPUT_OUT=output_unquantized_inp1,
+        num_warps=num_warps,
     )
 
     return (out1_fp8, out1_bs), out1, out2, out_res1
@@ -372,3 +390,274 @@ def fused_flatten_fp8_group_quant(
     )
 
     return out, out_block_scales
+
+
+@triton.jit
+def _fused_reduce_act_mul_fp8_group_quant(
+    x_ptr,
+    y_ptr,
+    y_scale_ptr,
+    x2_ptr,
+    y2_ptr,
+    M,
+    N1,
+    N2,
+    stride_x_spk,
+    stride_x_m,
+    stride_x_n,
+    stride_y_m,
+    stride_y_n,
+    stride_y_scale_m,
+    stride_y_scale_n,
+    stride_x2_spk,
+    stride_x2_m,
+    stride_x2_n,
+    stride_y2_m,
+    stride_y2_n,
+    # Meta-parameters
+    ACTIVATION: tl.constexpr,
+    BLOCK_SIZE_M2: tl.constexpr,
+    BLOCK_SIZE_N1: tl.constexpr,
+    BLOCK_SIZE_N2: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+    DTYPE_MIN: tl.constexpr,
+    X_HAS_SPLITK: tl.constexpr,
+    X_NUM_KSPLIT: tl.constexpr,
+    X_NUM_KSPLIT_POW2: tl.constexpr,
+    X_MASK: tl.constexpr,
+):
+
+    tl.assume(stride_x_spk > 0)
+    tl.assume(stride_x_m > 0)
+    tl.assume(stride_x_n > 0)
+    tl.assume(stride_y_m > 0)
+    tl.assume(stride_y_n > 0)
+    tl.assume(stride_y_scale_m > 0)
+    tl.assume(stride_y_scale_n > 0)
+    tl.assume(stride_x2_spk > 0)
+    tl.assume(stride_x2_m > 0)
+    tl.assume(stride_x2_n > 0)
+    tl.assume(stride_y2_m > 0)
+    tl.assume(stride_y2_n > 0)
+
+    m_pid = tl.program_id(axis=0)
+    if X_HAS_SPLITK and m_pid >= M:
+        pid2 = m_pid - M
+        num_pid_n2 = tl.cdiv(N2, BLOCK_SIZE_N2)
+        pid_m2 = pid2 // num_pid_n2
+        pid_n2 = pid2 % num_pid_n2
+        offs_m2 = (pid_m2 * BLOCK_SIZE_M2 + tl.arange(0, BLOCK_SIZE_M2)) % M
+        offs_n2 = (pid_n2 * BLOCK_SIZE_N2 + tl.arange(0, BLOCK_SIZE_N2)) % N2
+        offs_spk = tl.arange(0, X_NUM_KSPLIT_POW2)
+        x2_ptrs = (
+            x2_ptr
+            + offs_spk[:, None, None] * stride_x2_spk
+            + offs_m2[None, :, None] * stride_x2_m
+            + offs_n2[None, None, :] * stride_x2_n
+        )
+        if X_NUM_KSPLIT_POW2 == X_NUM_KSPLIT:
+            x2 = tl.load(x2_ptrs)
+        else:
+            x2 = tl.load(
+                x2_ptrs, mask=offs_spk[:, None, None] < X_NUM_KSPLIT, other=0.0
+            )
+        x2 = tl.sum(x2, axis=0)
+
+        x2 = x2.to(y2_ptr.type.element_ty)
+
+        y2_out_ptrs = (
+            y2_ptr + (offs_m2[:, None] * stride_y2_m) + (offs_n2[None, :] * stride_y2_n)
+        )
+
+        tl.store(y2_out_ptrs, x2)
+        return
+
+    n_offs = tl.arange(0, BLOCK_SIZE_N1)
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N1 // QUANT_BLOCK_SIZE
+
+    mask = None
+    other = None
+    if X_HAS_SPLITK:
+        offs_spk = tl.arange(0, X_NUM_KSPLIT_POW2)
+        x_ptrs = (
+            x_ptr
+            + offs_spk[:, None] * stride_x_spk
+            + m_pid * stride_x_m
+            + n_offs[None, :] * stride_x_n
+        )
+        if X_MASK:
+            mask = (offs_spk[:, None] < X_NUM_KSPLIT) & (n_offs[None, :] < N1)
+            other = 0.0
+        else:
+            mask = offs_spk[:, None] < X_NUM_KSPLIT
+            other = 0.0
+    else:
+        x_ptrs = x_ptr + m_pid * stride_x_m + n_offs * stride_x_n
+        if X_MASK:
+            mask = n_offs < N1
+            other = 0.0
+
+    x = tl.load(
+        x_ptrs,
+        mask=mask,
+        other=other,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+    x_mul = tl.load(
+        x_ptrs + N1 * stride_x_n,
+        mask=mask,
+        other=other,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+
+    if X_HAS_SPLITK:
+        x = tl.sum(x, axis=0)
+        x_mul = tl.sum(x_mul, axis=0)
+
+    x = ACTIVATION(x) * x_mul
+
+    y, y_scale = _fp8_quant_op(
+        x, 1, BLOCK_SIZE_N1, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
+    )
+    y = tl.ravel(y)
+    y_scale = tl.ravel(y_scale)
+
+    if X_MASK:
+        mask = n_offs < N1
+    else:
+        mask = n_offs < N1
+    tl.store(
+        y_ptr + m_pid * stride_y_m + n_offs * stride_y_n,
+        y.to(y_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    g_offs = tl.arange(0, NUM_QUANT_BLOCKS)
+    num_bs_cols = (N1 + QUANT_BLOCK_SIZE - 1) // QUANT_BLOCK_SIZE
+    tl.store(
+        y_scale_ptr + m_pid * stride_y_scale_m + g_offs * stride_y_scale_n,
+        y_scale.to(y_scale_ptr.dtype.element_ty),
+        mask=g_offs < num_bs_cols,
+    )
+
+
+def fused_reduce_act_mul_fp8_group_quant(
+    x: torch.Tensor,
+    activation: str = "silu",
+    x2: Optional[torch.Tensor] = None,
+    group_size=128,
+    dtype_quant=fp8_dtype,
+    dtype: Optional[float] = torch.bfloat16,
+):
+    """
+    Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
+
+    Key parameters:
+    - X: Matrix X with shape (M, K).
+    - W: Matrix W with shape (N, K).
+    - X_scale: Scale tensor for X with shape (M, *scale_k).
+    - W_scale: Scale tensor for W with shape (**scale_n, *scale_k).
+
+    Returns:
+    - Y: The output matrix with shape (M, N).
+
+    *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k
+    **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
+    """
+    _LOGGER.info(f"FUSED_ACT_MUL_FP8_GROUP_QUANT: x={tuple(x.shape)}")
+
+    from aiter.ops.triton.activation import _gelu, _gelu_tanh, _silu, _silu_exp2
+
+    def _get_activation_from_str(activation: str):
+        mapping = {
+            "gelu": _gelu,
+            "gelu_tanh": _gelu_tanh,
+            "silu": _silu,
+            "silu_exp2": _silu_exp2,
+        }
+        return mapping[activation]
+
+    assert (
+        x.dim() == 2 or x.dim() == 3
+    ), "The number of dimentions for x should be 2 or 3"
+    X_HAS_SPLITK = False
+    x_num_splitk = 1
+    N2 = 1
+    y2 = None
+    if x.dim() == 3:
+        x_num_splitk, M, N1 = x.shape
+        x_num_splitk, _, N2 = x2.shape
+        assert (
+            x.shape[0] == x2.shape[0] and x.shape[1] == x2.shape[1]
+        ), "The first two dimensions should be identical between x and x2"
+        assert (
+            x_num_splitk > 1
+        ), "x.shape[0] should be larger then 1 in x.dim() == 3 cases"
+        X_HAS_SPLITK = True
+        y2 = torch.empty((M, N2), dtype=dtype, device=x2.device)
+    else:
+        M, N1 = x.shape
+        assert x2 is None, "x2 should be None in x.dim() == 2 cases"
+
+    assert (
+        N1 % 2 == 0
+    ), "The last dimension for x1 should be multiple of 2 for acitvation and multiplication"
+    N1 = N1 // 2
+
+    y = torch.empty((M, N1), dtype=dtype_quant, device=x.device)
+    y_scale = torch.empty(
+        (M, (N1 + group_size - 1) // group_size),
+        dtype=torch.float32,
+        device=x.device,
+    )
+
+    BLOCK_SIZE_N1 = max(triton.next_power_of_2(N1), group_size)
+    BLOCK_SIZE_N2 = max(triton.next_power_of_2(N2), 32)
+    BLOCK_SIZE_M2 = 1 if M <= 128 else 4
+    X_MASK = N1 % BLOCK_SIZE_N1 != 0
+
+    DTYPE_MAX = (
+        torch.finfo(y.dtype).max
+        if torch.is_floating_point(y)
+        else torch.iinfo(y.dtype).max
+    )
+    num_pid = M
+    if X_HAS_SPLITK:
+        num_pid += triton.cdiv(M, BLOCK_SIZE_M2) * triton.cdiv(N2, BLOCK_SIZE_N2)
+    grid = (num_pid,)
+    _fused_reduce_act_mul_fp8_group_quant[grid](
+        x,
+        y,
+        y_scale,
+        x2,
+        y2,
+        M,
+        N1,
+        N2,
+        0 if not X_HAS_SPLITK else x.stride(0),
+        x.stride(0) if not X_HAS_SPLITK else x.stride(1),
+        x.stride(1) if not X_HAS_SPLITK else x.stride(2),
+        y.stride(0),
+        y.stride(1),
+        y_scale.stride(0),
+        y_scale.stride(1),
+        0 if not X_HAS_SPLITK else x2.stride(0),
+        0 if not X_HAS_SPLITK else x2.stride(1),
+        0 if not X_HAS_SPLITK else x2.stride(2),
+        0 if not X_HAS_SPLITK else y2.stride(0),
+        0 if not X_HAS_SPLITK else y2.stride(1),
+        ACTIVATION=_get_activation_from_str(activation) if activation else "",
+        BLOCK_SIZE_M2=BLOCK_SIZE_M2,
+        BLOCK_SIZE_N1=BLOCK_SIZE_N1,
+        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
+        QUANT_BLOCK_SIZE=group_size,
+        DTYPE_MAX=DTYPE_MAX,
+        DTYPE_MIN=-DTYPE_MAX,
+        X_HAS_SPLITK=X_HAS_SPLITK,
+        X_NUM_KSPLIT=x_num_splitk,
+        X_NUM_KSPLIT_POW2=triton.next_power_of_2(x_num_splitk),
+        X_MASK=X_MASK,
+        num_warps=1 if max(BLOCK_SIZE_N1, BLOCK_SIZE_N2) <= 512 else 4,
+    )
+
+    return (y, y_scale), y2
