@@ -37,36 +37,10 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 bestsols = {}
 
-solids = {}
-
 solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
-
-asm_solMap = {}
 
 # We need to set is 0 as default, None will error in torch.compile fakeTensor execution
 soltype = 0
-
-
-@torch_compile_guard()
-def create_ds_custom() -> None:
-    global solids, bestsols, solMap
-    df: pd.DataFrame = bestsols
-    solids = {}
-    for i in range(len(df)):
-        ds = df.iloc[i]
-        key = (
-            ds["M"],
-            ds["N"],
-            ds["K"],
-            ds["bias"],
-            ds["dtype"],
-            ds["outdtype"],
-            ds["scaleAB"],
-        )
-
-        if ds["libtype"] in ["hipblaslt", "rocblas", "asm"]:
-            soltype_ = solMap.index(ds["libtype"])
-        solids[key] = (soltype_, int(ds["solidx"]), int(ds["splitK"]), ds["kernelName"])
 
 
 @torch_compile_guard()
@@ -96,77 +70,57 @@ def load_best_sols_custom(tune_path: str) -> bool:
 
 
 @functools.lru_cache(maxsize=4096)
-def query_sol_core(
-    m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
-) -> torch.Tensor:
-    global solids, solMap, soltype, asm_solMap
-    soltype = None
-    solution_idx = 0
-    splitK = 0
-    kernelName = ""
-    cu_count = get_cu_num()
-    if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
-        if (
-            ((m == 1 and n <= 2 * cu_count) or (m > 1 and m <= 4 and n <= cu_count))
-            and k <= 9216
-            or (m > 4 and m <= 8 and n <= cu_count)
-            and k <= 5120
-            or (m > 8 and m <= 16 and n <= cu_count)
-            and k <= 256
-        ):
-            soltype, solution_idx = 3, 2
+def get_GEMM_config(
+    M: int, N: int, K: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
+):
+    if not hasattr(get_GEMM_config, "gemm_dict"):
+        gemm_dict = pd.read_csv(AITER_CONFIG_GEMM_BF16_FILE).drop_duplicates()
+        get_GEMM_config.gemm_dict = gemm_dict.set_index(
+            ["cu_num", "M", "N", "K", "bias", "dtype", "outdtype", "scaleAB"]
+        ).to_dict("index")
+    cu_num = get_cu_num()
+    padded_M = M
+    config = None
+    for gl in [None, 0, 1]:
+        padded_M = M if gl is None else get_padded_m(M, N, K, gl)
+        config = get_GEMM_config.gemm_dict.get(
+            (cu_num, padded_M, N, K, bias, str(dtype), str(otype), scaleAB), None
+        )
+        if config is not None:
+            if AITER_LOG_TUNED_CONFIG:
+                kernelName = config["kernelName"] if config["libtype"] == "asm" else ""
+                logger.info(
+                    f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIG_GEMM_BF16_FILE}, libtype is {config["libtype"]}, kernel name is {kernelName}"
+                )
+            break
+    if config is None:
+        default_config = {}
+        logger.info(
+            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {AITER_CONFIG_GEMM_BF16_FILE}, will use default config!"
+        )
+        if dtype in [dtypes.fp16, dtypes.bf16] and K % 8 == 0:
+            if (
+                ((M == 1 and N <= 2 * cu_num) or (M > 1 and M <= 4 and N <= cu_num))
+                and K <= 9216
+                or (M > 4 and M <= 8 and N <= cu_num)
+                and K <= 5120
+                or (M > 8 and M <= 16 and N <= cu_num)
+                and K <= 256
+            ):
+                # soltype, solution_idx = 3, 2
+                default_config["libtype"] = "skinny"
+                default_config["solidx"] = 2
+                default_config["kernelName"] = ""
+                return {"libtype": "skinny", "solidx": 2, "kernelName": ""}
+        else:
+            default_config["libtype"] = "torch"
+            default_config["solidx"] = 0
+        logger.info(
+            f"using {default_config["libtype"]} solution:{default_config["solidx"]} for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}"
+        )
+        return default_config
 
-    if soltype is None:
-        for gl in [None, 0, 1]:
-            padded_m = m if gl is None else get_padded_m(m, n, k, gl)
-            (soltype, solution_idx, splitK, kernelName) = solids.get(
-                (padded_m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0, 0, "")
-            )
-            if soltype > 0:
-                if AITER_LOG_TUNED_CONFIG:
-                    logger.info(
-                        f"shape is M:{m}, N:{n}, K:{k} {dtype=} {otype=} {bias=}, {scaleAB=}, found padded_M: {padded_m}, N:{n}, K:{k} is tuned on cu_num = {cu_count} in {AITER_CONFIG_GEMM_BF16_FILE} , kernel name is {kernelName}"
-                    )
-                break
-        asm_solMap[solution_idx] = kernelName
-    solution_name = solMap[soltype]
-    logger.info(
-        f"using {solution_name} solution:{solution_idx}, {splitK} {kernelName} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
-    )
-    return torch.Tensor([solution_idx, splitK]).to(torch.int32)
-
-
-def query_sol_fake(
-    m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
-) -> torch.Tensor:
-    global solids, solMap, soltype
-    # soltype = None
-    solution_idx = 0
-    cu_count = get_cu_num()
-    if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
-        if (
-            ((m == 1 and n <= 2 * cu_count) or (m > 1 and m <= 4 and n <= cu_count))
-            and k <= 9216
-            or (m > 4 and m <= 8 and n <= cu_count)
-            and k <= 5120
-            or (m > 8 and m <= 16 and n <= cu_count)
-            and k <= 256
-        ):
-            soltype, solution_idx = 3, 2
-
-    return torch.Tensor([solution_idx, 0]).to(torch.int32)
-
-
-@torch_compile_guard(gen_fake=query_sol_fake)
-def query_sol(
-    m: int, n: int, k: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
-) -> torch.Tensor:
-    # if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
-    #     if n > 8 and 0 < m <= 4:
-    #         return 3, 0
-    #     elif n % 4 == 0 and m == 1 and k <= 8192:
-    #         return 3, 1
-    return query_sol_core(m, n, k, bias, dtype, otype, scaleAB)
+    return config
 
 
 class TunedGemm:
@@ -200,7 +154,6 @@ class TunedGemm:
             self.bestsols = bestsols
 
     def create_ds(self):
-        create_ds_custom()
         self.solfuncs = [
             self.apply_torch_mm,
             self.apply_hipb_mm,
@@ -382,21 +335,23 @@ class TunedGemm:
         m, k = inp_view.shape
         n = weights.shape[0]
         use_bias = bias is not None
-        result = query_sol(
-            m=m,
-            n=n,
-            k=k,
+        config = get_GEMM_config(
+            M=m,
+            N=n,
+            K=k,
             bias=use_bias,
             dtype=str(inp.dtype),
             otype=str(otype) if otype is not None else str(inp.dtype),
             scaleAB=scale_a is not None or scale_b is not None,
         )
-        solution_idx = result[0].item()
-        splitK = result[1].item()
-        if solMap[soltype] == "asm":
-            kernelName = asm_solMap[solution_idx]
+
+        if config is not None and config["libtype"] == "asm":
+            kernelName = config["kernelName"]
+            splitK = config["splitK"]
             out = self.apply_asm_mm(inp_view, weights, bias, otype, splitK, kernelName)
         else:
+            soltype = solMap.index(config["libtype"])
+            solution_idx = config["solidx"]
             out = self.solfuncs[soltype](
                 inp_view, weights, solution_idx, bias, otype, scale_a, scale_b, scale_c
             )
