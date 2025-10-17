@@ -50,7 +50,7 @@ jobs:
           docker exec \
           -w /workspace \
           triton_test \
-          bash -c "pip install speedtest-cli && speedtest-cli --simple"
+          bash -c "pip install speedtest-cli && speedtest-cli --simple" || true
 
       - name: Setup-Triton
         run: |
