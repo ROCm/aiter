@@ -26,24 +26,18 @@ def _softmax_kernel_online(
     output_row_stride,
     n_rows,
     n_cols,
-    ELMT_SIZE: gl.constexpr,
+    SIZE_PER_THREAD: gl.constexpr,
+    THREADS_PER_WARP: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
     NUM_STAGES: gl.constexpr,
 ):
     row_start = gl.program_id(0)
     row_idx = row_start
 
-    buffer_size: gl.constexpr = 16
-    threads_per_warp: gl.constexpr = 64
-
-    # FIXME: need to use this value to set size_per_thread, just bounded by
-    # what can fit in the load buffer
-    cols_per_thread: gl.constexpr = triton.cdiv(BLOCK_SIZE, gl.num_warps() * 64)
+    gl.static_assert(SIZE_PER_THREAD <= triton.cdiv(BLOCK_SIZE, gl.num_warps() * THREADS_PER_WARP))
     blocked_cols: gl.constexpr = gl.BlockedLayout(
-        # each thread should only be loading as many elements
-        # as can fit in the load buffer (determined by element size)
-        size_per_thread=[buffer_size // ELMT_SIZE],
-        threads_per_warp=[threads_per_warp],
+        size_per_thread=[SIZE_PER_THREAD],
+        threads_per_warp=[THREADS_PER_WARP],
         warps_per_cta=[gl.num_warps()],
         order=[0],
     )
@@ -175,6 +169,14 @@ def softmax(x):
     waves_per_eu = 2
     num_warps = 8
     num_stages = 2
+    
+    buffer_size = 16
+    threads_per_warp = 64
+    
+    # each thread should only be loading as many elements
+    # as can fit in the load buffer (determined by element size)
+    cols_per_thread = triton.cdiv(BLOCK_SIZE, num_warps * threads_per_warp)
+    size_per_thread = min(cols_per_thread, buffer_size // x.element_size())
 
     num_programs = n_rows
 
@@ -186,7 +188,8 @@ def softmax(x):
         y.stride(0),
         n_rows,
         n_cols,
-        x.element_size(),
+        size_per_thread,
+        threads_per_warp,
         BLOCK_SIZE,
         num_stages,
         waves_per_eu=waves_per_eu,
