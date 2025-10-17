@@ -16,8 +16,6 @@ on:
         description: 'Build with Python 3.12'
         type: boolean
         default: true
-  pull_request:
-    branches: [main] # for test
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
