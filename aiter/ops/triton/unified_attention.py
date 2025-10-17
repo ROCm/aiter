@@ -98,6 +98,8 @@ def kernel_unified_attention_2d(
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
 
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+
     tl.assume(kv_head_idx >= 0)
     tl.assume(q_block_global_idx >= 0)
     tl.assume(block_table_stride > 0)
@@ -313,13 +315,13 @@ def kernel_unified_attention_2d(
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
 
         # P : (BLOCK_M, BLOCK_SIZE)
-        P = tl.exp(S - m_j[:, None])
+        P = tl.math.exp2((S - m_j[:, None]) * RCP_LN2)
 
         # l_j : (BLOCK_M,)
         l_j = tl.sum(P, axis=1)
 
         # alpha : (BLOCK_M, )
-        alpha = tl.exp(M - m_j)
+        alpha = tl.math.exp2((M - m_j) * RCP_LN2)
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * alpha[:, None]
@@ -349,6 +351,7 @@ def kernel_unified_attention_2d(
         acc,
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
     )
+
 
 
 @triton.jit
@@ -401,6 +404,8 @@ def kernel_unified_attention_3d(
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
+
+    RCP_LN2: tl.constexpr = 1.4426950408889634
 
     tl.assume(kv_head_idx >= 0)
     tl.assume(q_block_global_idx >= 0)
@@ -604,13 +609,13 @@ def kernel_unified_attention_3d(
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
 
         # P : (BLOCK_M, BLOCK_SIZE,)
-        P = tl.exp(S - m_j[:, None])
+        P = tl.math.exp2((S - m_j[:, None]) * RCP_LN2)
 
         # l_j : (BLOCK_M,)
         l_j = tl.sum(P, axis=1)
 
         # alpha : (BLOCK_M, )
-        alpha = tl.exp(M - m_j)
+        alpha = tl.math.exp2((M - m_j) * RCP_LN2)
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * alpha[:, None]
@@ -670,6 +675,8 @@ def reduce_segments(
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
 
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+
     seq_idx = find_seq_idx(
         query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
     )
@@ -699,7 +706,7 @@ def reduce_segments(
 
     # load and rescale segment exp sums
     segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
-    segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
+    segm_expsum = segm_expsum * tl.math.exp2((segm_max - overall_max) * RCP_LN2)
     overall_expsum = tl.sum(segm_expsum)
 
     # load, rescale, and add segment attention outputs
