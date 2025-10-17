@@ -21,8 +21,8 @@ cd triton
 pip install -r python/requirements.txt
 pip install filecheck
 MAX_JOBS=64 pip install .
-ls -all
-find . -name "*.whl"
+ls -all build
+find / -name "*.whl"
 
 echo
 echo "==== Show installed packages ===="
