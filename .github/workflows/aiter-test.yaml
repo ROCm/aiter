@@ -50,6 +50,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: ${{ fromJSON(needs.define-runners.outputs.standard_runners) }}
+        rocm_version: ["latest", "6.4.2"]
         include:
           - rocm_version: "latest"
             docker_image: "rocm/pytorch:latest"
@@ -139,6 +140,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: ${{ fromJSON(needs.define-runners.outputs.multigpu_runners) }}
+        rocm_version: ["latest", "6.4.2"]
         include:
           - rocm_version: "latest"
             docker_image: "rocm/pytorch:latest"
