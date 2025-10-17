@@ -14,10 +14,6 @@ fmha_v3_varlen_bwd(const at::Tensor& dout,         // [total_q, hq, d_v]
                    const at::Tensor& softmax_lse,  // [b, hq, sq]
                    const at::Tensor& cu_seqlens_q, // [b+1]
                    const at::Tensor& cu_seqlens_k, // [b+1]
-                   // FIXME: this two args currently not support on ck side
-                   //        and has no host code on aiter side
-                   //    const at::Tensor& cu_seqlens_q_padded,   // [b+1]
-                   //    const at::Tensor& cu_seqlens_k_padded,   // [b+1]
                    const int max_seqlen_q,
                    const int max_seqlen_k,
                    const float p_dropout,
@@ -34,7 +30,9 @@ fmha_v3_varlen_bwd(const at::Tensor& dout,         // [total_q, hq, d_v]
                    std::optional<at::Tensor> dv_,                 // [total_k, hk, d_v]
                    std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
                    std::optional<const at::Tensor> rng_state_,
-                   std::optional<at::Generator> gen_);
+                   std::optional<at::Generator> gen_,
+                   std::optional<const at::Tensor> cu_seqlens_q_padded = std::nullopt,
+                   std::optional<const at::Tensor> cu_seqlens_k_padded = std::nullopt);
 
 } // namespace torch_itfs
 } // namespace aiter
