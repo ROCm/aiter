@@ -11,9 +11,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  DOCKER_IMAGE: "rocm/pytorch:latest"
-
 jobs:
   define-runners:
     runs-on: ubuntu-latest
@@ -29,12 +26,12 @@ jobs:
           pr_title="${{ github.event.pull_request.title }}"
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             echo "It's main branch, running tests on MI300 and MI35X..."
-            echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-mi325-1gpu", "aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-mi355-8gpu", "aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           elif echo "$pr_title" | grep -qi "mi35x"; then
             echo "PR title contains 'MI35X', running tests on MI300 and MI35X..."
-            echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-mi325-1gpu", "aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-mi325-8gpu", "aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           else
             echo "Not main branch and PR title does not contain mi35x, only running on MI300..."
             echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
@@ -53,6 +50,16 @@ jobs:
       fail-fast: false
       matrix:
         runner: ${{ fromJSON(needs.define-runners.outputs.standard_runners) }}
+        rocm_version: ["latest", "6.4.2"]
+        include:
+          - rocm_version: "latest"
+            docker_image: "rocm/pytorch:latest"
+          - rocm_version: "6.4.2"
+            docker_image: "rocm/pytorch:rocm6.4.2_ubuntu22.04_py3.10_pytorch_release_2.6.0"
+        
+    env:
+      DOCKER_IMAGE: ${{ matrix.docker_image }}
+
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -81,15 +88,15 @@ jobs:
           set -ex
           echo "Starting container: aiter_test"
           docker run -dt \
-          --device=/dev/dri \
-          --device=/dev/kfd \
-          --shm-size=16G \
-          --group-add $(getent group render | cut -d: -f3) \
-          --group-add $(getent group video | cut -d: -f3) \
-          -v "${{ github.workspace }}:/workspace" \
-          -w /workspace \
-          --name aiter_test \
-          ${{ env.DOCKER_IMAGE }}
+            --device=/dev/dri \
+            --device=/dev/kfd \
+            --shm-size=16G \
+            --group-add $(getent group render | cut -d: -f3) \
+            --group-add $(getent group video | cut -d: -f3) \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            --name aiter_test \
+            ${{ env.DOCKER_IMAGE }}
 
       - name: Setup-Triton
         run: |
@@ -112,7 +119,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: standard-test-log-${{ matrix.runner }}
+          name: standard-test-log-${{ matrix.runner }}-${{ matrix.rocm_version }}
           path: latest_test.log
 
       - name: Cleanup container
@@ -133,7 +140,16 @@ jobs:
       fail-fast: false
       matrix:
         runner: ${{ fromJSON(needs.define-runners.outputs.multigpu_runners) }}
+        rocm_version: ["latest", "6.4.2"]
+        include:
+          - rocm_version: "latest"
+            docker_image: "rocm/pytorch:latest"
+          - rocm_version: "6.4.2"
+            docker_image: "rocm/pytorch:rocm6.4.2_ubuntu22.04_py3.10_pytorch_release_2.6.0"
     runs-on: ${{ matrix.runner }}
+
+    env:
+      DOCKER_IMAGE: ${{ matrix.docker_image }}
 
     steps:
       - name: Checkout code
@@ -160,15 +176,15 @@ jobs:
           set -ex
           echo "Starting container: aiter_test"
           docker run -dt \
-          --device=/dev/dri \
-          --device=/dev/kfd \
-          --shm-size=16G \
-          --group-add $(getent group render | cut -d: -f3) \
-          --group-add $(getent group video | cut -d: -f3) \
-          -v "${{ github.workspace }}:/workspace" \
-          -w /workspace \
-          --name aiter_test \
-          ${{ env.DOCKER_IMAGE }}
+            --device=/dev/dri \
+            --device=/dev/kfd \
+            --shm-size=16G \
+            --group-add $(getent group render | cut -d: -f3) \
+            --group-add $(getent group video | cut -d: -f3) \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            --name aiter_test \
+            ${{ env.DOCKER_IMAGE }}
 
       - name: Setup-Triton
         run: |
