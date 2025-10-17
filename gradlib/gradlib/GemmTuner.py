@@ -189,7 +189,7 @@ class Gemm:
         """calculate TFLOPS and bandwidth"""
         ### gemm flops,bw
         info, time, err_ratio = results
-        if time == -1:
+        if time <= 0:
             return -1, -1
         print("info is ", info)
         cu_num, m, n, k = info
@@ -679,6 +679,7 @@ class Gemm:
             self.best_soltime = 0
             self.best_splitK = 0
             self.best_err_ratio = 0
+            self.best_kernelName=""
         print(
             ">>> Fastest Solution is",
             self.best_libtype,

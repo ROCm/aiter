@@ -21,6 +21,8 @@ import pandas as pd
 import functools
 import torch
 import torch.nn.functional as F
+from typing import Optional
+from torch import Tensor
 from aiter import hipb_create_extension, hipb_mm, getHipblasltKernelName
 from aiter import rocb_create_extension, rocb_mm
 from aiter import logger, dtypes
@@ -41,6 +43,19 @@ solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
 
 # We need to set is 0 as default, None will error in torch.compile fakeTensor execution
 soltype = 0
+
+
+def get_solfunc(soltype: int):
+    if soltype == 1:
+        return hipb_gemm
+    elif soltype == 0:
+        return torch_gemm
+    elif soltype == 2:
+        return rocb_gemm
+    elif soltype == 3:
+        return skinny_gemm
+    elif soltype == 4:
+        return asm_gemm
 
 
 @torch_compile_guard()
@@ -137,6 +152,195 @@ def get_GEMM_A16W16_config(
 
     return config
 
+def gemm_a16w16(
+    A: Tensor,
+    B: Tensor,
+    bias: Optional[Tensor] = None,
+    otype=None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
+):
+    if A.dim() >= 3:
+        try:
+            inp_view = A.view(-1, A.size(-1))
+            batched = True
+        except RuntimeError:
+            return F.linear(A, B, bias)
+    else:
+        inp_view = A
+        batched = False
+    m, k = inp_view.shape
+    n = B.shape[0]
+    use_bias = bias is not None
+    config = get_GEMM_A16W16_config(
+        M=m,
+        N=n,
+        K=k,
+        bias=use_bias,
+        dtype=str(inp_view.dtype),
+        otype=str(otype) if otype is not None else str(inp_view.dtype),
+        scaleAB=scale_a is not None or scale_b is not None,
+    )
+
+    if config is not None and config["libtype"] == "asm":
+        kernelName = config["kernelName"]
+        splitK = config["splitK"]
+        out = asm_gemm(inp_view, B, bias, otype, splitK, kernelName)
+    else:
+        soltype = solMap.index(config["libtype"])
+        solution_idx = config["solidx"]
+        solfunc = get_solfunc(soltype)
+        out = solfunc(inp_view, B, solution_idx, bias, otype, scale_a, scale_b, scale_c)
+    if batched:
+        out = out.view(*A.shape[:-1], B.shape[0])
+    if otype is not None:
+        out = out.to(otype)
+    return out
+
+
+def skinny_gemm(
+    self,
+    inp,
+    weights,
+    solidx,
+    bias=None,
+    otype=None,
+    scale_a=None,
+    scale_b=None,
+    scale_c=None,
+):
+    import aiter as ops
+
+    if solidx == 0:
+        out = torch.empty(
+            inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
+        )
+        ops.wvSpltK(weights, inp, out, inp.shape[0], self.cu_count)
+    elif solidx == 1:
+        out = torch.empty(
+            inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
+        )
+        ops.LLMM1(weights, inp, out, 4)
+    if solidx == 2:
+        out = torch.empty(
+            inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
+        )
+        ops.wv_splitk_small_fp16_bf16(weights, inp, out, inp.shape[0], self.cu_count)
+    if bias is not None:
+        out += bias
+    return out
+
+
+def hipb_gemm(
+    inp,
+    weights,
+    solidx,
+    bias=None,
+    otype=None,
+    scale_a=None,
+    scale_b=None,
+    scale_c=None,
+):
+    if otype is None:
+        otype = inp.dtype
+    return hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
+
+
+def rocb_gemm(
+    inp,
+    weights,
+    solidx,
+    bias=None,
+    otype=None,
+    scale_a=None,
+    scale_b=None,
+    scale_c=None,
+):
+    assert (
+        scale_a is None and scale_b is None and scale_c is None
+    ), "scale_a, scale_b, scale_c must be None for rocblas"
+    out = rocb_mm(inp, weights.t(), solidx)
+    if bias is not None:
+        out = out + bias
+    return out
+
+
+def torch_gemm(
+    inp,
+    weights,
+    solidx,
+    bias=None,
+    otype=None,
+    scale_a=None,
+    scale_b=None,
+    scale_c=None,
+):
+    if int(os.environ.get("AITER_TUNE_GEMM", 0)) == 1:
+        m, k = inp.shape
+        n = weights.shape[0]
+        tuned_df = pd.DataFrame(
+            columns=["M", "N", "K", "bias", "dtype", "outdtype", "scaleAB"]
+        )
+        tuned_df = pd.concat(
+            [
+                tuned_df,
+                pd.DataFrame(
+                    {
+                        "M": [m],
+                        "N": [n],
+                        "K": [k],
+                        "bias": [bias is not None],
+                        "dtype": [inp.dtype],
+                        "outdtype": [otype],
+                        "scaleAB": [scale_a is not None or scale_b is not None],
+                    }
+                ),
+            ]
+        ).drop_duplicates()
+        tuned_df.to_csv(f"{this_dir}/configs/untuned_gemm.csv", index=False)
+    if inp.dtype == dtypes.fp8:
+        if scale_a is None:
+            scale_a = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
+        if scale_b is None:
+            scale_b = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
+        try:
+            out = torch._scaled_mm(
+                inp,
+                weights.t(),
+                out_dtype=otype,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                bias=bias,
+            )
+        except RuntimeError:
+            out = (
+                F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32))
+                * scale_a
+                * scale_b
+            )
+            out = (out.to(otype) + bias) if bias is not None else out.to(otype)
+        return out
+    out = F.linear(inp, weights, bias)
+    if otype is not None:
+        out = out.to(otype)
+    return out
+
+
+def asm_gemm(
+    inp,
+    weights,
+    bias=None,
+    otype=None,
+    splitK=None,
+    KernelName=None,
+):
+    # just support bf16gemm_outFp32
+    out_asm = torch.empty(
+        inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
+    )
+    return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName)
+
 
 class TunedGemm:
     """bf16/fp16 with per tensor fp8 quant"""
@@ -168,157 +372,6 @@ class TunedGemm:
             global bestsols
             self.bestsols = bestsols
 
-    def create_ds(self):
-        self.solfuncs = [
-            self.apply_torch_mm,
-            self.apply_hipb_mm,
-            self.apply_rocb_mm,
-            self.apply_skinny,
-            self.apply_asm_mm,
-        ]
-
-    def apply_skinny(
-        self,
-        inp,
-        weights,
-        solidx,
-        bias=None,
-        otype=None,
-        scale_a=None,
-        scale_b=None,
-        scale_c=None,
-    ):
-        import aiter as ops
-
-        if solidx == 0:
-            out = torch.empty(
-                inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
-            )
-            ops.wvSpltK(weights, inp, out, inp.shape[0], self.cu_count)
-        elif solidx == 1:
-            out = torch.empty(
-                inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
-            )
-            ops.LLMM1(weights, inp, out, 4)
-        if solidx == 2:
-            out = torch.empty(
-                inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
-            )
-            ops.wv_splitk_small_fp16_bf16(
-                weights, inp, out, inp.shape[0], self.cu_count
-            )
-        if bias is not None:
-            out += bias
-        return out
-
-    def apply_hipb_mm(
-        self,
-        inp,
-        weights,
-        solidx,
-        bias=None,
-        otype=None,
-        scale_a=None,
-        scale_b=None,
-        scale_c=None,
-    ):
-        if otype is None:
-            otype = inp.dtype
-        return hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
-
-    def apply_rocb_mm(
-        self,
-        inp,
-        weights,
-        solidx,
-        bias=None,
-        otype=None,
-        scale_a=None,
-        scale_b=None,
-        scale_c=None,
-    ):
-        assert (
-            scale_a is None and scale_b is None and scale_c is None
-        ), "scale_a, scale_b, scale_c must be None for rocblas"
-        out = rocb_mm(inp, weights.t(), solidx)
-        if bias is not None:
-            out = out + bias
-        return out
-
-    def apply_torch_mm(
-        self,
-        inp,
-        weights,
-        solidx,
-        bias=None,
-        otype=None,
-        scale_a=None,
-        scale_b=None,
-        scale_c=None,
-    ):
-        if self.save_gemm == 1:
-            m, k = inp.shape
-            n = weights.shape[0]
-            self.tuned_df = pd.concat(
-                [
-                    self.tuned_df,
-                    pd.DataFrame(
-                        {
-                            "M": [m],
-                            "N": [n],
-                            "K": [k],
-                            "bias": [bias is not None],
-                            "dtype": [inp.dtype],
-                            "outdtype": [otype],
-                            "scaleAB": [scale_a is not None or scale_b is not None],
-                        }
-                    ),
-                ]
-            ).drop_duplicates()
-            self.tuned_df.to_csv(self.untune_path, index=False)
-        if inp.dtype == dtypes.fp8:
-            if scale_a is None:
-                scale_a = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
-            if scale_b is None:
-                scale_b = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
-
-            try:
-                out = torch._scaled_mm(
-                    inp,
-                    weights.t(),
-                    out_dtype=otype,
-                    scale_a=scale_a,
-                    scale_b=scale_b,
-                    bias=bias,
-                )
-            except RuntimeError:
-                out = (
-                    F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32))
-                    * scale_a
-                    * scale_b
-                )
-                out = (out.to(otype) + bias) if bias is not None else out.to(otype)
-            return out
-        out = F.linear(inp, weights, bias)
-        if otype is not None:
-            out = out.to(otype)
-        return out
-
-    def apply_asm_mm(
-        self,
-        inp,
-        weights,
-        bias=None,
-        otype=None,
-        splitK=None,
-        KernelName=None,
-    ):
-        # just support bf16gemm_outFp32
-        out_asm = torch.empty(
-            inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
-        )
-        return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName)
-
     def mm(
         self,
         inp,
@@ -337,43 +390,28 @@ class TunedGemm:
             hipb_create_extension()
             self.extensions_created = True
             self.load_best_sols()
-            self.create_ds()
-        if inp.dim() >= 3:
-            try:
-                inp_view = inp.view(-1, inp.size(-1))
-                batched = True
-            except RuntimeError:
-                return F.linear(inp, weights, bias)
-        else:
-            inp_view = inp
-            batched = False
-        m, k = inp_view.shape
-        n = weights.shape[0]
-        use_bias = bias is not None
-        config = get_GEMM_A16W16_config(
-            M=m,
-            N=n,
-            K=k,
-            bias=use_bias,
-            dtype=str(inp.dtype),
-            otype=str(otype) if otype is not None else str(inp.dtype),
-            scaleAB=scale_a is not None or scale_b is not None,
+        #if inp.dim() >= 3:
+        #    try:
+        #        inp_view = inp.view(-1, inp.size(-1))
+        #        batched = True
+        #    except RuntimeError:
+        #        return F.linear(inp, weights, bias)
+        #else:
+        #    inp_view = inp
+        #    batched = False
+        out = gemm_a16w16(
+            inp,
+            weights,
+            bias=bias,
+            otype=otype,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            scale_c=scale_c,
         )
-
-        if config is not None and config["libtype"] == "asm":
-            kernelName = config["kernelName"]
-            splitK = config["splitK"]
-            out = self.apply_asm_mm(inp_view, weights, bias, otype, splitK, kernelName)
-        else:
-            soltype = solMap.index(config["libtype"])
-            solution_idx = config["solidx"]
-            out = self.solfuncs[soltype](
-                inp_view, weights, solution_idx, bias, otype, scale_a, scale_b, scale_c
-            )
-        if batched:
-            out = out.view(*inp.shape[:-1], weights.shape[0])
-        if otype is not None:
-            out = out.to(otype)
+        #if batched:
+        #    out = out.view(*inp.shape[:-1], weights.shape[0])
+        #if otype is not None:
+        #    out = out.to(otype)
         return out
 
 
