@@ -64,6 +64,8 @@ kernels_list = {
 #   (    M,     N,     K): kernel:        BLOCK_SIZE| MPerBLOCK| NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N|  LOOP_SCHED|PIPELINE_VERSION
     1:                     kernelInstance(       256,       128,       128,       128,           16,         16,          64,         1,           4),
     2:                     kernelInstance(       256,       128,       128,       128,           16,         16,          32,         1,           4),
+    3:                     kernelInstance(       256,       32,       64,       256,           16,         16,          64,         1,           4),
+    4:                     kernelInstance(       256,       32,       64,       256,           16,         16,          32,         1,           4),
 }
 
 
@@ -71,6 +73,8 @@ default_kernels_dict = {
 #   (    M,     N,     K): kernel:        BLOCK_SIZE| MPerBLOCK| NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_MAP_M| WAVE_MAP_N| ABLOCK_TRANSFER| BBLOCK_TRANSFER| CBLOCK_TRANSFER| CBLOCK_SPV| CSHUFFLE_MX| CSHUFFLE_NX|  LOOP_SCHED|PIPELINE_VERSION
     (-1):                     kernelInstance(       256,       128,       128,       128,           16,         16,          64,         1,           4),
     (-2):                     kernelInstance(       256,       128,       128,       128,           16,         16,          32,         1,           4),
+    (-3):                     kernelInstance(       256,       32,       64,       256,           16,         16,          64,         1,           4),
+    (-4):                     kernelInstance(       256,       32,       64,       256,           16,         16,          32,         1,           4),
 
 }
 # fmt: on

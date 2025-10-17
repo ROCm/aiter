@@ -35,7 +35,14 @@ template <typename ABDataType, typename AccDataType, typename CDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
   // Apply shape heuristics to find a suitable kernel implementation.
-  return m_grouped_gemm_256x128x128x128_16x16x64_1x4<ABDataType, AccDataType, CDataType>;
+  if (M <= 32) 
+  {
+    return m_grouped_gemm_256x32x64x256_16x16x64_1x4<ABDataType, AccDataType, CDataType>;
+  }
+  else
+  {
+    return m_grouped_gemm_256x128x128x128_16x16x64_1x4<ABDataType, AccDataType, CDataType>;
+  }
 }
 
 // Helper function to return the next largest power of 2
