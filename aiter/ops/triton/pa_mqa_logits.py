@@ -53,6 +53,7 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
         out_logits,
         out_logits.stride(0),
         max_model_len,
+        waves_per_eu=2,
         **config,
     )
 
