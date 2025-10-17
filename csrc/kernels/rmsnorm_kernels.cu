@@ -1,6 +1,6 @@
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
+ * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,27 +15,17 @@
  * limitations under the License.
  */
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 #include "dispatch_utils.h"
-// #include "attention/attention_dtypes.h"
-#ifndef USE_ROCM
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cub/util_type.cuh>
-#include <cub/cub.cuh>
-#else
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hipcub/util_type.hpp>
 #include <hipcub/hipcub.hpp>
-// #include "quantization/fp8/amd/hip_float8.h"
-// #include "quantization/fp8/amd/quant_utils.cuh"
+#include <hipcub/util_type.hpp>
 
 using __nv_bfloat16 = __hip_bfloat16;
 using __nv_bfloat162 = __hip_bfloat162;
-#endif
 
 namespace vllm
 {
@@ -110,10 +100,10 @@ namespace vllm
     }
     float v8_variance_sum = v8_variance.sum();
 
-    using BlockReduce = cub::BlockReduce<float, 1024>;
+    using BlockReduce = hipcub::BlockReduce<float, 1024>;
     __shared__ typename BlockReduce::TempStorage reduceStore;
     float variance =
-        BlockReduce(reduceStore).Reduce(v8_variance_sum, cub::Sum{}, blockDim.x);
+        BlockReduce(reduceStore).Reduce(v8_variance_sum, hipcub::Sum{}, blockDim.x);
 
     if (threadIdx.x == 0)
     {
@@ -145,9 +135,9 @@ namespace vllm
   //     variance += x * x;
   //   }
 
-  //   using BlockReduce = cub::BlockReduce<float, 1024>;
+  //   using BlockReduce = hipcub::BlockReduce<float, 1024>;
   //   __shared__ typename BlockReduce::TempStorage reduceStore;
-  //   variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+  //   variance = BlockReduce(reduceStore).Reduce(variance, hipcub::Sum{}, blockDim.x);
 
   //   if (threadIdx.x == 0) {
   //     s_variance = rsqrtf(variance / hidden_size + epsilon);
@@ -384,9 +374,9 @@ namespace vllm
       residual_v[id] = temp;
     }
 
-    using BlockReduce = cub::BlockReduce<float, 1024>;
+    using BlockReduce = hipcub::BlockReduce<float, 1024>;
     __shared__ typename BlockReduce::TempStorage reduceStore;
-    variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+    variance = BlockReduce(reduceStore).Reduce(variance, hipcub::Sum{}, blockDim.x);
 
     if (threadIdx.x == 0)
     {
@@ -427,9 +417,9 @@ namespace vllm
       residual[blockIdx.x * hidden_size + idx] = z;
     }
 
-    using BlockReduce = cub::BlockReduce<float, 1024>;
+    using BlockReduce = hipcub::BlockReduce<float, 1024>;
     __shared__ typename BlockReduce::TempStorage reduceStore;
-    variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+    variance = BlockReduce(reduceStore).Reduce(variance, hipcub::Sum{}, blockDim.x);
 
     if (threadIdx.x == 0)
     {
@@ -502,9 +492,9 @@ namespace vllm
   //     residual_v[id] = temp;
   //   }
 
-  //   using BlockReduce = cub::BlockReduce<float, 1024>;
+  //   using BlockReduce = hipcub::BlockReduce<float, 1024>;
   //   __shared__ typename BlockReduce::TempStorage reduceStore;
-  //   variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+  //   variance = BlockReduce(reduceStore).Reduce(variance, hipcub::Sum{}, blockDim.x);
 
   //   if (threadIdx.x == 0) {
   //     s_variance = rsqrtf(variance / hidden_size + epsilon);
@@ -545,9 +535,9 @@ namespace vllm
   //     residual[blockIdx.x * hidden_size + idx] = z;
   //   }
 
-  //   using BlockReduce = cub::BlockReduce<float, 1024>;
+  //   using BlockReduce = hipcub::BlockReduce<float, 1024>;
   //   __shared__ typename BlockReduce::TempStorage reduceStore;
-  //   variance = BlockReduce(reduceStore).Reduce(variance, cub::Sum{}, blockDim.x);
+  //   variance = BlockReduce(reduceStore).Reduce(variance, hipcub::Sum{}, blockDim.x);
 
   //   if (threadIdx.x == 0) {
   //     s_variance = rsqrtf(variance / hidden_size + epsilon);
@@ -574,8 +564,8 @@ void rms_norm(torch::Tensor &out,    // [..., hidden_size]
 
   dim3 grid(num_tokens);
   dim3 block(std::min(hidden_size, 1024));
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+  const hipStream_t stream = at::hip::getCurrentHIPStream();
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&]
                                { vllm::rms_norm_kernel<scalar_t><<<grid, block, 0, stream>>>(
                                      out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
@@ -591,8 +581,8 @@ void rms_norm(torch::Tensor &out,    // [..., hidden_size]
 
 //   dim3 grid(num_tokens);
 //   dim3 block(std::min(hidden_size, 1024));
-//   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-//   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+//   const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+//   const hipStream_t stream = at::hip::getCurrentHIPStream();
 //   VLLM_DISPATCH_FLOATING_TYPES(
 //       input.scalar_type(), "scaled_rms_norm_kernel", [&] {
 //         vllm::scaled_rms_norm_kernel<scalar_t><<<grid, block, 0, stream>>>(
@@ -625,8 +615,8 @@ void fused_add_rms_norm(torch::Tensor &input,    // [..., hidden_size]
      hiding on global mem ops. */
   const int max_block_size = (num_tokens < 256) ? 1024 : 256;
   dim3 block(std::min(hidden_size, max_block_size));
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+  const hipStream_t stream = at::hip::getCurrentHIPStream();
   /*If the tensor types are FP16/BF16, try to use the optimized kernel
     with packed + vectorized ops.
     Max optimization is achieved with a width-8 vector of FP16/BF16s
@@ -675,8 +665,8 @@ void fused_add_rms_norm(torch::Tensor &input,    // [..., hidden_size]
 //      hiding on global mem ops. */
 //   const int max_block_size = (num_tokens < 256) ? 1024 : 256;
 //   dim3 block(std::min(hidden_size, max_block_size));
-//   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-//   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+//   const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+//   const hipStream_t stream = at::hip::getCurrentHIPStream();
 //   /*If the tensor types are FP16/BF16, try to use the optimized kernel
 //     with packed + vectorized ops.
 //     Max optimization is achieved with a width-8 vector of FP16/BF16s

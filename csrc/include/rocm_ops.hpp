@@ -236,7 +236,19 @@
           py::arg("v_dequant_scales"),                                              \
           py::arg("slot_mapping"),                                                  \
           py::arg("asm_layout"),                                                    \
-          py::arg("ori_block_size") = 128);
+          py::arg("ori_block_size") = 128);                                         \
+      m.def("concat_and_cache_mla", &aiter::concat_and_cache_mla,                   \
+            "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"                        \
+      "                     Tensor! kv_cache,"                                      \
+      "                     Tensor slot_mapping,"                                   \
+      "                     str kv_cache_dtype,"                                    \
+      "                     Tensor scale) -> ()",                                   \
+          py::arg("kv_c"),                                                        \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("kv_cache_dtype"),                                                \
+          py::arg("scale"));                                                        \
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
     m.def("init_custom_ar",                                                                    \
@@ -319,6 +331,17 @@
           py::arg("pad_b")  = 0,                                        \
           py::arg("pad_c")  = 0,                                        \
           py::arg("splitK") = 0);
+
+#define GEMM_A16W16_ASM_PYBIND                  \
+    m.def("gemm_a16w16_asm",                    \
+          &gemm_a16w16_asm,                     \
+          "Asm gemm a16w16",                    \
+          py::arg("A"),                         \
+          py::arg("B"),                         \
+          py::arg("out"),                       \
+          py::arg("bias")       = std::nullopt, \
+          py::arg("splitK")     = std::nullopt, \
+          py::arg("kernelName") = std::nullopt);
 
 #define GEMM_A4W4_ASM_PYBIND                      \
     m.def("gemm_a4w4_asm",                        \
@@ -1137,7 +1160,8 @@
           py::arg("out_dtype") = std::nullopt,                                     \
           py::arg("scaleA")    = std::nullopt,                                     \
           py::arg("scaleB")    = std::nullopt,                                     \
-          py::arg("scaleOut")  = std::nullopt);                                     \
+          py::arg("scaleOut")  = std::nullopt,                                      \
+          py::arg("bpreshuffle")  = std::nullopt);                                     \
     m.def("hipb_findallsols",                                                      \
           &hipb_findallsols,                                                       \
           "hipb_findallsols",                                                      \
