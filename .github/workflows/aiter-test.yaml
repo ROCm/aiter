@@ -11,10 +11,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  DOCKER_IMAGE: "rocm/pytorch:latest"
-  DOCKER_IMAGE_6_4_2: "rocm/pytorch:rocm6.4.2_ubuntu22.04_py3.10_pytorch_release_2.6.0"
-
 jobs:
   define-runners:
     runs-on: ubuntu-latest
@@ -54,7 +50,15 @@ jobs:
       fail-fast: false
       matrix:
         runner: ${{ fromJSON(needs.define-runners.outputs.standard_runners) }}
-        rocm_version: ["6.4.2", "latest"]
+        include:
+          - rocm_version: "latest"
+            docker_image: "rocm/pytorch:latest"
+          - rocm_version: "6.4.2"
+            docker_image: "rocm/pytorch:rocm6.4.2_ubuntu22.04_py3.10_pytorch_release_2.6.0"
+        
+    env:
+      DOCKER_IMAGE: ${{ matrix.docker_image }}
+
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -82,11 +86,6 @@ jobs:
         run: |
           set -ex
           echo "Starting container: aiter_test"
-          if [[ "${{ matrix.rocm_version }}" == "6.4.2" ]]; then
-            docker_image="${{ env.DOCKER_IMAGE_6_4_2 }}"
-          else
-            docker_image="${{ env.DOCKER_IMAGE }}"
-          fi
           docker run -dt \
             --device=/dev/dri \
             --device=/dev/kfd \
@@ -96,7 +95,7 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             --name aiter_test \
-            $docker_image
+            ${{ env.DOCKER_IMAGE }}
 
       - name: Setup-Triton
         run: |
@@ -140,8 +139,15 @@ jobs:
       fail-fast: false
       matrix:
         runner: ${{ fromJSON(needs.define-runners.outputs.multigpu_runners) }}
-        rocm_version: ["6.4.2", "latest"]
+        include:
+          - rocm_version: "latest"
+            docker_image: "rocm/pytorch:latest"
+          - rocm_version: "6.4.2"
+            docker_image: "rocm/pytorch:rocm6.4.2_ubuntu22.04_py3.10_pytorch_release_2.6.0"
     runs-on: ${{ matrix.runner }}
+
+    env:
+      DOCKER_IMAGE: ${{ matrix.docker_image }}
 
     steps:
       - name: Checkout code
@@ -167,11 +173,6 @@ jobs:
         run: |
           set -ex
           echo "Starting container: aiter_test"
-          if [[ "${{ matrix.rocm_version }}" == "6.4.2" ]]; then
-            docker_image="${{ env.DOCKER_IMAGE_6_4_2 }}"
-          else
-            docker_image="${{ env.DOCKER_IMAGE }}"
-          fi
           docker run -dt \
             --device=/dev/dri \
             --device=/dev/kfd \
@@ -181,7 +182,7 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             --name aiter_test \
-            $docker_image
+            ${{ env.DOCKER_IMAGE }}
 
       - name: Setup-Triton
         run: |
