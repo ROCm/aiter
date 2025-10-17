@@ -4,7 +4,6 @@ import torch
 import triton
 from aiter.ops.triton.softmax import softmax as triton_softmax
 from aiter.ops.triton.gluon.softmax import softmax as gluon_softmax
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -43,6 +42,12 @@ def get_x_vals(dim=0):
             (8192, 4096),
             (8192, 8192),
             (8192, 16384),
+            (8192, 32768),
+            (8192, 49152),
+            (8192, 65536),
+            (8192, 81920),
+            (8192, 98304),
+            (8192, 131072),
         ]
     return x_vals
 
