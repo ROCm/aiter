@@ -11,6 +11,12 @@ float8_info = torch.finfo(e4m3_type)
 
 
 @triton.jit
+def fast_exp(x):
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    return tl.math.exp2(x * RCP_LN2)
+
+
+@triton.jit
 def cdiv_fn(x, y):
     return (x + y - 1) // y
 
@@ -18,8 +24,8 @@ def cdiv_fn(x, y):
 @triton.jit
 def apply_softcap(S, x):
     Sdiv = S / x
-    p1 = tl.exp(Sdiv)
-    p2 = tl.exp(-Sdiv)
+    p1 = fast_exp(Sdiv)
+    p2 = fast_exp(-Sdiv)
     return x * (p1 - p2) / (p1 + p2)
 
 
@@ -97,8 +103,6 @@ def kernel_unified_attention_2d(
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
-
-    RCP_LN2: tl.constexpr = 1.4426950408889634
 
     tl.assume(kv_head_idx >= 0)
     tl.assume(q_block_global_idx >= 0)
@@ -315,13 +319,13 @@ def kernel_unified_attention_2d(
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
 
         # P : (BLOCK_M, BLOCK_SIZE)
-        P = tl.math.exp2((S - m_j[:, None]) * RCP_LN2)
+        P = fast_exp(S - m_j[:, None])
 
         # l_j : (BLOCK_M,)
         l_j = tl.sum(P, axis=1)
 
         # alpha : (BLOCK_M, )
-        alpha = tl.math.exp2((M - m_j) * RCP_LN2)
+        alpha = fast_exp(M - m_j)
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * alpha[:, None]
@@ -404,8 +408,6 @@ def kernel_unified_attention_3d(
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
-
-    RCP_LN2: tl.constexpr = 1.4426950408889634
 
     tl.assume(kv_head_idx >= 0)
     tl.assume(q_block_global_idx >= 0)
@@ -609,13 +611,13 @@ def kernel_unified_attention_3d(
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
 
         # P : (BLOCK_M, BLOCK_SIZE,)
-        P = tl.math.exp2((S - m_j[:, None]) * RCP_LN2)
+        P = fast_exp(S - m_j[:, None])
 
         # l_j : (BLOCK_M,)
         l_j = tl.sum(P, axis=1)
 
         # alpha : (BLOCK_M, )
-        alpha = tl.math.exp2((M - m_j) * RCP_LN2)
+        alpha = fast_exp(M - m_j)
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * alpha[:, None]
@@ -675,8 +677,6 @@ def reduce_segments(
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
 
-    RCP_LN2: tl.constexpr = 1.4426950408889634
-
     seq_idx = find_seq_idx(
         query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
     )
@@ -706,7 +706,7 @@ def reduce_segments(
 
     # load and rescale segment exp sums
     segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
-    segm_expsum = segm_expsum * tl.math.exp2((segm_max - overall_max) * RCP_LN2)
+    segm_expsum = segm_expsum * fast_exp(segm_max - overall_max)
     overall_expsum = tl.sum(segm_expsum)
 
     # load, rescale, and add segment attention outputs
@@ -722,7 +722,7 @@ def reduce_segments(
         mask=segm_mask[:, None] & dim_mask[None, :],
         other=0.0,
     )
-    segm_output *= tl.math.exp2((segm_max - overall_max) * RCP_LN2)[:, None]
+    segm_output *= fast_exp(segm_max - overall_max)[:, None]
     acc_sum = tl.sum(segm_output, axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
