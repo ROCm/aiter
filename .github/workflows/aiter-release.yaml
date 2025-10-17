@@ -86,7 +86,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          pip install -r requirements.txt 
+          pip install --timeout=60 --retries=10 -r requirements.txt
       
       - name: Install ninja
         if: ${{ matrix.build_enabled }}
@@ -96,7 +96,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          pip install ninja
+          pip install --timeout=60 --retries=10 ninja
 
       - name: Build Aiter
         if: ${{ matrix.build_enabled }}
