@@ -28,6 +28,7 @@
 #define ROTATE_STYLE_NEOX 0
 #define ROTATE_STYLE_GPTJ 1
 
+namespace aiter {
 // =====================================================================================================================
 // Kernel Helper Functions
 //
@@ -3659,6 +3660,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                                                                             stride_o_d););
     }
 }
+} // namespace aiter
 
 #define DISPATCH_ROPE_TYPES_PARAMS(                                               \
     TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...)    \
