@@ -679,7 +679,7 @@ class Gemm:
             self.best_soltime = 0
             self.best_splitK = 0
             self.best_err_ratio = 0
-            self.best_kernelName=""
+            self.best_kernelName = ""
         print(
             ">>> Fastest Solution is",
             self.best_libtype,
