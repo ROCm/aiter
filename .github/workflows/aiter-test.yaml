@@ -13,7 +13,7 @@ concurrency:
 
 env:
   DOCKER_IMAGE: "rocm/pytorch:latest"
-  DOCKER_IMAGE_6_4_2: "rocm/pytorch:pytorch:rocm6.4.2_ubuntu22.04_py3.10_pytorch_release_2.6.0"
+  DOCKER_IMAGE_6_4_2: "rocm/pytorch:rocm6.4.2_ubuntu22.04_py3.10_pytorch_release_2.6.0"
 
 jobs:
   define-runners:
