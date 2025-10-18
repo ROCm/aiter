@@ -15,10 +15,6 @@ from gemm_a8w8_bpreshuffle_common import (
     kernels_list,
 )
 
-aiter_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, f"{aiter_dir}/")
-from aiter.utility import dtypes
-
 """
 
 a8w8_bpreshuffle_gemm instance gen
@@ -233,6 +229,12 @@ torch::Tensor
 
 
 def get_tune_dict(tune_dict_csv):
+    aiter_dir = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    sys.path.insert(0, f"{aiter_dir}/")
+    from aiter.utility import dtypes
+
     tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
         tune_df = pd.read_csv(tune_dict_csv)
