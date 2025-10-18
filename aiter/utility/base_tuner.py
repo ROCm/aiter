@@ -151,7 +151,7 @@ class TunerCommon:
 
     @abstractmethod
     def getKernelName(self, kernel_id):
-        """??kernel name"""
+        """obtain name of the kernel from its id"""
         pass
 
     @abstractmethod
