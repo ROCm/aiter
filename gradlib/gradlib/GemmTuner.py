@@ -347,8 +347,8 @@ class Gemm:
             splitK = info[2]
             kernelName = info[4]
             res_one = []
-            if err_ratio > self.check_err_ratio:
-                continue
+            # if err_ratio > self.check_err_ratio:
+            #    continue
             gtimes["solidx"] = solidx
             gtimes["gtimems"] = us / 1000.0
             gtimes["splitK"] = splitK
@@ -583,6 +583,7 @@ class Gemm:
                         "err_ratio",
                     ]
                 )
+
             resultsdf = pd.concat(
                 [self.rocb_gtimedf, self.hipb_gtimedf, self.asm_gtimedf],
                 ignore_index=True,
@@ -628,6 +629,11 @@ class Gemm:
 
             resultsdf = pd.concat([old_df, resultsdf], ignore_index=True)
             resultsdf.to_csv(self.profile_file, index=False)
+        if len(self.asm_gtimedf) > 0:
+            self.asm_gtimedf = self.asm_gtimedf[
+                self.asm_gtimedf["err_ratio"] < self.check_err_ratio
+            ]
+            print(self.asm_gtimedf)
         if len(self.hipb_gtimedf) > 0 or len(self.asm_gtimedf) > 0:
             self.hipb_gtimedf = pd.concat(
                 [self.hipb_gtimedf, self.asm_gtimedf], ignore_index=True
