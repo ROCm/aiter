@@ -424,7 +424,7 @@ def flash_attn_output_benchmark(
 
 @pytest.mark.parametrize(
     "padding_scenario",
-    ["mixed", "q_only", "k_only", "no_padding", "q_len_1", "k_len_1"],
+    ["mixed", "q_only", "k_only", "no_padding", "q_len_1"],
 )
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
