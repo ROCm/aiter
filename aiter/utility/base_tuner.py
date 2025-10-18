@@ -325,8 +325,10 @@ class TunerCommon:
             print(self.success)
         logger.info("Failed shapes:")
         print(self.failed)
+
+        tunedf_subset = tunedf[self.untunedf.columns].astype(self.untunedf.dtypes)
         mask = self.untunedf.apply(tuple, axis=1).isin(
-            tunedf[self.untunedf.columns].apply(tuple, axis=1)
+            tunedf_subset.apply(tuple, axis=1)
         )
         self.remain_untuned = self.untunedf[~mask]
         logger.info("untuned shapes:")
@@ -345,6 +347,7 @@ class TunerCommon:
     def run(self, args, fast_mode=False):
         """tuner run function"""
         self.pre_process(args)
+        print(self.untunedf)
         if args.verbose:
             logger.info(f"args: {args}")
         if len(self.untunedf) == 0:
@@ -435,7 +438,7 @@ class GemmCommonTuner(TunerCommon):
         info, time, err_ratio = results
         if time == -1:
             return -1, -1
-        cu_num, m, n, k = info[0]
+        cu_num, m, n, k, *rest = info[0]
         flop = m * n * k * 2
         tflops = round(flop / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes
@@ -474,7 +477,10 @@ class GemmCommonTuner(TunerCommon):
                 }
             )
             temp = pd.DataFrame(key_dict)
-            resultdf = pd.concat([resultdf, temp], ignore_index=True)
+            if resultdf.empty:
+                resultdf = temp
+            else:
+                resultdf = pd.concat([resultdf, temp], ignore_index=True)
         return resultdf
 
     def result_to_csv(self, resultdf, file, concat=False):
