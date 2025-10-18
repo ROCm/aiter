@@ -93,8 +93,8 @@ def gemm_a4w4(
         splitK = ck_config.get("splitK", None)
         kernelName = ck_config["kernelName"]
     if (
-        m < 256
-        or (ck_config is not None and kernelName.find("_ZN") == -1)
+        ck_config is not None
+        and kernelName.find("_ZN") == -1
         # or bias is None
     ):
         splitK = 0 if splitK is None else splitK

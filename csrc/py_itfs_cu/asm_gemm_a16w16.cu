@@ -203,16 +203,19 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     CFG* config_map          = &cfg_bf16gemm_outf32;
 
     // 2.1 static dict
-    std::string selectedKernelName;
-    int selectedksplit;
-    auto it_sel        = get_heuristic_kernel(Mdim,
+    std::string selectedKernelName = kernelName.value_or("");
+    int selectedksplit = splitK.value_or(0) ?: 1;
+    if (!kernelName.has_value() || kernelName == "") {
+
+        auto it_sel        = get_heuristic_kernel(Mdim,
                                        Ndim,
                                        Kdim,
                                        config_map,
                                        splitK.has_value() ? splitK : std::nullopt,
                                        kernelName.has_value() ? kernelName : std::nullopt);
-    selectedKernelName = std::get<0>(it_sel);
-    selectedksplit     = std::get<1>(it_sel);
+        selectedKernelName = std::get<0>(it_sel);
+        selectedksplit     = std::get<1>(it_sel);
+    }
 
     args.splitk = selectedksplit;
     // printf("=== KernelArgs Important Parameters ===\n");
