@@ -91,6 +91,24 @@ def unswizzle_mx_scale_cdna4(x, BLOCK_N: tl.constexpr, MX_SCALE_BLOCK_K: tl.cons
 
 
 @triton.jit
+def unswizzle_weight_cdna4(x, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    x = (
+        x.reshape(
+                    1,
+                    BLOCK_N // 16,
+                    BLOCK_K // 64,
+                    2,
+                    16,
+                    16,
+                )
+                .permute(0, 1, 4, 2, 3, 5)
+                .reshape(BLOCK_N, BLOCK_K // 2)
+                .trans(1, 0)
+    )
+    return x
+
+
+@triton.jit
 def clip(x, limit, clip_lower: tl.constexpr):
     res = tl.minimum(x, limit)
     if clip_lower:
@@ -209,12 +227,12 @@ def _reduce_grouped(X, stride_xb: tl.uint64, stride_xm: tl.uint64, stride_xn,  #
         OutPtrs += BLOCK_N_OUT * stride_on
 
 
-@triton.jit(launch_metadata=matmul_launch_metadata)
+@triton.jit(launch_metadata=matmul_launch_metadata, do_not_specialize=["grid_m", "grid_n"])
 def _moe_gemm_a8w4(
              Y, stride_y_k, stride_y_m, stride_y_n,
              X, stride_x_m, stride_x_k,
              XMxScale, stride_x_mx_m, stride_x_mx_k,
-             W, stride_w_e, stride_w_k, stride_w_n,
+             W, stride_w_e, stride_w_n, stride_w_k,
              WMxScale, stride_w_mx_e, stride_w_mx_k, stride_w_mx_n,
              X_static_scale, Quant_static_scale,
              B, stride_b_e, # Bias
@@ -343,18 +361,18 @@ def _moe_gemm_a8w4(
     else:
         PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N: tl.constexpr = BLOCK_N
-    offs_w_n_scale = (pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N)) % N
+    offs_w_n_scale = (pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N))
     offs_w_n_scale = tl.max_contiguous(tl.multiple_of(offs_w_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N)
     # K dimension must be the last dimension for the scales
-    offs_w_k_scale = PACKED_MX_BLOCK * pid_k + tl.arange(0, PACKED_MX_BLOCK)
+    offs_w_k_scale = pid_k * PACKED_MX_BLOCK + tl.arange(0, PACKED_MX_BLOCK)
     WMxScalePtrs = WMxScale + offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
 
     # B pointers
-    offs_w_n = pid_n * PACKED_BLOCK_N_W + tl.arange(0, PACKED_BLOCK_N_W)
-    offs_w_n = tl.max_contiguous(tl.multiple_of(offs_w_n % (N // W_N_DIVISOR), PACKED_BLOCK_N_W), PACKED_BLOCK_N_W)
-    offs_w_k = PACKED_BLOCK_K_W * pid_k + tl.arange(0, PACKED_BLOCK_K_W)
+    offs_w_n = pid_n * (PACKED_BLOCK_N_W // 16) + tl.arange(0, PACKED_BLOCK_N_W // 16)
+    offs_w_n = tl.max_contiguous(tl.multiple_of(offs_w_n, PACKED_BLOCK_N_W), PACKED_BLOCK_N_W)
+    offs_w_k = pid_k * (PACKED_BLOCK_K_W * 16) + tl.arange(0, PACKED_BLOCK_K_W * 16)
     W += expt_id * stride_w_e
-    WPtrs = W + (offs_w_k.to(index_type)[:, None] * stride_w_k + offs_w_n.to(index_type)[None, :] * stride_w_n)
+    WPtrs = W + (offs_w_k.to(index_type)[None, :] * stride_w_k + offs_w_n.to(index_type)[:, None] * stride_w_n)
 
     if is_x_microscaled:
         if GatherIndx is None:
@@ -362,10 +380,12 @@ def _moe_gemm_a8w4(
         offs_x_k_scale = MX_SCALE_BLOCK_K * pid_k + tl.arange(0, MX_SCALE_BLOCK_K)
         XMxScalePtrs = XMxScale + offs_x_m.to(index_type)[:, None] * stride_x_mx_m + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
 
-
     # compute output
+    num_k_iter = tl.cdiv(K, BLOCK_K * SPLIT_K)
+    if BLOCK_M == 16:
+        num_k_iter -= 1
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(K, BLOCK_K * pid_k, -(BLOCK_K * SPLIT_K)):
+    for k in range(num_k_iter):
         if EVEN_K:
             mask_x_k = tl.full([BLOCK_K], True, dtype=tl.int1)
             mask_w_k = tl.full([PACKED_BLOCK_K_W], True, dtype=tl.int1)
@@ -380,16 +400,17 @@ def _moe_gemm_a8w4(
                 mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < k
             if is_x_microscaled:
                 mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < k
-
+        
         x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0.0)
-        w = tl.load(WPtrs, mask=mask_w_k[:, None], other=0.0, cache_modifier=W_CACHE_MODIFIER)
+        w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
+        w = unswizzle_weight_cdna4(w, BLOCK_N, BLOCK_K)
 
         if is_x_microscaled:
             x_scales = tl.load(XMxScalePtrs, mask=mask_x_k_scale[None, :])
         else:
             x_scales = tl.full((BLOCK_M, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
-            w_scales = unswizzle_mx_scale_cdna4(tl.load(WMxScalePtrs), BLOCK_N, MX_SCALE_BLOCK_K)
+            w_scales = unswizzle_mx_scale_cdna4(tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER), BLOCK_N, MX_SCALE_BLOCK_K)
         else:
             w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
 
@@ -400,7 +421,27 @@ def _moe_gemm_a8w4(
             XMxScalePtrs += (MX_SCALE_BLOCK_K * SPLIT_K) * stride_x_mx_k
 
         XPtrs += (BLOCK_K * SPLIT_K) * stride_x_k
-        WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
+        WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * 16 * stride_w_k
+    
+    if BLOCK_M == 16:
+        mask_x_k = offs_x_k < 64
+        mask_w_k = offs_w_k < (64 // W_K_DIVISOR * 16)
+        
+        x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0.0)
+        w = tl.load(WPtrs, mask=mask_w_k[None, :], other=0.0, cache_modifier=W_CACHE_MODIFIER)
+        w = unswizzle_weight_cdna4(w, BLOCK_N, BLOCK_K)
+
+        if is_x_microscaled:
+            x_scales = tl.load(XMxScalePtrs, mask=mask_x_k_scale[None, :])
+        else:
+            x_scales = tl.full((BLOCK_M, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
+        if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+            w_scales = unswizzle_mx_scale_cdna4(tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER), BLOCK_N, MX_SCALE_BLOCK_K)
+        else:
+            w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
+
+        acc = tl.dot_scaled(x, x_scales, "e4m3", w, w_scales, "e2m1", acc=acc, fast_math=True)
+    
 
     # scalar fp8 scale
     if X_static_scale is not None:
@@ -413,7 +454,7 @@ def _moe_gemm_a8w4(
     if B is not None:
         BPtrs = B + expt_id * stride_b_e + offs_y_n
         if pid_k == 0:
-            bias = tl.load(BPtrs, mask=mask_n, other=0)
+            bias = tl.load(BPtrs, mask=mask_n, other=0.0, cache_modifier=W_CACHE_MODIFIER)
         else:
             bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
         acc = acc + bias[None, :]
