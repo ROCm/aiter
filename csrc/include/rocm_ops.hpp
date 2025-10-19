@@ -727,6 +727,19 @@
           py::arg("softmax_scale"),           \
           py::arg("is_causal"));
 
+#define MHA_V3_VARLEN_FWD_CK_PYBIND                  \
+    m.def("fmha_v3_varlen_fwd_ck",                   \
+          &aiter::torch_itfs::fmha_v3_varlen_fwd_ck, \
+          py::arg("q"),                              \
+          py::arg("k"),                              \
+          py::arg("v"),                              \
+          py::arg("cu_seqlens_q"),                   \
+          py::arg("cu_seqlens_k"),                   \
+          py::arg("max_seqlen_q"),                   \
+          py::arg("max_seqlen_k"),                   \
+          py::arg("softmax_scale"),                  \
+          py::arg("is_causal"));
+
 #define MHA_BATCH_PREFILL_PYBIND                  \
     m.def("mha_batch_prefill",                    \
           &aiter::torch_itfs::mha_batch_prefill,  \
