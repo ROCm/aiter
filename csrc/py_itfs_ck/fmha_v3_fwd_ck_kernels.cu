@@ -76,15 +76,20 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
                          ? ck_tile::fmha_fwd_v3_args::data_type_enum::fp16
                          : ck_tile::fmha_fwd_v3_args::data_type_enum::bf16;
 
-    args.batch    = batch_size;
-    args.seqlen_q = seqlen_q;
-    args.seqlen_k = seqlen_k;
-    args.hdim_qk  = head_size_q;
-    args.hdim_v   = head_size_v;
-    args.nhead_q  = num_heads;
-    args.nhead_kv = num_heads_k;
+    args.batch        = batch_size;
+    args.max_seqlen_q = seqlen_q;
+    args.seqlen_q     = seqlen_q;
+    args.seqlen_k     = seqlen_k;
+    args.hdim_qk      = head_size_q;
+    args.hdim_v       = head_size_v;
+    args.nhead_q      = num_heads;
+    args.nhead_kv     = num_heads_k;
 
     args.softmax_scale = softmax_scale;
+
+    args.seqstart_q_ptr = nullptr;
+    args.seqstart_k_ptr = nullptr;
+    args.seqlen_k_ptr   = nullptr;
 
     args.window_size_left  = mask.left;
     args.window_size_right = mask.right;
