@@ -319,6 +319,32 @@ class CustomAllreduce:
             # gains of using custom kernels
             return self.all_reduce_unreg(input)
 
+    def all_gather_reg(self, inp: torch.Tensor, out: torch.Tensor = None):
+        if out is None:
+            out = torch.empty(
+                inp.numel() * self.world_size, dtype=inp.dtype, device=inp.device
+            )
+        ops.all_gather_reg(self._ptr, inp, out)
+        return out
+
+    def all_gather_unreg(self, inp: torch.Tensor, out: torch.Tensor = None):
+        if out is None:
+            out = torch.empty(
+                inp.numel() * self.world_size, dtype=inp.dtype, device=inp.device
+            )
+        ops.all_gather_unreg(self._ptr, inp, self.buffer, out)
+        return out
+
+    def custom_all_gather(self, inp: torch.Tensor) -> Optional[torch.Tensor]:
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.all_gather_reg(inp)
+            else:
+                print("allgather capture hipgraph error")
+                return torch.empty_like(inp)
+        else:
+            return self.all_gather_unreg(inp)
+
     def close(self):
         if not self.disabled and self._ptr:
             ops.dispose(self._ptr)

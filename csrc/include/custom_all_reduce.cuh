@@ -526,6 +526,73 @@ namespace aiter
     }
   }
 
+  /*
+   * naive allgather
+   * for case: input(1345,)
+   * */
+  template <typename T, int ngpus>
+  __global__ void __launch_bounds__(512, 1) allgather_naive(
+      RankData* _dp,
+      RankSignals sg,
+      Signal* self_sg,
+      T* __restrict__ result,
+      int rank,
+      int size
+  )
+  {
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    int warp_id = threadIdx.x / tnum_gpu;
+    int lane_id = threadIdx.x % tnum_gpu;
+    int tid = blockIdx.x * tnum_gpu + lane_id;
+    int stride = gridDim.x * tnum_gpu;
+    const T* ptrs[ngpus];
+
+#pragma unroll
+    for (int i = 0; i < ngpus; ++i)
+    {
+      ptrs[i] = (const T*)_dp->ptrs[i];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for (int idx = tid; idx < size; idx += stride)
+    {
+      int write_idx = warp_id * size + idx;
+      result[write_idx] = ptrs[warp_id][idx];
+    }
+  }
+
+  template <typename T, int ngpus>
+  __global__ void __launch_bounds__(512, 1) allgather_vec(
+      RankData* _dp,
+      RankSignals sg,
+      Signal* self_sg,
+      T* __restrict__ result,
+      int rank,
+      int size
+  )
+  {
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    using P = typename packed_t<T>::P;
+    int warp_id = threadIdx.x / tnum_gpu;
+    int lane_id = threadIdx.x % tnum_gpu;
+    int tid = blockIdx.x * tnum_gpu + lane_id;
+    int stride = gridDim.x * tnum_gpu;
+    const P* ptrs[ngpus];
+
+#pragma unroll
+    for (int i = 0; i < ngpus; ++i)
+    {
+      ptrs[i] = (const P*)_dp->ptrs[i];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for (int idx = tid; idx < size; idx += stride)
+    {
+      int write_idx = warp_id * size + idx;
+      *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
+    }
+  }
+
   // fp8 quant all-reduce code start
   template <typename T>
   struct Fp16Filter
@@ -1176,6 +1243,54 @@ namespace aiter
     }
 #undef REDUCE_CASE
 #undef KL
+  }
+
+  template <typename T>
+  void dispatchAllGather(hipStream_t stream, T* input, T* output, int size)
+  {
+    RankData* ptrs = get_buffer_RD(stream, input);
+    auto d = packed_t<T>::P::size;
+    dim3 block(512);
+    if (size % d != 0)
+    {
+      int block_num = (size + 512 - 1) / 512;
+      dim3 grid(std::min(block_num, 80));
+      switch (world_size_)
+      {
+        case 8:
+          allgather_naive<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+          break;
+        case 4:
+          allgather_naive<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+          break;
+        case 2:
+          allgather_naive<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+          break;
+        default:
+          printf("allgather world_size error\n");
+      }
+    }
+    else
+    {
+      size /= d;
+      int tnum_per_block = 512 / world_size_;
+      int block_num = (size + tnum_per_block - 1) / tnum_per_block;
+      dim3 grid(std::min(block_num, 80));
+      switch (world_size_)
+      {
+        case 8:
+          allgather_vec<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+          break;
+        case 4:
+          allgather_vec<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+          break;
+        case 2:
+          allgather_vec<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+          break;
+        default:
+          printf("allgather world_size error\n");
+      }
+    }
   }
 
   ~CustomAllreduce()
