@@ -31,8 +31,8 @@ def _swiglu(
     secondPart = tl.zeros((BLOCK_SIZE_M,BLOCK_SIZE_N),tl.float32) #(x*V)
 
     #add biases (b and c)
-    b = tl.load(b_ptr + offm,mask=mask_m)
-    c = tl.load(c_ptr + offn,mask=mask_n)
+    b = tl.load(b_ptr + offm,mask=mask_m, other=0.0)
+    c = tl.load(c_ptr + offn,mask=mask_n, other=0.0)
     for k in range(0, K, BLOCK_SIZE_K): #xW
         offk = k + tl.arange(0, BLOCK_SIZE_K)
         mask_k = offk < K
@@ -51,7 +51,7 @@ def _swiglu(
         secondPart += tl.dot(x, V)
 
     firstPart = firstPart * tl.sigmoid(firstPart)
-    firstPart += b[None, :] #xW + b
+    firstPart += b[:, None]#xW + b
     secondPart += c[None, :] #xV + c
 
     res = firstPart * secondPart

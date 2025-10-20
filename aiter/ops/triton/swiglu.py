@@ -18,10 +18,11 @@ def swiglu(x, W, V, b, c, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K):
     Returns:
         out pointer pointing to the activated output tensor
     """
+
     M, tempK = x.shape
     K, N = W.shape
     assert tempK == 2 * K 
-    out = torch.empty((M, N), dtype=x.dtype)
+    out = torch.empty((M, N), dtype=x.dtype,device="cuda")
     
     # Check constraints.
     assert x.shape[1]//2 == W.shape[0], "Incompatible dimensions!!!"
@@ -43,7 +44,7 @@ def swiglu(x, W, V, b, c, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K):
         BLOCK_SIZE_N,
         BLOCK_SIZE_K
     )
-    return res
+    return out
 
 #Reference for testing
 def swiglu_ref(x, W, V, b, c):

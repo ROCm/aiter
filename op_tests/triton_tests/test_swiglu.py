@@ -18,17 +18,17 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
 def test_swiglu(M, K, N, dtype):
     dtype = str_to_torch_dtype[dtype]
     torch.manual_seed(0)
-    x = torch.randn(M, 2*K, dtype=dtype)
-    W = torch.randn(K, N, dtype=dtype)
-    V = torch.randn(K, N, dtype=dtype)
-    b = torch.randn(N, dtype=dtype)
-    c = torch.randn(N, dtype=dtype)
+    x = torch.randn(M, 2*K, dtype=dtype,device="cuda")
+    W = torch.randn(K, N, dtype=dtype,device="cuda")
+    V = torch.randn(K, N, dtype=dtype,device="cuda")
+    b = torch.randn(N, dtype=dtype,device="cuda")
+    c = torch.randn(N, dtype=dtype,device="cuda")
     BLOCK_SIZE_M = 16
     BLOCK_SIZE_N = 32
     BLOCK_SIZE_K = 16
 
     y_triton = swiglu(x, W, V, b, c, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
-    y_torch = swiglu_ref(x, W, V, b, c)
+    y_ref = swiglu_ref(x, W, V, b, c)
 
     if dtype in (torch.float16, torch.bfloat16):
         atol, rtol = 1e-2, 1e-2
