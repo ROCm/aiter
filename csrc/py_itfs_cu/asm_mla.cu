@@ -67,7 +67,7 @@ void mla_decode_stage1_asm_fwd(
     std::optional<torch::Tensor> q_scale  = std::nullopt, //   [1]
     std::optional<torch::Tensor> kv_scale = std::nullopt  //   [1]
 )
-{
+{    
     int batch           = qo_indptr.size(0) - 1;
     int num_heads       = Q.size(1);
     int head_size       = Q.size(2);
@@ -156,27 +156,66 @@ void mla_decode_stage1_asm_fwd(
     int sub_Q;
     if(Q.dtype() == at::ScalarType::BFloat16)
     {
-        if(gqa_ratio == 128)
+        if(KV.dtype() == at::ScalarType::BFloat16)
         {
-            sub_Q = 128;
-            static AiterAsmKernel impl_a16w16_bf16_subQ128(
-                "_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E",
-                "/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co");
-            impl_ptr = &impl_a16w16_bf16_subQ128;
-        }
-        else if(gqa_ratio == 16)
-        {
-            if(persistent)
+#if defined(__gfx942__)
+            if(gqa_ratio == 128)
             {
-                if(max_seqlen_q <= 4)
+                sub_Q = 128;
+                static AiterAsmKernel impl_a16w16_bf16_subQ128(
+                    "_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E",
+                    "/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co");
+                impl_ptr = &impl_a16w16_bf16_subQ128;
+            }
+            else if(gqa_ratio == 16)
+            {
+                if(persistent)
                 {
-                    sub_Q = 128;
-                    if (KV.dtype() == at::ScalarType::BFloat16) {
+                    if(max_seqlen_q <= 4)
+                    {
+                        sub_Q = 128;
                         static AiterAsmKernel impl_a16w16_bf16_ps(
                             "_ZN5aiter42mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_psE",
                             "/mla/mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_ps.co");
                         impl_ptr = &impl_a16w16_bf16_ps;
-                    } else if (KV.dtype() == at::ScalarType::Float8_e4m3fnuz) {
+                    }
+                }
+                else if(max_seqlen_q == 1)
+                {
+                    sub_Q = 16;
+                    static AiterAsmKernel impl_a16w16_bf16(
+                        "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E",
+                        "/mla/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co");
+                    impl_ptr = &impl_a16w16_bf16;
+                }
+                else if(max_seqlen_q <= 4)
+                {
+                    sub_Q = 128;
+                    static AiterAsmKernel impl_a16w16_bf16(
+                        "_ZN5aiter39mla_a16w16_qh16_m16x4_n16x1_coex0_mask1E",
+                        "/mla/mla_a16w16_qh16_m16x4_n16x1_coex0_mask1.co");
+                    impl_ptr = &impl_a16w16_bf16;
+                }
+                else
+                {
+                    sub_Q = 128;
+                    static AiterAsmKernel impl_a16w16_bf16(
+                        "_ZN5aiter39mla_a16w16_qh16_m32x4_n16x1_coex0_mask1E",
+                        "/mla/mla_a16w16_qh16_m32x4_n16x1_coex0_mask1.co");
+                    impl_ptr = &impl_a16w16_bf16;
+                }
+            }
+#endif
+        } 
+        else if(KV.dtype() == at::ScalarType::Float8_e4m3fnuz || KV.dtype() == at::ScalarType::Float8_e4m3fn)
+        {
+            if(gqa_ratio == 16)
+            {
+                if(persistent)
+                {
+                    if(max_seqlen_q <= 4)
+                    {
+                        sub_Q = 128;
                         assert(kv_scale.has_value());
                         assert(kv_scale.value().data_ptr() != nullptr);
                         args.ptr_KVSCALE = kv_scale.value().data_ptr();
@@ -187,33 +226,9 @@ void mla_decode_stage1_asm_fwd(
                     }
                 }
             }
-            else if(max_seqlen_q == 1)
-            {
-                sub_Q = 16;
-                static AiterAsmKernel impl_a16w16_bf16(
-                    "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E",
-                    "/mla/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co");
-                impl_ptr = &impl_a16w16_bf16;
-            }
-            else if(max_seqlen_q <= 4)
-            {
-                sub_Q = 128;
-                static AiterAsmKernel impl_a16w16_bf16(
-                    "_ZN5aiter39mla_a16w16_qh16_m16x4_n16x1_coex0_mask1E",
-                    "/mla/mla_a16w16_qh16_m16x4_n16x1_coex0_mask1.co");
-                impl_ptr = &impl_a16w16_bf16;
-            }
-            else
-            {
-                sub_Q = 128;
-                static AiterAsmKernel impl_a16w16_bf16(
-                    "_ZN5aiter39mla_a16w16_qh16_m32x4_n16x1_coex0_mask1E",
-                    "/mla/mla_a16w16_qh16_m32x4_n16x1_coex0_mask1.co");
-                impl_ptr = &impl_a16w16_bf16;
-            }
         }
     }
-    else if(Q.dtype() == at::ScalarType::Float8_e4m3fnuz) // at::ScalarType::Float8_e4m3fnuz in mi300
+    else if(Q.dtype() == at::ScalarType::Float8_e4m3fnuz || Q.dtype() == at::ScalarType::Float8_e4m3fn) // at::ScalarType::Float8_e4m3fnuz in mi300
     {
         assert(q_scale.has_value() && kv_scale.has_value());
         assert(q_scale.value().data_ptr() != nullptr && kv_scale.value().data_ptr() != nullptr);
@@ -282,7 +297,7 @@ void mla_decode_stage1_asm_fwd(
 
     }
 
-    TORCH_CHECK(impl_ptr != nullptr, __func__, ": unsupport current Q_type:", Q.scalar_type());
+    // TORCH_CHECK(impl_ptr != nullptr, __func__, ": unsupport current Q_type:", Q.scalar_type());
 
     int bdx = 256;
     int gdx = (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
