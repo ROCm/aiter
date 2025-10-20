@@ -10,8 +10,8 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes
-from aiter import paged_attn as ops
+from aiter import dtypes, paged_attn as ops
+from aiter import pertoken_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 torch.set_default_device("cuda")
@@ -197,8 +197,6 @@ def pertoken_quant_kvcache_symm(
         .contiguous()
     )
 
-    from aiter import pertoken_quant
-
     k_quant, k_scale_asm = pertoken_quant(k_cache_permute, quant_dtype=quant_dtype)
     v_quant, v_scale_asm = pertoken_quant(v_cache_permute, quant_dtype=quant_dtype)
 
@@ -271,7 +269,7 @@ def run_aiter_hip(
     k_scale=None,
     v_scale=None,
 ):
-    return aiter.paged_attn.PagedAttention.forward_decode(
+    return ops.PagedAttention.forward_decode(
         query,
         k_cache,
         v_cache,
@@ -302,6 +300,8 @@ def run_aiter_hip(
     scale,
     k_scale=None,
     v_scale=None,
+    q_scale=None,
+    output_dtype=dtypes.bf16,
 ):
     return aiter.paged_attn.PagedAttention.forward_decode(
         query,
@@ -316,7 +316,9 @@ def run_aiter_hip(
         None,
         k_scale,
         v_scale,
+        q_scale=q_scale,
         mtp=max_qlen,
+        output_dtype=output_dtype,
     )
 
 
@@ -477,8 +479,11 @@ def test_pa_mtp(
     ret["us_asm_fp8"] = us_aiter_asm
     ret["err fp8"] = err
 
+    q_quant, q_scale = pertoken_quant(query, quant_dtype=aiter.dtypes.fp8)
+    q_scale = q_scale.squeeze(-1)
+
     out_hip, us_hip = run_aiter_hip(
-        query,
+        q_quant,
         k_quant_,
         asm_V_shuffle(v_quant_),
         block_tables,
@@ -490,6 +495,8 @@ def test_pa_mtp(
         scale,
         k_scale_asm,
         v_scale_asm,
+        q_scale,
+        output_dtype=dtype,
     )
     err = checkAllclose(
         out_ref,

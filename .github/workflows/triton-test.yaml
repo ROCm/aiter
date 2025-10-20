@@ -43,6 +43,15 @@ jobs:
           --name triton_test \
           ${{ env.DOCKER_IMAGE }}
 
+      - name: Install speedtest-cli and test network
+        run: |
+          set -ex
+          echo "Installing speedtest-cli and testing network..."
+          docker exec \
+          -w /workspace \
+          triton_test \
+          bash -c "pip install speedtest-cli && speedtest-cli --simple" || true
+
       - name: Setup-Triton
         run: |
           set -ex

@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #ifdef USE_ROCM
 
@@ -14,9 +14,9 @@
 
 #include <ATen/ATen.h>
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 
 #include "ck/ck.hpp"
 #include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
@@ -272,7 +272,7 @@ __forceinline__ torch::Tensor batched_gemm_a8w8_rowwise_impl(
     int BatchStrideB = N * K;
     int BatchStrideE = M * N;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(XQ));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(XQ));
     auto device_gemm = DeviceGemmInstance{};
     auto invoker = device_gemm.MakeInvoker();
 
@@ -307,7 +307,7 @@ __forceinline__ torch::Tensor batched_gemm_a8w8_rowwise_impl(
 
     TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 
-    invoker.Run(argument, StreamConfig{at::cuda::getCurrentCUDAStream().stream()});
+    invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStream()});
     return Y;
 }
 
