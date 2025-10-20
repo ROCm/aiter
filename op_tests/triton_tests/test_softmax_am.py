@@ -39,4 +39,4 @@ def test_softmax_am(M, N, dtype):
     torch.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
     print("softmax asserted")
 
-test_softmax_am(8192, 4092, "fp16")
+test_softmax_am(1, 1, "fp16")

@@ -30,11 +30,11 @@ def _swiglu(
     # assuming two layers so ends up with Mx2N as the output, then multiply element-wise together
 
     pid = tl.program_id(0)
-    offsets_a = pid_m * B0 + tl.arange(0, B0)
+    offsets_a = pid * B0 + tl.arange(0, B0)
     offsets_b = pid * B1 + tl.arange(0, B1)
     offsets_k = tl.arange(0, BK)
-    a_ptrs = a_ptr + (offsets_a * a_rows_stride + offsets_k * a_cols_stride)
-    b_ptrs = b_ptr + (offets_k * b_rows_stride + offsets_b * b_cols_stride)
+    a_ptrs = input_ptr + (offsets_a * a_rows_stride + offsets_k * a_cols_stride)
+    b_ptrs = layer_ptr + (offsets_k * b_rows_stride + offsets_b * b_cols_stride)
 
     # accumulator for fp16->fp32 ala gemm tutorial
     out_setup = tl.zeros((B0, B1), dtype=tl.float32)
