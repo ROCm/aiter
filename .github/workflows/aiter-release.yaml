@@ -33,7 +33,7 @@ jobs:
             docker_image: "rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta"
             build_enabled: ${{ github.event.inputs.build_py310 == 'true' || github.event.inputs.build_py310 == true }}
           - python_version: "3.12"
-            docker_image: "rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0"
+            docker_image: "rocm/vllm-dev:nightly"
             build_enabled: ${{ github.event.inputs.build_py312 == 'true' || github.event.inputs.build_py312 == true }}
 
     env:
