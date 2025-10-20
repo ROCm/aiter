@@ -7,22 +7,23 @@ def _softmax_kernel(
     input_ptr,
     rows,
     cols,
+    stride_in_rows,
+    stride_out_rows,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    p_id = tl.program_id(0)
+    row_ptr = input_ptr + p_id * stride_in_rows
+    offCol = tl.arange(0,BLOCK_SIZE) #offset column
+    mask = offCol < cols
 
-    curRow = input_ptr + pid
-    offset = tl.arange(0, BLOCK_SIZE)
-    mask = offset < cols
-
-    row_ptr = input_ptr + pid * cols + offset
-    x = tl.load(row_ptr, mask=mask)
+    x = tl.load(row_ptr + offCol, mask=mask, other=-float('inf'))
     
     # do softmax 
-    zMax = tl.max(x,0)
-    numerator = tl.exp(x - zMax)
-    denomenator = tl.sum(numerator, 0)
-    softmax_out = numerator / denomenator
+    zMax = tl.max(x,axis=0)
+    temp = x - zMax
+    numerator = tl.exp(temp)
+    denominator = tl.sum(numerator, 0)
+    softmax_out = numerator / denominator
 
-    out_ptr = output_ptr + pid * cols + offset 
-    tl.store(out_ptr, softmax_out,mask=mask)
+    out_ptr = output_ptr + p_id * stride_out_rows 
+    tl.store(out_ptr + offCol, softmax_out,mask=mask)

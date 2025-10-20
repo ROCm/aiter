@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.swiglu import _swiglu
 
-def swiglu(x, W, V, b, c, BLOCK_SIZE_M, BLOCK_SIZE_N):
+def swiglu(x, W, V, b, c, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K):
     """
     Does swiglu activation on a 2D tensor
 
@@ -18,12 +18,13 @@ def swiglu(x, W, V, b, c, BLOCK_SIZE_M, BLOCK_SIZE_N):
     Returns:
         out pointer pointing to the activated output tensor
     """
-    M, K = x.shape
+    M, tempK = x.shape
     K, N = W.shape
-    out = torch.empty((M, N), dtype=torch.float32)
+    assert tempK == 2 * K 
+    out = torch.empty((M, N), dtype=x.dtype)
     
     # Check constraints.
-    assert x.shape[1] == W.shape[0], "Incompatible dimensions!!!"
+    assert x.shape[1]//2 == W.shape[0], "Incompatible dimensions!!!"
 
     grid = (
         triton.cdiv(M, BLOCK_SIZE_M), 
@@ -31,12 +32,29 @@ def swiglu(x, W, V, b, c, BLOCK_SIZE_M, BLOCK_SIZE_N):
     )
 
     res = _swiglu[grid](
-        out,
-        x,
+        out,x,
         W, V, b, c,
+        x.stride(0),x.stride(1),
+        out.stride(0),out.stride(1),
+        W.stride(0),W.stride(1),
+        V.stride(0),V.stride(1),
         M, K, N,
         BLOCK_SIZE_M,
-        BLOCK_SIZE_N
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K
     )
     return res
+
+#Reference for testing
+def swiglu_ref(x, W, V, b, c):
+    # x: [M, 2K], W, V: [K, N], b, c: [N]
+    M, tempK = x.shape
+    K = W.shape[0]
+    N = W.shape[1]
+    x1 = x[:, :K]
+    x2 = x[:, K:]
+    y1 = torch.matmul(x1, W) + b
+    y2 = torch.matmul(x2, V) + c
+    silu = y1 * torch.sigmoid(y1)
+    return silu * y2
 

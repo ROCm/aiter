@@ -56,14 +56,20 @@ def softmax2(x):
     
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(n_cols))
+    # BLOCK_SIZE = 128
     y = torch.empty_like(x)
+    num_programs = n_rows
 
-    grid = lambda meta: (n_rowss,)
+    grid = lambda meta: (num_programs,)
     _softmax_kernel[grid](
         y,
         x,
         n_rows,
         n_cols,
+        x.stride(0),
+        y.stride(0),
         BLOCK_SIZE
     )
+
+    return y
     
