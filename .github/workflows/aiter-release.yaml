@@ -18,11 +18,11 @@ on:
         default: true
       docker_image_py310:
         description: 'Docker image for Python 3.10 build'
-        required: false
+        required: true
         default: 'rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta'
       docker_image_py312:
         description: 'Docker image for Python 3.12 build'
-        required: false
+        required: true
         default: 'rocm/vllm-dev:nightly'
 
 concurrency:
