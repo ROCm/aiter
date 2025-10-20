@@ -31,7 +31,7 @@ jobs:
 
       - name: Pull SGlang base image
         run: |
-          docker pull ${{ env.SGL_IMAGE }} && docker tag ${{ env.SGL_IMAGE }} sglang_aiter_test
+          docker pull ${{ env.SGL_IMAGE }} && docker tag ${{ env.SGL_IMAGE }} sglang_aiter_test:ci
 
       - name: Start CI container
         run: |
