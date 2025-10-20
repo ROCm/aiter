@@ -2822,8 +2822,7 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
             sink_ptr + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs),
             mask=(kv_head_idx * QUERY_GRP_SZ + q_grp_offs) < num_query_heads,
         )
-        M = tl.math.exp2(M - max_logits) * log2e
-        exp_sum += M
+        exp_sum += tl.math.exp(M - ml)
     # p: [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2]
     p = exp_sums / exp_sum[None, :]
     p = tl.reshape(p, (MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2, 1))
