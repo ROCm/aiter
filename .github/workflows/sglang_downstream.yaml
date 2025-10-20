@@ -93,6 +93,9 @@ jobs:
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
 
+      - name: Show Dockerfile
+        run: cat Dockerfile.mod
+
       - name: Evaluate Accuracy
         timeout-minutes: 120
         run: |
