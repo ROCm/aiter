@@ -17,6 +17,7 @@ jobs:
     runs-on: aiter-mi325-1gpu
     env:
       SGL_BRANCH: v0.5.3
+      GPU_ARCH: gfx942
       SGL_IMAGE: rocm/sgl-dev:v0.5.3.post3-rocm700-mi30x-20251019
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
@@ -37,6 +38,9 @@ jobs:
         run: |
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.SGL_IMAGE }}
+          
+          ENV BUILD_LLVM="0"
+          ENV BUILD_AITER_ALL="1"
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
@@ -50,9 +54,9 @@ jobs:
            && git submodule update --init --recursive
           RUN cd aiter \
                && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
-                    HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+                    HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop; \
                   elif [ "$BUILD_AITER_ALL" = "1" ]; then \
-                    PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+                    PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop; \
                   else \
                     GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
                   fi
