@@ -52,7 +52,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
     k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
     v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-    sink_ptr,  # [num_query_heads]
     blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
     seq_lens_ptr,       # [num_seqs]
     scale,
@@ -84,7 +83,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     KV_BLK_SZ: gl.constexpr,
     KV_BLK_SZ_POW2: gl.constexpr,
     SEQ_PARTITION_SZ: gl.constexpr,
-    USE_SINKS: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
 ):
     """
@@ -93,7 +91,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
 
     seq_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
-    num_query_heads = gl.num_programs(1) * QUERY_GRP_SZ
+    # num_query_heads = gl.num_programs(1) * QUERY_GRP_SZ
     seq_part_idx = gl.program_id(2)
 
     log2e: gl.constexpr = 1.4426950408889634
@@ -243,17 +241,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     q_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_sz_offs[None, :] < HEAD_SZ)
     # q = gl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
     q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs, mask=q_mask)
-    # q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs)
-    # q = (q * scale).to(compute_type)
     q_shared = gl.allocate_shared_memory(q.dtype, q.shape, shared_a_layout, q)
-    if USE_SINKS:
-    #     M = gl.full([QUERY_GRP_SZ_POW2], float("-inf"), dtype=tl.float32)
-    # else:
-        M = gl.load(
-            sink_ptr + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs),
-            mask=(kv_head_idx * QUERY_GRP_SZ + q_grp_offs) < num_query_heads,
-            other=0,
-        )
     # k_blk_offs[MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD]
     k_blk_offs = (
         kv_blk_nums[:, None, None, None] * stride_k_b
@@ -308,11 +296,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     #     float("-inf"),
     # )
     if SLIDING_WINDOW > 0:
-        sliding_window_size = triton.cdiv(SLIDING_WINDOW, SEQ_PARTITION_SZ)
         qk = gl.where(qk_col_offs[None, :] > seq_len-SLIDING_WINDOW, qk, -100000.0)
-
-    if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 1:
-        print("qk1:", qk)
 
     if alibi_slopes is not None:
         qk += (alibi_slope[:, None] * (qk_col_offs - seq_len + 1)[None, :]).to(gl.float32)
@@ -322,8 +306,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         qk,
         float("-inf"),
     )
-    if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 1:
-        print("qk2:", qk)
+
 
     # if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 16:
     #     print("qk:", qk_col_offs[None, :] < seq_len)
@@ -335,12 +318,12 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     
     # p[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
     # p = gl.math.exp2((qk - max_logit_new[:, Nosne]) * log2e)
-    # if USE_SINKS:
-        # M = tl.math.exp2((gl.convert_layout(M[:, None], layout=qk_mfma_layout) - max_logit_new[:, None]) * log2e)
+
     p = tl.math.exp2((qk - max_logit_new[:, None]) * log2e)
-
+    # if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 1:
+    #     print("qk:", qk)
+    #     print("max_logit_new:", max_logit_new)
     exp_sum = gl.sum(p, axis=1)
-
     p = p.to(compute_type)
 
     m_l_base_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
@@ -450,20 +433,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         + seq_part_idx * stride_max_logits_p
         + m_l_base_offs
     )
-    m_l_grp_mask = m_l_base_offs < QUERY_GRP_SZ
-
-    # q_grp_offs2 = tl.arange(0, QUERY_GRP_SZ_POW2)
-    # max_logits_offs = (
-    #     seq_idx * stride_max_logits_s
-    #     + kv_head_idx * stride_max_logits_nh
-    #     + seq_part_idx * stride_max_logits_p
-    #     + q_grp_offs2
-    # )
-    # m_grp_mask = q_grp_offs2 < QUERY_GRP_SZ
-    # tl.store(max_logits_ptr + max_logits_offs, max_logit_new, mask=m_grp_mask)
-    # tl.store(exp_sums_ptr + max_logits_offs, exp_sum, mask=m_grp_mask)
-    gl.amd.cdna3.buffer_store(stored_value=max_logit_new, ptr=max_logits_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
-    gl.amd.cdna3.buffer_store(stored_value=exp_sum, ptr=exp_sums_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
 
     # acc[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     # acc = gl.dot(p, v, out_dtype=gl.float32)
@@ -475,9 +444,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
 
     acc = gl.amd.cdna3.mfma(pc, vc, accumulator2) * v_scale_val
     exp_sum = gl.convert_layout(exp_sum[:, None], layout=pv_mfma_layout)
-    if USE_SINKS:
-        M = tl.math.exp2((gl.convert_layout(M[:, None], layout=qk_mfma_layout) - max_logit_new[:, None]) * log2e)
-        exp_sum += gl.convert_layout(M, layout=pv_mfma_layout)
+
     exp_sum = tl.broadcast_to(exp_sum, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
     # exp_sum = tl.broadcast_to(exp_sum[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
     # exp_sum = gl.convert_layout(exp_sum, layout=pv_mfma_layout)
@@ -612,7 +579,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
             k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
             v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-            sink_ptr,           # [num_query_heads]
             blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
             seq_lens_ptr,       # [num_seqs]
             scale,
@@ -644,7 +610,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             KV_BLK_SZ=KV_BLK_SZ,
             KV_BLK_SZ_POW2=KV_BLK_SZ_POW2,
             SEQ_PARTITION_SZ=SEQ_PARTITION_SZ,
-            USE_SINKS=USE_SINKS,
             SLIDING_WINDOW=SLIDING_WINDOW,
         )
 
@@ -656,6 +621,7 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
     max_logits_ptr, # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
     logits_ptrs,    # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
     seq_lens_ptr,   # [num_seqs]
+    sink_ptr,
     stride_o_s,
     stride_o_h,
     stride_exp_sums_s,
@@ -672,6 +638,7 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
     SEQ_PARTITION_SZ,
     MAX_NUM_SEQ_PARTITIONS,
     MAX_NUM_SEQ_PARTITIONS_POW2,
+    USE_SINKS,
 ):
     _paged_attn_decode_v2_w_dot_reduce_kernel[grid](
         out_ptr,        # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
@@ -679,6 +646,7 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
         max_logits_ptr, # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
         logits_ptrs,    # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
         seq_lens_ptr,   # [num_seqs]
+        sink_ptr,
         stride_o_s,
         stride_o_h,
         stride_exp_sums_s,
@@ -695,6 +663,7 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
         SEQ_PARTITION_SZ=SEQ_PARTITION_SZ,
         MAX_NUM_SEQ_PARTITIONS=MAX_NUM_SEQ_PARTITIONS,
         MAX_NUM_SEQ_PARTITIONS_POW2=MAX_NUM_SEQ_PARTITIONS_POW2,
+        USE_SINKS=USE_SINKS,
     )
 
 def paged_attention_decode(
@@ -1391,6 +1360,7 @@ def paged_attn_decode_v2(
             max_logits,
             tmp_output,
             seq_lens,
+            sinks,
             output.stride(0),
             output.stride(1),
             exp_sums.stride(0),
@@ -1407,6 +1377,7 @@ def paged_attn_decode_v2(
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
             MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
             MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
+            USE_SINKS=sinks is not None,
         )
         # reduce_time = 0
         # print(f"gluon:\n{tmp_output[0]}")
@@ -2792,6 +2763,7 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     max_logits_ptr, # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
     logits_ptrs,    # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
     seq_lens_ptr,   # [num_seqs]
+    sink_ptr,       # [num_query_heads]
     stride_o_s,
     stride_o_h,
     stride_exp_sums_s,
@@ -2808,14 +2780,15 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     SEQ_PARTITION_SZ: tl.constexpr,
     MAX_NUM_SEQ_PARTITIONS: tl.constexpr,
     MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr,
+    USE_SINKS: tl.constexpr
 ):
     """
     #TODO: Add Doc
     """
-
+    log2e: tl.constexpr = 1.4426950408889634
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
-
+    num_query_heads = gl.num_programs(1) * QUERY_GRP_SZ
     seq_len = tl.load(seq_lens_ptr + seq_idx)
     num_partitions = tl.cdiv(seq_len, SEQ_PARTITION_SZ)
 
@@ -2848,7 +2821,13 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
 
     # exp_sum: [QUERY_GRP_SZ_POW2]
     exp_sum = tl.sum(exp_sums, axis=0)
-
+    if USE_SINKS:
+        M = tl.load(
+            sink_ptr + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs),
+            mask=(kv_head_idx * QUERY_GRP_SZ + q_grp_offs) < num_query_heads,
+        )
+        M = tl.math.exp2(M - max_logits) * log2e
+        exp_sum += M
     # p: [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2]
     p = exp_sums / exp_sum[None, :]
     p = tl.reshape(p, (MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2, 1))
