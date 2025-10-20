@@ -490,7 +490,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
     k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
     v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-    sink_ptr,           # [num_query_heads]
     blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
     seq_lens_ptr,       # [num_seqs]
     scale,
@@ -523,7 +522,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     KV_BLK_SZ,
     KV_BLK_SZ_POW2,
     SEQ_PARTITION_SZ,
-    USE_SINKS,
     SLIDING_WINDOW
 ):
     # Use ttgir as input
@@ -1316,7 +1314,6 @@ def paged_attn_decode_v2(
             query,
             key_cache,
             value_cache,
-            sinks,
             block_tables,
             seq_lens,
             scale,
@@ -1349,7 +1346,6 @@ def paged_attn_decode_v2(
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-            USE_SINKS=sinks is not None,
             SLIDING_WINDOW=sliding_window,
         )
         grid = (num_seqs, num_kv_heads, 1)
