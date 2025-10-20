@@ -1048,16 +1048,15 @@ __global__ void concat_and_cache_mla_opt_kernel(
   static constexpr int32_t vec_size_i = 4;
   static constexpr int32_t vec_size_o =  vec_size_i;
   using vec_i = ck_tile::vec_t<scalar_t, vec_size_i>;
-  using DTYPE_STORE = typename ck_tile::vector_traits<cache_t>::scalar_type;
+  static constexpr int32_t ooba_i = 4 / sizeof(scalar_t);
+  static constexpr int32_t ooba_o = 4 / sizeof(cache_t);
+  auto out_offset = block_idx * block_stride + block_offset * entry_stride;
   auto copy = [&](const scalar_t* __restrict__ src, cache_t* __restrict__ dst,
                   int src_stride, int dst_stride, int size, int offset) {
-    static constexpr int32_t ooba_i = 4 / sizeof(scalar_t);
-    static constexpr int32_t ooba_o = 4 / sizeof(cache_t);
     const int32_t oob_i             = (size + ooba_i - 1) / ooba_i * ooba_i;
     const int32_t oob_o             = (size + ooba_o - 1) / ooba_o * ooba_o;
     auto const* ptr_i               = reinterpret_cast<scalar_t const*>(src + token_idx * src_stride);
-    auto* ptr_o                     = reinterpret_cast<cache_t*>(dst +
-                                     block_idx * block_stride + block_offset * entry_stride + offset);
+    auto* ptr_o                     = reinterpret_cast<cache_t*>(dst + out_offset + offset);
     auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_i, oob_i);
     buffer_i.init_raw();
     auto buffer_o = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_o, oob_o);
@@ -1069,7 +1068,7 @@ __global__ void concat_and_cache_mla_opt_kernel(
     vec_i vec_cur;
 
     size_t vec_idx    = threadIdx.x;
-    size_t vec_stride = 256 * vec_size_o;
+    size_t vec_stride = blockDim.x;//* vec_size_o
     if(vec_idx < num_vecs)
     {
         vec_cur = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
@@ -1077,7 +1076,6 @@ __global__ void concat_and_cache_mla_opt_kernel(
     for(vec_idx += vec_stride; vec_idx < num_vecs; vec_idx += vec_stride)
     {
         vec_nxt = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
-        auto vec  = vec_cur.template get_as<cache_t>();
         if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
             buffer_o.template set(
                 (vec_idx - vec_stride) * vec_size_o,
@@ -1683,7 +1681,10 @@ void concat_and_cache_mla(
     dim3 block(std::min(kv_lora_rank, 1024)/4);
     DISPATCH_BY_KV_CACHE_DTYPE(kv_c.dtype(), kv_cache_dtype,
                                CALL_CONCAT_AND_CACHE_MLA_OPT);
+<<<<<<< HEAD
 
+=======
+>>>>>>> 37ef9c96 (opt concat_and_cache_mla)
   } else {
     dim3 grid(num_tokens);
     dim3 block(std::min(kv_lora_rank, 512));
