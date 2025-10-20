@@ -9,6 +9,7 @@ import random
 import itertools
 import argparse
 import math
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -65,7 +66,7 @@ def ref_masked_attention(
     l = attn_weights_exp.sum(-1)
 
     if is_fp8_q:
-        attn_weights_fp8 = attn_weights_exp.to(torch.float8_e4m3fnuz)
+        attn_weights_fp8 = attn_weights_exp.to(get_fp8_e4m3_dtype())
         attn_weights_exp = attn_weights_fp8.to(torch.float)
 
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
@@ -91,8 +92,8 @@ def torch_mla_extend(
     q_scale=None,
     kv_scale=None,
 ):
-    is_fp8_q = q.dtype == torch.float8_e4m3fnuz
-    is_fp8_kvc = kvc_cache.dtype == torch.float8_e4m3fnuz
+    is_fp8_q = q.dtype == get_fp8_e4m3_dtype()
+    is_fp8_kvc = kvc_cache.dtype == get_fp8_e4m3_dtype()
 
     if is_fp8_q:
         q = q.to(torch.float)
@@ -254,65 +255,66 @@ def test_mla(
         reduce_final_map,
         reduce_partial_map,
         kv_granularity=max(page_size, 16),
+        # kv_granularity=max(page_size, 32),
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=mtp,
         fast_mode=True,
     )
 
-    def test_absorb_decode():
-        kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
-        out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
+    # def test_absorb_decode():
+    #     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    #     out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
-            aiter.mla.mla_decode_fwd,
-            q,
-            kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
-            out_asm,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            max_seqlen_qo,
-            sm_scale,
-            work_meta_data=work_meta_data,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-        )
+    #     (attn_logits, attn_lse), us_asm_decode = run_perftest(
+    #         aiter.mla.mla_decode_fwd,
+    #         q,
+    #         kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
+    #         out_asm,
+    #         qo_indptr,
+    #         kv_indptr,
+    #         kv_indices,
+    #         kv_last_page_lens,
+    #         max_seqlen_qo,
+    #         sm_scale,
+    #         work_meta_data=work_meta_data,
+    #         work_indptr=work_indptr,
+    #         work_info_set=work_info_set,
+    #         reduce_indptr=reduce_indptr,
+    #         reduce_final_map=reduce_final_map,
+    #         reduce_partial_map=reduce_partial_map,
+    #     )
 
-        # print(f"{out_ref.view(total_q, -1)=}")
-        # print(f"{out_asm.view(total_q, -1)=}")
-        # checkAllclose(logits_ref, attn_logits,
-        #               msg=f'attn_logits [golden vs aiter_asm]')
-        # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
-        flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
-        bytes = (
-            total_kv * nhead_kv * qk_head_dim
-            + total_q * nhead * (qk_head_dim + v_head_dim)
-        ) * (torch.finfo(dtype).bits // 8)
-        err = checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        )
-        return err, us_asm_decode, flops, bytes
+    #     # print(f"{out_ref.view(total_q, -1)=}")
+    #     # print(f"{out_asm.view(total_q, -1)=}")
+    #     # checkAllclose(logits_ref, attn_logits,
+    #     #               msg=f'attn_logits [golden vs aiter_asm]')
+    #     # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
+    #     flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+    #     bytes = (
+    #         total_kv * nhead_kv * qk_head_dim
+    #         + total_q * nhead * (qk_head_dim + v_head_dim)
+    #     ) * (torch.finfo(dtype).bits // 8)
+    #     err = checkAllclose(
+    #         out_ref,
+    #         out_asm,
+    #         msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+    #     )
+    #     return err, us_asm_decode, flops, bytes
 
-    err = None
-    us_asm_decode = 10000000000
-    if nhead == 16:
-        err, us_asm_decode, flops, bytes = test_absorb_decode()
-        print("us_asm_decode:", us_asm_decode)
+    # err = None
+    # us_asm_decode = 10000000000
+    # if nhead == 16:
+    #     err, us_asm_decode, flops, bytes = test_absorb_decode()
+    #     print("us_asm_decode:", us_asm_decode)
 
     def test_absorb_decode_fp8():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
-        q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
+        q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=get_fp8_e4m3_dtype())
         q_scale = q_scale.to(torch.float)
 
-        kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
+        kv_buffer_fp8 = kv_buffer.to(get_fp8_e4m3_dtype())
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
@@ -329,6 +331,8 @@ def test_mla(
             q_scale=q_scale,
             kv_scale=kv_scale,
         )
+
+        # import pdb;pdb.set_trace()
 
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
@@ -350,6 +354,8 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
         )
+
+        # import pdb;pdb.set_trace()
 
         cal_diff(out_ref, out_asm, "out", True)
 
@@ -384,7 +390,7 @@ def test_mla(
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
-        kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
+        kv_buffer_fp8 = kv_buffer.to(get_fp8_e4m3_dtype())
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
@@ -401,6 +407,7 @@ def test_mla(
             q_scale=None,
             kv_scale=kv_scale,
         )
+        # import pdb;pdb.set_trace()
 
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
@@ -422,6 +429,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
         )
+        # import pdb;pdb.set_trace()
 
         cal_diff(out_ref, out_asm, "out", True)
 
@@ -453,15 +461,15 @@ def test_mla(
     # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
     # flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
 
-    # bytes = total_kv * nhead_kv * qk_head_dim * 1 + (total_q * nhead * (qk_head_dim + v_head_dim)) * (torch.finfo(dtype).bits // 8)
+    bytes = total_kv * nhead_kv * qk_head_dim * 1 + (total_q * nhead * (qk_head_dim + v_head_dim)) * (torch.finfo(dtype).bits // 8)
 
     return {
-        "decode:flops": flops,
-        "decode:bytes": bytes,
-        "decode:err": err,
-        "decode:asm_576": us_asm_decode,
-        "decode:TFLOPS": flops / us_asm_decode / 1e6,
-        "decode:TB/s": bytes / us_asm_decode / 1e6,
+        # "decode:flops": flops,
+        # "decode:bytes": bytes,
+        # "decode:err": err,
+        # "decode:asm_576": us_asm_decode,
+        # "decode:TFLOPS": flops / us_asm_decode / 1e6,
+        # "decode:TB/s": bytes / us_asm_decode / 1e6,
         "decode_fp8:err vs fp32": err_fp8_fp32,
         "decode_fp8:err vs fp8": err_fp8_fp8,
         "decode_fp8:asm_576": us_asm_decode_fp8,
@@ -480,7 +488,9 @@ qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16"]
-l_kv_dtype = ["bf16", "fp8"]
+# list_dtype = ["fp8"]
+# l_kv_dtype = ["bf16", "fp8"]
+l_kv_dtype = ["fp8"]
 list_nhead = [(16, 2)]
 
 parser = argparse.ArgumentParser(
