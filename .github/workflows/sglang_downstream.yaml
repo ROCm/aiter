@@ -16,8 +16,9 @@ jobs:
     name: sglang integration
     runs-on: aiter-mi325-1gpu
     env:
-      SGL_BRANCH: v0.5.3
-      GPU_ARCH: gfx942
+      SGL_IMAGE: rocm/sgl-dev:v0.5.3.post3-rocm700-mi35x-20251019
+      GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
+      GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
     steps:
       - name: Checkout aiter repo
@@ -27,29 +28,9 @@ jobs:
         run: |
           git clone -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git
 
-      # TODO: Currently, we use PAT, it should be replaced by repo token
-      - name: Make authenticated API request
+      - name: Pull SGlang base image
         run: |
-          curl -sSfL https://api.github.com/repos/casey/just/releases/latest
-      
-      - name: Workaround to change the connection of unbuntu from http to https
-        run: |
-          cd sglang
-          sed -i "79iRUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/* && sed -i 's|http://|https://|g' /etc/apt/sources.list && apt update -o Acquire::https::Verify-Peer=false && apt install -o Acquire::https::Verify-Peer=false ca-certificates -y && echo 'Acquire::https::Verify-Peer \"false\";' > /etc/apt/apt.conf.d/99insecure" docker/Dockerfile.rocm
-
-      - name: Build sglang_aiter_test image
-        run: |
-          cd sglang
-          sed -i '/ENV AITER_COMMIT="v0.1.4"/c\ARG AITER_COMMIT="v0.1.4"\nENV AITER_COMMIT=${AITER_COMMIT}' docker/Dockerfile.rocm
-          docker build --no-cache \
-          --build-arg SGL_BRANCH=${SGL_BRANCH} \
-          --build-arg GPU_ARCH=${GPU_ARCH} \
-          --build-arg AITER_REPO=${GITHUB_REPO_URL} \
-          --build-arg AITER_COMMIT=${GITHUB_COMMIT_SHA} \
-          -t sglang_aiter_test:ci -f docker/Dockerfile.rocm .
-        env:
-          GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
-          GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+          docker pull ${{ env.SGL_IMAGE }} && docker tag ${{ env.SGL_IMAGE }} sglang_aiter_test
 
       - name: Start CI container
         run: |
@@ -84,6 +65,32 @@ jobs:
           cd sglang
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_install_dependency.sh
           bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Generate Dockerfile
+        run: |
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.SGL_IMAGE }}
+
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
+          RUN pip uninstall -y aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+
+          RUN pip uninstall -y aiter
+          RUN git clone ${{ env.GITHUB_REPO_URL }} \
+           && cd aiter \
+           && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
+           && git submodule update --init --recursive
+          RUN cd aiter \
+               && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
+                    HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+                  elif [ "$BUILD_AITER_ALL" = "1" ]; then \
+                    PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+                  else \
+                    GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop; \
+                  fi
+          RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
+          EOF
 
       - name: Evaluate Accuracy
         timeout-minutes: 120
