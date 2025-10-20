@@ -9,6 +9,7 @@ from aiter.ops.triton._triton_kernels.pa_mqa_logits import (
     _deepgemm_fp8_paged_mqa_logits,
     _deepgemm_fp8_paged_mqa_logits_ragged_k,
     _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k,
+    _gluon_deepgemm_fp8_paged_mqa_logits,
 )
 
 
@@ -21,10 +22,13 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
     prefix_sum_context_lens: torch.Tensor,
     kv_indices: torch.Tensor,
     max_model_len: int,
-    ChunkK: int = 64,
-    SplitKV: int = 5,
+    ChunkK: int = 256,
+    TotalCuCount: int = 80,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
+
+    TileQCount = batch_size * next_n
+    SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5
 
     config = {
         "ChunkQ": heads,
@@ -122,6 +126,9 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     context_lens: torch.Tensor,
     kv_indices: torch.Tensor,
     max_model_len: int,
+    ChunkQ: int = 64,
+    ChunkK: int = 64,
+    SplitKV: int = 5,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, max_blk_len = kv_indices.size()
@@ -134,10 +141,10 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
 
     config = {
-        "ChunkQ": 32,
-        "ChunkK": 64,
+        "ChunkQ": ChunkQ,
+        "ChunkK": ChunkK,
         "HiddenDim": hidden_dim,
-        "SplitKV": 5,
+        "SplitKV": SplitKV,
     }
     assert heads % config["ChunkQ"] == 0
 
@@ -176,11 +183,14 @@ def deepgemm_fp8_paged_mqa_logits(
     context_lens: torch.Tensor,
     kv_indices: torch.Tensor,
     max_model_len: int,
-    ChunkK: int = 64,
-    SplitKV: int = 5,
+    ChunkK: int = 256,
+    TotalCuCount: int = 80,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, max_blk_len = kv_indices.size()
+
+    TileQCount = batch_size * next_n
+    SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5
 
     config = {
         "ChunkQ": heads,
@@ -190,7 +200,7 @@ def deepgemm_fp8_paged_mqa_logits(
     }
 
     grid = (batch_size * next_n * config["SplitKV"],)
-    dump_kernel = _deepgemm_fp8_paged_mqa_logits[grid](
+    dump_kernel = _gluon_deepgemm_fp8_paged_mqa_logits[grid](
         batch_size,
         next_n,
         heads,
@@ -209,6 +219,5 @@ def deepgemm_fp8_paged_mqa_logits(
         out_logits,
         out_logits.stride(0),
         max_model_len,
-        max_blk_len,
         **config,
     )
