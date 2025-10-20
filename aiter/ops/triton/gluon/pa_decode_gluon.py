@@ -252,7 +252,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         M = gl.load(
             sink_ptr + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs),
             mask=(kv_head_idx * QUERY_GRP_SZ + q_grp_offs) < num_query_heads,
-            other=float("-inf"),
+            other=0,
         )
     # k_blk_offs[MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD]
     k_blk_offs = (
@@ -308,26 +308,35 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     #     float("-inf"),
     # )
     if SLIDING_WINDOW > 0:
-        pos_diff = (seq_len - 1 + 1 - seq_start_idx  - gl.arange(0, SEQ_PARTITION_SZ))[None, :]
-        qk = gl.where(pos_diff < SLIDING_WINDOW and pos_diff >= 0, qk, -100000)
+        sliding_window_size = triton.cdiv(SLIDING_WINDOW, SEQ_PARTITION_SZ)
+        qk = gl.where(qk_col_offs[None, :] > seq_len-SLIDING_WINDOW, qk, -100000.0)
+
+    if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 1:
+        print("qk1:", qk)
+
     if alibi_slopes is not None:
         qk += (alibi_slope[:, None] * (qk_col_offs - seq_len + 1)[None, :]).to(gl.float32)
-    
+
     qk = gl.where(
         (qk_row_offs[:, None] < QUERY_GRP_SZ) & (qk_col_offs[None, :] < seq_len),
         qk,
         float("-inf"),
     )
+    if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 1:
+        print("qk2:", qk)
+
     # if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 16:
     #     print("qk:", qk_col_offs[None, :] < seq_len)
     # gl.static_print(qk.shape, qk_row_offs.shape, qk_col_offs.shape)
+
     max_logit_new = gl.max(qk, axis=1)
+
     max_logit_new = gl.where(max_logit_new > float("-inf"), max_logit_new, 0.0)
     
     # p[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
-    # p = gl.math.exp2((qk - max_logit_new[:, None]) * log2e)
-    if USE_SINKS:
-        M = tl.math.exp2((gl.convert_layout(M[:, None], layout=qk_mfma_layout) - max_logit_new[:, None]) * log2e)
+    # p = gl.math.exp2((qk - max_logit_new[:, Nosne]) * log2e)
+    # if USE_SINKS:
+        # M = tl.math.exp2((gl.convert_layout(M[:, None], layout=qk_mfma_layout) - max_logit_new[:, None]) * log2e)
     p = tl.math.exp2((qk - max_logit_new[:, None]) * log2e)
 
     exp_sum = gl.sum(p, axis=1)
@@ -463,10 +472,11 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
 
     pc = gl.convert_layout(p, layout=pv_lhs_layout)
     vc = gl.convert_layout(v, layout=pv_rhs_layout)
-    
+
     acc = gl.amd.cdna3.mfma(pc, vc, accumulator2) * v_scale_val
     exp_sum = gl.convert_layout(exp_sum[:, None], layout=pv_mfma_layout)
     if USE_SINKS:
+        M = tl.math.exp2((gl.convert_layout(M[:, None], layout=qk_mfma_layout) - max_logit_new[:, None]) * log2e)
         exp_sum += gl.convert_layout(M, layout=pv_mfma_layout)
     exp_sum = tl.broadcast_to(exp_sum, QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
     # exp_sum = tl.broadcast_to(exp_sum[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
@@ -503,7 +513,7 @@ def compile_ttgir_with_triton(ttgir_content: str):
     finally:
         os.unlink(ttgir_path)
 
-@perftest()
+@perftest(num_iters=2, num_warmup=0)
 # @perftest(num_iters=TEST_NUM_ITERS)
 def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     grid,
