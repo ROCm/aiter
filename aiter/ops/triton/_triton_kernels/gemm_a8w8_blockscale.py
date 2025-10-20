@@ -365,6 +365,10 @@ def _get_config(
             return _get_config._config_dict[key]["medium_M128"]
     elif M <= 256 and "large" in _get_config._config_dict[key]:
         return _get_config._config_dict[key]["large"]
+    elif M <= 2000:
+        return _get_config._config_dict[key]["medium_M2000"]
+    elif M <= 6017:
+        return _get_config._config_dict[key]["medium_M6017"]
     else:
         BLK_M = triton.next_power_of_2(M)
         if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
