@@ -17,6 +17,7 @@ from aiter.ops.triton.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
     deepgemm_fp8_paged_mqa_logits_ragged_k,
 )
+from aiter.ops.shuffle import shuffle_weight
 
 
 def cdiv(x: int, y: int) -> int:
@@ -82,7 +83,7 @@ def ref_fp8_paged_mqa_logits_ragged(
     max_model_len: int,
 ):
     batch_size, next_n, heads, dim = q.size()
-    seq_kv, _, dim = kv_cache.size()  # 3d
+    seq_kv, block_size, dim = kv_cache.size()  # 3d
     logits = torch.full(
         [batch_size * next_n, max_model_len],
         float("-inf"),
@@ -147,7 +148,7 @@ def run_benchmark(args: argparse.Namespace):
 
         max_model_len = 2 * avg_kv_length
         num_blocks = max_model_len
-        blocksize = 1
+        blocksize = 16 if kv_storage_kind == "non_ragged_k" else 1
 
         var_ratio = 0.0
         context_lens = (
@@ -204,7 +205,7 @@ def run_benchmark(args: argparse.Namespace):
         else:
             ref_logits = ref_fp8_paged_mqa_logits_ragged(
                 q,
-                kv_cache.view([num_blocks, 1, index_dim]),
+                kv_cache.view([num_blocks, blocksize, index_dim]),
                 weights,
                 prefix_sum_context_lens,
                 kv_indices,
@@ -234,17 +235,21 @@ def run_benchmark(args: argparse.Namespace):
             #     block_tables,
             #     max_model_len,
             # )
+            preshuffle_kv_cache_fp8 = shuffle_weight(split_kv_cache_fp8.view([num_blocks, blocksize, index_dim]))
+
             _, elapsed_us = run_perftest(
                 deepgemm_fp8_paged_mqa_logits,
                 q_fp8,
-                split_kv_cache_fp8,
+                preshuffle_kv_cache_fp8,
                 split_kv_cache_scale,
                 weights,
                 out_logits,
                 context_lens,
                 block_tables,
                 max_model_len,
-                ChunkK,
+                ChunkK=ChunkK,
+                Preshuffle=True,
+                KVBlockSize=blocksize,
             )
         else:
             # deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
@@ -291,6 +296,7 @@ def run_benchmark(args: argparse.Namespace):
 
         # assert qk_diff < 1e-3
         assert logits_diff < 1e-3
+        print(">>>! logits_diff = ", logits_diff)
 
         total_float_operations = 2 * next_n * heads * index_dim * context_lens.float().sum().item()
         flops = total_float_operations / elapsed_us * 1e-6

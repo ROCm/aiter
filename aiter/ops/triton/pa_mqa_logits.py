@@ -10,7 +10,10 @@ from aiter.ops.triton._triton_kernels.pa_mqa_logits import (
     _deepgemm_fp8_paged_mqa_logits_ragged_k,
     _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k,
     _gluon_deepgemm_fp8_paged_mqa_logits,
+    _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
 )
+
+from aiter.ops.shuffle import shuffle_weight
 
 
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
@@ -183,41 +186,79 @@ def deepgemm_fp8_paged_mqa_logits(
     context_lens: torch.Tensor,
     kv_indices: torch.Tensor,
     max_model_len: int,
+    Preshuffle: bool = False,
+    KVBlockSize: int = 1,
     ChunkK: int = 256,
     TotalCuCount: int = 80,
+    WavePerEU: int = 2,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, max_blk_len = kv_indices.size()
 
     TileQCount = batch_size * next_n
-    SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5
+    SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
+
+    assert ChunkK % KVBlockSize == 0
 
     config = {
         "ChunkQ": heads,
         "ChunkK": ChunkK,
+        "KVBlockSize": KVBlockSize,
         "HiddenDim": hidden_dim,
         "SplitKV": SplitKV,
     }
 
     grid = (batch_size * next_n * config["SplitKV"],)
-    dump_kernel = _gluon_deepgemm_fp8_paged_mqa_logits[grid](
-        batch_size,
-        next_n,
-        heads,
-        q_fp8,
-        q_fp8.stride(0),
-        q_fp8.stride(1),
-        q_fp8.stride(2),
-        kv_cache_fp8,
-        kv_cache_fp8.stride(0),
-        kv_cache_scale,
-        kv_cache_scale.stride(0),
-        context_lens,
-        kv_indices,
-        weights,
-        weights.stride(0),
-        out_logits,
-        out_logits.stride(0),
-        max_model_len,
-        **config,
-    )
+    if Preshuffle:
+        assert KVBlockSize == 16
+        dump_kernel = _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle[grid](
+            batch_size,
+            next_n,
+            heads,
+            q_fp8,
+            q_fp8.stride(0),
+            q_fp8.stride(1),
+            q_fp8.stride(2),
+            kv_cache_fp8,
+            kv_cache_fp8.stride(0),
+            kv_cache_scale,
+            kv_cache_scale.stride(0),
+            context_lens,
+            kv_indices,
+            weights,
+            weights.stride(0),
+            out_logits,
+            out_logits.stride(0),
+            max_model_len,
+            waves_per_eu=WavePerEU,
+            **config,
+        )
+    else:
+        assert KVBlockSize == 1
+        dump_kernel = _gluon_deepgemm_fp8_paged_mqa_logits[grid](
+            batch_size,
+            next_n,
+            heads,
+            q_fp8,
+            q_fp8.stride(0),
+            q_fp8.stride(1),
+            q_fp8.stride(2),
+            kv_cache_fp8,
+            kv_cache_fp8.stride(0),
+            kv_cache_scale,
+            kv_cache_scale.stride(0),
+            context_lens,
+            kv_indices,
+            weights,
+            weights.stride(0),
+            out_logits,
+            out_logits.stride(0),
+            max_model_len,
+            waves_per_eu=WavePerEU,
+            **config,
+        )
+
+    for k, v in dump_kernel.asm.items():
+        if type(v) is str:
+            with open(f"kernel_{k}.s", "w") as f:
+                f.write(v)
