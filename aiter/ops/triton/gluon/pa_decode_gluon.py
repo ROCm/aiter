@@ -308,9 +308,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     #     float("-inf"),
     # )
     if SLIDING_WINDOW > 0:
-        qk = gl.where((seq_len - 1 + 1 - seq_start_idx  - gl.arange(0, SEQ_PARTITION_SZ))[None, :] < SLIDING_WINDOW, qk, -1e37)
-        # if seq_idx == 0 and kv_head_idx == 0 and seq_part_idx == 7:
-        #     print("qk:", qk)
+        pos_diff = (seq_len - 1 + 1 - seq_start_idx  - gl.arange(0, SEQ_PARTITION_SZ))[None, :]
+        qk = gl.where(pos_diff < SLIDING_WINDOW and pos_diff >= 0, qk, -100000)
     if alibi_slopes is not None:
         qk += (alibi_slope[:, None] * (qk_col_offs - seq_len + 1)[None, :]).to(gl.float32)
     
