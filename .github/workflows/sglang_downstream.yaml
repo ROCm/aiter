@@ -44,14 +44,12 @@ jobs:
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
-          RUN echo "BUILD_LLVM=$BUILD_LLVM, BUILD_AITER_ALL=$BUILD_AITER_ALL"
           RUN rm -rf aiter \
            && git clone ${{ env.GITHUB_REPO_URL }} \
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
-           && git submodule update --init --recursive
-          RUN cd aiter \
-              PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop; \
+           && git submodule update --init --recursive \
+           && PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop; \
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
