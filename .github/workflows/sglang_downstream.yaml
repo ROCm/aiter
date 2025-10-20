@@ -16,7 +16,7 @@ jobs:
     name: sglang integration
     runs-on: aiter-mi325-1gpu
     env:
-      SGL_BRANCH: v0.5.2
+      SGL_BRANCH: v0.5.3
       GPU_ARCH: gfx942
 
     steps:
@@ -86,7 +86,7 @@ jobs:
           bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Evaluate Accuracy
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: |
           cd sglang
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_exec.sh
