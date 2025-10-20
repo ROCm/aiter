@@ -1070,8 +1070,8 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
         ),
     )
 
-    M_aot = max(triton.next_power_of_2(M), 4)
-    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_gemm_afp4_wfp4_kernel_preshuffled_weight_scales.fn.__name__}_M={M_aot}-N={N}-K={K*2}"
+    M_POW2 = triton.next_power_of_2(M)
+    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_gemm_afp4_wfp4_kernel_preshuffled_weight_scales.fn.__name__}_M={M_POW2}-N={N}-K={K*2}"
     if os.path.exists(metadata_pth):
         with AOTMetadataContext(
             _gemm_afp4_wfp4_kernel_preshuffled_weight_scales.fn.__name__,
