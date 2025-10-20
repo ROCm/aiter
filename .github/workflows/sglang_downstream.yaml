@@ -43,8 +43,8 @@ jobs:
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
-          RUN pip uninstall -y aiter
-          RUN git clone ${{ env.GITHUB_REPO_URL }} \
+          RUN rm -rf aiter \
+           && git clone ${{ env.GITHUB_REPO_URL }} \
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
            && git submodule update --init --recursive
