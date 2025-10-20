@@ -39,27 +39,20 @@ jobs:
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.SGL_IMAGE }}
 
-          ENV BUILD_LLVM="0"
-          ENV BUILD_AITER_ALL="1"
-
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
+          RUN echo "BUILD_LLVM=$BUILD_LLVM, BUILD_AITER_ALL=$BUILD_AITER_ALL"
           RUN rm -rf aiter \
            && git clone ${{ env.GITHUB_REPO_URL }} \
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
            && git submodule update --init --recursive
           RUN cd aiter \
-               && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
-                    HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop; \
-                  elif [ "$BUILD_AITER_ALL" = "1" ]; then \
-                    PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop; \
-                  else \
-                    GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop; \
-                  fi
+              PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop; \
+
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
 
