@@ -7,7 +7,7 @@ _ARCH_TO_DEVICE = {
 }
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=1)
 def get_arch():
     try:
         arch = (
@@ -22,7 +22,7 @@ def get_arch():
     return arch
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=1)
 def get_device():
     return _ARCH_TO_DEVICE[get_arch()]
 
