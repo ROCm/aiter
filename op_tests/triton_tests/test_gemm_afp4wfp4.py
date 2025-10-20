@@ -83,7 +83,7 @@ def generate_gemm_afp4wfp4_inputs(
         if M >= 32:
             x_scales_shuffled = shuffle_scales(x_scales)
         else:
-            x_scales_shuffled = x_scales
+            x_scales_shuffled = x_scales.contiguous()
         w_scales_shuffled = shuffle_scales(w_scales)
     else:
         x_scales_shuffled = x_scales
@@ -219,8 +219,7 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize(
     "shuffle_scales_fg, shuffle_weight_fg",
-    # [(False, False), (True, False), (True, True)],
-    [(True, True)],
+    [(False, False), (True, False), (True, True)],
 )
 def test_gemm_afp4_wfp4(
     M: int, N: int, K: int, dtype, layout, output, shuffle_scales_fg, shuffle_weight_fg
