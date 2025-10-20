@@ -147,12 +147,15 @@ def fp8_mqa_logits(
     seq_len, num_heads, head_size = Q.shape
     seq_len_kv = KV.shape[0]
     # TODO (cagri): Currently assuming num_heads and head_size is power of 2.
-    assert (num_heads & (num_heads - 1) == 0), "num q. heads should be power of 2."
-    assert (head_size & (head_size - 1) == 0), "head size should be power of 2."
+    assert num_heads & (num_heads - 1) == 0, "num q. heads should be power of 2."
+    assert head_size & (head_size - 1) == 0, "head size should be power of 2."
     # Initialize with -inf because of causal masking
-    logits = torch.full((seq_len, seq_len_kv), 
-                        fill_value=-float('inf'), 
-                        dtype=torch.float32, device=Q.device)
+    logits = torch.full(
+        (seq_len, seq_len_kv),
+        fill_value=-float("inf"),
+        dtype=torch.float32,
+        device=Q.device,
+    )
 
     stride_q_s, stride_q_h, stride_q_d = Q.stride()
     stride_kv_s, stride_kv_d = KV.stride()
