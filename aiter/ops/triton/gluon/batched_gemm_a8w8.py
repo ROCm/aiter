@@ -17,6 +17,7 @@ _LOGGER = AiterTritonLogger()
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,

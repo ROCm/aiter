@@ -25,7 +25,9 @@ from aiter.ops.triton.gluon.batched_gemm_a8w8 import (
 )
 
 
-def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str, impl: callable):
+def bench_gemm_fn(
+    batch: int, M: int, N: int, K: int, metric: str, layout: str, impl: callable
+):
     c_dtype = torch.bfloat16
     x, w, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
         batch, M, N, K, dtype=c_dtype, layout=layout, output=True
@@ -109,7 +111,7 @@ def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
-    
+
     if args.gluon:
         impl = gluon_batched_gemm_a8w8
     else:
