@@ -391,7 +391,7 @@ def _moe_gemm_a8w4(
         WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
 
     if not EVEN_K:
-        k = K % BLOCK_K
+        k = K - num_k_iter * BLOCK_K
         mask_x_k = offs_x_k < k
         mask_w_k = offs_w_k < (k // W_K_DIVISOR)
         if SWIZZLE_MX_SCALE is None:
