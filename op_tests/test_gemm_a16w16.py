@@ -65,6 +65,29 @@ def run_bf16gemm_asm(
     return aiter.gemm_a16w16_asm(x, weight, out_asm, bias, splitK, kernelName)
 
 
+@perftest(num_iters=TEST_NUM_ITERS)
+def aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
+    if scaleB is not None:
+        scaleB = scaleB.t()
+    return hipb_mm(
+        inp,
+        weights.t(),
+        solution_index=-1,
+        bias=None,
+        out_dtype=dtype,
+        scaleA=scaleA,
+        scaleB=scaleB,
+        scaleOut=None,
+        bpreshuffle=True,
+    )
+
+
+@lru_cache(maxsize=1)
+def init_hipblas():
+    hipb_create_extension()
+
+
+@benchmark()
 def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
@@ -79,7 +102,21 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
     (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
     (b, *_), avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
-
+    if (
+        n % 16 == 0
+        and k % 32 == 0
+        and dtype == otype
+        and otype == dtypes.bf16
+        and get_gfx() == "gfx942"
+    ):
+        init_hipblas()
+        weight_bpreshuffle = shuffle_weight(weight, layout=(16, 16), use_int4=False)
+        (c, *_), avg_c = aiter_hip_bpreshuffle(x, weight_bpreshuffle, None, None, otype)
+        if bias is not None:
+            c = c + bias
+    else:
+        c = None
+        avg_c = None
     assert (
         a.dtype == b.dtype
     ), f"Expected a.dtype == b.dtype, but a={a.dtype}, b={b.dtype}, input dtype={dtype}"
@@ -90,9 +127,15 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         assert (
             b.dtype == otype
         ), f"b={b.dtype}, expected output dtype={otype}, input dtype={dtype}"
-
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
-    checkAllclose(a, b, msg=msg)
+        if c is not None:
+            assert (
+                c.dtype == otype
+            ), f"c={c.dtype}, expected output dtype={otype}, input dtype={dtype}"
+    msg_b = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us,B uplift: {avg_a/avg_b-1:<5.1%}, "
+    if avg_c is not None:
+        msg_c = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, C avg: {avg_c:<8.2f} us, C uplift: {avg_a/avg_c-1:<5.1%}, "
+    err_tgemm = checkAllclose(a, b, msg=msg_b)
+    err_hipb = checkAllclose(a, c, msg=msg_c) if c is not None else None
 
     #### asm a16w16 gemm -- huan
     ### run bf16gemm_f32 asm
@@ -109,9 +152,19 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         # wshuffle = shuffle_weight(weight, layout=(16, 16))
         # out_asm = torch.empty((m + 191) // 192 * 192, n, dtype=otype)
         out_asm = torch.empty(m, n, dtype=otype, device=x.device)
-        (c, *_), avg_c = run_bf16gemm_asm(x, weight, out_asm, otype=dtypes.fp32)
-        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us, uplift: {avg_b/avg_c-1:<5.1%}"
-        checkAllclose(b, c, msg=msg)
+        (d, *_), avg_d = run_bf16gemm_asm(x, weight, out_asm, otype=dtypes.fp32)
+        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
+        err_asm = checkAllclose(b, d, msg=msg)
+
+    return {
+        "torch us": avg_a,
+        "tgemm us": avg_b,
+        "tgemm err (vs torch)": err_tgemm,
+        "hipb us": locals().get("avg_c", ""),
+        "hipb err (vs torch)": locals().get("err_hipb", ""),
+        "asm us": locals().get("avg_d", ""),
+        "asm err (vs tgemm)": locals().get("err_asm", ""),
+    }
 
 
 def get_boundary_test_cases(cu_count, aligned_k):
@@ -306,6 +359,7 @@ def calculate_total_valid_points(cu_count, aligned_k):
 
 
 def test_skinny_gemm():
+    df = []
     # seed = 8779
     # torch.manual_seed(seed)
     # torch.cuda.manual_seed(seed)
@@ -327,6 +381,13 @@ def test_skinny_gemm():
             [4, 1, 8192],
             [4, 32, 8192],
             [4, 32, 9216],
+            [16, 7424, 8192],
+            [32, 7424, 8192],
+            [48, 7424, 8192],
+            [64, 7424, 8192],
+            [4096, 7424, 8192],
+            [5120, 7424, 8192],
+            [8192, 7424, 8192],
         ]
     )
     test_mnk_list.extend(boundary_mnk_list)
@@ -345,7 +406,9 @@ def test_skinny_gemm():
             m, n, k = mnk
             for dtype in [dtypes.fp16, dtypes.bf16]:
                 for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
-                    test_gemm(dtype, m, n, k, otype=otype)
+                    ret = test_gemm(dtype, m, n, k, otype=otype)
+                    df.append(ret)
+    return df
 
 
 parser = argparse.ArgumentParser(
@@ -415,22 +478,13 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+df = []
 for test in args.test:
     if test == "normal":
-        test_gemm(
-            dtypes.fp8,
-            128,
-            768,
-            4096,
-            bias=False,
-            otype=dtypes.bf16,
-            scaleA=0.5,
-            scaleB=0.5,
-        )
         for dtype in args.dtype:
             for otype in args.otype:
                 for m, n, k in args.mnk:
-                    test_gemm(
+                    ret = test_gemm(
                         dtype,
                         m,
                         n,
@@ -440,5 +494,10 @@ for test in args.test:
                         scaleA=args.scale_a,
                         scaleB=args.scale_b,
                     )
+                df.append(ret)
+
     elif test == "skinny":
-        test_skinny_gemm()
+        ret = test_skinny_gemm()
+        df += ret
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")

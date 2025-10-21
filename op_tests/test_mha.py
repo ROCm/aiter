@@ -666,9 +666,6 @@ def test_flash_attn_seq_padding(
     assert diff <= out_tol
 
 
-l_dtype = ["bf16", "fp16"]
-l_dim = [32, 40, 64, 111, 128, 160]
-l_mha_type = ["mha", "mqa", "gqa"]
 l_causal = [False, True]
 l_local = [False, True]
 l_deterministic = [False, True]
@@ -710,20 +707,12 @@ parser.add_argument(
     e.g.: -k 1024""",
 )
 parser.add_argument(
-    "-qk",
-    "--d_qk",
-    type=int,
-    default=None,
+    "-d_qk_v",
+    type=dtypes.str2tuple,
+    nargs="+",
+    default=[(32, 32), (40, 40), (64, 64), (111, 111), (128, 128), (160, 160)],
     help="""Dimension of query and key. Default is None.
-    e.g.: -qk 256""",
-)
-parser.add_argument(
-    "-v",
-    "--d_v",
-    type=int,
-    default=128,
-    help="""Dimension of value. Default is 128.
-    e.g.: -v 256""",
+    e.g.: -qk_v 256,256""",
 )
 parser.add_argument(
     "-p",
@@ -772,7 +761,9 @@ parser.add_argument(
     "-m",
     "--mha_type",
     type=str,
-    default=None,
+    nargs="+",
+    choices=["mha", "mqa", "gqa"],
+    default=["mha", "mqa", "gqa"],
     help="""Type of multi-head attention.
     e.g.: -m mha""",
 )
@@ -780,7 +771,9 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=str,
-    default=None,
+    nargs="+",
+    choices=["bf16", "fp16"],
+    default=["bf16", "fp16"],
     help="""Data type.
     e.g.: -d bf16""",
 )
@@ -788,83 +781,67 @@ parser.add_argument(
     "-i",
     "--input_layout",
     type=str,
+    choices=["BSHD", "BHSD", "SBHD", "QKVPACKED", "KVPACKED"],
     default="BSHD",
     help="""input_layout.
     e.g.: -i BSHD""",
 )
 if __name__ == "__main__":
     args = parser.parse_args()
-    if args.dtype is not None:
-        l_dtype = [dtypes.d_dtypes[args.dtype]]
-    else:
-        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-        args.dtype = "bf16"
 
-    if args.d_qk is not None:
-        l_dim = [args.d_qk]
-    else:
-        args.d_qk = 128
-    if args.mha_type is not None:
-        l_mha_type = [args.mha_type]
-    else:
-        args.mha_type = "mha"
     if args.causal is not None:
         l_causal = [args.causal]
-    else:
-        args.causal = False
+
     if args.local is not None:
         l_local = [args.local]
-    else:
-        args.local = False
+
     if args.deterministic is not None:
         l_deterministic = [args.deterministic]
-    else:
-        args.deterministic = False
+
     collected = []
     for (
         dtype,
-        dim,
+        (dim_qk, dim_v),
         mha_type,
         causal,
         local,
         deterministic,
     ) in itertools.product(
-        l_dtype, l_dim, l_mha_type, l_causal, l_local, l_deterministic
+        args.dtype, args.d_qk_v, args.mha_type, l_causal, l_local, l_deterministic
     ):
         ret = flash_attn_output_benchmark(
             args.batch_size,
             args.nheads,
             args.seqlen_q,
             args.seqlen_k,
-            dim,
-            dim,
+            dim_qk,
+            dim_v,
             args.dropout_p,
             causal,
             local,
             args.bias_type,
             deterministic,
             mha_type,
-            dtype,
+            dtypes.d_dtypes[dtype],
             args.input_layout,
         )
         collected.append(ret)
+        test_flash_attn_seq_padding(
+            "mixed",
+            args.batch_size,
+            args.nheads,
+            args.seqlen_q,
+            args.seqlen_k,
+            dim_qk,
+            dim_v,
+            args.dropout_p,
+            causal,
+            local,
+            args.bias_type if args.bias_type != "bias" else "no",
+            deterministic,
+            mha_type,
+            dtypes.d_dtypes[dtype],
+        )
 
     df = pd.DataFrame(collected)
     aiter.logger.info(f"mha summary:\n{df}")
-
-    test_flash_attn_seq_padding(
-        "mixed",
-        args.batch_size,
-        args.nheads,
-        args.seqlen_q,
-        args.seqlen_k,
-        args.d_qk,
-        args.d_v,
-        args.dropout_p,
-        args.causal,
-        args.local,
-        args.bias_type if args.bias_type != "bias" else "no",
-        args.deterministic,
-        args.mha_type,
-        dtypes.d_dtypes[args.dtype],
-    )

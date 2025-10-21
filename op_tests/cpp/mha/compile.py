@@ -8,14 +8,28 @@ import argparse
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/../../../aiter/")
-from jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, get_asm_dir
+from jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_META_DIR
+from jit.utils.chip_info import get_gfx_list
+
+
+FWD_CODEGEN_CMD = []
+BWD_CODEGEN_CMD = []
+
+
+def get_asm_dir():
+    for gfx in get_gfx_list():
+        FWD_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/fmha_v3_fwd"
+        BWD_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/fmha_v3_bwd"
+        if os.path.exists(FWD_ASM_DIR):
+            FWD_CODEGEN_CMD.append(f"{FWD_ASM_DIR}/codegen.py --output_dir {{}}")
+        if os.path.exists(BWD_ASM_DIR):
+            BWD_CODEGEN_CMD.append(f"{BWD_ASM_DIR}/codegen.py --output_dir {{}}")
 
 
 def cmdGenFunc_mha_fwd(ck_exclude: bool):
     if ck_exclude:
         blob_gen_cmd = [
             f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}",
-            f"{get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}",
         ]
     else:
         blob_gen_cmd = [
@@ -23,8 +37,8 @@ def cmdGenFunc_mha_fwd(ck_exclude: bool):
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}",
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}",
             f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 5 --output_dir {{}}",
-            f"{get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}",
         ]
+    blob_gen_cmd.extend(FWD_CODEGEN_CMD)
     return {
         "md_name": "libmha_fwd",
         "blob_gen_cmd": blob_gen_cmd,
@@ -43,16 +57,15 @@ def cmdGenFunc_mha_bwd(ck_exclude: bool):
     if ck_exclude:
         blob_gen_cmd = [
             f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter "*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*" --output_dir {{}}',
-            f"{get_asm_dir()}/fmha_v3_bwd/codegen.py --output_dir {{}}",
             f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 2 --output_dir {{}}",
         ]
     else:
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}",
             f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter "*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*" --output_dir {{}}',
-            f"{get_asm_dir()}/fmha_v3_bwd/codegen.py --output_dir {{}}",
             f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}",
         ]
+    blob_gen_cmd.extend(BWD_CODEGEN_CMD)
     return {
         "md_name": "libmha_bwd",
         "blob_gen_cmd": blob_gen_cmd,
@@ -81,6 +94,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    get_asm_dir()
     if args.api == "fwd":
         compile_mha_fwd(False)
     elif args.api == "bwd":
