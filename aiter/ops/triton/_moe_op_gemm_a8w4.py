@@ -362,36 +362,24 @@ def _moe_gemm_a8w4(
         offs_x_k_scale = MX_SCALE_BLOCK_K * pid_k + tl.arange(0, MX_SCALE_BLOCK_K)
         XMxScalePtrs = XMxScale + offs_x_m.to(index_type)[:, None] * stride_x_mx_m + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
 
+    num_k_iter = tl.cdiv(K, BLOCK_K * SPLIT_K)
+    if not EVEN_K:
+        num_k_iter -= 1
 
     # compute output
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(K, BLOCK_K * pid_k, -(BLOCK_K * SPLIT_K)):
-        if EVEN_K:
-            mask_x_k = tl.full([BLOCK_K], True, dtype=tl.int1)
-            mask_w_k = tl.full([PACKED_BLOCK_K_W], True, dtype=tl.int1)
-            if SWIZZLE_MX_SCALE is None:
-                mask_w_k_scale = tl.full([PACKED_MX_BLOCK], True, dtype=tl.int1)
-            if is_x_microscaled:
-                mask_x_k_scale = tl.full([MX_SCALE_BLOCK_K], True, dtype=tl.int1)
-        else:
-            mask_x_k = offs_x_k < k
-            mask_w_k = offs_w_k < (k // W_K_DIVISOR)
-            if SWIZZLE_MX_SCALE is None:
-                mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < k
-            if is_x_microscaled:
-                mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < k
-
-        x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0.0)
-        w = tl.load(WPtrs, mask=mask_w_k[:, None], other=0.0, cache_modifier=W_CACHE_MODIFIER)
+    for k in range(num_k_iter):
+        x = tl.load(XPtrs)
+        w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
 
         if is_x_microscaled:
-            x_scales = tl.load(XMxScalePtrs, mask=mask_x_k_scale[None, :])
+            x_scales = tl.load(XMxScalePtrs)
         else:
             x_scales = tl.full((BLOCK_M, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
-            w_scales = unswizzle_mx_scale_cdna4(tl.load(WMxScalePtrs), BLOCK_N, MX_SCALE_BLOCK_K)
+            w_scales = unswizzle_mx_scale_cdna4(tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER), BLOCK_N, MX_SCALE_BLOCK_K)
         else:
-            w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
+            w_scales = tl.load(WMxScalePtrs)
 
         acc = tl.dot_scaled(x, x_scales, "e4m3", w, w_scales, "e2m1", acc=acc, fast_math=True)
 
@@ -401,6 +389,29 @@ def _moe_gemm_a8w4(
 
         XPtrs += (BLOCK_K * SPLIT_K) * stride_x_k
         WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
+
+    if not EVEN_K:
+        k = K % BLOCK_K
+        mask_x_k = offs_x_k < k
+        mask_w_k = offs_w_k < (k // W_K_DIVISOR)
+        if SWIZZLE_MX_SCALE is None:
+            mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < k
+        if is_x_microscaled:
+            mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < k
+
+        x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0.0)
+        w = tl.load(WPtrs, mask=mask_w_k[:, None], other=0, cache_modifier=W_CACHE_MODIFIER)
+
+        if is_x_microscaled:
+            x_scales = tl.load(XMxScalePtrs, mask=mask_x_k_scale[None, :])
+        else:
+            x_scales = tl.full((BLOCK_M, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
+        if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+            w_scales = unswizzle_mx_scale_cdna4(tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER), BLOCK_N, MX_SCALE_BLOCK_K)
+        else:
+            w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
+
+        acc = tl.dot_scaled(x, x_scales, "e4m3", w, w_scales, "e2m1", acc=acc, fast_math=True)
 
     # scalar fp8 scale
     if X_static_scale is not None:
@@ -413,7 +424,7 @@ def _moe_gemm_a8w4(
     if B is not None:
         BPtrs = B + expt_id * stride_b_e + offs_y_n
         if pid_k == 0:
-            bias = tl.load(BPtrs, mask=mask_n, other=0)
+            bias = tl.load(BPtrs, mask=mask_n, other=0, cache_modifier=W_CACHE_MODIFIER)
         else:
             bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
         acc = acc + bias[None, :]

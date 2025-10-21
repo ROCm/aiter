@@ -29,7 +29,7 @@ def should_upcast_indices(*args):
     return any(tensor is not None and can_overflow_int32(tensor) for tensor in args)
 
 
-def allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, routing_data, gather_indx, scatter_indx, split_k):
+def allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, routing_data, gather_indx, scatter_indx, block_m, split_k):
     # ---- output ------
     N = w.shape[-1]
     # by default - M is number of rows in the activations
@@ -44,7 +44,10 @@ def allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, 
         y_rows = scatter_indx.src_indx.shape[0] // routing_data.n_expts_act # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
-    matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
+    if block_m == 16:
+        matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
+    else:
+        matmul_output = torch.zeros(matmul_shape, device=x.device, dtype=out_dtype)
     if scatter_indx or split_k > 1:
         final_output = torch.empty(final_shape, device=x.device, dtype=out_dtype)
     else:
@@ -73,9 +76,9 @@ def get_kernel_config(
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
 
-    block_n = 128
     split_k = 1
-    if m <= 1024:
+    if block_m == 16:
+        block_n = 128
         block_k = 256
         num_warps = 4
     else:
@@ -203,7 +206,9 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
                out_dtype = torch.bfloat16,
                apply_swiglu = False,
                alpha = 1.0,
-               limit = 1.0
+               limit = 1.0,
+               unpadded_N = None,
+               unpadded_K = None
                ):
     """
     Y[:, :] = 0.
@@ -240,7 +245,7 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
         apply_swiglu_reduction = False
         reduction_n_reduction = 1
     # allocate output memory
-    y, y_final = allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, routing_data, gather_indx, scatter_indx, config["split_k"])
+    y, y_final = allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, routing_data, gather_indx, scatter_indx, config["block_m"], config["split_k"])
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
     expt_data = routing_data.expt_data
@@ -250,6 +255,10 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map[block_m]
     # spmd grid
+    if unpadded_N:
+        N = unpadded_N
+    if unpadded_K and block_m == 16:
+        K = unpadded_K
     if expt_block_pid_map is not None:
         grid_m = routing_data.n_blocks(M, config["block_m"])
     else:
