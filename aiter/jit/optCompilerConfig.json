@@ -721,6 +721,7 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": []
     },
     "module_fmha_v3_varlen_fwd_ck": {
@@ -751,6 +752,7 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": []
     },
     "module_mha_batch_prefill": {
