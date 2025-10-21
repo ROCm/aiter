@@ -216,7 +216,7 @@ def test_grouped_topk(
 
 
 l_dtype = ["fp32", "bf16", "fp16"]
-l_expert = [64, 256]
+l_expert = [64, 256, 160]
 l_m = [1, 8, 16, 32, 64, 128, 256, 65536, 163840]
 l_token = [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000, 16384]
 
@@ -289,10 +289,10 @@ aiter.logger.info(f"summary:\n{df}")
 df = []
 for token in l_token:
     # DeepSeek-R1
-    topk = 8
-    group = 8
-    topk_group = 4
-    expert = 256
+    topk = 1
+    group = 1
+    topk_group = 1
+    expert = 160
     dtype = dtypes.bf16
     need_renorm = True
     ret = test_biased_grouped_topk(
@@ -306,10 +306,10 @@ df = []
 for token in l_token:
     for scoring_func in ["softmax", "sigmoid"]:
         # DeepSeek-R1
-        topk = 8
-        group = 8
-        topk_group = 4
-        expert = 256
+        topk = 1
+        group = 1
+        topk_group = 1
+        expert = 160
         dtype = dtypes.bf16
         need_renorm = True
         ret = test_grouped_topk(

@@ -710,7 +710,9 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     int computed_vpt = num_experts / num_expert_group;
     // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=32. Maximum VPT
     // indicate max value per threads we can process.
-    TORCH_CHECK(computed_vpt <= MAX_VPT,
+    TORCH_CHECK(computed_vpt <= MAX_VPT || (topk == 1 &&
+                 num_expert_group == 1 &&
+                 topk_group==1 && num_fused_shared_experts == 0),
                 "Per group experts: num_experts / num_expert_group = (",
                 computed_vpt,
                 ") exceeds the maximum supported (",
