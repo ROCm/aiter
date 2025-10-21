@@ -104,9 +104,11 @@ AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
     "AITER_CONFIG_BATCHED_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
 )
-## merge config files
-##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
-import pandas as pd
+
+AITER_CONFIG_GEMM_BF16 = os.getenv(
+    "AITER_CONFIG_GEMM_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_gemm.csv",
+)
 
 
 def update_config_files(file_path: str, merge_name: str):
@@ -114,6 +116,10 @@ def update_config_files(file_path: str, merge_name: str):
     if len(path_list) <= 1:
         return file_path
     df_list = []
+    ## merge config files
+    ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
+    import pandas as pd
+
     df_list.append(pd.read_csv(path_list[0]))
     for i, path in enumerate(path_list[1:]):
         if os.path.exists(path):
@@ -155,6 +161,9 @@ AITER_CONFIG_A8W8_BATCHED_GEMM_FILE = update_config_files(
 )
 AITER_CONFIG_BF16_BATCHED_GEMM_FILE = update_config_files(
     AITER_CONFIG_BF16_BATCHED_GEMM, "bf16_tuned_batched_gemm"
+)
+AITER_CONFIG_GEMM_BF16_FILE = update_config_files(
+    AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
 )
 # config_env end here
 
@@ -914,6 +923,7 @@ def compile_ops(
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
+                    doc_str = doc_str.replace("list[", "List[")
                     for el in enum_types:
                         doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {

@@ -33,6 +33,16 @@ def all_reduce_unreg(
 ) -> None: ...
 
 
+@compile_ops("module_custom_all_reduce")
+def all_gather_reg(_fa: int, inp: torch.Tensor, out: torch.Tensor) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def all_gather_unreg(
+    _fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
+) -> None: ...
+
+
 def all_reduce_asm_fake_tensor(
     inp: torch.Tensor,
     ca: int,
