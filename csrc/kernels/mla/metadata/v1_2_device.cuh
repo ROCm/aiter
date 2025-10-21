@@ -125,7 +125,6 @@ __global__ void kn_get_mla_metadata_v1_2(
         {
             seqlen_kv = min(seqlen_kv, params.topk);
             p_lds_seqlens_kv[bid] = seqlen_kv;
-            // p_lds_kv_indptr[bid] = (bid + 1) * params.topk;
         }
         else
         {
@@ -368,13 +367,13 @@ __global__ void kn_get_mla_metadata_v1_2_no_split(
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
         int bid_ori = [&]() {
-            if constexpr (!Traits::kIsSparse || !Traits::kQoSplits)
+            if constexpr (Traits::kIsSparse || Traits::kQoSplits)
             {
-                return bid;
+                return bid / params.ori_seqlen_qo;
             }
             else
             {
-                return bid / params.ori_seqlen_qo;
+                return bid;
             }
         }();
         int32_t kv_end = params.p_seqlens_kv_indptr[bid_ori + 1];
