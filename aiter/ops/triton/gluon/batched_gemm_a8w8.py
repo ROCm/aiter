@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
+from typing import Optional, List
 import functools
 import json
 import os
@@ -62,9 +62,10 @@ def _batched_gemm_a8w8_kernel(
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
-    SIZE_PER_THREAD_MK: gl.constexpr,
-    SIZE_PER_THREAD_KN: gl.constexpr,
+    BUFFER_SIZE: gl.constexpr,
     THREADS_PER_WARP: gl.constexpr,
+    THREADS_PER_WARP_M: gl.constexpr,
+    THREADS_PER_WARP_N: gl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_a8w8 function
@@ -85,7 +86,258 @@ def _batched_gemm_a8w8_kernel(
     - Bias: Bias batch tensor with shape (B, 1, N).
     """
 
-    pass
+    # -----------------------------------------------------------
+    # Get batch program id
+    batch_id = tl.program_id(axis=0)
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    pid = tl.program_id(axis=1)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+
+    if GROUP_SIZE_M == 1:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + (pid % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+    remap_xcd(pid, GRID_MN)
+    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+
+    num_k_iter = gl.cdiv(K, BLOCK_SIZE_K)
+
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+
+    # Cast batch id and batch dimension strides to int64 to avoid int32 overflow during offset calculation
+    # Note: If you're attempting to cast strides to int64 to prevent integer overflow, use `tl.cast` instead of `.to()`.
+    # See https://github.com/ROCm/aiter/pull/597 for rationale
+    batch_id = tl.cast(batch_id, tl.int64)
+    stride_ab = tl.cast(stride_ab, tl.int64)
+    stride_bb = tl.cast(stride_bb, tl.int64)
+    stride_cb = tl.cast(stride_cb, tl.int64)
+
+    # Create layouts for contiguous access
+    elems_per_thread_mk: gl.constexpr = triton.cdiv(
+        BLOCK_SIZE_M * BLOCK_SIZE_K // (gl.num_warps() * THREADS_PER_WARP), BUFFER_SIZE
+    )
+    elems_per_thread_kn: gl.constexpr = triton.cdiv(
+        BLOCK_SIZE_K * BLOCK_SIZE_N // (gl.num_warps() * THREADS_PER_WARP), BUFFER_SIZE
+    )
+    gl.static_assert(
+        THREADS_PER_WARP_M * THREADS_PER_WARP_N == THREADS_PER_WARP
+    )
+    blocked_mk: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[elems_per_thread_mk, BUFFER_SIZE],
+        threads_per_warp=[THREADS_PER_WARP_M, THREADS_PER_WARP_N],
+        warps_per_cta=[gl.num_warps(), 1],
+        order=[1, 0],
+    )
+    blocked_kn: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[elems_per_thread_kn, BUFFER_SIZE],
+        threads_per_warp=[THREADS_PER_WARP_M, THREADS_PER_WARP_N],
+        warps_per_cta=[1, gl.num_warps()],
+        order=[0, 1],
+    )
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[gl.num_warps() // 2, 2],
+    )
+    shared_a: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=16, per_phase=2, max_phase=8, order=[1, 0]
+    )
+    shared_b: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=16, per_phase=2, max_phase=8, order=[0, 1]
+    )
+    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=16
+    )
+    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=16
+    )
+
+    # Create pointers for first block of A and B input matrices
+    offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, blocked_mk))
+    offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_kn))
+    offs_am = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk))
+    offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn))
+    offs_a = (
+        batch_id * stride_ab
+        + offs_am[:, None] * stride_am
+        + offs_ak[None, :] * stride_ak
+    )
+    offs_b = (
+        batch_id * stride_bb
+        + offs_bk[:, None] * stride_bk
+        + offs_bn[None, :] * stride_bn
+    )
+
+    # Create pointers for the scale tensors
+    offs_a_scale = (
+        batch_id * stride_ascaleb
+        + pid_m * BLOCK_SIZE_M
+        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk))
+    )
+    offs_b_scale = (
+        batch_id * stride_bscaleb
+        + pid_n * BLOCK_SIZE_N
+        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn))
+    )
+
+    # Allocate shared memory input matrices and scaling factors
+    smem_a = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
+    )
+    smem_b = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
+    )
+
+    # Prologue: Make initial loads of all data
+    if EVEN_K:
+        a = gl.amd.cdna4.buffer_load(
+            ptr=a_ptr, offsets=offs_a, mask=(offs_am[:, None] < M), other=0.0
+        )
+    else:
+        a = gl.amd.cdna4.buffer_load(
+            ptr=a_ptr,
+            offsets=offs_a,
+            mask=(offs_ak[None, :] < K & offs_am[:, None] < M),
+            other=0.0,
+        )
+    if EVEN_K:
+        b = gl.amd.cdna4.buffer_load(
+            ptr=b_ptr, offsets=offs_b, mask=(offs_bn[None, :] < N), other=0.0
+        )
+    else:
+        b = gl.amd.cdna4.buffer_load(
+            ptr=b_ptr,
+            offsets=offs_b,
+            mask=(offs_bk[:, None] < K & offs_bn[None, :] < N),
+            other=0.0,
+        )
+
+    # Store A in shared memory first (this data is used first)
+    smem_a.store(a)
+
+    acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
+    accumulator = gl.zeros(
+        (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout
+    )
+    zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout)
+
+    # Run the main loop
+    for k in range(0, num_k_iter - 1):
+        # Advance the ptrs to the next K block.
+        offs_a += BLOCK_SIZE_K * stride_ak
+        offs_b += BLOCK_SIZE_K * stride_bk
+
+        # Load the next block of A
+        if EVEN_K:
+            a = gl.amd.cdna4.buffer_load(
+                ptr=a_ptr, offsets=offs_a, mask=(offs_am[:, None] < M), other=0.0
+            )
+        else:
+            a = gl.amd.cdna4.buffer_load(
+                ptr=a_ptr,
+                offsets=offs_a,
+                mask=(
+                    offs_ak[None, :] < K - (k + 1) * BLOCK_SIZE_K & offs_am[:, None] < M
+                ),
+                other=0.0,
+            )
+
+        # Then store B in shared memory
+        smem_b.store(b)
+
+        # Grab the current block of A from shared memory
+        cur_a = smem_a.load(layout=dot_a_layout)
+
+        # Load the next block of B
+        if EVEN_K:
+            b = gl.amd.cdna4.buffer_load(
+                ptr=b_ptr, offsets=offs_b, mask=(offs_bn[None, :] < N), other=0.0
+            )
+        else:
+            b = gl.amd.cdna4.buffer_load(
+                ptr=b_ptr,
+                offsets=offs_b,
+                mask=(
+                    offs_bk[:, None] < K - (k + 1) * BLOCK_SIZE_K & offs_bn[None, :] < N
+                ),
+                other=0.0,
+            )
+
+        # Grab the current block of B from shared memory
+        cur_b = smem_b.load(layout=dot_b_layout)
+
+        # Perform and store the MFMA operation
+        accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
+
+        # Store next A in shared memory
+        smem_a.store(a)
+
+    # Epilogue: use remaining A and B in shared memory for last MFMA
+    smem_b.store(b)
+    cur_a = smem_a.load(layout=dot_a_layout)
+    cur_b = smem_b.load(layout=dot_b_layout)
+    accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
+
+    # Apply scales
+    a_scale = gl.amd.cdna4.buffer_load(
+        ptr=a_scale_ptr,
+        offsets=offs_a_scale,
+        mask=(offs_a_scale[:, None] < M),
+        other=0.0,
+    )
+    b_scale = gl.amd.cdna4.buffer_load(
+        ptr=b_scale_ptr,
+        offsets=offs_b_scale,
+        mask=(offs_b_scale[None, :] < N),
+        other=0.0,
+    )
+    accumulator *= a_scale[:, None] * b_scale[None, :]
+
+    # Apply bias
+    if HAS_BIAS:
+        offs_bias = (
+            batch_id * stride_biasb
+            + pid_n * BLOCK_SIZE_N
+            + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn))
+        )
+        bias = gl.amd.cdna4.buffer_load(
+            ptr=bias_ptr,
+            offsets=offs_bias,
+            mask=(offs_bias[None, :] < N),
+            other=0.0,
+        )
+        accumulator = accumulator.to(bias_ptr.type.element_ty) + bias[None, :]
+
+    # Store result in memory
+    c = accumulator.to(c_ptr.type.element_ty)
+    offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
+        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, mfma_layout)
+    )
+    offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
+        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout)
+    )
+    c_offs = (
+        batch_id * stride_cb
+        + offs_cm[:, None] * stride_cm
+        + offs_cn[None, :] * stride_cn
+    )
+    gl.amd.cdna4.buffer_store(
+        stored_value=c,
+        ptr=c_ptr,
+        offsets=c_offs,
+        mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N),
+    )
 
 
 @functools.lru_cache(maxsize=1024)
@@ -174,26 +426,14 @@ def batched_gemm_a8w8(
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
-    BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
-    BLOCK_SIZE_N = config["BLOCK_SIZE_N"]
-    BLOCK_SIZE_K = config["BLOCK_SIZE_K"]
-
-    num_warps = 16
-    assert XQ.element_size() == YQ.element_size()
+    num_warps = config["num_warps"]
+    assert XQ.element_size() == WQ.element_size()
     buffer_size = 16 // XQ.element_size()
-    assert buffer_size == 1
+    assert buffer_size == 16
 
-    elems_per_thread_mk = triton.cdiv(
-        BLOCK_SIZE_M * BLOCK_SIZE_K // (num_warps * threads_per_warp), buffer_size
-    )
-    size_per_thread_mk = [elems_per_thread_mk, buffer_size]
-
-    elems_per_thread_kn = triton.cdiv(
-        BLOCK_SIZE_K * BLOCK_SIZE_N // (num_warps * threads_per_warp), buffer_size
-    )
-    size_per_thread_kn = [elems_per_thread_kn, buffer_size]
-
-    threads_per_warp = [8, 8]
+    threads_per_warp = 64
+    threads_per_warp_m = 8
+    threads_per_warp_n = 8
 
     _batched_gemm_a8w8_kernel[grid](
         XQ,
@@ -218,10 +458,10 @@ def batched_gemm_a8w8(
         w_scale.stride(0),
         bias.stride(0) if has_bias else 0,
         has_bias,
-        SIZE_PER_THREAD_MK=size_per_thread_mk,
-        SIZE_PER_THREAD_KN=size_per_thread_kn,
+        BUFFER_SIZE=buffer_size,
         THREADS_PER_WARP=threads_per_warp,
-        num_warps=num_warps,
+        THREADS_PER_WARP_M=threads_per_warp_m,
+        THREADS_PER_WARP_N=threads_per_warp_n,
         **config,
     )
 
