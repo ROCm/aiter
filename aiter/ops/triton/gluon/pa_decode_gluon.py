@@ -480,7 +480,7 @@ def compile_ttgir_with_triton(ttgir_content: str):
     finally:
         os.unlink(ttgir_path)
 
-@perftest(num_iters=2, num_warmup=0)
+@perftest()
 # @perftest(num_iters=TEST_NUM_ITERS)
 def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     grid,
@@ -2784,7 +2784,7 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     num_query_heads = gl.num_programs(1) * QUERY_GRP_SZ
-    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    seq_len = gl.load(seq_lens_ptr + seq_idx)
     num_partitions = tl.cdiv(seq_len, SEQ_PARTITION_SZ)
     blocked_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread =[1, 2, 4],
