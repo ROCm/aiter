@@ -2752,7 +2752,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_load4(
 
     tl.store(logits_ptr + logits_offs, acc, mask=q_mask)
 
-@triton.jit
+@gluon.jit
 def _paged_attn_decode_v2_w_dot_reduce_kernel(
     out_ptr,        # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
     exp_sums_ptr,   # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
@@ -2781,16 +2781,24 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     """
     #TODO: Add Doc
     """
-    log2e: tl.constexpr = 1.4426950408889634
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     num_query_heads = gl.num_programs(1) * QUERY_GRP_SZ
     seq_len = tl.load(seq_lens_ptr + seq_idx)
     num_partitions = tl.cdiv(seq_len, SEQ_PARTITION_SZ)
+    blocked_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread =[1, 2, 4],
+        threads_per_warp=[4, 4, 4],
+        warps_per_cta   =[4, 1, 1],
+        order           =[2, 1, 0],
+    )
+    query_grp_sz_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, blocked_layout))
+    head_sz_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, blocked_layout))
+    seq_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, blocked_layout))
 
-    part_offs = tl.arange(0, MAX_NUM_SEQ_PARTITIONS_POW2)
-    q_grp_offs = tl.arange(0, QUERY_GRP_SZ_POW2)
-    head_offs = tl.arange(0, HEAD_SZ_POW2)
+    part_offs = gl.arange(0, MAX_NUM_SEQ_PARTITIONS_POW2, layout=seq_layout)
+    q_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=query_grp_sz_layout)
+    head_offs = gl.arange(0, HEAD_SZ_POW2, layout=head_sz_layout)
 
     # get global max logit
     exp_sums_offs = (
@@ -2804,21 +2812,21 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     )
 
     # max_logits: [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2]
-    max_logits = tl.load(
-        max_logits_ptr + exp_sums_offs, mask=exp_sums_mask, other=float("-inf")
+    max_logits = gl.amd.cdna3.buffer_load(
+        ptr=max_logits_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=float("-inf")
     )
     # max_logit: [QUERY_GRP_SZ_POW2]
     ml = tl.max(max_logits, axis=0)
 
     # Rescale the exp sums and compute the global sum
     # exp_sums: [MAX_NUM_SEQ_PARTITIONS, QUERY_GRP_SZ_POW2]
-    exp_sums = tl.load(exp_sums_ptr + exp_sums_offs, mask=exp_sums_mask, other=0.0)
+    exp_sums = gl.amd.cdna3.buffer_load(ptr=exp_sums_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=0.0)
     exp_sums *= tl.exp(max_logits - ml[None, :])
 
     # exp_sum: [QUERY_GRP_SZ_POW2]
     exp_sum = tl.sum(exp_sums, axis=0)
     if USE_SINKS:
-        M = tl.load(
+        M = gl.load(
             sink_ptr + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs),
             mask=(kv_head_idx * QUERY_GRP_SZ + q_grp_offs) < num_query_heads,
         )
@@ -2839,23 +2847,24 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     logits_mask = (part_offs[:, None] < num_partitions) & (
         q_grp_offs[None, :] < QUERY_GRP_SZ
     )
-    logits = tl.load(
-        logits_ptrs + logits_offset, mask=logits_mask[:, :, None], other=0.0
+    logits = gl.amd.cdna3.buffer_load(
+        ptr=logits_ptrs, offsets=logits_offset, mask=logits_mask[:, :, None], other=0.0
     )
 
     # out: [QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
-    out = tl.sum((logits * p).to(tl.float32), axis=0).to(out_ptr.dtype.element_ty)
-
+    out = tl.sum((logits * gl.convert_layout(p, layout=blocked_layout)).to(tl.float32), axis=0, keep_dims=True).to(out_ptr.dtype.element_ty)
     # store output
     out_offs = (
         seq_idx * stride_o_s
-        + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs[:, None]) * stride_o_h
-        + head_offs[None, :]
+        + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs[None, :, None]) * stride_o_h
+        + head_offs[None, None, :]
     )
-    tl.store(
-        out_ptr + out_offs,
-        out,
-        mask=(q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_offs[None, :] < HEAD_SZ),
+    # gl.static_print(out_offs)
+    gl.amd.cdna3.buffer_store(
+        stored_value=out,
+        ptr=out_ptr,
+        offsets=out_offs,
+        mask=(q_grp_offs[None, :, None] < QUERY_GRP_SZ) & (head_offs[None, None, :] < HEAD_SZ),
     )
 
 
@@ -3775,7 +3784,7 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
     q = (q * scale).to(compute_type)
 
     acc = tl.zeros([QUERY_GRP_SZ_POW2, HEAD_SZ_POW2], dtype=tl.float32)
-    max_logit = tl.zeros([QUERY_GRP_SZ_POW2], dtype=tl.float32) + float("-inf")
+    max_logit = tl.full([QUERY_GRP_SZ_POW2], dtype=tl.float32) + float("-inf")
     exp_sum = tl.zeros([QUERY_GRP_SZ_POW2], dtype=tl.float32)
 
     kv_offs = (
