@@ -2779,12 +2779,12 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     USE_SINKS: tl.constexpr
 ):
 
-    seq_idx = tl.program_id(0)
-    kv_head_idx = tl.program_id(1)
+    seq_idx = gl.program_id(0)
+    kv_head_idx = gl.program_id(1)
     num_query_heads = gl.num_programs(1) * QUERY_GRP_SZ
     seq_len = gl.load(seq_lens_ptr + seq_idx)
-    num_partitions = tl.cdiv(seq_len, SEQ_PARTITION_SZ)
-    if MAX_NUM_SEQ_PARTITIONS_POW2 >= 128:
+    num_partitions = gl.cdiv(seq_len, SEQ_PARTITION_SZ)
+    if MAX_NUM_SEQ_PARTITIONS_POW2 >= 256:
         blocked_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread =[1, 2, 4],
             threads_per_warp=[4, 4, 4],
