@@ -75,4 +75,5 @@ from .ops.mha import *
 from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
 from .ops.sample import *
+from .ops.mqa_logits import *
 from . import mla

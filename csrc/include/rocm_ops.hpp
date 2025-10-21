@@ -1185,3 +1185,6 @@
     pybind11::implicitly_convertible<int, ActivationType>();
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
+
+#define MQA_LOGITS_PYBIND \
+    m.def("paged_mqa_logits_metadata", &paged_mqa_logits_metadata);

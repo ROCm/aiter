@@ -36,6 +36,7 @@
 #include "rope.h"
 #include "smoothquant.h"
 #include "sample.h"
+#include "paged_mqa_logits_metadata.h"
 #include <torch/extension.h>
 
 // #include "torch/mha_batch_prefill.h"
