@@ -64,11 +64,6 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
         **config,
     )
 
-    for k, v in dump_kernel.asm.items():
-        if type(v) is str:
-            with open(f"kernel_{k}.s", "w") as f:
-                f.write(v)
-
 
 def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
     q_fp8: torch.Tensor,  # dtype = float8
@@ -260,8 +255,3 @@ def deepgemm_fp8_paged_mqa_logits(
             waves_per_eu=WavePerEU,
             **config,
         )
-
-    for k, v in dump_kernel.asm.items():
-        if type(v) is str:
-            with open(f"kernel_{k}.s", "w") as f:
-                f.write(v)
