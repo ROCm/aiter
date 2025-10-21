@@ -182,7 +182,6 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                              DsLayout,
                                              ELayout,
                                              CDEElementWise,
-                                             CodegenPipelineProblem::kBlockSize,
                                              TilePartitioner::MPerBlock,
                                              TilePartitioner::NPerBlock,
                                              FlatmmConfig::M_Warp,
@@ -286,7 +285,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
         // else
         // {
         ave_time = ck_tile::launch_kernel(s,
-                                          ck_tile::make_kernel<blocks.x, FlatmmConfig::kBlockPerCu>(
+                                          ck_tile::make_kernel<FlatmmConfig::kBlockPerCu>(
                                               Kernel{}, grids, blocks, 0, kargs));
         // }
         // return ave_time;
