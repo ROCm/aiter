@@ -235,20 +235,22 @@ def run_benchmark(args: argparse.Namespace):
             #     block_tables,
             #     max_model_len,
             # )
-            preshuffle_kv_cache_fp8 = shuffle_weight(split_kv_cache_fp8.view([num_blocks, blocksize, index_dim]))
+            Preshuffle = blocksize == 16
+            split_kv_cache_fp8 = shuffle_weight(split_kv_cache_fp8.view([num_blocks, blocksize, index_dim])) if Preshuffle else split_kv_cache_fp8
 
             _, elapsed_us = run_perftest(
                 deepgemm_fp8_paged_mqa_logits,
                 q_fp8,
-                preshuffle_kv_cache_fp8,
+                split_kv_cache_fp8,
                 split_kv_cache_scale,
                 weights,
                 out_logits,
                 context_lens,
                 block_tables,
                 max_model_len,
+                max_block_len,
                 ChunkK=ChunkK,
-                Preshuffle=True,
+                Preshuffle=Preshuffle,
                 KVBlockSize=blocksize,
             )
         else:
@@ -300,8 +302,6 @@ def run_benchmark(args: argparse.Namespace):
 
         total_float_operations = 2 * next_n * heads * index_dim * context_lens.float().sum().item()
         flops = total_float_operations / elapsed_us * 1e-6
-
-        ctx_list = context_lens.tolist()
 
         print(
             kv_storage_kind,

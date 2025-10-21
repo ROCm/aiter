@@ -186,6 +186,7 @@ def deepgemm_fp8_paged_mqa_logits(
     context_lens: torch.Tensor,
     kv_indices: torch.Tensor,
     max_model_len: int,
+    max_block_len: int,
     Preshuffle: bool = False,
     KVBlockSize: int = 1,
     ChunkK: int = 256,
@@ -230,6 +231,7 @@ def deepgemm_fp8_paged_mqa_logits(
             out_logits,
             out_logits.stride(0),
             max_model_len,
+            max_block_len,
             waves_per_eu=WavePerEU,
             **config,
         )
@@ -254,6 +256,7 @@ def deepgemm_fp8_paged_mqa_logits(
             out_logits,
             out_logits.stride(0),
             max_model_len,
+            max_block_len,
             waves_per_eu=WavePerEU,
             **config,
         )

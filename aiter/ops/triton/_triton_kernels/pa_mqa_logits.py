@@ -362,6 +362,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     OutLogits_buffer,
     stride_out_batch,
     max_model_len,
+    max_block_len,
     ChunkQ: tl.constexpr,
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
@@ -440,12 +441,12 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     mask_kv_scale_next = split_context_start - residual_context + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)) >= 0
     context_kv_idx_next = gl.amd.cdna3.buffer_load(
         ptr=kv_indices,
-        offsets=split_context_start - residual_context + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv)),
+        offsets=pid_batch * max_block_len + split_context_start - residual_context + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv)),
         mask=mask_kv_next,
     )
     context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
         ptr=kv_indices,
-        offsets=split_context_start - residual_context + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)),
+        offsets=pid_batch * max_block_len + split_context_start - residual_context + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)),
         mask=mask_kv_scale_next,
     )
 
@@ -466,11 +467,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
 
         context_kv_idx_next = gl.amd.cdna3.buffer_load(
             ptr=kv_indices,
-            offsets=context_idx + ChunkK + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv)),
+            offsets=pid_batch * max_block_len + context_idx + ChunkK + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv)),
         )
         context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
             ptr=kv_indices,
-            offsets=context_idx + ChunkK + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)),
+            offsets=pid_batch * max_block_len + context_idx + ChunkK + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)),
         )
 
         #!=----------------------------
@@ -551,6 +552,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     OutLogits_buffer,
     stride_out_batch,
     max_model_len,
+    max_block_len,
     ChunkQ: tl.constexpr,
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
@@ -634,12 +636,14 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     mask_kv_scale_next = split_context_start - residual_context + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)) >= 0
     context_kv_idx_next = gl.amd.cdna3.buffer_load(
         ptr=kv_indices,
-        offsets=(split_context_start - residual_context) // KVBlockSize + gl.arange(0, KVBlocks, layout_kv_table),
+        offsets=pid_batch * max_block_len + (split_context_start - residual_context) // KVBlockSize + gl.arange(0, KVBlocks, layout_kv_table),
         # mask=mask_kv_next,
     )
     context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
         ptr=kv_indices,
-        offsets=(split_context_start - residual_context) // KVBlockSize + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)) // KVBlockSize,
+        offsets=pid_batch * max_block_len
+        + (split_context_start - residual_context) // KVBlockSize
+        + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)) // KVBlockSize,
         # mask=mask_kv_scale_next,
     )
 
@@ -667,11 +671,13 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
         context_kv_idx_next = gl.amd.cdna3.buffer_load(
             ptr=kv_indices,
-            offsets=(context_idx + ChunkK) // KVBlockSize + gl.arange(0, KVBlocks, layout_kv_table),
+            offsets=pid_batch * max_block_len + (context_idx + ChunkK) // KVBlockSize + gl.arange(0, KVBlocks, layout_kv_table),
         )
         context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
             ptr=kv_indices,
-            offsets=(context_idx + ChunkK) // KVBlockSize + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)) // KVBlockSize,
+            offsets=pid_batch * max_block_len
+            + (context_idx + ChunkK) // KVBlockSize
+            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)) // KVBlockSize,
         )
 
         #!=----------------------------
