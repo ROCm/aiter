@@ -220,7 +220,7 @@ void mla_decode_stage1_asm_fwd(
                         assert(kv_scale.value().data_ptr() != nullptr);
                         args.ptr_KVSCALE = kv_scale.value().data_ptr();
                         static AiterAsmKernel impl_a16w8_bf16_ps(
-                            "_ZN5aiter42mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_psE",
+                            "_ZN5aiter41mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_psE",
                             "/mla/mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_ps.co");
                         impl_ptr = &impl_a16w8_bf16_ps;
                     }
@@ -271,7 +271,35 @@ void mla_decode_stage1_asm_fwd(
             }
             else
             {
-                TORCH_CHECK(false, __func__, ":only support persistent fp8 mla");
+                if(max_seqlen_q == 1)
+                {
+                    sub_Q = 128;
+                    static AiterAsmKernel impl_fp8(
+                        "_ZN5aiter33mla_a8w8_qh16_qseqlen1_gqaratio16E",
+                        "/mla/mla_a8w8_qh16_qseqlen1_gqaratio16.co");
+                    impl_ptr = &impl_fp8;
+                }
+                else if(max_seqlen_q == 2)
+                {
+                    sub_Q = 128;
+                    static AiterAsmKernel impl_fp8(
+                        "_ZN5aiter33mla_a8w8_qh16_qseqlen2_gqaratio16E",
+                        "/mla/mla_a8w8_qh16_qseqlen2_gqaratio16.co");
+                    impl_ptr = &impl_fp8;
+                }
+                else if(max_seqlen_q <= 4)
+                {
+                    // assert(false);
+                    sub_Q = 128;
+                    static AiterAsmKernel impl_fp8(
+                        "_ZN5aiter33mla_a8w8_qh16_qseqlen4_gqaratio16E",
+                        "/mla/mla_a8w8_qh16_qseqlen4_gqaratio16.co");
+                    impl_ptr = &impl_fp8;
+                }
+                else
+                {
+                    TORCH_CHECK(false, __func__, ":only support fp8 mla decoding for qo_len <= 4");
+                }
             }
         }
         else if(gqa_ratio == 128)
