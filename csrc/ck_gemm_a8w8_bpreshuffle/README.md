@@ -19,7 +19,7 @@ You can find the results of this tuning in `aiter/configs/a8w8_bpreshuffle_tuned
     |80        |128  |1536 |7168 |torch.float8_e4m3fnuz|23          |0         |32.99 |xxxxxxxx      |
 
     `cu_num` means the number of compute units, and it is used to distinguish between graphics.
-    `q_dtype_w` means the quantization data type of weight, and it is used to distinguish between different quantization data types.
+    `q_dtype_w` means the quantization data type of weight, and it is used to distinguish between different quantization data types. support torch.int8 and fp8
 
 4. Build tuned kernels and test:
 Test the performance, modify the test instance in `op_tests/test_gemm_a8w8.py` and run it, please wait a few minutes as it will build gemm_a8w8 tuned kernels in `aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv` via jit:
