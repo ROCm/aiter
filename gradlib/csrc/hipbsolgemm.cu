@@ -79,6 +79,75 @@ namespace
     }
   };
 
+  // Scaling type enumeration for Per-Token-Per-Channel support
+  enum class ScalingType {
+    TensorWise,  // Scalar scaling (single value)
+    RowWise,     // Vector scaling (per-token-per-channel)
+    Error
+  };
+
+  // Helper function to determine scaling type based on scale tensor dimensions
+  ScalingType get_scaling_type(
+      const torch::Tensor& scale_a,
+      const torch::Tensor& scale_b,
+      int64_t dim_m,
+      int64_t dim_n) {
+    // Both Per-Tensor and Row-wise scaling expect fp32 tensors
+    TORCH_CHECK(
+        scale_a.scalar_type() == at::kFloat && scale_b.scalar_type() == at::kFloat,
+        "Both scale_a and scale_b must be float (fp32) tensors.");
+
+    // Check the singular scale case for per-tensor scaling
+    if (scale_a.numel() == 1 && scale_b.numel() == 1) {
+      return ScalingType::TensorWise;
+    }
+
+    // For non-TensorWise scaling, enforce 2D input tensors
+    TORCH_CHECK(
+        scale_a.dim() == 2 && scale_b.dim() == 2,
+        "For non-TensorWise scaling, scale tensors must be 2-dimensional, "
+        "but got scale_a.dim()=",
+        scale_a.dim(),
+        " and scale_b.dim()=",
+        scale_b.dim());
+
+    // Check for RowWise scaling
+    if (scale_a.size(0) == dim_m && scale_a.size(1) == 1 &&
+        scale_b.size(0) == 1 && scale_b.size(1) == dim_n) {
+#if defined(HIPBLASLT_VEC_EXT) || defined(HIPBLASLT_OUTER_VEC)
+      TORCH_CHECK(
+          scale_a.is_contiguous() && scale_b.is_contiguous(),
+          "Both scale_a and scale_b must be contiguous for RowWise scaling.");
+      return ScalingType::RowWise;
+#else
+      TORCH_CHECK(false, "Per-row scaling is not supported for this platform!");
+      return ScalingType::Error;
+#endif
+    }
+
+    // If we reach here, the input doesn't match any valid scaling type
+    TORCH_CHECK(
+        false,
+        "Invalid scaling configuration. For TensorWise scaling, both scales should be scalar. "
+        "For RowWise scaling, scale_a should be (",
+        dim_m,
+        ", 1) and scale_b should be (1, ",
+        dim_n,
+        "). "
+        "Got scale_a.size()=(",
+        scale_a.size(0),
+        ", ",
+        scale_a.size(1),
+        ") and ",
+        "scale_b.size()=(",
+        scale_b.size(0),
+        ", ",
+        scale_b.size(1),
+        ")");
+
+    return ScalingType::Error;
+  }
+
   // std::map<std::tuple<int, int, int, int, int, int>,
   // std::vector<hipblasLtMatmulHeuristicResult_t>> heuristic_map;
   std::map<MatMulConfig, hipblasLtMatmulHeuristicResult_t> heuristic_map;
@@ -113,7 +182,7 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(
     const void *b, int ldb, const void *beta, void *c, int ldc,
     const void *bias, hipDataType intype, hipDataType outtype,
     const void *scaleA, const void *scaleB, const void *scaleC,
-    hipStream_t &stream)
+    hipStream_t &stream, bool use_rowwise = false)
 {
   int flag{0};
   hipblasLtMatrixLayout_t matA, matB, matC;
@@ -151,18 +220,49 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(
         matmul, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
   }
 
+  // Configure scaling attributes based on scaling type
   if (scaleA != nullptr)
   {
+    hipblasLtMatmulDescAttributes_t matmulDescA = HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER;
+#if defined(HIPBLASLT_OUTER_VEC)
+    // Use newer OUTER_VEC mode for vector scaling if available
+#elif defined(HIPBLASLT_VEC_EXT)
+    if (use_rowwise) {
+      matmulDescA = HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER_VEC_EXT;
+    }
+#endif
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
-        matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleA,
-        sizeof(scaleA)));
+        matmul, matmulDescA, &scaleA, sizeof(scaleA)));
   }
+
   if (scaleB != nullptr)
   {
+    hipblasLtMatmulDescAttributes_t matmulDescB = HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER;
+#if defined(HIPBLASLT_OUTER_VEC)
+    // Use newer OUTER_VEC mode for vector scaling if available
+#elif defined(HIPBLASLT_VEC_EXT)
+    if (use_rowwise) {
+      matmulDescB = HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER_VEC_EXT;
+    }
+#endif
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
-        matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleB,
-        sizeof(scaleB)));
+        matmul, matmulDescB, &scaleB, sizeof(scaleB)));
   }
+
+#if defined(HIPBLASLT_OUTER_VEC)
+  // Set scale mode to OUTER_VEC for newer hipBLASLt versions
+  if (use_rowwise && scaleA != nullptr) {
+    auto scaleMode = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scaleMode, sizeof(scaleMode)));
+  }
+  if (use_rowwise && scaleB != nullptr) {
+    auto scaleMode = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scaleMode, sizeof(scaleMode)));
+  }
+#endif
+
   if (scaleC != nullptr)
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
@@ -214,7 +314,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
     const void *scaleA, const void *b, int ldb, const void *scaleB,
     const void *beta, void *c, int ldc, const void *scaleC, const void *bias,
     hipDataType intype, hipDataType outtype, hipStream_t &stream,
-    int solution_index = -1, bool bpreshuffle = false)
+    int solution_index = -1, bool bpreshuffle = false, bool use_rowwise = false)
 {
   // TODO: flag is not supported for hipblasLt yet
   int flag{0};
@@ -269,18 +369,52 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
       matmul, HIPBLASLT_MATMUL_DESC_TRANSA, &op_A, sizeof(int32_t)));
   CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
       matmul, HIPBLASLT_MATMUL_DESC_TRANSB, &op_B, sizeof(int32_t)));
+
+  // Configure scaling attributes based on scaling type
   if (scaleA != nullptr)
   {
+    hipblasLtMatmulDescAttributes_t matmulDescA = HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER;
+#if defined(HIPBLASLT_OUTER_VEC)
+    // Use newer OUTER_VEC mode for vector scaling if available
+    // This case is handled below after setting the pointer
+#elif defined(HIPBLASLT_VEC_EXT)
+    if (use_rowwise) {
+      matmulDescA = HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER_VEC_EXT;
+    }
+#endif
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
-        matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleA,
-        sizeof(scaleA)));
+        matmul, matmulDescA, &scaleA, sizeof(scaleA)));
   }
+
   if (scaleB != nullptr)
   {
+    hipblasLtMatmulDescAttributes_t matmulDescB = HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER;
+#if defined(HIPBLASLT_OUTER_VEC)
+    // Use newer OUTER_VEC mode for vector scaling if available
+    // This case is handled below after setting the pointer
+#elif defined(HIPBLASLT_VEC_EXT)
+    if (use_rowwise) {
+      matmulDescB = HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER_VEC_EXT;
+    }
+#endif
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
-        matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleB,
-        sizeof(scaleB)));
+        matmul, matmulDescB, &scaleB, sizeof(scaleB)));
   }
+
+#if defined(HIPBLASLT_OUTER_VEC)
+  // Set scale mode to OUTER_VEC for newer hipBLASLt versions
+  if (use_rowwise && scaleA != nullptr) {
+    auto scaleMode = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scaleMode, sizeof(scaleMode)));
+  }
+  if (use_rowwise && scaleB != nullptr) {
+    auto scaleMode = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scaleMode, sizeof(scaleMode)));
+  }
+#endif
+
   if (scaleC != nullptr)
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
@@ -433,14 +567,30 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
   int64_t result_ld = result.stride(transpose_result ? 0 : 1);
 
   void *d_scaleA = nullptr, *d_scaleB = nullptr, *d_scaleOut = nullptr;
-  if (scaleA.has_value())
+  bool use_rowwise = false;
+
+  // Determine scaling type if scales are provided
+  if (scaleA.has_value() && scaleB.has_value())
+  {
+    // Get the scaling type based on dimensions
+    ScalingType scaling_choice = get_scaling_type(
+        scaleA.value(), scaleB.value(), mat1_sizes[0], mat2_sizes[1]);
+    TORCH_CHECK(scaling_choice != ScalingType::Error, "Scaling type not supported");
+
+    use_rowwise = (scaling_choice == ScalingType::RowWise);
+
+    d_scaleA = static_cast<void *>(scaleA.value().data_ptr());
+    d_scaleB = static_cast<void *>(scaleB.value().data_ptr());
+  }
+  else if (scaleA.has_value())
   {
     d_scaleA = static_cast<void *>(scaleA.value().data_ptr());
   }
-  if (scaleB.has_value())
+  else if (scaleB.has_value())
   {
     d_scaleB = static_cast<void *>(scaleB.value().data_ptr());
   }
+
   if (scaleOut.has_value())
   {
     d_scaleOut = static_cast<void *>(scaleOut.value().data_ptr());
@@ -463,7 +613,7 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
       transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k, &one, ptrA,
       mat1_ld, d_scaleA, ptrB, mat2_ld, d_scaleB, &zero, ptrC, result_ld,
       d_scaleOut, bias_ptr, hipblasInType, hipblasOutType, current_stream,
-      solution_index, bpreshuffle_flag));
+      solution_index, bpreshuffle_flag, use_rowwise));
 
   return result;
 }
@@ -567,11 +717,22 @@ std::vector<int> hipb_findallsols(
   auto scaleC_ptr =
       scaleC.has_value() ? static_cast<void *>(scaleC.value().data_ptr()) : nullptr;
 
+  // Determine scaling type if scales are provided
+  bool use_rowwise = false;
+  if (scaleA.has_value() && scaleB.has_value())
+  {
+    // Get the scaling type based on dimensions (using original mat1/mat2 sizes)
+    ScalingType scaling_choice = get_scaling_type(
+        scaleA.value(), scaleB.value(), mat1.size(0), mat2.size(1));
+    TORCH_CHECK(scaling_choice != ScalingType::Error, "Scaling type not supported");
+    use_rowwise = (scaling_choice == ScalingType::RowWise);
+  }
+
   return hipblasLtMatmul_findallsols_wrapper(
       hipblaslt_handle, transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
       transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k, &one, ptrA,
       mat1_ld, ptrB, mat2_ld, &zero, ptrC, result_ld, bias_ptr, hipblasInType,
-      hipblasOutType, scaleA_ptr, scaleB_ptr, scaleC_ptr, current_stream);
+      hipblasOutType, scaleA_ptr, scaleB_ptr, scaleC_ptr, current_stream, use_rowwise);
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
