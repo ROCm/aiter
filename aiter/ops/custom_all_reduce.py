@@ -42,6 +42,15 @@ def all_gather_unreg(
     _fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
 ) -> None: ...
 
+@compile_ops("module_custom_all_reduce")
+def fused_allreduce_rmsnorm_reg(_fa: int, inp: torch.Tensor, out: torch.Tensor, w: torch.Tensor, eps: float) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def fused_allreduce_rmsnorm_unreg(
+    _fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor, w: torch.Tensor, eps: float
+) -> None: ...
+
 
 def all_reduce_asm_fake_tensor(
     inp: torch.Tensor,

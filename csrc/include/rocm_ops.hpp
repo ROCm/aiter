@@ -290,6 +290,23 @@
           py::arg("inp"),                                                                      \
           py::arg("reg_buffer"),                                                               \
           py::arg("out"));                                                                     \
+    m.def("fused_allreduce_rmsnorm_reg",                                                                    \
+          &aiter::fused_allreduce_rmsnorm_reg,                                                              \
+          "fused_allreduce_rmsnorm_reg(int fa, Tensor inp, Tensor! out, Tensor w, float eps) -> ()",        \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("out"),                                                                      \
+          py::arg("w"),                                                          \
+          py::arg("eps"));\
+    m.def("fused_allreduce_rmsnorm_unreg",                                                                  \
+          &aiter::fused_allreduce_rmsnorm_unreg,                                                            \
+          "fused_allreduce_rmsnorm_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out, Tensor w, float eps) -> ()",        \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("reg_buffer"),                                                               \
+          py::arg("out"),                                                                     \
+          py::arg("w"), \
+          py::arg("eps"));\
     m.def("all_reduce_asm_", &all_reduce_asm, "");                                             \
     m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");                   \
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \

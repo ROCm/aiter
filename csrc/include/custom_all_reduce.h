@@ -31,6 +31,8 @@ void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
                       torch::Tensor &out);
 void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
 void all_gather_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out);
+void fused_allreduce_rmsnorm_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, torch::Tensor& w, float eps);
+void fused_allreduce_rmsnorm_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out, torch::Tensor& w, float eps);
 
 void dispose(fptr_t _fa);
 int64_t meta_size();

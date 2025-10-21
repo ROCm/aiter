@@ -873,6 +873,232 @@ namespace aiter
     }
   }
 
+  // fused allreduce rmsnorm first step
+  template <typename T, int ngpus>
+  __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_save(
+      RankData* _dp,
+      RankSignals sg,
+#ifndef USE_ROCM
+      volatile
+#endif
+      Signal* self_sg,
+      int rank,
+      int size
+  )
+  {
+    constexpr int pack_size = packed_t<T>::P::size;
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    using P = typename packed_t<T>::P;
+    using A = typename packed_t<T>::A;
+    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
+    int warp_id = threadIdx.x / tnum_gpu;
+    int lane_id = threadIdx.x % tnum_gpu;
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
+#pragma unroll
+    for (int i = 0; i < ngpus; ++i)
+    {
+      int target = (rank + i) % ngpus;
+      ptrs[i] = (const P*)_dp->ptrs[target];
+      tmps[target] = get_tmp_buf<P>(sg.signals[target]);
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    // the case of fused_allreduce_rmsnorm does not need thread level boundary check
+    int part = size / (pack_size * tnum_gpu) / ngpus;
+    for (int bid = blockIdx.x; bid < part; bid += gridDim.x)
+    {
+      // cross device read by all warp
+      *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][(rank * part + bid) * tnum_gpu + lane_id];
+      __syncthreads();
+      // calculate and save in first warp
+      if (warp_id == 0)
+      {
+        A add_reg;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          add_reg.data[i] = ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
+        }
+#pragma unroll
+        for (int i = i; i < ngpus; ++i)
+        {
+#pragma unroll
+          for (int j = 0; j < pack_size; ++j)
+          {
+            add_reg.data[j] += ck_tile::type_convert<float>(tmp_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
+          }
+        }
+        P write_reg;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+        }
+        // cross device save
+#pragma unroll
+        for (int i = 0; i < ngpus; ++i)
+        {
+          tmps[i][(rank * part + bid) * tnum_gpu + lane_id] = write_reg;
+        }
+      }
+    }
+  }
+
+  template <int reduce_range>
+  DINLINE void smemReduceSum(float* smem_addr)
+  {
+    // a warp executes the same instruction
+#pragma unroll
+    for (int stride = reduce_range / 2; stride > 32; stride >>= 1)
+    {
+      if (threadIdx.x < stride)
+      {
+        smem_addr[threadIdx.x] += smem_addr[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    volatile float* v_smem = &smem_addr[0];
+    if (threadIdx.x < 32)
+    {
+      v_smem[threadIdx.x] += v_smem[threadIdx.x + 32];
+      v_smem[threadIdx.x] += v_smem[threadIdx.x + 16];
+      v_smem[threadIdx.x] += v_smem[threadIdx.x + 8];
+      v_smem[threadIdx.x] += v_smem[threadIdx.x + 4];
+      v_smem[threadIdx.x] += v_smem[threadIdx.x + 2];
+      v_smem[threadIdx.x] += v_smem[threadIdx.x + 1];
+    }
+    __syncthreads();
+  }
+
+  /*
+   * input case n dim should be divided by 4096 with dtype bf16
+   * and should be divided by 2048 with dtype fp32
+   * */
+  template <typename T, int ngpus, int tnum, int n_loop>
+  __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm_4096n_naive(
+      RankSignals sg,
+      T* __restrict__ results,
+      T* __restrict__ weight,
+      float eps,
+      int rank,
+      int m,
+      int n
+  )
+  {
+    constexpr int pack_size = packed_t<T>::P::size;
+    using P = typename packed_t<T>::P;
+    using A = typename packed_t<T>::A;
+    __shared__ float smem[tnum];
+    P* tmps = get_tmp_buf<P>(sg.signals[rank]);
+
+    for (int bid = blockIdx.x; bid < m; bid += gridDim.x)
+    {
+      float square_sum = 0.0f;
+      P rmsnorm_inp[n_loop];
+      P w_arr[n_loop];
+#pragma unroll
+      for (int n_iter = 0; n_iter < n_loop; ++n_iter)
+      {
+        int read_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
+        rmsnorm_inp[n_iter] = tmps[read_idx];
+        w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * blockDim.x + threadIdx.x);
+        A reduce_pack;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          float ar_elem = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
+          reduce_pack.data[i] = ar_elem * ar_elem;
+        }
+        square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+      }
+      smem[threadIdx.x] = square_sum;
+      __syncthreads();
+      smemReduceSum<tnum>(&smem[0]);
+      square_sum = smem[0];
+      float denom = rsqrtf(square_sum / n + eps);
+#pragma unroll
+      for (int n_iter = 0; n_iter < n_loop; ++n_iter)
+      {
+        P rmsnorm_rslt;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          float x_f32 = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
+          float w_f32 = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+          rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
+        }
+        int write_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
+        *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
+      }
+    }
+  }
+
+  template <typename T, int ngpus, int tnum, int n_loop>
+  __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm_4096n(
+      RankSignals sg,
+      T* __restrict__ results,
+      T* __restrict__ weight,
+      float eps,
+      int rank,
+      int m,
+      int n
+  )
+  {
+    constexpr int pack_size = packed_t<T>::P::size;
+    using P = typename packed_t<T>::P;
+    using A = typename packed_t<T>::A;
+    __shared__ float smem[tnum];
+    P* tmps = get_tmp_buf<P>(sg.signals[rank]);
+
+    for (int bid = blockIdx.x; bid < m; bid += gridDim.x)
+    {
+      float square_sum = 0.0f;
+      P rmsnorm_inp[n_loop];
+      P w_arr[n_loop];
+#pragma unroll
+      for (int n_iter = 0; n_iter < n_loop; ++n_iter)
+      {
+        if (n_iter * tnum + threadIdx.x < (n / pack_size))
+        {
+          int read_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
+          rmsnorm_inp[n_iter] = tmps[read_idx];
+          w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
+          A reduce_pack;
+#pragma unroll
+          for (int i = 0; i < pack_size; ++i)
+          {
+            float ar_elem = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
+            reduce_pack.data[i] = ar_elem * ar_elem;
+          }
+          square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+        }
+      }
+      smem[threadIdx.x] = square_sum;
+      __syncthreads();
+      smemReduceSum<tnum>(&smem[0]);
+      square_sum = smem[0];
+      float denom = rsqrtf(square_sum / n + eps);
+#pragma unroll
+      for (int n_iter = 0; n_iter < n_loop; ++n_iter)
+      {
+        if (n_iter * tnum + threadIdx.x < (n / pack_size))
+        {
+          P rmsnorm_rslt;
+#pragma unroll
+          for (int i = 0; i < pack_size; ++i)
+          {
+            float x_f32 = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
+            float w_f32 = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+            rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
+          }
+          int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
+          *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
+        }
+      }
+    }
+  }
+
   using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
   static_assert(sizeof(IPC_KEY) == sizeof(hipIpcMemHandle_t));
   static_assert(alignof(IPC_KEY) == alignof(hipIpcMemHandle_t));
@@ -1291,6 +1517,27 @@ namespace aiter
           printf("allgather world_size error\n");
       }
     }
+  }
+
+  template <typename T>
+  void dispatchFusedAllReduceRMSNorm(hipStream_t stream, T* input, T* output, T* weight, float eps, int m, int n)
+  {
+    auto d = packed_t<T>::P::size;
+    int size = m * n;
+    if (size % d != 0)
+    {
+      throw std::runtime_error(
+          "custom allreduce currently requires input length to be multiple "
+          "of " +
+          std::to_string(d));
+    }
+    RankData* ptrs = get_buffer_RD(stream, input);
+    dim3 block(512);
+    int block_num = ((size / 8) + 512 - 1) / 512;
+    dim3 grid(std::min(block_num, 80));
+    reduce_scatter_cross_device_save<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+    grid.x = m;
+    local_device_load_rmsnorm_4096n_naive<T, 8, 512, 2><<<grid, block, 0, stream>>>(sg_, output, weight, eps, rank_, m, n);
   }
 
   ~CustomAllreduce()

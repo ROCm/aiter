@@ -29,6 +29,8 @@ def tensor_model_parallel_all_reduce(
     """All-reduce the input tensor across model parallel group."""
     return get_tp_group().all_reduce(input_, open_fp8_quant)
 
+def tensor_model_parallel_fused_allreduce_rmsnorm(input_: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    return get_tp_group().fused_allreduce_rmsnorm(input_, w, eps)
 
 def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().custom_all_gather(input_)

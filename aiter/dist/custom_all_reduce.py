@@ -345,6 +345,29 @@ class CustomAllreduce:
         else:
             return self.all_gather_unreg(inp)
 
+    def fused_ar_rmsnorm_reg(self, inp: torch.Tensor, weight: torch.Tensor, eps: float, out: torch.Tensor = None):
+        if out is None:
+            out = torch.empty_like(inp)
+        ops.fused_allreduce_rmsnorm_reg(self._ptr, inp, out, weight, eps)
+        return out
+
+    def fused_ar_rmsnorm_unreg(self, inp: torch.Tensor, weight: torch.Tensor, eps: float, out: torch.Tensor = None):
+        if out is None:
+            out = torch.empty_like(inp)
+        ops.fused_allreduce_rmsnorm_unreg(self._ptr, inp, self.buffer, out, weight, eps)
+        return out
+
+    def custom_fused_ar_rmsnorm(self, input: torch.Tensor, weight: torch.Tensor, eps: float) -> Optional[torch.Tensor]:
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_ar_rmsnorm_reg(input, weight, eps)
+            else:
+                return torch.empty_like(input)
+        else:
+            return self.fused_ar_rmsnorm_unreg(input, weight, eps)
+
     def close(self):
         if not self.disabled and self._ptr:
             ops.dispose(self._ptr)

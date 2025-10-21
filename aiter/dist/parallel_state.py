@@ -136,6 +136,13 @@ if supports_custom_op():
             raise ValueError(f"Group {group_name} is destroyed.")
         return group._all_gather_out_place(input)
 
+    def outplace_fused_allreduce_rmsnorm(input: torch.Tensor, w: torch.Tensor, eps: float, group_name: str) -> torch.Tensor:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        return group._fused_allreduce_rmsnorm_out_place(input, w, eps)
+
     @outplace_all_reduce.register_fake
     def _(
         tensor: torch.Tensor,
@@ -433,6 +440,17 @@ class GroupCoordinator:
             ipex.distributed.all_reduce(input_, group=self.device_group)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
+
+    def fused_allreduce_rmsnorm(self, input_: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        return outplace_fused_allreduce_rmsnorm(input_, weight, eps, group_name=self.unique_name)
+
+    def _fused_allreduce_rmsnorm_out_place(self, input_: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        ca_comm = self.ca_comm
+        assert ca_comm is not None
+        assert not ca_comm.disabled
+        out = ca_comm.custom_fused_ar_rmsnorm(input_, weight, eps)
+        assert out is not None
+        return out
 
     def _all_gather_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         ca_comm = self.ca_comm
