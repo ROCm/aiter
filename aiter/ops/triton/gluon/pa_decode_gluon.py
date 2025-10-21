@@ -2778,20 +2778,26 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr,
     USE_SINKS: tl.constexpr
 ):
-    """
-    #TODO: Add Doc
-    """
+
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     num_query_heads = gl.num_programs(1) * QUERY_GRP_SZ
     seq_len = gl.load(seq_lens_ptr + seq_idx)
     num_partitions = tl.cdiv(seq_len, SEQ_PARTITION_SZ)
-    blocked_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread =[1, 2, 4],
-        threads_per_warp=[4, 4, 4],
-        warps_per_cta   =[4, 1, 1],
-        order           =[2, 1, 0],
-    )
+    if MAX_NUM_SEQ_PARTITIONS_POW2 >= 128:
+        blocked_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread =[1, 2, 4],
+            threads_per_warp=[4, 4, 4],
+            warps_per_cta   =[4, 1, 1],
+            order           =[2, 1, 0],
+        )
+    else:
+        blocked_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread =[4, 1, 2],
+            threads_per_warp=[4, 4, 4],
+            warps_per_cta   =[1, 1, 4],
+            order           =[2, 1, 0],
+        )
     query_grp_sz_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, blocked_layout))
     head_sz_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, blocked_layout))
     seq_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, blocked_layout))
