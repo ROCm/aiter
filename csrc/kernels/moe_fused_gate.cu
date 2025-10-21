@@ -64,6 +64,132 @@ __device__ inline bool cmp_gt(const T& a, const T& b)
     }
 }
 
+// Chunked device implementation: scans per-thread VPT in bounded chunks to avoid
+// allocating large per-thread temporaries. This implementation is targeted at the
+// corner-case where per-thread VPT > MAX_VPT but topk==1.
+template <typename T, typename Params>
+__device__ void moe_fused_gate_flat_impl(void* input,
+                                           void* bias,
+                                           float* output_ptr,
+                                           int32_t* indices_ptr,
+                                           int64_t num_rows,
+                                           double routed_scaling_factor,
+                                           Params params)
+{
+    constexpr int topk = 1;
+
+    int tidx           = threadIdx.x;
+    int64_t thread_row = blockIdx.x * params.ROWS_PER_CTA + threadIdx.y * params.ROWS_PER_WARP +
+                         tidx / params.THREADS_PER_ROW;
+    if(thread_row >= num_rows)
+    {
+        return;
+    }
+
+    // For the single-thread-per-row / topk==1 fallback we don't need shared memory
+    // scratch. We'll write indices and outputs directly.
+
+    auto* input_ptr      = reinterpret_cast<T*>(input);
+    auto* bias_ptr       = reinterpret_cast<T*>(bias);
+    auto* thread_row_ptr = input_ptr + thread_row * params.NUM_EXPERTS;
+
+    int thread_group_idx         = tidx % params.THREADS_PER_ROW;
+    int first_elt_read_by_thread = thread_group_idx * params.VPT;
+
+    // Compute local best (only top-1) across params.VPT using chunked loads
+    float best_val = -FLT_MAX;
+    int best_idx   = -1;
+    float best_row = 0.0f;
+
+        // Double-buffered 32-byte vector loads to better hide memory latency.
+        // vec_size32 = number of T elements per 32 bytes (e.g., float -> 8, half -> 16)
+        constexpr int vec_size32 = 32 / sizeof(T);
+        using Vec32T = ck_tile::vec_t<T, vec_size32>;
+
+        int nvec = params.VPT / vec_size32;
+        int rem  = params.VPT % vec_size32;
+
+        if(nvec > 0)
+        {
+            // prefetch first
+            int base0 = first_elt_read_by_thread;
+            const Vec32T* vptr0 = reinterpret_cast<const Vec32T*>(thread_row_ptr + base0);
+            const Vec32T* bptr0 = reinterpret_cast<const Vec32T*>(bias_ptr + base0);
+            Vec32T cur_v = *vptr0;
+            Vec32T cur_b = *bptr0;
+
+            for(int vi = 1; vi < nvec; ++vi)
+            {
+                int next_base = first_elt_read_by_thread + vi * vec_size32;
+                const Vec32T* nvptr = reinterpret_cast<const Vec32T*>(thread_row_ptr + next_base);
+                const Vec32T* nbptr = reinterpret_cast<const Vec32T*>(bias_ptr + next_base);
+                Vec32T next_v = *nvptr;
+                Vec32T next_b = *nbptr;
+
+                // process current vector
+                for(int j = 0; j < vec_size32; ++j)
+                {
+                    float a = ck_tile::type_convert<float>(cur_v(j));
+                    float row_val = 1.0f / (1.0f + expf(-a));
+                    float b = ck_tile::type_convert<float>(cur_b(j));
+                    float combined = row_val + b;
+                    int local_idx = (vi - 1) * vec_size32 + j;
+                    if(cmp_gt(combined, best_val))
+                    {
+                        best_val = combined;
+                        best_idx = local_idx;
+                        best_row = row_val;
+                    }
+                }
+
+                // swap
+                cur_v = next_v;
+                cur_b = next_b;
+            }
+
+            // process last prefetched vector
+            for(int j = 0; j < vec_size32; ++j)
+            {
+                float a = ck_tile::type_convert<float>(cur_v(j));
+                float row_val = 1.0f / (1.0f + expf(-a));
+                float b = ck_tile::type_convert<float>(cur_b(j));
+                float combined = row_val + b;
+                int local_idx = (nvec - 1) * vec_size32 + j;
+                if(cmp_gt(combined, best_val))
+                {
+                    best_val = combined;
+                    best_idx = local_idx;
+                    best_row = row_val;
+                }
+            }
+        }
+
+        // Remainder scalar tail
+        for(int t = params.VPT - rem; t < params.VPT; ++t)
+        {
+            int local_idx = t;
+            float a = ck_tile::type_convert<float>(thread_row_ptr[first_elt_read_by_thread + local_idx]);
+            float row_val = 1.0f / (1.0f + expf(-a));
+            float b = ck_tile::type_convert<float>(bias_ptr[first_elt_read_by_thread + local_idx]);
+            float combined = row_val + b;
+            if(cmp_gt(combined, best_val))
+            {
+                best_val = combined;
+                best_idx = local_idx;
+                best_row = row_val;
+            }
+        }
+
+
+    // Top-k selection. Single-thread-per-row, topk==1: directly select the local best
+    // global expert id
+    int64_t idx = thread_row; // topk==1 -> idx = topk * thread_row
+    int expert = first_elt_read_by_thread + best_idx;
+    indices_ptr[idx] = ck_tile::type_convert<int32_t>(expert);
+    // With topk==1 the normalized output weight is 1.0
+    output_ptr[idx] = 1.0f;
+}
+
 template <typename T>
 __device__ inline bool cmp_eq(const T& a, const T& b)
 {
@@ -511,14 +637,26 @@ __global__ void moe_fused_gate_kernel_dynamic(void* input,
         std::max<int64_t>(1, WARP_SIZE / num_expert_group); // WARP_SIZE is fixed as 32
     params.ROWS_PER_CTA = params.WARPS_PER_CTA * params.ROWS_PER_WARP;
 
-    moe_fused_gate_impl<T>(input,
+    if (num_experts / num_expert_group < MAX_VPT) 
+    {
+        moe_fused_gate_impl<T>(input,
+                               bias,
+                               output_ptr,
+                               indices_ptr,
+                               num_rows,
+                               topk_group,
+                               topk,
+                               num_fused_shared_experts,
+                               routed_scaling_factor,
+                               params);
+        return;
+    }
+
+    moe_fused_gate_flat_impl<T>(input,
                            bias,
                            output_ptr,
                            indices_ptr,
                            num_rows,
-                           topk_group,
-                           topk,
-                           num_fused_shared_experts,
                            routed_scaling_factor,
                            params);
 }
@@ -553,7 +691,11 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
 
     // Check 1: Ensure that num_experts is a power of 2.
-    TORCH_CHECK((num_experts & (num_experts - 1)) == 0,
+    TORCH_CHECK((num_experts & (num_experts - 1)) == 0 || 
+    // This is a flat call to compute sigmoid activation
+                (topk == 1 &&
+                 num_expert_group == 1 && 
+                 topk_group==1 && num_fused_shared_experts == 0),
                 "num_experts must be a power of 2, but got ",
                 num_experts);
 
