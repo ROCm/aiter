@@ -1681,10 +1681,6 @@ void concat_and_cache_mla(
     dim3 block(std::min(kv_lora_rank, 1024)/4);
     DISPATCH_BY_KV_CACHE_DTYPE(kv_c.dtype(), kv_cache_dtype,
                                CALL_CONCAT_AND_CACHE_MLA_OPT);
-<<<<<<< HEAD
-
-=======
->>>>>>> 37ef9c96 (opt concat_and_cache_mla)
   } else {
     dim3 grid(num_tokens);
     dim3 block(std::min(kv_lora_rank, 512));
