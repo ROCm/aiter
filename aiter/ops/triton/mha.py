@@ -922,9 +922,7 @@ def _attn_fwd(
         RCP_LN2: tl.constexpr = 1.4426950408889634
         LN2: tl.constexpr = 0.6931471824645996
         # compute log-sum-exp in base 2 units
-        # mi_base2 = m_i * RCP_LN2
-        mi_base2 = m_i * (RCP_LN2 * sm_scale)
-        softmax_lse = mi_base2 + tl.math.log2(l_i)
+        softmax_lse = m_i + tl.math.log2(l_i)
         # convert back to natural units
         softmax_lse *= LN2
 
@@ -1276,7 +1274,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
 
-        _LOGGER.debug(f"Using fused backward kernel: {_USE_FUSED_BWD_KERNEL}")
+        #_LOGGER.debug(f"Using fused backward kernel: {_USE_FUSED_BWD_KERNEL}")
 
         if _USE_FUSED_BWD_KERNEL:
             flash_attn_fused_backward(
