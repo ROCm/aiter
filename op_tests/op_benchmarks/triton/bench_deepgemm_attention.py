@@ -296,9 +296,9 @@ def run_benchmark(args: argparse.Namespace):
         # qk_diff = calc_diff(out_qk_logits, ref_logits)
         logits_diff = calc_diff(out_logits, ref_logits)
 
+        print(">>>! logits_diff = ", logits_diff)
         # assert qk_diff < 1e-3
         assert logits_diff < 1e-3
-        print(">>>! logits_diff = ", logits_diff)
 
         total_float_operations = 2 * next_n * heads * index_dim * context_lens.float().sum().item()
         flops = total_float_operations / elapsed_us * 1e-6
