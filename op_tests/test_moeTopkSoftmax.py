@@ -410,7 +410,7 @@ def test_grouped_topk(
 
 
 l_dtype = ["fp32", "bf16", "fp16"]
-l_expert = [128, 256]
+l_expert = [128, 256, 160]
 l_topk = 8
 l_token = [
     1,
@@ -493,7 +493,7 @@ df = []
 for dtype in l_dtype:
     for e in l_expert:
         for m in l_token:
-            ret = test_topk_softmax(dtype, m, e, l_topk)
+            ret = test_topk_softmax(dtype, m, e, 8)
             df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary:\n{df}")
@@ -502,9 +502,9 @@ df = []
 for token in l_token:
     # DeepSeek-R1
     topk = 8
-    group = 8
-    topk_group = 4
-    expert = 256
+    group = 1
+    topk_group = 1
+    expert = 160
     dtype = dtypes.bf16
     need_renorm = True
     ret = test_biased_grouped_topk(
@@ -519,9 +519,9 @@ for token in l_token:
     for scoring_func in ["softmax", "sigmoid"]:
         # DeepSeek-R1
         topk = 8
-        group = 8
-        topk_group = 4
-        expert = 256
+        group = 1
+        topk_group = 1
+        expert = 160
         dtype = dtypes.bf16
         need_renorm = True
         ret = test_grouped_topk(
