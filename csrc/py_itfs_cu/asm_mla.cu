@@ -233,6 +233,25 @@ void mla_decode_stage1_asm_fwd(
                 assert(false);
             }
         }
+        else if(gqa_ratio == 128)
+        {
+            if(persistent)
+            {
+                sub_Q = 128;
+                static AiterAsmKernel impl_fp8(
+                    "_ZN5aiter28mla_a8w8_qh16_gqaratio128_psE",
+                    "/mla/mla_a8w8_qh16_gqaratio128_ps.co");
+                impl_ptr = &impl_fp8;
+            }
+            else
+            {
+                sub_Q = 128;
+                static AiterAsmKernel impl_fp8(
+                    "_ZN5aiter25mla_a8w8_qh16_gqaratio128E",
+                    "/mla/mla_a8w8_qh16_gqaratio128.co");
+                impl_ptr = &impl_fp8;
+            }
+        }
     }
 
     // std::cout << "ptr_QSCALE: " << args.ptr_QSCALE << std::endl;

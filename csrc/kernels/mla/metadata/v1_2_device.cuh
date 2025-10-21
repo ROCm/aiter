@@ -368,7 +368,7 @@ __global__ void kn_get_mla_metadata_v1_2_no_split(
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
         int bid_ori = [&]() {
-            if constexpr (!Traits::kIsSparse)
+            if constexpr (!Traits::kIsSparse || !Traits::kQoSplits)
             {
                 return bid;
             }
@@ -642,8 +642,12 @@ void get_mla_metadata_v1_2_device(
         if (topk == -1)
         {
             constexpr bool kIsSparse = false;
+            params.num_batches = uni_seqlen_qo * params.num_batches;
+            params.uni_seqlen_qo = 1;
+            params.ori_seqlen_qo = uni_seqlen_qo;
+
             MLA_UNI_SEQLEN_DISPATCHER(
-                kn_get_mla_metadata_v1_2<Traits>
+                kn_get_mla_metadata_v1_2_no_split<Traits>
                     <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params)
             );
         }
@@ -654,7 +658,7 @@ void get_mla_metadata_v1_2_device(
             params.ori_seqlen_qo = uni_seqlen_qo;
             constexpr bool kIsSparse = true;
             MLA_UNI_SEQLEN_DISPATCHER(
-                kn_get_mla_metadata_v1_2<Traits>
+                kn_get_mla_metadata_v1_2_no_split<Traits>
                     <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params)
             );
         }

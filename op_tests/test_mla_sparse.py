@@ -497,7 +497,7 @@ def test_mla(
 
     err = None
     us_asm_decode = 10000000000
-    if nhead == 16:
+    if nhead == 16 or nhead == 128:
         err, us_asm_decode = test_sparse_mla_bf16()
 
     def test_absorb_decode_fp8():
