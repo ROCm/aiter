@@ -919,7 +919,6 @@ def _attn_fwd(
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     overflow_size = end_m_idx - seqlen_q
     if softmax_lse_ptr is not None:
-        RCP_LN2: tl.constexpr = 1.4426950408889634
         LN2: tl.constexpr = 0.6931471824645996
         # compute log-sum-exp in base 2 units
         softmax_lse = m_i + tl.math.log2(l_i)
