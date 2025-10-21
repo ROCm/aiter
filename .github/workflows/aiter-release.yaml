@@ -24,6 +24,14 @@ on:
         description: 'Docker image for Python 3.12 build'
         required: true
         default: 'rocm/vllm-dev:nightly'
+      runner:
+        description: 'Select build host'
+        required: true
+        default: 'aiter-k8s-build'
+        type: choice
+        options:
+          - aiter-k8s-build
+          - aiter-1gpu-runner
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -31,7 +39,7 @@ concurrency:
 
 jobs:
   build_whl_package:
-    runs-on: aiter-k8s-build
+    runs-on: ${{ github.event.inputs.runner }}
 
     strategy:
       fail-fast: false
