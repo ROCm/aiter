@@ -47,7 +47,7 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
         return ms
     elif metric == "throughput":
         tflops = flops / ms * 1e-9
-        return tflops
+        return tflops #  flops / mem # tflops
     elif metric == "bandwidth":
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         return bandwidth
@@ -77,14 +77,14 @@ def run_model_benchmark(args):
         Tensor parallel splits across int_dim (N for fc1, K for fc2)
         """
         if layer == "fc1":
-            if args.no_glu:
-                N, K = intermediate_dim, hidden_dim
-            else:
-                N, K = intermediate_dim * 2, hidden_dim
+            N, K = intermediate_dim, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
         elif layer == "fc2":
-            N, K = hidden_dim, intermediate_dim
+            if args.no_glu:
+                N, K = hidden_dim, intermediate_dim
+            else:
+                N, K = hidden_dim, intermediate_dim // 2
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
