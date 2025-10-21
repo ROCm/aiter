@@ -29,7 +29,6 @@ def _softmax_kernel_online(
     SIZE_PER_THREAD: gl.constexpr,
     THREADS_PER_WARP: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
-    NUM_STAGES: gl.constexpr,
 ):
     row_start = gl.program_id(0)
     row_idx = row_start
@@ -170,7 +169,6 @@ def softmax(x):
 
     waves_per_eu = 2
     num_warps = 8
-    num_stages = 2
 
     buffer_size = 16
     threads_per_warp = 64
@@ -193,7 +191,6 @@ def softmax(x):
         size_per_thread,
         threads_per_warp,
         BLOCK_SIZE,
-        num_stages,
         waves_per_eu=waves_per_eu,
         num_warps=num_warps,
     )
