@@ -15,7 +15,7 @@
 #include <cstdlib>
 
 
-#include <THC/THCAtomics.cuh>
+//#include <THC/THCAtomics.cuh>
 
 #include <sstream>
 #include <array>
