@@ -1,6 +1,6 @@
 #include "mha_common.h"
 #include "py_itfs_common.h"
-#include <ATen/cuda/CUDAContext.h>
+//#include <ATen/cuda/CUDAContext.h>
 #include <torch/all.h>
 
 #include <string>

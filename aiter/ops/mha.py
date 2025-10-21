@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor, Generator
-from typing import Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
