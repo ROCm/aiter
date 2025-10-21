@@ -62,6 +62,9 @@ def _batched_gemm_a8w8_kernel(
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    SIZE_PER_THREAD_MK: gl.constexpr,
+    SIZE_PER_THREAD_KN: gl.constexpr,
+    THREADS_PER_WARP: gl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_a8w8 function
@@ -171,6 +174,27 @@ def batched_gemm_a8w8(
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
+    BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
+    BLOCK_SIZE_N = config["BLOCK_SIZE_N"]
+    BLOCK_SIZE_K = config["BLOCK_SIZE_K"]
+
+    num_warps = 16
+    assert XQ.element_size() == YQ.element_size()
+    buffer_size = 16 // XQ.element_size()
+    assert buffer_size == 1
+
+    elems_per_thread_mk = triton.cdiv(
+        BLOCK_SIZE_M * BLOCK_SIZE_K // (num_warps * threads_per_warp), buffer_size
+    )
+    size_per_thread_mk = [elems_per_thread_mk, buffer_size]
+
+    elems_per_thread_kn = triton.cdiv(
+        BLOCK_SIZE_K * BLOCK_SIZE_N // (num_warps * threads_per_warp), buffer_size
+    )
+    size_per_thread_kn = [elems_per_thread_kn, buffer_size]
+
+    threads_per_warp = [8, 8]
+
     _batched_gemm_a8w8_kernel[grid](
         XQ,
         WQ,
@@ -194,6 +218,10 @@ def batched_gemm_a8w8(
         w_scale.stride(0),
         bias.stride(0) if has_bias else 0,
         has_bias,
+        SIZE_PER_THREAD_MK=size_per_thread_mk,
+        SIZE_PER_THREAD_KN=size_per_thread_kn,
+        THREADS_PER_WARP=threads_per_warp,
+        num_warps=num_warps,
         **config,
     )
 

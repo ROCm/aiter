@@ -102,7 +102,7 @@ def run_shape_benchmark(args, impl):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_a8w8(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout, impl)
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
