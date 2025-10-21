@@ -420,17 +420,17 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k(
     mfma_layout_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=16)
     mfma_layout_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=16)
 
-    mfma_layout_a_linear: gl.constexpr = gl.DistributedLinearLayout( # 64x128
-        reg_bases=((0,1), (0,2), (0,4), (0,8), (16,0), (32,0), (0,64)),
-        lane_bases=((1,0), (2,0), (4,0), (8,0), (0,16), (0,32)),
-        warp_bases=((0,0), (0,0)),
+    mfma_layout_a_linear: gl.constexpr = gl.DistributedLinearLayout(  # 64x128
+        reg_bases=((0, 1), (0, 2), (0, 4), (0, 8), (16, 0), (32, 0), (0, 64)),
+        lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 16), (0, 32)),
+        warp_bases=((0, 0), (0, 0)),
         block_bases=[],
         shape=[64, 128],
     )
-    mfma_layout_b_linear: gl.constexpr = gl.DistributedLinearLayout( # 128x256
-        reg_bases=((1,0), (2,0), (4,0), (8,0), (0,64), (0,128), (64,0)),
-        lane_bases=((0,1), (0,2), (0,4), (0,8), (16,0), (32,0)),
-        warp_bases=((0,16), (0,32)),
+    mfma_layout_b_linear: gl.constexpr = gl.DistributedLinearLayout(  # 128x256
+        reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 64), (0, 128), (64, 0)),
+        lane_bases=((0, 1), (0, 2), (0, 4), (0, 8), (16, 0), (32, 0)),
+        warp_bases=((0, 16), (0, 32)),
         block_bases=[],
         shape=[128, 256],
     )
@@ -479,7 +479,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k(
     linear_mfma_q00_1, linear_mfma_q01_1 = gl.split(linear_mfma_q0_1)
     linear_mfma_q10_1, linear_mfma_q11_1 = gl.split(linear_mfma_q1_1)
 
-    # 
+    #
     mfma_q00_0 = gl.convert_layout(linear_mfma_q00_0, mfma_layout_a)
     mfma_q01_0 = gl.convert_layout(linear_mfma_q01_0, mfma_layout_a)
     mfma_q10_0 = gl.convert_layout(linear_mfma_q10_0, mfma_layout_a)
@@ -502,28 +502,18 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k(
         k = k_next
         k_scale_f = k_scale_f_next
 
-
-        context_kv_idx_next = gl.amd.cdna3.buffer_load(
-            ptr=kv_indices,
-            offsets=context_start + context_idx + ChunkK + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv)),
-        )
-        context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
-            ptr=kv_indices,
-            offsets=context_start + context_idx + ChunkK + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)),
-        )
-
         #!=----------------------------
         gl.amd.cdna3.sched_barrier(0x0)
         #!=----------------------------
         kT = k.T
-        mfma_k = gl.convert_layout(kT, mfma_layout_b_linear) 
+        mfma_k = gl.convert_layout(kT, mfma_layout_b_linear)
 
         mfma_k = gl.reshape(mfma_k, (2, 64, 2, 2, 64))
         mfma_k = gl.permute(mfma_k, (1, 4, 3, 2, 0))
-        mfma_k0, mfma_k1 = gl.split(mfma_k) # 64 x 256
-        mfma_k0_0, mfma_k0_1 = gl.split(mfma_k0) # 64 x 128
+        mfma_k0, mfma_k1 = gl.split(mfma_k)  # 64 x 256
+        mfma_k0_0, mfma_k0_1 = gl.split(mfma_k0)  # 64 x 128
         mfma_k1_0, mfma_k1_1 = gl.split(mfma_k1)
-        mfma_k0_00, mfma_k0_01 = gl.split(mfma_k0_0) # 64 x 64
+        mfma_k0_00, mfma_k0_01 = gl.split(mfma_k0_0)  # 64 x 64
         mfma_k0_10, mfma_k0_11 = gl.split(mfma_k0_1)
         mfma_k1_00, mfma_k1_01 = gl.split(mfma_k1_0)
         mfma_k1_10, mfma_k1_11 = gl.split(mfma_k1_1)
@@ -537,56 +527,57 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k(
         mfma_k1_10 = gl.convert_layout(mfma_k1_10, mfma_layout_b)
         mfma_k1_11 = gl.convert_layout(mfma_k1_11, mfma_layout_b)
 
+        context_kv_idx_next = gl.amd.cdna3.buffer_load(
+            ptr=kv_indices,
+            offsets=context_start + context_idx + ChunkK + gl.arange(0, ChunkK, layout=gl.SliceLayout(1, layout_kv)),
+        )
+        context_kv_scale_idx_next = gl.amd.cdna3.buffer_load(
+            ptr=kv_indices,
+            offsets=context_start + context_idx + ChunkK + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout)),
+        )
+
         # k=0, n=0
         o00_00 = gl.amd.cdna3.mfma(mfma_q00_0, mfma_k0_00, zero)
         o01_00 = gl.amd.cdna3.mfma(mfma_q01_0, mfma_k0_00, zero)
         o10_00 = gl.amd.cdna3.mfma(mfma_q10_0, mfma_k0_00, zero)
         o11_00 = gl.amd.cdna3.mfma(mfma_q11_0, mfma_k0_00, zero)
-        gl.amd.cdna3.sched_barrier(0x0)
         # k=0, n=1
         o00_01 = gl.amd.cdna3.mfma(mfma_q00_0, mfma_k0_01, zero)
         o01_01 = gl.amd.cdna3.mfma(mfma_q01_0, mfma_k0_01, zero)
         o10_01 = gl.amd.cdna3.mfma(mfma_q10_0, mfma_k0_01, zero)
         o11_01 = gl.amd.cdna3.mfma(mfma_q11_0, mfma_k0_01, zero)
-        gl.amd.cdna3.sched_barrier(0x0)
         # k=0, n=2
         o00_10 = gl.amd.cdna3.mfma(mfma_q00_0, mfma_k0_10, zero)
         o01_10 = gl.amd.cdna3.mfma(mfma_q01_0, mfma_k0_10, zero)
         o10_10 = gl.amd.cdna3.mfma(mfma_q10_0, mfma_k0_10, zero)
         o11_10 = gl.amd.cdna3.mfma(mfma_q11_0, mfma_k0_10, zero)
-        gl.amd.cdna3.sched_barrier(0x0)
         # k=0, n=3
         o00_11 = gl.amd.cdna3.mfma(mfma_q00_0, mfma_k0_11, zero)
         o01_11 = gl.amd.cdna3.mfma(mfma_q01_0, mfma_k0_11, zero)
         o10_11 = gl.amd.cdna3.mfma(mfma_q10_0, mfma_k0_11, zero)
         o11_11 = gl.amd.cdna3.mfma(mfma_q11_0, mfma_k0_11, zero)
-        gl.amd.cdna3.sched_barrier(0x0)
         # k=64, n=0
         o00_00 = gl.amd.cdna3.mfma(mfma_q00_1, mfma_k1_00, o00_00)
         o01_00 = gl.amd.cdna3.mfma(mfma_q01_1, mfma_k1_00, o01_00)
         o10_00 = gl.amd.cdna3.mfma(mfma_q10_1, mfma_k1_00, o10_00)
         o11_00 = gl.amd.cdna3.mfma(mfma_q11_1, mfma_k1_00, o11_00)
-        gl.amd.cdna3.sched_barrier(0x0)
         # k=64, n=1
         o00_01 = gl.amd.cdna3.mfma(mfma_q00_1, mfma_k1_01, o00_01)
         o01_01 = gl.amd.cdna3.mfma(mfma_q01_1, mfma_k1_01, o01_01)
         o10_01 = gl.amd.cdna3.mfma(mfma_q10_1, mfma_k1_01, o10_01)
         o11_01 = gl.amd.cdna3.mfma(mfma_q11_1, mfma_k1_01, o11_01)
-        gl.amd.cdna3.sched_barrier(0x0)
         # k=64, n=2
         o00_10 = gl.amd.cdna3.mfma(mfma_q00_1, mfma_k1_10, o00_10)
         o01_10 = gl.amd.cdna3.mfma(mfma_q01_1, mfma_k1_10, o01_10)
         o10_10 = gl.amd.cdna3.mfma(mfma_q10_1, mfma_k1_10, o10_10)
         o11_10 = gl.amd.cdna3.mfma(mfma_q11_1, mfma_k1_10, o11_10)
-        gl.amd.cdna3.sched_barrier(0x0)
         # k=64, n=3
         o00_11 = gl.amd.cdna3.mfma(mfma_q00_1, mfma_k1_11, o00_11)
         o01_11 = gl.amd.cdna3.mfma(mfma_q01_1, mfma_k1_11, o01_11)
         o10_11 = gl.amd.cdna3.mfma(mfma_q10_1, mfma_k1_11, o10_11)
         o11_11 = gl.amd.cdna3.mfma(mfma_q11_1, mfma_k1_11, o11_11)
-        gl.amd.cdna3.sched_barrier(0x0)
 
-        o00_0 = gl.join(o00_00, o00_01) # (16, 64, 2)
+        o00_0 = gl.join(o00_00, o00_01)  # (16, 64, 2)
         o00_1 = gl.join(o00_10, o00_11)
         o01_0 = gl.join(o01_00, o01_01)
         o01_1 = gl.join(o01_10, o01_11)
@@ -595,24 +586,33 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k(
         o11_0 = gl.join(o11_00, o11_01)
         o11_1 = gl.join(o11_10, o11_11)
 
-        o00 = gl.join(o00_0, o00_1) # (16, 64, 2, 2)
+        o00 = gl.join(o00_0, o00_1)  # (16, 64, 2, 2)
         o01 = gl.join(o01_0, o01_1)
         o10 = gl.join(o10_0, o10_1)
         o11 = gl.join(o11_0, o11_1)
 
-        o0 = gl.join(o00, o01) # (16, 64, 2, 2, 2)
+        o0 = gl.join(o00, o01)  # (16, 64, 2, 2, 2)
         o1 = gl.join(o10, o11)
-        o = gl.join(o0, o1) # [16, 64, 2, 2, 2, 2]
+        o = gl.join(o0, o1)  # [16, 64, 2, 2, 2, 2]
         o = gl.permute(o, (5, 4, 0, 3, 2, 1))
         o = gl.reshape(o, (64, 256))
         o = gl.convert_layout(o, mfma_layout)
 
         # o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
-        o = o * k_scale_f[None, :]
 
+        gl.amd.cdna3.sched_group_barrier(0x200, 8, 0)  # DS_WRITE
+        gl.amd.cdna3.sched_group_barrier(0x100, 4, 0)  # DS_READ
+        gl.amd.cdna3.sched_group_barrier(0x020, 6, 0)  # BUFFER_LOAD
+
+        gl.amd.cdna3.sched_group_barrier(0x008, 16, 0)  # V_MFMA
+        gl.amd.cdna3.sched_group_barrier(0x100, 2, 0)
+        gl.amd.cdna3.sched_group_barrier(0x008, 16, 0)
+        gl.amd.cdna3.sched_group_barrier(0x100, 2, 0)
+        gl.amd.cdna3.sched_group_barrier(0x008, 16 + 16, 0)
         #!=----------------------------
         gl.amd.cdna3.sched_barrier(0x0)
         #!=----------------------------
+        o = o * k_scale_f[None, :]
         k_next = gl.amd.cdna3.buffer_load(
             ptr=KV_buffer,
             offsets=context_kv_idx_next[:, None] * stride_k_seq + gl.arange(0, HiddenDim, layout=gl.SliceLayout(0, layout_kv))[None, :],
@@ -641,14 +641,14 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k(
     k = k_next
     k_scale_f = k_scale_f_next
     kT = k.T
-    mfma_k = gl.convert_layout(kT, mfma_layout_b_linear) 
+    mfma_k = gl.convert_layout(kT, mfma_layout_b_linear)
 
     mfma_k = gl.reshape(mfma_k, (2, 64, 2, 2, 64))
     mfma_k = gl.permute(mfma_k, (1, 4, 3, 2, 0))
-    mfma_k0, mfma_k1 = gl.split(mfma_k) # 64 x 256
-    mfma_k0_0, mfma_k0_1 = gl.split(mfma_k0) # 64 x 128
+    mfma_k0, mfma_k1 = gl.split(mfma_k)  # 64 x 256
+    mfma_k0_0, mfma_k0_1 = gl.split(mfma_k0)  # 64 x 128
     mfma_k1_0, mfma_k1_1 = gl.split(mfma_k1)
-    mfma_k0_00, mfma_k0_01 = gl.split(mfma_k0_0) # 64 x 64
+    mfma_k0_00, mfma_k0_01 = gl.split(mfma_k0_0)  # 64 x 64
     mfma_k0_10, mfma_k0_11 = gl.split(mfma_k0_1)
     mfma_k1_00, mfma_k1_01 = gl.split(mfma_k1_0)
     mfma_k1_10, mfma_k1_11 = gl.split(mfma_k1_1)
@@ -711,7 +711,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k(
     o11_11 = gl.amd.cdna3.mfma(mfma_q11_1, mfma_k1_11, o11_11)
     gl.amd.cdna3.sched_barrier(0x0)
 
-    o00_0 = gl.join(o00_00, o00_01) # (16, 64, 2)
+    o00_0 = gl.join(o00_00, o00_01)  # (16, 64, 2)
     o00_1 = gl.join(o00_10, o00_11)
     o01_0 = gl.join(o01_00, o01_01)
     o01_1 = gl.join(o01_10, o01_11)
@@ -720,14 +720,14 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_ragged_k(
     o11_0 = gl.join(o11_00, o11_01)
     o11_1 = gl.join(o11_10, o11_11)
 
-    o00 = gl.join(o00_0, o00_1) # (16, 64, 2, 2)
+    o00 = gl.join(o00_0, o00_1)  # (16, 64, 2, 2)
     o01 = gl.join(o01_0, o01_1)
     o10 = gl.join(o10_0, o10_1)
     o11 = gl.join(o11_0, o11_1)
 
-    o0 = gl.join(o00, o01) # (16, 64, 2, 2, 2)
+    o0 = gl.join(o00, o01)  # (16, 64, 2, 2, 2)
     o1 = gl.join(o10, o11)
-    o = gl.join(o0, o1) # [16, 64, 2, 2, 2, 2]
+    o = gl.join(o0, o1)  # [16, 64, 2, 2, 2, 2]
     o = gl.permute(o, (5, 4, 0, 3, 2, 1))
     o = gl.reshape(o, (64, 256))
     o = gl.convert_layout(o, mfma_layout)
