@@ -265,13 +265,13 @@ def _attn_fwd_inner(
                 k_offs_n,
                 (BLOCK_DMODEL + BLOCK_DMODEL_PE),
                 seqlen_k,
-            )        
-        v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)      
-      
+            )
+        v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
+
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
         # TODO: This can be optimized to only be true for the padded block.
-        #mask = tl.full([BLOCK_M, BLOCK_N], True, dtype=tl.int1)
+        # mask = tl.full([BLOCK_M, BLOCK_N], True, dtype=tl.int1)
         mask = tl.full([1, 1], True, dtype=tl.int1)
         if MASK_STEPS:
             # If this is the last block / iteration, we want to
@@ -743,7 +743,7 @@ def _attn_fwd(
         q_cache_mod: tl.constexpr = ".cg"
     else:
         q_cache_mod: tl.constexpr = ""
-        
+
     if HAS_PE:
         q_pe = tl.load(q_pe_ptrs, mask=q_mask, other=0.0, cache_modifier=q_cache_mod)
     else:
@@ -980,9 +980,11 @@ def _get_config(
             config = json.load(file)
         _get_config._config_dict["default"] = config
     # TODO: pe + dropout is not tuned
-    if (has_pe 
+    if (
+        has_pe
         and (enable_dropout or dtype == torch.float32)
-        and "pe_dropout_or_fp32" in _get_config._config_dict["default"]["fwd"]):
+        and "pe_dropout_or_fp32" in _get_config._config_dict["default"]["fwd"]
+    ):
         return _get_config._config_dict["default"]["fwd"]["pe_dropout_or_fp32"]
     elif has_pe and "pe" in _get_config._config_dict["default"]["fwd"]:
         return _get_config._config_dict["default"]["fwd"]["pe"]
@@ -1277,7 +1279,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
 
-        #_LOGGER.debug(f"Using fused backward kernel: {_USE_FUSED_BWD_KERNEL}")
+        # _LOGGER.debug(f"Using fused backward kernel: {_USE_FUSED_BWD_KERNEL}")
 
         if _USE_FUSED_BWD_KERNEL:
             flash_attn_fused_backward(
