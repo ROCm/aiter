@@ -7,9 +7,10 @@ import pytest
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 from typing import Union
+
+e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
 def generate_batched_gemm_a16w8_inputs(
@@ -45,12 +46,12 @@ def generate_batched_gemm_a16w8_inputs(
 
     if layout[1] == "N":
         weight = (torch.rand((B, N, K), dtype=torch.float16, device="cuda") / 10).to(
-            torch.float8_e4m3fnuz
+            e4m3_type
         )
     else:
         weight = (
             (torch.rand((B, N, K), dtype=torch.float16, device="cuda") / 10)
-            .to(torch.float8_e4m3fnuz)
+            .to(e4m3_type)
             .permute(0, 2, 1)
         )
 
@@ -104,9 +105,6 @@ def run_triton(
         YQ=y,
         transpose_bm=transpose_bm,
     )
-
-
-e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
 def get_x_vals():
