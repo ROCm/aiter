@@ -690,7 +690,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     delta_qk = seqlen_q - seqlen_k
     if DEBUG_TRITON:
         print(f"delta_qk = {delta_qk}")  # noqa: E701
-
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
     HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
     offs_d = tl.arange(0, HEAD_DIM)
@@ -1652,7 +1651,6 @@ def bwd_kernel_noncausal(
                 )
                 dq_pe *= sm_scale
                 tl.store(DQ + adj_dq + offs_dq_pe, dq_pe, mask=mask_q)
-
 
 def is_contiguous(x, name):
     if x.is_contiguous():

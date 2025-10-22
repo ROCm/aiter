@@ -388,6 +388,7 @@ def _bwd_kernel_dkdvdq_causal(
     FP8_MAX: tl.constexpr,
     NUM_SMS: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
+    NUM_XCD: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
         stride_q_b = tl.cast(stride_q_b_in, tl.int64)
@@ -468,7 +469,6 @@ def _bwd_kernel_dkdvdq_causal(
     GROUP_SIZE = NUM_Q_HEADS // NUM_K_HEADS
     wid = tl.program_id(0)  # workgoup id: 0, ..., NUM_Q_PIDS * BATCH * NUM_K_HEADS - 1
 
-    NUM_XCD: tl.constexpr = 8
     head_q_idx = wid % NUM_Q_HEADS
     head_q_idx = remap_xcd(head_q_idx, NUM_Q_HEADS, NUM_XCD)
     seq_k_blk_idx = (wid // NUM_Q_HEADS) % NUM_K_PIDS
