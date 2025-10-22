@@ -2,6 +2,7 @@
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "rope_common.h"
+using namespace aiter;
 
 // =====================================================================================================================
 // Interfaces
@@ -54,7 +55,7 @@ void rope_cached_positions_fwd_impl(
     assert(1 == positions.stride(1) && 2 == positions.dim());
     const int32_t max_position = cos.size(0);
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     DISPATCH_ROPE_TYPES_PARAMS(
         input.scalar_type(),
         cos.scalar_type(),
@@ -136,7 +137,7 @@ void rope_cached_positions_2c_fwd_impl(
     assert(1 == positions.stride(1) && 2 == positions.dim());
     const int32_t max_position = cos.size(0);
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input_x));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input_x));
     DISPATCH_ROPE_TYPES_PARAMS(
         input_x.scalar_type(),
         cos.scalar_type(),
@@ -212,7 +213,7 @@ void rope_cached_positions_offsets_fwd_impl(
     assert(1 == offsets.stride(1)   && 2 == offsets.dim());
     const int32_t max_position = cos.size(0);
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     DISPATCH_ROPE_TYPES_PARAMS(
         input.scalar_type(),
         cos.scalar_type(),
@@ -299,7 +300,7 @@ void rope_cached_positions_offsets_2c_fwd_impl(
     assert(1 == offsets.stride(1)   && 2 == offsets.dim());
     const int32_t max_position = cos.size(0);
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input_x));
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input_x));
     DISPATCH_ROPE_TYPES_PARAMS(
         input_x.scalar_type(),
         cos.scalar_type(),

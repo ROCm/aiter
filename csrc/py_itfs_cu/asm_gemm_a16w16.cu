@@ -3,8 +3,8 @@
 #include "aiter_hip_common.h"
 #include "asm_bf16gemm_configs.hpp"
 #include "py_itfs_common.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <cmath>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
@@ -203,16 +203,19 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     CFG* config_map          = &cfg_bf16gemm_outf32;
 
     // 2.1 static dict
-    std::string selectedKernelName;
-    int selectedksplit;
-    auto it_sel        = get_heuristic_kernel(Mdim,
+    std::string selectedKernelName = kernelName.value_or("");
+    int selectedksplit = splitK.value_or(0) ?: 1;
+    if (!kernelName.has_value() || kernelName == "") {
+
+        auto it_sel        = get_heuristic_kernel(Mdim,
                                        Ndim,
                                        Kdim,
                                        config_map,
                                        splitK.has_value() ? splitK : std::nullopt,
                                        kernelName.has_value() ? kernelName : std::nullopt);
-    selectedKernelName = std::get<0>(it_sel);
-    selectedksplit     = std::get<1>(it_sel);
+        selectedKernelName = std::get<0>(it_sel);
+        selectedksplit     = std::get<1>(it_sel);
+    }
 
     args.splitk = selectedksplit;
     // printf("=== KernelArgs Important Parameters ===\n");
@@ -252,8 +255,8 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
         TORCH_CHECK(false, __func__, " not find kernel~ " + selectedKernelName);
 
     // 3. launch kl
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     int bdx = 256;
     int gdx = (Ndim + SUBN - 1) / SUBN;
