@@ -420,7 +420,8 @@ __global__ void kn_get_mla_metadata_v1_1(
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
     for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
-        const int32_t bid                = Traits::kSortBatch ? p_lds_batch_idx[idx] : idx;        const int32_t qo_len             = qo_state.get_seqlen(bid);
+        const int32_t bid                = Traits::kSortBatch ? p_lds_batch_idx[idx] : idx;
+        const int32_t qo_len             = qo_state.get_seqlen(bid);
         const int32_t qo_batch_start     = qo_state.get_begin(bid);
         const int32_t kv_len             = p_lds_kv_lens[bid];
         const int32_t kv_batch_start     = Traits::kIsSparse ? bid * params.topk : params.p_seqlens_kv_indptr[bid];

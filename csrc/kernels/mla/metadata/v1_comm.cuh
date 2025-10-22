@@ -249,7 +249,7 @@ public:
         }
         else if constexpr (Traits::kUniSeqlenQo <= -1)
         {
-            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : bid;
+            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : batch_idx;
             return p_lds_seqlens_qo_[bid];
         }
         else
@@ -267,7 +267,7 @@ public:
         }
         else if constexpr (Traits::kUniSeqlenQo <= -1)
         {
-            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : bid;
+            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : batch_idx;
             return p_seqlens_qo_indptr_[bid];
         }
         else
@@ -285,7 +285,7 @@ public:
         }
         else if constexpr (Traits::kUniSeqlenQo <= -1)
         {
-            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : bid;
+            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : batch_idx;
             return p_seqlens_qo_indptr_[bid + 1];
         }
         else
