@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
+#include "ck/tensor_operation/gpu/device/impl/device_moe_mx_gemm_bpreshuffle.hpp"
 #include "ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_xdl_cshuffle_v3.hpp"
-#include "ck/tensor_operation/gpu/device/impl/device_moe_mx_gemm_bns.hpp"
+// #include "ck/tensor_operation/gpu/device/impl/device_moe_mx_gemm_bns.hpp"
 #include "gemm_moe_ck2stages.h"
 #include <iostream>
 
@@ -89,7 +90,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     static constexpr ck::index_t D1Vec               = PerTensorQuant ? 1 : EVec;
     static constexpr ck::index_t D2Vec               = 1;
 
-    using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemmMXBNS
+    using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemmMXBPreShuffle
         // clang-format off
 ///######|  ALayout|  BLayout| DsLayout| ELayout|      AData|      BData|     DsData|     EData|     AccData|         CShuffle|           A|           B|          CDE|           GEMM| Block|  MPer|  NPer|  KPer| AK1| BK1| MPer| NPer| MXdl| NXdl|  ABlockTransfer| ABlockTransfer| ABlockTransfer| ABlockTransfer| ABlockTransfer| ABlockTransfer| ABlockLds|  BBlockTransfer| BBlockTransfer| BBlockTransfer| BlockTransfer| BBlockTransfer| BBlockTransfer| BBlockLds|    CShuffle|    CShuffle| CBlockTransferClusterLengths|  CBlockTransfer|
 ///######|         |         |         |        |       Type|       Type|       Type|      Type|        Type|         DataType| Elementwise| Elementwise|  Elementwise| Spacialization|  Size| Block| Block| Block|    |    |  XDL|  XDL|  Per|  Per|   ThreadCluster|  ThreadCluster| SrcAccessOrder|   SrcVectorDim|      SrcScalar|      DstScalar| AddExtraM|   ThreadCluster|  ThreadCluster| SrcAccessOrder|  SrcVectorDim|      SrcScalar|      DstScalar| AddExtraN| MXdlPerWave| NXdlPerWave|         _MBlock_MWaveMPerXdl| ScalarPerVector|
@@ -278,7 +279,7 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     static constexpr ck::index_t K0_M          = BLOCKSIZE / K0_A;
     static constexpr ck::index_t K0_N          = BLOCKSIZE / K0_B;
 
-    using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemmMXBNS
+    using DeviceOpInstance = ck::tensor_operation::device::DeviceMoeGemmMXBPreShuffle
         // clang-format off
 ///#####|  ALayout|  BLayout| DsLayout| ELayout|      AData|      BData|     DsData|     EData|     AccData|         CShuffle|           A|           B|          CDE|           GEMM| Block|  MPer|  NPer|  KPer| AK1| BK1| MPer| NPer| MXdl| NXdl|  ABlockTransfer| ABlockTransfer| ABlockTransfer| ABlockTransfer| ABlockTransfer| ABlockTransfer| ABlockLds|  BBlockTransfer| BBlockTransfer| BBlockTransfer| BlockTransfer| BBlockTransfer| BBlockTransfer| BBlockLds|    CShuffle|    CShuffle| CBlockTransferClusterLengths|  CBlockTransfer|
 ///#####|         |         |         |        |       Type|       Type|       Type|      Type|        Type|         DataType| Elementwise| Elementwise|  Elementwise| Spacialization|  Size| Block| Block| Block|    |    |  XDL|  XDL|  Per|  Per|   ThreadCluster|  ThreadCluster| SrcAccessOrder|   SrcVectorDim|      SrcScalar|      DstScalar| AddExtraM|   ThreadCluster|  ThreadCluster| SrcAccessOrder|  SrcVectorDim|      SrcScalar|      DstScalar| AddExtraN| MXdlPerWave| NXdlPerWave|         _MBlock_MWaveMPerXdl| ScalarPerVector|
