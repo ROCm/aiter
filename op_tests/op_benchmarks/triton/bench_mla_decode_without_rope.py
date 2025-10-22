@@ -369,7 +369,7 @@ def run_benchmark(args: argparse.Namespace):
             # rep=100,
         )
         ms = us / 1000
-        import pdb;pdb.set_trace()
+        # import pdb;pdb.set_trace()
 
         checkAllclose(out_ref, out_tri,
             msg=f"mla_decode-absorb    [golden vs triton]: {ms * 1000} us......",

@@ -842,7 +842,7 @@ def _fwd_grouped_kernel_stage1_n32(
             ptr=K_Buffer,
             offsets=offs_buf_k_pe,
         )  # positional embedding part of keys
-        # offs_buf_kv = kv_loc[:, None] * stride_buf_kbs + offs_k_c[None, :]
+        offs_buf_kv = kv_loc[:, None] * stride_buf_kbs + offs_k_c[None, :]
 
         kv = gl.amd.cdna3.buffer_load(
             ptr=K_Buffer,
