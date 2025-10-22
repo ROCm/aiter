@@ -1,22 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-# -----------------------------------------------------------------------------
-# Description:
-#   This script runs either the operator test or the tuning script for each
-#   specified job, based on the input argument ("test" or "tune").
-#
-# Usage:
-#   bash op_tune.sh test   # Run operator tests
-#   bash op_tune.sh tune   # Run tuning scripts
-# -----------------------------------------------------------------------------
-
-if [ $# -ne 1 ]; then
-    echo "Usage: $0 [test|tune]"
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+    echo "Usage: $0 [test|tune] [shape_name (optional)]"
     exit 1
 fi
 
 mode="$1"
+shape_filter="${2:-}"
 
 tuneFailed=false
 testFailed=false
@@ -35,8 +26,11 @@ declare -a tune_jobs=(
 
 for job in "${tune_jobs[@]}"; do
     IFS=':' read -r shape dir test_path tune_cmd <<< "$job"
+    if [ -n "$shape_filter" ] && [ "$shape" != "$shape_filter" ]; then
+        continue
+    fi
     echo "============================================================"
-    echo "🧪 Processing shape: $shape under $dir"
+    echo "🧪 Processing shape: $shape under directory: $dir"
     echo "------------------------------------------------------------"
     if [ "$mode" == "test" ]; then
         echo "Running operator test: python3 $test_path"
@@ -70,7 +64,7 @@ if [ "$tuneFailed" = true ]; then
         echo "  $c"
     done
     exit 1
- elif [ "$testFailed" = true ]; then
+elif [ "$testFailed" = true ]; then
     echo "Failed test files:"
     for f in "${testFailedFiles[@]}"; do
         echo "  $f"

@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
   workflow_dispatch:
+    inputs:
+      shapes:
+        description: 'Comma separated shape names to run (leave empty for all)'
+        required: false
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -73,7 +78,7 @@ jobs:
           docker exec \
           -w /workspace \
           operators_tuning_test \
-          ./.github/scripts/op_tune.sh test
+          ./.github/scripts/op_tune.sh test "${{ github.event.inputs.shapes }}"
     
       - name: Operators tuning Tests
         run: |
@@ -82,7 +87,7 @@ jobs:
           docker exec \
           -w /workspace \
           operators_tuning_test \
-          ./.github/scripts/op_tune.sh tune
+          ./.github/scripts/op_tune.sh tune "${{ github.event.inputs.shapes }}"
       
       - name: Show the difference after tuning
         run: |
@@ -95,7 +100,7 @@ jobs:
           docker exec \
           -w /workspace \
           operators_tuning_test \
-          ./.github/scripts/op_tune.sh test
+          ./.github/scripts/op_tune.sh test "${{ github.event.inputs.shapes }}"
 
       - name: Upload tuned CSVs
         uses: actions/upload-artifact@v4
