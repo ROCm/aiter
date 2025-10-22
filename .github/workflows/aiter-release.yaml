@@ -127,7 +127,7 @@ jobs:
         if: ${{ matrix.build_enabled }}
         uses: actions/upload-artifact@v4
         with:
-          name: aiter-whl-packages-py${{ matrix.python_version }}
+          name: aiter-whl-packages-py${{ matrix.python_version }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/*.whl
 
       - name: Cleanup container
