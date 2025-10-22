@@ -236,7 +236,20 @@
           py::arg("v_dequant_scales"),                                              \
           py::arg("slot_mapping"),                                                  \
           py::arg("asm_layout"),                                                    \
-          py::arg("ori_block_size") = 128);
+          py::arg("ori_block_size") = 128);                                         \
+    m.def("concat_and_cache_mla",                                                   \
+          &aiter::concat_and_cache_mla,                                             \
+          "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"                          \
+          "                     Tensor! kv_cache,"                                  \
+          "                     Tensor slot_mapping,"                               \
+          "                     str kv_cache_dtype,"                                \
+          "                     Tensor scale) -> ()",                               \
+          py::arg("kv_c"),                                                          \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("kv_cache_dtype"),                                                \
+          py::arg("scale"));
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
     m.def("init_custom_ar",                                                                    \
@@ -250,6 +263,19 @@
           py::arg("offsets"),                                                                  \
           py::arg("rank"),                                                                     \
           py::arg("full_nvlink"));                                                             \
+    m.def("all_gather_reg",                                                                    \
+          &aiter::all_gather_reg,                                                              \
+          "all_gather_reg(int fa, Tensor inp, Tensor! out) -> ()",                             \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("out"));                                                                     \
+    m.def("all_gather_unreg",                                                                  \
+          &aiter::all_gather_unreg,                                                            \
+          "all_gather_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> ()",        \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("reg_buffer"),                                                               \
+          py::arg("out"));                                                                     \
     m.def("all_reduce_reg",                                                                    \
           &aiter::all_reduce_reg,                                                              \
           "all_reduce_reg(int fa, Tensor inp, Tensor! out, bool open_fp8_quant) -> ()",        \
@@ -319,6 +345,17 @@
           py::arg("pad_b")  = 0,                                        \
           py::arg("pad_c")  = 0,                                        \
           py::arg("splitK") = 0);
+
+#define GEMM_A16W16_ASM_PYBIND                  \
+    m.def("gemm_a16w16_asm",                    \
+          &gemm_a16w16_asm,                     \
+          "Asm gemm a16w16",                    \
+          py::arg("A"),                         \
+          py::arg("B"),                         \
+          py::arg("out"),                       \
+          py::arg("bias")       = std::nullopt, \
+          py::arg("splitK")     = std::nullopt, \
+          py::arg("kernelName") = std::nullopt);
 
 #define GEMM_A4W4_ASM_PYBIND                      \
     m.def("gemm_a4w4_asm",                        \
@@ -1091,13 +1128,49 @@
 
 #define ROPE_POS_FWD_PYBIND                                                                   \
     m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl);                 \
-    m.def("rope_cached_positions_2c_fwd_impl", &rope_cached_positions_2c_fwd_impl);           \
+    m.def("rope_cached_positions_2c_fwd_impl",                                                \
+          &rope_cached_positions_2c_fwd_impl,                                                 \
+          py::arg("output_x"),                                                                \
+          py::arg("output_y"),                                                                \
+          py::arg("input_x"),                                                                 \
+          py::arg("input_y"),                                                                 \
+          py::arg("cos"),                                                                     \
+          py::arg("sin"),                                                                     \
+          py::arg("positions"),                                                               \
+          py::arg("rotate_style"),                                                            \
+          py::arg("reuse_freqs_front_part"),                                                  \
+          py::arg("nope_first"));                                                             \
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
+
+#define SAMPLE_PYBIND                                                                \
+    m.def("greedy_sample", &aiter::greedy_sample, py::arg("out"), py::arg("input")); \
+    m.def("random_sample",                                                           \
+          &aiter::random_sample,                                                     \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("temperature"),                                                    \
+          py::arg("lambd")     = 1.0,                                                \
+          py::arg("generator") = std::nullopt,                                       \
+          py::arg("eps")       = 1e-10);                                                   \
+    m.def("mixed_sample",                                                            \
+          &aiter::mixed_sample,                                                      \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("temperature"),                                                    \
+          py::arg("lambd")     = 1.0,                                                \
+          py::arg("generator") = std::nullopt,                                       \
+          py::arg("eps")       = 1e-10);                                                   \
+    m.def("exponential",                                                             \
+          &aiter::exponential,                                                       \
+          py::arg("out"),                                                            \
+          py::arg("lambd")     = 1.0,                                                \
+          py::arg("generator") = std::nullopt,                                       \
+          py::arg("eps")       = 1e-10);
 
 #define HIPBSOLGEMM_PYBIND                                                         \
     m.def("hipb_create_extension", &hipb_create_extension, "create_extension");    \
@@ -1112,7 +1185,8 @@
           py::arg("out_dtype") = std::nullopt,                                     \
           py::arg("scaleA")    = std::nullopt,                                     \
           py::arg("scaleB")    = std::nullopt,                                     \
-          py::arg("scaleOut")  = std::nullopt);                                     \
+          py::arg("scaleOut")  = std::nullopt,                                      \
+          py::arg("bpreshuffle")  = std::nullopt);                                     \
     m.def("hipb_findallsols",                                                      \
           &hipb_findallsols,                                                       \
           "hipb_findallsols",                                                      \

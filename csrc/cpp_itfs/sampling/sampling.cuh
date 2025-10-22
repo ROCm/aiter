@@ -296,7 +296,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
         else
         {
             BlockScan<float, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage->block_prim.scan)
-                .InclusiveSum<VEC_SIZE>(prob_greater_than_threshold, inclusive_cdf);
+                .InclusiveSum(prob_greater_than_threshold, inclusive_cdf);
 
             __syncthreads();
         }

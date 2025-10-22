@@ -13,7 +13,8 @@ import sys
 import time
 import traceback
 import types
-from typing import Any, Callable, List, Optional
+import typing
+from typing import Any, Callable, List, Optional, Union, get_args, get_origin
 
 from packaging.version import Version, parse
 
@@ -31,9 +32,9 @@ aiter_lib = None
 
 def mp_lock(
     lockPath: str,
-    MainFunc: callable,
-    FinalFunc: callable = None,
-    WaitFunc: callable = None,
+    MainFunc: Callable,
+    FinalFunc: Optional[Callable] = None,
+    WaitFunc: Optional[Callable] = None,
 ):
     """
     Using FileBaton for multiprocessing.
@@ -65,6 +66,106 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
+AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
+
+# config_env start here
+AITER_CONFIG_GEMM_A4W4 = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
+)
+AITER_CONFIG_FMOE = os.getenv(
+    "AITER_CONFIG_FMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
+    "AITER_CONFIG_A8W8_BATCHED_GEMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv",
+)
+
+AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
+    "AITER_CONFIG_BATCHED_GEMM_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_BF16 = os.getenv(
+    "AITER_CONFIG_GEMM_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_gemm.csv",
+)
+
+
+def update_config_files(file_path: str, merge_name: str):
+    path_list = file_path.split(os.pathsep) if file_path else []
+    if len(path_list) <= 1:
+        return file_path
+    df_list = []
+    ## merge config files
+    ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
+    import pandas as pd
+
+    df_list.append(pd.read_csv(path_list[0]))
+    for i, path in enumerate(path_list[1:]):
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            ## check columns
+            assert (
+                df.columns.tolist() == df_list[0].columns.tolist()
+            ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
+
+            df_list.append(df)
+        else:
+            print(f"path {i+1}: {path} (not exist)")
+    merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+    merge_df = merge_df.drop_duplicates(keep="last")
+    new_file_path = f"/tmp/{merge_name}.csv"
+    merge_df.to_csv(new_file_path, index=False)
+    return new_file_path
+
+
+AITER_CONFIG_GEMM_A4W4_FILE = update_config_files(
+    AITER_CONFIG_GEMM_A4W4, "a4w4_blockscale_tuned_gemm"
+)
+AITER_CONFIG_GEMM_A8W8_FILE = update_config_files(
+    AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
+)
+AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE = update_config_files(
+    AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE, "a8w8_bpreshuffle_tuned_gemm"
+)
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE = update_config_files(
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE, "a8w8_blockscale_tuned_gemm"
+)
+AITER_CONFIG_FMOE_FILE = update_config_files(AITER_CONFIG_FMOE, "tuned_fmoe")
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE = update_config_files(
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
+    "a8w8_blockscale_bpreshuffle_tuned_gemm",
+)
+AITER_CONFIG_A8W8_BATCHED_GEMM_FILE = update_config_files(
+    AITER_CONFIG_A8W8_BATCHED_GEMM, "a8w8_tuned_batched_gemm"
+)
+AITER_CONFIG_BF16_BATCHED_GEMM_FILE = update_config_files(
+    AITER_CONFIG_BF16_BATCHED_GEMM, "bf16_tuned_batched_gemm"
+)
+AITER_CONFIG_GEMM_BF16_FILE = update_config_files(
+    AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+)
+# config_env end here
 
 find_aiter = importlib.util.find_spec("aiter")
 if find_aiter is not None:
@@ -189,13 +290,17 @@ def check_and_set_ninja_worker():
         os.environ["MAX_JOBS"] = str(max_jobs)
 
 
-def rename_cpp_to_cu(els, dst, recursive=False):
+def rename_cpp_to_cu(els, dst, hipify, recursive=False):
     def do_rename_and_mv(name, src, dst, ret):
         newName = name
-        if name.endswith(".cpp") or name.endswith(".cu"):
-            newName = name.replace(".cpp", ".cu")
-            ret.append(f"{dst}/{newName}")
-        shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
+        if hipify:
+            if name.endswith(".cpp") or name.endswith(".cu"):
+                newName = name.replace(".cpp", ".cu")
+                ret.append(f"{dst}/{newName}")
+            shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
+        else:
+            if name.endswith(".cpp") or name.endswith(".cu"):
+                ret.append(f"{src}/{newName}")
 
     ret = []
     for el in els:
@@ -206,7 +311,9 @@ def rename_cpp_to_cu(els, dst, recursive=False):
             for entry in os.listdir(el):
                 if os.path.isdir(f"{el}/{entry}"):
                     if recursive:
-                        ret += rename_cpp_to_cu([f"{el}/{entry}"], dst, recursive)
+                        ret += rename_cpp_to_cu(
+                            [f"{el}/{entry}"], dst, hipify, recursive
+                        )
                     continue
                 do_rename_and_mv(entry, el, dst, ret)
         else:
@@ -283,7 +390,7 @@ def build_module(
     is_python_module,
     is_standalone,
     torch_exclude,
-    hipify=True,
+    hipify=False,
     prebuild=0,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"
@@ -308,10 +415,12 @@ def build_module(
             os.remove(f"{get_user_jit_dir()}/{target_name}")
 
         if prebuild != 2:
-            sources = rename_cpp_to_cu(srcs, src_dir)
+            sources = rename_cpp_to_cu(srcs, src_dir, hipify)
         else:
             sources = rename_cpp_to_cu(
-                [get_user_jit_dir() + "/../../csrc/rocm_ops.cpp"], opbd_dir + "/srcs"
+                [get_user_jit_dir() + "/../../csrc/rocm_ops.cpp"],
+                src_dir,
+                hipify,
             )
 
         flags_cc = ["-O3", "-std=c++20"]
@@ -374,7 +483,7 @@ def build_module(
                 if AITER_LOG_MORE:
                     logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
                 os.system(f"{PY} {blob_gen_cmd.format(blob_dir)}")
-                sources += rename_cpp_to_cu([blob_dir], src_dir, recursive=True)
+                sources += rename_cpp_to_cu([blob_dir], src_dir, hipify, recursive=True)
             return sources
 
         if prebuild != 2:
@@ -384,30 +493,40 @@ def build_module(
             else:
                 sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
-        # TODO: Move all torch api into torch folder
-        old_bd_include_dir = f"{op_dir}/build/include"
-        os.makedirs(old_bd_include_dir, exist_ok=True)
-        rename_cpp_to_cu(
-            [f"{AITER_CSRC_DIR}/include"] + extra_include, old_bd_include_dir
-        )
-
-        if not is_standalone:
-            bd_include_dir = f"{op_dir}/build/include/torch"
-            os.makedirs(bd_include_dir, exist_ok=True)
-            rename_cpp_to_cu(
-                [f"{AITER_CSRC_DIR}/include/torch"] + extra_include, bd_include_dir
-            )
-
         extra_include_paths = [
             f"{CK_DIR}/include",
             f"{CK_DIR}/library/include",
-            f"{old_bd_include_dir}",
         ]
+        if not hipify:
+            extra_include_paths += [
+                f"{AITER_CSRC_DIR}/include",
+                f"{op_dir}/blob",
+            ] + extra_include
+            if not is_standalone:
+                extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
+        else:
+            old_bd_include_dir = f"{op_dir}/build/include"
+            extra_include_paths.append(old_bd_include_dir)
+            os.makedirs(old_bd_include_dir, exist_ok=True)
+            rename_cpp_to_cu(
+                [f"{AITER_CSRC_DIR}/include"] + extra_include,
+                old_bd_include_dir,
+                hipify,
+            )
+
+            if not is_standalone:
+                bd_include_dir = f"{op_dir}/build/include/torch"
+                os.makedirs(bd_include_dir, exist_ok=True)
+                rename_cpp_to_cu(
+                    [f"{AITER_CSRC_DIR}/include/torch"],
+                    bd_include_dir,
+                    hipify,
+                )
 
         try:
             _jit_compile(
                 md_name,
-                sources,
+                sorted(set(sources)),
                 extra_cflags=flags_cc,
                 extra_cuda_cflags=flags_hip,
                 extra_ldflags=extra_ldflags,
@@ -458,7 +577,7 @@ def build_module(
 
     def FinalFunc():
         logger.info(
-            f"finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s"
+            f"\033[32mfinish build [{md_name}], cost {time.perf_counter()-startTS:.1f}s \033[0m"
         )
 
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
@@ -570,6 +689,10 @@ MANUAL_SCHEMA_OPS = [
     "_ActivationType",
     "_QuantType",
     "init_custom_ar",
+    "greedy_sample",
+    "random_sample",
+    "mixed_sample",
+    "exponential",
 ]
 
 NONE_WRAPPED_OP = [
@@ -601,7 +724,6 @@ SPECIAL_OPS_MUTATES_ARGS = {}
 
 def generate_schema(func) -> str:
     import inspect
-    from typing import List, Optional, Union, get_args, get_origin
 
     import torch
 
@@ -751,7 +873,7 @@ def compile_ops(
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
                 torch_exclude = d_args["torch_exclude"]
-                hipify = d_args.get("hipify", True)
+                hipify = d_args.get("hipify", False)
                 hip_clang_path = d_args.get("hip_clang_path", None)
                 prev_hip_clang_path = None
                 if hip_clang_path is not None and os.path.exists(hip_clang_path):
@@ -793,7 +915,6 @@ def compile_ops(
                 get_asm_dir()
                 import inspect
                 import re
-                import typing
 
                 import torch
 
@@ -802,6 +923,7 @@ def compile_ops(
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
+                    doc_str = doc_str.replace("list[", "List[")
                     for el in enum_types:
                         doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {

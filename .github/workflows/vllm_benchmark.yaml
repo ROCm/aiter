@@ -21,7 +21,7 @@ env:
 jobs:
   build_vllm_image:
     if: ${{ !github.event.pull_request.head.repo.fork }}
-    runs-on: aiter-k8s-build
+    runs-on: aiter-1gpu-runner
 
     steps:
       - name: Checkout aiter repo
@@ -86,6 +86,12 @@ jobs:
         model:
           - 'mistralai/Mixtral-8x7B-Instruct-v0.1'
           - 'deepseek-ai/DeepSeek-R1'
+        kv_cache_dtype:
+          - 'default_kvcache'
+          - 'fp8_kvcache'
+        exclude:
+          - model: 'deepseek-ai/DeepSeek-R1'
+            kv_cache_dtype: 'fp8_kvcache'
         
     steps:
       - name: Checkout aiter repo
@@ -94,10 +100,10 @@ jobs:
       - name: Checkout vLLM repo with retry
         uses: nick-fields/retry@v2
         with:
-          timeout_minutes: 5
+          timeout_minutes: 20
           max_attempts: 3
           command: |
-            git clone --branch ${{ env.VLLM_BRANCH }} ${{ env.VLLM_REPOSITORY_URL }}
+            git clone --depth=1 --branch ${{ env.VLLM_BRANCH }} ${{ env.VLLM_REPOSITORY_URL }}
 
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
@@ -113,14 +119,18 @@ jobs:
       - name: Run benchmarks
         run: |
           set -x -o pipefail
-          echo "Starting benchmark for model: ${{ matrix.model }}"
+          echo "Starting benchmark for model: ${{ matrix.model }} with kv_cache_dtype: ${{ matrix.kv_cache_dtype }}"
 
-          logFile="result_$(echo '${{ matrix.model }}' | sed 's/\//_/g').log"
+          logFile="result_$(echo '${{ matrix.model }}' | sed 's/\//_/g')_kv_${{ matrix.kv_cache_dtype }}.log"
 
           if [[ "${{ matrix.model }}" == *DeepSeek* ]]; then
               extraArgs="--block-size 1"
           else
               extraArgs=""
+          fi
+
+          if [[ "${{ matrix.kv_cache_dtype }}" == "fp8_kvcache" ]]; then
+              extraArgs="${extraArgs} --kv-cache-dtype fp8"
           fi
 
           docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \

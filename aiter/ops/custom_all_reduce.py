@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 from typing import List
-from ..jit.core import (
-    compile_ops,
-)
+
+import torch
+
+from ..jit.core import compile_ops
 
 MD_NAME = "module_custom_all_reduce"
 
@@ -29,6 +29,16 @@ def all_reduce_reg(
 
 @compile_ops("module_custom_all_reduce")
 def all_reduce_unreg(
+    _fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def all_gather_reg(_fa: int, inp: torch.Tensor, out: torch.Tensor) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def all_gather_unreg(
     _fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
 ) -> None: ...
 
@@ -155,7 +165,7 @@ def register_buffer(
 
 # def gen_get_graph_buffer_ipc_meta_fake_tensors(_fa: int) -> List[torch.Tensor]:
 
-#     handle_sz = 64  # sizeof(cudaIpcMemHandle_t) is 64 byte
+#     handle_sz = 64  # sizeof(hipIpcMemHandle_t) is 64 byte
 #     num_buffers = 4  # ???
 #     handles = torch.empty((handle_sz * num_buffers,), dtype=torch.uint8, device="cuda")
 
