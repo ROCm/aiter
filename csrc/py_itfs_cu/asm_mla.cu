@@ -158,7 +158,6 @@ void mla_decode_stage1_asm_fwd(
     {
         if(KV.dtype() == at::ScalarType::BFloat16)
         {
-#if defined(__gfx942__)
             if(gqa_ratio == 128)
             {
                 sub_Q = 128;
@@ -205,7 +204,6 @@ void mla_decode_stage1_asm_fwd(
                     impl_ptr = &impl_a16w16_bf16;
                 }
             }
-#endif
         } 
         else if(KV.dtype() == at::ScalarType::Float8_e4m3fnuz || KV.dtype() == at::ScalarType::Float8_e4m3fn)
         {

@@ -204,6 +204,8 @@ def mla_decode_fwd(
             logits,
             attn_lse,
             o,
+            q_scale,
+            kv_scale,
         )
 
         # if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):
