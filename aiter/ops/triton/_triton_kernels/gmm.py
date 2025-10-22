@@ -34,9 +34,8 @@ def get_config(
         "nptgmm",
     }, f"'{gmm_type}' is an invalid GMM variant."
     if not hasattr(get_config, "_config_dict"):
-        config_filename = os.path.join(
-            AITER_TRITON_CONFIGS_PATH, f"{arch_info.get_arch()}-GMM.json"
-        )
+        dev = arch_info.get_arch()
+        config_filename = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GMM.json"
         assert os.path.exists(config_filename) and os.path.isfile(
             config_filename
         ), f"'{config_filename}' isn't an existent file."
