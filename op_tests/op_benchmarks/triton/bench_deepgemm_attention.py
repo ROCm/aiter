@@ -54,15 +54,23 @@ def ref_fp8_paged_mqa_logits(
     for i in range(batch_size):
         context_len = context_lens[i]
         q_offsets = torch.arange(context_len - next_n, context_len, device="cuda")
-        weight_slice = weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
+        weight_slice = (
+            weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
+        )
         for block_rk in range(cdiv(context_len, block_size)):
             block_idx = block_tables[i][block_rk]
             qx, kx = q[i], kv_cache[block_idx]
-            k_offsets = torch.arange(block_rk * block_size, (block_rk + 1) * block_size, device="cuda")
-            mask = (k_offsets[None, :] < context_len) & (k_offsets[None, :] <= q_offsets[:, None])
+            k_offsets = torch.arange(
+                block_rk * block_size, (block_rk + 1) * block_size, device="cuda"
+            )
+            mask = (k_offsets[None, :] < context_len) & (
+                k_offsets[None, :] <= q_offsets[:, None]
+            )
             s = torch.where(
                 mask[None, :, :],
-                (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(logits.dtype),
+                (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(
+                    logits.dtype
+                ),
                 float("-inf"),
             )
             s = torch.relu(s) * weight_slice[..., None]
@@ -70,7 +78,9 @@ def ref_fp8_paged_mqa_logits(
             logits[
                 i * next_n : (i + 1) * next_n,
                 block_rk * block_size : (block_rk + 1) * block_size,
-            ] = torch.where(k_offsets[None, None, :] <= q_offsets[None, :, None], s, float("-inf"))
+            ] = torch.where(
+                k_offsets[None, None, :] <= q_offsets[None, :, None], s, float("-inf")
+            )
     return logits
 
 
@@ -96,19 +106,27 @@ def ref_fp8_paged_mqa_logits_ragged(
         q_offsets = torch.arange(context_len - next_n, context_len, device="cuda")
         qx, kx = (
             q[i],
-            kv_cache[kv_indices[prefix_sum_context_lens[i] : prefix_sum_context_lens[i + 1]]],
+            kv_cache[
+                kv_indices[prefix_sum_context_lens[i] : prefix_sum_context_lens[i + 1]]
+            ],
         )
         k_offsets = torch.arange(0, context_len, device="cuda")
-        mask = (k_offsets[None, :] < context_len) & (k_offsets[None, :] <= q_offsets[:, None])
+        mask = (k_offsets[None, :] < context_len) & (
+            k_offsets[None, :] <= q_offsets[:, None]
+        )
         s = torch.where(
             mask[None, :, :],
             (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(logits.dtype),
             float("-inf"),
         )
-        weight_slice = weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
+        weight_slice = (
+            weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
+        )
         s = torch.relu(s) * weight_slice[..., None]
         s = s.sum(dim=0)
-        logits[i * next_n : (i + 1) * next_n, :context_len] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float("-inf"))
+        logits[i * next_n : (i + 1) * next_n, :context_len] = torch.where(
+            k_offsets[None, :] <= q_offsets[:, None], s, float("-inf")
+        )
 
     return logits
 
@@ -118,7 +136,9 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
     line_names = ["ragged_k", "non_ragged_k"]
     line_args = "kv_storage_kind"
 
-    x_vals_list = [(args.batch, args.mtp + 1, args.heads, args.index_dim, args.kv_length)]
+    x_vals_list = [
+        (args.batch, args.mtp + 1, args.heads, args.index_dim, args.kv_length)
+    ]
 
     configs = []
     configs.append(
@@ -142,7 +162,9 @@ def run_benchmark(args: argparse.Namespace):
     ChunkK = 256
 
     @triton.testing.perf_report(create_paged_mqa_logits_configs(args))
-    def test_deepgemm_fp8_paged_mqa_logits(batch_size, next_n, heads, index_dim, avg_kv_length, kv_storage_kind):
+    def test_deepgemm_fp8_paged_mqa_logits(
+        batch_size, next_n, heads, index_dim, avg_kv_length, kv_storage_kind
+    ):
         torch.manual_seed(0)
         random.seed(0)
 
@@ -160,7 +182,9 @@ def run_benchmark(args: argparse.Namespace):
             .cuda()
             .to(torch.int32)
         )
-        prefix_sum_context_lens = torch.zeros((batch_size + 1,), device="cuda", dtype=torch.int32)
+        prefix_sum_context_lens = torch.zeros(
+            (batch_size + 1,), device="cuda", dtype=torch.int32
+        )
         prefix_sum_context_lens[1:] = torch.cumsum(context_lens, dim=0)
 
         q = torch.randn(
@@ -180,8 +204,12 @@ def run_benchmark(args: argparse.Namespace):
         )
 
         qk_datatype = torch.float8_e4m3fnuz
-        max_block_len = (context_lens.max().item() + blocksize - 1) // blocksize * blocksize
-        block_tables = torch.zeros((batch_size, max_block_len), device="cuda", dtype=torch.int32)
+        max_block_len = (
+            (context_lens.max().item() + blocksize - 1) // blocksize * blocksize
+        )
+        block_tables = torch.zeros(
+            (batch_size, max_block_len), device="cuda", dtype=torch.int32
+        )
 
         counter = 0
         block_idx_pool = list(range(num_blocks))
@@ -195,13 +223,19 @@ def run_benchmark(args: argparse.Namespace):
         q_fp8 = q.to(qk_datatype)
         split_kv_cache_fp8, split_kv_cache_scale = kv_cache_cast_to_fp8(kv_cache)
 
-        kv_indices = torch.zeros(prefix_sum_context_lens[-1], device="cuda", dtype=torch.int32)
+        kv_indices = torch.zeros(
+            prefix_sum_context_lens[-1], device="cuda", dtype=torch.int32
+        )
         for i in range(batch_size):
             ctx_len = int(context_lens[i].item())
-            kv_indices[prefix_sum_context_lens[i] : prefix_sum_context_lens[i + 1]] = torch.randperm(max_model_len, device="cuda")[:ctx_len]
+            kv_indices[prefix_sum_context_lens[i] : prefix_sum_context_lens[i + 1]] = (
+                torch.randperm(max_model_len, device="cuda")[:ctx_len]
+            )
 
         if kv_storage_kind == "non_ragged_k":
-            ref_logits = ref_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, max_model_len)
+            ref_logits = ref_fp8_paged_mqa_logits(
+                q, kv_cache, weights, context_lens, block_tables, max_model_len
+            )
         else:
             ref_logits = ref_fp8_paged_mqa_logits_ragged(
                 q,
@@ -236,7 +270,13 @@ def run_benchmark(args: argparse.Namespace):
             #     max_model_len,
             # )
             Preshuffle = blocksize == 16
-            split_kv_cache_fp8 = shuffle_weight(split_kv_cache_fp8.view([num_blocks, blocksize, index_dim])) if Preshuffle else split_kv_cache_fp8
+            split_kv_cache_fp8 = (
+                shuffle_weight(
+                    split_kv_cache_fp8.view([num_blocks, blocksize, index_dim])
+                )
+                if Preshuffle
+                else split_kv_cache_fp8
+            )
 
             _, elapsed_us = run_perftest(
                 deepgemm_fp8_paged_mqa_logits,
@@ -278,10 +318,16 @@ def run_benchmark(args: argparse.Namespace):
 
         out_qk_logits = torch.sum(out_qk, dim=0)
 
-        positions = torch.arange(max_model_len, device="cuda").unsqueeze(0).expand(batch_size * next_n, -1)
+        positions = (
+            torch.arange(max_model_len, device="cuda")
+            .unsqueeze(0)
+            .expand(batch_size * next_n, -1)
+        )
         row_indices = torch.arange(batch_size * next_n, device="cuda") // next_n
         next_n_offset = torch.arange(batch_size * next_n, device="cuda") % next_n
-        mask = positions <= (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(1)
+        mask = positions <= (
+            context_lens[row_indices] - next_n + next_n_offset
+        ).unsqueeze(1)
 
         def calc_diff(x: torch.Tensor, y: torch.Tensor):
             x, y = x.double(), y.double()
@@ -300,7 +346,9 @@ def run_benchmark(args: argparse.Namespace):
         # assert qk_diff < 1e-3
         assert logits_diff < 1e-3
 
-        total_float_operations = 2 * next_n * heads * index_dim * context_lens.float().sum().item()
+        total_float_operations = (
+            2 * next_n * heads * index_dim * context_lens.float().sum().item()
+        )
         flops = total_float_operations / elapsed_us * 1e-6
 
         print(
