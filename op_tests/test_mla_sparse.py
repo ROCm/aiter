@@ -427,34 +427,34 @@ def test_mla(
         split_params=split_params,
     )
 
+    token_indices = generate_topk_kv(kv_indptr, mtp)
+    converted_indices = triton_convert_req_index_to_global_index(
+        kv_indptr,
+        kv_indices,
+        token_indices,
+        mtp,
+    )
+
+    new_qo_indptr, new_kv_indptr, new_indices = sparse_kv_indptr_to_dense(
+        kv_indptr,
+        converted_indices,
+        mtp,
+    ) 
+
+    out_ref, lse_ref = torch_mla_extend(
+        q,
+        kv_buffer,
+        new_qo_indptr,
+        new_kv_indptr,
+        new_indices,
+        sm_scale,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        is_causal=False,
+        dtype=dtype,
+    )
+
     def test_sparse_mla_bf16():
-        token_indices = generate_topk_kv(kv_indptr, mtp)
-        converted_indices = triton_convert_req_index_to_global_index(
-            kv_indptr,
-            kv_indices,
-            token_indices,
-            mtp,
-        )
-
-        new_qo_indptr, new_kv_indptr, new_indices = sparse_kv_indptr_to_dense(
-            kv_indptr,
-            converted_indices,
-            mtp,
-        ) 
-
-        out_ref, lse_ref = torch_mla_extend(
-            q,
-            kv_buffer,
-            new_qo_indptr,
-            new_kv_indptr,
-            new_indices,
-            sm_scale,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            is_causal=False,
-            dtype=dtype,
-        )
-
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
@@ -513,9 +513,9 @@ def test_mla(
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
             q_fp8,
             kv_buffer_fp8,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
+            new_qo_indptr,
+            new_kv_indptr,
+            new_indices,
             sm_scale,
             kv_lora_rank,
             qk_rope_head_dim,
@@ -532,9 +532,9 @@ def test_mla(
             out_asm,
             qo_indptr,
             kv_indptr,
-            kv_indices,
+            converted_indices.view(-1),
             kv_last_page_lens,
-            max_seqlen_qo,
+            1,
             sm_scale,
             q_scale=q_scale,
             kv_scale=kv_scale,
@@ -570,7 +570,7 @@ def test_mla(
         )
         return err, err_fp8, us_asm_decode
 
-    # err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8 = test_absorb_decode_fp8()
+    err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8 = test_absorb_decode_fp8()
 
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")

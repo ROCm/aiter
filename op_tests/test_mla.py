@@ -8,6 +8,7 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
+import math 
 
 torch.set_default_device("cuda")
 # torch.set_printoptions(sci_mode=False, threshold=torch.inf)
@@ -435,7 +436,6 @@ def test_mla(
     # print(reduce_final_map)
     # print(reduce_partial_map)
 
-    # import pdb; pdb.set_trace()
     # work_meta_data_2     = torch.empty([10], dtype=torch.uint64, device="cuda")
     # work_indptr_2        = torch.empty([81], dtype=torch.int32, device="cuda")
     # work_info_set_2      = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
@@ -457,7 +457,6 @@ def test_mla(
     #     reduce_partial_map_2,
     #     # num_reduce_tile,
     # )
-    # import pdb; pdb.set_trace()
 
     (attn_logits, attn_lse), us_asm_decode = run_perftest(
         aiter.mla.mla_decode_fwd_dispatch,

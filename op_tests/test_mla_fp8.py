@@ -276,7 +276,7 @@ def test_mla(
         "kv_granularity": max(page_size, 16),
         "max_seqlen_qo": max_seqlen_qo,
         "uni_seqlen_qo": mtp,
-        "fast_mode": 1,
+        # "fast_mode": 1,
     }
     # _, us_asm_decode = run_perftest(
     #     aiter.get_mla_metadata_v1,
@@ -325,8 +325,6 @@ def test_mla(
         reduce_partial_map=reduce_partial_map,
     )
     # out_asm = out_asm[:total_q]
-
-    # import pdb; pdb.set_trace()
 
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")
