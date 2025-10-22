@@ -1,17 +1,17 @@
 {
   "small": {
-     "BLOCK_SIZE_M": 8,
-    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
     "BLOCK_SIZE_K": 128,
-    "GROUP_SIZE_M": 8,
-    "num_warps": 8,
-    "num_stages": 4,
-    "waves_per_eu": 2,
+    "GROUP_SIZE_M": 1,
     "matrix_instr_nonkdim": 16,
-    "cache_modifier": ".ca",
+    "num_warps": 4,
+    "num_stages": 1,
+    "waves_per_eu": 8,
+    "cache_modifier": ".cg",
     "NUM_KSPLIT": 1
   },
-   "medium_M32": {
+  "medium_M32": {
     "BLOCK_SIZE_M": 8,
     "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 128,
@@ -47,7 +47,7 @@
     "cache_modifier": ".ca",
     "NUM_KSPLIT": 1
   },
-  "medium_M2000" : {
+  "medium_M2000": {
     "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K": 128,
@@ -59,7 +59,7 @@
     "matrix_instr_nonkdim": 32,
     "cache_modifier": ".ca"
   },
-  "medium_M6017" : {
+  "medium_M6017": {
     "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K": 128,
