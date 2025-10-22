@@ -143,8 +143,6 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=str,
-    choices=["fp16", "bf16"],
-    nargs="*",
     default="bf16",
     help="""Data type of input.
     e.g.: -d bf16""",

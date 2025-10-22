@@ -998,10 +998,6 @@ __global__ void concat_and_cache_mla_kernel(
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
   const float inverted_kscale = 1.0f / *scale;
-  static constexpr int32_t vec_size_i = 4;
-  static constexpr int32_t vec_size_o =  vec_size_i;
-  using vec_i = ck_tile::vec_t<scalar_t, vec_size_i>;
-  using DTYPE_STORE = typename ck_tile::vector_traits<cache_t>::scalar_type;
   auto copy = [&](const scalar_t* __restrict__ src, cache_t* __restrict__ dst,
                   int src_stride, int dst_stride, int size, int offset) {
     for (int i = threadIdx.x; i < size; i += blockDim.x) {
@@ -1045,7 +1041,7 @@ __global__ void concat_and_cache_mla_opt_kernel(
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
   const float inverted_kscale = 1.0f / *scale;
-  static constexpr int32_t vec_size_i = 4;
+  static constexpr int32_t vec_size_i =  std::is_same_v<scalar_t, float> ? 4 : 8;
   static constexpr int32_t vec_size_o =  vec_size_i;
   using vec_i = ck_tile::vec_t<scalar_t, vec_size_i>;
   static constexpr int32_t ooba_i = 4 / sizeof(scalar_t);
@@ -1068,7 +1064,7 @@ __global__ void concat_and_cache_mla_opt_kernel(
     vec_i vec_cur;
 
     size_t vec_idx    = threadIdx.x;
-    size_t vec_stride = blockDim.x;//* vec_size_o
+    size_t vec_stride = blockDim.x;
     if(vec_idx < num_vecs)
     {
         vec_cur = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
@@ -1676,11 +1672,12 @@ void concat_and_cache_mla(
  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(kv_c));
  const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-  if ((pe_dim & 0x3) == 0 && (kv_lora_rank & 0x3)== 0) {
+  if ((pe_dim & 0x7) == 0 && (kv_lora_rank & 0x7) == 0) {
     dim3 grid(num_tokens);
-    dim3 block(std::min(kv_lora_rank, 1024)/4);
+    dim3 block(std::min(kv_lora_rank, 1024)/8);
     DISPATCH_BY_KV_CACHE_DTYPE(kv_c.dtype(), kv_cache_dtype,
                                CALL_CONCAT_AND_CACHE_MLA_OPT);
+
   } else {
     dim3 grid(num_tokens);
     dim3 block(std::min(kv_lora_rank, 512));
@@ -1689,5 +1686,6 @@ void concat_and_cache_mla(
   }
 
 }
+
 
 } // namespace aiter
