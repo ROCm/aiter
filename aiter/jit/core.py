@@ -109,9 +109,6 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_gemm.csv",
 )
-## merge config files
-##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
-import pandas as pd
 
 
 def update_config_files(file_path: str, merge_name: str):
@@ -119,6 +116,10 @@ def update_config_files(file_path: str, merge_name: str):
     if len(path_list) <= 1:
         return file_path
     df_list = []
+    ## merge config files
+    ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
+    import pandas as pd
+
     df_list.append(pd.read_csv(path_list[0]))
     for i, path in enumerate(path_list[1:]):
         if os.path.exists(path):
