@@ -234,7 +234,7 @@ def _moe_gemm_a8w4(
              GROUP_M: tl.constexpr, XCD_SWIZZLE: tl.constexpr,
              # One of ["CDNA4", None]
              SWIZZLE_MX_SCALE: tl.constexpr,
-             EVEN_K: tl.constexpr, SPLIT_K: tl.constexpr,
+             EVEN_K: tl.constexpr, MASK_K_LIMIT: tl.constexpr, SPLIT_K: tl.constexpr,
              W_CACHE_MODIFIER: tl.constexpr,
              UPCAST_INDICES: tl.constexpr = False):
 
@@ -391,13 +391,12 @@ def _moe_gemm_a8w4(
         WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
 
     if not EVEN_K:
-        k = K - num_k_iter * BLOCK_K
-        mask_x_k = offs_x_k < k
-        mask_w_k = offs_w_k < (k // W_K_DIVISOR)
+        mask_x_k = offs_x_k < MASK_K_LIMIT
+        mask_w_k = offs_w_k < (MASK_K_LIMIT // W_K_DIVISOR)
         if SWIZZLE_MX_SCALE is None:
-            mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < k
+            mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
         if is_x_microscaled:
-            mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < k
+            mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
 
         x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0.0)
         w = tl.load(WPtrs, mask=mask_w_k[:, None], other=0, cache_modifier=W_CACHE_MODIFIER)
