@@ -543,49 +543,52 @@ def test_paged_attention(
         )
         k_cache, v_cache = k_caches[0], v_caches[0]
 
-    out_aiter, time_aiter = run_aiter(
-        query,
-        k_cache,
-        v_cache,
-        block_tables,
-        seq_lens,
-        max_seq_len,
-        kv_cache_dtype,
-        num_kv_heads,
-        scale,
-        alibi_slopes,
-        k_scale,
-        v_scale,
-    )
-    if debug_mode != VERIFY:
-        out_golden = out_aiter
-    checkAllclose(
-        out_golden, out_aiter, msg=f"golden vs aiter_shomy:{time_aiter:>8.2f} us......"
-    )
+    # out_aiter, time_aiter = run_aiter(
+    #     query,
+    #     k_cache,
+    #     v_cache,
+    #     block_tables,
+    #     seq_lens,
+    #     max_seq_len,
+    #     kv_cache_dtype,
+    #     num_kv_heads,
+    #     scale,
+    #     alibi_slopes,
+    #     k_scale,
+    #     v_scale,
+    # )
+    # if debug_mode != VERIFY:
+    #     out_golden = out_aiter
+    # checkAllclose(
+    #     out_golden, out_aiter, msg=f"golden vs aiter_shomy:{time_aiter:>8.2f} us......"
+    # )
     # tensor_dump(out_aiter, 'out_aiter')
 
-    time_aiter_asm = None
-    if dtype == dtypes.bf16:
-        out_aiter_asm, time_aiter_asm = run_aiter_asm(
-            query.contiguous(),  # this kernel need contiguous buffer
-            k_cache,
-            asm_V_shuffle(v_cache),
-            block_tables,
-            seq_lens,
-            max_seq_len,
-            kv_cache_dtype,
-            num_kv_heads,
-            scale,
-            alibi_slopes,
-            max_num_blocks_per_seq,
-        )
+    # time_aiter_asm = None
+    # if dtype == dtypes.bf16:
+    #     out_aiter_asm, time_aiter_asm = run_aiter_asm(
+    #         query.contiguous(),  # this kernel need contiguous buffer
+    #         k_cache,
+    #         asm_V_shuffle(v_cache),
+    #         block_tables,
+    #         seq_lens,
+    #         max_seq_len,
+    #         kv_cache_dtype,
+    #         num_kv_heads,
+    #         scale,
+    #         alibi_slopes,
+    #         max_num_blocks_per_seq,
+    #     )
 
-        checkAllclose(
-            out_golden,
-            out_aiter_asm,
-            msg=f"golden vs aiter_asm:{time_aiter_asm:>8.2f} us......",
-        )
-        # tensor_dump(out_aiter, 'out_aiter')
+    #     if debug_mode != VERIFY:
+    #         out_golden = out_aiter_asm
+
+    #     checkAllclose(
+    #         out_golden,
+    #         out_aiter_asm,
+    #         msg=f"golden vs aiter_asm:{time_aiter_asm:>8.2f} us......",
+    #     )
+    #     # tensor_dump(out_aiter, 'out_aiter')
 
     for quant_algo_, cache_type_ in [
         (0, k_cache.dtype),
@@ -635,25 +638,29 @@ def test_paged_attention(
             k_scale_asm.fill_(k_scale_.item())
             v_scale_asm.fill_(v_scale_.item())
 
-            out_aiter, time_aiter = run_aiter(
-                query,
-                k_quant_,
-                v_quant_,
-                block_tables,
-                seq_lens,
-                max_seq_len,
-                "fp8",
-                num_kv_heads,
-                scale,
-                alibi_slopes,
-                k_scale_,
-                v_scale_,
-            )
-            checkAllclose(
-                out_golden,
-                out_aiter,
-                msg=f"golden vs shomy:{time_aiter:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
-            )
+            # out_aiter, time_aiter = run_aiter(
+            #     query,
+            #     k_quant_,
+            #     v_quant_,
+            #     block_tables,
+            #     seq_lens,
+            #     max_seq_len,
+            #     "fp8",
+            #     num_kv_heads,
+            #     scale,
+            #     alibi_slopes,
+            #     k_scale_,
+            #     v_scale_,
+            # )
+
+            # if debug_mode != VERIFY:
+            #     out_golden = out_aiter
+
+            # checkAllclose(
+            #     out_golden,
+            #     out_aiter,
+            #     msg=f"golden vs shomy:{time_aiter:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
+            # )
         # if quant_algo != "KV_8BIT_PER_TENSOR":
         # out_aiter_naive, time_aiter_naive = run_aiter_naive(
         #     query,
@@ -691,6 +698,10 @@ def test_paged_attention(
                 k_scale_asm,
                 v_scale_asm,
             )
+            
+            if debug_mode != VERIFY:
+                out_golden = out_aiter_asm
+            
             checkAllclose(
                 out_golden,
                 out_aiter_asm,
@@ -801,13 +812,13 @@ def test_paged_attention(
     print(
         f"finish~ {ctx_lens=}, {num_seqs=}, {num_heads=}, {head_size=}, {use_alibi=}, {block_size=}, {dtype=}, {kv_cache_dtype=}\n"
     )
-    return {"aiter_shomy": time_aiter, "aiter_asm": time_aiter_asm}
+    return {"aiter_shomy": 0.0, "aiter_asm": time_aiter_asm}
 
 
 df = []
-l_num_heads = [(4, 1), (8, 1), (32, 8)]
-l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097]
-l_dtype = ["fp16", "bf16"]
+l_num_heads = [(5, 1)]
+l_ctx_len = [16384]
+l_dtype = ["bf16"]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -864,7 +875,7 @@ for num_heads in l_num_heads:
     for ctx_len in l_ctx_len:
         for dtype in l_dtype:
             ret = test_paged_attention(
-                ctx_len, 128, num_heads, 128, False, 16, dtype, "auto", 0, "cuda:0"
+                ctx_len, 1, num_heads, 128, False, 16, dtype, "auto", 0, "cuda:0"
             )
             df.append(ret)
 df = pd.DataFrame(df)

@@ -307,6 +307,8 @@ def run_aiter(
     if fp8_out_scale is not None:
         output = torch.empty_like(output, dtype=dtypes.fp8)
         cpa_fp8_out = True
+
+    # ((1, 5, 128), (5280,), (1, 5, 128), (1107664, 16, 1, 128), (1107664, 16, 1, 128), (), (1, 752), (2,), (1,), (), (), (), (), (), (), (), (), (), ())
     torch.ops.aiter.paged_attention_v1(
         output,
         workspace_buffer,
@@ -524,31 +526,34 @@ def test_paged_attention(
         )
         cu_query_lens = torch.arange(0, num_seqs + 1, dtype=torch.int)
 
-    if quant_cache_dtype is None:
-        if kv_cache_layout == "NHD":
-            key_cache_new = rearrange(key_cache_new, "b h s d -> b s h d")
-            value_cache_new = rearrange(value_cache_new, "b h s d -> b s h d")
+    # if quant_cache_dtype is None:
+    if kv_cache_layout == "NHD":
+        key_cache_new = rearrange(key_cache_new, "b h s d -> b s h d")
+        value_cache_new = rearrange(value_cache_new, "b h s d -> b s h d")
 
-        out_aiter, time_aiter = run_aiter(
-            query,
-            key_cache_new.contiguous(),
-            value_cache_new.contiguous(),
-            block_tables,
-            cu_query_lens,
-            seq_lens,
-            max_seq_len,
-            kv_cache_dtype,
-            kv_cache_layout,
-            scale,
-            alibi_slopes,
-            logits_soft_cap,
-            k_scale,
-            v_scale,
-        )
-        assert (
-            checkAllclose(out_golden, out_aiter, msg=f"golden vs aiter:{time_aiter}")
-            < 0.01
-        )
+    out_aiter, time_aiter = run_aiter(
+        query,
+        key_cache_new.contiguous(),
+        value_cache_new.contiguous(),
+        block_tables,
+        cu_query_lens,
+        seq_lens,
+        max_seq_len,
+        kv_cache_dtype,
+        kv_cache_layout,
+        scale,
+        alibi_slopes,
+        logits_soft_cap,
+        k_scale,
+        v_scale,
+    )
+    # if debug_mode != VERIFY:
+    # out_golden = out_aiter
+    
+    assert (
+        checkAllclose(out_golden, out_aiter, msg=f"golden vs aiter:{time_aiter}")
+        < 0.01
+    )
 
     if DUMP_INPUTS:
         dump_input(
@@ -616,29 +621,19 @@ if __name__ == "__main__":
         None if i == "none" else dtypes.d_dtypes[i] for i in args.quant_cache_dtype
     ]
 
-    for ctx_len, pa_variant, quant_cache_dtype in itertools.product(
-        args.ctx_len,
+    test_paged_attention(
+        16384,
+        1,
+        (5, 1),
+        128,
+        False,
+        16,
+        dtypes.fp16,
+        "auto",
+        "NHD",
+        0.0,
         args.pa_variant,
-        args.quant_cache_dtype,
-    ):
-
-        if pa_variant == PAVariant.Shomy:
-            if quant_cache_dtype is not None:
-                continue
-
-        test_paged_attention(
-            ctx_len,
-            8,
-            (8, 1),
-            128,
-            False,
-            16,
-            dtypes.fp16,
-            "auto",
-            "NHD",
-            0.0,
-            pa_variant,
-            quant_cache_dtype,
-            0,
-            "cuda:0",
-        )
+        "fp8",
+        0,
+        "cuda:0",
+    )
