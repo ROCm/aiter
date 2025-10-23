@@ -14,11 +14,20 @@ concurrency:
 jobs:
   sglang:
     name: sglang integration
-    runs-on: aiter-mi325-1gpu
+    strategy:
+      matrix:
+        include:
+          - GPU_ARCH: gfx942
+            RUNNER: aiter-mi325-1gpu
+            SGL_IMAGE: rocm/sgl-dev:v0.5.3.post3-rocm700-mi30x-20251019
+          - GPU_ARCH: gfx950
+            RUNNER: aiter-mi355-1gpu
+            SGL_IMAGE: rocm/sgl-dev:v0.5.3.post3-rocm700-mi35x-20251022
+    runs-on: ${{ matrix.RUNNER }}
     env:
       SGL_BRANCH: v0.5.3
-      GPU_ARCH: gfx942
-      SGL_IMAGE: rocm/sgl-dev:v0.5.3.post3-rocm700-mi30x-20251019
+      GPU_ARCH: ${{ matrix.GPU_ARCH }}
+      SGL_IMAGE: ${{ matrix.SGL_IMAGE }}
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
