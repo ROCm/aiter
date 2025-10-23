@@ -103,6 +103,15 @@ def fused_rms_fp8_group_quant(
         out_res1_row_stride = out_res1.stride(0)
         out_res1_col_stride = out_res1.stride(1)
 
+    if BLOCK_SIZE_N <= 512:
+        num_warps = 1
+    elif BLOCK_SIZE_N <= 2048:
+        num_warps = 4
+    elif BLOCK_SIZE_N <= 4096:
+        num_warps = 8
+    else:
+        num_warps = 16
+
     DTYPE_MAX = (
         torch.finfo(out1_fp8.dtype).max
         if torch.is_floating_point(out1_fp8)
@@ -147,6 +156,7 @@ def fused_rms_fp8_group_quant(
         HAVE_SECOND_INPUT=(inp2 is not None),
         FIRST_INPUT_RES=(res1 is not None),
         FIRST_INPUT_OUT=output_unquantized_inp1,
+        num_warps=num_warps,
     )
 
     return (out1_fp8, out1_bs), out1, out2, out_res1
