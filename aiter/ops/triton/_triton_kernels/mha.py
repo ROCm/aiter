@@ -103,6 +103,7 @@ def _attn_fwd_inner(
     descale_v,
     OFFS_M: tl.constexpr,
     OFFS_N: tl.constexpr,
+    PRELOAD_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -143,7 +144,8 @@ def _attn_fwd_inner(
                 (BLOCK_DMODEL + BLOCK_DMODEL_PE),
                 seqlen_k,
             )
-        v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
+        if PRELOAD_V:
+            v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
 
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
@@ -230,7 +232,8 @@ def _attn_fwd_inner(
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
         m_i = m_ij
-
+        if not PRELOAD_V:
+            v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
         if IS_FP8:
             scale_p, descale_p = _compute_fp8_scaling_factors(p, FP8_MAX)
             acc += (
@@ -305,6 +308,7 @@ def _attn_fwd(
     IS_CAUSAL: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
+    PRELOAD_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -691,6 +695,7 @@ def _attn_fwd(
             descale_v,
             offs_m,
             offs_n,
+            PRELOAD_V,
             BLOCK_M,
             BLOCK_N,
             BLOCK_DMODEL,
@@ -754,6 +759,7 @@ def _attn_fwd(
             descale_v,
             offs_m,
             offs_n,
+            PRELOAD_V,
             BLOCK_M,
             BLOCK_N,
             BLOCK_DMODEL,
