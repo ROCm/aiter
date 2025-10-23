@@ -165,7 +165,7 @@ void register_buffer(fptr_t _fa, torch::Tensor &t,
   fa->register_buffer(handles, offsets, t.data_ptr());
 }
 
-std::tuple<torch::Tensor, torch::Tensor> get_graph_buffer_ipc_meta(
+std::vector<at::Tensor> get_graph_buffer_ipc_meta(
     fptr_t _fa)
 {
   auto fa = reinterpret_cast<aiter::CustomAllreduce *>(_fa);
