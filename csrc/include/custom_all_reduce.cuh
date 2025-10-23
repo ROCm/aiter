@@ -1637,16 +1637,6 @@ namespace aiter
       template_kernel<<<grid, block, 0, stream>>>(sg_, output, weight, eps, rank_, m, n);\
     } while (0)
 
-#define case_branch(case_i, template_kernel) \
-    do \
-    {\
-      case case_i:\
-      {\
-        launch_fused_allreduce_rmsnorm(template_kernel);\
-        break;\
-      }\
-    } while(0)
-
     if (n_bytes % 1024 == 0)
     {
       if (8192 <= n_bytes && n_bytes <= 32768)
@@ -1655,24 +1645,38 @@ namespace aiter
         int n_loop = n_bytes / 8192; // 1, 2, 3, 4
         if (n_bytes % 8192 == 0)
         {
-          printf("===> call 4096 naive\n");
+          printf("===> call 4096 naive, n_loop = %d\n", n_loop);
           switch (n_loop)
           {
-            case_branch(1, (local_device_load_rmsnorm_naive<T, 512, 1>));
-            case_branch(2, (local_device_load_rmsnorm_naive<T, 512, 2>));
-            case_branch(3, (local_device_load_rmsnorm_naive<T, 512, 3>));
-            case_branch(4, (local_device_load_rmsnorm_naive<T, 512, 4>));
+            case 1:
+              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 1>));
+              break;
+            case 2:
+              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 2>));
+              break;
+            case 3:
+              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 3>));
+              break;
+            case 4:
+              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 4>));
+              break;
           }
         }
         else
         {
-          printf("===> call 4096 normal\n");
+          printf("===> call 4096 normal, n_loop = %d\n", n_loop);
           n_loop += 1;
           switch (n_loop)
           {
-            case_branch(2, (local_device_load_rmsnorm<T, 512, 2>));
-            case_branch(3, (local_device_load_rmsnorm<T, 512, 3>));
-            case_branch(4, (local_device_load_rmsnorm<T, 512, 4>));
+            case 2:
+              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 2>));
+              break;
+            case 3:
+              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 3>));
+              break;
+            case 4:
+              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 4>));
+              break;
           }
         }
       }
@@ -1698,12 +1702,18 @@ namespace aiter
         block.x = 256;
         int naive_grid_size = (m + 3) / 4;
         int n_loop = n_bytes / 1024;
-        printf("===> call 512\n");
+        printf("===> call 512, n_loop = %d\n", n_loop);
         switch (n_loop)
         {
-          case_branch(1, (local_device_load_rmsnorm_512n<T, 1>));
-          case_branch(2, (local_device_load_rmsnorm_512n<T, 2>));
-          case_branch(3, (local_device_load_rmsnorm_512n<T, 3>));
+          case 1:
+            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 1>));
+            break;
+          case 2:
+            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 2>));
+            break;
+          case 3:
+            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 3>));
+            break;
         }
       }
       else
