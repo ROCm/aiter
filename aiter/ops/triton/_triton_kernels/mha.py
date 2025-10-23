@@ -143,12 +143,13 @@ def _attn_fwd_inner(
                 (BLOCK_DMODEL + BLOCK_DMODEL_PE),
                 seqlen_k,
             )
+        v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
 
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
         # TODO: This can be optimized to only be true for the padded block.
-        mask = tl.full([BLOCK_M, BLOCK_N], True, dtype=tl.int1)
+        # mask = tl.full([BLOCK_M, BLOCK_N], True, dtype=tl.int1)
+        mask = tl.full([1, 1], True, dtype=tl.int1)
         if MASK_STEPS:
             # If this is the last block / iteration, we want to
             # mask if the sequence length is not a multiple of block size
@@ -162,24 +163,24 @@ def _attn_fwd_inner(
             # the causal for loop does not have the if-else block any more, which
             # helps instruction scheduling and register pressure.
             bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
-            boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
             size_n = start_n + OFFS_N[None, :]
-            mask_partial = size_n < boundary_m[:, None]
+            mask_partial = size_n < seqlen_k
             mask = tl.where(bound_cond, mask_partial, mask)
 
         # compute masks
         q_mask = OFFS_M[:, None] < seqlen_q
         k_mask = (start_n + tl.arange(0, BLOCK_N))[None, :] < seqlen_k
         p_mask = q_mask & k_mask
-
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk_scale = SM_SCALE * RCP_LN2
+        if HAS_PE:
+            qk += tl.dot(q_pe, k_pe)
         # -- compute qk ----
         if IS_FP8:
             qk += tl.dot(q, k) * descale_q * descale_k
         else:
             qk += tl.dot(q, k)
-            if HAS_PE:
-                qk += tl.dot(q_pe, k_pe)
-
+        qk = qk * qk_scale
         if IS_CAUSAL:
             causal_boundary = start_n + offs_n_causal
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
@@ -194,16 +195,12 @@ def _attn_fwd_inner(
             alibi_block = _compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, global_m_positions, global_n_positions
             )
-            qk += alibi_block / SM_SCALE
+            qk += alibi_block * RCP_LN2
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        m_ij_scaled = m_ij * SM_SCALE * RCP_LN2
-
-        # scale and subtract max
-        q_shifted = qk * SM_SCALE * RCP_LN2 - m_ij_scaled[:, None]
 
         # Compute scaled QK and softmax probabilities
-        p = tl.math.exp2(q_shifted)
+        p = tl.math.exp2(qk - m_ij[:, None])
 
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
@@ -227,10 +224,8 @@ def _attn_fwd_inner(
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff_scaled = m_i * SM_SCALE * RCP_LN2 - m_ij_scaled
-        alpha = tl.math.exp2(m_diff_scaled)
+        alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]
-        v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
@@ -620,12 +615,17 @@ def _attn_fwd(
         q_mask = offs_m[:, None] < seqlen_q
     else:
         q_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < BLOCK_DMODEL)
-    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+
+    if BLOCK_M >= NUM_Q_HEADS:
+        q_cache_mod: tl.constexpr = ".cg"
+    else:
+        q_cache_mod: tl.constexpr = ""
+
     if HAS_PE:
-        q_pe = tl.load(q_pe_ptrs, mask=q_mask, other=0.0)
+        q_pe = tl.load(q_pe_ptrs, mask=q_mask, other=0.0, cache_modifier=q_cache_mod)
     else:
         q_pe = None
-
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0, cache_modifier=q_cache_mod)
     if IS_FP8:
         descale_q = tl.load(descale_q_ptr + off_z * stride_descale_q_z + off_q_head)
         descale_k = tl.load(descale_k_ptr + off_z * stride_descale_k_z + off_k_head)
@@ -796,12 +796,9 @@ def _attn_fwd(
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     overflow_size = end_m_idx - seqlen_q
     if softmax_lse_ptr is not None:
-        RCP_LN2: tl.constexpr = 1.4426950408889634
         LN2: tl.constexpr = 0.6931471824645996
         # compute log-sum-exp in base 2 units
-        # mi_base2 = m_i * RCP_LN2
-        mi_base2 = m_i * RCP_LN2 * sm_scale
-        softmax_lse = mi_base2 + tl.math.log2(l_i)
+        softmax_lse = m_i + tl.math.log2(l_i)
         # convert back to natural units
         softmax_lse *= LN2
 
@@ -837,7 +834,7 @@ def _attn_fwd(
         + offs_m[:, None] * stride_om
         + offs_d[None, :] * stride_on
     )
-    out_mask = tl.full([BLOCK_M, BLOCK_DMODEL_POW2], 1, dtype=tl.int1)
+    out_mask = tl.full([BLOCK_M, 1], 1, dtype=tl.int1)
     if overflow_size > 0:
         out_mask = out_mask & (offs_m[:, None] < seqlen_q)
     if BLOCK_DMODEL != BLOCK_DMODEL_POW2:
