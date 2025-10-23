@@ -94,17 +94,6 @@ def _batched_gemm_a8w8_kernel(
     pid = gl.program_id(axis=1)
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
-    
-    if GROUP_SIZE_M == 1:
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-    else:
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + (pid % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
 
     remap_xcd(pid, GRID_MN)
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
@@ -129,9 +118,7 @@ def _batched_gemm_a8w8_kernel(
     elems_per_thread_kn: gl.constexpr = triton.cdiv(
         BLOCK_SIZE_K * BLOCK_SIZE_N // (gl.num_warps() * THREADS_PER_WARP), BUFFER_SIZE
     )
-    gl.static_assert(
-        THREADS_PER_WARP_M * THREADS_PER_WARP_N == THREADS_PER_WARP
-    )
+    gl.static_assert(THREADS_PER_WARP_M * THREADS_PER_WARP_N == THREADS_PER_WARP)
     blocked_mk: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[elems_per_thread_mk, BUFFER_SIZE],
         threads_per_warp=[THREADS_PER_WARP_M, THREADS_PER_WARP_N],
@@ -166,8 +153,12 @@ def _batched_gemm_a8w8_kernel(
     # Create offsets for first block of A and B input matrices
     offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, blocked_mk))
     offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_kn))
-    offs_am = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk))
-    offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn))
+    offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
+        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk)
+    )
+    offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(
+        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn)
+    )
     offs_a = (
         batch_id * stride_ab
         + offs_am[:, None] * stride_am
@@ -178,7 +169,7 @@ def _batched_gemm_a8w8_kernel(
         + offs_bk[:, None] * stride_bk
         + offs_bn[None, :] * stride_bn
     )
-    
+
     # Now cast offsets back to int32 for buffer_load operations
     offs_ak = tl.cast(offs_ak, gl.int32)
     offs_bk = tl.cast(offs_bk, gl.int32)
@@ -204,7 +195,7 @@ def _batched_gemm_a8w8_kernel(
         a = gl.amd.cdna4.buffer_load(
             ptr=a_ptr,
             offsets=offs_a,
-            mask=(offs_ak[None, :] < K & offs_am[:, None] < M),
+            mask=((offs_ak[None, :] < K) & (offs_am[:, None] < M)),
             other=0.0,
         )
     if EVEN_K:
@@ -215,7 +206,7 @@ def _batched_gemm_a8w8_kernel(
         b = gl.amd.cdna4.buffer_load(
             ptr=b_ptr,
             offsets=offs_b,
-            mask=(offs_bk[:, None] < K & offs_bn[None, :] < N),
+            mask=((offs_bk[:, None] < K) & (offs_bn[None, :] < N)),
             other=0.0,
         )
 
@@ -223,11 +214,11 @@ def _batched_gemm_a8w8_kernel(
     smem_a.store(a)
 
     # Run the main loop
-    acc_dtype = gl.int32 # TODO: Figure out why the Triton kernel uses tl.float32 in some cases
+    acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
     accumulator = gl.zeros(
         (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout
     )
-    zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout)
+    zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.int32, layout=mfma_layout)
     for k in range(0, num_k_iter - 1):
         # Advance the ptrs to the next K block.
         offs_a += BLOCK_SIZE_K * stride_ak
@@ -243,7 +234,8 @@ def _batched_gemm_a8w8_kernel(
                 ptr=a_ptr,
                 offsets=offs_a,
                 mask=(
-                    offs_ak[None, :] < K - (k + 1) * BLOCK_SIZE_K & offs_am[:, None] < M
+                    (offs_ak[None, :] < K - (k + 1) * BLOCK_SIZE_K)
+                    & (offs_am[:, None] < M)
                 ),
                 other=0.0,
             )
@@ -264,7 +256,8 @@ def _batched_gemm_a8w8_kernel(
                 ptr=b_ptr,
                 offsets=offs_b,
                 mask=(
-                    offs_bk[:, None] < K - (k + 1) * BLOCK_SIZE_K & offs_bn[None, :] < N
+                    (offs_bk[:, None] < K - (k + 1) * BLOCK_SIZE_K)
+                    & (offs_bn[None, :] < N)
                 ),
                 other=0.0,
             )
@@ -283,46 +276,43 @@ def _batched_gemm_a8w8_kernel(
     cur_a = smem_a.load(layout=dot_a_layout)
     cur_b = smem_b.load(layout=dot_b_layout)
     accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-    
+
     # Apply scales
-    offs_a_scale = (
-        batch_id * stride_ascaleb
-        + pid_m * BLOCK_SIZE_M
-        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, mfma_layout))
+    offs_a_scale_m = pid_m * BLOCK_SIZE_M + gl.arange(
+        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, mfma_layout)
     )
-    offs_b_scale = (
-        batch_id * stride_bscaleb
-        + pid_n * BLOCK_SIZE_N
-        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout))
+    offs_a_scale = batch_id * stride_ascaleb + offs_a_scale_m
+    offs_b_scale_n = pid_n * BLOCK_SIZE_N + gl.arange(
+        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout)
     )
+    offs_b_scale = batch_id * stride_bscaleb + offs_b_scale_n
     offs_a_scale = tl.cast(offs_a_scale, gl.int32)
     offs_b_scale = tl.cast(offs_b_scale, gl.int32)
     a_scale = gl.amd.cdna4.buffer_load(
         ptr=a_scale_ptr,
         offsets=offs_a_scale,
-        mask=(offs_a_scale < M),
-        other=0.0,
+        mask=(offs_a_scale_m < M),
+        other=1.0,
     )
     b_scale = gl.amd.cdna4.buffer_load(
         ptr=b_scale_ptr,
         offsets=offs_b_scale,
-        mask=(offs_b_scale < N),
-        other=0.0,
+        mask=(offs_b_scale_n < N),
+        other=1.0,
     )
     accumulator *= a_scale[:, None] * b_scale[None, :]
 
     # Apply bias
     if HAS_BIAS:
-        offs_bias = (
-            batch_id * stride_biasb
-            + pid_n * BLOCK_SIZE_N
-            + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout))
+        offs_bias_n = pid_n * BLOCK_SIZE_N + gl.arange(
+            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout)
         )
+        offs_bias = batch_id * stride_biasb + offs_bias_n
         offs_bias = tl.cast(offs_bias, gl.int32)
         bias = gl.amd.cdna4.buffer_load(
             ptr=bias_ptr,
             offsets=offs_bias,
-            mask=(offs_bias < N),
+            mask=(offs_bias_n < N),
             other=0.0,
         )
         accumulator = accumulator.to(bias_ptr.type.element_ty) + bias[None, :]
@@ -345,7 +335,7 @@ def _batched_gemm_a8w8_kernel(
         stored_value=c,
         ptr=c_ptr,
         offsets=c_offs,
-        mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N),
+        mask=((offs_cm[:, None] < M) & (offs_cn[None, :] < N)),
     )
 
 
@@ -435,7 +425,6 @@ def batched_gemm_a8w8(
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
-    num_warps = config["num_warps"]
     assert XQ.element_size() == WQ.element_size()
     buffer_size = 16 // XQ.element_size()
     assert buffer_size == 16
