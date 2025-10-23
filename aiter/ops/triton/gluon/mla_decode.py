@@ -562,7 +562,7 @@ def _fwd_grouped_kernel_stage1_n32(
         # warps_per_cta=[4, 1],
         # order=[1, 0],
         size_per_thread=[4, 8],  # 64 * 512
-        threads_per_warp=[4, 16],
+        threads_per_warp=[8, 8],
         warps_per_cta=[1, 4],
         order=[1, 0],
     )
@@ -574,8 +574,8 @@ def _fwd_grouped_kernel_stage1_n32(
     )
 
     blocked_ld_k_nope_kn: gl.constexpr = gl.BlockedLayout(  # max 16 * 576 for per wave
-        size_per_thread=[8, 8],  # 64 * 512
-        threads_per_warp=[4, 16],
+        size_per_thread=[4, 8],  # 64 * 512
+        threads_per_warp=[8, 8],
         warps_per_cta=[1, 4],
         order=[1, 0],
     )
@@ -749,7 +749,8 @@ def _fwd_grouped_kernel_stage1_n32(
         kv_indices + split_kv_start + cur_N + cur_batch_kv_start_idx,
     )
 
-    q = gl.reshape(q, [BLOCK_H, BLOCK_C // 2, 2])
+    q = gl.reshape(q, [BLOCK_H, 2, BLOCK_C // 2])
+    q = gl.permute(q, (0, 2, 1))
     q0, q1 = gl.split(q)
 
     smem_q0_nope.store(q0)
@@ -796,7 +797,8 @@ def _fwd_grouped_kernel_stage1_n32(
         offsets=offs_buf_kv,
     )  # the shared latent tensor for keys and values
 
-    kv_trans = gl.reshape(kv, [BLOCK_N, BLOCK_C // 2, 2])
+    kv_trans = gl.reshape(kv, [BLOCK_N, 2, BLOCK_C // 2])
+    kv_trans = gl.permute(kv_trans, (0, 2, 1))
     kv1, kv2 = gl.split(kv_trans)
 
     smem_k.store(kv1.T)
@@ -852,7 +854,8 @@ def _fwd_grouped_kernel_stage1_n32(
         qk *= sm_scale
         # cur_v = gl.convert_layout(cur_v, layout=dot_v_layout)
 
-        kv_trans = gl.reshape(kv, [BLOCK_N, BLOCK_C // 2, 2])
+        kv_trans = gl.reshape(kv, [BLOCK_N, 2, BLOCK_C // 2])
+        kv_trans = gl.permute(kv_trans, (0, 2, 1))
         kv1, kv2 = gl.split(kv_trans)
         if logit_cap > 0:
             qk = logit_cap * _tanh(qk / logit_cap)
@@ -918,6 +921,7 @@ def _fwd_grouped_kernel_stage1_n32(
     # smem_v._keep_alive()
 
     acc = gl.join(acc1, acc2)
+    acc  = gl.permute(acc, (0, 2, 1))
     acc = gl.reshape(acc, (BLOCK_H, BLOCK_C))
     acc = gl.convert_layout(acc, mfma_layout_kv)
 
