@@ -1,6 +1,8 @@
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.fused_qkv_split_qk_rope import _fused_qkv_split_qk_rope_kernel
+from aiter.ops.triton._triton_kernels.fused_qkv_split_qk_rope import (
+    _fused_qkv_split_qk_rope_kernel,
+)
 
 
 def fused_qkv_split_qk_rope(

@@ -7,7 +7,7 @@ import math
 from aiter.ops.triton._triton_kernels.unified_attention import (
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
-    reduce_segments
+    reduce_segments,
 )
 
 
