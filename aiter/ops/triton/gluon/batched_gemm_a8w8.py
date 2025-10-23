@@ -159,24 +159,8 @@ def _batched_gemm_a8w8_kernel(
     offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(
         0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn)
     )
-    offs_a = (
-        batch_id * stride_ab
-        + offs_am[:, None] * stride_am
-        + offs_ak[None, :] * stride_ak
-    )
-    offs_b = (
-        batch_id * stride_bb
-        + offs_bk[:, None] * stride_bk
-        + offs_bn[None, :] * stride_bn
-    )
-
-    # Now cast offsets back to int32 for buffer_load operations
-    offs_ak = tl.cast(offs_ak, gl.int32)
-    offs_bk = tl.cast(offs_bk, gl.int32)
-    offs_am = tl.cast(offs_am, gl.int32)
-    offs_bn = tl.cast(offs_bn, gl.int32)
-    offs_a = tl.cast(offs_a, gl.int32)
-    offs_b = tl.cast(offs_b, gl.int32)
+    offs_a = offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
+    offs_b = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
 
     # Allocate shared memory input matrices and scaling factors
     smem_a = gl.allocate_shared_memory(
@@ -189,22 +173,28 @@ def _batched_gemm_a8w8_kernel(
     # Prologue: Make initial loads of all data
     if EVEN_K:
         a = gl.amd.cdna4.buffer_load(
-            ptr=a_ptr, offsets=offs_a, mask=(offs_am[:, None] < M), other=0.0
+            ptr=(a_ptr + batch_id * stride_ab),
+            offsets=offs_a,
+            mask=(offs_am[:, None] < M),
+            other=0.0,
         )
     else:
         a = gl.amd.cdna4.buffer_load(
-            ptr=a_ptr,
+            ptr=(a_ptr + batch_id * stride_ab),
             offsets=offs_a,
             mask=((offs_ak[None, :] < K) & (offs_am[:, None] < M)),
             other=0.0,
         )
     if EVEN_K:
         b = gl.amd.cdna4.buffer_load(
-            ptr=b_ptr, offsets=offs_b, mask=(offs_bn[None, :] < N), other=0.0
+            ptr=(b_ptr + batch_id * stride_bb),
+            offsets=offs_b,
+            mask=(offs_bn[None, :] < N),
+            other=0.0,
         )
     else:
         b = gl.amd.cdna4.buffer_load(
-            ptr=b_ptr,
+            ptr=(b_ptr + batch_id * stride_bb),
             offsets=offs_b,
             mask=((offs_bk[:, None] < K) & (offs_bn[None, :] < N)),
             other=0.0,
@@ -227,11 +217,14 @@ def _batched_gemm_a8w8_kernel(
         # Load the next block of A
         if EVEN_K:
             a = gl.amd.cdna4.buffer_load(
-                ptr=a_ptr, offsets=offs_a, mask=(offs_am[:, None] < M), other=0.0
+                ptr=(a_ptr + batch_id * stride_ab),
+                offsets=offs_a,
+                mask=(offs_am[:, None] < M),
+                other=0.0,
             )
         else:
             a = gl.amd.cdna4.buffer_load(
-                ptr=a_ptr,
+                ptr=(a_ptr + batch_id * stride_ab),
                 offsets=offs_a,
                 mask=(
                     (offs_ak[None, :] < K - (k + 1) * BLOCK_SIZE_K)
@@ -249,11 +242,14 @@ def _batched_gemm_a8w8_kernel(
         # Load the next block of B
         if EVEN_K:
             b = gl.amd.cdna4.buffer_load(
-                ptr=b_ptr, offsets=offs_b, mask=(offs_bn[None, :] < N), other=0.0
+                ptr=(b_ptr + batch_id * stride_bb),
+                offsets=offs_b,
+                mask=(offs_bn[None, :] < N),
+                other=0.0,
             )
         else:
             b = gl.amd.cdna4.buffer_load(
-                ptr=b_ptr,
+                ptr=(b_ptr + batch_id * stride_bb),
                 offsets=offs_b,
                 mask=(
                     (offs_bk[:, None] < K - (k + 1) * BLOCK_SIZE_K)
@@ -278,41 +274,35 @@ def _batched_gemm_a8w8_kernel(
     accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
 
     # Apply scales
-    offs_a_scale_m = pid_m * BLOCK_SIZE_M + gl.arange(
+    offs_a_scale = pid_m * BLOCK_SIZE_M + gl.arange(
         0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, mfma_layout)
     )
-    offs_a_scale = batch_id * stride_ascaleb + offs_a_scale_m
-    offs_b_scale_n = pid_n * BLOCK_SIZE_N + gl.arange(
+    offs_b_scale = pid_n * BLOCK_SIZE_N + gl.arange(
         0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout)
     )
-    offs_b_scale = batch_id * stride_bscaleb + offs_b_scale_n
-    offs_a_scale = tl.cast(offs_a_scale, gl.int32)
-    offs_b_scale = tl.cast(offs_b_scale, gl.int32)
     a_scale = gl.amd.cdna4.buffer_load(
-        ptr=a_scale_ptr,
+        ptr=(a_scale_ptr + batch_id * stride_ascaleb),
         offsets=offs_a_scale,
-        mask=(offs_a_scale_m < M),
+        mask=(offs_a_scale < M),
         other=1.0,
     )
     b_scale = gl.amd.cdna4.buffer_load(
-        ptr=b_scale_ptr,
+        ptr=(b_scale_ptr + batch_id * stride_bscaleb),
         offsets=offs_b_scale,
-        mask=(offs_b_scale_n < N),
+        mask=(offs_b_scale < N),
         other=1.0,
     )
     accumulator *= a_scale[:, None] * b_scale[None, :]
 
     # Apply bias
     if HAS_BIAS:
-        offs_bias_n = pid_n * BLOCK_SIZE_N + gl.arange(
+        offs_bias = pid_n * BLOCK_SIZE_N + gl.arange(
             0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout)
         )
-        offs_bias = batch_id * stride_biasb + offs_bias_n
-        offs_bias = tl.cast(offs_bias, gl.int32)
         bias = gl.amd.cdna4.buffer_load(
-            ptr=bias_ptr,
+            ptr=(bias_ptr + batch_id * stride_biasb),
             offsets=offs_bias,
-            mask=(offs_bias_n < N),
+            mask=(offs_bias < N),
             other=0.0,
         )
         accumulator = accumulator.to(bias_ptr.type.element_ty) + bias[None, :]
@@ -325,15 +315,10 @@ def _batched_gemm_a8w8_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
         0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout)
     )
-    c_offs = (
-        batch_id * stride_cb
-        + offs_cm[:, None] * stride_cm
-        + offs_cn[None, :] * stride_cn
-    )
-    c_offs = tl.cast(c_offs, gl.int32)
+    c_offs = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
     gl.amd.cdna4.buffer_store(
         stored_value=c,
-        ptr=c_ptr,
+        ptr=(c_ptr + batch_id * stride_cb),
         offsets=c_offs,
         mask=((offs_cm[:, None] < M) & (offs_cn[None, :] < N)),
     )
