@@ -23,7 +23,14 @@ def rmsnorm(input, weight, eps=1e-6):
 def per_token_fp8_group_quant(x, dtype_quant, group_size=128):
     DTYPE_MAX = torch.finfo(dtype_quant).max
     M, N = x.shape
-    x_reshape = x.reshape(M, N // group_size, group_size).to(torch.float32)
+    if N % group_size > 0:
+        num_pad = group_size - (N % group_size)
+        x_reshape = F.pad(x, (0, num_pad, 0, 0), "constant", 0)
+        x_reshape = x_reshape.reshape(
+            M, (N + group_size - 1) // group_size, group_size
+        ).to(torch.float32)
+    else:
+        x_reshape = x.reshape(M, N // group_size, group_size).to(torch.float32)
     x_max = torch.max(torch.abs(x_reshape), dim=-1, keepdim=True)[0]
     x_max = torch.where(x_max < 1e-10, 1e-10, x_max).to(torch.float32)
     x_scale = x_max / DTYPE_MAX
@@ -31,7 +38,7 @@ def per_token_fp8_group_quant(x, dtype_quant, group_size=128):
     x_quant = torch.clamp(x_reshape * scale_recip, -DTYPE_MAX, DTYPE_MAX).to(
         dtype_quant
     )
-    x_quant = x_quant.reshape(M, N)
+    x_quant = x_quant.reshape(M, (N + group_size - 1) // group_size * group_size)[:, :N]
     x_scale = x_scale.squeeze(-1)
 
     return x_quant, x_scale
