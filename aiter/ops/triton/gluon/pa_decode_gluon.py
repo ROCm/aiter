@@ -2843,7 +2843,7 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
         ptr=logits_ptrs, offsets=logits_offset, mask=logits_mask[:, :, None], other=0.0
     )
     # out: [QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
-    out = tl.sum((logits * gl.convert_layout(p, layout=blocked_layout)).to(tl.float32), axis=0).to(out_ptr.dtype.element_ty)
+    out = tl.sum((logits.to(tl.float32) * gl.convert_layout(p, layout=blocked_layout)), axis=0).to(out_ptr.dtype.element_ty)
     out_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread =[1, 8],
         threads_per_warp=[4, 16],
