@@ -197,9 +197,9 @@ def fused_qk_rope_reshape_and_cache(
     Perform RoPE on q and k and along the last dimension and copy k and v in to key_cache and value_cache inplace
 
     Key parameters:
-    - q: shape (T, QH, D).
-    - k: shape (T_slot, KH, D).
-    - v: shape (T_slot, KH, D).
+    - q: shape (T, QH, D) or (NUM_KSPLIT, QH, D) .
+    - k: shape (T_slot, KH, D) or (NUM_KSPLIT, T_slot, KH, D).
+    - v: shape (T_slot, KH, D) or (NUM_KSPLIT, T_slot, KH, D).
     - if flash_layout:
     -     key_cache: shape (T_cache, block_size, KH, D).
     -     value_cache: shape (T_cache, block_size, KH, D).
@@ -223,9 +223,21 @@ def fused_qk_rope_reshape_and_cache(
         + f"pos={tuple(pos.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)} key_cache={tuple(key_cache.shape)} value_cache={tuple(value_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
     )
 
-    t, qh, d = q.shape
-    tk, kh, dk = k.shape
-    tv, vh, dv = v.shape
+    HAVE_SPLITK = False
+    num_splitk = 1
+    if q.dim() == 3:
+        t, qh, d = q.shape
+        tk, kh, dk = k.shape
+        tv, vh, dv = v.shape
+    else:
+        HAVE_SPLITK = True
+        num_splitk, t, qh, d = q.shape
+        num_splitkk, tk, kh, dk = k.shape
+        num_splitkv, tv, vh, dv = v.shape
+        assert (
+            num_splitk == num_splitkk == num_splitkv
+        ), "Number of split-k must be identical for q, k, and v"
+
     if flash_layout:
         t_cache, block_size, kh_cache, dk_cache = key_cache.shape
         t_cache_v, block_size_v, vh_cache, dv_cache = value_cache.shape
@@ -280,7 +292,7 @@ def fused_qk_rope_reshape_and_cache(
         ), f"q and zeros shape mismatch {q.shape=} {zeros_out.shape=}"
         output_zeros = True
     elif output_zeros:
-        zeros_out = torch.empty((t, qh, d), dtype=q.dtype, device=q.device)
+        zeros_out = torch.empty((t, qh, d), dtype=q_out.dtype, device=q.device)
     else:
         zeros_out = None
 
@@ -302,9 +314,18 @@ def fused_qk_rope_reshape_and_cache(
         zeros_out,
         t,
         t_slot,
-        *q.stride(),
-        *k.stride(),
-        *v.stride(),
+        0 if not HAVE_SPLITK else q.stride(0),
+        q.stride(0) if not HAVE_SPLITK else q.stride(1),
+        q.stride(1) if not HAVE_SPLITK else q.stride(2),
+        q.stride(2) if not HAVE_SPLITK else q.stride(3),
+        0 if not HAVE_SPLITK else k.stride(0),
+        k.stride(0) if not HAVE_SPLITK else k.stride(1),
+        k.stride(1) if not HAVE_SPLITK else k.stride(2),
+        k.stride(2) if not HAVE_SPLITK else k.stride(3),
+        0 if not HAVE_SPLITK else v.stride(0),
+        v.stride(0) if not HAVE_SPLITK else v.stride(1),
+        v.stride(1) if not HAVE_SPLITK else v.stride(2),
+        v.stride(2) if not HAVE_SPLITK else v.stride(3),
         cos.stride(0),
         cos.stride(-1),
         *q_out.stride(),
@@ -336,6 +357,9 @@ def fused_qk_rope_reshape_and_cache(
         HAVE_POS=(offs is not None),
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         HAVE_V_SCALE=(v_scale is not None and apply_scale),
+        HAVE_SPLITK=HAVE_SPLITK,
+        NUM_KSPLIT=num_splitk,
+        NUM_KSPLIT_POW2=triton.next_power_of_2(num_splitk),
         HAVE_ZEROS=output_zeros,
         num_warps=1,
     )

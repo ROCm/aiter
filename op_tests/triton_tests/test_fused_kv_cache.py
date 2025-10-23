@@ -6,14 +6,186 @@ import pytest
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from test_rope import ref_rope_sbhd_fwd, RotateStyle
 from .test_rope import generate_rope_inputs
-from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
+from aiter.ops.triton.fused_kv_cache import (
+    fused_qk_rope_reshape_and_cache,
+    fused_qk_rope_cat_and_cache_mla,
+)
 from aiter.ops.triton.utils._triton import arch_info
+
+
+@pytest.mark.parametrize("T", [1, 2, 4, 2048])
+@pytest.mark.parametrize("QH_per_KH", [1, 4, 16])
+@pytest.mark.parametrize("KH", [1, 8])
+@pytest.mark.parametrize("D", [64, 128])  # For now, D is power of 2. D >= 16
+@pytest.mark.parametrize("D_q_nope", [128])
+@pytest.mark.parametrize("D_lora", [512])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
+@pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.uint8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fused_qk_rope_cat_and_cache_mla(
+    T: int,
+    QH_per_KH: int,
+    KH: int,
+    D: int,
+    D_q_nope: int,
+    D_lora: int,
+    num_kv_cahce_tokens: int,
+    rotate_style: int,
+    reuse_freqs_front_part: bool,
+    cache_dtype: bool,
+    dtype: torch.dtype,
+):
+    pos = True
+    _, _, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        KH,
+        QH_per_KH,
+        D,
+        cached=True,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope=False,
+        pos=pos,
+        offs=False,
+        two_inputs=True,
+        layout="thd",
+        dtype=dtype,
+    )
+    q = torch.randn((T, QH_per_KH * KH, D_q_nope + D), dtype=dtype, device="cuda")
+    q_nope, q_pe = q.split((D_q_nope, D), dim=-1)
+    k_lora = torch.randn((T, KH, D_lora), dtype=dtype, device=q.device) / (
+        20 if cache_dtype == torch.uint8 else 1
+    )
+    k_pe = torch.randn((T, KH, D), dtype=dtype, device=q.device) / (
+        20 if cache_dtype == torch.uint8 else 1
+    )
+
+    if cache_dtype == torch.uint8:
+        if arch_info.get_arch() in ["gfx950"]:
+            cache_dtype_actual = torch.float8_e4m3fn
+        else:
+            cache_dtype_actual = torch.float8_e4m3fnuz
+
+    kv_cache = torch.zeros(
+        (num_kv_cahce_tokens, KH, D_lora + D), dtype=cache_dtype, device="cuda"
+    )
+
+    if cache_dtype == torch.uint8:
+        k_scale = torch.randn(
+            [
+                1,
+            ],
+            dtype=torch.float32,
+            device="cuda",
+        )[0]
+    else:
+        k_scale = torch.ones(
+            [
+                1,
+            ],
+            dtype=torch.float32,
+            device="cuda",
+        )[0]
+    slot_mapping = torch.randperm(T, device="cuda")
+    kv_cache_og_dtype = kv_cache.dtype
+
+    ref_freqs = (
+        freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(
+            -2
+        )
+        if pos
+        else freqs
+    )
+
+    torch_q_nope = q_nope
+    torch_q_pe = q_pe
+    torch_k_lora = k_lora
+    torch_k_pe = k_pe
+
+    torch_q_pe = ref_rope_sbhd_fwd(
+        torch_q_pe.unsqueeze(0),
+        ref_freqs,
+        rotate_style=rotate_style,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope_first=False,
+    ).squeeze(0)
+    torch_k_pe = ref_rope_sbhd_fwd(
+        torch_k_pe.unsqueeze(0),
+        ref_freqs,
+        rotate_style=rotate_style,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope_first=False,
+    ).squeeze(0)
+
+    torch_kv_cache = kv_cache.clone()
+    torch_k_pe_og_dtype = torch_k_pe.clone()
+    torch_q = torch.cat((torch_q_nope, torch_q_pe), dim=-1)
+    torch_decode_q_pe = torch_q_pe
+    if cache_dtype == torch.uint8:
+        torch_kv_cache = torch_kv_cache.view(cache_dtype_actual)
+        torch_k_lora = (torch_k_lora.to(torch.float32) / k_scale).to(cache_dtype_actual)
+        torch_k_pe = (torch_k_pe.to(torch.float32) / k_scale).to(cache_dtype_actual)
+    else:
+        torch_k_lora = torch_k_lora
+        torch_k_pe = torch_k_pe
+
+    torch_zeros = torch.zeros(((T, QH_per_KH * KH, D_lora)), dtype=dtype, device="cuda")
+    torch_kv_cache[slot_mapping, :, :] = torch.cat((torch_k_lora, torch_k_pe), dim=-1)
+    torch_kv_cache = torch_kv_cache.view(kv_cache_og_dtype)
+
+    triton_kv_cache = kv_cache.clone()
+    if cache_dtype == torch.uint8:
+        triton_kv_cache = triton_kv_cache.view(cache_dtype_actual)
+    triton_q, triton_decode_q_pe, triton_k_pe, triton_kv_cache, triton_zeros = (
+        fused_qk_rope_cat_and_cache_mla(
+            q_nope,
+            q_pe,
+            k_lora,
+            k_pe,
+            triton_kv_cache,
+            slot_mapping,
+            positions,
+            cos,
+            sin,
+            k_scale,
+            (rotate_style == RotateStyle.NEOX),
+            num_decode_toks_for_zeros=T,
+            apply_scale=(k_pe.dtype != kv_cache.dtype),
+            q_out=None,
+            decode_q_pe_out=None,
+            k_pe_out=None,
+        )
+    )
+    triton_kv_cache = triton_kv_cache.view(kv_cache_og_dtype)
+
+    torch.testing.assert_close(torch_q, triton_q, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(
+        torch_decode_q_pe, triton_decode_q_pe, atol=1e-1, rtol=1e-1
+    )
+    torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(torch_zeros, triton_zeros, atol=0.1, rtol=0.1)
+
+    if cache_dtype == torch.uint8:
+        torch_kv_cache = torch_kv_cache.view(cache_dtype_actual).to(dtype)
+        triton_kv_cache = triton_kv_cache.view(cache_dtype_actual).to(dtype)
+
+    torch.testing.assert_close(
+        torch_kv_cache[slot_mapping, :, :],
+        triton_kv_cache[slot_mapping, :, :],
+        atol=1e-1,
+        rtol=1e-1,
+    )
+
+    torch.testing.assert_close(torch_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
 
 
 @pytest.mark.parametrize("T", [1, 2, 4, 2048, 8192])
 @pytest.mark.parametrize("QH_per_KH", [1, 4, 16])
 @pytest.mark.parametrize("KH", [1, 8])
 @pytest.mark.parametrize("D", [64, 128])  # For now, D is power of 2. D >= 16
+@pytest.mark.parametrize("num_splitk", [1, 4])
 @pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
@@ -37,6 +209,7 @@ def test_fused_qk_rope_reshape_and_cache(
     cache_dtype: bool,
     offs: bool,
     dtype: torch.dtype,
+    num_splitk: int,
 ):
     pos = True
     q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
@@ -55,6 +228,22 @@ def test_fused_qk_rope_reshape_and_cache(
         dtype=dtype,
     )
     v = torch.randn_like(k)
+    if num_splitk > 1:
+        q = (
+            torch.randn((num_splitk, *q.shape), dtype=torch.float32, device=q.device)
+            / num_splitk
+            / 10.0
+        )
+        k = (
+            torch.randn((num_splitk, *k.shape), dtype=torch.float32, device=q.device)
+            / num_splitk
+            / 10.0
+        )
+        v = (
+            torch.randn((num_splitk, *v.shape), dtype=torch.float32, device=q.device)
+            / num_splitk
+            / 10.0
+        )
 
     if cache_dtype == torch.uint8:
         if arch_info.get_arch() in ["gfx950"]:
@@ -120,15 +309,23 @@ def test_fused_qk_rope_reshape_and_cache(
         else freqs
     )
 
+    torch_q = q
+    torch_k = k
+    torch_v = v
+    if num_splitk > 1:
+        torch_q = torch_q.sum(axis=0)
+        torch_k = torch_k.sum(axis=0)
+        torch_v = torch_v.sum(axis=0)
+
     torch_q = ref_rope_sbhd_fwd(
-        q.unsqueeze(0),
+        torch_q.unsqueeze(0),
         ref_freqs,
         rotate_style=rotate_style,
         reuse_freqs_front_part=reuse_freqs_front_part,
         nope_first=False,
     ).squeeze(0)
     torch_k = ref_rope_sbhd_fwd(
-        k.unsqueeze(0),
+        torch_k.unsqueeze(0),
         ref_freqs,
         rotate_style=rotate_style,
         reuse_freqs_front_part=reuse_freqs_front_part,
@@ -139,15 +336,22 @@ def test_fused_qk_rope_reshape_and_cache(
     torch_value_cache = value_cache.clone()
     slot_t = slot_mapping // block_size
     slot_b = slot_mapping % block_size
-    torch_k_og_dtype = torch_k.clone()
+    torch_k_og_dtype = torch_k.clone().to(dtype=dtype)
+    torch_q = torch_q.to(dtype=dtype)
     if cache_dtype == torch.uint8:
         torch_key_cache = torch_key_cache.view(cache_dtype_actual)
         torch_value_cache = torch_value_cache.view(cache_dtype_actual)
         torch_k = (torch_k.to(torch.float32) / k_scale).to(cache_dtype_actual)
-        torch_v = (v.to(torch.float32) / v_scale).to(cache_dtype_actual)
+        torch_v = (torch_v.to(torch.float32) / v_scale).to(cache_dtype_actual)
     else:
-        torch_v = v
-    torch_zeros = torch.zeros_like(q)
+        torch_k = torch_k.to(dtype=dtype)
+        torch_v = torch_v.to(dtype=dtype)
+
+    torch_zeros = (
+        torch.zeros_like(q)
+        if num_splitk == 1
+        else torch.zeros(q.shape[1:], dtype=dtype, device=q.device)
+    )
     if cache_flash:
         torch_key_cache[slot_t, slot_b] = torch_k
         torch_value_cache[slot_t, slot_b] = torch_v
@@ -181,8 +385,16 @@ def test_fused_qk_rope_reshape_and_cache(
             flash_layout=cache_flash,
             apply_scale=(cache_dtype != torch.bfloat16),
             offs=offsets,
-            q_out=q,
-            k_out=k,
+            q_out=(
+                q
+                if num_splitk == 1
+                else torch.empty(q.shape[1:], dtype=dtype, device=q.device)
+            ),
+            k_out=(
+                k
+                if num_splitk == 1
+                else torch.empty(k.shape[1:], dtype=dtype, device=q.device)
+            ),
         )
     )
     triton_key_cache = triton_key_cache.view(key_cache_og_dtype)

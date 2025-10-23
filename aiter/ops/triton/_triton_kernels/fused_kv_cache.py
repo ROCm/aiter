@@ -200,8 +200,9 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         )
         q_out_ptrs = q_out_ptr + pid_b * q_out_stride_b + pid_hq * q_out_stride_h
         q_nope = tl.load(q_nope_ptrs)
+        q_pe = tl.load(q_pe_ptrs)
         q_pe = _unit_rope(
-            q_pe_ptrs,
+            q_pe,
             cos,
             sin,
             d_pe_offs,
@@ -272,8 +273,9 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     + pid_hk * kv_cache_stride_h
                 )
                 k_nope = tl.load(k_nope_ptrs)
+                k_pe = tl.load(k_pe_ptrs)
                 k_pe = _unit_rope(
-                    k_pe_ptrs,
+                    k_pe,
                     cos,
                     sin,
                     d_pe_offs,
@@ -348,7 +350,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
 
 @triton.jit
 def _unit_rope(
-    x_ptrs,
+    x_pe,
     cos,
     sin,
     d_pe_offs,
@@ -356,7 +358,6 @@ def _unit_rope(
     BLOCK_D_pe: tl.constexpr,
     BLOCK_D_HALF_pe: tl.constexpr,
 ):
-    x_pe = tl.load(x_ptrs)
 
     if IS_NEOX:
         x_rotated_mask = d_pe_offs < BLOCK_D_HALF_pe
@@ -391,12 +392,15 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     zeros_out_ptr,
     T,
     T_slot,
+    q_stride_spk,
     q_stride_t,
     q_stride_h,
     q_stride_d,
+    k_stride_spk,
     k_stride_t,
     k_stride_h,
     k_stride_d,
+    v_stride_spk,
     v_stride_t,
     v_stride_h,
     v_stride_d,
@@ -435,11 +439,17 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     HAVE_POS: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
     HAVE_V_SCALE: tl.constexpr = False,
+    HAVE_SPLITK: tl.constexpr = False,
+    NUM_KSPLIT: tl.constexpr = 0,
+    NUM_KSPLIT_POW2: tl.constexpr = 0,
     HAVE_ZEROS: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
 
     d_pe_offs = tl.arange(0, BLOCK_D_pe)
+
+    if HAVE_SPLITK:
+        offs_k = tl.arange(0, NUM_KSPLIT_POW2)
 
     if pid < T * QH:
         pid_t = pid // QH
@@ -468,11 +478,29 @@ def _fused_qk_rope_reshape_and_cache_kernel(
         cos = tl.load(cos_ptr + cos_offs)
         sin = tl.load(sin_ptr + cos_offs)
 
-        q_ptrs = (
-            q_ptr + pid_t * q_stride_t + pid_hq * q_stride_h + d_pe_offs * q_stride_d
-        )
+        if HAVE_SPLITK:
+            q_ptrs = (
+                q_ptr
+                + offs_k[:, None] * q_stride_spk
+                + pid_t * q_stride_t
+                + pid_hq * q_stride_h
+                + d_pe_offs[None, :] * q_stride_d
+            )
+            if NUM_KSPLIT_POW2 == NUM_KSPLIT:
+                q_pe = tl.load(q_ptrs)
+            else:
+                q_pe = tl.load(q_ptrs, mask=offs_k[:, None] < NUM_KSPLIT, other=0.0)
+            q_pe = tl.sum(q_pe, axis=0)
+        else:
+            q_ptrs = (
+                q_ptr
+                + pid_t * q_stride_t
+                + pid_hq * q_stride_h
+                + d_pe_offs * q_stride_d
+            )
+            q_pe = tl.load(q_ptrs)
         q_pe = _unit_rope(
-            q_ptrs,
+            q_pe,
             cos,
             sin,
             d_pe_offs,
@@ -508,14 +536,31 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     k_scale = tl.load(k_scale_ptr)
                 else:
                     k_scale = 1
-                k_ptrs = (
-                    k_ptr
-                    + pid_t * k_stride_t
-                    + pid_hk * k_stride_h
-                    + d_pe_offs * k_stride_d
-                )
+                if HAVE_SPLITK:
+                    k_ptrs = (
+                        k_ptr
+                        + offs_k[:, None] * k_stride_spk
+                        + pid_t * k_stride_t
+                        + pid_hk * k_stride_h
+                        + d_pe_offs[None, :] * k_stride_d
+                    )
+                    if NUM_KSPLIT_POW2 == NUM_KSPLIT:
+                        k_pe = tl.load(k_ptrs)
+                    else:
+                        k_pe = tl.load(
+                            k_ptrs, mask=offs_k[:, None] < NUM_KSPLIT, other=0.0
+                        )
+                    k_pe = tl.sum(k_pe, axis=0)
+                else:
+                    k_ptrs = (
+                        k_ptr
+                        + pid_t * k_stride_t
+                        + pid_hk * k_stride_h
+                        + d_pe_offs * k_stride_d
+                    )
+                    k_pe = tl.load(k_ptrs)
                 k_pe = _unit_rope(
-                    k_ptrs,
+                    k_pe,
                     cos,
                     sin,
                     d_pe_offs,
@@ -558,18 +603,34 @@ def _fused_qk_rope_reshape_and_cache_kernel(
 
                 tl.store(k_out_ptrs, k_pe.to(key_cache_ptr.dtype.element_ty))
 
-                v_ptrs = (
-                    v_ptr
-                    + pid_t * v_stride_t
-                    + pid_hk * v_stride_h
-                    + d_pe_offs * v_stride_d
-                )
                 if HAVE_V_SCALE:
                     v_scale = tl.load(v_scale_ptr)
                 else:
                     v_scale = 1
                 v_scale_rcprl = 1 / v_scale
-                v = tl.load(v_ptrs) * v_scale_rcprl
+                if HAVE_SPLITK:
+                    v_ptrs = (
+                        v_ptr
+                        + offs_k[:, None] * v_stride_spk
+                        + pid_t * v_stride_t
+                        + pid_hk * v_stride_h
+                        + d_pe_offs[None, :] * v_stride_d
+                    )
+                    if NUM_KSPLIT_POW2 == NUM_KSPLIT:
+                        v = tl.load(v_ptrs)
+                    else:
+                        v = tl.load(
+                            v_ptrs, mask=offs_k[:, None] < NUM_KSPLIT, other=0.0
+                        )
+                    v = tl.sum(v, axis=0) * v_scale_rcprl
+                else:
+                    v_ptrs = (
+                        v_ptr
+                        + pid_t * v_stride_t
+                        + pid_hk * v_stride_h
+                        + d_pe_offs * v_stride_d
+                    )
+                    v = tl.load(v_ptrs) * v_scale_rcprl
                 v_out_ptrs = (
                     value_cache_ptr
                     + pid_t_slot * value_cache_stride_t
@@ -591,15 +652,29 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     k_scale = tl.load(k_scale_ptr)
                 else:
                     k_scale = 1
-                k_ptrs = (
-                    k_ptr
-                    + pid_t * k_stride_t
-                    + pid_hk * k_stride_h
-                    + d_pe_offs * k_stride_d
-                )
-
-                k_pe = tl.load(k_ptrs)
-
+                if HAVE_SPLITK:
+                    k_ptrs = (
+                        k_ptr
+                        + offs_k[:, None] * k_stride_spk
+                        + pid_t * k_stride_t
+                        + pid_hk * k_stride_h
+                        + d_pe_offs[None, :] * k_stride_d
+                    )
+                    if NUM_KSPLIT_POW2 == NUM_KSPLIT:
+                        k_pe = tl.load(k_ptrs)
+                    else:
+                        k_pe = tl.load(
+                            k_ptrs, mask=offs_k[:, None] < NUM_KSPLIT, other=0.0
+                        )
+                    k_pe = tl.sum(k_pe, axis=0)
+                else:
+                    k_ptrs = (
+                        k_ptr
+                        + pid_t * k_stride_t
+                        + pid_hk * k_stride_h
+                        + d_pe_offs * k_stride_d
+                    )
+                    k_pe = tl.load(k_ptrs)
                 k_out_ptrs = (
                     k_out_ptr
                     + pid_t * k_out_stride_t
@@ -633,18 +708,34 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     )
                 tl.store(k_out_ptrs, k_pe.to(key_cache_ptr.dtype.element_ty))
 
-                v_ptrs = (
-                    v_ptr
-                    + pid_t * v_stride_t
-                    + pid_hk * v_stride_h
-                    + d_pe_offs * v_stride_d
-                )
                 if HAVE_V_SCALE:
                     v_scale = tl.load(v_scale_ptr)
                 else:
                     v_scale = 1
                 v_scale_rcprl = 1 / v_scale
-                v = tl.load(v_ptrs) * v_scale_rcprl
+                if HAVE_SPLITK:
+                    v_ptrs = (
+                        v_ptr
+                        + offs_k[:, None] * v_stride_spk
+                        + pid_t * v_stride_t
+                        + pid_hk * v_stride_h
+                        + d_pe_offs[None, :] * v_stride_d
+                    )
+                    if NUM_KSPLIT_POW2 == NUM_KSPLIT:
+                        v = tl.load(v_ptrs)
+                    else:
+                        v = tl.load(
+                            v_ptrs, mask=offs_k[:, None] < NUM_KSPLIT, other=0.0
+                        )
+                    v = tl.sum(v, axis=0) * v_scale_rcprl
+                else:
+                    v_ptrs = (
+                        v_ptr
+                        + pid_t * v_stride_t
+                        + pid_hk * v_stride_h
+                        + d_pe_offs * v_stride_d
+                    )
+                    v = tl.load(v_ptrs) * v_scale_rcprl
                 v_out_ptrs = (
                     value_cache_ptr
                     + pid_t_slot * value_cache_stride_t
