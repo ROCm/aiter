@@ -202,6 +202,7 @@ CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
 )
 CK_HELPER_DIR = f"{AITER_META_DIR}/3rdparty/ck_helper"
+CK_DIR = CK_3RDPARTY_DIR
 
 
 @functools.lru_cache(maxsize=1)
@@ -231,7 +232,7 @@ if multiprocessing.current_process().name == "MainProcess":
     os.makedirs(bd_dir, exist_ok=True)
     # if os.path.exists(f"{bd_dir}/ck/library"):
     #     shutil.rmtree(f"{bd_dir}/ck/library")
-CK_DIR = f"{bd_dir}/ck"
+# CK_DIR = f"{bd_dir}/ck"
 
 
 def validate_and_update_archs():
@@ -366,14 +367,6 @@ def rm_module(md_name):
     os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
 
 
-@functools.lru_cache()
-def recopy_ck():
-    if os.path.exists(CK_DIR):
-        os.system(f"rm -rf {CK_DIR}")
-    shutil.copytree(CK_3RDPARTY_DIR, CK_DIR, dirs_exist_ok=True)
-    shutil.copy(f"{CK_HELPER_DIR}/config.h", f"{CK_DIR}/include/ck/config.h")
-
-
 def clear_build(md_name):
     os.system(f"rm -rf {bd_dir}/{md_name}")
 
@@ -398,8 +391,6 @@ def build_module(
     target_name = f"{md_name}.so" if not is_standalone else md_name
 
     def MainFunc():
-        if prebuild != 1:
-            recopy_ck()
         if AITER_REBUILD == 1:
             rm_module(md_name)
             clear_build(md_name)
@@ -494,8 +485,9 @@ def build_module(
                 sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
         extra_include_paths = [
-            f"{CK_DIR}/include",
-            f"{CK_DIR}/library/include",
+            f"{CK_HELPER_DIR}",
+            f"{CK_3RDPARTY_DIR}/include",
+            f"{CK_3RDPARTY_DIR}/library/include",
         ]
         if not hipify:
             extra_include_paths += [
