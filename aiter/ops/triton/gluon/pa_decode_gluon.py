@@ -91,7 +91,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
 
     seq_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
-    # num_query_heads = gl.num_programs(1) * QUERY_GRP_SZ
     seq_part_idx = gl.program_id(2)
 
     log2e: gl.constexpr = 1.4426950408889634
@@ -207,11 +206,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     if alibi_slopes is None:
         alibi_slope = gl.zeros([QUERY_GRP_SZ_POW2], dtype=gl.float32)
     else:
-        # alibi_slope = gl.load(
-        #     alibi_slopes + kv_head_idx * QUERY_GRP_SZ + q_grp_offs,
-        #     mask=q_grp_offs < QUERY_GRP_SZ,
-        #     other=0.0,
-        # )
         alibi_slope = gl.amd.cdna3.buffer_load(ptr=alibi_slopes + kv_head_idx * QUERY_GRP_SZ, offsets=qk_row_offs, mask=qk_row_offs < QUERY_GRP_SZ)
 
     # load all kv blocks in one time
@@ -284,6 +278,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # qc = gl.convert_layout(q, layout=qk_lhs_layout)
     qc = q_shared.load(qk_lhs_layout)
     kc = gl.convert_layout(kt, layout=qk_rhs_layout)
+
     qk = gl.amd.cdna3.mfma(qc, kc, accumulator) * scale * k_scale_val
     # qk = qk.to(compute_type)
 
@@ -426,14 +421,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # v[MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2]
     v = gl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
 
-    m_l_base_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
-    m_l_offs = (
-        seq_idx * stride_max_logits_s
-        + kv_head_idx * stride_max_logits_nh
-        + seq_part_idx * stride_max_logits_p
-        + m_l_base_offs
-    )
-
     # acc[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     # acc = gl.dot(p, v, out_dtype=gl.float32)
     # acc = acc / exp_sum[:, None]
@@ -462,7 +449,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         + o_grp_offs[:, None] * stride_logits_g
         + o_head_sz_offs[None, :]
     )
-    # gl.store(logits_ptr + logits_offs, acc, mask=q_mask)
     gl.amd.cdna3.buffer_store(stored_value=acc, ptr=logits_ptr, offsets=logits_offs, mask=o_mask)
 
 
@@ -2795,7 +2781,7 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
         blocked_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread =[4, 1, 2],
             threads_per_warp=[4, 4, 4],
-            warps_per_cta   =[1, 1, 4],
+            warps_per_cta   =[1, 2, 2],
             order           =[2, 1, 0],
         )
     query_grp_sz_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, blocked_layout))
@@ -2859,18 +2845,28 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
 
     # out: [QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     out = tl.sum((logits * gl.convert_layout(p, layout=blocked_layout)).to(tl.float32), axis=0, keep_dims=True).to(out_ptr.dtype.element_ty)
+    out_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread =[1, 8],
+        threads_per_warp=[4, 16],
+        warps_per_cta   =[4, 1],
+        order           =[1, 0],
+    )
+    query_grp_sz_out_layout: gl.constexpr = gl.SliceLayout(1, out_layout)
+    head_sz_out_layout: gl.constexpr = gl.SliceLayout(0, out_layout)
+    q_grp_offs_out = gl.arange(0, QUERY_GRP_SZ_POW2, layout=query_grp_sz_out_layout)
+    head_offs_out = gl.arange(0, HEAD_SZ_POW2, layout=head_sz_out_layout)
     # store output
     out_offs = (
         seq_idx * stride_o_s
-        + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs[None, :, None]) * stride_o_h
-        + head_offs[None, None, :]
+        + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs_out[:, None]) * stride_o_h
+        + head_offs_out[None, :]
     )
-    # gl.static_print(out_offs)
+    out = gl.reshape(out, [QUERY_GRP_SZ_POW2, HEAD_SZ_POW2])
     gl.amd.cdna3.buffer_store(
-        stored_value=out,
+        stored_value=gl.convert_layout(out, layout=out_layout),
         ptr=out_ptr,
         offsets=out_offs,
-        mask=(q_grp_offs[None, :, None] < QUERY_GRP_SZ) & (head_offs[None, None, :] < HEAD_SZ),
+        mask=(q_grp_offs_out[:, None] < QUERY_GRP_SZ) & (head_offs_out[None, :] < HEAD_SZ),
     )
 
 
