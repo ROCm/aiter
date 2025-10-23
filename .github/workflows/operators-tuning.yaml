@@ -1,9 +1,6 @@
 name: Operators Tuning
 
 on:
-  push:
-    paths:
-      - 'aiter/configs/*untuned*.csv'
   pull_request:
     paths:
       - 'aiter/configs/*untuned*.csv'
