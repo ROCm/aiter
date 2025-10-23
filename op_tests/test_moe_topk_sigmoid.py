@@ -10,10 +10,7 @@ from aiter.test_common import (
 
 
 @perftest(num_iters=10, num_warmup=1)
-def run_torch(
-    gating_output: torch.Tensor,
-    topk: int
-):
+def run_torch(gating_output: torch.Tensor, topk: int):
     # llama4 maverick custom routing function
     router_scores, router_indices = torch.topk(gating_output, topk, dim=-1)
     router_scores = torch.sigmoid(router_scores.float())
@@ -21,10 +18,7 @@ def run_torch(
 
 
 @perftest(num_iters=10, num_warmup=1)
-def run_fused(
-    gating_output: torch.Tensor,
-    topk: int
-):
+def run_fused(gating_output: torch.Tensor, topk: int):
     tokens, _ = gating_output.shape
     router_scores = torch.empty(
         (tokens, topk), dtype=torch.float32, device=gating_output.device
@@ -32,18 +26,23 @@ def run_fused(
     router_indices = torch.empty(
         (tokens, topk), dtype=torch.int32, device=gating_output.device
     )
-    aiter.topk_sigmoid(
-        router_scores,
-        router_indices,
-        gating_output
-    )
+    aiter.topk_sigmoid(router_scores, router_indices, gating_output)
     return router_scores, router_indices
 
 
-def test_topk_sigmoid(num_experts: int = 128, num_tokens: int = 1024, topk: int = 4, dtype: torch.dtype = torch.float16):
+def test_topk_sigmoid(
+    num_experts: int = 128,
+    num_tokens: int = 1024,
+    topk: int = 4,
+    dtype: torch.dtype = torch.float16,
+):
     # generate data - each row has only unique values
-    gating_output = torch.arange(-1, 1, 2.0 / num_experts).repeat((num_tokens, 1)).to(dtype=dtype, device="cuda")
-    permutation   = torch.argsort(torch.rand_like(gating_output), dim=-1)
+    gating_output = (
+        torch.arange(-1, 1, 2.0 / num_experts)
+        .repeat((num_tokens, 1))
+        .to(dtype=dtype, device="cuda")
+    )
+    permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
     gating_output = torch.gather(gating_output, dim=-1, index=permutation)
     assert gating_output.is_contiguous()
     # run benchmarks
@@ -65,7 +64,9 @@ def test_topk_sigmoid(num_experts: int = 128, num_tokens: int = 1024, topk: int 
         failed_values = gating_output[failed_rows][:5]
         failed_values, _ = failed_values.sort(dim=-1, descending=True)
         print(failed_values[:, :10])
-        print(f"Number of wrong tokens: {sum(failed_rows)} / {len(failed_rows)}, {100 * sum(failed_rows) / len(failed_rows):.2f} %")
+        print(
+            f"Number of wrong tokens: {sum(failed_rows)} / {len(failed_rows)}, {100 * sum(failed_rows) / len(failed_rows):.2f} %"
+        )
     # print run times
     print(f"Runtime (torch baseline):     {avg_torch}")
     print(f"Runtime (fused topk sigmoid): {avg_fused}")
