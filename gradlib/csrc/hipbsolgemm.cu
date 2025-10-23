@@ -113,7 +113,7 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(
     const void *b, int ldb, const void *beta, void *c, int ldc,
     const void *bias, hipDataType intype, hipDataType outtype,
     const void *scaleA, const void *scaleB, const void *scaleC,
-    hipStream_t &stream, bool use_rowwise = false)
+    hipStream_t &stream, bool use_rowwise = false, bool bpreshuffle = false)
 {
   int flag{0};
   hipblasLtMatrixLayout_t matA, matB, matC;
@@ -126,6 +126,25 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matA, intype, k, m, lda));
   }
+#if (HIPBLASLT_VERSION_MAJOR >= 1) || (HIPBLASLT_VERSION_MAJOR == 0 && HIPBLASLT_VERSION_MINOR >= 15)
+  if (bpreshuffle)
+  {
+    hipblasLtOrder_t orderA;
+    if (scaleA != nullptr)
+        orderA = HIPBLASLT_ORDER_COL16_4R16;
+    else
+        orderA = HIPBLASLT_ORDER_COL16_4R8;
+
+    CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutSetAttribute(
+        matA, HIPBLASLT_MATRIX_LAYOUT_ORDER, &orderA, sizeof(orderA)));
+  }
+#else
+  if (bpreshuffle)
+  {
+      std::cerr << "Warning: hipblasLt version lower than 0.15 does not support "
+                  "bpreshuffle. Please upgrade hipblasLt." << std::endl;
+  }
+#endif
   if (op_B == HIPBLAS_OP_N)
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, k, n, ldb));
@@ -622,7 +641,8 @@ std::vector<int> hipb_findallsols(
     std::optional<c10::ScalarType> out_dtype,
     std::optional<torch::Tensor> scaleA,
     std::optional<torch::Tensor> scaleB,
-    std::optional<torch::Tensor> scaleC)
+    std::optional<torch::Tensor> scaleC,
+    bool bpreshuffle)
 {
   auto mat1_strides{mat1.strides()};
   auto mat2_strides{mat2.strides()};
@@ -731,7 +751,7 @@ std::vector<int> hipb_findallsols(
       hipblaslt_handle, transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
       transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k, &one, ptrA,
       mat1_ld, ptrB, mat2_ld, &zero, ptrC, result_ld, bias_ptr, hipblasInType,
-      hipblasOutType, scaleA_ptr, scaleB_ptr, scaleC_ptr, current_stream, use_rowwise);
+      hipblasOutType, scaleA_ptr, scaleB_ptr, scaleC_ptr, current_stream, use_rowwise, bpreshuffle);
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -793,7 +813,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("hipb_findallsols", &hipb_findallsols, "hipb_findallsols",
         py::arg("mat1"), py::arg("mat2"), py::arg("bias") = std::nullopt,
         py::arg("out_dtype") = std::nullopt, py::arg("scaleA") = std::nullopt,
-        py::arg("scaleB") = std::nullopt, py::arg("scaleC") = std::nullopt);
+        py::arg("scaleB") = std::nullopt, py::arg("scaleC") = std::nullopt,
+        py::arg("bpreshuffle") = false);
   m.def("getHipblasltKernelName", &getHipblasltKernelName);
 }
 #endif
