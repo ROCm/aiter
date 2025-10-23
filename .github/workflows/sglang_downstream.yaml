@@ -15,6 +15,7 @@ jobs:
   sglang:
     name: sglang integration
     strategy:
+      fail-fast: false
       matrix:
         include:
           - GPU_ARCH: gfx942
@@ -56,7 +57,7 @@ jobs:
           RUN echo "Removed ck include directory to avoid conflicts"
           RUN ls -all /opt/rocm/include/ck && rm -rf /opt/rocm/include/ck
           RUN echo "Checking ck include directory after removal"
-          RUN ls -all /opt/rocm/include/ck
+          RUN ls -all /opt/rocm/include/ck || true
           RUN rm -rf aiter \
            && git clone ${{ env.GITHUB_REPO_URL }} \
            && cd aiter \
