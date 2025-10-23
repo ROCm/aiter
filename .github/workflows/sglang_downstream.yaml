@@ -53,7 +53,10 @@ jobs:
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
+          RUN echo "Removed ck include directory to avoid conflicts"
           RUN ls -all /opt/rocm/include/ck && rm -rf /opt/rocm/include/ck
+          RUN echo "Checking ck include directory after removal"
+          RUN ls -all /opt/rocm/include/ck
           RUN rm -rf aiter \
            && git clone ${{ env.GITHUB_REPO_URL }} \
            && cd aiter \
