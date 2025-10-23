@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   triton:
-    runs-on: aiter-mi325-1gpu
+    runs-on: aiter-1gpu-runner
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"
@@ -42,6 +42,15 @@ jobs:
           -w /workspace \
           --name triton_test \
           ${{ env.DOCKER_IMAGE }}
+
+      - name: Install speedtest-cli and test network
+        run: |
+          set -ex
+          echo "Installing speedtest-cli and testing network..."
+          docker exec \
+          -w /workspace \
+          triton_test \
+          bash -c "pip install speedtest-cli && speedtest-cli --simple" || true
 
       - name: Setup-Triton
         run: |

@@ -128,6 +128,14 @@ if supports_custom_op():
             tensor, outplace_all_reduce_method, ca_fp8_quant
         )
 
+    # @torch.library.custom_op("aiter::outplace_all_gather", mutates_args=[])
+    def outplace_all_gather(input: torch.Tensor, group_name: str) -> torch.Tensor:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        return group._all_gather_out_place(input)
+
     @outplace_all_reduce.register_fake
     def _(
         tensor: torch.Tensor,
@@ -426,7 +434,20 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def _all_gather_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+        ca_comm = self.ca_comm
+        assert ca_comm is not None
+        assert not ca_comm.disabled
+        out = ca_comm.custom_all_gather(input_)
+        assert out is not None
+        return out
+
+    def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
+        return outplace_all_gather(input_, group_name=self.unique_name)
+
+    def all_gather(
+        self, input_: torch.Tensor, use_custom: bool = False, dim: int = -1
+    ) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
@@ -444,14 +465,18 @@ class GroupCoordinator:
             # Convert negative dim to positive.
             dim += input_.dim()
         input_size = input_.size()
-        # Allocate output tensor.
-        output_tensor = torch.empty(
-            (world_size,) + input_size, dtype=input_.dtype, device=input_.device
-        )
-        # All-gather.
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
+        if use_custom:
+            output_tensor = outplace_all_gather(input_, group_name=self.unique_name)
+            output_tensor = output_tensor.reshape((world_size,) + input_size)
+        else:
+            # Allocate output tensor.
+            output_tensor = torch.empty(
+                (world_size,) + input_size, dtype=input_.dtype, device=input_.device
+            )
+            # All-gather.
+            torch.distributed.all_gather_into_tensor(
+                output_tensor, input_, group=self.device_group
+            )
         # Reshape
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(
