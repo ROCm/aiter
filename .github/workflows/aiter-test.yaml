@@ -16,6 +16,8 @@ env:
 
 jobs:
   define-runners:
+    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'black') && contains(github.event.pull_request.labels.*.name, 'deps') && contains(github.event.pull_request.labels.*.name, 'ruff'))
+
     runs-on: ubuntu-latest
     outputs:
       standard_runners: ${{ steps.machines.outputs.standard_runners }}
