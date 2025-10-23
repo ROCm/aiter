@@ -1,13 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-    echo "Usage: $0 [test|tune] [shape_name (optional)]"
+if [ $# -lt 1 ] || [ $# -gt 3 ]; then
+    echo "Usage: $0 [test|tune] [shape_name (optional)] [tuning_arg (optional)]"
     exit 1
 fi
 
 mode="$1"
 shape_filter="${2:-}"
+tuning_arg="${3:-}"
 
 tuneFailed=false
 testFailed=false
@@ -42,13 +43,19 @@ for job in "${tune_jobs[@]}"; do
             testFailedFiles+=($test_path)
         fi
     elif [ "$mode" == "tune" ]; then
-        echo "Running tuning script: $tune_cmd"
-        if eval "$tune_cmd"; then
-            echo "✅ Tuning PASSED: $tune_cmd"
+        # Append tuning_arg if provided
+        if [ -n "$tuning_arg" ]; then
+            full_tune_cmd="$tune_cmd $tuning_arg"
         else
-            echo "❌ Tuning FAILED: $tune_cmd"
+            full_tune_cmd="$tune_cmd"
+        fi
+        echo "Running tuning script: $full_tune_cmd"
+        if eval "$full_tune_cmd"; then
+            echo "✅ Tuning PASSED: $full_tune_cmd"
+        else
+            echo "❌ Tuning FAILED: $full_tune_cmd"
             tuneFailed=true
-            tuneFailedCmds+=($tune_cmd)
+            tuneFailedCmds+=("$full_tune_cmd")
         fi
     else
         echo "Unknown mode: $mode"
