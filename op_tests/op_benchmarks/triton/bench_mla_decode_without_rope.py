@@ -17,7 +17,7 @@ from aiter.ops.triton.gluon.mla_decode import (
     decode_attention_fwd_grouped,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
-from op_tests.triton_tests.test_mla_decode import input_helper, ref_preprocess
+from op_tests.triton_tests.test_mla_decode import ref_preprocess
 from aiter.test_common import checkAllclose, run_perftest
 
 arg_to_torch_dtype = {
@@ -28,6 +28,63 @@ arg_to_torch_dtype = {
 }
 
 torch.set_default_device("cuda")
+
+def input_helper(
+    B,
+    H,
+    S,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    num_kv_splits,
+    dtype,
+    device,
+    rope_base=10,
+    rope_max_seq_len=16324,
+    rope_scaling=1.0,
+    varlen=False,
+    mtp=0,
+):
+    if varlen:
+        seqlens = torch.randint(1, S + 1, (B,), dtype=torch.int32, device=device)
+    else:
+        seqlens = torch.full((B,), S, dtype=torch.int32, device=device)
+
+    cu_seqlens = torch.cat(
+        [
+            torch.tensor([0], dtype=torch.int32, device=device),
+            seqlens.cumsum(dim=0, dtype=torch.int32),
+        ]
+    )
+
+    total_seqlen = cu_seqlens[-1]
+
+    HK = 1
+    SQ = mtp + 1
+
+    q = torch.randn(B, SQ, H, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
+    kv_cache = torch.randn(
+        total_seqlen, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
+    )
+    # q = torch.randn(B, H, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
+    # kv_cache = torch.randn(
+    #     total_seqlen, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
+    # )
+
+    # interlancing [batch_start_off, batch_seq_len, batch_start_off, batch_seq_len, ...,]
+    kv_indptr = cu_seqlens
+    kv_indices = torch.arange(total_seqlen, device=device).to(torch.int32)
+
+    attn_logits = torch.zeros(
+        B, H * SQ, num_kv_splits, kv_lora_rank, dtype=torch.float, device=device
+    )
+    attn_lse = torch.zeros(
+        B, H * SQ, num_kv_splits, 1, dtype=torch.float, device=device
+    )
+
+    o = torch.zeros(B * SQ, H, kv_lora_rank, dtype=torch.bfloat16, device=device)
+
+    return kv_indptr, kv_indices, q, kv_cache, attn_logits, attn_lse, o
+
 
 def ref_masked_attention(
     query: torch.Tensor,
