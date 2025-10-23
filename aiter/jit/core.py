@@ -202,6 +202,7 @@ CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
 )
 CK_HELPER_DIR = f"{AITER_META_DIR}/3rdparty/ck_helper"
+CK_DIR = CK_3RDPARTY_DIR
 
 
 @functools.lru_cache(maxsize=1)
@@ -231,7 +232,7 @@ if multiprocessing.current_process().name == "MainProcess":
     os.makedirs(bd_dir, exist_ok=True)
     # if os.path.exists(f"{bd_dir}/ck/library"):
     #     shutil.rmtree(f"{bd_dir}/ck/library")
-CK_DIR = f"{bd_dir}/ck"
+# CK_DIR = f"{bd_dir}/ck"
 
 
 def validate_and_update_archs():
