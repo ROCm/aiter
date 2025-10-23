@@ -21,7 +21,7 @@ env:
 jobs:
   build_vllm_image:
     if: ${{ !github.event.pull_request.head.repo.fork }}
-    runs-on: aiter-k8s-build
+    runs-on: aiter-1gpu-runner
 
     steps:
       - name: Checkout aiter repo

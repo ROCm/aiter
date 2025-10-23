@@ -29,6 +29,8 @@ fptr_t init_custom_ar(torch::Tensor &meta, torch::Tensor &rank_data,
 void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, bool open_fp8_quant);
 void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
                       torch::Tensor &out);
+void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
+void all_gather_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out);
 
 void dispose(fptr_t _fa);
 int64_t meta_size();

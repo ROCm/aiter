@@ -94,7 +94,6 @@ if IS_ROCM:
         os.system(f"rm -rf {core.get_user_jit_dir()}/build")
         os.system(f"rm -rf {core.get_user_jit_dir()}/*.so")
         prebuild_dir = f"{core.get_user_jit_dir()}/build/aiter_/build"
-        core.recopy_ck()
         os.makedirs(prebuild_dir + "/srcs")
 
         def build_one_module(one_opt_args):
