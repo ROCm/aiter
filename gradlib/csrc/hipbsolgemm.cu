@@ -113,7 +113,7 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(
     const void *b, int ldb, const void *beta, void *c, int ldc,
     const void *bias, hipDataType intype, hipDataType outtype,
     const void *scaleA, const void *scaleB, const void *scaleC,
-    hipStream_t &stream)
+    hipStream_t &stream, bool use_rowwise = false)
 {
   int flag{0};
   hipblasLtMatrixLayout_t matA, matB, matC;
@@ -156,13 +156,34 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
         matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleA,
         sizeof(scaleA)));
+#if (HIPBLASLT_VERSION_MAJOR >= 1)
+    if (use_rowwise)
+    {
+      auto scale_mode_a = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+      CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+          matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode_a,
+          sizeof(scale_mode_a)));
+    }
+#endif
   }
   if (scaleB != nullptr)
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
         matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleB,
         sizeof(scaleB)));
+#if (HIPBLASLT_VERSION_MAJOR >= 1)
+    if (use_rowwise)
+    {
+      auto scale_mode_b = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+      CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+          matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode_b,
+          sizeof(scale_mode_b)));
+    }
+#endif
   }
+#if (HIPBLASLT_VERSION_MAJOR < 1)
+  TORCH_CHECK(!(use_rowwise), "Rowwise scaling requires hipBLASLt >= 1.0");
+#endif
   if (scaleC != nullptr)
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
@@ -693,11 +714,24 @@ std::vector<int> hipb_findallsols(
   auto scaleC_ptr =
       scaleC.has_value() ? static_cast<void *>(scaleC.value().data_ptr()) : nullptr;
 
+  bool use_rowwise = false;
+  if (scaleA.has_value() && scaleB.has_value())
+  {
+    int64_t m_orig = mat1.sizes()[0];
+    int64_t n_orig = mat2.sizes()[1];
+
+    ScalingType scaling_type = get_scaling_type(scaleA.value(), scaleB.value(), m_orig, n_orig);
+
+    if (scaling_type == ScalingType::RowWise) {
+      use_rowwise = true;
+    }
+  }
+
   return hipblasLtMatmul_findallsols_wrapper(
       hipblaslt_handle, transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
       transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k, &one, ptrA,
       mat1_ld, ptrB, mat2_ld, &zero, ptrC, result_ld, bias_ptr, hipblasInType,
-      hipblasOutType, scaleA_ptr, scaleB_ptr, scaleC_ptr, current_stream);
+      hipblasOutType, scaleA_ptr, scaleB_ptr, scaleC_ptr, current_stream, use_rowwise);
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
