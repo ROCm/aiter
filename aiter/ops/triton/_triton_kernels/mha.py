@@ -856,8 +856,14 @@ def _get_config(
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict["default"] = config
-
-    if has_pe and "pe" in _get_config._config_dict["default"]["fwd"]:
+    # TODO: pe + dropout is not tuned
+    if (
+        has_pe
+        and (enable_dropout or dtype == torch.float32)
+        and "pe_dropout_or_fp32" in _get_config._config_dict["default"]["fwd"]
+    ):
+        return _get_config._config_dict["default"]["fwd"]["pe_dropout_or_fp32"]
+    elif has_pe and "pe" in _get_config._config_dict["default"]["fwd"]:
         return _get_config._config_dict["default"]["fwd"]["pe"]
     elif enable_dropout or dtype == torch.float32:
         return _get_config._config_dict["default"]["fwd"]["dropout_or_fp32"]
