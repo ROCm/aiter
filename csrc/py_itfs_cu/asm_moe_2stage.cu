@@ -97,6 +97,13 @@ static CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, Q
     {
         return &cfg_fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1;
     }
+    else if((inp.scalar_type() == torch::kFloat4_e2m1fn_x2) ||
+            (inp.scalar_type() == torch::kUInt8) &&
+                (out.scalar_type() == at::ScalarType::BFloat16) &&
+                quant_type == QuantType::per_1x32)
+    {
+        return &cfg_fmoe_stage1_bf16_pertokenFp4_blockscale_g1u1;
+    }
     else
     {
         TORCH_CHECK(false, __func__, " Unsupported input_type:", inp.scalar_type(), ", weight_type:", w1.scalar_type(),
@@ -210,8 +217,8 @@ void moe_stage1_g1u1(
     int stride_X = input.stride(0) * input.element_size();
     int stride_GU = dim * w1.element_size();
 
-    int stride_expert_GU = stride_GU * inter_dim;
-    int stride_expert_GUDQN = w1_scale.has_value() ? w1_scale.value().stride(0) * sizeof(float) : 0;
+    int stride_expert_GU = input.scalar_type() == torch::kFloat4_e2m1fn_x2 || input.scalar_type() == torch::kUInt8 ? hidden_dim * dim / 2 : stride_GU * inter_dim;
+    int stride_expert_GUDQN = input.scalar_type() == torch::kFloat4_e2m1fn_x2 || input.scalar_type() == torch::kUInt8 ? hidden_dim * 2 * (dim / 32) : w1_scale.has_value() ? w1_scale.value().stride(0) * sizeof(float) : 0;
     int stride_expert_SMTDQN = inter_dim * sizeof(float);
     int stride_O = out.stride(0) * out.element_size();
     if (inter_dim * 2 == w1.size(1))
@@ -237,15 +244,22 @@ void moe_stage1_g1u1(
     args.token_cnt = token_cnt;
     args.eprt_cnt = eprt;
     args.Xs = stride_X;
-    args.GUs = stride_GU;
+    args.GUs =
+        input.scalar_type() == torch::kFloat4_e2m1fn_x2 || input.scalar_type() == torch::kUInt8
+            ? dim / 2
+            : stride_GU;
     args.Os = stride_O;
     args.eGUs = stride_expert_GU;
     args.eGUQs = stride_expert_GUDQN;
-    args.eSMQs = stride_expert_SMTDQN;
+    args.eSMQs = input.scalar_type() == torch::kFloat4_e2m1fn_x2 || input.scalar_type() == torch::kUInt8? 0 : stride_expert_SMTDQN;
     args.topk = topk;
     args.splitk = ksplit;
     args.activation = static_cast<int>(activation);
-    args.ptr_SW = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
+    args.ptr_SW =
+        input.scalar_type() == torch::kFloat4_e2m1fn_x2 || input.scalar_type() == torch::kUInt8
+            ? nullptr
+        : sorted_weights.has_value() ? sorted_weights.value().data_ptr()
+                                     : nullptr;
 
     uint32_t k_num = 1 << ksplit;
     TORCH_CHECK(model_dim % k_num == 0, __func__, " Unsupported ksplit for model_dim:", model_dim, " k_num:", k_num);

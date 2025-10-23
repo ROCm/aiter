@@ -1,0 +1,2 @@
+tile_m,tile_n,knl_name,co_name
+256,128,_ZN5aiter52fmoe_stage1_bf16_pertokenFp4_blockscale_g1u1_256x128E,fmoe_stage1_bf16_pertokenFp4_blockscale_g1u1_256x128.co
