@@ -1041,8 +1041,8 @@ __global__ void concat_and_cache_mla_opt_kernel(
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
   const float inverted_kscale = 1.0f / *scale;
-  static constexpr int32_t vec_size_i =  std::is_same_v<scalar_t, float> ? 4 : 8;
-  static constexpr int32_t vec_size_o =  vec_size_i;
+  static constexpr int32_t vec_size_i = std::is_same_v<scalar_t, float> ? 4 : 8;
+  static constexpr int32_t vec_size_o = vec_size_i;
   using vec_i = ck_tile::vec_t<scalar_t, vec_size_i>;
   static constexpr int32_t ooba_i = 4 / sizeof(scalar_t);
   static constexpr int32_t ooba_o = 4 / sizeof(cache_t);
@@ -1065,11 +1065,11 @@ __global__ void concat_and_cache_mla_opt_kernel(
 
     size_t vec_idx    = threadIdx.x;
     size_t vec_stride = blockDim.x;
-    if(vec_idx < num_vecs)
+    if (vec_idx < num_vecs)
     {
         vec_cur = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
     }
-    for(vec_idx += vec_stride; vec_idx < num_vecs; vec_idx += vec_stride)
+    for (vec_idx += vec_stride; vec_idx < num_vecs; vec_idx += vec_stride)
     {
         vec_nxt = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
         if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
@@ -1088,7 +1088,7 @@ __global__ void concat_and_cache_mla_opt_kernel(
         }
         vec_cur = vec_nxt;
     }
-    if( vec_idx - vec_stride < num_vecs)
+    if (vec_idx - vec_stride < num_vecs)
     {
         if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
             buffer_o.template set(
@@ -1674,7 +1674,7 @@ void concat_and_cache_mla(
 
   if ((pe_dim & 0x7) == 0 && (kv_lora_rank & 0x7) == 0) {
     dim3 grid(num_tokens);
-    dim3 block(std::min(kv_lora_rank, 1024)/8);
+    dim3 block(std::min(kv_lora_rank, 1024) / 8);
     DISPATCH_BY_KV_CACHE_DTYPE(kv_c.dtype(), kv_cache_dtype,
                                CALL_CONCAT_AND_CACHE_MLA_OPT);
 
