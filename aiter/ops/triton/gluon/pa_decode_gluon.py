@@ -2842,9 +2842,8 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     logits = gl.amd.cdna3.buffer_load(
         ptr=logits_ptrs, offsets=logits_offset, mask=logits_mask[:, :, None], other=0.0
     )
-
     # out: [QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
-    out = tl.sum((logits * gl.convert_layout(p, layout=blocked_layout)).to(tl.float32), axis=0, keep_dims=True).to(out_ptr.dtype.element_ty)
+    out = tl.sum((logits * gl.convert_layout(p, layout=blocked_layout)).to(tl.float32), axis=0).to(out_ptr.dtype.element_ty)
     out_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread =[1, 8],
         threads_per_warp=[4, 16],
@@ -2861,7 +2860,7 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
         + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs_out[:, None]) * stride_o_h
         + head_offs_out[None, :]
     )
-    out = gl.reshape(out, [QUERY_GRP_SZ_POW2, HEAD_SZ_POW2])
+
     gl.amd.cdna3.buffer_store(
         stored_value=gl.convert_layout(out, layout=out_layout),
         ptr=out_ptr,
