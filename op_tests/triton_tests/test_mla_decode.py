@@ -21,6 +21,7 @@ def input_helper(
     H,
     S,
     kv_lora_rank,
+    rotary_dim,
     qk_rope_head_dim,
     num_kv_splits,
     dtype,
@@ -28,49 +29,50 @@ def input_helper(
     rope_base=10,
     rope_max_seq_len=16324,
     rope_scaling=1.0,
-    varlen=False,
-    mtp=0,
+    is_neox_style=True,
+    equal_seqlens=True,
 ):
-    if varlen:
-        seqlens = torch.randint(1, S + 1, (B,), dtype=torch.int32, device=device)
+    if not equal_seqlens:
+        max_seqlens = S // B
+        seqlens = torch.randint(1, max_seqlens + 1, (B,), dtype=torch.int32, device=device)
     else:
-        seqlens = torch.full((B,), S, dtype=torch.int32, device=device)
+        seqlens = torch.full((B,), S // B, dtype=torch.int32, device=device)
 
+    # Calculate cumulative sequence lengths
     cu_seqlens = torch.cat(
-        [
-            torch.tensor([0], dtype=torch.int32, device=device),
-            seqlens.cumsum(dim=0, dtype=torch.int32),
-        ]
+        [torch.tensor([0], dtype=torch.int32, device=device), seqlens.cumsum(dim=0, dtype=torch.int32)]
     )
+    total_seq = cu_seqlens[-1].item()
 
-    total_seqlen = cu_seqlens[-1]
-
-    HK = 1
-    SQ = mtp + 1
-
-    q = torch.randn(B, SQ, H, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
+    q = torch.randn(B, H, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
     kv_cache = torch.randn(
-        total_seqlen, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
+        B * total_seq, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
     )
-    # q = torch.randn(B, H, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
-    # kv_cache = torch.randn(
-    #     total_seqlen, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
-    # )
 
     # interlancing [batch_start_off, batch_seq_len, batch_start_off, batch_seq_len, ...,]
     kv_indptr = cu_seqlens
-    kv_indices = torch.arange(total_seqlen, device=device).to(torch.int32)
+    kv_indices = torch.arange(B * total_seq, device=device)
 
-    attn_logits = torch.zeros(
-        B, H * SQ, num_kv_splits, kv_lora_rank, dtype=torch.float, device=device
-    )
-    attn_lse = torch.zeros(
-        B, H * SQ, num_kv_splits, 1, dtype=torch.float, device=device
+    attn_logits = torch.empty(
+        B, H, num_kv_splits, kv_lora_rank + 1, dtype=dtype, device=device
     )
 
-    o = torch.zeros(B * SQ, H, kv_lora_rank, dtype=torch.bfloat16, device=device)
+    rotary_emb = DeepseekScalingRotaryEmbedding(
+        qk_rope_head_dim,
+        rotary_dim,
+        rope_max_seq_len,
+        rope_base,
+        is_neox_style,
+        rope_scaling,
+        q.dtype,
+        device=device,
+    )
 
-    return kv_indptr, kv_indices, q, kv_cache, attn_logits, attn_lse, o
+    positions = (
+        torch.tensor([S], device=device).unsqueeze(0).repeat(B, 1)
+    )  # k positions and q position as last
+
+    return kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions
 
 
 def ref_preprocess(kv_cache, kv_lora_rank):
@@ -265,7 +267,7 @@ def test_op_fwd_rope(
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(0)
 
-    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
+    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
         input_helper(
             B,
             H,
@@ -367,7 +369,7 @@ def test_op_fwd_rope_neox(
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(0)
 
-    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
+    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
         input_helper(
             B,
             H,
@@ -479,7 +481,7 @@ def test_op_fwd_rope_integration(
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(0)
 
-    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
+    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
         input_helper(
             B,
             H,
@@ -547,4 +549,3 @@ def test_op_fwd_rope_integration(
 
     torch.testing.assert_close(ref_logits, tri_logits, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(ref_o, tri_o, atol=1e-2, rtol=1e-2)
-
