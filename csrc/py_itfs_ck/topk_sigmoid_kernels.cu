@@ -9,6 +9,9 @@
 // from CK examples:
 #include "topk_softmax_api.hpp"
 
+namespace aiter
+{
+
 void topk_sigmoid(torch::Tensor topk_weights,   // [tokens, topk]
                   torch::Tensor topk_indices,   // [tokens, topk]
                   torch::Tensor gating_output)  // [tokens, experts] 
@@ -26,8 +29,31 @@ void topk_sigmoid(torch::Tensor topk_weights,   // [tokens, topk]
     const int stride_input  = experts;
     const int stride_output = topk;
 
+    // Determine datatypes
+    auto dtype_to_string = [](const auto dtype) -> std::string {
+        if(dtype == torch::kFloat16)
+        {
+            return "fp16";
+        }
+        else if(dtype == torch::kBFloat16)
+        {
+            return "bf16";
+        }
+        else if(dtype == torch::kFloat32)
+        {
+            return "fp32";
+        }
+        else
+        {
+            throw std::runtime_error("invalid datatype for topk_sigmoid: only fp16/bf16/fp32!");
+        }
+    };
+    std::string input_prec  = dtype_to_string(gating_output.dtype());
+    std::string weight_prec = dtype_to_string(topk_weights.dtype());
+
     // Prepare kernel arguments
-    topk_softmax_trait trait{input_prec, weight_prec, experts};
+    static constexpr std::string activation = "sigmoid";
+    topk_softmax_trait trait{input_prec, weight_prec, experts, activation};
 
     topk_softmax_kargs karg{gating_output.data_ptr(),
                             topk_weights.data_ptr(),
@@ -42,3 +68,5 @@ void topk_sigmoid(torch::Tensor topk_weights,   // [tokens, topk]
   
     topk_softmax(trait, karg, sc);
 }
+
+} // namespace aiter

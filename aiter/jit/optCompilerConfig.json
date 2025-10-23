@@ -345,7 +345,8 @@
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_2stage.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topksoftmax.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_ck/topk_sigmoid_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/topk_sigmoid_kernels.cu'",
+            "f'{CK_DIR}/example/ck_tile/09_topk_softmax/topk_softmax_api.cpp'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

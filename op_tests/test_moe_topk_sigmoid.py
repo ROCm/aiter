@@ -40,9 +40,9 @@ def run_fused(
     return router_scores, router_indices
 
 
-def test_topk_sigmoid(num_experts: int = 128, num_tokens: int = 1024, topk: int = 4):
+def test_topk_sigmoid(num_experts: int = 128, num_tokens: int = 1024, topk: int = 4, dtype: torch.dtype = torch.float16):
     # generate data - each row has only unique values
-    gating_output = torch.arange(-1, 1, 2.0 / num_experts).repeat((num_tokens, 1)).to(dtype=torch.float16, device="cuda")
+    gating_output = torch.arange(-1, 1, 2.0 / num_experts).repeat((num_tokens, 1)).to(dtype=dtype, device="cuda")
     permutation   = torch.argsort(torch.rand_like(gating_output), dim=-1)
     gating_output = torch.gather(gating_output, dim=-1, index=permutation)
     assert gating_output.is_contiguous()
@@ -73,4 +73,5 @@ def test_topk_sigmoid(num_experts: int = 128, num_tokens: int = 1024, topk: int 
 
 
 if __name__ == "__main__":
-    test_topk_sigmoid()
+    test_topk_sigmoid(dtype=torch.float16)
+    test_topk_sigmoid(dtype=torch.bfloat16)

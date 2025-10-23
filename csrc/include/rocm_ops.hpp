@@ -745,6 +745,12 @@
           py::arg("need_renorm"),                                              \
           py::arg("routed_scaling_factor") = 1.0f,                             \
           "Apply biased grouped topk softmax to the gating outputs.");         \
+    m.def("topk_sigmoid",                                                      \
+          &aiter::topk_sigmoid,                                                       \
+          py::arg("topk_weights"),                                             \
+          py::arg("topk_indices"),                                             \
+          py::arg("gating_output"),                                            \
+          "Apply topk sigmoid to the gating outputs.");                        \
     m.def("moe_fused_gate",                                                    \
           &moe_fused_gate,                                                     \
           py::arg("input"),                                                    \
