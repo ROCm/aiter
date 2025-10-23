@@ -47,7 +47,7 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
         return ms
     elif metric == "throughput":
         tflops = flops / ms * 1e-9
-        return tflops #  flops / mem # tflops
+        return tflops  #  flops / mem # tflops
     elif metric == "bandwidth":
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         return bandwidth
