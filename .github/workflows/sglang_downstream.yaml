@@ -44,12 +44,12 @@ jobs:
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
+          RUN ls /opt/rocm/include/ck && rm -rf /opt/rocm/include/ck
           RUN rm -rf aiter \
            && git clone ${{ env.GITHUB_REPO_URL }} \
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
            && git submodule update --init --recursive \
-           && rm -rf /opt/rocm/include/ck \
            && PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop; \
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
