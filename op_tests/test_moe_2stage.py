@@ -403,6 +403,7 @@ def test_fmoe(
             w2_scale=fp4_utils.e8m0_shuffle(w2_scale),
             quant_type=qType,
             activation=actType,
+            block_size_M=64,
             doweight_stage1=doweight_stage1,
         )
 
@@ -411,6 +412,16 @@ def test_fmoe(
             out2_aiter,
             msg=f"aiter_all_stages:{us_fuse:>8.2f} us......",
         )
+
+        def calc_diff(x: torch.Tensor, y: torch.Tensor):
+            x, y = x.double(), y.double()
+            denominator = (x * x + y * y).sum()
+            sim = 2 * (x * y).sum() / denominator
+            return 1 - sim
+ 
+ 
+        logits_diff = calc_diff(out2_ref, out2_aiter)
+        assert logits_diff < 1e-2
 
         return {"us": us_fuse, "err": err}
 
@@ -421,9 +432,9 @@ l_tokenNum = [
     # 1,
     # 3,
     # 5,
-    16,
+    # 16,
     # 32,
-    # 64,
+    64,
     # 128,
     # 256,
     # 1024,
@@ -527,7 +538,7 @@ parser.add_argument(
     "-k",
     "--topk",
     type=int,
-    default=4,
+    default=2,
     help="""Number of top experts.
     e.g.: -k 2""",
 )
