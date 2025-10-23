@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Optional, Dict
 import functools
 import json
+import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
-from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -35,15 +37,12 @@ def _bwd_preprocess(
     stride_delta_b,
     stride_delta_h,
     stride_delta_m,
-    stride_descale_do_z,
     cu_seqlens_q,
     max_seqlen_q,
-    descale_do_ptr,
     BLOCK_M: tl.constexpr,
     BLOCK_D_MODEL: tl.constexpr,
     BLOCK_D_MODEL_POW2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    IS_FP8: tl.constexpr,
 ):
     pid_m = tl.program_id(0)  # seqlen
     bid = tl.program_id(1)  # batch
@@ -85,13 +84,7 @@ def _bwd_preprocess(
     do = tl.load(do_ptr + offs, mask=mask, other=0.0)
 
     # compute and write-back to delta
-    if IS_FP8:
-        descale_do = tl.load(descale_do_ptr + bid * stride_descale_do_z + hid)
-
-        # NOTE: do is in the fp8 range and o is not in fp8
-        delta = tl.sum(o.to(tl.float32) * (do.to(tl.float32) * descale_do), axis=1)
-    else:
-        delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
+    delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
 
     offs_delta = (
         bid * stride_delta_b
@@ -105,12 +98,10 @@ def _bwd_preprocess(
 # The main inner-loop logic for computing dK and dV.
 @triton.jit
 def _bwd_dkdv_inner(
-    dk,  # output
-    dk_pe,  # optional output, pass None for non-PE case
+    dk,
     dv,  # output
     Q,
     k,
-    k_pe,
     v,
     DO,
     M,
@@ -127,7 +118,6 @@ def _bwd_dkdv_inner(
     BLOCK_N: tl.constexpr,  # 128
     HEAD_DIM: tl.constexpr,  #
     ACTUAL_HEAD_DIM: tl.constexpr,  #
-    PE_HEAD_DIM: tl.constexpr,
     dropout_p,
     philox_seed,
     batch_philox_offset,
@@ -139,35 +129,24 @@ def _bwd_dkdv_inner(
     start_n,
     start_m,
     num_steps,  # iteration numbers
-    descale_q,
-    descale_k,
-    descale_v,
-    descale_do,  # fp8 descale factors from user
     MASK: tl.constexpr,  # causal masking, only apply to tiles on mask diagonal
     ENABLE_DROPOUT: tl.constexpr,  # activate dropout
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,  # activate exp2
-    IS_FP8: tl.constexpr,
-    FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
-    HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
     delta_qk = seqlen_q - seqlen_k
     offs_m = start_m + tl.arange(0, BLOCK_M)  # start_m + (0, 15)
     offs_n = start_n + tl.arange(0, BLOCK_N)  # start_m + (0, 127)
     offs_k = tl.arange(0, HEAD_DIM)
-    if HAS_PE:
-        offs_k_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
     # mask to make sure not OOB of seqlen_q
     mask_n = offs_n < seqlen_k
     # Q and DO are (seqlen_q, head_dim)
     # qT_ptrs = (1, BLOCK_M) + (HEAD_DIM, 1), transpose of q
     qT_ptrs = Q + offs_m[None, :] * stride_qm + offs_k[:, None] * stride_qk
-    if HAS_PE:
-        qT_pe_ptrs = Q + offs_m[None, :] * stride_qm + offs_k_pe[:, None] * stride_qk
     # do_ptrs = (BLOCK_M, 1) + (1, HEAD_DIM), NOT transposed
     do_ptrs = DO + offs_m[:, None] * stride_dom + offs_k[None, :] * stride_dok
     # BLOCK_N must be a multiple of BLOCK_M, otherwise the code wouldn't work.
@@ -191,8 +170,6 @@ def _bwd_dkdv_inner(
             mask_qT &= offs_k[:, None] < ACTUAL_HEAD_DIM
             mask_do &= offs_k[None, :] < ACTUAL_HEAD_DIM
         qT = tl.load(qT_ptrs, mask=mask_qT, other=0.0)
-        if HAS_PE:
-            qT_pe = tl.load(qT_pe_ptrs, mask=mask_qT, other=0.0)
         # generate dropout mask
         if ENABLE_DROPOUT:
             # NOTE: dropout is transposed because it is used to mask pT
@@ -213,12 +190,7 @@ def _bwd_dkdv_inner(
             dropout_scale = 1.0 / (1 - dropout_p)
         # Load m before computing qk to reduce pipeline stall.
         m = tl.load(M + offs_m * stride_deltam, mask=mask_m, other=0.0)
-        if IS_FP8:
-            qkT = tl.dot(k, qT) * descale_q * descale_k
-        else:
-            qkT = tl.dot(k, qT)
-            if HAS_PE:
-                qkT += tl.dot(k_pe, qT_pe)
+        qkT = tl.dot(k, qT)
         qkT_scaled = qkT * sm_scale
 
         if USE_ALIBI:
@@ -255,27 +227,9 @@ def _bwd_dkdv_inner(
         # Compute dV.
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            if IS_FP8:
-                scale_p_dropout, descale_p_dropout = _compute_fp8_scaling_factors(
-                    pT_dropout, FP8_MAX
-                )
-                dv += (
-                    tl.dot((pT_dropout * scale_p_dropout).to(do.type.element_ty), do)
-                    * descale_p_dropout
-                    * descale_do
-                )
-            else:
-                dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
-            if IS_FP8:
-                scale_pT, descale_pT = _compute_fp8_scaling_factors(pT, FP8_MAX)
-                dv += (
-                    tl.dot((pT * scale_pT).to(do.type.element_ty), do)
-                    * descale_pT
-                    * descale_do
-                )
-            else:
-                dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv += tl.dot(pT.to(do.type.element_ty), do)
 
         if DEBUG_TRITON_DETAIL:
             if start_n == 256:
@@ -283,41 +237,24 @@ def _bwd_dkdv_inner(
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
         # Compute dP and dS.
-        if IS_FP8:
-            dpT = tl.dot(v, tl.trans(do)) * descale_v * descale_do
-        else:
-            dpT = tl.dot(v, tl.trans(do))
+        dpT = tl.dot(v, tl.trans(do))
         if ENABLE_DROPOUT:
             dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
-        if IS_FP8:
-            scale_dsT, descale_dsT = _compute_fp8_scaling_factors(dsT, FP8_MAX)
-            dk += (
-                tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT))
-                * descale_dsT
-                * descale_q
-            )
-        else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
-            if HAS_PE:
-                dk_pe += tl.dot(dsT.to(qT_pe.type.element_ty), tl.trans(qT_pe))
+        dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
-        if HAS_PE:
-            qT_pe_ptrs += step_m * stride_qm
         do_ptrs += step_m * stride_dom
-    return dk, dk_pe, dv
+    return dk, dv
 
 
 # the main inner-loop logic for computing dQ
 @triton.jit
 def _bwd_dq_inner(
     dq,  # output
-    dq_pe,  # optional output, pass None for non-PE case
     q,
-    q_pe,
     K,
     V,
     do,
@@ -340,7 +277,6 @@ def _bwd_dq_inner(
     BLOCK_N2: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,
     ACTUAL_HEAD_DIM: tl.constexpr,  #
-    PE_HEAD_DIM: tl.constexpr,
     dropout_p,
     philox_seed,
     batch_philox_offset,
@@ -350,36 +286,25 @@ def _bwd_dq_inner(
     start_m,
     start_n,
     end_n,
-    num_steps,  #
-    descale_q,
-    descale_k,
-    descale_v,
-    descale_do,  # fp8 descale factors from user
+    num_steps,  # iteration numbers
     MASK: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
-    IS_FP8: tl.constexpr,
-    FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
-    HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
     delta_qk = seqlen_q - seqlen_k
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
-    if HAS_PE:
-        offs_k_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
 
     # mask to make sure not OOB of seqlen_q
     mask_m = offs_m < seqlen_q
 
     kT_ptrs = K + offs_n[None, :] * stride_kn + offs_k[:, None] * stride_kk
-    if HAS_PE:
-        kT_pe_ptrs = K + offs_n[None, :] * stride_kn + offs_k_pe[:, None] * stride_kk
     vT_ptrs = V + offs_n[None, :] * stride_vn + offs_k[:, None] * stride_vk
     # D (= delta) is pre-divided by ds_scale.
     Di = tl.load(Delta + offs_m * stride_deltam, mask=mask_m, other=0.0)
@@ -409,8 +334,6 @@ def _bwd_dq_inner(
             mask_kT &= offs_k[:, None] < ACTUAL_HEAD_DIM
 
         kT = tl.load(kT_ptrs, mask=mask_kT, other=0.0)
-        if HAS_PE:
-            kT_pe = tl.load(kT_pe_ptrs, mask=mask_kT, other=0.0)
         vT = tl.load(vT_ptrs, mask=mask_kT, other=0.0)
 
         if ENABLE_DROPOUT:
@@ -431,12 +354,7 @@ def _bwd_dq_inner(
                 dropout_mask = rand_vals > dropout_p
             dropout_scale = 1 / (1 - dropout_p)
 
-        if IS_FP8:
-            qk = tl.dot(q, kT) * descale_q * descale_k
-        else:
-            qk = tl.dot(q, kT)
-            if HAS_PE:
-                qk += tl.dot(q_pe, kT_pe)
+        qk = tl.dot(q, kT)
         qk_scaled = qk * sm_scale
 
         if USE_ALIBI:
@@ -457,34 +375,19 @@ def _bwd_dq_inner(
             mask = causal_mask & mask_mn
             p = tl.where(mask, p, 0.0)
         # Compute dP and dS.
-        if IS_FP8:
-            dp = tl.dot(do, vT) * descale_do * descale_v
-        else:
-            dp = tl.dot(do, vT)
+        dp = tl.dot(do, vT)
         if ENABLE_DROPOUT:
             dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
         delta_i = Di[:, None]
         ds = p * (dp - delta_i)
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
-        if IS_FP8:
-            scale_ds, descale_ds = _compute_fp8_scaling_factors(ds, FP8_MAX)
-            dq += (
-                tl.dot((ds * scale_ds).to(kT.type.element_ty), tl.trans(kT))
-                * descale_ds
-                * descale_k
-            )
-        else:
-            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
-            if HAS_PE:
-                dq_pe += tl.dot(ds.to(kT_pe.type.element_ty), tl.trans(kT_pe))
+        dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
-        if HAS_PE:
-            kT_pe_ptrs += step_n * stride_kn
         vT_ptrs += step_n * stride_vn
-    return dq, dq_pe
+    return dq
 
 
 @triton.jit
@@ -534,10 +437,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     stride_dropouth_in,
     stride_dropoutm_in,
     stride_dropoutn_in,
-    stride_descale_q_z_in,
-    stride_descale_k_z_in,
-    stride_descale_v_z_in,
-    stride_descale_do_z_in,
     stride_az_in,
     stride_ah_in,
     HQ,
@@ -551,10 +450,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     philox_seed,
     philox_offset_base_in,
     Alibi_slopes,
-    Descale_q,
-    Descale_k,
-    Descale_v,
-    Descale_do,
     BLOCK_M1: tl.constexpr,
     BLOCK_N1: tl.constexpr,
     BLOCK_M2: tl.constexpr,
@@ -562,14 +457,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     BLK_SLICE_FACTOR: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     ACTUAL_HEAD_DIM: tl.constexpr,
-    PE_HEAD_DIM: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
-    IS_FP8: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-    FP8_OUTPUT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
@@ -611,11 +502,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         stride_dropouth = tl.cast(stride_dropouth_in, tl.int64)
         stride_dropoutm = tl.cast(stride_dropoutm_in, tl.int64)
         stride_dropoutn = tl.cast(stride_dropoutn_in, tl.int64)
-        if IS_FP8:
-            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
-            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
-            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
-            stride_descale_do_z = tl.cast(stride_descale_do_z_in, tl.int64)
         stride_az = tl.cast(stride_az_in, tl.int64)
         stride_ah = tl.cast(stride_ah_in, tl.int64)
     else:
@@ -655,10 +541,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         stride_dropouth = stride_dropouth_in
         stride_dropoutm = stride_dropoutm_in
         stride_dropoutn = stride_dropoutn_in
-        stride_descale_q_z = stride_descale_q_z_in
-        stride_descale_k_z = stride_descale_k_z_in
-        stride_descale_v_z = stride_descale_v_z_in
-        stride_descale_do_z = stride_descale_do_z_in
         stride_az = stride_az_in
         stride_ah = stride_ah_in
 
@@ -686,10 +568,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     if DEBUG_TRITON:
         print(f"delta_qk = {delta_qk}")  # noqa: E701
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
-    HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
     offs_d = tl.arange(0, HEAD_DIM)
-    if HAS_PE:
-        offs_d_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
     GROUP_SIZE: tl.constexpr = HQ // HK
 
     # align the delta_qk
@@ -697,11 +576,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     if start_n < seqlen_k:
         # This section does dk and dv
         dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
-        if HAS_PE:
-            dk_pe = tl.zeros([BLOCK_N1, PE_HEAD_DIM], dtype=tl.float32)
-        else:
-            # Couldn't assign None to dk_pe because _bwd_dkdv_inner can't return None.
-            dk_pe = dk
         dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
 
         # q > k: diretcly skip all the way until the start of causal block
@@ -741,14 +615,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             + offs_n[:, None] * stride_kn
             + offs_d[None, :] * stride_kd
         )
-        if HAS_PE:
-            adj_k_pe = (
-                bid * stride_kb
-                + hkid * stride_kh
-                + k_start * stride_kn
-                + offs_n[:, None] * stride_kn
-                + offs_d_pe[None, :] * stride_kd
-            )
         adj_v = (
             bid * stride_vb
             + hkid * stride_vh
@@ -758,10 +624,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         )
         # load K and V: they stay in SRAM throughout the inner loop.
         k = tl.load(K + adj_k, mask=mask_kv, other=0.0)
-        if HAS_PE:
-            k_pe = tl.load(K + adj_k_pe, mask=mask_kv, other=0.0)
-        else:
-            k_pe = None
         v = tl.load(V + adj_v, mask=mask_kv, other=0.0)
         # If MQA / GQA, set the K and V head offsets appropriately.
         # hqid = hkid
@@ -809,14 +671,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                     Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
                 )
 
-            if IS_FP8:
-                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
-                descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
-                descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
-                descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
-            else:
-                descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
-
             MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
             # bound the masked operation to q len so it does not have to wast cycles
             len_m = min(len_m, seqlen_q)
@@ -831,13 +685,11 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 print(
                     f"Masked: start_n: {start_n}; start_m: {start_m}, num_steps: {num_steps}"
                 )  # noqa: E701
-            dk, dk_pe, dv = _bwd_dkdv_inner(
-                dk,  # output tensor
-                dk_pe,  # optional output tensor
-                dv,  # output tensor
+            dk, dv = _bwd_dkdv_inner(
+                dk,
+                dv,  # output tensors
                 Q_ptr,
                 k,
-                k_pe,
                 v,
                 DO_ptr,
                 M_ptr,
@@ -854,7 +706,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 BLOCK_N1,  # block dim
                 HEAD_DIM,
                 ACTUAL_HEAD_DIM,  # head dim
-                PE_HEAD_DIM,
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
@@ -865,16 +716,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 start_n,
                 start_m,
                 num_steps,  # iteration numbers
-                descale_q,
-                descale_k,
-                descale_v,
-                descale_do,
                 MASK=True,  # causal masking
                 ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
@@ -892,13 +737,11 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 )  # noqa: E701
             if DEBUG_TRITON:
                 print("unMasked")  # noqa: E701
-            dk, dk_pe, dv = _bwd_dkdv_inner(
-                dk,  # output tensor
-                dk_pe,  # optional output tensor
-                dv,  # output tensor
+            dk, dv = _bwd_dkdv_inner(
+                dk,
+                dv,  # output tensors
                 Q_ptr,
                 k,
-                k_pe,
                 v,
                 DO_ptr,
                 M_ptr,
@@ -915,7 +758,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 BLOCK_N1,  # block dim
                 HEAD_DIM,
                 ACTUAL_HEAD_DIM,  # head dim
-                PE_HEAD_DIM,
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
@@ -926,16 +768,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 start_n,
                 start_m,
                 num_steps,  # iteration numbers
-                descale_q,
-                descale_k,
-                descale_v,
-                descale_do,
                 MASK=False,  # causal masking
                 ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
@@ -949,10 +785,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         offs_dk = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
         dk *= sm_scale
         tl.store(DK + adj_dk + offs_dk, dk, mask=mask_kv)
-        if HAS_PE:
-            offs_dk_pe = offs_n[:, None] * stride_dkn + offs_d_pe[None, :] * stride_dkd
-            dk_pe *= sm_scale
-            tl.store(DK + adj_dk + offs_dk_pe, dk_pe, mask=mask_kv)
 
     # This part does dq
     start_m = pid * BLOCK_M2
@@ -976,8 +808,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             mask_d = offs_d < ACTUAL_HEAD_DIM
             mask_q &= mask_d[None, :]
         offs_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        if HAS_PE:
-            offs_q_pe = offs_m[:, None] * stride_qm + offs_d_pe[None, :] * stride_qd
         offs_do = offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
         # NOTE: don't assume that the strides for k and v are the same!
         K += bid * stride_kb + hkid * stride_kh + k_start * stride_kn
@@ -1018,10 +848,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                     Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
                 )
             q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
-            if HAS_PE:
-                q_pe = tl.load(Q + adj_q + offs_q_pe, mask=mask_q, other=0.0)
-            else:
-                q_pe = None
             do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
             m = tl.load(M + adj_delta + offs_m * stride_deltam, mask=offs_m < seqlen_q)
             m = m[:, None]
@@ -1031,24 +857,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             start_n = max(end_n - BLOCK_M2, 0)
             num_steps = tl.cdiv(end_n - start_n, MASK_BLOCK_N2)
 
-            if IS_FP8:
-                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
-                descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
-                descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
-                descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
-            else:
-                descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
-
             dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
-            if HAS_PE:
-                dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
-            else:
-                dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
-            dq, dq_pe = _bwd_dq_inner(
-                dq,  # output tensor
-                dq_pe,  # optional output tensor
+            dq = _bwd_dq_inner(
+                dq,
                 q,
-                q_pe,
                 K,
                 V,
                 do,
@@ -1070,7 +882,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 MASK_BLOCK_N2,
                 HEAD_DIM,
                 ACTUAL_HEAD_DIM,
-                PE_HEAD_DIM,
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
@@ -1080,16 +891,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 start_n,
                 end_n,
                 num_steps,
-                descale_q,
-                descale_k,
-                descale_v,
-                descale_do,
                 MASK=True,  #
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
@@ -1100,11 +905,9 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 print(
                     f"unMasked: start_m: {start_m}, start_n: {start_n}, end_n: {end_n}, num_steps: {num_steps}"
                 )  # noqa: E701
-            dq, dq_pe = _bwd_dq_inner(
-                dq,  # output tensor
-                dq_pe,  # optional output tensor
+            dq = _bwd_dq_inner(
+                dq,
                 q,
-                q_pe,
                 K,
                 V,
                 do,
@@ -1126,7 +929,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 BLOCK_N2,
                 HEAD_DIM,
                 ACTUAL_HEAD_DIM,
-                PE_HEAD_DIM,
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
@@ -1136,16 +938,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 start_n,
                 end_n,
                 num_steps,
-                descale_q,
-                descale_k,
-                descale_v,
-                descale_do,
                 MASK=False,
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
@@ -1154,12 +950,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
             dq *= sm_scale
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
-            if HAS_PE:
-                offs_dq_pe = (
-                    offs_m[:, None] * stride_dqm + offs_d_pe[None, :] * stride_dqd
-                )
-                dq_pe *= sm_scale
-                tl.store(DQ + adj_dq + offs_dq_pe, dq_pe, mask=mask_q)
             # end of GQA/MQA of dq
 
 
@@ -1210,10 +1000,6 @@ def bwd_kernel_noncausal(
     stride_dropouth_in,
     stride_dropoutm_in,
     stride_dropoutn_in,
-    stride_descale_q_z_in,
-    stride_descale_k_z_in,
-    stride_descale_v_z_in,
-    stride_descale_do_z_in,
     stride_az_in,
     stride_ah_in,
     HQ,
@@ -1227,10 +1013,6 @@ def bwd_kernel_noncausal(
     philox_seed,
     philox_offset_base_in,
     Alibi_slopes,
-    Descale_q,
-    Descale_k,
-    Descale_v,
-    Descale_do,
     BLOCK_M1: tl.constexpr,  # 32
     BLOCK_N1: tl.constexpr,  # 128
     BLOCK_M2: tl.constexpr,  # 128
@@ -1238,14 +1020,10 @@ def bwd_kernel_noncausal(
     BLK_SLICE_FACTOR: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     ACTUAL_HEAD_DIM: tl.constexpr,
-    PE_HEAD_DIM: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
-    IS_FP8: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-    FP8_OUTPUT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
@@ -1287,11 +1065,6 @@ def bwd_kernel_noncausal(
         stride_dropouth = tl.cast(stride_dropouth_in, tl.int64)
         stride_dropoutm = tl.cast(stride_dropoutm_in, tl.int64)
         stride_dropoutn = tl.cast(stride_dropoutn_in, tl.int64)
-        if IS_FP8:
-            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
-            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
-            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
-            stride_descale_do_z = tl.cast(stride_descale_do_z_in, tl.int64)
         stride_az = tl.cast(stride_az_in, tl.int64)
         stride_ah = tl.cast(stride_ah_in, tl.int64)
     else:
@@ -1331,10 +1104,6 @@ def bwd_kernel_noncausal(
         stride_dropouth = stride_dropouth_in
         stride_dropoutm = stride_dropoutm_in
         stride_dropoutn = stride_dropoutn_in
-        stride_descale_q_z = stride_descale_q_z_in
-        stride_descale_k_z = stride_descale_k_z_in
-        stride_descale_v_z = stride_descale_v_z_in
-        stride_descale_do_z = stride_descale_do_z_in
         stride_az = stride_az_in
         stride_ah = stride_ah_in
 
@@ -1359,20 +1128,12 @@ def bwd_kernel_noncausal(
         seqlen_k = k_end - k_start
 
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
-    HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
     offs_d = tl.arange(0, HEAD_DIM)
-    if HAS_PE:
-        offs_d_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
     GROUP_SIZE: tl.constexpr = HQ // HK
 
     start_n = pid * BLOCK_N1
     if start_n < seqlen_k:
         dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
-        if HAS_PE:
-            dk_pe = tl.zeros([BLOCK_N1, PE_HEAD_DIM], dtype=tl.float32)
-        else:
-            # Couldn't assign None to dk_pe because _bwd_dkdv_inner can't return None.
-            dk_pe = dk
         dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
 
         offs_n = start_n + tl.arange(0, BLOCK_N1)
@@ -1390,14 +1151,6 @@ def bwd_kernel_noncausal(
             + offs_n[:, None] * stride_kn
             + offs_d[None, :] * stride_kd
         )
-        if HAS_PE:
-            adj_k_pe = (
-                bid * stride_kb
-                + hkid * stride_kh
-                + k_start * stride_kn
-                + offs_n[:, None] * stride_kn
-                + offs_d_pe[None, :] * stride_kd
-            )
         adj_v = (
             bid * stride_vb
             + hkid * stride_vh
@@ -1407,10 +1160,6 @@ def bwd_kernel_noncausal(
         )
         # load K and V: they stay in SRAM throughout the inner loop.
         k = tl.load(K + adj_k, mask=mask_kv, other=0.0)
-        if HAS_PE:
-            k_pe = tl.load(K + adj_k_pe, mask=mask_kv, other=0.0)
-        else:
-            k_pe = None
         v = tl.load(V + adj_v, mask=mask_kv, other=0.0)
         # If MQA / GQA, set the K and V head offsets appropriately.
         for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
@@ -1443,24 +1192,14 @@ def bwd_kernel_noncausal(
                     Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
                 )
 
-            if IS_FP8:
-                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
-                descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
-                descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
-                descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
-            else:
-                descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
-
             # because there is no causal, we always start from the beginning
             start_m = 0
             num_steps = tl.cdiv(seqlen_q, BLOCK_M1)
-            dk, dk_pe, dv = _bwd_dkdv_inner(
-                dk,  # output tensor
-                dk_pe,  # optional output tensor
-                dv,  # output tensor
+            dk, dv = _bwd_dkdv_inner(
+                dk,
+                dv,  # output tensors
                 Q_ptr,
                 k,
-                k_pe,
                 v,
                 DO_ptr,
                 M_ptr,
@@ -1477,7 +1216,6 @@ def bwd_kernel_noncausal(
                 BLOCK_N1,  # block dim
                 HEAD_DIM,
                 ACTUAL_HEAD_DIM,  # head dim
-                PE_HEAD_DIM,
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
@@ -1488,16 +1226,10 @@ def bwd_kernel_noncausal(
                 start_n,
                 start_m,
                 num_steps,  # iteration numbers
-                descale_q,
-                descale_k,
-                descale_v,
-                descale_do,  # fp8 descale factors from user
                 MASK=False,  # causal masking
                 ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
@@ -1511,10 +1243,6 @@ def bwd_kernel_noncausal(
         offs_dk = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
         dk *= sm_scale
         tl.store(DK + adj_dk + offs_dk, dk, mask=mask_kv)
-        if HAS_PE:
-            offs_dk_pe = offs_n[:, None] * stride_dkn + offs_d_pe[None, :] * stride_dkd
-            dk_pe *= sm_scale
-            tl.store(DK + adj_dk + offs_dk_pe, dk_pe, mask=mask_kv)
 
     # THIS PART DOES DQ
     start_m = pid * BLOCK_M2
@@ -1526,8 +1254,6 @@ def bwd_kernel_noncausal(
             mask_d = offs_d < ACTUAL_HEAD_DIM
             mask_q &= mask_d[None, :]
         offs_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        if HAS_PE:
-            offs_q_pe = offs_m[:, None] * stride_qm + offs_d_pe[None, :] * stride_qd
         offs_do = offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
         K += bid * stride_kb + hkid * stride_kh + k_start * stride_kn
         V += bid * stride_vb + hkid * stride_vh + k_start * stride_vn
@@ -1560,21 +1286,9 @@ def bwd_kernel_noncausal(
                 )
 
             q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
-            if HAS_PE:
-                q_pe = tl.load(Q + adj_q + offs_q_pe, mask=mask_q, other=0.0)
-            else:
-                q_pe = None
             do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
             m = tl.load(M + adj_delta + offs_m * stride_deltam, mask=offs_m < seqlen_q)
             m = m[:, None]
-
-            if IS_FP8:
-                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
-                descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
-                descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
-                descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
-            else:
-                descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
             # start can only be 0 at minimum
             start_n = 0
@@ -1582,15 +1296,9 @@ def bwd_kernel_noncausal(
             num_steps = tl.cdiv(seqlen_k, BLOCK_N2)
 
             dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
-            if HAS_PE:
-                dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
-            else:
-                dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
-            dq, dq_pe = _bwd_dq_inner(
-                dq,  # output tensor
-                dq_pe,  # optional output tensor
+            dq = _bwd_dq_inner(
+                dq,
                 q,
-                q_pe,
                 K,
                 V,
                 do,
@@ -1612,7 +1320,6 @@ def bwd_kernel_noncausal(
                 BLOCK_N2,
                 HEAD_DIM,
                 ACTUAL_HEAD_DIM,
-                PE_HEAD_DIM,
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
@@ -1622,16 +1329,10 @@ def bwd_kernel_noncausal(
                 start_n,
                 end_n,
                 num_steps,
-                descale_q,
-                descale_k,
-                descale_v,
-                descale_do,
                 MASK=False,
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
-                IS_FP8=IS_FP8,
-                FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
@@ -1640,12 +1341,6 @@ def bwd_kernel_noncausal(
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
             dq *= sm_scale
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
-            if HAS_PE:
-                offs_dq_pe = (
-                    offs_m[:, None] * stride_dqm + offs_d_pe[None, :] * stride_dqd
-                )
-                dq_pe *= sm_scale
-                tl.store(DQ + adj_dq + offs_dq_pe, dq_pe, mask=mask_q)
 
 
 @functools.lru_cache(maxsize=1024)

@@ -7,9 +7,7 @@ import logging
 import numpy as np
 from aiter.ops.triton.mha import (
     flash_attn_func,
-    flash_attn_fp8_func,
     flash_attn_varlen_func,
-    flash_attn_varlen_fp8_func,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
@@ -22,8 +20,6 @@ from aiter.test_mha_common import (
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 DEBUG_MODE = False
-ATOL_fp8 = 2.5e-1
-RTOL_fp8 = 2.5e-1
 
 
 def pad_rearrange_dropout_mask(
@@ -57,47 +53,6 @@ def pad_rearrange_dropout_mask(
     return padded_dropout_mask
 
 
-def fp8_assert_close(
-    tensor_a, tensor_b, atol=ATOL_fp8, rtol=RTOL_fp8, max_diff_percentage=0.5
-):
-    """Assert tensors are close with tolerance for small percentage of elements"""
-    # standard comparison
-    abs_diff = torch.abs(tensor_a - tensor_b)
-    rel_diff = abs_diff / torch.abs(tensor_b.clamp(min=1e-6))
-
-    # calculate elements that exceed tolerance
-    abs_check = abs_diff > atol
-    rel_check = rel_diff > rtol
-    failed_check = torch.logical_and(abs_check, rel_check)
-
-    # calculate percentage of failed elements
-    failed_percentage = failed_check.sum().item() / failed_check.numel() * 100
-
-    # if percentage is small enough, test passes
-    if failed_percentage <= max_diff_percentage:
-        return True
-
-    # Otherwise, provide diagnostic information
-    max_abs_idx = torch.argmax(abs_diff).item()
-    max_rel_idx = torch.argmax(rel_diff).item()
-
-    flat_to_idx = lambda flat_idx, shape: np.unravel_index(  # noqa: E731
-        flat_idx, shape
-    )
-
-    max_abs_pos = flat_to_idx(max_abs_idx, tensor_a.shape)
-    max_rel_pos = flat_to_idx(max_rel_idx, tensor_a.shape)
-
-    max_abs_diff = abs_diff.flatten()[max_abs_idx].item()
-    max_rel_diff = rel_diff.flatten()[max_rel_idx].item()
-
-    raise AssertionError(
-        f"Tensors not close enough! {failed_percentage:.6f}% elements exceed tolerance.\n"
-        f"Greatest absolute difference: {max_abs_diff} at index {max_abs_pos} (up to {atol} allowed)\n"
-        f"Greatest relative difference: {max_rel_diff} at index {max_rel_pos} (up to {rtol} allowed)"
-    )
-
-
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -111,7 +66,7 @@ def fp8_assert_close(
     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True), (0.0, False, False)]
 )
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-@pytest.mark.parametrize("FP8", [(True), (False)])
+# @pytest.mark.parametrize("FP8", [(True), (False)])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -123,7 +78,7 @@ def test_mha(
     RETURN_LSE: bool,
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
-    FP8: bool,
+    # FP8: bool,
     dtype=torch.float16,
 ):
     torch.cuda.empty_cache()
@@ -132,26 +87,15 @@ def test_mha(
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
 
     dropout_mask = None
-    if FP8:
-        triton_out = flash_attn_fp8_func(
-            q,
-            k,
-            v,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
-        )
-    else:
-        triton_out = flash_attn_func(
-            q,
-            k,
-            v,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
-        )
+    triton_out = flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=DROPOUT,
+        causal=CAUSAL,
+        return_lse=RETURN_LSE,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     if RETURN_LSE:
         assert len(triton_out) > 1
@@ -181,19 +125,14 @@ def test_mha(
     torch_out = attention_ref(
         q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
     )
-    torch_out, attention_scores, _ = torch_out
+    torch_out, attention_scores = torch_out
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
         print(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
 
-    if FP8:
-        fp8_assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
-        )
-    else:
-        torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
 # LLaMA 3 405B config
@@ -309,7 +248,7 @@ def test_mha_int64_strides(
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-@pytest.mark.parametrize("FP8", [(False), (True)])
+# @pytest.mark.parametrize("FP8", [(False), (True)])
 def test_mha_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -321,7 +260,7 @@ def test_mha_varlen(
     RETURN_LSE: bool,
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
-    FP8: bool,
+    # FP8: bool,
     dtype=torch.float16,
 ):
     torch.set_printoptions(threshold=10000)
@@ -370,34 +309,19 @@ def test_mha_varlen(
         print(f"max_seqlens_k={max_seqlen_k }")
         print(f"cu_seqlens_q={cu_seqlens_q }")
         print(f"cu_seqlens_k={cu_seqlens_k }")
-    if FP8:
-        triton_out = flash_attn_varlen_fp8_func(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
-        )
-    else:
-        triton_out = flash_attn_varlen_func(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
-        )
+    triton_out = flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=DROPOUT,
+        causal=CAUSAL,
+        return_lse=RETURN_LSE,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     if RETURN_LSE:
         assert len(triton_out) > 1
@@ -447,7 +371,7 @@ def test_mha_varlen(
         dropout_mask=dropout_mask,
         causal=CAUSAL,
     )
-    torch_out, attention_scores, _ = torch_out
+    torch_out, attention_scores = torch_out
 
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
@@ -455,14 +379,9 @@ def test_mha_varlen(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
 
-    if FP8:
-        fp8_assert_close(
-            triton_out, torch_out.to(torch_out.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
-        )
-    else:
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
-        )
+    torch.testing.assert_close(
+        triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
+    )
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
@@ -476,7 +395,7 @@ def test_mha_varlen(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
-@pytest.mark.parametrize("FP8", [False])
+# @pytest.mark.parametrize("FP8", [False])
 @pytest.mark.parametrize("FUSED", [False, True])
 # @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
 def test_mha_backward(
@@ -488,14 +407,14 @@ def test_mha_backward(
     HEAD_SZ: int,
     DROPOUT: float,
     CAUSAL: bool,
-    FP8: bool,
+    # FP8: bool,
     FUSED: bool,
     dtype=torch.float16,
 ):
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
-    # pytest.skip("Backward accuracy issues due to Triton compiler")
+    pytest.skip("Backward accuracy issues due to Triton compiler")
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
     mha_set_use_fused_bwd_kernel(FUSED)
@@ -516,26 +435,15 @@ def test_mha_backward(
         print(f"do.shape={do.shape} do={do}")
 
     with torch.enable_grad():
-        if FP8:
-            triton_out = flash_attn_fp8_func(
-                q,
-                k,
-                v,
-                dropout_p=DROPOUT,
-                causal=CAUSAL,
-                return_lse=True,
-                return_attn_probs=True,
-            )
-        else:
-            triton_out = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=DROPOUT,
-                causal=CAUSAL,
-                return_lse=True,
-                return_attn_probs=True,
-            )
+        triton_out = flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=DROPOUT,
+            causal=CAUSAL,
+            return_lse=True,
+            return_attn_probs=True,
+        )
 
     assert len(triton_out) == 3
     triton_out, lse, sd_mask = triton_out[0], triton_out[1], triton_out[2]
@@ -568,7 +476,7 @@ def test_mha_backward(
         torch_out = attention_ref(
             q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
         )
-    torch_out, attention_scores, _ = torch_out
+    torch_out, attention_scores = torch_out
 
     torch.testing.assert_close(
         triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
@@ -583,26 +491,15 @@ def test_mha_backward(
         print(f"torch_dk.shape={torch_dk.shape} torch_dk={torch_dk}")
         print(f"torch_dv.shape={torch_dv.shape} torch_dv={torch_dv}")
 
-    if FP8:
-        fp8_assert_close(
-            triton_dq, torch_dq.to(triton_dq.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
-        )
-        fp8_assert_close(
-            triton_dk, torch_dk.to(triton_dk.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
-        )
-        fp8_assert_close(
-            triton_dv, torch_dv.to(triton_dv.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
-        )
-    else:
-        torch.testing.assert_close(
-            triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
+    torch.testing.assert_close(
+        triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
@@ -616,7 +513,7 @@ def test_mha_backward(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
-@pytest.mark.parametrize("FP8", [False])
+# @pytest.mark.parametrize("FP8", [False])
 @pytest.mark.parametrize("FUSED", [False, True])
 # @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
 def test_mha_backward_varlen(
@@ -628,13 +525,13 @@ def test_mha_backward_varlen(
     HEAD_SZ: int,
     DROPOUT: float,
     CAUSAL: bool,
-    FP8: bool,
+    # FP8: bool,
     FUSED: bool,
     dtype=torch.float16,
 ):
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    # pytest.skip("Backward accuracy issues due to Triton compiler")
+    pytest.skip("Backward accuracy issues due to Triton compiler")
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
 
@@ -759,7 +656,7 @@ def test_mha_backward_varlen(
             dropout_mask=dropout_mask,
             causal=CAUSAL,
         )
-    torch_out, attention_scores, _ = torch_out
+    torch_out, attention_scores = torch_out
 
     torch.testing.assert_close(
         triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
@@ -782,474 +679,4 @@ def test_mha_backward_varlen(
     )
     torch.testing.assert_close(
         triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-    )
-
-
-# Run PE tests with:
-# pytest op_tests/triton_tests/test_mha.py -k with_pe
-
-
-@pytest.mark.parametrize("BATCH", [1, 3])
-@pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K",
-    [(128, 128), (32, 16), (16, 48), (4096, 4096)],
-)
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (2, 1), (128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(128, 64), (192, 128)])
-@pytest.mark.parametrize("DROPOUT", [0.0, 0.25])
-@pytest.mark.parametrize("CAUSAL", [True, False])
-def test_mha_with_pe(
-    BATCH: int,
-    SEQLEN_Q: int,
-    SEQLEN_K: int,
-    NUM_Q_HEADS: int,
-    NUM_K_HEADS: int,
-    HEAD_SZ_QK: int,
-    HEAD_SZ_V: int,
-    DROPOUT: float,
-    CAUSAL: bool,
-):
-    HAS_DROPOUT: bool = DROPOUT > 0.0
-    device: str = "cuda"
-    dtype: torch.dtype = torch.bfloat16
-
-    # Generate tensors
-    torch.cuda.empty_cache()
-    torch.manual_seed(20)
-    q = torch.randn(
-        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
-    )
-    k = torch.randn(
-        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
-    )
-    v = torch.randn(
-        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_V), device=device, dtype=dtype
-    )
-
-    # Triton
-    triton_out = flash_attn_func(
-        q,
-        k,
-        v,
-        dropout_p=DROPOUT,
-        causal=CAUSAL,
-        return_lse=HAS_DROPOUT,
-        return_attn_probs=HAS_DROPOUT,
-    )
-    if HAS_DROPOUT:
-        assert len(triton_out) == 3
-        dropout_mask = triton_out[2] > 0
-        triton_out = triton_out[0]
-    else:
-        dropout_mask = None
-
-    # Torch
-    torch_out, _, _ = attention_ref(
-        q,
-        k,
-        v,
-        dropout_p=DROPOUT,
-        dropout_mask=dropout_mask,
-        causal=CAUSAL,
-    )
-
-    # Assertion
-    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize("BATCH", [1, 3])
-@pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K",
-    [(16, 16), (32, 16), (64, 128), (4096, 4096)],
-)
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 4), (128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(96, 64), (192, 128)])
-@pytest.mark.parametrize("DROPOUT", [0.0, 0.17])
-@pytest.mark.parametrize("CAUSAL", [True, False])
-def test_mha_varlen_with_pe(
-    BATCH: int,
-    SEQLEN_Q: int,
-    SEQLEN_K: int,
-    NUM_Q_HEADS: int,
-    NUM_K_HEADS: int,
-    HEAD_SZ_QK: int,
-    HEAD_SZ_V: int,
-    DROPOUT: float,
-    CAUSAL: bool,
-):
-    HAS_DROPOUT: bool = DROPOUT > 0.0
-    device: str = "cuda"
-    dtype: torch.dtype = torch.bfloat16
-
-    # Generate tensors
-    torch.cuda.empty_cache()
-    torch.manual_seed(77)
-    q = torch.randn(
-        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
-    )
-    k = torch.randn(
-        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
-    )
-    v = torch.randn(
-        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_V), device=device, dtype=dtype
-    )
-    query_padding_mask = generate_random_padding_mask(SEQLEN_Q, BATCH, device)
-    key_padding_mask = generate_random_padding_mask(SEQLEN_K, BATCH, device)
-    (
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        q,
-        k,
-        v,
-        output_pad_fn,
-        _,
-        _,
-    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask)
-
-    # Triton
-    triton_out = flash_attn_varlen_func(
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p=DROPOUT,
-        causal=CAUSAL,
-        return_lse=HAS_DROPOUT,
-        return_attn_probs=HAS_DROPOUT,
-    )
-    if HAS_DROPOUT:
-        assert len(triton_out) == 3
-        dropout_mask = (
-            pad_rearrange_dropout_mask(
-                triton_out[2] > 0,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                SEQLEN_Q,
-                SEQLEN_K,
-                NUM_Q_HEADS,
-            )
-            > 0
-        )
-        triton_out = triton_out[0]
-    else:
-        dropout_mask = None
-    triton_out = output_pad_fn(triton_out)
-
-    # Torch
-    torch_out, _, _ = attention_ref(
-        q,
-        k,
-        v,
-        query_padding_mask=query_padding_mask,
-        key_padding_mask=key_padding_mask,
-        dropout_p=DROPOUT,
-        dropout_mask=dropout_mask,
-        causal=CAUSAL,
-    )
-
-    # Assertion
-    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize("BATCH", [1, 4])
-@pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K",
-    [(16, 16), (32, 8), (64, 16), (2048, 2048)],
-)
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 2), (128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (192, 128)])
-@pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
-@pytest.mark.parametrize("CAUSAL", [True, False])
-def test_mha_backward_with_pe(
-    BATCH: int,
-    SEQLEN_Q: int,
-    SEQLEN_K: int,
-    NUM_Q_HEADS: int,
-    NUM_K_HEADS: int,
-    HEAD_SZ_QK: int,
-    HEAD_SZ_V: int,
-    DROPOUT: float,
-    CAUSAL: bool,
-):
-    HAS_DROPOUT: bool = DROPOUT > 0.0
-
-    # Causal + Dropout use case is disabled in `test_mha_backward` and `test_mha_backward_varlen`.
-    # FIXME: We should fix it in the base implementation before adding PE to the mix.
-    if CAUSAL and HAS_DROPOUT:
-        pytest.skip(
-            "Causal + Dropout use case isn't supported in backward with Positional Encoding."
-        )
-
-    device: str = "cuda"
-    dtype: torch.dtype = torch.bfloat16
-
-    # Generate tensors
-    torch.cuda.empty_cache()
-    torch.manual_seed(63)
-    q = torch.randn(
-        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK),
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    k = torch.randn(
-        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_QK),
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    v = torch.randn(
-        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_V),
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    do = torch.randn((q.shape[:-1] + v.shape[-1:]), dtype=dtype, device=device)
-
-    # Triton forward
-    with torch.enable_grad():
-        triton_out = flash_attn_func(
-            q,
-            k,
-            v,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=HAS_DROPOUT,
-            return_attn_probs=HAS_DROPOUT,
-        )
-    if HAS_DROPOUT:
-        assert len(triton_out) == 3
-        dropout_mask = triton_out[2] > 0
-        triton_out = triton_out[0]
-    else:
-        dropout_mask = None
-
-    # Torch forward
-    with torch.enable_grad():
-        torch_out, _, _ = attention_ref(
-            q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
-        )
-
-    # Forward assertion
-    torch.testing.assert_close(
-        triton_out,
-        torch_out,
-        atol=1e-2,
-        rtol=1e-2,
-        msg=lambda msg: f"fwd mismatch\n\n{msg}\n",
-    )
-
-    # Triton backward
-    # PE support isn't implemented in fused backward.
-    mha_set_use_fused_bwd_kernel(False)
-    triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
-
-    # Torch backward
-    torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
-
-    # Backward assertions
-    # When dropout is active, some cases fail due to less than 1% mismatched elements.
-    bwd_atol = 1e-1 if HAS_DROPOUT else 1.5e-2
-    bwd_rtol = 1e-1 if HAS_DROPOUT else 1.5e-2
-    torch.testing.assert_close(
-        triton_dq,
-        torch_dq,
-        atol=bwd_atol,
-        rtol=bwd_rtol,
-        msg=lambda msg: f"bwd dq mismatch\n\n{msg}\n",
-    )
-    torch.testing.assert_close(
-        triton_dk,
-        torch_dk,
-        atol=bwd_atol,
-        rtol=bwd_rtol,
-        msg=lambda msg: f"bwd dk mismatch\n\n{msg}\n",
-    )
-    torch.testing.assert_close(
-        triton_dv,
-        torch_dv,
-        atol=bwd_atol,
-        rtol=bwd_rtol,
-        msg=lambda msg: f"bwd dv mismatch\n\n{msg}\n",
-    )
-
-
-@pytest.mark.parametrize("BATCH", [1, 4])
-@pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K",
-    [(8, 8), (32, 8), (16, 64), (64, 64)],
-)
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 2), (128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (192, 128)])
-@pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
-@pytest.mark.parametrize("CAUSAL", [True, False])
-def test_mha_backward_varlen_with_pe(
-    BATCH: int,
-    SEQLEN_Q: int,
-    SEQLEN_K: int,
-    NUM_Q_HEADS: int,
-    NUM_K_HEADS: int,
-    HEAD_SZ_QK: int,
-    HEAD_SZ_V: int,
-    DROPOUT: float,
-    CAUSAL: bool,
-):
-    HAS_DROPOUT: bool = DROPOUT > 0.0
-
-    # Causal + Dropout use case is disabled in `test_mha_backward` and `test_mha_backward_varlen`.
-    # FIXME: We should fix it in the base implementation before adding PE to the mix.
-    if CAUSAL and HAS_DROPOUT:
-        pytest.skip(
-            "Causal + Dropout use case isn't supported in backward with Positional Encoding."
-        )
-
-    device: str = "cuda"
-    dtype: torch.dtype = torch.bfloat16
-
-    # Generate tensors
-    torch.cuda.empty_cache()
-    torch.manual_seed(133)
-    q = torch.randn(
-        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK),
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    k = torch.randn(
-        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_QK),
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    v = torch.randn(
-        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_V),
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    query_padding_mask = generate_random_padding_mask(SEQLEN_Q, BATCH, device)
-    key_padding_mask = generate_random_padding_mask(SEQLEN_K, BATCH, device)
-    (
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        q,
-        k,
-        v,
-        output_pad_fn,
-        dq_pad_fn,
-        dk_pad_fn,
-    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask)
-    q_unpad.requires_grad = True
-    k_unpad.requires_grad = True
-    v_unpad.requires_grad = True
-    do = torch.randn((q.shape[:-1] + v.shape[-1:]), dtype=dtype, device=device)
-
-    # Triton forward
-    with torch.enable_grad():
-        triton_out = flash_attn_varlen_func(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=HAS_DROPOUT,
-            return_attn_probs=HAS_DROPOUT,
-        )
-    if HAS_DROPOUT:
-        assert len(triton_out) == 3
-        dropout_mask = (
-            pad_rearrange_dropout_mask(
-                triton_out[2] > 0,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                SEQLEN_Q,
-                SEQLEN_K,
-                NUM_Q_HEADS,
-            )
-            > 0
-        )
-        triton_out = triton_out[0]
-    else:
-        dropout_mask = None
-    triton_out = output_pad_fn(triton_out)
-
-    # Torch forward
-    with torch.enable_grad():
-        torch_out, _, _ = attention_ref(
-            q,
-            k,
-            v,
-            query_padding_mask=query_padding_mask,
-            key_padding_mask=key_padding_mask,
-            dropout_p=DROPOUT,
-            dropout_mask=dropout_mask,
-            causal=CAUSAL,
-        )
-
-    # Forward assertion
-    torch.testing.assert_close(
-        triton_out,
-        torch_out,
-        atol=1e-2,
-        rtol=1e-2,
-        msg=lambda msg: f"fwd mismatch\n\n{msg}\n",
-    )
-
-    # Triton backward
-    # PE support isn't implemented in fused backward.
-    mha_set_use_fused_bwd_kernel(False)
-    triton_dq, triton_dk, triton_dv = torch.autograd.grad(
-        triton_out, (q_unpad, k_unpad, v_unpad), do
-    )
-    triton_dq = dq_pad_fn(triton_dq)
-    triton_dk = dk_pad_fn(triton_dk)
-    triton_dv = dk_pad_fn(triton_dv)
-
-    # Torch backward
-    torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
-
-    # Backward assertions
-    bwd_atol = 1e-1
-    bwd_rtol = 1e-1
-    torch.testing.assert_close(
-        triton_dq,
-        torch_dq,
-        atol=bwd_atol,
-        rtol=bwd_rtol,
-        msg=lambda msg: f"bwd dq mismatch\n\n{msg}\n",
-    )
-    torch.testing.assert_close(
-        triton_dk,
-        torch_dk,
-        atol=bwd_atol,
-        rtol=bwd_rtol,
-        msg=lambda msg: f"bwd dk mismatch\n\n{msg}\n",
-    )
-    torch.testing.assert_close(
-        triton_dv,
-        torch_dv,
-        atol=bwd_atol,
-        rtol=bwd_rtol,
-        msg=lambda msg: f"bwd dv mismatch\n\n{msg}\n",
     )

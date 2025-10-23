@@ -7,6 +7,9 @@ import triton
 import triton.language as tl
 
 import aiter.ops.triton.utils.types as types
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -31,103 +34,6 @@ def mha_set_use_int64_strides(value: bool):
     """Use 64-bit integer strides to prevent integer overflows with very large tensors."""
     global _USE_INT64_STRIDES
     _USE_INT64_STRIDES = value
-
-
-def _cast_to_fp8(
-    x: torch.Tensor,
-    fp8_dtype,
-    layout,
-    clamp_val=1e-9,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Convert a tensor to FP8 format, returning an FP8 tensor and a descale factor.
-    Args:
-        - x (torch.Tensor): shape [batch, seq_len, heads, dim]
-    Returns:
-        - x_fp8 (torch.Tensor): FP8 tensor with the same shape as x
-        - descale_factor (torch.Tensor): tensor of shape [batch, 1, heads, 1]
-    """
-    if len(x.shape) != 4:
-        raise ValueError(
-            f"'bshd' tensor should have shape [batch, seqlen, heads, dim], got {x.shape}"
-        )
-    reduce_dims = (1, 3)  # seq_len and dim dimensions
-
-    # Compute the absolute max along reduce_dims, clamped to avoid 0-scale
-    x_abs_max = x.abs().amax(dim=reduce_dims)
-    x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
-
-    # Unsqueeze back to a shape suitable for broadcast
-    unsqueeze_dims = sorted(reduce_dims)
-    for d in unsqueeze_dims:
-        x_abs_max = x_abs_max.unsqueeze(d)
-
-    # compute scale and descale
-    fp8_max = torch.finfo(fp8_dtype).max
-    scale = fp8_max / x_abs_max
-    descale_factor = x_abs_max / fp8_max
-
-    # cast to FP8, optionally setting requires_grad
-    x_fp8 = (x * scale).to(fp8_dtype)
-
-    return x_fp8, descale_factor
-
-
-def _cast_varlen_to_fp8(
-    x: torch.Tensor,
-    fp8_dtype: torch.dtype,
-    cu_seqlens,
-    clamp_val: float = 1e-9,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Convert a tensor of sequences with variable seq_len into fp8.
-    Args:
-        - x (torch.Tensor): shape [total_seq_len, heads, dim]
-    Returns:
-        - x_fp8 (torch.Tensor): shape [total_seq_len, heads, dim]
-        - descale_factors (torch.Tensor): shape [batch, heads]
-    """
-    # validate tensor shape
-    if len(x.shape) != 3:
-        raise ValueError(
-            f"tensor should have shape [total_seqlen, heads, dim], got {x.shape}"
-        )
-    num_heads = x.shape[1]
-
-    # Get batch size from cu_seqlens
-    batch = cu_seqlens.shape[0] - 1
-    fp8_max = torch.finfo(fp8_dtype).max
-
-    # Compute scale and descale factors per sequence
-    x_fp8 = torch.zeros_like(x, dtype=fp8_dtype)
-    descale_factors = torch.zeros(
-        (batch, num_heads), device=x.device, dtype=torch.float32
-    )
-
-    for i in range(batch):
-        start = cu_seqlens[i]
-        end = cu_seqlens[i + 1]
-        x_slice = x[start:end]  # Slice for current sequence
-
-        # Standard tensor (0: seq_len, 2: head_dim)
-        x_abs_max = x_slice.abs().amax(dim=(0, 2))  # [heads]
-
-        # apply minimum clamping
-        x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
-
-        # compute scale and descale factors
-        scale_i = fp8_max / x_abs_max
-        descale_i = x_abs_max / fp8_max
-
-        # store descale factors
-        descale_factors[i, :] = descale_i
-
-        scale_reshape = scale_i.reshape(1, num_heads, 1)
-
-        # scale and cast to FP8
-        x_fp8[start:end] = (x_slice * scale_reshape).to(fp8_dtype)
-
-    return x_fp8, descale_factors
 
 
 def _flash_attn_forward(
@@ -158,56 +64,35 @@ def _flash_attn_forward(
     if window_size_left != -1 or window_size_right != -1:
         raise ValueError("Sliding Window is not supported yet in the Triton Backend")
 
-    # FP8
-    IS_FP8 = types._is_fp8(q)
-    FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
     is_varlen = True if cu_seqlens_q is not None else False
 
-    if IS_FP8:
-        o = torch.zeros(
-            (q.shape[:-1] + v.shape[-1:]), dtype=torch.float32, device=q.device
-        )
-    else:
-        o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=q.dtype, device=q.device)
+    o = torch.zeros_like(q)
     if is_varlen:
-        # Layout is thd.
-        # q and k are [total_tokens, num_head, head_dim_qk].
-        # v is [total_tokens, num_head, head_dim_v].
-        batch, seqlen_q, num_q_heads = (
+        # Layout for q,k,v is thd ie [total_tokens, num_head, head_dim]
+        batch, seqlen_q, num_q_heads, head_sz = (
             len(cu_seqlens_q) - 1,
             max_seqlen_q,
             q.shape[1],
+            q.shape[2],
         )
-        num_k_heads = k.shape[1]
+        seqlen_k, num_k_heads = max_seqlen_k, k.shape[1]
         q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
         k_strides = (0, k.stride(1), k.stride(0), k.stride(2))
         v_strides = (0, v.stride(1), v.stride(0), v.stride(2))
         o_strides = (0, o.stride(1), o.stride(0), o.stride(2))
     else:
-        # Layout is bshd.
-        # q and k are [batch, seq_len, num_head, head_dim_qk].
-        # v is [batch, seq_len, num_head, head_dim_v].
-        batch, seqlen_q, num_q_heads = q.shape[:-1]
+        # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim]
+        batch, seqlen_q, num_q_heads, head_sz = q.shape
+        seqlen_k = k.shape[1]
         num_k_heads = k.shape[2]
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
         k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
         v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
         o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
 
-    qk_head_dim = q.shape[-1]
-    v_head_dim = v.shape[-1]
-    pe_head_dim = qk_head_dim - v_head_dim
     # padding for head_dim. Power of 2 or 16
-    BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(v_head_dim), 16)
-    BLOCK_DMODEL_PE_POW2 = (
-        0 if pe_head_dim == 0 else max(triton.next_power_of_2(pe_head_dim), 16)
-    )
-    assert (pe_head_dim == 0 and BLOCK_DMODEL_PE_POW2 == 0) or (
-        v_head_dim == BLOCK_DMODEL_POW2 and pe_head_dim == BLOCK_DMODEL_PE_POW2
-    ), "Positional encoding support requires NOPE and PE head sizes to be unpadded powers of 2."
-    assert (not IS_FP8) or (
-        IS_FP8 and pe_head_dim == 0
-    ), "Positional encoding doesn't support FP8."
+    BLOCK_DMODEL_POW2 = triton.next_power_of_2(head_sz)
+    BLOCK_DMODEL_POW2 = max(BLOCK_DMODEL_POW2, 16)
 
     # softmax_lse [batch, num_q_heads, seqlen_q]
     if is_varlen:
@@ -253,7 +138,7 @@ def _flash_attn_forward(
         dropout_mask = None
 
     if config is None:
-        config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
+        config = _get_config(enable_dropout, q.dtype)
 
     """
     # Tuned for MI300x
@@ -320,13 +205,12 @@ def _flash_attn_forward(
         IS_CAUSAL=causal,
         NUM_Q_HEADS=num_q_heads,
         NUM_K_HEADS=num_k_heads,
-        BLOCK_DMODEL=v_head_dim,
+        BLOCK_DMODEL=head_sz,
         BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
-        BLOCK_DMODEL_PE=pe_head_dim,
         RETURN_SCORES=return_softmax,
         ENABLE_DROPOUT=enable_dropout,
-        IS_FP8=IS_FP8,
-        FP8_MAX=FP8_MAX,
+        # IS_FP8=IS_FP8,
+        # FP8_MAX=FP8_MAX,
         VARLEN=is_varlen,
         BATCH=batch,
         NUM_XCD=get_num_xcds(),
@@ -562,221 +446,6 @@ def flash_attn_func(
         causal,
         window_size,
         bias,
-        alibi_slopes,
-        deterministic,
-        return_lse,
-        return_attn_probs,
-        torch.is_grad_enabled(),
-        config,
-    )
-
-
-class _FlashAttnFP8Func(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q,
-        k,
-        v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        alibi_slopes,
-        deterministic,
-        return_lse,
-        return_softmax,
-        is_grad_enabled,
-        config=None,
-    ):
-        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_og = q.size(3)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-
-        # cast input to fp8
-        fp8_dtype = types.get_fp8_e4m3_dtype()
-        q_fp8, descale_q = _cast_to_fp8(q, fp8_dtype, "bshd")
-        k_fp8, descale_k = _cast_to_fp8(k, fp8_dtype, "bshd")
-        v_fp8, descale_v = _cast_to_fp8(v, fp8_dtype, "bshd")
-
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
-            _flash_attn_forward(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                dropout_p,
-                softmax_scale,
-                causal=causal,
-                window_size_left=int(window_size[0]),
-                window_size_right=int(window_size[1]),
-                bias=None,
-                alibi_slopes=alibi_slopes,
-                return_lse=return_lse,
-                return_softmax=return_softmax and dropout_p > 0,
-                max_seqlen_q=q.shape[1],
-                max_seqlen_k=k.shape[1],
-                cu_seqlens_q=None,
-                cu_seqlens_k=None,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                config=config,
-            )
-        )
-
-        if is_grad:
-            ctx.save_for_backward(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                out_padded,
-                softmax_lse,
-                descale_q,
-                descale_k,
-                descale_v,
-            )
-            ctx.philox_seed = philox_seed
-            ctx.philox_offset = philox_offset
-            ctx.dropout_p = dropout_p
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.alibi_slopes = alibi_slopes
-
-        out = out_padded[..., :head_size_og]
-        result = [out]
-        if return_lse:
-            result.append(softmax_lse)
-        if return_softmax:
-            result.append(S_dmask)
-
-        return result[0] if len(result) == 1 else tuple(result)
-
-    @staticmethod
-    def backward(ctx, do, *args):
-        q_fp8, k_fp8, v_fp8, out, softmax_lse, descale_q, descale_k, descale_v = (
-            ctx.saved_tensors
-        )
-        dq, dk, dv = (
-            torch.zeros_like(q_fp8, dtype=torch.float32),
-            torch.zeros_like(k_fp8, dtype=torch.float32),
-            torch.zeros_like(v_fp8, dtype=torch.float32),
-        )
-        head_size_v_og = do.size(3)
-        do_padded = do
-        if head_size_v_og % 8 != 0:
-            do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
-
-        fp8_dtype = types.get_fp8_e4m3_dtype()
-        do_padded_fp8, descale_do = _cast_to_fp8(do_padded, fp8_dtype, "bshd")
-        if _USE_FUSED_BWD_KERNEL:
-            flash_attn_fused_backward(
-                do_padded_fp8,
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                out,
-                softmax_lse,
-                dq,
-                dk,
-                dv,
-                None,
-                ctx.softmax_scale,
-                ctx.alibi_slopes,
-                ctx.causal,
-                None,
-                None,
-                max_seqlen_q=q_fp8.shape[1],
-                max_seqlen_k=k_fp8.shape[1],
-                dropout_p=ctx.dropout_p,
-                philox_seed=ctx.philox_seed,
-                philox_offset=ctx.philox_offset,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                descale_do=descale_do,
-                USE_INT64_STRIDES=_USE_INT64_STRIDES,
-            )
-        else:
-            flash_attn_onekernel_backward(
-                do_padded_fp8,
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                out,
-                softmax_lse,
-                dq,
-                dk,
-                dv,
-                None,
-                ctx.softmax_scale,
-                ctx.alibi_slopes,
-                ctx.causal,
-                None,
-                None,
-                max_seqlen_q=q_fp8.shape[1],
-                max_seqlen_k=k_fp8.shape[1],
-                dropout_p=ctx.dropout_p,
-                philox_seed=ctx.philox_seed,
-                philox_offset=ctx.philox_offset,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                descale_do=descale_do,
-                USE_INT64_STRIDES=_USE_INT64_STRIDES,
-            )
-
-        # dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
-        # dk = dk[..., : k_fp8.shape[-1]]
-        # dv = dv[..., : v_fp8.shape[-1]]
-        return (
-            dq,
-            dk,
-            dv,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-
-
-def flash_attn_fp8_func(
-    q,
-    k,
-    v,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    alibi_slopes=None,
-    deterministic=False,
-    return_lse=False,
-    return_attn_probs=False,
-    config: Optional[dict[str, any]] = None,
-):
-    _LOGGER.info(
-        f"FLASH_ATTN_FP8:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
-    )
-    return _FlashAttnFP8Func.apply(
-        q,
-        k,
-        v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
         alibi_slopes,
         deterministic,
         return_lse,
@@ -1051,234 +720,6 @@ def flash_attn_varlen_func(
         return_attn_probs,
         block_table,
         out,
-        torch.is_grad_enabled(),
-        config,
-    )
-
-
-class _FlashAttnVarlenFP8Func(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        alibi_slopes,
-        deterministic,
-        return_lse,
-        return_softmax,
-        block_table,
-        is_grad_enabled,
-        config=None,
-    ):
-        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_og = q.size(2)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-
-        # cast input to fp8
-        fp8_dtype = types.get_fp8_e4m3_dtype()
-        q_fp8, descale_q = _cast_varlen_to_fp8(q, fp8_dtype, cu_seqlens=cu_seqlens_q)
-        k_fp8, descale_k = _cast_varlen_to_fp8(k, fp8_dtype, cu_seqlens=cu_seqlens_k)
-        v_fp8, descale_v = _cast_varlen_to_fp8(v, fp8_dtype, cu_seqlens=cu_seqlens_k)
-
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
-            _flash_attn_forward(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                dropout_p,
-                softmax_scale,
-                causal=causal,
-                window_size_left=int(window_size[0]),
-                window_size_right=int(window_size[1]),
-                bias=None,
-                alibi_slopes=alibi_slopes,
-                return_lse=return_lse,
-                return_softmax=return_softmax and dropout_p > 0,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                config=config,
-            )
-        )
-        if is_grad:
-            ctx.save_for_backward(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                out_padded,
-                softmax_lse,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                descale_q,
-                descale_k,
-                descale_v,
-            )
-            ctx.max_seqlen_q = max_seqlen_q
-            ctx.max_seqlen_k = max_seqlen_k
-            ctx.philox_seed = philox_seed
-            ctx.philox_offset = philox_offset
-            ctx.dropout_p = dropout_p
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.alibi_slopes = alibi_slopes
-
-        out = out_padded[..., :head_size_og]
-        result = [out]
-        if return_lse:
-            result.append(softmax_lse)
-        if return_softmax:
-            result.append(S_dmask)
-
-        return result[0] if len(result) == 1 else tuple(result)
-
-    @staticmethod
-    def backward(ctx, do, *args):
-        (
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            out,
-            softmax_lse,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            descale_q,
-            descale_k,
-            descale_v,
-        ) = ctx.saved_tensors
-        dq, dk, dv = (
-            torch.zeros_like(q_fp8, dtype=torch.float32),
-            torch.zeros_like(k_fp8, dtype=torch.float32),
-            torch.zeros_like(v_fp8, dtype=torch.float32),
-        )
-        head_size_v_og = do.size(3)
-        do_padded = do
-        if head_size_v_og % 8 != 0:
-            do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
-
-        fp8_dtype = types.get_fp8_e4m3_dtype()
-        do_padded_fp8, descale_do = _cast_varlen_to_fp8(
-            do_padded, fp8_dtype, "thd", cu_seqlens_q
-        )
-        if _USE_FUSED_BWD_KERNEL:
-            flash_attn_fused_backward(
-                do_padded_fp8,
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                out,
-                softmax_lse,
-                dq,
-                dk,
-                dv,
-                None,
-                ctx.softmax_scale,
-                ctx.alibi_slopes,
-                ctx.causal,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q=ctx.max_seqlen_q,
-                max_seqlen_k=ctx.max_seqlen_k,
-                dropout_p=ctx.dropout_p,
-                philox_seed=ctx.philox_seed,
-                philox_offset=ctx.philox_offset,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                descale_do=descale_do,
-                USE_INT64_STRIDES=_USE_INT64_STRIDES,
-            )
-        else:
-            flash_attn_onekernel_backward(
-                do_padded_fp8,
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                out,
-                softmax_lse,
-                dq,
-                dk,
-                dv,
-                None,
-                ctx.softmax_scale,
-                ctx.alibi_slopes,
-                ctx.causal,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q=ctx.max_seqlen_q,
-                max_seqlen_k=ctx.max_seqlen_k,
-                dropout_p=ctx.dropout_p,
-                philox_seed=ctx.philox_seed,
-                philox_offset=ctx.philox_offset,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                descale_do=descale_do,
-                USE_INT64_STRIDES=_USE_INT64_STRIDES,
-            )
-        dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : k_fp8.shape[-1]]
-        dv = dv[..., : v_fp8.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
-
-
-def flash_attn_varlen_fp8_func(
-    q,
-    k,
-    v,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    alibi_slopes=None,
-    deterministic=False,
-    return_lse=False,
-    return_attn_probs=False,
-    block_table=None,
-    config: Optional[dict[str, any]] = None,
-):
-    _LOGGER.info(
-        f"FLASH_ATTN_VARLEN_FP8:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
-    )
-    return _FlashAttnVarlenFP8Func.apply(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        alibi_slopes,
-        deterministic,
-        return_lse,
-        return_attn_probs,
-        block_table,
         torch.is_grad_enabled(),
         config,
     )
