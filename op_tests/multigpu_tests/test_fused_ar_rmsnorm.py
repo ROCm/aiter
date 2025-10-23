@@ -393,7 +393,7 @@ def acc_test_cudagraph_on(tp_size, pp_size, shape, dtype, loop_time = 1):
 l_dtype = ["bf16"]
 l_shape = [
     # (4096, 2048)
-    (64, 8192)
+    (128, 16384)
     # (64, 512 * 99)
     # (16, 512)
 ]
@@ -431,9 +431,9 @@ if __name__ == "__main__":
         l_shape = [args.shape]
     for dtype in l_dtype:
         for shape in l_shape:
-            # test_split_ar_rmsnorm(8, 1, shape, dtype, withGraph=True)
-            # test_fused_ar_rmsnorm(8, 1, shape, dtype, withGraph=True)
-            test_split_ar_rmsnorm(8, 1, shape, dtype, withGraph=False)
-            test_fused_ar_rmsnorm(8, 1, shape, dtype, withGraph=False)
+            test_split_ar_rmsnorm(8, 1, shape, dtype, withGraph=True)
+            test_fused_ar_rmsnorm(8, 1, shape, dtype, withGraph=True)
+            # test_split_ar_rmsnorm(8, 1, shape, dtype, withGraph=False)
+            # test_fused_ar_rmsnorm(8, 1, shape, dtype, withGraph=False)
             # acc_test(8, 1, shape, dtype)
             # acc_test_cudagraph_on(8, 1, shape, dtype, 3)

@@ -921,7 +921,7 @@ namespace aiter
           add_reg.data[i] = ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
         }
 #pragma unroll
-        for (int i = i; i < ngpus; ++i)
+        for (int i = 1; i < ngpus; ++i)
         {
 #pragma unroll
           for (int j = 0; j < pack_size; ++j)
@@ -975,8 +975,8 @@ namespace aiter
    * input case n dim should be divided by 4096 with dtype bf16
    * and should be divided by 2048 with dtype fp32
    * */
-  template <typename T, int ngpus, int tnum, int n_loop>
-  __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm_4096n_naive(
+  template <typename T, int tnum, int n_loop>
+  __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm_naive(
       RankSignals sg,
       T* __restrict__ results,
       T* __restrict__ weight,
@@ -1034,8 +1034,12 @@ namespace aiter
     }
   }
 
-  template <typename T, int ngpus, int tnum, int n_loop>
-  __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm_4096n(
+  /*
+   * block size can be 256 and 512
+   * corresponding 2048 and 4096 elem per block
+   * */
+  template <typename T, int tnum, int n_loop>
+  __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(
       RankSignals sg,
       T* __restrict__ results,
       T* __restrict__ weight,
@@ -1095,6 +1099,65 @@ namespace aiter
           int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
           *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
         }
+      }
+    }
+  }
+
+  template <typename T, int n_loop>
+  __global__ void __launch_bounds__(256, 1) local_device_load_rmsnorm_512n(
+      RankSignals sg,
+      T* __restrict__ results,
+      T* __restrict__ weight,
+      float eps,
+      int rank,
+      int m,
+      int n
+  )
+  {
+    constexpr int pack_size = packed_t<T>::P::size;
+    using P = typename packed_t<T>::P;
+    using A = typename packed_t<T>::A;
+    P* tmps = get_tmp_buf<P>(sg.signals[rank]);
+    int warp_id = threadIdx.x / 64;
+    int lane_id = threadIdx.x % 64;
+    int warp_num = blockDim.x / 64;
+
+    for (int bid = blockIdx.x * warp_num + warp_id; bid < m; bid += gridDim.x * warp_num)
+    {
+      float square_sum = 0.0f;
+      P rmsnorm_inp[n_loop];
+      P w_arr[n_loop];
+#pragma unroll
+      for (int n_iter = 0; n_iter < n_loop; ++n_iter)
+      {
+        int read_idx = bid * 64 * n_loop + n_iter * 64 + lane_id;
+        rmsnorm_inp[n_iter] = tmps[read_idx];
+        w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * 64 + lane_id);
+        A reduce_pack;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          float ar_elem = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
+          reduce_pack.data[i] = ar_elem * ar_elem;
+        }
+        float tmp_sum = packReduce<AddFunctor, float, pack_size>(reduce_pack);
+        square_sum += tmp_sum;
+      }
+      square_sum = warpReduce<AddFunctor, float, 64>(square_sum);
+      float denom = rsqrtf(square_sum / n + eps);
+#pragma unroll
+      for (int n_iter = 0; n_iter < n_loop; ++n_iter)
+      {
+        P rmsnorm_rslt;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          float x_f32 = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
+          float w_f32 = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+          rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
+        }
+        int write_idx = bid * 64 * n_loop + n_iter * 64 + lane_id;
+        *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
       }
     }
   }
@@ -1532,12 +1595,134 @@ namespace aiter
           std::to_string(d));
     }
     RankData* ptrs = get_buffer_RD(stream, input);
+    hipDevice_t dev;
+    hipDeviceProp_t dev_prop;
+    hipGetDevice(&dev);
+    hipGetDeviceProperties(&dev_prop, dev);
+    uint32_t num_cu = dev_prop.multiProcessorCount;
+
+    // step 1, run reduce-scatter + allgather cross device save
     dim3 block(512);
-    int block_num = ((size / 8) + 512 - 1) / 512;
+    int block_num = ((size / world_size_) + 512 - 1) / 512;
     dim3 grid(std::min(block_num, 80));
-    reduce_scatter_cross_device_save<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
-    grid.x = m;
-    local_device_load_rmsnorm_4096n_naive<T, 8, 512, 2><<<grid, block, 0, stream>>>(sg_, output, weight, eps, rank_, m, n);
+    switch (world_size_)
+    {
+      case 8:
+        reduce_scatter_cross_device_save<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+        break;
+      case 4:
+        reduce_scatter_cross_device_save<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+        break;
+      case 2:
+        reduce_scatter_cross_device_save<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+        break;
+      default:
+        printf("fused allreduce rmsnorm world size error\n");
+    }
+
+    // step 2, run allgather local device load + rmsnorm
+    int n_bytes = n * sizeof(T);
+    auto setGrid = [&](int naive_grid_size, const void* kernel_ptr)
+    {
+      int occupancy;
+      hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel_ptr, block.x, 0);
+      grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
+    };
+
+#define launch_fused_allreduce_rmsnorm(template_kernel) \
+    do \
+    {\
+      auto kernel_ptr = reinterpret_cast<const void*>(template_kernel); \
+      setGrid(naive_grid_size, kernel_ptr);\
+      template_kernel<<<grid, block, 0, stream>>>(sg_, output, weight, eps, rank_, m, n);\
+    } while (0)
+
+#define case_branch(case_i, template_kernel) \
+    do \
+    {\
+      case case_i:\
+      {\
+        launch_fused_allreduce_rmsnorm(template_kernel);\
+        break;\
+      }\
+    } while(0)
+
+    if (n_bytes % 1024 == 0)
+    {
+      if (8192 <= n_bytes && n_bytes <= 32768)
+      {
+        int naive_grid_size = m;
+        int n_loop = n_bytes / 8192; // 1, 2, 3, 4
+        if (n_bytes % 8192 == 0)
+        {
+          printf("===> call 4096 naive\n");
+          switch (n_loop)
+          {
+            case_branch(1, (local_device_load_rmsnorm_naive<T, 512, 1>));
+            case_branch(2, (local_device_load_rmsnorm_naive<T, 512, 2>));
+            case_branch(3, (local_device_load_rmsnorm_naive<T, 512, 3>));
+            case_branch(4, (local_device_load_rmsnorm_naive<T, 512, 4>));
+          }
+        }
+        else
+        {
+          printf("===> call 4096 normal\n");
+          n_loop += 1;
+          switch (n_loop)
+          {
+            case_branch(2, (local_device_load_rmsnorm<T, 512, 2>));
+            case_branch(3, (local_device_load_rmsnorm<T, 512, 3>));
+            case_branch(4, (local_device_load_rmsnorm<T, 512, 4>));
+          }
+        }
+      }
+      else if (4096 <= n_bytes && n_bytes < 8192)
+      {
+        block.x = 256;
+        int naive_grid_size = m;
+        if (n_bytes == 4096)
+        {
+          printf("===> call 2048 naive\n");
+          // naive n_loop = 1
+          launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 256, 1>));
+        }
+        else
+        {
+          printf("===> call 2048 normal\n");
+          // n_loop = 2
+          launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 256, 2>));
+        }
+      }
+      else if (1024 <= n_bytes && n_bytes < 4096)
+      {
+        block.x = 256;
+        int naive_grid_size = (m + 3) / 4;
+        int n_loop = n_bytes / 1024;
+        printf("===> call 512\n");
+        switch (n_loop)
+        {
+          case_branch(1, (local_device_load_rmsnorm_512n<T, 1>));
+          case_branch(2, (local_device_load_rmsnorm_512n<T, 2>));
+          case_branch(3, (local_device_load_rmsnorm_512n<T, 3>));
+        }
+      }
+      else
+      {
+        printf("fused allreduce rmsnorm shape size error\n");
+      }
+    }
+    else
+    {
+      printf("fused allreduce rmsnorm shape error\n");
+    }
+    /*
+    auto kernel_ptr = aiter::local_device_load_rmsnorm_naive<T, 8, 512, 4>;
+    hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, reinterpret_cast<const void*>(kernel_ptr), 512, 0);
+    int grid_x = m;
+    grid_x = grid_x < num_cu * occupancy ? grid_x : num_cu * occupancy;
+    grid.x = grid_x;
+    local_device_load_rmsnorm_naive<T, 8, 512, 4><<<grid, block, 0, stream>>>(sg_, output, weight, eps, rank_, m, n);
+    */
   }
 
   ~CustomAllreduce()
