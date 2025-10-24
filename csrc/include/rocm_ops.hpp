@@ -1220,3 +1220,10 @@
     pybind11::implicitly_convertible<int, ActivationType>();
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
+
+#define TOPK_PLAIN_PYBIND                                               \
+    m.def("topk_plain",                                                 \
+          &topk_plain,                                                  \
+          py::arg("output"),                                            \
+          py::arg("topk_ids"),                                          \
+          py::arg("topk_num"));
