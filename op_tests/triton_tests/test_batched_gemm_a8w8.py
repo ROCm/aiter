@@ -4,8 +4,12 @@
 import torch
 import pytest
 import functools
-from aiter.ops.triton.batched_gemm_a8w8 import batched_gemm_a8w8 as triton_batched_gemm_a8w8
-from aiter.ops.triton.gluon.batched_gemm_a8w8 import batched_gemm_a8w8 as gluon_batched_gemm_a8w8
+from aiter.ops.triton.batched_gemm_a8w8 import (
+    batched_gemm_a8w8 as triton_batched_gemm_a8w8,
+)
+from aiter.ops.triton.gluon.batched_gemm_a8w8 import (
+    batched_gemm_a8w8 as gluon_batched_gemm_a8w8,
+)
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 from typing import Union
@@ -69,7 +73,9 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
-def run_triton(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=None, impl=None):
+def run_triton(
+    x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=None, impl=None
+):
     return impl(x, weight, x_scale, w_scale, bias, dtype, YQ=y)
 
 
