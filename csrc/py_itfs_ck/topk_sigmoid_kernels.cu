@@ -52,7 +52,7 @@ void topk_sigmoid(torch::Tensor topk_weights,   // [tokens, topk]
     std::string weight_prec = dtype_to_string(topk_weights.dtype());
 
     // Prepare kernel arguments
-    static constexpr std::string activation = "sigmoid";
+    static const std::string activation = "sigmoid";
     topk_softmax_trait trait{input_prec, weight_prec, experts, activation};
 
     topk_softmax_kargs karg{gating_output.data_ptr(),
