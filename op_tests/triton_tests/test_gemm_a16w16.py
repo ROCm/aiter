@@ -134,16 +134,18 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
     triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("M, N, K", [(333,444,555)])
+@pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("output", [True])
-@pytest.mark.parametrize("bias", [False])
+@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("bias", [True, False])
 def test_gemm_a16_w16_silu_fused(M: int, N: int, K: int, dtype, output, bias):
     x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
         M, N, K, dtype, output=output, bias=bias, silu_fused=True
     )
-    torch_out = F.linear(x, w, bias=bias)
-    torch_out = torch_silu_and_mul_ref(torch_out.view(-1, N))
+    if bias is not None:
+        bias = bias.to(torch.float32)
+    torch_out = F.linear(x.to(torch.float32), w.to(torch.float32), bias=bias)
+    torch_out = torch_silu_and_mul_ref(torch_out.view(-1, N)).to(dtype)
 
     if output:
         triton_out = gemm_a16w16_silu_fused(x, w, bias, out_dtype, y)
@@ -160,3 +162,4 @@ if __name__ == "__main__":
         test_gemm_a16_w16_silu_fused(x_val[0], x_val[1], x_val[2], torch.bfloat16, False)
         i += 1
         print(f"GEMM A16W16 test passed! {i}")
+
