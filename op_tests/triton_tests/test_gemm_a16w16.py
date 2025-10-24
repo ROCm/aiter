@@ -7,10 +7,32 @@ import triton
 import pytest
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
+from aiter.ops.triton.gemm_a16w16_silu_fused import gemm_a16w16_silu_fused
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
-def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=False):
+def torch_silu_and_mul_ref(input):
+    """
+    Performs the SiLU activation on the first half of the input tensor and
+    multiplies it element-wise with the second half.
+    Args:
+        input (torch.Tensor): Input tensor of shape [..., 2 * d].
+        param (float): Parameter for the SiLU activation function.
+    Returns:
+        torch.Tensor: Output tensor of shape [..., d].
+    """
+    dtype = input.dtype
+    d = input.size(-1) // 2
+    A, B = input[:, :d], input[:, d:]
+
+    silu_A = A / (1.0 + torch.exp(-A.float()))
+
+    output = silu_A * B
+
+    return output.to(dtype)
+
+
+def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=False, silu_fused=False):
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
 
@@ -31,7 +53,7 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype).cuda()
+        y = torch.empty((M, N//2 if silu_fused else N), dtype=dtype).cuda()
         out_dtype = (None,)
     else:
         out_dtype = dtype
@@ -110,3 +132,25 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
         triton_out = gemm_a16w16_atomic(x, w, dtype=torch.float32).to(dtype)
 
     triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("output", [True, False])
+def test_gemm_a16_w16_silu_fused(M: int, N: int, K: int, dtype, output):
+    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output, silu_fused=True)
+    torch_out = F.linear(x, w, bias=None)
+    torch_out = torch_silu_and_mul_ref(torch_out.view(-1, N))
+    # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
+    if output:
+        y = y.to(torch.float32).zero_()
+        triton_out = gemm_a16w16_atomic(x, w, torch.float32, y).to(dtype)
+    else:
+        triton_out = gemm_a16w16_atomic(x, w, dtype=torch.float32).to(dtype)
+
+    triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+if __name__ == "__main__":
+    test_gemm_a16_w16(666, 666, 666, torch.bfloat16, False)
+    print("GEMM A16W16 test passed!")
