@@ -115,10 +115,10 @@ def _gemm_a16_w16_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
+        
         if EVEN_K:
             a = tl.load(a_ptrs)
             b_i0 = tl.load(b_ptrs_i0, cache_modifier=cache_modifier)
-            b_i1 = tl.load(b_ptrs_i1, cache_modifier=cache_modifier)
         else:
             a = tl.load(
                 a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
@@ -126,12 +126,17 @@ def _gemm_a16_w16_kernel(
             b_i0 = tl.load(
                 b_ptrs_i0, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
             )
+
+        silu_acc += tl.dot(a, b_i0, input_precision="ieee")
+
+        if EVEN_K:
+            b_i1 = tl.load(b_ptrs_i1, cache_modifier=cache_modifier)
+        else:
             b_i1 = tl.load(
                 b_ptrs_i1, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
             )
 
         # Perform dot operation and apply scale
-        silu_acc += tl.dot(a, b_i0, input_precision="ieee")
         mul_acc += tl.dot(a, b_i1, input_precision="ieee")
 
         # Advance the ptrs to the next K block.
