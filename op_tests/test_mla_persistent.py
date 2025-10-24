@@ -9,6 +9,7 @@ import random
 import itertools
 import argparse
 import math
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -65,7 +66,7 @@ def ref_masked_attention(
     l = attn_weights_exp.sum(-1)
 
     if is_fp8_q:
-        attn_weights_fp8 = attn_weights_exp.to(torch.float8_e4m3fnuz)
+        attn_weights_fp8 = attn_weights_exp.to(get_fp8_e4m3_dtype())
         attn_weights_exp = attn_weights_fp8.to(torch.float)
 
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
@@ -91,8 +92,8 @@ def torch_mla_extend(
     q_scale=None,
     kv_scale=None,
 ):
-    is_fp8_q = q.dtype == torch.float8_e4m3fnuz
-    is_fp8_kvc = kvc_cache.dtype == torch.float8_e4m3fnuz
+    is_fp8_q = q.dtype == get_fp8_e4m3_dtype()
+    is_fp8_kvc = kvc_cache.dtype == get_fp8_e4m3_dtype()
 
     if is_fp8_q:
         q = q.to(torch.float)
@@ -309,10 +310,10 @@ def test_mla(
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
-        q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
+        q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=get_fp8_e4m3_dtype())
         q_scale = q_scale.to(torch.float)
 
-        kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
+        kv_buffer_fp8 = kv_buffer.to(get_fp8_e4m3_dtype())
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
@@ -384,7 +385,7 @@ def test_mla(
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
-        kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
+        kv_buffer_fp8 = kv_buffer.to(get_fp8_e4m3_dtype())
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
@@ -479,7 +480,7 @@ qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
-list_dtype = ["bf16"]
+list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
 list_nhead = [(16, 2)]
 
