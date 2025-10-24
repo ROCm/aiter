@@ -16,6 +16,26 @@ on:
         description: 'Build with Python 3.12'
         type: boolean
         default: true
+      docker_image_py310:
+        description: 'Docker image for Python 3.10 build'
+        required: true
+        default: 'rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta'
+      docker_image_py312:
+        description: 'Docker image for Python 3.12 build'
+        required: true
+        default: 'rocm/vllm-dev:nightly'
+      gpu_archs:
+        description: 'GPU architectures (e.g. gfx942;gfx950)'
+        required: false
+        default: 'gfx942;gfx950'
+      runner:
+        description: 'Select build host'
+        required: true
+        default: 'aiter-k8s-build'
+        type: choice
+        options:
+          - aiter-k8s-build
+          - aiter-1gpu-runner
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,25 +43,25 @@ concurrency:
 
 jobs:
   build_whl_package:
-    runs-on: aiter-k8s-build
+    runs-on: ${{ github.event.inputs.runner }}
 
     strategy:
       fail-fast: false
       matrix:
         include:
           - python_version: "3.10"
-            docker_image: "rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta"
+            docker_image: ${{ github.event.inputs.docker_image_py310 }}
             build_enabled: ${{ github.event.inputs.build_py310 == 'true' || github.event.inputs.build_py310 == true }}
           - python_version: "3.12"
-            docker_image: "rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.8.0"
+            docker_image: ${{ github.event.inputs.docker_image_py312 }}
             build_enabled: ${{ github.event.inputs.build_py312 == 'true' || github.event.inputs.build_py312 == true }}
 
     env:
       BUILD_DOCKER_IMAGE: ${{ matrix.docker_image }}
       PYTHON_VERSION: ${{ matrix.python_version }}
+      GPU_ARCHS: ${{ github.event.inputs.gpu_archs }}
 
     steps:
-
       - name: Checkout aiter repo
         if: ${{ matrix.build_enabled }}
         uses: actions/checkout@v4
@@ -106,13 +126,13 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="gfx942;gfx950" python3 setup.py bdist_wheel && ls dist/*.whl'
+          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCHS }}" python3 setup.py bdist_wheel && ls dist/*.whl'
 
       - name: Upload whl file as artifact
         if: ${{ matrix.build_enabled }}
         uses: actions/upload-artifact@v4
         with:
-          name: aiter-whl-packages-py${{ matrix.python_version }}
+          name: aiter-whl-packages-py${{ matrix.python_version }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/*.whl
 
       - name: Cleanup container
