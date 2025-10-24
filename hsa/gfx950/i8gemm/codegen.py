@@ -7,6 +7,7 @@ import glob
 import pandas as pd
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
+hsa_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
@@ -59,6 +60,17 @@ if __name__ == "__main__":
         txt = f"""static CFG cfg_{cfgname} = {{
             {cfg_txt}}};"""
         cfgs.append(txt)
+    ## remove this when adding a kernel on gfx950
+    if not cfgs:
+        for el in glob.glob(f"{hsa_dir}/gfx942/{os.path.basename(this_dir)}/*.csv"):
+            filename = os.path.basename(el)
+            cfgname = filename.split(".")[0]
+            cfg_txt = "\n"
+            cfgname = "i8gemm_bf16_perTokenI8"
+            txt = f"""static CFG cfg_{cfgname} = {{
+                {cfg_txt}}};"""
+            cfgs.append(txt)
+
     txt_all = template + "\n".join(cfgs)
     with open(f"{args.output_dir}/asm_i8gemm_configs.hpp", "w") as f:
         f.write(txt_all)

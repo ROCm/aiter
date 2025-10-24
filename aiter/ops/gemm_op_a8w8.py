@@ -405,14 +405,29 @@ def gemm_a8w8_bpreshuffle(
     return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
-def gemm_a8w8_blockscale(
+def gemm_a8w8_blockscale_fake(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
     dtype=dtypes.bf16,
     isBpreshuffled=False,
-):
+) -> torch.Tensor:
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    return Y
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_fake)
+def gemm_a8w8_blockscale(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    isBpreshuffled: bool = False,
+) -> torch.Tensor:
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
@@ -427,7 +442,7 @@ def gemm_a8w8_blockscale(
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             return mi350_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
         else:
-            assert 0, f"asm kernel only support B preshuffle and m >= 16"
+            assert 0, "asm kernel only support B preshuffle and m >= 16"
     else:
         get_CKGEMM_config(m, n, k, AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE)
         return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
