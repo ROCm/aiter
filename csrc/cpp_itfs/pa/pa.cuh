@@ -477,7 +477,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                         }
                     }
                 }
-                d_out[gqa_ratio_loop][mtp][token_depth] *= scale * q_scale;
+                d_out[gqa_ratio_loop][mtp][token_depth] *= scale / q_scale;
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
                 {
                     if constexpr(QUANT_METHOD == vllm::Fp8QuantMethod::kPerTensor)
