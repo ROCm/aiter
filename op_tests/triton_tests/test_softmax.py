@@ -1,11 +1,7 @@
 import torch
 import pytest
-from aiter.ops.triton.softmax import (
-    softmax as triton_softmax
-)
-from aiter.ops.triton.gluon.softmax import (
-    softmax as gluon_softmax
-)
+from aiter.ops.triton.softmax import softmax as triton_softmax
+from aiter.ops.triton.gluon.softmax import softmax as gluon_softmax
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
