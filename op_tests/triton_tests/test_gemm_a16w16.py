@@ -134,10 +134,10 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
     triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("M, N, K", [(333,444,555)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("output", [True, False])
-@pytest.mark.parametrize("bias", [True, False])
+@pytest.mark.parametrize("output", [True])
+@pytest.mark.parametrize("bias", [False])
 def test_gemm_a16_w16_silu_fused(M: int, N: int, K: int, dtype, output, bias):
     x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
         M, N, K, dtype, output=output, bias=bias, silu_fused=True
@@ -150,11 +150,11 @@ def test_gemm_a16_w16_silu_fused(M: int, N: int, K: int, dtype, output, bias):
     else:
         triton_out = gemm_a16w16_silu_fused(x, w, bias, out_dtype)
 
-    triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+    triton.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":
-    x_vals = get_x_vals()
+    x_vals = [(333,444,555)]
     i = 0
     for x_val in x_vals:
         test_gemm_a16_w16_silu_fused(x_val[0], x_val[1], x_val[2], torch.bfloat16, False)

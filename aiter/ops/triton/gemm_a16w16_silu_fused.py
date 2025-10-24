@@ -197,7 +197,7 @@ def _gemm_a16_w16_kernel_silu_fused(
     # offset for silu_acc
     i0 = (pid_n * BLOCK_SIZE_HALF + offs_i0) % (N // 2)
     # offset for mul_acc
-    i1 = (pid_n * BLOCK_SIZE_HALF + offs_i1) % (N // 2)
+    i1 = (pid_n * BLOCK_SIZE_HALF + offs_i1) % N
     
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     a_ptrs = a_ptr + (
