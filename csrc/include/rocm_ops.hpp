@@ -1224,6 +1224,7 @@
 #define TOPK_PLAIN_PYBIND                                               \
     m.def("topk_plain",                                                 \
           &topk_plain,                                                  \
-          py::arg("output"),                                            \
+          py::arg("values"),                                            \
           py::arg("topk_ids"),                                          \
-          py::arg("topk_num"));
+          py::arg("topk"),                                          \
+          py::arg("largest"));

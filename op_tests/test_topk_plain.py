@@ -18,39 +18,48 @@ torch.set_printoptions(sci_mode=False)
 
 @benchmark()
 def test_topk(
-    batch,
-    length,
-    topk_num,
+    batch_size,
+    hiddensize,
+    topk,
+    largest,
     dtype,
 ):
-    output = torch.randn((batch, length), dtype=dtype)
+    output = torch.randn((batch_size, hiddensize), dtype=dtype)
     device = output.device
 
-    row = torch.arange(length, dtype=dtypes.i32, device=device)  # [0, 1, ..., length-1]
-    topk_ids = row.unsqueeze(0).expand(batch, -1).clone()
+    row = torch.arange(hiddensize, dtype=dtypes.i32, device=device)  # [0, 1, ..., length-1]
+    topk_ids = row.unsqueeze(0).expand(batch_size, -1).clone()
+
+    x = torch.arange(hiddensize, dtype=dtype).repeat(batch_size, 1)
+    for b in range(batch_size):
+        x[b] = x[b, torch.randperm(hiddensize)]
 
     _, us_aiter = run_perftest(
         aiter.topk_plain,
-        output,
+        x,
         topk_ids,
-        topk_num,
+        topk,
+        largest,
     )
-    
     
     err = 0
     return {"err": err, "us": us_aiter}
 
+# BATCH_SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 16, 1335]
+# DIM2 = [16, 128256]
+# K = [2, 8]
 
-batch = 400
-length = 100000
-topk_num = 64
-
+batch_size = 400
+hiddensize = 100000
+topk = 64
+largest = True
 
 df = []
 ret = test_topk(
-    batch,
-    length,
-    topk_num,
+    batch_size,
+    hiddensize,
+    topk,
+    largest,
     dtypes.fp32,
 )
 df = pd.DataFrame(df)

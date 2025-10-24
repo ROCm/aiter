@@ -13,7 +13,8 @@ from ..jit.utils.chip_info import get_cu_num
 
 @compile_ops("module_topk_plain")
 def topk_plain(
-    output: torch.Tensor,
+    x: torch.Tensor,
     topk_ids: torch.Tensor,
-    topk_num: int,
+    topk: int,
+    largest: bool,
 ) -> None: ...

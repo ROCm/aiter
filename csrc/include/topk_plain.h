@@ -4,8 +4,7 @@
 #include "aiter_enum.h"
 #include <torch/extension.h>
 
-
-void topk_plain(torch::Tensor& output, 
-                  torch::Tensor& topk_ids,  
-                  int topk_num);
-
+void topk_plain(torch::Tensor& values,
+                torch::Tensor& topk_ids,
+                int topk_num,
+                bool largest);

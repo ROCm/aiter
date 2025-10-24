@@ -12,12 +12,12 @@
 #include <hipcub/util_type.hpp>
 #include <torch/all.h>
 
-void topk_plain(torch::Tensor& output, 
-                  torch::Tensor& topk_ids,  
-                  int topk_num) 
+void topk_plain(torch::Tensor& values,
+                torch::Tensor& topk_ids,
+                int topk,
+                bool largest)
 {
     printf("Before launch kernel xxxxx\n");
 
     // LAUNCH_KERNEL()
 }
-
