@@ -81,7 +81,7 @@ def _softmax_kernel_online(
         )
 
         # find the max within the block
-        m_p = gl.max(row_block, axis=0)
+        m_p = gl.max(row_block)
 
         # find new max among all blocks
         m_p = gl.maximum(m, m_p)
@@ -90,17 +90,17 @@ def _softmax_kernel_online(
         row_sum = row_sum * gl.exp(m - m_p)
 
         # add new exponential to row sum
-        row_sum += gl.sum(gl.exp(row_block - m_p), axis=0)
+        row_sum += gl.sum(gl.exp(row_block - m_p))
 
         # save the new max and update block
         m = m_p
         row_block = next_row_block
 
     # epilogue
-    m_p = gl.max(row_block, axis=0)
+    m_p = gl.max(row_block)
     m_p = gl.maximum(m, m_p)
     row_sum = row_sum * gl.exp(m - m_p)
-    row_sum += gl.sum(gl.exp(row_block - m_p), axis=0)
+    row_sum += gl.sum(gl.exp(row_block - m_p))
     m = m_p
 
     # loop 2: divide each row by respective norms
