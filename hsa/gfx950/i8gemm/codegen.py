@@ -60,7 +60,7 @@ if __name__ == "__main__":
         txt = f"""static CFG cfg_{cfgname} = {{
             {cfg_txt}}};"""
         cfgs.append(txt)
-    ## remove this when add kernel on gfx950
+    ## remove this when adding a kernel on gfx950
     if not cfgs:
         for el in glob.glob(f"{hsa_dir}/gfx942/{os.path.basename(this_dir)}/*.csv"):
             filename = os.path.basename(el)
