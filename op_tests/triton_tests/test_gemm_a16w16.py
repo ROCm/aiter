@@ -137,11 +137,12 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_a16_w16_silu_fused(M: int, N: int, K: int, dtype, output):
+@pytest.mark.parametrize("bias", [True, False])
+def test_gemm_a16_w16_silu_fused(M: int, N: int, K: int, dtype, output, bias):
     x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
-        M, N, K, dtype, output=output, bias=True, silu_fused=True
+        M, N, K, dtype, output=output, bias=bias, silu_fused=True
     )
-    torch_out = F.linear(x, w, bias=None)
+    torch_out = F.linear(x, w, bias=bias)
     torch_out = torch_silu_and_mul_ref(torch_out.view(-1, N))
 
     if output:
@@ -153,5 +154,9 @@ def test_gemm_a16_w16_silu_fused(M: int, N: int, K: int, dtype, output):
 
 
 if __name__ == "__main__":
-    test_gemm_a16_w16_silu_fused(666, 666, 666, torch.bfloat16, False)
-    print("GEMM A16W16 test passed!")
+    x_vals = get_x_vals()
+    i = 0
+    for x_val in x_vals:
+        test_gemm_a16_w16_silu_fused(x_val[0], x_val[1], x_val[2], torch.bfloat16, False)
+        i += 1
+        print(f"GEMM A16W16 test passed! {i}")
