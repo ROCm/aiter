@@ -170,6 +170,26 @@ def _batched_gemm_a8w8_kernel(
         b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
     )
 
+    # Load the scales
+    offs_a_scale = pid_m * BLOCK_SIZE_M + gl.arange(
+        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, mfma_layout)
+    )
+    offs_b_scale = pid_n * BLOCK_SIZE_N + gl.arange(
+        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout)
+    )
+    a_scale = gl.amd.cdna4.buffer_load(
+        ptr=(a_scale_ptr + batch_id * stride_ascaleb),
+        offsets=offs_a_scale,
+        mask=(offs_a_scale < M),
+        other=1.0,
+    )
+    b_scale = gl.amd.cdna4.buffer_load(
+        ptr=(b_scale_ptr + batch_id * stride_bscaleb),
+        offsets=offs_b_scale,
+        mask=(offs_b_scale < N),
+        other=1.0,
+    )
+
     # Prologue: Make initial loads of all data
     if EVEN_K:
         a = gl.amd.cdna4.buffer_load(
@@ -265,33 +285,15 @@ def _batched_gemm_a8w8_kernel(
         accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
 
         # Store next A in shared memory
-        smem_a.store(a)
+        if k < num_k_iter - 2:
+            smem_a.store(a)
 
     # Epilogue: use remaining A and B in shared memory for last MFMA
-    smem_b.store(b)
-    cur_a = smem_a.load(layout=dot_a_layout)
-    cur_b = smem_b.load(layout=dot_b_layout)
+    cur_a = gl.convert_layout(a, dot_a_layout)
+    cur_b = gl.convert_layout(b, dot_b_layout)
     accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
 
     # Apply scales
-    offs_a_scale = pid_m * BLOCK_SIZE_M + gl.arange(
-        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, mfma_layout)
-    )
-    offs_b_scale = pid_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout)
-    )
-    a_scale = gl.amd.cdna4.buffer_load(
-        ptr=(a_scale_ptr + batch_id * stride_ascaleb),
-        offsets=offs_a_scale,
-        mask=(offs_a_scale < M),
-        other=1.0,
-    )
-    b_scale = gl.amd.cdna4.buffer_load(
-        ptr=(b_scale_ptr + batch_id * stride_bscaleb),
-        offsets=offs_b_scale,
-        mask=(offs_b_scale < N),
-        other=1.0,
-    )
     accumulator *= a_scale[:, None] * b_scale[None, :]
 
     # Apply bias
