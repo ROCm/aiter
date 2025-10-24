@@ -7,6 +7,7 @@ from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm_a16w16_silu_fused import gemm_a16w16_silu_fused
 from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.test_gemm_a16w16 import generate_gemm_a16w16_inputs
+from aiter.ops.triton.gemm_a16w16 import _get_config
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
     add_argparse_ff,
@@ -36,23 +37,25 @@ def bench_gemm_fn(
     mem_write = (M * N) * x.element_size()
     mem = mem_read + mem_write
 
+    config = _get_config(M, N, K)
+
     if atomic:
         # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
         y = y.to(torch.float32).zero_()
         ms = triton.testing.do_bench(
-            lambda: gemm_a16w16_atomic(x, w, torch.float32, y),
+            lambda: gemm_a16w16_atomic(x, w, torch.float32, y, config),
             warmup=25,
             rep=100,  # noqa: E731
         )
     elif silu_fused: # Only fc1 can use silu_fused
         ms = triton.testing.do_bench(
-            lambda: gemm_a16w16_silu_fused(x, w, bias, c_dtype, y),
+            lambda: gemm_a16w16_silu_fused(x, w, bias, c_dtype, y, config),
             warmup=25,
             rep=100,  # noqa: E731
         )
     else:
         ms = triton.testing.do_bench(
-            lambda: gemm_a16w16(x, w, bias, c_dtype, y),
+            lambda: gemm_a16w16(x, w, bias, c_dtype, y, config),
             warmup=25,
             rep=100,  # noqa: E731
         )

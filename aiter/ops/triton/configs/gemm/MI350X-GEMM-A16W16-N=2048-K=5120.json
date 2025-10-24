@@ -88,15 +88,15 @@
     "num_stages": 2
   },
   "M_LEQ_1024": {
-    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 128,
-    "BLOCK_SIZE_K": 128,
-    "GROUP_SIZE_M": 4,
-    "waves_per_eu": 1,
+    "BLOCK_SIZE_K": 512,
+    "GROUP_SIZE_M": 2,
+    "waves_per_eu": 0,
     "matrix_instr_nonkdim": 16,
     "cache_modifier": null,
     "num_warps": 8,
-    "num_stages": 2
+    "num_stages": 1
   },
   "M_LEQ_2048": {
     "BLOCK_SIZE_M": 128,

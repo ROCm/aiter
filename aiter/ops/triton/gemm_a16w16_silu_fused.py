@@ -16,6 +16,123 @@ from .activation import _silu_exp2
 
 _LOGGER = AiterTritonLogger()
 
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+    }
+)
+@triton.jit
+def _gemm_a16_w16_kernel_silu_fused_swizzle_n(
+    a_ptr,
+    b_ptr,
+    bias_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    next_M_2,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    cache_modifier: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
+    SWIZZLE_N: tl.constexpr = False,
+):
+    """Kernel for computing the matmul C = A x B.
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+
+    pid = remap_xcd(pid, num_pid_m * num_pid_n)
+    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+
+    # Create pointers for first block of A and B input matrices
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # swizzle elements in N dimension for B ptrs
+    BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
+    i = tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    # [0, 0, 1, 1, ..., BLOCK_SIZE_HALF - 1, BLOCK_SIZE_HALF - 1]
+    i_floor = i // 2
+    offs_half = (pid_n * (BLOCK_SIZE_N // 2) + i_floor) % (N // 2)
+    # (i % 2): [0, 1, 0, 1, ...] (alternating)
+    # (i % 2) * (N // 2) : [0, (N // 2), 0, (N // 2),...]
+    # So offs_w1n now takes element from the first BLOCK_SIZE_HALF half and the second BLOCK_SIZE_HALF half in an alternating way (This allows us to do reshape without permute)
+    offs_bn = (offs_half + (i % 2) * (N // 2)) % N
+    offs_am = (pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
+    if ADD_BIAS:
+        accumulator = tl.load(bias_ptr + offs_bn).to(dtype=acc_dtype)
+        accumulator = tl.broadcast_to(
+            accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
+        )
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Load the next block of A and B, generate a mask by checking the K dimension.
+        # If it is out of bounds, set it to 0.
+        if EVEN_K:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+        else:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(
+                b_ptrs,
+                mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                other=0.0,
+                cache_modifier=cache_modifier,
+            )
+
+        accumulator += tl.dot(a, b, input_precision="ieee")
+
+        # Advance the ptrs to the next K block.
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    
+    
+    silu_acc, mul_acc = accumulator.reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
+    silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
+    c = (silu_acc * mul_acc).to(c_ptr.type.element_ty)
+
+
+    # Write back the block of the output matrix C with masks.
+    offs_cm = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n.to(tl.int64) * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N//2)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+
 
 @triton.heuristics(
     {
@@ -23,7 +140,7 @@ _LOGGER = AiterTritonLogger()
     }
 )
 @triton.jit
-def _gemm_a16_w16_kernel(
+def _gemm_a16_w16_kernel_silu_fused(
     a_ptr,
     b_ptr,
     bias_ptr,
@@ -81,8 +198,6 @@ def _gemm_a16_w16_kernel(
     i0 = (pid_n * BLOCK_SIZE_HALF + offs_i0) % N
     # offset for mul_acc
     i1 = (pid_n * BLOCK_SIZE_HALF + offs_i1) % N
-    
-    
     
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     a_ptrs = a_ptr + (
@@ -225,10 +340,15 @@ def gemm_a16w16_silu_fused(
     if config is None:
         config = _get_config(M, N, K)
 
+    # print("config", config)
+
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    _gemm_a16_w16_kernel[grid](
+
+    # print("grid size", triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]))
+    
+    _gemm_a16_w16_kernel_silu_fused[grid](
         x,
         w,
         bias,
