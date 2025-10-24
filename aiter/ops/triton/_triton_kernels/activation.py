@@ -4,6 +4,10 @@ import triton.language as tl
 
 
 @triton.jit
+def _sigmoid(x):
+    return tl.sigmoid(x)
+
+@triton.jit
 def _silu(x):
     return x * tl.sigmoid(x)
 
@@ -48,6 +52,7 @@ def _get_activation_from_str(activation: str):
         "silu": _silu,
         "silu_exp2": _silu_exp2,
         "relu": _relu,
+        "sigmoid": _sigmoid,
     }
     return mapping[activation]
 
@@ -64,6 +69,8 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
         return _silu_exp2(x)
     elif activation == "relu":
         return _relu(x)
+    elif activation == "sigmoid":
+        return _sigmoid(x)
     else:
         return x  # No activation if it is not recognized
 
