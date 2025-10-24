@@ -246,6 +246,7 @@ def run_ck(
             (us_fwd, fwd_flop, fwd_num_bytes, us_bwd, bwd_flop, bwd_num_bytes),
         )
 
+
 def run_ck_seq_padding(
     q,
     k,
@@ -360,7 +361,7 @@ def run_ck_seq_padding(
                 device=flat.device,
                 dtype=flat.dtype,
             )
-            t[:padded_lens[i]] = flat[start:end]
+            t[: padded_lens[i]] = flat[start:end]
             pieces.append(t)
             start = end
         return torch.stack(pieces, dim=0)
@@ -824,7 +825,6 @@ def test_varlen_flash_attn_seq_padding(
     )
     assert out_diff <= out_tol
 
-
     def _mask_grad(tensor, lens):
         masked = tensor.clone()
         for i, length in enumerate(lens):
@@ -892,8 +892,6 @@ def varlen_flash_attn_seq_padding_benchmark(
         seqlen_k=seqlen_k,
         local=local,
     )
-
-
 
 
 l_causal = [False, True]

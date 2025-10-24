@@ -23,12 +23,10 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                                           const at::Tensor q,
                                           const at::Tensor k,
                                           const at::Tensor v,
-                                          const at::Tensor seqlens_q,
-                                          const at::Tensor seqlens_k,
+                                          const at::Tensor cu_seqlens_q,
+                                          const at::Tensor cu_seqlens_k,
                                           std::optional<const at::Tensor> &cu_seqlens_q_padded,
                                           std::optional<const at::Tensor> &cu_seqlens_k_padded,
-                                          std::optional<const at::Tensor> &seqlen_q,
-                                          std::optional<const at::Tensor> &seqlen_k,
                                           std::optional<const at::Tensor> &alibi_slopes_,
                                           const at::Tensor out,
                                           const at::Tensor softmax_lse,
@@ -116,21 +114,21 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
 
     const void* seqstart_k_ptr = nullptr;
     const void* seqstart_q_ptr = nullptr;
-    const void* seqlen_k_ptr = nullptr;
-    const void* seqlen_q_ptr = nullptr;
+    const void* cu_seqlen_k_ptr = nullptr;
+    const void* cu_seqlen_q_ptr = nullptr;
 
     if (cu_seqlens_k_padded.has_value()) {
         seqstart_k_ptr = cu_seqlens_k_padded.value().data_ptr();
-        seqlen_k_ptr = seqlen_k.has_value() ? seqlen_k.value().data_ptr() : nullptr;
+        cu_seqlen_k_ptr = cu_seqlens_k.data_ptr();
     } else {
-        seqstart_k_ptr = seqlens_k.data_ptr();
+        seqstart_k_ptr = cu_seqlens_k.data_ptr();
     }
 
     if (cu_seqlens_q_padded.has_value()) {
         seqstart_q_ptr = cu_seqlens_q_padded.value().data_ptr();
-        seqlen_q_ptr = seqlen_q.has_value() ? seqlen_q.value().data_ptr() : nullptr;
+        cu_seqlen_q_ptr = cu_seqlens_q.data_ptr();
     } else {
-        seqstart_q_ptr = seqlens_q.data_ptr();
+        seqstart_q_ptr = cu_seqlens_q.data_ptr();
     }
 
     return fmha_bwd_args{q.data_ptr(),
@@ -147,10 +145,12 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          dv.data_ptr(),
                          nullptr, // dbias
                          dq_acc.data_ptr(), // dq_acc
-                         seqstart_q_ptr, // seqstart_q
-                         seqstart_k_ptr, // seqstart_k
-                         seqlen_q_ptr, // seqlen_q_ptr
-                         seqlen_k_ptr, // seqlen_k_ptr
+                         seqstart_q_ptr, // seqstart_q_ptr (physical cumulative)
+                         seqstart_k_ptr, // seqstart_k_ptr (physical cumulative)
+                         nullptr, // seqlen_q_ptr (per-sequence logical)
+                         nullptr, // seqlen_k_ptr (per-sequence logical)
+                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr (cumulative logical, not used in CK backend for now)
+                         cu_seqlen_k_ptr, // cu_seqlen_k_ptr (cumulative logical, not used in CK backend for now)
                          total_q,
                          total_k,
                          b,
@@ -158,7 +158,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          max_seqlen_k, // max_seqlen_k
                          hdim_q, // hdim_q
                          hdim_v, // hdim_v
-                         h, // nhead
+                         h, // nhead_q
                          h_k, // nhead_k
                          softmax_scale,
                          stride_q,
@@ -397,20 +397,6 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
     }
 
-    // Create seqlen tensors to avoid dangling pointers
-    auto make_lengths = [&](const at::Tensor& cu_seqlens, const char* name) {
-        TORCH_CHECK(cu_seqlens.dim() == 1, name, " must be 1D cumulative lengths");
-        TORCH_CHECK(
-            cu_seqlens.numel() == batch_size + 1,
-            name,
-            " must have size batch+1");
-        auto lengths = cu_seqlens.slice(/*dim=*/0, 1, torch::nullopt) - cu_seqlens.slice(/*dim=*/0, 0, cu_seqlens.size(0) - 1);
-        return lengths.contiguous();
-    };
-
-    std::optional<const at::Tensor> seqlen_q = cu_seqlens_q_padded.has_value() ? std::optional<const at::Tensor>(make_lengths(cu_seqlens_q, "cu_seqlens_q")) : std::nullopt;
-    std::optional<const at::Tensor> seqlen_k = cu_seqlens_k_padded.has_value() ? std::optional<const at::Tensor>(make_lengths(cu_seqlens_k, "cu_seqlens_k")) : std::nullopt;
-
     if (max_seqlen_q > 0) {
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
@@ -433,8 +419,6 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                 cu_seqlens_k,
                 cu_seqlens_q_padded,
                 cu_seqlens_k_padded,
-                seqlen_q,
-                seqlen_k,
                 alibi_slopes_,
                 out,
                 softmax_lse,
