@@ -126,7 +126,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCHS }} python3 setup.py bdist_wheel && ls dist/*.whl'
+          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCHS }}" python3 setup.py bdist_wheel && ls dist/*.whl'
 
       - name: Upload whl file as artifact
         if: ${{ matrix.build_enabled }}
