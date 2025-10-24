@@ -24,6 +24,10 @@ on:
         description: 'Docker image for Python 3.12 build'
         required: true
         default: 'rocm/vllm-dev:nightly'
+      gpu_archs:
+        description: 'GPU architectures (e.g. gfx942;gfx950)'
+        required: false
+        default: 'gfx942;gfx950'
       runner:
         description: 'Select build host'
         required: true
@@ -55,6 +59,7 @@ jobs:
     env:
       BUILD_DOCKER_IMAGE: ${{ matrix.docker_image }}
       PYTHON_VERSION: ${{ matrix.python_version }}
+      GPU_ARCHS: ${{ github.event.inputs.gpu_archs }}
 
     steps:
       - name: Checkout aiter repo
@@ -121,7 +126,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="gfx942;gfx950" python3 setup.py bdist_wheel && ls dist/*.whl'
+          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCHS }} python3 setup.py bdist_wheel && ls dist/*.whl'
 
       - name: Upload whl file as artifact
         if: ${{ matrix.build_enabled }}
