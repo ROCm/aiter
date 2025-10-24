@@ -4,6 +4,7 @@ import torch
 import triton
 import math
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+from aiter.ops.triton.gemm_a16w16_silu_fused import gemm_a16w16_silu_fused
 from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.test_gemm_a16w16 import generate_gemm_a16w16_inputs
 from op_tests.op_benchmarks.triton.utils.argparse import (
@@ -20,8 +21,9 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 
 def bench_gemm_fn(
-    M: int, N: int, K: int, metric: str, layout: str, atomic: bool = False, **kwargs
+    M: int, N: int, K: int, metric: str, layout: str, atomic: bool = False, silu_fused=False, **kwargs
 ):
+    assert not (atomic and silu_fused), "Both 'atomic' and 'silu_fused' cannot be True at the same time."
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
     x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
@@ -39,6 +41,12 @@ def bench_gemm_fn(
         y = y.to(torch.float32).zero_()
         ms = triton.testing.do_bench(
             lambda: gemm_a16w16_atomic(x, w, torch.float32, y),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
+    elif silu_fused: # Only fc1 can use silu_fused
+        ms = triton.testing.do_bench(
+            lambda: gemm_a16w16_silu_fused(x, w, bias, c_dtype, y),
             warmup=25,
             rep=100,  # noqa: E731
         )
@@ -81,20 +89,20 @@ def run_model_benchmark(args):
 
         Tensor parallel splits across int_dim (N for fc1, K for fc2)
         """
-        if layer == "fc1":
-            if args.no_glu:
-                N, K = intermediate_dim, hidden_dim
-            else:
-                N, K = intermediate_dim * 2, hidden_dim
+        if layer == "fc1":          
+            N, K = intermediate_dim, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
         elif layer == "fc2":
-            N, K = hidden_dim, intermediate_dim
+            if args.no_glu:
+                N, K = hidden_dim, intermediate_dim
+            else:
+                N, K = hidden_dim, intermediate_dim // 2
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, atomic=args.atomic)
+        return bench_gemm_fn(M, N, K, metric, args.layout, atomic=args.atomic, silu_fused=args.silu_fused and layer=="fc1") 
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
@@ -109,7 +117,7 @@ def run_shape_benchmark(args):
     def bench_gemm_a16w16(M, N, K, metric, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, atomic=args.atomic)
+        return bench_gemm_fn(M, N, K, metric, args.layout, atomic=args.atomic, silu_fused=args.silu_fused)
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
@@ -148,6 +156,12 @@ def parse_args():
         action="store_true",
         default=False,
         help="Use the atomic kernel (split-k with atomic_add) instead of the standard a16w16 kernel.",
+    )
+    parser.add_argument(
+        "--silu_fused",
+        action="store_true",
+        default=False,
+        help="Fuse the GEMM + gated SiLU activation",
     )
     return get_ff_args(parser)
 

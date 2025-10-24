@@ -41,8 +41,6 @@ def _gelu_tanh(x):
     inner = BETA * (x + KAPPA * x_cube)
     return 0.5 * x * (1.0 + _tanh(inner))
 
-
-@tl.constexpr_function
 def _get_activation_from_str(activation: str):
     mapping = {
         "gelu": _gelu,
