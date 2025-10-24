@@ -27,8 +27,6 @@ fmha_bwd_args get_asm_fmha_varlen_bwd_args(const mask_info &mask,
                                           const at::Tensor cu_seqlens_k,
                                           std::optional<const at::Tensor> &cu_seqlens_q_padded,
                                           std::optional<const at::Tensor> &cu_seqlens_k_padded,
-                                          std::optional<const at::Tensor> &seqlen_q,
-                                          std::optional<const at::Tensor> &seqlen_k,
                                           std::optional<const at::Tensor> &alibi_slopes_,
                                           const at::Tensor out,
                                           const at::Tensor softmax_lse,
@@ -127,21 +125,21 @@ fmha_bwd_args get_asm_fmha_varlen_bwd_args(const mask_info &mask,
         stride_alibi_slopes = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
-    const void* seqstart_k_ptr = nullptr;
     const void* seqstart_q_ptr = nullptr;
-    const void* seqlen_k_ptr = nullptr;
-    const void* seqlen_q_ptr = nullptr;
+    const void* seqstart_k_ptr = nullptr;
+    const void* cu_seqlen_q_ptr = nullptr;
+    const void* cu_seqlen_k_ptr = nullptr;
 
     if (cu_seqlens_k_padded.has_value()) {
         seqstart_k_ptr = cu_seqlens_k_padded.value().data_ptr();
-        seqlen_k_ptr = seqlen_k.has_value() ? seqlen_k.value().data_ptr() : nullptr;
+        cu_seqlen_k_ptr = cu_seqlens_k.data_ptr();
     } else {
         seqstart_k_ptr = cu_seqlens_k.data_ptr();
     }
 
     if (cu_seqlens_q_padded.has_value()) {
         seqstart_q_ptr = cu_seqlens_q_padded.value().data_ptr();
-        seqlen_q_ptr = seqlen_q.has_value() ? seqlen_q.value().data_ptr() : nullptr;
+        cu_seqlen_q_ptr = cu_seqlens_q.data_ptr();
     } else {
         seqstart_q_ptr = cu_seqlens_q.data_ptr();
     }
@@ -162,8 +160,10 @@ fmha_bwd_args get_asm_fmha_varlen_bwd_args(const mask_info &mask,
                          dq_acc.data_ptr(), // dq_acc
                          seqstart_q_ptr, // seqstart_q
                          seqstart_k_ptr, // seqstart_k
-                         seqlen_q_ptr, // seqlen_q_ptr
-                         seqlen_k_ptr, // seqlen_k_ptr
+                         nullptr, // seqlen_q_ptr
+                         nullptr, // seqlen_k_ptr
+                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
+                         cu_seqlen_k_ptr, // cu_seqlen_k_ptr
                          total_q,
                          total_k,
                          b,
@@ -417,20 +417,6 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
         rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
     }
 
-    // Create seqlen tensors to avoid dangling pointers
-    auto make_lengths = [&](const at::Tensor& cu_seqlens, const char* name) {
-        TORCH_CHECK(cu_seqlens.dim() == 1, name, " must be 1D cumulative lengths");
-        TORCH_CHECK(
-            cu_seqlens.numel() == batch_size + 1,
-            name,
-            " must have size batch+1");
-        auto lengths = cu_seqlens.slice(/*dim=*/0, 1, torch::nullopt) - cu_seqlens.slice(/*dim=*/0, 0, cu_seqlens.size(0) - 1);
-        return lengths.contiguous();
-    };
-
-    std::optional<const at::Tensor> seqlen_q = cu_seqlens_q_padded.has_value() ? std::optional<const at::Tensor>(make_lengths(cu_seqlens_q, "cu_seqlens_q")) : std::nullopt;
-    std::optional<const at::Tensor> seqlen_k = cu_seqlens_k_padded.has_value() ? std::optional<const at::Tensor>(make_lengths(cu_seqlens_k, "cu_seqlens_k")) : std::nullopt;
-
     if (max_seqlen_q > 0) {
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
@@ -453,8 +439,6 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
                 cu_seqlens_k,
                 cu_seqlens_q_padded,
                 cu_seqlens_k_padded,
-                seqlen_q,
-                seqlen_k,
                 alibi_slopes_,
                 out,
                 softmax_lse,
@@ -469,8 +453,6 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
                 drop_seed_offset,
                 is_v3_atomic_fp32);
 
-        const void* seqlen_q_unpadded = args.seqlen_q_ptr && args.seqstart_q_ptr ? cu_seqlens_q.data_ptr() : nullptr;
-        const void* seqlen_k_unpadded = args.seqlen_k_ptr && args.seqstart_k_ptr ? cu_seqlens_k.data_ptr() : nullptr;
 
         float t = aiter::mha_bwd(args,
                                  stream_config,
@@ -483,9 +465,7 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
                                  deterministic,
                                  true,   // use_ext_asm
                                  is_v3_atomic_fp32,
-                                 how_v3_bf16_cvt,
-                                 seqlen_q_unpadded,
-                                 seqlen_k_unpadded);
+                                 how_v3_bf16_cvt);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_bwd");
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
