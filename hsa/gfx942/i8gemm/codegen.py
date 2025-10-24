@@ -34,7 +34,7 @@ using CFG = std::unordered_map<std::string, I8GemmConfig>;
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="generate",
-        description="gen API for CK fmha kernel",
+        description="generate configuration API for i8gemm asm kernels",
     )
     parser.add_argument(
         "-o",
