@@ -12,9 +12,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Retry download checks signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
   sglang:
     name: sglang integration
     runs-on: aiter-mi325-1gpu
+    needs: [check-signal]
     env:
       SGL_BRANCH: v0.5.3
       GPU_ARCH: gfx942

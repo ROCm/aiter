@@ -2,12 +2,13 @@ name: Checks
 
 on:
   push:
-    branches: [ "**" ]
+    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
 
 jobs:
   check-ck:
+    name: Check Repository Dependency
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -19,6 +20,7 @@ jobs:
         run: ./.github/scripts/check_deps.sh
 
   black:
+    name: Check Code Style with Black
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -26,7 +28,8 @@ jobs:
       - name: Run Black
         uses: psf/black@stable
 
-  ruff_black:
+  ruff:
+    name: Check Code Style with Ruff
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -44,3 +47,43 @@ jobs:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ruff check . -e | reviewdog -efm="%f:%l:%c: %m" -diff="git diff FETCH_HEAD" -reporter=github-pr-check -tee
+
+  upload-success-artifact:
+    name: Upload Success Signal
+    runs-on: ubuntu-latest
+    needs: [check-ck, black, ruff]
+    if: ${{ success() }}
+    steps:
+      - name: Create success signal file
+        run: echo "success" > checks_signal.txt
+
+      - name: Upload success artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checks-signal-${{ github.sha }}
+          path: checks_signal.txt
+
+  upload-failure-artifact:
+    name: Upload Failure Signal
+    runs-on: ubuntu-latest
+    needs: [check-ck, black, ruff]
+    if: ${{ failure() }}
+    steps:
+      - name: Create failure signal file with failed jobs
+        run: |
+          echo "failure" > checks_signal.txt
+          if [ "${{ needs.check-ck.result }}" != "success" ]; then
+            echo "FAILED: check-ck (${{ needs.check-ck.result }})" >> checks_signal.txt
+          fi
+          if [ "${{ needs.black.result }}" != "success" ]; then
+            echo "FAILED: black (${{ needs.black.result }})" >> checks_signal.txt
+          fi
+          if [ "${{ needs.ruff.result }}" != "success" ]; then
+            echo "FAILED: ruff (${{ needs.ruff.result }})" >> checks_signal.txt
+          fi
+
+      - name: Upload failure artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checks-signal-${{ github.sha }}
+          path: checks_signal.txt
