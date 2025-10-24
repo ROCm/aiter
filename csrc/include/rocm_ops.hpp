@@ -1220,3 +1220,16 @@
     pybind11::implicitly_convertible<int, ActivationType>();
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
+
+#define TOPK_PER_ROW_PYBIND                              \
+      m.def("topk_per_row",                              \
+            &topk_per_row,                               \
+            py::arg("logits"),                           \
+            py::arg("rowStarts"),                        \
+            py::arg("rowEnds"),                          \
+            py::arg("indices"),                          \
+            py::arg("values"),                           \
+            py::arg("numRows"),                          \
+            py::arg("stride0"),                          \
+            py::arg("stride1"));
+
