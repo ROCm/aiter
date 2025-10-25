@@ -403,7 +403,6 @@ def test_fmoe(
             w2_scale=fp4_utils.e8m0_shuffle(w2_scale),
             quant_type=qType,
             activation=actType,
-            block_size_M=64,
             doweight_stage1=doweight_stage1,
         )
 
