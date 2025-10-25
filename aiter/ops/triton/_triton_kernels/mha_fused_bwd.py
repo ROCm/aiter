@@ -28,9 +28,10 @@ def _bwd_preprocess(
     # Strides
     stride_o_b, stride_o_h, stride_o_m, stride_o_k,
     stride_delta_b, stride_delta_h, stride_deltam,
-    # Meta-parameters
+    # Configurations
     cu_seqlens_q,
     max_seqlen_q,
+    # Meta-parameters
     BLOCK_M: tl.constexpr,
     BLOCK_D_MODEL: tl.constexpr,
     BLOCK_D_MODEL_POW2: tl.constexpr,
@@ -54,9 +55,6 @@ def _bwd_preprocess(
     # Compute offsets
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BLOCK_D_MODEL_POW2)
-
-    tl.static_print("offs_m", offs_m)
-    tl.static_print("seqlen_q", seqlen_q)
 
     # Offset O/DO by batch, head and q_start
     offs = (
@@ -104,7 +102,7 @@ def _bwd_dkdvdq_inner(
     stride_do_m, stride_do_k,
     stride_dropout_m, stride_dropout_n,
     stride_deltam,
-    # Meta-parameters
+    # Configurations
     sm_scale,
     dropout_p,
     philox_seed,
@@ -115,6 +113,7 @@ def _bwd_dkdvdq_inner(
     start_n,
     start_m,
     num_steps,
+    # Meta-parameters
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D_MODEL: tl.constexpr,
@@ -273,7 +272,7 @@ def _bwd_kernel_dkdvdq_causal(
     stride_delta_b_in, stride_delta_h_in, stride_deltam_in,
     stride_do_b_in, stride_do_h_in, stride_do_m_in, stride_do_k_in,
     stride_dropout_b_in, stride_dropout_h_in, stride_dropout_m_in, stride_dropout_n_in,
-    # Meta-parameters
+    # Configurations
     sm_scale,
     cu_seqlens_q,
     cu_seqlens_k,
@@ -283,6 +282,7 @@ def _bwd_kernel_dkdvdq_causal(
     dropout_p,
     philox_seed,
     philox_offset_base_in,
+    # Meta-parameters
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     BATCH,
@@ -513,7 +513,7 @@ def _bwd_kernel_dkdvdq_causal(
         stride_do_m, stride_do_k,  # strides for do
         stride_dropout_m, stride_dropout_n,  # strides for dropout
         stride_deltam,
-        # Meta-parameters
+        # Configurations
         sm_scale,
         dropout_p,
         philox_seed,
@@ -523,6 +523,7 @@ def _bwd_kernel_dkdvdq_causal(
         start_n,
         start_m,
         num_steps,  # iteration numbers
+        # Meta-parameters
         MASK_BLOCK_M,
         BLOCK_N,  # block dim
         BLOCK_D_MODEL,
@@ -548,7 +549,7 @@ def _bwd_kernel_dkdvdq_causal(
         stride_do_m, stride_do_k,  # strides for o
         stride_dropout_m, stride_dropout_n,  # strides for dropout
         stride_deltam,
-        # Meta-parameters
+        # Configurations
         sm_scale,
         dropout_p,
         philox_seed,
@@ -558,6 +559,7 @@ def _bwd_kernel_dkdvdq_causal(
         start_n,
         start_m,
         num_steps,  # iteration numbers
+        # Meta-parameters
         BLOCK_M,
         BLOCK_N,  # block dim
         BLOCK_D_MODEL,
@@ -598,7 +600,7 @@ def _bwd_kernel_dkdvdq_noncausal(
     stride_deltab_in, stride_deltah_in, stride_deltam_in,
     stride_dob_in, stride_doh_in, stride_dom_in, stride_dok_in,
     stride_dropoutb_in, stride_dropouth_in, stride_dropoutm_in, stride_dropoutn_in,
-    # Meta-parameters
+    # Configurations
     sm_scale,
     cu_seqlens_q,
     cu_seqlens_k,
@@ -608,6 +610,7 @@ def _bwd_kernel_dkdvdq_noncausal(
     dropout_p,
     philox_seed,
     philox_offset,
+    # Meta-parameters
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     BATCH,
@@ -779,7 +782,7 @@ def _bwd_kernel_dkdvdq_noncausal(
             stride_dom, stride_dok,
             stride_dropoutm, stride_dropoutn,
             stride_deltam,
-            # Meta-parameters
+            # Configurations
             sm_scale,
             dropout_p,
             philox_seed,
@@ -790,6 +793,7 @@ def _bwd_kernel_dkdvdq_noncausal(
             start_n,
             start_m,
             num_steps,
+            # Meta-parameters
             BLOCK_M,
             BLOCK_N,
             BLOCK_D_MODEL,

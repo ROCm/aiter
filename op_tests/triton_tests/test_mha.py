@@ -66,7 +66,6 @@ def pad_rearrange_dropout_mask(
     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True), (0.0, False, False)]
 )
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-# @pytest.mark.parametrize("FP8", [(True), (False)])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -78,7 +77,6 @@ def test_mha(
     RETURN_LSE: bool,
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
-    # FP8: bool,
     dtype=torch.float16,
 ):
     torch.cuda.empty_cache()
@@ -248,7 +246,6 @@ def test_mha_int64_strides(
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-# @pytest.mark.parametrize("FP8", [(False), (True)])
 def test_mha_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -260,7 +257,6 @@ def test_mha_varlen(
     RETURN_LSE: bool,
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
-    # FP8: bool,
     dtype=torch.float16,
 ):
     torch.set_printoptions(threshold=10000)
@@ -395,9 +391,7 @@ def test_mha_varlen(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
-# @pytest.mark.parametrize("FP8", [False])
 @pytest.mark.parametrize("FUSED", [False, True])
-# @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
 def test_mha_backward(
     BATCH: int,
     SEQLEN_Q: int,
@@ -407,7 +401,6 @@ def test_mha_backward(
     HEAD_SZ: int,
     DROPOUT: float,
     CAUSAL: bool,
-    # FP8: bool,
     FUSED: bool,
     dtype=torch.float16,
 ):
@@ -513,9 +506,7 @@ def test_mha_backward(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
-# @pytest.mark.parametrize("FP8", [False])
 @pytest.mark.parametrize("FUSED", [False, True])
-# @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
 def test_mha_backward_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -525,7 +516,6 @@ def test_mha_backward_varlen(
     HEAD_SZ: int,
     DROPOUT: float,
     CAUSAL: bool,
-    # FP8: bool,
     FUSED: bool,
     dtype=torch.float16,
 ):

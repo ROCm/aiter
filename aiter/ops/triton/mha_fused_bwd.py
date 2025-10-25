@@ -35,7 +35,7 @@ def flash_attn_fused_backward(
     dk: jnp.ndarray,
     dv: jnp.ndarray,
     dbias: jnp.ndarray,
-    # Meta-parameters
+    # Configurations
     sm_scale: float,
     alibi_slopes: Optional[jnp.ndarray],
     causal: bool,
@@ -128,8 +128,6 @@ def flash_attn_fused_backward(
         BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
         IS_VARLEN=IS_VARLEN,
     )
-    print(o_strides)
-    print(delta_strides)
 
     delta = jt.triton_call(
         o,
@@ -209,7 +207,7 @@ def flash_attn_fused_backward(
         *delta_strides,
         *do_strides,
         *dropout_strides,
-        # Meta-parameters
+        # Configurations
         sm_scale,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -295,7 +293,7 @@ def main(unused_argv):
     k = jax.random.normal(k_key, MHA_SHAPE, dtype=MHA_DTYPE)
     v = jax.random.normal(v_key, MHA_SHAPE, dtype=MHA_DTYPE)
 
-    # metaparams
+    # configurations
     sm_scale = HEAD_SIZE ** -0.5
     causal = True
     alibi_slopes = None
@@ -326,7 +324,7 @@ def main(unused_argv):
         dk=dk,
         dv=dv,
         dbias=None,
-        # Meta-parameters
+        # Configurations
         sm_scale=sm_scale,
         causal=causal,
         alibi_slopes=alibi_slopes,
