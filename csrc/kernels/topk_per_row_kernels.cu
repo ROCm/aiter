@@ -10,7 +10,7 @@
 
 namespace aiter {
 
-static inline __device__ uint16_t extractBinIdx(float x, int kNumBins)
+static inline __device__ uint16_t extractBinIdx(float x)
 {
     union
     {
@@ -19,27 +19,20 @@ static inline __device__ uint16_t extractBinIdx(float x, int kNumBins)
     } tmp;
     tmp.h   = __float2half_rn(x);
     tmp.u16 = (x < 0.f) ? (~tmp.u16 & 0xffff) : (tmp.u16 | 0x8000);
-
-    uint16_t idx = kNumBins - 1 - (tmp.u16 >> 7);
-
-    return idx;
+    return 511 - (tmp.u16 >> 7);
 }
 
-template <int kNumThreadsPerBlock = 512, int kTopK = 2048>
-__launch_bounds__(kNumThreadsPerBlock) __global__ void topKPerRow(const float* logits,
-                                                                  const int* rowStarts,
-                                                                  const int* rowEnds,
-                                                                  int* outIndices,
-                                                                  float* outLogits,
-                                                                  int stride0,
-                                                                  int stride1)
+template <int kNumThreadsPerBlock = 512, int kNumBins = 512, int kTopK = 2048>
+__device__ void topk_per_row_kernel(const float* logits,
+                                    const int rowStart,
+                                    const int rowEnd,
+                                    const int rowIdx,
+                                    int* outIndices,
+                                    int stride0,
+                                    int stride1)
 {
-    // The number of bins in the histogram.
-    static constexpr int kNumBins = 512;
-
     // The number of elements per thread for the final top-k sort.
     static constexpr int kNumTopKItemsPerThread = kTopK / kNumThreadsPerBlock;
-
     // The class to sort the elements during the final top-k sort.
     using TopKSort =
         hipcub::BlockRadixSort<float, kNumThreadsPerBlock, kNumTopKItemsPerThread, int>;
@@ -79,17 +72,11 @@ __launch_bounds__(kNumThreadsPerBlock) __global__ void topKPerRow(const float* l
     __shared__ int smemHistogram[kNumBins];
     // Shared memory to store the selected indices.
     __shared__ int smemIndices[kTopK];
-    // Shared memory to store the selected logits.
-    __shared__ float smemLogits[kTopK];
     // Shared memory to store the threshold bin.
     __shared__ int smemThresholdBinIdx[1];
     // Shared memory counter to register the candidates for the final phase.
     __shared__ int smemFinalDstIdx[1];
 
-    // The row computed by this block.
-    int rowIdx = blockIdx.x;
-    // The range of logits within the row.
-    int rowStart = rowStarts[rowIdx], rowEnd = rowEnds[rowIdx];
     // The length of the row.
     int rowLen = rowEnd - rowStart;
 
@@ -101,12 +88,10 @@ __launch_bounds__(kNumThreadsPerBlock) __global__ void topKPerRow(const float* l
         {
             int idx                            = rowStart + rowIt;
             outIndices[rowIdx * kTopK + rowIt] = idx - rowStart;
-            outLogits[rowIdx * kTopK + rowIt]  = logits[rowIdx * stride0 + idx * stride1];
         }
         for(int rowIt = rowLen + threadIdx.x; rowIt < kTopK; rowIt += kNumThreadsPerBlock)
         {
             outIndices[rowIdx * kTopK + rowIt] = -1;
-            outLogits[rowIdx * kTopK + rowIt]  = -FLT_MAX;
         }
         return;
     }
@@ -123,7 +108,7 @@ __launch_bounds__(kNumThreadsPerBlock) __global__ void topKPerRow(const float* l
     // Fetch elements one-by-one.
     for(int rowIt = rowStart + threadIdx.x; rowIt < rowEnd; rowIt += kNumThreadsPerBlock)
     {
-        uint16_t idx = extractBinIdx(logits[rowIdx * stride0 + rowIt * stride1], kNumBins);
+        uint16_t idx = extractBinIdx(logits[rowIdx * stride0 + rowIt * stride1]);
         atomicAdd(&smemHistogram[idx], 1);
     }
 
@@ -179,11 +164,10 @@ __launch_bounds__(kNumThreadsPerBlock) __global__ void topKPerRow(const float* l
     for(int rowIt = rowStart + threadIdx.x; rowIt < rowEnd; rowIt += kNumThreadsPerBlock)
     {
         float logit  = logits[rowIdx * stride0 + rowIt * stride1];
-        uint16_t idx = extractBinIdx(logit, kNumBins);
+        uint16_t idx = extractBinIdx(logit);
         if(idx < thresholdBinIdx)
         {
             int dstIdx          = atomicAdd(&smemHistogram[idx], 1);
-            smemLogits[dstIdx]  = logit;
             smemIndices[dstIdx] = rowIt;
         }
         else if(idx == thresholdBinIdx)
@@ -239,7 +223,6 @@ __launch_bounds__(kNumThreadsPerBlock) __global__ void topKPerRow(const float* l
         int dstIdx = baseIdx + srcIdx;
         if(dstIdx < kTopK)
         {
-            smemLogits[dstIdx]  = finalLogits[ii];
             smemIndices[dstIdx] = finalIndices[ii];
         }
     }
@@ -247,31 +230,61 @@ __launch_bounds__(kNumThreadsPerBlock) __global__ void topKPerRow(const float* l
     // Make sure the data is in shared memory.
     __syncthreads();
 
-    // The topK logits.
-    float topKLogits[kNumTopKItemsPerThread];
-    // The topK indices.
-    int topKIndices[kNumTopKItemsPerThread];
-
-// Load from shared memory.
-#pragma unroll
-    for(int ii = 0; ii < kNumTopKItemsPerThread; ++ii)
-    {
-        topKLogits[ii]  = smemLogits[ii * kNumThreadsPerBlock + threadIdx.x];
-        topKIndices[ii] = smemIndices[ii * kNumThreadsPerBlock + threadIdx.x];
-    }
-
-    // Sort the elements.
-    TopKSort(smemFinal.topKSort).SortDescendingBlockedToStriped(topKLogits, topKIndices);
-
 // Store to global memory.
 #pragma unroll
     for(int ii = 0; ii < kNumTopKItemsPerThread; ++ii)
     {
         int offset         = rowIdx * kTopK + ii * kNumThreadsPerBlock + threadIdx.x;
-        outIndices[offset] = topKIndices[ii] - rowStart;
-        outLogits[offset]  = topKLogits[ii];
+        outIndices[offset] = smemIndices[ii * kNumThreadsPerBlock + threadIdx.x] - rowStart;
     }
-};
+}
+
+template <int kNumThreadsPerBlock = 512>
+static __global__ void topk_per_row(const float* logits,
+                                    const int* rowStarts,
+                                    const int* rowEnds,
+                                    int* outIndices,
+                                    int stride0,
+                                    int stride1)
+{
+    // The number of bins in the histogram.
+    static constexpr int kNumBins = 512;
+
+    // The top-k width.
+    static constexpr int kTopK = 2048;
+
+    // The row computed by this block.
+    int rowIdx = blockIdx.x;
+
+    // The range of logits within the row.
+    int rowStart = rowStarts[rowIdx];
+    int rowEnd   = rowEnds[rowIdx];
+
+    topk_per_row_kernel<kNumThreadsPerBlock, kNumBins, kTopK>(
+        logits, rowStart, rowEnd, rowIdx, outIndices, stride0, stride1);
+}
+
+template <int kNumThreadsPerBlock = 512>
+static __global__ void topk_per_row_decode(
+    const float* logits, const int* seqLens, int* outIndices, int stride0, int stride1, int next_n)
+{
+    // The number of bins in the histogram.
+    static constexpr int kNumBins = 512;
+
+    // The top-k width.
+    static constexpr int kTopK = 2048;
+
+    // The row computed by this block.
+    int rowIdx = blockIdx.x;
+
+    // The range of logits within the row.
+    int rowStart = 0;
+    int seq_len  = seqLens[rowIdx / next_n];
+    int rowEnd   = seq_len - next_n + (rowIdx % next_n) + 1;
+
+    topk_per_row_kernel<kNumThreadsPerBlock, kNumBins, kTopK>(
+        logits, rowStart, rowEnd, rowIdx, outIndices, stride0, stride1);
+}
 
 } // namespace aiter
 
@@ -279,7 +292,6 @@ void topk_per_row(const torch::Tensor& logits,
                   const torch::Tensor& rowStarts,
                   const torch::Tensor& rowEnds,
                   torch::Tensor& indices,
-                  torch::Tensor& values,
                   int64_t numRows,
                   int64_t stride0,
                   int64_t stride1)
@@ -288,16 +300,36 @@ void topk_per_row(const torch::Tensor& logits,
     constexpr int kNumThreadsPerBlock = 512;
 
     // The top-k width.
-    static constexpr int kTopK = 2048; 
+    static constexpr int kTopK = 2048;
 
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    aiter::topKPerRow<kNumThreadsPerBlock, kTopK>
+    aiter::topk_per_row<kNumThreadsPerBlock>
         <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
                                                       rowStarts.data_ptr<int>(),
                                                       rowEnds.data_ptr<int>(),
                                                       indices.data_ptr<int>(),
-                                                      values.data_ptr<float>(),
                                                       static_cast<int>(stride0),
                                                       static_cast<int>(stride1));
+}
+
+void topk_per_row_decode(const torch::Tensor& logits,
+                         int64_t next_n,
+                         const torch::Tensor& seqLens,
+                         torch::Tensor& indices,
+                         int64_t numRows,
+                         int64_t stride0,
+                         int64_t stride1)
+{
+    // Compute the results on the device.
+    constexpr int kNumThreadsPerBlock = 512;
+    const hipStream_t stream          = at::hip::getCurrentHIPStream();
+
+    aiter::topk_per_row_decode<kNumThreadsPerBlock>
+        <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
+                                                      seqLens.data_ptr<int>(),
+                                                      indices.data_ptr<int>(),
+                                                      static_cast<int>(stride0),
+                                                      static_cast<int>(stride1),
+                                                      static_cast<int>(next_n));
 }

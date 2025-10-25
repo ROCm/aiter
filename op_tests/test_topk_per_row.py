@@ -1,8 +1,9 @@
+import argparse
 import torch
 import aiter
-import pytest
-
 import numpy as np
+import pandas as pd
+from aiter.test_common import benchmark, perftest
 
 
 def create_random_logits(
@@ -31,10 +32,9 @@ def create_row_boundaries(
 
 
 def compare_top_k_results(
+    logits: torch.Tensor,
     cuda_indices: torch.Tensor,
-    cuda_values: torch.Tensor,
     torch_indices: torch.Tensor,
-    torch_values: torch.Tensor,
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     top_k: int,
@@ -58,13 +58,13 @@ def compare_top_k_results(
         # Compare the sets of indices first
         cuda_set = set(cuda_row_indices.tolist())
         torch_set = set(torch_row_indices.tolist())
-
         if cuda_set == torch_set:
             continue
 
         # Any difference in elements, compare the values
-        cuda_row_values = cuda_values[row_idx][:num_valid].cpu()
-        torch_row_values = torch_values[row_idx][:num_valid].cpu()
+        logits_row = logits[row_idx]
+        cuda_row_values = [logits_row[i] for i in cuda_row_indices]
+        torch_row_values = [logits_row[i] for i in torch_row_indices]
 
         cuda_only_values, torch_only_values = [], []
         for idx in cuda_set - torch_set:
@@ -77,7 +77,6 @@ def compare_top_k_results(
 
         if len(cuda_only_values) != len(torch_only_values):
             return False
-
         if not torch.allclose(
             torch.tensor(cuda_only_values),
             torch.tensor(torch_only_values),
@@ -89,13 +88,37 @@ def compare_top_k_results(
     return True
 
 
-@pytest.mark.parametrize("num_rows", [8, 16, 32, 64, 128, 256, 512, 768, 1024])
-def test_top_k_per_row(num_rows: int) -> None:
+@perftest()
+def run_topk_per_row(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride_row: int,
+    stride_col: int,
+) -> None:
+    """
+    Run the top_k_per_row kernel.
+    """
+    return aiter.topk_per_row(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        num_rows,
+        stride_row,
+        stride_col,
+    )
+
+
+@benchmark()
+def test_top_k_per_row(num_rows: int, top_k: int) -> None:
     """
     Test top_k_per_row.
     """
+    ret = {}
     torch.set_default_device("cuda:0")
-    top_k = 2048
 
     # Create test data
     row_starts, row_ends = create_row_boundaries(num_rows)
@@ -103,28 +126,75 @@ def test_top_k_per_row(num_rows: int) -> None:
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
-    values = torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda")
 
     # Run the kernel
-    aiter.topk_per_row(
+    output, us = run_topk_per_row(
         logits,
         row_starts,
         row_ends,
         indices,
-        values,
         num_rows,
         logits.stride(0),
         logits.stride(1),
     )
 
     # Run reference implementation
-    torch_values, torch_indices = logits.topk(min(top_k, max(row_ends)), dim=-1)
+    torch_indices = logits.topk(min(top_k, max(row_ends)), dim=-1)[1]
     mask_lo = torch_indices >= 0
     mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
     mask = mask_lo & mask_hi
     torch_indices = torch_indices.masked_fill(~mask, -1)
 
     # Compare results
-    assert compare_top_k_results(
-        indices, values, torch_indices, torch_values, row_starts, row_ends, top_k
-    ), "aiter topk_per_row results don't match with reference torch topk implementation"
+    all_close = compare_top_k_results(
+        logits, indices, torch_indices, row_starts, row_ends, top_k
+    )
+
+    # measure performance
+    ret["vocab_size"] = logits.shape[1]
+    ret["all_close"] = all_close
+    ret["us"] = us
+    return ret
+
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-n",
+    "--num_rows",
+    type=int,
+    default=None,
+    help="""number of rows.
+    e.g.: -n 64""",
+)
+
+parser.add_argument(
+    "-k",
+    "--top_k",
+    type=int,
+    default=None,
+    help="""top-k elements per row.
+    e.g.: -k 2048""",
+)
+
+args = parser.parse_args()
+if args.num_rows is None:
+    num_rows = [8, 16, 32, 64, 128, 256, 512, 768, 1024]
+else:
+    num_rows = [args.num_rows]
+
+if args.top_k is not None:
+    top_k = [args.top_k]
+else:
+    top_k = [2048]
+
+df = []
+for n in num_rows:
+    for k in top_k:
+        ret = test_top_k_per_row(n, k)
+        df.append(ret)
+
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")
