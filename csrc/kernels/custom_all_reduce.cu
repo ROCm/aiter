@@ -31,7 +31,7 @@ fptr_t init_custom_ar(torch::Tensor& meta,
                       const std::vector<torch::Tensor>& handles,
                       const std::vector<int64_t>& offsets,
                       int64_t rank,
-                      bool full_nvlink)
+                      bool fully_connected)
 {
     int world_size = offsets.size();
     if(world_size > 8)
@@ -55,7 +55,7 @@ fptr_t init_custom_ar(torch::Tensor& meta,
                                                ipc_handles,
                                                offsets,
                                                rank,
-                                               full_nvlink);
+                                               fully_connected);
 }
 
 /**
@@ -129,32 +129,38 @@ void _all_reduce(
     }
 }
 
-void all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, bool open_fp8_quant)
+void all_reduce(fptr_t _fa,
+                torch::Tensor& inp,
+                torch::Tensor& out,
+                bool open_fp8_quant,
+                std::optional<torch::Tensor>& reg_buffer)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
     TORCH_CHECK_EQ(inp.numel(), out.numel());
-    _all_reduce(_fa, inp, out, stream, open_fp8_quant);
+
+    if(reg_buffer.has_value())
+    {
+        auto input_size = inp.numel() * inp.element_size();
+        TORCH_CHECK(input_size <= reg_buffer.value().numel() * reg_buffer.value().element_size(),
+                    "registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync(reg_buffer.value().data_ptr(),
+                                inp.data_ptr(),
+                                input_size,
+                                hipMemcpyDeviceToDevice,
+                                stream));
+        _all_reduce(_fa, reg_buffer.value(), out, stream, open_fp8_quant);
+    }
+    else
+    {
+        _all_reduce(_fa, inp, out, stream, open_fp8_quant);
+    }
+    
+
 }
 
-void all_reduce_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out)
-{
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-
-    auto input_size = inp.numel() * inp.element_size();
-    TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
-    TORCH_CHECK_EQ(inp.numel(), out.numel());
-    TORCH_CHECK(input_size <= reg_buffer.numel() * reg_buffer.element_size(),
-                "registered buffer is too small to contain the input");
-    HIP_CALL(hipMemcpyAsync(
-        reg_buffer.data_ptr(), inp.data_ptr(), input_size, hipMemcpyDeviceToDevice, stream));
-    _all_reduce(_fa, reg_buffer, out, stream, false);
-}
-
-void _all_gather(
-    fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, hipStream_t stream)
+void _all_gather(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     TORCH_CHECK(_is_weak_contiguous(out));
@@ -162,24 +168,24 @@ void _all_gather(
     {
     case at::ScalarType::Float: {
         fa->dispatchAllGather<float>(stream,
-                             reinterpret_cast<float*>(inp.data_ptr()),
-                             reinterpret_cast<float*>(out.data_ptr()),
-                             size);
+                                     reinterpret_cast<float*>(inp.data_ptr()),
+                                     reinterpret_cast<float*>(out.data_ptr()),
+                                     size);
         break;
     }
     case at::ScalarType::Half: {
         fa->dispatchAllGather<half>(stream,
-                            reinterpret_cast<half*>(inp.data_ptr()),
-                            reinterpret_cast<half*>(out.data_ptr()),
-                            size);
+                                    reinterpret_cast<half*>(inp.data_ptr()),
+                                    reinterpret_cast<half*>(out.data_ptr()),
+                                    size);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
         fa->dispatchAllGather<__hip_bfloat16>(stream,
-                                      reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
-                                      reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
-                                      size);
+                                              reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
+                                              reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
+                                              size);
         break;
     }
 #endif

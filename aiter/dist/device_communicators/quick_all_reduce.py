@@ -11,15 +11,26 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import aiter as ops
-from .parallel_state import in_the_same_node_as
+from ..parallel_state import in_the_same_node_as
 from aiter import logger
 
 logger = logging.getLogger(__name__)
 
 
+class QuickReduceRegime(Enum):
+    FP = 0
+    FP8 = 1
+    INT6 = 2
+    INT4 = 3
+    NONE = 4
+
+
 try:
-    ops.qr_max_size()
-    quick_ar = True
+    quick_ar = False
+    regime_str = os.environ.get("AITER_QUICK_REDUCE_QUANTIZATION", None)
+    if regime_str in QuickReduceRegime.__members__:
+        ops.qr_max_size()
+        quick_ar = True
 except Exception:
     # For CPUs and CUDA
     quick_ar = False
@@ -41,14 +52,6 @@ def is_weak_contiguous(inp: torch.Tensor):
         inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
         == inp.numel() * inp.element_size()
     )
-
-
-class QuickReduceRegime(Enum):
-    FP = 0
-    FP8 = 1
-    INT6 = 2
-    INT4 = 3
-    NONE = 4
 
 
 MB = 1024 * 1024
@@ -97,12 +100,6 @@ class QuickAllReduce:
             return
 
         if not quick_ar:
-            # disable because of missing quick reduce library
-            # e.g. in a cuda environment
-            logger.info(
-                "Custom quick allreduce is disabled because "
-                "of missing custom quick allreduce library"
-            )
             return
 
         self.group = group
