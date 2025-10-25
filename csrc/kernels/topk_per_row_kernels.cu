@@ -290,8 +290,7 @@ void topk_per_row(const torch::Tensor& logits,
     // The top-k width.
     static constexpr int kTopK = 2048; 
 
-    const hipStream_t stream = at::hi
-    p::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     aiter::topKPerRow<kNumThreadsPerBlock, kTopK>
         <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
