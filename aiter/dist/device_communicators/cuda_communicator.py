@@ -147,26 +147,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = ca_comm.custom_all_reduce(input_, ca_fp8_quant)
             assert out is not None
             return out
-        # symm_mem_comm = self.symm_mem_comm
-        # if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
-        #     out = symm_mem_comm.all_reduce(input_)
-        #     assert out is not None
-        #     return out
-        # pynccl_comm = self.pynccl_comm
-        # if pynccl_comm is None or pynccl_comm.disabled:
-        #     out = input_.clone()
-        #     torch.distributed.all_reduce(out, group=self.device_group)
-        #     return out
-        # assert pynccl_comm is not None
-        # out = pynccl_comm.all_reduce(input_)
-        # if out is None:
-        #     # fall back to the default all-reduce using PyTorch.
-        #     # this usually happens during testing.
-        #     # when we run the model, allreduce only happens for the TP
-        #     # group, where we always have either custom allreduce or pynccl.
-        #     out = input_.clone()
-        #     torch.distributed.all_reduce(out, group=self.device_group)
-        # return out
+        symm_mem_comm = self.symm_mem_comm
+        if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
+            out = symm_mem_comm.all_reduce(input_)
+            assert out is not None
+            return out
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            out = input_.clone()
+            torch.distributed.all_reduce(out, group=self.device_group)
+            return out
+        assert pynccl_comm is not None
+        out = pynccl_comm.all_reduce(input_)
+        if out is None:
+            # fall back to the default all-reduce using PyTorch.
+            # this usually happens during testing.
+            # when we run the model, allreduce only happens for the TP
+            # group, where we always have either custom allreduce or pynccl.
+            out = input_.clone()
+            torch.distributed.all_reduce(out, group=self.device_group)
+        return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
