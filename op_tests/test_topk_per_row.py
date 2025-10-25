@@ -107,15 +107,15 @@ def test_top_k_per_row(num_rows: int) -> None:
 
     # Run the kernel
     aiter.topk_per_row(
-            logits,
-            row_starts,
-            row_ends,
-            indices,
-            values,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1)
-        )
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        values,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+    )
 
     # Run reference implementation
     torch_values, torch_indices = logits.topk(min(top_k, max(row_ends)), dim=-1)

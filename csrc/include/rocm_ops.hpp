@@ -1178,12 +1178,12 @@
           py::arg("mat1"),                                                         \
           py::arg("mat2"),                                                         \
           py::arg("solution_index"),                                               \
-          py::arg("bias")      = std::nullopt,                                     \
-          py::arg("out_dtype") = std::nullopt,                                     \
-          py::arg("scaleA")    = std::nullopt,                                     \
-          py::arg("scaleB")    = std::nullopt,                                     \
-          py::arg("scaleOut")  = std::nullopt,                                      \
-          py::arg("bpreshuffle")  = std::nullopt);                                     \
+          py::arg("bias")        = std::nullopt,                                   \
+          py::arg("out_dtype")   = std::nullopt,                                   \
+          py::arg("scaleA")      = std::nullopt,                                   \
+          py::arg("scaleB")      = std::nullopt,                                   \
+          py::arg("scaleOut")    = std::nullopt,                                   \
+          py::arg("bpreshuffle") = std::nullopt);                                  \
     m.def("hipb_findallsols",                                                      \
           &hipb_findallsols,                                                       \
           "hipb_findallsols",                                                      \
@@ -1221,14 +1221,14 @@
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
 
-#define TOPK_PER_ROW_PYBIND                              \
-      m.def("topk_per_row",                              \
-            &topk_per_row,                               \
-            py::arg("logits"),                           \
-            py::arg("rowStarts"),                        \
-            py::arg("rowEnds"),                          \
-            py::arg("indices"),                          \
-            py::arg("values"),                           \
-            py::arg("numRows"),                          \
-            py::arg("stride0"),                          \
-            py::arg("stride1"));
+#define TOPK_PER_ROW_PYBIND     \
+    m.def("topk_per_row",       \
+          &topk_per_row,        \
+          py::arg("logits"),    \
+          py::arg("rowStarts"), \
+          py::arg("rowEnds"),   \
+          py::arg("indices"),   \
+          py::arg("values"),    \
+          py::arg("numRows"),   \
+          py::arg("stride0"),   \
+          py::arg("stride1"));
