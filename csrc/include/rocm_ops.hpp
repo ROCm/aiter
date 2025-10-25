@@ -1232,4 +1232,3 @@
             py::arg("numRows"),                          \
             py::arg("stride0"),                          \
             py::arg("stride1"));
-

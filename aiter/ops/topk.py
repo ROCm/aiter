@@ -194,3 +194,16 @@ def grouped_topk_torch(
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
+
+
+@compile_ops("module_topk_per_row")
+def topk_per_row(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+) -> None: ...
