@@ -27,7 +27,7 @@ def _bwd_preprocess(
     delta_ptr,
     # Strides
     stride_o_b, stride_o_h, stride_o_m, stride_o_k,
-    stride_delta_b, stride_delta_h, stride_deltam,
+    stride_delta_b, stride_delta_h, stride_delta_m,
     # Configurations
     cu_seqlens_q,
     max_seqlen_q,
@@ -269,7 +269,7 @@ def _bwd_kernel_dkdvdq_causal(
     stride_v_b_in, stride_v_h_in, stride_v_n_in, stride_v_k_in,
     stride_dk_b_in, stride_dk_h_in, stride_dk_n_in, stride_dk_k_in,
     stride_dq_b_in, stride_dq_h_in, stride_dq_m_in, stride_dq_k_in,
-    stride_delta_b_in, stride_delta_h_in, stride_deltam_in,
+    stride_delta_b_in, stride_delta_h_in, stride_delta_m_in,
     stride_do_b_in, stride_do_h_in, stride_do_m_in, stride_do_k_in,
     stride_dropout_b_in, stride_dropout_h_in, stride_dropout_m_in, stride_dropout_n_in,
     # Configurations
@@ -512,7 +512,7 @@ def _bwd_kernel_dkdvdq_causal(
         stride_dq_m, stride_dq_k,  # strides for dq
         stride_do_m, stride_do_k,  # strides for do
         stride_dropout_m, stride_dropout_n,  # strides for dropout
-        stride_deltam,
+        stride_delta_m,
         # Configurations
         sm_scale,
         dropout_p,
@@ -548,7 +548,7 @@ def _bwd_kernel_dkdvdq_causal(
         stride_dq_m, stride_dq_k,  # strides for q
         stride_do_m, stride_do_k,  # strides for o
         stride_dropout_m, stride_dropout_n,  # strides for dropout
-        stride_deltam,
+        stride_delta_m,
         # Configurations
         sm_scale,
         dropout_p,
