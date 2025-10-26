@@ -10,6 +10,7 @@ from aiter.test_common import (
     perftest,
 )
 from aiter import dtypes, get_gfx
+from aiter.ops.triton.topk import topk as triton_topk
 import pandas as pd
 import argparse
 
@@ -34,6 +35,39 @@ def test_topk(
     for b in range(batch_size):
         x[b] = x[b, torch.randperm(hiddensize)]
 
+
+    (ref_value, ref_index), us_ref = run_perftest(
+        torch.topk,
+        x,
+        topk,
+        largest=largest,
+        num_iters=1000,
+        num_warmup=100,
+    )
+
+    (res_triton_value, res_triton_index), us_triton = run_perftest(
+        torch.topk,
+        x,
+        topk,
+        largest=largest,
+        num_iters=1000,
+        num_warmup=100,
+
+    )
+
+    id_ref, _ref = torch.sort(ref_index)
+    id_triton, _triton = torch.sort(res_triton_index)
+    err = checkAllclose(
+        ref_value.gather(1, _ref),
+        res_triton_value.gather(1, _triton),
+        msg="topk_values [golden vs triton]",
+    )
+    checkAllclose(
+        id_ref,
+        id_triton,
+        msg=f"topk_ids     [golden vs triton]:{us_ref:>8.2f} us vs {us_triton:>8.2f} us......",
+    )
+
     _, us_aiter = run_perftest(
         aiter.topk_plain,
         x,
@@ -41,7 +75,7 @@ def test_topk(
         topk,
         largest,
     )
-    
+
     err = 0
     return {"err": err, "us": us_aiter}
 
@@ -49,7 +83,7 @@ def test_topk(
 # DIM2 = [16, 128256]
 # K = [2, 8]
 
-batch_size = 400
+batch_size = 1000
 hiddensize = 100000
 topk = 64
 largest = True
