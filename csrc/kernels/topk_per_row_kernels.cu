@@ -108,7 +108,8 @@ __device__ void topk_per_row_kernel(const float* logits,
     // Fetch elements one-by-one.
     for(int rowIt = rowStart + threadIdx.x; rowIt < rowEnd; rowIt += kNumThreadsPerBlock)
     {
-        uint16_t idx = extractBinIdx(logits[rowIdx * stride0 + rowIt * stride1]);
+        int64_t offset = ((int64_t)rowIdx) * stride0 + ((int64_t)rowIt) * stride1;
+        uint16_t idx   = extractBinIdx(logits[offset]);
         atomicAdd(&smemHistogram[idx], 1);
     }
 
@@ -163,8 +164,9 @@ __device__ void topk_per_row_kernel(const float* logits,
     // Fetch elements one-by-one and populate the shared memory buffers.
     for(int rowIt = rowStart + threadIdx.x; rowIt < rowEnd; rowIt += kNumThreadsPerBlock)
     {
-        float logit  = logits[rowIdx * stride0 + rowIt * stride1];
-        uint16_t idx = extractBinIdx(logit);
+        int64_t offset = ((int64_t)rowIdx) * stride0 + ((int64_t)rowIt) * stride1;
+        float logit    = logits[offset];
+        uint16_t idx   = extractBinIdx(logit);
         if(idx < thresholdBinIdx)
         {
             int dstIdx          = atomicAdd(&smemHistogram[idx], 1);

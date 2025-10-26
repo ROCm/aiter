@@ -1,8 +1,10 @@
 import argparse
-import torch
-import aiter
+
 import numpy as np
 import pandas as pd
+import torch
+
+import aiter
 from aiter.test_common import benchmark, perftest
 
 
@@ -27,7 +29,7 @@ def create_row_boundaries(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Create row start and end indices for testing."""
     row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
-    row_ends = torch.arange(1, num_rows + 1, device="cuda", dtype=torch.int32) * 128
+    row_ends = torch.arange(1, num_rows + 1, device="cuda", dtype=torch.int32)
     return row_starts, row_ends
 
 
@@ -113,7 +115,7 @@ def run_topk_per_row(
 
 
 @benchmark()
-def test_top_k_per_row(num_rows: int, top_k: int) -> None:
+def test_top_k_per_row(num_rows: int, top_k: int) -> dict:
     """
     Test top_k_per_row.
     """
@@ -128,7 +130,7 @@ def test_top_k_per_row(num_rows: int, top_k: int) -> None:
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
 
     # Run the kernel
-    output, us = run_topk_per_row(
+    _, us = run_topk_per_row(
         logits,
         row_starts,
         row_ends,
@@ -162,38 +164,32 @@ parser = argparse.ArgumentParser(
     description="config input of test",
 )
 parser.add_argument(
-    "-n",
+    "-m",
     "--num_rows",
     type=int,
-    default=None,
+    default=[8, 16, 32, 64, 128, 1024, 16384, 65536, 90000, 128000],
+    nargs="+",
     help="""number of rows.
-    e.g.: -n 64""",
+    e.g.: -m 64""",
 )
 
 parser.add_argument(
     "-k",
     "--top_k",
     type=int,
-    default=None,
+    default=[2048],
+    nargs="+",
     help="""top-k elements per row.
     e.g.: -k 2048""",
 )
 
 args = parser.parse_args()
-if args.num_rows is None:
-    num_rows = [8, 16, 32, 64, 128, 256, 512, 768, 1024]
-else:
-    num_rows = [args.num_rows]
 
-if args.top_k is not None:
-    top_k = [args.top_k]
-else:
-    top_k = [2048]
 
 df = []
-for n in num_rows:
-    for k in top_k:
-        ret = test_top_k_per_row(n, k)
+for m in args.num_rows:
+    for k in args.top_k:
+        ret = test_top_k_per_row(m, k)
         df.append(ret)
 
 df = pd.DataFrame(df)
