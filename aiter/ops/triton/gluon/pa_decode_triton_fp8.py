@@ -3,6 +3,7 @@
 
 import math
 from typing import Optional
+import hashlib
 
 import triton
 import triton.language as tl
@@ -203,7 +204,7 @@ def pa_decode_v2_big_blk_fp8(
         alibi_slope = tl.zeros([QUERY_GRP_SZ_POW2], dtype=tl.float32)
     else:
         alibi_slope = tl.load(
-            alibi_slopes + kv_head_idx * QUERY_GRP_SZ + q_grp_offs,
+            alibi_slopes + kv_head_idx * Q_SEQ_LEN * QUERY_GRP_SZ + q_grp_offs,
             mask=q_grp_offs < QUERY_GRP_SZ,
             other=0.0,
         )
@@ -217,8 +218,8 @@ def pa_decode_v2_big_blk_fp8(
 
     # load q[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     q_offs = (
-        seq_idx * Q_SEQ_LEN * stride_q_s
-        + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs[:, None]) * stride_q_nh
+        seq_idx * stride_q_s
+        + (kv_head_idx * Q_SEQ_LEN * QUERY_GRP_SZ + q_grp_offs[:, None]) * stride_q_nh
         + head_sz_offs[None, :]
     )
     q_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_sz_offs[None, :] < HEAD_SZ)
@@ -227,7 +228,7 @@ def pa_decode_v2_big_blk_fp8(
     q_scale_offs = None
     if q0.dtype.is_fp8():
         # [QUERY_GRP_SZ_POW2]
-        q_scale_offs = seq_idx * Q_SEQ_LEN * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + q_grp_offs
+        q_scale_offs = seq_idx * q_scale_stride0 + kv_head_idx * Q_SEQ_LEN * QUERY_GRP_SZ + q_grp_offs
         q_scale_val = tl.load(q_scale + q_scale_offs, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
         # q_scale_val = tl.load(q_scale + q_scale_offs)
         q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
@@ -238,26 +239,26 @@ def pa_decode_v2_big_blk_fp8(
     q3 = q0
     if Q_SEQ_LEN >= 2:
         qid = 1
-        q1 = tl.load(q_ptr + q_offs + qid * stride_q_s, mask=q_mask, other=0.0)
+        q1 = tl.load(q_ptr + q_offs + qid * QUERY_GRP_SZ * stride_q_nh, mask=q_mask, other=0.0)
         if q1.dtype.is_fp8():
             # [QUERY_GRP_SZ_POW2]
-            q_scale_val = tl.load(q_scale + q_scale_offs + qid * q_scale_stride0, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
+            q_scale_val = tl.load(q_scale + q_scale_offs + qid * QUERY_GRP_SZ, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
             q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
             q1 = q_scale_val * q1.to(tl.float32)
     elif Q_SEQ_LEN >= 3:
         qid = 2
-        q2 = tl.load(q_ptr + q_offs + qid * stride_q_s, mask=q_mask, other=0.0)
+        q2 = tl.load(q_ptr + q_offs + qid * QUERY_GRP_SZ * stride_q_nh, mask=q_mask, other=0.0)
         if q2.dtype.is_fp8():
             # [QUERY_GRP_SZ_POW2]
-            q_scale_val = tl.load(q_scale + q_scale_offs + qid * q_scale_stride0, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
+            q_scale_val = tl.load(q_scale + q_scale_offs + qid * QUERY_GRP_SZ, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
             q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
             q2 = q_scale_val * q2.to(tl.float32)
     elif Q_SEQ_LEN >= 4:
         qid = 3
-        q3 = tl.load(q_ptr + q_offs + qid * stride_q_s, mask=q_mask, other=0.0)
+        q3 = tl.load(q_ptr + q_offs + qid * QUERY_GRP_SZ * stride_q_nh, mask=q_mask, other=0.0)
         if q3.dtype.is_fp8():
             # [QUERY_GRP_SZ_POW2]
-            q_scale_val = tl.load(q_scale + q_scale_offs + qid * q_scale_stride0, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
+            q_scale_val = tl.load(q_scale + q_scale_offs + qid * QUERY_GRP_SZ, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
             q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
             q3 = q_scale_val * q3.to(tl.float32)
 
@@ -592,7 +593,7 @@ def pa_decode_v2_fp8(
         alibi_slope = tl.zeros([QUERY_GRP_SZ_POW2], dtype=tl.float32)
     else:
         alibi_slope = tl.load(
-            alibi_slopes + kv_head_idx * QUERY_GRP_SZ + q_grp_offs,
+            alibi_slopes + kv_head_idx * Q_SEQ_LEN * QUERY_GRP_SZ + q_grp_offs,
             mask=q_grp_offs < QUERY_GRP_SZ,
             other=0.0,
         )
@@ -607,14 +608,14 @@ def pa_decode_v2_fp8(
 
     # load q[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     q_offs = (
-        seq_idx * Q_SEQ_LEN * stride_q_s
-        + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs[:, None]) * stride_q_nh
+        seq_idx * stride_q_s
+        + (kv_head_idx * Q_SEQ_LEN * QUERY_GRP_SZ + q_grp_offs[:, None]) * stride_q_nh
         + head_sz_offs[None, :]
     )
     q_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_sz_offs[None, :] < HEAD_SZ)
     q0 = tl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
 
-    q_scale_offs = seq_idx * Q_SEQ_LEN * q_scale_stride0 + kv_head_idx * QUERY_GRP_SZ + q_grp_offs
+    q_scale_offs = seq_idx * q_scale_stride0 + kv_head_idx * Q_SEQ_LEN * QUERY_GRP_SZ + q_grp_offs
     if q0.dtype.is_fp8():
         # [QUERY_GRP_SZ_POW2]
         q_scale_val = tl.load(q_scale + q_scale_offs, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
@@ -627,26 +628,26 @@ def pa_decode_v2_fp8(
     q3 = q0
     if Q_SEQ_LEN >= 2:
         qid = 1
-        q1 = tl.load(q_ptr + q_offs + qid * stride_q_s, mask=q_mask, other=0.0)
+        q1 = tl.load(q_ptr + q_offs + qid * QUERY_GRP_SZ * stride_q_nh, mask=q_mask, other=0.0)
         if q1.dtype.is_fp8():
             # [QUERY_GRP_SZ_POW2]
-            q_scale_val = tl.load(q_scale + q_scale_offs + qid * q_scale_stride0, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
+            q_scale_val = tl.load(q_scale + q_scale_offs + qid * QUERY_GRP_SZ, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
             q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
             q1 = q_scale_val * q1.to(tl.float32)
     elif Q_SEQ_LEN >= 3:
         qid = 2
-        q2 = tl.load(q_ptr + q_offs + qid * stride_q_s, mask=q_mask, other=0.0)
+        q2 = tl.load(q_ptr + q_offs + qid * QUERY_GRP_SZ * stride_q_nh, mask=q_mask, other=0.0)
         if q2.dtype.is_fp8():
             # [QUERY_GRP_SZ_POW2]
-            q_scale_val = tl.load(q_scale + q_scale_offs + qid * q_scale_stride0, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
+            q_scale_val = tl.load(q_scale + q_scale_offs + qid * QUERY_GRP_SZ, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
             q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
             q2 = q_scale_val * q2.to(tl.float32)
     elif Q_SEQ_LEN >= 4:
         qid = 3
-        q3 = tl.load(q_ptr + q_offs + qid * stride_q_s, mask=q_mask, other=0.0)
+        q3 = tl.load(q_ptr + q_offs + qid * QUERY_GRP_SZ * stride_q_nh, mask=q_mask, other=0.0)
         if q3.dtype.is_fp8():
             # [QUERY_GRP_SZ_POW2]
-            q_scale_val = tl.load(q_scale + q_scale_offs + qid * q_scale_stride0, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
+            q_scale_val = tl.load(q_scale + q_scale_offs + qid * QUERY_GRP_SZ, mask=q_grp_offs < QUERY_GRP_SZ, other=0.0)
             q_scale_val = tl.broadcast_to(q_scale_val[:, None], QUERY_GRP_SZ_POW2, HEAD_SZ_POW2)
             q3 = q_scale_val * q3.to(tl.float32)
 
@@ -1217,6 +1218,7 @@ def paged_attention_decode(
     seq_lens: torch.Tensor,     # [num_seqs]
     block_tables: torch.Tensor, # [num_seqs, max_num_blks_per_seq]
     attn_scale: float,
+    q_seq_len: int,
     max_seq_len: int,
     compute_type,
     q_scale: torch.Tensor,      # [num_seqs, num_kv_heads * query_grp_sz, 1]
@@ -1231,10 +1233,9 @@ def paged_attention_decode(
     batch_size = block_tables.shape[0]
     num_seqs = query.shape[0]
     num_q_heads = query.shape[1]
+    num_q_heads = num_q_heads // q_seq_len
     num_kv_heads = key_cache.shape[1]
-    q_seq_len = num_seqs // batch_size
     max_num_partitions = int((max_seq_len + _SEQ_PARTITION_SIZE - 1) // _SEQ_PARTITION_SIZE)
-    num_q_heads = query.shape[1]
     head_sz = query.shape[-1]
     kv_blk_sz = key_cache.shape[-2]
     query_grp_sz = num_q_heads // num_kv_heads
@@ -1243,12 +1244,11 @@ def paged_attention_decode(
     kv_blk_sz_pow2 = triton.next_power_of_2(kv_blk_sz)
     head_sz_pow2 = triton.next_power_of_2(head_sz)
     is_causal = q_seq_len > 1
-    # is_causal = False
     num_seqs = batch_size
     kv_16b_ele_num = 16 // key_cache.dtype.itemsize
 
     grid = (num_seqs, num_kv_heads, max_num_partitions)
-    shape_info = (num_seqs, num_kv_heads, max_num_partitions, q_seq_len * query_grp_sz)
+    shape_info = (num_seqs, num_kv_heads, max_num_partitions, equi_query_grp_sz)
     max_logits = torch.zeros(shape_info, dtype=torch.float32, device=output.device)
     exp_sums = torch.zeros(shape_info, dtype=torch.float32, device=output.device)
     # tmp_output = torch.empty(
@@ -1272,9 +1272,6 @@ def paged_attention_decode(
         trans_v = False
     else:
         raise RuntimeError(f"Do not support such value_cache shape:{value_cache.shape}")
-
-    output = output.reshape(batch_size, q_seq_len, num_kv_heads, query_grp_sz, head_sz)
-    output = output.transpose(1, 2).reshape(batch_size, num_kv_heads * q_seq_len * query_grp_sz, head_sz).contiguous()
 
     # print(f"shape_info={shape_info}")
     # print(f"query.shape={query.shape}")
@@ -1383,11 +1380,9 @@ def paged_attention_decode(
         MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
         MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
     )
-    output = output.reshape(batch_size, num_kv_heads, q_seq_len, query_grp_sz, head_sz)
-    output = output.transpose(1, 2).reshape(batch_size * q_seq_len, num_kv_heads * query_grp_sz, head_sz).contiguous()
 
-    tmp_output_nan_cnt = torch.isnan(tmp_output).sum()
-    output_nan_cnt = torch.isnan(output).sum()
+    # tmp_output_nan_cnt = torch.isnan(tmp_output).sum()
+    # output_nan_cnt = torch.isnan(output).sum()
     # print(f"tmp_output_nan_cnt={tmp_output_nan_cnt}")
     # print(f"output_nan_cnt={output_nan_cnt}")
 
