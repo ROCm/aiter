@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 // #ifdef __gfx908__
 // // Uncomment ifdef and endif only if you need to undef the HIP_HALF ops below
 // just for gfx908 and not for others
@@ -46,11 +46,11 @@
 
 namespace
 {
-  /*thread_local*/ cudaStream_t weight_stream;
+  /*thread_local*/ hipStream_t weight_stream;
   // BUG: DLM has event and stream on different devices error
   // In multi-GPU scenerio, do names defined in this namespace exist on all
   // devices? C++ keyword: thread_local <- maybe this can help?
-  /*thread_local*/ cudaEvent_t event;
+  /*thread_local*/ hipEvent_t event;
 
   // hipBLASLt
   hipblasLtHandle_t hipblaslt_handle;
@@ -235,20 +235,25 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matA, intype, k, m, lda));
   }
-  if (bpreshuffle) 
-  {
-    hipblasLtOrder_t orderA;
-    if (scaleA != nullptr)
+  #if (HIPBLASLT_VERSION_MAJOR >= 1) || (HIPBLASLT_VERSION_MAJOR == 0 && HIPBLASLT_VERSION_MINOR >= 15)
+    if (bpreshuffle) 
     {
-        orderA = HIPBLASLT_ORDER_COL16_4R16;
+        hipblasLtOrder_t orderA;
+        if (scaleA != nullptr)
+            orderA = HIPBLASLT_ORDER_COL16_4R16;
+        else
+            orderA = HIPBLASLT_ORDER_COL16_4R8;
+
+        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutSetAttribute(
+            matA, HIPBLASLT_MATRIX_LAYOUT_ORDER, &orderA, sizeof(orderA)));
     }
-    else
-    {
-        orderA = HIPBLASLT_ORDER_COL16_4R8;
-    }
-    CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutSetAttribute(
-        matA, HIPBLASLT_MATRIX_LAYOUT_ORDER, &orderA, sizeof(orderA)));
-  }  
+  #else
+      if (bpreshuffle)
+      {
+          std::cerr << "Warning: hipblasLt version lower than 0.15 does not support "
+                      "bpreshuffle. Please upgrade hipblasLt." << std::endl;
+      }
+  #endif
   if (op_B == HIPBLAS_OP_N)
   {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, k, n, ldb));
@@ -299,9 +304,9 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
   if (solution_index < 0)
   {
     // nvtxRangePushA("hipblasLtMatmulAlgoGetHeuristic");
-    std::cout
-        << "Warning! HipbSolId Gemm Fallback Path used for solution index <0"
-        << std::endl;
+    // std::cout
+    //     << "Warning! HipbSolId Gemm Fallback Path used for solution index <0"
+    //     << std::endl;
     if (cout_print)
     {
       std::cout << (op_A == HIPBLAS_OP_N ? "N" : "T")

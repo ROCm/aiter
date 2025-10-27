@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from aiter import dtypes
 from aiter.test_common import perftest
+from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
 from aiter.utility.base_tuner import GemmCommonTuner
 from gemm_a8w8_blockscale_common import kernels_list
 import argparse
@@ -73,7 +74,7 @@ def generate_data(m, n, k, seed, device="cuda"):
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         "verbose": False,
-        "tune_file": "aiter/configs/a8w8_blockscale_tuned_gemm.csv",
+        "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}",
         "untune_file": "aiter/configs/a8w8_blockscale_untuned_gemm.csv",
         "errRatio": 0.05,
         "batch": 100,
@@ -113,51 +114,46 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
             kernels_num = len(kernels_list)
-            if tunedf[
-                (tunedf["M"] == M)
-                & (tunedf["N"] == N)
-                & (tunedf["K"] == K)
-                & (tunedf["cu_num"] == cu_num)
-            ].empty:
-                seed = seed + 1
-                total_kernel_nums = 0
-                for i in range(kernels_num):
-                    kernel = kernels_list[i]
-                    maxsplitK = (
-                        aiter.compute_gemm_SplitK(
-                            M,
-                            N,
-                            K,
-                            kernel.MPerBLOCK,
-                            kernel.NPerBLOCK,
-                            kernel.KPerBLOCK,
-                        )
-                        if useSplitK
-                        else 0
+
+            seed = seed + 1
+            total_kernel_nums = 0
+            for i in range(kernels_num):
+                kernel = kernels_list[i]
+                maxsplitK = (
+                    aiter.compute_gemm_SplitK(
+                        M,
+                        N,
+                        K,
+                        kernel.MPerBLOCK,
+                        kernel.NPerBLOCK,
+                        kernel.KPerBLOCK,
                     )
-                    for splitK in range(maxsplitK + 1):
-                        info = ((cu_num, M, N, K), i, splitK, "")
-                        task.append(
+                    if useSplitK
+                    else 0
+                )
+                for splitK in range(maxsplitK + 1):
+                    info = ((cu_num, M, N, K), i, splitK, "")
+                    task.append(
+                        (
+                            info,
+                            generate_data,
+                            (M, N, K, seed),
+                            run_gemm_a8w8_blockscale,
                             (
-                                info,
-                                generate_data,
-                                (M, N, K, seed),
-                                run_gemm_a8w8_blockscale,
-                                (
-                                    gemm_a8w8_data_idx,
-                                    i,
-                                    splitK,
-                                ),
-                                {},
-                                run_torch,
-                                (ref_data_idx, None, dtypes.bf16),
-                                {},
-                                None,
-                                1e-2,
-                                0.1,
-                            )
+                                gemm_a8w8_data_idx,
+                                i,
+                                splitK,
+                            ),
+                            {},
+                            run_torch,
+                            (ref_data_idx, None, dtypes.bf16),
+                            {},
+                            None,
+                            1e-2,
+                            0.1,
                         )
-                        total_kernel_nums = total_kernel_nums + 1
+                    )
+                    total_kernel_nums = total_kernel_nums + 1
 
                 tasks_data.append((total_kernel_nums, ()))
         ret = []
