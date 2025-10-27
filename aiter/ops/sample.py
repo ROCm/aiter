@@ -36,6 +36,16 @@ def random_sample(
 
 
 @compile_ops("module_sample")
+def mixed_sample_outer_exponential(
+    out: Tensor,
+    input: Tensor,
+    exponentials: Tensor,
+    temperatures: Tensor,
+    eps: float = 1e-10,
+) -> None: ...
+
+
+@compile_ops("module_sample")
 def mixed_sample(
     out: Tensor,
     input: Tensor,

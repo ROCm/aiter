@@ -28,6 +28,7 @@ __device__ void random_sample_outer_exponential_impl(const DTYPE_I* input,
                                                      int m_idx,
                                                      int N,
                                                      int stride_M,
+                                                     int exponentials_stride0,
                                                      float eps)
 {
     static constexpr int32_t vec_size_i = VecSize;
@@ -37,8 +38,8 @@ __device__ void random_sample_outer_exponential_impl(const DTYPE_I* input,
     static constexpr int32_t ooba_i     = 4 / sizeof(DTYPE_I);
     const int32_t oob_i                 = (N + ooba_i - 1) / ooba_i * ooba_i;
     auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_i, oob_i);
-    auto buffer_e =
-        ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(exponentials + m_idx * N, N);
+    auto buffer_e = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(
+        exponentials + m_idx * exponentials_stride0, N);
     buffer_i.init_raw();
     buffer_e.init_raw();
 
@@ -369,12 +370,13 @@ __global__ void random_sample_outer_exponential_kernel(const DTYPE_I* input,
                                                        int* output,
                                                        int N,
                                                        int stride_M,
+                                                       int exponentials_stride0,
                                                        float eps)
 {
     int m_idx         = blockIdx.x;
     float temperature = temperatures[m_idx];
     random_sample_outer_exponential_impl<DTYPE_I, BlockSize, WarpSize, VecSize, NeedSum>(
-        input, exponentials, output, temperature, m_idx, N, stride_M, eps);
+        input, exponentials, output, temperature, m_idx, N, stride_M, exponentials_stride0, eps);
 }
 
 template <typename DTYPE_I,
@@ -408,6 +410,41 @@ __global__ void random_sample_kernel(const DTYPE_I* input,
                                                                        dist_func,
                                                                        transform_func,
                                                                        eps);
+}
+
+template <typename DTYPE_I,
+          int BlockSize = 256,
+          int WarpSize  = 64,
+          int VecSize   = 4,
+          bool NeedSum  = false>
+__global__ void mix_sample_outer_exponential_kernel(const DTYPE_I* input,
+                                                    const float* exponentials,
+                                                    const float* temperatures,
+                                                    int* output,
+                                                    int N,
+                                                    int stride_M,
+                                                    int exponentials_stride0,
+                                                    float eps)
+{
+    int m_idx         = blockIdx.x;
+    float temperature = temperatures[m_idx];
+    if(temperature == 0.0f)
+    {
+        argmax_impl<DTYPE_I, BlockSize, WarpSize, VecSize>(input, output, m_idx, N, stride_M);
+    }
+    else
+    {
+        random_sample_outer_exponential_impl<DTYPE_I, BlockSize, WarpSize, VecSize, NeedSum>(
+            input,
+            exponentials,
+            output,
+            temperature,
+            m_idx,
+            N,
+            stride_M,
+            exponentials_stride0,
+            eps);
+    }
 }
 
 template <typename DTYPE_I,
@@ -480,13 +517,14 @@ void random_sample_outer_exponential(torch::Tensor& out,
                                      torch::Tensor& temperatures,
                                      float eps = 1e-10)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    int M         = input.size(0);
-    int N         = input.size(1);
-    int stride_M  = input.stride(0);
-    int64_t numel = input.numel();
+    int M                    = input.size(0);
+    int N                    = input.size(1);
+    int stride_M             = input.stride(0);
+    int64_t numel            = input.numel();
+    int exponentials_stride0 = exponentials.stride(0);
     if(numel == 0)
     {
         return;
@@ -509,6 +547,44 @@ void random_sample_outer_exponential(torch::Tensor& out,
                               out.data_ptr<int>(),
                               N,
                               stride_M,
+                              exponentials_stride0,
+                              eps);
+    });
+}
+
+void mixed_sample_outer_exponential(torch::Tensor& out,
+                                    torch::Tensor& input,
+                                    torch::Tensor& exponentials,
+                                    torch::Tensor& temperatures,
+                                    float eps = 1e-10)
+{
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    int M                    = input.size(0);
+    int N                    = input.size(1);
+    int stride_M             = input.stride(0);
+    int exponentials_stride0 = exponentials.stride(0);
+    int64_t numel            = input.numel();
+    if(numel == 0)
+    {
+        return;
+    }
+    const int unroll_factor   = sizeof(float4) / sizeof(float);
+    const uint32_t block_size = 1024;
+    dim3 grid(M);
+    dim3 block(block_size);
+
+    VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "mix_sample_outer_exponential", [&] {
+        using input_dtype = typename t2ck<scalar_t>::type;
+        mix_sample_outer_exponential_kernel<input_dtype, block_size, warpSize, unroll_factor, true>
+            <<<grid, block>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
+                              exponentials.data_ptr<float>(),
+                              temperatures.data_ptr<float>(),
+                              out.data_ptr<int>(),
+                              N,
+                              stride_M,
+                              exponentials_stride0,
                               eps);
     });
 }

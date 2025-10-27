@@ -237,18 +237,19 @@
           py::arg("slot_mapping"),                                                  \
           py::arg("asm_layout"),                                                    \
           py::arg("ori_block_size") = 128);                                         \
-      m.def("concat_and_cache_mla", &aiter::concat_and_cache_mla,                   \
-            "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"                        \
-      "                     Tensor! kv_cache,"                                      \
-      "                     Tensor slot_mapping,"                                   \
-      "                     str kv_cache_dtype,"                                    \
-      "                     Tensor scale) -> ()",                                   \
-          py::arg("kv_c"),                                                        \
+    m.def("concat_and_cache_mla",                                                   \
+          &aiter::concat_and_cache_mla,                                             \
+          "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"                          \
+          "                     Tensor! kv_cache,"                                  \
+          "                     Tensor slot_mapping,"                               \
+          "                     str kv_cache_dtype,"                                \
+          "                     Tensor scale) -> ()",                               \
+          py::arg("kv_c"),                                                          \
           py::arg("k_pe"),                                                          \
           py::arg("kv_cache"),                                                      \
           py::arg("slot_mapping"),                                                  \
           py::arg("kv_cache_dtype"),                                                \
-          py::arg("scale"));                                                        \
+          py::arg("scale"));
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
     m.def("init_custom_ar",                                                                    \
@@ -1139,6 +1140,13 @@
           py::arg("lambd")     = 1.0,                                                \
           py::arg("generator") = std::nullopt,                                       \
           py::arg("eps")       = 1e-10);                                                   \
+    m.def("mixed_sample_outer_exponential",                                          \
+          &aiter::mixed_sample_outer_exponential,                                    \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("exponentials"),                                                   \
+          py::arg("temperature"),                                                    \
+          py::arg("eps") = 1e-10);                                                   \
     m.def("mixed_sample",                                                            \
           &aiter::mixed_sample,                                                      \
           py::arg("out"),                                                            \
