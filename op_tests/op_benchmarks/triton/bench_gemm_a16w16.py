@@ -6,7 +6,7 @@ import math
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm_a16w16_silu_fused import gemm_a16w16_silu_fused
 from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
-from op_tests.triton_tests.test_gemm_a16w16 import generate_gemm_a16w16_inputs
+from op_tests.triton_tests.test_gemm_a16w16 import generate_gemm_a16w16_inputs, generate_gemm_a16w16_silu_fused_inputs
 from aiter.ops.triton.gemm_a16w16 import _get_config
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
@@ -27,9 +27,14 @@ def bench_gemm_fn(
     assert not (atomic and silu_fused), "Both 'atomic' and 'silu_fused' cannot be True at the same time."
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
-    x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
-        M, N, K, c_dtype, layout=layout, output=True, bias=True
-    )
+    if silu_fused:
+        x, w, bias, out_dtype, y = generate_gemm_a16w16_silu_fused_inputs(
+            M, N, K, c_dtype, output=True, bias=True
+        )
+    else:
+        x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
+            M, N, K, c_dtype, layout=layout, output=True, bias=True
+        )
     # flops
     flops = 2.0 * M * N * K
     # memory transfer

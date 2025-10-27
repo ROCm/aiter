@@ -182,7 +182,7 @@ def _gemm_a16_w16_kernel_silu_fused(
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    pid = remap_xcd(pid, num_pid_m * num_pid_n)
+    # pid = remap_xcd(pid, num_pid_m * num_pid_n)
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 
     BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
@@ -227,32 +227,30 @@ def _gemm_a16_w16_kernel_silu_fused(
         silu_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=acc_dtype)
         mul_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=acc_dtype)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the K dimension.
-        # If it is out of bounds, set it to 0.
-        
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):        
+        # pipeline silu and mul accs
         if EVEN_K:
             a = tl.load(a_ptrs)
-            b_i0 = tl.load(b_ptrs_i0, cache_modifier=cache_modifier)
+            b = tl.load(b_ptrs_i0, cache_modifier=cache_modifier)
         else:
             a = tl.load(
                 a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
             )
-            b_i0 = tl.load(
+            b = tl.load(
                 b_ptrs_i0, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
             )
 
-        silu_acc += tl.dot(a, b_i0, input_precision="ieee")
+        silu_acc += tl.dot(a, b)
 
         if EVEN_K:
-            b_i1 = tl.load(b_ptrs_i1, cache_modifier=cache_modifier)
+            b = tl.load(b_ptrs_i1, cache_modifier=cache_modifier)
         else:
-            b_i1 = tl.load(
+            b = tl.load(
                 b_ptrs_i1, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
             )
 
         # Perform dot operation and apply scale
-        mul_acc += tl.dot(a, b_i1, input_precision="ieee")
+        mul_acc += tl.dot(a, b)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -318,7 +316,7 @@ def gemm_a16w16_silu_fused(
 
     Key parameters:
     - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
+    - W: Matrix W with shape (K, N).
     - bias: Vector with shape (N).
     - dtype: Optional parameter to specifcy bf16 or fp16 datatype. Default is bf16
     - Y: Output Matrix Y with shape (M, N///2). If this is none, then it's created by this API and returned as output
@@ -329,11 +327,11 @@ def gemm_a16w16_silu_fused(
 
     _LOGGER.info(f"GEMM_A16W16: x={tuple(x.shape)} w={tuple(w.shape)}")
     # Shape checks
-    assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
+    assert x.shape[1] == w.shape[0], "Incompatible matrix shapes."
 
     M, K = x.shape
-    N, K = w.shape
-    w = w.T
+    _, N = w.shape
+    # w = w.T
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 

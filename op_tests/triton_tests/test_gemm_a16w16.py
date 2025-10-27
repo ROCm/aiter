@@ -60,6 +60,27 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
 
     return x, weight, bias_tensor, out_dtype, y
 
+def generate_gemm_a16w16_silu_fused_inputs(M, N, K, dtype, output=True, bias=False):
+    if isinstance(dtype, str):
+        dtype = str_to_torch_dtype[dtype]
+
+    x = torch.randn((M, K), dtype=dtype).cuda()
+    weight = torch.randn((K, N), dtype=dtype).cuda()
+
+    bias_tensor = None
+    if bias:
+        bias_tensor = torch.empty((N), dtype=dtype).cuda()
+
+    y = None
+    if output:
+        y = torch.empty((M, N//2), dtype=dtype).cuda()
+        out_dtype = (None,)
+    else:
+        out_dtype = dtype
+
+    return x, weight, bias_tensor, out_dtype, y
+
+
 
 def get_x_vals():
 
@@ -139,12 +160,12 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("bias", [True, False])
 def test_gemm_a16_w16_silu_fused(M: int, N: int, K: int, dtype, output, bias):
-    x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
-        M, N, K, dtype, output=output, bias=bias, silu_fused=True
+    x, w, bias, out_dtype, y = generate_gemm_a16w16_silu_fused_inputs(
+        M, N, K, dtype, output=output, bias=bias
     )
     if bias is not None:
         bias = bias.to(torch.float32)
-    torch_out = F.linear(x.to(torch.float32), w.to(torch.float32), bias=bias)
+    torch_out = F.linear(x.to(torch.float32), w.T.to(torch.float32), bias=bias)
     torch_out = torch_silu_and_mul_ref(torch_out.view(-1, N)).to(dtype)
 
     if output:
