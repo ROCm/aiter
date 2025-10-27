@@ -162,13 +162,37 @@ def _batched_gemm_a8w8_kernel(
     offs_a = offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
     offs_b = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
 
-    # Allocate shared memory input matrices and scaling factors
-    smem_a = gl.allocate_shared_memory(
-        a_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
-    )
-    smem_b = gl.allocate_shared_memory(
-        b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
-    )
+    # Load first block of A
+    if EVEN_K:
+        a = gl.amd.cdna4.buffer_load(
+            ptr=(a_ptr + batch_id * stride_ab),
+            offsets=offs_a,
+            mask=(offs_am[:, None] < M),
+            other=0.0,
+        )
+    else:
+        a = gl.amd.cdna4.buffer_load(
+            ptr=(a_ptr + batch_id * stride_ab),
+            offsets=offs_a,
+            mask=((offs_ak[None, :] < K) & (offs_am[:, None] < M)),
+            other=0.0,
+        )
+
+    # Load first block of B
+    if EVEN_K:
+        b = gl.amd.cdna4.buffer_load(
+            ptr=(b_ptr + batch_id * stride_bb),
+            offsets=offs_b,
+            mask=(offs_bn[None, :] < N),
+            other=0.0,
+        )
+    else:
+        b = gl.amd.cdna4.buffer_load(
+            ptr=(b_ptr + batch_id * stride_bb),
+            offsets=offs_b,
+            mask=((offs_bk[:, None] < K) & (offs_bn[None, :] < N)),
+            other=0.0,
+        )
 
     # Load the scales
     offs_a_scale = pid_m * BLOCK_SIZE_M + gl.arange(
@@ -190,38 +214,17 @@ def _batched_gemm_a8w8_kernel(
         other=1.0,
     )
 
-    # Prologue: Make initial loads of all data
-    if EVEN_K:
-        a = gl.amd.cdna4.buffer_load(
-            ptr=(a_ptr + batch_id * stride_ab),
-            offsets=offs_a,
-            mask=(offs_am[:, None] < M),
-            other=0.0,
-        )
-    else:
-        a = gl.amd.cdna4.buffer_load(
-            ptr=(a_ptr + batch_id * stride_ab),
-            offsets=offs_a,
-            mask=((offs_ak[None, :] < K) & (offs_am[:, None] < M)),
-            other=0.0,
-        )
-    if EVEN_K:
-        b = gl.amd.cdna4.buffer_load(
-            ptr=(b_ptr + batch_id * stride_bb),
-            offsets=offs_b,
-            mask=(offs_bn[None, :] < N),
-            other=0.0,
-        )
-    else:
-        b = gl.amd.cdna4.buffer_load(
-            ptr=(b_ptr + batch_id * stride_bb),
-            offsets=offs_b,
-            mask=((offs_bk[:, None] < K) & (offs_bn[None, :] < N)),
-            other=0.0,
-        )
+    # Allocate shared memory input matrices and scaling factors
+    smem_a = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
+    )
+    smem_b = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
+    )
 
-    # Store A in shared memory first (this data is used first)
+    # Store first block of A and B in shared memory
     smem_a.store(a)
+    smem_b.store(b)
 
     # Run the main loop
     acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
@@ -253,11 +256,9 @@ def _batched_gemm_a8w8_kernel(
                 other=0.0,
             )
 
-        # Then store B in shared memory
-        smem_b.store(b)
-
         # Grab the current block of A from shared memory
         cur_a = smem_a.load(layout=dot_a_layout)
+        cur_b = smem_b.load(layout=dot_b_layout)
 
         # Load the next block of B
         if EVEN_K:
@@ -278,15 +279,13 @@ def _batched_gemm_a8w8_kernel(
                 other=0.0,
             )
 
-        # Grab the current block of B from shared memory
-        cur_b = smem_b.load(layout=dot_b_layout)
-
         # Perform and store the MFMA operation
         accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
 
-        # Store next A in shared memory
+        # Store next A and B in shared memory, unless this is the last block
         if k < num_k_iter - 2:
             smem_a.store(a)
+            smem_b.store(b)
 
     # Epilogue: use remaining A and B in shared memory for last MFMA
     cur_a = gl.convert_layout(a, dot_a_layout)
@@ -296,7 +295,7 @@ def _batched_gemm_a8w8_kernel(
     # Apply scales
     accumulator *= a_scale[:, None] * b_scale[None, :]
 
-    # Apply bias
+    # Load and apply bias
     if HAS_BIAS:
         offs_bias = pid_n * BLOCK_SIZE_N + gl.arange(
             0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout)
