@@ -52,7 +52,6 @@ jobs:
     name: Upload Success Signal
     runs-on: ubuntu-latest
     needs: [check-ck, black, ruff]
-    if: ${{ success() }}
     steps:
       - name: Create success signal file
         run: echo "success" > checks_signal.txt
