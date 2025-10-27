@@ -35,7 +35,7 @@ using CFG = std::unordered_map<std::string, I8GemmConfig>;
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="generate",
-        description="gen API for CK fmha kernel",
+        description="generate configuration API for i8gemm asm kernels",
     )
     parser.add_argument(
         "-o",
@@ -60,6 +60,7 @@ if __name__ == "__main__":
         txt = f"""static CFG cfg_{cfgname} = {{
             {cfg_txt}}};"""
         cfgs.append(txt)
+    ## remove this when adding a kernel on gfx950
     if not cfgs:
         for el in glob.glob(f"{hsa_dir}/gfx942/{os.path.basename(this_dir)}/*.csv"):
             filename = os.path.basename(el)

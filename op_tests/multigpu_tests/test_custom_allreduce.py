@@ -1,31 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import logging
 import os
+from multiprocessing import Pool, freeze_support, set_start_method
 
 import torch
 import torch.distributed as dist
-import argparse
-from aiter import dtypes
 
+from aiter import dtypes
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
     ensure_model_parallel_initialized,
-    init_distributed_environment,
-    set_custom_all_reduce,
     get_tp_group,
     graph_capture,
-    destroy_model_parallel,
-    destroy_distributed_environment,
+    init_distributed_environment,
+    set_custom_all_reduce,
 )
-from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.test_common import (
-    checkAllclose,
-    perftest,
-    benchmark,
-)
-from multiprocessing import set_start_method, Pool, freeze_support
-import logging
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 logger = logging.getLogger("aiter")
 
