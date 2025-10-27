@@ -22,6 +22,12 @@ from _triton_kernels.mha_fused_bwd import (
 _LOGGER = AiterTritonLogger()
 
 
+def safe_tensor(x):
+    if x is None:
+        return jnp.zeros((1,), dtype=jnp.int32)
+    return x
+
+
 def flash_attn_fused_backward(
     # Input tensors
     do: jnp.ndarray,
@@ -135,7 +141,7 @@ def flash_attn_fused_backward(
         delta,
         *o_strides,
         *delta_strides,
-        cu_seqlens_q,
+        safe_tensor(cu_seqlens_q),
         max_seqlen_q,
         kernel=_bwd_preprocess,
         grid=pre_grid,
@@ -209,8 +215,8 @@ def flash_attn_fused_backward(
         *dropout_strides,
         # Configurations
         sm_scale,
-        cu_seqlens_q,
-        cu_seqlens_k,
+        safe_tensor(cu_seqlens_q),
+        safe_tensor(cu_seqlens_k),
         max_seqlen_q,
         max_seqlen_k,
         dropout_mask,
