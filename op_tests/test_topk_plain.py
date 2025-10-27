@@ -29,7 +29,7 @@ def test_topk(
     device = output.device
 
     row = torch.arange(hiddensize, dtype=dtypes.i32, device=device)  # [0, 1, ..., length-1]
-    topk_ids = row.unsqueeze(0).expand(batch_size, -1).clone()
+    topk_ids = torch.zeros((batch_size, topk), dtype=dtypes.i32, device=device)
 
     x = torch.arange(hiddensize, dtype=dtype).repeat(batch_size, 1)
     for b in range(batch_size):
@@ -65,7 +65,13 @@ def test_topk(
     checkAllclose(
         id_ref,
         id_triton,
-        msg=f"topk_ids     [golden vs triton]:{us_ref:>8.2f} us vs {us_triton:>8.2f} us......",
+        msg=(
+            f"topk_ids Performance Comparison:\n"
+            f"  {'Method':<10} {'Time (μs)':>12}\n"
+            f"  {'-'*10} {'-'*12}\n"
+            f"  {'golden':<10} {us_ref:>12.2f}\n"
+            f"  {'triton':<10} {us_triton:>12.2f}\n"
+        ),
     )
 
     _, us_aiter = run_perftest(
@@ -74,6 +80,20 @@ def test_topk(
         topk_ids,
         topk,
         largest,
+    )
+
+    id_aiter, _aiter = torch.sort(topk_ids.to(torch.long))
+    checkAllclose(
+        id_ref,
+        id_aiter,
+        msg=(
+            f"topk_ids Performance Comparison:\n"
+            f"  {'Method':<10} {'Time (μs)':>12}\n"
+            f"  {'-'*10} {'-'*12}\n"
+            f"  {'golden':<10} {us_ref:>12.2f}\n"
+            f"  {'triton':<10} {us_triton:>12.2f}\n"
+            f"  {'aiter':<10} {us_aiter:>12.2f}\n"
+        ),
     )
 
     return {"err": err, "us": us_aiter}
