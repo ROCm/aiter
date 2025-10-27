@@ -1033,3 +1033,9 @@
           py::arg("bias"),                                        \
           py::arg("epsilon") = 1e-5f,                             \
           py::arg("x_bias")  = std::nullopt);                      \
+
+
+#define SOFTMAX_PYBIND \
+    m.def("softmax2d_hip",                                        \
+          &softmax2d_hip,                                           \
+          py::arg("input"));                                      \
