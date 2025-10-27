@@ -138,6 +138,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          batch_stride_o,
                          mask.left,
                          mask.right,
+                         mask.sink,
                          static_cast<ck_tile::index_t>(mask.type),
                          0,
                          p_dropout,
@@ -154,6 +155,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         bool is_causal,
         int window_size_left,
         int window_size_right,
+        int sink_size,
         bool return_softmax_lse,
         bool return_dropout_randval,
         std::optional<at::Tensor> cu_seqlens_q_,
@@ -215,7 +217,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     if (is_causal) {
         // Causal is the special case where window_size_right == 0 and window_size_left < 0.
         window_size_right = 0;
-        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0";
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0" + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // casual
     }
     else if (window_size_left == -1 && window_size_right == -1) {
@@ -223,7 +225,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     }
     else {
         // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right) + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
     }
 

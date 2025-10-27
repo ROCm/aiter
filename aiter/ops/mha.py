@@ -19,6 +19,7 @@ def cmdGenFunc_mha_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -149,6 +150,7 @@ def gen_mha_fwd_fake_tensors(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size:int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -178,6 +180,7 @@ def mha_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -247,6 +250,7 @@ def cmdGenFunc_mha_varlen_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
@@ -400,6 +404,7 @@ def gen_mha_varlen_fwd_fake_tensor(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
@@ -464,6 +469,7 @@ def mha_varlen_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
@@ -1164,6 +1170,7 @@ def _flash_attn_forward(
     causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
     return_lse: bool,
@@ -1178,6 +1185,7 @@ def _flash_attn_forward(
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
+    sink_size = 0
     mask = causal and window_size_left == -1  # causal mask
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
@@ -1236,6 +1244,7 @@ def _flash_attn_forward(
             causal,
             window_size_left,
             window_size_right,
+            sink_size,
             return_lse,
             return_softmax,
             cu_seqlens_q,
@@ -1613,6 +1622,7 @@ class FlashAttnFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=int(window_size[0]),
             window_size_right=int(window_size[1]),
+            sink_size=int(window_size[2]),
             bias=bias,
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
@@ -1727,7 +1737,7 @@ def flash_attn_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
+    window_size=(-1, -1, 0),  # -1 means infinite context window
     bias=None,
     alibi_slopes=None,
     deterministic=True,
@@ -1825,6 +1835,7 @@ def _flash_attn_varlen_forward(
     logits_soft_cap: float = 0.0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    sink_size:int = 0,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     return_lse: bool = False,
@@ -1842,6 +1853,7 @@ def _flash_attn_varlen_forward(
     # mask
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
+    sink_size = 0 if sink_size >= max_seqlen_k else sink_size
     mask = causal == True and window_size_left == -1  # causal mask
     nmask = (
         causal == False and window_size_left == -1 and window_size_right == -1
@@ -1924,6 +1936,7 @@ def _flash_attn_varlen_forward(
             causal,
             window_size_left,
             window_size_right,
+            sink_size,
             return_lse,
             return_softmax,
             out=out,
@@ -2187,6 +2200,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             logits_soft_cap=logits_soft_cap,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            sink_size=window_size[2],
             bias=bias,
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
