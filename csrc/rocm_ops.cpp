@@ -24,6 +24,7 @@
 #include "gemm_a8w8_bpreshuffle.h"
 #include "gemm_common.h"
 #include "hipbsolgemm.cuh"
+#include "m_grouped_gemm.h"
 #include "moe_ck.h"
 #include "moe_op.h"
 #include "moe_sorting.h"
@@ -34,8 +35,8 @@
 #include "rmsnorm.h"
 #include "rocsolgemm.cuh"
 #include "rope.h"
-#include "smoothquant.h"
 #include "sample.h"
+#include "smoothquant.h"
 #include <torch/extension.h>
 
 // #include "torch/mha_batch_prefill.h"
@@ -101,5 +102,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     SAMPLE_PYBIND;
     HIPBSOLGEMM_PYBIND;
     ROCSOLGEMM_PYBIND;
+    M_GROUPED_GEMM_PYBIND;
 }
 #endif
