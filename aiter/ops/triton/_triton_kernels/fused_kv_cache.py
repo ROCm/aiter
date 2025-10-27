@@ -437,7 +437,39 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     HAVE_V_SCALE: tl.constexpr = False,
     HAVE_ZEROS: tl.constexpr = False,
 ):
+
+    tl.assume(q_stride_t >= 0)
+    tl.assume(q_stride_h >= 0)
+    tl.assume(q_stride_d >= 0)
+    tl.assume(k_stride_t >= 0)
+    tl.assume(k_stride_h >= 0)
+    tl.assume(k_stride_d >= 0)
+    tl.assume(v_stride_t >= 0)
+    tl.assume(v_stride_h >= 0)
+    tl.assume(v_stride_d >= 0)
+    tl.assume(cos_stride_t >= 0)
+    tl.assume(cos_stride_d >= 0)
+    tl.assume(q_out_stride_t >= 0)
+    tl.assume(q_out_stride_h >= 0)
+    tl.assume(q_out_stride_d >= 0)
+    tl.assume(k_out_stride_t >= 0)
+    tl.assume(k_out_stride_h >= 0)
+    tl.assume(k_out_stride_d >= 0)
+    tl.assume(key_cache_stride_t >= 0)
+    tl.assume(key_cache_stride_h >= 0)
+    tl.assume(key_cache_stride_d >= 0)
+    tl.assume(key_cache_stride_b >= 0)
+    tl.assume(key_cache_stride_x >= 0)
+    tl.assume(value_cache_stride_t >= 0)
+    tl.assume(value_cache_stride_h >= 0)
+    tl.assume(value_cache_stride_d >= 0)
+    tl.assume(value_cache_stride_b >= 0)
+    tl.assume(zeros_out_stride_t >= 0)
+    tl.assume(zeros_out_stride_h >= 0)
+    tl.assume(zeros_out_stride_d >= 0)
+
     pid = tl.program_id(0)
+    tl.assume(pid >= 0)
 
     d_pe_offs = tl.arange(0, BLOCK_D_pe).to(tl.int64)
 
@@ -574,7 +606,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     value_cache_ptr
                     + pid_t_slot * value_cache_stride_t
                     + pid_hk * value_cache_stride_h
-                    + d_pe_offs * value_cache_stride_d
+                    + d_pe_offs.to(tl.int64) * value_cache_stride_d
                     + pid_b * value_cache_stride_b
                 )
                 tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
