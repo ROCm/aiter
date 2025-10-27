@@ -40,7 +40,7 @@ for job in "${tune_jobs[@]}"; do
         else
             echo "❌ Test FAILED: $test_path"
             testFailed=true
-            testFailedFiles+=($test_path)
+            testFailedFiles+=("$test_path")
         fi
     elif [ "$mode" == "tune" ]; then
         # Append tuning_arg if provided
