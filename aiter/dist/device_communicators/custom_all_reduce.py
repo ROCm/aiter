@@ -25,26 +25,16 @@ from torch.distributed import ProcessGroup
 # import vllm.envs as envs
 # from vllm import _custom_ops as ops
 import aiter as ops
-from .custom_all_reduce_utils import gpu_p2p_access_check
-from .parallel_state import in_the_same_node_as
-from .utils import get_cuda_visible_devices
+from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
 
 try:
     ops.meta_size()
     custom_ar = True
-except Exception:
+except Exception as e:
     # For CPUs
     custom_ar = False
-
-
-def _can_p2p(rank: int, world_size: int) -> bool:
-    for i in range(world_size):
-        if i == rank:
-            continue
-        if not gpu_p2p_access_check(rank, i):
-            return False
-    return True
+    logger.warning(f"Custom allreduce is disabled: {e}")
 
 
 def is_weak_contiguous(inp: torch.Tensor):
@@ -121,23 +111,23 @@ class CustomAllreduce:
         assert isinstance(device, torch.device)
         self.device = device
 
-        device_ids = get_cuda_visible_devices()
+        # device_ids = get_cuda_visible_devices()
 
-        physical_device_id = device_ids[device.index]
-        tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-        gather_list = [
-            torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
-        ]
-        dist.all_gather(gather_list, tensor, group=self.group)
-        physical_device_ids = [t.item() for t in gather_list]
+        # physical_device_id = device_ids[device.index]
+        # tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
+        # gather_list = [
+        #     torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
+        # ]
+        # dist.all_gather(gather_list, tensor, group=self.group)
+        # physical_device_ids = [t.item() for t in gather_list]
 
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
         # assert current_platform.is_cuda() or current_platform.is_rocm()
-        # full_nvlink = current_platform.is_full_nvlink(physical_device_ids)
-        full_nvlink = True
-        if world_size > 2 and not full_nvlink:
+        # fully_connected = current_platform.is_full_nvlink(physical_device_ids)
+        fully_connected = True
+        if world_size > 2 and not fully_connected:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
                 " more than two PCIe-only GPUs. To silence this warning, "
@@ -161,13 +151,7 @@ class CustomAllreduce:
         # (256 bytes) and a temporary buffer for storing intermediate
         # allreduce results.
         # if current_platform.is_rocm():
-        if 1:
-            # meta data buffers need to be "uncached" for signal on MI200
-            self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
-        else:
-            self.meta = torch.zeros(
-                ops.meta_size() + max_size, dtype=torch.uint8, device=self.device
-            )
+        self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
         # This is a pre-registered IPC buffer. In eager mode, input tensors
         # are first copied into this buffer before allreduce is performed
         self.buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
@@ -182,21 +166,16 @@ class CustomAllreduce:
         self.max_size = max_size
         self.rank = rank
         self.world_size = world_size
-        # if current_platform.is_rocm():
-        if 1:
-            # _share_cuda_() doesn't accept meta buffer not allocated from
-            # PyTorch cache allocator, use direct HIP call to get IPC handle
-            handle = ops.get_meta_buffer_ipc_handle(self.meta)
-            shard_data = (
-                handle,  # ipc handle to base ptr
-                0,  # offset of base ptr
-            )
-            handles, offsets = self._gather_ipc_meta(shard_data)
-        else:
-            handles, offsets = self._get_ipc_meta(self.meta)
-        self.full_nvlink = full_nvlink
+        handle = ops.get_meta_buffer_ipc_handle(self.meta)
+        shard_data = (
+            handle,  # ipc handle to base ptr
+            0,  # offset of base ptr
+        )
+        handles, offsets = self._gather_ipc_meta(shard_data)
+
+        self.fully_connected = fully_connected
         self._ptr = ops.init_custom_ar(
-            self.meta, self.rank_data, handles, offsets, rank, self.full_nvlink
+            self.meta, self.rank_data, handles, offsets, rank, self.fully_connected
         )
         self.register_buffer(self.buffer)
 
@@ -278,25 +257,33 @@ class CustomAllreduce:
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
-        if self.world_size == 2 or self.full_nvlink:
+        if self.world_size == 2 or self.fully_connected:
             return inp_size < self.max_size
         return False
 
-    # all reduce, assuming inp tensor is IPC registered with register_buffer,
-    # or, in the context of cuda graphs, register_graph_buffers
-    def all_reduce_reg(
-        self, inp: torch.Tensor, out: torch.Tensor = None, open_fp8_quant: bool = False
+    def all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        open_fp8_quant: bool = False,
+        registered: bool = False,
     ):
-        if out is None:
-            out = torch.empty_like(inp)
-        ops.all_reduce_reg(self._ptr, inp, out, open_fp8_quant)
-        return out
+        """Performs an out-of-place all reduce.
 
-    # all reduce, assuming inp tensor is NOT IPC registered
-    def all_reduce_unreg(self, inp: torch.Tensor, out: torch.Tensor = None):
+        If registered is True, this assumes inp's pointer is already
+        IPC-registered. Otherwise, inp is first copied into a pre-registered
+        buffer.
+        """
         if out is None:
             out = torch.empty_like(inp)
-        ops.all_reduce_unreg(self._ptr, inp, self.buffer, out)
+        ops.all_reduce(
+            self._ptr,
+            inp,
+            out,
+            open_fp8_quant,
+            None if registered else self.buffer,
+        )
         return out
 
     def custom_all_reduce(
@@ -307,7 +294,9 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce_reg(input, open_fp8_quant=open_fp8_quant)
+                return self.all_reduce(
+                    input, open_fp8_quant=open_fp8_quant, registered=True
+                )
             else:
                 # if warm up, mimic the allocation pattern
                 # since custom allreduce is out-of-place
@@ -317,7 +306,9 @@ class CustomAllreduce:
             # custom allreduce incurs a cost of cudaMemcpy, which should
             # be small(<=1% of overall latency) compared to the performance
             # gains of using custom kernels
-            return self.all_reduce_unreg(input)
+            return self.all_reduce(
+                input, open_fp8_quant=open_fp8_quant, registered=False
+            )
 
     def all_gather_reg(self, inp: torch.Tensor, out: torch.Tensor = None):
         if out is None:

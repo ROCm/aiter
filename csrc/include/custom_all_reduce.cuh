@@ -907,10 +907,10 @@ namespace aiter
     CustomAllreduce(Signal *meta, void *rank_data, size_t rank_data_sz,
                     const hipIpcMemHandle_t *handles,
                     const std::vector<int64_t> &offsets, int rank,
-                    bool full_nvlink = true)
+                    bool fully_connected = true)
         : rank_(rank),
           world_size_(offsets.size()),
-          full_nvlink_(full_nvlink),
+          full_nvlink_(fully_connected),
           self_sg_(meta),
           d_rank_data_base_(reinterpret_cast<RankData *>(rank_data)),
           d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData))
