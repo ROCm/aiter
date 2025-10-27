@@ -36,7 +36,7 @@ def init_dist_env(world_size, rankID):
     if world_size > 1:
         # hack custom_allreduce
         tp_grp = get_tp_group()
-        ca_comm = tp_grp.ca_comm
+        ca_comm = tp_grp.device_communicator.ca_comm
         # signal
         signal = torch.zeros(world_size * 64, dtype=torch.int64, device=rankID)
         ca_comm.signal = signal
@@ -53,7 +53,7 @@ def destroy_dist_env():
 
 def all_reduce_asm(inp: torch.Tensor):
     tp_grp = get_tp_group()
-    ca = tp_grp.ca_comm
+    ca = tp_grp.device_communicator.ca_comm
     if ca._IS_CAPTURING:
         if torch.cuda.is_current_stream_capturing():
             return aiter.all_reduce_asm_(
