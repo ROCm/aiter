@@ -46,7 +46,7 @@ def test_topk(
     )
 
     (res_triton_value, res_triton_index), us_triton = run_perftest(
-        torch.topk,
+        triton_topk,
         x,
         topk,
         largest=largest,
@@ -76,7 +76,6 @@ def test_topk(
         largest,
     )
 
-    err = 0
     return {"err": err, "us": us_aiter}
 
 # BATCH_SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 16, 1335]
