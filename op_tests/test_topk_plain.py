@@ -17,6 +17,7 @@ import argparse
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
+
 @benchmark()
 def test_topk(
     batch_size,
@@ -28,13 +29,14 @@ def test_topk(
     output = torch.randn((batch_size, hiddensize), dtype=dtype)
     device = output.device
 
-    row = torch.arange(hiddensize, dtype=dtypes.i32, device=device)  # [0, 1, ..., length-1]
+    row = torch.arange(
+        hiddensize, dtype=dtypes.i32, device=device
+    )  # [0, 1, ..., length-1]
     topk_ids = torch.zeros((batch_size, topk), dtype=dtypes.i32, device=device)
 
     x = torch.arange(hiddensize, dtype=dtype).repeat(batch_size, 1)
     for b in range(batch_size):
         x[b] = x[b, torch.randperm(hiddensize)]
-
 
     (ref_value, ref_index), us_ref = run_perftest(
         torch.topk,
@@ -52,7 +54,6 @@ def test_topk(
         largest=largest,
         num_iters=1000,
         num_warmup=100,
-
     )
 
     id_ref, _ref = torch.sort(ref_index)
@@ -97,6 +98,7 @@ def test_topk(
     )
 
     return {"err": err, "us": us_aiter}
+
 
 # BATCH_SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 16, 1335]
 # DIM2 = [16, 128256]
