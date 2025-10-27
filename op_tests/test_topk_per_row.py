@@ -186,6 +186,7 @@ def test_topk_per_row(num_rows: int, top_k: int) -> dict:
 @benchmark()
 def test_topk_per_row_decode(
     batch_size: int,
+    context_len: int,
     top_k: int,
     next_n: int,
 ) -> None:
@@ -196,9 +197,8 @@ def test_topk_per_row_decode(
     ret = {}
     # Create test data
     num_rows = batch_size * next_n
-    vocab_size = 20000
-    seq_lens = torch.randint(
-        vocab_size, (batch_size,), dtype=torch.int32, device="cuda"
+    seq_lens = torch.empty(batch_size, dtype=torch.int32, device="cuda").fill_(
+        context_len
     )
     row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
     row_indices = torch.arange(num_rows, device="cuda") // next_n
@@ -235,7 +235,7 @@ def test_topk_per_row_decode(
     )
 
     # measure performance
-    ret["context_len"] = logits.shape[1]
+    # ret["context_len"] = logits.shape[1]
     ret["all_close"] = all_close
     ret["us"] = us
     return ret
@@ -246,13 +246,13 @@ parser = argparse.ArgumentParser(
     description="config input of test",
 )
 parser.add_argument(
-    "-m",
-    "--num_rows",
+    "-c",
+    "--context_len",
     type=int,
     default=[8, 16, 32, 64, 128, 1024, 16384, 65536, 90000, 128000],
     nargs="+",
-    help="""number of rows.
-    e.g.: -m 64""",
+    help="""number of kv.
+    e.g.: -c 64""",
 )
 
 parser.add_argument(
@@ -279,7 +279,7 @@ parser.add_argument(
     "-n",
     "--next_n",
     type=int,
-    default=[4, 8],
+    default=[1, 2, 3, 4],
     nargs="+",
     help="""next_n elements per sequence in a row.
     e.g.: -n 4""",
@@ -289,7 +289,7 @@ args = parser.parse_args()
 
 
 df = []
-for m in args.num_rows:
+for m in args.context_len:
     for k in args.top_k:
         ret = test_topk_per_row(m, k)
         df.append(ret)
@@ -300,10 +300,11 @@ aiter.logger.info(f"summary for topk_per_row kernel:\n{df}")
 
 df = []
 for m in args.decode_batch_size:
-    for k in args.top_k:
-        for n in args.next_n:
-            ret = test_topk_per_row_decode(m, k, n)
-            df.append(ret)
+    for ctx in args.context_len:
+        for k in args.top_k:
+            for n in args.next_n:
+                ret = test_topk_per_row_decode(m, ctx, k, n)
+                df.append(ret)
 
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary for topk_per_row_decode kernel:\n{df}")
