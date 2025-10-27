@@ -194,12 +194,12 @@ def e2e_moe_kernel(
     offs_i0 = tl.arange(0, BLOCK_SIZE_HALF).to(tl.int64)
     offs_i1 = (tl.arange(0, BLOCK_SIZE_HALF) + N // 2).to(tl.int64)
     # offset for silu_acc
-    i0 = pid_n * BLOCK_SIZE_HALF + offs_i0
+    i0 = (pid_n * BLOCK_SIZE_HALF + offs_i0) % N
     # offset for mul_acc
-    i1 = pid_n * BLOCK_SIZE_HALF + offs_i1
+    i1 = (pid_n * BLOCK_SIZE_HALF + offs_i1) % N
     # TODO: add EVEN_N and pid_n is not last pid_n so no need for masking conditions
     # same mask applicable to both silu and mul acc
-    mask_w1n = i0 < (N // 2)
+    # mask_w1n = i0 < (N // 2)
 
     a_ptrs = A + (
         offs_token[:, None] // top_k * stride_am + offs_k1[None, :] * stride_ak
@@ -225,18 +225,19 @@ def e2e_moe_kernel(
         i1s = i0s + ((N // 2) // group_n)
         w1_i0_scale_ptrs = (
             W1_scale + off_experts * stride_w1se + i0s[None, :] * stride_w1sn
-        )
+        ) 
         w1_i1_scale_ptrs = (
             W1_scale + off_experts * stride_w1se + i1s[None, :] * stride_w1sn
         )
 
     num_k1 = tl.cdiv(K, BLOCK_SIZE_K1)
     for k1 in tl.range(0, num_k1):
-        # Masking ensures we don't load from invalid tokens or indices
+        # pipeline silu acc and mul acc so they can use the same LDS for weight loading
+        
+        # silu acc
         if EVEN_K:
             a = tl.load(a_ptrs, mask=(token_mask[:, None]), other=0.0)
-            w1_i0 = tl.load(w1_ptrs_i0, mask=mask_w1n[None, :], other=0.0)
-            w1_i1 = tl.load(w1_ptrs_i1, mask=mask_w1n[None, :], other=0.0)
+            w1 = tl.load(w1_ptrs_i0)
         else:
             a = tl.load(
                 a_ptrs,
@@ -245,48 +246,51 @@ def e2e_moe_kernel(
                 ),
                 other=0.0,
             )
-            w1_i0 = tl.load(
+            w1 = tl.load(
                 w1_ptrs_i0,
-                mask=(offs_k1[:, None] < K - k1 * BLOCK_SIZE_K1) & mask_w1n[None, :],
-                other=0.0,
-            )
-            w1_i1 = tl.load(
-                w1_ptrs_i1,
-                mask=(offs_k1[:, None] < K - k1 * BLOCK_SIZE_K1) & mask_w1n[None, :],
+                mask=(offs_k1[:, None] < K - k1 * BLOCK_SIZE_K1),
                 other=0.0,
             )
 
         if use_fp8_w8a8:
             start_k = (k1 * BLOCK_SIZE_K1) // group_k
-            mask_w1sn = i0s < ((N // 2) // group_n)
-            w1_i0_scale = tl.load(
-                w1_i0_scale_ptrs + start_k * stride_w1sk,
-                mask=mask_w1sn[None, :],
-                other=0.0,
-            )
-            w1_i1_scale = tl.load(
-                w1_i1_scale_ptrs + start_k * stride_w1sk,
-                mask=mask_w1sn[None, :],
-                other=0.0,
+            w1_scale = tl.load(
+                w1_i0_scale_ptrs + start_k * stride_w1sk
             )
 
             # if num_scales_along_n > 1: # singleton dimension get automatic broadcast
-            w1_i0_scale = group_broadcast(
-                w1_i0_scale, 1, num_scales_along_n, group_n, 1
-            )
-            w1_i1_scale = group_broadcast(
-                w1_i1_scale, 1, num_scales_along_n, group_n, 1
+            w1_scale = group_broadcast(
+                w1_scale, 1, num_scales_along_n, group_n, 1
             )
 
             a_scale = tl.load(
                 a_scale_ptrs + start_k * stride_ask, mask=token_mask[:, None], other=0.0
             )
 
-            silu_acc += tl.dot(a, w1_i0, out_dtype=tl.float32) * a_scale * w1_i0_scale
-            mul_acc += tl.dot(a, w1_i1, out_dtype=tl.float32) * a_scale * w1_i1_scale
+            silu_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
         else:
-            silu_acc = tl.dot(a, w1_i0, acc=silu_acc)
-            mul_acc = tl.dot(a, w1_i1, acc=mul_acc)
+            silu_acc = tl.dot(a, w1, acc=silu_acc)
+
+        # mul acc
+        if EVEN_K:
+            w1 = tl.load(w1_ptrs_i1)
+        else:
+            w1 = tl.load(
+                w1_ptrs_i1,
+                mask=(offs_k1[:, None] < K - k1 * BLOCK_SIZE_K1),
+                other=0.0,
+            )
+
+        if use_fp8_w8a8:
+            w1_scale = tl.load(
+                w1_i1_scale_ptrs + start_k * stride_w1sk
+            )
+            w1_scale = group_broadcast(
+                w1_scale, 1, num_scales_along_n, group_n, 1
+            )
+            mul_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
+        else:
+            mul_acc = tl.dot(a, w1, acc=mul_acc)
 
         a_ptrs += BLOCK_SIZE_K1 * stride_ak
         w1_ptrs_i0 += BLOCK_SIZE_K1 * stride_w1k
@@ -307,7 +311,9 @@ def e2e_moe_kernel(
     else:
         acc = acc.to(dtype)
 
-    offs_w2n = tl.arange(0, BLOCK_SIZE_HALF) + pid_n * (BLOCK_SIZE_HALF)
+    acc = tl.where(pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)[None, :] < N // 2, acc, 0.0)
+
+    offs_w2n = (tl.arange(0, BLOCK_SIZE_HALF) + pid_n * (BLOCK_SIZE_HALF)) % (N // 2)
 
     w2_ptrs = (
         W2
@@ -321,7 +327,6 @@ def e2e_moe_kernel(
         offs_w2_sn = (pid_n * BLOCK_SIZE_HALF) // group_n + tl.arange(
             0, num_scales_along_n
         )
-        w2_scale_nmask = offs_w2_sn < ((N // 2) // group_n)
         # ... + tl.arange(0, num_scales_along_n) * group_n // group_n = ... + tl.arange(0, num_scales_along_n)
         w2_scale_ptrs = (
             W2_scale + off_experts * stride_w2se + offs_w2_sn[:, None] * stride_w2sn
@@ -333,31 +338,12 @@ def e2e_moe_kernel(
 
     num_k2 = tl.cdiv(K, BLOCK_SIZE_K2)
     for k2 in tl.range(0, num_k2, num_stages=1):
-        if EVEN_K:
-            w2 = tl.load(
-                w2_ptrs + k2 * BLOCK_SIZE_K2 * stride_w2k,
-                mask=(offs_w2n[:, None] < N // 2),
-                other=0.0,
-            )
-        else:
-            w2 = tl.load(
-                w2_ptrs + k2 * BLOCK_SIZE_K2 * stride_w2k,
-                mask=(
-                    (offs_w2n[:, None] < N // 2)
-                    & ((offs_k2 + k2 * BLOCK_SIZE_K2)[None, :] < K)
-                ),
-                other=0.0,
-            )
-
+        w2 = tl.load(
+            w2_ptrs + k2 * BLOCK_SIZE_K2 * stride_w2k,
+        )
         if use_fp8_w8a8:
-            w2_scale_kmask = tl.arange(0, num_scales_along_k2) < (
-                (K // group_k) - (k2 * BLOCK_SIZE_K2) // group_k
-            )
-            w2_scale_mask = w2_scale_nmask[:, None] & w2_scale_kmask[None, :]
             w2_scale = tl.load(
                 w2_scale_ptrs + (k2 * BLOCK_SIZE_K2) // group_k * stride_w2sk,
-                mask=w2_scale_mask,
-                other=0.0,
             )  # (num_scales_along_n, num_scales_along_k2)
             w2_scale = group_broadcast(
                 w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0

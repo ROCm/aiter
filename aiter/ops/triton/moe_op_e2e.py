@@ -124,6 +124,8 @@ def e2e_moe(
     else:
         Intermediate = None
 
+    # print("grid size", pid_m * pid_n)
+    
     e2e_moe_kernel[grid](
         A,
         W1,
