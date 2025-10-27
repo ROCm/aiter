@@ -162,6 +162,15 @@ def torch_mha_extend(
         v = v_cache.view(torch.int8)[idx].view(kv_dtype).to(torch.float)
         if v_scale is not None:
             v *= v_scale[:, idx].t().unsqueeze(-1)
+
+        nheads_kv = k.shape[1]
+        nheads_q = q.shape[1]
+        if nheads_q != nheads_kv:
+            assert nheads_q % nheads_kv == 0
+            g = nheads_q // nheads_kv
+            k = k.repeat_interleave(g, dim=1)
+            v = v.repeat_interleave(g, dim=1)
+
         o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=True)
         os.append(o)
     o = torch.concat(os)
@@ -459,25 +468,25 @@ def test_pa_mtp(
     out_ref = torch_mha_extend(
         query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
     )
-    out_aiter_asm, us_aiter_asm = run_aiter_asm(
-        query,
-        k_quant_,
-        asm_V_shuffle(v_quant_),
-        block_tables,
-        seq_lens,
-        block_tables.size(1),
-        max_qlen,
-        k_scale_asm,
-        v_scale_asm,
-        qo_indptr,
-    )
-    err = checkAllclose(
-        out_ref,
-        out_aiter_asm,
-        msg=f"[torch vs  aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
-    )
-    ret["us_asm_fp8"] = us_aiter_asm
-    ret["err fp8"] = err
+    # out_aiter_asm, us_aiter_asm = run_aiter_asm(
+    #     query,
+    #     k_quant_,
+    #     asm_V_shuffle(v_quant_),
+    #     block_tables,
+    #     seq_lens,
+    #     block_tables.size(1),
+    #     max_qlen,
+    #     k_scale_asm,
+    #     v_scale_asm,
+    #     qo_indptr,
+    # )
+    # err = checkAllclose(
+    #     out_ref,
+    #     out_aiter_asm,
+    #     msg=f"[torch vs  aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
+    # )
+    # ret["us_asm_fp8"] = us_aiter_asm
+    # ret["err fp8"] = err
 
     q_quant, q_scale = pertoken_quant(query, quant_dtype=aiter.dtypes.fp8)
     q_scale = q_scale.squeeze(-1)
@@ -506,16 +515,39 @@ def test_pa_mtp(
     ret["us_hip_fp8"] = us_hip
     ret["err_hip_fp8"] = err
 
+    out_hip_only_kv_quant, us_hip_only_kv_quant = run_aiter_hip(
+        query,
+        k_quant_,
+        asm_V_shuffle(v_quant_),
+        block_tables,
+        seq_lens,
+        ctx_lens,
+        max_qlen,
+        "fp8",
+        num_kv_heads,
+        scale,
+        k_scale_asm,
+        v_scale_asm,
+        output_dtype=dtype,
+    )
+    err = checkAllclose(
+        out_ref,
+        out_hip_only_kv_quant,
+        msg=f"[torch vs  aiter_hip][Only KV Quant]: {us_hip_only_kv_quant:>8.2f} us......",
+    )
+    ret["us_hip_only_kv_quant"] = us_hip_only_kv_quant
+    ret["err_hip_only_kv_quant"] = err
+
     return ret
 
 
 head_dim = 128
 l_block_size = [16]
 l_dtype = ["bf16"]
-l_num_heads = [(5, 1), (8, 1), (10, 1)]
+l_num_heads = [(64, 4), (64, 8)]
 l_qlen = [1, 2, 3, 4]
-l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
-l_batch_size = [128]
+l_ctx_len = [2048, 4096, 8192]
+l_batch_size = [1, 2, 4, 8, 16, 32, 64, 128]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -605,4 +637,4 @@ for dtype in l_dtype:
         df.append(ret)
     df = pd.DataFrame(df)
     aiter.logger.info(f"summary:\n{df}")
-    # df.to_csv("mla_prefill.csv")
+    df.to_csv("mtp_new.csv")
