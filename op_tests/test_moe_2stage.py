@@ -155,7 +155,8 @@ def test_fmoe(
 
     M, _ = topk_ids.shape
 
-    BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
+    BLOCK_SIZE_M = 32
+    #  = get_block_size_M(M, topk, E, inter_dim)
     if qType == aiter.QuantType.per_128x128:
         BLOCK_SIZE_M = 64
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
@@ -403,7 +404,7 @@ def test_fmoe(
             w2_scale=fp4_utils.e8m0_shuffle(w2_scale),
             quant_type=qType,
             activation=actType,
-            block_size_M=64,
+            block_size_M=BLOCK_SIZE_M,
             doweight_stage1=doweight_stage1,
         )
 
@@ -413,15 +414,16 @@ def test_fmoe(
             msg=f"aiter_all_stages:{us_fuse:>8.2f} us......",
         )
 
-        # def calc_diff(x: torch.Tensor, y: torch.Tensor):
-        #     x, y = x.double(), y.double()
-        #     denominator = (x * x + y * y).sum()
-        #     sim = 2 * (x * y).sum() / denominator
-        #     return 1 - sim
+        def calc_diff(x: torch.Tensor, y: torch.Tensor):
+            x, y = x.double(), y.double()
+            denominator = (x * x + y * y).sum()
+            sim = 2 * (x * y).sum() / denominator
+            return 1 - sim
  
  
-        # logits_diff = calc_diff(out2_ref, out2_aiter)
-        # assert logits_diff < 1e-2
+        logits_diff = calc_diff(out2_ref, out2_aiter)
+        assert logits_diff < 1e-3
+        print("L2L2")
 
         return {"us": us_fuse, "err": err}
 
@@ -433,8 +435,8 @@ l_tokenNum = [
     # 3,
     # 5,
     # 16,
-    # 32,
-    64,
+    208,
+    # 64,
     # 128,
     # 256,
     # 1024,
