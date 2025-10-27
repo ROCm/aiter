@@ -194,7 +194,7 @@ def kernel_unified_attention_2d(
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
-    qk_scale = scale * RCP_LN2
+    _qk_scale = scale * RCP_LN2
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -319,8 +319,17 @@ def kernel_unified_attention_2d(
         # Convert to tile indices and clamp
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
-
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
+    
+    if key_cache_ptr.dtype.is_fp8() and query_ptr.dtype.is_fp8() == False:
+        v_scale_val = tl.load(v_scale)
+        k_scale_val = tl.load(k_scale)
+        apply_fp8_scale: tl.constexpr = True
+        qk_scale = _qk_scale * k_scale_val
+    else:
+        apply_fp8_scale: tl.constexpr = False
+        qk_scale = _qk_scale
+
     # iterate through tiles (now limited to the sliding window range)
     for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
@@ -360,7 +369,7 @@ def kernel_unified_attention_2d(
             if Q.dtype.is_fp8():
                 K = K_load
             else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+                K = K_load.to(Q.dtype)
         else:
             K = K_load
 
@@ -371,15 +380,13 @@ def kernel_unified_attention_2d(
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
-
         if V_load.dtype.is_fp8():
             if Q.dtype.is_fp8():
                 V = V_load
             else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+                V = V_load.to(Q.dtype)
         else:
             V = V_load
-
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
         S = qk_scale * tl.dot(Q, K)
@@ -443,7 +450,10 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        if apply_fp8_scale:
+            acc += tl.dot(P.to(V.dtype), V) * v_scale_val
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -520,7 +530,7 @@ def kernel_unified_attention_3d(
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
-    qk_scale: tl.constexpr = scale * RCP_LN2
+    _qk_scale: tl.constexpr = scale * RCP_LN2
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -630,6 +640,15 @@ def kernel_unified_attention_3d(
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
+    if key_cache_ptr.dtype.is_fp8() and query_ptr.dtype.is_fp8() == False:
+        v_scale_val = tl.load(v_scale)
+        k_scale_val = tl.load(k_scale)
+        # apply fp8 scales together with qk_scale for perf
+        apply_fp8_scale: tl.constexpr = True
+        qk_scale = _qk_scale * k_scale_val
+    else:
+        apply_fp8_scale: tl.constexpr = False
+        qk_scale = _qk_scale
     # iterate through tiles within current segment
     for j in range(
         segm_idx * tiles_per_segment,
@@ -671,7 +690,7 @@ def kernel_unified_attention_3d(
             if Q.dtype.is_fp8():
                 K = K_load
             else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+                K = K_load.to(Q.dtype)
         else:
             K = K_load
 
@@ -682,19 +701,17 @@ def kernel_unified_attention_3d(
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
-
         if V_load.dtype.is_fp8():
             if Q.dtype.is_fp8():
                 V = V_load
             else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+                V = V_load.to(Q.dtype)
         else:
             V = V_load
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
         # S : (BLOCK_M, TILE_SIZE)
-        # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
         S = qk_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
@@ -755,7 +772,11 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        # apply fp8 scales here so we dont have to have fp32 conversion
+        if apply_fp8_scale:
+            acc += tl.dot(P.to(V.dtype), V) * v_scale_val
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
@@ -823,7 +844,7 @@ def reduce_segments(
     )
 
     if HEAD_SIZE_PADDED != HEAD_SIZE:
-        dim_mask = offs_d < HEAD_SIZE
+        dim_mask = tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE
     else:
         dim_mask = tl.full((1,), 1, dtype=tl.int1)
 
@@ -933,6 +954,8 @@ def unified_attention(
     target_num_prgms = cu_count * cu_mult
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
+
+    
     # if batch contains a prefill
     if use_2d_kernel(
         head_size,
