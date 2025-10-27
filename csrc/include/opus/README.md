@@ -7,42 +7,44 @@
 </div>
 
 ## About
-**opus** is a light weight templated C++ DSL designed to accelerate writting HIP/C++ based kernels on AMD GPU. It is highly inspired by project like [ck/ck_tile](https://github.com/ROCm/composable_kernel), [cutlass/cute](https://github.com/NVIDIA/cutlass), but with much simplified design and better maintainability.
+**opus** is a lightweight, templated C++ DSL designed to accelerate the development of HIP/C++ kernels for AMD GPUs. Inspired by projects such as [ck/ck_tile](https://github.com/ROCm/composable_kernel) and [cutlass/cute](https://github.com/NVIDIA/cutlass), **opus** adopts a significantly simplified design while prioritizing maintainability.
 
-It is a single-header file, hence only included very basic abstractions. Trade off must be made to include new concept into **opus**. One example is there is no `tensor` concept in **opus**, which usually contains both data provider (a pointer, or array/tuple for register) and layout descriptor (to help index calculation) inside one class. **opus** seperate them into 2 different classes, and still allow user to manually calculate index. As a consequence, the positioning of **opus** is `above hand written HIP kernel, below optimized template library like ck/cutlass`.
+Distributed as a single-header library, **opus** provides only essential abstractions. This constraint requires careful trade-offs when introducing new concepts. For instance, **opus** deliberately avoids a unified `tensor` class—which typically combines data providers (pointers or register arrays/tuples) with layout descriptors (for index calculation)—and instead separates them into two distinct classes. This design preserves the flexibility of manual index computation while maintaining clarity. As a result, **opus** positions itself **above hand-written HIP kernels** yet **below highly optimized template libraries like ck/cutlass**.
 
 If you are looking for:
-- AMDGPU data type declare, convert, 
-- buffer load/store vectorization auto dispatch (instead of manually write by yourself)
-- different matrix core instruction, and don't want change much code while switch between different mfma.
-- various utility device function
-- (optionally) some simple and easy to understand layout abstraction to boost index calculation.
+- AMDGPU data type declaration and conversion
+- Automated vectorized buffer load/store dispatch (without manual implementation)
+- Support for various matrix core instructions with minimal code changes when switching MFMA types
+- A collection of utility device functions
+- (Optional) Simple and intuitive layout abstractions to streamline index calculations
 
 then **opus** is a good choice for you.
 
 However, if you are looking for:
 
-- optimized gemm/fa/reduce/... kernel to use directly
-- optimized gemm/fa/reduce/... device pipeline to reuse
-- some layout system can describe any tensor transformation
+- Pre-optimized kernels (e.g., GEMM, attention, reduction) for direct use
+- Reusable device-side pipelines for GEMM/attention/reduction
+- A comprehensive layout system capable of describing arbitrary tensor transformations
 
-then **opus** is not a good one, you may looking for `ck` or `aiter` kernels.
+then **opus** is not a good one, you may looking for alternatives like `ck` or `aiter` kernels.
 
 ## Design
-**opus** source code can be devided into two part (within a single file). The first half is some device independent structures, containers, utility functions. The second half is arch related device function like buffer load/store, mfma, etc... let's use a simple gemm as example to show case how to use **opus**
+The **opus** source code is structured into two logical sections within a single header file:
+- The first half contains device-independent structures, containers, and utility functions
+- The second half includes architecture-specific device functions, such as buffer load/store operations and MFMA instructions
+
+Below, we illustrate the usage of **opus** through a naive GEMM example.
 
 ### naive gemm using opus
 #### 1. vectorization load/store
-First you may wait to load data from global memory. This can be done as simple as poninter dereference:
+Loading data from global memory can be as simple as pointer dereferencing:
 ```
 int offset_a = (threadIdx.x / 32 * 4) + (threadIdx.x % 32 * stride_a);
 fp16x4_t v_a = *reinterpret_cast<const fp16x4_t*>(reinterpret_cast<const fp16_t*>(ptr_a) + offset_a);
 ```
-For this naive example, we load data based on the matrix core layout requirement of A matrix (check [this blog](https://rocm.blogs.amd.com/software-tools-optimization/matrix-cores/README.html) for more detail about matrix core).
+*For this example, we load data based on the matrix core layout of A matrix (check [this blog](https://rocm.blogs.amd.com/software-tools-optimization/matrix-cores/README.html) for more detail about matrix core).*
 
-This is OK, but if we want to control vectorization (e.g. sometimes we have to load data pixel by pixel due to layout) we have to rewrite the code, like use more `if constexpr` to conditionally do the loading. If we think about `ck`, `cutlss`, or `triton`, we don't need to change code very much, this is powerful place of DSL.
-
-in **opus** we can achieve so by:
+However, manually controlling vectorization across different layouts can lead to repetitive and error-prone code. With **opus**, the same operation becomes more expressive and adaptable:
 ```
 // create fp16 gmem and load with vector size load<*>
 auto g_a = opus::make_gmem(reinterpret_cast<const opus::fp16_t*>(ptr_a));
@@ -52,31 +54,31 @@ auto v_a = g_a.load<4>((threadIdx.x / 32 * 4) + (threadIdx.x % 32 * stride_a));
 auto g_a = opus::make_gmem(reinterpret_cast<const opus::fp16x4_t*>(ptr_a));
 auto v_a = g_a.load(((threadIdx.x / 32 * 4) + (threadIdx.x % 32 * stride_a)) / 4_I);
 ```
-Note we use `auto` to hint the return loading data without knowing the vectorization before hand. Indeed the `gmem` structure will automatically do the vectorization load for you by `load<*>`/`store<*>`. What's more, it may utilize the buffer load OOB feature of AMD GPU for you, if you provide a second argument to tell the size of this buffer. Check [AMD GPU ISA](https://gpuopen.com/machine-readable-isa/) and `make_gmem()` api within `opus.hpp`
+Note we use `auto` to hint the return loading data without knowing the vectorization before hand. The `gmem` abstraction automatically handles vectorized load/store operations. Optionally, it can leverage AMD GPU's out-of-bounds (OOB) load features when a buffer size is provided as 2nd argument for `make_gmem()`. Refer to the [AMD GPU ISA](https://gpuopen.com/machine-readable-isa/) and the `make_gmem()` API in `opus.hpp` for details. Check [AMD GPU ISA](https://gpuopen.com/machine-readable-isa/) and `make_gmem()` api within `opus.hpp`
 
 #### 2. layout for index calculation
-**opus** provide a simple tensor descriptor to help calculate the address, name it `layout`. It uses very simple stride and coordinate to calculate the linear offset of a ND tensor:
+**opus** provides a lightweight `layout` descriptor to simplify ND tensor address calculation. It computes linear offsets as:
 ```
 int offset = index[0] * stride[0] + index[1] * stride[1] + index[2] * stride[2] + ...
 ```
-here index/stride can be either static or dynamic variable.
-
-This would be the first real step when you feel hand written is tedious and want some DSL to accelerate the index calculation. `create descriptor first, then doing the math` instead of expand your index calculation for every place, this is exactly a DSL is good at.
-
-in **opus** you can create a layout and calculate address by:
+Here, indices and strides can be static or dynamic values. Using layouts helps abstract repetitive index calculations into reusable descriptors.
 ```
 auto u = opus::make_layout(opus::make_tuple(128, 64));
 ...
 int offset = u(4, 8); // will return 4 * 64 + 8 * 1
 ```
-the first arguement for `make_layout` is a `tuple`, to describe the shape of this tensor. If no more arguement provided, then assume this is a `packed tensor`, will internally calculate the stride based on this input shape.
+If no strides are provided, `make_layout` assumes a packed tensor and computes strides automatically based on the input shape.
 
-#### 3. x-dim/p-dim/y-dim, how to describe tensor in a distributed way across multiple threads.
-*optional if you don't want to introduce too many concept*
+#### 3. x-dim/p-dim/y-dim, distributed tensor views across threads
+*(optional if you don't want to introduce too many concept)*
 
-for GPU, it is natually need to consider in a multi-threaded way when dealing with a tensor, aka, one threads only responsible for a small portion of the tensor, multiple threads will collaboratively be responible for the whole tensor.
+In GPU programming, tensors are often distributed across multiple threads. Consider loading a `48x32` tensor using a 64-thread wavefront:
+- Each thread loads 8 contiguous elements per row
+- 4 threads cover one row (32 elements)
+- The remaining 16 threads load 16 rows
+- Each thread repeats 3 times to cover all 48 rows
 
-Suppose we have a `48x32` tensor from global, a wave with `64` threads want to load from this tensor. suppose every threads vectorized load `8` contiguous pixel, every row with `32` pixel will have `4` threads to load. The remaning `64/4=16` threads will responsible for load `16` rows. In the end, every threads need to repeat `48/16=3` times to finish such loading. By borrowing the `p/y/x` terms from [ck_tile](https://github.com/ROCm/composable_kernel/tree/develop/include/ck_tile), we can describe the layout partition in following psudo code:
+We adapt the `p/y/x` terminology from [ck_tile](https://github.com/ROCm/composable_kernel/tree/develop/include/ck_tile) to describe this distribution:
 ```
          x[0]       x[1]
           v          v
@@ -85,13 +87,14 @@ view   : [[3,  16], [4,   8]]
            ^   ^     ^    ^
          y[0] p[0]  p[1] y[1]
 ```
-- x-dim: view it as a whole tensor
-- y-dim: dims that is within a single threads (inside register)
-- p-dim: dims that need cross threads collaboratoin.
+- **x-dim**: The original tensor dimensions
+- **y-dim**: Dimensions handled within a single thread (register-level)
+- **p-dim**: Dimensions requiring collaboration across threads
 
-But `layout` structure we designed is so simple that it does not know the `x/y/p` information, how can we achieve such complex tensor description? This is through
-1. use `underscore` internally, a special empty structure to hint the dims that need use weathre p or y dim (if you don't quite understand it, just skip it. this is internally trick)
-2. use `adaptor` concept to provide more information
+While the basic `layout` structure does not inherently understand `x/y/p` partitioning, **opus** enables such descriptions through:
+
+1. Internal use of `underscore` placeholders to hint at p/y dimensions
+2. The `adaptor` concept to provide additional structural information
 
 above example can be expressed like this:
 ```
@@ -117,27 +120,27 @@ auto u = partition_layout(some_tile_adaptor{}, s, c);
 ...
 auto offset = u(1, 0); // => get ofset at y[0] = 1, y[1] = 0 for each thread
 ```
-Indeed **opus** support load/store with `layout` as argument, in which case will help you do all the dirty calculation. As of above example, usually need explcitly for loop to load `3` times with dwordx4. But with this feature, it can be simplified as:
+**opus** also supports direct load/store operations using `layout` objects, which automate the indexing logic. For instance, instead of manually looping over repetitions:
 ```
 auto g = opus::make_gmem(reinterpret_cast<const some_tile_dtype*>(ptr));
 
-// originally we need do below for loop
 some_vec_type v[3];
 for(auto i = 0; i < 3; i++)
     v[i] = g.load<8>(u(i, 0));
-
-// or, feed the layout to load(), then it will do the for loop for you.
+```
+You can simply write:
+```
+auto g = opus::make_gmem(reinterpret_cast<const some_tile_dtype*>(ptr));
 auto v = g.load<8>(u);
 ```
 
 #### 4. warp gemm and tiled mma
-use `make_mfma()` to create a warp gemm instance, and use `make_tiled_mma()` to create a block gemm(multi-warp) instance. If you check the **opus** source code of mfma related code, you can see they all return a `adaptor` structure.
-```
-auto mma = opus::make_mfma()
-```
+Use `make_mfma()` to create a warp-level GEMM instance, and `make_tiled_mma()` for multi-warp (block-level) GEMM operations. These functions return `adaptor` structures that integrate seamlessly with the layout system.
+1. the 1st arguement `shape` is usually from x-dim point of view.
+2. the 2nd optional arguement is `stride`, from x-dim point of view
+3. the 3rd optional arguement is `coordinate`, from p-dim point of view.
+4. use `operator()` to issue underneath matrix core instruction
 
-
-While calling `make_layout`, the 1st arguement `shape` is usually from x-dim point of view. the 2nd optional arguement is `stride`, but from x-dim point of view. the 3rd optional arguement is `coordinate`, but from p-dim point of view. And the `operator()` which return the linear offset, is indeed from y-dim point of view. Above tensor can be described by:
 ```
 using namespace opus;
 
@@ -151,6 +154,8 @@ auto mma = make_mfma<fp16_t, fp16_t, fp32_t>(32_I, 32_I, 8_I, mfma_adaptor_swap_
 // hence block tile: 64x32x16
 auto mma = make_tiled_mma<fp16_t, fp16_t, fp32_t>(seq<2, 1, 1>{}, seq<2, 2, 1>{}, seq<16, 16, 16>{}, mfma_adaptor_swap_ab{});
 
+...
+v_c = mma(v_a, v_b, v_c);
 ```
 
 check [this repo](https://github.com/carlushuang/gcnasm/tree/master/matrix_core_opus) for mfma example using **opus**
