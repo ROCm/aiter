@@ -256,27 +256,33 @@
           &aiter::init_custom_ar,                                                              \
           "init_custom_ar(Tensor meta, Tensor rank_data, "                                     \
           "str[] handles, int[] offsets, int rank, "                                           \
-          "bool full_nvlink) -> int",                                                          \
+          "bool fully_connected) -> int",                                                      \
           py::arg("meta"),                                                                     \
           py::arg("rank_data"),                                                                \
           py::arg("handles"),                                                                  \
           py::arg("offsets"),                                                                  \
           py::arg("rank"),                                                                     \
-          py::arg("full_nvlink"));                                                             \
-    m.def("all_reduce_reg",                                                                    \
-          &aiter::all_reduce_reg,                                                              \
-          "all_reduce_reg(int fa, Tensor inp, Tensor! out, bool open_fp8_quant) -> ()",        \
+          py::arg("fully_connected"));                                                         \
+    m.def("all_gather_reg",                                                                    \
+          &aiter::all_gather_reg,                                                              \
+          "all_gather_reg(int fa, Tensor inp, Tensor! out) -> ()",                             \
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
-          py::arg("out"),                                                                      \
-          py::arg("open_fp8_quant"));                                                          \
-    m.def("all_reduce_unreg",                                                                  \
-          &aiter::all_reduce_unreg,                                                            \
-          "all_reduce_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> ()",        \
+          py::arg("out"));                                                                     \
+    m.def("all_gather_unreg",                                                                  \
+          &aiter::all_gather_unreg,                                                            \
+          "all_gather_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> ()",        \
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("reg_buffer"),                                                               \
           py::arg("out"));                                                                     \
+    m.def("all_reduce",                                                                        \
+          &aiter::all_reduce,                                                                  \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("out"),                                                                      \
+          py::arg("open_fp8_quant"),                                                           \
+          py::arg("reg_buffer") = std::nullopt);                                               \
     m.def("all_reduce_asm_", &all_reduce_asm, "");                                             \
     m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");                   \
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \
@@ -325,13 +331,10 @@
           py::arg("x_scale"),                                           \
           py::arg("w_scale"),                                           \
           py::arg("Out"),                                               \
+          py::arg("kernelName"),                                        \
           py::arg("bias"),                                              \
-          py::arg("sub_m")  = 128,                                      \
-          py::arg("sub_n")  = 128,                                      \
-          py::arg("pad_a")  = 0,                                        \
-          py::arg("pad_b")  = 0,                                        \
-          py::arg("pad_c")  = 0,                                        \
-          py::arg("splitK") = 0);
+          py::arg("bpreshuffle") = true,                                \
+          py::arg("splitK")      = std::nullopt);
 
 #define GEMM_A16W16_ASM_PYBIND                  \
     m.def("gemm_a16w16_asm",                    \
@@ -1115,7 +1118,18 @@
 
 #define ROPE_POS_FWD_PYBIND                                                                   \
     m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl);                 \
-    m.def("rope_cached_positions_2c_fwd_impl", &rope_cached_positions_2c_fwd_impl);           \
+    m.def("rope_cached_positions_2c_fwd_impl",                                                \
+          &rope_cached_positions_2c_fwd_impl,                                                 \
+          py::arg("output_x"),                                                                \
+          py::arg("output_y"),                                                                \
+          py::arg("input_x"),                                                                 \
+          py::arg("input_y"),                                                                 \
+          py::arg("cos"),                                                                     \
+          py::arg("sin"),                                                                     \
+          py::arg("positions"),                                                               \
+          py::arg("rotate_style"),                                                            \
+          py::arg("reuse_freqs_front_part"),                                                  \
+          py::arg("nope_first"));                                                             \
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
@@ -1171,11 +1185,12 @@
           py::arg("mat1"),                                                         \
           py::arg("mat2"),                                                         \
           py::arg("solution_index"),                                               \
-          py::arg("bias")      = std::nullopt,                                     \
-          py::arg("out_dtype") = std::nullopt,                                     \
-          py::arg("scaleA")    = std::nullopt,                                     \
-          py::arg("scaleB")    = std::nullopt,                                     \
-          py::arg("scaleOut")  = std::nullopt);                                     \
+          py::arg("bias")        = std::nullopt,                                   \
+          py::arg("out_dtype")   = std::nullopt,                                   \
+          py::arg("scaleA")      = std::nullopt,                                   \
+          py::arg("scaleB")      = std::nullopt,                                   \
+          py::arg("scaleOut")    = std::nullopt,                                   \
+          py::arg("bpreshuffle") = std::nullopt);                                  \
     m.def("hipb_findallsols",                                                      \
           &hipb_findallsols,                                                       \
           "hipb_findallsols",                                                      \
