@@ -38,18 +38,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
             CustomAllreduce,
         )
 
-        # from aiter.dist.device_communicators.pynccl import PyNcclCommunicator
-
         # from aiter.dist.device_communicators.symm_mem import SymmMemCommunicator
 
         self.pynccl_comm = None
-        # if self.world_size > 1:
-        #     self.pynccl_comm = PyNcclCommunicator(
-        #         group=self.cpu_group,
-        #         device=self.device,
-        #     )
-        #     if is_symmetric_memory_enabled():
-        #         register_nccl_symmetric_ops(self.pynccl_comm)
+        if self.world_size > 1:
+            from aiter.dist.device_communicators.communicator_pynccl import (
+                PyNcclCommunicator,
+            )
+
+            self.pynccl_comm = PyNcclCommunicator(
+                group=self.cpu_group,
+                device=self.device,
+            )
+            # if is_symmetric_memory_enabled():
+            #     register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm = None
@@ -70,8 +72,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # ),
             )
 
-        # if current_platform.is_rocm():
-        if True and self.world_size > 1:
+        if self.world_size > 1:
             from aiter.dist.device_communicators.quick_all_reduce import (
                 QuickAllReduce,
             )
@@ -248,6 +249,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def destroy(self):
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
+        if self.qr_comm is not None:
+            self.qr_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.all2all_manager is not None:

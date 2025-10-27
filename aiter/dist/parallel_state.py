@@ -213,7 +213,7 @@ class GroupCoordinator:
         )
         self.device_communicator = None
         if use_device_communicator and self.world_size > 1:
-            from .device_communicators.cuda_communicator import CudaCommunicator
+            from .device_communicators.communicator_cuda import CudaCommunicator
 
             self.device_communicator = CudaCommunicator(
                 cpu_group=self.cpu_group,
@@ -277,7 +277,7 @@ class GroupCoordinator:
         # only cuda uses this function,
         # so we don't abstract it into the base class
         maybe_ca_context = nullcontext()
-        from aiter.dist.device_communicators.cuda_communicator import (
+        from aiter.dist.device_communicators.communicator_cuda import (
             CudaCommunicator,
         )
 
