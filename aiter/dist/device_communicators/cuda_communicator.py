@@ -118,14 +118,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 )
 
     def all_reduce(self, input_, ca_fp8_quant: bool = False) -> torch.Tensor:
-        # since currently we perform copy input -> symm_input -> out-of-place AR
-        # return symm_output, we don't need to check if input is symmetric
-        if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
-            self.pynccl_comm.world_size, input_
-        ):
-            out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
-            if out is not None:
-                return out
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
@@ -153,19 +145,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert out is not None
             return out
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is None or pynccl_comm.disabled:
-            out = input_.clone()
-            torch.distributed.all_reduce(out, group=self.device_group)
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            out = pynccl_comm.all_reduce(input_)
+            assert out is not None
             return out
-        assert pynccl_comm is not None
-        out = pynccl_comm.all_reduce(input_)
-        if out is None:
-            # fall back to the default all-reduce using PyTorch.
-            # this usually happens during testing.
-            # when we run the model, allreduce only happens for the TP
-            # group, where we always have either custom allreduce or pynccl.
-            out = input_.clone()
-            torch.distributed.all_reduce(out, group=self.device_group)
+        # fall back to the default all-reduce using PyTorch.
+        # this usually happens during testing.
+        # when we run the model, allreduce only happens for the TP
+        # group, where we always have either custom allreduce or pynccl.
+        out = input_.clone()
+        torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):

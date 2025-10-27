@@ -329,7 +329,7 @@ class GroupCoordinator:
         return self.device_communicator.all_reduce(input_, ca_fp8_quant)
 
     def _all_gather_out_place(self, input_: torch.Tensor) -> torch.Tensor:
-        ca_comm = self.ca_comm
+        ca_comm = self.device_communicator.ca_comm
         assert ca_comm is not None
         assert not ca_comm.disabled
         out = ca_comm.custom_all_gather(input_)
