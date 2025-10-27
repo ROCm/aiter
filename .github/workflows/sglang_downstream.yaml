@@ -18,7 +18,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Retry download checks signal artifact
+      - name: Download and check signal artifact
         run: ./.github/scripts/check_signal.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

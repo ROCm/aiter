@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# This script attempts to download a pre-checks artifact from a GitHub workflow up to 5 times.
+# If the artifact is found and the signal indicates success, the workflow continues.
+# If the signal indicates failure, the workflow is skipped with details printed.
+# If the artifact cannot be downloaded after all retries, the workflow exits with an error.
+
 set -e
 
 ARTIFACT_NAME="checks-signal-${GITHUB_SHA:-${1}}"
