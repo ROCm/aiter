@@ -6,7 +6,7 @@ import argparse
 import torch
 import pandas as pd
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from aiter import logger
 import traceback
 from operator import itemgetter
