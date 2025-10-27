@@ -33,7 +33,7 @@ def create_row_boundaries(
     return row_starts, row_ends
 
 
-def compare_top_k_results(
+def compare_topk_results(
     logits: torch.Tensor,
     cuda_indices: torch.Tensor,
     torch_indices: torch.Tensor,
@@ -114,10 +114,34 @@ def run_topk_per_row(
     )
 
 
-@benchmark()
-def test_top_k_per_row(num_rows: int, top_k: int) -> dict:
+@perftest()
+def run_topk_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seqLens: torch.Tensor,
+    indices: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+) -> None:
     """
-    Test top_k_per_row.
+    Run the top_k_per_row kernel.
+    """
+    return aiter.topk_per_row_decode(
+        logits,
+        next_n,
+        seqLens,
+        indices,
+        numRows,
+        stride0,
+        stride1,
+    )
+
+
+@benchmark()
+def test_topk_per_row(num_rows: int, top_k: int) -> dict:
+    """
+    Test topk_per_row.
     """
     ret = {}
     torch.set_default_device("cuda:0")
@@ -148,12 +172,70 @@ def test_top_k_per_row(num_rows: int, top_k: int) -> dict:
     torch_indices = torch_indices.masked_fill(~mask, -1)
 
     # Compare results
-    all_close = compare_top_k_results(
+    all_close = compare_topk_results(
         logits, indices, torch_indices, row_starts, row_ends, top_k
     )
 
     # measure performance
-    ret["vocab_size"] = logits.shape[1]
+    ret["context_len"] = logits.shape[1]
+    ret["all_close"] = all_close
+    ret["us"] = us
+    return ret
+
+
+@benchmark()
+def test_topk_per_row_decode(
+    batch_size: int,
+    top_k: int,
+    next_n: int,
+) -> None:
+    """
+    Test topk_per_row with seq_lens tensor.
+    """
+    torch.set_default_device("cuda:0")
+    ret = {}
+    # Create test data
+    num_rows = batch_size * next_n
+    vocab_size = 20000
+    seq_lens = torch.randint(
+        vocab_size, (batch_size,), dtype=torch.int32, device="cuda"
+    )
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+    row_indices = torch.arange(num_rows, device="cuda") // next_n
+    next_n_offset = torch.arange(num_rows, device="cuda") % next_n
+    row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
+    logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
+
+    # Create output tensors
+    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+
+    # Run the kernel
+    _, us = run_topk_per_row_decode(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+    )
+
+    torch.cuda.synchronize()
+
+    # Run reference implementation
+    torch_indices = logits.topk(min(top_k, max(row_ends)), dim=-1)[1]
+    mask_lo = torch_indices >= 0
+    mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
+    mask = mask_lo & mask_hi
+    torch_indices = torch_indices.masked_fill(~mask, -1)
+
+    # Compare results
+    all_close = compare_topk_results(
+        logits, indices, torch_indices, row_starts, row_ends, top_k
+    )
+
+    # measure performance
+    ret["context_len"] = logits.shape[1]
     ret["all_close"] = all_close
     ret["us"] = us
     return ret
@@ -183,14 +265,45 @@ parser.add_argument(
     e.g.: -k 2048""",
 )
 
+parser.add_argument(
+    "-b",
+    "--decode_batch_size",
+    type=int,
+    default=[4, 8, 16, 24],
+    nargs="+",
+    help="""decode_batch_size batch size.
+    e.g.: -b 4""",
+)
+
+parser.add_argument(
+    "-n",
+    "--next_n",
+    type=int,
+    default=[4, 8],
+    nargs="+",
+    help="""next_n elements per sequence in a row.
+    e.g.: -n 4""",
+)
+
 args = parser.parse_args()
 
 
 df = []
 for m in args.num_rows:
     for k in args.top_k:
-        ret = test_top_k_per_row(m, k)
+        ret = test_topk_per_row(m, k)
         df.append(ret)
 
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+aiter.logger.info(f"summary for topk_per_row kernel:\n{df}")
+
+
+df = []
+for m in args.decode_batch_size:
+    for k in args.top_k:
+        for n in args.next_n:
+            ret = test_topk_per_row_decode(m, k, n)
+            df.append(ret)
+
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary for topk_per_row_decode kernel:\n{df}")

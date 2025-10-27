@@ -208,7 +208,7 @@ def topk_per_row(
 ) -> None: ...
 
 
-@compile_ops("module_topk_per_row_decode")
+@compile_ops("module_topk_per_row")
 def topk_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
