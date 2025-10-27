@@ -19,7 +19,7 @@ configs.append(
             "hq",
             "hk",
             "n_ctx_q",
-            "n_ctx",
+            "n_ctx_k",
             "d",
             "total_programs",
             "init_dtype",
@@ -100,6 +100,9 @@ configs.append(
             (True, 1, 32, 32, 2048, [2048], 128, 608, torch.float16, 128, 64, 2, 4),
             (True, 1, 64, 32, 2048, [2048], 128, 608, torch.float16, 128, 64, 2, 4),
             (True, 1, 128, 32, 2048, [2048], 128, 608, torch.float16, 128, 64, 2, 4),
+            (False, 512, 32, 8, 16, [8192], 128, 608, torch.float16, 16, 64, 2, 4),
+            (False, 512, 64, 8, 16, [8192], 128, 608, torch.float16, 16, 128, 2, 4),
+            (False, 512, 128, 8, 16, [8192], 128, 608, torch.float16, 16, 128, 2, 4),
         ],
         line_arg="provider",
         line_vals=["triton"],
@@ -121,7 +124,7 @@ def bench_lean_attention(
     hq,
     hk,
     n_ctx_q,
-    n_ctx,
+    n_ctx_k,
     d,
     total_programs,
     init_dtype,
@@ -132,7 +135,7 @@ def bench_lean_attention(
     provider,
     device="cuda",
 ):
-
+    n_ctx = n_ctx_k * batch
     assert batch == len(n_ctx)
 
     try:
