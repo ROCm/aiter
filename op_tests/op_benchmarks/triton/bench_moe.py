@@ -102,10 +102,11 @@ def fused_moe(
         if tp > 1:
             w1 = w1[:, :N // tp, :].contiguous()
             w2 = w2[:, :, :(N//2//tp)].contiguous()
-            num_w1_scales_per_gpu = triton.cdiv(N // tp, block_shape[0])
-            w1_scale = w1_scale[:, :num_w1_scales_per_gpu].contiguous()
-            num_w2_scales_per_gpu = triton.cdiv((N // 2) // tp, block_shape[0])
-            w2_scale = w2_scale[:, :, :num_w2_scales_per_gpu].contiguous()
+            if fp8_w8a8:
+                num_w1_scales_per_gpu = triton.cdiv(N // tp, block_shape[0])
+                w1_scale = w1_scale[:, :num_w1_scales_per_gpu].contiguous()
+                num_w2_scales_per_gpu = triton.cdiv((N // 2) // tp, block_shape[0])
+                w2_scale = w2_scale[:, :, :num_w2_scales_per_gpu].contiguous()
 
         fn = lambda: triton_e2e_moe(
             a,
@@ -201,6 +202,14 @@ def fused_moe(
             blockshape=block_shape,
             int8_w8a16=int8_w8a16,
         )
+
+        # tensor parallel slicing
+        if tp > 1:
+            b = b[:, :N // tp, :].contiguous()
+            if fp8_w8a8:
+                num_b_scales_per_gpu = triton.cdiv(N // tp, block_shape[0])
+                b_scale = b_scale[:, :num_b_scales_per_gpu].contiguous()
+
 
         fn = lambda: moe_fn(
             a,

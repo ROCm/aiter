@@ -3,10 +3,10 @@
     "BLOCK_SIZE_M": 32,
     "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K1": 128,
-    "BLOCK_SIZE_K2": 512,
+    "BLOCK_SIZE_K2": 1024,
     "GROUP_SIZE_M": 1,
     "num_warps": 8,
-    "num_stages": 2,
+    "num_stages": 3,
     "waves_per_eu": 0,
     "matrix_instr_nonkdim": 16,
     "kpack": 1
