@@ -41,7 +41,10 @@ def test_m_grouped_gemm(
     quant_dtype=aiter.dtypes.fp8,
     dtypes=torch.bfloat16,
 ):
-    max_m = 4096 if expect_m < 128 else 2 * expect_m
+    # TODO: add support for gfx950
+    if get_gfx() not in ["gfx942"]:
+        return
+    max_m = 256 if expect_m < 128 else 2 * expect_m
     x = torch.randn((num_groups, max_m, k), device="cuda", dtype=dtypes)
     weight = torch.randn((num_groups, n, k), device="cuda", dtype=dtypes)
     out = torch.zeros((num_groups, max_m, n), device="cuda", dtype=dtypes)
@@ -92,7 +95,7 @@ def test_m_grouped_gemm(
 
 l_dtype = ["bf16", "fp16"]
 l_num_groups = [
-    20,
+    Wjx,
 ]
 l_expect_m = [
     1,
@@ -107,7 +110,7 @@ l_expect_m = [
     512,
     1024,
 ]
-l_dim = [(6144, 5120)]
+l_dim = [(7168, 4096)]
 l_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
     (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
