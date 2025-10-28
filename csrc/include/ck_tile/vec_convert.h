@@ -116,6 +116,38 @@ CK_TILE_HOST_DEVICE constexpr vec_t<Y, N> vec_convert(vec_t<X, N> x)
 template <typename Y,
           typename X,
           index_t N,
+          std::enable_if_t<(std::is_same_v<X, fp32_t>), bool> = false,
+          std::enable_if_t<(std::is_same_v<Y, bf16_t>), bool> = false>
+CK_TILE_HOST_DEVICE constexpr vec_t<Y, N> vec_convert(vec_t<X, N> x)
+{
+    using bf16xX_t = vec_t<Y, N>;
+    bf16xX_t tmp;
+    for(size_t i = 0; i < N; i++)
+    {
+        tmp[i] = type_convert<Y>(x[i]);
+    }
+    return tmp;
+}
+
+template <typename Y,
+          typename X,
+          index_t N,
+          std::enable_if_t<(std::is_same_v<X, fp32_t>), bool> = false,
+          std::enable_if_t<(std::is_same_v<Y, int8_t>), bool> = false>
+CK_TILE_HOST_DEVICE constexpr vec_t<Y, N> vec_convert(vec_t<X, N> x)
+{
+    using int8xX_t = vec_t<Y, N>;
+    int8xX_t tmp;
+    for(size_t i = 0; i < N; i++)
+    {
+        tmp[i] = type_convert<Y>(x[i]);
+    }
+    return tmp;
+}
+
+template <typename Y,
+          typename X,
+          index_t N,
           std::enable_if_t<(N % 2 == 0), bool>                    = false,
           std::enable_if_t<(!(std::is_same_v<Y, fp4x2_t>)), bool> = false>
 CK_TILE_HOST_DEVICE constexpr vec_t<Y, N> vec_convert(vec_t<X, N> x, fp32_t inverted_scale)
