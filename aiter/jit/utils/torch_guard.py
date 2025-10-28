@@ -284,7 +284,7 @@ def torch_compile_guard(
                 return torch.empty(1, device="cuda"), 1
             if gen_fake is not None:
                 return gen_fake(*args, **kwargs)
-            return func(*args, **kwargs)
+            return calling_func(*args, **kwargs)
 
         def outer_wrapper(*args, **kwargs):
             return (
@@ -298,7 +298,7 @@ def torch_compile_guard(
                 return torch.empty(1, device="cuda"), 1
             if gen_fake is not None:
                 return gen_fake(*args, **kwargs)
-            return func(*args, **kwargs)
+            return calling_func(*args, **kwargs)
 
         def outer_wrapper_dummy(dummy, *args, **kwargs):
             return (
