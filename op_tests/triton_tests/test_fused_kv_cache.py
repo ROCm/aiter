@@ -233,6 +233,7 @@ def test_fused_qk_rope_reshape_and_cache(
             cache_dtype_actual = torch.float8_e4m3fn
         else:
             cache_dtype_actual = torch.float8_e4m3fnuz
+            pytest.skip("Skipping FP8 dtype cases non-gfx950")
 
     if cache_flash:
         key_cache = torch.zeros(
