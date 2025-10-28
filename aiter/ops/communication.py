@@ -77,7 +77,7 @@ def all_reduce_rmsnorm(
     input: Tensor, residual_in: Tensor, weight: Tensor, bias: Tensor, epsilon: float
 ):
     tp_grp = get_tp_group()
-    ca = tp_grp.ca_comm
+    ca = tp_grp.device_communicator.ca_comm
 
     return aiter.all_reduce_rmsnorm_(
         input,
@@ -101,7 +101,7 @@ def all_reduce_rmsnorm_quant(
     epsilon: float,
 ):
     tp_grp = get_tp_group()
-    ca = tp_grp.ca_comm
+    ca = tp_grp.device_communicator.ca_comm
 
     return aiter.all_reduce_rmsnorm_quant_(
         input,
