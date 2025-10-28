@@ -63,9 +63,6 @@ def _batched_gemm_a8w8_kernel(
     EVEN_K: gl.constexpr,
     GRID_MN: gl.constexpr,
     BUFFER_SIZE: gl.constexpr,
-    THREADS_PER_WARP: gl.constexpr,
-    THREADS_PER_WARP_M: gl.constexpr,
-    THREADS_PER_WARP_N: gl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_a8w8 function
@@ -113,21 +110,20 @@ def _batched_gemm_a8w8_kernel(
 
     # Create layouts for contiguous access
     elems_per_thread_mk: gl.constexpr = triton.cdiv(
-        BLOCK_SIZE_M * BLOCK_SIZE_K // (gl.num_warps() * THREADS_PER_WARP), BUFFER_SIZE
+        BLOCK_SIZE_M * BLOCK_SIZE_K // (gl.num_warps() * 64), BUFFER_SIZE
     )
     elems_per_thread_kn: gl.constexpr = triton.cdiv(
-        BLOCK_SIZE_K * BLOCK_SIZE_N // (gl.num_warps() * THREADS_PER_WARP), BUFFER_SIZE
+        BLOCK_SIZE_K * BLOCK_SIZE_N // (gl.num_warps() * 64), BUFFER_SIZE
     )
-    gl.static_assert(THREADS_PER_WARP_M * THREADS_PER_WARP_N == THREADS_PER_WARP)
     blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[elems_per_thread_mk, BUFFER_SIZE],
-        threads_per_warp=[THREADS_PER_WARP_M, THREADS_PER_WARP_N],
+        size_per_thread=[elems_per_thread_mk, 16],
+        threads_per_warp=[16, 4],
         warps_per_cta=[gl.num_warps(), 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[BUFFER_SIZE, elems_per_thread_kn],
-        threads_per_warp=[THREADS_PER_WARP_N, THREADS_PER_WARP_M],
+        size_per_thread=[16, elems_per_thread_kn],
+        threads_per_warp=[4, 16],
         warps_per_cta=[1, gl.num_warps()],
         order=[0, 1],
     )
@@ -223,8 +219,9 @@ def _batched_gemm_a8w8_kernel(
     )
 
     # Store first block of A and B in shared memory
-    smem_a.store(a)
-    smem_b.store(b)
+    if num_k_iter > 1:
+        smem_a.store(a)
+        smem_b.store(b)
 
     # Run the main loop
     acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
@@ -287,7 +284,7 @@ def _batched_gemm_a8w8_kernel(
             smem_a.store(a)
             smem_b.store(b)
 
-    # Epilogue: use remaining A and B in shared memory for last MFMA
+    # Epilogue: use remaining A and B for last MFMA
     cur_a = gl.convert_layout(a, dot_a_layout)
     cur_b = gl.convert_layout(b, dot_b_layout)
     accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
@@ -415,10 +412,6 @@ def batched_gemm_a8w8(
     buffer_size = 16 // XQ.element_size()
     assert buffer_size == 16
 
-    threads_per_warp = 64
-    threads_per_warp_m = 8
-    threads_per_warp_n = 8
-
     _batched_gemm_a8w8_kernel[grid](
         XQ,
         WQ,
@@ -443,9 +436,6 @@ def batched_gemm_a8w8(
         bias.stride(0) if has_bias else 0,
         has_bias,
         BUFFER_SIZE=buffer_size,
-        THREADS_PER_WARP=threads_per_warp,
-        THREADS_PER_WARP_M=threads_per_warp_m,
-        THREADS_PER_WARP_N=threads_per_warp_n,
         **config,
     )
 
