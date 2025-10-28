@@ -74,6 +74,9 @@ def bench_gemm_fn(
     elif metric == "bandwidth":
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         return bandwidth
+    elif metric == "ai":
+        ai = flops / mem  # FLOPs/Byte
+        return ai
     else:
         raise ValueError("Unknown metric: " + metric)
 
