@@ -1,14 +1,14 @@
 {
     "small": {
-      "BLOCK_SIZE_M": 16,
-      "BLOCK_SIZE_N": 16,
+      "BLOCK_SIZE_M": 32,
+      "BLOCK_SIZE_N": 32,
       "BLOCK_SIZE_K": 512,
       "GROUP_SIZE_M": 4,
-      "matrix_instr_nonkdim": 32,
-      "num_warps": 2,
-      "num_stages": 1,
-      "waves_per_eu": 4,
-      "cache_modifier": ".cg",
+      "matrix_instr_nonkdim": 16,
+      "num_warps": 16,
+      "num_stages": 2,
+      "waves_per_eu": 2,
+      "cache_modifier": ".ca",
       "NUM_KSPLIT": 1
     },
     "medium_M32": {
