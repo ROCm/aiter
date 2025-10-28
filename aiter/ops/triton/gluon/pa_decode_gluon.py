@@ -155,7 +155,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # in the same row instead of column, which is good for chained dot and global write.
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         # version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[4, 1]
-        version=3, instr_shape=[16, 16, 16], transposed=True, warps_per_cta=[1, 4]
+        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
     )
     qk_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=qk_mfma_layout, k_width=8
@@ -165,7 +165,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     )
 
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16, 16], transposed=False, warps_per_cta=[1, 4]
+        version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[1, 4]
     )
     pv_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=pv_mfma_layout, k_width=16
@@ -2804,15 +2804,17 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     )
 
     # max_logits: [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2]
+    other = gl.full(exp_sums_offs.shape, float("-inf"), max_logits_ptr.type.element_ty, layout=gl.SliceLayout(2, blocked_layout))
     max_logits = gl.amd.cdna3.buffer_load(
-        ptr=max_logits_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=float("-inf")
+        ptr=max_logits_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=other
     )
     # max_logit: [QUERY_GRP_SZ_POW2]
     ml = tl.max(max_logits, axis=0)
 
     # Rescale the exp sums and compute the global sum
     # exp_sums: [MAX_NUM_SEQ_PARTITIONS, QUERY_GRP_SZ_POW2]
-    exp_sums = gl.amd.cdna3.buffer_load(ptr=exp_sums_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=0.0)
+    other = gl.full(exp_sums_offs.shape, 0.0, exp_sums_ptr.type.element_ty, layout=gl.SliceLayout(2, blocked_layout))
+    exp_sums = gl.amd.cdna3.buffer_load(ptr=exp_sums_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=other)
     exp_sums *= tl.exp(max_logits - ml[None, :])
 
     # exp_sum: [QUERY_GRP_SZ_POW2]
@@ -2839,8 +2841,9 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     logits_mask = (part_offs[:, None] < num_partitions) & (
         q_grp_offs[None, :] < QUERY_GRP_SZ
     )
+    other = gl.full(logits_offset.shape, 0.0, logits_ptrs.type.element_ty, layout=blocked_layout)
     logits = gl.amd.cdna3.buffer_load(
-        ptr=logits_ptrs, offsets=logits_offset, mask=logits_mask[:, :, None], other=0.0
+        ptr=logits_ptrs, offsets=logits_offset, mask=logits_mask[:, :, None], other=other
     )
     # out: [QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     out = tl.sum((logits.to(tl.float32) * gl.convert_layout(p, layout=blocked_layout)), axis=0).to(out_ptr.dtype.element_ty)
