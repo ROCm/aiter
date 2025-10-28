@@ -46,6 +46,7 @@ def persistent_lean_attention(
     batch_size: int,
     sm_scale: torch.float16,
     causal: bool = True,  # causal masking
+    RAGGED_BATCH: bool = False,
     config: Optional[dict] = None,
     program_count: Optional[int] = None,
 ):
@@ -80,6 +81,7 @@ def persistent_lean_attention(
         causal=causal,
         batch_size=batch_size,
         sm_scale=sm_scale,
+        RAGGED_BATCH=RAGGED_BATCH,
         num_warps=config["num_warps"],
         waves_per_eu=config["waves_per_eu"],
         config=config,
@@ -103,6 +105,7 @@ def _persistent_lean_attention(
     causal: bool,  # causal masking
     batch_size: int,
     sm_scale: torch.float16,  # typically 1 / sqrt(d)
+    RAGGED_BATCH: bool,
     num_warps: int,
     waves_per_eu: int,
     config: dict = {},
@@ -189,7 +192,7 @@ def _persistent_lean_attention(
         MODE=CAUSAL_MODE,
     )
     if not causal:
-        max_output_tile_cnt = math.ceil((H * batch_size) / total_programs)
+        max_output_tile_cnt = math.ceil((H * batch_size) / total_programs) + 4
 
     if DEBUG:
         print(f"max_output_tile_cnt={max_output_tile_cnt}")
@@ -325,7 +328,7 @@ def _persistent_lean_attention(
             or (o.stride(0) * N_CTX_Q) >= (1 << 31)
             or (q.stride(0) * N_CTX_Q) >= (1 << 31)
         ),
-        RAGGED_BATCH=False,
+        RAGGED_BATCH=RAGGED_BATCH,
         **config,
     )
     """
@@ -336,7 +339,7 @@ def _persistent_lean_attention(
         kernel_timing[k]["ms"] += ms
     total_ms = kernel_timing["attn_fwd"]["ms"]
     """
-    print(f"la kernel {la_kernel.n_regs} registers used, {la_kernel.n_spills} spills")
+    # print(f"la kernel {la_kernel.n_regs} registers used, {la_kernel.n_spills} spills")
     ms = 0
     return (o, ms)
 
