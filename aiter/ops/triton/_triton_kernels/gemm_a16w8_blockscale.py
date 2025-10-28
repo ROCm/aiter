@@ -237,4 +237,3 @@ def _get_config(
             return _get_config._config_dict[key]["xlarge"]
 
     return _get_config._config_dict[key]["any"]
-

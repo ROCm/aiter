@@ -7,6 +7,7 @@ import pytest
 from aiter.ops.triton.gemm_a16w8_blockscale import gemm_a16w8_blockscale
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+
 # from op_tests.triton_tests.test_fused_fp8_quant import per_token_fp8_group_quant
 import torch.nn.functional as F
 

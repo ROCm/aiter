@@ -419,8 +419,10 @@ def fused_reduce_rms_fp8_group_quant(
         inp1_col_stride = inp1.stride(1)
     BLOCK_SIZE_N1 = max(triton.next_power_of_2(N1), group_size)
     if inp2 is not None:
-        if SPK > 1:            
-            assert inp2.dim() == 3 and inp2.shape[0] == SPK and inp2.shape[1] == M, f"Incompatible shapes {inp1.shape=}, {inp2.shape=}"
+        if SPK > 1:
+            assert (
+                inp2.dim() == 3 and inp2.shape[0] == SPK and inp2.shape[1] == M
+            ), f"Incompatible shapes {inp1.shape=}, {inp2.shape=}"
             _, _, N2 = inp2.shape
         else:
             _, N2 = inp2.shape
@@ -428,8 +430,10 @@ def fused_reduce_rms_fp8_group_quant(
     else:
         N2 = 0
         BLOCK_SIZE_N2 = 1
-    if inp3 is not None:  
-        assert inp3.dim() == 3 and inp3.shape[0] == SPK and inp3.shape[1] == M, f"Incompatible shapes {inp1.shape=}, {inp3.shape=}"
+    if inp3 is not None:
+        assert (
+            inp3.dim() == 3 and inp3.shape[0] == SPK and inp3.shape[1] == M
+        ), f"Incompatible shapes {inp1.shape=}, {inp3.shape=}"
         _, _, N3 = inp3.shape
         BLOCK_SIZE_N3 = triton.next_power_of_2(N3)
     else:
@@ -512,13 +516,13 @@ def fused_reduce_rms_fp8_group_quant(
         num_warps = 8
     else:
         num_warps = 16
-        
+
     DTYPE_MAX = (
         torch.finfo(out1_fp8.dtype).max
         if torch.is_floating_point(out1_fp8)
         else torch.iinfo(out1_fp8.dtype).max
     )
-    _fused_reduce_rms_fp8_group_quant_kernel[(3*M if HAS_SPLITK else 2*M,)](
+    _fused_reduce_rms_fp8_group_quant_kernel[(3 * M if HAS_SPLITK else 2 * M,)](
         inp1,
         inp1_weight,
         inp2,

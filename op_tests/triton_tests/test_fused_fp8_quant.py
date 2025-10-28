@@ -307,13 +307,13 @@ def test_fused_reduce_act_mul_fp8_group_quant(
 
 def run_torch_reduce_rms_fp8_group_quant(
     x1, w1, eps1, x2, w2, eps2, res1, x3, dtype_quant, dtype, group_size
-):  
+):
     out_dtype = dtype if dtype is not None else x1.dtype
     if x1.dim() == 3:
-        x1 = torch.sum(x1, dim = 0)
-        x2 = torch.sum(x2, dim = 0)
+        x1 = torch.sum(x1, dim=0)
+        x2 = torch.sum(x2, dim=0)
         assert x3 is not None
-        x3 = torch.sum(x3, dim = 0).to(out_dtype)
+        x3 = torch.sum(x3, dim=0).to(out_dtype)
     else:
         assert x3 is None
     if res1 is not None:
@@ -345,13 +345,19 @@ def generate_fused_reduce_rms_quant_data(M, N1, N2, N3, SPK, dtype=torch.bfloat1
 
 
 @pytest.mark.parametrize("M", [1, 32, 256, 8192])
-@pytest.mark.parametrize("N1, N2, N3", [(128, 128, 128), (1536, 512, 64), (7168, 7168, 7168)])
+@pytest.mark.parametrize(
+    "N1, N2, N3", [(128, 128, 128), (1536, 512, 64), (7168, 7168, 7168)]
+)
 @pytest.mark.parametrize("SPK", [1, 4, 14])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_reduce_rms_fp8_group_quant(M: int, N1: int, N2: int, N3: int, SPK: int, dtype):
+def test_fused_reduce_rms_fp8_group_quant(
+    M: int, N1: int, N2: int, N3: int, SPK: int, dtype
+):
     group_size = 128
     dtype_quant = aiter.dtypes.fp8
-    x1, w1, x2, w2, res1, x3 = generate_fused_reduce_rms_quant_data(M, N1, N2, N3, SPK, dtype)
+    x1, w1, x2, w2, res1, x3 = generate_fused_reduce_rms_quant_data(
+        M, N1, N2, N3, SPK, dtype
+    )
     (y1_q_torch, y1_s_torch), y1_torch, y2_torch, y1_res_torch, y3_torch = (
         run_torch_reduce_rms_fp8_group_quant(
             x1, w1, 1e-6, x2, w2, 1e-6, res1, x3, dtype_quant, dtype, group_size
@@ -388,6 +394,6 @@ def test_fused_reduce_rms_fp8_group_quant(M: int, N1: int, N2: int, N3: int, SPK
         y1_q_triton, y1_s_triton, dtype=torch.float32, group_size=group_size
     )
     torch.testing.assert_close(y1_upcast_torch, y1_upcast_triton, atol=0.1, rtol=0.1)
-    
+
     if y3_torch is not None:
         torch.testing.assert_close(y3_torch, y3_triton, atol=0.1, rtol=0.1)

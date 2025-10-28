@@ -420,9 +420,11 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
             spk_offs = tl.arange(0, NUM_SPLITK_POW2)
             if NUM_SPLITK_POW2 != NUM_SPLITK:
                 if N_MASK1:
-                    mask1_in = (spk_offs[:, None] < NUM_SPLITK) & (n1_offs[None, :] < inp1_n_cols)
+                    mask1_in = (spk_offs[:, None] < NUM_SPLITK) & (
+                        n1_offs[None, :] < inp1_n_cols
+                    )
                 else:
-                    mask1_in = (spk_offs[:, None] < NUM_SPLITK)
+                    mask1_in = spk_offs[:, None] < NUM_SPLITK
                 other1_in = 0.0
             else:
                 if N_MASK1:
@@ -432,7 +434,10 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
                 other1_in = other1
 
             inp1 = tl.load(
-                inp1_ptr + spk_offs[:, None] * inp1_spk_stride + m_pid * inp1_row_stride + n1_offs[None, :] * inp1_col_stride,
+                inp1_ptr
+                + spk_offs[:, None] * inp1_spk_stride
+                + m_pid * inp1_row_stride
+                + n1_offs[None, :] * inp1_col_stride,
                 mask=mask1_in,
                 other=other1_in,
                 cache_modifier=".cg",
@@ -445,7 +450,7 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
                 other=other1,
                 cache_modifier=".cg",
             ).to(tl.float32)
-        
+
         if FIRST_INPUT_RES:
             res1 = tl.load(
                 res1_ptr + m_pid * res1_row_stride + n1_offs * res1_col_stride,
@@ -484,16 +489,18 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
             out1_bs_ptr + m_pid * out1_bs_row_stride + g_offs * out1_bs_col_stride,
             out1_block_scales.to(out1_bs_ptr.dtype.element_ty),
             mask=g_offs < num_bs_cols,
-        )    
+        )
 
         if FIRST_INPUT_RES:
             inp1 = inp1.to(out_res1_ptr.dtype.element_ty)
             tl.store(
-                out_res1_ptr + m_pid * out_res1_row_stride + n1_offs * out_res1_col_stride,
+                out_res1_ptr
+                + m_pid * out_res1_row_stride
+                + n1_offs * out_res1_col_stride,
                 inp1,
                 mask=mask1,
             )
-    elif m_pid < 2*n_rows:
+    elif m_pid < 2 * n_rows:
         m_pid -= n_rows
         if HAS_SPLITK:
             spk_offs = tl.arange(0, NUM_SPLITK_POW2)
@@ -508,9 +515,11 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
             if HAS_SPLITK:
                 if NUM_SPLITK_POW2 != NUM_SPLITK:
                     if N_MASK2:
-                        mask2_in = (spk_offs[:, None] < NUM_SPLITK) & (n2_offs[None, :] < inp2_n_cols)
+                        mask2_in = (spk_offs[:, None] < NUM_SPLITK) & (
+                            n2_offs[None, :] < inp2_n_cols
+                        )
                     else:
-                        mask2_in = (spk_offs[:, None] < NUM_SPLITK)
+                        mask2_in = spk_offs[:, None] < NUM_SPLITK
                     other2_in = 0.0
                 else:
                     if N_MASK2:
@@ -519,7 +528,10 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
                         mask2_in = mask2
                     other2_in = other2
                 inp2 = tl.load(
-                    inp2_ptr + spk_offs[:, None] * inp2_spk_stride + m_pid * inp2_row_stride + n2_offs[None, :] * inp2_col_stride,
+                    inp2_ptr
+                    + spk_offs[:, None] * inp2_spk_stride
+                    + m_pid * inp2_row_stride
+                    + n2_offs[None, :] * inp2_col_stride,
                     mask=mask2_in,
                     other=other2_in,
                     cache_modifier=".cg",
@@ -539,8 +551,8 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
                 norm2,
                 mask=mask2,
             )
-    elif m_pid < 3*n_rows:
-        m_pid -= 2*n_rows
+    elif m_pid < 3 * n_rows:
+        m_pid -= 2 * n_rows
         if HAS_SPLITK:
             spk_offs = tl.arange(0, NUM_SPLITK_POW2)
             n3_offs = tl.arange(0, BLOCK_SIZE_N3)
@@ -552,9 +564,11 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
                 other3 = None
             if NUM_SPLITK_POW2 != NUM_SPLITK:
                 if N_MASK3:
-                    mask3_in = (spk_offs[:, None] < NUM_SPLITK) & (n3_offs[None, :] < inp3_n_cols)
+                    mask3_in = (spk_offs[:, None] < NUM_SPLITK) & (
+                        n3_offs[None, :] < inp3_n_cols
+                    )
                 else:
-                    mask3_in = (spk_offs[:, None] < NUM_SPLITK)
+                    mask3_in = spk_offs[:, None] < NUM_SPLITK
                 other3_in = 0.0
             else:
                 if N_MASK3:
@@ -563,7 +577,10 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
                     mask3_in = mask3
                 other3_in = other3
             inp3 = tl.load(
-                inp3_ptr + spk_offs[:, None] * inp3_spk_stride + m_pid * inp3_row_stride + n3_offs[None, :] * inp3_col_stride,
+                inp3_ptr
+                + spk_offs[:, None] * inp3_spk_stride
+                + m_pid * inp3_row_stride
+                + n3_offs[None, :] * inp3_col_stride,
                 mask=mask3_in,
                 other=other3_in,
                 cache_modifier=".cg",

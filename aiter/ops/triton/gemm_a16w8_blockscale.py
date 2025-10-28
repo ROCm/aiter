@@ -4,7 +4,9 @@
 from typing import Optional
 import torch
 import triton
-from aiter.ops.triton.gemm_a8w8_blockscale import _gemm_a8w8_blockscale_reduce_kernel
+from aiter.ops.triton._triton_kernels.gemm_a8w8_blockscale import (
+    _gemm_a8w8_blockscale_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm_a16w8_blockscale import (
     _gemm_a16w8_blockscale_kernel,
     _get_config,

@@ -67,8 +67,8 @@ def gemm_a8w8_blockscale(
     )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
-            (config["NUM_KSPLIT"], M, N), 
-            dtype=torch.float32, 
+            (config["NUM_KSPLIT"], M, N),
+            dtype=torch.float32,
             device=y.device if y is not None else x.device,
         )
     else:
@@ -130,7 +130,7 @@ def gemm_a8w8_blockscale(
     if config["NUM_KSPLIT"] > 1:
         if skip_reduce:
             return y_pp
-        
+
         REDUCE_BLOCK_SIZE_M = 32
         REDUCE_BLOCK_SIZE_N = 32
         ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
