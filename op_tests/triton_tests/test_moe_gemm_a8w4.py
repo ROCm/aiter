@@ -8,7 +8,7 @@ import torch
 from typing import Union
 import triton
 # routing utilities
-from triton_kernels.routing import routing
+from aiter.ops.triton.moe_routing.routing import routing
 # matmul utilities
 from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4, moe_gemm_torch, swizzle_scales, downcast_to_static_fp8
 # numerics utilities
