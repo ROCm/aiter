@@ -193,6 +193,7 @@ __global__ void no_fused_softmax_kernel(SoftmaxParameter params)
 //         // vec_out_ptr[ii * blockDim] = ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(
 //         //     acc_in_ptr[ii]
 //         // );
+//         __builtin_nontemporal_store(ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(acc_in_ptr[ii]), vec_out_ptr + ii * blockDim);
 //     }
 #pragma unroll  // Unroll loop for better instruction pipelining
     for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
@@ -249,3 +250,4 @@ torch::Tensor softmax2d_hip(torch::Tensor &input) // [m, n]
 
     return out;
 }
+

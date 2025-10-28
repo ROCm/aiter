@@ -273,6 +273,7 @@ struct LayerNormParameter
 template <typename DTYPE,
           int HIDDEN_SIZE,
           int WIDTH,
+          int ROW_WIDTH,       // Row block
           int blockDim,
           typename ACC_DTYPE,
           typename QUANT_DTYPE>
@@ -298,10 +299,6 @@ __global__ void no_fused_layer_norm_kernel(LayerNormParameter params)
     using StoreQuantType = ck_tile::vec_t<QUANT_DTYPE, WIDTH>;
     using QuantVecType = ck_tile::vec_t<QUANT_DTYPE, WIDTH>;
 
-    float variance = 0.0f;
-    float sum = 0.0f;
-    float max_local = 0.0f;
-
 
     __shared__ float s_variance[WARP_GROUP];
     __shared__ float s_sum[WARP_GROUP];
@@ -309,7 +306,7 @@ __global__ void no_fused_layer_norm_kernel(LayerNormParameter params)
 
     // const int cta_base_row = blockIdx.x * HIDDEN_SIZE * BlockDim.y;
     // const int warp_base_row = cta_base_row + threadIdx.y * ROWS_PER_WARP;
-    const int warp_base_row = blockIdx.x;
+    const int warp_base_row = blockIdx.x * ROW_WIDTH;
 
     constexpr int THREADS_PER_ROW = blockDim;
     // constexpr int THREADS_PER_ROW = 64;
@@ -333,33 +330,43 @@ __global__ void no_fused_layer_norm_kernel(LayerNormParameter params)
 	// 	printf("blockIdx %d, offset %d val %f first_elt_read_by_thread %d ", blockIdx.x, row_offset, ck_tile::type_convert<float>(thread_in_ptr[0]), first_elt_read_by_thread);
 
 
-    float in_local[LANE_HIDDEN_SIZE];
+    float in_local[LANE_HIDDEN_SIZE * ROW_WIDTH];
+    DTYPE gamma_local[LANE_HIDDEN_SIZE];
+    DTYPE beta_local[LANE_HIDDEN_SIZE];
+    DTYPE in_local_b16[LANE_HIDDEN_SIZE];
+
     // float residual_in_local[LANE_HIDDEN_SIZE];
     AccVecType* row_in_ptr            = reinterpret_cast<AccVecType*>(&in_local);
     const AccessType* vec_in_read_ptr = reinterpret_cast<const AccessType*>(thread_in_ptr);
 
-    float r_dim_scale = __builtin_amdgcn_rcpf(HIDDEN_SIZE);
-
-#pragma unroll
-    for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
-    {
-        row_in_ptr[ii] = ck_tile::vec_convert<ACC_DTYPE, DTYPE, WIDTH>(
-            vec_in_read_ptr[ii * THREADS_PER_ROW]);
-    }
-
     // Weight init
     const DTYPE* thread_gamma_ptr = reinterpret_cast<DTYPE*>(params.p_weight) + first_elt_read_by_thread;
-    DTYPE gamma_local[LANE_HIDDEN_SIZE];
     AccessType* gamma_in_ptr = reinterpret_cast<AccessType*>(&gamma_local);
     const AccessType* vec_gamma_read_ptr = reinterpret_cast<const AccessType*>(thread_gamma_ptr);
 
     // Bias init
     const DTYPE* thread_beta_ptr = reinterpret_cast<DTYPE*>(params.p_bias) + first_elt_read_by_thread;
-    DTYPE beta_local[LANE_HIDDEN_SIZE];
     AccessType* beta_in_ptr = reinterpret_cast<AccessType*>(&beta_local);
     const AccessType* vec_beta_read_ptr = reinterpret_cast<const AccessType*>(thread_beta_ptr);
 
-    static constexpr auto WIDTH_SUB = WIDTH - 1;
+    AccessType* row_in_b16_ptr = reinterpret_cast<AccessType*>(&in_local_b16);
+
+    float r_dim_scale = __builtin_amdgcn_rcpf(HIDDEN_SIZE);
+#pragma unroll  // Unroll loop for better instruction pipelining
+    for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+    {
+#pragma unroll
+        for (int j = 0; j < WIDTH; ++j)
+        {
+            in_local_b16[ii * WIDTH + j] = __builtin_nontemporal_load(thread_in_ptr + ii * blockDim * WIDTH + j);
+        }
+    }
+
+#pragma unroll
+    for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+    {
+        row_in_ptr[ii] = ck_tile::vec_convert<ACC_DTYPE, DTYPE, WIDTH>(row_in_b16_ptr[ii]);
+    }
 
     // Issue gamma with add.
 #pragma unroll
@@ -371,91 +378,115 @@ __global__ void no_fused_layer_norm_kernel(LayerNormParameter params)
 #pragma unroll
     for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
     {
-#pragma unroll
-        for (int j = 0; j < WIDTH; ++j)
-        {
-            auto idx = ii * WIDTH + j;
-            sum      += in_local[idx];
-            variance += in_local[idx] * in_local[idx];
-        }
-    }
-
-    variance = multithread_reduce(variance, arg_sum, 64);
-    sum      = multithread_reduce(sum, arg_sum, 64);
-
-    auto warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
-
-#pragma unroll
-    for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
-    {
         beta_in_ptr[ii] = vec_beta_read_ptr[ii * THREADS_PER_ROW];
     }
 
-    s_variance[warp_id] = variance;
-    s_sum[warp_id] = sum;
-    __syncthreads();
-
-
-    if (threadIdx.x == 0)
-    {
-        auto variance_local = s_variance[0];
-        auto sum_local = s_sum[0];
-#pragma unroll
-        for (int i = 1; i < WARP_GROUP; ++i)
-        {
-            variance_local += s_variance[i];
-            sum_local += s_sum[i];
-        }
-#pragma unroll
-        for (int i = 0; i < WARP_GROUP; ++i)
-        {
-            s_variance[i] = variance_local;
-        }
-
-#pragma unroll
-        for (int i = 0; i < WARP_GROUP; ++i)
-        {
-            s_sum[i] = sum_local;
-        }
-    }
-
-    __syncthreads();
-
-    auto * thread_out_ptr = reinterpret_cast<QUANT_DTYPE*>(params.p_out) + row_offset_out + first_elt_read_by_thread;
-    StoreQuantType* vec_out_st_ptr = reinterpret_cast<StoreQuantType*>(thread_out_ptr);
-
-    variance = s_variance[warp_id];
-    sum = s_sum[warp_id];
-    auto mean = sum * r_dim_scale;
-
-    float scale_rms = rsqrtf((variance * r_dim_scale - mean * mean) + params.epsilon);
-
-	// if(threadIdx.x <= 10 && blockIdx.x == 1)
-	// 	printf("threadIdx.x %d in_local %f, s_sum %f  s_variance %f \n", threadIdx.x, in_local[0], sum, variance);
-
-// #pragma unroll
-//     for (int ii = 0; ii < LANE_HIDDEN_SIZE; ++ii)
-//     {
-//         in_local[ii] = ((in_local[ii] - mean) * scale_rms * ck_tile::type_convert<ACC_DTYPE>(gamma_local[ii]) + ck_tile::type_convert<ACC_DTYPE>(beta_local[ii]));
-//     }
-//
-// #pragma unroll
-//     for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
-//     {
-//         vec_out_st_ptr[ii * THREADS_PER_ROW] = ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(row_in_ptr[ii]);
-//     }
-#pragma unroll
-    for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+#pragma unroll  // Unroll loop for better instruction pipelining
+    for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
     {
 #pragma unroll
         for (int j = 0; j < WIDTH; ++j)
         {
-            auto idx = ii * WIDTH + j;
-			in_local[idx] = ((in_local[idx] - mean) * scale_rms * ck_tile::type_convert<ACC_DTYPE>(gamma_local[idx]) + ck_tile::type_convert<ACC_DTYPE>(beta_local[idx]));
+            in_local_b16[ii * WIDTH + j] = __builtin_nontemporal_load(thread_in_ptr + ii * blockDim * WIDTH + j + params.stride);
         }
-        vec_out_st_ptr[ii * THREADS_PER_ROW] = ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(row_in_ptr[ii]);
     }
 
+#pragma unroll
+    for (int r = 0; r < ROW_WIDTH; ++r)
+    {
+        float variance = 0.0f;
+        float sum = 0.0f;
+        float max_local = 0.0f;
+
+#pragma unroll
+        for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+        {
+#pragma unroll
+            for (int j = 0; j < WIDTH; ++j)
+            {
+                auto idx = ii * WIDTH + j;
+                sum      += in_local[idx + r * LANE_HIDDEN_SIZE];
+                variance += in_local[idx + r * LANE_HIDDEN_SIZE] * in_local[idx + r * LANE_HIDDEN_SIZE];
+            }
+        }
+
+        variance = multithread_reduce(variance, arg_sum, 64);
+        sum      = multithread_reduce(sum, arg_sum, 64);
+
+        auto warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
+
+        s_variance[warp_id] = variance;
+        s_sum[warp_id] = sum;
+        __syncthreads();
+
+
+        if (threadIdx.x == 0)
+        {
+            auto variance_local = s_variance[0];
+            auto sum_local = s_sum[0];
+#pragma unroll
+            for (int i = 1; i < WARP_GROUP; ++i)
+            {
+                variance_local += s_variance[i];
+                sum_local += s_sum[i];
+            }
+#pragma unroll
+            for (int i = 0; i < WARP_GROUP; ++i)
+            {
+                s_variance[i] = variance_local;
+            }
+
+#pragma unroll
+            for (int i = 0; i < WARP_GROUP; ++i)
+            {
+                s_sum[i] = sum_local;
+            }
+        }
+
+        __syncthreads();
+
+        auto * thread_out_ptr = reinterpret_cast<QUANT_DTYPE*>(params.p_out) + row_offset_out + first_elt_read_by_thread;
+        StoreQuantType* vec_out_st_ptr = reinterpret_cast<StoreQuantType*>(thread_out_ptr);
+
+        variance = s_variance[warp_id];
+        sum = s_sum[warp_id];
+        auto mean = sum * r_dim_scale;
+
+        float scale_rms = rsqrtf((variance * r_dim_scale - mean * mean) + params.epsilon);
+        
+        if (r == 0)
+        {
+#pragma unroll
+            for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+            {
+                row_in_ptr[ii + VEC_HIDDEN_SIZE_LOC] = ck_tile::vec_convert<ACC_DTYPE, DTYPE, WIDTH>(row_in_b16_ptr[ii]);
+            }
+        }
+
+
+#pragma unroll
+        for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+        {
+#pragma unroll
+            for (int j = 0; j < WIDTH; ++j)
+            {
+                auto idx = ii * WIDTH + j;
+                in_local[idx + r * LANE_HIDDEN_SIZE] = ((in_local[idx + r * LANE_HIDDEN_SIZE] - mean) * scale_rms * ck_tile::type_convert<ACC_DTYPE>(gamma_local[idx]) + ck_tile::type_convert<ACC_DTYPE>(beta_local[idx]));
+            }
+            // vec_out_st_ptr[ii * THREADS_PER_ROW] = ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(row_in_ptr[ii]);
+            row_in_b16_ptr[ii] = ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(row_in_ptr[ii + r * VEC_HIDDEN_SIZE_LOC]);
+        }
+
+#pragma unroll  // Unroll loop for better instruction pipelining
+        for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+        {
+#pragma unroll
+            for (int j = 0; j < WIDTH; ++j)
+            {
+                __builtin_nontemporal_store(in_local_b16[ii * WIDTH + j], thread_out_ptr + ii * blockDim * WIDTH + j + r * HIDDEN_SIZE);
+            }
+        }
+    }
 }
 
 // void layernorm2d_hip(
@@ -479,7 +510,7 @@ void layernorm2d(torch::Tensor &out,    // [m, n]
   int hidden_size = input.size(-1);
   int num_tokens = input.size(0);
 
-  dim3 grid(num_tokens);
+  dim3 grid(num_tokens / 2);
   /* This kernel is memory-latency bound in many scenarios.
      When num_tokens is large, a smaller block size allows
      for increased block occupancy on CUs and better latency
@@ -506,7 +537,7 @@ void layernorm2d(torch::Tensor &out,    // [m, n]
   params.stride = input.stride(0);
 
   // fused_add_smooth_quant_layer_norm_kernel<ck_tile::bf16_t, 5120, 8, 128, float, int8_t><<<grid, block, 0, stream>>>(params);
-  no_fused_layer_norm_kernel<ck_tile::bf16_t, 8192, 8, 256, float, ck_tile::bf16_t><<<grid, block, 0, stream>>>(params);
+  no_fused_layer_norm_kernel<ck_tile::bf16_t, 8192, 8, 2, 256, float, ck_tile::bf16_t><<<grid, block, 0, stream>>>(params);
   // fused_add_smooth_quant_rms_norm_kernel<__hip_bfloat16, 5120, 8, 128, float, int8_t><<<grid, block, 0, stream>>>(params);
 }
 
@@ -521,3 +552,4 @@ torch::Tensor layernorm2d_hip(torch::Tensor &input,  // [m, n]
 
     return out;
 }
+

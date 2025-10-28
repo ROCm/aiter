@@ -86,5 +86,5 @@ else:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_softmax2d(dtype, m, n)
-test_softmax2d(dtypes.bf16, 1024, 8192)
+test_softmax2d(dtypes.bf16, 32*1024, 8192)
 
