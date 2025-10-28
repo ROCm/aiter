@@ -8,6 +8,11 @@ from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
 import argparse
 
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+setup_seed(1)
 
 @perftest()
 def run_torch(input, dim=-1):

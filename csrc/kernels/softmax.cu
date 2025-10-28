@@ -1,6 +1,6 @@
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -66,17 +66,30 @@ __global__ void no_fused_softmax_kernel(SoftmaxParameter params)
     const AccessType* vec_in_ptr = reinterpret_cast<const AccessType*>(row_in_ptr + first_elt);
 
     // Local memory to hold input elements for this thread (faster than global memory)
+    DTYPE in_local_b16[LANE_HIDDEN_SIZE];
     ACC_DTYPE in_local[LANE_HIDDEN_SIZE];
     AccVecType* acc_in_ptr = reinterpret_cast<AccVecType*>(in_local);  // Vector view of local memory
+    AccessType* acc_in_b16_ptr = reinterpret_cast<AccessType*>(in_local_b16);  // Vector view of local memory
 
     // 1. Load input data from global memory to thread-local memory (vectorized load)
 #pragma unroll  // Unroll loop for better instruction pipelining
     for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
     {
         // Load vector from global memory and convert to accumulation type
-        acc_in_ptr[ii] = ck_tile::vec_convert<ACC_DTYPE, DTYPE, WIDTH>(
-            vec_in_ptr[ii * blockDim]  // Offset by thread count to avoid overlap
-        );
+        // acc_in_ptr[ii] = ck_tile::vec_convert<ACC_DTYPE, DTYPE, WIDTH>(
+        //     vec_in_ptr[ii * blockDim])  // Offset by thread count to avoid overlap
+        // );
+#pragma unroll
+        for (int j = 0; j < WIDTH; ++j)
+        {
+            in_local_b16[ii * WIDTH + j] = __builtin_nontemporal_load(row_in_ptr + first_elt + ii * blockDim * WIDTH + j);
+        }
+    }
+
+#pragma unroll
+    for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+    {
+        acc_in_ptr[ii] = ck_tile::vec_convert<ACC_DTYPE, DTYPE, WIDTH>(acc_in_b16_ptr[ii]);
     }
 
     // 2. Compute per-thread maximum value (for numerical stability in softmax)
@@ -170,10 +183,25 @@ __global__ void no_fused_softmax_kernel(SoftmaxParameter params)
 #pragma unroll
     for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
     {
-        // Convert to output type and store vector to global memory
-        vec_out_ptr[ii * blockDim] = ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(
-            acc_in_ptr[ii]
-        );
+        acc_in_b16_ptr[ii] = ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(acc_in_ptr[ii]);
+    }
+
+// #pragma unroll
+//     for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+//     {
+//         // Convert to output type and store vector to global memory
+//         // vec_out_ptr[ii * blockDim] = ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(
+//         //     acc_in_ptr[ii]
+//         // );
+//     }
+#pragma unroll  // Unroll loop for better instruction pipelining
+    for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+    {
+#pragma unroll
+        for (int j = 0; j < WIDTH; ++j)
+        {
+            __builtin_nontemporal_store(in_local_b16[ii * WIDTH + j], row_out_ptr + first_elt + ii * blockDim * WIDTH + j);
+        }
     }
 }
 
@@ -196,8 +224,8 @@ void softmax2d(torch::Tensor &out,    // [m, n]
   // const int max_block_size = 128;
   const int max_block_size = 256;
   dim3 block(std::min(hidden_size, max_block_size));
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+  const hipStream_t stream = at::hip::getCurrentHIPStream();
   /*If the tensor types are FP16/BF16, try to use the optimized kernel
     with packed + vectorized ops.
     Max optimization is achieved with a width-8 vector of FP16/BF16s
