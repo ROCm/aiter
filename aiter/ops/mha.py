@@ -1185,7 +1185,7 @@ def _flash_attn_forward(
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    sink_size = 0
+    sink_size = sink_size
     mask = causal and window_size_left == -1  # causal mask
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
