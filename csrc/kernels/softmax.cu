@@ -40,6 +40,8 @@ __global__ void no_fused_softmax_kernel(SoftmaxParameter params)
     // Number of warps in the thread block
     static constexpr int WARP_GROUP = blockDim / WARP_SIZE;
 
+    static constexpr float LOG2E = 1.4426950408889634;
+
     // Reduction operators for max and sum (used in parallel reduction)
     auto arg_max = [](const ACC_DTYPE& a, const ACC_DTYPE& b) { return ck_tile::max(a, b); };
     auto arg_sum = [](const ACC_DTYPE& a, const ACC_DTYPE& b) { return a + b; };
@@ -120,7 +122,7 @@ __global__ void no_fused_softmax_kernel(SoftmaxParameter params)
 #pragma unroll
     for (int i = 0; i < LANE_HIDDEN_SIZE; ++i)
     {
-        in_local[i] = ck_tile::exp(in_local[i] - global_max);  // Stabilized exp calculation
+        in_local[i] = ck_tile::exp2((in_local[i] - global_max) * LOG2E);  // Stabilized exp calculation
         thread_sum += in_local[i];  // Accumulate sum of exponentials
     }
 
