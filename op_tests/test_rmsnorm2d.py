@@ -70,6 +70,7 @@ def test_rmsnorm2d(dtype, m, n):
     (a, *_), avg_a = run_torch(input, weight, 1e-5)
     (b, *_), avg_b = run_ck(input, weight, 1e-5)
     (c, *_), avg_c = run_cu(input, weight, 1e-5)
+
     msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
     checkAllclose(a, c, msg="cu")

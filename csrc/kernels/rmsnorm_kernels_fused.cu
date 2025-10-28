@@ -290,7 +290,7 @@ __global__ void no_fused_rms_norm_kernel(NoFusedRMSNormParameter params)
     // const int warp_base_row = cta_base_row + threadIdx.y * ROWS_PER_WARP;
     const int warp_base_row = blockIdx.x * ROW_WIDTH;
 
-    constexpr int THREADS_PER_ROW = 128;
+    constexpr int THREADS_PER_ROW = 256;
     // constexpr int THREADS_PER_ROW = 64;
     // const int thread_row_in_warp = threadIdx.x / THREADS_PER_ROW;
     // const int thread_row         = warp_base_row + thread_row_in_warp;
@@ -303,21 +303,22 @@ __global__ void no_fused_rms_norm_kernel(NoFusedRMSNormParameter params)
     // Input init
     const DTYPE* thread_in_ptr = warp_in_ptr + first_elt_read_by_thread;
 
+    float in_local[LANE_HIDDEN_SIZE * ROW_WIDTH];
+    DTYPE gamma_local[LANE_HIDDEN_SIZE];
     DTYPE in_local_b16[LANE_HIDDEN_SIZE];
-    float in_local[LANE_HIDDEN_SIZE];
-    AccVecType* row_in_ptr           = reinterpret_cast<AccVecType*>(&in_local);
+
+    // float residual_in_local[LANE_HIDDEN_SIZE];
+    AccVecType* row_in_ptr            = reinterpret_cast<AccVecType*>(&in_local);
     const AccessType* vec_in_read_ptr = reinterpret_cast<const AccessType*>(thread_in_ptr);
-
-    AccessType* row_in_b16_ptr = reinterpret_cast<AccessType*>(&row_in_b16_ptr);
-
-    auto * thread_out_ptr = reinterpret_cast<QUANT_DTYPE*>(params.p_out) + warp_base_row * HIDDEN_SIZE + first_elt_read_by_thread;
-    StoreQuantType* vec_out_st_ptr = reinterpret_cast<StoreQuantType*>(thread_out_ptr);
 
     // Weight init
     const DTYPE* thread_gamma_ptr = reinterpret_cast<DTYPE*>(params.p_weight) + first_elt_read_by_thread;
-    DTYPE gamma_local[LANE_HIDDEN_SIZE];
     AccessType* gamma_in_ptr = reinterpret_cast<AccessType*>(&gamma_local);
     const AccessType* vec_gamma_read_ptr = reinterpret_cast<const AccessType*>(thread_gamma_ptr);
+
+    AccessType* row_in_b16_ptr = reinterpret_cast<AccessType*>(&in_local_b16);
+
+    QUANT_DTYPE* thread_out_ptr = reinterpret_cast<QUANT_DTYPE*>(params.p_out) + warp_base_row * HIDDEN_SIZE + first_elt_read_by_thread;
 
     float r_dim_scale = __builtin_amdgcn_rcpf(HIDDEN_SIZE);
 #pragma unroll  // Unroll loop for better instruction pipelining
@@ -357,7 +358,6 @@ __global__ void no_fused_rms_norm_kernel(NoFusedRMSNormParameter params)
     for (int r = 0; r < ROW_WIDTH; ++r)
     {
         float variance = 0.0f;
-        float max_local = 0.0f;
 
 #pragma unroll
         for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
@@ -414,7 +414,7 @@ __global__ void no_fused_rms_norm_kernel(NoFusedRMSNormParameter params)
             for (int j = 0; j < WIDTH; ++j)
             {
                 auto idx = ii * WIDTH + j;
-                in_local[idx] = in_local[idx] * scale_rms * ck_tile::type_convert<ACC_DTYPE>(gamma_local[idx]);
+                in_local[idx + r * LANE_HIDDEN_SIZE] = in_local[idx + r * LANE_HIDDEN_SIZE] * scale_rms * ck_tile::type_convert<ACC_DTYPE>(gamma_local[idx]);
             }
             row_in_b16_ptr[ii] = ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(row_in_ptr[ii + r * VEC_HIDDEN_SIZE_LOC]);
         }
@@ -425,10 +425,11 @@ __global__ void no_fused_rms_norm_kernel(NoFusedRMSNormParameter params)
 #pragma unroll
             for (int j = 0; j < WIDTH; ++j)
             {
+                // __builtin_nontemporal_store(in_local_b16[ii * WIDTH + j], thread_out_ptr);
                 __builtin_nontemporal_store(in_local_b16[ii * WIDTH + j], thread_out_ptr + ii * blockDim * WIDTH + j + r * HIDDEN_SIZE);
             }
         }
-    }
+     }
 }
 
 void rmsnorm2d_with_add_smoothquant_hip(
@@ -497,17 +498,10 @@ rmsnorm2d_hip(torch::Tensor& input,
        When num_tokens is large, a smaller block size allows
        for increased block occupancy on CUs and better latency
        hiding on global mem ops. */
-    const int max_block_size = 128;
+    const int max_block_size = 256;
     dim3 block(std::min(hidden_size, max_block_size));
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    /*If the tensor types are FP16/BF16, try to use the optimized kernel
-      with packed + vectorized ops.
-      Max optimization is achieved with a width-8 vector of FP16/BF16s
-      since we can load at most 128 bits at once in a global memory op.
-      However, this requires each tensor's data to be aligned to 16
-      bytes.
-     */
 
     NoFusedRMSNormParameter params;
     params.p_out = out.data_ptr();
