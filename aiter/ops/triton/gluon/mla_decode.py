@@ -1294,9 +1294,6 @@ def _fwd_grouped_kernel_stage1_n32_prefetch_k(
             offsets=offs_buf_kv + 256,
         )
 
-        cur_k1 = smem_kv1.load(layout=dot_v_layout)
-        cur_k2 = smem_kv2.load(layout=dot_v_layout)
-
         # smem_kv1._keep_alive()
         # smem_kv2._keep_alive()
 
@@ -1310,6 +1307,8 @@ def _fwd_grouped_kernel_stage1_n32_prefetch_k(
         re_scale = tl.math.exp2((e_max - n_e_max) * log2e)
         p = tl.math.exp2((qk - n_e_max[:, None]) * log2e)
         smem_p.store(p.to(q0.dtype))
+        cur_k1 = smem_kv1.load(layout=dot_v_layout)
+        cur_k2 = smem_kv2.load(layout=dot_v_layout)
 
         # smem_kv1 = smem_kv1.permute([1, 0])
         # smem_kv2 = smem_kv2.permute([1, 0])
