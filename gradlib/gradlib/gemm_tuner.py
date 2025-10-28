@@ -123,7 +123,7 @@ if __name__ == "__main__":
     indtype = get_dtype(args.indtype)
     args.indtype = indtype
     outdtype = get_dtype(args.outdtype)
-    args.outdtype=outdtype
+    args.outdtype = outdtype
     if not args.untune_file:
         nsets = [i * args.batch_size for i in args.nsets]
         if not args.model_dir:
