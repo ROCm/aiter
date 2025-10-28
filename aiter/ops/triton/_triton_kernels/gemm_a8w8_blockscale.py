@@ -11,6 +11,36 @@ import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
+
+
+_gemm_a8w8_blockscale_repr = make_kernel_repr(
+    "_gemm_a8w8_blockscale_kernel",
+    [
+        "GROUP_K",
+        "GROUP_N",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "cache_modifier",
+    ],
+)
+
+
+_gemm_a8w8_blockscale_reduce_repr = make_kernel_repr(
+    "_gemm_a8w8_blockscale_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
 
 
 @triton.heuristics(
@@ -20,7 +50,7 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_gemm_a8w8_blockscale_repr)
 def _gemm_a8w8_blockscale_kernel(
     # Pointers to matrices
     a_ptr,
@@ -195,7 +225,7 @@ def _gemm_a8w8_blockscale_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(repr=_gemm_a8w8_blockscale_reduce_repr)
 def _gemm_a8w8_blockscale_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
