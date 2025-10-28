@@ -519,6 +519,7 @@ class Gemm:
         rets = self.run_best_solutions()
         return rets
 
+
 class GemmTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
