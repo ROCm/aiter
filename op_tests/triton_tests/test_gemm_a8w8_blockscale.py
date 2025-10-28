@@ -46,7 +46,6 @@ e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
 def get_x_vals():
-
     x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
     x_vals += [(4864, 4096, 8192), (9728, 8192, 65536)]
     x_vals += [
