@@ -325,6 +325,8 @@ def _get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         else:
             break
 
-        SPLITK_BLOCK_SIZE = triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+        SPLITK_BLOCK_SIZE = (
+            triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+        )
 
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
