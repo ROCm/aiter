@@ -27,7 +27,7 @@ template <typename DTYPE,       // Input data type (e.g., float, bf16_t)
           int blockDim,        // Number of threads per block (e.g., 128, 256)
           typename ACC_DTYPE,  // Accumulation type for intermediate calculations (typically float for precision)
           typename QUANT_DTYPE>// Output quantization type (e.g., bf16_t, fp16_t)
-__global__ void softmax_kernel(SoftmaxParameter params)
+__global__ void no_fused_softmax_kernel(SoftmaxParameter params)
 {
     // Thread-to-data mapping constants
     // Number of elements processed per thread in the hidden dimension
@@ -181,7 +181,7 @@ __global__ void softmax_kernel(SoftmaxParameter params)
 //     std::optional<torch::Tensor> out_before_quant,
 //     int use_model_sensitive_rmsnorm = 0)
 void softmax2d(torch::Tensor &out,    // [m, n]
-                 torch::Tensor &input)  // [m, n]
+               torch::Tensor &input)  // [m, n]
 {
   int hidden_size = input.size(-1);
   int num_tokens = input.size(0);

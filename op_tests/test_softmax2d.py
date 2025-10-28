@@ -16,8 +16,9 @@ def run_torch(input, dim=-1):
 
 
 @perftest()
-def run_ck(input, dim=-1):
-    output = aiter.softmax2d_hip(input, dim=dim)
+def run_ck(input, dim=[-1]):
+    # output = aiter.softmax2d_hip(input, dim=dim)
+    output = aiter.softmax2d_hip(input)
     return output
 
 

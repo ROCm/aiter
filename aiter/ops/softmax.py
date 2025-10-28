@@ -3,7 +3,7 @@
 
 import torch
 from torch import Tensor
-from typing import Optional
+from typing import Optional, List
 from ..jit.core import compile_ops
 
 MD_NAME = "module_softmax"
@@ -80,5 +80,5 @@ def softmax2d_with_add_smoothquant_asm(
 @compile_ops("module_softmax")
 def softmax2d_hip(
     input: Tensor,
-    dim: List[int],
+    # dim: List[int],
 ) -> Tensor: ...
