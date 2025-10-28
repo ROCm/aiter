@@ -90,8 +90,8 @@ def load_input_gemms(input_file):
 
 
 if __name__ == "__main__":
-    gtuner = GemmTuner() 
-    ext_group = gtuner.parser.add_argument_group('extra parameters')
+    gtuner = GemmTuner()
+    ext_group = gtuner.parser.add_argument_group("extra parameters")
     ext_group.add_argument(
         "--model_dir",
         type=str,
@@ -99,62 +99,40 @@ if __name__ == "__main__":
         help="Enter the location of your model directory",
     )
     ext_group.add_argument(
-            "--batch_size",
-            type=int,
-            default=os.getenv("GTUNE_BATCH_SIZE", 1),
-            help="Batch size to tune for",
-        )
+        "--batch_size",
+        type=int,
+        default=os.getenv("GTUNE_BATCH_SIZE", 1),
+        help="Batch size to tune for",
+    )
     ext_group.add_argument(
-            "--nsets",
-            type=list_of_ints,
-            default=[1, 512, 1024, 2048, 3072, 4096, 8192, 16384],
-            help="N sizes to tune for: 1,128,2048",
-        )
+        "--nsets",
+        type=list_of_ints,
+        default=[1, 512, 1024, 2048, 3072, 4096, 8192, 16384],
+        help="N sizes to tune for: 1,128,2048",
+    )
     ext_group.add_argument(
-            "--tp",
-            type=int,
-            default=os.getenv("GTUNE_TP", 1),
-            help="Tensor parallelism to be used.",
-        )
+        "--tp",
+        type=int,
+        default=os.getenv("GTUNE_TP", 1),
+        help="Tensor parallelism to be used.",
+    )
     args = gtuner.parse_args()
-    
-    
+
     if args.outdtype is None:
         args.outdtype = args.indtype
     indtype = get_dtype(args.indtype)
+    args.indtype = indtype
     outdtype = get_dtype(args.outdtype)
-
-    if args.input_file:
-        print(f">>> Loading {args.input_file}")
-        if not Path(args.input_file).is_file():
-            print(f">>> ERROR: {args.input_file} does not exist.  Exiting")
-            exit(1)
-        shapes = pd.read_csv(args.input_file).fillna("")
-        if "outdtype" not in shapes.columns:
-            shapes["outdtype"] = ""
-        if "scaleAB" not in shapes.columns:
-            shapes["scaleAB"] = False
-        for i in range(len(shapes)):
-            ds = shapes.iloc[i]
-            for bias in [True, False] if args.all_bias else [ds["bias"]]:
-                gtuner.add_gemm(
-                    ds["M"],
-                    ds["N"],
-                    ds["K"],
-                    indtype=get_dtype(ds["dtype"]),
-                    bias=bias,
-                    outdtype=get_dtype(ds["outdtype"]),
-                    scaleAB=ds["scaleAB"],
-                )
-    else:
+    args.outdtype=outdtype
+    if not args.untune_file:
         nsets = [i * args.batch_size for i in args.nsets]
         if not args.model_dir:
             print(">>> Warning! NO MODEL SPECIFIED. Tuning for LL2 13B TP1")
             # LL2 13B sizes
             mksets = [(15360, 5120), (5120, 5120), (27648, 5120), (5120, 13824)]
-        
-            gtuner.add_gemm(m=32000, n=1, k=5120, indtype=torch.float16)  # logits gemm
-         
+
+            gtuner.add_gemm(m=32000, n=1, k=5120, indtype=indtype)  # logits gemm
+
         else:
             mksets, hidden_size, dtype = generate_mk_sets(args.model_dir, args.tp)
             gtuner.add_gemm(
@@ -167,9 +145,7 @@ if __name__ == "__main__":
             for n in sorted(nsets):
                 for m, k in mksets:
                     gtuner.add_gemm(m, n, k, indtype=dtype)
-        gtuner.untunedf.to_csv("./tmp_untuned.csv",index=False)
+        gtuner.untunedf.to_csv("./tmp_untuned.csv", index=False)
         args.untune_file = "./tmp_untuned.csv"
-    
-    gtuner.run(args)
 
-    
+    gtuner.run(args)
