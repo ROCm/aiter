@@ -179,7 +179,7 @@ def allgather_perftest(
 l_dtype = ["bf16"]
 l_shape = [
     # (4096, 2048)
-    (1345,)
+    (6144,)
     # (16, 512)
 ]
 

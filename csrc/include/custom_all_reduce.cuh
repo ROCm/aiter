@@ -875,7 +875,7 @@ namespace aiter
 
   // fused allreduce rmsnorm first step
   template <typename T, int ngpus>
-  __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_save(
+  __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
       RankData* _dp,
       RankSignals sg,
 #ifndef USE_ROCM
@@ -898,9 +898,8 @@ namespace aiter
 #pragma unroll
     for (int i = 0; i < ngpus; ++i)
     {
-      int target = (rank + i) % ngpus;
-      ptrs[i] = (const P*)_dp->ptrs[target];
-      tmps[target] = get_tmp_buf<P>(sg.signals[target]);
+      ptrs[i] = (const P*)_dp->ptrs[i];
+      tmps[i] = get_tmp_buf<P>(sg.signals[i]);
     }
     start_sync<ngpus>(sg, self_sg, rank);
 
@@ -909,7 +908,8 @@ namespace aiter
     for (int bid = blockIdx.x; bid < part; bid += gridDim.x)
     {
       // cross device read by all warp
-      *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][(rank * part + bid) * tnum_gpu + lane_id];
+      P input_reg = ptrs[warp_id][(rank * part + bid) * tnum_gpu + lane_id];
+      *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
       __syncthreads();
       // calculate and save in first warp
       if (warp_id == 0)
@@ -929,19 +929,20 @@ namespace aiter
             add_reg.data[j] += ck_tile::type_convert<float>(tmp_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
           }
         }
-        P write_reg;
-#pragma unroll
-        for (int i = 0; i < pack_size; ++i)
-        {
-          write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
-        }
-        // cross device save
-#pragma unroll
-        for (int i = 0; i < ngpus; ++i)
-        {
-          tmps[i][(rank * part + bid) * tnum_gpu + lane_id] = write_reg;
-        }
+        *(reinterpret_cast<A*>(&tmp_smem[0]) + lane_id) = add_reg;
       }
+      __syncthreads();
+
+      // cross device store
+      P rslt;
+#pragma unroll
+      for (int i = 0; i < pack_size; ++i)
+      {
+        float res_x = ck_tile::type_convert<float>(input_reg.data[i]);
+        float sum_x = *(reinterpret_cast<float*>(&tmp_smem[0]) + lane_id * pack_size + i);
+        rslt.data[i] = ck_tile::type_convert<T>(res_x + sum_x);
+      }
+      tmps[warp_id][(rank * part + bid) * tnum_gpu + lane_id] = rslt;
     }
   }
 
@@ -1608,17 +1609,22 @@ namespace aiter
     switch (world_size_)
     {
       case 8:
-        reduce_scatter_cross_device_save<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+        reduce_scatter_cross_device_store<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
         break;
       case 4:
-        reduce_scatter_cross_device_save<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+        reduce_scatter_cross_device_store<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
         break;
       case 2:
-        reduce_scatter_cross_device_save<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
+        reduce_scatter_cross_device_store<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, size);
         break;
       default:
         printf("fused allreduce rmsnorm world size error\n");
     }
+    /*
+    dim3 g(m);
+    tt<T, 512, 1><<<g, block, 0, stream>>>(ptrs, sg_, output, weight, eps, rank_, m, n);
+    return;
+    */
 
     // step 2, run allgather local device load + rmsnorm
     int n_bytes = n * sizeof(T);
@@ -1645,7 +1651,6 @@ namespace aiter
         int n_loop = n_bytes / 8192; // 1, 2, 3, 4
         if (n_bytes % 8192 == 0)
         {
-          printf("===> call 4096 naive, n_loop = %d\n", n_loop);
           switch (n_loop)
           {
             case 1:
@@ -1664,7 +1669,6 @@ namespace aiter
         }
         else
         {
-          printf("===> call 4096 normal, n_loop = %d\n", n_loop);
           n_loop += 1;
           switch (n_loop)
           {
@@ -1686,13 +1690,11 @@ namespace aiter
         int naive_grid_size = m;
         if (n_bytes == 4096)
         {
-          printf("===> call 2048 naive\n");
           // naive n_loop = 1
           launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 256, 1>));
         }
         else
         {
-          printf("===> call 2048 normal\n");
           // n_loop = 2
           launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 256, 2>));
         }
@@ -1702,7 +1704,6 @@ namespace aiter
         block.x = 256;
         int naive_grid_size = (m + 3) / 4;
         int n_loop = n_bytes / 1024;
-        printf("===> call 512, n_loop = %d\n", n_loop);
         switch (n_loop)
         {
           case 1:

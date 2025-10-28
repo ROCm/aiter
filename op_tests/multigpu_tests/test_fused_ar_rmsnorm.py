@@ -182,6 +182,7 @@ def split_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
                 ar_out = tensor_model_parallel_all_reduce(x)
+                ar_out += x
                 out = aiter.rms_norm(ar_out, weight, eps, 0)
         out.fill_(0)
 
@@ -196,6 +197,7 @@ def split_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
         @perftest()
         def run_ca(x):
             ar_out = tensor_model_parallel_all_reduce(x)
+            ar_out += x
             return aiter.rms_norm(ar_out, weight, eps, 0)
 
         out = run_ca(x)
@@ -227,12 +229,14 @@ def test_split_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
     rets = []
     cpu_rslt = []
     weight_list = []
+    res_inp = []
     # print(type(shape[0]), shape[1], ref.device)
     m = shape[0]
     n = shape[1]
     eps = 1e-6
     for i in range(tp_size):
         x = torch.randn(shape, dtype=dtype)
+        res_inp.append(x)
         ref += x
         weight = torch.randn((n,), dtype=dtype)
         weight_list.append(weight)
@@ -244,7 +248,7 @@ def test_split_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
     pool.join()
     for i in range(tp_size):
         host_rslt = F.rms_norm(
-            input=ref, normalized_shape=(ref.shape[-1],), weight=weight_list[i], eps=eps
+            input=(ref + res_inp[i]), normalized_shape=(ref.shape[-1],), weight=weight_list[i], eps=eps
         )
         cpu_rslt.append(host_rslt)
     rets = [el.get() for el in rets]
@@ -262,13 +266,16 @@ def test_fused_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
     rets = []
     cpu_rslt = []
     weight_list = []
+    res_inp = []
     # print(type(shape[0]), shape[1], ref.device)
     m = shape[0]
     n = shape[1]
     eps = 1e-6
     for i in range(tp_size):
         x = torch.randn(shape, dtype=dtype)
-        print(f"device {i}, x[0][0] = {x[0][0]}")
+        # x = torch.ones(shape, dtype=dtype)
+        res_inp.append(x)
+        # print(f"device {i}, x[0][0] = {x[0][0]}")
         ref += x
         weight = torch.randn((n,), dtype=dtype)
         weight_list.append(weight)
@@ -282,8 +289,9 @@ def test_fused_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
 
     for i in range(tp_size):
         host_rslt = F.rms_norm(
-            input=ref, normalized_shape=(ref.shape[-1],), weight=weight_list[i], eps=eps
+            input=(ref + res_inp[i]), normalized_shape=(ref.shape[-1],), weight=weight_list[i], eps=eps
         )
+        # host_rslt = ref + res_inp[i]
         cpu_rslt.append(host_rslt)
 
     rets = [el.get() for el in rets]
@@ -393,7 +401,7 @@ def acc_test_cudagraph_on(tp_size, pp_size, shape, dtype, loop_time = 1):
 l_dtype = ["bf16"]
 l_shape = [
     # (4096, 2048)
-    (256, 8192)
+    (256, 16384)
     # (64, 512 * 99)
     # (16, 512)
 ]
