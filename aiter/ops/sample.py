@@ -17,12 +17,32 @@ def greedy_sample(
 
 
 @compile_ops("module_sample")
+def random_sample_outer_exponential(
+    out: Tensor,
+    input: Tensor,
+    exponentials: Tensor,
+    temperatures: Tensor,
+    eps: float = 1e-10,
+) -> None: ...
+
+
+@compile_ops("module_sample")
 def random_sample(
     out: Tensor,
     input: Tensor,
     temperatures: Tensor,
     lambd: float = 1,
     generator: Optional[Generator] = None,
+    eps: float = 1e-10,
+) -> None: ...
+
+
+@compile_ops("module_sample")
+def mixed_sample_outer_exponential(
+    out: Tensor,
+    input: Tensor,
+    exponentials: Tensor,
+    temperatures: Tensor,
     eps: float = 1e-10,
 ) -> None: ...
 

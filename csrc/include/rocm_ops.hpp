@@ -1141,6 +1141,13 @@
 
 #define SAMPLE_PYBIND                                                                \
     m.def("greedy_sample", &aiter::greedy_sample, py::arg("out"), py::arg("input")); \
+    m.def("random_sample_outer_exponential",                                         \
+          &aiter::random_sample_outer_exponential,                                   \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("exponentials"),                                                   \
+          py::arg("temperature"),                                                    \
+          py::arg("eps") = 1e-10);                                                   \
     m.def("random_sample",                                                           \
           &aiter::random_sample,                                                     \
           py::arg("out"),                                                            \
@@ -1149,6 +1156,13 @@
           py::arg("lambd")     = 1.0,                                                \
           py::arg("generator") = std::nullopt,                                       \
           py::arg("eps")       = 1e-10);                                                   \
+    m.def("mixed_sample_outer_exponential",                                          \
+          &aiter::mixed_sample_outer_exponential,                                    \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("exponentials"),                                                   \
+          py::arg("temperature"),                                                    \
+          py::arg("eps") = 1e-10);                                                   \
     m.def("mixed_sample",                                                            \
           &aiter::mixed_sample,                                                      \
           py::arg("out"),                                                            \
