@@ -12,13 +12,13 @@
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
-#define HIP_CHECK(val)                                            \
-    {                                                             \
-        HipKernels::Utils::hip_check_((val), __FILE__, __LINE__); \
+#define HIP_CHECK(val)                                \
+    {                                                 \
+        utils::hip_check_((val), __FILE__, __LINE__); \
     }
 
-namespace HipKernels {
-namespace Utils {
+namespace topk {
+namespace utils {
 
 constexpr int WARP_SIZE                     = 64;
 constexpr unsigned long long FULL_WARP_MASK = 0xffffffffffffffffULL;
@@ -161,11 +161,11 @@ __inline__ __host__ __device__ constexpr int integer_log2(T n, int p = 0)
 
 __inline__ __host__ __device__ constexpr int calc_capacity(int k)
 {
-    int capacity = HipKernels::Utils::ceil_to_power_of_2(k);
+    int capacity = utils::ceil_to_power_of_2(k);
     return (capacity < WARP_SIZE) ? WARP_SIZE : capacity;
 }
 
-} // namespace Utils
+} // namespace utils
 
 namespace numeric {
 
@@ -178,7 +178,7 @@ namespace numeric {
 template <typename T>
 __inline__ constexpr T get_lower_bound()
 {
-    static_assert(Utils::is_supported_type_v<T>,
+    static_assert(utils::is_supported_type_v<T>,
                   "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
     if constexpr(std::is_floating_point_v<T> && std::is_signed_v<T>)
     {
@@ -207,7 +207,7 @@ __inline__ constexpr T get_lower_bound()
 template <typename T>
 __inline__ constexpr T get_upper_bound()
 {
-    static_assert(Utils::is_supported_type_v<T>,
+    static_assert(utils::is_supported_type_v<T>,
                   "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
     if constexpr(std::is_floating_point_v<T>)
     {
@@ -278,9 +278,8 @@ __device__ __host__ constexpr bool is_preferred(T val, T baseline)
 }
 
 } // namespace numeric
-} // namespace HipKernels
 
-namespace HipKernels {
+namespace sorting {
 
 template <int size, bool ascending, typename T, typename idxT>
 struct BitonicMerge
@@ -288,9 +287,9 @@ struct BitonicMerge
     // input should be a bitonic sequence, and sort it to be a monotonic sequence
     __device__ static void merge(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
     {
-        static_assert(HipKernels::Utils::is_power_of_2(size));
-        static_assert(size >= 2 * HipKernels::Utils::WARP_SIZE);
-        constexpr int arr_len = size / HipKernels::Utils::WARP_SIZE;
+        static_assert(utils::is_power_of_2(size));
+        static_assert(size >= 2 * utils::WARP_SIZE);
+        constexpr int arr_len = size / utils::WARP_SIZE;
 
         constexpr int stride = arr_len / 2;
         for(int i = 0; i < stride; ++i)
@@ -321,9 +320,9 @@ struct BitonicSort
 {
     __device__ static void sort(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
     {
-        static_assert(HipKernels::Utils::is_power_of_2(size));
-        static_assert(size >= 2 * HipKernels::Utils::WARP_SIZE);
-        constexpr int arr_len = size / HipKernels::Utils::WARP_SIZE;
+        static_assert(utils::is_power_of_2(size));
+        static_assert(size >= 2 * utils::WARP_SIZE);
+        constexpr int arr_len = size / utils::WARP_SIZE;
 
         BitonicSort<size / 2, true, T, idxT>::sort(val_arr, idx_arr);
         BitonicSort<size / 2, false, T, idxT>::sort(val_arr + arr_len / 2, idx_arr + arr_len / 2);
@@ -545,7 +544,7 @@ template <typename T, typename idxT, int stage, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride <= 2), void>::type
 sort_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (HipKernels::Utils::WARP_SIZE - 1);
+    const int lane = threadIdx.x & (utils::WARP_SIZE - 1);
     bool reverse   = (lane >> stage) & 2;
     bool is_second = lane & stride;
 
@@ -567,7 +566,7 @@ template <typename T, typename idxT, int stage, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride > 2 && stride <= 8), void>::type
 sort_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (HipKernels::Utils::WARP_SIZE - 1);
+    const int lane = threadIdx.x & (utils::WARP_SIZE - 1);
     bool reverse   = (lane >> stage) & 2;
     bool is_second = lane & stride;
 
@@ -596,7 +595,7 @@ template <typename T, typename idxT, int stage, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride > 8), void>::type
 sort_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (HipKernels::Utils::WARP_SIZE - 1);
+    const int lane = threadIdx.x & (utils::WARP_SIZE - 1);
     bool reverse   = (lane >> stage) & 2;
     bool is_second = lane & stride;
 
@@ -652,7 +651,7 @@ template <bool ascending, typename T, typename idxT, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride <= 2), void>::type
 merge_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (HipKernels::Utils::WARP_SIZE - 1);
+    const int lane = threadIdx.x & (utils::WARP_SIZE - 1);
     bool is_second = lane & stride;
     T& val         = *val_arr;
     idxT& idx      = *idx_arr;
@@ -673,7 +672,7 @@ template <bool ascending, typename T, typename idxT, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride > 2 && stride <= 8), void>::type
 merge_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (HipKernels::Utils::WARP_SIZE - 1);
+    const int lane = threadIdx.x & (utils::WARP_SIZE - 1);
     bool is_second = lane & stride;
     T& val         = *val_arr;
     idxT& idx      = *idx_arr;
@@ -701,7 +700,7 @@ template <bool ascending, typename T, typename idxT, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride > 8), void>::type
 merge_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (HipKernels::Utils::WARP_SIZE - 1);
+    const int lane = threadIdx.x & (topk::utils::WARP_SIZE - 1);
     bool is_second = lane & stride;
     T& val         = *val_arr;
     idxT& idx      = *idx_arr;
@@ -730,10 +729,8 @@ struct BitonicMerge<64, ascending, T, idxT>
         merge_step<ascending, T, idxT, 1>(val_arr, idx_arr);  // DPP
     }
 };
+} // namespace sorting
 
-} // namespace HipKernels
-
-namespace HipKernels {
 namespace buffer_load_helpers {
 
 constexpr int MAX_CAPACITY = 512;
@@ -764,6 +761,7 @@ enum struct AmdBufferCoherence
 
 using int32x4_t = int __attribute__((ext_vector_type(4)));
 using floatx4_t = float __attribute__((ext_vector_type(4)));
+using bf16x8_t  = uint16_t __attribute__((ext_vector_type(8)));
 using halfx8_t  = _Float16 __attribute__((ext_vector_type(8)));
 using uint32_t  = unsigned int;
 using index_t   = uint32_t;
@@ -833,9 +831,9 @@ class WarpSort
 {
     public:
     __device__ WarpSort(IdxT k, T dummy)
-        : lane_(threadIdx.x % Utils::WARP_SIZE), k_(k), dummy_(dummy)
+        : lane_(threadIdx.x % utils::WARP_SIZE), k_(k), dummy_(dummy)
     {
-        static_assert(capacity >= Utils::WARP_SIZE && Utils::is_power_of_2(capacity));
+        static_assert(capacity >= utils::WARP_SIZE && utils::is_power_of_2(capacity));
 #pragma unroll
         for(int i = 0; i < max_elements_per_thread_; ++i)
         {
@@ -846,9 +844,9 @@ class WarpSort
     __device__ void
     load_sorted(const T* __restrict__ in, const IdxT* __restrict__ in_idx, IdxT start)
     {
-        IdxT idx = start + Utils::WARP_SIZE - 1 - lane_;
+        IdxT idx = start + utils::WARP_SIZE - 1 - lane_;
 #pragma unroll
-        for(int i = max_elements_per_thread_ - 1; i >= 0; --i, idx += Utils::WARP_SIZE)
+        for(int i = max_elements_per_thread_ - 1; i >= 0; --i, idx += utils::WARP_SIZE)
         {
             if(idx < start + k_)
             {
@@ -860,7 +858,7 @@ class WarpSort
                 }
             }
         }
-        BitonicMerge<capacity, !greater, T, IdxT>::merge(values_, indices_);
+        sorting::BitonicMerge<capacity, !greater, T, IdxT>::merge(values_, indices_);
     }
 
     __device__ void dump(T* __restrict__ out, IdxT* __restrict__ out_idx) const
@@ -868,20 +866,17 @@ class WarpSort
 #pragma unroll
         for(int i = 0; i < max_elements_per_thread_; ++i)
         {
-            IdxT out_i = i * Utils::WARP_SIZE + lane_;
+            IdxT out_i = i * utils::WARP_SIZE + lane_;
             if(out_i < k_)
             {
                 out[out_i] = values_[i];
-                if(out_idx)
-                {
-                    out_idx[out_i] = indices_[i];
-                }
+                out_idx[out_i] = indices_[i];
             }
         }
     }
 
     protected:
-    static constexpr int max_elements_per_thread_ = capacity / Utils::WARP_SIZE;
+    static constexpr int max_elements_per_thread_ = capacity / utils::WARP_SIZE;
     T values_[max_elements_per_thread_];
     IdxT indices_[max_elements_per_thread_];
     const int lane_;
@@ -896,33 +891,33 @@ class WarpSelect : public WarpSort<capacity, greater, T, IdxT>
     __device__ WarpSelect(IdxT k, T dummy)
         : WarpSort<capacity, greater, T, IdxT>(k, dummy),
           k_th_(dummy),
-          k_th_lane_((k - 1) % Utils::WARP_SIZE)
+          k_th_lane_((k - 1) % utils::WARP_SIZE)
     {
         extern __shared__ char smem_buf[];
-        const int num_warps = blockDim.x / Utils::WARP_SIZE;
-        const int warp_id   = threadIdx.x / Utils::WARP_SIZE;
+        const int num_warps = blockDim.x / utils::WARP_SIZE;
+        const int warp_id   = threadIdx.x / utils::WARP_SIZE;
         values_smem_        = reinterpret_cast<T*>(smem_buf);
-        values_smem_ += warp_id * Utils::WARP_SIZE;
+        values_smem_ += warp_id * utils::WARP_SIZE;
         indices_smem_ =
-            reinterpret_cast<IdxT*>(smem_buf + Utils::round_up_to_multiple_of<16>(
-                                                   num_warps * sizeof(T) * Utils::WARP_SIZE));
-        indices_smem_ += warp_id * Utils::WARP_SIZE;
+            reinterpret_cast<IdxT*>(smem_buf + utils::round_up_to_multiple_of<16>(
+                                                   num_warps * sizeof(T) * utils::WARP_SIZE));
+        indices_smem_ += warp_id * utils::WARP_SIZE;
     }
 
     __device__ void add(const T* __restrict__ in, IdxT start, IdxT end)
     {
         const IdxT n                = end - start;
-        const IdxT whole            = n & ~(static_cast<IdxT>(Utils::WARP_SIZE) - 1);
-        const IdxT padded           = (n == whole) ? n : (whole + Utils::WARP_SIZE);
+        const IdxT whole            = n & ~(static_cast<IdxT>(utils::WARP_SIZE) - 1);
+        const IdxT padded           = (n == whole) ? n : (whole + utils::WARP_SIZE);
         const IdxT end_aligned      = start + whole;
         const IdxT end_for_fullwarp = start + padded;
 
-        for(IdxT i = start + this->lane_; i < end_aligned; i += Utils::WARP_SIZE)
+        for(IdxT i = start + this->lane_; i < end_aligned; i += utils::WARP_SIZE)
         {
             add(in[i], i);
         }
 
-        for(IdxT i = end_aligned + this->lane_; i < end_for_fullwarp; i += Utils::WARP_SIZE)
+        for(IdxT i = end_aligned + this->lane_; i < end_for_fullwarp; i += utils::WARP_SIZE)
         {
             T val = (i < end) ? in[i] : this->dummy_;
             add(val, i);
@@ -942,7 +937,7 @@ class WarpSelect : public WarpSort<capacity, greater, T, IdxT>
         const int prefix    = __popcll(mask & ((1ull << this->lane_) - 1));
         const int base      = smem_buf_len_;
         const int pos       = base + prefix;
-        const bool in_place = do_add && (pos < Utils::WARP_SIZE);
+        const bool in_place = do_add && (pos < utils::WARP_SIZE);
 
         if(in_place)
         {
@@ -953,17 +948,17 @@ class WarpSelect : public WarpSort<capacity, greater, T, IdxT>
         const int total = __popcll(mask);
         smem_buf_len_   = base + total;
 
-        if(smem_buf_len_ >= Utils::WARP_SIZE)
+        if(smem_buf_len_ >= utils::WARP_SIZE)
         {
             __builtin_amdgcn_wave_barrier();
             merge_buf_(values_smem_[this->lane_], indices_smem_[this->lane_]);
-            smem_buf_len_ -= Utils::WARP_SIZE;
+            smem_buf_len_ -= utils::WARP_SIZE;
         }
 
         const bool overflow = do_add && !in_place;
         if(overflow)
         {
-            const int new_pos      = pos - Utils::WARP_SIZE;
+            const int new_pos      = pos - utils::WARP_SIZE;
             values_smem_[new_pos]  = val;
             indices_smem_[new_pos] = idx;
         }
@@ -1018,14 +1013,14 @@ class WarpSelect : public WarpSort<capacity, greater, T, IdxT>
 
     __device__ void merge_buf_(T val, IdxT idx)
     {
-        BitonicSort<Utils::WARP_SIZE, greater, T, IdxT>::sort(&val, &idx);
+        sorting::BitonicSort<utils::WARP_SIZE, greater, T, IdxT>::sort(&val, &idx);
         T& old_val = this->values_[this->max_elements_per_thread_ - 1];
         if(numeric::is_preferred<greater>(val, old_val))
         {
             old_val                                            = val;
             this->indices_[this->max_elements_per_thread_ - 1] = idx;
         }
-        BitonicMerge<capacity, !greater, T, IdxT>::merge(this->values_, this->indices_);
+        sorting::BitonicMerge<capacity, !greater, T, IdxT>::merge(this->values_, this->indices_);
         set_k_th_();
     }
 
@@ -1078,7 +1073,7 @@ class WarpBitonic : public WarpSort<capacity, greater, T, IdxT>
         ++buf_len_;
         if(buf_len_ == this->max_elements_per_thread_)
         {
-            BitonicSort<capacity, greater, T, IdxT>::sort(val_buf_, idx_buf_);
+            sorting::BitonicSort<capacity, greater, T, IdxT>::sort(val_buf_, idx_buf_);
             merge_();
             buf_len_ = 0;
         }
@@ -1096,7 +1091,7 @@ class WarpBitonic : public WarpSort<capacity, greater, T, IdxT>
                     val_buf_[i] = this->dummy_;
                 }
             }
-            BitonicSort<capacity, greater, T, IdxT>::sort(val_buf_, idx_buf_);
+            sorting::BitonicSort<capacity, greater, T, IdxT>::sort(val_buf_, idx_buf_);
             merge_();
         }
     }
@@ -1106,7 +1101,7 @@ class WarpBitonic : public WarpSort<capacity, greater, T, IdxT>
     {
         IdxT idx = start + this->lane_;
 #pragma unroll
-        for(int i = 0; i < this->max_elements_per_thread_; ++i, idx += Utils::WARP_SIZE)
+        for(int i = 0; i < this->max_elements_per_thread_; ++i, idx += utils::WARP_SIZE)
         {
             if(idx < end)
             {
@@ -1114,19 +1109,19 @@ class WarpBitonic : public WarpSort<capacity, greater, T, IdxT>
                 this->indices_[i] = idx;
             }
         }
-        BitonicSort<capacity, !greater, T, IdxT>::sort(this->values_, this->indices_);
+        sorting::BitonicSort<capacity, !greater, T, IdxT>::sort(this->values_, this->indices_);
     }
 
     __device__ void add_extra_(const T* __restrict__ in, IdxT start, IdxT end)
     {
         IdxT idx = start + this->lane_;
 #pragma unroll
-        for(int i = 0; i < this->max_elements_per_thread_; ++i, idx += Utils::WARP_SIZE)
+        for(int i = 0; i < this->max_elements_per_thread_; ++i, idx += utils::WARP_SIZE)
         {
             val_buf_[i] = (idx < end) ? in[idx] : this->dummy_;
             idx_buf_[i] = idx;
         }
-        BitonicSort<capacity, greater, T, IdxT>::sort(val_buf_, idx_buf_);
+        sorting::BitonicSort<capacity, greater, T, IdxT>::sort(val_buf_, idx_buf_);
     }
 
     __device__ void merge_()
@@ -1140,7 +1135,7 @@ class WarpBitonic : public WarpSort<capacity, greater, T, IdxT>
                 this->indices_[i] = idx_buf_[i];
             }
         }
-        BitonicMerge<capacity, !greater, T, IdxT>::merge(this->values_, this->indices_);
+        sorting::BitonicMerge<capacity, !greater, T, IdxT>::merge(this->values_, this->indices_);
     }
 
     using WarpSort<capacity, greater, T, IdxT>::max_elements_per_thread_;
@@ -1167,7 +1162,7 @@ class WarpMerge : public WarpSort<capacity, greater, T, IdxT>
         IdxT idx       = start + this->lane_;
         IdxT first_end = (start + this->k_ < end) ? (start + this->k_) : end;
 #pragma unroll
-        for(int i = 0; i < this->max_elements_per_thread_; ++i, idx += Utils::WARP_SIZE)
+        for(int i = 0; i < this->max_elements_per_thread_; ++i, idx += utils::WARP_SIZE)
         {
             if(idx < first_end)
             {
@@ -1206,10 +1201,10 @@ class WarpSortBlockWide
         : queue_(k, dummy), k_(k), dummy_(dummy)
     {
         val_smem_           = static_cast<T*>(smem_buf);
-        const int num_warps = blockDim.x / Utils::WARP_SIZE;
+        const int num_warps = blockDim.x / utils::WARP_SIZE;
         idx_smem_           = reinterpret_cast<IdxT*>(
             reinterpret_cast<char*>(smem_buf) +
-            Utils::round_up_to_multiple_of<16>(num_warps / 2 * sizeof(T) * k_));
+            utils::round_up_to_multiple_of<16>(num_warps / 2 * sizeof(T) * k_));
     }
 
     __device__ void
@@ -1217,8 +1212,8 @@ class WarpSortBlockWide
     {
         static_assert(std::is_same_v<WarpSortImpl<capacity, greater, T, IdxT>,
                                      WarpMerge<capacity, greater, T, IdxT>>);
-        int num_warps     = blockDim.x / Utils::WARP_SIZE;
-        const int warp_id = threadIdx.x / Utils::WARP_SIZE;
+        int num_warps     = blockDim.x / utils::WARP_SIZE;
+        const int warp_id = threadIdx.x / utils::WARP_SIZE;
         IdxT len_per_warp = (end - start - 1) / num_warps + 1;
         len_per_warp      = ((len_per_warp - 1) / k_ + 1) * k_;
         IdxT warp_start   = start + warp_id * len_per_warp;
@@ -1234,20 +1229,24 @@ class WarpSortBlockWide
             const IdxT n      = end - start;
             const IdxT tid    = threadIdx.x;
             const IdxT stride = blockDim.x;
+            constexpr auto elements = 16 / sizeof(T);
+            const IdxT n_aligned    = utils::round_up_to_multiple_of<elements>(n);
 
             constexpr auto cache_policy = buffer_load_helpers::AmdBufferCoherence::slc;
 
             if constexpr(std::is_same_v<T, _Float16>)
             {
-                constexpr auto elements = sizeof(float) * 4 / sizeof(_Float16);
-                const IdxT n_aligned    = Utils::round_up_to_multiple_of<elements>(n);
                 const IdxT tile         = blockDim.x * 16;
-                const IdxT end_aligned  = start + Utils::round_up_to_multiple_of(n_aligned, tile);
+                const IdxT end_aligned  = start + utils::round_up_to_multiple_of(n_aligned, tile);
                 const IdxT tail         = end_aligned - tile;
 
                 IdxT idx = start + tid * 2 - stride * 2 * 8;
 
-                buffer_load_helpers::halfx8_t h8[2];
+                using VecType = std::conditional_t<std::is_same_v<T, __bf16>,
+                                                   buffer_load_helpers::bf16x8_t,
+                                                   buffer_load_helpers::halfx8_t>;
+
+                VecType arr[2];
                 for(IdxT i = start + tid * 16; i < tail; i += stride * 16)
                 {
                     idx              = i;
@@ -1268,34 +1267,34 @@ class WarpSortBlockWide
                     const auto idx14 = i + 14;
                     const auto idx15 = i + 15;
 
-                    h8[0] = buffer_load_helpers::buffer_load<buffer_load_helpers::halfx8_t,
-                                                             cache_policy>(in, idx0, n_aligned);
-                    h8[1] = buffer_load_helpers::buffer_load<buffer_load_helpers::halfx8_t,
-                                                             cache_policy>(in, idx8, n_aligned);
+                    arr[0] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
+                        in, idx0, n_aligned);
+                    arr[1] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
+                        in, idx8, n_aligned);
 
-                    queue_.add(h8[0][0], idx0);
-                    queue_.add(h8[0][1], idx1);
+                    queue_.add(arr[0][0], idx0);
+                    queue_.add(arr[0][1], idx1);
 
-                    queue_.add(h8[0][2], idx2);
-                    queue_.add(h8[0][3], idx3);
+                    queue_.add(arr[0][2], idx2);
+                    queue_.add(arr[0][3], idx3);
 
-                    queue_.add(h8[0][4], idx4);
-                    queue_.add(h8[0][5], idx5);
+                    queue_.add(arr[0][4], idx4);
+                    queue_.add(arr[0][5], idx5);
 
-                    queue_.add(h8[0][6], idx6);
-                    queue_.add(h8[0][7], idx7);
+                    queue_.add(arr[0][6], idx6);
+                    queue_.add(arr[0][7], idx7);
 
-                    queue_.add(h8[1][0], idx8);
-                    queue_.add(h8[1][1], idx9);
+                    queue_.add(arr[1][0], idx8);
+                    queue_.add(arr[1][1], idx9);
 
-                    queue_.add(h8[1][2], idx10);
-                    queue_.add(h8[1][3], idx11);
+                    queue_.add(arr[1][2], idx10);
+                    queue_.add(arr[1][3], idx11);
 
-                    queue_.add(h8[1][4], idx12);
-                    queue_.add(h8[1][5], idx13);
+                    queue_.add(arr[1][4], idx12);
+                    queue_.add(arr[1][5], idx13);
 
-                    queue_.add(h8[1][6], idx14);
-                    queue_.add(h8[1][7], idx15);
+                    queue_.add(arr[1][6], idx14);
+                    queue_.add(arr[1][7], idx15);
                 }
 
                 // tail
@@ -1335,51 +1334,49 @@ class WarpSortBlockWide
                     const bool valid14 = (idx14 < end);
                     const bool valid15 = (idx15 < end);
 
-                    h8[0] = buffer_load_helpers::buffer_load<buffer_load_helpers::halfx8_t,
-                                                             cache_policy>(in, idx0, n_aligned);
-                    h8[1] = buffer_load_helpers::buffer_load<buffer_load_helpers::halfx8_t,
-                                                             cache_policy>(in, idx8, n_aligned);
+                    arr[0] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
+                        in, idx0, n_aligned);
+                    arr[1] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
+                        in, idx8, n_aligned);
 
-                    auto val = valid0 ? _Float16(h8[0][0]) : dummy_;
+                    auto val = valid0 ? _Float16(arr[0][0]) : dummy_;
                     queue_.add(val, idx0);
-                    val = valid1 ? _Float16(h8[0][1]) : dummy_;
+                    val = valid1 ? _Float16(arr[0][1]) : dummy_;
                     queue_.add(val, idx1);
-                    val = valid2 ? _Float16(h8[0][2]) : dummy_;
+                    val = valid2 ? _Float16(arr[0][2]) : dummy_;
                     queue_.add(val, idx2);
-                    val = valid3 ? _Float16(h8[0][3]) : dummy_;
+                    val = valid3 ? _Float16(arr[0][3]) : dummy_;
                     queue_.add(val, idx3);
-                    val = valid4 ? _Float16(h8[0][4]) : dummy_;
+                    val = valid4 ? _Float16(arr[0][4]) : dummy_;
                     queue_.add(val, idx4);
-                    val = valid5 ? _Float16(h8[0][5]) : dummy_;
+                    val = valid5 ? _Float16(arr[0][5]) : dummy_;
                     queue_.add(val, idx5);
-                    val = valid6 ? _Float16(h8[0][6]) : dummy_;
+                    val = valid6 ? _Float16(arr[0][6]) : dummy_;
                     queue_.add(val, idx6);
-                    val = valid7 ? _Float16(h8[0][7]) : dummy_;
+                    val = valid7 ? _Float16(arr[0][7]) : dummy_;
                     queue_.add(val, idx7);
-                    val = valid8 ? _Float16(h8[1][0]) : dummy_;
+                    val = valid8 ? _Float16(arr[1][0]) : dummy_;
                     queue_.add(val, idx8);
-                    val = valid9 ? _Float16(h8[1][1]) : dummy_;
+                    val = valid9 ? _Float16(arr[1][1]) : dummy_;
                     queue_.add(val, idx9);
-                    val = valid10 ? _Float16(h8[1][2]) : dummy_;
+                    val = valid10 ? _Float16(arr[1][2]) : dummy_;
                     queue_.add(val, idx10);
-                    val = valid11 ? _Float16(h8[1][3]) : dummy_;
+                    val = valid11 ? _Float16(arr[1][3]) : dummy_;
                     queue_.add(val, idx11);
-                    val = valid12 ? _Float16(h8[1][4]) : dummy_;
+                    val = valid12 ? _Float16(arr[1][4]) : dummy_;
                     queue_.add(val, idx12);
-                    val = valid13 ? _Float16(h8[1][5]) : dummy_;
+                    val = valid13 ? _Float16(arr[1][5]) : dummy_;
                     queue_.add(val, idx13);
-                    val = valid14 ? _Float16(h8[1][6]) : dummy_;
+                    val = valid14 ? _Float16(arr[1][6]) : dummy_;
                     queue_.add(val, idx14);
-                    val = valid15 ? _Float16(h8[1][7]) : dummy_;
+                    val = valid15 ? _Float16(arr[1][7]) : dummy_;
                     queue_.add(val, idx15);
                 }
             }
             else if(std::is_same_v<T, float> || std::is_same_v<T, int>)
             {
-                constexpr auto elements = 16 / sizeof(T);
-                const IdxT n_aligned    = Utils::round_up_to_multiple_of<elements>(n);
                 const IdxT tile         = blockDim.x * 8;
-                const IdxT end_aligned  = start + Utils::round_up_to_multiple_of(n_aligned, tile);
+                const IdxT end_aligned  = start + utils::round_up_to_multiple_of(n_aligned, tile);
 
                 IdxT idx = start + tid * 8 - stride * 8;
 
@@ -1433,7 +1430,7 @@ class WarpSortBlockWide
             else
             {
                 static_assert(
-                    Utils::is_supported_type_v<T>,
+                    utils::is_supported_type_v<T>,
                     "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
                 __builtin_unreachable();
             }
@@ -1441,10 +1438,10 @@ class WarpSortBlockWide
         else if constexpr(std::is_same_v<WarpSortImpl<capacity, greater, T, IdxT>,
                                          WarpBitonic<capacity, greater, T, IdxT>>)
         {
-            int num_warps     = blockDim.x / Utils::WARP_SIZE;
-            const int warp_id = threadIdx.x / Utils::WARP_SIZE;
+            int num_warps     = blockDim.x / utils::WARP_SIZE;
+            const int warp_id = threadIdx.x / utils::WARP_SIZE;
             IdxT len_per_warp = (end - start - 1) / num_warps + 1;
-            len_per_warp      = Utils::round_up_to_multiple_of<Utils::WARP_SIZE>(len_per_warp);
+            len_per_warp      = utils::round_up_to_multiple_of<utils::WARP_SIZE>(len_per_warp);
             IdxT warp_start   = start + warp_id * len_per_warp;
             IdxT warp_end     = std::min(warp_start + len_per_warp, end);
             this->queue_.add(in, warp_start, warp_end);
@@ -1456,8 +1453,8 @@ class WarpSortBlockWide
     __device__ void done()
     {
         queue_.done();
-        int num_warps     = blockDim.x / Utils::WARP_SIZE;
-        const int warp_id = threadIdx.x / Utils::WARP_SIZE;
+        int num_warps     = blockDim.x / utils::WARP_SIZE;
+        const int warp_id = threadIdx.x / utils::WARP_SIZE;
         while(num_warps > 1)
         {
             int half_num_warps = (num_warps + 1) / 2;
@@ -1478,7 +1475,7 @@ class WarpSortBlockWide
 
     __device__ void dump(T* __restrict__ out, IdxT* __restrict__ out_idx) const
     {
-        if(threadIdx.x < Utils::WARP_SIZE)
+        if(threadIdx.x < utils::WARP_SIZE)
         {
             queue_.dump(out, out_idx);
         }
@@ -1542,10 +1539,10 @@ template <bool greater,
           typename IdxT>
 auto find_block_kernel_helper(int capacity)
 {
-    if constexpr(Capacity == Utils::WARP_SIZE)
+    if constexpr(Capacity == utils::WARP_SIZE)
     {
-        return greater ? block_kernel<WarpSortClass, Utils::WARP_SIZE, true, T, IdxT>
-                       : block_kernel<WarpSortClass, Utils::WARP_SIZE, false, T, IdxT>;
+        return greater ? block_kernel<WarpSortClass, utils::WARP_SIZE, true, T, IdxT>
+                       : block_kernel<WarpSortClass, utils::WARP_SIZE, false, T, IdxT>;
     }
     else
     {
@@ -1565,7 +1562,7 @@ template <bool greater,
           typename IdxT>
 auto find_block_kernel(int k)
 {
-    const int capacity = Utils::calc_capacity(k);
+    const int capacity = utils::calc_capacity(k);
     assert(capacity <= buffer_load_helpers::MAX_CAPACITY);
     return find_block_kernel_helper<greater,
                                     buffer_load_helpers::MAX_CAPACITY,
@@ -1577,8 +1574,8 @@ auto find_block_kernel(int k)
 template <typename T, typename IdxT>
 int calc_smem_size_for_block_wide(int num_of_warp, IdxT k)
 {
-    int n = std::max<int>(num_of_warp / 2 * k, num_of_warp * Utils::WARP_SIZE);
-    return Utils::round_up_to_multiple_of<16>(n * sizeof(T)) + n * sizeof(IdxT);
+    int n = std::max<int>(num_of_warp / 2 * k, num_of_warp * utils::WARP_SIZE);
+    return utils::round_up_to_multiple_of<16>(n * sizeof(T)) + n * sizeof(IdxT);
 }
 
 template <template <int, bool, typename, typename> class WarpSortClass, typename T, typename IdxT>
@@ -1586,7 +1583,7 @@ void calc_launch_parameter_by_occupancy(IdxT k, int* block_size, int* min_grid_s
 {
     auto func      = find_block_kernel<true, WarpSortClass, T, IdxT>(k);
     auto calc_smem = [k](int bs) {
-        return calc_smem_size_for_block_wide<T, IdxT>(bs / Utils::WARP_SIZE, k);
+        return calc_smem_size_for_block_wide<T, IdxT>(bs / utils::WARP_SIZE, k);
     };
     HIP_CHECK(
         hipOccupancyMaxPotentialBlockSizeVariableSMem(min_grid_size, block_size, func, calc_smem));
@@ -1616,7 +1613,7 @@ template <template <int, bool, typename, typename> class WarpSortClass, typename
 void calc_launch_parameter(
     int batch_size, IdxT len, IdxT k, int* p_num_of_block, int* p_num_of_warp)
 {
-    const int capacity = Utils::calc_capacity(k);
+    const int capacity = utils::calc_capacity(k);
     int block_size     = 0;
     int min_grid_size  = 0;
     calc_launch_parameter_by_occupancy<WarpSortClass, T, IdxT>(k, &block_size, &min_grid_size);
@@ -1625,11 +1622,11 @@ void calc_launch_parameter(
     int num_of_block;
     if(batch_size < min_grid_size)
     {
-        num_of_warp              = block_size / Utils::WARP_SIZE;
+        num_of_warp              = block_size / utils::WARP_SIZE;
         num_of_block             = min_grid_size / batch_size;
         IdxT len_per_block       = (len - 1) / num_of_block + 1;
         IdxT len_per_warp        = (len_per_block - 1) / num_of_warp + 1;
-        len_per_warp             = Utils::round_up_to_multiple_of<Utils::WARP_SIZE>(len_per_warp);
+        len_per_warp             = utils::round_up_to_multiple_of<utils::WARP_SIZE>(len_per_warp);
         len_per_block            = len_per_warp * num_of_warp;
         num_of_block             = (len - 1) / len_per_block + 1;
         constexpr int len_factor = LaunchThreshold<WarpSortClass>::len_factor_for_multi_block;
@@ -1660,11 +1657,11 @@ void calc_launch_parameter(
             {
                 block_size = 1;
             }
-            block_size = Utils::round_up_to_multiple_of<Utils::WARP_SIZE>(block_size);
+            block_size = utils::round_up_to_multiple_of<utils::WARP_SIZE>(block_size);
         }
-        num_of_warp              = block_size / Utils::WARP_SIZE;
+        num_of_warp              = block_size / utils::WARP_SIZE;
         IdxT len_per_warp        = (len - 1) / num_of_warp + 1;
-        len_per_warp             = Utils::round_up_to_multiple_of<Utils::WARP_SIZE>(len_per_warp);
+        len_per_warp             = utils::round_up_to_multiple_of<utils::WARP_SIZE>(len_per_warp);
         num_of_warp              = (len - 1) / len_per_warp + 1;
         constexpr int len_factor = LaunchThreshold<WarpSortClass>::len_factor_for_single_block;
         if(len_per_warp < static_cast<IdxT>(capacity * len_factor))
@@ -1674,7 +1671,7 @@ void calc_launch_parameter(
         }
     }
     *p_num_of_block = num_of_block;
-    *p_num_of_warp  = Utils::round_up_to_multiple_of<4>(num_of_warp);
+    *p_num_of_warp  = utils::round_up_to_multiple_of<4>(num_of_warp);
 }
 
 template <typename T, typename IdxT>
@@ -1684,7 +1681,7 @@ void calc_launch_parameter_for_merge(IdxT len, IdxT k, int* num_of_block, int* n
     int block_size    = 0;
     int min_grid_size = 0;
     calc_launch_parameter_by_occupancy<WarpMerge, T, IdxT>(k, &block_size, &min_grid_size);
-    *num_of_warp      = block_size / Utils::WARP_SIZE;
+    *num_of_warp      = block_size / utils::WARP_SIZE;
     IdxT len_per_warp = (len - 1) / (*num_of_warp) + 1;
     len_per_warp      = ((len_per_warp - 1) / k + 1) * k;
     *num_of_warp      = (len - 1) / len_per_warp + 1;
@@ -1710,7 +1707,7 @@ void warp_sort_topk_impl(int num_of_block,
     T dummy                = numeric::get_sentinel_value<greater, T>();
     T* result_val          = (num_of_block == 1) ? out : tmp_val;
     IdxT* result_idx       = (num_of_block == 1) ? out_idx : tmp_idx;
-    int block_dim          = num_of_warp * Utils::WARP_SIZE;
+    int block_dim          = num_of_warp * utils::WARP_SIZE;
     int smem_size          = calc_smem_size_for_block_wide<T, IdxT>(num_of_warp, k);
     auto block_kernel_func = find_block_kernel<greater, WarpSortClass, T, IdxT>(k);
 
@@ -1721,7 +1718,7 @@ void warp_sort_topk_impl(int num_of_block,
     {
         len = k * num_of_block;
         calc_launch_parameter_for_merge<T, IdxT>(len, k, &num_of_block, &num_of_warp);
-        block_dim              = num_of_warp * Utils::WARP_SIZE;
+        block_dim              = num_of_warp * utils::WARP_SIZE;
         smem_size              = calc_smem_size_for_block_wide<T, IdxT>(num_of_warp, k);
         auto merge_kernel_func = find_block_kernel<greater, WarpMerge, T, IdxT>(k);
 
@@ -1736,11 +1733,11 @@ void WarpSortTopk(int batch_size,
                   IdxT k,
                   const T* __restrict__ in,
                   T* __restrict__ out,
-                  IdxT* __restrict__ out_idx = nullptr,
-                  hipStream_t stream         = 0)
+                  IdxT* __restrict__ out_idx,
+                  hipStream_t stream = 0)
 {
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
-    const int capacity = Utils::calc_capacity(k);
+    const int capacity = utils::calc_capacity(k);
     int num_of_block   = 0;
     int num_of_warp    = 0;
 
@@ -1761,7 +1758,7 @@ void WarpSortTopk(int batch_size,
     }
 }
 
-} // namespace HipKernels
+} // namespace topk
 
 void topk_plain(torch::Tensor& values,   // [batch, len]
                 torch::Tensor& topk_ids, // [batch, len]
@@ -1796,12 +1793,12 @@ void topk_plain(torch::Tensor& values,   // [batch, len]
 
         if(largest)
         {
-            HipKernels::WarpSortTopk<true, input_dtype, IdxT>(
+            topk::WarpSortTopk<true, input_dtype, IdxT>(
                 batch, len, topk, values_kernel_ptr, topk_out_kernel_ptr, topk_ids_ptr, stream);
         }
         else
         {
-            HipKernels::WarpSortTopk<false, input_dtype, IdxT>(
+            topk::WarpSortTopk<false, input_dtype, IdxT>(
                 batch, len, topk, values_kernel_ptr, topk_out_kernel_ptr, topk_ids_ptr, stream);
         }
     });
