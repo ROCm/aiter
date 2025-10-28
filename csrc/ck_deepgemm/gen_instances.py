@@ -6,10 +6,10 @@ import pandas as pd
 import argparse
 import shutil
 import torch
-from m_grouped_gemm_common import kernelInstance, kernels_list, default_kernels_dict
+from deepgemm_common import kernelInstance, kernels_list, default_kernels_dict
 
 
-class m_grouped_gemm_codegen:
+class deepgemm_codegen:
     def __init__(self, working_path, istune=False):
         self.working_path = working_path
         self.impl_path = os.path.join(working_path, "impl")
@@ -24,7 +24,7 @@ class m_grouped_gemm_codegen:
     def gen_instance(self, k: kernelInstance):
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-#include "m_grouped_gemm_common.cuh"
+#include "deepgemm_common.cuh"
 template <typename ABDataType, typename AccDataType, typename CDataType>
 torch::Tensor
 {k.name}(
@@ -172,7 +172,7 @@ template torch::Tensor
    }
 // #endif // USE_ROCM
 """
-        with open(os.path.join(self.working_path, "m_grouped_gemm_lookup.h"), "w") as f:
+        with open(os.path.join(self.working_path, "deepgemm_lookup.h"), "w") as f:
             f.write(LOOKUP_head)
             for mnk, k in kernels_dict.items():
                 if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
@@ -211,9 +211,7 @@ torch::Tensor
 // endif // USE_ROCM
 """
 
-        with open(
-            os.path.join(self.working_path, "m_grouped_gemm_manifest.h"), "w"
-        ) as f:
+        with open(os.path.join(self.working_path, "deepgemm_manifest.h"), "w") as f:
             f.write(MAINFEST_head)
             for mnk, k in kernels_dict.items():
                 f.write(MAINFEST_template.format(kernel_name=k.name))
@@ -299,7 +297,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     # TODO: use tune flag.
-    codegen = m_grouped_gemm_codegen(args.working_path, False)
+    codegen = deepgemm_codegen(args.working_path, False)
 
     # if args.tune:
     codegen.gen_instances(kernels_list)

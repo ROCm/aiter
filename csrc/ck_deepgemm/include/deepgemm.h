@@ -16,9 +16,9 @@ using bf16                  = ck_tile::bf16_t;
 using fp16                  = ck_tile::half_t;
 using fp8                   = ck_tile::fp8_t;
 
-torch::Tensor m_grouped_gemm(torch::Tensor& XQ,
-                             torch::Tensor& WQ,
-                             torch::Tensor& Y,
-                             torch::Tensor& group_layout,
-                             std::optional<torch::Tensor> x_scale,
-                             std::optional<torch::Tensor> w_scale);
+torch::Tensor deepgemm(torch::Tensor& XQ,
+                       torch::Tensor& WQ,
+                       torch::Tensor& Y,
+                       torch::Tensor& group_layout,
+                       std::optional<torch::Tensor> x_scale,
+                       std::optional<torch::Tensor> w_scale);

@@ -8,7 +8,8 @@ import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter import m_grouped_gemm
+from aiter.jit.utils.chip_info import get_gfx
+from aiter import deepgemm
 import pandas as pd
 import argparse
 
@@ -31,7 +32,7 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @benchmark()
-def test_m_grouped_gemm(
+def test_deepgemm(
     num_groups: int,
     expect_m: int,
     k: int,
@@ -65,7 +66,7 @@ def test_m_grouped_gemm(
     weightshuffle = shuffle_weight(weight, layout=(16, 16))
 
     out, us = run_perftest(
-        m_grouped_gemm,
+        deepgemm,
         x,
         weightshuffle,
         out,
@@ -95,7 +96,7 @@ def test_m_grouped_gemm(
 
 l_dtype = ["bf16", "fp16"]
 l_num_groups = [
-    Wjx,
+    16,
 ]
 l_expect_m = [
     1,
@@ -195,7 +196,7 @@ for (
 ) in itertools.product(l_dtype, l_num_groups, l_quant, l_dim):
     df = []
     for expect_m in l_expect_m:
-        ret = test_m_grouped_gemm(
+        ret = test_deepgemm(
             num_groups,
             expect_m,
             k,

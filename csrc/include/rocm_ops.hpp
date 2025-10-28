@@ -169,10 +169,10 @@
           py::arg("kernelId") = 0,    \
           py::arg("splitK")   = 0);
 
-#define M_GROUPED_GEMM_PYBIND                \
-    m.def("m_grouped_gemm",                  \
-          &m_grouped_gemm,                   \
-          "m_grouped_gemm",                  \
+#define DEEPGEMM_PYBIND                      \
+    m.def("deepgemm",                        \
+          &deepgemm,                         \
+          "deepgemm",                        \
           py::arg("XQ"),                     \
           py::arg("WQ"),                     \
           py::arg("Y"),                      \

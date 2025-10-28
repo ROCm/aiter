@@ -8,8 +8,8 @@ from ..jit.core import (
 )
 
 
-@compile_ops("module_m_grouped_gemm", fc_name="m_grouped_gemm")
-def m_grouped_gemm_ck(
+@compile_ops("module_deepgemm", fc_name="deepgemm")
+def deepgemm_ck(
     XQ: Tensor,
     WQ: Tensor,
     Y: Tensor,
@@ -19,7 +19,7 @@ def m_grouped_gemm_ck(
 ) -> Tensor: ...
 
 
-def m_grouped_gemm(
+def deepgemm(
     XQ: Tensor,
     WQ: Tensor,
     Y: Tensor,
@@ -27,4 +27,4 @@ def m_grouped_gemm(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
 ):
-    return m_grouped_gemm_ck(XQ, WQ, Y, group_layout, x_scale, w_scale)
+    return deepgemm_ck(XQ, WQ, Y, group_layout, x_scale, w_scale)

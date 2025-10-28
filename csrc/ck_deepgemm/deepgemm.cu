@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "m_grouped_gemm_common.cuh"
-#include "m_grouped_gemm_lookup.h"
-#include "m_grouped_gemm_manifest.h"
+#include "deepgemm_common.cuh"
+#include "deepgemm_lookup.h"
+#include "deepgemm_manifest.h"
 #include <cmath>
 #include "py_itfs_common.h"
 
@@ -37,11 +37,11 @@ RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
   // Apply shape heuristics to find a suitable kernel implementation.
   if (M < 128) 
   {
-    return m_grouped_gemm_256x32x64x256_16x16x64_1x4<ABDataType, AccDataType, CDataType>;
+    return deepgemm_256x32x64x256_16x16x64_1x4<ABDataType, AccDataType, CDataType>;
   }
   else
   {
-    return m_grouped_gemm_256x128x128x128_16x16x64_1x4<ABDataType, AccDataType, CDataType>;
+    return deepgemm_256x128x128x128_16x16x64_1x4<ABDataType, AccDataType, CDataType>;
   }
 }
 
@@ -98,7 +98,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
   return rowwise_heuristic_dispatch<ABDataType, AccDataType, CDataType>(M, N, K);
 }
 
-torch::Tensor m_grouped_gemm(
+torch::Tensor deepgemm(
   torch::Tensor &XQ,
   torch::Tensor &WQ,
   torch::Tensor &Y,

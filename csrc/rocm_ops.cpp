@@ -18,13 +18,13 @@
 #include "communication_asm.h"
 #include "custom.h"
 #include "custom_all_reduce.h"
+#include "deepgemm.h"
 #include "gemm_a4w4_blockscale.h"
 #include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
 #include "gemm_a8w8_bpreshuffle.h"
 #include "gemm_common.h"
 #include "hipbsolgemm.cuh"
-#include "m_grouped_gemm.h"
 #include "moe_ck.h"
 #include "moe_op.h"
 #include "moe_sorting.h"
@@ -102,6 +102,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     SAMPLE_PYBIND;
     HIPBSOLGEMM_PYBIND;
     ROCSOLGEMM_PYBIND;
-    M_GROUPED_GEMM_PYBIND;
+    DEEPGEMM_PYBIND;
 }
 #endif

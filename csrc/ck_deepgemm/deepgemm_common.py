@@ -20,7 +20,7 @@ class kernelInstance:
     def name(self) -> str:
         return ("_").join(
             [
-                "m_grouped_gemm",
+                "deepgemm",
                 ("x").join(
                     map(
                         lambda x: str(x),
