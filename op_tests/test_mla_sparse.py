@@ -216,8 +216,6 @@ def _convert_req_index_to_global_index_kernel(
                    mask=valid_block,
                    other=0)
 
-    # base = 0
-
     # If token == -1 OR block_id OOB, output -1; else base * BLOCK_SIZE + offset
     out_val = tl.where(is_invalid_tok | (~valid_block), -1,
                        base * BLOCK_SIZE + inblock_off)
@@ -335,7 +333,6 @@ def test_mla(
     max_seqlen_qo = seq_lens_qo.max().item()
     max_seqlen_kv = seq_lens_kv.max().item()
     total_qo = qo_indptr[-1].item()
-    total_kv = kv_indptr[-1].item()
     kv_buffer = torch.randn(
         (num_page * page_size, 1, kv_lora_rank + qk_rope_head_dim),
         dtype=kvtype,
@@ -440,6 +437,7 @@ def test_mla(
         converted_indices,
         mtp,
     ) 
+    total_kv = new_kv_indptr[-1].item()
 
     out_ref, lse_ref = torch_mla_extend(
         q,
@@ -497,8 +495,8 @@ def test_mla(
 
     err = None
     us_asm_decode = 10000000000
-    if nhead == 16:
-        err, us_asm_decode = test_sparse_mla_bf16()
+    # if nhead == 16:
+    #     err, us_asm_decode = test_sparse_mla_bf16()
 
     def test_absorb_decode_fp8():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -554,10 +552,10 @@ def test_mla(
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
         flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
-        bytes = (
-            total_kv * nhead_kv * qk_head_dim
-            + total_q * nhead * (qk_head_dim + v_head_dim)
-        ) * (torch.finfo(dtype).bits // 8)
+
+        bytes = (total_kv * nhead_kv * qk_head_dim + total_q * nhead * qk_head_dim) + \
+            total_q * nhead * v_head_dim * (torch.finfo(dtype).bits // 8)
+
         err = checkAllclose(
             out_ref,
             out_asm,
@@ -578,22 +576,25 @@ def test_mla(
     #               msg=f'attn_logits [golden vs aiter_asm]')
     # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
     flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+
     bytes = (
         total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
     ) * (torch.finfo(dtype).bits // 8)
 
+    import pdb; pdb.set_trace()
+
     return {
-        "decode:flops": flops,
-        "decode:bytes": bytes,
-        "decode:err": err,
-        "decode:asm_576": us_asm_decode,
-        "decode:TFLOPS": flops / us_asm_decode / 1e6,
-        "decode:TB/s": bytes / us_asm_decode / 1e6,
-        # "decode_fp8:err vs fp32": err_fp8_fp32,
-        # "decode_fp8:err vs fp8": err_fp8_fp8,
-        # "decode_fp8:asm_576": us_asm_decode_fp8,
-        # "decode_fp8:TFLOPS": flops / us_asm_decode_fp8 / 1e6,
-        # "decode_fp8:TB/s": bytes / us_asm_decode_fp8 / 1e6,
+        # "decode:flops": flops,
+        # "decode:bytes": bytes,
+        # "decode:err": err,
+        # "decode:asm_576": us_asm_decode,
+        # "decode:TFLOPS": flops / us_asm_decode / 1e6,
+        # "decode:TB/s": bytes / us_asm_decode / 1e6,
+        "decode_fp8:err vs fp32": err_fp8_fp32,
+        "decode_fp8:err vs fp8": err_fp8_fp8,
+        "decode_fp8:asm_576": us_asm_decode_fp8,
+        "decode_fp8:TFLOPS": flops / us_asm_decode_fp8 / 1e6,
+        "decode_fp8:TB/s": bytes / us_asm_decode_fp8 / 1e6,
     }
 
 
