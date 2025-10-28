@@ -8,7 +8,6 @@ MD_NAME = "pa_v1"
 with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_v1.cpp.jinja", "r") as f:
     src_template = Template(f.read())
 
-
 def compile(
     gqa_ratio: int,
     head_size: int,
@@ -72,38 +71,23 @@ def paged_attention_v1(
     partition_size: int = 256,
     mtp: int = 1,
     q_scale=None,
+    folder: str = None,
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
-    warpSize = torch.cuda.get_device_properties(out.device).warp_size
-    if kv_cache_dtype == "auto":
-        if query.dtype == torch.bfloat16:
-            dtype = "__hip_bfloat16"
-            kv_dtype = "__hip_bfloat16"
-        elif query.dtype == torch.float16:
-            dtype = "_Float16"
-            kv_dtype = "_Float16"
-        else:
-            raise ValueError(f"Unsupported data type: {query.dtype}")
-    elif kv_cache_dtype == "fp8" or kv_cache_dtype == "fp8_e4m3":
-        if query.dtype == torch.bfloat16:
-            dtype = "__hip_bfloat16"
-            kv_dtype = "uint8_t"
-        elif query.dtype == torch.float16:
-            dtype = "_Float16"
-            kv_dtype = "uint8_t"
-        else:
-            raise ValueError(f"Unsupported data type: {query.dtype}")
-    else:
-        raise ValueError(f"Unsupported kv_cache_dtype: {kv_cache_dtype}")
+    dtype_map = {
+        torch.bfloat16: "__hip_bfloat16",
+        torch.float16: "_Float16",
+        torch.float8_e4m3fnuz: "uint8_t",
+        torch.float8_e4m3fn: "uint8_t",
+    }
 
-    if out.dtype == torch.bfloat16:
-        out_dtype = "__hip_bfloat16"
-    elif out.dtype == torch.float16:
-        out_dtype = "_Float16"
-    else:
-        raise ValueError(f"Unsupported data type: {out.dtype}")
+    warpSize = torch.cuda.get_device_properties(out.device).warp_size
+
+    dtype = dtype_map[query.dtype]
+    kv_dtype = dtype_map[key_cache.dtype]
+    out_dtype = dtype_map[out.dtype]
 
     num_kv_heads = key_cache.size(1) if kv_cache_layout == "HND" else key_cache.size(2)
     num_seqs = block_tables.size(0)
@@ -137,6 +121,7 @@ def paged_attention_v1(
         logits_soft_cap_enabled,
         partition_size,
         mtp,
+        folder,
     )
 
     alibi_slopes_ptr = (

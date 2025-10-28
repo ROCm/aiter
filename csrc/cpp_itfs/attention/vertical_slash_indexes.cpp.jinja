@@ -1,0 +1,28 @@
+#include "vertical_slash_indexes.cuh"
+
+#define FUNCTION_DEFINE                                 \
+    void {{func_name}}(  \
+        const void* q_seqlens,          \
+        const void* kv_seqlens,         \
+        void* vertical_indexes,  \
+        void* slash_indexes,    \
+        void* block_count,        \
+        void* block_offset,  \
+        void* column_count,   \
+        void* column_index, \
+        int BATCH_SIZE, int N_HEADS)
+
+extern "C" {
+FUNCTION_DEFINE;
+}
+                        
+FUNCTION_DEFINE
+{
+  const int N_THREADS = 8;
+  const dim3 dimBlock(N_THREADS);
+  const dim3 dimGrid(N_HEADS, BATCH_SIZE, ({{n_rows}} + N_THREADS - 1) / N_THREADS);
+  const auto kernel = convert_vertical_slash_index_kernel;
+  kernel<<<dimGrid, dimBlock>>>(
+      reinterpret_cast<const int*>(q_seqlens), reinterpret_cast<const int*>(kv_seqlens), reinterpret_cast<int*>(vertical_indexes), reinterpret_cast<int*>(slash_indexes), reinterpret_cast<int*>(block_count),
+      reinterpret_cast<int*>(block_offset), reinterpret_cast<int*>(column_count), reinterpret_cast<int*>(column_index), N_HEADS, {{n_rows}}, {{block_size_m}}, {{block_size_n}}, {{nnz_v}}, {{nnz_s}});
+}

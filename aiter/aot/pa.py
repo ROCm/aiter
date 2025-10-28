@@ -36,7 +36,7 @@ def process_config(config):
 def main():
     configs = []
     for gqa_ratio in range(1, 17):
-        for alibi_enabled in ["false", "true"]:
+        for alibi_enabled in [False, True]:
             for block_size in [1, 16, 32]:
                 for npar_loops in range(1, 9):
                     for head_size in [64, 128]:

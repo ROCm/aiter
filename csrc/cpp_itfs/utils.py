@@ -55,7 +55,7 @@ SRCS = {{sources | join(" ")}}
 OBJS = $(SRCS:.cpp=.o)
 
 build: $(OBJS)
-	$(CXX) -shared $(OBJS) -o $(TARGET)
+	/opt/rocm/lib/llvm/bin/clang++ --driver-mode=g++ -O3 --hip-link --shared *.o -o $(TARGET)
 
 %.o: %.cpp
 	$(CXX) -fPIC {{cxxflags | join(" ")}} {{includes | join(" ")}} -c $< -o $@
@@ -134,7 +134,7 @@ def validate_and_update_archs():
     return archs
 
 
-def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
+def compile_lib(src_files, func_names, folder, includes=None, sources=None, cxxflags=None):
     sub_build_dir = os.path.join(BUILD_DIR, folder)
     include_dir = f"{sub_build_dir}/include"
     os.makedirs(include_dir, exist_ok=True)
@@ -160,10 +160,11 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
                 shutil.copytree(source, sub_build_dir, dirs_exist_ok=True)
             else:
                 shutil.copy(source, sub_build_dir)
-        with open(f"{sub_build_dir}/{folder}.cpp", "w") as f:
-            f.write(src_file)
+        for func_name, src_file in zip(func_names, src_files):
+            with open(f"{sub_build_dir}/{func_name}.cpp", "w") as f:
+                f.write(src_file)
 
-        sources += [f"{folder}.cpp"]
+            sources += [f"{func_name}.cpp"]
         cxxflags += [
             "-DUSE_ROCM",
             "-DENABLE_FP8",
@@ -216,7 +217,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         with open(f"{sub_build_dir}/Makefile", "w") as f:
             f.write(makefile_file)
         subprocess.run(
-            f"cd {sub_build_dir} && make build -j{len(sources)}", shell=True, check=True
+            f"cd {sub_build_dir} && make build -j{min(len(sources), os.cpu_count())}", shell=True, check=True
         )
 
     def final_func():
@@ -231,12 +232,9 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
     mp_lock(lock_path=lock_path, main_func=main_func, final_func=final_func)
 
 
-@lru_cache(maxsize=AITER_MAX_CACHE_SIZE)
-def run_lib(func_name, folder=None):
-    if folder is None:
-        folder = func_name
-    lib = ctypes.CDLL(f"{BUILD_DIR}/{folder}/lib.so", os.RTLD_LAZY)
-    return getattr(lib, func_name)
+def get_lib(folder):
+    lib_path = f"{BUILD_DIR}/{folder}/lib.so"
+    return ctypes.CDLL(lib_path, os.RTLD_LAZY)
 
 
 def hash_signature(signature: str):
@@ -268,8 +266,41 @@ def compile_template_op(
         func_name = get_default_func_name(md_name, tuple(kwargs.values()))
     if folder is None:
         folder = func_name
+    if includes is None:
+        includes = []
+    if sources is None:
+        sources = []
+    if cxxflags is None:
+        cxxflags = []
 
-    if not_built(folder):
+    try:
+        lib = get_lib(folder)
+        return getattr(lib, func_name)
+    except Exception as e:
+        src_file = src_template.render(func_name=func_name, **kwargs)
+        logger.info(f"compile_template_op {func_name = } with {kwargs}")
+        compile_lib([src_file], [func_name], folder, includes, sources, cxxflags)
+        lib = get_lib(folder)
+        libdl = ctypes.CDLL(ctypes.find_library('dl'))
+        libdl.dlclose(lib._handle)
+        lib = get_lib(folder)
+        return getattr(lib, func_name)
+
+
+def compile_template_ops(
+    src_template,
+    md_name,
+    configs,
+    folder,
+    includes=None,
+    sources=None,
+    cxxflags=None,
+):
+    src_files = []
+    func_names = []
+    for config in configs:
+        kwargs = OrderedDict(config)
+        func_name = get_default_func_name(md_name, tuple(kwargs.values()))
         if includes is None:
             includes = []
         if sources is None:
@@ -277,9 +308,10 @@ def compile_template_op(
         if cxxflags is None:
             cxxflags = []
         src_file = src_template.render(func_name=func_name, **kwargs)
-        logger.info(f"compile_template_op {func_name = } with {locals()}...")
-        compile_lib(src_file, folder, includes, sources, cxxflags)
-    return run_lib(func_name, folder)
+        logger.info(f"compile_template_op {func_name = } with {kwargs}")
+        func_names.append(func_name)
+        src_files.append(src_file)
+    compile_lib(src_files, func_names, folder, includes, sources, cxxflags)
 
 
 def transfer_hsaco(hsaco_path):
