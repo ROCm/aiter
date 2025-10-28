@@ -343,3 +343,234 @@ def _fused_reduce_act_mul_fp8_group_quant(
         y_scale.to(y_scale_ptr.dtype.element_ty),
         mask=g_offs < num_bs_cols,
     )
+
+
+@triton.jit
+def _fused_reduce_rms_fp8_group_quant_kernel(
+    inp1_ptr,
+    weight1_ptr,
+    inp2_ptr,
+    weight2_ptr,
+    inp3_ptr,
+    res1_ptr,
+    out1_fp8_ptr,
+    out1_bs_ptr,
+    out2_ptr,
+    out_res1_ptr,
+    out1_ptr,
+    out3_ptr,
+    eps1,
+    eps2,
+    n_rows,
+    inp1_n_cols,
+    inp2_n_cols,
+    inp3_n_cols,
+    inp1_spk_stride,
+    inp2_spk_stride,
+    inp3_spk_stride,
+    inp1_row_stride,
+    inp2_row_stride,
+    inp3_row_stride,
+    inp1_col_stride,
+    inp2_col_stride,
+    inp3_col_stride,
+    res1_row_stride,
+    res1_col_stride,
+    out1_fp8_row_stride,
+    out1_fp8_col_stride,
+    out1_bs_row_stride,
+    out1_bs_col_stride,
+    out2_row_stride,
+    out2_col_stride,
+    out_res1_row_stride,
+    out_res1_col_stride,
+    out1_row_stride,
+    out1_col_stride,
+    out3_row_stride,
+    out3_col_stride,
+    BLOCK_SIZE_N1: tl.constexpr,
+    BLOCK_SIZE_N2: tl.constexpr,
+    BLOCK_SIZE_N3: tl.constexpr,
+    N_MASK1: tl.constexpr,
+    N_MASK2: tl.constexpr,
+    N_MASK3: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+    DTYPE_MIN: tl.constexpr,
+    HAVE_SECOND_INPUT: tl.constexpr,
+    FIRST_INPUT_RES: tl.constexpr,
+    FIRST_INPUT_OUT: tl.constexpr,
+    HAS_SPLITK: tl.constexpr,
+    NUM_SPLITK: tl.constexpr,
+    NUM_SPLITK_POW2: tl.constexpr,
+):
+    m_pid = tl.program_id(0)
+
+    if m_pid < n_rows:
+        n1_offs = tl.arange(0, BLOCK_SIZE_N1)
+        NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N1 // QUANT_BLOCK_SIZE
+
+        if N_MASK1:
+            mask1 = n1_offs < inp1_n_cols
+            other1 = 0.0
+        else:
+            mask1 = None
+            other1 = None
+        if HAS_SPLITK:
+            spk_offs = tl.arange(0, NUM_SPLITK_POW2)
+            if NUM_SPLITK_POW2 != NUM_SPLITK:
+                if N_MASK1:
+                    mask1_in = (spk_offs[:, None] < NUM_SPLITK) & (n1_offs[None, :] < inp1_n_cols)
+                else:
+                    mask1_in = (spk_offs[:, None] < NUM_SPLITK)
+                other1_in = 0.0
+            else:
+                if N_MASK1:
+                    mask1_in = mask1[None, :]
+                else:
+                    mask1_in = mask1
+                other1_in = other1
+
+            inp1 = tl.load(
+                inp1_ptr + spk_offs[:, None] * inp1_spk_stride + m_pid * inp1_row_stride + n1_offs[None, :] * inp1_col_stride,
+                mask=mask1_in,
+                other=other1_in,
+                cache_modifier=".cg",
+            ).to(tl.float32)
+            inp1 = tl.sum(inp1, axis=0)
+        else:
+            inp1 = tl.load(
+                inp1_ptr + m_pid * inp1_row_stride + n1_offs * inp1_col_stride,
+                mask=mask1,
+                other=other1,
+                cache_modifier=".cg",
+            ).to(tl.float32)
+        
+        if FIRST_INPUT_RES:
+            res1 = tl.load(
+                res1_ptr + m_pid * res1_row_stride + n1_offs * res1_col_stride,
+                mask=mask1,
+                other=other1,
+                cache_modifier=".cg",
+            ).to(tl.float32)
+            inp1 = inp1 + res1
+
+        w1 = tl.load(weight1_ptr + n1_offs, mask=mask1, other=other1).to(tl.float32)
+
+        norm1 = _rmsmorm_op(inp1, w1, inp1_n_cols, eps1)
+
+        if FIRST_INPUT_OUT:
+            tl.store(
+                out1_ptr + m_pid * out1_row_stride + n1_offs * out1_col_stride,
+                norm1,
+                mask=mask1,
+            )
+
+        out1_fp8, out1_block_scales = _fp8_quant_op(
+            norm1, 1, BLOCK_SIZE_N1, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
+        )
+        out1_fp8 = tl.ravel(out1_fp8)
+        out1_block_scales = tl.ravel(out1_block_scales)
+
+        # store the results
+        tl.store(
+            out1_fp8_ptr + m_pid * out1_fp8_row_stride + n1_offs * out1_fp8_col_stride,
+            out1_fp8.to(out1_fp8_ptr.dtype.element_ty),
+            mask=mask1,
+        )
+        g_offs = tl.arange(0, NUM_QUANT_BLOCKS)
+        num_bs_cols = (inp1_n_cols + QUANT_BLOCK_SIZE - 1) // QUANT_BLOCK_SIZE
+        tl.store(
+            out1_bs_ptr + m_pid * out1_bs_row_stride + g_offs * out1_bs_col_stride,
+            out1_block_scales.to(out1_bs_ptr.dtype.element_ty),
+            mask=g_offs < num_bs_cols,
+        )    
+
+        if FIRST_INPUT_RES:
+            inp1 = inp1.to(out_res1_ptr.dtype.element_ty)
+            tl.store(
+                out_res1_ptr + m_pid * out_res1_row_stride + n1_offs * out_res1_col_stride,
+                inp1,
+                mask=mask1,
+            )
+    elif m_pid < 2*n_rows:
+        m_pid -= n_rows
+        if HAS_SPLITK:
+            spk_offs = tl.arange(0, NUM_SPLITK_POW2)
+        if HAVE_SECOND_INPUT:
+            n2_offs = tl.arange(0, BLOCK_SIZE_N2)
+            if N_MASK2:
+                mask2 = n2_offs < inp1_n_cols
+                other2 = 0.0
+            else:
+                mask2 = None
+                other2 = None
+            if HAS_SPLITK:
+                if NUM_SPLITK_POW2 != NUM_SPLITK:
+                    if N_MASK2:
+                        mask2_in = (spk_offs[:, None] < NUM_SPLITK) & (n2_offs[None, :] < inp2_n_cols)
+                    else:
+                        mask2_in = (spk_offs[:, None] < NUM_SPLITK)
+                    other2_in = 0.0
+                else:
+                    if N_MASK2:
+                        mask2_in = mask2[None, :]
+                    else:
+                        mask2_in = mask2
+                    other2_in = other2
+                inp2 = tl.load(
+                    inp2_ptr + spk_offs[:, None] * inp2_spk_stride + m_pid * inp2_row_stride + n2_offs[None, :] * inp2_col_stride,
+                    mask=mask2_in,
+                    other=other2_in,
+                    cache_modifier=".cg",
+                ).to(tl.float32)
+                inp2 = tl.sum(inp2, axis=0)
+            else:
+                inp2 = tl.load(
+                    inp2_ptr + m_pid * inp2_row_stride + n2_offs * inp2_col_stride,
+                    mask=mask2,
+                    other=other2,
+                    cache_modifier=".cg",
+                ).to(tl.float32)
+            w2 = tl.load(weight2_ptr + n2_offs, mask=mask2, other=other2).to(tl.float32)
+            norm2 = _rmsmorm_op(inp2, w2, inp2_n_cols, eps2)
+            tl.store(
+                out2_ptr + m_pid * out2_row_stride + n2_offs * out2_col_stride,
+                norm2,
+                mask=mask2,
+            )
+    elif m_pid < 3*n_rows:
+        m_pid -= 2*n_rows
+        if HAS_SPLITK:
+            spk_offs = tl.arange(0, NUM_SPLITK_POW2)
+            n3_offs = tl.arange(0, BLOCK_SIZE_N3)
+            if N_MASK3:
+                mask3 = n3_offs < inp3_n_cols
+                other3 = 0.0
+            else:
+                mask3 = None
+                other3 = None
+            if NUM_SPLITK_POW2 != NUM_SPLITK:
+                if N_MASK3:
+                    mask3_in = (spk_offs[:, None] < NUM_SPLITK) & (n3_offs[None, :] < inp3_n_cols)
+                else:
+                    mask3_in = (spk_offs[:, None] < NUM_SPLITK)
+                other3_in = 0.0
+            else:
+                if N_MASK3:
+                    mask3_in = mask3[None, :]
+                else:
+                    mask3_in = mask3
+                other3_in = other3
+            inp3 = tl.load(
+                inp3_ptr + spk_offs[:, None] * inp3_spk_stride + m_pid * inp3_row_stride + n3_offs[None, :] * inp3_col_stride,
+                mask=mask3_in,
+                other=other3_in,
+                cache_modifier=".cg",
+            ).to(tl.float32)
+            inp3 = tl.sum(inp3, axis=0)
+            tl.store(
+                out3_ptr + m_pid * out3_row_stride + n3_offs * out3_col_stride,
+                inp3,
+                mask=mask3,
+            )
