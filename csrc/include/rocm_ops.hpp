@@ -1202,7 +1202,8 @@
           py::arg("out_dtype") = std::nullopt,                                     \
           py::arg("scaleA")    = std::nullopt,                                     \
           py::arg("scaleB")    = std::nullopt,                                     \
-          py::arg("scaleC")    = std::nullopt);                                       \
+          py::arg("scaleC")    = std::nullopt,                                     \
+          py::arg("bpreshuffle") = false);                                         \
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
 
 #define ROCSOLGEMM_PYBIND                                                          \
