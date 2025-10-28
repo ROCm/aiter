@@ -182,11 +182,14 @@ def fused_rms_fp8_group_quant(
 
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
-    - transpose_scale: If True, return scale with shape (cdiv(N1, group_size), M) instead of (M, cdiv(N1, group_size)).
+    - transpose_scale: If True, return scale with shape (M, cdiv(N1, group_size)) but stored in
+                      column-major (transposed) memory layout. Equivalent to:
+                      scale.transpose(0, 1).contiguous().view(*scale.shape)
 
     Returns:
     - out1_fp8: The output matrix with shape (M, N1).
-    - out1_bs: The output matrix with shape (M, cdiv(N1, group_size)) or (cdiv(N1, group_size), M) if transpose_scale=True.
+    - out1_bs: The output matrix with shape (M, cdiv(N1, group_size)).
+              When transpose_scale=True, has column-major memory layout (transposed storage).
     - out1: The output matrix with shape (M, N1).
     - out2: The output matrix with shape (M, N2).
     - out_res1: The output matrix with shape (M, N1).
@@ -321,6 +324,11 @@ def fused_rms_fp8_group_quant(
         FIRST_INPUT_OUT=output_unquantized_inp1,
         num_warps=num_warps,
     )
+
+    # When transpose_scale=True, view the transposed buffer back to original shape
+    # This keeps shape (M, num_bs_cols) but with column-major memory layout
+    if transpose_scale:
+        out1_bs = out1_bs.view(M, num_bs_cols)
 
     return (out1_fp8, out1_bs), out1, out2, out_res1
 
