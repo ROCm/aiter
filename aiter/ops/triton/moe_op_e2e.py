@@ -84,8 +84,8 @@ def e2e_moe(
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(W1.shape[-2], block_n) == W1_scale.shape[-2]
             assert triton.cdiv(W1.shape[-1], block_k) == W1_scale.shape[-1]
-            assert triton.cdiv(W2.shape[-2], block_n) == W2_scale.shape[-2]
-            assert triton.cdiv(W2.shape[-1], block_k) == W2_scale.shape[-1]
+            assert triton.cdiv(W2.shape[-1], block_n) == W2_scale.shape[-1]
+            assert triton.cdiv(W2.shape[-2], block_k) == W2_scale.shape[-2]
     else:
         assert A_scale is None
         assert W1_scale is None
@@ -123,8 +123,6 @@ def e2e_moe(
         )
     else:
         Intermediate = None
-
-    # print("grid size", pid_m * pid_n)
     
     e2e_moe_kernel[grid](
         A,

@@ -34,17 +34,17 @@ def model_benchmark_configs(args):
                 f"Missing MoE keys ('moe_intermediate_size', 'hidden_size', 'num_expert', 'top_k') in model configuration for {model_name}: skipping this model."
             )
         else:
-            N1 = config["moe_intermediate_size"]
+            N1 = config["moe_intermediate_size"] # // args.tp
             K1 = config["hidden_size"]
-            if no_bench_stage2:
+            if not no_bench_stage2:
                 N2 = config["hidden_size"]
-                K2 = config["moe_intermediate_size"] // 2
+                K2 = config["moe_intermediate_size"] // 2 # // args.tp
 
             E = config["num_expert"]
             top_k = config["top_k"]
 
             moe_configs.append((model_name, M, N1, K1, E, top_k))
-            if no_bench_stage2:
+            if not no_bench_stage2:
                 moe_configs.append((model_name, M, N2, K2, E, top_k))
 
     return moe_configs
@@ -65,6 +65,7 @@ def fused_moe(
     has_zp=True,
     silu_fused=False,
     e2e_fused=False,
+    tp=1,
 ):
     moe_fn = triton_moe_silu if silu_fused else triton_moe
     block_shape_k = (
@@ -95,7 +96,16 @@ def fused_moe(
             dtype=dtype,
             fp8_w8a8=fp8_w8a8,
             blockshape=block_shape,
+            tp=tp,
         )
+        # tensor parallel slicing
+        if tp > 1:
+            w1 = w1[:, :N // tp, :].contiguous()
+            w2 = w2[:, :, :(N//2//tp)].contiguous()
+            num_w1_scales_per_gpu = triton.cdiv(N // tp, block_shape[0])
+            w1_scale = w1_scale[:, :num_w1_scales_per_gpu].contiguous()
+            num_w2_scales_per_gpu = triton.cdiv((N // 2) // tp, block_shape[0])
+            w2_scale = w2_scale[:, :, :num_w2_scales_per_gpu].contiguous()
 
         fn = lambda: triton_e2e_moe(
             a,
@@ -235,23 +245,12 @@ def run_benchmark(args):
 
     assert not (e2e_fused and silu_fused)
 
-    if silu_fused:
+    if silu_fused or e2e_fused:
         args.no_bench_stage2 = True
 
-    if e2e_fused:
-        args.no_bench_stage2 = False
-
-    if block_shape:
-        block_shape_n, block_shape_k = block_shape[0], block_shape[1]
-    else:
-        block_shape_n, block_shape_k = None, None
 
     if int4_w4a16:
         assert block_shape != None, "set group_size with -group_size"
-
-    kernel_name = "_fused_moe_kernel"
-    if (int8_w8a16 or int4_w4a16) and (block_shape_k is not None) and block_shape_k > 0:
-        kernel_name = "_fused_moe_kernel_gptq_awq"
 
     # python3 op_tests/test_moe_blockscale.py -d bf16 -m 32 -dim 7168 -idim 512 -e 512 -k 8
     if args.model is not None:
@@ -292,21 +291,7 @@ def run_benchmark(args):
     @triton.testing.perf_report([benchmark])
     def bench_moe_gemm(M, N, K, E, top_k, metric, model=None):
 
-        # (M, K) * (top_k, N, K) -> (M, top_k, N). 2 for multiplication and accumulation
-        flops = 2.0 * M * top_k * K * N
-        # The weight is applied on the gemm product which has the shape of (M, top_k, N)
-        if routed_weight:
-            flops += M * top_k * N
-
-        if fp8_w8a8:
-            a_bytes = b_bytes = torch.tensor([], dtype=fp8_type).element_size()
-            c_bytes = torch.tensor([], dtype=dtype).element_size()
-        elif int8_w8a16:
-            b_bytes = torch.tensor([], dtype=torch.int8).element_size()
-            a_bytes = c_bytes = torch.tensor([], dtype=dtype).element_size()
-        else:
-            a_bytes = b_bytes = c_bytes = torch.tensor([], dtype=dtype).element_size()
-        # TODO add the int4 case
+        
 
         fn, num_expert_loaded = fused_moe(
             M,
@@ -323,10 +308,31 @@ def run_benchmark(args):
             has_zp=has_zp,
             silu_fused=silu_fused,
             e2e_fused=e2e_fused,
+            tp=args.tp,
         )
         # num_expert_loaded: len(torch.unique(expert_ids))
         # max_expert_loaded = min(E, top_k * M)
         # print("num_expert_loaded:", num_expert_loaded, "max_expert_loaded:", max_expert_loaded)
+
+        if args.tp > 1: # take tensor parallelism into account when calculating performance metrics
+            N = N // args.tp
+        
+        # (M, K) * (top_k, N, K) -> (M, top_k, N). 2 for multiplication and accumulation
+        flops = 2.0 * M * top_k * K * N
+        # The weight is applied on the gemm product which has the shape of (M, top_k, N)
+        if routed_weight:
+            flops += M * top_k * N
+
+        if fp8_w8a8:
+            a_bytes = b_bytes = torch.tensor([], dtype=fp8_type).element_size()
+            c_bytes = torch.tensor([], dtype=dtype).element_size()
+        elif int8_w8a16:
+            b_bytes = torch.tensor([], dtype=torch.int8).element_size()
+            a_bytes = c_bytes = torch.tensor([], dtype=dtype).element_size()
+        else:
+            a_bytes = b_bytes = c_bytes = torch.tensor([], dtype=dtype).element_size()
+        # TODO add the int4 case
+
         mem_read = (M * K) * a_bytes + (num_expert_loaded * N * K) * b_bytes
 
         mem_write = (M * top_k * N) * c_bytes
@@ -386,6 +392,7 @@ def parse_args():
     parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-M", type=int, default=0, help="num tokens")
     parser.add_argument("-N", type=int, default=0, help="intermediate dimension")
+    parser.add_argument( "-tp", type=int, default=1, help="tensor paraller degree")
     parser.add_argument(
         "-K",
         type=int,
@@ -414,7 +421,7 @@ def parse_args():
         default=False,
         help="Print VGPR usage for Triton kernels.",
     )
-    parser.add_argument("-no_bench_stage2", action="store_false", default=True)
+    parser.add_argument("-no_bench_stage2", action="store_true", default=False)
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-fp8_type", default="e5m2fnuz")
     parser.add_argument("-silu_fused", action="store_true", default=False)
