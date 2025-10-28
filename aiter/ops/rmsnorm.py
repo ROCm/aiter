@@ -144,3 +144,18 @@ def rmsnorm2d_with_add_smoothquant_hip(
     out_before_quant: Optional[Tensor] = None,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None: ...
+
+
+@compile_ops(
+    "module_rmsnorm_fused", fc_name="rmsnorm2d_hip", gen_fake=gen_rms_norm_fake_tensor
+)
+def rmsnorm2d_hip(
+    input: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    use_model_sensitive_rmsnorm: int = 0,
+) -> Tensor:
+    """
+    CK version of rmsnorm
+    """
+    ...

@@ -396,7 +396,6 @@ __global__ void no_fused_layer_norm_kernel(LayerNormParameter params)
     {
         float variance = 0.0f;
         float sum = 0.0f;
-        float max_local = 0.0f;
 
 #pragma unroll
         for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)

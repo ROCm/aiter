@@ -28,3 +28,9 @@ void rmsnorm2d_with_add_smoothquant_hip(
     double epsilon,
     std::optional<torch::Tensor> out_before_quant,
     int use_model_sensitive_rmsnorm = 0); // 0: Use default RMSNorm; 1: Use T5-like implementation
+                                          //
+torch::Tensor
+rmsnorm2d_hip(torch::Tensor& input,
+              torch::Tensor& weight,
+              double epsilon,
+              int use_model_sensitive_rmsnorm = 0); // 0: Use default RMSNorm; 1: Use T5-like implementation

@@ -1022,17 +1022,22 @@
           py::arg("weight"),                                                                       \
           py::arg("epsilon"),                                                                      \
           py::arg("out_before_quant")            = std::nullopt,                                   \
+          py::arg("use_model_sensitive_rmsnorm") = 0); \
+    m.def("rmsnorm2d_hip", &rmsnorm2d_hip,                                                         \
+          py::arg("input"),                                                                        \
+          py::arg("weight"),                                                                       \
+          py::arg("epsilon"),                                                                      \
           py::arg("use_model_sensitive_rmsnorm") = 0);
 
 
 #define LAYERNORM_PYBIND \
     m.def("layernorm2d_hip",                                      \
-          &layernorm2d_hip,                                           \
+          &layernorm2d_hip,                                       \
           py::arg("input"),                                       \
           py::arg("weight"),                                      \
           py::arg("bias"),                                        \
           py::arg("epsilon") = 1e-5f,                             \
-          py::arg("x_bias")  = std::nullopt);                      \
+          py::arg("x_bias")  = std::nullopt);
 
 
 #define SOFTMAX_PYBIND \
