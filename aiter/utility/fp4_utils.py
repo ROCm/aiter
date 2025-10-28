@@ -422,7 +422,7 @@ def dynamic_mxfp4_quant(
         SHUFFLE=shuffle,
     )
 
-    return (x_fp4, blockscale_e8m0.view(dtypes.fp8_e8m0))
+    return (x_fp4.view(dtypes.fp4x2), blockscale_e8m0.view(dtypes.fp8_e8m0))
 
 
 @triton.jit
