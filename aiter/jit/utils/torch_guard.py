@@ -189,7 +189,6 @@ def generate_schema(func) -> str:
 
 def torch_compile_guard(
     mutates_args: list[str] = [],
-    device: str = "cpu",
     calling_func_: Optional[Callable[..., Any]] = None,
     gen_fake: Optional[Callable[..., Any]] = None,
 ):
