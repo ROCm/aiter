@@ -27,6 +27,16 @@ _gemm_a8wfp4_repr = make_kernel_repr(
     ],
 )
 
+_gemm_afp4_wfp4_reduce_repr = make_kernel_repr(
+    "_gemm_afp4_wfp4_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
+
 
 @triton.heuristics(
     {
@@ -201,7 +211,7 @@ def _gemm_a8wfp4_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(repr=_gemm_afp4_wfp4_reduce_repr)
 def _gemm_afp4_wfp4_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
@@ -315,8 +325,6 @@ def _get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         else:
             break
 
-        SPLITK_BLOCK_SIZE = (
-            triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
-        )
+        SPLITK_BLOCK_SIZE = triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
 
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
