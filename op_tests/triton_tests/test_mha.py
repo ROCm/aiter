@@ -456,9 +456,9 @@ def test_mha_varlen(
         )
 
     if FP8:
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=0.25, rtol=10
-        )  # Lower tolerance for FP8
+        fp8_assert_close(
+            triton_out, torch_out.to(torch_out.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
+        )
     else:
         torch.testing.assert_close(
             triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
