@@ -1220,3 +1220,8 @@
     pybind11::implicitly_convertible<int, ActivationType>();
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
+
+#define SOFTMAX_PYBIND \
+    m.def("softmax2d_hip",                                        \
+          &softmax2d_hip,                                           \
+          py::arg("input"));
