@@ -1229,202 +1229,87 @@ class WarpSortBlockWide
             const IdxT n      = end - start;
             const IdxT tid    = threadIdx.x;
             const IdxT stride = blockDim.x;
-            constexpr auto elements = 16 / sizeof(T);
+            constexpr IdxT elements = 16 / sizeof(T);
             const IdxT n_aligned    = utils::round_up_to_multiple_of<elements>(n);
 
             constexpr auto cache_policy = buffer_load_helpers::AmdBufferCoherence::slc;
 
             if constexpr(std::is_same_v<T, _Float16>)
             {
-                const IdxT tile         = blockDim.x * 16;
-                const IdxT end_aligned  = start + utils::round_up_to_multiple_of(n_aligned, tile);
-                const IdxT tail         = end_aligned - tile;
+                constexpr IdxT repetition = 2;
+                constexpr IdxT tile       = elements * repetition;
+                const IdxT block_tile     = blockDim.x * tile;
+                const IdxT end_aligned =
+                    start + utils::round_up_to_multiple_of(n_aligned, block_tile);
+                const IdxT tail = end_aligned - block_tile;
 
-                IdxT idx = start + tid * 2 - stride * 2 * 8;
+                IdxT idx = start + tid * tile - stride * tile;
 
                 using VecType = std::conditional_t<std::is_same_v<T, __bf16>,
                                                    buffer_load_helpers::bf16x8_t,
                                                    buffer_load_helpers::halfx8_t>;
 
-                VecType arr[2];
-                for(IdxT i = start + tid * 16; i < tail; i += stride * 16)
+                VecType arr[repetition];
+                for(IdxT i = start + tid * tile; i < tail; i += stride * tile)
                 {
-                    idx              = i;
-                    const auto idx0  = i;
-                    const auto idx1  = i + 1;
-                    const auto idx2  = i + 2;
-                    const auto idx3  = i + 3;
-                    const auto idx4  = i + 4;
-                    const auto idx5  = i + 5;
-                    const auto idx6  = i + 6;
-                    const auto idx7  = i + 7;
-                    const auto idx8  = i + 8;
-                    const auto idx9  = i + 9;
-                    const auto idx10 = i + 10;
-                    const auto idx11 = i + 11;
-                    const auto idx12 = i + 12;
-                    const auto idx13 = i + 13;
-                    const auto idx14 = i + 14;
-                    const auto idx15 = i + 15;
-
-                    arr[0] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
-                        in, idx0, n_aligned);
-                    arr[1] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
-                        in, idx8, n_aligned);
-
-                    queue_.add(arr[0][0], idx0);
-                    queue_.add(arr[0][1], idx1);
-
-                    queue_.add(arr[0][2], idx2);
-                    queue_.add(arr[0][3], idx3);
-
-                    queue_.add(arr[0][4], idx4);
-                    queue_.add(arr[0][5], idx5);
-
-                    queue_.add(arr[0][6], idx6);
-                    queue_.add(arr[0][7], idx7);
-
-                    queue_.add(arr[1][0], idx8);
-                    queue_.add(arr[1][1], idx9);
-
-                    queue_.add(arr[1][2], idx10);
-                    queue_.add(arr[1][3], idx11);
-
-                    queue_.add(arr[1][4], idx12);
-                    queue_.add(arr[1][5], idx13);
-
-                    queue_.add(arr[1][6], idx14);
-                    queue_.add(arr[1][7], idx15);
+#pragma unroll
+                    for(IdxT idx = 0; idx < repetition; ++idx)
+                    {
+                        arr[idx] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
+                            in, i + idx * elements, n_aligned);
+                    }
+#pragma unroll
+                    for(IdxT idx = 0; idx < tile; ++idx)
+                    {
+                        queue_.add(arr[idx / elements][idx % elements], i + idx);
+                    }
+                    idx = i;
                 }
 
                 // tail
-                for(IdxT i = idx + stride * 2 * 8; i < end_aligned; i += stride * 2 * 8)
+                for(IdxT i = idx + stride * tile; i < end_aligned; i += stride * tile)
                 {
-                    const auto idx0  = i;
-                    const auto idx1  = i + 1;
-                    const auto idx2  = i + 2;
-                    const auto idx3  = i + 3;
-                    const auto idx4  = i + 4;
-                    const auto idx5  = i + 5;
-                    const auto idx6  = i + 6;
-                    const auto idx7  = i + 7;
-                    const auto idx8  = i + 8;
-                    const auto idx9  = i + 9;
-                    const auto idx10 = i + 10;
-                    const auto idx11 = i + 11;
-                    const auto idx12 = i + 12;
-                    const auto idx13 = i + 13;
-                    const auto idx14 = i + 14;
-                    const auto idx15 = i + 15;
-
-                    const bool valid0  = (idx0 < end);
-                    const bool valid1  = (idx1 < end);
-                    const bool valid2  = (idx2 < end);
-                    const bool valid3  = (idx3 < end);
-                    const bool valid4  = (idx4 < end);
-                    const bool valid5  = (idx5 < end);
-                    const bool valid6  = (idx6 < end);
-                    const bool valid7  = (idx7 < end);
-                    const bool valid8  = (idx8 < end);
-                    const bool valid9  = (idx9 < end);
-                    const bool valid10 = (idx10 < end);
-                    const bool valid11 = (idx11 < end);
-                    const bool valid12 = (idx12 < end);
-                    const bool valid13 = (idx13 < end);
-                    const bool valid14 = (idx14 < end);
-                    const bool valid15 = (idx15 < end);
-
-                    arr[0] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
-                        in, idx0, n_aligned);
-                    arr[1] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
-                        in, idx8, n_aligned);
-
-                    auto val = valid0 ? _Float16(arr[0][0]) : dummy_;
-                    queue_.add(val, idx0);
-                    val = valid1 ? _Float16(arr[0][1]) : dummy_;
-                    queue_.add(val, idx1);
-                    val = valid2 ? _Float16(arr[0][2]) : dummy_;
-                    queue_.add(val, idx2);
-                    val = valid3 ? _Float16(arr[0][3]) : dummy_;
-                    queue_.add(val, idx3);
-                    val = valid4 ? _Float16(arr[0][4]) : dummy_;
-                    queue_.add(val, idx4);
-                    val = valid5 ? _Float16(arr[0][5]) : dummy_;
-                    queue_.add(val, idx5);
-                    val = valid6 ? _Float16(arr[0][6]) : dummy_;
-                    queue_.add(val, idx6);
-                    val = valid7 ? _Float16(arr[0][7]) : dummy_;
-                    queue_.add(val, idx7);
-                    val = valid8 ? _Float16(arr[1][0]) : dummy_;
-                    queue_.add(val, idx8);
-                    val = valid9 ? _Float16(arr[1][1]) : dummy_;
-                    queue_.add(val, idx9);
-                    val = valid10 ? _Float16(arr[1][2]) : dummy_;
-                    queue_.add(val, idx10);
-                    val = valid11 ? _Float16(arr[1][3]) : dummy_;
-                    queue_.add(val, idx11);
-                    val = valid12 ? _Float16(arr[1][4]) : dummy_;
-                    queue_.add(val, idx12);
-                    val = valid13 ? _Float16(arr[1][5]) : dummy_;
-                    queue_.add(val, idx13);
-                    val = valid14 ? _Float16(arr[1][6]) : dummy_;
-                    queue_.add(val, idx14);
-                    val = valid15 ? _Float16(arr[1][7]) : dummy_;
-                    queue_.add(val, idx15);
+#pragma unroll
+                    for(IdxT idx = 0; idx < repetition; ++idx)
+                    {
+                        arr[idx] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
+                            in, i + idx * elements, n_aligned);
+                    }
+#pragma unroll
+                    for(IdxT idx = 0; idx < tile; ++idx)
+                    {
+                        const auto val = (i + idx < end)
+                                             ? _Float16(arr[idx / elements][idx % elements])
+                                             : dummy_;
+                        queue_.add(val, i + idx);
+                    }
                 }
             }
             else if(std::is_same_v<T, float> || std::is_same_v<T, int>)
             {
-                const IdxT tile         = blockDim.x * 8;
-                const IdxT end_aligned  = start + utils::round_up_to_multiple_of(n_aligned, tile);
-
-                IdxT idx = start + tid * 8 - stride * 8;
+                constexpr IdxT repetition = 2;
+                constexpr IdxT tile = elements * repetition;
+                const IdxT block_tile = blockDim.x * tile;
+                const IdxT end_aligned  = start + utils::round_up_to_multiple_of(n_aligned, block_tile);
 
                 using VecType = std::conditional_t<std::is_same_v<T, float>,
                                                    buffer_load_helpers::floatx4_t,
                                                    buffer_load_helpers::int32x4_t>;
-                VecType arr[2];
-                for(IdxT i = start + tid * 8; i < end_aligned; i += stride * 8)
+                VecType arr[repetition];
+                for(IdxT i = start + tid * tile; i < end_aligned; i += stride * tile)
                 {
-                    idx               = i;
-                    const auto idx0   = i;
-                    const auto idx1   = i + 1;
-                    const auto idx2   = i + 2;
-                    const auto idx3   = i + 3;
-                    const auto idx4   = i + 4;
-                    const auto idx5   = i + 5;
-                    const auto idx6   = i + 6;
-                    const auto idx7   = i + 7;
-                    const bool valid0 = (idx0 < end);
-                    const bool valid1 = (idx1 < end);
-                    const bool valid2 = (idx2 < end);
-                    const bool valid3 = (idx3 < end);
-                    const bool valid4 = (idx4 < end);
-                    const bool valid5 = (idx5 < end);
-                    const bool valid6 = (idx6 < end);
-                    const bool valid7 = (idx7 < end);
-
-                    arr[0] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
-                        in, idx0, n_aligned);
-                    arr[1] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
-                        in, idx4, n_aligned);
-
-                    auto val = valid0 ? arr[0][0] : dummy_;
-                    queue_.add(val, idx0);
-                    val = valid1 ? arr[0][1] : dummy_;
-                    queue_.add(val, idx1);
-                    val = valid2 ? arr[0][2] : dummy_;
-                    queue_.add(val, idx2);
-                    val = valid3 ? arr[0][3] : dummy_;
-                    queue_.add(val, idx3);
-                    val = valid4 ? arr[1][0] : dummy_;
-                    queue_.add(val, idx4);
-                    val = valid5 ? arr[1][1] : dummy_;
-                    queue_.add(val, idx5);
-                    val = valid6 ? arr[1][2] : dummy_;
-                    queue_.add(val, idx6);
-                    val = valid7 ? arr[1][3] : dummy_;
-                    queue_.add(val, idx7);
+#pragma unroll
+                    for(IdxT idx = 0; idx < repetition; ++idx)
+                    {
+                        arr[idx] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
+                            in, i + idx * elements, n_aligned);
+                    }
+#pragma unroll
+                    for(IdxT idx = 0; idx < tile; ++idx)
+                    {
+                        const auto val = (i + idx < end) ? arr[idx / elements][idx % elements] : dummy_;
+                        queue_.add(val, i + idx);
+                    }
                 }
             }
             else
