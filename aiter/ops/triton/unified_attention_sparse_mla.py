@@ -21,8 +21,8 @@ def unified_attention_sparse_mla(
 
     Note: topk_indices index the KV cache, not block_table.
 
-    Q:             [seq_len, NUM_HEADS, HEAD_SIZE], dtype bfloat16
-    KV:            [seq_len_kv, 1, HEAD_SIZE + ROPE_RANK], dtype bfloat16
+    Q:             [seq_len, NUM_HEADS, kv_lora_rank + rope_rank], dtype bfloat16
+    KV:            [seq_len_kv, 1, kv_lora_rank + rope_rank], dtype bfloat16
     cu_seqlens_q:  [BATCH + 1], dtype int32
     max_seqlen_q:  scalar, dtype int32
     max_seqlen_k:  scalar, dtype int32
@@ -32,7 +32,7 @@ def unified_attention_sparse_mla(
     kv_lora_rank:  scalar, dtype int32
 
     Returns:
-    out (in-place):  [seq_len, NUM_HEADS, HEAD_SIZE], dtype bfloat16
+    out (in-place):  [seq_len, NUM_HEADS, kv_lora_rank], dtype bfloat16
     """
 
     # TODO: This kernel is not optimized and simplified for initial development.
@@ -44,7 +44,6 @@ def unified_attention_sparse_mla(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
     topk_count = topk_indices.shape[1]
-    # TODO(cagri): this should work?
     k = kv
     v = kv[..., :kv_lora_rank]
 
