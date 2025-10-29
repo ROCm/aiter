@@ -1,6 +1,6 @@
 #pragma once
 /*
- * Copyright © Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,36 +15,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <cuda.h>
-#ifdef USE_ROCM
+#include "aiter_hip_common.h"
+#include "ck_tile/core.hpp"
+#include "communication_asm.h"
+#include "hip_float8.h"
 #include <hip/hip_bf16.h>
-typedef __hip_bfloat16 nv_bfloat16;
-#else
-#include <cuda_bf16.h>
-#endif
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <unordered_map>
 #include <vector>
-#include "communication_asm.h"
-#include "hip_float8.h"
-#include "ck_tile/core.hpp"
 
-#define CUDACHECK(cmd)                                              \
-  do                                                                \
-  {                                                                 \
-    cudaError_t e = cmd;                                            \
-    if (e != cudaSuccess)                                           \
-    {                                                               \
-      printf("Failed: Cuda error %s:%d '%s'\n", __FILE__, __LINE__, \
-             cudaGetErrorString(e));                                \
-      exit(EXIT_FAILURE);                                           \
-    }                                                               \
-  } while (0)
 
 namespace aiter
 {
@@ -117,13 +100,13 @@ namespace aiter
   DINLINE float &assign_add(float &a, float b) { return a += b; }
 
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-  DINLINE float upcast_s(nv_bfloat16 val) { return __bfloat162float(val); }
+  DINLINE float upcast_s(__hip_bfloat16 val) { return __bfloat162float(val); }
   template <>
-  DINLINE nv_bfloat16 downcast_s(float val)
+  DINLINE __hip_bfloat16 downcast_s(float val)
   {
     return __float2bfloat16(val);
   }
-  DINLINE nv_bfloat16 &assign_add(nv_bfloat16 &a, nv_bfloat16 b)
+  DINLINE __hip_bfloat16 &assign_add(__hip_bfloat16 &a, __hip_bfloat16 b)
   {
     a = __hadd(a, b);
     return a;
@@ -543,6 +526,73 @@ namespace aiter
     }
   }
 
+  /*
+   * naive allgather
+   * for case: input(1345,)
+   * */
+  template <typename T, int ngpus>
+  __global__ void __launch_bounds__(512, 1) allgather_naive(
+      RankData* _dp,
+      RankSignals sg,
+      Signal* self_sg,
+      T* __restrict__ result,
+      int rank,
+      int size
+  )
+  {
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    int warp_id = threadIdx.x / tnum_gpu;
+    int lane_id = threadIdx.x % tnum_gpu;
+    int tid = blockIdx.x * tnum_gpu + lane_id;
+    int stride = gridDim.x * tnum_gpu;
+    const T* ptrs[ngpus];
+
+#pragma unroll
+    for (int i = 0; i < ngpus; ++i)
+    {
+      ptrs[i] = (const T*)_dp->ptrs[i];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for (int idx = tid; idx < size; idx += stride)
+    {
+      int write_idx = warp_id * size + idx;
+      result[write_idx] = ptrs[warp_id][idx];
+    }
+  }
+
+  template <typename T, int ngpus>
+  __global__ void __launch_bounds__(512, 1) allgather_vec(
+      RankData* _dp,
+      RankSignals sg,
+      Signal* self_sg,
+      T* __restrict__ result,
+      int rank,
+      int size
+  )
+  {
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    using P = typename packed_t<T>::P;
+    int warp_id = threadIdx.x / tnum_gpu;
+    int lane_id = threadIdx.x % tnum_gpu;
+    int tid = blockIdx.x * tnum_gpu + lane_id;
+    int stride = gridDim.x * tnum_gpu;
+    const P* ptrs[ngpus];
+
+#pragma unroll
+    for (int i = 0; i < ngpus; ++i)
+    {
+      ptrs[i] = (const P*)_dp->ptrs[i];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for (int idx = tid; idx < size; idx += stride)
+    {
+      int write_idx = warp_id * size + idx;
+      *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
+    }
+  }
+
   // fp8 quant all-reduce code start
   template <typename T>
   struct Fp16Filter
@@ -823,9 +873,9 @@ namespace aiter
     }
   }
 
-  using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
-  static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
-  static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
+  using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
+  static_assert(sizeof(IPC_KEY) == sizeof(hipIpcMemHandle_t));
+  static_assert(alignof(IPC_KEY) == alignof(hipIpcMemHandle_t));
 
   class CustomAllreduce
   {
@@ -855,12 +905,12 @@ namespace aiter
      * are passed in from the constructor
      */
     CustomAllreduce(Signal *meta, void *rank_data, size_t rank_data_sz,
-                    const cudaIpcMemHandle_t *handles,
+                    const hipIpcMemHandle_t *handles,
                     const std::vector<int64_t> &offsets, int rank,
-                    bool full_nvlink = true)
+                    bool fully_connected = true)
         : rank_(rank),
           world_size_(offsets.size()),
-          full_nvlink_(full_nvlink),
+          full_nvlink_(fully_connected),
           self_sg_(meta),
           d_rank_data_base_(reinterpret_cast<RankData *>(rank_data)),
           d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData))
@@ -889,9 +939,9 @@ namespace aiter
       if (new_handle)
       {
         char *ipc_ptr;
-        CUDACHECK(cudaIpcOpenMemHandle((void **)&ipc_ptr,
-                                       *((const cudaIpcMemHandle_t *)ipc_handle),
-                                       cudaIpcMemLazyEnablePeerAccess));
+        HIP_CALL(hipIpcOpenMemHandle((void **)&ipc_ptr,
+                                       *((const hipIpcMemHandle_t *)ipc_handle),
+                                       hipIpcMemLazyEnablePeerAccess));
         it->second = ipc_ptr;
       }
       return it->second;
@@ -901,7 +951,7 @@ namespace aiter
     get_graph_buffer_ipc_meta()
     {
       auto num_buffers = graph_unreg_buffers_.size();
-      auto handle_sz = sizeof(cudaIpcMemHandle_t);
+      auto handle_sz = sizeof(hipIpcMemHandle_t);
       std::vector<uint8_t> handles(handle_sz * num_buffers, 0);
       std::vector<int64_t> offsets(num_buffers);
       for (int i = 0; i < num_buffers; i++)
@@ -910,16 +960,16 @@ namespace aiter
         void *base_ptr;
         // note: must share the base address of each allocation, or we get wrong
         // address
-        if (cuPointerGetAttribute(&base_ptr,
+        if (hipPointerGetAttribute(&base_ptr,
 #ifdef USE_ROCM
                                   HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
 #else
                                   CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
 #endif
-                                  (CUdeviceptr)ptr) != CUDA_SUCCESS)
+                                  (hipDeviceptr_t)ptr) != CUDA_SUCCESS)
           throw std::runtime_error("failed to get pointer attr");
-        CUDACHECK(cudaIpcGetMemHandle(
-            (cudaIpcMemHandle_t *)&handles[i * handle_sz], base_ptr));
+        HIP_CALL(hipIpcGetMemHandle(
+            (hipIpcMemHandle_t *)&handles[i * handle_sz], base_ptr));
         offsets[i] = ((char *)ptr) - ((char *)base_ptr);
       }
       return std::make_pair(handles, offsets);
@@ -942,7 +992,7 @@ namespace aiter
       {
         if (i != rank_)
         {
-          cudaIpcMemHandle_t* ipc_handle_ptr = (cudaIpcMemHandle_t*)handles[i].data_ptr();
+          hipIpcMemHandle_t* ipc_handle_ptr = (hipIpcMemHandle_t*)handles[i].data_ptr();
           char *handle = open_ipc_handle((void*)ipc_handle_ptr);
           handle += offsets[i];
           data.ptrs[i] = handle;
@@ -953,12 +1003,12 @@ namespace aiter
         }
       }
       auto d_data = d_rank_data_base_++;
-      CUDACHECK(
-          cudaMemcpy(d_data, &data, sizeof(RankData), cudaMemcpyHostToDevice));
+      HIP_CALL(
+          hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
       buffers_[self] = d_data;
     }
 
-    RankData *get_buffer_RD(cudaStream_t stream, void *input)
+    RankData *get_buffer_RD(hipStream_t stream, void *input)
     {
       RankData *ptrs;
       auto it = buffers_.find(input);
@@ -968,9 +1018,9 @@ namespace aiter
       }
       else
       {
-        cudaStreamCaptureStatus status;
-        CUDACHECK(cudaStreamIsCapturing(stream, &status));
-        if (status == cudaStreamCaptureStatusActive)
+        hipStreamCaptureStatus status;
+        HIP_CALL(hipStreamIsCapturing(stream, &status));
+        if (status == hipStreamCaptureStatusActive)
         {
           ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
           graph_unreg_buffers_.push_back(input);
@@ -1009,7 +1059,7 @@ namespace aiter
         {
           if (j != rank_)
           {
-            cudaIpcMemHandle_t* ipc_handle_ptr = (cudaIpcMemHandle_t*)handles[j].data_ptr() + i;
+            hipIpcMemHandle_t* ipc_handle_ptr = (hipIpcMemHandle_t*)handles[j].data_ptr() + i;
             char *handle = open_ipc_handle(ipc_handle_ptr);
             handle += *((int64_t*)offsets[j].data_ptr() + i);
             rd.ptrs[j] = handle;
@@ -1020,9 +1070,9 @@ namespace aiter
           }
         }
       }
-      CUDACHECK(cudaMemcpy(d_rank_data_base_, rank_data.data(),
+      HIP_CALL(hipMemcpy(d_rank_data_base_, rank_data.data(),
                            sizeof(RankData) * num_buffers,
-                           cudaMemcpyHostToDevice));
+                           hipMemcpyHostToDevice));
       d_rank_data_base_ += num_buffers;
       graph_unreg_buffers_.clear();
     }
@@ -1035,7 +1085,7 @@ namespace aiter
      * should quant scale match hidden_dim when hidden_dim less than 128?
      * */
     template <typename T>
-    void runFp8QuantKernel(cudaStream_t stream, T* input, T* output, int size)
+    void runFp8QuantKernel(hipStream_t stream, T* input, T* output, int size)
     {
       RankData *ptrs = get_buffer_RD(stream, input);
       // 32 block 512 thread or 64 block 256 thread
@@ -1099,7 +1149,7 @@ namespace aiter
      * will cause contention on NVLink bus.
      */
     template <typename T>
-    void allreduce(cudaStream_t stream, T *input, T *output, int size,
+    void allreduce(hipStream_t stream, T *input, T *output, int size,
 #ifndef USE_ROCM
                    int threads = 512, int block_limit = 20){
 #else
@@ -1195,18 +1245,66 @@ namespace aiter
 #undef KL
   }
 
+  template <typename T>
+  void dispatchAllGather(hipStream_t stream, T* input, T* output, int size)
+  {
+    RankData* ptrs = get_buffer_RD(stream, input);
+    auto d = packed_t<T>::P::size;
+    dim3 block(512);
+    if (size % d != 0)
+    {
+      int block_num = (size + 512 - 1) / 512;
+      dim3 grid(std::min(block_num, 80));
+      switch (world_size_)
+      {
+        case 8:
+          allgather_naive<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+          break;
+        case 4:
+          allgather_naive<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+          break;
+        case 2:
+          allgather_naive<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+          break;
+        default:
+          printf("allgather world_size error\n");
+      }
+    }
+    else
+    {
+      size /= d;
+      int tnum_per_block = 512 / world_size_;
+      int block_num = (size + tnum_per_block - 1) / tnum_per_block;
+      dim3 grid(std::min(block_num, 80));
+      switch (world_size_)
+      {
+        case 8:
+          allgather_vec<T, 8><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+          break;
+        case 4:
+          allgather_vec<T, 4><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+          break;
+        case 2:
+          allgather_vec<T, 2><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+          break;
+        default:
+          printf("allgather world_size error\n");
+      }
+    }
+  }
+
   ~CustomAllreduce()
   {
     for (auto [_, ptr] : ipc_handles_)
     {
-      CUDACHECK(cudaIpcCloseMemHandle(ptr));
+      HIP_CALL(hipIpcCloseMemHandle(ptr));
     }
   }
 }; // namespace aiter
 /**
  * To inspect PTX/SASS, copy paste this header file to compiler explorer and add
  a template instantiation:
- * template void aiter::CustomAllreduce::allreduce<half>(cudaStream_t, half *,
+ * template void aiter::CustomAllreduce::allreduce<half>(hipStream_t, half *,
  half *, int, int, int);
 */
 } // namespace aiter

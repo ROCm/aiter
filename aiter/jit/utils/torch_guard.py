@@ -1,11 +1,43 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+from packaging import version
+from packaging.version import Version
+import importlib
+from typing import Any, Callable, Optional
 
 
 aiter_lib = None
 
 
-def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
+def is_torch_equal_or_newer(target: str) -> bool:
+    """Check if the installed torch version is >= the target version.
+
+    Args:
+        target: a version string, like "2.6.0".
+
+    Returns:
+        Whether the condition meets.
+    """
+    import torch
+
+    try:
+        return _is_torch_equal_or_newer(str(torch.__version__), target)
+    except Exception:
+        # Fallback to PKG-INFO to load the package info, needed by the doc gen.
+        return Version(importlib.metadata.version("torch")) >= Version(target)
+
+
+# Helper function used in testing.
+def _is_torch_equal_or_newer(torch_version: str, target: str) -> bool:
+    torch_version = version.parse(torch_version)
+    return torch_version >= version.parse(target)
+
+
+def torch_compile_guard(
+    mutates_args: list[str] = [],
+    device: str = "cpu",
+    gen_fake: Optional[Callable[..., Any]] = None,
+):
     def decorator(func):
         try:
             import torch
@@ -68,11 +100,27 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
                 return func(*args, **kwargs)
             return out, func(*args, **kwargs)
 
+        def fake_impl(dummy_tensor, *args, **kwargs):
+            out = torch.empty(1, device=device)
+            if not return_non_tensor:
+                if gen_fake is not None:
+                    return gen_fake(*args, **kwargs)
+                return func(*args, **kwargs)
+
+            if gen_fake is not None:
+                return out, gen_fake(*args, **kwargs)
+            return out, func(*args, **kwargs)
+
+        if is_torch_equal_or_newer("2.8.0"):
+            tags = ()
+        else:
+            tags = (torch.Tag.needs_fixed_stride_order,)
+
         my_lib = aiter_lib
-        my_lib.define(op_name + schema_str, tags=())
+        my_lib.define(op_name + schema_str, tags=tags)
         my_lib.impl(op_name, custom_impl, dispatch_key="CUDA")
         my_lib.impl(op_name, custom_impl, dispatch_key="CPU")
-        my_lib._register_fake(op_name, custom_impl)
+        my_lib._register_fake(op_name, fake_impl)
 
         return outer_wrapper
 
