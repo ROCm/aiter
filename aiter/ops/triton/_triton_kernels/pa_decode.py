@@ -4,13 +4,26 @@
 import math
 import triton
 import triton.language as tl
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
 
 
-@triton.jit
+_paged_attn_decode_v1_wo_dot_repr = make_kernel_repr(
+    "_paged_attn_decode_v1_wo_dot_kernel",
+    [
+        "compute_type",
+        "KV_BLK_SZ",
+        "HEAD_SZ",
+        "QUERY_GRP_SZ",
+        "MAX_SEQ_LEN_POW2",
+    ],
+)
+
+
+@triton.jit(repr=_paged_attn_decode_v1_wo_dot_repr)
 def _paged_attn_decode_v1_wo_dot_kernel(
     out,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
     q_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
@@ -135,7 +148,18 @@ def _paged_attn_decode_v1_wo_dot_kernel(
     )
 
 
-@triton.jit
+_paged_attn_decode_v1_w_dot_repr = make_kernel_repr(
+    "_paged_attn_decode_v1_w_dot_kernel",
+    [
+        "compute_type",
+        "HEAD_SZ",
+        "QUERY_GRP_SZ",
+        "KV_BLK_SZ",
+    ],
+)
+
+
+@triton.jit(repr=_paged_attn_decode_v1_w_dot_repr)
 def _paged_attn_decode_v1_w_dot_kernel(
     out_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
     q_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
@@ -280,7 +304,19 @@ def _paged_attn_decode_v1_w_dot_kernel(
     tl.store(out_ptr + out_offs, acc.to(out_ptr.dtype.element_ty), mask=out_mask)
 
 
-@triton.jit
+_paged_attn_decode_v2_wo_dot_repr = make_kernel_repr(
+    "_paged_attn_decode_v2_wo_dot_kernel",
+    [
+        "compute_type",
+        "KV_BLK_SZ",
+        "HEAD_SZ",
+        "QUERY_GRP_SZ",
+        "SEQ_PARTITION_SZ",
+    ],
+)
+
+
+@triton.jit(repr=_paged_attn_decode_v2_wo_dot_repr)
 def _paged_attn_decode_v2_wo_dot_kernel(
     exp_sums_ptr,
     max_logits_ptr,
@@ -426,7 +462,17 @@ def _paged_attn_decode_v2_wo_dot_kernel(
     )
 
 
-@triton.jit
+_paged_attn_decode_v2_wo_dot_reduce_repr = make_kernel_repr(
+    "_paged_attn_decode_v2_wo_dot_reduce_kernel",
+    [
+        "HEAD_SZ",
+        "SEQ_PARTITION_SZ",
+        "MAX_NUM_SEQ_PARTITIONS",
+    ],
+)
+
+
+@triton.jit(repr=_paged_attn_decode_v2_wo_dot_reduce_repr)
 def _paged_attn_decode_v2_wo_dot_reduce_kernel(
     out,
     exp_sums_ptr,
@@ -515,7 +561,19 @@ def _paged_attn_decode_v2_wo_dot_reduce_kernel(
     tl.store(out + out_ptr, acc.to(out.dtype.element_ty), mask=out_mask)
 
 
-@triton.jit
+_paged_attn_decode_v2_w_dot_repr = make_kernel_repr(
+    "_paged_attn_decode_v2_w_dot_kernel",
+    [
+        "compute_type",
+        "HEAD_SZ",
+        "QUERY_GRP_SZ",
+        "KV_BLK_SZ",
+        "SEQ_PARTITION_SZ",
+    ],
+)
+
+
+@triton.jit(repr=_paged_attn_decode_v2_w_dot_repr)
 def _paged_attn_decode_v2_w_dot_kernel(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
@@ -685,7 +743,18 @@ def _paged_attn_decode_v2_w_dot_kernel(
     tl.store(logits_ptr + logits_offs, acc, mask=q_mask)
 
 
-@triton.jit
+_paged_attn_decode_v2_w_dot_reduce_repr = make_kernel_repr(
+    "_paged_attn_decode_v2_w_dot_reduce_kernel",
+    [
+        "HEAD_SZ",
+        "QUERY_GRP_SZ",
+        "SEQ_PARTITION_SZ",
+        "MAX_NUM_SEQ_PARTITIONS",
+    ],
+)
+
+
+@triton.jit(repr=_paged_attn_decode_v2_w_dot_reduce_repr)
 def _paged_attn_decode_v2_w_dot_reduce_kernel(
     out_ptr,  # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
