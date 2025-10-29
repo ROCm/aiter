@@ -2,9 +2,9 @@ import torch
 import torch.nn.functional as F
 import pytest
 from .test_quant_mxfp4 import torch_dynamic_mxfp4_quant
-from .test_gemm_afp4wfp4 import shuffle_scales
+from .test_gemm_afp4wfp4 import shuffle_scales, un_shuffle_scales
 from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
-
+from op_tests.triton_tests.test_fused_mxfp4_quant import convert_mxfp4_to_fp32
 DEBUG_MODE = False
 
 
@@ -20,7 +20,7 @@ def pad_tensor_2d(tensor, mult_m=256, mult_n=8):
     return padded_tensor
 
 
-def torch_act_mul_and_mxfp4_quant(input: torch.Tensor, activation: str) -> torch.Tensor:
+def torch_act_mul_and_mxfp4_quant(input: torch.Tensor, activation: str, shuffle: bool) -> torch.Tensor:
     """
     The fused kernel casts the original input to float32 and does all the arithmetic
     and bit operations in float32.
@@ -34,12 +34,27 @@ def torch_act_mul_and_mxfp4_quant(input: torch.Tensor, activation: str) -> torch
         out = F.gelu(x) * y
     else:
         out = F.gelu(x, approximate="tanh") * y
-    return torch_dynamic_mxfp4_quant(out)
+    out, out_scale = torch_dynamic_mxfp4_quant(out)
+    if shuffle:
+        out_scale_pad = out_scale
+        M = out_scale.shape[0]
+        if M % 256 > 0:
+            M_pad = (M + 255) // 256 * 256
+            out_scale_pad = torch.empty((M_pad, out_scale.shape[1]), dtype = out_scale.dtype, device = out_scale.device)
+            out_scale_pad[:M, ...] = out_scale[:M, ...]
+        out_scale = shuffle_scales(out_scale_pad)
+        out_scale = out_scale.view(out_scale.shape[0] * 32, -1)
+    return out, out_scale
 
 
 @pytest.mark.parametrize(
     "M, N",
     [
+        (512, 57344),
+        (504, 57344),
+        (1, 57344),
+        (4, 57344),
+        (32, 8192),
         (1, 4),
         (1, 28),
         (1, 32),
@@ -66,9 +81,9 @@ def torch_act_mul_and_mxfp4_quant(input: torch.Tensor, activation: str) -> torch
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_tanh"])
 @pytest.mark.parametrize("shuffle", [False, True])
-def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str, shuffle: bool):
-    # TODO: extend tests to different shapes with proper padding
-    if shuffle and (M % 256 != 0 or N % 512 != 0):
+@pytest.mark.parametrize("scale_shuffle_padding", [False, True])
+def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str, shuffle: bool, scale_shuffle_padding: bool):
+    if shuffle and N % 512 != 0:
         pytest.skip()
     torch.manual_seed(20)
     x = torch.randn((M, N), dtype=dtype, device="cuda")
@@ -77,19 +92,27 @@ def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str, shuffle
         print(f"x.shape={x.shape} x={x}")
 
     triton_out, triton_scale = act_mul_and_mxfp4_quant(
-        x, activation=activation, shuffle=shuffle
+        x, activation=activation, shuffle=shuffle, scale_shuffle_padding=scale_shuffle_padding
     )
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape} triton_out={triton_out}")
         print(f"triton_scale.shape={triton_scale.shape} triton_scale={triton_scale}")
 
-    torch_out, torch_scale = torch_act_mul_and_mxfp4_quant(x, activation=activation)
+    torch_out, torch_scale = torch_act_mul_and_mxfp4_quant(x, activation=activation, shuffle=shuffle)
+    
     if shuffle:
-        torch_scale = shuffle_scales(torch_scale)
-        triton_scale = triton_scale.reshape(triton_scale.shape[0] // 32, -1)
+        triton_scale = un_shuffle_scales(triton_scale.view(triton_scale.shape[0] // 32, -1))
+        torch_scale = un_shuffle_scales(torch_scale.view(torch_scale.shape[0] // 32, -1))
+
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape} torch_out={torch_out}")
         print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")
-
+        
+    if scale_shuffle_padding and torch_scale.shape[1] % 8 > 0:
+        triton_scale = triton_scale[:M, :torch_scale.shape[1]]
+        torch_scale = torch_scale[:M, :torch_scale.shape[1]]
+    else:
+        triton_scale = triton_scale[:M, ...]
+        torch_scale = torch_scale[:M, ...]
     torch.testing.assert_close(triton_out, torch_out)
-    torch.testing.assert_close(triton_scale, torch_scale)
+    torch.testing.assert_close(triton_scale[:M, ...], torch_scale[:M, ...])
