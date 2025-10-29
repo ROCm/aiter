@@ -107,8 +107,9 @@ def all_reduce_fake(
     return torch.empty_like(tensor)
 
 
+# There is same name all_reduce in aiter.op, use Alias
 @torch_compile_guard(gen_fake=all_reduce_fake)
-def all_reduce(
+def all_reduce_(
     tensor: torch.Tensor, group_name: str, ca_fp8_quant: bool
 ) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -317,7 +318,7 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        return all_reduce(
+        return all_reduce_(
             input_, group_name=self.unique_name, ca_fp8_quant=ca_fp8_quant
         )
 
