@@ -236,6 +236,10 @@ def fused_moe_(
         moe_sorting_dispatch_policy,
     )
 
+    # Pre-shuffle moe mxfp4 tuning configuration
+    if q_dtype_a == dtypes.fp4x2:
+        metadata.run_1stage = False if M < 32 else True
+
     if metadata.run_1stage:
         assert (
             doweight_stage1 == False
