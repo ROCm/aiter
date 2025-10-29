@@ -1,0 +1,124 @@
+name: Operators Tuning
+
+on:
+  pull_request:
+    paths:
+      - 'aiter/configs/*untuned*.csv'
+  workflow_dispatch:
+    inputs:
+      shapes:
+        description: 'Comma separated shape names to run (leave empty for all)'
+        required: false
+        default: ''
+      arguments:
+        description: 'Additional arguments for the tuning script'
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  operators_tuning:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [aiter-1gpu-runner] # TODO: add more runners
+    name: Operators tuning
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+
+      - name: Sync submodules
+        run: |
+          set -e
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Clean up Rocm processes
+        run: |
+          ./.github/scripts/clean_up_rocm.sh
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: operators_tuning_test"
+          docker run -dt \
+          --device=/dev/dri \
+          --device=/dev/kfd \
+          --shm-size=16G \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name operators_tuning_test \
+          rocm/pytorch:latest
+
+      - name: Setup-Triton
+        run: |
+          set -ex
+          echo "Setting up Triton..."
+          docker exec \
+          -w /workspace \
+          operators_tuning_test \
+          ./.github/scripts/build_triton.sh
+
+      - name: Show Computing Units
+        run: |
+          set -ex
+          echo "Showing Computing Units..."
+          docker exec \
+          -w /workspace \
+          operators_tuning_test \
+          rocminfo | grep -i 'Compute Unit'
+    
+      - name: Test Performance before tuning
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          operators_tuning_test \
+          ./.github/scripts/op_tune.sh test "${{ github.event.inputs.shapes }}"
+
+      - name: Operators tuning Tests
+        run: |
+          set -ex
+          echo "Running Operators tuning Tests..."
+          docker exec \
+          -w /workspace \
+          operators_tuning_test \
+          ./.github/scripts/op_tune.sh tune "${{ github.event.inputs.shapes }}" "${{ github.event.inputs.arguments }}"
+      
+      - name: Show the difference after tuning
+        run: |
+          set -ex
+          git diff --color-words --word-diff=porcelain
+
+      - name: Test Performance after tuning
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          operators_tuning_test \
+          ./.github/scripts/op_tune.sh test "${{ github.event.inputs.shapes }}"
+
+      - name: Upload tuned CSVs
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuned-csvs
+          path: aiter/configs/*.csv
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          set -ex
+          echo "Cleaning up..."
+          docker rm -f operators_tuning_test || true
+
+      - name: Clean up Rocm processes
+        if: always()
+        run: |
+          ./.github/scripts/clean_up_rocm.sh
