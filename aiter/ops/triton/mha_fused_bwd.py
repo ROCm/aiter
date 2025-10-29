@@ -4,7 +4,6 @@
 from typing import Optional, Dict
 import torch
 import triton
-import triton.language as tl
 
 from aiter.ops.triton.utils.types import _is_fp8
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -14,6 +13,7 @@ from aiter.ops.triton._triton_kernels.mha_fused_bwd import (
     _bwd_kernel_dkdvdq_noncausal,
     _get_config,
 )
+from aiter.ops.triton.utils.device_info import get_num_xcds
 
 
 _LOGGER = AiterTritonLogger()
@@ -53,6 +53,10 @@ def flash_attn_fused_backward(
     )
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
+    if q.shape[-1] == k.shape[-1] and k.shape[-1] > v.shape[-1]:
+        raise ValueError(
+            "'Fused' backward doesn't support Positional Encoding (PE). Please use 'one kernel' backward implementation for PE."
+        )
 
     IS_FP8 = _is_fp8(q)
     if IS_FP8:
@@ -268,7 +272,6 @@ def flash_attn_fused_backward(
             FP8_MAX=FP8_MAX,
             NUM_SMS=NUM_SMS,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
-            NUM_XCD=get_num_xcds(),
             **config_dkdvdq,
         )
 
