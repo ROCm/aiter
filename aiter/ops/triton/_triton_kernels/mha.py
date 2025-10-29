@@ -11,6 +11,8 @@ from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.pid_preprocessing import remap_xcd
 from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+from ..utils.device_info import get_num_xcds
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
 @triton.jit
@@ -258,7 +260,28 @@ def _attn_fwd_inner(
     return acc, l_i, m_i
 
 
-@triton.jit
+_attn_fwd_repr = make_kernel_repr(
+    "_attn_fwd",
+    [
+        "SEQLEN_Q",
+        "SEQLEN_K",
+        "IS_CAUSAL",
+        "NUM_Q_HEADS",
+        "NUM_K_HEADS",
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_DMODEL",
+        "RETURN_SCORES",
+        "ENABLE_DROPOUT",
+        "IS_FP8",
+        "VARLEN",
+        "NUM_XCD",
+        "USE_INT64_STRIDES",
+    ],
+)
+
+
+@triton.jit(repr=_attn_fwd_repr)
 def _attn_fwd(
     q_ptr: torch.Tensor,
     k_ptr: torch.Tensor,

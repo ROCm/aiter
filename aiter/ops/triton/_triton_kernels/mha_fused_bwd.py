@@ -13,6 +13,7 @@ from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
 # This function computes delta given output Out and gradient DO
@@ -20,7 +21,18 @@ from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 # Out: (batch, nhead_q, max_seqlens_q, headDim)
 # DO: (batch, nhead_q, max_seqlens_q, headDim)
 # Delta: (batch, nheads_q, max_seqlens_q), same as softmax_lse defined at
-@triton.jit
+_bwd_preprocess_repr = make_kernel_repr(
+    "_bwd_preprocess",
+    [
+        "BLOCK_M",
+        "BLOCK_D_MODEL",
+        "IS_VARLEN",
+        "IS_FP8",
+    ],
+)
+
+
+@triton.jit(repr=_bwd_preprocess_repr)
 def _bwd_preprocess(
     o_ptr,
     do_ptr,  # noqa: E741
@@ -63,11 +75,7 @@ def _bwd_preprocess(
 
     # Offset O/DO by batch, head and q_start
     offs = (
-        bid * stride_o_b
-        + hid * stride_o_h
-        + q_start * stride_o_m
-        + offs_m[:, None] * stride_o_m
-        + offs_k[None, :] * stride_o_k
+        bid * stride_o_b + hid * stride_o_h + q_start * stride_o_m + offs_m[:, None] * stride_o_m + offs_k[None, :] * stride_o_k
     )
 
     # create masks
@@ -90,12 +98,7 @@ def _bwd_preprocess(
     else:
         delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
 
-    offs_delta = (
-        bid * stride_delta_b
-        + hid * stride_delta_h
-        + q_start * stride_delta_m
-        + offs_m * stride_delta_m
-    )
+    offs_delta = bid * stride_delta_b + hid * stride_delta_h + q_start * stride_delta_m + offs_m * stride_delta_m
     tl.store(delta_ptr + offs_delta, delta, mask=mask_m)
 
 
@@ -160,12 +163,8 @@ def _bwd_dkdvdq_inner(
     # mask to make sure not OOB of seqlen_q
     mask_n = offs_n < seqlen_k
 
-    qT_ptrs_start = (
-        Q + offs_m[None, :] * stride_q_m + offs_k[:, None] * stride_q_k
-    )  # [BLOCK_D_MODEL_POW2, BLOCK_M]
-    dq_ptrs_start = (
-        DQ + offs_m[:, None] * stride_dq_m + offs_k[None, :] * stride_dq_k
-    )  # [BLOCK_M, BLOCK_D_MODEL_POW2]
+    qT_ptrs_start = Q + offs_m[None, :] * stride_q_m + offs_k[:, None] * stride_q_k  # [BLOCK_D_MODEL_POW2, BLOCK_M]
+    dq_ptrs_start = DQ + offs_m[:, None] * stride_dq_m + offs_k[None, :] * stride_dq_k  # [BLOCK_M, BLOCK_D_MODEL_POW2]
 
     do_ptrs_start = DO + offs_m[:, None] * stride_do_m + offs_k[None, :] * stride_do_k
     curr_m = start_m
@@ -213,11 +212,7 @@ def _bwd_dkdvdq_inner(
         # dropout
         if ENABLE_DROPOUT:
             # NOTE: dropout is transposed because it is used to mask pT
-            philox_offs = (
-                curr_philox_offset
-                + offs_m[None, :] * stride_dropout_m
-                + offs_n[:, None] * stride_dropout_n
-            )
+            philox_offs = curr_philox_offset + offs_m[None, :] * stride_dropout_m + offs_n[:, None] * stride_dropout_n
             rand_vals = tl.rand(philox_seed, philox_offs)
             dropout_mask = rand_vals > dropout_p
             dropout_scale = 1.0 / (1 - dropout_p)
@@ -246,24 +241,14 @@ def _bwd_dkdvdq_inner(
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
             if IS_FP8:
-                scale_p_dropout, descale_p_dropout = _compute_fp8_scaling_factors(
-                    pT_dropout, FP8_MAX
-                )
-                dv += (
-                    tl.dot((pT_dropout * scale_p_dropout).to(do.type.element_ty), do)
-                    * descale_p_dropout
-                    * descale_do
-                )
+                scale_p_dropout, descale_p_dropout = _compute_fp8_scaling_factors(pT_dropout, FP8_MAX)
+                dv += tl.dot((pT_dropout * scale_p_dropout).to(do.type.element_ty), do) * descale_p_dropout * descale_do
             else:
                 dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
             if IS_FP8:
                 scale_pT, descale_pT = _compute_fp8_scaling_factors(pT, FP8_MAX)
-                dv += (
-                    tl.dot((pT * scale_pT).to(do.type.element_ty), do)
-                    * descale_pT
-                    * descale_do
-                )
+                dv += tl.dot((pT * scale_pT).to(do.type.element_ty), do) * descale_pT * descale_do
             else:
                 dv += tl.dot(pT.to(do.type.element_ty), do)
 
@@ -285,11 +270,7 @@ def _bwd_dkdvdq_inner(
         # compute dk
         if IS_FP8:
             scale_dsT, descale_dsT = _compute_fp8_scaling_factors(dsT, FP8_MAX)
-            dk += (
-                tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT))
-                * descale_dsT
-                * descale_q
-            )
+            dk += tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT)) * descale_dsT * descale_q
         else:
             dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
 
@@ -297,9 +278,7 @@ def _bwd_dkdvdq_inner(
         # NOTE: Possible problems with the atomic add: contention, is inside a loop which has achieved bad perf before
         # (BLOCK_M, BLOCK_N) x (BLOCK_N, D)
         if IS_FP8:
-            dq_partial = (
-                tl.dot((dsT * scale_dsT).to(k.dtype).T, k) * descale_dsT * descale_k
-            )
+            dq_partial = tl.dot((dsT * scale_dsT).to(k.dtype).T, k) * descale_dsT * descale_k
         else:
             dq_partial = tl.dot(dsT.to(k.dtype).T, k)
         tl.atomic_add(
@@ -312,7 +291,26 @@ def _bwd_dkdvdq_inner(
     return dk, dv
 
 
-@triton.jit
+_bwd_kernel_dkdvdq_causal_repr = make_kernel_repr(
+    "_bwd_kernel_dkdvdq_causal",
+    [
+        "NUM_Q_HEADS",
+        "NUM_K_HEADS",
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLK_SLICE_FACTOR",
+        "BLOCK_D_MODEL",
+        "ENABLE_DROPOUT",
+        "IS_VARLEN",
+        "IS_FP8",
+        "NUM_SMS",
+        "USE_INT64_STRIDES",
+        "NUM_XCD",
+    ],
+)
+
+
+@triton.jit(repr=_bwd_kernel_dkdvdq_causal_repr)
 def _bwd_kernel_dkdvdq_causal(
     q_ptr,
     k_ptr,
@@ -567,11 +565,7 @@ def _bwd_kernel_dkdvdq_causal(
 
     adj_do = batch_idx * stride_do_b + head_q_idx * stride_do_h + q_start * stride_do_m
     do_ptr_adj = do_ptr + adj_do
-    adj_delta = (
-        batch_idx * stride_delta_b
-        + head_q_idx * stride_delta_h
-        + q_start * stride_delta_m
-    )
+    adj_delta = batch_idx * stride_delta_b + head_q_idx * stride_delta_h + q_start * stride_delta_m
     m_ptr_adj = m_ptr + adj_delta
     delta_ptr_adj = delta_ptr + adj_delta
 
@@ -580,14 +574,8 @@ def _bwd_kernel_dkdvdq_causal(
     batch_philox_offset = 0
     dropout_offset = 0
     if ENABLE_DROPOUT:
-        batch_philox_offset = (
-            philox_offset_base
-            + batch_idx * stride_dropout_b
-            + head_q_idx * stride_dropout_h
-        )
-        dropout_offset = (
-            dropout_mask + batch_idx * stride_dropout_b + head_q_idx * stride_dropout_h
-        )
+        batch_philox_offset = philox_offset_base + batch_idx * stride_dropout_b + head_q_idx * stride_dropout_h
+        dropout_offset = dropout_mask + batch_idx * stride_dropout_b + head_q_idx * stride_dropout_h
 
     MASK_BLOCK_M: tl.constexpr = BLOCK_M // BLK_SLICE_FACTOR
     # bound the masked operation to q len so it does not have to wast cycles
@@ -602,9 +590,7 @@ def _bwd_kernel_dkdvdq_causal(
         descale_q = tl.load(descale_q_ptr + batch_idx * stride_descale_q_z + head_q_idx)
         descale_k = tl.load(descale_k_ptr + batch_idx * stride_descale_k_z + head_k_idx)
         descale_v = tl.load(descale_v_ptr + batch_idx * stride_descale_v_z + head_k_idx)
-        descale_do = tl.load(
-            descale_do_ptr + batch_idx * stride_descale_do_z + head_q_idx
-        )
+        descale_do = tl.load(descale_do_ptr + batch_idx * stride_descale_do_z + head_q_idx)
     else:
         descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
@@ -714,7 +700,25 @@ def _bwd_kernel_dkdvdq_causal(
     tl.atomic_add(dk_ptr + offs_dkdv, dk, mask=mask_kv, sem="relaxed")
 
 
-@triton.jit
+_bwd_kernel_dkdvdq_noncausal_repr = make_kernel_repr(
+    "_bwd_kernel_dkdvdq_noncausal",
+    [
+        "NUM_Q_HEADS",
+        "NUM_K_HEADS",
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLK_SLICE_FACTOR",
+        "BLOCK_D_MODEL",
+        "ENABLE_DROPOUT",
+        "IS_VARLEN",
+        "IS_FP8",
+        "NUM_SMS",
+        "USE_INT64_STRIDES",
+    ],
+)
+
+
+@triton.jit(repr=_bwd_kernel_dkdvdq_noncausal_repr)
 def _bwd_kernel_dkdvdq_noncausal(
     Q,
     K,
@@ -898,20 +902,8 @@ def _bwd_kernel_dkdvdq_noncausal(
         mask_kv &= offs_k < BLOCK_D_MODEL
 
     GROUP_SIZE = NUM_Q_HEADS // NUM_K_HEADS
-    adj_k = (
-        bid * stride_kb
-        + hkid * stride_kh
-        + k_start * stride_kn
-        + offs_n[:, None] * stride_kn
-        + offs_k[None, :] * stride_kk
-    )
-    adj_v = (
-        bid * stride_vb
-        + hkid * stride_vh
-        + k_start * stride_vn
-        + offs_n[:, None] * stride_vn
-        + offs_k[None, :] * stride_vk
-    )
+    adj_k = bid * stride_kb + hkid * stride_kh + k_start * stride_kn + offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk
+    adj_v = bid * stride_vb + hkid * stride_vh + k_start * stride_vn + offs_n[:, None] * stride_vn + offs_k[None, :] * stride_vk
 
     k = tl.load(K + adj_k, mask=mask_kv, other=0.0)
     v = tl.load(V + adj_v, mask=mask_kv, other=0.0)
@@ -933,12 +925,8 @@ def _bwd_kernel_dkdvdq_noncausal(
         batch_philox_offset = 0
         dropout_offset = 0
         if ENABLE_DROPOUT:
-            batch_philox_offset = (
-                philox_offset + bid * stride_dropoutb + hqid * stride_dropouth
-            )
-            dropout_offset = (
-                dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
-            )
+            batch_philox_offset = philox_offset + bid * stride_dropoutb + hqid * stride_dropouth
+            dropout_offset = dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
 
         if IS_FP8:
             descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hqid)
@@ -996,11 +984,7 @@ def _bwd_kernel_dkdvdq_noncausal(
         )
 
     adj_dkdv = (
-        bid * stride_dkb
-        + hkid * stride_dkh
-        + k_start * stride_dkn
-        + offs_n[:, None] * stride_dkn
-        + offs_k[None, :] * stride_dkk
+        bid * stride_dkb + hkid * stride_dkh + k_start * stride_dkn + offs_n[:, None] * stride_dkn + offs_k[None, :] * stride_dkk
     )
     tl.store(DV + adj_dkdv, dv, mask=mask_kv)
     dk *= sm_scale

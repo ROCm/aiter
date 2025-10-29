@@ -25,6 +25,7 @@ import functools
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 try:
     from triton.language.extra.libdevice import (
@@ -315,7 +316,25 @@ def _hstu_attn_fwd_compute(  # noqa C901
             tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
 
 
-@triton.jit
+_hstu_attn_fwd_repr = make_kernel_repr(
+    "_hstu_attn_fwd",
+    [
+        "CAUSAL",
+        "HAS_MULTIPLE_TARGETS",
+        "IS_DELTA_Q",
+        "ALLOW_TF32",
+        "BLOCK_D_Q",
+        "BLOCK_D_V",
+        "BLOCK_M",
+        "BLOCK_N",
+        "HAS_CONTEXTUAL_SEQ_LEN",
+        "HAS_MAX_ATTN_LEN",
+        "HAS_SORT_BY_LENGTH_INDICES",
+    ],
+)
+
+
+@triton.jit(repr=_hstu_attn_fwd_repr)
 def _hstu_attn_fwd(  # noqa C901
     Q,
     K,
@@ -693,7 +712,26 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     tl.store(dk_ptrs, dk.to(k.dtype), mask=mask_n[:, None])
 
 
-@triton.jit
+_hstu_attn_bwd_repr = make_kernel_repr(
+    "_hstu_attn_bwd",
+    [
+        "CAUSAL",
+        "HAS_MULTIPLE_TARGETS",
+        "IS_DELTA_Q",
+        "ALLOW_TF32",
+        "BLOCK_D_Q",
+        "BLOCK_D_V",
+        "BLOCK_M",
+        "BLOCK_N",
+        "HAS_CONTEXTUAL_SEQ_LEN",
+        "HAS_MAX_ATTN_LEN",
+        "HAS_SORT_BY_LENGTH_INDICES",
+        "ATOMIC_ADD",
+    ],
+)
+
+
+@triton.jit(repr=_hstu_attn_bwd_repr)
 def _hstu_attn_bwd(  # noqa C901
     Q,
     K,
