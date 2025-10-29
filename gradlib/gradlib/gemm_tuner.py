@@ -26,7 +26,7 @@ from aiter import dtypes
 import pandas as pd
 
 from GemmTuner import GemmTuner
-from aiter.jit.core import AITER_CONFIG_GEMM_BF16_FILE
+
 import time
 
 aiter.rocb_create_extension()
@@ -90,136 +90,49 @@ def load_input_gemms(input_file):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
+    gtuner = GemmTuner()
+    ext_group = gtuner.parser.add_argument_group("extra parameters")
+    ext_group.add_argument(
         "--model_dir",
         type=str,
         default=os.getenv("GTUNE_MODEL", ""),
         help="Enter the location of your model directory",
     )
-    parser.add_argument(
-        "--tuned_file",
-        type=str,
-        default=os.getenv("GTUNE_TUNED", AITER_CONFIG_GEMM_BF16_FILE),
-        help="output file for tuned gemm solutions",
-    )
-    parser.add_argument(
-        "--input_file",
-        type=str,
-        default=os.getenv("GTUNE_INPUT", None),
-        help="list of gemms to tune for, mutually exclusive with model_dir",
-    )
-    parser.add_argument(
-        "--mp",
-        type=int,
-        default=torch.cuda.device_count(),
-        help="Tuning on multiple GPUs using multiple processes",
-    )
-
-    parser.add_argument(
-        "--tp",
-        type=int,
-        default=os.getenv("GTUNE_TP", 1),
-        help="Tensor parallelism to be used.",
-    )
-    parser.add_argument(
-        "--indtype",
-        type=str,
-        default=None,
-        choices=["f32", "f16", "bf16", "fp8"],
-        help="dtype: f32 f16 bf16 fp8. Use this to override the"
-        " input_file or if no input_file provided",
-    )
-    parser.add_argument(
-        "--outdtype",
-        type=str,
-        choices=["f32", "f16", "bf16", "fp8"],
-        help="dtype: f32 f16 bf16 fp8. Use to override the default value,"
-        " which is the same as indtype for each shape (see --indtype.)",
-    )
-    parser.add_argument(
-        "--rocblas-decode",
-        action="store_true",
-        default=False,
-        help="forces rocblas solution on decode N=1",
-    )
-    parser.add_argument(
+    ext_group.add_argument(
         "--batch_size",
         type=int,
         default=os.getenv("GTUNE_BATCH_SIZE", 1),
         help="Batch size to tune for",
     )
-    parser.add_argument(
+    ext_group.add_argument(
         "--nsets",
         type=list_of_ints,
         default=[1, 512, 1024, 2048, 3072, 4096, 8192, 16384],
         help="N sizes to tune for: 1,128,2048",
     )
-    parser.add_argument(
-        "--all_bias",
-        action="store_true",
-        help="Tune for both bias and non bias cases,"
-        " regardless of what was used"
-        " to collect the shapes",
+    ext_group.add_argument(
+        "--tp",
+        type=int,
+        default=os.getenv("GTUNE_TP", 1),
+        help="Tensor parallelism to be used.",
     )
-    parser.add_argument(
-        "--errRatio",
-        type=float,
-        default=0.01,
-        help="tolerable error ratio, default 0.01.",
-    )
-    parser.add_argument(
-        "-o2",
-        "--profile_file",
-        default="",
-        help="output: all tuning results stored in this file",
-    )
-    args = parser.parse_args()
+    args = gtuner.parse_args()
 
     if args.outdtype is None:
         args.outdtype = args.indtype
     indtype = get_dtype(args.indtype)
+    args.indtype = indtype
     outdtype = get_dtype(args.outdtype)
-
-    gtuner = GemmTuner(
-        indtype,
-        outdtype,
-        args.tuned_file,
-        args.rocblas_decode,
-        args.mp,
-        args.errRatio,  # , args.splitK
-        args.profile_file,
-    )
-    nsets = [i * args.batch_size for i in args.nsets]
-    if args.input_file:
-        print(f">>> Loading {args.input_file}")
-        if not Path(args.input_file).is_file():
-            print(f">>> ERROR: {args.input_file} does not exist.  Exiting")
-            exit(1)
-        shapes = pd.read_csv(args.input_file).fillna("")
-        if "outdtype" not in shapes.columns:
-            shapes["outdtype"] = ""
-        if "scaleAB" not in shapes.columns:
-            shapes["scaleAB"] = False
-        for i in range(len(shapes)):
-            ds = shapes.iloc[i]
-            for bias in [True, False] if args.all_bias else [ds["bias"]]:
-                gtuner.add_gemm(
-                    ds["M"],
-                    ds["N"],
-                    ds["K"],
-                    indtype=get_dtype(ds["dtype"]),
-                    bias=bias,
-                    outdtype=get_dtype(ds["outdtype"]),
-                    scaleAB=ds["scaleAB"],
-                )
-    else:
+    args.outdtype = outdtype
+    if not args.untune_file:
+        nsets = [i * args.batch_size for i in args.nsets]
         if not args.model_dir:
             print(">>> Warning! NO MODEL SPECIFIED. Tuning for LL2 13B TP1")
             # LL2 13B sizes
             mksets = [(15360, 5120), (5120, 5120), (27648, 5120), (5120, 13824)]
-            gtuner.add_gemm(m=32000, n=1, k=5120)  # logits gemm
-            dtype = dtypes.fp16
+
+            gtuner.add_gemm(m=32000, n=1, k=5120, indtype=indtype)  # logits gemm
+
         else:
             mksets, hidden_size, dtype = generate_mk_sets(args.model_dir, args.tp)
             gtuner.add_gemm(
@@ -229,10 +142,10 @@ if __name__ == "__main__":
                 indtype=dtype,
             )  # TODO: Handle cases where vocab_size is not divisible by tp
 
-        for n in sorted(nsets):
-            for m, k in mksets:
-                gtuner.add_gemm(m, n, k, indtype=dtype)
-    start_time = time.time()
-    gtuner.find_best_sols()
-    end_time = time.time()
-    print(f"Tuning time is : {end_time - start_time} s")
+            for n in sorted(nsets):
+                for m, k in mksets:
+                    gtuner.add_gemm(m, n, k, indtype=dtype)
+        gtuner.untunedf.to_csv("./tmp_untuned.csv", index=False)
+        args.untune_file = "./tmp_untuned.csv"
+
+    gtuner.run(args)

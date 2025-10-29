@@ -6,7 +6,7 @@ import argparse
 import torch
 import pandas as pd
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from aiter import logger
 import traceback
 from operator import itemgetter
@@ -37,6 +37,7 @@ class TunerCommon:
         dtypes.fp4x2: 1,
         torch.uint8: 1,
         torch.uint32: 4,
+        dtypes.fp32: 4,
         torch.int4: 1 / 2,
         torch.float8_e4m3fnuz: 1,
         torch.float8_e4m3fn: 1,
@@ -76,6 +77,7 @@ class TunerCommon:
             "-i",
             "--untune_file",
             default=defaults["untune_file"],
+            dest="untune_file",
             required=False,
             help="input",
         )
@@ -83,6 +85,7 @@ class TunerCommon:
             "-o",
             "--tune_file",
             default=defaults["tune_file"],
+            dest="tune_file",
             required=False,
             help="output: tuning result store this file",
         )
@@ -494,7 +497,7 @@ class GemmCommonTuner(TunerCommon):
             [self.success, resultdf[resultdf["us"] != self.INVALID_TIME]],
             ignore_index=True,
         )
-        update_tunedf = self.success
+        update_tunedf = resultdf[resultdf["us"] != self.INVALID_TIME]  # self.success
         if not concat:
             resultdf = self.update_tunedf(old_df, update_tunedf)
         else:
