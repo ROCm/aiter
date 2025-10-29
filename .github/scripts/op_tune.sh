@@ -27,17 +27,18 @@ declare -a tune_jobs=(
 
 for job in "${tune_jobs[@]}"; do
     IFS=':' read -r shape dir test_path tune_cmd <<< "$job"
-    echo "shape: $shape"
-    echo "dir: $dir"
-    echo "test_path: $test_path"
-    echo "tune_cmd: $tune_cmd"
     # If shape_filter is not empty, check if the current shape exists in the filter list.
     # shape_filter is a comma-separated list, e.g. "ck_gemm_a8w8,ck_batched_gemm_a8w8"
     if [ -n "$shape_filter" ]; then
-        # Add surrounding commas to make strict "contains" matching robust (avoids partial match issues)
-        filter_str=",$shape_filter,"
-        if [[ "$filter_str" != *",$shape,"* ]]; then
-            # If current shape is not present in the filter, skip this job
+        IFS=',' read -ra filter_shapes <<< "$shape_filter"
+        found_match=false
+        for filter_shape in "${filter_shapes[@]}"; do
+            if [[ "$shape" == "$filter_shape" ]]; then
+                found_match=true
+                break
+            fi
+        done
+        if [ "$found_match" = false ]; then
             continue
         fi
     fi
