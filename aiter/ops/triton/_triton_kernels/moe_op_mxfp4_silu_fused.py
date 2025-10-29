@@ -6,6 +6,7 @@ import triton.language as tl
 from .activation import _silu_exp2
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton.moe_common import _write_zeros_to_output
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
 def get_scaled_dot_format_string(dtype: tl.dtype):
@@ -19,12 +20,31 @@ def get_scaled_dot_format_string(dtype: tl.dtype):
     return mapping[dtype]
 
 
+_fused_moe_kernel_mxfp4_silu_repr = make_kernel_repr(
+    "_fused_moe_kernel_mxfp4_silu",
+    [
+        "A_DTYPE_FORMAT",
+        "B_DTYPE_FORMAT",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "EVEN_K",
+        "MUL_ROUTED_WEIGHT",
+        "top_k",
+        "compute_type",
+        "SWIZZLE_MX_A",
+        "SWIZZLE_MX_B",
+    ],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_moe_kernel_mxfp4_silu_repr)
 def _fused_moe_kernel_mxfp4_silu(
     # Pointers to matrices
     a_ptr,

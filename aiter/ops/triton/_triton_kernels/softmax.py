@@ -1,8 +1,17 @@
 import triton
 import triton.language as tl
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
-@triton.jit
+_softmax_kernel_online_repr = make_kernel_repr(
+    "_softmax_kernel_online",
+    [
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_softmax_kernel_online_repr)
 def _softmax_kernel_online(
     output_ptr,
     input_ptr,
