@@ -5,11 +5,17 @@ import argparse
 import itertools
 import triton
 from aiter.ops.triton.mha import (
-    flash_attn_func,
-    flash_attn_fp8_func,
-    flash_attn_varlen_func,
-    flash_attn_varlen_fp8_func,
+    flash_attn_func as triton_flash_attn_func,
+    flash_attn_fp8_func as triton_flash_attn_fp8_func,
+    flash_attn_varlen_func as triton_flash_attn_varlen_func,
+    flash_attn_varlen_fp8_func as triton_flash_attn_varlen_fp8_func,
     mha_set_use_fused_bwd_kernel,
+)
+from aiter.ops.triton.gluon.mha import (
+    flash_attn_func as gluon_flash_attn_func,
+    flash_attn_fp8_func as gluon_flash_attn_fp8_func,
+    flash_attn_varlen_func as gluon_flash_attn_varlen_func,
+    flash_attn_varlen_fp8_func as gluon_flash_attn_varlen_fp8_func,
 )
 from aiter.test_mha_common import (
     generate_random_padding_mask,
@@ -430,6 +436,10 @@ def run_benchmark(custom, args):
         # Benchmark mode
         if varlen:
             if args.fp8:
+                if args.gluon:
+                    flash_attn_varlen_fp8_func = gluon_flash_attn_varlen_fp8_func
+                else:
+                    flash_attn_varlen_fp8_func = triton_flash_attn_varlen_fp8_func
 
                 def fn():
                     return flash_attn_varlen_fp8_func(
@@ -448,6 +458,10 @@ def run_benchmark(custom, args):
                     )
 
             else:
+                if args.gluon:
+                    flash_attn_varlen_func = gluon_flash_attn_varlen_func
+                else:
+                    flash_attn_varlen_func = triton_flash_attn_varlen_func
 
                 def fn():
                     return flash_attn_varlen_func(
@@ -467,6 +481,10 @@ def run_benchmark(custom, args):
 
         else:
             if args.fp8:
+                if args.gluon:
+                    flash_attn_fp8_func = gluon_flash_attn_fp8_func
+                else:
+                    flash_attn_fp8_func = triton_flash_attn_fp8_func
 
                 def fn():
                     return flash_attn_fp8_func(
@@ -481,6 +499,10 @@ def run_benchmark(custom, args):
                     )
 
             else:
+                if args.gluon:
+                    flash_attn_func = gluon_flash_attn_func
+                else:
+                    flash_attn_func = triton_flash_attn_func
 
                 def fn():
                     return flash_attn_func(
@@ -622,6 +644,11 @@ def parse_args():
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
+    )
+    parser.add_argument(
+        "-gluon",
+        action="store_true",
+        help="Use Gluon implementation (experimental, requires latest Triton from main)",
     )
     return parser.parse_args()
 
