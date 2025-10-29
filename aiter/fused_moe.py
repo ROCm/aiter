@@ -236,10 +236,6 @@ def fused_moe_(
         moe_sorting_dispatch_policy,
     )
 
-    # Pre-shuffle moe mxfp4 tuning configuration
-    if q_dtype_a == dtypes.fp4x2:
-        metadata.run_1stage = False if M < 32 else True
-
     if metadata.run_1stage:
         assert (
             doweight_stage1 == False
@@ -595,6 +591,11 @@ def get_2stage_cfgs(
                 run_1stage = token > 32
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
+            
+            # Pre-shuffle moe mxfp4 tuned configuration
+            if q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2:
+                run_1stage = False if token < 32 else True
+                
         block_m = (
             BLOCK_SIZE_M
             if run_1stage
