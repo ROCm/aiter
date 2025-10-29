@@ -1,4 +1,4 @@
-M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,splitK,soltimes,kernelName,err_ratio,tflops,bw
+M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,splitK,us,kernelName,err_ratio,tflops,bw
 64,256,5120,False,torch.bfloat16,torch.float32,False,80,asm,1,10,8.3,_ZN5aiter28bf16gemm_outf32_tn_32x64_pf3E,0.0,20.21,402.69
 80,256,5120,False,torch.bfloat16,torch.float32,False,80,asm,2,10,8.8,_ZN5aiter28bf16gemm_outf32_tn_48x64_pf3E,0.0,23.83,400.29
 128,256,5120,False,torch.bfloat16,torch.float32,False,80,asm,3,10,11.2,_ZN5aiter28bf16gemm_outf32_tn_64x64_pf3E,0.0,29.96,362.79
