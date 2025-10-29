@@ -428,14 +428,12 @@ def gemm_a8w8_blockscale(
     dtype: torch.dtype = None,
     isBpreshuffled: bool = False,
 ) -> torch.Tensor:
+    if dtype is None:
+        dtype = torch.bfloat16
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
-
-    if dtype is None:
-        dtype = torch.bfloat16
-
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
