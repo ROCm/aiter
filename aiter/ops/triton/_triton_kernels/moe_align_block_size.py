@@ -3,9 +3,45 @@
 
 import triton
 import triton.language as tl
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
-@triton.jit
+_moe_align_block_size_stage1_repr = make_kernel_repr(
+    "_moe_align_block_size_stage1_kernel",
+    [
+        "num_experts",
+        "numel",
+        "tokens_per_thread",
+    ],
+)
+
+_moe_align_block_size_stage2_repr = make_kernel_repr(
+    "_moe_align_block_size_stage2_kernel",
+    [
+        "num_experts",
+    ],
+)
+
+_moe_align_block_size_stage3_repr = make_kernel_repr(
+    "_moe_align_block_size_stage3_kernel",
+    [
+        "num_experts",
+        "block_size",
+    ],
+)
+
+_moe_align_block_size_stage4_repr = make_kernel_repr(
+    "_moe_align_block_size_stage4_kernel",
+    [
+        "num_experts",
+        "block_size",
+        "numel",
+        "tokens_per_thread",
+    ],
+)
+
+
+@triton.jit(repr=_moe_align_block_size_stage1_repr)
 def _moe_align_block_size_stage1_kernel(
     topk_ids_ptr,
     tokens_cnts_ptr,
