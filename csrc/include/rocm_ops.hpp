@@ -580,6 +580,7 @@
           py::arg("is_causal"),                    \
           py::arg("window_size_left"),             \
           py::arg("window_size_right"),            \
+          py::arg("sink_size"),                    \
           py::arg("return_softmax_lse"),           \
           py::arg("return_dropout_randval"),       \
           py::arg("cu_seqlens_q")  = std::nullopt, \
@@ -698,6 +699,7 @@
           py::arg("is_causal"),                          \
           py::arg("window_size_left"),                   \
           py::arg("window_size_right"),                  \
+          py::arg("sink_size"),                          \
           py::arg("return_softmax_lse"),                 \
           py::arg("return_dropout_randval"),             \
           py::arg("out")                 = std::nullopt, \
