@@ -154,6 +154,7 @@ def run_ck(
         return_attn_probs=return_attn_probs,
         cu_seqlens_q_padded=cu_seqlens_q_padded,
         cu_seqlens_k_padded=cu_seqlens_k_padded,
+        num_rotate_args=1,
     )
 
     if type(outputs) is tuple:
