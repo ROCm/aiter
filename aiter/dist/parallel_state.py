@@ -107,8 +107,9 @@ def all_reduce_fake(
     return torch.empty_like(tensor)
 
 
+# There is same name all_reduce in aiter.op, use Alias
 @torch_compile_guard(gen_fake=all_reduce_fake)
-def all_reduce(
+def all_reduce_(
     tensor: torch.Tensor, group_name: str, ca_fp8_quant: bool
 ) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -317,7 +318,7 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        return all_reduce(
+        return all_reduce_(
             input_, group_name=self.unique_name, ca_fp8_quant=ca_fp8_quant
         )
 
@@ -828,7 +829,8 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
-_DP: GroupCoordinator | None = None
+from typing import Optional
+_DP: Optional[GroupCoordinator] = None
 
 
 def get_dp_group() -> GroupCoordinator:
@@ -836,7 +838,7 @@ def get_dp_group() -> GroupCoordinator:
     return _DP
 
 
-_EP: GroupCoordinator | None = None
+_EP: Optional[GroupCoordinator] = None
 
 
 def get_ep_group() -> GroupCoordinator:
@@ -934,8 +936,8 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
-    decode_context_model_parallel_size: int | None = 1,
-    backend: str | None = None,
+    decode_context_model_parallel_size: Optional[int] = 1,
+    backend: Optional[str] = None,
 ) -> None:
     """
     Initialize model parallel groups.
