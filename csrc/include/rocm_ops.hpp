@@ -283,6 +283,14 @@
           py::arg("out"),                                                                      \
           py::arg("open_fp8_quant"),                                                           \
           py::arg("reg_buffer") = std::nullopt);                                               \
+    m.def("fused_allreduce_rmsnorm",                                                           \
+          &aiter::fused_allreduce_rmsnorm,                                                     \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("out"),                                                                      \
+          py::arg("w"),                                                                        \
+          py::arg("eps"),                                                                      \
+          py::arg("reg_buffer") = std::nullopt);                                               \
     m.def("all_reduce_asm_", &all_reduce_asm, "");                                             \
     m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");                   \
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \
