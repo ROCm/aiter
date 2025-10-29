@@ -73,26 +73,24 @@ def fp8_mqa_logits_kernel(
     kv_tile_start = block_min_start // BLOCK_KV
     kv_tile_end = (block_max_end + BLOCK_KV - 1) // BLOCK_KV
 
+    logits_row_ptrs = logits_ptr + row_offsets[:, None] * stride_logits_s
+
     # Loop over KV tiles
     for kv_tile_ind in tl.range(kv_tile_start, kv_tile_end):
-        kv_col_offsets = kv_tile_ind * BLOCK_KV + tl.arange(0, BLOCK_KV)
+        kv_col_offsets = (kv_tile_ind * BLOCK_KV + tl.arange(0, BLOCK_KV))[None, :]
         kv_col_mask = kv_col_offsets < seq_len_kv
 
         # Load KV tile [HEAD_SIZE, BLOCK_KV]
-        kv_ptrs = (
-            KV_ptr
-            + kv_col_offsets[None, :] * stride_kv_s
-            + d_inds[:, None] * stride_kv_d
+        kv_ptrs = KV_ptr + kv_col_offsets * stride_kv_s + d_inds[:, None] * stride_kv_d
+        kv_block = tl.load(kv_ptrs, kv_col_mask, other=0.0)
+        kv_scales = tl.load(kv_scales_ptr + kv_col_offsets, kv_col_mask, other=0.0).to(
+            tl.float32
         )
-        kv_block = tl.load(kv_ptrs, mask=kv_col_mask[None, :], other=0.0)
         # [BLOCK_Q*NUM_HEADS, BLOCK_KV] = [BLOCK_Q*NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
-        scores = tl.dot(q_block, kv_block, input_precision="ieee").to(tl.float32)
+        scores = tl.dot(q_block, kv_block)
 
         # Multiply by kv_scales (broadcast along rows)
-        kv_scales = tl.load(
-            kv_scales_ptr + kv_col_offsets, mask=kv_col_mask, other=0.0
-        ).to(tl.float32)
-        scores = scores * kv_scales[None, :]
+        scores = scores * kv_scales
         scores = tl.reshape(scores, (BLOCK_Q, NUM_HEADS, BLOCK_KV))
 
         # ReLU
@@ -102,22 +100,17 @@ def fp8_mqa_logits_kernel(
         scores = scores * w_block[:, :, None]
         # [BLOCK_Q, BK]
         scores = tl.sum(scores, axis=1)
-        kv_cols = kv_col_offsets[None, :]
+
         # [BQ, BK]
-        in_window = (kv_cols >= start_inds[:, None]) & (kv_cols < end_inds[:, None])
-        store_mask = (
-            (row_offsets[:, None] < seq_len)
-            & (kv_col_offsets[None, :] < seq_len_kv)
-            & in_window
+        in_window = (kv_col_offsets >= start_inds[:, None]) & (
+            kv_col_offsets < end_inds[:, None]
         )
-        scores = tl.where(store_mask, scores, float("-inf"))
+        store_mask = (
+            (row_offsets[:, None] < seq_len) & (kv_col_offsets < seq_len_kv) & in_window
+        )
 
         # Store to logits [BLOCK_Q, BK]
-        logits_ptrs = (
-            logits_ptr
-            + row_offsets[:, None] * stride_logits_s
-            + kv_col_offsets[None, :] * stride_logits_k
-        )
+        logits_ptrs = logits_row_ptrs + kv_col_offsets * stride_logits_k
         tl.store(logits_ptrs, scores, mask=store_mask)
 
 
@@ -185,7 +178,7 @@ def fp8_mqa_logits(
         BLOCK_Q=BLOCK_Q,
         BLOCK_KV=BLOCK_KV,
         num_warps=4,
-        num_stages=2,
+        num_stages=1,
         waves_per_eu=2,
     )
 
