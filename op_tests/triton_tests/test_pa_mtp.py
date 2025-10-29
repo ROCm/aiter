@@ -18,13 +18,17 @@ from aiter import pertoken_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 # from utils import compare_arrays
-from aiter.ops.triton.gluon.pa_decode_gluon import paged_attention_decode as paged_attention_decode_gluon
+from aiter.ops.triton.gluon.pa_decode_gluon import (
+    paged_attention_decode as paged_attention_decode_gluon,
+)
+
 # from pa_decode_triton import paged_attention_decode as paged_attention_decode_triton
 # from pa_decode_triton import _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk
 # from pa_decode_triton_fp8 import paged_attention_decode as paged_attention_decode_triton_fp8
 # from pa_decode_triton_fp8_2 import paged_attention_decode as paged_attention_decode_triton_fp8
 # from pa_decode_triton_fp8_gluon import paged_attention_decode as paged_attention_decode_gluon_fp8
 import triton.language as tl
+
 # from triton.tools.triton_to_gluon_translater.translator import convert_triton_to_gluon
 # out = convert_triton_to_gluon(_paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk)
 # print(out)
@@ -56,6 +60,8 @@ def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
+
+
 setup_seed(123)
 
 
@@ -135,7 +141,7 @@ def ref_masked_attention(
     dtype,
     is_causal=True,
     sinks=None,
-    sliding_window=None
+    sliding_window=None,
 ) -> torch.Tensor:
     h_q = query.shape[1]
     s_q = query.shape[0]
@@ -143,7 +149,9 @@ def ref_masked_attention(
     h_kv = key.shape[1]
     key = key.repeat_interleave(h_q // h_kv, dim=1)
     value = value.repeat_interleave(h_q // h_kv, dim=1)
-    attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * softmax_scale
+    attn_weights = (
+        torch.einsum("qhd,khd->hqk", query.float(), key.float()) * softmax_scale
+    )
     if is_causal:
         attn_bias = torch.zeros(s_q, s_k, dtype=query.dtype)
         temp_mask = torch.ones(s_q, s_k, dtype=torch.bool).tril(diagonal=s_k - s_q)
@@ -159,14 +167,20 @@ def ref_masked_attention(
             key_positions = torch.arange(s_k, device=query.device)
         else:
             # Generation phase: query is at position s_k (after the cache)
-            query_positions = torch.arange(s_k, s_k + s_q, device=query.device)  # [s_k] for s_q=1
+            query_positions = torch.arange(
+                s_k, s_k + s_q, device=query.device
+            )  # [s_k] for s_q=1
             key_positions = torch.arange(s_k, device=query.device)  # [0,1,2,...,s_k-1]
 
         # Create position difference matrix: query_pos - key_pos
-        pos_diff = query_positions.unsqueeze(1) - key_positions.unsqueeze(0)  # [s_q, s_k]
+        pos_diff = query_positions.unsqueeze(1) - key_positions.unsqueeze(
+            0
+        )  # [s_q, s_k]
 
         # Sliding window mask: allow attention only if 0 <= pos_diff < sliding_window_size
-        sliding_window_mask = (pos_diff < 0) | (pos_diff >= sliding_window)  # [s_q, s_k]
+        sliding_window_mask = (pos_diff < 0) | (
+            pos_diff >= sliding_window
+        )  # [s_q, s_k]
         attn_weights.masked_fill_(sliding_window_mask.unsqueeze(0), float("-inf"))
 
     if sinks is not None:
@@ -231,7 +245,16 @@ def torch_mha_extend(
         #     print(f"q.shape={q.shape}")
         #     print(f"k.shape={k.shape}")
         #     print(f"v.shape={v.shape}")
-        o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=True, sinks=sinks, sliding_window=sliding_window)
+        o = ref_masked_attention(
+            q,
+            k,
+            v,
+            sm_scale,
+            dtype,
+            is_causal=True,
+            sinks=sinks,
+            sliding_window=sliding_window,
+        )
         # o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=False)
         os.append(o)
     o = torch.concat(os)
@@ -372,12 +395,12 @@ def asm_V_shuffle(VC):
 
 
 def run_triton(
-    output: torch.Tensor,       # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
-    query: torch.Tensor,        # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
-    key_cache: torch.Tensor,    # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+    output: torch.Tensor,  # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
+    query: torch.Tensor,  # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
+    key_cache: torch.Tensor,  # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
     value_cache: torch.Tensor,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-    seq_lens: torch.Tensor,     # [num_seqs]
-    block_tables: torch.Tensor, # [num_seqs, max_num_blks_per_seq]
+    seq_lens: torch.Tensor,  # [num_seqs]
+    block_tables: torch.Tensor,  # [num_seqs, max_num_blks_per_seq]
     attn_scale: float,
     max_seq_len: int,
     compute_type,
@@ -557,17 +580,10 @@ def test_pa_mtp(
         device,
     )
     k_cache, v_cache = k_caches[0], v_caches[0]
-    softmax_scale = float(1.0 / (head_size ** 0.5))
+    softmax_scale = float(1.0 / (head_size**0.5))
 
-
-    k_quant2_, k_scale2_ = aiter.per_tensor_quant(
-        k_cache, quant_dtype=aiter.dtypes.fp8
-    )
-    v_quant2_, v_scale2_ = aiter.per_tensor_quant(
-        v_cache, quant_dtype=aiter.dtypes.fp8
-    )
-
-
+    k_quant2_, k_scale2_ = aiter.per_tensor_quant(k_cache, quant_dtype=aiter.dtypes.fp8)
+    v_quant2_, v_scale2_ = aiter.per_tensor_quant(v_cache, quant_dtype=aiter.dtypes.fp8)
 
     sinks = torch.ones(num_query_heads, device=query.device, dtype=dtype)
     # sinks = None
@@ -583,7 +599,6 @@ def test_pa_mtp(
         sinks=sinks,
         sliding_window=sliding_window,
     )
-
 
     # out_hip_noquant, us_hip = run_aiter_hip(
     #     query,
@@ -606,8 +621,6 @@ def test_pa_mtp(
     # ret["us_hip_bf16"] = us_hip
     # ret["err_hip_bf16"] = err_hip_noquant
 
-
-
     triton_output = torch.empty_like(out_ref_noquant)
     triton_output, us_triton = run_triton(
         triton_output,
@@ -624,7 +637,7 @@ def test_pa_mtp(
         sinks=sinks,
         sliding_window=sliding_window,
     )
-    us_triton = us_triton['triton']
+    us_triton = us_triton["triton"]
     err_triton_noquant = checkAllclose(
         out_ref_noquant,
         triton_output,
@@ -633,12 +646,24 @@ def test_pa_mtp(
     # compare_arrays(triton_output.to(torch.float32).detach().cpu().numpy(), out_ref_noquant.to(torch.float32).detach().cpu().numpy())
     ret["us_gluon_bf16"] = us_triton
     ret["err_gluon_bf16"] = err_triton_noquant
-    out_ref_noquant_md5 = hashlib.md5(out_ref_noquant.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-    triton_output_md5 = hashlib.md5(triton_output.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    out_ref_noquant_md5 = hashlib.md5(
+        out_ref_noquant.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()
+    ).hexdigest()
+    triton_output_md5 = hashlib.md5(
+        triton_output.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()
+    ).hexdigest()
     print(f"out_ref_noquant_md5={out_ref_noquant_md5}")
     print(f"gluon_output_md5={triton_output_md5}")
     kt_us = us_triton
-    bandwith = batch_size * head_size * (2 * ctx_lens * num_kv_heads * k_quant2_.dtype.itemsize + 2 * qlen * num_query_heads * query.dtype.itemsize) / (kt_us * 1e6 * 1.024 ** 4)
+    bandwith = (
+        batch_size
+        * head_size
+        * (
+            2 * ctx_lens * num_kv_heads * k_quant2_.dtype.itemsize
+            + 2 * qlen * num_query_heads * query.dtype.itemsize
+        )
+        / (kt_us * 1e6 * 1.024**4)
+    )
     ret["gluon_fp8_bandwith(TB/s)"] = bandwith
 
     # print(f"batch_size={batch_size}")
@@ -663,7 +688,6 @@ def test_pa_mtp(
     # print(f"v_scale_asm.shape={v_scale_asm.shape}")
     # print(f"out_ref_noquant.shape={out_ref_noquant.shape}")
 
-
     # q_cvted = q_scale * q_quant.to(torch.float32)
     # k_ref = k_cache.transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1).to(torch.float32)
     # v_ref = v_cache.transpose(2, 3).reshape(num_blocks, num_kv_heads, block_size, -1).to(torch.float32)
@@ -686,7 +710,6 @@ def test_pa_mtp(
     # print(f"k_cvted_md5={k_cvted_md5}")
     # print(f"v_cvted_md5={v_cvted_md5}")
 
-
     # q_scale1 = q_scale.clone()
     # k_scale_asm1 = k_scale_asm.clone()
     # v_scale_asm1 = v_scale_asm.clone()
@@ -696,7 +719,7 @@ def test_pa_mtp(
     # query = q_scale * q_quant.to(torch.float32)
     # query = query.to(dtype)
     # quant version torch ref
-    
+
     # out_ref = torch_mha_extend(
     #     query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_, sinks=sinks, sliding_window=3
     # )
@@ -785,7 +808,6 @@ def test_pa_mtp(
     # bandwith = batch_size * head_size * (2 * ctx_lens * num_kv_heads * k_quant_.dtype.itemsize + 2 * qlen * num_query_heads * q_quant.dtype.itemsize) / (kt_us * 1e6 * 1.024 ** 4)
     # ret["gluon_fp8_bandwith(TB/s)"] = bandwith
 
-
     # out_aiter_asm, us_aiter_asm = run_aiter_asm(
     #     query,
     #     k_quant_,
@@ -811,7 +833,6 @@ def test_pa_mtp(
     # kt_us = us_aiter_asm
     # bandwith = batch_size * head_size * (2 * ctx_lens * num_kv_heads * k_quant_.dtype.itemsize + 2 * qlen * num_query_heads * query.dtype.itemsize) / (kt_us * 1e6 * 1.024 ** 4)
     # ret["asm_fp8_bandwith(TB/s)"] = bandwith
-
 
     # q_scale = q_scale.squeeze(-1)
     # out_hip, us_hip = run_aiter_hip(
@@ -839,7 +860,6 @@ def test_pa_mtp(
     # compare_arrays(out_hip.to(torch.float32).detach().cpu().numpy(), out_ref.to(torch.float32).detach().cpu().numpy())
     # ret["us_hip_fp8"] = us_hip
     # ret["err_hip_fp8"] = err
-
 
     print(f"triton={triton}")
     print(f"triton.version={triton.__version__}")
