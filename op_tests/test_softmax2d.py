@@ -44,8 +44,8 @@ def test_softmax2d(dtype, m, n):
     (a, *_), avg_a = run_torch(input)
     (b, *_), avg_b = run_ck(input)
     # import pdb; pdb.set_trace()
-    tflops = m * n * input.element_size() * 2 / avg_b / 1e-6
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}, ck(tflops): {tflops}"
+    gbps = m * n * input.element_size() * 2 / avg_b / 1e3
+    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}, ck(gbps): {gbps:<8.2f}"
     checkAllclose(a, b, msg=msg)
 
 

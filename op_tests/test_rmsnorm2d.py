@@ -31,7 +31,8 @@ def run_torch(input, weight, eps, residual=None):
 def run_ck(input, weight, eps, residual=None, use_model_sensitive_rmsnorm=0):
     if residual is None:
         residual_out = None
-        output = aiter.rms_norm(input, weight, eps, use_model_sensitive_rmsnorm)
+        # output = aiter.rms_norm(input, weight, eps, use_model_sensitive_rmsnorm)
+        output = aiter.rmsnorm2d_hip(input, weight, eps, 0)
     else:
         residual_out = torch.empty_like(input)
         output = torch.empty_like(input)
@@ -69,7 +70,8 @@ def test_rmsnorm2d(dtype, m, n):
     (a, *_), avg_a = run_torch(input, weight, 1e-5)
     (b, *_), avg_b = run_ck(input, weight, 1e-5)
     (c, *_), avg_c = run_cu(input, weight, 1e-5)
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    gbps = m * n * input.element_size() * 2 / avg_b / 1e3
+    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}, ck(gbps): {gbps:<8.2f}"
     checkAllclose(a, b, msg=msg)
     checkAllclose(a, c, msg="cu")
 

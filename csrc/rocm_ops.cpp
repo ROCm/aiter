@@ -32,6 +32,7 @@
 #include "quant.h"
 #include "quick_all_reduce.h"
 #include "rmsnorm.h"
+#include "rmsnorm_fused.h"
 #include "rocsolgemm.cuh"
 #include "rope.h"
 #include "smoothquant.h"
@@ -101,6 +102,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     SAMPLE_PYBIND;
     HIPBSOLGEMM_PYBIND;
     ROCSOLGEMM_PYBIND;
+    RMSNORM_FUSED_PYBIND;
+    LAYERNORM_PYBIND;
     SOFTMAX_PYBIND;
 }
 #endif

@@ -139,3 +139,13 @@ def layernorm2d_with_add_smoothquant_asm(
     epsilon: float,
     x_bias: Optional[Tensor] = None,
 ) -> None: ...
+
+@compile_ops("module_layernorm")
+def layernorm2d_hip(
+    input: Tensor,
+    # normalized_shape: List[int],
+    weight: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    epsilon: float = 1e-5,
+    x_bias: Optional[Tensor] = None,
+) -> Tensor: ...

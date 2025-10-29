@@ -38,7 +38,8 @@ def run_torch(input, weight, bias, eps, residual=None, x_bias=None):
 def run_ck(input, weight, bias, eps, residual=None, x_bias=None):
     if residual is None:
         residual_out = None
-        output = aiter.layer_norm(input, weight, bias, eps, x_bias)
+        # output = aiter.layer_norm(input, weight, bias, eps, x_bias)
+        output = aiter.layernorm2d_hip(input, weight, bias, eps, x_bias)
         # output = torch.empty_like(input)
         # aiter.layernorm2d_fwd(
         #     output,
@@ -80,7 +81,8 @@ def test_layernorm2d(dtype, m, n):
     input = k
     (a, *_), avg_a = run_torch(input, weight, bias, 1e-5)
     (b, *_), avg_b = run_ck(input, weight, bias, 1e-5)
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    gbps = m * n * input.element_size() * 2 / avg_b / 1e3
+    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}, ck(gbps): {gbps:<8.2f}"
     checkAllclose(a, b, msg=msg)
 
 

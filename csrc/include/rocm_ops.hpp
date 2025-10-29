@@ -1221,7 +1221,36 @@
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
 
+#define RMSNORM_FUSED_PYBIND \
+    m.def("rmsnorm2d_with_add_smoothquant_hip",                                                    \
+          &rmsnorm2d_with_add_smoothquant_hip,                                                     \
+          py::arg("out"),                                                                          \
+          py::arg("input"),                                                                        \
+          py::arg("residual_in"),                                                                  \
+          py::arg("residual_out"),                                                                 \
+          py::arg("xscale"),                                                                       \
+          py::arg("yscale"),                                                                       \
+          py::arg("weight"),                                                                       \
+          py::arg("epsilon"),                                                                      \
+          py::arg("out_before_quant")            = std::nullopt,                                   \
+          py::arg("use_model_sensitive_rmsnorm") = 0); \
+    m.def("rmsnorm2d_hip", &rmsnorm2d_hip,                                                         \
+          py::arg("input"),                                                                        \
+          py::arg("weight"),                                                                       \
+          py::arg("epsilon"),                                                                      \
+          py::arg("use_model_sensitive_rmsnorm") = 0);
+
+
+#define LAYERNORM_PYBIND \
+    m.def("layernorm2d_hip",                                      \
+          &layernorm2d_hip,                                       \
+          py::arg("input"),                                       \
+          py::arg("weight"),                                      \
+          py::arg("bias"),                                        \
+          py::arg("epsilon") = 1e-5f,                             \
+          py::arg("x_bias")  = std::nullopt);
+
 #define SOFTMAX_PYBIND \
     m.def("softmax2d_hip",                                        \
-          &softmax2d_hip,                                           \
+          &softmax2d_hip,                                         \
           py::arg("input"));
