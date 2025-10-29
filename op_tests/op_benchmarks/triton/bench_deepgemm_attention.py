@@ -140,7 +140,7 @@ def ref_fp8_paged_mqa_logits_ragged(
 
 def create_paged_mqa_logits_configs(args: argparse.Namespace):
     x_names = ["batch_size", "next_n", "heads", "index_dim", "avg_kv_length"]
-    line_names = ["ragged_k", "non_ragged_k"]
+    line_names = ["non_ragged_k"]
     line_args = "kv_storage_kind"
 
     x_vals_list = [
@@ -166,8 +166,7 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
 
 
 def run_benchmark(args: argparse.Namespace):
-    ChunkK = 64
-    SplitKV = 5
+    ChunkK = 256
 
     @triton.testing.perf_report(create_paged_mqa_logits_configs(args))
     def test_deepgemm_fp8_paged_mqa_logits(
@@ -267,8 +266,10 @@ def run_benchmark(args: argparse.Namespace):
             dtype=torch.float32,
         )
 
+        elapsed_us_stage1 = 0
         if kv_storage_kind == "non_ragged_k":
-            deepgemm_fp8_paged_mqa_logits_stage1(
+            _, elapsed_us_stage1 = run_perftest(
+                deepgemm_fp8_paged_mqa_logits_stage1,
                 q_fp8,
                 kv_cache_fp8,
                 weights,
@@ -286,8 +287,6 @@ def run_benchmark(args: argparse.Namespace):
                 context_lens,
                 block_tables,
                 max_model_len,
-                ChunkK,
-                SplitKV,
             )
         else:
             deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
@@ -309,7 +308,6 @@ def run_benchmark(args: argparse.Namespace):
                 kv_indices,
                 max_model_len,
                 ChunkK,
-                SplitKV,
             )
 
         out_qk_logits = torch.sum(out_qk, dim=0)
@@ -346,15 +344,12 @@ def run_benchmark(args: argparse.Namespace):
         )
         flops = total_float_operations / elapsed_us * 1e-6
 
-        ctx_list = context_lens.tolist()
-        total_memcpyA_bytes = batch_size * next_n * SplitKV * heads * index_dim
-        total_memcpyB_bytes = (
-            sum([cdiv(ctx, ChunkK) * ChunkK * index_dim for ctx in ctx_list]) * next_n
+        print(
+            kv_storage_kind,
+            " time elapsed: ",
+            elapsed_us,
+            "us  ",
         )
-
-        bandwidth_gbps = (total_memcpyA_bytes + total_memcpyB_bytes) / elapsed_us * 1e-3
-
-        print("bandwidth (GB/s): ", bandwidth_gbps)
 
         return flops
 
