@@ -248,7 +248,7 @@ def test_fmoe(
                 shuffle_weight(w2_qt_aiter, (16, 16), use_int4=True)
             )
         )
-    elif WQDType != dtypes.fp4x2:
+    else:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
     # # ######################## ck stage 1 start ###########
