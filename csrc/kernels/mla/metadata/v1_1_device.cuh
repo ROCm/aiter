@@ -241,7 +241,8 @@ __global__ void kn_get_mla_metadata_v1_1(
     int32_t* p_lds_kv_lens   = p_lds_qo_lens + params.num_batches;
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
-        const int32_t bid_ori = Traits::kIsSparse ? (bid / params.ori_seqlen_qo) : bid;
+        const int32_t bid_ori = Traits::kIsSparse ? (bid / params.ori_seqlen_qo / params.qk_batch_ratio)
+                                                  : (bid / params.qk_batch_ratio);
         if constexpr (Traits::kSortBatch)
         {
             p_lds_batch_idx[bid] = bid;
@@ -352,15 +353,28 @@ __global__ void kn_get_mla_metadata_v1_1(
     }
 
     // Step.5. Fill the output buffers except indptrs
+    auto get_kv_batch_start = [&](const int32_t bid) {
+        const int32_t bid_ori = bid / params.qk_batch_ratio;
+        if constexpr (Traits::kIsSparse)
+        {
+            return bid_ori * params.topk;
+        }
+        else
+        {
+            return params.p_seqlens_kv_indptr[bid_ori];
+        }
+    };
 
     // Step.5.1. Get total work for each cluster
     for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
         const int32_t bid                = Traits::kSortBatch ? p_lds_batch_idx[idx] : idx;
+        const int32_t bid_ori            = bid / params.qk_batch_ratio;
         const int32_t qo_len             = qo_state.get_seqlen(bid);
         const int32_t qo_batch_start     = qo_state.get_begin(bid);
         const int32_t kv_len             = p_lds_kv_lens[bid];
-        const int32_t kv_batch_start     = Traits::kIsSparse ? bid * params.topk : params.p_seqlens_kv_indptr[bid];
+        const int32_t kv_batch_start     = Traits::kIsSparse ? bid_ori * params.topk
+                                                             : params.p_seqlens_kv_indptr[bid_ori];
         const int32_t kv_batch_end       = kv_batch_start + kv_len;
         const int32_t packed_qo_len      = qo_len * params.num_heads;
         const int32_t num_qo_tiles       = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
@@ -421,10 +435,12 @@ __global__ void kn_get_mla_metadata_v1_1(
     for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
         const int32_t bid                = Traits::kSortBatch ? p_lds_batch_idx[idx] : idx;
+        const int32_t bid_ori            = bid / params.qk_batch_ratio;
         const int32_t qo_len             = qo_state.get_seqlen(bid);
         const int32_t qo_batch_start     = qo_state.get_begin(bid);
         const int32_t kv_len             = p_lds_kv_lens[bid];
-        const int32_t kv_batch_start     = Traits::kIsSparse ? bid * params.topk : params.p_seqlens_kv_indptr[bid];
+        const int32_t kv_batch_start     = Traits::kIsSparse ? bid_ori * params.topk
+                                                             : params.p_seqlens_kv_indptr[bid_ori];
         const int32_t kv_batch_end       = kv_batch_start + kv_len;
         const int32_t packed_qo_len      = qo_len * params.num_heads;
         const int32_t num_qo_tiles       = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
@@ -541,7 +557,7 @@ void get_mla_metadata_v1_1_device(
     const bool           no_redundant,
     const int32_t        kv_granularity,
     const int32_t        max_seqlen_qo,
-    const int32_t        uni_seqlen_qo,
+    const int32_t        ori_uni_seqlen_qo,
     const int32_t        topk,
     torch::Tensor&       work_metadata_ptrs,
     torch::Tensor&       work_info_set,
@@ -563,10 +579,31 @@ void get_mla_metadata_v1_1_device(
     HIP_CALL(hipGetDevice(&dev));
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
 
-    const int32_t num_batches = seqlens_qo_indptr.size(0) - 1;
-    const int32_t num_cu      = dev_prop.multiProcessorCount;
-    const int32_t num_heads   = num_heads_per_head_k * num_heads_k;
-    const bool is_sparse      = (topk >= 0);
+    const int32_t num_cu = dev_prop.multiProcessorCount;
+    const bool is_sparse = (topk >= 0);
+
+    int32_t num_batches    = seqlens_qo_indptr.size(0) - 1;
+    int32_t num_heads      = num_heads_k * num_heads_per_head_k;
+    int32_t qk_batch_ratio = 1;
+    int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
+
+    // In the following cases, we use #head=16 to simulate cases which is not natively supported by mla main kernel.
+    if ((num_heads != 16) && (num_heads != 128) &&  // main kernel natively supports #head=16 or #head=128
+        (num_heads % 16 == 0) && (num_heads < 128))
+    {
+        qk_batch_ratio = num_heads / 16;
+        num_heads      = 16;
+        num_batches   *= qk_batch_ratio;
+    }
+
+    if (is_sparse)
+    {
+        num_batches  *= uni_seqlen_qo;
+        uni_seqlen_qo = 1;
+    }
+
+    TORCH_CHECK((num_heads == 16) || (num_heads == 128), __func__,
+                ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where N is in [2, 8).")
 
     const int32_t lds_size_in_bytes = [&]()
     {
@@ -620,16 +657,17 @@ void get_mla_metadata_v1_1_device(
     params.p_reduce_partial_map = reduce_partial_map.data_ptr<int32_t>();
     params.p_seqlens_qo_indptr  = seqlens_qo_indptr.data_ptr<int32_t>();
     params.p_seqlens_kv_indptr  = seqlens_kv_indptr.data_ptr<int32_t>();
-    params.num_batches          = is_sparse ? (uni_seqlen_qo * num_batches) : num_batches;
+    params.num_batches          = num_batches;
     params.num_heads            = num_heads;
     params.num_cu               = num_cu;
     params.reduce_indptr_size   = reduce_indptr.size(0);
     params.kv_granularity       = kv_granularity;
     params.kv_granularity_log2  = __builtin_ctz(kv_granularity);
-    params.uni_seqlen_qo        = is_sparse ? 1 : uni_seqlen_qo;
-    params.ori_seqlen_qo        = is_sparse ? uni_seqlen_qo : 0; // not used in non-sparse attn
+    params.uni_seqlen_qo        = uni_seqlen_qo;
+    params.ori_seqlen_qo        = ori_uni_seqlen_qo;
     params.topk                 = topk;
     params.is_causal            = is_causal;
+    params.qk_batch_ratio       = qk_batch_ratio;
 
     MlaMetadataV11Coefficients coefs = {};
     coefs.workload_limit_global_0 = 0.01f;

@@ -221,7 +221,7 @@ def test_mla(
 
     # 128 here is the maxmium len in packed_qo (qolen*#heads) can handled by mla main kernel
     # It would be more decent to query this value from aiter.
-    max_qo_tiles_per_batch = int(math.ceil(torch.max(seq_lens_qo).item() * nhead / 128))
+    max_qo_tiles_per_batch = int(math.ceil(torch.max(seq_lens_qo).item() * nhead / 128)) if nhead in [16, 128] else int(math.ceil(torch.max(seq_lens_qo).item() * nhead / 16))
 
     # aiter implementation
     # the tensor's meaning please refer aiter/ops/attention.py
@@ -302,11 +302,10 @@ def test_mla(
 
     err = None
     us_asm_decode = 10000000000
-    flops = 0
+    flops = 0.0
     bytes = 1
-    if nhead == 16:
+    if (nhead in [16]) or (max_seqlen_qo == 1 and nhead in range(32, 512+1, 16)):
         err, us_asm_decode, flops, bytes = test_absorb_decode()
-        print("us_asm_decode:", us_asm_decode)
 
     def test_absorb_decode_fp8():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -483,7 +482,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 2), (128, 2)]
+list_nhead = [(16, 2), (128, 2), (48, 1)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,

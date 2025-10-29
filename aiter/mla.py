@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 import functools
 from aiter.jit.utils.chip_info import get_cu_num
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 
 @triton.jit
@@ -151,11 +152,14 @@ def mla_decode_fwd(
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
 
+    ori_total_s, ori_nhead, ori_v_head_dim = o.shape
     total_s, nhead, v_head_dim = o.shape
     bs = qo_indptr.shape[0] - 1
     total_kv = kv_indices.shape[0]
 
-    if num_kv_splits_indptr is None and work_meta_data is None:
+    persistent_mode = work_meta_data is not None
+
+    if num_kv_splits_indptr is None and not persistent_mode:
         num_kv_splits, mgc = get_meta_param(None, bs, total_kv, nhead, max_seqlen_q)
         num_kv_splits_indptr = torch.arange(
             0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device=device
@@ -164,30 +168,37 @@ def mla_decode_fwd(
     if num_kv_splits is None:
         num_kv_splits = get_cu_num()
 
+    MAYBE_FINAL_OUT = True
+    io_tranformed = False
     if nhead == 16 and max_seqlen_q == 1:
         # special case for 16 heads and max_seqlen_q == 1
-        logits = torch.empty(
-            (total_s, num_kv_splits, nhead, v_head_dim),
-            dtype=dtypes.fp32,
-            device=device,
-        )
         MAYBE_FINAL_OUT = False
-    elif nhead in [16, 128]:
-        MAYBE_FINAL_OUT = True
-        logits = torch.empty(
-            (total_s, num_kv_splits, nhead, v_head_dim),
-            dtype=dtypes.fp32,
-            device=device,
-        )
+    elif nhead == 16 or (nhead == 128 and q.dtype == get_fp8_e4m3_dtype()):
+        # Natively support cases
+        pass
+    elif nhead in range(32, 512+1, 16) and persistent_mode and max_seqlen_q == 1:
+        # we use nhead=16 to simulate such cases by customized metadata
+        # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
+        total_s = ori_total_s * (ori_nhead // 16)
+        nhead = 16
+        q = q.view(total_s, nhead, -1)
+        o = o.view(total_s, nhead, -1)
+        io_tranformed = True
     else:
-        assert False, f"{nhead=} not supported"
+        assert False, f"{nhead=} and {max_seqlen_q=} not supported"
+
+    logits = torch.empty(
+        (total_s, num_kv_splits, nhead, v_head_dim),
+        dtype=dtypes.fp32,
+        device=device,
+    )
 
     attn_lse = torch.empty(
         (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
     )
     final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
 
-    if num_kv_splits_indptr is not None:
+    if not persistent_mode:
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
@@ -237,37 +248,41 @@ def mla_decode_fwd(
             num_stages=2,
             **extra_kargs,
         )
-        return logits, final_lse
+    else:
+        aiter.mla_decode_stage1_asm_fwd(
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            num_kv_splits_indptr,
+            work_meta_data,
+            work_indptr,
+            work_info_set,
+            max_seqlen_q,
+            sm_scale,
+            logits,
+            attn_lse,
+            o,
+            q_scale,
+            kv_scale,
+        )
 
-    aiter.mla_decode_stage1_asm_fwd(
-        q,
-        kv_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_lens,
-        num_kv_splits_indptr,
-        work_meta_data,
-        work_indptr,
-        work_info_set,
-        max_seqlen_q,
-        sm_scale,
-        logits,
-        attn_lse,
-        o,
-        q_scale,
-        kv_scale,
-    )
+        aiter.mla_reduce_v1(
+            logits,
+            attn_lse,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            o,
+            final_lse,
+        )
 
-    aiter.mla_reduce_v1(
-        logits,
-        attn_lse,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-        o,
-        final_lse,
-    )
+    if io_tranformed:
+        logits = logits.view(ori_total_s, num_kv_splits, ori_nhead, v_head_dim)
+        q = q.view(ori_total_s, ori_nhead, -1)
+        o = o.view(ori_total_s, ori_nhead, -1)
 
     return logits, final_lse
 
