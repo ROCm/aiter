@@ -269,6 +269,10 @@ void mla_decode_stage1_asm_fwd(
             }
             else
             {
+                if(kv_split == 1)
+		{
+                    args.ptr_R = output.data_ptr();
+		}
                 if(max_seqlen_q == 1)
                 {
                     sub_Q = 128;
@@ -336,7 +340,7 @@ void mla_decode_stage1_asm_fwd(
         gdy = 1;
         gdz = 1;
     }
-    // printf("gdx: %d \n", gdx);
+    // printf("gdz: %d \n", gdz);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,

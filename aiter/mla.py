@@ -208,8 +208,9 @@ def mla_decode_fwd(
             kv_scale,
         )
 
-        # if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):
-        #     return logits.view(total_s, nhead, v_head_dim), attn_lse
+        if num_kv_splits == 1 and q.dtype != torch.bfloat16:
+            return logits.view(total_s, nhead, v_head_dim), attn_lse
+
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
         grid = (bs, nhead)

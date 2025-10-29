@@ -14,6 +14,20 @@ torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 
+def cal_diff(
+    x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
+) -> None:
+    x, y = x.double(), y.double()
+    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    amax_diff = (x - y).abs().max().item()
+    print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
+    if use_fp8:
+        assert cos_diff < 3e-2
+    # else:
+    #     assert cos_diff < 1e-5
+
+
 def ref_masked_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -333,7 +347,7 @@ def test_mla(
 
     # aiter implementation
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
-    out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
+    out_asm_fp8 = torch.zeros((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
     q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=get_fp8_e4m3_dtype())
     q_scale = q_scale.to(torch.float)
 
@@ -345,7 +359,7 @@ def test_mla(
         # kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim), --> fp8
         q_fp8,
         kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
-        out_asm,
+        out_asm_fp8,
         qo_indptr,
         kv_indptr,
         kv_indices,
@@ -367,10 +381,13 @@ def test_mla(
         total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
     ) * (torch.finfo(dtype).bits // 8)
     err = checkAllclose(
+        out_asm_fp8,
         out_ref,
-        out_asm,
         msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
     )
+
+    cal_diff(out_ref, out_asm_fp8, "out", True)
+
     return {
         "prefill:ck_192": us_aiter,
         "prefill:asm_576": us_asm,
