@@ -1,8 +1,6 @@
 name: Operators Tuning
 
 on:
-  pull_request:
-    branches: [main] # for test
   workflow_dispatch:
     inputs:
       shapes:
