@@ -107,8 +107,9 @@ def all_reduce_fake(
     return torch.empty_like(tensor)
 
 
+# There is same name all_reduce in aiter.op, use Alias
 @torch_compile_guard(gen_fake=all_reduce_fake)
-def all_reduce(
+def all_reduce_(
     tensor: torch.Tensor, group_name: str, ca_fp8_quant: bool
 ) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -213,7 +214,7 @@ class GroupCoordinator:
         )
         self.device_communicator = None
         if use_device_communicator and self.world_size > 1:
-            from .device_communicators.cuda_communicator import CudaCommunicator
+            from .device_communicators.communicator_cuda import CudaCommunicator
 
             self.device_communicator = CudaCommunicator(
                 cpu_group=self.cpu_group,
@@ -277,7 +278,7 @@ class GroupCoordinator:
         # only cuda uses this function,
         # so we don't abstract it into the base class
         maybe_ca_context = nullcontext()
-        from aiter.dist.device_communicators.cuda_communicator import (
+        from aiter.dist.device_communicators.communicator_cuda import (
             CudaCommunicator,
         )
 
@@ -317,7 +318,7 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        return all_reduce(
+        return all_reduce_(
             input_, group_name=self.unique_name, ca_fp8_quant=ca_fp8_quant
         )
 
@@ -329,7 +330,7 @@ class GroupCoordinator:
         return self.device_communicator.all_reduce(input_, ca_fp8_quant)
 
     def _all_gather_out_place(self, input_: torch.Tensor) -> torch.Tensor:
-        ca_comm = self.ca_comm
+        ca_comm = self.device_communicator.ca_comm
         assert ca_comm is not None
         assert not ca_comm.disabled
         out = ca_comm.custom_all_gather(input_)
@@ -828,7 +829,8 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
-_DP: GroupCoordinator | None = None
+from typing import Optional
+_DP: Optional[GroupCoordinator] = None
 
 
 def get_dp_group() -> GroupCoordinator:
@@ -836,7 +838,7 @@ def get_dp_group() -> GroupCoordinator:
     return _DP
 
 
-_EP: GroupCoordinator | None = None
+_EP: Optional[GroupCoordinator] = None
 
 
 def get_ep_group() -> GroupCoordinator:
@@ -934,8 +936,8 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
-    decode_context_model_parallel_size: int | None = 1,
-    backend: str | None = None,
+    decode_context_model_parallel_size: Optional[int] = 1,
+    backend: Optional[str] = None,
 ) -> None:
     """
     Initialize model parallel groups.

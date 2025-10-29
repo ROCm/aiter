@@ -108,6 +108,7 @@ def run_ck(
         return_attn_probs,
         cu_seqlens_q,
         cu_seqlens_kv,
+        num_rotate_args=1,
     )
 
     if dropout_p > 0.0:
