@@ -659,7 +659,9 @@ def input_helper_e2e(
     softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
-    moe_config_func = get_optimal_moe_e2e_config_func(N//tp, dtype, use_fp8_w8a8=fp8_w8a8)
+    moe_config_func = get_optimal_moe_e2e_config_func(
+        N // tp, dtype, use_fp8_w8a8=fp8_w8a8
+    )
 
     config = moe_config_func(M)
 
@@ -1088,11 +1090,11 @@ def test_fused_moe_gelu(
         (3, 768, 2048, 8, 128),  # qwen3
         (333, 768, 2048, 8, 128),
         (1033, 768, 2048, 8, 128),
-        (1033, 1024, 2048, 8, 128),  
+        (1033, 1024, 2048, 8, 128),
         (3, 2048, 4096, 2, 8),  # mixtral-7B
         (33, 768, 2048, 8, 128),  # qwen3
         (333, 512, 2048, 10, 512),  # qwen3next
-        (33, 8192, 5120, 1, 128) # llama4-maverick
+        (33, 8192, 5120, 1, 128),  # llama4-maverick
         # TODO: add other shapes
     ],
 )
@@ -1100,7 +1102,7 @@ def test_fused_moe_gelu(
 @pytest.mark.parametrize("fp8_w8a8", [False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("blockshape_n, blockshape_k", [(128, 128)])
-@pytest.mark.parametrize("tp", [1,8])
+@pytest.mark.parametrize("tp", [1, 8])
 def test_moe_e2e(
     M: int,
     N: int,
@@ -1145,16 +1147,15 @@ def test_moe_e2e(
 
     # tensor parallel slicing
     if tp > 1:
-        w1 = w1[:, :N // tp, :].contiguous()
-        w2 = w2[:, :, :(N//2//tp)].contiguous()
+        w1 = w1[:, : N // tp, :].contiguous()
+        w2 = w2[:, :, : (N // 2 // tp)].contiguous()
         if fp8_w8a8:
             num_w1_scales_per_gpu = triton.cdiv(N // tp, blockshape[0])
             w1_scale = w1_scale[:, :num_w1_scales_per_gpu].contiguous()
             num_w2_scales_per_gpu = triton.cdiv((N // 2) // tp, blockshape[0])
             w2_scale = w2_scale[:, :, :num_w2_scales_per_gpu].contiguous()
-        N = N // tp # for later reshape
+        N = N // tp  # for later reshape
 
-    
     if DEBUG_MODE:
         print(f"M={M}, N={N}, K={K}, top_K={top_k}, E={E}")
         print(f"config={config}")

@@ -225,7 +225,7 @@ def e2e_moe_kernel(
         i1s = i0s + ((N // 2) // group_n)
         w1_i0_scale_ptrs = (
             W1_scale + off_experts * stride_w1se + i0s[None, :] * stride_w1sn
-        ) 
+        )
         w1_i1_scale_ptrs = (
             W1_scale + off_experts * stride_w1se + i1s[None, :] * stride_w1sn
         )
@@ -233,7 +233,7 @@ def e2e_moe_kernel(
     num_k1 = tl.cdiv(K, BLOCK_SIZE_K1)
     for k1 in tl.range(0, num_k1):
         # pipeline silu acc and mul acc so they can use the same LDS for weight loading
-        
+
         # silu acc
         if EVEN_K:
             a = tl.load(a_ptrs, mask=(token_mask[:, None]), other=0.0)
@@ -254,14 +254,10 @@ def e2e_moe_kernel(
 
         if use_fp8_w8a8:
             start_k = (k1 * BLOCK_SIZE_K1) // group_k
-            w1_scale = tl.load(
-                w1_i0_scale_ptrs + start_k * stride_w1sk
-            )
+            w1_scale = tl.load(w1_i0_scale_ptrs + start_k * stride_w1sk)
 
             # if num_scales_along_n > 1: # singleton dimension get automatic broadcast
-            w1_scale = group_broadcast(
-                w1_scale, 1, num_scales_along_n, group_n, 1
-            )
+            w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
 
             a_scale = tl.load(
                 a_scale_ptrs + start_k * stride_ask, mask=token_mask[:, None], other=0.0
@@ -282,12 +278,8 @@ def e2e_moe_kernel(
             )
 
         if use_fp8_w8a8:
-            w1_scale = tl.load(
-                w1_i1_scale_ptrs + start_k * stride_w1sk
-            )
-            w1_scale = group_broadcast(
-                w1_scale, 1, num_scales_along_n, group_n, 1
-            )
+            w1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk)
+            w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
             mul_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
         else:
             mul_acc = tl.dot(a, w1, acc=mul_acc)
@@ -311,7 +303,11 @@ def e2e_moe_kernel(
     else:
         acc = acc.to(dtype)
 
-    acc = tl.where(pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)[None, :] < N // 2, acc, 0.0)
+    acc = tl.where(
+        pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)[None, :] < N // 2,
+        acc,
+        0.0,
+    )
 
     offs_w2n = (tl.arange(0, BLOCK_SIZE_HALF) + pid_n * (BLOCK_SIZE_HALF)) % (N // 2)
 

@@ -123,7 +123,7 @@ def e2e_moe(
         )
     else:
         Intermediate = None
-    
+
     e2e_moe_kernel[grid](
         A,
         W1,

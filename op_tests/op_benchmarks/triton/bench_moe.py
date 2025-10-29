@@ -34,16 +34,26 @@ def model_benchmark_configs(args):
                 f"Missing MoE keys ('moe_intermediate_size', 'hidden_size', 'num_expert', 'top_k') in model configuration for {model_name}: skipping this model."
             )
         else:
-            N1 = config["moe_intermediate_size"] # // args.tp
+            N1 = config["moe_intermediate_size"]  # // args.tp
             K1 = config["hidden_size"]
             if not no_bench_stage2:
                 N2 = config["hidden_size"]
-                K2 = config["moe_intermediate_size"] // 2 # // args.tp
+                K2 = config["moe_intermediate_size"] // 2  # // args.tp
 
             E = config["num_expert"]
             top_k = config["top_k"]
 
-            moe_configs.append((model_name, M, N1, K1, E, top_k, "both" if args.e2e_fused else "stage1"))
+            moe_configs.append(
+                (
+                    model_name,
+                    M,
+                    N1,
+                    K1,
+                    E,
+                    top_k,
+                    "both" if args.e2e_fused else "stage1",
+                )
+            )
             if not no_bench_stage2:
                 moe_configs.append((model_name, M, N2, K2, E, top_k, "stage2"))
 
@@ -101,8 +111,8 @@ def fused_moe(
         )
         # tensor parallel slicing
         if tp > 1:
-            w1 = w1[:, :N // tp, :].contiguous()
-            w2 = w2[:, :, :(N//2//tp)].contiguous()
+            w1 = w1[:, : N // tp, :].contiguous()
+            w2 = w2[:, :, : (N // 2 // tp)].contiguous()
             if fp8_w8a8:
                 num_w1_scales_per_gpu = triton.cdiv(N // tp, block_shape[0])
                 w1_scale = w1_scale[:, :num_w1_scales_per_gpu].contiguous()
@@ -207,12 +217,12 @@ def fused_moe(
         # tensor parallel slicing
         if tp > 1:
             if stage == "stage1":
-                b = b[:, :N // tp, :].contiguous()
+                b = b[:, : N // tp, :].contiguous()
                 if fp8_w8a8:
                     num_b_scales_per_gpu = triton.cdiv(N // tp, block_shape[0])
                     b_scale = b_scale[:, :num_b_scales_per_gpu].contiguous()
             else:
-                b = b[:, :, :(K//tp)].contiguous()
+                b = b[:, :, : (K // tp)].contiguous()
                 if fp8_w8a8:
                     num_b_scales_per_gpu = triton.cdiv(K // tp, block_shape[1])
                     b_scale = b_scale[:, :, :num_b_scales_per_gpu].contiguous()
@@ -263,18 +273,27 @@ def run_benchmark(args):
     if silu_fused or e2e_fused:
         args.no_bench_stage2 = True
 
-
     if int4_w4a16:
         assert block_shape != None, "set group_size with -group_size"
 
     # python3 op_tests/test_moe_blockscale.py -d bf16 -m 32 -dim 7168 -idim 512 -e 512 -k 8
     if args.model is not None:
-        assert (args.N and args.K and args.E and args.TopK) == 0, (
-            "When -model is set, do not set -N, -K, -E or -TopK, as they are model specific."
-        )
-    
+        assert (
+            args.N and args.K and args.E and args.TopK
+        ) == 0, "When -model is set, do not set -N, -K, -E or -TopK, as they are model specific."
+
     if args.N and args.K and args.TopK and args.E:
-        x_vals_list = [("custom shape", args.M if args.M else 32, args.N, args.K, args.E, args.TopK, "custom")]
+        x_vals_list = [
+            (
+                "custom shape",
+                args.M if args.M else 32,
+                args.N,
+                args.K,
+                args.E,
+                args.TopK,
+                "custom",
+            )
+        ]
     else:
         x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k", "stage"]
@@ -327,12 +346,14 @@ def run_benchmark(args):
         # max_expert_loaded = min(E, top_k * M)
         # print("num_expert_loaded:", num_expert_loaded, "max_expert_loaded:", max_expert_loaded)
 
-        if args.tp > 1: # take tensor parallelism into account when calculating performance metrics
+        if (
+            args.tp > 1
+        ):  # take tensor parallelism into account when calculating performance metrics
             if stage == "stage1":
                 N = N // args.tp
             else:
                 K = K // args.tp
-        
+
         # (M, K) * (top_k, N, K) -> (M, top_k, N). 2 for multiplication and accumulation
         flops = 2.0 * M * top_k * K * N
         # The weight is applied on the gemm product which has the shape of (M, top_k, N)
@@ -408,7 +429,7 @@ def parse_args():
     parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-M", type=int, default=0, help="num tokens")
     parser.add_argument("-N", type=int, default=0, help="intermediate dimension")
-    parser.add_argument( "-tp", type=int, default=1, help="tensor paraller degree")
+    parser.add_argument("-tp", type=int, default=1, help="tensor paraller degree")
     parser.add_argument(
         "-K",
         type=int,
