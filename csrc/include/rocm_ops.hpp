@@ -169,6 +169,17 @@
           py::arg("kernelId") = 0,    \
           py::arg("splitK")   = 0);
 
+#define DEEPGEMM_PYBIND                      \
+    m.def("deepgemm",                        \
+          &deepgemm,                         \
+          "deepgemm",                        \
+          py::arg("XQ"),                     \
+          py::arg("WQ"),                     \
+          py::arg("Y"),                      \
+          py::arg("group_layout"),           \
+          py::arg("x_scale") = std::nullopt, \
+          py::arg("w_scale") = std::nullopt);
+
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
           &aiter::swap_blocks,                                                      \
@@ -1147,6 +1158,13 @@
 
 #define SAMPLE_PYBIND                                                                \
     m.def("greedy_sample", &aiter::greedy_sample, py::arg("out"), py::arg("input")); \
+    m.def("random_sample_outer_exponential",                                         \
+          &aiter::random_sample_outer_exponential,                                   \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("exponentials"),                                                   \
+          py::arg("temperature"),                                                    \
+          py::arg("eps") = 1e-10);                                                   \
     m.def("random_sample",                                                           \
           &aiter::random_sample,                                                     \
           py::arg("out"),                                                            \
@@ -1155,6 +1173,13 @@
           py::arg("lambd")     = 1.0,                                                \
           py::arg("generator") = std::nullopt,                                       \
           py::arg("eps")       = 1e-10);                                                   \
+    m.def("mixed_sample_outer_exponential",                                          \
+          &aiter::mixed_sample_outer_exponential,                                    \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("exponentials"),                                                   \
+          py::arg("temperature"),                                                    \
+          py::arg("eps") = 1e-10);                                                   \
     m.def("mixed_sample",                                                            \
           &aiter::mixed_sample,                                                      \
           py::arg("out"),                                                            \
@@ -1194,7 +1219,8 @@
           py::arg("out_dtype") = std::nullopt,                                     \
           py::arg("scaleA")    = std::nullopt,                                     \
           py::arg("scaleB")    = std::nullopt,                                     \
-          py::arg("scaleC")    = std::nullopt);                                       \
+          py::arg("scaleC")    = std::nullopt,                                     \
+          py::arg("bpreshuffle") = false);                                         \
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
 
 #define ROCSOLGEMM_PYBIND                                                          \
