@@ -18,6 +18,7 @@ def select_2d_config(
     max_seqlen_k,
     num_queries_per_kv,
     num_2d_prgms,
+    element_size,
 ):
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -51,12 +52,12 @@ def select_2d_config(
 
 
 def select_3d_config(
-    head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms
+    head_size, block_size, max_seqlen_k, target_num_prgms, num_2d_prgms, element_size
 ):
     TILE_SIZE = 64
     reduce_num_warps = 2
-    attn_warps = 2 if head_size < 128 else 4
-    MIN_SEGMENTS = 8 if head_size < 128 else 4
+    attn_warps = 2 if (head_size < 128 or element_size == 1)  else 4
+    MIN_SEGMENTS = 8 if (head_size < 128 or element_size == 1) else 4
 
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
@@ -89,11 +90,13 @@ def use_2d_kernel(
     max_seqlen_k,
     target_num_prgms,
     num_2d_prgms,
+    element_size,
 ):
     return (
         (sliding_window > 0)
         or (max_seqlen_k <= 512)
-        or (num_2d_prgms > target_num_prgms)
+        or (num_2d_prgms > target_num_prgms 
+            and (element_size > 1 or all_decode == False))
     )
 
 
@@ -187,7 +190,7 @@ def kernel_unified_attention_2d(
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
-    ALL_DECODE: tl.constexpr = False,  # bool
+    ALL_DECODE: tl.constexpr = False,  # bool 
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -369,7 +372,7 @@ def kernel_unified_attention_2d(
             if Q.dtype.is_fp8():
                 K = K_load
             else:
-                K = K_load.to(Q.dtype)
+                K = (K_load).to(Q.dtype)
         else:
             K = K_load
 
@@ -384,7 +387,7 @@ def kernel_unified_attention_2d(
             if Q.dtype.is_fp8():
                 V = V_load
             else:
-                V = V_load.to(Q.dtype)
+                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
         else:
             V = V_load
         # S : (BLOCK_M, TILE_SIZE)
@@ -450,10 +453,11 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        if apply_fp8_scale:
-            acc += tl.dot(P.to(V.dtype), V) * v_scale_val
-        else:
-            acc += tl.dot(P.to(V.dtype), V)
+        acc += tl.dot(P.to(V.dtype), V)
+        # if apply_fp8_scale:
+        #     acc += tl.dot(P.to(V.dtype), V)
+        # else:
+        #     acc += tl.dot(P.to(V.dtype), V)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -530,7 +534,7 @@ def kernel_unified_attention_3d(
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
-    _qk_scale: tl.constexpr = scale * RCP_LN2
+    qk_scale: tl.constexpr = scale * RCP_LN2
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -640,15 +644,15 @@ def kernel_unified_attention_3d(
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
-    if key_cache_ptr.dtype.is_fp8() and query_ptr.dtype.is_fp8() == False:
-        v_scale_val = tl.load(v_scale)
-        k_scale_val = tl.load(k_scale)
-        # apply fp8 scales together with qk_scale for perf
-        apply_fp8_scale: tl.constexpr = True
-        qk_scale = _qk_scale * k_scale_val
-    else:
-        apply_fp8_scale: tl.constexpr = False
-        qk_scale = _qk_scale
+    # if key_cache_ptr.dtype.is_fp8() and query_ptr.dtype.is_fp8() == False:
+    #     #v_scale_val = tl.load(v_scale)
+    #     k_scale_val = tl.load(k_scale)
+    #     # apply fp8 scales together with qk_scale for perf
+    #     apply_fp8_scale: tl.constexpr = True
+    #     qk_scale = _qk_scale * k_scale_val
+    # else:
+    #     apply_fp8_scale: tl.constexpr = False
+    #     qk_scale = _qk_scale
     # iterate through tiles within current segment
     for j in range(
         segm_idx * tiles_per_segment,
@@ -690,7 +694,7 @@ def kernel_unified_attention_3d(
             if Q.dtype.is_fp8():
                 K = K_load
             else:
-                K = K_load.to(Q.dtype)
+                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
         else:
             K = K_load
 
@@ -705,7 +709,7 @@ def kernel_unified_attention_3d(
             if Q.dtype.is_fp8():
                 V = V_load
             else:
-                V = V_load.to(Q.dtype)
+                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
         else:
             V = V_load
 
@@ -773,10 +777,7 @@ def kernel_unified_attention_3d(
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         # apply fp8 scales here so we dont have to have fp32 conversion
-        if apply_fp8_scale:
-            acc += tl.dot(P.to(V.dtype), V) * v_scale_val
-        else:
-            acc += tl.dot(P.to(V.dtype), V)
+        acc += tl.dot(P.to(V.dtype), V)
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
@@ -932,6 +933,7 @@ def unified_attention(
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
+    kv_element_size = k.element_size()
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -949,8 +951,10 @@ def unified_attention(
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     cu_count = get_num_sms()
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
-    cu_mult = 4 // max(1, head_size // 64)
-    cu_mult = max(1, cu_mult)
+    if head_size < 128 or k.element_size() == 1:
+        cu_mult = 4
+    else:
+        cu_mult = 2         
     target_num_prgms = cu_count * cu_mult
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
@@ -965,6 +969,7 @@ def unified_attention(
         max_seqlen_k,
         target_num_prgms,
         num_2d_prgms,
+        kv_element_size
     ):
         config = select_2d_config(
             block_size,
@@ -975,6 +980,7 @@ def unified_attention(
             max_seqlen_k,
             num_queries_per_kv,
             num_2d_prgms,
+            kv_element_size
         )
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
@@ -1034,10 +1040,10 @@ def unified_attention(
         attn_config, reduce_config = select_3d_config(
             head_size,
             block_size,
-            q.element_size(),
             max_seqlen_k,
             target_num_prgms,
             num_2d_prgms,
+            kv_element_size,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         segm_output = torch.empty(
