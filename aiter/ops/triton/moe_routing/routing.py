@@ -89,75 +89,56 @@ class RoutingData:
 # --------------------------
 
 
-class SortTokens(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, expt_scal, expt_indx, n_expts_tot, bitmatrix):
-        HIST_BLOCK_M = 32
-        INDX_OFFS_BLOCK_M = 512
-        MEMSET_BLOCK = 1024
-        cdiv = triton.cdiv
-
-        device = expt_scal.device
-        dtype = expt_scal.dtype
-        n_tokens_raw, _ = bitmatrix.shape
-        n_tokens_pad, n_expts_act = expt_scal.shape
-        n_gates_pad = n_tokens_pad * n_expts_act
-
-        hist, partial_hist = bitmatrix.sum(partials_block_size=HIST_BLOCK_M)
-        hist = hist[:n_expts_tot]
-        assert hist.dtype == torch.int32
-        # scratchpad
-        expt_offs = torch.empty(n_expts_tot, dtype=torch.int32, device=device)
-        combined_indx = torch.empty(n_gates_pad * 2, dtype=torch.int32, device=device)
-        # output
-        topk_indx = combined_indx[:n_gates_pad]
-        gate_indx = combined_indx[n_gates_pad:]
-        gate_scal = torch.empty(n_gates_pad, dtype=dtype, device=device)
-
-        token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1a, blocks2a, MEMSET_BLOCK_A, HIST2_BLOCK_M, block_m_log2_start, block_m_num = _compute_expt_data_internal(
-            hist, n_expts_tot, n_gates_pad)
-
-        blocks1b = cdiv(n_gates_pad * 2, MEMSET_BLOCK) + n_expts_tot + 1
-        blocks2b = cdiv(n_tokens_pad, HIST_BLOCK_M)
-
-        _combined_routing_memset[(blocks1a + blocks1b, )](
-            combined_indx, n_gates_pad * 2, -1, MEMSET_BLOCK, hist,  #
-            expt_offs, hist.shape[0], n_expts_tot, partial_hist,  # inputs
-            partial_hist.shape[0], partial_hist.stride(0), partial_hist.stride(1),  # outputs
-            token_offs_combined, token_offs_combined.stride(0),  #
-            blocks1a, block_pid_map,  #
-            block_m_log2_start, SIZES=block_m_num, BLOCK_A=MEMSET_BLOCK_A,  # optimization parameters
-            BLOCK_N=512, BLOCK_M=INDX_OFFS_BLOCK_M,  # tunable parameters
-        )
-
-        indx_offs = partial_hist
-
-        _combined_routing_compute[(blocks2a + blocks2b, )](
-            topk_indx, gate_indx, gate_scal,  # outputs
-            expt_scal, expt_indx, indx_offs, indx_offs.stride(0), indx_offs.stride(1),  # inputs
-            expt_offs, n_tokens_raw,  # input shape
-            HIST_BLOCK_M, n_expts_act,  # constants
-            hist, token_offs_pad, token_offs_pad.stride(0), block_pid_map, block_pid_map.stride(0),  # outputs
-            block_m_log2_start, block_m_num, HIST2_BLOCK_M, blocks2a,  # etc.
-        )
-
-        ctx.n_tokens_raw = n_tokens_raw
-        ctx.n_tokens_pad = n_tokens_pad
-        ctx.n_expts_act = n_expts_act
-        ctx.save_for_backward(gate_indx)
-        return hist, topk_indx, gate_indx, gate_scal, token_offs_raw, token_offs_pad, block_pid_map
-
-    @staticmethod
-    def backward(ctx, _0, _1, _2, dgate_scal, _3, _4, _5):
-        (gate_indx, ) = ctx.saved_tensors
-        dgate_scal = dgate_scal[gate_indx]
-        dgate_scal = dgate_scal.reshape(ctx.n_tokens_pad, ctx.n_expts_act)
-        return dgate_scal, None, None, None
-
-
 def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix):
-    return SortTokens.apply(expt_scal, expt_indx, n_expts_tot, bitmatrix)
+    HIST_BLOCK_M = 32
+    INDX_OFFS_BLOCK_M = 512
+    MEMSET_BLOCK = 1024
+    cdiv = triton.cdiv
+
+    device = expt_scal.device
+    dtype = expt_scal.dtype
+    n_tokens, n_expts_act = expt_scal.shape
+    n_gates = n_tokens * n_expts_act
+
+    hist, partial_hist = bitmatrix.sum(partials_block_size=HIST_BLOCK_M)
+    hist = hist[:n_expts_tot]
+    assert hist.dtype == torch.int32
+    # scratchpad
+    expt_offs = torch.empty(n_expts_tot, dtype=torch.int32, device=device)
+    combined_indx = torch.empty(n_gates * 2, dtype=torch.int32, device=device)
+    # output
+    topk_indx = combined_indx[:n_gates]
+    gate_indx = combined_indx[n_gates:]
+    gate_scal = torch.empty(n_gates, dtype=dtype, device=device)
+
+    token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1a, blocks2a, MEMSET_BLOCK_A, HIST2_BLOCK_M, block_m_log2_start, block_m_num = _compute_expt_data_internal(
+        hist, n_expts_tot, n_gates)
+
+    blocks1b = n_expts_tot + 1
+    blocks2b = cdiv(n_tokens, HIST_BLOCK_M)
+
+    _combined_routing_memset[(blocks1a + blocks1b, )](
+        combined_indx, n_gates * 2, -1, MEMSET_BLOCK, hist,  #
+        expt_offs, hist.shape[0], n_expts_tot, partial_hist,  # inputs
+        partial_hist.shape[0], partial_hist.stride(0), partial_hist.stride(1),  # outputs
+        token_offs_combined, token_offs_combined.stride(0),  #
+        blocks1a, block_pid_map,  #
+        block_m_log2_start, SIZES=block_m_num, BLOCK_A=MEMSET_BLOCK_A,  # optimization parameters
+        BLOCK_N=512, BLOCK_M=INDX_OFFS_BLOCK_M,  # tunable parameters
+    )
+
+    indx_offs = partial_hist
+
+    _combined_routing_compute[(blocks2a + blocks2b, )](
+        topk_indx, gate_indx, gate_scal,  # outputs
+        expt_scal, expt_indx, indx_offs, indx_offs.stride(0), indx_offs.stride(1),  # inputs
+        expt_offs, n_tokens,  # input shape
+        HIST_BLOCK_M, n_expts_act,  # constants
+        hist, token_offs_pad, token_offs_pad.stride(0), block_pid_map, block_pid_map.stride(0),  # outputs
+        block_m_log2_start, block_m_num, HIST2_BLOCK_M, blocks2a,  # etc.
+    )
+
+    return hist, topk_indx, gate_indx, gate_scal, token_offs_raw, token_offs_pad, block_pid_map
 
 
 # --------------------------

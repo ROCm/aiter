@@ -117,7 +117,7 @@ def _combined_routing_memset(Indx, size, sentinel, BLOCK: tl.constexpr, ExpertHi
                              blocks1a, MDTileInfo, first_tile_dim_log2, SIZES: tl.constexpr, BLOCK_A: tl.constexpr,
                              BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr):
     """
-    This kernel essentially combines 6 different pieces of functionality,
+    This kernel essentially combines 5 different pieces of functionality,
     statically branching on the value of tl.program_id(0) to decide which
     codepath to take.
 
@@ -126,7 +126,6 @@ def _combined_routing_memset(Indx, size, sentinel, BLOCK: tl.constexpr, ExpertHi
         SIZES < pid < blocks1a:                    initialise MDTileInfo to 0xffffffff
         blocks1a <= pid < blocks1a + n_expts_tot:  compute_indx_offs
         pid == blocks1a + n_expts_tot:             compute_expt_offs
-        pid > blocks1a + n_expts_tot:              initialise Indx to sentinel
 
     As each of these is a relatively trivial workload, launching them from
     this single trampoline is beneficial as they can execute on different
@@ -140,9 +139,5 @@ def _combined_routing_memset(Indx, size, sentinel, BLOCK: tl.constexpr, ExpertHi
                           SIZES, BLOCK_A)
     elif pid == n_expts_tot + blocks1a:
         _routing_compute_expt_offs(ExpertHist, FinalExpertOffs, hist_size, BLOCK_N)
-    elif pid < n_expts_tot + blocks1a:
-        _routing_compute_indx_offs(PartialHist, shape_pm, stride_pm, stride_pn, BLOCK_M, pid - blocks1a)
     else:
-        offs = (pid - n_expts_tot - blocks1a - 1) * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < size
-        tl.store(Indx + offs, sentinel, mask=mask)
+        _routing_compute_indx_offs(PartialHist, shape_pm, stride_pm, stride_pn, BLOCK_M, pid - blocks1a)
