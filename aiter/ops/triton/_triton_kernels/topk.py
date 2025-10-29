@@ -10,10 +10,44 @@ import triton
 import triton.language as tl
 import triton.language.core as core
 from triton.language.standard import _log2, zeros_like
+from ..utils._triton.kernel_repr import make_kernel_repr
+
+
+_topk_kernel_repr = make_kernel_repr(
+    "_topk_kernel",
+    [
+        "M",
+        "K",
+        "BLOCK",
+        "FILL_VALUE",
+    ],
+)
+
+_topk_stage1_kernel_repr = make_kernel_repr(
+    "topk_stage1_kernel",
+    [
+        "N",
+        "CHUNK_SIZE",
+        "DESCENDING",
+        "FILL_VALUE",
+    ],
+)
+
+_topk_stage2_kernel_repr = make_kernel_repr(
+    "topk_stage2_kernel",
+    [
+        "k",
+        "N",
+        "BLOCK_SIZE",
+        "DESCENDING",
+        "FILL_VALUE",
+        "MASK_INDEX_VAL",
+    ],
+)
 
 
 # 1-STAGE KERNEL (tiny rows)
-@triton.jit
+@triton.jit(repr=_topk_kernel_repr)
 def _topk_kernel(
     X,
     OUT_V,
@@ -53,7 +87,7 @@ def _topk_kernel(
 
 
 # 2-STAGE KERNEL (large rows)
-@triton.jit
+@triton.jit(repr=_topk_stage1_kernel_repr)
 def topk_stage1_kernel(
     y_ptr,
     index_ptr,
@@ -211,7 +245,7 @@ def argsort(x, ids, dim: tl.constexpr, descending: core.constexpr):
     return x, ids
 
 
-@triton.jit
+@triton.jit(repr=_topk_stage2_kernel_repr)
 def topk_stage2_kernel(
     y_ptr,
     index_ptr,

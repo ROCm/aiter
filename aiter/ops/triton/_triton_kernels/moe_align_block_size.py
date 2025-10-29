@@ -62,7 +62,7 @@ def _moe_align_block_size_stage1_kernel(
             tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
 
 
-@triton.jit
+@triton.jit(repr=_moe_align_block_size_stage2_repr)
 def _moe_align_block_size_stage2_kernel(
     tokens_cnts_ptr,
     num_experts: tl.constexpr,
@@ -76,7 +76,7 @@ def _moe_align_block_size_stage2_kernel(
         tl.store(tokens_cnts_ptr + i * num_experts + pid, last_cnt)
 
 
-@triton.jit
+@triton.jit(repr=_moe_align_block_size_stage3_repr)
 def _moe_align_block_size_stage3_kernel(
     total_tokens_post_pad_ptr,
     tokens_cnts_ptr,
@@ -93,7 +93,7 @@ def _moe_align_block_size_stage3_kernel(
     tl.store(total_tokens_post_pad_ptr, last_cumsum)
 
 
-@triton.jit
+@triton.jit(repr=_moe_align_block_size_stage4_repr)
 def _moe_align_block_size_stage4_kernel(
     topk_ids_ptr,
     sorted_token_ids_ptr,
