@@ -8,6 +8,21 @@ import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
+
+
+_batched_gemm_a8w8_repr = make_kernel_repr(
+    "_batched_gemm_a8w8_kernel",
+    [
+        "HAS_BIAS",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "EVEN_K",
+        "GRID_MN",
+    ],
+)
 
 
 @triton.heuristics(
@@ -17,7 +32,7 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_batched_gemm_a8w8_repr)
 def _batched_gemm_a8w8_kernel(
     # Pointers to matrices
     a_ptr,
