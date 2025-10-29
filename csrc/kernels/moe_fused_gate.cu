@@ -66,7 +66,7 @@ __device__ inline bool cmp_gt(const T& a, const T& b)
 
 // Chunked device implementation: scans per-thread VPT in bounded chunks to avoid
 // allocating large per-thread temporaries. This implementation is targeted at the
-// corner-case where per-thread VPT > MAX_VPT but topk==1.
+// corner-case where per-thread VPT > MAX_VPT and supports topk=8 only.
 template <typename T, typename Params>
 __device__ void moe_fused_gate_flat_impl(void* input,
                                            void* bias,
@@ -76,7 +76,7 @@ __device__ void moe_fused_gate_flat_impl(void* input,
                                            double routed_scaling_factor,
                                            Params params)
 {
-    constexpr int topk = 1;
+    constexpr int topk = 8;
 
     int tidx           = threadIdx.x;
     int64_t thread_row = blockIdx.x * params.ROWS_PER_CTA + threadIdx.y * params.ROWS_PER_WARP +
@@ -86,9 +86,6 @@ __device__ void moe_fused_gate_flat_impl(void* input,
         return;
     }
 
-    // For the single-thread-per-row / topk==1 fallback we don't need shared memory
-    // scratch. We'll write indices and outputs directly.
-
     auto* input_ptr      = reinterpret_cast<T*>(input);
     auto* bias_ptr       = reinterpret_cast<T*>(bias);
     auto* thread_row_ptr = input_ptr + thread_row * params.NUM_EXPERTS;
@@ -96,98 +93,141 @@ __device__ void moe_fused_gate_flat_impl(void* input,
     int thread_group_idx         = tidx % params.THREADS_PER_ROW;
     int first_elt_read_by_thread = thread_group_idx * params.VPT;
 
-    // Compute local best (only top-1) across params.VPT using chunked loads
-    float best_val = -FLT_MAX;
-    int best_idx   = -1;
-    float best_row = 0.0f;
+    // Fixed-size arrays to minimize register pressure (topk=8)
+    float topk_scores[8];      // Store sigmoid values for selected experts
+    int topk_indices[8];       // Store local indices for selected experts
+    float topk_combined[8];    // Store combined values for comparison
+    
+    // Initialize to worst case
+    #pragma unroll
+    for(int i = 0; i < 8; ++i)
+    {
+        topk_scores[i] = 0.0f;
+        topk_indices[i] = -1;
+        topk_combined[i] = -FLT_MAX;
+    }
 
-        // Double-buffered 32-byte vector loads to better hide memory latency.
-        // vec_size32 = number of T elements per 32 bytes (e.g., float -> 8, half -> 16)
-        constexpr int vec_size32 = 32 / sizeof(T);
-        using Vec32T = ck_tile::vec_t<T, vec_size32>;
+    // Double-buffered 32-byte vector loads to better hide memory latency.
+    // vec_size32 = number of T elements per 32 bytes (e.g., float -> 8, half -> 16)
+    constexpr int vec_size32 = 32 / sizeof(T);
+    using Vec32T = ck_tile::vec_t<T, vec_size32>;
 
-        int nvec = params.VPT / vec_size32;
-        int rem  = params.VPT % vec_size32;
+    int nvec = params.VPT / vec_size32;
+    int rem  = params.VPT % vec_size32;
 
-        if(nvec > 0)
+    // Helper lambda to insert into top-8 heap
+    auto insert_topk = [&](float sigmoid_val, float combined_val, int local_idx) {
+        // Find position to insert (maintain sorted order by combined value)
+        // We keep the array sorted in ascending order, so topk_combined[7] has the max
+        if(cmp_gt(combined_val, topk_combined[0]))
         {
-            // prefetch first
-            int base0 = first_elt_read_by_thread;
-            const Vec32T* vptr0 = reinterpret_cast<const Vec32T*>(thread_row_ptr + base0);
-            const Vec32T* bptr0 = reinterpret_cast<const Vec32T*>(bias_ptr + base0);
-            Vec32T cur_v = *vptr0;
-            Vec32T cur_b = *bptr0;
-
-            for(int vi = 1; vi < nvec; ++vi)
+            // Find the position where this value should be inserted
+            int insert_pos = 0;
+            #pragma unroll
+            for(int k = 1; k < 8; ++k)
             {
-                int next_base = first_elt_read_by_thread + vi * vec_size32;
-                const Vec32T* nvptr = reinterpret_cast<const Vec32T*>(thread_row_ptr + next_base);
-                const Vec32T* nbptr = reinterpret_cast<const Vec32T*>(bias_ptr + next_base);
-                Vec32T next_v = *nvptr;
-                Vec32T next_b = *nbptr;
-
-                // process current vector
-                for(int j = 0; j < vec_size32; ++j)
+                if(cmp_gt(combined_val, topk_combined[k]))
                 {
-                    float a = ck_tile::type_convert<float>(cur_v(j));
-                    float row_val = 1.0f / (1.0f + expf(-a));
-                    float b = ck_tile::type_convert<float>(cur_b(j));
-                    float combined = row_val + b;
-                    int local_idx = (vi - 1) * vec_size32 + j;
-                    if(cmp_gt(combined, best_val))
-                    {
-                        best_val = combined;
-                        best_idx = local_idx;
-                        best_row = row_val;
-                    }
+                    insert_pos = k;
                 }
-
-                // swap
-                cur_v = next_v;
-                cur_b = next_b;
+                else
+                {
+                    break;
+                }
             }
+            
+            // Shift elements from 0 to insert_pos-1 down by one position
+            #pragma unroll
+            for(int k = 0; k < 7; ++k)
+            {
+                if(k < insert_pos)
+                {
+                    topk_combined[k] = topk_combined[k+1];
+                    topk_scores[k] = topk_scores[k+1];
+                    topk_indices[k] = topk_indices[k+1];
+                }
+            }
+            
+            // Insert the new value
+            topk_combined[insert_pos] = combined_val;
+            topk_scores[insert_pos] = sigmoid_val;
+            topk_indices[insert_pos] = local_idx;
+        }
+    };
 
-            // process last prefetched vector
+    if(nvec > 0)
+    {
+        // prefetch first
+        int base0 = first_elt_read_by_thread;
+        const Vec32T* vptr0 = reinterpret_cast<const Vec32T*>(thread_row_ptr + base0);
+        const Vec32T* bptr0 = reinterpret_cast<const Vec32T*>(bias_ptr + base0);
+        Vec32T cur_v = *vptr0;
+        Vec32T cur_b = *bptr0;
+
+        for(int vi = 1; vi < nvec; ++vi)
+        {
+            int next_base = first_elt_read_by_thread + vi * vec_size32;
+            const Vec32T* nvptr = reinterpret_cast<const Vec32T*>(thread_row_ptr + next_base);
+            const Vec32T* nbptr = reinterpret_cast<const Vec32T*>(bias_ptr + next_base);
+            Vec32T next_v = *nvptr;
+            Vec32T next_b = *nbptr;
+
+            // process current vector
             for(int j = 0; j < vec_size32; ++j)
             {
                 float a = ck_tile::type_convert<float>(cur_v(j));
                 float row_val = 1.0f / (1.0f + expf(-a));
                 float b = ck_tile::type_convert<float>(cur_b(j));
                 float combined = row_val + b;
-                int local_idx = (nvec - 1) * vec_size32 + j;
-                if(cmp_gt(combined, best_val))
-                {
-                    best_val = combined;
-                    best_idx = local_idx;
-                    best_row = row_val;
-                }
+                int local_idx = (vi - 1) * vec_size32 + j;
+                insert_topk(row_val, combined, local_idx);
             }
+
+            // swap
+            cur_v = next_v;
+            cur_b = next_b;
         }
 
-        // Remainder scalar tail
-        for(int t = params.VPT - rem; t < params.VPT; ++t)
+        // process last prefetched vector
+        for(int j = 0; j < vec_size32; ++j)
         {
-            int local_idx = t;
-            float a = ck_tile::type_convert<float>(thread_row_ptr[first_elt_read_by_thread + local_idx]);
+            float a = ck_tile::type_convert<float>(cur_v(j));
             float row_val = 1.0f / (1.0f + expf(-a));
-            float b = ck_tile::type_convert<float>(bias_ptr[first_elt_read_by_thread + local_idx]);
+            float b = ck_tile::type_convert<float>(cur_b(j));
             float combined = row_val + b;
-            if(cmp_gt(combined, best_val))
-            {
-                best_val = combined;
-                best_idx = local_idx;
-                best_row = row_val;
-            }
+            int local_idx = (nvec - 1) * vec_size32 + j;
+            insert_topk(row_val, combined, local_idx);
         }
+    }
 
+    // Remainder scalar tail
+    for(int t = params.VPT - rem; t < params.VPT; ++t)
+    {
+        int local_idx = t;
+        float a = ck_tile::type_convert<float>(thread_row_ptr[first_elt_read_by_thread + local_idx]);
+        float row_val = 1.0f / (1.0f + expf(-a));
+        float b = ck_tile::type_convert<float>(bias_ptr[first_elt_read_by_thread + local_idx]);
+        float combined = row_val + b;
+        insert_topk(row_val, combined, local_idx);
+    }
 
-    // Top-k selection. Single-thread-per-row, topk==1: directly select the local best
-    // global expert id
-    int64_t idx = thread_row; // topk==1 -> idx = topk * thread_row
-    int expert = first_elt_read_by_thread + best_idx;
-    indices_ptr[idx] = ck_tile::type_convert<int32_t>(expert);
-    // With topk==1 the normalized output weight is 1.0
-    output_ptr[idx] = 1.0f;
+    // Compute normalization factor (sum of sigmoid values)
+    float output_sum = 0.0f;
+    #pragma unroll
+    for(int k_idx = 0; k_idx < 8; ++k_idx)
+    {
+        output_sum += topk_scores[k_idx];
+    }
+
+    // Write normalized outputs (in descending order of combined value)
+    #pragma unroll
+    for(int k_idx = 0; k_idx < 8; ++k_idx)
+    {
+        int64_t idx = 8 * thread_row + k_idx;
+        int expert = first_elt_read_by_thread + topk_indices[7 - k_idx]; // reverse order
+        indices_ptr[idx] = ck_tile::type_convert<int32_t>(expert);
+        output_ptr[idx] = topk_scores[7 - k_idx] / output_sum;
+    }
 }
 
 template <typename T>
@@ -652,13 +692,14 @@ __global__ void moe_fused_gate_kernel_dynamic(void* input,
         return;
     }
 
+    // Flat implementation for topk=8
     moe_fused_gate_flat_impl<T>(input,
-                           bias,
-                           output_ptr,
-                           indices_ptr,
-                           num_rows,
-                           routed_scaling_factor,
-                           params);
+                                 bias,
+                                 output_ptr,
+                                 indices_ptr,
+                                 num_rows,
+                                 routed_scaling_factor,
+                                 params);
 }
 
 //------------------------------------------------------------------------------
@@ -692,10 +733,9 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
 
     // Check 1: Ensure that num_experts is a power of 2.
     TORCH_CHECK((num_experts & (num_experts - 1)) == 0 || 
-    // This is a flat call to compute sigmoid activation
-                (topk == 1 &&
-                 num_expert_group == 1 && 
-                 topk_group==1 && num_fused_shared_experts == 0),
+                // Flat implementation supports non-power-of-2 with topk=8 only
+                (topk == 8 && num_expert_group == 1 && 
+                 topk_group == 1 && num_fused_shared_experts == 0),
                 "num_experts must be a power of 2, but got ",
                 num_experts);
 
@@ -708,11 +748,11 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
                 num_expert_group);
 
     int computed_vpt = num_experts / num_expert_group;
-    // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=32. Maximum VPT
-    // indicate max value per threads we can process.
-    TORCH_CHECK(computed_vpt <= MAX_VPT || (topk == 1 &&
-                 num_expert_group == 1 &&
-                 topk_group==1 && num_fused_shared_experts == 0),
+    // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=32.
+    // Flat implementation can handle VPT > MAX_VPT but only with topk=8
+    TORCH_CHECK(computed_vpt <= MAX_VPT || 
+                (topk == 8 && num_expert_group == 1 &&
+                 topk_group == 1 && num_fused_shared_experts == 0),
                 "Per group experts: num_experts / num_expert_group = (",
                 computed_vpt,
                 ") exceeds the maximum supported (",

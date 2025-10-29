@@ -281,7 +281,7 @@ df = []
 for dtype in l_dtype:
     for e in l_expert:
         for m in l_m:
-            ret = test_topk_softmax(dtype, m, e, 5)
+            ret = test_topk_softmax(dtype, m, e, 8)
             df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary:\n{df}")
@@ -289,7 +289,7 @@ aiter.logger.info(f"summary:\n{df}")
 df = []
 for token in l_token:
     # DeepSeek-R1
-    topk = 1
+    topk = 8
     group = 1
     topk_group = 1
     expert = 160
@@ -306,7 +306,7 @@ df = []
 for token in l_token:
     for scoring_func in ["softmax", "sigmoid"]:
         # DeepSeek-R1
-        topk = 1
+        topk = 8
         group = 1
         topk_group = 1
         expert = 160
