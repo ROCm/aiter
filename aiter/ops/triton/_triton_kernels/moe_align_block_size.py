@@ -19,7 +19,7 @@ _moe_align_block_size_stage2_repr = make_kernel_repr(
     "_moe_align_block_size_stage2_kernel",
     [
         "num_experts",
-        ],
+    ],
 )
 
 _moe_align_block_size_stage3_repr = make_kernel_repr(
