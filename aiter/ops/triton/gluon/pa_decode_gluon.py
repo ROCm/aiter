@@ -1,26 +1,15 @@
-from typing import Tuple, List, Dict
 from typing import Optional
-import re
 import torch
-import pytest
-import numpy as np
-import hashlib
 import math
 import tempfile
 import os
 
 import triton
 import triton.language as tl
-from triton.compiler.code_generator import ast_to_ttir
 from triton.compiler.compiler import compile
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language.nvidia.ampere import async_copy
-from triton.experimental.gluon.language.nvidia.hopper import tma, mbarrier, fence_async_shared
-from triton.experimental.gluon.language.nvidia import hopper
-from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
-from triton.experimental.gluon.language.extra import libdevice
 
 from aiter.test_common import perftest
 
@@ -41,19 +30,21 @@ def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
+
+
 setup_seed(123)
 
 
 @gluon.jit
 def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
-    exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-    q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
-    k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
-    v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-    blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
-    seq_lens_ptr,       # [num_seqs]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+    q_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
+    k_cache_ptr,  # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+    v_cache_ptr,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    blk_tables_ptrs,  # [num_seqs, max_num_blks_per_seq]
+    seq_lens_ptr,  # [num_seqs]
     scale,
     k_scale,
     v_scale,
@@ -111,26 +102,29 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # # 1 x QUERY_GRP_SZ_POW2 x HEAD_SZ_POW2
     # # 1 x 8(mdim) x 128(kdim)
     blocked_q: gl.constexpr = gl.BlockedLayout(
-        size_per_thread =[1, 8],
+        size_per_thread=[1, 8],
         threads_per_warp=[4, 16],
-        warps_per_cta   =[4, 1],
-        order           =[1, 0],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
     )
     shared_a_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
     # MAX_NUM_KV_BLKS x K_HEAD_SZ_POW2_SPLIT x KV_BLK_SZ_POW2 x CONTIGUOUS_KV_ELEMS_16B_LOAD
     # 16 x 16 x 16 x 8
     blocked_k: gl.constexpr = gl.BlockedLayout(
-        size_per_thread =[1, 1, 1, 8],
+        size_per_thread=[1, 1, 1, 8],
         threads_per_warp=[1, 4, 16, 1],
-        warps_per_cta   =[4, 1, 1, 1],
-        order           =[3, 2, 1, 0],
+        warps_per_cta=[4, 1, 1, 1],
+        order=[3, 2, 1, 0],
     )
 
     # transposed: indicates the result tensor is transposed so that each thread holds consecutive elements
     # in the same row instead of column, which is good for chained dot and global write.
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         # version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[4, 1]
-        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+        version=3,
+        instr_shape=[16, 16],
+        transposed=True,
+        warps_per_cta=[1, 4],
     )
     qk_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=qk_mfma_layout, k_width=8
@@ -155,35 +149,55 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     head_sz_layout: gl.constexpr = gl.SliceLayout(0, blocked_q)
 
     # blocked_k dim0
-    blk_id_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_k)))
+    blk_id_layout: gl.constexpr = gl.SliceLayout(
+        1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_k))
+    )
     # blocked_k dim1
-    head_sz_div_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, gl.SliceLayout(3, blocked_k)))
+    head_sz_div_layout: gl.constexpr = gl.SliceLayout(
+        0, gl.SliceLayout(2, gl.SliceLayout(3, blocked_k))
+    )
     # blocked_k dim2
-    blk_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(3, blocked_k)))
+    blk_layout: gl.constexpr = gl.SliceLayout(
+        0, gl.SliceLayout(1, gl.SliceLayout(3, blocked_k))
+    )
     # blocked_k dim3
-    contiguous_kv_elems_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, blocked_k)))
+    contiguous_kv_elems_layout: gl.constexpr = gl.SliceLayout(
+        0, gl.SliceLayout(1, gl.SliceLayout(2, blocked_k))
+    )
 
     q_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=query_grp_sz_layout)
     head_sz_offs = gl.arange(0, HEAD_SZ_POW2, layout=head_sz_layout)
     head_sz_div_offs = gl.arange(0, K_HEAD_SZ_POW2_SPLIT, layout=head_sz_div_layout)
     blk_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=blk_layout)
-    contiguous_kv_elems_offs = gl.arange(0, CONTIGUOUS_KV_ELEMS_16B_LOAD, layout=contiguous_kv_elems_layout)
+    contiguous_kv_elems_offs = gl.arange(
+        0, CONTIGUOUS_KV_ELEMS_16B_LOAD, layout=contiguous_kv_elems_layout
+    )
 
     kv_blk_start = seq_part_idx * MAX_NUM_KV_BLKS
-    qk_row_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
-    qk_col_offs = seq_start_idx + gl.arange(0, SEQ_PARTITION_SZ, layout=gl.SliceLayout(0, qk_mfma_layout))
+    qk_row_offs = gl.arange(
+        0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout)
+    )
+    qk_col_offs = seq_start_idx + gl.arange(
+        0, SEQ_PARTITION_SZ, layout=gl.SliceLayout(0, qk_mfma_layout)
+    )
 
     # load alibi slopes[QUERY_GRP_SZ_POW2]
     if alibi_slopes is None:
         alibi_slope = gl.zeros([QUERY_GRP_SZ_POW2], dtype=gl.float32)
     else:
-        alibi_slope = gl.amd.cdna3.buffer_load(ptr=alibi_slopes + kv_head_idx * QUERY_GRP_SZ, offsets=qk_row_offs, mask=qk_row_offs < QUERY_GRP_SZ)
+        alibi_slope = gl.amd.cdna3.buffer_load(
+            ptr=alibi_slopes + kv_head_idx * QUERY_GRP_SZ,
+            offsets=qk_row_offs,
+            mask=qk_row_offs < QUERY_GRP_SZ,
+        )
 
     # load all kv blocks in one time
     blk_ids = gl.arange(0, MAX_NUM_KV_BLKS, layout=blk_id_layout)
     masked_blk_ids = gl.where(blk_ids < num_kv_blks, blk_ids, 0)
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
-    kv_blk_nums = gl.amd.cdna3.buffer_load(ptr=blk_tables_start_ptr + kv_blk_start, offsets=masked_blk_ids)
+    kv_blk_nums = gl.amd.cdna3.buffer_load(
+        ptr=blk_tables_start_ptr + kv_blk_start, offsets=masked_blk_ids
+    )
 
     # load q[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     q_offs = (
@@ -212,7 +226,11 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # k[HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
     kt = tl.reshape(kt_temp, [HEAD_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2])
 
-    accumulator = gl.zeros((QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2), dtype=gl.float32, layout=qk_mfma_layout)
+    accumulator = gl.zeros(
+        (QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2),
+        dtype=gl.float32,
+        layout=qk_mfma_layout,
+    )
     # qc = gl.convert_layout(q, layout=qk_lhs_layout)
     qc = q_shared.load(qk_lhs_layout)
     kc = gl.convert_layout(kt, layout=qk_rhs_layout)
@@ -220,10 +238,12 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     qk = gl.amd.cdna3.mfma(qc, kc, accumulator) * scale * k_scale_val
 
     if SLIDING_WINDOW > 0:
-        qk = gl.where(qk_col_offs[None, :] > seq_len-SLIDING_WINDOW, qk, -100000.0)
+        qk = gl.where(qk_col_offs[None, :] > seq_len - SLIDING_WINDOW, qk, -100000.0)
 
     if alibi_slopes is not None:
-        qk += (alibi_slope[:, None] * (qk_col_offs - seq_len + 1)[None, :]).to(gl.float32)
+        qk += (alibi_slope[:, None] * (qk_col_offs - seq_len + 1)[None, :]).to(
+            gl.float32
+        )
 
     qk = gl.where(
         (qk_row_offs[:, None] < QUERY_GRP_SZ) & (qk_col_offs[None, :] < seq_len),
@@ -233,13 +253,15 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
 
     max_logit_new = gl.max(qk, axis=1)
     max_logit_new = gl.where(max_logit_new > float("-inf"), max_logit_new, 0.0)
-    
+
     # p[QUERY_GRP_SZ_POW2, MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2]
     p = tl.math.exp2((qk - max_logit_new[:, None]) * log2e)
     exp_sum = gl.sum(p, axis=1)
     p = p.to(compute_type)
 
-    m_l_base_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout))
+    m_l_base_offs = gl.arange(
+        0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, qk_mfma_layout)
+    )
     m_l_offs = (
         seq_idx * stride_max_logits_s
         + kv_head_idx * stride_max_logits_nh
@@ -247,22 +269,50 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         + m_l_base_offs
     )
     m_l_grp_mask = m_l_base_offs < QUERY_GRP_SZ
-    gl.amd.cdna3.buffer_store(stored_value=max_logit_new, ptr=max_logits_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
-    gl.amd.cdna3.buffer_store(stored_value=exp_sum, ptr=exp_sums_ptr, offsets=m_l_offs, mask=m_l_grp_mask)
+    gl.amd.cdna3.buffer_store(
+        stored_value=max_logit_new,
+        ptr=max_logits_ptr,
+        offsets=m_l_offs,
+        mask=m_l_grp_mask,
+    )
+    gl.amd.cdna3.buffer_store(
+        stored_value=exp_sum, ptr=exp_sums_ptr, offsets=m_l_offs, mask=m_l_grp_mask
+    )
     # MAX_NUM_KV_BLKS x HEAD_SZ_POW2 x KV_BLK_SZ_POW2
     # 16(kdim0) x 128(ndim) x 16(kdim1)
-    blocked_v_layout: gl.constexpr = gl.DistributedLinearLayout( # 256x128
-        reg_bases=((0,0,1), (0,0,2), (0,0,4), (0,0,8), (4,0,0), (8,0,0), (0,64,0)), # 16 x 8
-        lane_bases=((0,1,0), (0,2,0), (0,4,0), (0,8,0), (1,0,0), (2,0,0)), # 64
-        warp_bases=((0,16,0), (0,32,0)), # 4
-        block_bases=[], # 8
+    blocked_v_layout: gl.constexpr = gl.DistributedLinearLayout(  # 256x128
+        reg_bases=(
+            (0, 0, 1),
+            (0, 0, 2),
+            (0, 0, 4),
+            (0, 0, 8),
+            (4, 0, 0),
+            (8, 0, 0),
+            (0, 64, 0),
+        ),  # 16 x 8
+        lane_bases=(
+            (0, 1, 0),
+            (0, 2, 0),
+            (0, 4, 0),
+            (0, 8, 0),
+            (1, 0, 0),
+            (2, 0, 0),
+        ),  # 64
+        warp_bases=((0, 16, 0), (0, 32, 0)),  # 4
+        block_bases=[],  # 8
         shape=[16, 128, 16],
     )
-    v_dim1_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_v_layout)))
-    v_dim2_offs = gl.arange(0, KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_v_layout)))
+    v_dim1_offs = gl.arange(
+        0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(2, blocked_v_layout))
+    )
+    v_dim2_offs = gl.arange(
+        0, KV_BLK_SZ_POW2, layout=gl.SliceLayout(0, gl.SliceLayout(1, blocked_v_layout))
+    )
 
     # # load all kv blocks in one time
-    kv_blk_nums2 = gl.convert_layout(kv_blk_nums, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout)))
+    kv_blk_nums2 = gl.convert_layout(
+        kv_blk_nums, layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_v_layout))
+    )
     # v_blk_offs[MAX_NUM_KV_BLKS, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
     v_blk_offs = (
         kv_blk_nums2[:, None, None] * stride_v_b
@@ -279,7 +329,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     v = gl.permute(v, [0, 2, 1])
     # v[MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2]
     v = gl.reshape(v, [MAX_NUM_KV_BLKS * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
-    accumulator2 = gl.zeros((QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout)
+    accumulator2 = gl.zeros(
+        (QUERY_GRP_SZ_POW2, HEAD_SZ_POW2), dtype=gl.float32, layout=pv_mfma_layout
+    )
 
     pc = gl.convert_layout(p, layout=pv_lhs_layout)
     vc = gl.convert_layout(v, layout=pv_rhs_layout)
@@ -290,8 +342,12 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     acc = acc.to(compute_type)
 
     # end up computation
-    o_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, pv_mfma_layout))
-    o_head_sz_offs = gl.arange(0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, pv_mfma_layout))
+    o_grp_offs = gl.arange(
+        0, QUERY_GRP_SZ_POW2, layout=gl.SliceLayout(1, pv_mfma_layout)
+    )
+    o_head_sz_offs = gl.arange(
+        0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, pv_mfma_layout)
+    )
     o_mask = (o_grp_offs[:, None] < QUERY_GRP_SZ) & (o_head_sz_offs[None, :] < HEAD_SZ)
     logits_offs = seq_idx * stride_logits_s
     logits_offs += kv_head_idx * stride_logits_nh
@@ -300,13 +356,15 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         + o_grp_offs[:, None] * stride_logits_g
         + o_head_sz_offs[None, :]
     )
-    gl.amd.cdna3.buffer_store(stored_value=acc, ptr=logits_ptr, offsets=logits_offs, mask=o_mask)
+    gl.amd.cdna3.buffer_store(
+        stored_value=acc, ptr=logits_ptr, offsets=logits_offs, mask=o_mask
+    )
 
 
 # Compile ttgir with triton
 def compile_ttgir_with_triton(ttgir_content: str):
     # Read ttgir string from file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.ttgir', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".ttgir", delete=False) as f:
         f.write(ttgir_content)
         ttgir_path = f.name
 
@@ -317,18 +375,19 @@ def compile_ttgir_with_triton(ttgir_content: str):
     finally:
         os.unlink(ttgir_path)
 
+
 @perftest()
 # @perftest(num_iters=TEST_NUM_ITERS)
 def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     grid,
-    exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-    q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
-    k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
-    v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-    blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
-    seq_lens_ptr,       # [num_seqs]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+    q_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
+    k_cache_ptr,  # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+    v_cache_ptr,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    blk_tables_ptrs,  # [num_seqs, max_num_blks_per_seq]
+    seq_lens_ptr,  # [num_seqs]
     scale,
     k_scale,
     v_scale,
@@ -356,7 +415,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     QUERY_GRP_SZ,
     KV_BLK_SZ,
     SEQ_PARTITION_SZ,
-    SLIDING_WINDOW
+    SLIDING_WINDOW,
 ):
     # Use ttgir as input
     # print(f"_paged_attn_decode_v2_w_dot_kernel_reshape_wrapper")
@@ -365,20 +424,20 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
 
     # if 1:
     if 0:
-        with open(ttgir_file_path, 'r') as f:
+        with open(ttgir_file_path, "r") as f:
             ttgir_content = f.read()
 
         try:
             compiled_kernel = compile_ttgir_with_triton(ttgir_content)
             compiled_kernel[grid](
-                exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-                max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-                logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-                q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
-                k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
-                v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-                blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
-                seq_lens_ptr,       # [num_seqs]
+                exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+                max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+                logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+                q_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
+                k_cache_ptr,  # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+                v_cache_ptr,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+                blk_tables_ptrs,  # [num_seqs, max_num_blks_per_seq]
+                seq_lens_ptr,  # [num_seqs]
                 scale,
                 k_scale,
                 v_scale,
@@ -405,14 +464,14 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     else:
         # _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk[grid](
         _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon[grid](
-            exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-            max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-            logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-            q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
-            k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
-            v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-            blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
-            seq_lens_ptr,       # [num_seqs]
+            exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+            max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+            logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+            q_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
+            k_cache_ptr,  # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+            v_cache_ptr,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+            blk_tables_ptrs,  # [num_seqs, max_num_blks_per_seq]
+            seq_lens_ptr,  # [num_seqs]
             scale,
             k_scale,
             v_scale,
@@ -441,14 +500,15 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             SLIDING_WINDOW=SLIDING_WINDOW,
         )
 
+
 @perftest()
 def _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
     grid,
-    out_ptr,        # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
-    exp_sums_ptr,   # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    max_logits_ptr, # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    logits_ptrs,    # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-    seq_lens_ptr,   # [num_seqs]
+    out_ptr,  # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    logits_ptrs,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+    seq_lens_ptr,  # [num_seqs]
     sink_ptr,
     stride_o_s,
     stride_o_h,
@@ -465,11 +525,11 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
     MAX_NUM_SEQ_PARTITIONS,
 ):
     _paged_attn_decode_v2_w_dot_reduce_kernel[grid](
-        out_ptr,        # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
-        exp_sums_ptr,   # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-        max_logits_ptr, # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-        logits_ptrs,    # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-        seq_lens_ptr,   # [num_seqs]
+        out_ptr,  # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
+        exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+        max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+        logits_ptrs,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+        seq_lens_ptr,  # [num_seqs]
         sink_ptr,
         stride_o_s,
         stride_o_h,
@@ -486,13 +546,14 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
         MAX_NUM_SEQ_PARTITIONS=MAX_NUM_SEQ_PARTITIONS,
     )
 
+
 def paged_attention_decode(
-    output: torch.Tensor,       # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
-    query: torch.Tensor,        # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
-    key_cache: torch.Tensor,    # [num_blks, num_kv_heads, kv_blk_sz, head_sz]
+    output: torch.Tensor,  # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
+    query: torch.Tensor,  # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
+    key_cache: torch.Tensor,  # [num_blks, num_kv_heads, kv_blk_sz, head_sz]
     value_cache: torch.Tensor,  # [num_blks, num_kv_heads, kv_blk_sz, head_sz]
-    seq_lens: torch.Tensor,     # [num_seqs]
-    block_tables: torch.Tensor, # [num_seqs, max_num_blks_per_seq]
+    seq_lens: torch.Tensor,  # [num_seqs]
+    block_tables: torch.Tensor,  # [num_seqs, max_num_blks_per_seq]
     attn_scale: float,
     max_seq_len: int,
     compute_type,
@@ -512,7 +573,9 @@ def paged_attention_decode(
     num_q_heads = query.shape[1]
     num_kv_heads = key_cache.shape[1]
 
-    max_num_partitions = int((max_seq_len + _SEQ_PARTITION_SIZE - 1) // _SEQ_PARTITION_SIZE)
+    max_num_partitions = int(
+        (max_seq_len + _SEQ_PARTITION_SIZE - 1) // _SEQ_PARTITION_SIZE
+    )
 
     # use_v1 = max_seq_len <= 8192 and (
     #     max_num_partitions == 1 or num_seqs * num_q_heads > 512
@@ -1103,12 +1166,14 @@ def paged_attn_decode_v2(
         MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
     )
 
-    return {'triton_decode': decode_time,
-            'triton_reduce': reduce_time,
-            'tmp_output': tmp_output,
-            'exp_sums': exp_sums,
-            'max_logits': max_logits,
-            'triton': decode_time + reduce_time}
+    return {
+        "triton_decode": decode_time,
+        "triton_reduce": reduce_time,
+        "tmp_output": tmp_output,
+        "exp_sums": exp_sums,
+        "max_logits": max_logits,
+        "triton": decode_time + reduce_time,
+    }
 
 
 @triton.jit
@@ -1515,18 +1580,19 @@ def _paged_attn_decode_v2_w_dot_kernel(
 
     tl.store(logits_ptr + logits_offs, acc, mask=q_mask)
 
+
 # Transpose k_cache_ptr before execution
 # Suffer from k_cache loading without prefetching (131 us)
 @triton.jit
 def _paged_attn_decode_v2_w_dot_kernel_reshape(
-    exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-    q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
-    k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
-    v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-    blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
-    seq_lens_ptr,       # [num_seqs]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+    q_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
+    k_cache_ptr,  # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+    v_cache_ptr,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    blk_tables_ptrs,  # [num_seqs, max_num_blks_per_seq]
+    seq_lens_ptr,  # [num_seqs]
     scale,
     k_scale,
     v_scale,
@@ -1622,8 +1688,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape(
     # v_offs[HEAD_SZ_POW2, KV_BLK_SZ_POW2]
     v_offs = (
         kv_head_idx * stride_v_nh
-        + blk_offs[None, :]                     # blk_offs: [KV_BLK_SZ_POW2]
-        + head_sz_offs[:, None] * stride_v_kb   # head_sz_offs: [HEAD_SZ_POW2]
+        + blk_offs[None, :]  # blk_offs: [KV_BLK_SZ_POW2]
+        + head_sz_offs[:, None] * stride_v_kb  # head_sz_offs: [HEAD_SZ_POW2]
     )
     kv_blk_start = seq_part_idx * (SEQ_PARTITION_SZ // KV_BLK_SZ)
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
@@ -1634,9 +1700,12 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape(
         k_blk_offs = kv_blk_nums * stride_k_b + k_offs
         blk_seq_offs = kv_blk_idx * KV_BLK_SZ + blk_offs
         k_mask = (
-            (blk_seq_offs[None, :, None] < seq_len)   # blk_seq_offs: [KV_BLK_SZ_POW2]
-            & (blk_offs[None, :, None] < KV_BLK_SZ)   # blk_offs: [KV_BLK_SZ_POW2]
-            & (head_sz_div_offs[:, None, None] < (HEAD_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD)) # head_sz_offs: [HEAD_SZ_POW2]
+            (blk_seq_offs[None, :, None] < seq_len)  # blk_seq_offs: [KV_BLK_SZ_POW2]
+            & (blk_offs[None, :, None] < KV_BLK_SZ)  # blk_offs: [KV_BLK_SZ_POW2]
+            & (
+                head_sz_div_offs[:, None, None]
+                < (HEAD_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD)
+            )  # head_sz_offs: [HEAD_SZ_POW2]
         )
 
         # load k[HEAD_SZ_POW2/x, KV_BLK_SZ_POW2, x]
@@ -1644,7 +1713,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape(
         k = k_0.to(tl.float32) * k_scale if k_0.dtype.is_fp8() else k_0
         k = k.to(compute_type)
         # k[HEAD_SZ_POW2, KV_BLK_SZ_POW2]
-        k = tl.permute(k, [0, 2, 1]) # [HEAD_SZ_POW2/x, x, KV_BLK_SZ_POW2]
+        k = tl.permute(k, [0, 2, 1])  # [HEAD_SZ_POW2/x, x, KV_BLK_SZ_POW2]
         k = tl.reshape(k, [HEAD_SZ_POW2, KV_BLK_SZ_POW2])
 
         # qk: [QUERY_GRP_SZ_POW2, KV_BLK_SZ_POW2]
@@ -1675,9 +1744,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape(
         # load v[HEAD_SZ_POW2, KV_BLK_SZ_POW2]
         v_blk_offs = kv_blk_nums * stride_v_b + v_offs
         v_mask = (
-            (blk_seq_offs[None, :] < seq_len)   # blk_seq_offs: [KV_BLK_SZ_POW2]
-            & (blk_offs[None, :] < KV_BLK_SZ)   # blk_offs: [KV_BLK_SZ_POW2]
-            & (head_sz_offs[:, None] < HEAD_SZ) # head_sz_offs: [HEAD_SZ_POW2]
+            (blk_seq_offs[None, :] < seq_len)  # blk_seq_offs: [KV_BLK_SZ_POW2]
+            & (blk_offs[None, :] < KV_BLK_SZ)  # blk_offs: [KV_BLK_SZ_POW2]
+            & (head_sz_offs[:, None] < HEAD_SZ)  # head_sz_offs: [HEAD_SZ_POW2]
         )
         v_0 = tl.load(v_cache_ptr + v_blk_offs, mask=v_mask, other=0.0)
         v = v_0.to(tl.float32) * v_scale if v_0.dtype.is_fp8() else v_0
@@ -1713,18 +1782,19 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape(
 
     tl.store(logits_ptr + logits_offs, acc, mask=q_mask)
 
+
 # Reshape KV cache before execution
 # Suffer from k_cache loading without prefetching (177 us)
 @triton.jit
 def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop(
-    exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-    q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
-    k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
-    v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-    blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
-    seq_lens_ptr,       # [num_seqs]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+    q_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
+    k_cache_ptr,  # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+    v_cache_ptr,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    blk_tables_ptrs,  # [num_seqs, max_num_blks_per_seq]
+    seq_lens_ptr,  # [num_seqs]
     scale,
     k_scale,
     v_scale,
@@ -1817,13 +1887,19 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop(
         + contiguous_kv_elems_offs[None, None, None, :]
     )
     # blk_seq_offs[max_num_kv_blks, KV_BLK_SZ_POW2]
-    blk_seq_offs = ((kv_blk_start + blk_ids[:, None]) * KV_BLK_SZ  # blk_ids: [max_num_kv_blks]
-                    + blk_offs[None, :]) # blk_offs: [KV_BLK_SZ_POW2]
+    blk_seq_offs = (
+        kv_blk_start + blk_ids[:, None]
+    ) * KV_BLK_SZ + blk_offs[  # blk_ids: [max_num_kv_blks]
+        None, :
+    ]  # blk_offs: [KV_BLK_SZ_POW2]
 
     k_mask = (
-        (blk_seq_offs[:, None, :, None] < seq_len) &
-        (blk_offs[None, None, :, None] < KV_BLK_SZ) &
-        (head_sz_div_offs[None, :, None, None] < (HEAD_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD))
+        (blk_seq_offs[:, None, :, None] < seq_len)
+        & (blk_offs[None, None, :, None] < KV_BLK_SZ)
+        & (
+            head_sz_div_offs[None, :, None, None]
+            < (HEAD_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD)
+        )
     )
 
     # k[max_num_kv_blks, HEAD_SZ_POW2/x, KV_BLK_SZ_POW2, x]
@@ -1831,7 +1907,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop(
     k = k_0.to(tl.float32) * k_scale if k_0.dtype.is_fp8() else k_0
     k = k.to(compute_type)
     # k[HEAD_SZ_POW2, max_num_kv_blks * KV_BLK_SZ_POW2]
-    k = tl.permute(k, [0, 2, 1, 3]) # [max_num_kv_blks, KV_BLK_SZ_POW2, HEAD_SZ_POW2/x, x]
+    k = tl.permute(
+        k, [0, 2, 1, 3]
+    )  # [max_num_kv_blks, KV_BLK_SZ_POW2, HEAD_SZ_POW2/x, x]
     k = tl.reshape(k, [max_num_kv_blks * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
 
     # qk[max_num_kv_blks * KV_BLK_SZ_POW2, QUERY_GRP_SZ_POW2]
@@ -1872,9 +1950,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop(
         + blk_offs[None, None, :]
     )
     v_mask = (
-        (blk_seq_offs[:, None, :] < seq_len) &
-        (blk_offs[None, None, :] < KV_BLK_SZ) &
-        (head_sz_offs[None, :, None] < HEAD_SZ)
+        (blk_seq_offs[:, None, :] < seq_len)
+        & (blk_offs[None, None, :] < KV_BLK_SZ)
+        & (head_sz_offs[None, :, None] < HEAD_SZ)
     )
     v_0 = tl.load(v_cache_ptr + v_blk_offs)
     v = v_0.to(tl.float32) * v_scale if v_0.dtype.is_fp8() else v_0
@@ -1894,6 +1972,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop(
     )
 
     tl.store(logits_ptr + logits_offs, acc, mask=q_mask)
+
 
 # Reshape KV cache before execution
 # Suffer from k_cache loading without prefetching (177 us)
@@ -2005,21 +2084,30 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_load4_qk(
     # v_offs[HEAD_SZ_POW2, KV_BLK_SZ_POW2]
     v_offs = (
         kv_head_idx * stride_v_nh
-        + blk_offs[None, :]   # blk_offs: [KV_BLK_SZ_POW2]
-        + head_sz_offs[:, None] * stride_v_kb             # head_sz_offs: [HEAD_SZ_POW2]
+        + blk_offs[None, :]  # blk_offs: [KV_BLK_SZ_POW2]
+        + head_sz_offs[:, None] * stride_v_kb  # head_sz_offs: [HEAD_SZ_POW2]
     )
     kv_blk_start = seq_part_idx * (SEQ_PARTITION_SZ // KV_BLK_SZ)
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
     for iter in range(NUM_ITER):
         kv_blk_idx = iter * KV_BLK_PER_ITER + kv_blk_per_iter_offs
-        kv_blk_nums = tl.load(blk_tables_start_ptr + kv_blk_start + kv_blk_idx, mask=(kv_blk_idx < num_kv_blks), other=0)
+        kv_blk_nums = tl.load(
+            blk_tables_start_ptr + kv_blk_start + kv_blk_idx,
+            mask=(kv_blk_idx < num_kv_blks),
+            other=0,
+        )
 
-        k_blk_offs = kv_blk_nums[:, None, None, None] * stride_k_b + k_offs[None, :, :, :]
+        k_blk_offs = (
+            kv_blk_nums[:, None, None, None] * stride_k_b + k_offs[None, :, :, :]
+        )
         blk_seq_offs = kv_blk_idx[:, None] * KV_BLK_SZ + blk_offs[None, :]
         k_mask = (
-            (blk_seq_offs[:, None, :, None] < seq_len)   # blk_seq_offs: [KV_BLK_SZ_POW2]
-            & (blk_offs[None, None, :, None] < KV_BLK_SZ)   # blk_offs: [KV_BLK_SZ_POW2]
-            & (head_sz_div_offs[None, :, None, None] < (HEAD_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD)) # head_sz_offs: [HEAD_SZ_POW2]
+            (blk_seq_offs[:, None, :, None] < seq_len)  # blk_seq_offs: [KV_BLK_SZ_POW2]
+            & (blk_offs[None, None, :, None] < KV_BLK_SZ)  # blk_offs: [KV_BLK_SZ_POW2]
+            & (
+                head_sz_div_offs[None, :, None, None]
+                < (HEAD_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD)
+            )  # head_sz_offs: [HEAD_SZ_POW2]
         )
 
         # load k[KV_BLK_PER_ITER, HEAD_SZ_POW2/x, KV_BLK_SZ_POW2, x]
@@ -2027,7 +2115,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_load4_qk(
         k = k_0.to(tl.float32) * k_scale if k_0.dtype.is_fp8() else k_0
         k = k.to(compute_type)
         # k[HEAD_SZ_POW2, KV_BLK_SZ_POW2]
-        k = tl.permute(k, [1, 3, 0, 2]) # [HEAD_SZ_POW2/x, x, KV_BLK_PER_ITER, KV_BLK_SZ_POW2]
+        k = tl.permute(
+            k, [1, 3, 0, 2]
+        )  # [HEAD_SZ_POW2/x, x, KV_BLK_PER_ITER, KV_BLK_SZ_POW2]
         k = tl.reshape(k, [HEAD_SZ_POW2, KV_BLK_PER_ITER * KV_BLK_SZ_POW2])
 
         # qk: [QUERY_GRP_SZ_POW2, KV_BLK_PER_ITER * KV_BLK_SZ_POW2]
@@ -2035,11 +2125,12 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_load4_qk(
 
         blk_seq_offs_flatten = blk_seq_offs.reshape([KV_BLK_PER_ITER * KV_BLK_SZ_POW2])
         if alibi_slopes is not None:
-            qk += (alibi_slope[:, None] * (blk_seq_offs_flatten - seq_len + 1)[None, :]).to(
-                tl.float32
-            )
+            qk += (
+                alibi_slope[:, None] * (blk_seq_offs_flatten - seq_len + 1)[None, :]
+            ).to(tl.float32)
         qk = tl.where(
-            (q_grp_offs[:, None] < QUERY_GRP_SZ) & (blk_seq_offs_flatten[None, :] < seq_len),
+            (q_grp_offs[:, None] < QUERY_GRP_SZ)
+            & (blk_seq_offs_flatten[None, :] < seq_len),
             qk,
             float("-inf"),
         )
@@ -2058,14 +2149,14 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_load4_qk(
         # load v[KV_BLK_PER_ITER, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
         v_blk_offs = kv_blk_nums[:, None, None] * stride_v_b + v_offs[None, :, :]
         v_mask = (
-            (blk_seq_offs[:, None, :] < seq_len)   # blk_seq_offs: [KV_BLK_SZ_POW2]
-            & (blk_offs[None, None, :] < KV_BLK_SZ)   # blk_offs: [KV_BLK_SZ_POW2]
-            & (head_sz_offs[None, :, None] < HEAD_SZ) # head_sz_offs: [HEAD_SZ_POW2]
+            (blk_seq_offs[:, None, :] < seq_len)  # blk_seq_offs: [KV_BLK_SZ_POW2]
+            & (blk_offs[None, None, :] < KV_BLK_SZ)  # blk_offs: [KV_BLK_SZ_POW2]
+            & (head_sz_offs[None, :, None] < HEAD_SZ)  # head_sz_offs: [HEAD_SZ_POW2]
         )
         v_0 = tl.load(v_cache_ptr + v_blk_offs)
         v = v_0.to(tl.float32) * v_scale if v_0.dtype.is_fp8() else v_0
         v = v.to(compute_type)
-        v = tl.permute(v, [0, 2, 1]) # [KV_BLK_PER_ITER, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
+        v = tl.permute(v, [0, 2, 1])  # [KV_BLK_PER_ITER, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
         v = tl.reshape(v, [KV_BLK_PER_ITER * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
 
         acc += tl.dot(p, v, out_dtype=tl.float32)
@@ -2092,16 +2183,17 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_load4_qk(
 
     tl.store(logits_ptr + logits_offs, acc, mask=q_mask)
 
+
 @triton.jit
 def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
-    exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-    q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
-    k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
-    v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-    blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
-    seq_lens_ptr,       # [num_seqs]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+    q_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
+    k_cache_ptr,  # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+    v_cache_ptr,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    blk_tables_ptrs,  # [num_seqs, max_num_blks_per_seq]
+    seq_lens_ptr,  # [num_seqs]
     scale,
     k_scale,
     v_scale,
@@ -2194,13 +2286,19 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
         + contiguous_kv_elems_offs[None, None, None, :]
     )
     # blk_seq_offs[max_num_kv_blks, KV_BLK_SZ_POW2]
-    blk_seq_offs = ((kv_blk_start + blk_ids[:, None]) * KV_BLK_SZ  # blk_ids: [max_num_kv_blks]
-                    + blk_offs[None, :]) # blk_offs: [KV_BLK_SZ_POW2]
+    blk_seq_offs = (
+        kv_blk_start + blk_ids[:, None]
+    ) * KV_BLK_SZ + blk_offs[  # blk_ids: [max_num_kv_blks]
+        None, :
+    ]  # blk_offs: [KV_BLK_SZ_POW2]
 
     k_mask = (
-        (blk_seq_offs[:, None, :, None] < seq_len) &
-        (blk_offs[None, None, :, None] < KV_BLK_SZ) &
-        (head_sz_div_offs[None, :, None, None] < (HEAD_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD))
+        (blk_seq_offs[:, None, :, None] < seq_len)
+        & (blk_offs[None, None, :, None] < KV_BLK_SZ)
+        & (
+            head_sz_div_offs[None, :, None, None]
+            < (HEAD_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD)
+        )
     )
 
     # k[max_num_kv_blks, HEAD_SZ_POW2/x, KV_BLK_SZ_POW2, x]
@@ -2208,7 +2306,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
     k = k_0.to(tl.float32) * k_scale if k_0.dtype.is_fp8() else k_0
     k = k.to(compute_type)
     # k[HEAD_SZ_POW2, max_num_kv_blks * KV_BLK_SZ_POW2]
-    k = tl.permute(k, [1, 3, 0, 2]) # [HEAD_SZ_POW2/x, x, max_num_kv_blks, KV_BLK_SZ_POW2]
+    k = tl.permute(
+        k, [1, 3, 0, 2]
+    )  # [HEAD_SZ_POW2/x, x, max_num_kv_blks, KV_BLK_SZ_POW2]
     k = tl.reshape(k, [HEAD_SZ_POW2, max_num_kv_blks * KV_BLK_SZ_POW2])
 
     # qk[QUERY_GRP_SZ_POW2, max_num_kv_blks * KV_BLK_SZ_POW2]
@@ -2219,7 +2319,8 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
             tl.float32
         )
     qk = tl.where(
-        (q_grp_offs[:, None] < QUERY_GRP_SZ) & (blk_seq_flatten_offs[None, :] < seq_len),
+        (q_grp_offs[:, None] < QUERY_GRP_SZ)
+        & (blk_seq_flatten_offs[None, :] < seq_len),
         qk,
         float("-inf"),
     )
@@ -2238,9 +2339,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
         + blk_offs[None, None, :]
     )
     v_mask = (
-        (blk_seq_offs[:, None, :] < seq_len) &
-        (blk_offs[None, None, :] < KV_BLK_SZ) &
-        (head_sz_offs[None, :, None] < HEAD_SZ)
+        (blk_seq_offs[:, None, :] < seq_len)
+        & (blk_offs[None, None, :] < KV_BLK_SZ)
+        & (head_sz_offs[None, :, None] < HEAD_SZ)
     )
 
     # v[max_num_kv_blks, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
@@ -2280,14 +2381,14 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk(
 # Suffer from k_cache loading without prefetching (150 us)
 @triton.jit
 def _paged_attn_decode_v2_w_dot_kernel_reshape_load4(
-    exp_sums_ptr,       # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    max_logits_ptr,     # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    logits_ptr,         # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-    q_ptr,              # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
-    k_cache_ptr,        # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
-    v_cache_ptr,        # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
-    blk_tables_ptrs,    # [num_seqs, max_num_blks_per_seq]
-    seq_lens_ptr,       # [num_seqs]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+    q_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
+    k_cache_ptr,  # [num_blks, num_kv_heads, head_sz/x, kv_blk_sz, x]
+    v_cache_ptr,  # [num_blks, num_kv_heads, head_sz, kv_blk_sz]
+    blk_tables_ptrs,  # [num_seqs, max_num_blks_per_seq]
+    seq_lens_ptr,  # [num_seqs]
     scale,
     k_scale,
     v_scale,
@@ -2390,21 +2491,30 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_load4(
     # v_offs[HEAD_SZ_POW2, KV_BLK_SZ_POW2]
     v_offs = (
         kv_head_idx * stride_v_nh
-        + blk_offs[None, :]                     # blk_offs: [KV_BLK_SZ_POW2]
-        + head_sz_offs[:, None] * stride_v_kb   # head_sz_offs: [HEAD_SZ_POW2]
+        + blk_offs[None, :]  # blk_offs: [KV_BLK_SZ_POW2]
+        + head_sz_offs[:, None] * stride_v_kb  # head_sz_offs: [HEAD_SZ_POW2]
     )
     kv_blk_start = seq_part_idx * (SEQ_PARTITION_SZ // KV_BLK_SZ)
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
     for iter in range(NUM_ITER):
         kv_blk_idx = iter * KV_BLK_PER_ITER + kv_blk_per_iter_offs
-        kv_blk_nums = tl.load(blk_tables_start_ptr + kv_blk_start + kv_blk_idx, mask=(kv_blk_idx < num_kv_blks), other=0)
+        kv_blk_nums = tl.load(
+            blk_tables_start_ptr + kv_blk_start + kv_blk_idx,
+            mask=(kv_blk_idx < num_kv_blks),
+            other=0,
+        )
 
-        k_blk_offs = kv_blk_nums[:, None, None, None] * stride_k_b + k_offs[None, :, :, :]
+        k_blk_offs = (
+            kv_blk_nums[:, None, None, None] * stride_k_b + k_offs[None, :, :, :]
+        )
         blk_seq_offs = kv_blk_idx[:, None] * KV_BLK_SZ + blk_offs[None, :]
         k_mask = (
-            (blk_seq_offs[:, None, :, None] < seq_len)   # blk_seq_offs: [KV_BLK_SZ_POW2]
-            & (blk_offs[None, None, :, None] < KV_BLK_SZ)   # blk_offs: [KV_BLK_SZ_POW2]
-            & (head_sz_div_offs[None, :, None, None] < (HEAD_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD)) # head_sz_offs: [HEAD_SZ_POW2]
+            (blk_seq_offs[:, None, :, None] < seq_len)  # blk_seq_offs: [KV_BLK_SZ_POW2]
+            & (blk_offs[None, None, :, None] < KV_BLK_SZ)  # blk_offs: [KV_BLK_SZ_POW2]
+            & (
+                head_sz_div_offs[None, :, None, None]
+                < (HEAD_SZ // CONTIGUOUS_KV_ELEMS_16B_LOAD)
+            )  # head_sz_offs: [HEAD_SZ_POW2]
         )
 
         # load k[KV_BLK_PER_ITER, HEAD_SZ_POW2/x, KV_BLK_SZ_POW2, x]
@@ -2412,7 +2522,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_load4(
         k = k_0.to(tl.float32) * k_scale if k_0.dtype.is_fp8() else k_0
         k = k.to(compute_type)
         # k[HEAD_SZ_POW2, KV_BLK_SZ_POW2]
-        k = tl.permute(k, [0, 2, 1, 3]) # [KV_BLK_PER_ITER, KV_BLK_SZ_POW2, HEAD_SZ_POW2/x, x]
+        k = tl.permute(
+            k, [0, 2, 1, 3]
+        )  # [KV_BLK_PER_ITER, KV_BLK_SZ_POW2, HEAD_SZ_POW2/x, x]
         k = tl.reshape(k, [KV_BLK_PER_ITER * KV_BLK_SZ_POW2, HEAD_SZ_POW2])
 
         # qk: [KV_BLK_PER_ITER * KV_BLK_SZ_POW2, QUERY_GRP_SZ_POW2]
@@ -2420,11 +2532,12 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_load4(
 
         blk_seq_offs_flatten = blk_seq_offs.reshape([KV_BLK_PER_ITER * KV_BLK_SZ_POW2])
         if alibi_slopes is not None:
-            qk += (alibi_slope[None, :] * (blk_seq_offs_flatten - seq_len + 1)[:, None]).to(
-                tl.float32
-            )
+            qk += (
+                alibi_slope[None, :] * (blk_seq_offs_flatten - seq_len + 1)[:, None]
+            ).to(tl.float32)
         qk = tl.where(
-            (q_grp_offs[None, :] < QUERY_GRP_SZ) & (blk_seq_offs_flatten[:, None] < seq_len),
+            (q_grp_offs[None, :] < QUERY_GRP_SZ)
+            & (blk_seq_offs_flatten[:, None] < seq_len),
             qk,
             float("-inf"),
         )
@@ -2443,14 +2556,14 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_load4(
         # load v[KV_BLK_PER_ITER, HEAD_SZ_POW2, KV_BLK_SZ_POW2]
         v_blk_offs = kv_blk_nums[:, None, None] * stride_v_b + v_offs[None, :, :]
         v_mask = (
-            (blk_seq_offs[:, None, :] < seq_len)      # blk_seq_offs: [KV_BLK_SZ_POW2]
-            & (blk_offs[None, None, :] < KV_BLK_SZ)   # blk_offs: [KV_BLK_SZ_POW2]
-            & (head_sz_offs[None, :, None] < HEAD_SZ) # head_sz_offs: [HEAD_SZ_POW2]
+            (blk_seq_offs[:, None, :] < seq_len)  # blk_seq_offs: [KV_BLK_SZ_POW2]
+            & (blk_offs[None, None, :] < KV_BLK_SZ)  # blk_offs: [KV_BLK_SZ_POW2]
+            & (head_sz_offs[None, :, None] < HEAD_SZ)  # head_sz_offs: [HEAD_SZ_POW2]
         )
         v_0 = tl.load(v_cache_ptr + v_blk_offs)
         v = v_0.to(tl.float32) * v_scale if v_0.dtype.is_fp8() else v_0
         v = v.to(compute_type)
-        v = tl.permute(v, [1, 0, 2]) # [HEAD_SZ_POW2, KV_BLK_PER_ITER, KV_BLK_SZ_POW2]
+        v = tl.permute(v, [1, 0, 2])  # [HEAD_SZ_POW2, KV_BLK_PER_ITER, KV_BLK_SZ_POW2]
         v = tl.reshape(v, [HEAD_SZ_POW2, KV_BLK_PER_ITER * KV_BLK_SZ_POW2])
 
         acc += tl.dot(v, p, out_dtype=tl.float32).T
@@ -2477,14 +2590,15 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_load4(
 
     tl.store(logits_ptr + logits_offs, acc, mask=q_mask)
 
+
 @gluon.jit
 def _paged_attn_decode_v2_w_dot_reduce_kernel(
-    out_ptr,        # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
-    exp_sums_ptr,   # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    max_logits_ptr, # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    logits_ptrs,    # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-    seq_lens_ptr,   # [num_seqs]
-    sink_ptr,       # [num_query_heads]
+    out_ptr,  # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
+    logits_ptrs,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
+    seq_lens_ptr,  # [num_seqs]
+    sink_ptr,  # [num_query_heads]
     stride_o_s,
     stride_o_h,
     stride_exp_sums_s,
@@ -2504,7 +2618,9 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     else:
         QUERY_GRP_SZ_POW2: gl.constexpr = triton.next_power_of_2(QUERY_GRP_SZ)
 
-    MAX_NUM_SEQ_PARTITIONS_POW2: gl.constexpr = triton.next_power_of_2(MAX_NUM_SEQ_PARTITIONS)
+    MAX_NUM_SEQ_PARTITIONS_POW2: gl.constexpr = triton.next_power_of_2(
+        MAX_NUM_SEQ_PARTITIONS
+    )
     HEAD_SZ_POW2: gl.constexpr = triton.next_power_of_2(HEAD_SZ)
     seq_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
@@ -2513,19 +2629,21 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     num_partitions = gl.cdiv(seq_len, SEQ_PARTITION_SZ)
     if MAX_NUM_SEQ_PARTITIONS_POW2 >= 256:
         blocked_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread =[1, 2, 4],
+            size_per_thread=[1, 2, 4],
             threads_per_warp=[4, 4, 4],
-            warps_per_cta   =[4, 1, 1],
-            order           =[2, 1, 0],
+            warps_per_cta=[4, 1, 1],
+            order=[2, 1, 0],
         )
     else:
         blocked_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread =[4, 1, 2],
+            size_per_thread=[4, 1, 2],
             threads_per_warp=[4, 4, 4],
-            warps_per_cta   =[1, 2, 2],
-            order           =[2, 1, 0],
+            warps_per_cta=[1, 2, 2],
+            order=[2, 1, 0],
         )
-    query_grp_sz_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, blocked_layout))
+    query_grp_sz_layout: gl.constexpr = gl.SliceLayout(
+        0, gl.SliceLayout(2, blocked_layout)
+    )
     head_sz_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, blocked_layout))
     seq_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, blocked_layout))
 
@@ -2545,7 +2663,12 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     )
 
     # max_logits: [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2]
-    other = gl.full(exp_sums_offs.shape, float("-inf"), max_logits_ptr.type.element_ty, layout=gl.SliceLayout(2, blocked_layout))
+    other = gl.full(
+        exp_sums_offs.shape,
+        float("-inf"),
+        max_logits_ptr.type.element_ty,
+        layout=gl.SliceLayout(2, blocked_layout),
+    )
     max_logits = gl.amd.cdna3.buffer_load(
         ptr=max_logits_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=other
     )
@@ -2554,8 +2677,15 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
 
     # Rescale the exp sums and compute the global sum
     # exp_sums: [MAX_NUM_SEQ_PARTITIONS, QUERY_GRP_SZ_POW2]
-    other = gl.full(exp_sums_offs.shape, 0.0, exp_sums_ptr.type.element_ty, layout=gl.SliceLayout(2, blocked_layout))
-    exp_sums = gl.amd.cdna3.buffer_load(ptr=exp_sums_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=other)
+    other = gl.full(
+        exp_sums_offs.shape,
+        0.0,
+        exp_sums_ptr.type.element_ty,
+        layout=gl.SliceLayout(2, blocked_layout),
+    )
+    exp_sums = gl.amd.cdna3.buffer_load(
+        ptr=exp_sums_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=other
+    )
     exp_sums *= tl.exp(max_logits - ml[None, :])
 
     # exp_sum: [QUERY_GRP_SZ_POW2]
@@ -2582,17 +2712,24 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     logits_mask = (part_offs[:, None] < num_partitions) & (
         q_grp_offs[None, :] < QUERY_GRP_SZ
     )
-    other = gl.full(logits_offset.shape, 0.0, logits_ptrs.type.element_ty, layout=blocked_layout)
+    other = gl.full(
+        logits_offset.shape, 0.0, logits_ptrs.type.element_ty, layout=blocked_layout
+    )
     logits = gl.amd.cdna3.buffer_load(
-        ptr=logits_ptrs, offsets=logits_offset, mask=logits_mask[:, :, None], other=other
+        ptr=logits_ptrs,
+        offsets=logits_offset,
+        mask=logits_mask[:, :, None],
+        other=other,
     )
     # out: [QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
-    out = tl.sum((logits.to(gl.float32) * gl.convert_layout(p, layout=blocked_layout)), axis=0).to(out_ptr.dtype.element_ty)
+    out = tl.sum(
+        (logits.to(gl.float32) * gl.convert_layout(p, layout=blocked_layout)), axis=0
+    ).to(out_ptr.dtype.element_ty)
     out_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread =[1, 8],
+        size_per_thread=[1, 8],
         threads_per_warp=[4, 16],
-        warps_per_cta   =[4, 1],
-        order           =[1, 0],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
     )
     query_grp_sz_out_layout: gl.constexpr = gl.SliceLayout(1, out_layout)
     head_sz_out_layout: gl.constexpr = gl.SliceLayout(0, out_layout)
@@ -2609,7 +2746,8 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
         stored_value=gl.convert_layout(out, layout=out_layout),
         ptr=out_ptr,
         offsets=out_offs,
-        mask=(q_grp_offs_out[:, None] < QUERY_GRP_SZ) & (head_offs_out[None, :] < HEAD_SZ),
+        mask=(q_grp_offs_out[:, None] < QUERY_GRP_SZ)
+        & (head_offs_out[None, :] < HEAD_SZ),
     )
 
 
