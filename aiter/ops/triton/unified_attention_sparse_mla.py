@@ -16,6 +16,26 @@ def unified_attention_sparse_mla(
     block_table,
     kv_lora_rank,
 ):
+    """
+    This function computes the sparse attention.
+
+    Note: topk_indices index the KV cache, not block_table.
+
+    Q:             [seq_len, NUM_HEADS, HEAD_SIZE], dtype bfloat16
+    KV:            [seq_len_kv, 1, HEAD_SIZE + ROPE_RANK], dtype bfloat16
+    cu_seqlens_q:  [BATCH + 1], dtype int32
+    max_seqlen_q:  scalar, dtype int32
+    max_seqlen_k:  scalar, dtype int32
+    softmax_scale: scalar, dtype float32
+    topk_indices:  [seq_len, TOP_K], dtype int32
+    block_table:   [BATCH, MAX_NUM_BLOCKS_PER_BATCH], dtype int32
+    kv_lora_rank:  scalar, dtype int32
+
+    Returns:
+    out (in-place):  [seq_len, NUM_HEADS, HEAD_SIZE], dtype bfloat16 
+    """
+
+    # TODO: This kernel is not optimized and simplified for initial development.
 
     block_size = kv.shape[1]
     num_seqs = len(seqused_k)

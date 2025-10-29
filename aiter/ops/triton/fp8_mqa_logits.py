@@ -14,12 +14,14 @@ def fp8_mqa_logits(
     cu_ends,
 ):
     """
+    This function computes the logits to be used by a topk function for sparse attention.
+
     Q:           [seq_len, NUM_HEADS, HEAD_SIZE], dtype float8
     KV:          [seq_len_kv, HEAD_SIZE], dtype float8
     kv_scales:   [seq_len_kv], dtype float32
     weights:     [seq_len, NUM_HEADS], dtype float32
-    cu_starts:   [seq_len], dtype int32
-    cu_ends:     [seq_len], dtype int32
+    cu_starts:   [seq_len], dtype int32, start indices
+    cu_ends:     [seq_len], dtype int32, end indices
 
     Returns:
     logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
