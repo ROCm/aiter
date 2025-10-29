@@ -20,6 +20,7 @@ TO be added features:
 import torch
 from typing import Optional
 from bisect import bisect_right
+import math
 import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.lean_atten import la_persistent, _get_config
@@ -45,6 +46,7 @@ def persistent_lean_attention(
     batch_size: int,
     sm_scale: torch.float16,
     causal: bool = True,  # causal masking
+    RAGGED_BATCH: bool = False,
     config: Optional[dict] = None,
     program_count: Optional[int] = None,
 ):
@@ -79,6 +81,7 @@ def persistent_lean_attention(
         causal=causal,
         batch_size=batch_size,
         sm_scale=sm_scale,
+        RAGGED_BATCH=RAGGED_BATCH,
         num_warps=config["num_warps"],
         waves_per_eu=config["waves_per_eu"],
         config=config,
@@ -102,6 +105,7 @@ def _persistent_lean_attention(
     causal: bool,  # causal masking
     batch_size: int,
     sm_scale: torch.float16,  # typically 1 / sqrt(d)
+    RAGGED_BATCH: bool,
     num_warps: int,
     waves_per_eu: int,
     config: dict = {},
@@ -187,6 +191,9 @@ def _persistent_lean_attention(
         MASKED_BLOCKS=MASKED_BLOCKS,
         MODE=CAUSAL_MODE,
     )
+    if not causal:
+        max_output_tile_cnt = math.ceil((H * batch_size) / total_programs) + 4
+
     if DEBUG:
         print(f"max_output_tile_cnt={max_output_tile_cnt}")
 
@@ -242,8 +249,6 @@ def _persistent_lean_attention(
         raise ValueError(
             f"locks must have length >= total_programs ({total_programs}), got {locks.numel()}"
         )
-
-    max_output_tile_cnt = max_output_tile_cnt + 4
 
     grid = (total_programs, 1, 1)
 
@@ -321,7 +326,9 @@ def _persistent_lean_attention(
             or (Op.stride(0) * total_programs) >= (1 << 31)
             or (Op.stride(1) * N_CTX_Q) >= (1 << 31)
             or (o.stride(0) * N_CTX_Q) >= (1 << 31)
+            or (q.stride(0) * N_CTX_Q) >= (1 << 31)
         ),
+        RAGGED_BATCH=RAGGED_BATCH,
         **config,
     )
     """
