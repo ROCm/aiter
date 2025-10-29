@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
 
 
-def get_shape_benchmark_object(plot_name, args, x_names=None):
+def  get_shape_benchmark_object(plot_name, args, x_names=None):
     """
     Utility function for returning a triton.testing.Benchmark object to populate.
 
@@ -44,12 +44,28 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
     else:
         x_vals_list = get_x_vals(dims=len(x_names), args=args)
 
+    styles = [("green", "-")]
     if args.metric == "time":
         ylabel = "Time (ms)"
+        line_vals = ["time"]
+        line_names = ["Time (ms)"]
     elif args.metric == "throughput":
         ylabel = "Throughput (TFLOPS)"
+        line_vals = ["throughput"]
+        line_names = ["Throughput (TFLOPS)"]
     elif args.metric == "bandwidth":
         ylabel = "Bandwidth (GB/s)"
+        line_vals = ["bandwidth"]
+        line_names = ["Bandwidth (GB/s)"]
+    elif args.metric == "all":
+        ylabel = "Time (ms) / Throughput (TFLOPS) / Bandwidth (GB/s)"
+        line_vals = ["time", "throughput", "bandwidth"]
+        line_names = ["Time (ms)", "Throughput (TFLOPS)", "Bandwidth (GB/s)"]
+        styles = [
+            ("green", "-"),
+            ("blue", "--"),
+            ("red", ":"),
+    ]
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
@@ -58,13 +74,13 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
         x_vals=x_vals_list,
         x_log=True,
         y_log=True,
-        line_arg="provider",
-        line_vals=["Triton"],
-        line_names=["Triton"],
-        styles=[("green", "-")],
+        line_arg="metric",
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=styles,
         ylabel=ylabel,
         plot_name=plot_name,
-        args={"metric": args.metric},
+        args={},
     )
     return benchmark
 
