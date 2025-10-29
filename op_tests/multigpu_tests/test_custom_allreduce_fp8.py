@@ -111,7 +111,7 @@ def test_allreduce_custom(tp_size, pp_size, shape, dtype, withGraph=False):
     qtype = QuantType.per_1x128
     quant_function = get_hip_quant(qtype)
     a = a.reshape(8192, 128)
-    fp8_output, scale = quant_function(a, quant_dtype=torch.float8_e4m3fnuz)
+    fp8_output, scale = quant_function(a, quant_dtype=dtypes.fp8)
     fp32_output = fp8_output.to(torch.float) * scale
     fp16_quanted_ref = fp32_output.to(torch.float16).reshape(128, 8192)
     for out, us in rets:

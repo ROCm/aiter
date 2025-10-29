@@ -15,11 +15,13 @@
 * limitations under the License.
 """
 
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
+
 import torch
+
 import aiter as ops
 from aiter import dtypes
-from dataclasses import dataclass
 
 
 # from vllm.utils import is_hip
@@ -162,11 +164,7 @@ def _use_rocm_custom_paged_attention(
 ) -> bool:
     # rocm custom page attention not support on navi (gfx1*)
     return (
-        not _ON_NAVI
-        and (qtype == torch.half or qtype == dtypes.bf16)
-        and (head_size == 64 or head_size == 128)
-        and (gqa_ratio >= 1 and gqa_ratio <= 32)
-        and max_seq_len <= 65536
+        not _ON_NAVI and (gqa_ratio >= 1 and gqa_ratio <= 32) and max_seq_len <= 65536
     )
 
 
@@ -237,6 +235,7 @@ class PagedAttention:
         alibi_slopes: Optional[torch.Tensor],
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
+        q_scale: Optional[torch.Tensor] = None,
         tp_rank: int = 0,
         blocksparse_local_blocks: int = 0,
         blocksparse_vert_stride: int = 0,
@@ -244,6 +243,7 @@ class PagedAttention:
         blocksparse_head_sliding_step: int = 0,
         fp8_out_scale=None,
         mtp: int = 1,
+        output_dtype: torch.dtype = None,
     ) -> torch.Tensor:
         # Whether to use rocm custom paged attention or not
         num_seqs, num_heads, head_size = query.shape
@@ -252,7 +252,7 @@ class PagedAttention:
         use_custom = _use_rocm_custom_paged_attention(
             query.dtype, head_size, block_size, gqa_ratio, max_seq_len
         )
-        output = torch.empty_like(query)
+        output = torch.empty_like(query, dtype=output_dtype)
         if use_custom:
             max_num_partitions = (
                 max_seq_len + _PARTITION_SIZE_ROCM - 1
@@ -292,6 +292,7 @@ class PagedAttention:
                 v_scale,
                 fp8_out_scale if cpa_fp8_out else None,
                 _PARTITION_SIZE_ROCM,
+                q_scale=q_scale,
                 mtp=mtp,
             )
             if cpa_fp8_out:

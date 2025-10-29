@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+import argparse
 import os
-import aiter
+
 import pandas as pd
 import torch
-from aiter import dtypes
-from aiter.utility import fp4_utils
-from aiter.test_common import perftest
-from aiter.utility.base_tuner import GemmCommonTuner
-from aiter.ops.shuffle import shuffle_weight
 from gemm_a4w4_blockscale_common import kernels_list
-import argparse
+
+import aiter
+from aiter import dtypes
+from aiter.jit.core import AITER_CONFIG_GEMM_A4W4, get_asm_dir
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import perftest
+from aiter.utility import fp4_utils
+from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
-from aiter.jit.core import get_asm_dir
 
 # torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -129,7 +131,7 @@ def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
 class GemmA4W4BlockScaleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
-        "tune_file": "aiter/configs/a4w4_blockscale_tuned_gemm.csv",
+        "tune_file": f"{AITER_CONFIG_GEMM_A4W4}",
         "untune_file": "aiter/configs/a4w4_blockscale_untuned_gemm.csv",
     }
 
