@@ -24,9 +24,23 @@ It supporst page size = 1.
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
 import triton
 import triton.language as tl
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
-@triton.jit
+_fwd_kernel_repr = make_kernel_repr(
+    "_fwd_kernel",
+    [
+        "kv_group_num",
+        "BLOCK_M",
+        "BLOCK_DMODEL",
+        "BLOCK_N",
+        "IS_CAUSAL",
+        "Lk",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_kernel_repr)
 def _fwd_kernel(
     Q,
     K,

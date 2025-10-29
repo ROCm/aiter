@@ -31,9 +31,33 @@ from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils.device_info import get_num_xcds
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
-@triton.jit
+_fwd_kernel_extend_repr = make_kernel_repr(
+    "_fwd_kernel",
+    [
+        "logit_cap",
+        "Lq",
+        "Lv",
+        "BLOCK_DMODEL",
+        "BLOCK_DPE",
+        "BLOCK_DV",
+        "BLOCK_M",
+        "BLOCK_N",
+        "USE_CUSTOM_MASK",
+        "IS_CAUSAL",
+        "SKIP_PREFIX_CUSTOM_MASK",
+        "STORE_TRANSPOSE",
+        "NUM_Q_HEADS",
+        "NUM_BLOCKS",
+        "BATCH",
+        "NUM_XCDS",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_kernel_extend_repr)
 def _fwd_kernel(
     Q_Extend,
     K_Extend,
