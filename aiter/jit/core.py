@@ -832,7 +832,7 @@ def compile_ops(
 
             return op(*args, **kwargs)
 
-        @torch_compile_guard(gen_fake=gen_fake, calling_func_=func)
+        @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
         def custom_wrapper(*args, **kwargs):
             return wrapper(*args, **kwargs)
 

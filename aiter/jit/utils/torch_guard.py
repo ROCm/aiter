@@ -189,6 +189,7 @@ def generate_schema(func) -> str:
 
 def torch_compile_guard(
     mutates_args: list[str] = [],
+    device: str = "cpu",
     calling_func_: Optional[Callable[..., Any]] = None,
     gen_fake: Optional[Callable[..., Any]] = None,
 ):
@@ -281,7 +282,7 @@ def torch_compile_guard(
 
         def abstract_impl(*args, custom_build_args={}, **kwargs):
             if return_int:
-                return torch.empty(1, device="cuda"), 1
+                return torch.empty(1, device=device), 1
             if gen_fake is not None:
                 return gen_fake(*args, **kwargs)
             return calling_func(*args, **kwargs)
@@ -290,12 +291,12 @@ def torch_compile_guard(
             return (
                 wrapper(*args, **kwargs)
                 if not return_int
-                else (torch.empty(1, device="cuda"), wrapper(*args, **kwargs))
+                else (torch.empty(1, device=device), wrapper(*args, **kwargs))
             )
 
         def abstract_impl_dummy(dummy, *args, custom_build_args={}, **kwargs):
             if return_int:
-                return torch.empty(1, device="cuda"), 1
+                return torch.empty(1, device=device), 1
             if gen_fake is not None:
                 return gen_fake(*args, **kwargs)
             return calling_func(*args, **kwargs)
@@ -304,7 +305,7 @@ def torch_compile_guard(
             return (
                 wrapper(*args, **kwargs)
                 if not return_int
-                else (torch.empty(1, device="cuda"), wrapper(*args, **kwargs))
+                else (torch.empty(1, device=device), wrapper(*args, **kwargs))
             )
 
         custom_func = outer_wrapper
@@ -329,7 +330,7 @@ def torch_compile_guard(
                 getattr(torch.ops.aiter, f"{loadName}")(*args, **kwargs)
                 if input_is_tensor
                 else getattr(torch.ops.aiter, f"{loadName}")(
-                    torch.empty(1, device="cuda"), *args, **kwargs
+                    torch.empty(1, device=device), *args, **kwargs
                 )
             )
             return result[1] if return_int else result
