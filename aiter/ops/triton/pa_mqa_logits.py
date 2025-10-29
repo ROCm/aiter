@@ -121,9 +121,18 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     context_lens: torch.Tensor,
     kv_indices: torch.Tensor,
     max_model_len: int,
+    ChunkQ: int = 64,
+    ChunkK: int = 256,
+    TotalCuCount: int = 80,
+    WavePerEU: int = 2,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, max_blk_len = kv_indices.size()
+
+
+    TileQCount = batch_size * next_n * (heads // ChunkQ)
+    SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
+
     kv_cache_fp8, kv_cache_scale = (
         kv_cache_fp8[..., :hidden_dim],
         kv_cache_fp8[..., hidden_dim:],
@@ -133,14 +142,14 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
 
     config = {
-        "ChunkQ": 32,
-        "ChunkK": 64,
+        "ChunkQ": ChunkQ,
+        "ChunkK": ChunkK,
         "HiddenDim": hidden_dim,
-        "SplitKV": 5,
+        "SplitKV": SplitKV,
     }
     assert heads % config["ChunkQ"] == 0
 
-    grid = (batch_size * next_n * (heads // config["ChunkQ"] * config["SplitKV"]),)
+    grid = (batch_size * next_n * (heads // config["ChunkQ"] * SplitKV),)
     _deepgemm_fp8_paged_mqa_logits_stage1[grid](
         batch_size,
         next_n,
@@ -162,6 +171,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         out_qk.stride(1),
         max_model_len,
         max_blk_len,
+        waves_per_eu=WavePerEU,
         **config,
     )
 
@@ -174,8 +184,9 @@ def deepgemm_fp8_paged_mqa_logits(
     context_lens: torch.Tensor,
     kv_indices: torch.Tensor,
     max_model_len: int,
-    ChunkK: int = 64,
-    SplitKV: int = 5,
+    ChunkK: int = 256,
+    TotalCuCount: int = 80,
+    WavePerEU: int = 2,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, max_blk_len = kv_indices.size()
@@ -183,6 +194,10 @@ def deepgemm_fp8_paged_mqa_logits(
         kv_cache_fp8[..., :hidden_dim],
         kv_cache_fp8[..., hidden_dim:],
     )
+
+    TileQCount = batch_size * next_n
+    SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
+
     # Since triton doesn't have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
     kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
@@ -215,5 +230,6 @@ def deepgemm_fp8_paged_mqa_logits(
         out_logits.stride(0),
         max_model_len,
         max_blk_len,
+        waves_per_eu=WavePerEU,
         **config,
     )
