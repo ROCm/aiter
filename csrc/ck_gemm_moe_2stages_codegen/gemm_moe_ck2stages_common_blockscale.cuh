@@ -62,7 +62,7 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     constexpr ck::index_t NumDTensor = DsDataType::Size();
     constexpr auto StrideDs = std::array<ck::index_t, NumDTensor>{0};
 
-    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
+    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::NKPadding;
     static constexpr ck::index_t MNPerXDL = 16;
     static constexpr ck::index_t WAVES = BLOCKSIZE / 64;
     static constexpr ck::index_t MXDLPerWave = MPerBlock / (MNPerXDL * MWaves);
