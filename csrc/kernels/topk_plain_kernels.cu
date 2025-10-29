@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "dispatch_utils.h"
-#include "py_itfs_common.h"
-
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
@@ -11,6 +8,10 @@
 #include <hip/hip_runtime.h>
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
+
+#include "ck_tile/core.hpp"
+#include "dispatch_utils.h"
+#include "py_itfs_common.h"
 
 #define HIP_CHECK(val)                                \
     {                                                 \
@@ -735,79 +736,30 @@ namespace buffer_load_helpers {
 
 constexpr int MAX_CAPACITY = 512;
 
-// memory coherency bit for buffer store/load instruction
-// check ISA manual for each GFX target
-// e.g. for
-// https://www.amd.com/system/files/TechDocs/instinct-mi200-cdna2-instruction-set-architecture.pdf,
-// // page 67~68
-enum struct AmdBufferCoherence
-{
-    coherence_default = 0, // default value
-    glc               = 1,
-    slc               = 2,
-    glc_slc           = 3,
-    // gfx94: bit 0 = sc0, bit 1 = nt, bit 3 = swz, bit 4 = sc1
-    // SC[1:0] System Cache level: 0=wave, 1=group, 2=device, 3=system
-    // NT Non-Temporal: 0=expect temporal reuse; 1=do not expect temporal reuse
-    WAVE_NT0   = 0,
-    WAVE_NT1   = 2,
-    GROUP_NT0  = 1,
-    GROUP_NT1  = 3,
-    DEVICE_NT0 = 8,
-    DEVICE_NT1 = 10,
-    SYSTEM_NT0 = 9,
-    SYSTEM_NT1 = 11,
-};
-
 using int32x4_t = int __attribute__((ext_vector_type(4)));
 using floatx4_t = float __attribute__((ext_vector_type(4)));
 using bf16x8_t  = uint16_t __attribute__((ext_vector_type(8)));
 using halfx8_t  = _Float16 __attribute__((ext_vector_type(8)));
-using uint32_t  = unsigned int;
 using index_t   = uint32_t;
 
-// The hardware buffer descriptor structure
-struct __attribute__((packed)) BufferResource
-{
-    const void* ptr;
-    uint32_t range;
-    uint32_t config;
-};
-
-// Standard config for raw 4-byte buffer access
-#ifndef CK_TILE_BUFFER_RESOURCE_3RD_DWORD
-#define CK_TILE_BUFFER_RESOURCE_3RD_DWORD 0x00020000
-#endif
-
-// Create a buffer resource descriptor from pointer and size for raw buffer loads.
-__device__ __forceinline__ int32x4_t make_wave_buffer_resource(const void* ptr,
-                                                               uint32_t size_in_bytes)
-{
-    BufferResource res{ptr, size_in_bytes, CK_TILE_BUFFER_RESOURCE_3RD_DWORD};
-    return __builtin_bit_cast(int32x4_t, res);
-}
-
-extern "C" __device__ int32x4_t
-llvm_amdgcn_raw_buffer_load_i32x4(int32x4_t srsrc,
-                                  index_t voffset,
-                                  index_t soffset,
-                                  index_t glc_slc) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
-
-template <typename T, AmdBufferCoherence coherence>
+template <typename T, ck_tile::amd_buffer_coherence_enum coherence>
 __device__ __forceinline__ T buffer_load_dwordx4(const int32x4_t& src_wave_buffer_resource,
                                                  index_t src_thread_addr_offset_bytes,
                                                  index_t src_wave_addr_offset)
 {
     static_assert(sizeof(T) == 16, "T must be 128 bits (4 dwords)");
 
-    int32x4_t tmp = llvm_amdgcn_raw_buffer_load_i32x4(src_wave_buffer_resource,
-                                                      src_thread_addr_offset_bytes,
-                                                      src_wave_addr_offset,
-                                                      static_cast<index_t>(coherence));
+    int32x4_t tmp = ck_tile::llvm_amdgcn_raw_buffer_load_i32x4(src_wave_buffer_resource,
+                                                               src_thread_addr_offset_bytes,
+                                                               src_wave_addr_offset,
+                                                               static_cast<index_t>(coherence));
     return __builtin_bit_cast(T, tmp);
 }
 
-template <typename ReturnT, AmdBufferCoherence coherence, typename SrcT, typename IdxT>
+template <typename ReturnT,
+          ck_tile::amd_buffer_coherence_enum coherence,
+          typename SrcT,
+          typename IdxT>
 __device__ __forceinline__ ReturnT
 buffer_load(const SrcT* p_src_wave,
             IdxT base_idx0,          // index of the first element
@@ -815,7 +767,7 @@ buffer_load(const SrcT* p_src_wave,
 {
     static_assert(sizeof(ReturnT) == 16, "ReturnT must be 128 bits (4 dwords)");
 
-    const int32x4_t srsrc = make_wave_buffer_resource(
+    const int32x4_t srsrc = ck_tile::make_wave_buffer_resource(
         p_src_wave, static_cast<uint32_t>(element_space_size * sizeof(SrcT)));
     const index_t voffset_bytes = static_cast<index_t>(base_idx0 * sizeof(SrcT));
     ReturnT packed              = buffer_load_dwordx4<ReturnT, coherence>(srsrc, voffset_bytes, 0);
@@ -1232,7 +1184,7 @@ class WarpSortBlockWide
             constexpr IdxT elements = 16 / sizeof(T);
             const IdxT n_aligned    = utils::round_up_to_multiple_of<elements>(n);
 
-            constexpr auto cache_policy = buffer_load_helpers::AmdBufferCoherence::slc;
+            constexpr auto cache_policy = ck_tile::amd_buffer_coherence_enum::slc;
 
             if constexpr(std::is_same_v<T, _Float16>)
             {
@@ -1332,8 +1284,6 @@ class WarpSortBlockWide
             this->queue_.add(in, warp_start, warp_end);
         }
     }
-
-    __device__ void add(T val, IdxT idx) { queue_.add(val, idx); }
 
     __device__ void done()
     {
