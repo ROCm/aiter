@@ -3,7 +3,7 @@
 
 from torch import Tensor, Generator
 from typing import Optional, Tuple, Any
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
+from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
@@ -977,11 +977,83 @@ def cmdGenFunc_mha_batch_prefill(
     }
 
 
+def gen_mha_varlen_bwd_fake_tensors_common(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    max_seqlen_q: int,
+    zero_tensors: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+):
+    num_heads = q.size(1)
+
+    batch_size = cu_seqlens_q.numel() - 1
+    dq_ = torch.empty_like(q)
+    dk_ = torch.empty_like(k)
+    dv_ = torch.empty_like(v)
+    if dq is not None:
+        dq_ = dq
+    else:
+        dq_ = torch.empty_like(q)
+
+    if dk is not None:
+        dk_ = dk
+    else:
+        dk_ = torch.empty_like(k)
+
+    if dv is not None:
+        dv_ = dv
+    else:
+        dv_ = torch.empty_like(v)
+
+    softmax_d = torch.empty(batch_size, num_heads, max_seqlen_q, dtype=torch.float)
+
+    if zero_tensors:
+        dq_.zero_()
+        softmax_d.zero_()
+
+    return dq_, dk_, dv_, softmax_d
+
+
+def gen_mha_varlen_bwd_fake_tensors(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    return gen_mha_varlen_bwd_fake_tensors_common(
+        q, k, v, cu_seqlens_q, max_seqlen_q, zero_tensors, dq, dk, dv
+    )
+    # return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
+
+
 @compile_ops(
     "module_mha_varlen_bwd",
     fc_name="mha_varlen_bwd",
     gen_func=cmdGenFunc_mha_varlen_bwd,
-    gen_fake=gen_mha_bwd_fake_tensors,
+    gen_fake=gen_mha_varlen_bwd_fake_tensors,
 )
 def mha_varlen_bwd(
     dout: Tensor,
@@ -1037,7 +1109,10 @@ def gen_fmha_v3_varlen_bwd_fake_tensor(
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ):
-    return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
+    return gen_mha_varlen_bwd_fake_tensors_common(
+        q, k, v, cu_seqlens_q, max_seqlen_q, zero_tensors, dq, dk, dv
+    )
+    # return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
 
 @compile_ops(
@@ -1112,8 +1187,8 @@ def _flash_attn_forward(
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_q == hdim_v)
-        ret = ret and (hdim_q == 128)
+        ret = ret and (hdim_v == 128)
+        ret = ret and (hdim_q == 128 or (get_gfx() == "gfx950" and hdim_q == 192))
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
@@ -1376,10 +1451,8 @@ def _flash_attn_backward(
     is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
 ) -> torch.Tensor:
+    # rtna & rtz are deprecated in gfx950
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
-        logger.warning(
-            "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
-        )
         how_v3_bf16_cvt = 0
 
     # can_impl_fmha_v3_bwd should before maybe_contiguous to get pure dout, q, k, v, out
@@ -1408,6 +1481,17 @@ def _flash_attn_backward(
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
     mask = causal and window_size_left == -1  # causal mask
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
+    swa = (window_size_left > 0) or (window_size_right > 0)
+
+    # only 1 block when sk <= 256, thus deterministic
+    is_950_1block = (
+        get_gfx() == "gfx950"
+        and seqlen_k <= 256
+        and hdim_q > 64
+        and hdim_q <= 128
+        and hdim_q % 8 == 0
+        and not swa
+    )
 
     def can_impl_fmha_v3_bwd_gfx950():
         ret = get_gfx() == "gfx950"
@@ -1415,7 +1499,7 @@ def _flash_attn_backward(
         ret &= bias is None
         ret &= dbias is None
         ret &= dropout_p == 0.0
-        ret &= not deterministic
+        ret &= not deterministic or is_950_1block
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
@@ -1446,8 +1530,8 @@ def _flash_attn_backward(
             causal,
             window_size_left,
             window_size_right,
-            deterministic,
-            is_v3_atomic_fp32,
+            False if is_950_1block else deterministic,
+            False if is_950_1block else is_v3_atomic_fp32,
             how_v3_bf16_cvt,
             dq,
             dk,
@@ -1769,8 +1853,8 @@ def _flash_attn_varlen_forward(
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_q == hdim_v)
-        ret = ret and (hdim_q == 128)
+        ret = ret and (hdim_v == 128)
+        ret = ret and (hdim_q == 128 or (get_gfx() == "gfx950" and hdim_q == 192))
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)

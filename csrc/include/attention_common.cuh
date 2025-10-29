@@ -2,8 +2,9 @@
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
-#include <hip/hip_bf16.h>
 #include "hip_compat.h"
+#include <cfloat>
+#include <hip/hip_bf16.h>
 
 #include "dtype_fp8.cuh"
 #include "quant_utils.cuh"
@@ -348,7 +349,7 @@ __device__ void _paged_attention_kernel(
     const int partition_start_token_idx,
     const scalar_t* q,
     const cache_t* k_cache,
-    const cache_t* v_cache,     
+    const cache_t* v_cache,
     const float scale,
     const float* __restrict__ alibi_slopes,    // [num_heads]
     const int q_stride,
@@ -368,7 +369,7 @@ __device__ void _paged_attention_kernel(
 {
     const int seq_idx       = blockIdx.x;
     const int partition_idx = blockIdx.y;
-    constexpr int T_PAR_SIZE = 256; 
+    constexpr int T_PAR_SIZE = 256;
     constexpr int NWARPS = NUM_THREADS / WARP_SIZE;
     const int warpid     = threadIdx.x / WARP_SIZE;
     const int laneid     = threadIdx.x % WARP_SIZE;
