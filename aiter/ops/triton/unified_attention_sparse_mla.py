@@ -1,6 +1,7 @@
 from aiter.ops.triton._triton_kernels.unified_attention_sparse_mla import (
-    kernel_unified_attention_sparse_mla_2d
+    kernel_unified_attention_sparse_mla_2d,
 )
+
 
 def unified_attention_sparse_mla(
     q,
