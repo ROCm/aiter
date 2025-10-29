@@ -828,7 +828,8 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
-_DP: GroupCoordinator | None = None
+from typing import Optional
+_DP: Optional[GroupCoordinator] = None
 
 
 def get_dp_group() -> GroupCoordinator:
@@ -836,7 +837,7 @@ def get_dp_group() -> GroupCoordinator:
     return _DP
 
 
-_EP: GroupCoordinator | None = None
+_EP: Optional[GroupCoordinator] = None
 
 
 def get_ep_group() -> GroupCoordinator:
@@ -934,8 +935,8 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
-    decode_context_model_parallel_size: int | None = 1,
-    backend: str | None = None,
+    decode_context_model_parallel_size: Optional[int] = 1,
+    backend: Optional[str] = None,
 ) -> None:
     """
     Initialize model parallel groups.
