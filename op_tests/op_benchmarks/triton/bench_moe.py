@@ -43,9 +43,9 @@ def model_benchmark_configs(args):
             E = config["num_expert"]
             top_k = config["top_k"]
 
-            moe_configs.append((model_name, M, N1, K1, E, top_k))
+            moe_configs.append((model_name, M, N1, K1, E, top_k, "both" if args.e2e_fused else "stage1"))
             if not no_bench_stage2:
-                moe_configs.append((model_name, M, N2, K2, E, top_k))
+                moe_configs.append((model_name, M, N2, K2, E, top_k, "stage2"))
 
     return moe_configs
 
@@ -66,6 +66,7 @@ def fused_moe(
     silu_fused=False,
     e2e_fused=False,
     tp=1,
+    stage="stage1",
 ):
     moe_fn = triton_moe_silu if silu_fused else triton_moe
     block_shape_k = (
@@ -205,11 +206,16 @@ def fused_moe(
 
         # tensor parallel slicing
         if tp > 1:
-            b = b[:, :N // tp, :].contiguous()
-            if fp8_w8a8:
-                num_b_scales_per_gpu = triton.cdiv(N // tp, block_shape[0])
-                b_scale = b_scale[:, :num_b_scales_per_gpu].contiguous()
-
+            if stage == "stage1":
+                b = b[:, :N // tp, :].contiguous()
+                if fp8_w8a8:
+                    num_b_scales_per_gpu = triton.cdiv(N // tp, block_shape[0])
+                    b_scale = b_scale[:, :num_b_scales_per_gpu].contiguous()
+            else:
+                b = b[:, :, :(K//tp)].contiguous()
+                if fp8_w8a8:
+                    num_b_scales_per_gpu = triton.cdiv(K // tp, block_shape[1])
+                    b_scale = b_scale[:, :, :num_b_scales_per_gpu].contiguous()
 
         fn = lambda: moe_fn(
             a,
@@ -268,10 +274,10 @@ def run_benchmark(args):
         )
     
     if args.N and args.K and args.TopK and args.E:
-        x_vals_list = [("custom shape", args.M if args.M else 32, args.N, args.K, args.E, args.TopK)]
+        x_vals_list = [("custom shape", args.M if args.M else 32, args.N, args.K, args.E, args.TopK, "custom")]
     else:
         x_vals_list = model_benchmark_configs(args)
-    x_names = ["model", "M", "N", "K", "E", "top_k"]
+    x_names = ["model", "M", "N", "K", "E", "top_k", "stage"]
 
     if print_time:
         line_names = ["Time_(ms)"]
@@ -298,10 +304,7 @@ def run_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_moe_gemm(M, N, K, E, top_k, metric, model=None):
-
-        
-
+    def bench_moe_gemm(M, N, K, E, stage, top_k, metric, model=None):
         fn, num_expert_loaded = fused_moe(
             M,
             N,
@@ -318,13 +321,17 @@ def run_benchmark(args):
             silu_fused=silu_fused,
             e2e_fused=e2e_fused,
             tp=args.tp,
+            stage=stage,
         )
         # num_expert_loaded: len(torch.unique(expert_ids))
         # max_expert_loaded = min(E, top_k * M)
         # print("num_expert_loaded:", num_expert_loaded, "max_expert_loaded:", max_expert_loaded)
 
         if args.tp > 1: # take tensor parallelism into account when calculating performance metrics
-            N = N // args.tp
+            if stage == "stage1":
+                N = N // args.tp
+            else:
+                K = K // args.tp
         
         # (M, K) * (top_k, N, K) -> (M, top_k, N). 2 for multiplication and accumulation
         flops = 2.0 * M * top_k * K * N
