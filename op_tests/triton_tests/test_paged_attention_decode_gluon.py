@@ -9,19 +9,19 @@ from typing import List, Optional, Tuple, Union, Dict
 import hashlib
 
 import pandas as pd
+import numpy as np
 import torch
 import triton
 import triton.language as tl
 
 import aiter
 from aiter import dtypes
-from aiter import pertoken_quant
+from aiter import pertoken_quant, per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8 import (
     paged_attention_decode as paged_attention_decode_gluon_fp8,
 )
-
 
 TRITON_VERSION = triton.__version__
 
@@ -51,6 +51,119 @@ def setup_seed(seed: int) -> None:
 
 
 setup_seed(123)
+
+
+def compare_arrays(
+    arr1: np.ndarray,
+    arr2: np.ndarray,
+    k: int = 5,
+    thresholds: List[float] = [0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1],
+) -> Dict:
+    """
+    Compare two numpy arrays and compute various difference metrics.
+
+    Args:
+        arr1: First input array (float32)
+        arr2: Second input array (float32)
+        k: Number of top differences to return
+        thresholds: List of thresholds for difference magnitude analysis
+
+    Returns:
+        Dictionary containing:
+        - top_k_diff: Top k absolute differences with their positions
+        - threshold_stats: Count and percentage of differences above each threshold
+        - nan_info: Information about NaN values in input arrays
+    """
+    # Check input shapes
+    if arr1.shape != arr2.shape:
+        raise ValueError("Input arrays must have the same shape")
+    arr1 = arr1.astype(np.float32)
+    arr2 = arr2.astype(np.float32)
+
+    result = {"top_k_diff": [], "threshold_stats": [], "nan_info": {}}
+
+    # Check for NaN values
+    nan_mask1 = np.isnan(arr1)
+    nan_mask2 = np.isnan(arr2)
+
+    if np.any(nan_mask1):
+        result["nan_info"]["arr1_nan_count"] = np.sum(nan_mask1)
+        result["nan_info"]["arr1_nan_positions"] = np.argwhere(nan_mask1)
+        print(
+            f"Warning: arr1 contains {result['nan_info']['arr1_nan_count']} NaN values"
+        )
+
+    if np.any(nan_mask2):
+        result["nan_info"]["arr2_nan_count"] = np.sum(nan_mask2)
+        result["nan_info"]["arr2_nan_positions"] = np.argwhere(nan_mask2)
+        print(
+            f"Warning: arr2 contains {result['nan_info']['arr2_nan_count']} NaN values"
+        )
+
+    # Compute absolute differences
+    diff = np.abs(arr1 - arr2)
+    total_elements = arr1.size
+
+    max_diff_thr = diff / (1.0 + np.abs(arr2))
+    max_diff_thr = max_diff_thr.max()
+    print(f"diff.abs.max={diff.max()}")
+    print(f"max_diff_thr={max_diff_thr}")
+
+    # Find top k differences
+    flat_diff = diff.flatten()
+    top_k_indices = np.argpartition(flat_diff, -k)[-k:]
+    top_k_indices = top_k_indices[np.argsort(-flat_diff[top_k_indices])]
+
+    # Convert flat indices to multi-dimensional indices
+    orig_indices = np.unravel_index(top_k_indices, diff.shape)
+    for i in range(k):
+        idx = tuple(dim[i] for dim in orig_indices)
+        result["top_k_diff"].append(
+            {
+                "value": diff[idx],
+                "position": idx,
+                "arr1_value": arr1[idx],
+                "arr2_value": arr2[idx],
+            }
+        )
+
+    # Compute threshold statistics
+    for i in range(len(thresholds) - 1):
+        lower = thresholds[i]
+        upper = thresholds[i + 1]
+        mask = (diff >= lower) & (diff < upper)
+        count = np.sum(mask)
+        result["threshold_stats"].append(
+            {
+                "range": f"[{lower:.1e}, {upper:.1e})",
+                "count": count,
+                "percentage": 100 * count / total_elements,
+            }
+        )
+
+    # Handle values above the largest threshold
+    mask = diff >= thresholds[-1]
+    count = np.sum(mask)
+    result["threshold_stats"].append(
+        {
+            "range": f">={thresholds[-1]:.1e}",
+            "count": count,
+            "percentage": 100 * count / total_elements,
+        }
+    )
+
+    # print("\nTop differences:")
+    # for item in result['top_k_diff']:
+    #     print(f"Position {item['position']}: arr1 = {arr1[item['position']]:.6f}, arr2 = {arr2[item['position']]:.6f}, Diff = {item['value']:.6f}")
+
+    # print("\nThreshold statistics:")
+    # for stat in result['threshold_stats']:
+    #     print(f"{stat['range']}: {stat['count']} ({stat['percentage']:.2f}%)")
+
+    print("\nNaN info:")
+    print(result["nan_info"])
+
+    return result
 
 
 def get_kv_cache_torch_dtype(
@@ -239,7 +352,6 @@ def quantize_kv_cache_symmetric(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     quant_dtype: torch.dtype,
-    scale_dtype: torch.dtype = torch.float32,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -297,6 +409,41 @@ def quantize_kv_cache_symmetric(
         .contiguous()
         .view(num_heads, total_tokens)
     )
+
+    return (
+        quantized_keys,
+        key_scales_flat,
+        quantized_values,
+        value_scales_flat,
+        key_scales_original,
+        value_scales_original,
+    )
+
+
+def quantize_kv_cache_per_tensor(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    quant_dtype: torch.dtype,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Apply per-tensor quantization to KV cache."""
+    num_blocks, num_heads, head_dim, block_size = value_cache.shape
+
+    # Per-tensor quantization for keys
+    quantized_keys, key_scale = per_tensor_quant(key_cache, quant_dtype=quant_dtype)
+    # Per-tensor quantization for values
+    quantized_values, value_scale = per_tensor_quant(
+        value_cache, quant_dtype=quant_dtype
+    )
+
+    # For per-tensor quantization, scales are scalars
+    key_scales_flat = key_scale.expand(num_heads, num_blocks * block_size)
+    value_scales_flat = value_scale.expand(num_heads, num_blocks * block_size)
+
+    # Create proper shape for original scales (per-tensor uses scalar broadcasted to appropriate shape)
+    key_scales_original = key_scale.squeeze()
+    value_scales_original = value_scale.squeeze()
 
     return (
         quantized_keys,
@@ -402,6 +549,7 @@ def test_paged_attention_decode_gluon(
     data_type: torch.dtype,
     query_length: int,
     trans_v: bool,
+    quant_mode: str = "per_token",  # "per_token" or "per_tensor"
 ) -> Dict[str, Union[float, str]]:
     """Test paged attention decode with assembly and gluon implementations."""
     results = {}
@@ -462,20 +610,42 @@ def test_paged_attention_decode_gluon(
     key_cache, value_cache = key_caches[0], value_caches[0]
     softmax_scale = 1.0 / (head_size**0.5)
 
-    # Quantization
-    quantized_query, query_scale_factors = pertoken_quant(
-        query, quant_dtype=aiter.dtypes.fp8
-    )
-    (
-        quantized_keys,
-        key_scale_factors_flat,
-        quantized_values,
-        value_scale_factors_flat,
-        key_scale_original,
-        value_scale_original,
-    ) = quantize_kv_cache_symmetric(
-        key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
-    )
+    # Quantization based on mode
+    if quant_mode == "per_token":
+        # Per-token quantization for query
+        quantized_query, query_scale_factors = pertoken_quant(
+            query, quant_dtype=aiter.dtypes.fp8
+        )
+
+        # Per-token quantization for KV cache
+        (
+            quantized_keys,
+            key_scale_factors_flat,
+            quantized_values,
+            value_scale_factors_flat,
+            key_scale_original,
+            value_scale_original,
+        ) = quantize_kv_cache_symmetric(
+            key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
+        )
+    else:  # per_tensor
+        # Per-tensor quantization for query
+        quantized_query, query_scale = per_tensor_quant(
+            query, quant_dtype=aiter.dtypes.fp8
+        )
+        query_scale_factors = query_scale.squeeze()
+
+        # Per-tensor quantization for KV cache
+        (
+            quantized_keys,
+            key_scale_factors_flat,
+            quantized_values,
+            value_scale_factors_flat,
+            key_scale_original,
+            value_scale_original,
+        ) = quantize_kv_cache_per_tensor(
+            key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
+        )
 
     # Reference
     reference_output_quant = torch_mha_extend(
@@ -517,13 +687,16 @@ def test_paged_attention_decode_gluon(
             batch_size, num_kv_heads * query_length * query_group_size, head_size
         )
 
-        if len(query_scale_factors.shape) > 0:
+        if len(query_scale_factors.shape) > 0:  # per-token quantization
             query_scale_gluon = query_scale_factors.reshape(
                 batch_size, query_length, num_kv_heads, query_group_size, 1
             )
             query_scale_gluon = query_scale_gluon.transpose(1, 2).reshape(
                 batch_size, num_kv_heads * query_length * query_group_size, 1
             )
+        else:  # per-tensor quantization
+            # For per-tensor, query_scale is already a scalar, no need to reshape
+            pass
 
     # Test Gluon
     gluon_results = run_gluon_fp8_kernel(
@@ -559,11 +732,14 @@ def test_paged_attention_decode_gluon(
         final_gluon_output,
         atol=fp8_tolerance,
         rtol=fp8_tolerance,
-        msg=f"[PyTorch vs Gluon_FP8][Quant]: {gluon_time:>8.2f} us......",
+        msg=f"[PyTorch vs Gluon_FP8][{quant_mode}]: {gluon_time:>8.2f} us......",
     )
-
-    results["us_gluon_fp8"] = gluon_time
-    results["err_gluon_fp8"] = gluon_error
+    compare_arrays(
+        final_gluon_output.to(torch.float32).detach().cpu().numpy(),
+        reference_output_quant.to(torch.float32).detach().cpu().numpy(),
+    )
+    results[f"us_gluon_fp8"] = gluon_time
+    results[f"err_gluon_fp8"] = gluon_error
 
     # MD5 hash
     reference_hash = hashlib.md5(
@@ -596,7 +772,7 @@ def test_paged_attention_decode_gluon(
         )
         / (kernel_time_us * 1e6 * 1.024**4)
     )
-    results["gluon_fp8_bandwith(TB/s)"] = bandwidth_tb_per_sec
+    results[f"gluon_fp8_bandwith(TB/s)"] = bandwidth_tb_per_sec
 
     # Test Assembly
     query_group_size = num_query_heads // num_kv_heads
@@ -607,6 +783,7 @@ def test_paged_attention_decode_gluon(
         or (block_size == 64)
     )
 
+    # aiter_assembly_kernel do not support per-tensor quantization, we always use per-token quantization here
     if not skip_assembly:
         assembly_output, assembly_time = run_aiter_assembly_kernel(
             query,
@@ -616,8 +793,8 @@ def test_paged_attention_decode_gluon(
             sequence_lengths,
             block_tables.size(1),
             max_query_length,
-            key_scale_original,
-            value_scale_original,
+            key_scale_factors_flat.contiguous(),
+            value_scale_factors_flat.contiguous(),
             query_output_indptr,
         )
         assembly_error = checkAllclose(
@@ -625,10 +802,13 @@ def test_paged_attention_decode_gluon(
             assembly_output,
             atol=fp8_tolerance,
             rtol=fp8_tolerance,
-            msg=f"[PyTorch vs AIT_Assembly][Quant]: {assembly_time:>8.2f} us......",
+            msg=f"[PyTorch vs AIT_Assembly][{quant_mode}]: {assembly_time:>8.2f} us......",
         )
-
-        results["us_asm_fp8"] = assembly_time
+        compare_arrays(
+            assembly_output.to(torch.float32).detach().cpu().numpy(),
+            reference_output_quant.to(torch.float32).detach().cpu().numpy(),
+        )
+        results[f"us_asm_fp8"] = assembly_time
         assembly_bandwidth = (
             batch_size
             * head_size
@@ -638,16 +818,17 @@ def test_paged_attention_decode_gluon(
             )
             / (assembly_time * 1e6 * 1.024**4)
         )
-        results["asm_fp8_bandwith(TB/s)"] = assembly_bandwidth
+        results[f"asm_fp8_bandwith(TB/s)"] = assembly_bandwidth
 
-    if "us_asm_fp8" in results:
-        results["perf_fp8_gluon_vs_asm"] = (
-            f'{results["us_asm_fp8"] / results["us_gluon_fp8"]:.0%}'
+    if f"us_asm_fp8" in results:
+        results[f"perf_fp8_gluon_vs_asm"] = (
+            f'{results[f"us_asm_fp8"] / results[f"us_gluon_fp8"]:.0%}'
         )
     else:
-        results["perf_fp8_gluon_vs_asm"] = "NaN"
+        results[f"perf_fp8_gluon_vs_asm"] = "NaN"
 
     print(f"Triton version: {triton.__version__}")
+    print(f"Quantization mode: {quant_mode}")
     sys.stdout.flush()
 
     return results
@@ -691,6 +872,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trans_v", action="store_true", help="Transpose value cache layout"
     )
+    parser.add_argument(
+        "--quant_mode",
+        type=str,
+        choices=["per_token", "per_tensor", "both"],
+        default="both",
+        help="Quantization mode: per_token, per_tensor, or both",
+    )
 
     return parser
 
@@ -728,6 +916,7 @@ def process_arguments(args: argparse.Namespace) -> tuple:
         batch_sizes,
         query_lengths,
         args.trans_v,
+        args.quant_mode,
     )
 
 
@@ -739,6 +928,7 @@ def run_tests(
     batch_sizes,
     query_lengths,
     trans_v,
+    quant_mode,
 ) -> pd.DataFrame:
     """Run all tests."""
     results = []
@@ -752,18 +942,23 @@ def run_tests(
     )
     current = 0
 
-    for dt in data_types:
-        for bs in block_sizes:
-            for hc in head_configs:
-                for cl in context_lengths:
-                    for bsz in batch_sizes:
-                        for ql in query_lengths:
-                            current += 1
-                            print(
-                                f"\n[{current}/{total}] Testing: dtype={dt}, block_size={bs}, heads={hc}, ctx_len={cl}, batch={bsz}, qlen={ql}"
-                            )
+    # Determine which quantization modes to test
+    if quant_mode == "both":
+        quant_modes_to_test = ["per_token", "per_tensor"]
+    else:
+        quant_modes_to_test = [quant_mode]
 
-                            try:
+    for qm in quant_modes_to_test:
+        for dt in data_types:
+            for bs in block_sizes:
+                for hc in head_configs:
+                    for cl in context_lengths:
+                        for bsz in batch_sizes:
+                            for ql in query_lengths:
+                                current += 1
+                                print(
+                                    f"\n[{current}/{total * len(quant_modes_to_test)}] Testing: dtype={dt}, block_size={bs}, heads={hc}, ctx_len={cl}, batch={bsz}, qlen={ql}, quant_mode={qm}"
+                                )
                                 result = test_paged_attention_decode_gluon(
                                     context_lengths=cl,
                                     batch_size=bsz,
@@ -773,10 +968,9 @@ def run_tests(
                                     data_type=dt,
                                     query_length=ql,
                                     trans_v=trans_v,
+                                    quant_mode=qm,
                                 )
                                 results.append(result)
-                            except Exception as e:
-                                print(f"Test failed: {e}")
 
     return pd.DataFrame(results)
 
@@ -794,6 +988,7 @@ def main():
         batch_sizes,
         query_lengths,
         trans_v,
+        quant_mode,
     ) = process_arguments(args)
 
     results_df = run_tests(
@@ -804,9 +999,10 @@ def main():
         batch_sizes,
         query_lengths,
         trans_v,
+        quant_mode,
     )
 
-    output_file = f"test_paged_attention_decode_gluon{'_trans_v' if trans_v else ''}.triton.{TRITON_VERSION}.csv"
+    output_file = f"test_paged_attention_decode_gluon{'_trans_v' if trans_v else ''}.triton.{TRITON_VERSION}.quant_{quant_mode}.csv"
     results_df.to_csv(output_file, index=False)
     print(f"\nResults saved to {output_file}")
     print(f"\nSummary:\n{results_df}")
@@ -821,12 +1017,15 @@ if __name__ == "__main__":
     # QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
     # CONTEXT_LENGTH_OPTIONS = [512, 4096, 4097]
     # BATCH_SIZE_OPTIONS = [4, 80, 128]
+
     HEAD_DIMENSION = 128
     BLOCK_SIZE_OPTIONS = [16]
+    # BLOCK_SIZE_OPTIONS = [1024]
     DATA_TYPE_OPTIONS = ["bf16"]
     HEAD_CONFIGURATIONS = [(16, 1)]
+    # HEAD_CONFIGURATIONS = [(10, 1)]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
     CONTEXT_LENGTH_OPTIONS = [4096]
-    BATCH_SIZE_OPTIONS = [128]
+    BATCH_SIZE_OPTIONS = [4, 128]
 
     main()

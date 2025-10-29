@@ -1984,7 +1984,8 @@ def paged_attention_decode(
     output: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
     query: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size/x, kv_block_size, x]
-    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size/x, head_size, x]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or
+    # [num_blocks, num_kv_heads, kv_block_size/x, head_size, x]
     sequence_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
@@ -1998,29 +1999,71 @@ def paged_attention_decode(
     alibi_slopes: torch.Tensor = None,
 ) -> None:
     """
-    Paged Attention Decode Function with FP8/BF16 Support.
+    Paged Attention Decode with FP8/BF16 Support.
 
-    This function implements the attention mechanism for transformer decoding with
-    paged KV caches, supporting various quantization schemes and data types.
+    Implements the attention mechanism for transformer decoding with paged KV caches,
+    supporting various quantization schemes and data types.
 
-    Args:
-        output: Output tensor for attention results
-        query: Input query tensor
-        key_cache: Paged key cache in block layout
-        value_cache: Paged value cache in block layout
-        sequence_lengths: Current sequence lengths for each sequence
-        block_tables: Mapping from sequences to physical cache blocks
-        softmax_scale: Scaling factor for attention scores
-        query_sequence_length: Length of query sequences
-        max_sequence_length: Maximum sequence length supported
-        compute_type: Data type for computation (FP8, BF16, etc.)
-        query_scale: Quantization scales for queries
-        key_scale: Quantization scales for keys
-        value_scale: Quantization scales for values
-        num_sequence_partitions: Number of sequence partitions (future use)
-        alibi_slopes: ALiBi attention bias slopes
+    Parameters
+    ----------
+    output : torch.Tensor
+        Output tensor for attention results
+        Shape: [num_seqs, num_kv_heads * query_group_size, head_size]
 
-    Returns:
+    query : torch.Tensor
+        Input query tensor
+        Shape: [num_seqs, num_kv_heads * query_group_size, head_size]
+
+    key_cache : torch.Tensor
+        Paged key cache in block layout
+        Shape: [num_blocks, num_kv_heads, head_size/x, kv_block_size, x]
+
+    value_cache : torch.Tensor
+        Paged value cache in block layout
+        Shape: [num_blocks, num_kv_heads, head_size, kv_block_size] or
+               [num_blocks, num_kv_heads, kv_block_size/x, head_size, x]
+
+    sequence_lengths : torch.Tensor
+        Current sequence lengths for each sequence
+        Shape: [num_seqs]
+
+    block_tables : torch.Tensor
+        Mapping from sequences to physical cache blocks
+        Shape: [num_seqs, max_num_blocks_per_seq]
+
+    softmax_scale : float
+        Scaling factor for attention scores
+
+    query_sequence_length : int
+        Length of query sequences
+
+    max_sequence_length : int
+        Maximum sequence length supported
+
+    compute_type
+        Data type for computation (FP8, BF16, etc.)
+
+    query_scale : torch.Tensor
+        Quantization scales for queries
+        Shape: [] (per-tensor) or [num_seqs, num_kv_heads * query_group_size, 1] (per-token)
+
+    key_scale : torch.Tensor
+        Quantization scales for keys
+        Shape: [] (per-tensor) or [num_blocks, num_kv_heads, kv_block_size, 1] (per-token)
+
+    value_scale : torch.Tensor
+        Quantization scales for values
+        Shape: [] (per-tensor) or [num_blocks, num_kv_heads, kv_block_size, 1] (per-token)
+
+    num_sequence_partitions : int, optional
+        Number of sequence partitions (future use), by default 0
+
+    alibi_slopes : torch.Tensor, optional
+        ALiBi attention bias slopes, by default None
+
+    Returns
+    -------
+    dict
         Dictionary containing timing information and intermediate tensors
     """
     # Extract tensor dimensions
