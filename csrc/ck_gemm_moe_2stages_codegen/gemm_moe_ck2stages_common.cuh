@@ -214,7 +214,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     using AElementOp = PassThrough;
     using BElementOp = PassThrough;
 
-    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
+    static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::NKPadding;
     // static constexpr ck::index_t BLOCKSIZE = 256;
     static constexpr ck::index_t WAVES = BLOCKSIZE / 64;
     static constexpr ck::index_t MNPerXDL = 16;
