@@ -55,7 +55,8 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& bl
     char* dst_ptr = static_cast<char*>(dst.data_ptr());
 
     const int64_t block_size_in_bytes = src.element_size() * src[0].numel();
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(src_device.is_cuda() ? src_device : dst_device);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(
+        src_device.is_cuda() ? src_device : dst_device);
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     // NOTE(woosuk): This can be slow if the number of blocks is large.
     const int64_t num_blocks = block_mapping.size(0);
@@ -975,140 +976,293 @@ __global__ void reshape_and_cache_with_block_quant_kernel_for_asmpa(
 }
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
 __global__ void concat_and_cache_mla_kernel(
-    const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
-    const scalar_t* __restrict__ k_pe,  // [num_tokens, pe_dim]
-    cache_t* __restrict__ kv_cache,  // [num_blocks, block_size, (kv_lora_rank
-                                     // + pe_dim)]
-    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
-    const int block_stride,                    //
-    const int entry_stride,                    //
-    const int kv_c_stride,                     //
-    const int k_pe_stride,                     //
-    const int kv_lora_rank,                    //
-    const int pe_dim,                          //
-    const int block_size,                      //
-    const float* scale                         //
-) {
-  const int64_t token_idx = blockIdx.x;
-  const int64_t slot_idx = slot_mapping[token_idx];
-  // NOTE: slot_idx can be -1 if the token is padded
-  if (slot_idx < 0) {
-    return;
-  }
-  const int64_t block_idx = slot_idx / block_size;
-  const int64_t block_offset = slot_idx % block_size;
-  const float inverted_kscale = 1.0f / *scale;
-  auto copy = [&](const scalar_t* __restrict__ src, cache_t* __restrict__ dst,
-                  int src_stride, int dst_stride, int size, int offset) {
-    for (int i = threadIdx.x; i < size; i += blockDim.x) {
-      const int64_t src_idx = token_idx * src_stride + i;
-      const int64_t dst_idx =
-          block_idx * block_stride + block_offset * entry_stride + i + offset;
-      if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
-        dst[dst_idx] = src[src_idx];
-      } else {
-        dst[dst_idx]= ck_tile::type_convert<cache_t>(
-                ck_tile::type_convert<float>(src[src_idx]) * inverted_kscale);
-      }
+    const scalar_t* __restrict__ kv_c,        // [num_tokens, kv_lora_rank]
+    const scalar_t* __restrict__ k_pe,        // [num_tokens, pe_dim]
+    cache_t* __restrict__ kv_cache,           // [num_blocks, block_size, (kv_lora_rank
+                                              // + pe_dim)]
+    const int64_t* __restrict__ slot_mapping, // [num_tokens]
+    const int block_stride,                   //
+    const int entry_stride,                   //
+    const int kv_c_stride,                    //
+    const int k_pe_stride,                    //
+    const int kv_lora_rank,                   //
+    const int pe_dim,                         //
+    const int block_size,                     //
+    const float* scale                        //
+)
+{
+    const int64_t token_idx = blockIdx.x;
+    const int64_t slot_idx  = slot_mapping[token_idx];
+    // NOTE: slot_idx can be -1 if the token is padded
+    if(slot_idx < 0)
+    {
+        return;
     }
-  };
-  copy(kv_c, kv_cache, kv_c_stride, block_stride, kv_lora_rank, 0);
-  copy(k_pe, kv_cache, k_pe_stride, block_stride, pe_dim, kv_lora_rank);
+    const int64_t block_idx     = slot_idx / block_size;
+    const int64_t block_offset  = slot_idx % block_size;
+    const float inverted_kscale = 1.0f / *scale;
+    auto copy                   = [&](const scalar_t* __restrict__ src,
+                    cache_t* __restrict__ dst,
+                    int src_stride,
+                    int dst_stride,
+                    int size,
+                    int offset) {
+        for(int i = threadIdx.x; i < size; i += blockDim.x)
+        {
+            const int64_t src_idx = token_idx * src_stride + i;
+            const int64_t dst_idx =
+                block_idx * block_stride + block_offset * entry_stride + i + offset;
+            if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+            {
+                dst[dst_idx] = src[src_idx];
+            }
+            else
+            {
+                dst[dst_idx] = ck_tile::type_convert<cache_t>(
+                    ck_tile::type_convert<float>(src[src_idx]) * inverted_kscale);
+            }
+        }
+    };
+    copy(kv_c, kv_cache, kv_c_stride, block_stride, kv_lora_rank, 0);
+    copy(k_pe, kv_cache, k_pe_stride, block_stride, pe_dim, kv_lora_rank);
 }
 
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
 __global__ void concat_and_cache_mla_opt_kernel(
-    const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
-    const scalar_t* __restrict__ k_pe,  // [num_tokens, pe_dim]
-    cache_t* __restrict__ kv_cache,  // [num_blocks, block_size, (kv_lora_rank
-                                     // + pe_dim)]
-    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
-    const int block_stride,                    //
-    const int entry_stride,                    //
-    const int kv_c_stride,                     //
-    const int k_pe_stride,                     //
-    const int kv_lora_rank,                    //
-    const int pe_dim,                          //
-    const int block_size,                      //
-    const float* scale                         //
-) {
-  const int64_t token_idx = blockIdx.x;
-  const int64_t slot_idx = slot_mapping[token_idx];
-  // NOTE: slot_idx can be -1 if the token is padded
-  if (slot_idx < 0) {
-    return;
-  }
-  const int64_t block_idx = slot_idx / block_size;
-  const int64_t block_offset = slot_idx % block_size;
-  const float inverted_kscale = 1.0f / *scale;
-  static constexpr int32_t vec_size_i = std::is_same_v<scalar_t, float> ? 4 : 8;
-  static constexpr int32_t vec_size_o = vec_size_i;
-  using vec_i = ck_tile::vec_t<scalar_t, vec_size_i>;
-  static constexpr int32_t ooba_i = 4 / sizeof(scalar_t);
-  static constexpr int32_t ooba_o = 4 / sizeof(cache_t);
-  auto out_offset = block_idx * block_stride + block_offset * entry_stride;
-  auto copy = [&](const scalar_t* __restrict__ src, cache_t* __restrict__ dst,
-                  int src_stride, int dst_stride, int size, int offset) {
-    const int32_t oob_i             = (size + ooba_i - 1) / ooba_i * ooba_i;
-    const int32_t oob_o             = (size + ooba_o - 1) / ooba_o * ooba_o;
-    auto const* ptr_i               = reinterpret_cast<scalar_t const*>(src + token_idx * src_stride);
-    auto* ptr_o                     = reinterpret_cast<cache_t*>(dst + out_offset + offset);
-    auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_i, oob_i);
-    buffer_i.init_raw();
-    auto buffer_o = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_o, oob_o);
-    buffer_o.init_raw();
-
-    // double load core loop start
-    const int32_t num_vecs       = (size + vec_size_i - 1) / vec_size_i;
-    vec_i vec_nxt;
-    vec_i vec_cur;
-
-    size_t vec_idx    = threadIdx.x;
-    size_t vec_stride = blockDim.x;
-    if (vec_idx < num_vecs)
+    const scalar_t* __restrict__ kv_c,        // [num_tokens, kv_lora_rank]
+    const scalar_t* __restrict__ k_pe,        // [num_tokens, pe_dim]
+    cache_t* __restrict__ kv_cache,           // [num_blocks, block_size, (kv_lora_rank
+                                              // + pe_dim)]
+    const int64_t* __restrict__ slot_mapping, // [num_tokens]
+    const int block_stride,                   //
+    const int entry_stride,                   //
+    const int kv_c_stride,                    //
+    const int k_pe_stride,                    //
+    const int kv_lora_rank,                   //
+    const int pe_dim,                         //
+    const int block_size,                     //
+    const float* scale                        //
+)
+{
+    const int64_t token_idx = blockIdx.x;
+    const int64_t slot_idx  = slot_mapping[token_idx];
+    // NOTE: slot_idx can be -1 if the token is padded
+    if(slot_idx < 0)
     {
-        vec_cur = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
+        return;
     }
-    for (vec_idx += vec_stride; vec_idx < num_vecs; vec_idx += vec_stride)
-    {
-        vec_nxt = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
-        if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
-            buffer_o.template set(
-                (vec_idx - vec_stride) * vec_size_o,
-                0,
-                true,
-                vec_cur.template get_as<cache_t>());
-        } else {
-            buffer_o.template set(
-                (vec_idx - vec_stride) * vec_size_o,
-                0,
-                true,
-                ck_tile::vec_convert<cache_t, scalar_t, vec_size_i>(vec_cur, inverted_kscale)
-                       .template get_as<cache_t>());
+    const int64_t block_idx             = slot_idx / block_size;
+    const int64_t block_offset          = slot_idx % block_size;
+    const float inverted_kscale         = 1.0f / *scale;
+    static constexpr int32_t vec_size_i = std::is_same_v<scalar_t, float> ? 4 : 8;
+    static constexpr int32_t vec_size_o = vec_size_i;
+    using vec_i                         = ck_tile::vec_t<scalar_t, vec_size_i>;
+    static constexpr int32_t ooba_i     = 4 / sizeof(scalar_t);
+    static constexpr int32_t ooba_o     = 4 / sizeof(cache_t);
+    auto out_offset                     = block_idx * block_stride + block_offset * entry_stride;
+    auto copy                           = [&](const scalar_t* __restrict__ src,
+                    cache_t* __restrict__ dst,
+                    int src_stride,
+                    int dst_stride,
+                    int size,
+                    int offset) {
+        const int32_t oob_i = (size + ooba_i - 1) / ooba_i * ooba_i;
+        const int32_t oob_o = (size + ooba_o - 1) / ooba_o * ooba_o;
+        auto const* ptr_i   = reinterpret_cast<scalar_t const*>(src + token_idx * src_stride);
+        auto* ptr_o         = reinterpret_cast<cache_t*>(dst + out_offset + offset);
+        auto buffer_i =
+            ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_i, oob_i);
+        buffer_i.init_raw();
+        auto buffer_o =
+            ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_o, oob_o);
+        buffer_o.init_raw();
+
+        // double load core loop start
+        const int32_t num_vecs = (size + vec_size_i - 1) / vec_size_i;
+        vec_i vec_nxt;
+        vec_i vec_cur;
+
+        size_t vec_idx    = threadIdx.x;
+        size_t vec_stride = blockDim.x;
+        if(vec_idx < num_vecs)
+        {
+            vec_cur = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
         }
-        vec_cur = vec_nxt;
-    }
-    if (vec_idx - vec_stride < num_vecs)
+        for(vec_idx += vec_stride; vec_idx < num_vecs; vec_idx += vec_stride)
+        {
+            vec_nxt = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
+            if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+            {
+                buffer_o.template set((vec_idx - vec_stride) * vec_size_o,
+                                      0,
+                                      true,
+                                      vec_cur.template get_as<cache_t>());
+            }
+            else
+            {
+                buffer_o.template set(
+                    (vec_idx - vec_stride) * vec_size_o,
+                    0,
+                    true,
+                    ck_tile::vec_convert<cache_t, scalar_t, vec_size_i>(vec_cur, inverted_kscale)
+                        .template get_as<cache_t>());
+            }
+            vec_cur = vec_nxt;
+        }
+        if(vec_idx - vec_stride < num_vecs)
+        {
+            if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+            {
+                buffer_o.template set((vec_idx - vec_stride) * vec_size_o,
+                                      0,
+                                      true,
+                                      vec_cur.template get_as<cache_t>());
+            }
+            else
+            {
+                buffer_o.template set(
+                    (vec_idx - vec_stride) * vec_size_o,
+                    0,
+                    true,
+                    ck_tile::vec_convert<cache_t, scalar_t, vec_size_i>(vec_cur, inverted_kscale)
+                        .template get_as<cache_t>());
+            }
+        }
+    };
+
+    copy(kv_c, kv_cache, kv_c_stride, block_stride, kv_lora_rank, 0);
+    copy(k_pe, kv_cache, k_pe_stride, block_stride, pe_dim, kv_lora_rank);
+}
+
+template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
+__global__ void indexer_k_quant_and_cache_kernel(
+    const scalar_t* __restrict__ k,           // [num_tokens, head_dim]
+    cache_t* __restrict__ kv_cache,           // [num_blocks, block_size, cache_stride]
+    const int64_t* __restrict__ slot_mapping, // [num_tokens]
+    const int head_dim,                       // dimension of each head
+    const int quant_block_size,               // quantization block size
+    const int cache_block_size,               // cache block size
+    const int cache_stride,                   // stride for each token in kv_cache
+    const bool use_ue8m0                      // use ue8m0 scale format
+)
+{
+    constexpr int VEC_SIZE  = 4;
+    const int64_t token_idx = blockIdx.x;
+    const int64_t head_dim_idx =
+        (blockIdx.y * blockDim.y * blockDim.x + threadIdx.y * blockDim.x + threadIdx.x) * VEC_SIZE;
+    const int64_t slot_idx     = slot_mapping[token_idx];
+    const int64_t block_idx    = slot_idx / cache_block_size;
+    const int64_t block_offset = slot_idx % cache_block_size;
+    using vec_i                = ck_tile::vec_t<scalar_t, VEC_SIZE>;
+    using vec_o                = ck_tile::vec_t<cache_t, VEC_SIZE>;
+
+    // NOTE: slot_idx can be -1 if the token is padded
+    if(slot_idx < 0 || (head_dim_idx >= head_dim))
     {
-        if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
-            buffer_o.template set(
-                (vec_idx - vec_stride) * vec_size_o,
-                0,
-                true,
-                vec_cur.template get_as<cache_t>());
-        } else {
-            buffer_o.template set(
-                (vec_idx - vec_stride) * vec_size_o,
-                0,
-                true,
-                ck_tile::vec_convert<cache_t, scalar_t, vec_size_i>(vec_cur, inverted_kscale)
-                       .template get_as<cache_t>());
+        return;
+    }
+
+    vec_i k_val =
+        (reinterpret_cast<const vec_i*>(k))[(token_idx * head_dim + head_dim_idx) / VEC_SIZE];
+
+    // float amax = 0.0f;
+    // for(int i = 0; i < VEC_SIZE; i++)
+    // {
+    //     amax = fmaxf(amax, fabsf(float(k_val[i])));
+    // }
+
+    // // Reduced amax
+    // for(int mask = 16; mask > 0; mask /= 2)
+    // {
+    //     amax = fmaxf(amax, __shfl_xor_sync(uint64_t(-1), amax, mask));
+    // }
+    // float scale = fmaxf(amax, 1e-4) / ck_tile::type_convert<float>(ck_tile::numeric<cache_t>::max());
+    // if(use_ue8m0)
+    // {
+    //     scale = exp2f(ceilf(log2f(scale)));
+    // }
+
+    // const int64_t dst_offset =
+    //     block_idx * cache_block_size * cache_stride + block_offset * head_dim + head_dim_idx;
+
+    //   for (int i = 0; i < VEC_SIZE; i++) {
+    //     kv_cache[dst_offset + i] = ck_tile::type_convert<cache_t>(k_val[i] / scale);
+        // kv_cache[dst_offset + i] =
+        //     fp8::scaled_convert<cache_t, scalar_t, kv_dt>(k_val_ptr[i], scale);
+    //   }
+    // if(threadIdx.x == 0)
+    // {
+    //     const int64_t dst_scale_idx =
+    //         block_idx * cache_block_size * cache_stride + cache_block_size * head_dim +
+    //         (block_offset * head_dim + head_dim_idx) * 4 / quant_block_size;
+    //     reinterpret_cast<float*>(kv_cache)[dst_scale_idx / 4] = scale;
+    // }
+    // scale = 1.0f / scale;
+    // vec_o* kv_cache_vec = reinterpret_cast<vec_o*>(kv_cache + dst_offset);
+    // *kv_cache_vec = ck_tile::vec_convert<cache_t, scalar_t, VEC_SIZE>(k_val, scale);
+}
+
+template <int BLOCK_X_SIZE, int BLOCK_Y_SIZE>
+__global__ void cp_gather_indexer_k_quant_cache_kernel(
+    const char* __restrict__ kv_cache,   // [num_blocks, block_size,
+                                         // cache_stride]
+    char* __restrict__ dst_k,            // [num_tokens, head_dim]
+    char* __restrict__ dst_scale,        // [num_tokens, head_dim / quant_block_size *
+                                         // 4]
+    const int* __restrict__ block_table, // [batch_size, num_blocks]
+    const int* __restrict__ cu_seq_lens, // [batch_size + 1]
+    const int batch_size,                // batch size
+    const int64_t token_stride,          // stride for each token in dst_k
+    const int64_t head_dim,              // dimension of each head
+    const int64_t block_stride,          // stride for each block in kv_cache
+    const int64_t cache_token_stride,    // stride for each token in kv_cache
+    const int64_t cache_block_size,      // num_tokens for each block in kv_cache
+    const int num_blocks,                // number of blocks
+    const int num_tokens,                // number of tokens
+    const int quant_block_size           // quantization block size
+)
+{
+    constexpr int VEC_SIZE = sizeof(float4) / sizeof(char);
+    const int token_idx    = blockIdx.x * blockDim.y + threadIdx.y;
+    const int head_idx     = (blockIdx.y * blockDim.x + threadIdx.x) * VEC_SIZE;
+    // Find batch index within a block
+    __shared__ int batch_idx[BLOCK_Y_SIZE];
+    for(int iter = 0; iter < (batch_size - BLOCK_X_SIZE + 1) / BLOCK_X_SIZE; iter++)
+    {
+        int tid = iter * blockDim.x + threadIdx.x;
+        if(tid < batch_size)
+        {
+            const int seq_start = cu_seq_lens[tid];
+            const int seq_end   = cu_seq_lens[tid + 1];
+            if(token_idx >= seq_start && token_idx < seq_end)
+            {
+                batch_idx[threadIdx.y] = tid;
+            }
         }
     }
-  };
 
-  copy(kv_c, kv_cache, kv_c_stride, block_stride, kv_lora_rank, 0);
-  copy(k_pe, kv_cache, k_pe_stride, block_stride, pe_dim, kv_lora_rank);
+    if(head_idx >= head_dim || token_idx >= num_tokens)
+    {
+        return;
+    }
+    const int inbatch_seq_idx = token_idx - cu_seq_lens[batch_idx[threadIdx.y]];
+    const int block_idx =
+        block_table[batch_idx[threadIdx.y] * num_blocks + inbatch_seq_idx / cache_block_size];
+    const int64_t src_block_offset     = block_idx * block_stride;
+    const int64_t cache_inblock_offset = (inbatch_seq_idx % cache_block_size) * head_dim + head_idx;
+    const int64_t src_inblock_offset   = src_block_offset + cache_inblock_offset;
+    const int64_t dst_inblock_offset   = token_idx * token_stride + head_idx;
+
+    reinterpret_cast<float4*>(dst_k)[dst_inblock_offset / VEC_SIZE] =
+        reinterpret_cast<const float4*>(kv_cache)[src_inblock_offset / VEC_SIZE];
+    ;
+    if(threadIdx.x == 0)
+    {
+        const int64_t src_scale_offset = src_block_offset + cache_block_size * head_dim +
+                                         cache_inblock_offset * 4 / quant_block_size;
+        reinterpret_cast<float*>(dst_scale)[dst_inblock_offset / quant_block_size] =
+            reinterpret_cast<const float*>(kv_cache)[src_scale_offset / 4];
+    }
 }
 
 } // namespace aiter
@@ -1378,25 +1532,69 @@ void reshape_and_cache_flash(
 // KV_T is the data type of key and value tensors.
 // CACHE_T is the stored data type of kv-cache.
 // KV_DTYPE is the real data type of kv-cache.
-#define CALL_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE)              \
-  aiter::concat_and_cache_mla_kernel<KV_T, CACHE_T, KV_DTYPE>            \
-      <<<grid, block, 0, stream>>>(                                     \
-          reinterpret_cast<KV_T*>(kv_c.data_ptr()),                     \
-          reinterpret_cast<KV_T*>(k_pe.data_ptr()),                     \
-          reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),              \
-          slot_mapping.data_ptr<int64_t>(), block_stride, entry_stride, \
-          kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,   \
-          reinterpret_cast<const float*>(scale.data_ptr()));
+#define CALL_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE)                            \
+    aiter::concat_and_cache_mla_kernel<KV_T, CACHE_T, KV_DTYPE>                       \
+        <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(kv_c.data_ptr()),        \
+                                     reinterpret_cast<KV_T*>(k_pe.data_ptr()),        \
+                                     reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()), \
+                                     slot_mapping.data_ptr<int64_t>(),                \
+                                     block_stride,                                    \
+                                     entry_stride,                                    \
+                                     kv_c_stride,                                     \
+                                     k_pe_stride,                                     \
+                                     kv_lora_rank,                                    \
+                                     pe_dim,                                          \
+                                     block_size,                                      \
+                                     reinterpret_cast<const float*>(scale.data_ptr()));
 
-#define CALL_CONCAT_AND_CACHE_MLA_OPT(KV_T, CACHE_T, KV_DTYPE)              \
-  aiter::concat_and_cache_mla_opt_kernel<KV_T, CACHE_T, KV_DTYPE>       \
-      <<<grid, block, 0, stream>>>(                                     \
-          reinterpret_cast<KV_T*>(kv_c.data_ptr()),                     \
-          reinterpret_cast<KV_T*>(k_pe.data_ptr()),                     \
-          reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),              \
-          slot_mapping.data_ptr<int64_t>(), block_stride, entry_stride, \
-          kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,   \
-          reinterpret_cast<const float*>(scale.data_ptr()));
+#define CALL_CONCAT_AND_CACHE_MLA_OPT(KV_T, CACHE_T, KV_DTYPE)                        \
+    aiter::concat_and_cache_mla_opt_kernel<KV_T, CACHE_T, KV_DTYPE>                   \
+        <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(kv_c.data_ptr()),        \
+                                     reinterpret_cast<KV_T*>(k_pe.data_ptr()),        \
+                                     reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()), \
+                                     slot_mapping.data_ptr<int64_t>(),                \
+                                     block_stride,                                    \
+                                     entry_stride,                                    \
+                                     kv_c_stride,                                     \
+                                     k_pe_stride,                                     \
+                                     kv_lora_rank,                                    \
+                                     pe_dim,                                          \
+                                     block_size,                                      \
+                                     reinterpret_cast<const float*>(scale.data_ptr()));
+
+// Macro to dispatch the kernel based on the data type.
+#define CALL_INDEXER_K_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                       \
+    aiter::indexer_k_quant_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE>                  \
+        <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(k.data_ptr()),           \
+                                     reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()), \
+                                     slot_mapping.data_ptr<int64_t>(),                \
+                                     head_dim,                                        \
+                                     quant_block_size,                                \
+                                     cache_block_size,                                \
+                                     cache_stride,                                    \
+                                     use_ue8m0);
+
+// Macro to dispatch the kernel based on the data amount.
+#define CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(BLOCK_Y_SIZE)          \
+    aiter::cp_gather_indexer_k_quant_cache_kernel<8, BLOCK_Y_SIZE>  \
+        <<<dim3((num_tokens + BLOCK_Y_SIZE - 1) / BLOCK_Y_SIZE,     \
+                (head_dim + 8 * vec_size - 1) / (8 * vec_size)),    \
+           dim3(8, BLOCK_Y_SIZE),                                   \
+           0,                                                       \
+           stream>>>(reinterpret_cast<char*>(kv_cache.data_ptr()),  \
+                     reinterpret_cast<char*>(dst_k.data_ptr()),     \
+                     reinterpret_cast<char*>(dst_scale.data_ptr()), \
+                     block_table.data_ptr<int32_t>(),               \
+                     cu_seq_lens.data_ptr<int32_t>(),               \
+                     batch_size,                                    \
+                     dst_k.stride(0),                               \
+                     dst_k.size(1),                                 \
+                     kv_cache.stride(0),                            \
+                     kv_cache.stride(1),                            \
+                     kv_cache.size(1),                              \
+                     block_table.size(1),                           \
+                     num_tokens,                                    \
+                     quant_block_size);
 
 namespace aiter {
 
@@ -1652,40 +1850,121 @@ void reshape_and_cache_with_block_quant_for_asm_pa(
     }
 }
 
-void concat_and_cache_mla(
-    torch::Tensor& kv_c,          // [num_tokens, kv_lora_rank]
-    torch::Tensor& k_pe,          // [num_tokens, pe_dim]
-    torch::Tensor& kv_cache,      // [num_blocks, block_size, (kv_lora_rank +
-                                  // pe_dim)]
-    torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
-    const std::string& kv_cache_dtype, torch::Tensor& scale) {
-  int num_tokens = slot_mapping.size(0);
-  int kv_lora_rank = kv_c.size(1);
-  int pe_dim = k_pe.size(1);
-  int block_size = kv_cache.size(1);
+void concat_and_cache_mla(torch::Tensor& kv_c,         // [num_tokens, kv_lora_rank]
+                          torch::Tensor& k_pe,         // [num_tokens, pe_dim]
+                          torch::Tensor& kv_cache,     // [num_blocks, block_size, (kv_lora_rank +
+                                                       // pe_dim)]
+                          torch::Tensor& slot_mapping, // [num_tokens] or [num_actual_tokens]
+                          const std::string& kv_cache_dtype,
+                          torch::Tensor& scale)
+{
+    int num_tokens   = slot_mapping.size(0);
+    int kv_lora_rank = kv_c.size(1);
+    int pe_dim       = k_pe.size(1);
+    int block_size   = kv_cache.size(1);
 
-  TORCH_CHECK(kv_cache.size(2) == kv_lora_rank + pe_dim);
-  int kv_c_stride = kv_c.stride(0);
-  int k_pe_stride = k_pe.stride(0);
-  int block_stride = kv_cache.stride(0);
-  int entry_stride = kv_cache.stride(1);
- const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(kv_c));
- const hipStream_t stream = at::hip::getCurrentHIPStream();
+    TORCH_CHECK(kv_cache.size(2) == kv_lora_rank + pe_dim);
+    int kv_c_stride  = kv_c.stride(0);
+    int k_pe_stride  = k_pe.stride(0);
+    int block_stride = kv_cache.stride(0);
+    int entry_stride = kv_cache.stride(1);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(kv_c));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-  if ((pe_dim & 0x7) == 0 && (kv_lora_rank & 0x7) == 0) {
-    dim3 grid(num_tokens);
-    dim3 block(std::min(kv_lora_rank, 1024) / 8);
-    DISPATCH_BY_KV_CACHE_DTYPE(kv_c.dtype(), kv_cache_dtype,
-                               CALL_CONCAT_AND_CACHE_MLA_OPT);
-
-  } else {
-    dim3 grid(num_tokens);
-    dim3 block(std::min(kv_lora_rank, 512));
-    DISPATCH_BY_KV_CACHE_DTYPE(kv_c.dtype(), kv_cache_dtype,
-                               CALL_CONCAT_AND_CACHE_MLA);
-  }
-
+    if((pe_dim & 0x7) == 0 && (kv_lora_rank & 0x7) == 0)
+    {
+        dim3 grid(num_tokens);
+        dim3 block(std::min(kv_lora_rank, 1024) / 8);
+        DISPATCH_BY_KV_CACHE_DTYPE(kv_c.dtype(), kv_cache_dtype, CALL_CONCAT_AND_CACHE_MLA_OPT);
+    }
+    else
+    {
+        dim3 grid(num_tokens);
+        dim3 block(std::min(kv_lora_rank, 512));
+        DISPATCH_BY_KV_CACHE_DTYPE(kv_c.dtype(), kv_cache_dtype, CALL_CONCAT_AND_CACHE_MLA);
+    }
 }
 
+// copy from vllm: https://github.com/vllm-project/vllm/blob/main/csrc/cache_kernels.cu
+void indexer_k_quant_and_cache(torch::Tensor& k,        // [num_tokens, head_dim]
+                               torch::Tensor& kv_cache, // [num_blocks, block_size, cache_stride]
+                               torch::Tensor& slot_mapping, // [num_tokens]
+                               int64_t quant_block_size,    // quantization block size
+                               const std::string& scale_fmt)
+{
+    int num_tokens       = k.size(0);
+    int head_dim         = k.size(1);
+    int cache_block_size = kv_cache.size(1);
+    int cache_stride     = kv_cache.size(2);
+    bool use_ue8m0       = scale_fmt == "ue8m0";
+
+    TORCH_CHECK(k.device() == kv_cache.device(), "k and kv_cache must be on the same device");
+    TORCH_CHECK(k.device() == slot_mapping.device(),
+                "k and slot_mapping must be on the same device");
+    TORCH_CHECK(head_dim % quant_block_size == 0, "head_dim must be divisible by quant_block_size");
+
+    constexpr int vec_size = 4;
+    dim3 grid(num_tokens,
+              (head_dim + quant_block_size * vec_size - 1) / (quant_block_size * vec_size));
+    dim3 block(32, vec_size);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(k));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    DISPATCH_BY_KV_CACHE_DTYPE(k.dtype(), "fp8_e4m3", CALL_INDEXER_K_QUANT_AND_CACHE);
+}
+
+// copy from vllm: https://github.com/vllm-project/vllm/blob/main/csrc/cache_kernels.cu
+void cp_gather_indexer_k_quant_cache(
+    const torch::Tensor& kv_cache,    // [num_blocks, block_size, cache_stride]
+    torch::Tensor& dst_k,             // [num_tokens, head_dim]
+    torch::Tensor& dst_scale,         // [num_tokens, head_dim / quant_block_size * 4]
+    const torch::Tensor& block_table, // [batch_size, num_blocks]
+    const torch::Tensor& cu_seq_lens  // [batch_size + 1]
+)
+{
+    int batch_size       = block_table.size(0);
+    int num_tokens       = dst_k.size(0);
+    int head_dim         = dst_k.size(1);
+    int quant_block_size = head_dim * 4 / dst_scale.size(1);
+
+    TORCH_CHECK(kv_cache.device() == dst_k.device(),
+                "kv_cache and dst_k must be on the same device");
+    TORCH_CHECK(kv_cache.device() == dst_scale.device(),
+                "kv_cache and dst_scale must be on the same device");
+    TORCH_CHECK(kv_cache.device() == block_table.device(),
+                "kv_cache and block_table must be on the same device");
+    TORCH_CHECK(kv_cache.device() == cu_seq_lens.device(),
+                "kv_cache and cu_seq_lens must be on the same device");
+    TORCH_CHECK(head_dim % quant_block_size == 0, "head_dim must be divisible by quant_block_size");
+
+    constexpr int vec_size = 16;
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(kv_cache));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    if(num_tokens < 32)
+    {
+        CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(1);
+    }
+    else if(num_tokens < 64)
+    {
+        CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(2);
+    }
+    else if(num_tokens < 128)
+    {
+        CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(4);
+    }
+    else if(num_tokens < 256)
+    {
+        CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(8);
+    }
+    else if(num_tokens < 512)
+    {
+        CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(16);
+    }
+    else
+    {
+        CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(32);
+    }
+}
 
 } // namespace aiter
