@@ -682,6 +682,7 @@ MANUAL_SCHEMA_OPS = [
     "_QuantType",
     "init_custom_ar",
     "greedy_sample",
+    "random_sample_outer_exponential",
     "random_sample",
     "mixed_sample",
     "exponential",
@@ -693,11 +694,9 @@ NONE_WRAPPED_OP = [
     "getHipblasltKernelName",
     # "rocb_create_extension",
     # "rocb_destroy_extension",
-    "get_meta_buffer_ipc_handle",
     "get_graph_buffer_ipc_meta",
     "_ActivationType",
     "_QuantType",
-    # "allocate_meta_buffer",
     # "dispose",
     # "meta_size",
     # "get_padded_m",
@@ -924,6 +923,9 @@ def compile_ops(
                         "torch": torch,
                         "typing": typing,
                     }
+                    if sys.version_info < (3, 10):
+                        pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
+                        doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
                     exec(
                         f"from aiter import*\ndef {doc_str}: pass",
                         namespace,
