@@ -286,7 +286,7 @@ def run_benchmark(args: argparse.Namespace):
                 out_logits,
                 context_lens,
                 block_tables,
-                max_model_len
+                max_model_len,
             )
         else:
             deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
@@ -347,7 +347,7 @@ def run_benchmark(args: argparse.Namespace):
         print(
             kv_storage_kind,
             " time elapsed: ",
-            elapsed_us, "us    stage1 time elapsed: ", elapsed_us_stage1,
+            elapsed_us,
             "us  ",
         )
 
