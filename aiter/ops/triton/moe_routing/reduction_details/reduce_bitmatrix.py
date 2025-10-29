@@ -86,13 +86,12 @@ def sum_bitmatrix_rows(x, out_ret, partials_block_size=None):
     cdiv = triton.cdiv
     PARTIALS_BLOCK_M = partials_block_size
     n_rows, n_cols = x.shape
-    n_rows_max = x.shape_max[0]
     assert out_ret.shape == (n_cols, )
 
     TILE_SIZE = max(1, 128 // PARTIALS_BLOCK_M)
     BLOCK_MM = PARTIALS_BLOCK_M * TILE_SIZE
 
-    pids_x = cdiv(n_rows_max, BLOCK_MM)
+    pids_x = cdiv(n_rows, BLOCK_MM)
     pids_y = cdiv(n_cols, 32)
     out_partials = torch.empty((pids_y * 32, pids_x * TILE_SIZE), device=out_ret.device, dtype=torch.int32)
     out_partials = torch.transpose(out_partials, 0, 1)
@@ -106,6 +105,6 @@ def sum_bitmatrix_rows(x, out_ret, partials_block_size=None):
         BLOCK_M=PARTIALS_BLOCK_M, BLOCK_MM=BLOCK_MM,  # constants
         num_warps=8)
 
-    out_partials = out_partials[:cdiv(n_rows_max, PARTIALS_BLOCK_M), :]
+    out_partials = out_partials[:cdiv(n_rows, PARTIALS_BLOCK_M), :]
 
     return out_ret, out_partials

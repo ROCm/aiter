@@ -18,10 +18,9 @@ class Bitmatrix:
 
     scratchpad: torch.Tensor = None
 
-    def __init__(self, data, shape, shape_max=None, scratchpad=None):
+    def __init__(self, data, shape, scratchpad=None):
         self.data = data
         self.shape = shape
-        self.shape_max = shape_max
         self.device = data.device
         self.scratchpad = scratchpad
 

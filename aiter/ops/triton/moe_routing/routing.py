@@ -275,7 +275,13 @@ def compute_expt_data(expt_hist, n_expts_tot, n_gates):
 # --------------------------
 
 
-def routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx, n_expts_tot, n_expts_act):
+def routing(logits, n_expts_act, sm_first=False, expt_indx=None):
+    from .topk import topk
+    if sm_first:
+        logits = torch.softmax(logits, dim=-1)
+    expt_scal, expt_indx, bitmatrix = topk(logits, n_expts_act, apply_softmax=not sm_first, y_indx=expt_indx)
+    n_expts_tot = logits.shape[-1]
+    
     hist, topk_indx, gate_indx, gate_scal, token_offs_raw, token_offs_pad, block_pid_map = sort_tokens(
         expt_scal, expt_indx, n_expts_tot, bitmatrix)
     token_offs_pad = _unpack_into_dict(token_offs_pad)
@@ -286,20 +292,6 @@ def routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx, n_expts_tot, n_expts
     gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
     scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
     return RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data), gather_indx, scatter_indx
-
-
-def routing(logits, n_expts_act, sm_first=False, expt_indx=None, simulated_ep=1, n_rows=None):
-    from .topk import topk
-    if sm_first:
-        logits = torch.softmax(logits, dim=-1)
-    expt_scal, expt_indx, bitmatrix = topk(logits, n_expts_act,  #
-                                           apply_softmax=not sm_first, y_indx=expt_indx, n_rows=n_rows)
-    n_expts_tot = logits.shape[-1] // simulated_ep
-    # mutate bitmatrix
-    if simulated_ep > 1:
-        expt_scal, expt_indx, bitmatrix = prune_routing(expt_scal, expt_indx, bitmatrix, logits.shape[-1], simulated_ep)
-
-    return routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx, n_expts_tot, n_expts_act)
 
 
 # --------------------------
@@ -341,12 +333,9 @@ def compute_expt_data_torch(hist, n_expts_tot, n_gates):
     return ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
 
 
-def routing_torch(logits, n_expts_act, sm_first=False, expt_indx=None, n_rows=None):
+def routing_torch(logits, n_expts_act, sm_first=False, expt_indx=None):
     has_user_provided_indx = expt_indx is not None
     n_gates_pad = logits.shape[0] * n_expts_act
-
-    if n_rows is not None:
-        logits = logits[:n_rows, :]
 
     def topk(vals, k, expt_indx):
         # topk of experts

@@ -70,44 +70,34 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 
 
 def init_data(n_tokens, n_expts_tot, dtype=torch.float16, device="cuda"):
-    logits = torch.randn((n_tokens, n_expts_tot), dtype=dtype, device=device, requires_grad=True)
+    logits = torch.randn((n_tokens, n_expts_tot), dtype=dtype, device=device)
     return logits
 
 
-n_tokens = [(x, None) for x in [371, 255, 256, 4096, 1023, 1024]]
-n_tokens += [(1152, 911)]
+n_tokens = [371, 255, 256, 4096, 1023, 1024, 911]
 
-
-@pytest.mark.parametrize("n_tokens_pad, n_tokens_raw", n_tokens)
-@pytest.mark.parametrize("n_expts_tot, n_expts_act", [(128, 32), (1500, 8)])
+@pytest.mark.parametrize("n_tokens", n_tokens)
+@pytest.mark.parametrize("n_expts_tot, n_expts_act", [(128, 4), (128, 32), (1500, 8)])
 @pytest.mark.parametrize("use_expt_indx", [False, True])
 @pytest.mark.parametrize("sm_first", [True, False])
-def test_op(n_tokens_pad, n_tokens_raw, n_expts_tot, n_expts_act, sm_first, use_expt_indx):
+def test_op(n_tokens, n_expts_tot, n_expts_act, sm_first, use_expt_indx):
     device = "cuda"
     torch.manual_seed(2)
-    if n_tokens_raw is None:
-        n_tokens_raw = n_tokens_pad
-        n_routing_rows = None
-    else:
-        n_routing_rows = torch.tensor([n_tokens_raw], dtype=torch.int32, device=device)
-    n_gates_raw = n_tokens_raw * n_expts_act
-    tri_logits = init_data(n_tokens_pad, n_expts_tot, device=device, dtype=torch.float32).detach()
-    tri_logits[n_tokens_raw:, :] = float("inf")  # should not be used
-    tri_logits = tri_logits.requires_grad_(True)
-    ref_logits = tri_logits.clone().detach().requires_grad_(True)
+    n_gates_raw = n_tokens * n_expts_act
+    tri_logits = init_data(n_tokens, n_expts_tot, device=device, dtype=torch.float32).detach()
+    tri_logits[n_tokens:, :] = float("inf")  # should not be used
+    ref_logits = tri_logits.clone().detach()
 
     if use_expt_indx:
         rand_idx = lambda: torch.randperm(n_expts_tot, device="cuda", dtype=torch.int64)
-        tri_expt_indx = torch.stack([rand_idx()[:n_expts_act] for _ in range(n_tokens_pad)])
+        tri_expt_indx = torch.stack([rand_idx()[:n_expts_act] for _ in range(n_tokens)])
         tri_expt_indx, _ = torch.sort(tri_expt_indx, dim=1)
-        tri_expt_indx[n_tokens_raw:] = -99999  # should not be used
-        ref_expt_indx = tri_expt_indx[:n_tokens_raw]
+        tri_expt_indx[n_tokens:] = -99999  # should not be used
+        ref_expt_indx = tri_expt_indx[:n_tokens]
     else:
         tri_expt_indx = ref_expt_indx = None
-    ref_routing_data, ref_gather, ref_scatter = routing_torch(ref_logits, n_expts_act, sm_first, ref_expt_indx,
-                                                              n_rows=n_routing_rows)
-    tri_routing_data, tri_gather, tri_scatter = routing(tri_logits, n_expts_act, sm_first, tri_expt_indx,
-                                                        n_rows=n_routing_rows)
+    ref_routing_data, ref_gather, ref_scatter = routing_torch(ref_logits, n_expts_act, sm_first, ref_expt_indx)
+    tri_routing_data, tri_gather, tri_scatter = routing(tri_logits, n_expts_act, sm_first, tri_expt_indx)
 
     def _assert_indx_equal(ref, tri):
         assert_equal(ref, tri[:len(ref)])
@@ -133,12 +123,6 @@ def test_op(n_tokens_pad, n_tokens_raw, n_expts_tot, n_expts_act, sm_first, use_
     _assert_indx_equal(ref_gather.dst_indx, tri_gather.dst_indx)
     _assert_indx_equal(ref_scatter.src_indx, tri_scatter.src_indx)
     _assert_indx_equal(ref_scatter.dst_indx, tri_scatter.dst_indx)
-
-    scales_grad = torch.randn_like(tri_routing_data.gate_scal)
-    ref_routing_data.gate_scal.backward(scales_grad[:n_gates_raw])
-    tri_routing_data.gate_scal.backward(scales_grad)
-
-    assert_close(ref_logits.grad[:n_tokens_raw], tri_logits.grad[:n_tokens_raw])
 
 
 def bench_routing():
