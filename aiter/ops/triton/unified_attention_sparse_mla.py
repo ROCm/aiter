@@ -32,7 +32,7 @@ def unified_attention_sparse_mla(
     kv_lora_rank:  scalar, dtype int32
 
     Returns:
-    out (in-place):  [seq_len, NUM_HEADS, HEAD_SIZE], dtype bfloat16 
+    out (in-place):  [seq_len, NUM_HEADS, HEAD_SIZE], dtype bfloat16
     """
 
     # TODO: This kernel is not optimized and simplified for initial development.
