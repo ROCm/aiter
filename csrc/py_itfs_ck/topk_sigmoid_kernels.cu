@@ -2,8 +2,9 @@
 // Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include "py_itfs_common.h"
 
 // from CK examples:
@@ -17,8 +18,7 @@ void topk_sigmoid(torch::Tensor topk_weights,   // [tokens, topk]
                   torch::Tensor gating_output)  // [tokens, experts] 
 {
     // Ensure the tensors are on the correct device
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
 
     // Extract dimensions
     const int tokens  = gating_output.size(0);
@@ -64,7 +64,7 @@ void topk_sigmoid(torch::Tensor topk_weights,   // [tokens, topk]
                             stride_input,
                             stride_output};
 
-    ck_tile::stream_config sc{stream};
+    ck_tile::stream_config sc{at::hip::getCurrentHIPStream()};
   
     topk_softmax(trait, karg, sc);
 }
