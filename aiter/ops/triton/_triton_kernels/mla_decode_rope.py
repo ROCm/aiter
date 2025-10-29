@@ -32,9 +32,31 @@ from .activation import _tanh
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
-@triton.jit
+_fwd_grouped_kernel_stage1_rope_repr = make_kernel_repr(
+    "_fwd_grouped_kernel_stage1_rope",
+    [
+        "rotary_dim",
+        "kv_lora_rank",
+        "qk_rope_head_dim",
+        "kv_group_num",
+        "q_head_num",
+        "batch",
+        "BLOCK_C",
+        "BLOCK_R",
+        "BLOCK_N",
+        "BLOCK_H",
+        "NUM_KV_SPLITS",
+        "logit_cap",
+        "USE_ROPE",
+        "IS_NEOX_STYLE",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_grouped_kernel_stage1_rope_repr)
 def _fwd_grouped_kernel_stage1_rope(
     Q,  # Holds [Q_NOPE; Q_PE], b x h x (d+r)
     K_Buffer,  # Holds [KV; K_PE], b*s x (c+r)
@@ -308,7 +330,19 @@ def _fwd_grouped_kernel_stage1_rope(
         )
 
 
-@triton.jit
+_fwd_kernel_stage2_repr = make_kernel_repr(
+    "_fwd_kernel_stage2",
+    [
+        "NUM_KV_SPLITS",
+        "BLOCK_DV",
+        "Lv",
+        "batch",
+        "head_num",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_kernel_stage2_repr)
 def _fwd_kernel_stage2(
     Mid_O,
     O,
