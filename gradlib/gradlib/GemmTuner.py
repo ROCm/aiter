@@ -17,19 +17,20 @@
 
 import functools
 import os
-import random
-from pathlib import Path
 
 import aiter
 import pandas as pd
 from aiter import dtypes
 import torch
 import torch.nn.functional as F
+from aiter import logger
 
 from aiter.utility.mp_tuner import mp_tuner
 from functools import lru_cache
 from aiter.jit.core import get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.core import AITER_CONFIG_GEMM_BF16_FILE, get_asm_dir
+from aiter.utility.base_tuner import GemmCommonTuner
 
 aiter.rocb_create_extension()
 aiter.hipb_create_extension()
@@ -73,7 +74,7 @@ def run_gemm_bf16_asm(inp, w, out, bias=None, splitK=None, kernelName=None):
 def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int):
     cu_num = get_cu_num()
     tile_num = ((M + tile_m - 1) // tile_m) * ((N + tile_n - 1) // tile_n)
-    cusPerTile = cu_num / tile_num
+    # cusPerTile = cu_num / tile_num
     splitK = 0
     if tile_num < cu_num:
         splitK = int(cu_num / tile_num)
@@ -180,28 +181,6 @@ class Gemm:
         self.outbpe = self.ref.element_size()
         self.asm_map = {}
 
-    def calculate_perf(
-        self,
-        results,
-        inbpe,
-        outbpe,
-    ):
-        """calculate TFLOPS and bandwidth"""
-        ### gemm flops,bw
-        info, time, err_ratio = results
-        if time <= 0:
-            return -1, -1
-        print("info is ", info)
-        cu_num, m, n, k = info
-        flops = m * n * k * 2
-        tflops = round(flops / (time * 1000000), 2)
-
-        bw = round(
-            (m * k * inbpe + n * k * inbpe + m * n * outbpe) / (time * 1e-6) / 1e9,
-            2,
-        )
-        return tflops, bw
-
     def find_hipblas_sols(self):
         sols = aiter.hipb_findallsols(
             self.inp,
@@ -270,11 +249,11 @@ class Gemm:
     def asm_gemm_all_solutions(self):
         if (
             self.scaleAB
-            # or self.k % 64 != 0
+            or self.k % 64 != 0
             or (not (self.indtype == dtypes.bf16 and self.outdtype == dtypes.fp32))
         ):
             self.asm_gtimedf = pd.DataFrame(columns=["gtimems", "libtype"])
-            return
+            return []
         asm_kernel_list_csv = f"{get_asm_dir()}/bf16gemm/bf16gemm_outf32.csv"
         asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
         asm_tiles = [key for key in asm_kernels.keys()]
@@ -298,8 +277,8 @@ class Gemm:
                         self.n,
                         self.k,
                         False,
-                        self.indtype,
-                        self.outdtype,
+                        str(self.indtype),
+                        str(self.outdtype),
                         self.scaleAB,
                     ),
                     solidx,
@@ -338,36 +317,8 @@ class Gemm:
                 (),
             )
         ]
-        gtimes = {}
         ret = mp_tuner(task_asm, in_data, self.mp, False)
-
-        results = []
-        for info, us, err_ratio in ret:
-            solidx = info[1]
-            splitK = info[2]
-            kernelName = info[4]
-            res_one = []
-            # if err_ratio > self.check_err_ratio:
-            #    continue
-            gtimes["solidx"] = solidx
-            gtimes["gtimems"] = us / 1000.0
-            gtimes["splitK"] = splitK
-            res_one.append(solidx)
-            res_one.append(round(us / 1000.0, 4))
-            res_one.append(splitK)
-            res_one.append(err_ratio)
-            res_one.append(kernelName)
-            results.append(res_one)
-
-        self.asm_gtimedf = pd.DataFrame(
-            results, columns=["solidx", "gtimems", "splitK", "err_ratio", "kernelName"]
-        )
-        self.asm_gtimedf["libtype"] = "asm"
-        print(self.asm_gtimedf)
-        self.asm_gtimedf.to_csv("/tmp/asm_gtimedf.csv", index=False)
-        self.asm_gtimedf = self.asm_gtimedf.sort_values(by="gtimems")
-        print(">>> asm top solutions, Fast Mode", 0)
-        print(self.asm_gtimedf.head(self.topn))
+        return ret
 
     def hipb_time_all_sols(self, fast_mode=0, top_sols=0):
         coldi = 20
@@ -390,8 +341,8 @@ class Gemm:
                     self.n,
                     self.k,
                     False,
-                    self.indtype,
-                    self.outdtype,
+                    str(self.indtype),
+                    str(self.outdtype),
                     self.scaleAB,
                 ),
                 solidx,
@@ -425,31 +376,39 @@ class Gemm:
             )
         ]
         ret = mp_tuner(task, in_data, self.mp, fast_mode == 1)
+        if fast_mode == 1:
+            self.hipb_gtimedf = self.save_topn_result(ret, fast_mode, "hipblaslt")
+            return []
+        return ret
+
+    def save_topn_result(self, rets, fast_mode, libtype):
         results = []
-        for info, us, err_ratio in ret:
+        for info, us, err_ratio in rets:
             res_one = []
             solidx = info[1]
+            splitK = info[2]
             kernelName = info[4]
-            if fast_mode == 0:
-                if err_ratio > self.check_err_ratio:
-                    continue
+            # if fast_mode == 0:
+            #    if err_ratio > self.check_err_ratio:
+            #        continue
             res_one.append(solidx)
             res_one.append(round(us / 1000.0, 4))
+            res_one.append(splitK)
             res_one.append(err_ratio)
             res_one.append(kernelName)
 
             results.append(res_one)
-        self.hipb_gtimedf = pd.DataFrame(
-            results, columns=["solidx", "gtimems", "err_ratio", "kernelName"]
+        gtimedf = pd.DataFrame(
+            results, columns=["solidx", "gtimems", "splitK", "err_ratio", "kernelName"]
         )
 
-        self.hipb_gtimedf = self.hipb_gtimedf.sort_values(by="gtimems")
-        self.hipb_gtimedf["libtype"] = "hipblaslt"
+        gtimedf = gtimedf.sort_values(by="gtimems")
+        gtimedf["libtype"] = libtype
 
-        self.hipb_gtimedf.to_csv("/tmp/hipb_gtimedf.csv", index=False)
-        print(">>> HipBlasLt top solutions, Fast Mode", fast_mode)
-        print(self.hipb_gtimedf.head(self.topn))
-        self.hipb_gtimedf["splitK"] = 0
+        gtimedf.to_csv(f"/tmp/{libtype}_gtimedf.csv", index=False)
+        print(f">>> {libtype} top solutions, Fast Mode {fast_mode}")
+        print(gtimedf.head(self.topn), flush=True)
+        return gtimedf
 
     def find_rocblas_sols(self):
         if self.scaleAB or self.bias is not None:
@@ -483,7 +442,15 @@ class Gemm:
         gtimes = {}
         for solidx in solutions:
             info = (
-                (self.m, self.n, self.k, False, self.indtype, self.outdtype, False),
+                (
+                    self.m,
+                    self.n,
+                    self.k,
+                    False,
+                    str(self.indtype),
+                    str(self.outdtype),
+                    False,
+                ),
                 solidx,
                 0,
                 "rocblas",
@@ -513,28 +480,10 @@ class Gemm:
             )
         in_data = [(len(solutions), ())]
         ret = mp_tuner(task, in_data, self.mp, fast_mode == 1)
-        results = []
-        for info, us, err_ratio in ret:
-            solidx = info[1]
-            kernelName = info[4]
-            ret_one = []
-            if fast_mode == 0:
-                if err_ratio > self.check_err_ratio:
-                    continue
-            ret_one.append(solidx)
-            ret_one.append(round(us / 1000.0, 4))
-            ret_one.append(err_ratio)
-            ret_one.append(kernelName)
-            results.append(ret_one)
-        self.rocb_gtimedf = pd.DataFrame(
-            results, columns=["solidx", "gtimems", "err_ratio", "kernelName"]
-        )
-        self.rocb_gtimedf = self.rocb_gtimedf.sort_values(by="gtimems")
-        self.rocb_gtimedf["libtype"] = "rocblas"
-        self.rocb_gtimedf["splitK"] = 0
-        self.rocb_gtimedf.to_csv("/tmp/rocb_gtimedf.csv", index=False)
-        print(">>> Rocblas top solutions, Fast Mode", fast_mode, flush=True)
-        print(self.rocb_gtimedf.head(self.topn), flush=True)
+        if fast_mode == 1:
+            self.rocb_gtimedf = self.save_topn_result(ret, fast_mode, "rocblas")
+            return []
+        return ret
 
     def warmup(self, warmi=500):
         for i in range(warmi):
@@ -546,208 +495,192 @@ class Gemm:
         hipb_topn = self.hipb_gtimedf["solidx"].head(self.topn).tolist()
         self.hipb_top_sols = hipb_topn
 
-    def find_fastest_solution(self):
+    def run_fast_solutions(self):
         if self.use_rocblas:
             self.find_rocblas_sols()
         if not (self.rocblas_decode and self.m == 1):
             self.find_hipblas_sols()
         self.warmup()
-        self.rocb_time_all_sols(fast_mode=1)
+        rets_rocb_fast = self.rocb_time_all_sols(fast_mode=1)
         self.warmup()
-        self.hipb_time_all_sols(fast_mode=1)
+        rets_hipb_fast = self.hipb_time_all_sols(fast_mode=1)
+
+    def run_best_solutions(self):
+        self.warmup()
+        rets_rocb = self.rocb_time_all_sols(fast_mode=0, top_sols=1)
+        self.warmup()
+        rets_hipb = self.hipb_time_all_sols(fast_mode=0, top_sols=1)
+        rets_asm = self.asm_gemm_all_solutions()
+        return rets_rocb + rets_hipb + rets_asm
+
+    def run_solutions(self):
+        self.run_fast_solutions()
         self.functional_get_topn_fastest()
-        self.warmup()
-        self.rocb_time_all_sols(fast_mode=0, top_sols=1)
-        self.warmup()
-        self.hipb_time_all_sols(fast_mode=0, top_sols=1)
-        self.asm_gemm_all_solutions()
-        if self.profile_file != "":
-            if os.path.exists(self.profile_file):
-                old_df = pd.read_csv(self.profile_file)
-            else:
-                old_df = pd.DataFrame(
-                    columns=[
-                        "M",
-                        "N",
-                        "K",
-                        "bias",
-                        "dtype",
-                        "outdtype",
-                        "scaleAB",
-                        "cu_num",
-                        "libtype",
-                        "solidx",
-                        "splitK",
-                        "soltimes",
-                        "kernelName",
-                        "err_ratio",
-                    ]
-                )
+        rets = self.run_best_solutions()
+        return rets
 
-            resultsdf = pd.concat(
-                [self.rocb_gtimedf, self.hipb_gtimedf, self.asm_gtimedf],
-                ignore_index=True,
-            )
-            resultsdf = resultsdf.rename(
-                columns={
-                    "gtimems": "soltimes",
-                }
-            )
-            resultsdf["soltimes"] = resultsdf["soltimes"].apply(
-                lambda x: round(x * 1000, 3)
-            )
-            print(resultsdf)
-            resultsdf["M"] = self.m
-            resultsdf["N"] = self.n
-            resultsdf["K"] = self.k
-            resultsdf["bias"] = self.bias
-            resultsdf["dtype"] = self.indtype
-            resultsdf["outdtype"] = self.outdtype
-            resultsdf["scaleAB"] = self.scaleAB
-            resultsdf["cu_num"] = get_cu_num()
-            keys = [
-                "cu_num",
-                "M",
-                "N",
-                "K",
-            ]
-            results = resultsdf.apply(
-                lambda row: self.calculate_perf(
-                    (
-                        tuple(row[col] for col in keys),
-                        row["soltimes"],
-                        row["err_ratio"],
-                    ),
-                    self.inbpe,
-                    self.outbpe,
-                ),
-                axis=1,
-                result_type="expand",
-            )
-            resultsdf["tflops"] = results[0]
-            resultsdf["bw"] = results[1]
 
-            resultsdf = pd.concat([old_df, resultsdf], ignore_index=True)
-            resultsdf.to_csv(self.profile_file, index=False)
-        if len(self.asm_gtimedf) > 0:
-            self.asm_gtimedf = self.asm_gtimedf[
-                self.asm_gtimedf["err_ratio"] < self.check_err_ratio
-            ]
-            print(self.asm_gtimedf)
-        if len(self.hipb_gtimedf) > 0 or len(self.asm_gtimedf) > 0:
-            self.hipb_gtimedf = pd.concat(
-                [self.hipb_gtimedf, self.asm_gtimedf], ignore_index=True
-            )
-        # get best solution
-        self.hipb_gtimedf = self.hipb_gtimedf.sort_values(by="gtimems")
-        print("rocb_gtimedf", self.rocb_gtimedf)
-        if len(self.rocb_gtimedf) > 0 and len(self.hipb_gtimedf) > 0:
-            best_rocb_time = self.rocb_gtimedf.gtimems.iloc[0]
-            best_hipb_time = self.hipb_gtimedf.gtimems.iloc[0]
-            best_asm_time = 100  # self.asm_gtimedf.gtimems.iloc[0]
-            self.best_kernelName = ""
-            if best_rocb_time < best_hipb_time * self.hipb_prefer_ratio:
-                self.best_libtype = self.rocb_gtimedf.libtype.iloc[0]
-                self.best_solidx = self.rocb_gtimedf.solidx.iloc[0]
-                self.best_soltime = best_rocb_time
-                self.best_splitK = self.rocb_gtimedf.splitK.iloc[0]
-                self.best_err_ratio = self.rocb_gtimedf.err_ratio.iloc[0]
-                self.best_kernelName = self.rocb_gtimedf.kernelName.iloc[0]
-            else:
-                self.best_libtype = "hipblaslt"
-                self.best_solidx = self.hipb_gtimedf.solidx.iloc[0]
-                self.best_soltime = best_hipb_time
-                self.best_splitK = self.hipb_gtimedf.splitK.iloc[0]
-                self.best_err_ratio = self.hipb_gtimedf.err_ratio.iloc[0]
-            # self.check_gemm_ref(self.best_libtype,self.best_solidx)
-        elif len(self.hipb_gtimedf) > 0:
-            print(">>> Only hipblas or asm solutions found!", flush=True)
-            best_hipb_time = self.hipb_gtimedf.gtimems.iloc[0]
-            self.best_libtype = self.hipb_gtimedf.libtype.iloc[0]
-            self.best_solidx = self.hipb_gtimedf.solidx.iloc[0]
-            self.best_soltime = best_hipb_time
-            self.best_splitK = self.hipb_gtimedf.splitK.iloc[0]
-            self.best_err_ratio = self.hipb_gtimedf.err_ratio.iloc[0]
-            self.best_kernelName = self.hipb_gtimedf.kernelName.iloc[0]
-        elif len(self.rocb_gtimedf) > 0:
-            print(">>> Only rocblas solutions found!", flush=True)
-            best_rocb_time = self.rocb_gtimedf.gtimems.iloc[0]
-            self.best_libtype = self.rocb_gtimedf.libtype.iloc[0]
-            self.best_solidx = self.rocb_gtimedf.solidx.iloc[0]
-            self.best_soltime = best_rocb_time
-            self.best_splitK = self.rocb_gtimedf.splitK.iloc[0]
-            self.best_err_ratio = self.rocb_gtimedf.err_ratio.iloc[0]
-            self.best_kernelName = self.rocb_gtimedf.kernelName.iloc[0]
-        else:
-            print(">>> No rocblas or hipblas or asm solutions found!", flush=True)
-            self.best_libtype = "rocblas"
-            self.best_solidx = 0
-            self.best_soltime = 0
-            self.best_splitK = 0
-            self.best_err_ratio = 0
-            self.best_kernelName = ""
-        print(
-            ">>> Fastest Solution is",
-            self.best_libtype,
-            self.best_solidx,
-            self.best_soltime,
-            self.best_splitK,
-            self.best_err_ratio,
-            flush=True,
+class GemmTuner(GemmCommonTuner):
+    ARG_DEFAULTS = {
+        **GemmCommonTuner.ARG_DEFAULTS,
+        "tune_file": f"{AITER_CONFIG_GEMM_BF16_FILE}",
+        "untune_file": "aiter/configs/untuned_gemm.csv",
+        "batch": 1,
+    }
+
+    def _setup_specific_arguments(self):
+        self.parser.add_argument(
+            "--tuned_file",
+            type=str,
+            default=os.getenv("GTUNE_TUNED", AITER_CONFIG_GEMM_BF16_FILE),
+            dest="tune_file",
+            help="output file for tuned gemm solutions",
+        )
+        self.parser.add_argument(
+            "--input_file",
+            type=str,
+            default=os.getenv("GTUNE_INPUT", None),
+            dest="untune_file",
+            help="list of gemms to tune for, mutually exclusive with model_dir",
+        )
+        self.parser.add_argument(
+            "--indtype",
+            type=str,
+            default=None,
+            choices=["f32", "f16", "bf16", "fp8"],
+            help="dtype: f32 f16 bf16 fp8. Use this to override the"
+            " input_file or if no input_file provided",
+        )
+        self.parser.add_argument(
+            "--outdtype",
+            type=str,
+            choices=["f32", "f16", "bf16", "fp8"],
+            help="dtype: f32 f16 bf16 fp8. Use to override the default value,"
+            " which is the same as indtype for each shape (see --indtype.)",
+        )
+        self.parser.add_argument(
+            "--rocblas-decode",
+            action="store_true",
+            default=False,
+            help="forces rocblas solution on decode N=1",
         )
 
-
-class GemmTuner:
+        self.parser.add_argument(
+            "--all_bias",
+            action="store_true",
+            help="Tune for both bias and non bias cases,"
+            " regardless of what was used"
+            " to collect the shapes",
+        )
 
     def __init__(
         self,
-        indtype,
-        outdtype,
-        tuned_file=None,
-        rocblas_decode=False,
-        mp=1,
-        err_ratio=0.01,
-        profile_file="",
+        key=["M", "N", "K", "bias", "dtype", "outdtype", "scaleAB", "cu_num"],
+        resultList=[
+            "libtype",
+            "solidx",
+            "splitK",
+            "us",
+            "kernelName",
+            "err_ratio",
+            "tflops",
+            "bw",
+        ],
+        description="GemmTuner",
     ):
-        self.gemm_problems = pd.DataFrame(columns=["M", "N", "K", "bias"])
-        self.indtype = indtype
-        self.outdtype = outdtype
-        self.rocblas_decode = rocblas_decode
-        self.tuned_file = tuned_file
-        self.mp = mp
-        self.err_ratio = err_ratio
-        self.profile_file = profile_file
+        super().__init__(
+            "GemmTuner",
+            key=key,
+            resultList=resultList,
+            description=description,
+        )
 
-        tuned_file_path = Path(tuned_file)
-        if tuned_file_path.exists():
-            self.tuned_shapes = (
-                pd.read_csv(tuned_file) if tuned_file_path.is_file() else None
-            )
+        self.hipb_prefer_ratio = 0.995
+        self.cu_num = self.get_cu_num()
+
+    def calculate_perf(
+        self,
+        results,
+        inbpe,
+        outbpe,
+    ):
+        """calculate TFLOPS and bandwidth"""
+        ### gemm flops,bw
+        info, time, err_ratio = results
+        if time <= 0:
+            return -1, -1
+        cu_num, m, n, k = info
+        flops = m * n * k * 2
+        tflops = round(flops / (time * 1000000), 2)
+
+        bw = round(
+            (m * k * inbpe + n * k * inbpe + m * n * outbpe) / (time * 1e-6) / 1e9,
+            2,
+        )
+        return tflops, bw
+
+    def get_untuned_gemm_list(self, untuned_gemm_file):
+        assert os.path.exists(
+            untuned_gemm_file
+        ), f"Not exist untuned file: {untuned_gemm_file}"
+        untunedf = pd.read_csv(untuned_gemm_file).fillna("")
+        filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
+
+        return filtered_df
+
+    def pre_process(self, args):
+        if args.all:
+            self.get_retune_gemm_list(args)
         else:
-            self.tuned_shapes = None
-            with open(tuned_file, "w") as tf:
-                tf.write(
-                    "M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,splitK,soltimes,kernelName,err_ratio,tflops,bw\n"
+            self.untunedf = self.get_untuned_gemm_list(args.untune_file)
+            if "outdtype" not in self.untunedf.columns:
+                self.untunedf["outdtype"] = ""
+            if "scaleAB" not in self.untunedf.columns:
+                self.untunedf["scaleAB"] = False
+            if args.indtype is not None:
+                self.untunedf["dtype"] = str(args.indtype)
+            if args.outdtype is not None:
+                self.untunedf["outdtype"] = str(args.outdtype)
+            if args.all_bias:
+                for i in range(len(self.untunedf)):
+                    ds = self.untunedf.iloc[i]
+                    for bias in [True, False] if args.all_bias else [ds["bias"]]:
+                        self.add_gemm(
+                            ds["M"],
+                            ds["N"],
+                            ds["K"],
+                            indtype=str(ds["dtype"]),
+                            bias=bias,
+                            outdtype=str(ds["outdtype"]),
+                            scaleAB=ds["scaleAB"],
+                        )
+            self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+            self.untunedf["cu_num"] = self.get_cu_num()
+            untunedf_cols = self.untunedf.columns
+            if len(self.tunedf) != 0:
+                mask = self.untunedf.apply(tuple, axis=1).isin(
+                    self.tunedf[untunedf_cols].apply(tuple, axis=1)
                 )
-
-        gpu = torch.cuda.current_device()
-        device_properties = torch.cuda.get_device_properties(gpu)
-        cu_num = device_properties.multi_processor_count
-        self.cu_num = cu_num
+                if args.verbose:
+                    logger.info("skiped tuned shapes:")
+                    print(self.untunedf[mask])
+                self.untunedf = self.untunedf[~mask]
+            self.untunedf.drop_duplicates().reset_index(drop=True)
 
     def add_gemm(self, m, n, k, indtype, bias=False, outdtype=None, scaleAB=False):
         assert indtype is not None
         outdtype = outdtype if outdtype is not None else indtype
         assert outdtype is not None
-        if self.tuned_shapes is None or (
-            self.tuned_shapes[
-                (self.tuned_shapes["cu_num"] == self.cu_num)
-                & (self.tuned_shapes["M"] == m)
-                & (self.tuned_shapes["N"] == n)
-                & (self.tuned_shapes["K"] == k)
-                & (self.tuned_shapes["bias"] == bias)
-                & (self.tuned_shapes["dtype"] == str(indtype))
-                & (self.tuned_shapes["outdtype"] == str(outdtype))
+        print(self.tunedf)
+        if self.tunedf is None or (
+            self.tunedf[
+                (self.tunedf["cu_num"] == self.cu_num)
+                & (self.tunedf["M"] == m)
+                & (self.tunedf["N"] == n)
+                & (self.tunedf["K"] == k)
+                & (self.tunedf["bias"] == bias)
+                & (self.tunedf["dtype"] == str(indtype))
+                & (self.tunedf["outdtype"] == str(outdtype))
             ].empty
         ):
             entry = {
@@ -760,15 +693,17 @@ class GemmTuner:
                 "scaleAB": [scaleAB],
             }
             df = pd.DataFrame(entry)
-            self.gemm_problems = pd.concat([self.gemm_problems, df], ignore_index=True)
+            self.untunedf = pd.concat([self.untunedf, df], ignore_index=True)
+            print("self untunedf is ", self.untunedf)
         else:
             print(
                 f">>>Info: Found Duplicate shape(M:{m},"
                 f" N:{n}, K:{k} bias:{bias}), skipping"
             )
 
-    def find_best_sols(self):
-        df = self.gemm_problems
+    def tune(self, untunedf, tunedf, args):
+        df = untunedf
+        ret = []
         for i in range(len(df)):
             ds = df.loc[i, :]
             indtype = ds["dtype"]
@@ -779,42 +714,123 @@ class GemmTuner:
                 ds["N"],
                 ds["K"],
                 ds["bias"],
-                indtype=indtype,
-                outdtype=outdtype,
+                indtype=eval(indtype),
+                outdtype=eval(outdtype),
                 scaleAB=ds["scaleAB"],
-                rocblas_decode=self.rocblas_decode,
-                mp=self.mp,
-                err_ratio=self.err_ratio,
-                profile_file=self.profile_file,
+                rocblas_decode=args.rocblas_decode,
+                mp=args.mp,
+                err_ratio=args.errRatio,
+                profile_file=args.profile_file,
             )
-            gemmobj.find_fastest_solution()
-
-            soltimes = round(gemmobj.best_soltime * 1000, 2)
-            splitK = gemmobj.best_splitK
-            err_ratio = gemmobj.best_err_ratio
-            kernal_name = (
-                aiter.getHipblasltKernelName(int(gemmobj.best_solidx))
-                if gemmobj.best_libtype == "hipblaslt"
-                else gemmobj.best_kernelName
-            )
-            ret = (
-                (self.cu_num, ds["M"], ds["N"], ds["K"]),
-                soltimes,
-                gemmobj.check_err_ratio,
-            )
-            tflops, bw = gemmobj.calculate_perf(
-                ret,
-                gemmobj.inbpe,
-                gemmobj.outbpe,
-            )
-            with open(self.tuned_file, "a") as tf:
-                tf.write(
-                    f"{ds['M']},{ds['N']},{ds['K']},{ds['bias']},{indtype},{outdtype},{ds['scaleAB']},"
-                    f"{self.cu_num},{gemmobj.best_libtype},{int(gemmobj.best_solidx)},{int(splitK)},{(soltimes)},{kernal_name},{err_ratio},{tflops},{bw}\n"
-                )
-
+            ret.extend(gemmobj.run_solutions())
             del gemmobj
             torch.cuda.empty_cache()
+        return ret
 
-        finaldf = pd.read_csv(self.tuned_file)
-        print(finaldf)
+    def processResult(self, rets, fast_mode):
+        results = []
+        for info, us, err_ratio in rets:
+            res_one = []
+            solidx = info[1]
+            splitK = info[2]
+            kernelName = info[4]
+            libtype = info[3]
+            for ele in info[0]:
+                res_one.append(ele)
+            res_one.append(get_cu_num())
+            res_one.append(libtype)
+            res_one.append(int(solidx))
+            res_one.append(int(splitK))
+            res_one.append(round(us, 4))
+
+            res_one.append(kernelName)
+            res_one.append(err_ratio)
+            ret = (
+                (self.cu_num, info[0][0], info[0][1], info[0][2]),
+                us,
+                err_ratio,
+            )
+            tflops, bw = self.calculate_perf(
+                ret,
+                self.get_bpe(eval(info[0][4])),
+                self.get_bpe(eval(info[0][5])),
+            )
+            res_one.append(tflops)
+            res_one.append(bw)
+
+            results.append(res_one)
+        gtimedf = pd.DataFrame(results, columns=self.columns)
+        gtimedf = gtimedf.sort_values(by="us")
+        return gtimedf
+
+    def post_process(self, rets, args, topk=-1, fast_mode=False):
+        from collections import defaultdict
+
+        grouped_rets = defaultdict(list)
+
+        for info, us, max_err_ratio in rets:
+            grouped_rets[info[0]].append((info, us, max_err_ratio))
+
+        grouped_results = list(grouped_rets.items())
+        gtimedf_dic = {}
+        for key, ret_info in grouped_results:
+            gtimedf_dic[key] = self.processResult(ret_info, fast_mode)
+
+        if args.profile_file != "":
+            resultsdf = pd.concat(
+                gtimedf_dic.values(),
+                ignore_index=True,
+            )
+        else:
+            resultsdf = pd.DataFrame(self.columns)
+        self.save_profile(resultsdf, args.profile_file)
+        import numpy as np
+
+        best_gtimedfs = pd.DataFrame(columns=self.columns)
+        for key, df in gtimedf_dic.items():
+            gtimedf_dic[key] = df[df["err_ratio"] < args.errRatio]
+            gtimedf_dic[key]["gtimems"] = np.where(
+                df["libtype"] == "rocblas", df["us"], df["us"] * self.hipb_prefer_ratio
+            )
+            # get best solution
+            best_gtimedf = gtimedf_dic[key].sort_values(by="gtimems")
+
+            if len(gtimedf_dic[key]) == 0:
+                print(">>> No rocblas or hipblas or asm solutions found!", flush=True)
+                continue
+            robs_gtimedf = gtimedf_dic[key][gtimedf_dic[key]["libtype"] == "rocblas"]
+            asm_gtimedf = gtimedf_dic[key][gtimedf_dic[key]["libtype"] == "asm"]
+            hibs_gtimedf = gtimedf_dic[key][gtimedf_dic[key]["libtype"] == "hipblaslt"]
+            if len(robs_gtimedf) == 0 and len(hibs_gtimedf) == 0:
+                print(">>>Only asm solutions found!", flush=True)
+            elif len(robs_gtimedf) == 0:
+                print(">>> Only hipblas or asm solutions found!", flush=True)
+            elif len(hibs_gtimedf) == 0 and len(asm_gtimedf) == 0:
+                print(">>> Only rocblas solutions found!", flush=True)
+            resultdf1 = (
+                best_gtimedf.head(1).drop(["gtimems"], axis=1).reset_index(drop=True)
+            )
+            kernal_name = (
+                aiter.getHipblasltKernelName(int(resultdf1.iloc[0]["solidx"]))
+                if resultdf1.iloc[0]["libtype"] == "hipblaslt"
+                else resultdf1.iloc[0]["kernelName"]
+            )
+            resultdf1.loc[0, "kernelName"] = kernal_name
+            if best_gtimedfs.empty:
+                best_gtimedfs = resultdf1
+            else:
+                print("concat ", resultdf1)
+                best_gtimedfs = pd.concat([best_gtimedfs, resultdf1], ignore_index=True)
+
+            print(f"{key} >>> Fastest Solution is \n {resultdf1}", flush=True)
+        return best_gtimedfs
+
+    def save_profile(self, timedf, profile_file):
+        if profile_file != "":
+            if os.path.exists(profile_file):
+                old_df = pd.read_csv(profile_file)
+            else:
+                old_df = pd.DataFrame(columns=self.columns)
+
+            resultsdf = pd.concat([old_df, timedf], ignore_index=True)
+            resultsdf.to_csv(profile_file, index=False)
