@@ -23,6 +23,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     splitK: Optional[int] = None,
     YQ: Optional[torch.Tensor] = None,
     transpose_bm: Optional[bool] = False,
+    transpose_bm_in: Optional[bool] = False,
     config: Optional[dict] = None,
 ):
     """
@@ -33,19 +34,28 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     2D one before being applied.
 
     Key parameters:
-    - XQ: Batch tensor XQ with shape (B, M, K).
+    - XQ: Batch tensor XQ with shape (B, M, K) if transpose_bm_in == False else (M, B, K).
     - WQ: Batch tensor WQ with shape (B, N, K).
     - W_scale: Second scale batch tensor with shape (1, ).
     - Bias: Bias batch tensor with shape (B, 1, N).
     - YQ: Output Matrix Y with shape (B, M, N). If this is none, then it's created by this API and returned as output
 
     Returns:
-    - YQ: The output batch tensor with shape (B, M, N).
+    - YQ: The output batch tensor with shape (B, M, N) if transpose_bm == False else (M, B, N).
     """
 
     # Check constraints.
-    assert X.shape[0] == WQ.shape[0], "Incompatible Batch dimensions!!!"
-    assert X.shape[2] == WQ.shape[2], "Incompatible K dimensions!!!"
+    if not transpose_bm_in:
+        B = X.shape[0]
+        M = X.shape[1]
+    else:
+        M = X.shape[0]
+        B = X.shape[1]
+    K = X.shape[2]
+    N = WQ.shape[1]
+
+    assert B == WQ.shape[0], "Incompatible Batch dimensions!!!"
+    assert K == WQ.shape[2], "Incompatible K dimensions!!!"
     assert (
         triton.next_power_of_2(group_size) == group_size
     ), "group_size mush be power of 2"
@@ -54,11 +64,6 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         torch.float16,
     ], f"Output {dtype=} is currently not supported in batched_gemm_a8w8"
     assert splitK is None, "Currently, there isn't any support for splitK on Triton"
-
-    B = X.shape[0]
-    M = X.shape[1]
-    K = X.shape[2]
-    N = WQ.shape[1]
 
     WQ = WQ.transpose(1, 2)
 
@@ -104,8 +109,8 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         M,
         N,
         K,
-        X.stride(0),
-        X.stride(1),
+        X.stride(0) if not transpose_bm_in else X.stride(1),
+        X.stride(1) if not transpose_bm_in else X.stride(0),
         X.stride(2),
         WQ.stride(0),
         WQ.stride(1),
