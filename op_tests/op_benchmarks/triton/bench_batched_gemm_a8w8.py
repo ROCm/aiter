@@ -111,7 +111,16 @@ def run_model_benchmark(args, impl):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout, impl, args.async_copy if args.gluon else None)
+        return bench_gemm_fn(
+            batch,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            impl,
+            args.async_copy if args.gluon else None,
+        )
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -125,7 +134,16 @@ def run_shape_benchmark(args, impl):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_a8w8(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout, impl, args.async_copy if args.gluon else None)
+        return bench_gemm_fn(
+            batch,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            impl,
+            args.async_copy if args.gluon else None,
+        )
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
