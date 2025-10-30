@@ -526,6 +526,8 @@ if __name__ == "__main__":
     if args.graphon is not None:
         print(args.graphon)
         l_graph = [args.graphon]
-    for (dtype, shape, tp, pp, graph_on) in itertools.product(l_dtype, l_shape, l_tp, l_pp, l_graph):
+    for dtype, shape, tp, pp, graph_on in itertools.product(
+        l_dtype, l_shape, l_tp, l_pp, l_graph
+    ):
         test_split_ar_rmsnorm(tp, pp, shape, dtype, withGraph=graph_on)
         test_fused_ar_rmsnorm(tp, pp, shape, dtype, withGraph=graph_on)
