@@ -133,7 +133,7 @@ void all_reduce(fptr_t _fa,
                 torch::Tensor& inp,
                 torch::Tensor& out,
                 bool open_fp8_quant,
-                std::optional<torch::Tensor>& reg_buffer)
+                std::optional<torch::Tensor> reg_buffer)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
@@ -259,7 +259,7 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                 torch::Tensor& out,
                 torch::Tensor& w,
                 float eps,
-                std::optional<torch::Tensor>& reg_buffer)
+                std::optional<torch::Tensor> reg_buffer)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();

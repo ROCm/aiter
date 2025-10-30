@@ -32,7 +32,7 @@ void all_reduce(fptr_t _fa,
                 torch::Tensor& inp,
                 torch::Tensor& out,
                 bool open_fp8_quant,
-                std::optional<torch::Tensor>& reg_buffer);
+                std::optional<torch::Tensor> reg_buffer);
 void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
 void all_gather_unreg(fptr_t _fa,
                       torch::Tensor& inp,
@@ -43,7 +43,7 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                 torch::Tensor& out,
                 torch::Tensor& w,
                 float eps,
-                std::optional<torch::Tensor>& reg_buffer);
+                std::optional<torch::Tensor> reg_buffer);
 
 void dispose(fptr_t _fa);
 int64_t meta_size();
