@@ -27,7 +27,6 @@ from torch import Tensor
 from aiter import (
     dtypes,
     gemm_a16w16_asm,
-    getHipblasltKernelName,
     hipb_create_extension,
     hipb_mm,
     logger,
@@ -132,6 +131,8 @@ def gen_gemm_a16w16_fake_tensor(
     out = torch.empty(
         A.view(-1, A.size(-1)).shape[0], B.shape[0], dtype=A.dtype, device=A.device
     )
+    if otype is not None:
+        out = out.to(otype)
     return out.view(*A.shape[:-1], B.shape[0])
 
 
