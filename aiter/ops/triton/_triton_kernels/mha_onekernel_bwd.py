@@ -11,6 +11,7 @@ from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -26,7 +27,18 @@ tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
 # Out: (batch, nhead_q, max_seqlens_q, headDim)
 # DO: (batch, nhead_q, max_seqlens_q, headDim)
 # Delta: (batch, nheads_q, max_seqlens_q), same as softmax_lse defined at
-@triton.jit
+_bwd_preprocess_repr = make_kernel_repr(
+    "_bwd_preprocess",
+    [
+        "BLOCK_M",
+        "BLOCK_D_MODEL",
+        "IS_VARLEN",
+        "IS_FP8",
+    ],
+)
+
+
+@triton.jit(repr=_bwd_preprocess_repr)
 def _bwd_preprocess(
     o_ptr,
     do_ptr,  # noqa: E741
@@ -458,7 +470,27 @@ def _bwd_dq_inner(
     return dq
 
 
-@triton.jit
+_bwd_kernel_causal_repr = make_kernel_repr(
+    "bwd_kernel_causal",
+    [
+        "BLOCK_M1",
+        "BLOCK_N1",
+        "BLOCK_M2",
+        "BLOCK_N2",
+        "BLK_SLICE_FACTOR",
+        "HEAD_DIM",
+        "ENABLE_DROPOUT",
+        "IS_VARLEN",
+        "USE_ALIBI",
+        "USE_EXP2",
+        "IS_FP8",
+        "FP8_OUTPUT",
+        "USE_INT64_STRIDES",
+    ],
+)
+
+
+@triton.jit(repr=_bwd_kernel_causal_repr)
 def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nheads_q)
     Q,
     K,
@@ -1081,7 +1113,27 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             # end of GQA/MQA of dq
 
 
-@triton.jit
+_bwd_kernel_noncausal_repr = make_kernel_repr(
+    "bwd_kernel_noncausal",
+    [
+        "BLOCK_M1",
+        "BLOCK_N1",
+        "BLOCK_M2",
+        "BLOCK_N2",
+        "BLK_SLICE_FACTOR",
+        "HEAD_DIM",
+        "ENABLE_DROPOUT",
+        "IS_VARLEN",
+        "USE_ALIBI",
+        "USE_EXP2",
+        "IS_FP8",
+        "FP8_OUTPUT",
+        "USE_INT64_STRIDES",
+    ],
+)
+
+
+@triton.jit(repr=_bwd_kernel_noncausal_repr)
 def bwd_kernel_noncausal(
     Q,
     K,
