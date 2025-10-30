@@ -217,7 +217,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         with open(f"{sub_build_dir}/Makefile", "w") as f:
             f.write(makefile_file)
         subprocess.run(
-            f"cd {sub_build_dir} && make build -j{len(sources)}", shell=True, check=True
+            f"cd {sub_build_dir} && make build -j{len(sources)}", shell=True, capture_output=AITER_LOG_MORE<2, check=True
         )
 
     def final_func():
