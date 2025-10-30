@@ -1604,20 +1604,18 @@ def paged_attention_decode_v2_reduce_kernel(
     logits_offsets = (
         sequence_idx * stride_logits_seq
         + kv_head_idx * stride_logits_head
-        + partition_offsets[None, :, None] * stride_logits_part
-        + query_group_offsets[:, None, None] * stride_logits_group
+        + partition_offsets[:, None, None] * stride_logits_part
+        + query_group_offsets[None, :, None] * stride_logits_group
         + head_size_offsets[None, None, :]
     )
 
     # Create mask for valid logits access
-    logits_mask = (partition_offsets[None, :] < num_partitions) & (
-        query_group_offsets[:, None] < QUERY_GROUP_SIZE
+    logits_mask = (partition_offsets[:, None] < num_partitions) & (
+        query_group_offsets[None, :] < QUERY_GROUP_SIZE
     )
 
     # Load partial logits from all partitions
     partial_logits = tl.load(logits_ptr + logits_offsets, mask=logits_mask[:, :, None])
-
-    partial_logits = tl.permute(partial_logits, (1, 0, 2))
 
     # Compute weighted sum of logits to produce final output [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     final_output = tl.sum((partial_logits * attention_probs).to(tl.float32), axis=0).to(
