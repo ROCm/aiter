@@ -7,9 +7,10 @@ import json
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
+from utils._triton import arch_info
+from utils.core import AITER_TRITON_CONFIGS_PATH
+from utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
