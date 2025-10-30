@@ -28,7 +28,7 @@ Based on this, we provide CI pipelines to generate and use these tuned CSV files
         - Upload the tuned CSV files as GitHub workflow artifacts.
         - You can download the tuned CSV artifacts and upload them to the Aiter repository as needed.
 
-    4. If you wish to upload your own untuned CSV files, please create a new branch and update the relevant untuned CSV files in the `aiter/config` directory. Then, trigger the workflow on your branch to proceed with tuning.
+    4. If you wish to upload your own untuned CSV files, please create a new branch and update the relevant untuned CSV files in the `aiter/configs` directory. Then, trigger the workflow on your branch to proceed with tuning.
 
         ![Aiter Autotuning CI Pipeline - 2](https://raw.githubusercontent.com/ROCm/aiter/main/docs/images/autotuning_ci_pipeline_2.jpeg)
 
