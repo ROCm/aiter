@@ -362,10 +362,10 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
     # ==================== Attention State Initialization ====================
     # Initialize attention computation state
-    current_max_logits = max_logits_base_offsets.to(gl.float32) * float(0.0) - float(
+    max_logits = max_logits_base_offsets.to(gl.float32) * float(0.0) - float(
         "inf"
     )
-    current_exp_sums = max_logits_base_offsets.to(gl.float32) * float(0.0)
+    exp_sums = max_logits_base_offsets.to(gl.float32) * float(0.0)
     attention_accumulator = gl.zeros(
         (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
     )
@@ -558,19 +558,19 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
         # ==================== Softmax Computation ====================
         # Compute new maximum logits
-        current_max_new = gl.max(qk_matrix, axis=1)
-        updated_max_logits = gl.maximum(current_max_logits, current_max_new)
+        current_max_logits = gl.max(qk_matrix, axis=1)
+        new_max_logits = gl.maximum(max_logits, current_max_logits)
 
         # Compute scaling factor for numerical stability
         accumulator_scale = tl.math.exp2(
-            (current_max_logits - updated_max_logits) * LOG2_E
+            (max_logits - new_max_logits) * LOG2_E
         )
 
         # Compute attention probabilities
         attention_probs = tl.math.exp2(
-            (qk_matrix - updated_max_logits[:, None]) * LOG2_E
+            (qk_matrix - new_max_logits[:, None]) * LOG2_E
         )
-        current_exp_sums = accumulator_scale * current_exp_sums + gl.sum(
+        exp_sums = accumulator_scale * exp_sums + gl.sum(
             attention_probs, axis=1
         )
 
@@ -616,31 +616,36 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         attention_output = gl.amd.cdna3.mfma(
             attention_probs_converted, value_block_converted, pv_accumulator
         )
-        attention_accumulator += probability_scale * attention_output
+
+        # Apply value quantization scaling
+        if KV_QUANT_MODE == 0:
+            attention_accumulator += value_scale_value * attention_output
+        elif KV_QUANT_MODE == 1:
+            attention_accumulator += probability_scale * attention_output
 
         # Update maximum logits for next iteration
-        current_max_logits = updated_max_logits
+        max_logits = new_max_logits
 
     # ==================== Final Output Scaling and Storage ====================
     # Compute final exponential sums
-    exponential_sums = 1.0 / current_exp_sums
-    exponential_sums_converted = gl.convert_layout(
-        exponential_sums[:, None], layout=pv_mfma_layout
+    exp_sums_reciprocal = 1.0 / exp_sums
+    exp_sums_reciprocal_cvt = gl.convert_layout(
+        exp_sums_reciprocal[:, None], layout=pv_mfma_layout
     )
 
     # Apply final scaling to attention accumulator
-    attention_accumulator = attention_accumulator * exponential_sums_converted
+    attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
     attention_accumulator = attention_accumulator.to(COMPUTE_TYPE)
 
     # Store results to output buffers
     gl.amd.cdna3.buffer_store(
-        stored_value=current_max_logits,
+        stored_value=max_logits,
         ptr=max_logits_ptr,
         offsets=max_logits_offsets,
         mask=max_logits_group_mask,
     )
     gl.amd.cdna3.buffer_store(
-        stored_value=current_exp_sums,
+        stored_value=exp_sums,
         ptr=exp_sums_ptr,
         offsets=max_logits_offsets,
         mask=max_logits_group_mask,
@@ -1003,11 +1008,11 @@ def paged_attention_decode_v2_gluon_fp8(
     )
 
     # Initialize attention state variables
-    max_attention_scores = max_logits_base_offsets.to(gl.float32) * float(0.0) - float(
+    max_logits = max_logits_base_offsets.to(gl.float32) * float(0.0) - float(
         "inf"
     )
-    attention_denominators = max_logits_base_offsets.to(gl.float32) * float(0.0)
-    attention_output_accumulator = gl.zeros(
+    exp_sums = max_logits_base_offsets.to(gl.float32) * float(0.0)
+    attention_accumulator = gl.zeros(
         (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
     )
 
@@ -1223,19 +1228,19 @@ def paged_attention_decode_v2_gluon_fp8(
 
         # ==================== SOFTMAX COMPUTATION ====================
         # Update running maximum for numerical stability
-        current_max_scores = gl.max(attention_scores, axis=1)
-        new_max_scores = gl.maximum(max_attention_scores, current_max_scores)
+        current_max_logits = gl.max(attention_scores, axis=1)
+        new_max_logits = gl.maximum(max_logits, current_max_logits)
 
         # Compute scaling factor for previous accumulator
         accumulator_scale = tl.math.exp2(
-            (max_attention_scores - new_max_scores) * LOG2_E
+            (max_logits - new_max_logits) * LOG2_E
         )
 
         # Compute attention probabilities
         attention_probs = tl.math.exp2(
-            (attention_scores - new_max_scores[:, None]) * LOG2_E
+            (attention_scores - new_max_logits[:, None]) * LOG2_E
         )
-        attention_denominators = accumulator_scale * attention_denominators + gl.sum(
+        exp_sums = accumulator_scale * exp_sums + gl.sum(
             attention_probs, axis=1
         )
 
@@ -1269,52 +1274,52 @@ def paged_attention_decode_v2_gluon_fp8(
         accumulator_scale_expanded = gl.convert_layout(
             accumulator_scale[:, None], layout=pv_mfma_layout
         )
-        attention_output_accumulator *= accumulator_scale_expanded
+        attention_accumulator *= accumulator_scale_expanded
 
         pv_accumulator = gl.zeros(
             (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2),
             dtype=gl.float32,
             layout=pv_mfma_layout,
         )
-        attention_update = gl.amd.cdna3.mfma(
+        attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
         )
 
         # Apply value quantization scaling
         if KV_QUANT_MODE == 0:
-            attention_output_accumulator += value_scale_value * attention_update
+            attention_accumulator += value_scale_value * attention_output
         elif KV_QUANT_MODE == 1:
-            attention_output_accumulator += probability_scale * attention_update
+            attention_accumulator += probability_scale * attention_output
 
         # Update running maximum for next iteration
-        max_attention_scores = new_max_scores
+        max_logits = new_max_logits
 
     # ==================== OUTPUT NORMALIZATION AND STORING ====================
     # Normalize attention output by softmax denominator
-    exp_sum_reciprocal = 1.0 / attention_denominators
-    exp_sum_reciprocal_expanded = gl.convert_layout(
-        exp_sum_reciprocal[:, None], layout=pv_mfma_layout
+    exp_sums_reciprocal = 1.0 / exp_sums
+    exp_sums_reciprocal_cvt = gl.convert_layout(
+        exp_sums_reciprocal[:, None], layout=pv_mfma_layout
     )
-    attention_output_accumulator = (
-        attention_output_accumulator * exp_sum_reciprocal_expanded
+    attention_accumulator = (
+        attention_accumulator * exp_sums_reciprocal_cvt
     )
-    attention_output_accumulator = attention_output_accumulator.to(COMPUTE_TYPE)
+    attention_accumulator = attention_accumulator.to(COMPUTE_TYPE)
 
     # Store results to global memory
     gl.amd.cdna3.buffer_store(
-        stored_value=max_attention_scores,
+        stored_value=max_logits,
         ptr=max_logits_ptr,
         offsets=max_logits_offsets,
         mask=max_logits_group_mask,
     )
     gl.amd.cdna3.buffer_store(
-        stored_value=attention_denominators,
+        stored_value=exp_sums,
         ptr=exp_sums_ptr,
         offsets=max_logits_offsets,
         mask=max_logits_group_mask,
     )
     gl.amd.cdna3.buffer_store(
-        stored_value=attention_output_accumulator,
+        stored_value=attention_accumulator,
         ptr=output_ptr,
         offsets=output_offsets,
         mask=output_mask,
