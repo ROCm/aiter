@@ -194,6 +194,31 @@ void _all_gather(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, h
     }
 }
 
+void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, bool open_fp8_quant)
+{
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+    TORCH_CHECK_EQ(inp.numel(), out.numel());
+    _all_reduce(_fa, inp, out, stream, open_fp8_quant);
+}
+
+void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
+                      torch::Tensor &out)
+{
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+
+    auto input_size = inp.numel() * inp.element_size();
+    TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+    TORCH_CHECK_EQ(inp.numel(), out.numel());
+    TORCH_CHECK(input_size <= reg_buffer.numel() * reg_buffer.element_size(),
+                "registered buffer is too small to contain the input");
+    HIP_CALL(hipMemcpyAsync(reg_buffer.data_ptr(), inp.data_ptr(),
+                                  input_size, hipMemcpyDeviceToDevice, stream));
+    _all_reduce(_fa, reg_buffer, out, stream, false);
+}
+
 void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
