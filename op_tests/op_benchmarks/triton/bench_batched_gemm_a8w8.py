@@ -1,4 +1,5 @@
 import sys
+from typing import Optional
 import torch
 import triton
 import math
@@ -26,7 +27,14 @@ from aiter.ops.triton.gluon.batched_gemm_a8w8 import (
 
 
 def bench_gemm_fn(
-    batch: int, M: int, N: int, K: int, metric: str, layout: str, impl: callable
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    impl: callable,
+    use_async_copy: Optional[bool],
 ):
     c_dtype = torch.bfloat16
     x, w, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
@@ -45,7 +53,22 @@ def bench_gemm_fn(
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: impl(x, w, x_scale, w_scale, bias, c_dtype, YQ=y),
+        (
+            (lambda: impl(x, w, x_scale, w_scale, bias, c_dtype, YQ=y))
+            if use_async_copy is None
+            else (
+                lambda: impl(
+                    x,
+                    w,
+                    x_scale,
+                    w_scale,
+                    bias,
+                    c_dtype,
+                    YQ=y,
+                    use_async_copy=use_async_copy,
+                )
+            )
+        ),
         warmup=25,
         rep=100,
     )
@@ -88,7 +111,7 @@ def run_model_benchmark(args, impl):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout, impl)
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout, impl, args.async_copy if args.gluon else None)
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -102,7 +125,7 @@ def run_shape_benchmark(args, impl):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_a8w8(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout, impl)
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout, impl, args.async_copy if args.gluon else None)
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -115,6 +138,10 @@ def run_benchmark(args, defaults):
     if args.gluon:
         impl = gluon_batched_gemm_a8w8
     else:
+        if args.async_copy:
+            raise Exception(
+                f"Argument '{arg}' is not supported for benchmarking without the -gluon flag."
+            )
         impl = triton_batched_gemm_a8w8
 
     if args.model:
@@ -153,6 +180,11 @@ def parse_args():
         "-gluon",
         action="store_true",
         help="Use Gluon implementation (experimental, requires latest Triton from main)",
+    )
+    parser.add_argument(
+        "-async_copy",
+        action="store_true",
+        help="Use async_copy loads for Gluon implementation (experimental, requires latest Triton from main)",
     )
     return get_ff_args(parser)
 
