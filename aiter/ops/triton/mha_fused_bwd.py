@@ -11,7 +11,11 @@ import jax.numpy as jnp
 import jax_triton as jt
 
 from utils.logger import AiterTritonLogger
+<<<<<<< Updated upstream
 from _triton_kernels.mha_fused_bwd import (
+=======
+from _triton_kernels.mha_fused_bwd_kernel import (
+>>>>>>> Stashed changes
     _bwd_preprocess,
     _bwd_kernel_dkdvdq_causal,
     _bwd_kernel_dkdvdq_noncausal,
@@ -116,11 +120,12 @@ def flash_attn_fused_backward(
         # [batch, num_q_heads, seqlen_q]
         delta_strides = delta_strides_in
 
-    # preprocess
-    # compute D(delta) = rowsum(dO*O). Note, multiplication is element-wise.
+    # Configs
     if config is None:
         config = _get_config()
 
+    # preprocess
+    # compute D(delta) = rowsum(dO*O). Note, multiplication is element-wise.
     pre_grid = (
         triton.cdiv(max_seqlen_q, config["preprocess_kernel"]["PRE_BLOCK"]),
         batch,
