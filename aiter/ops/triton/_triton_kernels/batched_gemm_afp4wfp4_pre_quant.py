@@ -33,6 +33,7 @@ _batched_gemm_afp4_wfp4_pre_quant_reduce_repr = make_kernel_repr(
     ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "ACTUAL_KSPLIT", "MAX_KSPLIT"],
 )
 
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
