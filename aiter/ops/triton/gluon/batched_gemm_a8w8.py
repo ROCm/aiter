@@ -16,6 +16,7 @@ from triton import language as tl
 _LOGGER = AiterTritonLogger()
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+import triton.experimental.gluon.language.amd.cdna4.async_copy as acp
 
 
 @triton.heuristics(
@@ -322,6 +323,14 @@ def _batched_gemm_a8w8_kernel(
     )
 
 
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+    }
+)
+@gluon.jit
 def _batched_gemm_a8w8_kernel_async_copy(
     # Pointers to matrices
     a_ptr,
@@ -405,20 +414,17 @@ def _batched_gemm_a8w8_kernel_async_copy(
     stride_cb = tl.cast(stride_cb, gl.int64)
 
     # Create layouts for contiguous access
-    elems_per_thread_mk: gl.constexpr = triton.cdiv(
-        BLOCK_SIZE_M * BLOCK_SIZE_K // (gl.num_warps() * 64), BUFFER_SIZE
-    )
-    elems_per_thread_kn: gl.constexpr = triton.cdiv(
-        BLOCK_SIZE_K * BLOCK_SIZE_N // (gl.num_warps() * 64), BUFFER_SIZE
-    )
+    # NOTE: Different from original Gluon kernel, size_per_thread must have size 16, as both
+    # buffer_load_to_shared and global_load_to_shared require that size_of_thread * 8 == 128 bits
+    # (the kernel is loading 8-bit elements from the tensors)
     blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[elems_per_thread_mk, 16],
+        size_per_thread=[1, 16],
         threads_per_warp=[16, 4],
         warps_per_cta=[gl.num_warps(), 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, elems_per_thread_kn],
+        size_per_thread=[16, 1],
         threads_per_warp=[4, 16],
         warps_per_cta=[1, gl.num_warps()],
         order=[0, 1],
@@ -454,38 +460,6 @@ def _batched_gemm_a8w8_kernel_async_copy(
     offs_a = offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
     offs_b = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
 
-    # Load first block of A
-    if EVEN_K:
-        a = gl.amd.cdna4.buffer_load(
-            ptr=(a_ptr + batch_id * stride_ab),
-            offsets=offs_a,
-            mask=(offs_am[:, None] < M),
-            other=0.0,
-        )
-    else:
-        a = gl.amd.cdna4.buffer_load(
-            ptr=(a_ptr + batch_id * stride_ab),
-            offsets=offs_a,
-            mask=((offs_ak[None, :] < K) & (offs_am[:, None] < M)),
-            other=0.0,
-        )
-
-    # Load first block of B
-    if EVEN_K:
-        b = gl.amd.cdna4.buffer_load(
-            ptr=(b_ptr + batch_id * stride_bb),
-            offsets=offs_b,
-            mask=(offs_bn[None, :] < N),
-            other=0.0,
-        )
-    else:
-        b = gl.amd.cdna4.buffer_load(
-            ptr=(b_ptr + batch_id * stride_bb),
-            offsets=offs_b,
-            mask=((offs_bk[:, None] < K) & (offs_bn[None, :] < N)),
-            other=0.0,
-        )
-
     # Load the scales
     offs_a_scale = pid_m * BLOCK_SIZE_M + gl.arange(
         0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, mfma_layout)
@@ -508,16 +482,51 @@ def _batched_gemm_a8w8_kernel_async_copy(
 
     # Allocate shared memory input matrices and scaling factors
     smem_a = gl.allocate_shared_memory(
-        a_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
+        a_ptr.type.element_ty, [2, BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
     )
     smem_b = gl.allocate_shared_memory(
-        b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
+        b_ptr.type.element_ty, [2, BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
     )
 
-    # Store first block of A and B in shared memory
-    if num_k_iter > 1:
-        smem_a.store(a)
-        smem_b.store(b)
+    # Load first block of A
+    if EVEN_K:
+        acp.buffer_load_to_shared(
+            dest=smem_a.index(0),
+            ptr=(a_ptr + batch_id * stride_ab),
+            offsets=offs_a,
+            mask=(offs_am[:, None] < M),
+            other=0.0,
+            cache_modifier=".cg",
+        )
+    else:
+        acp.buffer_load_to_shared(
+            dest=smem_a.index(0),
+            ptr=(a_ptr + batch_id * stride_ab),
+            offsets=offs_a,
+            mask=((offs_ak[None, :] < K) & (offs_am[:, None] < M)),
+            other=0.0,
+            cache_modifier=".cg",
+        )
+
+    # Load first block of B
+    if EVEN_K:
+        acp.buffer_load_to_shared(
+            dest=smem_b.index(0),
+            ptr=(b_ptr + batch_id * stride_bb),
+            offsets=offs_b,
+            mask=(offs_bn[None, :] < N),
+            other=0.0,
+            cache_modifier=".cg",
+        )
+    else:
+        acp.buffer_load_to_shared(
+            dest=smem_b.index(0),
+            ptr=(b_ptr + batch_id * stride_bb),
+            offsets=offs_b,
+            mask=((offs_bk[:, None] < K) & (offs_bn[None, :] < N)),
+            other=0.0,
+            cache_modifier=".cg",
+        )
 
     # Run the main loop
     acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
@@ -526,20 +535,26 @@ def _batched_gemm_a8w8_kernel_async_copy(
     )
     zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.int32, layout=mfma_layout)
     for k in range(0, num_k_iter - 1):
+        # Wait for loads to finish before using shared memory
+        acp.async_wait(num_outstanding=0)
+
         # Advance the ptrs to the next K block.
         offs_a += BLOCK_SIZE_K * stride_ak
         offs_b += BLOCK_SIZE_K * stride_bk
 
         # Load the next block of A
         if EVEN_K:
-            a = gl.amd.cdna4.buffer_load(
+            acp.buffer_load_to_shared(
+                dest=smem_a.index((k + 1) % 2),
                 ptr=(a_ptr + batch_id * stride_ab),
                 offsets=offs_a,
                 mask=(offs_am[:, None] < M),
                 other=0.0,
+                cache_modifier=".cg",
             )
         else:
-            a = gl.amd.cdna4.buffer_load(
+            acp.buffer_load_to_shared(
+                dest=smem_a.index((k + 1) % 2),
                 ptr=(a_ptr + batch_id * stride_ab),
                 offsets=offs_a,
                 mask=(
@@ -547,22 +562,22 @@ def _batched_gemm_a8w8_kernel_async_copy(
                     & (offs_am[:, None] < M)
                 ),
                 other=0.0,
+                cache_modifier=".cg",
             )
-
-        # Grab the current block of A from shared memory
-        cur_a = smem_a.load(layout=dot_a_layout)
-        cur_b = smem_b.load(layout=dot_b_layout)
 
         # Load the next block of B
         if EVEN_K:
-            b = gl.amd.cdna4.buffer_load(
+            acp.buffer_load_to_shared(
+                dest=smem_b.index((k + 1) % 2),
                 ptr=(b_ptr + batch_id * stride_bb),
                 offsets=offs_b,
                 mask=(offs_bn[None, :] < N),
                 other=0.0,
+                cache_modifier=".cg",
             )
         else:
-            b = gl.amd.cdna4.buffer_load(
+            acp.buffer_load_to_shared(
+                dest=smem_b.index((k + 1) % 2),
                 ptr=(b_ptr + batch_id * stride_bb),
                 offsets=offs_b,
                 mask=(
@@ -570,19 +585,21 @@ def _batched_gemm_a8w8_kernel_async_copy(
                     & (offs_bn[None, :] < N)
                 ),
                 other=0.0,
+                cache_modifier=".cg",
             )
+
+        # Grab the current block of A from shared memory
+        cur_a = smem_a.index(k % 2).load(layout=dot_a_layout)
+
+        # Grab the current block of B from shared memory
+        cur_b = smem_b.index(k % 2).load(layout=dot_b_layout)
 
         # Perform and store the MFMA operation
         accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
 
-        # Store next A and B in shared memory, unless this is the last block
-        if k < num_k_iter - 2:
-            smem_a.store(a)
-            smem_b.store(b)
-
     # Epilogue: use remaining A and B for last MFMA
-    cur_a = gl.convert_layout(a, dot_a_layout)
-    cur_b = gl.convert_layout(b, dot_b_layout)
+    cur_a = smem_a.index((num_k_iter - 1) % 2).load(layout=dot_a_layout)
+    cur_b = smem_b.index((num_k_iter - 1) % 2).load(layout=dot_b_layout)
     accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
 
     # Apply scales
