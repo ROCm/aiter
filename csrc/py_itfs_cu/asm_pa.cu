@@ -3,8 +3,8 @@
 #include "aiter_hip_common.h"
 #include "asm_pa_configs.hpp"
 #include "py_itfs_common.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
@@ -120,8 +120,8 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
 
     int dim            = head_size;
     int stride_Q       = Q.stride(0) * Q.itemsize();
-    int stride_KV_head = block_size * dim * K.itemsize();
-    int stride_KV_blk  = stride_KV_head * num_kv_heads;
+    int stride_KV_head = K.stride(1) * K.itemsize();
+    int stride_KV_blk  = K.stride(0) * K.itemsize();
     float k_log2e      = f_log2E;
     float k_scalar     = sqrt(dim);
     k_scalar           = (float)((double)k_log2e / (double)k_scalar);
@@ -156,8 +156,8 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     //           << " kv_nheads:" << args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs
     //           << " KVs:" << args.KVs << std::endl;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     std::string q_type;
     std::string kv_type;
