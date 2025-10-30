@@ -854,7 +854,21 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     )
 
 
-@triton.jit
+_paged_attn_decode_v1_wo_dot_per_token_quant_repr = make_kernel_repr(
+    "_paged_attn_decode_v1_wo_dot_kernel_per_token_quant",
+    [
+        "compute_type",
+        "KV_BLK_SZ",
+        "KV_BLK_SZ_POW2",
+        "HEAD_SZ",
+        "HEAD_SZ_POW2",
+        "QUERY_GRP_SZ",
+        "MAX_SEQ_LEN_POW2",
+    ],
+)
+
+
+@triton.jit(repr=_paged_attn_decode_v1_wo_dot_per_token_quant_repr)
 def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
     out,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
     q_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
@@ -984,7 +998,21 @@ def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
     )
 
 
-@triton.jit
+_paged_attn_decode_v1_w_dot_per_token_quant_repr = make_kernel_repr(
+    "_paged_attn_decode_v1_w_dot_kernel_per_token_quant",
+    [
+        "compute_type",
+        "KV_BLK_SZ",
+        "KV_BLK_SZ_POW2",
+        "HEAD_SZ",
+        "HEAD_SZ_POW2",
+        "QUERY_GRP_SZ",
+        "MAX_SEQ_LEN_POW2",
+    ],
+)
+
+
+@triton.jit(repr=_paged_attn_decode_v1_w_dot_per_token_quant_repr)
 def _paged_attn_decode_v1_w_dot_kernel_per_token_quant(
     out_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
     q_ptr,  # [num_seqs, num_kv_heads * query_grp_sz, head_sz]
@@ -1138,7 +1166,21 @@ def _paged_attn_decode_v1_w_dot_kernel_per_token_quant(
     tl.store(out_ptr + out_offs, acc.to(out_ptr.dtype.element_ty), mask=out_mask)
 
 
-@triton.jit
+_paged_attn_decode_v2_wo_dot_per_token_quant_repr = make_kernel_repr(
+    "_paged_attn_decode_v2_wo_dot_kernel_per_token_quant",
+    [
+        "compute_type",
+        "KV_BLK_SZ",
+        "KV_BLK_SZ_POW2",
+        "HEAD_SZ",
+        "HEAD_SZ_POW2",
+        "QUERY_GRP_SZ",
+        "MAX_SEQ_LEN_POW2",
+    ],
+)
+
+
+@triton.jit(repr=_paged_attn_decode_v2_wo_dot_per_token_quant_repr)
 def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
     exp_sums_ptr,
     max_logits_ptr,
@@ -1293,7 +1335,19 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
     )
 
 
-@triton.jit
+_paged_attn_decode_v2_wo_dot_reduce_per_token_quant_repr = make_kernel_repr(
+    "_paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant",
+    [
+        "compute_type",
+        "KV_BLK_SZ",
+        "HEAD_SZ",
+        "QUERY_GRP_SZ",
+        "MAX_SEQ_LEN_POW2",
+    ],
+)
+
+
+@triton.jit(repr=_paged_attn_decode_v2_wo_dot_reduce_per_token_quant_repr)
 def _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant(
     out,
     exp_sums_ptr,
@@ -1382,7 +1436,21 @@ def _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant(
     tl.store(out + out_ptr, acc.to(out.dtype.element_ty), mask=out_mask)
 
 
-@triton.jit
+_paged_attn_decode_v2_w_dot_per_token_quant_repr = make_kernel_repr(
+    "_paged_attn_decode_v2_w_dot_kernel_per_token_quant",
+    [
+        "compute_type",
+        "KV_BLK_SZ",
+        "KV_BLK_SZ_POW2",
+        "HEAD_SZ",
+        "HEAD_SZ_POW2",
+        "QUERY_GRP_SZ",
+        "MAX_SEQ_LEN_POW2",
+    ],
+)
+
+
+@triton.jit(repr=_paged_attn_decode_v2_w_dot_per_token_quant_repr)
 def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
@@ -1561,7 +1629,19 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
     tl.store(logits_ptr + logits_offs, acc, mask=q_mask)
 
 
-@triton.jit
+_paged_attn_decode_v2_w_dot_reduce_per_token_quant_repr = make_kernel_repr(
+    "_paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant",
+    [
+        "compute_type",
+        "KV_BLK_SZ",
+        "HEAD_SZ",
+        "QUERY_GRP_SZ",
+        "MAX_SEQ_LEN_POW2",
+    ],
+)
+
+
+@triton.jit(repr=_paged_attn_decode_v2_w_dot_reduce_per_token_quant_repr)
 def _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant(
     out_ptr,  # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
