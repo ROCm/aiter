@@ -385,18 +385,11 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         kv_sub_sequence_start_index = (
             kv_sequence_start_index + kv_block_index * KV_COMPUTE_BLOCK_SIZE
         )
-        kv_sub_sequence_end_index = gl.minimum(
-            kv_sub_sequence_start_index + KV_COMPUTE_BLOCK_SIZE, kv_sequence_length
-        )
-        kv_sub_sequence_len = kv_sub_sequence_end_index - kv_sub_sequence_start_index
-        # kv_sub_sequence_len = kv_sequence_length
-
         block_table_id = kv_sub_sequence_start_index // KV_BLOCK_SIZE
         current_page_offset = page_offset + kv_block_index * KV_COMPUTE_BLOCK_SIZE
 
         # Calculate column offsets for QK computation
-        # qk_column_offsets = kv_sub_sequence_start_index + gl.arange(
-        qk_column_offsets = gl.arange(
+        qk_column_offsets = kv_sub_sequence_start_index + gl.arange(
             0, KV_COMPUTE_BLOCK_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
         )
 
@@ -535,7 +528,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         if alibi_slopes_ptr is not None:
             alibi_bias = (
                 alibi_slope_values[:, None]
-                * (qk_column_offsets - kv_sub_sequence_len + 1)[None, :]
+                * (qk_column_offsets - kv_sequence_length + 1)[None, :]
             ).to(gl.float32)
             qk_matrix += alibi_bias
 
@@ -550,10 +543,10 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
             )
             causal_mask = (
                 sequence_extension[:, None] + qk_column_offsets[None, :]
-                < kv_sub_sequence_len
+                < kv_sequence_length
             )
         else:
-            causal_mask = qk_column_offsets[None, :] < kv_sub_sequence_len
+            causal_mask = qk_column_offsets[None, :] < kv_sequence_length
 
         # Combine masks
         combined_mask = boundary_mask & causal_mask
@@ -1611,20 +1604,18 @@ def paged_attention_decode_v2_reduce_kernel(
     logits_offsets = (
         sequence_idx * stride_logits_seq
         + kv_head_idx * stride_logits_head
-        + partition_offsets[None, :, None] * stride_logits_part
-        + query_group_offsets[:, None, None] * stride_logits_group
+        + partition_offsets[:, None, None] * stride_logits_part
+        + query_group_offsets[None, :, None] * stride_logits_group
         + head_size_offsets[None, None, :]
     )
 
     # Create mask for valid logits access
-    logits_mask = (partition_offsets[None, :] < num_partitions) & (
-        query_group_offsets[:, None] < QUERY_GROUP_SIZE
+    logits_mask = (partition_offsets[:, None] < num_partitions) & (
+        query_group_offsets[None, :] < QUERY_GROUP_SIZE
     )
 
     # Load partial logits from all partitions
     partial_logits = tl.load(logits_ptr + logits_offsets, mask=logits_mask[:, :, None])
-
-    partial_logits = tl.permute(partial_logits, (1, 0, 2))
 
     # Compute weighted sum of logits to produce final output [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     final_output = tl.sum((partial_logits * attention_probs).to(tl.float32), axis=0).to(
