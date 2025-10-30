@@ -19,9 +19,13 @@ from aiter import dtypes
 from aiter import pertoken_quant, per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 
+from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8_triton34 import (
+    paged_attention_decode as paged_attention_decode_gluon_fp8_triton34,
+)
 from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8 import (
     paged_attention_decode as paged_attention_decode_gluon_fp8,
 )
+
 
 TRITON_VERSION = triton.__version__
 
@@ -51,6 +55,23 @@ def setup_seed(seed: int) -> None:
 
 
 setup_seed(123)
+
+
+# Convert version string to comparable tuple format
+def parse_version(version_str):
+    """Parse version string into tuple format, handling possible development version suffixes"""
+    # Remove potential suffixes like .dev, +git etc.
+    version_str = version_str.split("+")[0].split("-")[0]
+
+    # Split version number and convert to integers
+    parts = []
+    for part in version_str.split("."):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            break
+
+    return tuple(parts)
 
 
 def compare_arrays(
@@ -431,19 +452,17 @@ def quantize_kv_cache_per_tensor(
     num_blocks, num_heads, head_dim, block_size = value_cache.shape
 
     # Per-tensor quantization for keys
-    quantized_keys, key_scale = per_tensor_quant(key_cache, quant_dtype=quant_dtype)
+    quantized_keys, key_scales_original = per_tensor_quant(
+        key_cache, quant_dtype=quant_dtype
+    )
     # Per-tensor quantization for values
-    quantized_values, value_scale = per_tensor_quant(
+    quantized_values, value_scales_original = per_tensor_quant(
         value_cache, quant_dtype=quant_dtype
     )
 
     # For per-tensor quantization, scales are scalars
-    key_scales_flat = key_scale.expand(num_heads, num_blocks * block_size)
-    value_scales_flat = value_scale.expand(num_heads, num_blocks * block_size)
-
-    # Create proper shape for original scales (per-tensor uses scalar broadcasted to appropriate shape)
-    key_scales_original = key_scale.squeeze()
-    value_scales_original = value_scale.squeeze()
+    key_scales_flat = key_scales_original.expand(num_heads, num_blocks * block_size)
+    value_scales_flat = value_scales_original.expand(num_heads, num_blocks * block_size)
 
     return (
         quantized_keys,
@@ -502,6 +521,7 @@ def shuffle_value_cache_layout(value_cache: torch.Tensor) -> torch.Tensor:
 
 
 def run_gluon_fp8_kernel(
+    pa_gluon_fp8_op,
     output: torch.Tensor,
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -519,7 +539,7 @@ def run_gluon_fp8_kernel(
     alibi_slopes: Optional[torch.Tensor] = None,
 ) -> Dict:
     """Run Gluon FP8 kernel for paged attention."""
-    result = paged_attention_decode_gluon_fp8(
+    result = pa_gluon_fp8_op(
         output,
         query,
         key_cache,
@@ -583,9 +603,12 @@ def test_paged_attention_decode_gluon(
     )
     query.uniform_(*UNIFORM_RANGE)
 
+    # kv_len_list = [context_lengths] * batch_size
+    kv_len_list = [random.randint(1, context_lengths) for _ in range(batch_size)]
     sequence_lengths = torch.tensor(
-        [context_lengths] * batch_size, dtype=torch.int32, device=device
+        kv_len_list, dtype=torch.int32, device=device
     )
+    print(sequence_lengths)
 
     block_tables_list = []
     for _ in range(batch_size):
@@ -630,10 +653,9 @@ def test_paged_attention_decode_gluon(
         )
     else:  # per_tensor
         # Per-tensor quantization for query
-        quantized_query, query_scale = per_tensor_quant(
+        quantized_query, query_scale_factors = per_tensor_quant(
             query, quant_dtype=aiter.dtypes.fp8
         )
-        query_scale_factors = query_scale.squeeze()
 
         # Per-tensor quantization for KV cache
         (
@@ -687,7 +709,7 @@ def test_paged_attention_decode_gluon(
             batch_size, num_kv_heads * query_length * query_group_size, head_size
         )
 
-        if len(query_scale_factors.shape) > 0:  # per-token quantization
+        if len(query_scale_factors.shape) > 1:  # per-token quantization
             query_scale_gluon = query_scale_factors.reshape(
                 batch_size, query_length, num_kv_heads, query_group_size, 1
             )
@@ -699,7 +721,15 @@ def test_paged_attention_decode_gluon(
             pass
 
     # Test Gluon
+    pa_gluon_fp8_op = paged_attention_decode_gluon_fp8_triton34
+    triton_version = parse_version(TRITON_VERSION)
+    if triton_version > (3, 4, 0):
+        print(f"pa_gluon_fp8_op==paged_attention_decode_gluon_fp8")
+        pa_gluon_fp8_op = paged_attention_decode_gluon_fp8
+    else:
+        print(f"pa_gluon_fp8_op==paged_attention_decode_gluon_fp8_triton34")
     gluon_results = run_gluon_fp8_kernel(
+        pa_gluon_fp8_op,
         gluon_output,
         quantized_query_gluon,
         quantized_keys,
@@ -784,6 +814,9 @@ def test_paged_attention_decode_gluon(
     )
 
     # aiter_assembly_kernel do not support per-tensor quantization, we always use per-token quantization here
+    if quant_mode == "per_tensor":
+        key_scale_original = key_scale_factors_flat.contiguous()
+        value_scale_original = value_scale_factors_flat.contiguous()
     if not skip_assembly:
         assembly_output, assembly_time = run_aiter_assembly_kernel(
             query,
@@ -793,8 +826,8 @@ def test_paged_attention_decode_gluon(
             sequence_lengths,
             block_tables.size(1),
             max_query_length,
-            key_scale_factors_flat.contiguous(),
-            value_scale_factors_flat.contiguous(),
+            key_scale_original,
+            value_scale_original,
             query_output_indptr,
         )
         assembly_error = checkAllclose(
@@ -808,11 +841,11 @@ def test_paged_attention_decode_gluon(
             assembly_output.to(torch.float32).detach().cpu().numpy(),
             reference_output_quant.to(torch.float32).detach().cpu().numpy(),
         )
-        print("compare gluon_fp8 and asm")
-        compare_arrays(
-            final_gluon_output.to(torch.float32).detach().cpu().numpy(),
-            assembly_output.to(torch.float32).detach().cpu().numpy(),
-        )
+        # print("compare gluon_fp8 and asm")
+        # compare_arrays(
+        #     final_gluon_output.to(torch.float32).detach().cpu().numpy(),
+        #     assembly_output.to(torch.float32).detach().cpu().numpy(),
+        # )
         results[f"us_asm_fp8"] = assembly_time
         assembly_bandwidth = (
             batch_size
@@ -832,6 +865,7 @@ def test_paged_attention_decode_gluon(
     else:
         results[f"perf_fp8_gluon_vs_asm"] = "NaN"
 
+    print(f"Triton location: {triton}")
     print(f"Triton version: {triton.__version__}")
     print(f"Quantization mode: {quant_mode}")
     sys.stdout.flush()
