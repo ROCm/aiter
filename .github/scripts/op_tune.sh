@@ -27,8 +27,22 @@ declare -a tune_jobs=(
 
 for job in "${tune_jobs[@]}"; do
     IFS=':' read -r shape dir test_path tune_cmd <<< "$job"
-    if [ -n "$shape_filter" ] && [ "$shape" != "$shape_filter" ]; then
-        continue
+    # If shape_filter is not empty, check if the current shape exists in the filter list.
+    # shape_filter is a comma-separated list, e.g. "ck_gemm_a8w8,ck_batched_gemm_a8w8"
+    if [ -n "$shape_filter" ]; then
+        # Remove all whitespace from the shape_filter string
+        shape_filter_no_space="${shape_filter//[[:space:]]/}"
+        IFS=',' read -ra filter_shapes <<< "$shape_filter_no_space"
+        found_match=false
+        for filter_shape in "${filter_shapes[@]}"; do
+            if [[ "$shape" == "$filter_shape" ]]; then
+                found_match=true
+                break
+            fi
+        done
+        if [ "$found_match" = false ]; then
+            continue
+        fi
     fi
     echo "============================================================"
     echo "🧪 Processing shape: $shape under directory: $dir"
