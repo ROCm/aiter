@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "hip_compat.h"
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <algorithm>
-#include <c10/cuda/CUDAGuard.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 #include <stdexcept>
 #include <torch/all.h>
 
@@ -383,7 +383,7 @@ void LLGemm1(void* in_a,
              void* out_c,
              const int M,
              const int K,
-             cudaStream_t stream,
+             hipStream_t stream,
              const int rows_per_block,
              const c10::ScalarType scalar_type)
 {
@@ -1658,7 +1658,7 @@ int mindiv(int N, int div1, int div2)
 constexpr int MAX_N = 16;
 template <typename fptype, int N>
 void launch_wv_splitk_small_fp16_bf16_kernel(
-    cudaStream_t stream, int K_in, int M_in, fptype* af4, const fptype* bf4, fptype* c, int CuCount)
+    hipStream_t stream, int K_in, int M_in, fptype* af4, const fptype* bf4, fptype* c, int CuCount)
 {
     dim3 grid(CuCount);
     dim3 block(64, 1);
@@ -1679,7 +1679,7 @@ void launch_wv_splitk_small_fp16_bf16_kernel(
 }
 
 template <typename fptype>
-using KernelFuncPtr = void (*)(cudaStream_t, int, int, fptype*, const fptype*, fptype*, int);
+using KernelFuncPtr = void (*)(hipStream_t, int, int, fptype*, const fptype*, fptype*, int);
 
 // generate jump table during compilation (1~MAX_N)
 template <typename fptype, int... Is>
@@ -1695,7 +1695,7 @@ void wv_splitk_small_fp16_bf16(void* in_a,
                                const int M_in,
                                const int K_in,
                                const int N_in,
-                               cudaStream_t stream,
+                               hipStream_t stream,
                                const int CuCount,
                                const c10::ScalarType scalar_type)
 {
@@ -1724,7 +1724,7 @@ void wvSplitK_(void* in_a,
                const int M_in,
                const int K_in,
                const int N_in,
-               cudaStream_t stream,
+               hipStream_t stream,
                const int CuCount,
                const c10::ScalarType scalar_type)
 {
@@ -2220,7 +2220,7 @@ void wvSplitKQ_(void* in_a,
                 const int K_in,
                 const int Kp_in,
                 const int N_in,
-                cudaStream_t stream,
+                hipStream_t stream,
                 const int CuCount,
                 const c10::ScalarType a_scalar_type,
                 const c10::ScalarType c_scalar_type)
@@ -2352,7 +2352,7 @@ void LLGemmZZ(void* in_a,
               void* out_c,
               const int M,
               const int K,
-              cudaStream_t stream,
+              hipStream_t stream,
               const int solidx = 0)
 {
     // m -> M, n-> K
@@ -2398,14 +2398,14 @@ void LLGemmZZ(void* in_a,
                                          reinterpret_cast<const _Float16*>(in_b),
                                          reinterpret_cast<_Float16*>(out_c));
     }
-    cudaError_t err = cudaGetLastError();
-    if(cudaSuccess != err)
+    hipError_t err = hipGetLastError();
+    if(hipSuccess != err)
         throw std::runtime_error("CUDA kernel failed : " + std::to_string(err));
 }
 
 // instantiate the kernel template for T=float:
 // template void AddGPUKernel<float>(float *in_a, float *in_b, float *out_c,
-// const int M, const int K, cudaStream_t stream);
+// const int M, const int K, hipStream_t stream);
 const unsigned int TILE_WIDTH = 32;
 // Compute C = A * B
 __global__ void matrixMultiplyShared(float* A,
@@ -2466,7 +2466,7 @@ void MMGPUKernel(float* in_a,
                  int numBColumns,
                  int numCRows,
                  int numCColumns,
-                 cudaStream_t stream)
+                 hipStream_t stream)
 {
     // Initialize the grid and block dimensions
     dim3 dimBlock(TILE_WIDTH, TILE_WIDTH, 1);
@@ -2475,8 +2475,8 @@ void MMGPUKernel(float* in_a,
     matrixMultiplyShared<<<dimGrid, dimBlock>>>(
         in_a, in_b, out_c, numARows, numAColumns, numBRows, numBColumns, numCRows, numCColumns);
 
-    cudaError_t err = cudaGetLastError();
-    if(cudaSuccess != err)
+    hipError_t err = hipGetLastError();
+    if(hipSuccess != err)
         throw std::runtime_error("CUDA kernel failed : " + std::to_string(err));
 }
 } // namespace aiter

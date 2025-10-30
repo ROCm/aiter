@@ -3,7 +3,7 @@
 
 # user interface
 
-from typing import List
+from typing import Tuple
 import torch
 from ..jit.core import (
     compile_ops,
@@ -48,7 +48,7 @@ def gen_moe_fused_gate_fake_tensor(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     output = torch.empty_like(
         topk_weights, dtype=topk_weights.dtype, device=topk_weights.device
     )
@@ -69,7 +69,7 @@ def moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> List[torch.Tensor]: ...
+) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def biased_grouped_topk(
