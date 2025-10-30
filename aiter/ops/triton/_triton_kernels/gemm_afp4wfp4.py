@@ -141,7 +141,7 @@ def _gemm_afp4_wfp4_kernel(
                     cache_modifier=cache_modifier,
                 )
 
-            accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
+            accumulator = tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1", accumulator)
 
             # Advance the ptrs to the next K block.
             a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
@@ -340,7 +340,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
                     b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
                 )
 
-            accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
+            accumulator = tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1", accumulator)
 
             # Advance the ptrs to the next K block.
             a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
