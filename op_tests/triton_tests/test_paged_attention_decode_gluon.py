@@ -808,6 +808,11 @@ def test_paged_attention_decode_gluon(
             assembly_output.to(torch.float32).detach().cpu().numpy(),
             reference_output_quant.to(torch.float32).detach().cpu().numpy(),
         )
+        print("compare gluon_fp8 and asm")
+        compare_arrays(
+            final_gluon_output.to(torch.float32).detach().cpu().numpy(),
+            assembly_output.to(torch.float32).detach().cpu().numpy(),
+        )
         results[f"us_asm_fp8"] = assembly_time
         assembly_bandwidth = (
             batch_size
@@ -1018,12 +1023,13 @@ if __name__ == "__main__":
     # CONTEXT_LENGTH_OPTIONS = [512, 4096, 4097]
     # BATCH_SIZE_OPTIONS = [4, 80, 128]
 
-    HEAD_DIMENSION = 128
     BLOCK_SIZE_OPTIONS = [16]
-    # BLOCK_SIZE_OPTIONS = [1024]
-    DATA_TYPE_OPTIONS = ["bf16"]
     HEAD_CONFIGURATIONS = [(16, 1)]
+    # BLOCK_SIZE_OPTIONS = [1024]
     # HEAD_CONFIGURATIONS = [(10, 1)]
+
+    HEAD_DIMENSION = 128
+    DATA_TYPE_OPTIONS = ["bf16"]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
     CONTEXT_LENGTH_OPTIONS = [4096]
     BATCH_SIZE_OPTIONS = [4, 128]
