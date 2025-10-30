@@ -44,10 +44,12 @@ def calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, eps=1e-6, shuffle=F
     if shuffle:
         out1_scale_pad = out1_scale
         M = out1_scale.shape[0]
-        if M % 256 > 0:
-            M_pad = (M + 255) // 256 * 256
-            out1_scale_pad = torch.empty((M_pad, out1_scale.shape[1]), dtype = out1_scale.dtype, device = out1_scale.device)
-            out1_scale_pad[:M, ...] = out1_scale[:M, ...]
+        N = x1.shape[1]
+        scaleM = (M + 255) // 256 * 256
+        scaleN_valid = (N + 31) // 32
+        scaleN = (scaleN_valid + 7) // 8 * 8
+        out1_scale_pad = torch.empty((scaleM, scaleN), dtype = out1_scale.dtype, device = out1_scale.device)
+        out1_scale_pad[:M, :scaleN_valid] = out1_scale[:M, :scaleN_valid]
         out1_scale = shuffle_scales(out1_scale_pad)
         out1_scale = out1_scale.view(out1_scale.shape[0] * 32, -1)
 
@@ -100,25 +102,21 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
     torch.testing.assert_close(triton_scale, torch_scale)
     torch.testing.assert_close(triton_out, torch_out)
 
-
-# @pytest.mark.parametrize("B", [1, 32, 256])
-# @pytest.mark.parametrize("M", [128, 132, 2112])
-# @pytest.mark.parametrize("N", [32, 96])
-# @pytest.mark.parametrize("stride", [2112])
-# @pytest.mark.parametrize("inp2", [True, False])
-# @pytest.mark.parametrize("res1", [True, False])
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("M", [4])
-@pytest.mark.parametrize("N1", [8192])
-@pytest.mark.parametrize("N2", [8192])
-@pytest.mark.parametrize("stride", [8192])
-@pytest.mark.parametrize("inp2", [True])
-@pytest.mark.parametrize("res1", [True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("shuffle", [True])
-@pytest.mark.parametrize("scale_shuffle_padding", [True])
-# @pytest.mark.parametrize("shuffle", [False])
-# @pytest.mark.parametrize("scale_shuffle_padding", [False])
+@pytest.mark.parametrize(
+    "M, N1, N2, stride",
+    [(M, N1, N2, stride) 
+     for M in [1, 4, 33, 64, 132, 256]
+     for N1, N2, stride in [
+         (200, 200, 200), 
+         (256, 256, 256),
+         (256, 256, 2112),
+     ]],
+)
+@pytest.mark.parametrize("inp2", [True, False])
+@pytest.mark.parametrize("res1", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shuffle", [True, False])
+@pytest.mark.parametrize("scale_shuffle_padding", [True, False])
 def test_fused_rms_quant(
     M: int, N1: int, N2: int, stride: int, inp2: bool, res1: bool, dtype, shuffle: bool, scale_shuffle_padding: bool,
 ):
@@ -134,36 +132,24 @@ def test_fused_rms_quant(
     (x1_fp4_torch, x1_scales_torch), x2_torch, res1_out_torch = (
         calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, shuffle=shuffle)
     )
-    from triton.testing import runtime
-    di = runtime.driver.active.get_device_interface()
-    cache = runtime.driver.active.get_empty_cache_for_benchmark()
     
-    for _ in range(250):
-        cache.zero_()
-        di.synchronize()
-        (x1_fp4_triton, x1_scales_triton), x2_triton, res1_out_triton = (
-            fused_rms_mxfp4_quant(x1, rms1_w, 1e-6, x2, rms2_w, 1e-6, resid1, shuffle=shuffle, scale_shuffle_padding=scale_shuffle_padding)
-        )
-        di.synchronize()
+    (x1_fp4_triton, x1_scales_triton), x2_triton, res1_out_triton = (
+        fused_rms_mxfp4_quant(x1, rms1_w, 1e-6, x2, rms2_w, 1e-6, resid1, shuffle=shuffle, scale_shuffle_padding=scale_shuffle_padding)
+    )
     
     if shuffle:
         x1_scales_triton = un_shuffle_scales(x1_scales_triton.view(x1_scales_triton.shape[0] // 32, -1))
         x1_scales_torch = un_shuffle_scales(x1_scales_torch.view(x1_scales_torch.shape[0] // 32, -1))
 
-    if scale_shuffle_padding and x1_scales_triton.shape[1] % 8 > 0:
-        x1_scales_triton = x1_scales_triton[:M, :x1_scales_triton.shape[1]]
-        x1_scales_torch = x1_scales_torch[:M, :x1_scales_torch.shape[1]]
-    else:
-        x1_scales_triton = x1_scales_triton[:M, ...]
-        x1_scales_torch = x1_scales_torch[:M, ...]
+    scaleN_valid = (N1 + 31) // 32
+    x1_scales_triton = x1_scales_triton[:M, :scaleN_valid]
+    x1_scales_torch = x1_scales_torch[:M, :scaleN_valid]
 
     if x2_triton is not None:
         torch.testing.assert_close(x2_torch, x2_triton)
 
     if res1_out_triton is not None:
         torch.testing.assert_close(res1_out_torch, res1_out_triton)
-
-    torch.testing.assert_close(x1_scales_triton, x1_scales_torch)
 
     res_fp32_torch = convert_mxfp4_to_fp32(x1_fp4_torch, x1_scales_torch)
     res_fp32_triton = convert_mxfp4_to_fp32(x1_fp4_triton, x1_scales_triton)

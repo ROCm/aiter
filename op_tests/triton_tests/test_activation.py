@@ -38,10 +38,12 @@ def torch_act_mul_and_mxfp4_quant(input: torch.Tensor, activation: str, shuffle:
     if shuffle:
         out_scale_pad = out_scale
         M = out_scale.shape[0]
-        if M % 256 > 0:
-            M_pad = (M + 255) // 256 * 256
-            out_scale_pad = torch.empty((M_pad, out_scale.shape[1]), dtype = out_scale.dtype, device = out_scale.device)
-            out_scale_pad[:M, ...] = out_scale[:M, ...]
+        N = out_scale.shape[1]
+        scaleM = (M + 255) // 256 * 256
+        scaleN_valid = (N + 31) // 32
+        scaleN = (scaleN_valid + 7) // 8 * 8
+        out_scale_pad = torch.empty((scaleM, scaleN), dtype = out_scale.dtype, device = out_scale.device)
+        out_scale_pad[:M, :scaleN_valid] = out_scale[:M, :scaleN_valid]
         out_scale = shuffle_scales(out_scale_pad)
         out_scale = out_scale.view(out_scale.shape[0] * 32, -1)
     return out, out_scale
@@ -108,11 +110,8 @@ def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str, shuffle
         print(f"torch_out.shape={torch_out.shape} torch_out={torch_out}")
         print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")
         
-    if scale_shuffle_padding and torch_scale.shape[1] % 8 > 0:
-        triton_scale = triton_scale[:M, :torch_scale.shape[1]]
-        torch_scale = torch_scale[:M, :torch_scale.shape[1]]
-    else:
-        triton_scale = triton_scale[:M, ...]
-        torch_scale = torch_scale[:M, ...]
+    scaleN_valid = (N + 31) // 32
+    triton_scale = triton_scale[:M, :scaleN_valid]
+    torch_scale = torch_scale[:M, :scaleN_valid]
     torch.testing.assert_close(triton_out, torch_out)
-    torch.testing.assert_close(triton_scale[:M, ...], torch_scale[:M, ...])
+    torch.testing.assert_close(triton_scale, torch_scale)

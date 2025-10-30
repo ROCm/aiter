@@ -20,7 +20,7 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
         "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
         and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,     
         "EVEN_M_N2": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N2"] % (args["BLOCK_SIZE_N"]) == 0,      
+        and args["N2"] % (args["BLOCK_SIZE_N2"]) == 0,      
     }
 )
 @triton.jit
@@ -49,12 +49,13 @@ def _fused_rms_mxfp4_quant_kernel(
     out_res1_stride_m,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_N2: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     HAS_SECOND_INPUT: tl.constexpr,
     FIRST_INPUT_RES: tl.constexpr,
-    scaleN: tl.constexpr,
-    scaleM_pad: tl.constexpr,
-    scaleN_pad: tl.constexpr,
+    SCALE_N: tl.constexpr,
+    SCALE_M_PAD: tl.constexpr,
+    SCALE_N_PAD: tl.constexpr,
     SHUFFLE: tl.constexpr,
     SHUFFLE_PAD: tl.constexpr,
     EVEN_M_N: tl.constexpr,
@@ -62,20 +63,20 @@ def _fused_rms_mxfp4_quant_kernel(
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    x_offs_n = tl.arange(0, BLOCK_SIZE_N)
 
-    if HAS_SECOND_INPUT:
-        if pid >= num_pid_m:
+    if pid >= num_pid_m:
+        if HAS_SECOND_INPUT:
             pid -= num_pid_m
             x_offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            x_offs_n2 = tl.arange(0, BLOCK_SIZE_N2)
             mask2 = None
             other2 = None
             if not EVEN_M_N2:
-                mask2 = (x_offs_m < M)[:, None] & (x_offs_n < N2)[None, :]
+                mask2 = (x_offs_m < M)[:, None] & (x_offs_n2 < N2)[None, :]
                 other2 = 0.0
 
             x2 = tl.load(
-                x2_ptr + x_offs_m[:, None] * x2_stride_m + x_offs_n[None, :],
+                x2_ptr + x_offs_m[:, None] * x2_stride_m + x_offs_n2[None, :],
                 mask=mask2,
                 other=other2,
                 cache_modifier=".cg",
@@ -84,20 +85,21 @@ def _fused_rms_mxfp4_quant_kernel(
             w_mask2 = None
             w_other2 = None
             if not EVEN_M_N2:
-                w_mask2 = x_offs_n < N2
+                w_mask2 = x_offs_n2 < N2
                 w_other2 = 0.0
 
-            w2 = tl.load(w2_ptr + x_offs_n, mask=w_mask2, other=w_other2).to(tl.float32)
+            w2 = tl.load(w2_ptr + x_offs_n2, mask=w_mask2, other=w_other2).to(tl.float32)
 
             norm2 = _rmsmorm_op(x2, w2, N2, eps2)
 
             tl.store(
-                out2_ptr + x_offs_m[:, None] * out2_stride_m + x_offs_n[None, :],
+                out2_ptr + x_offs_m[:, None] * out2_stride_m + x_offs_n2[None, :],
                 norm2.to(out2_ptr.type.element_ty),
                 mask=mask2,
             )
-            return
+        return
 
+    x_offs_n = tl.arange(0, BLOCK_SIZE_N)
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
     x_offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
 
@@ -166,7 +168,7 @@ def _fused_rms_mxfp4_quant_kernel(
             + bs_offs_2 * 2 * 2
             + bs_offs_5 * 2 * 2 * 16
             + bs_offs_3 * 2 * 2 * 16 * 4
-            + bs_offs_0 * 2 * 16 * scaleN
+            + bs_offs_0 * 2 * 16 * SCALE_N_PAD
         )
         bs_mask_127 = (bs_offs_m < M)[:, None] & (bs_offs_n < num_bs_cols)[None, :]
         bs_e8m0 = tl.where(bs_mask_127, bs_e8m0, 127)
@@ -178,9 +180,9 @@ def _fused_rms_mxfp4_quant_kernel(
     bs_mask = None
     if not EVEN_M_N:
         if SHUFFLE_PAD:
-            bs_mask = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[None, :]
+            bs_mask = (bs_offs_m < SCALE_M_PAD)[:, None] & (bs_offs_n < SCALE_N_PAD)[None, :]
         else:
-            bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
+            bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < SCALE_N)[None, :]
 
     tl.store(
         out1_bs_ptr + bs_offs,
@@ -232,9 +234,10 @@ def fused_rms_mxfp4_quant(
     MXFP4_QUANT_BLOCK_SIZE = 32
     M, N1 = x1.shape
     BLOCK_SIZE_N = max(triton.next_power_of_2(N1), MXFP4_QUANT_BLOCK_SIZE)
+    BLOCK_SIZE_N2 = 1
     if x2 is not None:
         N2 = x2.shape[1]
-        BLOCK_SIZE_N = max(triton.next_power_of_2(N2), BLOCK_SIZE_N)
+        BLOCK_SIZE_N2 = triton.next_power_of_2(N2)
     else:
         N2 = 0
     # as we merge 2 fp4s to 1 uint8
@@ -243,18 +246,18 @@ def fused_rms_mxfp4_quant(
     # BLOCK_SIZE_M = 32
     BLOCK_SIZE_N = max(BLOCK_SIZE_N, MXFP4_QUANT_BLOCK_SIZE)
     out1_fp4 = torch.empty((M, N1 // 2), dtype=torch.uint8, device=x1.device)
-    scaleN_valid = triton.cdiv(N1, MXFP4_QUANT_BLOCK_SIZE)
+    SCALE_N_valid = triton.cdiv(N1, MXFP4_QUANT_BLOCK_SIZE)
     use_scale_shuffle_padding = shuffle or scale_shuffle_padding
     if use_scale_shuffle_padding:
-        scaleM = triton.cdiv(M, 256) * 256
-        scaleN = triton.cdiv(scaleN_valid, 8) * 8
+        SCALE_M = triton.cdiv(M, 256) * 256
+        SCALE_N = triton.cdiv(SCALE_N_valid, 8) * 8
         # BLOCK_SIZE_M = triton.cdiv(BLOCK_SIZE_M, 32) * 32
         BLOCK_SIZE_N = triton.cdiv(BLOCK_SIZE_N, 32) * 32
     else:
-        scaleM = M
-        scaleN = scaleN_valid
+        SCALE_M = M
+        SCALE_N = SCALE_N_valid
     out1_bs = torch.empty(
-        (scaleM, scaleN),
+        (SCALE_M, SCALE_N),
         dtype=torch.uint8,
         device=x1.device,
     )
@@ -302,12 +305,13 @@ def fused_rms_mxfp4_quant(
         out_res1_stride_m,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         HAS_SECOND_INPUT=(x2 is not None),
         FIRST_INPUT_RES=(res1 is not None),
-        scaleN=scaleN_valid,
-        scaleM_pad=(scaleM if use_scale_shuffle_padding else 1),
-        scaleN_pad=scaleN,
+        SCALE_N=SCALE_N_valid,
+        SCALE_M_PAD=(SCALE_M if use_scale_shuffle_padding else 1),
+        SCALE_N_PAD=SCALE_N,
         SHUFFLE=shuffle,
         SHUFFLE_PAD=use_scale_shuffle_padding,
     )
