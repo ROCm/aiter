@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import jax_triton as jt
 
 from utils.logger import AiterTritonLogger
-from _triton_kernels.mha_onekernel_bwd import (
+from _triton_kernels.mha_onekernel_bwd_kernel import (
     _bwd_preprocess,
     bwd_kernel_causal,
     bwd_kernel_noncausal,
@@ -330,7 +330,7 @@ def main(unused_argv):
     dv = jnp.zeros_like(v)
 
     # jax-triton mha fused bwd
-    dq, dk, dv = flash_attn_fused_backward(
+    dq, dk, dv = flash_attn_onekernel_backward(
         # Input tensors
         do=do,
         q=q,
