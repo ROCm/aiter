@@ -3,7 +3,7 @@
     "dropout_or_fp32": {
       "BLOCK_M": 32,
       "BLOCK_N": 32,
-      "PRELOAD_V": false,
+      "PRELOAD_V": true,
       "waves_per_eu": 1,
       "num_warps": 2,
       "num_ctas": 1,
@@ -12,7 +12,7 @@
     "default": {
       "BLOCK_M": 128,
       "BLOCK_N": 64,
-      "PRELOAD_V": false,
+      "PRELOAD_V": true,
       "waves_per_eu": 2,
       "num_warps": 4,
       "num_ctas": 1,
