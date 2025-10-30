@@ -142,7 +142,8 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
     start_ts = time.perf_counter()
 
     def main_func(includes=None, sources=None, cxxflags=None):
-        logger.info(f"start build {sub_build_dir}")
+        if AITER_LOG_MORE >= 2:
+            logger.info(f"start build {sub_build_dir}")
         if includes is None:
             includes = []
         if sources is None:
@@ -216,13 +217,17 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         with open(f"{sub_build_dir}/Makefile", "w") as f:
             f.write(makefile_file)
         subprocess.run(
-            f"cd {sub_build_dir} && make build -j{len(sources)}", shell=True, check=True
+            f"cd {sub_build_dir} && make build -j{len(sources)}",
+            shell=True,
+            capture_output=AITER_LOG_MORE < 2,
+            check=True,
         )
 
     def final_func():
-        logger.info(
-            f"finish build {sub_build_dir}, cost {time.perf_counter()-start_ts:.8f}s"
-        )
+        if AITER_LOG_MORE >= 2:
+            logger.info(
+                f"finish build {sub_build_dir}, cost {time.perf_counter()-start_ts:.8f}s"
+            )
 
     main_func = partial(
         main_func, includes=includes, sources=sources, cxxflags=cxxflags
@@ -276,8 +281,9 @@ def compile_template_op(
             sources = []
         if cxxflags is None:
             cxxflags = []
+        if AITER_LOG_MORE >= 2:
+            logger.info(f"compile_template_op {func_name = } with {locals()}...")
         src_file = src_template.render(func_name=func_name, **kwargs)
-        logger.info(f"compile_template_op {func_name = } with {locals()}...")
         compile_lib(src_file, folder, includes, sources, cxxflags)
     return run_lib(func_name, folder)
 
