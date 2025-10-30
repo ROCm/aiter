@@ -10,13 +10,8 @@ import jax
 import jax.numpy as jnp
 import jax_triton as jt
 
-<<<<<<< Updated upstream
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton._triton_kernels.mha_onekernel_bwd import (
-=======
 from utils.logger import AiterTritonLogger
 from _triton_kernels.mha_onekernel_bwd_kernel import (
->>>>>>> Stashed changes
     _bwd_preprocess,
     bwd_kernel_causal,
     bwd_kernel_noncausal,
@@ -157,18 +152,10 @@ def flash_attn_onekernel_backward(
         *delta_strides,
         safe_tensor(cu_seqlens_q),
         max_seqlen_q,
-<<<<<<< Updated upstream
-        descale_do,
-        BLOCK_M=config["preprocess_kernel"]["PRE_BLOCK"],
-        BLOCK_D_MODEL=head_sz,
-        BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
-        IS_VARLEN=IS_VARLEN,
-=======
         kernel=_bwd_preprocess,
         grid=pre_grid,
         out_shape=out_shape,
         **metaparams_pre
->>>>>>> Stashed changes
     )
 
     # dropout_mask
@@ -206,103 +193,9 @@ def flash_attn_onekernel_backward(
     )
 
     if causal:
-<<<<<<< Updated upstream
-        bwd_kernel_causal[grid](
-            q,
-            k,
-            v,
-            sm_scale,
-            do,
-            dq,
-            dk,
-            dv,
-            softmax_lse,
-            delta,
-            *q_strides,
-            *k_strides,
-            *v_strides,
-            *dq_strides,
-            *dk_strides,
-            *dv_strides,
-            *delta_strides,
-            *do_strides,
-            *dropout_strides,
-            *descale_strides,
-            stride_az,
-            stride_ah,
-            num_q_heads,
-            num_k_heads,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_mask,
-            dropout_p,
-            philox_seed,
-            philox_offset,
-            alibi_slopes,
-            HEAD_DIM=head_sz,
-            ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
-            ENABLE_DROPOUT=use_dropout,
-            IS_VARLEN=IS_VARLEN,
-            USE_ALIBI=use_alibi,
-            USE_EXP2=True,
-            DEBUG_TRITON=False,
-            DEBUG_TRITON_DETAIL=False,
-            USE_INT64_STRIDES=USE_INT64_STRIDES,
-            **config_onekernel,
-        )
-    else:
-        bwd_kernel_noncausal[grid](
-            q,
-            k,
-            v,
-            sm_scale,
-            do,
-            dq,
-            dk,
-            dv,
-            softmax_lse,
-            delta,
-            *q_strides,
-            *k_strides,
-            *v_strides,
-            *dq_strides,
-            *dk_strides,
-            *dv_strides,
-            *delta_strides,
-            *do_strides,
-            *dropout_strides,
-            *descale_strides,
-            stride_az,
-            stride_ah,
-            num_q_heads,
-            num_k_heads,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_mask,
-            dropout_p,
-            philox_seed,
-            philox_offset,
-            alibi_slopes,
-            HEAD_DIM=head_sz,
-            ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
-            ENABLE_DROPOUT=use_dropout,
-            IS_VARLEN=IS_VARLEN,
-            USE_ALIBI=use_alibi,
-            USE_EXP2=True,
-            DEBUG_TRITON=False,
-            DEBUG_TRITON_DETAIL=False,
-            USE_INT64_STRIDES=USE_INT64_STRIDES,
-            **config_onekernel,
-        )
-=======
         kernel = bwd_kernel_causal
     else:
         kernel = bwd_kernel_noncausal
->>>>>>> Stashed changes
 
     out_shape = [
         jax.ShapeDtypeStruct(shape=dk.shape, dtype=dk.dtype),

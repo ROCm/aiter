@@ -11,11 +11,7 @@ import jax.numpy as jnp
 import jax_triton as jt
 
 from utils.logger import AiterTritonLogger
-<<<<<<< Updated upstream
-from _triton_kernels.mha_fused_bwd import (
-=======
 from _triton_kernels.mha_fused_bwd_kernel import (
->>>>>>> Stashed changes
     _bwd_preprocess,
     _bwd_kernel_dkdvdq_causal,
     _bwd_kernel_dkdvdq_noncausal,
