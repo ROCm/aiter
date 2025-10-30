@@ -35,7 +35,9 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit(repr=_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr)
+@triton.jit(
+    repr=_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr
+)
 def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel(
     # Pointers to matrices
     a_ptr,
