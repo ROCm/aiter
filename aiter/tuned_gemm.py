@@ -129,10 +129,11 @@ def gen_gemm_a16w16_fake_tensor(
     scale_c: Optional[Tensor] = None,
 ) -> Tensor:
     out = torch.empty(
-        A.view(-1, A.size(-1)).shape[0], B.shape[0], dtype=A.dtype, device=A.device
+        A.view(-1, A.size(-1)).shape[0],
+        B.shape[0],
+        dtype=otype or A.dtype,
+        device=A.device,
     )
-    if otype is not None:
-        out = out.to(otype)
     return out.view(*A.shape[:-1], B.shape[0])
 
 
