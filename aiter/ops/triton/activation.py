@@ -213,7 +213,8 @@ def act_mul_and_mxfp4_quant(
     x_fp4 = torch.empty((M, N_half // 2), dtype=torch.uint8, device=x.device)
     scaleN_valid = triton.cdiv(N_half, MXFP4_QUANT_BLOCK_SIZE)
     # Setting scale M to be multiple of 256 and scale N to be multiple of 8
-    if shuffle or scale_shuffle_padding:
+    use_scale_shuffle_padding = shuffle or scale_shuffle_padding
+    if use_scale_shuffle_padding:
         scaleM = triton.cdiv(M, 256) * 256
         scaleN = triton.cdiv(scaleN_valid, 8) * 8
     else:
@@ -271,7 +272,7 @@ def act_mul_and_mxfp4_quant(
         SCALING_MODE=0,
         ACTIVATION=activation,
         scaleN=scaleN_valid,
-        scaleM_pad=scaleM,
+        scaleM_pad=(scaleM if use_scale_shuffle_padding else 1),
         scaleN_pad=scaleN,
         SHUFFLE=shuffle,
         NUM_ITER=NUM_ITER,
