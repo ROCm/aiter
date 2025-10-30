@@ -1,4 +1,4 @@
-import torch, csv, sys
+import torch, csv, sys, argparse, os
 from aiter import dtypes, pertoken_quant, get_triton_quant, QuantType, gemm_a8w8_CK, gemm_a4w4
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale
 from aiter.ops.gemm_op_a4w4 import gemm_a4w4_blockscale
@@ -75,29 +75,57 @@ SHAPES = [(1,1280,8192),(32,1280,8192),(64,1280,8192),(128,1280,8192),(256,1280,
           (512,8192,1024),(1024,8192,1024),(2048,8192,1024),(4096,8192,1024),(8192,8192,1024),
           (2048,8192,8192)]
 
+KERNELS = {
+    "gemm_a4w4_asm": ("A4W4", lambda m,n,k: bench_a4w4(m,n,k)),
+    "gemm_a4w4_blockscale": ("A4W4-BLK", lambda m,n,k: bench_a4w4_blockscale(m,n,k)),
+    "gemm_a8w8_i8": ("A8W8-INT8", lambda m,n,k: bench_a8w8(m,n,k,"i8")),
+    "gemm_a8w8_fp8": ("A8W8-FP8", lambda m,n,k: bench_a8w8(m,n,k,"fp8")),
+    "gemm_a8w8_blockscale_i8": ("A8W8BLK-INT8", lambda m,n,k: bench_a8w8_blockscale(m,n,k,"i8")),
+    "gemm_a8w8_blockscale_fp8": ("A8W8BLK-FP8", lambda m,n,k: bench_a8w8_blockscale(m,n,k,"fp8")),
+}
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--shapes", type=str, help="Comma-separated M,N,K or multiple shapes like '2048,8192,8192 4096,8192,8192'")
+    parser.add_argument("--kernel", type=str, choices=list(KERNELS.keys()), help="Kernel to benchmark")
+    parser.add_argument("--output", type=str, default="gemm_benchmark_results.csv", help="Output CSV file (default: gemm_benchmark_results.csv)")
+    args = parser.parse_args()
+    
+    # Parse shapes
+    if args.shapes:
+        shapes = []
+        for s in args.shapes.split():
+            m,n,k = map(int, s.split(','))
+            shapes.append((m,n,k))
+    else:
+        shapes = SHAPES
+    
+    # Select kernels
+    if args.kernel:
+        kernels_to_run = [(KERNELS[args.kernel][0], KERNELS[args.kernel][1])]
+    else:
+        kernels_to_run = [v for v in KERNELS.values()]
+    
     print(f"GFX:{get_gfx()}, Device:{torch.cuda.get_device_name()}\n")
     results = []
     
-    for dt, fn in [("A4W4", lambda m,n,k: bench_a4w4(m,n,k)),
-                   ("A4W4-BLK", lambda m,n,k: bench_a4w4_blockscale(m,n,k)),
-                   ("A8W8-INT8", lambda m,n,k: bench_a8w8(m,n,k,"i8")),
-                   ("A8W8-FP8", lambda m,n,k: bench_a8w8(m,n,k,"fp8")),
-                   ("A8W8BLK-INT8", lambda m,n,k: bench_a8w8_blockscale(m,n,k,"i8")),
-                   ("A8W8BLK-FP8", lambda m,n,k: bench_a8w8_blockscale(m,n,k,"fp8"))]:
+    for dt, fn in kernels_to_run:
         print(f"{dt}:")
-        for i, (M,N,K) in enumerate(SHAPES, 1):
+        for i, (M,N,K) in enumerate(shapes, 1):
             r = fn(M,N,K)
             results.append(r)
-            print(f"  [{i}/{len(SHAPES)}] {M}x{N}x{K}: {r['TFLOPS']} TFLOPS" if r['TFLOPS'] else f"  [{i}/{len(SHAPES)}] SKIP")
+            print(f"  [{i}/{len(shapes)}] {M}x{N}x{K}: {r['TFLOPS']} TFLOPS" if r['TFLOPS'] else f"  [{i}/{len(shapes)}] SKIP")
     
-    with open("gemm_benchmark_results.csv", "w") as f:
+    # Write or append to CSV
+    file_exists = os.path.exists(args.output)
+    with open(args.output, "a" if file_exists else "w") as f:
         w = csv.DictWriter(f, ["M","N","K","dtype","backend","time_us","TFLOPS","GB/s"])
-        w.writeheader()
+        if not file_exists:
+            w.writeheader()
         w.writerows([r for r in results if r['TFLOPS']])
     
     print("\n" + "="*60)
     for dt in ["a4w4", "a4w4blk", "a8w8_i8", "a8w8_fp8", "a8w8blk_i8", "a8w8blk_fp8"]:
         v = [r['TFLOPS'] for r in results if r['dtype']==dt and r['TFLOPS']]
         if v: print(f"{dt:13s}: Avg={sum(v)/len(v):7.1f}, Max={max(v):7.1f}, Min={min(v):7.1f} TFLOPS")
-    print("\nResults: gemm_benchmark_results.csv")
+    print(f"\nResults: {args.output}")
