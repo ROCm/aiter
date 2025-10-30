@@ -5,9 +5,56 @@ import triton
 import triton.language as tl
 
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 # Source:
 # MoE Kernel adapted from VLLM
+
+
+_e2e_moe_kernel_repr = make_kernel_repr(
+    "e2e_moe_kernel",
+    [
+        "top_k",
+        "EM",
+        "N",
+        "K",
+        "EVEN_K",
+        "MUL_ROUTED_WEIGHT",
+        "use_fp8_w8a8",
+        "use_int8_w8a16",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K1",
+        "BLOCK_SIZE_K2",
+        "GROUP_SIZE_M",
+        "GRID_MN",
+        "atomic_num_stages",
+        "dtype",
+        "NUM_XCDS",
+    ],
+)
+
+_e2e_moe_persistent_kernel_repr = make_kernel_repr(
+    "e2e_moe_persistent_kernel",
+    [
+        "top_k",
+        "EM",
+        "N",
+        "K",
+        "EVEN_K",
+        "EVEN_N",
+        "MUL_ROUTED_WEIGHT",
+        "use_fp8_w8a8",
+        "use_int8_w8a16",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N1",
+        "BLOCK_SIZE_N2",
+        "BLOCK_SIZE_K1",
+        "BLOCK_SIZE_K2",
+        "NUM_SMS",
+        "NUM_XCDS",
+    ],
+)
 
 
 @triton.heuristics(
@@ -16,7 +63,7 @@ from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
     }
 )
-@triton.jit
+@triton.jit(repr=_e2e_moe_kernel_repr)
 def e2e_moe_kernel(
     A,
     W1,
@@ -316,7 +363,7 @@ def e2e_moe_kernel(
         # tl.store(out_ptrs + k * BLOCK_SIZE_K2, out, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(repr=_e2e_moe_persistent_kernel_repr)
 def e2e_moe_persistent_kernel(
     A,
     W1,

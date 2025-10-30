@@ -26,6 +26,7 @@ from bisect import bisect_right
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
 LOG_TWO_E = 1.44269504  # log_2(e) value for softmax scaling
@@ -208,7 +209,31 @@ def remap_xcd(pid, GRID_MN: tl.constexpr, NUM_XCDS: tl.constexpr = 8):
     return pid, pids_per_xcd
 
 
-@triton.jit
+_la_persistent_repr = make_kernel_repr(
+    "la_persistent",
+    [
+        "HEADS_PER_XCD",
+        "HEAD_DIM",
+        "BLOCK_M",
+        "BLOCK_N",
+        "MASKED_BLOCKS",
+        "XCD_REMAP",
+        "NUM_XCDS",
+        "batch_size",
+        "causal",
+        "num_m_blocks",
+        "num_n_blocks",
+        "total_programs",
+        "high_load_wgs",
+        "max_tiles_per_wg",
+        "tiles_per_head",
+        "num_splits",
+        "max_output_tile_cnt",
+    ],
+)
+
+
+@triton.jit(repr=_la_persistent_repr)
 def la_persistent(
     is_pod,
     pod_pid,
