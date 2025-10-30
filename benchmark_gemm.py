@@ -6,16 +6,17 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter.jit.utils.chip_info import get_gfx
 
 torch.set_default_device("cuda")
+COLD_ITERS, HOT_ITERS = 10, 50
 
 def bench(func, *args, **kw):
-    for _ in range(10): func(*args, **kw)
+    for _ in range(COLD_ITERS): func(*args, **kw)
     torch.cuda.synchronize()
     s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     times = []
-    for _ in range(50):
+    for _ in range(HOT_ITERS):
         s.record(); func(*args, **kw); e.record(); torch.cuda.synchronize()
         times.append(s.elapsed_time(e))
-    return sorted(times)[25] * 1000
+    return sorted(times)[HOT_ITERS//2] * 1000
 
 def bench_a8w8(M, N, K, qt):
     try:
@@ -89,7 +90,11 @@ if __name__ == "__main__":
     parser.add_argument("--shapes", type=str, help="Comma-separated M,N,K or multiple shapes like '2048,8192,8192 4096,8192,8192'")
     parser.add_argument("--kernel", type=str, choices=list(KERNELS.keys()), help="Kernel to benchmark")
     parser.add_argument("--output", type=str, default="gemm_benchmark_results.csv", help="Output CSV file (default: gemm_benchmark_results.csv)")
+    parser.add_argument("--cold-iters", type=int, default=10, help="Warmup iterations (default: 10)")
+    parser.add_argument("--hot-iters", type=int, default=50, help="Measurement iterations (default: 50)")
     args = parser.parse_args()
+    
+    COLD_ITERS, HOT_ITERS = args.cold_iters, args.hot_iters
     
     # Parse shapes
     if args.shapes:

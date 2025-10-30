@@ -6,6 +6,8 @@ Added command-line arguments to `benchmark_gemm.py`:
 - `--shapes`: Specify custom M,N,K dimensions
 - `--kernel`: Select specific kernel to benchmark  
 - `--output`: Specify output CSV file (supports append)
+- `--cold-iters`: Warmup iterations (default: 10)
+- `--hot-iters`: Measurement iterations for median calculation (default: 50)
 
 ## Usage Examples
 
@@ -34,6 +36,12 @@ python benchmark_gemm.py --kernel gemm_a8w8_fp8 --shapes "2048,8192,8192" --outp
 python benchmark_gemm.py --kernel gemm_a4w4_asm --shapes "2048,8192,8192" --output results.csv
 python benchmark_gemm.py --kernel gemm_a8w8_fp8 --shapes "2048,8192,8192" --output results.csv
 # Both results now in results.csv!
+```
+
+### 6. Custom warmup and measurement iterations
+```bash
+python benchmark_gemm.py --kernel gemm_a4w4_asm --shapes "2048,8192,8192" --cold-iters 20 --hot-iters 100
+# 20 warmup iterations, 100 measurement iterations (median of 100)
 ```
 
 ## Available Kernels
