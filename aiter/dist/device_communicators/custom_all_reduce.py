@@ -369,7 +369,7 @@ class CustomAllreduce:
             else:
                 return torch.empty_like(input)
         else:
-            return self.all_reduce(input, w=weight, eps=eps, registered=False)
+            return self.fused_ar_rms(input, w=weight, eps=eps, registered=False)
 
     def close(self):
         if not self.disabled and self._ptr:

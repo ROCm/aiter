@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 import argparse
+import itertools
 from aiter import dtypes
 
 from aiter.dist.parallel_state import (
@@ -453,6 +454,9 @@ l_shape = [
     # (64, 512 * 99)
     # (16, 512)
 ]
+l_tp = [8]
+l_pp = [1]
+l_graph = [True, False]
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(
@@ -475,6 +479,36 @@ parser.add_argument(
     help="shape. e.g. -s 128,8192",
 )
 
+parser.add_argument(
+    "-t",
+    "--tp",
+    type=int,
+    nargs="?",
+    const=None,
+    default=None,
+    help="tp num. e.g. -t 8",
+)
+
+parser.add_argument(
+    "-p",
+    "--pp",
+    type=int,
+    nargs="?",
+    const=None,
+    default=None,
+    help="tp num. e.g. -p 1",
+)
+
+parser.add_argument(
+    "-g",
+    "--graphon",
+    type=int,
+    nargs="?",
+    const=None,
+    default=None,
+    help="open cudagraph. e.g. -g 1",
+)
+
 
 if __name__ == "__main__":
     freeze_support()
@@ -485,11 +519,13 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
-    for dtype in l_dtype:
-        for shape in l_shape:
-            test_split_ar_rmsnorm(8, 1, shape, dtype, withGraph=True)
-            test_fused_ar_rmsnorm(8, 1, shape, dtype, withGraph=True)
-            # test_split_ar_rmsnorm(8, 1, shape, dtype, withGraph=False)
-            # test_fused_ar_rmsnorm(8, 1, shape, dtype, withGraph=False)
-            # acc_test(8, 1, shape, dtype)
-            # acc_test_cudagraph_on(8, 1, shape, dtype, 3)
+    if args.tp is not None:
+        l_tp = [args.tp]
+    if args.pp is not None:
+        l_pp = [args.pp]
+    if args.graphon is not None:
+        print(args.graphon)
+        l_graph = [args.graphon]
+    for (dtype, shape, tp, pp, graph_on) in itertools.product(l_dtype, l_shape, l_tp, l_pp, l_graph):
+        test_split_ar_rmsnorm(tp, pp, shape, dtype, withGraph=graph_on)
+        test_fused_ar_rmsnorm(tp, pp, shape, dtype, withGraph=graph_on)
