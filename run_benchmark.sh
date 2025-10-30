@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# Variables for clarity
 IMAGE=""
 WORKDIR="/work"
 

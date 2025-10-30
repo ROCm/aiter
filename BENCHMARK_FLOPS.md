@@ -1,6 +1,6 @@
 # AITER GEMM FLOPS Benchmark
 
-Benchmark A4W4 and A8W8 GEMM operations on AMD GPUs with FLOPS measurements.
+Benchmark A4W4 and A8W8 GEMM operations (including blockscale variants) on AMD GPUs with FLOPS measurements.
 
 ## Usage
 
@@ -10,21 +10,9 @@ cd aiter
 ./run_benchmark.sh
 ```
 
-Results: `gemm_benchmark_results.csv`
+## Operations Benchmarked
 
-
-## Implementation
-
-- **Script**: `benchmark_gemm.py` (73 lines)
-- **Runner**: `run_benchmark.sh` (5 lines, uses Docker)
-- **Warmup**: 10 iterations
-- **Measurement**: Median of 50 runs
-- **Shapes**: 21 shapes covering inference to training workloads
-
-## Files
-
-- `benchmark_gemm.py` - Benchmark implementation
-- `run_benchmark.sh` - Docker runner (auto-installs AITER)
-- `gemm_benchmark_results.csv` - Output
-- `BENCHMARK_FLOPS.md` - This file
-
+- **A4W4**: 4-bit GEMM (ASM kernel, per-1×32 scale)
+- **A4W4-BLK**: 4-bit blockscale (CK kernel)
+- **A8W8-INT8/FP8**: 8-bit GEMM (CK kernel, per-token scale)
+- **A8W8BLK-INT8/FP8**: 8-bit blockscale (CK kernel, 128×128 blocks)
