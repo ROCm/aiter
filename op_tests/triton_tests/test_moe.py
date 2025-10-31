@@ -1072,26 +1072,26 @@ def test_fused_moe_gelu(
 @pytest.mark.parametrize(
     "M, N, K, top_k, E",
     [
-        # (3, 512, 2048, 10, 512),  # qwen3next
-        # (333, 512, 2048, 10, 512),
-        # (1033, 512, 2048, 10, 512),
-        # (3, 768, 2048, 8, 128),  # qwen3
-        # (333, 768, 2048, 8, 128),
-        # (1033, 768, 2048, 8, 128),
-        # (1033, 1024, 2048, 8, 128),
-        # (3, 2048, 4096, 2, 8),  # mixtral-7B
-        # (33, 768, 2048, 8, 128),  # qwen3
-        # (333, 512, 2048, 10, 512),  # qwen3next
-        # (33, 8192, 5120, 1, 128),  # llama4-maverick
+        (3, 512, 2048, 10, 512),  # qwen3next
+        (333, 512, 2048, 10, 512),
+        (1033, 512, 2048, 10, 512),
+        (3, 768, 2048, 8, 128),  # qwen3
+        (333, 768, 2048, 8, 128),
+        (1033, 768, 2048, 8, 128),
+        (1033, 1024, 2048, 8, 128),
+        (3, 2048, 4096, 2, 8),  # mixtral-7B
+        (33, 768, 2048, 8, 128),  # qwen3
+        (333, 512, 2048, 10, 512),  # qwen3next
+        (33, 8192, 5120, 1, 128),  # llama4-maverick
         (33, 1536, 4096, 8, 128),  # qwen3
         # TODO: add other shapes
     ],
 )
 @pytest.mark.parametrize("routed_weight", [False])
-@pytest.mark.parametrize("fp8_w8a8", [True])
+@pytest.mark.parametrize("fp8_w8a8", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("blockshape_n, blockshape_k", [(128, 128)])
-@pytest.mark.parametrize("tp", [8])
+@pytest.mark.parametrize("tp", [1, 8])
 def test_moe_e2e(
     M: int,
     N: int,
@@ -1226,4 +1226,4 @@ def test_moe_e2e(
 
 
 if __name__ == "__main__":
-    test_moe_e2e(33, 512, 4096, 8, 128, False, True, 128, 128, torch.bfloat16, 1)
+    test_moe_e2e(32, 64, 64, 1, 1, False, True, 128, 128, torch.bfloat16, 1)
