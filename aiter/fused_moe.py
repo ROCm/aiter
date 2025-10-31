@@ -646,14 +646,12 @@ def get_2stage_cfgs(
                 kernelName=kernelName1,
                 activation=activation,
                 quant_type=q_type,
-                nbs_or_preshf=True,  # True:nbs False:preshuffle
             ),
             functools.partial(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
                 activation=activation,
                 quant_type=q_type,
-                nbs_or_preshf=True,  # True:nbs False:preshuffle
             ),
             block_m,
             ksplit,

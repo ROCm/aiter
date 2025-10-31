@@ -284,7 +284,6 @@ def ck_moe_stage1(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
-    nbs_or_preshf: bool = False,
 ) -> None: ...
 
 
@@ -305,7 +304,6 @@ def ck_moe_stage2(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
-    nbs_or_preshf: bool = False,
 ) -> None: ...
 
 
@@ -378,7 +376,6 @@ def ck_moe_stage1_fwd(
     sorted_weights: Optional[Tensor] = None,
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
-    nbs_or_preshf: bool = False,
 ):
     ck_moe_stage1(
         hidden_states,
@@ -396,7 +393,6 @@ def ck_moe_stage1_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
-        nbs_or_preshf,
     )
     return out
 
@@ -417,7 +413,6 @@ def ck_moe_stage2_fwd(
     sorted_weights: Optional[Tensor] = None,
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
-    nbs_or_preshf: bool = False,
 ):
 
     ck_moe_stage2(
@@ -436,6 +431,5 @@ def ck_moe_stage2_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
-        nbs_or_preshf,
     )
     return out

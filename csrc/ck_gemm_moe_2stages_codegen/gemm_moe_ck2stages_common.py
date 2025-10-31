@@ -395,6 +395,7 @@ def get_gemm2_kernels_list(
     QuantType: str,
     MulRoutedWeight: bool,
 ) -> list:
+    global bns_or_preslf
     arch = get_gfx()
 
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
@@ -421,7 +422,10 @@ def get_gemm2_kernels_list(
     ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
-        tag = "a4w4"
+        if bns_or_preslf:
+            tag = "a4w4_bns"
+        else:
+            tag = "a4w4"
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm2_kernels_dict[tag]
