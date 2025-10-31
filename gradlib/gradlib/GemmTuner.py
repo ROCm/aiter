@@ -166,19 +166,19 @@ class Gemm:
         self.rocb_sols = []
         self.rtol = 1e-2
         self.atol = 1e-2
-        #self.ref = self.get_gemm_ref()
+        # self.ref = self.get_gemm_ref()
         self.check_err_ratio = err_ratio
         self.splitK = None
         self.profile_file = profile_file
-        #self.start = torch.cuda.Event(enable_timing=True)
-        #self.end = torch.cuda.Event(enable_timing=True)
+        # self.start = torch.cuda.Event(enable_timing=True)
+        # self.end = torch.cuda.Event(enable_timing=True)
         # prefer hipblaslt unless rocblas time is less than this
         # ratio of hipblaslt time
         self.hipb_prefer_ratio = 0.995
         self.rocblas_decode = rocblas_decode
         self.mp = mp
-        #self.inbpe = self.inp.element_size()
-        #self.outbpe = self.ref.element_size()
+        # self.inbpe = self.inp.element_size()
+        # self.outbpe = self.ref.element_size()
         self.asm_map = {}
 
     def find_hipblas_sols(self):
@@ -385,7 +385,9 @@ class Gemm:
     def save_topn_result(self, rets, fast_mode, libtype):
         results = []
         if not rets:
-            return pd.DataFrame(columns=["solidx", "gtimems", "splitK", "err_ratio", "kernelName"])
+            return pd.DataFrame(
+                columns=["solidx", "gtimems", "splitK", "err_ratio", "kernelName"]
+            )
         for info, us, err_ratio in rets:
             res_one = []
             solidx = info[1]
@@ -530,6 +532,17 @@ class Gemm:
         if hasattr(self, 'weights'):
             del self.weights
         if hasattr(self, 'bias') and self.bias is not None:
+            del self.bias
+        if hasattr(self, "blob"):
+            cpu_blob = self.blob.cpu()
+            del cpu_blob
+
+    def cleanup(self):
+        if hasattr(self, "inp"):
+            del self.inp
+        if hasattr(self, "weights"):
+            del self.weights
+        if hasattr(self, "bias") and self.bias is not None:
             del self.bias
         if hasattr(self, "blob"):
             cpu_blob = self.blob.cpu()
@@ -726,19 +739,19 @@ class GemmTuner(GemmCommonTuner):
             indtype = ds["dtype"]
             outdtype = ds["outdtype"]
             gemmobj = Gemm(
-                    ds["M"],
-                    ds["N"],
-                    ds["K"],
-                    ds["bias"],
-                    indtype=eval(indtype),
-                    outdtype=eval(outdtype),
-                    scaleAB=ds["scaleAB"],
-                    rocblas_decode=args.rocblas_decode,
-                    mp=args.mp,
-                    err_ratio=args.errRatio,
-                    profile_file=args.profile_file,
-                )
-            
+                ds["M"],
+                ds["N"],
+                ds["K"],
+                ds["bias"],
+                indtype=eval(indtype),
+                outdtype=eval(outdtype),
+                scaleAB=ds["scaleAB"],
+                rocblas_decode=args.rocblas_decode,
+                mp=args.mp,
+                err_ratio=args.errRatio,
+                profile_file=args.profile_file,
+            )
+
             ret.extend(gemmobj.run_solutions())
             gemmobj.cleanup()
             del gemmobj

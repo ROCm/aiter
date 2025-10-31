@@ -28,7 +28,12 @@ import pandas as pd
 from GemmTuner import GemmTuner
 
 import time
+<<<<<<< HEAD
 import multiprocessing
+=======
+import multiprocessing as mp
+import gc
+>>>>>>> f68846e9 (workaround-retry tuning when encounter invalid pointer)
 
 aiter.rocb_create_extension()
 aiter.hipb_create_extension()
@@ -89,6 +94,10 @@ def load_input_gemms(input_file):
     if Path(input_file).is_file():
         return
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> f68846e9 (workaround-retry tuning when encounter invalid pointer)
 def runGemmTuner():
     gtuner = GemmTuner()
     ext_group = gtuner.parser.add_argument_group("extra parameters")
@@ -144,20 +153,56 @@ def runGemmTuner():
         gtuner.untunedf.to_csv("./tmp_untuned.csv", index=False)
         args.untune_file = "./tmp_untuned.csv"
     gtuner.run(args)
-    
+
+
+def clean():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch.cuda, "memory_allocated"):
+        torch.cuda.synchronize()
+    try:
+        if hasattr(mp, "resource_tracker"):
+            mp.resource_tracker.ensure_running()
+            # clean  leaked semaphore objects
+            if hasattr(mp.resource_tracker, "_CLEANUP_FUNCS"):
+                # be careful
+                for name in list(mp.resource_tracker._CLEANUP_FUNCS.keys()):
+                    try:
+                        mp.resource_tracker._CLEANUP_FUNCS.pop(name)()
+                    except:
+                        pass
+    except Exception as e:
+        print(f"Resource cleanup warning: {e}")
+
 
 if __name__ == "__main__":
     retries = 0
     MAX_TRY = 30
-    multiprocessing.set_start_method("spawn", force=True)
+    mp.set_start_method("spawn", force=True)
     while retries <= MAX_TRY:
-        process = multiprocessing.Process(target=runGemmTuner, args=())
-        process.start()
-        process.join()
-        if process.exitcode != 0:
-            time.sleep(0.5)
-            print("!Error when run GemmTuner process exitcode is ", process.exitcode)
-            retries = retries + 1
-        else:
-            break
+        try:
+            process = mp.Process(target=runGemmTuner, args=(), daemon=False)
+            process.start()
+            process.join(timeout=600)
+            if process.exitcode != 0:
+                time.sleep(0.5 * retries)
+                print(
+                    "!Error when run GemmTuner process exitcode is ", process.exitcode
+                )
+                clean()
+                retries += 1
+            else:
+                break
+        except Exception as e:
+            print(f"Process creation failed: {e}")
+            retries += 1
+            clean()
+            time.sleep(1)
+        finally:
+            if process and process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    clean()
     print(f"retried num is {retries}")
