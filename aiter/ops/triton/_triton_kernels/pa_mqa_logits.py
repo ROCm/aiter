@@ -836,14 +836,18 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         mfma_k = gl.convert_layout(k, mfma_layout_b)
         o = gl.amd.cdna3.mfma(mfma_q, mfma_k, zero)
 
-        #!=----------------------------
-        gl.amd.cdna3.sched_barrier(0x0)
-        #!=----------------------------
+        # gl.amd.cdna3.sched_group_barrier(8, 32, 0)
         k_next = gl.amd.cdna3.buffer_load(
             ptr=KV_buffer,
             offsets=offset_k_fixed + context_kv_idx_next[None, :] * stride_k_seq,
         )
 
+        # for _ in range(8):
+        # gl.amd.cdna3.sched_group_barrier(32, 4, 0)
+        # gl.amd.cdna3.sched_group_barrier(8, 32, 0)
+        #!=----------------------------
+        gl.amd.cdna3.sched_barrier(0x0)
+        #!=----------------------------
         k_scale_f = gl.convert_layout(k_scale_f, gl.SliceLayout(0, mfma_layout))
         o = o * k_scale_f[None, :]
         o = gl.maximum(o, 0.0)

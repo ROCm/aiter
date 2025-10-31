@@ -133,7 +133,7 @@ def ref_fp8_paged_mqa_logits_ragged(
 
 def create_paged_mqa_logits_configs(args: argparse.Namespace):
     x_names = ["batch_size", "next_n", "heads", "index_dim", "avg_kv_length"]
-    line_names = ["ragged_k", "non_ragged_k"]
+    line_names = ["non_ragged_k"]
     line_args = "kv_storage_kind"
 
     x_vals_list = [
@@ -160,7 +160,7 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
 
 def run_benchmark(args: argparse.Namespace):
     ChunkK = 256
-
+    
     @triton.testing.perf_report(create_paged_mqa_logits_configs(args))
     def test_deepgemm_fp8_paged_mqa_logits(
         batch_size, next_n, heads, index_dim, avg_kv_length, kv_storage_kind
@@ -231,20 +231,20 @@ def run_benchmark(args: argparse.Namespace):
             kv_indices[prefix_sum_context_lens[i] : prefix_sum_context_lens[i + 1]] = (
                 torch.randperm(max_model_len, device="cuda")[:ctx_len]
             )
-
-        if kv_storage_kind == "non_ragged_k":
-            ref_logits = ref_fp8_paged_mqa_logits(
-                q, kv_cache, weights, context_lens, block_tables, max_model_len
-            )
-        else:
-            ref_logits = ref_fp8_paged_mqa_logits_ragged(
-                q,
-                kv_cache.view([num_blocks, blocksize, index_dim]),
-                weights,
-                prefix_sum_context_lens,
-                kv_indices,
-                max_model_len,
-            )
+        if args.v:
+            if kv_storage_kind == "non_ragged_k":
+                ref_logits = ref_fp8_paged_mqa_logits(
+                    q, kv_cache, weights, context_lens, block_tables, max_model_len
+                )
+            else:
+                ref_logits = ref_fp8_paged_mqa_logits_ragged(
+                    q,
+                    kv_cache.view([num_blocks, blocksize, index_dim]),
+                    weights,
+                    prefix_sum_context_lens,
+                    kv_indices,
+                    max_model_len,
+                )
 
         out_qk = torch.full(
             (heads, batch_size * next_n, max_model_len),
@@ -316,36 +316,34 @@ def run_benchmark(args: argparse.Namespace):
                 ChunkK,
             )
 
-        out_qk_logits = torch.sum(out_qk, dim=0)
+        if args.v:
+            out_qk_logits = torch.sum(out_qk, dim=0)
 
-        positions = (
-            torch.arange(max_model_len, device="cuda")
-            .unsqueeze(0)
-            .expand(batch_size * next_n, -1)
-        )
-        row_indices = torch.arange(batch_size * next_n, device="cuda") // next_n
-        next_n_offset = torch.arange(batch_size * next_n, device="cuda") % next_n
-        mask = positions <= (
-            context_lens[row_indices] - next_n + next_n_offset
-        ).unsqueeze(1)
+            positions = (
+                torch.arange(max_model_len, device="cuda")
+                .unsqueeze(0)
+                .expand(batch_size * next_n, -1)
+            )
+            row_indices = torch.arange(batch_size * next_n, device="cuda") // next_n
+            next_n_offset = torch.arange(batch_size * next_n, device="cuda") % next_n
+            mask = positions <= (
+                context_lens[row_indices] - next_n + next_n_offset
+            ).unsqueeze(1)
 
-        def calc_diff(x: torch.Tensor, y: torch.Tensor):
-            x, y = x.double(), y.double()
-            denominator = (x * x + y * y).sum()
-            sim = 2 * (x * y).sum() / denominator
-            return 1 - sim
+            def calc_diff(x: torch.Tensor, y: torch.Tensor):
+                x, y = x.double(), y.double()
+                denominator = (x * x + y * y).sum()
+                sim = 2 * (x * y).sum() / denominator
+                return 1 - sim
 
-        out_logits = out_logits.masked_fill(~mask, 0)
-        out_qk_logits = out_qk_logits.masked_fill(~mask, 0)
-        ref_logits = ref_logits.masked_fill(~mask, 0)
+            out_logits = out_logits.masked_fill(~mask, 0)
+            out_qk_logits = out_qk_logits.masked_fill(~mask, 0)
+            ref_logits = ref_logits.masked_fill(~mask, 0)
 
-        # qk_diff = calc_diff(out_qk_logits, ref_logits)
-        logits_diff = calc_diff(out_logits, ref_logits)
+            # qk_diff = calc_diff(out_qk_logits, ref_logits)
+            logits_diff = calc_diff(out_logits, ref_logits)
 
-        print(">>>! logits_diff = ", logits_diff)
-        # assert qk_diff < 1e-3
-        assert logits_diff < 1e-3
-
+            print(">>>! logits_diff = ", logits_diff)
         total_float_operations = (
             2 * next_n * heads * index_dim * context_lens.float().sum().item()
         )
@@ -356,6 +354,9 @@ def run_benchmark(args: argparse.Namespace):
             " time elapsed: ",
             elapsed_us,
         )
+        if args.v:
+            # assert qk_diff < 1e-3
+            assert logits_diff < 1e-3
 
         return flops
 
@@ -389,6 +390,12 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="Q sequence length (mtp + 1 == qo_len) in MTP mode",
+    )
+    parser.add_argument(
+        "-v",
+        type=bool,
+        default=True,
+        help="Validate output",
     )
     args = parser.parse_args()
     run_benchmark(args)

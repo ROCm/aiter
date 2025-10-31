@@ -1,0 +1,1643 @@
+	.amdgcn_target "amdgcn-amd-amdhsa--gfx942"
+	.amdhsa_code_object_version 5
+	.text
+	.globl	_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle ; -- Begin function _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
+	.p2align	8
+	.type	_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,@function
+_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle: ; @_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
+.Lfunc_begin0:
+	.cfi_sections .debug_frame
+	.cfi_startproc
+; %bb.9:
+	.file	1 "xxx2/EXVFLIHTCEFSEUBZG27CPQO2DVZM2QEROUBEXX6ECNGRBPWNACKQ" "_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir"
+	.loc	1 25 0 prologue_end             ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:25:0
+	s_load_dwordx2 s[2:3], s[0:1], 0x0
+	s_load_dwordx8 s[4:11], s[0:1], 0x8
+	s_load_dwordx4 s[12:15], s[0:1], 0x28
+	s_waitcnt lgkmcnt(0)
+	s_branch .LBB0_0
+	.loc	1 0 0 is_stmt 0                 ; :0:0
+.Ltmp0:
+	.p2align	8
+; %bb.10:
+.LBB0_0:
+.Ltmp1:
+	.loc	1 45 4 is_stmt 1                ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:45:4
+	s_abs_i32 s7, s2
+	v_cvt_f32_u32_e32 v1, s7
+	s_mov_b64 s[28:29], s[10:11]
+	s_sub_i32 s11, 0, s7
+	.loc	1 42 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:42:4
+	s_add_i32 s3, s3, 63
+	.loc	1 45 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:45:4
+	v_rcp_iflag_f32_e32 v1, v1
+	s_abs_i32 s10, s16
+	.loc	1 43 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:43:4
+	s_ashr_i32 s9, s3, 31
+	s_lshr_b32 s9, s9, 26
+	.loc	1 45 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:45:4
+	v_mul_f32_e32 v1, 0x4f7ffffe, v1
+	v_cvt_u32_f32_e32 v1, v1
+	.loc	1 43 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:43:4
+	s_add_i32 s3, s3, s9
+	.loc	1 45 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:45:4
+	s_xor_b32 s9, s16, s2
+	s_mov_b64 s[24:25], s[14:15]
+	v_readfirstlane_b32 s13, v1
+	s_mul_i32 s11, s11, s13
+	s_mul_hi_u32 s11, s13, s11
+	s_add_i32 s13, s13, s11
+	s_mul_hi_u32 s11, s10, s13
+	s_mul_i32 s13, s11, s7
+	s_sub_i32 s10, s10, s13
+	.loc	1 43 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:43:4
+	s_ashr_i32 s3, s3, 6
+	.loc	1 45 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:45:4
+	s_ashr_i32 s9, s9, 31
+	s_add_i32 s13, s11, 1
+	s_sub_i32 s14, s10, s7
+	s_cmp_ge_u32 s10, s7
+	s_cselect_b32 s11, s13, s11
+	s_cselect_b32 s10, s14, s10
+	s_add_i32 s13, s11, 1
+	s_cmp_ge_u32 s10, s7
+	s_cselect_b32 s7, s13, s11
+	.loc	1 47 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:47:4
+	s_abs_i32 s13, s3
+	v_cvt_f32_u32_e32 v1, s13
+	.loc	1 45 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:45:4
+	s_xor_b32 s7, s7, s9
+	s_sub_i32 s7, s7, s9
+	.loc	1 44 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:44:4
+	s_mul_i32 s2, s7, s2
+	.loc	1 47 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:47:4
+	v_rcp_iflag_f32_e32 v1, v1
+	.loc	1 44 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:44:4
+	s_sub_i32 s14, s16, s2
+	.loc	1 47 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:47:4
+	s_sub_i32 s15, 0, s13
+	s_abs_i32 s9, s7
+	v_mul_f32_e32 v1, 0x4f7ffffe, v1
+	v_cvt_u32_f32_e32 v1, v1
+	s_xor_b32 s2, s7, s3
+	s_ashr_i32 s2, s2, 31
+	s_load_dwordx2 s[10:11], s[0:1], 0x40
+	s_load_dword s18, s[0:1], 0x74
+	v_readfirstlane_b32 s16, v1
+	s_mul_i32 s15, s15, s16
+	s_mul_hi_u32 s15, s16, s15
+	s_add_i32 s16, s16, s15
+	s_mul_hi_u32 s15, s9, s16
+	s_mul_i32 s16, s15, s13
+	s_sub_i32 s9, s9, s16
+	s_add_i32 s16, s15, 1
+	s_sub_i32 s17, s9, s13
+	s_cmp_ge_u32 s9, s13
+	s_cselect_b32 s15, s16, s15
+	s_cselect_b32 s9, s17, s9
+	s_add_i32 s16, s15, 1
+	s_cmp_ge_u32 s9, s13
+	s_cselect_b32 s9, s16, s15
+	s_xor_b32 s9, s9, s2
+	.loc	1 48 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:48:4
+	s_ashr_i32 s15, s14, 31
+	.loc	1 47 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:47:4
+	s_sub_i32 s2, s9, s2
+	.loc	1 48 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:48:4
+	s_lshl_b64 s[16:17], s[14:15], 2
+	s_waitcnt lgkmcnt(0)
+	s_add_u32 s10, s10, s16
+	s_addc_u32 s11, s11, s17
+	.loc	1 49 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:49:4
+	s_load_dword s13, s[10:11], 0x0
+	.loc	1 54 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:54:4
+	s_abs_i32 s11, s18
+	v_cvt_f32_u32_e32 v1, s11
+	s_sub_i32 s15, 0, s11
+	.loc	1 50 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:50:4
+	s_waitcnt lgkmcnt(0)
+	s_add_i32 s9, s13, 0xff
+	.loc	1 54 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:54:4
+	v_rcp_iflag_f32_e32 v1, v1
+	.loc	1 51 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:51:4
+	s_ashr_i32 s10, s9, 31
+	s_lshr_b32 s10, s10, 24
+	s_add_i32 s9, s9, s10
+	.loc	1 54 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:54:4
+	v_mul_f32_e32 v1, 0x4f7ffffe, v1
+	v_cvt_u32_f32_e32 v1, v1
+	.loc	1 51 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:51:4
+	s_ashr_i32 s9, s9, 8
+	.loc	1 52 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:52:4
+	s_add_i32 s9, s18, s9
+	.loc	1 53 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:53:4
+	s_add_i32 s9, s9, -1
+	.loc	1 54 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:54:4
+	v_readfirstlane_b32 s16, v1
+	s_mul_i32 s15, s15, s16
+	s_mul_hi_u32 s15, s16, s15
+	s_xor_b32 s10, s9, s18
+	s_abs_i32 s9, s9
+	s_add_i32 s16, s16, s15
+	s_mul_hi_u32 s15, s9, s16
+	s_mul_i32 s16, s15, s11
+	s_sub_i32 s9, s9, s16
+	s_ashr_i32 s10, s10, 31
+	s_add_i32 s16, s15, 1
+	s_sub_i32 s17, s9, s11
+	s_cmp_ge_u32 s9, s11
+	s_cselect_b32 s15, s16, s15
+	s_cselect_b32 s9, s17, s9
+	s_add_i32 s16, s15, 1
+	s_cmp_ge_u32 s9, s11
+	s_cselect_b32 s9, s16, s15
+	s_xor_b32 s9, s9, s10
+	s_sub_i32 s9, s9, s10
+	.loc	1 56 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:56:4
+	s_mul_i32 s10, s2, s9
+	s_lshl_b32 s18, s10, 8
+	.loc	1 57 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:57:4
+	s_sub_i32 s10, s13, s18
+	.loc	1 58 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:58:4
+	s_lshl_b32 s9, s9, 8
+	.loc	1 59 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:59:4
+	s_min_i32 s9, s10, s9
+	.loc	1 60 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:60:4
+	s_cmp_gt_i32 s9, 0
+	.loc	1 61 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:61:4
+	s_cbranch_scc0 .LBB0_8
+; %bb.1:
+	.loc	1 46 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:46:4
+	s_mul_i32 s2, s2, s3
+	.loc	1 67 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:67:4
+	s_add_i32 s3, s9, 15
+	.loc	1 46 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:46:4
+	s_sub_i32 s2, s7, s2
+	.loc	1 68 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:68:4
+	s_ashr_i32 s7, s3, 31
+	s_lshr_b32 s7, s7, 28
+	s_add_i32 s35, s3, s7
+	s_ashr_i32 s19, s35, 4
+	.loc	1 76 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:76:4
+	v_and_b32_e32 v58, 0xf8, v0
+	.loc	1 73 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:73:4
+	s_mul_i32 s3, s19, 0xf0
+	.loc	1 75 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:75:4
+	s_lshl_b32 s15, s2, 6
+	.loc	1 76 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:76:4
+	v_lshrrev_b32_e32 v1, 2, v58
+	.loc	1 84 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:84:4
+	v_lshlrev_b32_e32 v59, 4, v0
+	s_load_dwordx4 s[20:23], s[0:1], 0x48
+	s_load_dword s10, s[0:1], 0x58
+	s_load_dwordx2 s[16:17], s[0:1], 0x60
+	s_load_dword s11, s[0:1], 0x70
+	.loc	1 73 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:73:4
+	s_and_b32 s9, s3, 0xf0
+	.loc	1 74 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:74:4
+	s_mul_i32 s3, s14, s6
+	.loc	1 78 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:78:4
+	v_or_b32_e32 v1, s15, v1
+	.loc	1 84 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:84:4
+	v_and_b32_e32 v2, 0x70, v59
+	.loc	1 78 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:78:4
+	v_or_b32_e32 v3, 1, v1
+	.loc	1 83 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:83:4
+	v_add_u32_e32 v2, s3, v2
+	.loc	1 88 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:88:4
+	v_mad_u64_u32 v[4:5], s[2:3], v1, s8, v[2:3]
+	v_mad_u64_u32 v[2:3], s[2:3], v3, s8, v[2:3]
+	.loc	1 89 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:89:4
+	s_and_b32 s5, s5, 0xffff
+	s_mov_b32 s7, 0x27000
+	s_mov_b32 s6, 0x7ffffffe
+	.loc	1 90 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:90:4
+	s_waitcnt lgkmcnt(0)
+	s_mul_i32 s2, s14, s10
+	.loc	1 92 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:92:4
+	v_and_b32_e32 v1, 48, v0
+	.loc	1 89 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:89:4
+	buffer_load_dwordx4 v[38:41], v4, s[4:7], 0 offen
+	buffer_load_dwordx4 v[46:49], v2, s[4:7], 0 offen
+	.loc	1 91 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:91:4
+	s_add_i32 s15, s15, s2
+	.loc	1 92 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:92:4
+	v_lshrrev_b32_e32 v2, 2, v1
+	.loc	1 95 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:95:4
+	s_and_b32 s5, s23, 0xffff
+	s_mov_b32 s4, s22
+	.loc	1 94 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:94:4
+	v_add_lshl_u32 v18, s15, v2, 2
+	.loc	1 95 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:95:4
+	buffer_load_dwordx4 v[6:9], v18, s[4:7], 0 offen
+	buffer_load_dwordx4 v[2:5], v18, s[4:7], 0 offen offset:64
+	buffer_load_dwordx4 v[14:17], v18, s[4:7], 0 offen offset:128
+	buffer_load_dwordx4 v[10:13], v18, s[4:7], 0 offen offset:192
+	.loc	1 98 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:98:4
+	v_lshrrev_b32_e32 v18, 2, v0
+	v_and_b32_e32 v121, 15, v0
+	v_and_b32_e32 v82, 48, v18
+	.loc	1 96 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:96:4
+	s_sub_i32 s34, s18, s9
+	.loc	1 98 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:98:4
+	v_or_b32_e32 v116, v82, v121
+	.loc	1 97 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:97:4
+	s_ashr_i32 s2, s34, 4
+	.loc	1 98 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:98:4
+	v_or_b32_e32 v117, 64, v116
+	.loc	1 99 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:99:4
+	v_lshrrev_b32_e32 v122, 6, v0
+	.loc	1 103 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:103:4
+	s_mul_i32 s15, s14, s11
+	.loc	1 98 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:98:4
+	v_or_b32_e32 v118, 0x80, v116
+	v_or_b32_e32 v119, 0xc0, v116
+	.loc	1 99 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:99:4
+	v_lshrrev_b32_e32 v123, 4, v117
+	.loc	1 101 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:101:4
+	v_add_u32_e32 v18, s2, v122
+	.loc	1 104 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:104:4
+	s_add_i32 s10, s2, s15
+	.loc	1 99 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:99:4
+	v_lshrrev_b32_e32 v124, 4, v118
+	v_lshrrev_b32_e32 v125, 4, v119
+	.loc	1 101 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:101:4
+	v_add_u32_e32 v19, s2, v123
+	.loc	1 107 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:107:4
+	v_add_lshl_u32 v22, s10, v122, 2
+	v_bfrev_b32_e32 v23, 1
+	.loc	1 102 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:102:4
+	v_cmp_lt_i32_e32 vcc, -1, v18
+	.loc	1 101 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:101:4
+	v_add_u32_e32 v20, s2, v124
+	v_add_u32_e32 v21, s2, v125
+	.loc	1 107 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:107:4
+	v_cndmask_b32_e32 v18, v23, v22, vcc
+	v_add_lshl_u32 v22, s10, v123, 2
+	.loc	1 102 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:102:4
+	v_cmp_lt_i32_e64 s[2:3], -1, v19
+	.loc	1 107 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:107:4
+	s_and_b32 s21, s21, 0xffff
+	.loc	1 102 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:102:4
+	v_cmp_lt_i32_e64 s[8:9], -1, v20
+	.loc	1 107 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:107:4
+	v_cndmask_b32_e64 v19, v23, v22, s[2:3]
+	v_add_lshl_u32 v22, s10, v124, 2
+	s_mov_b32 s4, s20
+	s_mov_b32 s5, s21
+	v_cndmask_b32_e64 v20, v23, v22, s[8:9]
+	v_add_lshl_u32 v22, s10, v125, 2
+	.loc	1 102 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:102:4
+	v_cmp_lt_i32_e64 s[10:11], -1, v21
+	s_load_dword s33, s[0:1], 0x38
+	.loc	1 119 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:119:4
+	v_and_b32_e32 v126, 0x3f0, v59
+	.loc	1 107 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:107:4
+	v_cndmask_b32_e64 v21, v23, v22, s[10:11]
+	buffer_load_dword v22, v18, s[4:7], 0 offen
+	buffer_load_dword v23, v19, s[4:7], 0 offen
+	buffer_load_dword v24, v20, s[4:7], 0 offen
+	buffer_load_dword v25, v21, s[4:7], 0 offen
+	.loc	1 119 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:119:4
+	v_or_b32_e32 v127, 0x400, v126
+	.loc	1 126 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:126:4
+	s_and_b32 s29, s29, 0xffff
+	s_mov_b32 s30, s6
+	s_mov_b32 s31, s7
+	.loc	1 130 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:130:4
+	s_and_b32 s25, s25, 0xffff
+	s_mov_b32 s26, s6
+	s_mov_b32 s27, s7
+	.loc	1 131 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:131:4
+	v_and_b32_e32 v59, 0x60, v59
+	v_lshlrev_b32_e32 v58, 1, v58
+	v_lshl_or_b32 v59, v1, 5, v59
+	v_xor_b32_e32 v58, v59, v58
+	s_and_b32 s17, s17, 0xffff
+	.loc	1 107 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:107:4
+	s_mov_b32 s22, s6
+	s_mov_b32 s23, s7
+	v_lshlrev_b32_e32 v83, 2, v0
+	.loc	1 120 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:120:4
+	s_waitcnt vmcnt(3)
+	v_cndmask_b32_e32 v60, 0, v22, vcc
+	s_waitcnt vmcnt(2)
+	v_cndmask_b32_e64 v61, 0, v23, s[2:3]
+	s_waitcnt vmcnt(1)
+	v_cndmask_b32_e64 v62, 0, v24, s[8:9]
+	s_waitcnt vmcnt(0)
+	v_cndmask_b32_e64 v63, 0, v25, s[10:11]
+	.loc	1 123 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:123:4
+	v_mul_lo_u32 v18, v60, s12
+	v_mul_lo_u32 v19, v61, s12
+	v_mul_lo_u32 v20, v62, s12
+	v_mul_lo_u32 v21, v63, s12
+	.loc	1 125 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:125:4
+	v_add_u32_e32 v64, v18, v126
+	v_add_u32_e32 v65, v18, v127
+	v_add_u32_e32 v66, v19, v126
+	v_add_u32_e32 v67, v19, v127
+	v_add_u32_e32 v68, v20, v126
+	v_add_u32_e32 v69, v20, v127
+	v_add_u32_e32 v70, v21, v126
+	v_add_u32_e32 v71, v21, v127
+	.loc	1 126 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:126:4
+	buffer_load_dwordx4 v[54:57], v64, s[28:31], 0 offen
+	buffer_load_dwordx4 v[30:33], v65, s[28:31], 0 offen
+	buffer_load_dwordx4 v[50:53], v66, s[28:31], 0 offen
+	buffer_load_dwordx4 v[26:29], v67, s[28:31], 0 offen
+	buffer_load_dwordx4 v[42:45], v68, s[28:31], 0 offen
+	buffer_load_dwordx4 v[22:25], v69, s[28:31], 0 offen
+	buffer_load_dwordx4 v[34:37], v70, s[28:31], 0 offen
+	buffer_load_dwordx4 v[18:21], v71, s[28:31], 0 offen
+	s_load_dword s2, s[0:1], 0x68
+	.loc	1 128 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:128:4
+	s_waitcnt lgkmcnt(0)
+	v_mul_lo_u32 v60, v60, s33
+	v_mul_lo_u32 v61, v61, s33
+	v_mul_lo_u32 v62, v62, s33
+	v_mul_lo_u32 v63, v63, s33
+	.loc	1 130 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:130:4
+	v_add_lshl_u32 v60, v60, v121, 2
+	v_add_lshl_u32 v61, v61, v121, 2
+	v_add_lshl_u32 v62, v62, v121, 2
+	v_add_lshl_u32 v63, v63, v121, 2
+	buffer_load_dword v131, v60, s[24:27], 0 offen
+	buffer_load_dword v130, v61, s[24:27], 0 offen
+	buffer_load_dword v129, v62, s[24:27], 0 offen
+	buffer_load_dword v128, v63, s[24:27], 0 offen
+	.loc	1 131 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:131:4
+	v_and_b32_e32 v60, 1, v0
+	v_lshlrev_b32_e32 v61, 11, v60
+	v_add3_u32 v58, 0, v61, v58
+	ds_write_b128 v58, v[38:41]
+	ds_write_b128 v58, v[46:49] offset:4096
+	v_lshlrev_b32_e32 v39, 3, v0
+	v_lshlrev_b32_e32 v38, 7, v0
+	v_and_b32_e32 v39, 0x70, v39
+	s_movk_i32 s1, 0xe00
+	v_and_b32_e32 v40, 32, v0
+	v_and_or_b32 v38, v38, s1, v39
+	v_xor_b32_e32 v38, v38, v40
+	v_lshl_or_b32 v38, v60, 12, v38
+	v_add_u32_e32 v39, 0, v38
+	v_xad_u32 v38, v38, 64, 0
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_read_b128 v[74:77], v39
+	ds_read_b128 v[66:69], v39 offset:128
+	ds_read_b128 v[62:65], v39 offset:256
+	ds_read_b128 v[46:49], v39 offset:384
+	ds_read_b128 v[78:81], v38
+	ds_read_b128 v[70:73], v38 offset:128
+	ds_read_b128 v[58:61], v38 offset:256
+	ds_read_b128 v[38:41], v38 offset:384
+	.loc	1 69 4                          ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:69:4
+	s_and_b32 s0, s35, -16
+	.loc	1 132 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:132:4
+	s_add_i32 s9, s18, s0
+	.loc	1 133 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:133:4
+	s_addk_i32 s9, 0xff00
+	.loc	1 134 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:134:4
+	s_cmp_lt_i32 s34, s9
+	s_cbranch_scc1 .LBB0_3
+; %bb.2:                                ; %.._crit_edge_crit_edge
+	.loc	1 0 4 is_stmt 0                 ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:0:4
+	s_mov_b64 s[0:1], 0
+	s_branch .LBB0_4
+.LBB0_3:
+	s_mov_b64 s[0:1], -1
+.LBB0_4:                                ; %Flow
+	v_xor_b32_e32 v120, 0x80, v83
+	s_mul_i32 s8, s14, s2
+	s_andn2_b64 vcc, exec, s[0:1]
+	v_cmp_eq_u32_e64 s[0:1], 0, v1
+	s_cbranch_vccnz .LBB0_7
+; %bb.5:                                ; %.lr.ph
+	.loc	1 134 4 is_stmt 1               ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:134:4
+	s_lshl_b32 s2, s8, 2
+	s_lshl_b32 s3, s18, 2
+	s_add_i32 s2, s2, s3
+	v_and_b32_e32 v0, 0xc0, v0
+	v_add_u32_e32 v0, s2, v0
+	s_sub_i32 s2, 0, s19
+	s_and_b32 s2, s2, 15
+	s_lshl_b32 s2, s2, 6
+	v_add_u32_e32 v132, v82, v121
+	v_lshlrev_b32_e32 v133, 2, v121
+	v_subrev_u32_e32 v134, s2, v0
+	s_mov_b32 s30, s22
+	s_mov_b32 s31, s23
+	s_mov_b32 s26, s22
+	s_mov_b32 s27, s23
+	v_mov_b32_e32 v135, 0xff800000
+	v_bfrev_b32_e32 v136, 1
+	s_mov_b32 s18, s22
+	s_mov_b32 s19, s23
+.LBB0_6:                                ; =>This Inner Loop Header: Depth=1
+	; sched_barrier mask(0x00000000)
+	.loc	1 136 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:136:6
+	s_add_i32 s10, s34, 0x100
+	.loc	1 137 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:137:6
+	s_ashr_i32 s2, s10, 4
+	.loc	1 138 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:138:6
+	s_add_i32 s2, s2, s15
+	.loc	1 141 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:141:6
+	v_add_lshl_u32 v0, s2, v122, 2
+	v_add_lshl_u32 v1, s2, v123, 2
+	v_add_lshl_u32 v82, s2, v124, 2
+	v_add_lshl_u32 v83, s2, v125, 2
+	buffer_load_dword v137, v0, s[20:23], 0 offen
+	buffer_load_dword v170, v1, s[20:23], 0 offen
+	buffer_load_dword v171, v82, s[20:23], 0 offen
+	buffer_load_dword v172, v83, s[20:23], 0 offen
+	; sched_barrier mask(0x00000000)
+	.loc	1 144 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:144:6
+	s_waitcnt vmcnt(15) lgkmcnt(7)
+	v_mfma_f32_16x16x32_fp8_fp8 v[82:85], v[74:75], v[54:55], 0
+	.loc	1 146 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:146:6
+	s_waitcnt vmcnt(3)
+	v_mul_lo_u32 v0, v137, s12
+	s_waitcnt vmcnt(2)
+	v_mul_lo_u32 v1, v170, s12
+	.loc	1 144 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:144:6
+	v_mfma_f32_16x16x32_fp8_fp8 v[86:89], v[74:75], v[50:51], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[90:93], v[74:75], v[42:43], 0
+	s_waitcnt lgkmcnt(6)
+	v_mfma_f32_16x16x32_fp8_fp8 v[98:101], v[66:67], v[54:55], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[102:105], v[66:67], v[50:51], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[106:109], v[66:67], v[42:43], 0
+	s_waitcnt lgkmcnt(5)
+	v_mfma_f32_16x16x32_fp8_fp8 v[138:141], v[62:63], v[54:55], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[142:145], v[62:63], v[50:51], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[146:149], v[62:63], v[42:43], 0
+	s_waitcnt lgkmcnt(4)
+	v_mfma_f32_16x16x32_fp8_fp8 v[154:157], v[46:47], v[54:55], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[158:161], v[46:47], v[50:51], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[162:165], v[46:47], v[42:43], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[94:97], v[74:75], v[34:35], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[110:113], v[66:67], v[34:35], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[150:153], v[62:63], v[34:35], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[166:169], v[46:47], v[34:35], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[82:85], v[76:77], v[56:57], v[82:85]
+	v_mfma_f32_16x16x32_fp8_fp8 v[86:89], v[76:77], v[52:53], v[86:89]
+	v_mfma_f32_16x16x32_fp8_fp8 v[90:93], v[76:77], v[44:45], v[90:93]
+	v_mfma_f32_16x16x32_fp8_fp8 v[98:101], v[68:69], v[56:57], v[98:101]
+	v_mfma_f32_16x16x32_fp8_fp8 v[102:105], v[68:69], v[52:53], v[102:105]
+	v_mfma_f32_16x16x32_fp8_fp8 v[106:109], v[68:69], v[44:45], v[106:109]
+	v_mfma_f32_16x16x32_fp8_fp8 v[138:141], v[64:65], v[56:57], v[138:141]
+	v_mfma_f32_16x16x32_fp8_fp8 v[142:145], v[64:65], v[52:53], v[142:145]
+	v_mfma_f32_16x16x32_fp8_fp8 v[146:149], v[64:65], v[44:45], v[146:149]
+	v_mfma_f32_16x16x32_fp8_fp8 v[54:57], v[48:49], v[56:57], v[154:157]
+	v_mfma_f32_16x16x32_fp8_fp8 v[50:53], v[48:49], v[52:53], v[158:161]
+	v_mfma_f32_16x16x32_fp8_fp8 v[42:45], v[48:49], v[44:45], v[162:165]
+	v_mfma_f32_16x16x32_fp8_fp8 v[94:97], v[76:77], v[36:37], v[94:97]
+	v_mfma_f32_16x16x32_fp8_fp8 v[110:113], v[68:69], v[36:37], v[110:113]
+	v_mfma_f32_16x16x32_fp8_fp8 v[150:153], v[64:65], v[36:37], v[150:153]
+	v_mfma_f32_16x16x32_fp8_fp8 v[34:37], v[48:49], v[36:37], v[166:169]
+	s_waitcnt lgkmcnt(3)
+	v_mfma_f32_16x16x32_fp8_fp8 v[82:85], v[78:79], v[30:31], v[82:85]
+	v_mfma_f32_16x16x32_fp8_fp8 v[86:89], v[78:79], v[26:27], v[86:89]
+	v_mfma_f32_16x16x32_fp8_fp8 v[90:93], v[78:79], v[22:23], v[90:93]
+	s_waitcnt lgkmcnt(2)
+	v_mfma_f32_16x16x32_fp8_fp8 v[98:101], v[70:71], v[30:31], v[98:101]
+	v_mfma_f32_16x16x32_fp8_fp8 v[102:105], v[70:71], v[26:27], v[102:105]
+	v_mfma_f32_16x16x32_fp8_fp8 v[106:109], v[70:71], v[22:23], v[106:109]
+	s_waitcnt lgkmcnt(1)
+	v_mfma_f32_16x16x32_fp8_fp8 v[138:141], v[58:59], v[30:31], v[138:141]
+	v_mfma_f32_16x16x32_fp8_fp8 v[142:145], v[58:59], v[26:27], v[142:145]
+	v_mfma_f32_16x16x32_fp8_fp8 v[146:149], v[58:59], v[22:23], v[146:149]
+	s_waitcnt lgkmcnt(0)
+	v_mfma_f32_16x16x32_fp8_fp8 v[54:57], v[38:39], v[30:31], v[54:57]
+	v_mfma_f32_16x16x32_fp8_fp8 v[50:53], v[38:39], v[26:27], v[50:53]
+	v_mfma_f32_16x16x32_fp8_fp8 v[154:157], v[38:39], v[22:23], v[42:45]
+	.loc	1 148 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:148:6
+	v_add_u32_e32 v22, v0, v126
+	v_add_u32_e32 v0, v0, v127
+	v_add_u32_e32 v23, v1, v126
+	.loc	1 144 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:144:6
+	v_mfma_f32_16x16x32_fp8_fp8 v[94:97], v[78:79], v[18:19], v[94:97]
+	.loc	1 148 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:148:6
+	v_add_u32_e32 v1, v1, v127
+	.loc	1 144 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:144:6
+	v_mfma_f32_16x16x32_fp8_fp8 v[110:113], v[70:71], v[18:19], v[110:113]
+	v_mfma_f32_16x16x32_fp8_fp8 v[150:153], v[58:59], v[18:19], v[150:153]
+	v_mfma_f32_16x16x32_fp8_fp8 v[158:161], v[38:39], v[18:19], v[34:37]
+	.loc	1 146 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:146:6
+	s_waitcnt vmcnt(1)
+	v_mul_lo_u32 v18, v171, s12
+	s_waitcnt vmcnt(0)
+	v_mul_lo_u32 v19, v172, s12
+	.loc	1 148 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:148:6
+	v_add_u32_e32 v26, v18, v126
+	v_add_u32_e32 v27, v19, v126
+	.loc	1 144 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:144:6
+	v_mfma_f32_16x16x32_fp8_fp8 v[82:85], v[80:81], v[32:33], v[82:85]
+	.loc	1 148 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:148:6
+	v_add_u32_e32 v18, v18, v127
+	v_add_u32_e32 v19, v19, v127
+	.loc	1 144 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:144:6
+	v_mfma_f32_16x16x32_fp8_fp8 v[86:89], v[80:81], v[28:29], v[86:89]
+	v_mfma_f32_16x16x32_fp8_fp8 v[90:93], v[80:81], v[24:25], v[90:93]
+	v_mfma_f32_16x16x32_fp8_fp8 v[98:101], v[72:73], v[32:33], v[98:101]
+	v_mfma_f32_16x16x32_fp8_fp8 v[102:105], v[72:73], v[28:29], v[102:105]
+	v_mfma_f32_16x16x32_fp8_fp8 v[106:109], v[72:73], v[24:25], v[106:109]
+	v_mfma_f32_16x16x32_fp8_fp8 v[138:141], v[60:61], v[32:33], v[138:141]
+	v_mfma_f32_16x16x32_fp8_fp8 v[142:145], v[60:61], v[28:29], v[142:145]
+	v_mfma_f32_16x16x32_fp8_fp8 v[146:149], v[60:61], v[24:25], v[146:149]
+	v_mfma_f32_16x16x32_fp8_fp8 v[162:165], v[40:41], v[32:33], v[54:57]
+	.loc	1 149 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:149:6
+	s_nop 2
+	buffer_load_dwordx4 v[54:57], v22, s[28:31], 0 offen
+	.loc	1 144 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:144:6
+	v_mfma_f32_16x16x32_fp8_fp8 v[166:169], v[40:41], v[28:29], v[50:53]
+	.loc	1 149 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:149:6
+	s_nop 2
+	buffer_load_dwordx4 v[50:53], v23, s[28:31], 0 offen
+	buffer_load_dwordx4 v[42:45], v26, s[28:31], 0 offen
+	buffer_load_dwordx4 v[34:37], v27, s[28:31], 0 offen
+	.loc	1 144 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:144:6
+	v_mfma_f32_16x16x32_fp8_fp8 v[154:157], v[40:41], v[24:25], v[154:157]
+	.loc	1 149 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:149:6
+	buffer_load_dwordx4 v[30:33], v0, s[28:31], 0 offen
+	buffer_load_dwordx4 v[26:29], v1, s[28:31], 0 offen
+	buffer_load_dwordx4 v[22:25], v18, s[28:31], 0 offen
+	.loc	1 144 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:144:6
+	v_mfma_f32_16x16x32_fp8_fp8 v[94:97], v[80:81], v[20:21], v[94:97]
+	v_mfma_f32_16x16x32_fp8_fp8 v[110:113], v[72:73], v[20:21], v[110:113]
+	v_mfma_f32_16x16x32_fp8_fp8 v[150:153], v[60:61], v[20:21], v[150:153]
+	v_mfma_f32_16x16x32_fp8_fp8 v[158:161], v[40:41], v[20:21], v[158:161]
+	.loc	1 149 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:149:6
+	buffer_load_dwordx4 v[18:21], v19, s[28:31], 0 offen
+	; sched_barrier mask(0x00000000)
+	.loc	1 154 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:154:6
+	v_mul_f32_e32 v0, v131, v82
+	v_mul_f32_e32 v1, v131, v83
+	v_mul_f32_e32 v82, v131, v84
+	v_mul_f32_e32 v83, v131, v85
+	v_mul_f32_e32 v84, v130, v86
+	v_mul_f32_e32 v85, v130, v87
+	v_mul_f32_e32 v86, v130, v88
+	v_mul_f32_e32 v87, v130, v89
+	v_mul_f32_e32 v88, v129, v90
+	v_mul_f32_e32 v89, v129, v91
+	v_mul_f32_e32 v90, v129, v92
+	v_mul_f32_e32 v91, v129, v93
+	v_mul_f32_e32 v92, v128, v94
+	v_mul_f32_e32 v93, v128, v95
+	v_mul_f32_e32 v94, v128, v96
+	v_mul_f32_e32 v95, v128, v97
+	v_mul_f32_e32 v96, v131, v98
+	v_mul_f32_e32 v97, v131, v99
+	v_mul_f32_e32 v98, v131, v100
+	v_mul_f32_e32 v99, v131, v101
+	v_mul_f32_e32 v100, v130, v102
+	v_mul_f32_e32 v101, v130, v103
+	v_mul_f32_e32 v102, v130, v104
+	v_mul_f32_e32 v103, v130, v105
+	v_mul_f32_e32 v104, v129, v106
+	v_mul_f32_e32 v105, v129, v107
+	v_mul_f32_e32 v106, v129, v108
+	v_mul_f32_e32 v107, v129, v109
+	v_mul_f32_e32 v108, v128, v110
+	v_mul_f32_e32 v109, v128, v111
+	v_mul_f32_e32 v110, v128, v112
+	v_mul_f32_e32 v111, v128, v113
+	v_mul_f32_e32 v112, v131, v138
+	v_mul_f32_e32 v113, v131, v139
+	v_mul_f32_e32 v114, v131, v140
+	v_mul_f32_e32 v115, v131, v141
+	v_mul_f32_e32 v138, v130, v142
+	v_mul_f32_e32 v139, v130, v143
+	v_mul_f32_e32 v140, v130, v144
+	v_mul_f32_e32 v141, v130, v145
+	v_mul_f32_e32 v142, v129, v146
+	v_mul_f32_e32 v143, v129, v147
+	v_mul_f32_e32 v144, v129, v148
+	v_mul_f32_e32 v145, v129, v149
+	v_mul_f32_e32 v146, v128, v150
+	v_mul_f32_e32 v147, v128, v151
+	v_mul_f32_e32 v148, v128, v152
+	v_mul_f32_e32 v149, v128, v153
+	v_mul_f32_e32 v150, v131, v162
+	v_mul_f32_e32 v151, v131, v163
+	v_mul_f32_e32 v152, v131, v164
+	v_mul_f32_e32 v131, v131, v165
+	v_mul_f32_e32 v153, v130, v166
+	v_mul_f32_e32 v162, v130, v167
+	v_mul_f32_e32 v163, v130, v168
+	v_mul_f32_e32 v164, v130, v169
+	v_mul_f32_e32 v154, v129, v154
+	v_mul_f32_e32 v155, v129, v155
+	v_mul_f32_e32 v156, v129, v156
+	v_mul_f32_e32 v157, v129, v157
+	v_mul_f32_e32 v158, v128, v158
+	v_mul_f32_e32 v159, v128, v159
+	v_mul_f32_e32 v160, v128, v160
+	v_mul_f32_e32 v161, v128, v161
+	.loc	1 155 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:155:6
+	v_max_f32_e32 v180, 0, v95
+	v_max_f32_e32 v95, 0, v115
+	v_max_f32_e32 v115, 0, v131
+	v_max_f32_e32 v128, 0, v153
+	v_max_f32_e32 v129, 0, v162
+	v_max_f32_e32 v130, 0, v163
+	v_max_f32_e32 v131, 0, v164
+	v_max_f32_e32 v165, 0, v0
+	v_max_f32_e32 v166, 0, v1
+	v_max_f32_e32 v167, 0, v82
+	v_max_f32_e32 v168, 0, v83
+	v_max_f32_e32 v169, 0, v84
+	v_max_f32_e32 v82, 0, v85
+	v_max_f32_e32 v173, 0, v86
+	v_max_f32_e32 v174, 0, v87
+	v_max_f32_e32 v175, 0, v88
+	v_max_f32_e32 v83, 0, v89
+	v_max_f32_e32 v176, 0, v90
+	v_max_f32_e32 v177, 0, v91
+	v_max_f32_e32 v178, 0, v92
+	v_max_f32_e32 v92, 0, v93
+	v_max_f32_e32 v179, 0, v94
+	v_max_f32_e32 v181, 0, v96
+	v_max_f32_e32 v182, 0, v97
+	v_max_f32_e32 v0, 0, v98
+	v_max_f32_e32 v1, 0, v99
+	v_max_f32_e32 v183, 0, v100
+	v_max_f32_e32 v184, 0, v101
+	v_max_f32_e32 v84, 0, v102
+	v_max_f32_e32 v85, 0, v103
+	v_max_f32_e32 v185, 0, v104
+	v_max_f32_e32 v186, 0, v105
+	v_max_f32_e32 v86, 0, v106
+	v_max_f32_e32 v87, 0, v107
+	v_max_f32_e32 v187, 0, v108
+	v_max_f32_e32 v188, 0, v109
+	v_max_f32_e32 v88, 0, v110
+	v_max_f32_e32 v89, 0, v111
+	v_max_f32_e32 v90, 0, v112
+	v_max_f32_e32 v91, 0, v113
+	v_max_f32_e32 v94, 0, v114
+	v_max_f32_e32 v96, 0, v138
+	v_max_f32_e32 v97, 0, v139
+	v_max_f32_e32 v98, 0, v140
+	v_max_f32_e32 v99, 0, v141
+	v_max_f32_e32 v100, 0, v142
+	v_max_f32_e32 v101, 0, v143
+	v_max_f32_e32 v102, 0, v144
+	v_max_f32_e32 v103, 0, v145
+	v_max_f32_e32 v106, 0, v146
+	v_max_f32_e32 v107, 0, v147
+	v_max_f32_e32 v108, 0, v148
+	v_max_f32_e32 v109, 0, v149
+	v_max_f32_e32 v110, 0, v150
+	v_max_f32_e32 v111, 0, v151
+	v_max_f32_e32 v114, 0, v152
+	v_max_f32_e32 v138, 0, v154
+	v_max_f32_e32 v139, 0, v155
+	v_max_f32_e32 v140, 0, v156
+	v_max_f32_e32 v141, 0, v157
+	v_max_f32_e32 v142, 0, v158
+	v_max_f32_e32 v143, 0, v159
+	v_max_f32_e32 v144, 0, v160
+	v_max_f32_e32 v145, 0, v161
+	; sched_barrier mask(0x00000000)
+	.loc	1 157 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:157:6
+	v_mul_lo_u32 v137, v137, s33
+	v_mul_lo_u32 v146, v170, s33
+	v_mul_lo_u32 v147, v171, s33
+	v_mul_lo_u32 v148, v172, s33
+	.loc	1 162 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:162:6
+	v_pk_mul_f32 v[104:105], v[14:15], v[100:101]
+	v_pk_mul_f32 v[100:101], v[10:11], v[110:111]
+	v_pk_mul_f32 v[110:111], v[10:11], v[128:129]
+	.loc	1 159 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:159:6
+	v_add_lshl_u32 v128, v137, v121, 2
+	v_add_lshl_u32 v129, v146, v121, 2
+	.loc	1 162 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:162:6
+	v_mul_f32_e32 v150, v7, v82
+	v_mul_f32_e32 v151, v7, v83
+	v_mul_f32_e32 v152, v7, v92
+	v_pk_mul_f32 v[82:83], v[4:5], v[0:1]
+	v_pk_mul_f32 v[92:93], v[4:5], v[88:89]
+	v_pk_mul_f32 v[88:89], v[14:15], v[90:91]
+	v_pk_mul_f32 v[0:1], v[16:17], v[94:95]
+	v_pk_mul_f32 v[90:91], v[16:17], v[98:99]
+	v_pk_mul_f32 v[98:99], v[16:17], v[102:103]
+	v_pk_mul_f32 v[94:95], v[12:13], v[114:115]
+	v_pk_mul_f32 v[102:103], v[12:13], v[130:131]
+	v_pk_mul_f32 v[114:115], v[12:13], v[144:145]
+	.loc	1 159 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:159:6
+	v_add_lshl_u32 v137, v147, v121, 2
+	v_add_lshl_u32 v144, v148, v121, 2
+	buffer_load_dword v131, v128, s[24:27], 0 offen
+	buffer_load_dword v130, v129, s[24:27], 0 offen
+	s_nop 0
+	buffer_load_dword v129, v137, s[24:27], 0 offen
+	buffer_load_dword v128, v144, s[24:27], 0 offen
+	.loc	1 162 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:162:6
+	v_mul_f32_e32 v149, v7, v166
+	.loc	1 173 8                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:173:8
+	v_fmac_f32_e32 v149, v6, v165
+	v_fmac_f32_e32 v150, v6, v169
+	v_fmac_f32_e32 v151, v6, v175
+	v_fmac_f32_e32 v152, v6, v178
+	v_fmac_f32_e32 v149, v8, v167
+	v_fmac_f32_e32 v150, v8, v173
+	v_fmac_f32_e32 v151, v8, v176
+	v_fmac_f32_e32 v152, v8, v179
+	v_fmac_f32_e32 v149, v9, v168
+	v_fmac_f32_e32 v150, v9, v174
+	v_fmac_f32_e32 v151, v9, v177
+	v_fmac_f32_e32 v152, v9, v180
+	v_fmac_f32_e32 v149, v2, v181
+	v_fmac_f32_e32 v150, v2, v183
+	v_fmac_f32_e32 v151, v2, v185
+	v_fmac_f32_e32 v152, v2, v187
+	v_fmac_f32_e32 v149, v3, v182
+	.loc	1 162 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:162:6
+	v_pk_mul_f32 v[84:85], v[4:5], v[84:85]
+	v_pk_mul_f32 v[86:87], v[4:5], v[86:87]
+	.loc	1 173 8                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:173:8
+	v_fmac_f32_e32 v150, v3, v184
+	v_fmac_f32_e32 v151, v3, v186
+	v_fmac_f32_e32 v152, v3, v188
+	v_add_f32_e32 v82, v82, v149
+	v_add_f32_e32 v84, v84, v150
+	v_add_f32_e32 v86, v86, v151
+	v_add_f32_e32 v92, v92, v152
+	v_add_f32_e32 v82, v83, v82
+	.loc	1 162 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:162:6
+	v_pk_mul_f32 v[96:97], v[14:15], v[96:97]
+	v_pk_mul_f32 v[112:113], v[14:15], v[106:107]
+	.loc	1 173 8                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:173:8
+	v_add_f32_e32 v83, v85, v84
+	v_add_f32_e32 v84, v87, v86
+	v_add_f32_e32 v85, v93, v92
+	v_add_f32_e32 v82, v82, v88
+	v_add_f32_e32 v83, v83, v96
+	v_add_f32_e32 v84, v84, v104
+	v_add_f32_e32 v85, v85, v112
+	v_add_f32_e32 v82, v89, v82
+	.loc	1 162 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:162:6
+	v_pk_mul_f32 v[106:107], v[16:17], v[108:109]
+	v_pk_mul_f32 v[108:109], v[12:13], v[140:141]
+	v_pk_mul_f32 v[140:141], v[10:11], v[142:143]
+	.loc	1 165 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:165:6
+	v_add_u32_e32 v142, s34, v132
+	.loc	1 173 8                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:173:8
+	v_add_f32_e32 v83, v97, v83
+	v_add_f32_e32 v84, v105, v84
+	v_add_f32_e32 v85, v113, v85
+	v_add_f32_e32 v0, v0, v82
+	.loc	1 165 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:165:6
+	v_add_u32_e32 v145, 64, v142
+	.loc	1 179 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:179:6
+	v_cmp_lt_i32_e32 vcc, -1, v142
+	.loc	1 173 8                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:173:8
+	v_add_f32_e32 v82, v90, v83
+	v_add_f32_e32 v83, v98, v84
+	v_add_f32_e32 v84, v106, v85
+	v_add_f32_e32 v0, v1, v0
+	.loc	1 162 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:162:6
+	v_pk_mul_f32 v[138:139], v[10:11], v[138:139]
+	.loc	1 180 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:180:6
+	v_add_u32_e32 v143, v133, v134
+	.loc	1 165 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:165:6
+	v_add_u32_e32 v146, 0x80, v142
+	.loc	1 179 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:179:6
+	v_cmp_lt_i32_e64 s[2:3], -1, v145
+	.loc	1 180 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:180:6
+	s_and_b64 vcc, s[0:1], vcc
+	.loc	1 173 8                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:173:8
+	v_add_f32_e32 v1, v91, v82
+	v_add_f32_e32 v82, v99, v83
+	v_add_f32_e32 v83, v107, v84
+	v_add_f32_e32 v0, v0, v100
+	.loc	1 167 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:167:6
+	v_add_u32_e32 v147, 0xc0, v142
+	.loc	1 180 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:180:6
+	v_add_u32_e32 v148, 0x100, v143
+	.loc	1 179 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:179:6
+	v_cmp_lt_i32_e64 s[4:5], -1, v146
+	.loc	1 180 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:180:6
+	v_cndmask_b32_e32 v137, v136, v143, vcc
+	s_and_b64 vcc, s[0:1], s[2:3]
+	.loc	1 173 8                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:173:8
+	v_add_f32_e32 v1, v1, v110
+	v_add_f32_e32 v82, v82, v138
+	v_add_f32_e32 v83, v83, v140
+	v_add_f32_e32 v0, v101, v0
+	.loc	1 180 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:180:6
+	v_add_u32_e32 v153, 0x200, v143
+	v_add_u32_e32 v154, 0x300, v143
+	.loc	1 179 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:179:6
+	v_cmp_lt_i32_e64 s[6:7], -1, v147
+	.loc	1 180 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:180:6
+	v_cndmask_b32_e32 v143, v136, v148, vcc
+	s_and_b64 vcc, s[0:1], s[4:5]
+	.loc	1 173 8                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:173:8
+	v_add_f32_e32 v1, v111, v1
+	v_add_f32_e32 v82, v139, v82
+	v_add_f32_e32 v83, v141, v83
+	v_add_f32_e32 v0, v94, v0
+	.loc	1 180 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:180:6
+	v_cndmask_b32_e32 v144, v136, v153, vcc
+	s_and_b64 vcc, s[0:1], s[6:7]
+	.loc	1 173 8                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:173:8
+	v_add_f32_e32 v1, v102, v1
+	v_add_f32_e32 v82, v108, v82
+	v_add_f32_e32 v83, v114, v83
+	v_add_f32_e32 v0, v95, v0
+	v_cmp_ge_i32_e64 s[6:7], s13, v142
+	.loc	1 180 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:180:6
+	v_cndmask_b32_e32 v148, v136, v154, vcc
+	.loc	1 173 8                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:173:8
+	v_add_f32_e32 v1, v103, v1
+	v_cmp_ge_i32_e32 vcc, s13, v145
+	v_add_f32_e32 v82, v109, v82
+	v_cmp_ge_i32_e64 s[2:3], s13, v146
+	v_add_f32_e32 v83, v115, v83
+	v_cmp_ge_i32_e64 s[4:5], s13, v147
+	v_cndmask_b32_e64 v0, v135, v0, s[6:7]
+	v_cndmask_b32_e32 v1, v135, v1, vcc
+	v_cndmask_b32_e64 v82, v135, v82, s[2:3]
+	v_cndmask_b32_e64 v83, v135, v83, s[4:5]
+	.loc	1 171 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:171:6
+	ds_bpermute_b32 v84, v120, v0
+	ds_bpermute_b32 v85, v120, v1
+	ds_bpermute_b32 v86, v120, v82
+	ds_bpermute_b32 v87, v120, v83
+	.loc	1 134 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:134:4
+	v_add_u32_e32 v134, 0x400, v134
+	.loc	1 173 8                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:173:8
+	s_waitcnt lgkmcnt(3)
+	v_add_f32_e32 v0, v0, v84
+	s_waitcnt lgkmcnt(2)
+	v_add_f32_e32 v1, v1, v85
+	s_waitcnt lgkmcnt(1)
+	v_add_f32_e32 v82, v82, v86
+	s_waitcnt lgkmcnt(0)
+	v_add_f32_e32 v83, v83, v87
+	.loc	1 171 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:171:6
+	ds_swizzle_b32 v84, v0 offset:swizzle(SWAP,16)
+	ds_swizzle_b32 v85, v1 offset:swizzle(SWAP,16)
+	ds_swizzle_b32 v86, v82 offset:swizzle(SWAP,16)
+	ds_swizzle_b32 v87, v83 offset:swizzle(SWAP,16)
+	s_mov_b32 s34, s10
+	.loc	1 134 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:134:4
+	s_cmp_lt_i32 s10, s9
+	.loc	1 173 8                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:173:8
+	s_waitcnt lgkmcnt(3)
+	v_add_f32_e32 v0, v0, v84
+	s_waitcnt lgkmcnt(2)
+	v_add_f32_e32 v1, v1, v85
+	s_waitcnt lgkmcnt(1)
+	v_add_f32_e32 v82, v82, v86
+	s_waitcnt lgkmcnt(0)
+	v_add_f32_e32 v83, v83, v87
+	.loc	1 180 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:180:6
+	buffer_store_dword v0, v137, s[16:19], 0 offen
+	buffer_store_dword v1, v143, s[16:19], 0 offen
+	buffer_store_dword v82, v144, s[16:19], 0 offen
+	buffer_store_dword v83, v148, s[16:19], 0 offen
+	.loc	1 134 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:134:4
+	s_cbranch_scc1 .LBB0_6
+.LBB0_7:                                ; %._crit_edge
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	s_waitcnt vmcnt(11) lgkmcnt(7)
+	v_mfma_f32_16x16x32_fp8_fp8 v[82:85], v[74:75], v[54:55], 0
+	.loc	1 210 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:210:4
+	s_mov_b32 s18, s22
+	s_mov_b32 s19, s23
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	s_waitcnt vmcnt(9)
+	v_mfma_f32_16x16x32_fp8_fp8 v[86:89], v[74:75], v[50:51], 0
+	s_waitcnt vmcnt(7)
+	v_mfma_f32_16x16x32_fp8_fp8 v[90:93], v[74:75], v[42:43], 0
+	s_waitcnt vmcnt(5)
+	v_mfma_f32_16x16x32_fp8_fp8 v[94:97], v[74:75], v[34:35], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[82:85], v[76:77], v[56:57], v[82:85]
+	v_mfma_f32_16x16x32_fp8_fp8 v[86:89], v[76:77], v[52:53], v[86:89]
+	v_mfma_f32_16x16x32_fp8_fp8 v[90:93], v[76:77], v[44:45], v[90:93]
+	v_mfma_f32_16x16x32_fp8_fp8 v[74:77], v[76:77], v[36:37], v[94:97]
+	s_waitcnt lgkmcnt(3)
+	v_mfma_f32_16x16x32_fp8_fp8 v[82:85], v[78:79], v[30:31], v[82:85]
+	v_mfma_f32_16x16x32_fp8_fp8 v[86:89], v[78:79], v[26:27], v[86:89]
+	v_mfma_f32_16x16x32_fp8_fp8 v[90:93], v[78:79], v[22:23], v[90:93]
+	s_waitcnt vmcnt(4)
+	v_mfma_f32_16x16x32_fp8_fp8 v[74:77], v[78:79], v[18:19], v[74:77]
+	v_mfma_f32_16x16x32_fp8_fp8 v[82:85], v[80:81], v[32:33], v[82:85]
+	v_mfma_f32_16x16x32_fp8_fp8 v[86:89], v[80:81], v[28:29], v[86:89]
+	v_mfma_f32_16x16x32_fp8_fp8 v[90:93], v[80:81], v[24:25], v[90:93]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	s_waitcnt vmcnt(3)
+	s_nop 3
+	v_mul_f32_e32 v0, v131, v82
+	v_mul_f32_e32 v82, v131, v84
+	s_waitcnt vmcnt(2)
+	v_mul_f32_e32 v84, v130, v86
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[74:77], v[80:81], v[20:21], v[74:77]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v86, v130, v88
+	s_waitcnt vmcnt(1)
+	v_mul_f32_e32 v88, v129, v90
+	v_mul_f32_e32 v90, v129, v92
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[78:81], v[66:67], v[54:55], 0
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v1, v131, v83
+	v_mul_f32_e32 v83, v131, v85
+	v_mul_f32_e32 v85, v130, v87
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[94:97], v[66:67], v[50:51], 0
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v87, v130, v89
+	v_mul_f32_e32 v89, v129, v91
+	v_mul_f32_e32 v91, v129, v93
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[98:101], v[66:67], v[42:43], 0
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v82, 0, v82
+	v_max_f32_e32 v83, 0, v83
+	v_max_f32_e32 v85, 0, v85
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[102:105], v[66:67], v[34:35], 0
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	s_waitcnt vmcnt(0)
+	v_mul_f32_e32 v75, v128, v75
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v84, 0, v84
+	v_max_f32_e32 v89, 0, v89
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[78:81], v[68:69], v[56:57], v[78:81]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v74, v128, v74
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v86, 0, v86
+	v_max_f32_e32 v88, 0, v88
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[94:97], v[68:69], v[52:53], v[94:97]
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v75, 0, v75
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v76, v128, v76
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v87, 0, v87
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[98:101], v[68:69], v[44:45], v[98:101]
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v90, 0, v90
+	v_max_f32_e32 v74, 0, v74
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v77, v128, v77
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[66:69], v[68:69], v[36:37], v[102:105]
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v91, 0, v91
+	v_max_f32_e32 v76, 0, v76
+	v_max_f32_e32 v77, 0, v77
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	s_waitcnt lgkmcnt(2)
+	v_mfma_f32_16x16x32_fp8_fp8 v[78:81], v[70:71], v[30:31], v[78:81]
+	v_mfma_f32_16x16x32_fp8_fp8 v[94:97], v[70:71], v[26:27], v[94:97]
+	v_mfma_f32_16x16x32_fp8_fp8 v[98:101], v[70:71], v[22:23], v[98:101]
+	v_mfma_f32_16x16x32_fp8_fp8 v[66:69], v[70:71], v[18:19], v[66:69]
+	v_mfma_f32_16x16x32_fp8_fp8 v[78:81], v[72:73], v[32:33], v[78:81]
+	v_mfma_f32_16x16x32_fp8_fp8 v[94:97], v[72:73], v[28:29], v[94:97]
+	v_mfma_f32_16x16x32_fp8_fp8 v[98:101], v[72:73], v[24:25], v[98:101]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	s_nop 4
+	v_mul_f32_e32 v78, v131, v78
+	v_mul_f32_e32 v79, v131, v79
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v78, 0, v78
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[66:69], v[72:73], v[20:21], v[66:69]
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v79, 0, v79
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v92, v129, v98
+	v_mul_f32_e32 v93, v129, v99
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[70:73], v[62:63], v[54:55], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[102:105], v[62:63], v[50:51], 0
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	s_nop 1
+	v_mul_f32_e32 v66, v128, v66
+	v_mul_f32_e32 v67, v128, v67
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v66, 0, v66
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[106:109], v[62:63], v[42:43], 0
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v67, 0, v67
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[110:113], v[62:63], v[34:35], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[70:73], v[64:65], v[56:57], v[70:73]
+	v_mfma_f32_16x16x32_fp8_fp8 v[102:105], v[64:65], v[52:53], v[102:105]
+	v_mfma_f32_16x16x32_fp8_fp8 v[106:109], v[64:65], v[44:45], v[106:109]
+	v_mfma_f32_16x16x32_fp8_fp8 v[62:65], v[64:65], v[36:37], v[110:113]
+	s_waitcnt lgkmcnt(1)
+	v_mfma_f32_16x16x32_fp8_fp8 v[70:73], v[58:59], v[30:31], v[70:73]
+	v_mfma_f32_16x16x32_fp8_fp8 v[102:105], v[58:59], v[26:27], v[102:105]
+	v_mfma_f32_16x16x32_fp8_fp8 v[106:109], v[58:59], v[22:23], v[106:109]
+	v_mfma_f32_16x16x32_fp8_fp8 v[62:65], v[58:59], v[18:19], v[62:65]
+	v_mfma_f32_16x16x32_fp8_fp8 v[70:73], v[60:61], v[32:33], v[70:73]
+	v_mfma_f32_16x16x32_fp8_fp8 v[102:105], v[60:61], v[28:29], v[102:105]
+	v_mfma_f32_16x16x32_fp8_fp8 v[106:109], v[60:61], v[24:25], v[106:109]
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[60:61], v[20:21], v[62:65]
+	v_mfma_f32_16x16x32_fp8_fp8 v[62:65], v[46:47], v[54:55], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[54:57], v[48:49], v[56:57], v[62:65]
+	s_waitcnt lgkmcnt(0)
+	v_mfma_f32_16x16x32_fp8_fp8 v[54:57], v[38:39], v[30:31], v[54:57]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	s_nop 3
+	v_mul_f32_e32 v62, v131, v80
+	v_mul_f32_e32 v63, v131, v81
+	v_mul_f32_e32 v64, v130, v94
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[30:33], v[40:41], v[32:33], v[54:57]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v65, v130, v95
+	v_mul_f32_e32 v80, v130, v96
+	v_mul_f32_e32 v81, v130, v97
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[54:57], v[46:47], v[50:51], 0
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v94, v129, v100
+	s_nop 1
+	v_mul_f32_e32 v98, v131, v32
+	v_mul_f32_e32 v95, v129, v101
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[50:53], v[48:49], v[52:53], v[54:57]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v96, v129, v106
+	v_mul_f32_e32 v97, v129, v107
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[50:53], v[38:39], v[26:27], v[50:53]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v56, v131, v70
+	v_mul_f32_e32 v70, v130, v102
+	v_mul_f32_e32 v57, v131, v71
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[26:29], v[40:41], v[28:29], v[50:53]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v71, v130, v103
+	v_mul_f32_e32 v54, v128, v68
+	v_mul_f32_e32 v55, v128, v69
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[50:53], v[46:47], v[42:43], 0
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v68, v131, v72
+	s_nop 1
+	v_mul_f32_e32 v99, v130, v27
+	v_mul_f32_e32 v69, v131, v73
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[42:45], v[48:49], v[44:45], v[50:53]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v72, v130, v104
+	v_mul_f32_e32 v73, v130, v105
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[42:45], v[38:39], v[22:23], v[42:45]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v52, v128, v58
+	v_mul_f32_e32 v53, v128, v59
+	v_mul_f32_e32 v58, v128, v60
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[22:25], v[40:41], v[24:25], v[42:45]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v59, v128, v61
+	v_mul_f32_e32 v60, v131, v30
+	v_mul_f32_e32 v61, v131, v31
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[42:45], v[46:47], v[34:35], 0
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v46, v131, v33
+	v_mul_f32_e32 v47, v130, v26
+	v_mul_f32_e32 v51, v129, v109
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[30:33], v[48:49], v[36:37], v[42:45]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v48, v130, v28
+	v_mul_f32_e32 v49, v130, v29
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v109, 0, v1
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[26:29], v[38:39], v[18:19], v[30:33]
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v50, v129, v108
+	v_mul_f32_e32 v102, v129, v24
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v108, 0, v0
+	v_max_f32_e32 v24, 0, v56
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_mul_f32_e32 v56, v7, v109
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_fmac_f32_e32 v56, v6, v108
+	.loc	1 184 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:184:4
+	v_mfma_f32_16x16x32_fp8_fp8 v[18:21], v[40:41], v[20:21], v[26:29]
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_fmac_f32_e32 v56, v8, v82
+	v_fmac_f32_e32 v56, v9, v83
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v103, v129, v25
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v0, 0, v62
+	v_max_f32_e32 v1, 0, v63
+	v_max_f32_e32 v25, 0, v57
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_mul_f32_e32 v57, v7, v85
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_fmac_f32_e32 v56, v2, v78
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v38, 0, v58
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_mul_f32_e32 v58, v7, v89
+	v_pk_mul_f32 v[0:1], v[4:5], v[0:1]
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_fmac_f32_e32 v57, v6, v84
+	v_fmac_f32_e32 v56, v3, v79
+	.loc	1 188 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:188:4
+	v_mul_f32_e32 v100, v129, v22
+	v_mul_f32_e32 v101, v129, v23
+	v_mul_f32_e32 v104, v128, v18
+	v_mul_f32_e32 v105, v128, v19
+	v_mul_f32_e32 v106, v128, v20
+	v_mul_f32_e32 v107, v128, v21
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v18, 0, v80
+	v_max_f32_e32 v19, 0, v81
+	v_max_f32_e32 v20, 0, v94
+	v_max_f32_e32 v21, 0, v95
+	v_max_f32_e32 v22, 0, v54
+	v_max_f32_e32 v23, 0, v55
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_mul_f32_e32 v7, v7, v75
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_fmac_f32_e32 v57, v8, v86
+	v_fmac_f32_e32 v58, v6, v88
+	v_add_f32_e32 v0, v0, v56
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v62, 0, v64
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_pk_mul_f32 v[18:19], v[4:5], v[18:19]
+	v_pk_mul_f32 v[20:21], v[4:5], v[20:21]
+	v_pk_mul_f32 v[4:5], v[4:5], v[22:23]
+	v_pk_mul_f32 v[22:23], v[14:15], v[24:25]
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_fmac_f32_e32 v57, v9, v87
+	v_fmac_f32_e32 v58, v8, v90
+	v_fmac_f32_e32 v7, v6, v74
+	v_add_f32_e32 v0, v1, v0
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v63, 0, v65
+	v_max_f32_e32 v64, 0, v92
+	v_max_f32_e32 v26, 0, v68
+	v_max_f32_e32 v27, 0, v69
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_fmac_f32_e32 v58, v9, v91
+	v_fmac_f32_e32 v7, v8, v76
+	v_fmac_f32_e32 v57, v2, v62
+	v_add_f32_e32 v0, v0, v22
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v65, 0, v93
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_pk_mul_f32 v[24:25], v[16:17], v[26:27]
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_fmac_f32_e32 v7, v9, v77
+	v_fmac_f32_e32 v57, v3, v63
+	v_fmac_f32_e32 v58, v2, v64
+	v_add_f32_e32 v0, v23, v0
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v28, 0, v70
+	v_max_f32_e32 v29, 0, v71
+	v_max_f32_e32 v30, 0, v72
+	v_max_f32_e32 v31, 0, v73
+	v_max_f32_e32 v32, 0, v96
+	v_max_f32_e32 v33, 0, v97
+	v_max_f32_e32 v34, 0, v50
+	v_max_f32_e32 v35, 0, v51
+	v_max_f32_e32 v40, 0, v60
+	v_max_f32_e32 v41, 0, v61
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_add_f32_e32 v1, v18, v57
+	v_fmac_f32_e32 v58, v3, v65
+	v_fmac_f32_e32 v7, v2, v66
+	v_add_f32_e32 v0, v24, v0
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_pk_mul_f32 v[26:27], v[14:15], v[28:29]
+	v_pk_mul_f32 v[28:29], v[16:17], v[30:31]
+	v_pk_mul_f32 v[30:31], v[14:15], v[32:33]
+	v_pk_mul_f32 v[32:33], v[16:17], v[34:35]
+	v_pk_mul_f32 v[34:35], v[10:11], v[40:41]
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_add_f32_e32 v1, v19, v1
+	v_add_f32_e32 v6, v20, v58
+	v_fmac_f32_e32 v7, v3, v67
+	v_add_f32_e32 v0, v25, v0
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v36, 0, v52
+	v_max_f32_e32 v37, 0, v53
+	v_max_f32_e32 v42, 0, v98
+	v_max_f32_e32 v43, 0, v46
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_add_f32_e32 v6, v21, v6
+	v_add_f32_e32 v2, v4, v7
+	v_add_f32_e32 v1, v1, v26
+	v_add_f32_e32 v0, v0, v34
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v44, 0, v47
+	v_max_f32_e32 v46, 0, v48
+	v_max_f32_e32 v47, 0, v49
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_pk_mul_f32 v[14:15], v[14:15], v[36:37]
+	v_pk_mul_f32 v[36:37], v[12:13], v[42:43]
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_add_f32_e32 v2, v5, v2
+	v_add_f32_e32 v1, v27, v1
+	v_add_f32_e32 v3, v6, v30
+	v_add_f32_e32 v0, v35, v0
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v39, 0, v59
+	v_max_f32_e32 v45, 0, v99
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_pk_mul_f32 v[40:41], v[12:13], v[46:47]
+	.loc	1 195 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:195:4
+	v_add_u32_e32 v46, s9, v116
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_add_f32_e32 v1, v28, v1
+	v_add_f32_e32 v3, v31, v3
+	v_add_f32_e32 v2, v2, v14
+	v_add_f32_e32 v0, v36, v0
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v48, 0, v100
+	v_max_f32_e32 v49, 0, v101
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_pk_mul_f32 v[16:17], v[16:17], v[38:39]
+	v_pk_mul_f32 v[38:39], v[10:11], v[44:45]
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_add_f32_e32 v1, v29, v1
+	v_add_f32_e32 v3, v32, v3
+	v_add_f32_e32 v2, v15, v2
+	v_add_f32_e32 v0, v37, v0
+	v_mov_b32_e32 v4, 0xff800000
+	v_cmp_ge_i32_e32 vcc, s13, v46
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v52, 0, v104
+	v_max_f32_e32 v53, 0, v105
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_pk_mul_f32 v[42:43], v[10:11], v[48:49]
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_add_f32_e32 v3, v33, v3
+	v_add_f32_e32 v2, v16, v2
+	v_cndmask_b32_e32 v0, v4, v0, vcc
+	v_add_f32_e32 v1, v1, v38
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v50, 0, v102
+	v_max_f32_e32 v51, 0, v103
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_pk_mul_f32 v[10:11], v[10:11], v[52:53]
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_add_f32_e32 v2, v17, v2
+	v_add_f32_e32 v1, v39, v1
+	v_add_f32_e32 v3, v3, v42
+	.loc	1 201 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:201:4
+	ds_bpermute_b32 v5, v120, v0
+	.loc	1 189 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:189:4
+	v_max_f32_e32 v54, 0, v106
+	v_max_f32_e32 v55, 0, v107
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_pk_mul_f32 v[44:45], v[12:13], v[50:51]
+	.loc	1 195 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:195:4
+	v_add_u32_e32 v47, s9, v117
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_add_f32_e32 v1, v40, v1
+	v_add_f32_e32 v3, v43, v3
+	v_add_f32_e32 v2, v2, v10
+	.loc	1 192 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:192:4
+	v_pk_mul_f32 v[12:13], v[12:13], v[54:55]
+	.loc	1 195 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:195:4
+	v_add_u32_e32 v48, s9, v118
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_add_f32_e32 v1, v41, v1
+	v_cmp_ge_i32_e32 vcc, s13, v47
+	v_add_f32_e32 v3, v44, v3
+	v_add_f32_e32 v2, v11, v2
+	.loc	1 195 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:195:4
+	v_add_u32_e32 v49, s9, v119
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_cndmask_b32_e32 v1, v4, v1, vcc
+	v_add_f32_e32 v3, v45, v3
+	v_cmp_ge_i32_e32 vcc, s13, v48
+	v_add_f32_e32 v2, v12, v2
+	v_add_f32_e32 v2, v13, v2
+	v_cndmask_b32_e32 v3, v4, v3, vcc
+	v_cmp_ge_i32_e32 vcc, s13, v49
+	s_waitcnt lgkmcnt(0)
+	v_add_f32_e32 v0, v0, v5
+	.loc	1 201 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:201:4
+	ds_bpermute_b32 v5, v120, v3
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_cndmask_b32_e32 v2, v4, v2, vcc
+	.loc	1 201 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:201:4
+	ds_bpermute_b32 v4, v120, v1
+	ds_swizzle_b32 v6, v0 offset:swizzle(SWAP,16)
+	ds_bpermute_b32 v7, v120, v2
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	s_waitcnt lgkmcnt(3)
+	v_add_f32_e32 v3, v3, v5
+	.loc	1 201 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:201:4
+	ds_swizzle_b32 v5, v3 offset:swizzle(SWAP,16)
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	s_waitcnt lgkmcnt(3)
+	v_add_f32_e32 v1, v1, v4
+	.loc	1 201 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:201:4
+	ds_swizzle_b32 v4, v1 offset:swizzle(SWAP,16)
+	.loc	1 209 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:209:4
+	v_cmp_lt_i32_e32 vcc, -1, v46
+	.loc	1 210 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:210:4
+	s_and_b64 vcc, s[0:1], vcc
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	s_waitcnt lgkmcnt(1)
+	v_add_f32_e32 v3, v3, v5
+	.loc	1 210 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:210:4
+	v_bfrev_b32_e32 v5, 1
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	s_waitcnt lgkmcnt(0)
+	v_add_f32_e32 v1, v1, v4
+	.loc	1 210 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:210:4
+	v_add_lshl_u32 v4, v46, s8, 2
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	v_add_f32_e32 v2, v2, v7
+	v_add_f32_e32 v0, v0, v6
+	.loc	1 209 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:209:4
+	v_cmp_lt_i32_e64 s[2:3], -1, v47
+	.loc	1 210 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:210:4
+	v_cndmask_b32_e32 v4, v5, v4, vcc
+	.loc	1 201 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:201:4
+	ds_swizzle_b32 v7, v2 offset:swizzle(SWAP,16)
+	.loc	1 210 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:210:4
+	buffer_store_dword v0, v4, s[16:19], 0 offen
+	v_add_lshl_u32 v0, v47, s8, 2
+	s_and_b64 vcc, s[0:1], s[2:3]
+	.loc	1 209 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:209:4
+	v_cmp_lt_i32_e64 s[4:5], -1, v48
+	.loc	1 210 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:210:4
+	v_cndmask_b32_e32 v0, v5, v0, vcc
+	buffer_store_dword v1, v0, s[16:19], 0 offen
+	v_add_lshl_u32 v0, v48, s8, 2
+	s_and_b64 vcc, s[0:1], s[4:5]
+	.loc	1 209 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:209:4
+	v_cmp_lt_i32_e64 s[6:7], -1, v49
+	.loc	1 210 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:210:4
+	v_cndmask_b32_e32 v0, v5, v0, vcc
+	buffer_store_dword v3, v0, s[16:19], 0 offen
+	v_add_lshl_u32 v0, v49, s8, 2
+	s_and_b64 vcc, s[0:1], s[6:7]
+	.loc	1 203 6                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:203:6
+	s_waitcnt lgkmcnt(0)
+	v_add_f32_e32 v2, v2, v7
+	.loc	1 210 4                         ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:210:4
+	v_cndmask_b32_e32 v0, v5, v0, vcc
+	buffer_store_dword v2, v0, s[16:19], 0 offen
+.LBB0_8:                                ; %common.ret
+	.loc	1 0 0 is_stmt 0                 ; _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir:0
+	s_endpgm
+.Ltmp2:
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
+		.amdhsa_group_segment_fixed_size 0
+		.amdhsa_private_segment_fixed_size 0
+		.amdhsa_kernarg_size 136
+		.amdhsa_user_sgpr_count 16
+		.amdhsa_user_sgpr_dispatch_ptr 0
+		.amdhsa_user_sgpr_queue_ptr 0
+		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_user_sgpr_dispatch_id 0
+		.amdhsa_user_sgpr_kernarg_preload_length 14
+		.amdhsa_user_sgpr_kernarg_preload_offset 0
+		.amdhsa_user_sgpr_private_segment_size 0
+		.amdhsa_uses_dynamic_stack 0
+		.amdhsa_enable_private_segment 0
+		.amdhsa_system_sgpr_workgroup_id_x 1
+		.amdhsa_system_sgpr_workgroup_id_y 0
+		.amdhsa_system_sgpr_workgroup_id_z 0
+		.amdhsa_system_sgpr_workgroup_info 0
+		.amdhsa_system_vgpr_workitem_id 0
+		.amdhsa_next_free_vgpr 189
+		.amdhsa_next_free_sgpr 96
+		.amdhsa_accum_offset 192
+		.amdhsa_reserve_vcc 1
+		.amdhsa_reserve_xnack_mask 1
+		.amdhsa_float_round_mode_32 0
+		.amdhsa_float_round_mode_16_64 0
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_float_denorm_mode_16_64 3
+		.amdhsa_dx10_clamp 1
+		.amdhsa_ieee_mode 1
+		.amdhsa_fp16_overflow 0
+		.amdhsa_tg_split 0
+		.amdhsa_exception_fp_ieee_invalid_op 0
+		.amdhsa_exception_fp_denorm_src 0
+		.amdhsa_exception_fp_ieee_div_zero 0
+		.amdhsa_exception_fp_ieee_overflow 0
+		.amdhsa_exception_fp_ieee_underflow 0
+		.amdhsa_exception_fp_ieee_inexact 0
+		.amdhsa_exception_int_div_zero 0
+	.end_amdhsa_kernel
+	.text
+.Lfunc_end0:
+	.size	_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle, .Lfunc_end0-_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
+	.cfi_endproc
+                                        ; -- End function
+	.set _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.num_vgpr, 189
+	.set _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.num_agpr, 0
+	.set _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.numbered_sgpr, 36
+	.set _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.private_seg_size, 0
+	.set _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.uses_vcc, 1
+	.set _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.uses_flat_scratch, 0
+	.set _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.has_dyn_sized_stack, 0
+	.set _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.has_recursion, 0
+	.set _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.has_indirect_call, 0
+	.section	.AMDGPU.csdata,"",@progbits
+; Kernel info:
+; codeLenInByte = 5864
+; TotalNumSgprs: 42
+; NumVgprs: 189
+; NumAgprs: 0
+; TotalNumVgprs: 189
+; ScratchSize: 0
+; MemoryBound: 0
+; FloatMode: 240
+; IeeeMode: 1
+; LDSByteSize: 0 bytes/workgroup (compile time only)
+; SGPRBlocks: 12
+; VGPRBlocks: 23
+; NumSGPRsForWavesPerEU: 102
+; NumVGPRsForWavesPerEU: 189
+; AccumOffset: 192
+; Occupancy: 2
+; WaveLimiterHint : 0
+; COMPUTE_PGM_RSRC2:SCRATCH_EN: 0
+; COMPUTE_PGM_RSRC2:USER_SGPR: 16
+; COMPUTE_PGM_RSRC2:TRAP_HANDLER: 0
+; COMPUTE_PGM_RSRC2:TGID_X_EN: 1
+; COMPUTE_PGM_RSRC2:TGID_Y_EN: 0
+; COMPUTE_PGM_RSRC2:TGID_Z_EN: 0
+; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 0
+; COMPUTE_PGM_RSRC3_GFX90A:ACCUM_OFFSET: 47
+; COMPUTE_PGM_RSRC3_GFX90A:TG_SPLIT: 0
+	.text
+	.p2alignl 6, 3212836864
+	.fill 256, 4, 3212836864
+	.section	.AMDGPU.gpr_maximums,"",@progbits
+	.set amdgpu.max_num_vgpr, 0
+	.set amdgpu.max_num_agpr, 0
+	.set amdgpu.max_num_sgpr, 0
+	.text
+	.section	.debug_abbrev,"",@progbits
+	.byte	1                               ; Abbreviation Code
+	.byte	17                              ; DW_TAG_compile_unit
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	37                              ; DW_AT_producer
+	.byte	14                              ; DW_FORM_strp
+	.byte	19                              ; DW_AT_language
+	.byte	5                               ; DW_FORM_data2
+	.byte	3                               ; DW_AT_name
+	.byte	14                              ; DW_FORM_strp
+	.byte	16                              ; DW_AT_stmt_list
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	27                              ; DW_AT_comp_dir
+	.byte	14                              ; DW_FORM_strp
+	.byte	17                              ; DW_AT_low_pc
+	.byte	1                               ; DW_FORM_addr
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	0                               ; EOM(3)
+	.section	.debug_info,"",@progbits
+.Lcu_begin0:
+	.long	.Ldebug_info_end0-.Ldebug_info_start0 ; Length of Unit
+.Ldebug_info_start0:
+	.short	4                               ; DWARF version number
+	.long	.debug_abbrev                   ; Offset Into Abbrev. Section
+	.byte	8                               ; Address Size (in bytes)
+	.byte	1                               ; Abbrev [1] 0xb:0x1f DW_TAG_compile_unit
+	.long	.Linfo_string0                  ; DW_AT_producer
+	.short	2                               ; DW_AT_language
+	.long	.Linfo_string1                  ; DW_AT_name
+	.long	.Lline_table_start0             ; DW_AT_stmt_list
+	.long	.Linfo_string2                  ; DW_AT_comp_dir
+	.quad	.Lfunc_begin0                   ; DW_AT_low_pc
+	.long	.Lfunc_end0-.Lfunc_begin0       ; DW_AT_high_pc
+.Ldebug_info_end0:
+	.section	.debug_str,"MS",@progbits,1
+.Linfo_string0:
+	.asciz	"triton"                        ; string offset=0
+.Linfo_string1:
+	.asciz	"_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.ttgir" ; string offset=7
+.Linfo_string2:
+	.asciz	"xxx2/EXVFLIHTCEFSEUBZG27CPQO2DVZM2QEROUBEXX6ECNGRBPWNACKQ" ; string offset=61
+	.section	".note.GNU-stack","",@progbits
+	.amdgpu_metadata
+---
+amdhsa.kernels:
+  - .agpr_count:     0
+    .args:
+      - .offset:         0
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         4
+        .size:           4
+        .value_kind:     by_value
+      - .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         16
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         20
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         24
+        .size:           4
+        .value_kind:     by_value
+      - .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         40
+        .size:           4
+        .value_kind:     by_value
+      - .address_space:  global
+        .offset:         48
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         56
+        .size:           4
+        .value_kind:     by_value
+      - .address_space:  global
+        .offset:         64
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         72
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         80
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         88
+        .size:           4
+        .value_kind:     by_value
+      - .address_space:  global
+        .offset:         96
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         104
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         108
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         112
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         116
+        .size:           4
+        .value_kind:     by_value
+      - .address_space:  global
+        .offset:         120
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         128
+        .size:           8
+        .value_kind:     global_buffer
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 136
+    .max_flat_workgroup_size: 256
+    .name:           _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
+    .private_segment_fixed_size: 0
+    .sgpr_count:     42
+    .sgpr_spill_count: 0
+    .symbol:         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle.kd
+    .uses_dynamic_stack: false
+    .vgpr_count:     189
+    .vgpr_spill_count: 0
+    .wavefront_size: 64
+amdhsa.target:   amdgcn-amd-amdhsa--gfx942
+amdhsa.version:
+  - 1
+  - 2
+...
+
+	.end_amdgpu_metadata
+	.section	.debug_line,"",@progbits
+.Lline_table_start0:
