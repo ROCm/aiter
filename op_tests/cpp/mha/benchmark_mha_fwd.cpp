@@ -119,7 +119,8 @@ auto create_args(int argc, char* argv[])
         .insert("v3_bf16_cvt",
                 "1",
                 "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
-        .insert("fwd_v3", "0", "if set to 1, some cases will call the fwd v3 kernel");
+        .insert("fwd_v3", "0", "if set to 1, some cases will call the fwd v3 kernel")
+        .insert("is_v3_check", "0", "if set to 1, check whether the input scenarios is supported by the asm kernel.");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -451,6 +452,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     int stream_repeat = arg_parser.get_int("repeat");
     bool kname        = arg_parser.get_bool("kname");
     bool fwd_v3       = arg_parser.get_bool("fwd_v3");
+    bool is_v3_check  = arg_parser.get_bool("is_v3_check");
     int v3_bf16_cvt   = arg_parser.get_int("v3_bf16_cvt");
 
     ck_tile::stream_config stream_config{nullptr,
@@ -1045,7 +1047,10 @@ bool run(const ck_tile::ArgParser& arg_parser)
                               bias.type,
                               lse,
                               fwd_v3,
-                              v3_bf16_cvt);
+                              v3_bf16_cvt,
+                              nullptr,
+                              nullptr,
+                              is_v3_check);
     }();
 
     if(fwd_ave_time < 0.0f)
