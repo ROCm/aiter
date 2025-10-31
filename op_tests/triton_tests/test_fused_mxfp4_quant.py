@@ -34,7 +34,7 @@ def calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, eps=1e-6, shuffle=F
         res1_out = res1_out.to(orig_dtype)
     x1 = rmsnorm(x1, rms1_w, eps)
     out1_fp4, out1_scale = torch_dynamic_mxfp4_quant(x1)
-    
+
     out2 = None
     if x2 is not None:
         x2 = x2.to(torch.float32)
@@ -48,7 +48,9 @@ def calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, eps=1e-6, shuffle=F
         scaleM = (M + 255) // 256 * 256
         scaleN_valid = (N + 31) // 32
         scaleN = (scaleN_valid + 7) // 8 * 8
-        out1_scale_pad = torch.empty((scaleM, scaleN), dtype = out1_scale.dtype, device = out1_scale.device)
+        out1_scale_pad = torch.empty(
+            (scaleM, scaleN), dtype=out1_scale.dtype, device=out1_scale.device
+        )
         out1_scale_pad[:M, :scaleN_valid] = out1_scale[:M, :scaleN_valid]
         out1_scale = shuffle_scales(out1_scale_pad)
         out1_scale = out1_scale.view(out1_scale.shape[0] * 32, -1)
@@ -102,15 +104,18 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
     torch.testing.assert_close(triton_scale, torch_scale)
     torch.testing.assert_close(triton_out, torch_out)
 
+
 @pytest.mark.parametrize(
     "M, N1, N2, stride",
-    [(M, N1, N2, stride) 
-     for M in [1, 4, 33, 64, 132, 256]
-     for N1, N2, stride in [
-         (200, 200, 200), 
-         (256, 256, 256),
-         (256, 256, 2112),
-     ]],
+    [
+        (M, N1, N2, stride)
+        for M in [1, 4, 33, 64, 132, 256]  # TODO: debug for 131072
+        for N1, N2, stride in [
+            (200, 200, 200),
+            (256, 256, 256),
+            (256, 256, 2112),
+        ]
+    ],
 )
 @pytest.mark.parametrize("inp2", [True, False])
 @pytest.mark.parametrize("res1", [True, False])
@@ -118,7 +123,15 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
 @pytest.mark.parametrize("shuffle", [True, False])
 @pytest.mark.parametrize("scale_shuffle_padding", [True, False])
 def test_fused_rms_quant(
-    M: int, N1: int, N2: int, stride: int, inp2: bool, res1: bool, dtype, shuffle: bool, scale_shuffle_padding: bool,
+    M: int,
+    N1: int,
+    N2: int,
+    stride: int,
+    inp2: bool,
+    res1: bool,
+    dtype,
+    shuffle: bool,
+    scale_shuffle_padding: bool,
 ):
     x1, x2, rms1_w, rms2_w, resid1 = generate_fused_rms_quant_data(
         x1_shape=(M, N1),
@@ -132,14 +145,28 @@ def test_fused_rms_quant(
     (x1_fp4_torch, x1_scales_torch), x2_torch, res1_out_torch = (
         calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, shuffle=shuffle)
     )
-    
+
     (x1_fp4_triton, x1_scales_triton), x2_triton, res1_out_triton = (
-        fused_rms_mxfp4_quant(x1, rms1_w, 1e-6, x2, rms2_w, 1e-6, resid1, shuffle=shuffle, scale_shuffle_padding=scale_shuffle_padding)
+        fused_rms_mxfp4_quant(
+            x1,
+            rms1_w,
+            1e-6,
+            x2,
+            rms2_w,
+            1e-6,
+            resid1,
+            shuffle=shuffle,
+            scale_shuffle_padding=scale_shuffle_padding,
+        )
     )
-    
+
     if shuffle:
-        x1_scales_triton = un_shuffle_scales(x1_scales_triton.view(x1_scales_triton.shape[0] // 32, -1))
-        x1_scales_torch = un_shuffle_scales(x1_scales_torch.view(x1_scales_torch.shape[0] // 32, -1))
+        x1_scales_triton = un_shuffle_scales(
+            x1_scales_triton.view(x1_scales_triton.shape[0] // 32, -1)
+        )
+        x1_scales_torch = un_shuffle_scales(
+            x1_scales_torch.view(x1_scales_torch.shape[0] // 32, -1)
+        )
 
     scaleN_valid = (N1 + 31) // 32
     x1_scales_triton = x1_scales_triton[:M, :scaleN_valid]
