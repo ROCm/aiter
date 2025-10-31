@@ -223,7 +223,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
 
         mask = (
             context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
-            <= context_length - pid_next_n
+            <= context_length - next_n + pid_next_n
         )
         o = tl.where(mask[None, :], o, float("-inf"))
 
@@ -254,7 +254,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
 
     mask = (
         context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
-        <= context_length - pid_next_n
+        <= context_length - next_n + pid_next_n
     )
     o = tl.where(mask[None, :], o, float("-inf"))
 
@@ -482,7 +482,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
         mask = (
             context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
-            <= context_length - pid_next_n
+            <= context_length - next_n + pid_next_n
         )
         o = tl.where(mask[None, :], o, float("-inf"))
 
@@ -514,7 +514,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
     mask = (
         context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
-        <= context_length - pid_next_n
+        <= context_length - next_n + pid_next_n
     )
     o = tl.where(mask[None, :], o, float("-inf"))
 
