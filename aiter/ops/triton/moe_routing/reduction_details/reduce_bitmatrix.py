@@ -51,7 +51,7 @@ def _sum_bitmatrix_memset(Ret, BLOCK: tl.constexpr):
 
 @triton.jit
 def _sum_bitmatrix_rows(B, shape_bm, stride_bm, stride_bn,  # input bitmatrix
-                        Ret, Partials, stride_pm, stride_pn, shape_pn,  # outputs
+                        Ret, Partials, stride_pm, stride_pn, shape_pn, num_pids_m,  # outputs
                         BLOCK_MM: tl.constexpr, BLOCK_M: tl.constexpr):
 
     tl.static_assert(BLOCK_MM % BLOCK_M == 0)
@@ -70,7 +70,15 @@ def _sum_bitmatrix_rows(B, shape_bm, stride_bm, stride_bn,  # input bitmatrix
     offs_t = pid_m * TILE_SIZE + tl.arange(0, TILE_SIZE)
 
     tl.atomic_add(Ret + offs_n, tl.sum(ret, 0), sem="relaxed")
-    tl.store(Partials + offs_t[:, None] * stride_pm + offs_n[None, :] * stride_pn, ret)
+
+    curr = tl.cumsum(ret, 0) - ret
+    tl.atomic_add(Partials + offs_t[:, None] * stride_pm + offs_n[None, :] * stride_pn, curr, sem="relaxed")
+    curr = tl.sum(ret, 0, keep_dims=True)
+    for i in range(pid_m + 1, num_pids_m):
+        offs_t = i * TILE_SIZE + tl.arange(0, TILE_SIZE)
+        tl.atomic_add(Partials + offs_t[:, None] * stride_pm + offs_n[None, :] * stride_pn, curr, sem="relaxed")
+
+    #tl.store(Partials + offs_t[:, None] * stride_pm + offs_n[None, :] * stride_pn, ret)
 
 
 def clear_sums(n_cols, device, MEMSET_BLOCK=512):
@@ -88,20 +96,23 @@ def sum_bitmatrix_rows(x, out_ret, partials_block_size=None):
     n_rows, n_cols = x.shape
     assert out_ret.shape == (n_cols, )
 
-    TILE_SIZE = max(1, 128 // PARTIALS_BLOCK_M)
+    TILE_SIZE = 8 # max(1, 128 // PARTIALS_BLOCK_M)
     BLOCK_MM = PARTIALS_BLOCK_M * TILE_SIZE
 
     pids_x = cdiv(n_rows, BLOCK_MM)
     pids_y = cdiv(n_cols, 32)
-    out_partials = torch.empty((pids_y * 32, pids_x * TILE_SIZE), device=out_ret.device, dtype=torch.int32)
-    out_partials = torch.transpose(out_partials, 0, 1)
+    #out_partials = torch.empty((pids_y * 32, pids_x * TILE_SIZE), device=out_ret.device, dtype=torch.int32)
+    #out_partials = torch.zeros((pids_y * 32, pids_x * TILE_SIZE), device=out_ret.device, dtype=torch.int32)
+    #out_partials = torch.transpose(out_partials, 0, 1)
+    out_partials = x.scratchpad_partials
+    #print(out_partials.sum())
 
     # output tensors
     _sum_bitmatrix_rows[(pids_x, pids_y)](
         x.data, n_rows, x.data.stride(0), x.data.stride(1),  # input
         out_ret,  # output [final reduction]
         out_partials, out_partials.stride(0), out_partials.stride(1),
-        out_partials.shape[1],  # output [partial reductions]
+        out_partials.shape[1], pids_x,  # output [partial reductions]
         BLOCK_M=PARTIALS_BLOCK_M, BLOCK_MM=BLOCK_MM,  # constants
         num_warps=8)
 

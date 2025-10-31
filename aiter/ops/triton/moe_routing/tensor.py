@@ -18,11 +18,12 @@ class Bitmatrix:
 
     scratchpad: torch.Tensor = None
 
-    def __init__(self, data, shape, scratchpad=None):
+    def __init__(self, data, shape, scratchpad=None, scratchpad_partials=None):
         self.data = data
         self.shape = shape
         self.device = data.device
         self.scratchpad = scratchpad
+        self.scratchpad_partials = scratchpad_partials
 
     def sum(self, partials_block_size):
         _, n_cols = self.shape

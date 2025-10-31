@@ -1,10 +1,7 @@
 import torch
 import triton
 from dataclasses import dataclass, field
-from .routing_details._routing_compute import _combined_routing_compute
-from .routing_details._routing_compute import _combined_routing_memset
-from .routing_details._routing_compute import _routing_clear_bitmatrix
-from .routing_details._expt_data import _expt_data_memset
+from .routing_details._routing_compute import _combined_routing
 from .routing_details._expt_data import _expt_data_compute
 
 
@@ -89,8 +86,7 @@ class RoutingData:
 # --------------------------
 
 
-def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix):
-    HIST_BLOCK_M = 32
+def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, HIST_BLOCK_M):
     INDX_OFFS_BLOCK_M = 512
     MEMSET_BLOCK = 1024
     cdiv = triton.cdiv
@@ -111,65 +107,27 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix):
     gate_indx = combined_indx[n_gates:]
     gate_scal = torch.empty(n_gates, dtype=dtype, device=device)
 
-    token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1a, blocks2a, MEMSET_BLOCK_A, HIST2_BLOCK_M, block_m_log2_start, block_m_num = _compute_expt_data_internal(
+    token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1a, MEMSET_BLOCK_A, HIST2_BLOCK_M, block_m_log2_start, block_m_num = _compute_expt_data_internal(
         hist, n_expts_tot, n_gates)
 
-    blocks1b = n_expts_tot + 1
-    blocks2b = cdiv(n_tokens, HIST_BLOCK_M)
-
-    _combined_routing_memset[(blocks1a + blocks1b, )](
-        combined_indx, n_gates * 2, -1, MEMSET_BLOCK, hist,  #
-        expt_offs, hist.shape[0], n_expts_tot, partial_hist,  # inputs
-        partial_hist.shape[0], partial_hist.stride(0), partial_hist.stride(1),  # outputs
-        token_offs_combined, token_offs_combined.stride(0),  #
-        blocks1a, block_pid_map,  #
-        block_m_log2_start, SIZES=block_m_num, BLOCK_A=MEMSET_BLOCK_A,  # optimization parameters
-        BLOCK_N=512, BLOCK_M=INDX_OFFS_BLOCK_M,  # tunable parameters
-    )
+    blocks1b = cdiv(n_tokens, HIST_BLOCK_M)
 
     indx_offs = partial_hist
 
-    _combined_routing_compute[(blocks2a + blocks2b, )](
+    _combined_routing[(blocks1a + blocks1b, )](
         topk_indx, gate_indx, gate_scal,  # outputs
         expt_scal, expt_indx, indx_offs, indx_offs.stride(0), indx_offs.stride(1),  # inputs
         expt_offs, n_tokens,  # input shape
         HIST_BLOCK_M, n_expts_act,  # constants
-        hist, token_offs_pad, token_offs_pad.stride(0), block_pid_map, block_pid_map.stride(0),  # outputs
-        block_m_log2_start, block_m_num, HIST2_BLOCK_M, blocks2a,  # etc.
+        hist, hist.shape[0], n_expts_tot,  # inputs
+        token_offs_combined, token_offs_combined.stride(0),  #
+        blocks1a, block_pid_map, block_pid_map.stride(0), block_pid_map.shape[1],  #
+        block_m_log2_start, SIZES=block_m_num, BLOCK_A=MEMSET_BLOCK_A,  # optimization parameters
+        BLOCK_N=512,  # tunable parameters
+        num_warps=2
     )
 
     return hist, topk_indx, gate_indx, gate_scal, token_offs_raw, token_offs_pad, block_pid_map
-
-
-# --------------------------
-# prune routing
-# --------------------------
-
-
-class PruneRouting(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, expt_scal, expt_indx, bitmatrix, n_expts_tot, simulated_ep):
-        from .compaction import compaction
-        n_tokens_pad = expt_scal.shape[0]
-        assert n_expts_tot % simulated_ep == 0
-        _routing_clear_bitmatrix[(n_tokens_pad, )](
-            bitmatrix.storage.data,
-            bitmatrix.storage.data.stride(0),
-            bitmatrix.storage.data.stride(1),
-            bitmatrix.storage.data.shape[1],
-            n_expts_tot // simulated_ep,
-            BLOCK_N=512,
-        )
-        # perform compaction to update expt_scal / expt_indx
-        expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix)
-        n_expts_tot = n_expts_tot // simulated_ep
-        bitmatrix.shape[-1] = n_expts_tot
-        return expt_scal, expt_indx, bitmatrix
-
-
-def prune_routing(expt_scal, expt_indx, bitmatrix, n_expts_tot, simulated_ep):
-    return PruneRouting.apply(expt_scal, expt_indx, bitmatrix, n_expts_tot, simulated_ep)
 
 
 # --------------------------
@@ -214,9 +172,8 @@ def _compute_expt_data_internal(expt_hist, n_expts_tot, n_gates):
     token_offs_pad = token_offs_pad[:, :n_expts_tot + 1]
     block_pid_map = block_pid_map[:, :max_n_tiles]
 
-    blocks1 = memset_grid + block_m_num + 1
-    blocks2 = n_expts_tot * block_m_num
-    return token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1, blocks2, MEMSET_BLOCK, HIST2_BLOCK_M, block_m_log2_start, block_m_num
+    blocks1 = n_expts_tot * block_m_num + 1
+    return token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1, MEMSET_BLOCK, HIST2_BLOCK_M, block_m_log2_start, block_m_num
 
 
 def _unpack_into_dict(x):
@@ -257,14 +214,16 @@ def compute_expt_data(expt_hist, n_expts_tot, n_gates):
 
 
 def routing(logits, n_expts_act, sm_first=False, expt_indx=None):
+    HIST_BLOCK_M = 32
+
     from .topk import topk
     if sm_first:
         logits = torch.softmax(logits, dim=-1)
-    expt_scal, expt_indx, bitmatrix = topk(logits, n_expts_act, apply_softmax=not sm_first, y_indx=expt_indx)
+    expt_scal, expt_indx, bitmatrix = topk(logits, n_expts_act, apply_softmax=not sm_first, y_indx=expt_indx, HIST_BLOCK_M=HIST_BLOCK_M)
     n_expts_tot = logits.shape[-1]
     
     hist, topk_indx, gate_indx, gate_scal, token_offs_raw, token_offs_pad, block_pid_map = sort_tokens(
-        expt_scal, expt_indx, n_expts_tot, bitmatrix)
+        expt_scal, expt_indx, n_expts_tot, bitmatrix, HIST_BLOCK_M)
     token_offs_pad = _unpack_into_dict(token_offs_pad)
     block_pid_map = _unpack_into_dict(block_pid_map)
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
