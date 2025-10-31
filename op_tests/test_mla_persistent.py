@@ -362,10 +362,9 @@ def test_mla(
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
         flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
-        bytes = (
-            total_kv * nhead_kv * qk_head_dim
-            + total_q * nhead * (qk_head_dim + v_head_dim)
-        ) * 1
+        bytes = ( total_kv * nhead_kv * qk_head_dim + total_q * nhead * v_head_dim) + \
+            total_q * nhead * qk_head_dim + v_head_dim
+
         err = checkAllclose(
             out_ref,
             out_asm,
