@@ -95,6 +95,7 @@ def e2e_moe_kernel(
     N: tl.constexpr,
     K: tl.constexpr,
     EVEN_K: tl.constexpr,
+    EVEN_K2: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -197,9 +198,6 @@ def e2e_moe_kernel(
     i0 = (pid_n * BLOCK_SIZE_HALF + offs_i0) % N
     # offset for mul_acc
     i1 = (pid_n * BLOCK_SIZE_HALF + offs_i1) % N
-    # TODO: add EVEN_N and pid_n is not last pid_n so no need for masking conditions
-    # same mask applicable to both silu and mul acc
-    # mask_w1n = i0 < (N // 2)
 
     a_ptrs = A + (
         offs_token[:, None] // top_k * stride_am + offs_k1[None, :] * stride_ak
@@ -292,6 +290,12 @@ def e2e_moe_kernel(
     silu_acc = _silu_exp2(silu_acc)
     acc = silu_acc * mul_acc
 
+    acc = tl.where(
+        (pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)[None, :]) < N // 2,
+        acc,
+        0.0,
+    )
+
     if return_intermediate:
         offs_in = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
         i_ptrs = Intermediate + stride_im * offs_token[:, None] + offs_in[None, :]
@@ -303,11 +307,7 @@ def e2e_moe_kernel(
     else:
         acc = acc.to(dtype)
 
-    acc = tl.where(
-        pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)[None, :] < N // 2,
-        acc,
-        0.0,
-    )
+    
 
     offs_w2n = (tl.arange(0, BLOCK_SIZE_HALF) + pid_n * (BLOCK_SIZE_HALF)) % (N // 2)
 
@@ -331,6 +331,8 @@ def e2e_moe_kernel(
         # w2_scale_ptrs: (num_scales_along_n, num_scales_along_k2)
 
     out_ptrs = Out + stride_om * offs_token[:, None] + offs_k2[None, :] * stride_ok
+
+    
 
     num_k2 = tl.cdiv(K, BLOCK_SIZE_K2)
     for k2 in tl.range(0, num_k2, num_stages=1):
@@ -367,13 +369,14 @@ def e2e_moe_kernel(
             )
             out = out * moe_weight[:, None]
 
-        if EVEN_K:
+        if EVEN_K2:
             out_mask = token_mask[:, None]
         else:
             out_mask = token_mask[:, None] & (
-                offs_k2[None, :] < (K - k2 * BLOCK_SIZE_K2 * stride_ok)
+                offs_k2[None, :] < (K - k2 * BLOCK_SIZE_K2)
             )
 
+        
         if SKINNY:
             # Skinny means that there is only one pid along N (i.e. BLOCK_SIZE_N >= N).
             # Thus we don't need atomics, as there is only workgroup updating a output location.
@@ -384,7 +387,5 @@ def e2e_moe_kernel(
             tl.atomic_add(
                 out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok,
                 out,
-                mask=out_mask,
-                sem="relaxed",
-                scope="cta",
+                mask=out_mask
             )

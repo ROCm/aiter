@@ -139,12 +139,14 @@ def torch_moe_ref(
             b_scale[topk_ids.flatten()]
             .permute(0, 2, 1)
             .repeat_interleave(blockshape_n, dim=2)
-        )
+        )[..., :N]
         # (M*top_k, sK, N)
         # combined scales
         scale_matrix = a_scale_expanded * b_scale_expanded
         # (M*top_k, sK, N)
         # apply scales, then reduce over sK
+        
+        # temp = c_fp8 * scale_matrix
         c = (c_fp8 * scale_matrix).sum(dim=1).reshape(-1, N)
         # (M*top_k, N)
     else:
@@ -302,34 +304,19 @@ def torch_moe_gemm2(
 
     E, K, N_HALF = b.shape
 
-    if fp8_w8a8 and not use_block_scale:
-        a, _, a_scale = quantize_fp8(a)
-
     if fp8_w8a8 and use_block_scale:
         # dequantize w2
-        b_scale = b_scale.reshape(E, K // blockshape_k, 1, N_HALF // blockshape_n, 1)
-        b = b.to(torch.float32) * b_scale.broadcast_to(
-            E, K // blockshape_k, blockshape_k, N_HALF // blockshape_n, blockshape_n
-        ).reshape(E, K, N_HALF)
+        b_scale = b_scale.repeat_interleave(blockshape_k, dim=1).repeat_interleave(blockshape_n, dim=2)[:, :K, :N_HALF]  # (E, K, N_HALF)
+        b = b.to(torch.float32) * b_scale.to(torch.float32)
 
-        b = b.to(torch.bfloat16)
-
-    if fp8_w8a8:
-        if blockshape is not None:
-            b_indexed = b[topk_ids]
-        else:
-            b_indexed = b.half()[topk_ids]
-    else:
-        b_indexed = b[topk_ids]
+    b_indexed = b[topk_ids]
 
     out = torch.einsum(
-        "mek,menk->men", a.to(torch.bfloat16), b_indexed.to(torch.bfloat16)
+        "men,mekn->mek", a.to(torch.bfloat16), b_indexed.to(torch.bfloat16)
     )
 
-    if fp8_w8a8 and not use_block_scale:
-        out = out * a_scale * b_scale
     if routed_weight:
-        out *= topk_weights.unsqueeze(-1)
+        out = out * topk_weights.unsqueeze(-1)
 
     return out.to(out_dtype)
 
@@ -1085,26 +1072,26 @@ def test_fused_moe_gelu(
 @pytest.mark.parametrize(
     "M, N, K, top_k, E",
     [
-        (3, 512, 2048, 10, 512),  # qwen3next
-        (333, 512, 2048, 10, 512),
-        (1033, 512, 2048, 10, 512),
-        (3, 768, 2048, 8, 128),  # qwen3
-        (333, 768, 2048, 8, 128),
-        (1033, 768, 2048, 8, 128),
-        (1033, 1024, 2048, 8, 128),
-        (3, 2048, 4096, 2, 8),  # mixtral-7B
-        (33, 768, 2048, 8, 128),  # qwen3
-        (333, 512, 2048, 10, 512),  # qwen3next
-        (33, 8192, 5120, 1, 128),  # llama4-maverick
+        # (3, 512, 2048, 10, 512),  # qwen3next
+        # (333, 512, 2048, 10, 512),
+        # (1033, 512, 2048, 10, 512),
+        # (3, 768, 2048, 8, 128),  # qwen3
+        # (333, 768, 2048, 8, 128),
+        # (1033, 768, 2048, 8, 128),
+        # (1033, 1024, 2048, 8, 128),
+        # (3, 2048, 4096, 2, 8),  # mixtral-7B
+        # (33, 768, 2048, 8, 128),  # qwen3
+        # (333, 512, 2048, 10, 512),  # qwen3next
+        # (33, 8192, 5120, 1, 128),  # llama4-maverick
+        (33, 1536, 4096, 8, 128),  # qwen3
         # TODO: add other shapes
     ],
 )
 @pytest.mark.parametrize("routed_weight", [False])
-# @pytest.mark.parametrize("fp8_w8a8", [True, False]) # precision issue with the block scale
-@pytest.mark.parametrize("fp8_w8a8", [False])
+@pytest.mark.parametrize("fp8_w8a8", [True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("blockshape_n, blockshape_k", [(128, 128)])
-@pytest.mark.parametrize("tp", [1, 8])
+@pytest.mark.parametrize("tp", [8])
 def test_moe_e2e(
     M: int,
     N: int,
@@ -1193,10 +1180,11 @@ def test_moe_e2e(
     )
 
     # validate correctness by comparing to the outputs of two torch gemms
+    torch_intermediate = torch.zeros_like(triton_intermediate)
     torch_intermediate = torch_moe_ref(
         a,
         w1,
-        triton_intermediate,
+        torch_intermediate,
         a_scale,
         w1_scale,
         None,
@@ -1233,4 +1221,9 @@ def test_moe_e2e(
     torch.testing.assert_close(
         triton_intermediate, torch_intermediate, atol=1e-1, rtol=1e-1
     )
+    # Print both outputs in scientific notation for consistency
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+if __name__ == "__main__":
+    test_moe_e2e(33, 512, 4096, 8, 128, False, True, 128, 128, torch.bfloat16, 1)

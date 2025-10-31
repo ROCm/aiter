@@ -103,7 +103,8 @@ def e2e_moe(
     M = A.shape[0]
     N = W1.shape[1]
     K = A.shape[1] - _PADDING_SIZE
-    EVEN_K = K % config["BLOCK_SIZE_K1"] == 0
+    EVEN_K1 = K % config["BLOCK_SIZE_K1"] == 0
+    EVEN_K2 = K % config["BLOCK_SIZE_K2"] == 0
 
     pid_m = (EM + config["BLOCK_SIZE_M"] - 1) // config["BLOCK_SIZE_M"]
     pid_n = (N + config["BLOCK_SIZE_N"] - 1) // config["BLOCK_SIZE_N"]
@@ -150,7 +151,7 @@ def e2e_moe(
         W1_scale.stride(1) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
         W1_scale.stride(2) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
         W2_scale.stride(0) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
-        W1_scale.stride(1) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
+        W2_scale.stride(1) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
         W2_scale.stride(2) if W2_scale is not None and W2_scale.ndim >= 2 else 0,
         top_k,
         topk_weights,
@@ -163,7 +164,8 @@ def e2e_moe(
         EM,
         N,
         K,
-        EVEN_K,
+        EVEN_K1,
+        EVEN_K2,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         use_fp8_w8a8=use_fp8_w8a8,
         NUM_XCDS=get_num_xcds(),
