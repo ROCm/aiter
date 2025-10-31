@@ -1,0 +1,88 @@
+name: Checks
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  check-ck:
+    name: Check Repository Dependency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Verify 3rdparty commits
+        run: ./.github/scripts/check_deps.sh
+
+  black:
+    name: Check Code Style with Black
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run Black
+        uses: psf/black@stable
+
+  ruff:
+    name: Check Code Style with Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python environment
+        uses: actions/setup-python@v2
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip3 install ruff
+      - name: Install reviewdog
+        uses: reviewdog/action-setup@e04ffabe3898a0af8d0fb1af00c188831c4b5893
+      - name: Run ruff with reviewdog
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ruff check . -e | reviewdog -efm="%f:%l:%c: %m" -diff="git diff FETCH_HEAD" -reporter=github-pr-check -tee
+
+  upload-success-artifact:
+    name: Upload Success Signal
+    runs-on: ubuntu-latest
+    needs: [check-ck, black, ruff]
+    steps:
+      - name: Create success signal file
+        run: echo "success" > checks_signal.txt
+
+      - name: Upload success artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checks-signal-${{ github.sha }}
+          path: checks_signal.txt
+
+  upload-failure-artifact:
+    name: Upload Failure Signal
+    runs-on: ubuntu-latest
+    needs: [check-ck, black, ruff]
+    if: ${{ always() && (needs.check-ck.result != 'success' || needs.black.result != 'success' || needs.ruff.result != 'success') }}
+    steps:
+      - name: Create failure signal file with failed jobs
+        run: |
+          echo "failure" > checks_signal.txt
+          if [ "${{ needs.check-ck.result }}" != "success" ]; then
+            echo "FAILED: check-ck (${{ needs.check-ck.result }})" >> checks_signal.txt
+          fi
+          if [ "${{ needs.black.result }}" != "success" ]; then
+            echo "FAILED: black (${{ needs.black.result }})" >> checks_signal.txt
+          fi
+          if [ "${{ needs.ruff.result }}" != "success" ]; then
+            echo "FAILED: ruff (${{ needs.ruff.result }})" >> checks_signal.txt
+          fi
+
+      - name: Upload failure artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checks-signal-${{ github.sha }}
+          path: checks_signal.txt
