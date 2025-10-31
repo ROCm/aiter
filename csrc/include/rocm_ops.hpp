@@ -294,6 +294,14 @@
           py::arg("out"),                                                                      \
           py::arg("open_fp8_quant"),                                                           \
           py::arg("reg_buffer") = std::nullopt);                                               \
+    m.def("fused_allreduce_rmsnorm",                                                           \
+          &aiter::fused_allreduce_rmsnorm,                                                     \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("out"),                                                                      \
+          py::arg("w"),                                                                        \
+          py::arg("eps"),                                                                      \
+          py::arg("reg_buffer") = std::nullopt);                                               \
     m.def("all_reduce_asm_", &all_reduce_asm, "");                                             \
     m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");                   \
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \
@@ -906,6 +914,14 @@
           py::arg("sorted_weights") = std::nullopt);                           \
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
+#define MOE_TOPK_PYBIND                                                        \
+    m.def("topk_sigmoid",                                                      \
+          &aiter::topk_sigmoid,                                                \
+          py::arg("topk_weights"),                                             \
+          py::arg("topk_indices"),                                             \
+          py::arg("gating_output"),                                            \
+          "Apply topk sigmoid to the gating outputs.");
+
 #define MOE_SORTING_PYBIND                             \
     m.def("moe_sorting_fwd",                           \
           &moe_sorting_fwd,                            \
@@ -1239,3 +1255,23 @@
     pybind11::implicitly_convertible<int, ActivationType>();
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
+
+#define TOPK_PER_ROW_PYBIND      \
+    m.def("topk_per_row",        \
+          &topk_per_row,         \
+          py::arg("logits"),     \
+          py::arg("rowStarts"),  \
+          py::arg("rowEnds"),    \
+          py::arg("indices"),    \
+          py::arg("numRows"),    \
+          py::arg("stride0"),    \
+          py::arg("stride1"));   \
+    m.def("topk_per_row_decode", \
+          &topk_per_row_decode,  \
+          py::arg("logits"),     \
+          py::arg("next_n"),     \
+          py::arg("seqLens"),    \
+          py::arg("indices"),    \
+          py::arg("numRows"),    \
+          py::arg("stride0"),    \
+          py::arg("stride1"));
