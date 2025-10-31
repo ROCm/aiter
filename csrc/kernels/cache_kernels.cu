@@ -1181,8 +1181,8 @@ __global__ void indexer_k_quant_and_cache_kernel(
             asm volatile("v_max3_f32 %0, %1, %2, %3\n"
                          : "=v"(amax)
                          : "v"(amax),
-                           "v"(ck_tile::type_convert<float>(k_val[i])),
-                           "v"(ck_tile::type_convert<float>(k_val[i + 1])));
+                           "v"(fabsf(ck_tile::type_convert<float>(k_val[i]))),
+                           "v"(fabsf(ck_tile::type_convert<float>(k_val[i + 1]))));
         }
     }
     else
@@ -1276,7 +1276,6 @@ __global__ void cp_gather_indexer_k_quant_cache_kernel(
 
     reinterpret_cast<float4*>(dst_k)[dst_inblock_offset / VEC_SIZE] =
         reinterpret_cast<const float4*>(kv_cache)[src_inblock_offset / VEC_SIZE];
-    ;
     if(threadIdx.x == 0)
     {
         const int64_t src_scale_offset = src_block_offset + cache_block_size * head_dim +

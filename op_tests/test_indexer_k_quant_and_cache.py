@@ -5,10 +5,8 @@ import torch
 import aiter
 from aiter.test_common import checkAllclose, run_perftest, benchmark
 from aiter import dtypes
-from typing import Tuple
 from aiter import pertoken_quant, dtypes, indexer_k_quant_and_cache
 import argparse
-import itertools
 import pandas as pd
 
 MAX_TOKEN_SUPPORTED = 16384
@@ -48,7 +46,7 @@ def test_indexer_k_quant_and_cache(
     slot_mapping = torch.arange(0, num_token, 1, dtype=torch.int64)
     scale_fmt = "ue8m0"
     kv_cache = torch.empty((block_num, block_size, head_dim + 4), dtype=dtypes.fp8)
-    _ = run_torch(k, kv_cache, slot_mapping, quant_block_size, scale_fmt)
+    run_torch(k, kv_cache, slot_mapping, quant_block_size, scale_fmt)
     kv_cache2 = torch.empty((block_num, block_size, head_dim + 4), dtype=dtypes.fp8)
     _, us = run_perftest(
         indexer_k_quant_and_cache,
@@ -83,6 +81,7 @@ def test_indexer_k_quant_and_cache(
         )
         ret.update({"vllm us": us2, "vllm err": err2})
     except Exception:
+        # Ignore all exceptions here because vllm._custom_ops is optional and may not be available.
         pass
     return ret
 
