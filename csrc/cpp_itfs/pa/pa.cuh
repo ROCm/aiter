@@ -1,7 +1,7 @@
 #pragma once
 
 /*
- * Copyright © Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,7 +56,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,         // [num_seqs*mtp, num_heads, head_size]
     const cache_t* __restrict__ k_cache,    // [num_blocks, num_kv_heads, head_size/x, block_size, x]
     const cache_t* __restrict__ v_cache,    // [num_blocks, num_kv_heads, head_size, block_size]
-    const float scale,    
+    const float scale,
     const int* __restrict__ block_tables,   // [num_seqs, max_num_blocks_per_seq]
     const int* __restrict__ context_lens,   // [num_seqs]
     const int* __restrict__ query_start_loc_ptr,   // [num_seqs]
@@ -551,7 +551,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
             }
 
 
-            
+
             for(int mask = WARP_SIZE / 2; mask >= 16; mask /= 2)
             {
                 exp_sum[gqa_ratio_loop][mtp] += __shfl_xor(exp_sum[gqa_ratio_loop][mtp], mask);
