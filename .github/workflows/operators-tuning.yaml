@@ -78,7 +78,7 @@ jobs:
           docker exec \
           -w /workspace \
           operators_tuning_test \
-          ./.github/scripts/op_tune.sh test "ck_batched_gemm_a8w8, ck_gemm_a8w8, ck_gemm_a8w8_blockscale"
+          ./.github/scripts/op_tune.sh test "${{ github.event.inputs.shapes }}"
 
       - name: Operators tuning Tests
         run: |
@@ -87,7 +87,7 @@ jobs:
           docker exec \
           -w /workspace \
           operators_tuning_test \
-          ./.github/scripts/op_tune.sh tune "ck_batched_gemm_a8w8, ck_gemm_a8w8, ck_gemm_a8w8_blockscale" "${{ github.event.inputs.arguments }}"
+          ./.github/scripts/op_tune.sh tune "${{ github.event.inputs.shapes }}" "${{ github.event.inputs.arguments }}"
       
       - name: Show the difference after tuning
         run: |
@@ -100,7 +100,7 @@ jobs:
           docker exec \
           -w /workspace \
           operators_tuning_test \
-          ./.github/scripts/op_tune.sh test "ck_batched_gemm_a8w8, ck_gemm_a8w8, ck_gemm_a8w8_blockscale"
+          ./.github/scripts/op_tune.sh test "${{ github.event.inputs.shapes }}"
 
       - name: Upload tuned CSVs
         uses: actions/upload-artifact@v4
