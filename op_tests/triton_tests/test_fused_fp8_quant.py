@@ -41,9 +41,7 @@ def per_token_fp8_group_quant(x, dtype_quant, group_size=128):
 def per_tensor_fp8_static_quant(x, dtype_quant, x_scale):
     DTYPE_MAX = torch.finfo(dtype_quant).max
     scale_recip = 1.0 / x_scale
-    x_quant = torch.clamp(x * scale_recip, -DTYPE_MAX, DTYPE_MAX).to(
-        dtype_quant
-    )
+    x_quant = torch.clamp(x * scale_recip, -DTYPE_MAX, DTYPE_MAX).to(dtype_quant)
     return x_quant
 
 

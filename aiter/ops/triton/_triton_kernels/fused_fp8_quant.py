@@ -77,7 +77,7 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
         inp1_ptr + m_pid * inp1_row_stride + n_offs * inp1_col_stride,
         mask=mask1,
         other=0.0,
-        cache_modifier=".cg"
+        cache_modifier=".cg",
     ).to(tl.float32)
 
     if FIRST_INPUT_RES:
@@ -133,7 +133,7 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
         tl.store(
             out_res1_ptr + m_pid * out_res1_row_stride + n_offs * out_res1_col_stride,
             inp1,
-            mask=mask1
+            mask=mask1,
         )
 
 
