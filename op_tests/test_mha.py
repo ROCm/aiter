@@ -365,18 +365,26 @@ def test_flash_attn_output(
         dbias_tol = max(10 * (dbias_pt - dbias_ref).abs().max().item(), 0.01)
         assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
 
-    fwd_flop = nheads * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+    fwd_flop = (
+        batch_size
+        * nheads
+        * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+    )
     dtype_bytes = torch.finfo(dtype).bits // 8
     fwd_num_bytes = (
-        nheads
+        batch_size
+        * nheads
         * dtype_bytes
         * (seqlen_q * d + seqlen_k * d + seqlen_k * d_v + seqlen_q * d_v)
     )
-    bwd_flop = nheads * (
-        seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2
+    bwd_flop = (
+        batch_size
+        * nheads
+        * (seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2)
     )
     bwd_num_bytes = (
-        2 * fwd_num_bytes + nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
+        2 * fwd_num_bytes
+        + batch_size * nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
     )
     ret = {}
     ret["fwd_us"] = us_fwd
