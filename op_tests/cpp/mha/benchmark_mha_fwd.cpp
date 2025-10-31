@@ -374,7 +374,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                  /*seqlen_k_min=*/0 < seqlen_knew ? seqlen_knew : 0,
                                  need_append_kvcache,
                                  random_engine);
-    ck_tile::ignore(seqlen_qpads);
+    ck_tile::ignore = seqlen_qpads;
 
     // compute kvcache seqlen_k (before appending knew/vnew)
     auto cache_seqlen_ks = seqlen_ks;

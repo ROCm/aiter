@@ -581,6 +581,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              seqstart_k.GetDeviceBuffer(),
                              nullptr,
                              nullptr,
+                             nullptr,
+                             nullptr,
                              shape_seqlen_q,
                              shape_seqlen_k,
                              batch,
