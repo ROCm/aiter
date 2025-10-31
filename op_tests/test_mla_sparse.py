@@ -391,7 +391,13 @@ def test_mla(
         (reduce_final_map_size, reduce_final_map_type),
         (reduce_partial_map_size, reduce_partial_map_type),
     ) = aiter.get_mla_metadata_info_v1(
-        q, seq_lens_qo, nhead, mtp=mtp, is_sparse=True, fast_mode=True
+        batch_size,
+        max_seqlen_qo,
+        nhead,
+        q.dtype,
+        kv_buffer.dtype,
+        is_sparse=True,
+        fast_mode=True,
     )
 
     # aiter implementation

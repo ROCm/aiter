@@ -335,10 +335,11 @@ def mla_prefill_asm_fwd(
 
 
 def get_mla_metadata_info_v1(
-    query: torch.Tensor,
-    seq_lens_qo: torch.Tensor,
+    batch_size: int,
+    max_seqlen_qo: int,
     num_head_qo: int,
-    mtp: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
     is_sparse: int,
     fast_mode: bool = True,
 ):
@@ -358,13 +359,12 @@ def get_mla_metadata_info_v1(
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
 
-    batch_size = seq_lens_qo.size(0)
-    reduce_batch_size = batch_size * mtp if is_sparse else batch_size
+    reduce_batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     max_qo_tiles_per_batch = (
-        int(math.ceil(torch.max(seq_lens_qo).item() * num_head_qo / 64))
+        int(math.ceil(max_seqlen_qo * num_head_qo / 64))
         if num_head_qo == 16
-        or (num_head_qo == 128 and query.dtype == get_fp8_e4m3_dtype())
-        else int(math.ceil(torch.max(seq_lens_qo).item() * num_head_qo / 16))
+        or (num_head_qo == 128 and kv_dtype == get_fp8_e4m3_dtype())
+        else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
 
     return (
