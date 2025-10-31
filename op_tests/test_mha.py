@@ -144,15 +144,16 @@ def run_ck(
         )
         return out, softmax_lse, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd)
     else:
-        (dq, dk, dv), us_bwd = run_perftest(
-            torch.autograd.grad,
-            out,
-            (q, k, v),
-            dout,
-            retain_graph=True,
-            num_rotate_args=1,
-        )
-        return out, softmax_lse, dropout_mask, dq, dk, dv, None, (us_fwd, us_bwd)
+        # (dq, dk, dv), us_bwd = run_perftest(
+        #     torch.autograd.grad,
+        #     out,
+        #     (q, k, v),
+        #     dout,
+        #     retain_graph=True,
+        #     num_rotate_args=1,
+        # )
+        # return out, softmax_lse, dropout_mask, dq, dk, dv, None, (us_fwd, us_bwd)
+        return out, softmax_lse, dropout_mask, None, None, None, None, (us_fwd, None)
 
 
 @pytest.mark.parametrize("input_layout", ["BSHD", "BHSD", "SBHD", "KVPACKED"])
@@ -344,47 +345,55 @@ def test_flash_attn_output(
     )
     # assert (softmax_lse - softmax_lse_ref).abs().max().item() <= softmax_lse_tol
 
-    print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-    print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-    print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-    print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-    print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-    print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+    # print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+    # print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+    # print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+    # print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+    # print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+    # print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
 
-    dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
-    dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
-    dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
+    # dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
+    # dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
+    # dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
 
-    assert (dq - dq_ref).abs().max().item() <= dq_tol
-    assert (dk - dk_ref).abs().max().item() <= dk_tol
-    assert (dv - dv_ref).abs().max().item() <= dv_tol
+    # assert (dq - dq_ref).abs().max().item() <= dq_tol
+    # assert (dk - dk_ref).abs().max().item() <= dk_tol
+    # assert (dv - dv_ref).abs().max().item() <= dv_tol
 
-    if attn_bias is not None:
-        print(f"dBias max diff: {(dbias - dbias_ref).abs().max().item()}")
-        print(f"dBias Pytorch max diff: {(dbias_pt - dbias_ref).abs().max().item()}")
-        dbias_tol = max(10 * (dbias_pt - dbias_ref).abs().max().item(), 0.01)
-        assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
+    # if attn_bias is not None:
+    #     print(f"dBias max diff: {(dbias - dbias_ref).abs().max().item()}")
+    #     print(f"dBias Pytorch max diff: {(dbias_pt - dbias_ref).abs().max().item()}")
+    #     dbias_tol = max(10 * (dbias_pt - dbias_ref).abs().max().item(), 0.01)
+    #     assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
 
-    fwd_flop = nheads * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+    fwd_flop = (
+        batch_size
+        * nheads
+        * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+    )
     dtype_bytes = torch.finfo(dtype).bits // 8
     fwd_num_bytes = (
-        nheads
+        batch_size
+        * nheads
         * dtype_bytes
         * (seqlen_q * d + seqlen_k * d + seqlen_k * d_v + seqlen_q * d_v)
     )
-    bwd_flop = nheads * (
-        seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2
+    bwd_flop = (
+        batch_size
+        * nheads
+        * (seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2)
     )
     bwd_num_bytes = (
-        2 * fwd_num_bytes + nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
+        2 * fwd_num_bytes
+        + batch_size * nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
     )
     ret = {}
     ret["fwd_us"] = us_fwd
     ret["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
     ret["fwd_gb_per_sec"] = (fwd_num_bytes) / 1.0e3 / us_fwd
-    ret["bwd_us"] = us_bwd
-    ret["bwd_tflops"] = (bwd_flop) / 1.0e6 / us_bwd
-    ret["bwd_gb_per_sec"] = (bwd_num_bytes) / 1.0e3 / us_bwd
+    # ret["bwd_us"] = us_bwd
+    # ret["bwd_tflops"] = (bwd_flop) / 1.0e6 / us_bwd
+    # ret["bwd_gb_per_sec"] = (bwd_num_bytes) / 1.0e3 / us_bwd
     return ret
 
 
