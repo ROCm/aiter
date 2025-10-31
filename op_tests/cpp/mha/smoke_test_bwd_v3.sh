@@ -112,9 +112,8 @@ run_gfx950_bwd_v3() {
         hdim_v=128
     fi
 
-    set -x
     $EXE -prec=$prec -b=$batch -h=$head -h_k=2 -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
-    set +x
+
     done
     done
     done
