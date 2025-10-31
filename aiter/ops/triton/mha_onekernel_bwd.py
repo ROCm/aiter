@@ -246,47 +246,6 @@ def flash_attn_onekernel_backward(
     return dq, dk, dv
 
 
-def mha_fwd_reference(q, k, v, causal=True, sm_scale=None):
-    """Reference forward using JAX numpy to produce out and softmax_lse.
-
-    Returns:
-        out: [B, Lq, H, D]  (same layout as q/k/v in your code: b, s, h, d)
-        softmax_lse: [B, H, Lq]  (logsumexp per query position)
-    """
-    B, Lq, H, D = q.shape
-    max_seqlen_q = SEQ_LEN
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(D)
-
-    # compute logits: [B, H, Lq, Lk]
-    # q: [B, Lq, H, D]  -> transpose to [B, H, Lq, D]
-    qT = jnp.transpose(q, (0, 2, 1, 3))
-    kT = jnp.transpose(k, (0, 2, 1, 3))
-
-    # einsum for clarity: [B, H, Lq, D] @ [B, H, D, Lk] -> [B, H, Lq, Lk]
-    logits = jnp.einsum("bhqd,bhkd->bhqk", qT, kT) * sm_scale
-
-    # causal mask: allow j <= i
-    if causal:
-        # mask shape [Lq, Lk]
-        mask = jnp.tril(jnp.ones((Lq, max_seqlen_q), dtype=logits.dtype))
-        logits = jnp.where(mask[None, None, :, :] == 1, logits, -jnp.inf)
-
-    # compute softmax weights and out
-    # jax.nn.softmax handles numeric stability internally (uses logsumexp)
-    weights = jax.nn.softmax(logits, axis=-1)  # shape [B, H, Lq Lk]
-    vT = jnp.transpose(v, (0, 2, 1, 3))  # [B, H, Lk, D]
-    outT = jnp.einsum("bhqk,bhkd->bhqd", weights, vT)  # [B, H, Lq, D]
-
-    # transpose back to [B, Lq, H, D] to match your function's expected layout
-    out = jnp.transpose(outT, (0, 2, 1, 3))
-
-    # softmax_lse = logsumexp(logits, axis=-1), shape [B, H, Lq]
-    softmax_lse = jax.scipy.special.logsumexp(logits, axis=-1)
-
-    return out, softmax_lse
-
-
 # MHA shape
 BATCH_SIZE: int = 2
 SEQ_LEN: int = 1024
@@ -357,6 +316,15 @@ def main(unused_argv):
         # USE_INT64_STRIDES=False,
         # config=config,
     )
+
+    dq_ref, dk_ref, dv_ref = jax_attn_bwd_reference(q,k,v)
+
+    # numeric check (allow fp16 tolerance)
+    atol = 1e-2 if MHA_DTYPE in (jnp.float16, jnp.bfloat16) else 1e-3
+    max_diff = jnp.max(jnp.abs(dq - dq_ref))
+        
+    assert jnp.allclose(dq, dq_ref, atol=atol), \
+        f"Max diff ({max_diff}) exceeds tolerance (atol={atol})"
 
 
 if __name__ == "__main__":
