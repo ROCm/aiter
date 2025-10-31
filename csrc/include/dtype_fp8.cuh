@@ -56,7 +56,7 @@ namespace vllm
   template <>
   struct Vec<uint8_t, 8>
   {
-    using Type = uint2;
+    using Type = uint64_t;
   };
 
 } // namespace vllm
