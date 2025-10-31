@@ -1,0 +1,8 @@
+stage,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,us,kernelName,err
+stage1,256,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,0,76.9207,moe_ck2stages_gemm1_256x32x64x128_1x4_TypeCast_v1_Nswizzle0_no_MulRoutedWeight0_silu,0.0%
+stage1,256,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,0,76.0706,moe_ck2stages_gemm1_256x32x64x64_1x4_TypeCast_v1_Nswizzle0_no_MulRoutedWeight0_silu,0.0%
+stage1,256,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,64,0,81.5285,moe_ck2stages_gemm1_256x64x64x128_1x4_TypeCast_v1_Nswizzle0_no_MulRoutedWeight0_silu,0.0%
+stage1,256,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,64,0,79.2701,moe_ck2stages_gemm1_256x64x64x64_1x4_TypeCast_v1_Nswizzle0_no_MulRoutedWeight0_silu,0.0%
+stage1,256,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,128,0,84.2129,moe_ck2stages_gemm1_256x128x64x64_1x4_TypeCast_v1_Nswizzle0_no_MulRoutedWeight0_silu,0.0%
+stage2,256,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,128,0,77.7733,moe_ck2stages_gemm2_256x128x128x64_1x4_TypeCast_v1_Nswizzle0_no_MulRoutedWeight1,0.1%
+stage2,256,4096,192,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,128,0,67.6697,moe_ck2stages_gemm2_256x128x128x64_1x4_TypeCast_v3_Nswizzle0_no_MulRoutedWeight1,0.1%
