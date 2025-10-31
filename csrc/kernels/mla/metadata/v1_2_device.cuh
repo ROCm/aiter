@@ -29,6 +29,7 @@ __global__ void kn_get_mla_metadata_v1_2(
     extern __shared__ uint8_t p_smem[];
     int32_t* p_lds_seqlens_qo = reinterpret_cast<int32_t*>(p_smem);
     int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + params.num_batches;
+    int32_t* p_lds_partial_info = p_lds_seqlens_kv + params.num_batches;
 
     QoState<Traits> qo_state(params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
 
@@ -128,8 +129,20 @@ __global__ void kn_get_mla_metadata_v1_2(
                             last_reduce_indptr + (qo_tile_idx + 1) * num_splits;
                         params.p_reduce_final_map[global_qo_tile_idx * 2] = work_info.qo_start;
                         params.p_reduce_final_map[global_qo_tile_idx * 2 + 1] = work_info.qo_end;
-                        params.p_reduce_partial_map[last_reduce_indptr + qo_tile_idx * num_splits + split_idx] =
-                            partial_idx - (curr_n_split_idx - split_idx) * qo_tile_size * num_qo_tiles;
+
+                        if constexpr (Traits::kQoSplits)
+                        {
+                            const int32_t partial_qo_loc = (split_idx < (num_splits - 1))
+                                ? p_lds_partial_info[qo_tile_idx + split_idx * num_qo_tiles]
+                                : work_info.partial_qo_loc;
+                            params.p_reduce_partial_map[last_reduce_indptr + qo_tile_idx * num_splits + split_idx] =
+                                partial_qo_loc;
+                        }
+                        else
+                        {
+                            params.p_reduce_partial_map[last_reduce_indptr + split_idx] =
+                                partial_idx - (curr_n_split_idx - split_idx) * qo_tile_size;
+                        }
                     }
                     else
                     {
@@ -218,6 +231,12 @@ __global__ void kn_get_mla_metadata_v1_2(
                         work_info.kv_offset = curr_kv_end - work_info.kv_end;
                         work_info.partial_qo_loc = partial_idx + qo_tile_idx * qo_tile_size;
                         p_work_info_set[num_works + qo_tile_idx] = work_info;
+
+                        if constexpr (Traits::kQoSplits)
+                        {
+                            p_lds_partial_info[curr_n_split_idx * num_qo_tiles + qo_tile_idx] =
+                                work_info.partial_qo_loc;
+                        }
                     };
 
                     // record a work in work_info_set
@@ -249,7 +268,7 @@ __global__ void kn_get_mla_metadata_v1_2(
         params.p_work_indptr[cid + 1] = num_works;
     }
 
-    for (int32_t i = params.num_batches + lane_idx; i < params.reduce_indptr_size; i += ck_tile::get_warp_size())
+    for (int32_t i = tot_qo_tiles + lane_idx; i < params.reduce_indptr_size; i += ck_tile::get_warp_size())
     {
         params.p_reduce_indptr[i] = last_reduce_indptr;
     }

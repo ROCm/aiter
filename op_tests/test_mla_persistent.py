@@ -302,6 +302,8 @@ def test_mla(
 
     err = None
     us_asm_decode = 10000000000
+    flops = 0
+    bytes = 1
     if nhead == 16:
         err, us_asm_decode, flops, bytes = test_absorb_decode()
         print("us_asm_decode:", us_asm_decode)
@@ -482,7 +484,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 2)]
+list_nhead = [(16, 2), (128, 2)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -562,7 +564,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(1, 80)],  # [41],
+    default=[i for i in range(1, 80, 3)],  # [41],
     help="""Batch size.
     e.g.: -b 16""",
 )
