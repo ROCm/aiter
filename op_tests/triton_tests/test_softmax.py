@@ -1,6 +1,7 @@
 import torch
 import pytest
-from aiter.ops.triton.softmax import softmax
+from aiter.ops.triton.softmax import softmax as triton_softmax
+from aiter.ops.triton.gluon.softmax import softmax as gluon_softmax
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
@@ -21,11 +22,24 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
         (1, 89999),
     ],
 )
-def test_softmax(M, N, dtype):
+@pytest.mark.parametrize(
+    "impl",
+    [
+        "gluon",
+        "triton",
+    ],
+)
+def test_softmax(M, N, dtype, impl: str):
     dtype = str_to_torch_dtype[dtype]
     torch.manual_seed(0)
     x = torch.randn(M, N, dtype=dtype, device="cuda")
-    y_triton = softmax(x)
+    if impl == "gluon":
+        impl = gluon_softmax
+    elif impl == "triton":
+        impl = triton_softmax
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
+    y_triton = impl(x)
     y_torch = torch.softmax(x, axis=1)
 
     if dtype in (torch.float16, torch.bfloat16):

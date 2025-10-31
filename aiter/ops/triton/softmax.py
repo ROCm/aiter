@@ -43,9 +43,9 @@ def softmax(x):
         n_rows,
         n_cols,
         BLOCK_SIZE,
+        num_stages,
         waves_per_eu=waves_per_eu,
         num_warps=num_warps,
-        num_stages=num_stages,
     )
 
     return y
