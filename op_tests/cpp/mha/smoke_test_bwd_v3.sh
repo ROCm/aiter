@@ -145,8 +145,8 @@ run_gfx950_group_bwd_v3() {
     done
 }
 
-# run_batch_mode_tests
-# run_group_mode_tests
-# run_swa_tests
+run_batch_mode_tests
+run_group_mode_tests
+run_swa_tests
 # run_gfx950_group_bwd_v3
-run_gfx950_bwd_v3
+# run_gfx950_bwd_v3
