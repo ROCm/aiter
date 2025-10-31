@@ -371,7 +371,7 @@ def e2e_moe_kernel(
             out_mask = token_mask[:, None]
         else:
             out_mask = token_mask[:, None] & (
-                offs_k2[None, :] < (K - k2 * BLOCK_SIZE_K2 * stride_ok)
+                offs_k2[None, :] < (K - k2 * BLOCK_SIZE_K2)
             )
 
         if SKINNY:
