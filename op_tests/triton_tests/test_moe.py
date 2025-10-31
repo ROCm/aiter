@@ -73,14 +73,15 @@ def torch_moe_ref(
     if use_block_scale:
         blockshape_n, blockshape_k = blockshape
 
-    if fp8_w8a8:
+    if fp8_w8a8 and a_scale is None:
         if use_block_scale:
             a, _, a_scale = quantize_fp8_a(a, blockshape_k=blockshape_k)
         else:
             a, _, a_scale = quantize_fp8(a)
 
-    M, top_k, N = c.shape
+    M, top_k, N_half = c.shape
     _, K = a.shape
+    N = N_half * 2
 
     if int4_w4a16:
         b = torch.repeat_interleave(b, repeats=2, dim=2)  # Expand to (E, N, K)
@@ -1099,6 +1100,7 @@ def test_fused_moe_gelu(
     ],
 )
 @pytest.mark.parametrize("routed_weight", [False])
+# @pytest.mark.parametrize("fp8_w8a8", [True, False]) # precision issue with the block scale
 @pytest.mark.parametrize("fp8_w8a8", [False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("blockshape_n, blockshape_k", [(128, 128)])
