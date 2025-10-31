@@ -287,7 +287,7 @@ def test_gemm_afp4_wfp4(
                 w_scales_triton,
                 dtype,
                 y,
-                use_aot=(layout == "TN"),
+                use_aot=(dtype == torch.bfloat16 and layout == "TN"),
             )
         else:
             triton_out = gemm_afp4wfp4_preshuffled_weight_scales(
@@ -296,7 +296,7 @@ def test_gemm_afp4_wfp4(
                 x_scales_triton,
                 w_scales_triton,
                 dtype,
-                use_aot=(layout == "TN"),
+                use_aot=(dtype == torch.bfloat16 and layout == "TN"),
             )
     elif shuffle_scales_fg and not shuffle_weight_fg:
         if output:
