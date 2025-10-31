@@ -169,6 +169,17 @@
           py::arg("kernelId") = 0,    \
           py::arg("splitK")   = 0);
 
+#define DEEPGEMM_PYBIND                      \
+    m.def("deepgemm",                        \
+          &deepgemm,                         \
+          "deepgemm",                        \
+          py::arg("XQ"),                     \
+          py::arg("WQ"),                     \
+          py::arg("Y"),                      \
+          py::arg("group_layout"),           \
+          py::arg("x_scale") = std::nullopt, \
+          py::arg("w_scale") = std::nullopt);
+
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
           &aiter::swap_blocks,                                                      \
@@ -256,13 +267,13 @@
           &aiter::init_custom_ar,                                                              \
           "init_custom_ar(Tensor meta, Tensor rank_data, "                                     \
           "str[] handles, int[] offsets, int rank, "                                           \
-          "bool full_nvlink) -> int",                                                          \
+          "bool fully_connected) -> int",                                                      \
           py::arg("meta"),                                                                     \
           py::arg("rank_data"),                                                                \
           py::arg("handles"),                                                                  \
           py::arg("offsets"),                                                                  \
           py::arg("rank"),                                                                     \
-          py::arg("full_nvlink"));                                                             \
+          py::arg("fully_connected"));                                                         \
     m.def("all_gather_reg",                                                                    \
           &aiter::all_gather_reg,                                                              \
           "all_gather_reg(int fa, Tensor inp, Tensor! out) -> ()",                             \
@@ -276,20 +287,13 @@
           py::arg("inp"),                                                                      \
           py::arg("reg_buffer"),                                                               \
           py::arg("out"));                                                                     \
-    m.def("all_reduce_reg",                                                                    \
-          &aiter::all_reduce_reg,                                                              \
-          "all_reduce_reg(int fa, Tensor inp, Tensor! out, bool open_fp8_quant) -> ()",        \
+    m.def("all_reduce",                                                                        \
+          &aiter::all_reduce,                                                                  \
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("out"),                                                                      \
-          py::arg("open_fp8_quant"));                                                          \
-    m.def("all_reduce_unreg",                                                                  \
-          &aiter::all_reduce_unreg,                                                            \
-          "all_reduce_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> ()",        \
-          py::arg("_fa"),                                                                      \
-          py::arg("inp"),                                                                      \
-          py::arg("reg_buffer"),                                                               \
-          py::arg("out"));                                                                     \
+          py::arg("open_fp8_quant"),                                                           \
+          py::arg("reg_buffer") = std::nullopt);                                               \
     m.def("all_reduce_asm_", &all_reduce_asm, "");                                             \
     m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");                   \
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \
@@ -338,13 +342,10 @@
           py::arg("x_scale"),                                           \
           py::arg("w_scale"),                                           \
           py::arg("Out"),                                               \
+          py::arg("kernelName"),                                        \
           py::arg("bias"),                                              \
-          py::arg("sub_m")  = 128,                                      \
-          py::arg("sub_n")  = 128,                                      \
-          py::arg("pad_a")  = 0,                                        \
-          py::arg("pad_b")  = 0,                                        \
-          py::arg("pad_c")  = 0,                                        \
-          py::arg("splitK") = 0);
+          py::arg("bpreshuffle") = true,                                \
+          py::arg("splitK")      = std::nullopt);
 
 #define GEMM_A16W16_ASM_PYBIND                  \
     m.def("gemm_a16w16_asm",                    \
@@ -1149,6 +1150,13 @@
 
 #define SAMPLE_PYBIND                                                                \
     m.def("greedy_sample", &aiter::greedy_sample, py::arg("out"), py::arg("input")); \
+    m.def("random_sample_outer_exponential",                                         \
+          &aiter::random_sample_outer_exponential,                                   \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("exponentials"),                                                   \
+          py::arg("temperature"),                                                    \
+          py::arg("eps") = 1e-10);                                                   \
     m.def("random_sample",                                                           \
           &aiter::random_sample,                                                     \
           py::arg("out"),                                                            \
@@ -1157,6 +1165,13 @@
           py::arg("lambd")     = 1.0,                                                \
           py::arg("generator") = std::nullopt,                                       \
           py::arg("eps")       = 1e-10);                                                   \
+    m.def("mixed_sample_outer_exponential",                                          \
+          &aiter::mixed_sample_outer_exponential,                                    \
+          py::arg("out"),                                                            \
+          py::arg("input"),                                                          \
+          py::arg("exponentials"),                                                   \
+          py::arg("temperature"),                                                    \
+          py::arg("eps") = 1e-10);                                                   \
     m.def("mixed_sample",                                                            \
           &aiter::mixed_sample,                                                      \
           py::arg("out"),                                                            \
@@ -1181,12 +1196,12 @@
           py::arg("mat1"),                                                         \
           py::arg("mat2"),                                                         \
           py::arg("solution_index"),                                               \
-          py::arg("bias")      = std::nullopt,                                     \
-          py::arg("out_dtype") = std::nullopt,                                     \
-          py::arg("scaleA")    = std::nullopt,                                     \
-          py::arg("scaleB")    = std::nullopt,                                     \
-          py::arg("scaleOut")  = std::nullopt,                                      \
-          py::arg("bpreshuffle")  = std::nullopt);                                     \
+          py::arg("bias")        = std::nullopt,                                   \
+          py::arg("out_dtype")   = std::nullopt,                                   \
+          py::arg("scaleA")      = std::nullopt,                                   \
+          py::arg("scaleB")      = std::nullopt,                                   \
+          py::arg("scaleOut")    = std::nullopt,                                   \
+          py::arg("bpreshuffle") = std::nullopt);                                  \
     m.def("hipb_findallsols",                                                      \
           &hipb_findallsols,                                                       \
           "hipb_findallsols",                                                      \
@@ -1196,7 +1211,8 @@
           py::arg("out_dtype") = std::nullopt,                                     \
           py::arg("scaleA")    = std::nullopt,                                     \
           py::arg("scaleB")    = std::nullopt,                                     \
-          py::arg("scaleC")    = std::nullopt);                                       \
+          py::arg("scaleC")    = std::nullopt,                                     \
+          py::arg("bpreshuffle") = false);                                         \
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
 
 #define ROCSOLGEMM_PYBIND                                                          \
@@ -1223,3 +1239,23 @@
     pybind11::implicitly_convertible<int, ActivationType>();
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
+
+#define TOPK_PER_ROW_PYBIND      \
+    m.def("topk_per_row",        \
+          &topk_per_row,         \
+          py::arg("logits"),     \
+          py::arg("rowStarts"),  \
+          py::arg("rowEnds"),    \
+          py::arg("indices"),    \
+          py::arg("numRows"),    \
+          py::arg("stride0"),    \
+          py::arg("stride1"));   \
+    m.def("topk_per_row_decode", \
+          &topk_per_row_decode,  \
+          py::arg("logits"),     \
+          py::arg("next_n"),     \
+          py::arg("seqLens"),    \
+          py::arg("indices"),    \
+          py::arg("numRows"),    \
+          py::arg("stride0"),    \
+          py::arg("stride1"));
