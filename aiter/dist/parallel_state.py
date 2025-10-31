@@ -119,6 +119,23 @@ def all_reduce_(
     return group._all_reduce_out_place(tensor, ca_fp8_quant)
 
 
+def fused_allreduce_rmsnorm_fake(
+    inp: torch.Tensor, w: torch.Tensor, eps: float, group_name: str
+) -> torch.Tensor:
+    return torch.empty_like(inp)
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
+def fused_allreduce_rmsnorm_(
+    inp: torch.Tensor, w: torch.Tensor, eps: float, group_name: str
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_out_place(inp, w, eps)
+
+
 if supports_custom_op():
 
     # @torch.library.custom_op("aiter::outplace_all_gather", mutates_args=[])
@@ -328,6 +345,20 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_, ca_fp8_quant)
+
+    def fused_allreduce_rmsnorm(
+        self, input_: torch.Tensor, weight_: torch.Tensor, eps: float
+    ) -> torch.Tensor:
+        return fused_allreduce_rmsnorm_(
+            input_, weight_, eps, group_name=self.unique_name
+        )
+
+    def _fused_allreduce_rmsnorm_out_place(
+        self, input_: torch.Tensor, weight_: torch.Tensor, eps: float
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm(input_, weight_, eps)
 
     def _all_gather_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         ca_comm = self.device_communicator.ca_comm
