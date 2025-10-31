@@ -201,6 +201,27 @@ def moe_stage1_g1u1(
 ) -> None: ...
 
 
+@compile_ops("module_moe_asm")
+def moe_stage2_g1u1(
+    input: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    inter_dim: int,
+    kernelName: str,
+    block_m: int,
+    ksplit: int = 0,
+    activation: Optional[Enum] = ActivationType.Silu.value,
+    quant_type: Optional[Enum] = QuantType.No.value,
+    a2_scale: Optional[Tensor] = None,
+    w2_scale: Optional[Tensor] = None,
+    sorted_weights: Optional[Tensor] = None,
+) -> None: ...
+
+
 def cmdGenFunc_ck_moe_stage(
     hidden_states: Tensor,
     w1: Tensor,

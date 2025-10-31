@@ -166,6 +166,24 @@ void moe_stage1_g1u1(
     std::optional<torch::Tensor> w1_scale, // [expert, 1, inter_dim], gate(up) scale
     std::optional<torch::Tensor> sorted_weights);
 
+void moe_stage2_g1u1(
+    torch::Tensor& input,             // [token_cnt, topK, inter_dim] M,topk,N
+    torch::Tensor& w1,                // [expert, inter_dim*2, model_dim] N,K
+    torch::Tensor& w2,                // [expert, model_dim, inter_dim]
+    torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
+    torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
+    torch::Tensor& num_valid_ids,     // [1]
+    torch::Tensor& out,               // [token_cnt, topk, inter_dim]
+    int inter_dim,
+    std::string& kernelName,
+    int block_m,
+    int ksplit,
+    ActivationType activation,
+    QuantType quant_type,
+    std::optional<torch::Tensor> a2_scale, // [token_cnt, 1], token scale
+    std::optional<torch::Tensor> w2_scale, // [expert, 1, inter_dim], gate(up) scale
+    std::optional<torch::Tensor> sorted_weights);
+
 void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
                       torch::Tensor& topk_indices,         // [num_tokens, topk]
                       torch::Tensor& token_expert_indices, // [num_tokens, topk]

@@ -900,6 +900,24 @@
           py::arg("a1_scale")       = std::nullopt,                            \
           py::arg("w1_scale")       = std::nullopt,                            \
           py::arg("sorted_weights") = std::nullopt);                           \
+    m.def("moe_stage2_g1u1",                                                   \
+          &moe_stage2_g1u1,                                                    \
+          py::arg("input"),                                                    \
+          py::arg("w1"),                                                       \
+          py::arg("w2"),                                                       \
+          py::arg("sorted_token_ids"),                                         \
+          py::arg("sorted_expert_ids"),                                        \
+          py::arg("num_valid_ids"),                                            \
+          py::arg("out"),                                                      \
+          py::arg("inter_dim"),                                                \
+          py::arg("kernelName"),                                               \
+          py::arg("block_m"),                                                  \
+          py::arg("ksplit")         = 0,                                       \
+          py::arg("activation")     = ActivationType::Silu,                    \
+          py::arg("quant_type")     = QuantType::No,                           \
+          py::arg("a2_scale")       = std::nullopt,                            \
+          py::arg("w2_scale")       = std::nullopt,                            \
+          py::arg("sorted_weights") = std::nullopt);                           \
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_SORTING_PYBIND                             \
@@ -1178,12 +1196,12 @@
           py::arg("mat1"),                                                         \
           py::arg("mat2"),                                                         \
           py::arg("solution_index"),                                               \
-          py::arg("bias")      = std::nullopt,                                     \
-          py::arg("out_dtype") = std::nullopt,                                     \
-          py::arg("scaleA")    = std::nullopt,                                     \
-          py::arg("scaleB")    = std::nullopt,                                     \
-          py::arg("scaleOut")  = std::nullopt,                                      \
-          py::arg("bpreshuffle")  = std::nullopt);                                     \
+          py::arg("bias")        = std::nullopt,                                   \
+          py::arg("out_dtype")   = std::nullopt,                                   \
+          py::arg("scaleA")      = std::nullopt,                                   \
+          py::arg("scaleB")      = std::nullopt,                                   \
+          py::arg("scaleOut")    = std::nullopt,                                   \
+          py::arg("bpreshuffle") = std::nullopt);                                  \
     m.def("hipb_findallsols",                                                      \
           &hipb_findallsols,                                                       \
           "hipb_findallsols",                                                      \

@@ -908,6 +908,61 @@ def asm_stage1(
     return out
 
 
+def asm_stage2(
+    input,  # [token_num, topk, inter_dim]
+    w1,
+    w2,
+    sorted_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,  # [token_num, inter_dim]M N
+    topk,
+    block_m: int,
+    kernelName: str = "",
+    ksplit: int = 0,
+    activation=ActivationType.Silu,
+    quant_type=QuantType.No,
+    a2_scale=None,
+    w2_scale=None,
+    sorted_weights=None,
+):
+    dtype = dtypes.bf16  # out.dtype, asm only support bf16
+    if quant_type != QuantType.per_1x32:
+        print('only support fp4 in MoE stage2 asm')
+        assert(0)
+    device = out.device
+    token_num, _= out.shape
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+
+    if quant_type == QuantType.per_Tensor:
+        a1_scale = a1_scale.view(1, 1).repeat(token_num, 1)
+        w1_scale = w1_scale.view(E, 1).repeat(1, w1.shape[1])
+        quant_type = QuantType.per_Token
+
+    tmp_out = out
+
+    aiter.moe_stage2_g1u1(
+        input,
+        w1,
+        w2,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        tmp_out,
+        inter_dim,
+        kernelName,
+        block_m,
+        ksplit=ksplit,
+        activation=activation,
+        quant_type=quant_type,
+        a1_scale=a1_scale,
+        w1_scale=w1_scale,
+        sorted_weights=sorted_weights,
+    )
+    return out
+
+
+
 def torch_moe(
     hidden_states,
     w1,
