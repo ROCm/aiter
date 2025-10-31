@@ -494,7 +494,7 @@ def get_2stage_cfgs(
         ksplit = cfg["ksplit"]
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
-        run_1stage = cfg["run_1stage"]
+        run_1stage = False if "run_1stage" not in cfg else cfg["run_1stage"]
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(

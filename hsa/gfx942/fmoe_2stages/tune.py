@@ -235,7 +235,10 @@ def go(
         w1_qt = w1_qt.view(w1.shape)
         w2_qt = w2_qt.view(w2.shape)
         score = torch.randn((token, expert), dtype=dtype)
-        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+        topk_weights, topk_ids = torch.topk(score, topk, dim=-1)
+        # Normalize weights
+        topk_weights = torch.softmax(topk_weights.float(), dim=-1)
+        topk_ids = topk_ids.to(torch.int32)
         if q_type == QuantType.per_128x128:
             a1_qt, a1_scale = aiter.pertoken_quant(
                 input.view(token, -1, 128), quant_dtype=q_dtype_a
