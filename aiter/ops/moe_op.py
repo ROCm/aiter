@@ -32,6 +32,12 @@ def topk_softmax_asm(
 ) -> None: ...
 
 
+@compile_ops("module_moe_topk")
+def topk_sigmoid(
+    topk_weights: Tensor, topk_indices: Tensor, gating_output: Tensor
+) -> None: ...
+
+
 @compile_ops("module_moe_asm")
 def moe_sum(input: Tensor, output: Tensor) -> None: ...
 

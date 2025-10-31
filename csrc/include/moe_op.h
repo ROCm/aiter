@@ -190,4 +190,8 @@ void moe_align_block_size(torch::Tensor topk_ids,
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
 
+void topk_sigmoid(torch::Tensor topk_weights,   // [tokens, topk]
+                  torch::Tensor topk_indices,   // [tokens, topk]
+                  torch::Tensor gating_output); // [tokens, experts]
+
 } // namespace aiter
