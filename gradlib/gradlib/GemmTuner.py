@@ -45,6 +45,7 @@ def init_hipblas():
 def init_rocblas():
     aiter.rocb_create_extension()
 
+
 def call_hipb_mm(input, weight, bias, scale_a, scale_b, solidx, out_dtype):
     init_hipblas()
     return aiter.hipb_mm(
@@ -203,7 +204,7 @@ class Gemm:
             len(sols),
             flush=True,
         )
-        #print(sols)
+        # print(sols)
         self.hipb_sols = sols
 
     def get_gemm_ref(self):
@@ -526,12 +527,13 @@ class Gemm:
         self.functional_get_topn_fastest()
         rets = self.run_best_solutions()
         return rets
+
     def cleanup(self):
-        if hasattr(self, 'inp'):
+        if hasattr(self, "inp"):
             del self.inp
-        if hasattr(self, 'weights'):
+        if hasattr(self, "weights"):
             del self.weights
-        if hasattr(self, 'bias') and self.bias is not None:
+        if hasattr(self, "bias") and self.bias is not None:
             del self.bias
         if hasattr(self, "blob"):
             cpu_blob = self.blob.cpu()

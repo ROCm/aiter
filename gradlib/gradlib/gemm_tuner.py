@@ -28,12 +28,8 @@ import pandas as pd
 from GemmTuner import GemmTuner
 
 import time
-<<<<<<< HEAD
-import multiprocessing
-=======
 import multiprocessing as mp
 import gc
->>>>>>> f68846e9 (workaround-retry tuning when encounter invalid pointer)
 
 aiter.rocb_create_extension()
 aiter.hipb_create_extension()
@@ -94,10 +90,7 @@ def load_input_gemms(input_file):
     if Path(input_file).is_file():
         return
 
-<<<<<<< HEAD
-=======
 
->>>>>>> f68846e9 (workaround-retry tuning when encounter invalid pointer)
 def runGemmTuner():
     gtuner = GemmTuner()
     ext_group = gtuner.parser.add_argument_group("extra parameters")
