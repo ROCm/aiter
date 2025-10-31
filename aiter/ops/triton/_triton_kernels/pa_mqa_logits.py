@@ -387,3 +387,65 @@ def _deepgemm_fp8_paged_mqa_logits(
             + (context_idx + tl.arange(0, ChunkK)),
             logits,
         )
+
+
+@triton.jit
+def _gluon_deepgemm_fp8_paged_mqa_logits(
+    batch_size,
+    next_n,
+    heads_num,
+    Q_buffer,
+    stride_q_batch,
+    stride_q_next_n,
+    stride_q_heads,
+    KV_buffer,
+    stride_k_seq,
+    scale_buffer,
+    stride_scale_seq,
+    context_len_ptr,
+    kv_indices,
+    weights,
+    stride_w_batch,
+    OutLogits_buffer,
+    stride_out_batch,
+    max_model_len,
+    max_block_len,
+    SplitKV,
+    dummyPointerArg,
+    ChunkQ: tl.constexpr,
+    ChunkK: tl.constexpr,
+    HiddenDim: tl.constexpr,
+    KVBlockSize: tl.constexpr = 1,
+):
+    pass
+
+
+@triton.jit
+def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
+    batch_size,
+    next_n,
+    heads_num,
+    Q_buffer,
+    stride_q_batch,
+    stride_q_next_n,
+    stride_q_heads,
+    KV_buffer,
+    stride_k_seq,
+    scale_buffer,
+    stride_scale_seq,
+    context_len_ptr,
+    kv_indices,
+    weights,
+    stride_w_batch,
+    OutLogits_buffer,
+    stride_out_batch,
+    max_model_len,
+    max_block_len,
+    SplitKV,
+    dummyPointerArg,
+    ChunkQ: tl.constexpr,
+    ChunkK: tl.constexpr,
+    HiddenDim: tl.constexpr,
+    KVBlockSize: tl.constexpr = 16,
+):
+    pass
