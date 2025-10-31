@@ -331,6 +331,7 @@ def get_gemm1_kernels_list(
     ActOP: str,
     MulRoutedWeight: bool,
 ) -> list:
+    global bns_or_preslf
     arch = get_gfx()
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
         if arch == "gfx950":
