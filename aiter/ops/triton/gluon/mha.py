@@ -14,6 +14,12 @@ from aiter.ops.triton.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.gluon._gluon_kernels.mha import _attn_fwd, _get_config
+from aiter.ops.triton.mha import (
+    _cast_to_fp8,
+    _cast_varlen_to_fp8,
+    _USE_FUSED_BWD_KERNEL,
+    _USE_INT64_STRIDES,
+)
 
 
 def _flash_attn_forward(
