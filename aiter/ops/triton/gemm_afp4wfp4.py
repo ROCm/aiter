@@ -329,6 +329,7 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
+    use_aot: Optional[bool] = True,
 ):
     """
     Computes the matmul Y = X x W
@@ -407,7 +408,7 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
     if M < 32 and M_POW2 > 16:
         M_POW2 = 16
     metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_gemm_afp4_wfp4_kernel_preshuffled_weight_scales.fn.__name__}_M={M_POW2}-N={N}-K={K*2}"
-    if os.path.exists(metadata_pth):
+    if use_aot and os.path.exists(metadata_pth):
         with AOTMetadataContext(
             _gemm_afp4_wfp4_kernel_preshuffled_weight_scales.fn.__name__,
             f"{metadata_pth}",
