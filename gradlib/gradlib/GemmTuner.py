@@ -45,7 +45,6 @@ def init_hipblas():
 def init_rocblas():
     aiter.rocb_create_extension()
 
-
 def call_hipb_mm(input, weight, bias, scale_a, scale_b, solidx, out_dtype):
     init_hipblas()
     return aiter.hipb_mm(
@@ -148,6 +147,7 @@ class Gemm:
         profile_file="",
         # splitK=None,
     ):
+        torch.cuda.empty_cache()
         self.m = m
         self.k = k
         self.n = n
@@ -166,19 +166,19 @@ class Gemm:
         self.rocb_sols = []
         self.rtol = 1e-2
         self.atol = 1e-2
-        self.ref = self.get_gemm_ref()
+        #self.ref = self.get_gemm_ref()
         self.check_err_ratio = err_ratio
         self.splitK = None
         self.profile_file = profile_file
-        self.start = torch.cuda.Event(enable_timing=True)
-        self.end = torch.cuda.Event(enable_timing=True)
+        #self.start = torch.cuda.Event(enable_timing=True)
+        #self.end = torch.cuda.Event(enable_timing=True)
         # prefer hipblaslt unless rocblas time is less than this
         # ratio of hipblaslt time
         self.hipb_prefer_ratio = 0.995
         self.rocblas_decode = rocblas_decode
         self.mp = mp
-        self.inbpe = self.inp.element_size()
-        self.outbpe = self.ref.element_size()
+        #self.inbpe = self.inp.element_size()
+        #self.outbpe = self.ref.element_size()
         self.asm_map = {}
 
     def find_hipblas_sols(self):
@@ -203,7 +203,7 @@ class Gemm:
             len(sols),
             flush=True,
         )
-        # print(sols)
+        #print(sols)
         self.hipb_sols = sols
 
     def get_gemm_ref(self):
@@ -379,10 +379,13 @@ class Gemm:
         if fast_mode == 1:
             self.hipb_gtimedf = self.save_topn_result(ret, fast_mode, "hipblaslt")
             return []
+        print(f">>> hipblaslt top solutions, Fast Mode {fast_mode}")
         return ret
 
     def save_topn_result(self, rets, fast_mode, libtype):
         results = []
+        if not rets:
+            return pd.DataFrame(columns=["solidx", "gtimems", "splitK", "err_ratio", "kernelName"])
         for info, us, err_ratio in rets:
             res_one = []
             solidx = info[1]
@@ -478,8 +481,11 @@ class Gemm:
                     self.atol,
                 )
             )
-        in_data = [(len(solutions), ())]
-        ret = mp_tuner(task, in_data, self.mp, fast_mode == 1)
+        if task:
+            in_data = [(len(solutions), ())]
+            ret = mp_tuner(task, in_data, self.mp, fast_mode == 1)
+        else:
+            ret = []
         if fast_mode == 1:
             self.rocb_gtimedf = self.save_topn_result(ret, fast_mode, "rocblas")
             return []
@@ -518,6 +524,16 @@ class Gemm:
         self.functional_get_topn_fastest()
         rets = self.run_best_solutions()
         return rets
+    def cleanup(self):
+        if hasattr(self, 'inp'):
+            del self.inp
+        if hasattr(self, 'weights'):
+            del self.weights
+        if hasattr(self, 'bias') and self.bias is not None:
+            del self.bias
+        if hasattr(self, "blob"):
+            cpu_blob = self.blob.cpu()
+            del cpu_blob
 
 
 class GemmTuner(GemmCommonTuner):
@@ -597,6 +613,7 @@ class GemmTuner(GemmCommonTuner):
 
         self.hipb_prefer_ratio = 0.995
         self.cu_num = self.get_cu_num()
+        self.gemmobj = None
 
     def calculate_perf(
         self,
@@ -708,23 +725,24 @@ class GemmTuner(GemmCommonTuner):
             ds = df.loc[i, :]
             indtype = ds["dtype"]
             outdtype = ds["outdtype"]
-
             gemmobj = Gemm(
-                ds["M"],
-                ds["N"],
-                ds["K"],
-                ds["bias"],
-                indtype=eval(indtype),
-                outdtype=eval(outdtype),
-                scaleAB=ds["scaleAB"],
-                rocblas_decode=args.rocblas_decode,
-                mp=args.mp,
-                err_ratio=args.errRatio,
-                profile_file=args.profile_file,
-            )
+                    ds["M"],
+                    ds["N"],
+                    ds["K"],
+                    ds["bias"],
+                    indtype=eval(indtype),
+                    outdtype=eval(outdtype),
+                    scaleAB=ds["scaleAB"],
+                    rocblas_decode=args.rocblas_decode,
+                    mp=args.mp,
+                    err_ratio=args.errRatio,
+                    profile_file=args.profile_file,
+                )
+            
             ret.extend(gemmobj.run_solutions())
+            gemmobj.cleanup()
             del gemmobj
-            torch.cuda.empty_cache()
+
         return ret
 
     def processResult(self, rets, fast_mode):
@@ -819,7 +837,6 @@ class GemmTuner(GemmCommonTuner):
             if best_gtimedfs.empty:
                 best_gtimedfs = resultdf1
             else:
-                print("concat ", resultdf1)
                 best_gtimedfs = pd.concat([best_gtimedfs, resultdf1], ignore_index=True)
 
             print(f"{key} >>> Fastest Solution is \n {resultdf1}", flush=True)

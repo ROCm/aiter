@@ -28,6 +28,7 @@ import pandas as pd
 from GemmTuner import GemmTuner
 
 import time
+import multiprocessing
 
 aiter.rocb_create_extension()
 aiter.hipb_create_extension()
@@ -88,8 +89,7 @@ def load_input_gemms(input_file):
     if Path(input_file).is_file():
         return
 
-
-if __name__ == "__main__":
+def runGemmTuner():
     gtuner = GemmTuner()
     ext_group = gtuner.parser.add_argument_group("extra parameters")
     ext_group.add_argument(
@@ -117,7 +117,6 @@ if __name__ == "__main__":
         help="Tensor parallelism to be used.",
     )
     args = gtuner.parse_args()
-
     if args.outdtype is None:
         args.outdtype = args.indtype
     indtype = get_dtype(args.indtype)
@@ -130,9 +129,7 @@ if __name__ == "__main__":
             print(">>> Warning! NO MODEL SPECIFIED. Tuning for LL2 13B TP1")
             # LL2 13B sizes
             mksets = [(15360, 5120), (5120, 5120), (27648, 5120), (5120, 13824)]
-
             gtuner.add_gemm(m=32000, n=1, k=5120, indtype=indtype)  # logits gemm
-
         else:
             mksets, hidden_size, dtype = generate_mk_sets(args.model_dir, args.tp)
             gtuner.add_gemm(
@@ -141,11 +138,26 @@ if __name__ == "__main__":
                 k=hidden_size,
                 indtype=dtype,
             )  # TODO: Handle cases where vocab_size is not divisible by tp
-
             for n in sorted(nsets):
                 for m, k in mksets:
                     gtuner.add_gemm(m, n, k, indtype=dtype)
         gtuner.untunedf.to_csv("./tmp_untuned.csv", index=False)
         args.untune_file = "./tmp_untuned.csv"
-
     gtuner.run(args)
+    
+
+if __name__ == "__main__":
+    retries = 0
+    MAX_TRY = 30
+    multiprocessing.set_start_method("spawn", force=True)
+    while retries <= MAX_TRY:
+        process = multiprocessing.Process(target=runGemmTuner, args=())
+        process.start()
+        process.join()
+        if process.exitcode != 0:
+            time.sleep(0.5)
+            print("!Error when run GemmTuner process exitcode is ", process.exitcode)
+            retries = retries + 1
+        else:
+            break
+    print(f"retried num is {retries}")
