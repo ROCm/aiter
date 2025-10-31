@@ -8,7 +8,6 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
-import math
 import triton
 import triton.language as tl
 
@@ -384,42 +383,36 @@ def test_mla(
         dtype=dtype,
     )
 
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
-
-    # 128 here is the maxmium len in packed_qo (qolen*#heads) can handled by mla main kernel
-    # It would be more decent to query this value from aiter.
-    max_qo_tiles_per_batch = (
-        int(math.ceil(torch.max(seq_lens_qo).item() * nhead / 128))
-        if nhead in [16, 128]
-        else int(math.ceil(torch.max(seq_lens_qo).item() * nhead / 16))
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_mla_metadata_info_v1(
+        q, seq_lens_qo, nhead, mtp=mtp, is_sparse=True, fast_mode=True
     )
 
     # aiter implementation
     # the tensor's meaning please refer aiter/ops/attention.py
-    work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
-    work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
+    work_meta_data = torch.empty(
+        work_meta_data_size, dtype=work_meta_data_type, device="cuda"
+    )
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device="cuda")
     work_info_set = torch.empty(
-        [batch_size * max_qo_tiles_per_batch * cu_num, 8],
-        dtype=torch.int32,
+        work_info_set_size,
+        dtype=work_info_set_type,
         device="cuda",
     ).fill_(-1)
-    reduce_batch_size = batch_size * mtp
     reduce_indptr = torch.empty(
-        [reduce_batch_size * max_qo_tiles_per_batch + 1],
-        dtype=torch.int32,
-        device="cuda",
+        reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
     )
     reduce_final_map = torch.empty(
-        [reduce_batch_size * max_qo_tiles_per_batch, 2],
-        dtype=torch.int32,
-        device="cuda",
+        reduce_final_map_size, dtype=reduce_final_map_type, device="cuda"
     )
     reduce_partial_map = torch.empty(
-        [reduce_batch_size * max_qo_tiles_per_batch * cu_num],
-        dtype=torch.int32,
-        device="cuda",
+        reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
     meta = aiter.get_mla_metadata_v1(

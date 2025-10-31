@@ -173,7 +173,7 @@ def mla_decode_fwd(
     if nhead == 16 and max_seqlen_q == 1:
         # special case for 16 heads and max_seqlen_q == 1
         MAYBE_FINAL_OUT = False
-    elif nhead == 16 or (nhead == 128 and q.dtype == get_fp8_e4m3_dtype()):
+    elif nhead == 16 or (nhead == 128 and kv_buffer.dtype == get_fp8_e4m3_dtype()):
         # Natively support cases
         pass
     elif nhead in range(32, 512+1, 16) and persistent_mode and max_seqlen_q == 1:

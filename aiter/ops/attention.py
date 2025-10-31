@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 import torch
 from typing import Tuple, Optional
 from ..jit.core import (
@@ -12,6 +13,7 @@ from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
 )
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 MD_NAME = "module_attention"
 
@@ -330,6 +332,61 @@ def mla_prefill_asm_fwd(
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor,
 ) -> None: ...
+
+
+def get_mla_metadata_info_v1(
+    query: torch.Tensor,
+    seq_lens_qo: torch.Tensor,
+    num_head_qo: int,
+    mtp: int,
+    is_sparse: int,
+    fast_mode: bool = True,
+):
+    """
+    Returns:
+        1. Shape of work_metadata_ptrs followed by its scalar type.
+        2. Shape of work_indptr followed by its scalar type.
+        3. Shape of work_info_set followed by its scalar type.
+        4. Shape of reduce_indptr followed by its scalar type.
+        5. Shape of reduce_final_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type.
+    """
+
+    assert num_head_qo % 16 == 0
+
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+
+    batch_size = seq_lens_qo.size(0)
+    reduce_batch_size = batch_size * mtp if is_sparse else batch_size
+    max_qo_tiles_per_batch = (
+        int(math.ceil(torch.max(seq_lens_qo).item() * num_head_qo / 64))
+        if num_head_qo == 16
+        or (num_head_qo == 128 and query.dtype == get_fp8_e4m3_dtype())
+        else int(math.ceil(torch.max(seq_lens_qo).item() * num_head_qo / 16))
+    )
+
+    return (
+        ((2), torch.uint64),  # work_metadata_ptrs
+        ((cu_num + 1), torch.int32),  # work_indptr
+        (
+            (batch_size * max_qo_tiles_per_batch * cu_num, 8),
+            torch.int32,
+        ),  # work_info_set
+        (
+            (reduce_batch_size * max_qo_tiles_per_batch + 1),
+            torch.int32,
+        ),  # reduce_indptr
+        (
+            (reduce_batch_size * max_qo_tiles_per_batch, 2),
+            torch.int32,
+        ),  # reduce_final_map
+        (
+            (reduce_batch_size * max_qo_tiles_per_batch * cu_num),
+            torch.int32,
+        ),  # reduce_partial_map
+    )
 
 
 @compile_ops("module_mla_metadata")

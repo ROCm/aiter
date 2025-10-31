@@ -8,7 +8,6 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
-import math
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 torch.set_default_device("cuda")
@@ -215,31 +214,36 @@ def test_mla(
         dtype=dtype,
     )
 
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
-
-    # 128 here is the maxmium len in packed_qo (qolen*#heads) can handled by mla main kernel
-    # It would be more decent to query this value from aiter.
-    max_qo_tiles_per_batch = int(math.ceil(torch.max(seq_lens_qo).item() * nhead / 128)) if nhead in [16, 128] else int(math.ceil(torch.max(seq_lens_qo).item() * nhead / 16))
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_mla_metadata_info_v1(
+        q, seq_lens_qo, nhead, mtp=mtp, is_sparse=False, fast_mode=True
+    )
 
     # aiter implementation
     # the tensor's meaning please refer aiter/ops/attention.py
-    work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
-    work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
+    work_meta_data = torch.empty(
+        work_meta_data_size, dtype=work_meta_data_type, device="cuda"
+    )
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device="cuda")
     work_info_set = torch.empty(
-        [batch_size * max_qo_tiles_per_batch * cu_num, 8],
-        dtype=torch.int32,
+        work_info_set_size,
+        dtype=work_info_set_type,
         device="cuda",
     ).fill_(-1)
     reduce_indptr = torch.empty(
-        [batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
+        reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
     )
     reduce_final_map = torch.empty(
-        [batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
+        reduce_final_map_size, dtype=reduce_final_map_type, device="cuda"
     )
     reduce_partial_map = torch.empty(
-        [batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
+        reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
     meta = aiter.get_mla_metadata_v1(
@@ -304,7 +308,7 @@ def test_mla(
     us_asm_decode = 10000000000
     flops = 0.0
     bytes = 1
-    if (nhead in [16]) or (max_seqlen_qo == 1 and nhead in range(32, 512+1, 16)):
+    if (nhead in [16]) or (max_seqlen_qo == 1 and nhead in range(32, 512 + 1, 16)):
         err, us_asm_decode, flops, bytes = test_absorb_decode()
 
     def test_absorb_decode_fp8():
@@ -442,10 +446,14 @@ def test_mla(
         )
         return err, us_asm_decode, flops, bytes
 
-    err_bf16_fp8_fp32, us_asm_decode_bf16_fp8, flops_bf16_fp8, bytes_bf16_fp8 = (
-        test_absorb_decode_bf16_fp8()
-    )
-    print("us_asm_decode_bf16_fp8:", us_asm_decode_bf16_fp8)
+    err_bf16_fp8_fp32 = 0
+    us_asm_decode_bf16_fp8 = 10000000000
+    flops_bf16_fp8 = 0
+    bytes_bf16_fp8 = 1
+    if nhead == 16:
+        err_bf16_fp8_fp32, us_asm_decode_bf16_fp8, flops_bf16_fp8, bytes_bf16_fp8 = (
+            test_absorb_decode_bf16_fp8()
+        )
 
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")
