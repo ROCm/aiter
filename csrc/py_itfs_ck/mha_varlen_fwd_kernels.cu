@@ -96,31 +96,25 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
         bias_ptr = alibi_slopes.data_ptr();
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
-    
-    // Validate padded seqstart arrays if provided: shape [b+1], 1D, contiguous, int32/int64, monotonic
-    auto validate_and_maybe_convert = [&](std::optional<const at::Tensor> &opt_seqstarts,
-                                          const char *name) -> const ck_tile::index_t* {
-        if (!opt_seqstarts.has_value()) return nullptr;
-        const at::Tensor &t = opt_seqstarts.value();
-        CHECK_DEVICE(t);
-        TORCH_CHECK(t.dim() == 1, name, " must be 1D");
-        TORCH_CHECK(t.numel() == b + 1, name, " must have length batch+1");
-        TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
-        TORCH_CHECK(t.dtype() == torch::kInt32, name, " must be int32, actual: ", t.dtype());
-        auto ptr = reinterpret_cast<const ck_tile::index_t*>(t.data_ptr<int32_t>());
-        auto acc = t.index({0}).item<int32_t>();
-        TORCH_CHECK(acc == 0, name, " first element must be 0");
-        auto data_ptr32 = t.data_ptr<int32_t>();
-        for (int i = 1; i < t.numel(); ++i) {
-            int v = data_ptr32[i];
-            TORCH_CHECK(v >= acc, name, " must be non-decreasing");
-            acc = v;
-        }
-        return ptr;
-    };
+        
+    const void* seqstart_k_ptr = nullptr;
+    const void* seqstart_q_ptr = nullptr;
+    const void* cu_seqlen_k_ptr = nullptr;
+    const void* cu_seqlen_q_ptr = nullptr;
 
-    const ck_tile::index_t *seqstart_padded_q_ptr = validate_and_maybe_convert(cu_seqlens_q_padded_, "cu_seqlens_q_padded");
-    const ck_tile::index_t *seqstart_padded_k_ptr = validate_and_maybe_convert(cu_seqlens_k_padded_, "cu_seqlens_k_padded");
+    if (cu_seqlens_k_padded_.has_value()) {
+        seqstart_k_ptr = cu_seqlens_k_padded_.value().data_ptr();
+        cu_seqlen_k_ptr = cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr;
+    } else {
+        seqstart_k_ptr = cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr;
+    }
+
+    if (cu_seqlens_q_padded_.has_value()) {
+        seqstart_q_ptr = cu_seqlens_q_padded_.value().data_ptr();
+        cu_seqlen_q_ptr = cu_seqlens_q.data_ptr();
+    } else {
+        seqstart_q_ptr = cu_seqlens_q.data_ptr();
+    }
 
     return mha_fwd_args{q.data_ptr(),
                          k.data_ptr(),
@@ -129,20 +123,19 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
-                         nullptr, // cu_seqlen_q_ptr (batch mode only)
-                         nullptr, // cu_seqlen_kv_ptr (batch mode only)
-                         cu_seqlens_q.data_ptr(), // seqstart_q
-                         cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k
-                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_kpads
-                         seqstart_padded_q_ptr,
-                         seqstart_padded_k_ptr,
+                         seqstart_q_ptr, // seqstart_q_ptr (cumulative physical with padding)
+                         seqstart_k_ptr, // seqstart_k_ptr (cumulative physical with padding)
+                         nullptr, // seqlen_q_ptr (per-sequence logical, alternative to cu_seqlen_q_ptr)
+                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr (per-sequence logical K lengths)
+                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
+                         cu_seqlen_k_ptr, // cu_seqlen_k_ptr
                          total_q,
                          total_k,
                          b,
                          max_seqlen_q,
                          d,             // hdim_q
                          d_v,           // hdim_v
-                         h,             // nhead
+                         h,             // nhead_q
                          h_k,           // nhead_k
                          softmax_scale, // scale_s
                          1,             // scale_p
@@ -624,9 +617,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                                      bias_type,
                                      has_lse,
                                      false, // use_ext_asm
-                                     1,     // how_v3_bf16_cvt
-                                     args.seqstart_padded_q_ptr,
-                                     args.seqstart_padded_k_ptr);
+                                     1);     // how_v3_bf16_cvt
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
         }
     }

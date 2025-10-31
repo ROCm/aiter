@@ -97,20 +97,19 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
-                         cu_seqlen_q_ptr,
-                         cu_seqlen_kv_ptr,
-                         nullptr, // seqstart_q
-                         nullptr, // seqstart_k
-                         nullptr,
-                         nullptr, // seqstart_padded_q_ptr
-                         nullptr, // seqstart_padded_k_ptr
+                         nullptr, // seqstart_q_ptr
+                         nullptr, // seqstart_k_ptr
+                         nullptr, // seqlen_q_ptr
+                         nullptr, // seqlen_k_ptr
+                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
+                         cu_seqlen_kv_ptr, // cu_seqlen_k_ptr
                          seqlen_q,
                          seqlen_k,
                          b,
                          seqlen_q,      // max_seqlen_q
                          d,             // hdim_q
                          d_v,           // hdim_v
-                         h,             // nhead
+                         h,             // nhead_q
                          h_k,           // nhead_k
                          softmax_scale, // scale_s
                          1,             // scale_p
@@ -139,7 +138,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          mask.left,
                          mask.right,
                          static_cast<ck_tile::index_t>(mask.type),
-                         0,
+                         0, // min_seqlen_q
                          p_dropout,
                          has_dropout_randval,
                          drop_seed_offset};
