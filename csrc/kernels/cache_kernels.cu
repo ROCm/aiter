@@ -1244,7 +1244,7 @@ __global__ void cp_gather_indexer_k_quant_cache_kernel(
 )
 {
     constexpr int VEC_SIZE = sizeof(float4) / sizeof(char);
-    const int token_idx    = blockIdx.x * BLOCK_Y_SIZE+ threadIdx.y;
+    const int token_idx    = blockIdx.x * BLOCK_Y_SIZE + threadIdx.y;
     const int head_idx     = (blockIdx.y * BLOCK_X_SIZE + threadIdx.x) * VEC_SIZE;
     // Find batch index within a block
     __shared__ int batch_idx[BLOCK_Y_SIZE];
@@ -1584,16 +1584,17 @@ void reshape_and_cache_flash(
                                      reinterpret_cast<const float*>(scale.data_ptr()));
 
 // Macro to dispatch the kernel based on the data type.
-#define CALL_INDEXER_K_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                            \
-    aiter::indexer_k_quant_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, blockDimx, blockDimy, vec_size> \
-        <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(k.data_ptr()),                \
-                                     reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),      \
-                                     slot_mapping.data_ptr<int64_t>(),                     \
-                                     num_tokens,                                           \
-                                     head_dim,                                             \
-                                     quant_block_size,                                     \
-                                     cache_block_size,                                     \
-                                     cache_stride,                                         \
+#define CALL_INDEXER_K_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                                   \
+    aiter::                                                                                       \
+        indexer_k_quant_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, blockDimx, blockDimy, vec_size> \
+        <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(k.data_ptr()),                       \
+                                     reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),             \
+                                     slot_mapping.data_ptr<int64_t>(),                            \
+                                     num_tokens,                                                  \
+                                     head_dim,                                                    \
+                                     quant_block_size,                                            \
+                                     cache_block_size,                                            \
+                                     cache_stride,                                                \
                                      use_ue8m0);
 
 // Macro to dispatch the kernel based on the data amount.
@@ -1926,7 +1927,7 @@ void indexer_k_quant_and_cache(torch::Tensor& k,        // [num_tokens, head_dim
     TORCH_CHECK(head_dim % quant_block_size == 0, "head_dim must be divisible by quant_block_size");
 
     int quant_blocks    = num_tokens * head_dim / quant_block_size;
-    const int vec_size = 16;
+    const int vec_size  = 16;
     const int blockDimx = 8;
     const int blockDimy = ck_tile::get_warp_size() / blockDimx;
     dim3 grid((quant_blocks + blockDimy - 1) / (blockDimy));
@@ -1949,7 +1950,7 @@ void cp_gather_indexer_k_quant_cache(
     int batch_size       = block_table.size(0);
     int num_tokens       = dst_k.size(0);
     int head_dim         = dst_k.size(1);
-    int quant_block_size = head_dim / (dst_scale.size(1) * dst_scale.itemsize()) / 4;
+    int quant_block_size = head_dim / (dst_scale.size(1) * dst_scale.itemsize() / 4);
 
     TORCH_CHECK(kv_cache.device() == dst_k.device(),
                 "kv_cache and dst_k must be on the same device");
