@@ -761,6 +761,13 @@ def compile_ops(
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
                     doc_str = doc_str.replace("list[", "List[")
+                    doc_str = doc_str.replace("tuple[", "Tuple[")
+                    doc_str = doc_str.replace("collections.abc.Sequence[", "List[")
+                    doc_str = doc_str.replace("typing.SupportsInt", "int")
+                    doc_str = doc_str.replace("typing.SupportsFloat", "float")
+                    # A|None  -->  Optional[A]
+                    pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
+                    doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
                     for el in enum_types:
                         doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {
@@ -769,9 +776,7 @@ def compile_ops(
                         "torch": torch,
                         "typing": typing,
                     }
-                    if sys.version_info < (3, 10):
-                        pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
-                        doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
+
                     exec(
                         f"from aiter import*\ndef {doc_str}: pass",
                         namespace,
