@@ -18,11 +18,11 @@ testFailedFiles=()
 declare -a tune_jobs=(
   "ck_batched_gemm_a8w8:csrc/ck_batched_gemm_a8w8:op_tests/test_batched_gemm_a8w8.py:python3 csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py -i aiter/configs/a8w8_untuned_batched_gemm.csv -o aiter/configs/a8w8_tuned_batched_gemm.csv"
   "ck_batched_gemm_bf16:csrc/ck_batched_gemm_bf16:op_tests/test_batched_gemm_bf16.py:python3 csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py -i aiter/configs/bf16_untuned_batched_gemm.csv -o aiter/configs/bf16_tuned_batched_gemm.csv"
-#  "csrc/ck_gemm_a4w4_blockscale:op_tests/test_gemm_a4w4_blockscale.py:python3 csrc/ck_gemm_a4w4_blockscale/gemm_a4w4_blockscale_tune.py -i aiter/configs/a4w4_blockscale_untuned_gemm.csv -o aiter/configs/a4w4_blockscale_tuned_gemm.csv"
   "ck_gemm_a8w8:csrc/ck_gemm_a8w8:op_tests/test_gemm_a8w8.py:python3 csrc/ck_gemm_a8w8/gemm_a8w8_tune.py -i aiter/configs/a8w8_untuned_gemm.csv -o aiter/configs/a8w8_tuned_gemm.csv"
   "ck_gemm_a8w8_blockscale:csrc/ck_gemm_a8w8_blockscale:op_tests/test_gemm_a8w8_blockscale.py:python3 csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py -i aiter/configs/a8w8_blockscale_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_tuned_gemm.csv"
   "ck_gemm_a8w8_blockscale_bpreshuffle:csrc/ck_gemm_a8w8_blockscale_bpreshuffle:op_tests/test_gemm_a8w8_blockscale.py:python3 csrc/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle_tune.py -i aiter/configs/a8w8_blockscale_bpreshuffle_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv"
   "ck_gemm_a8w8_bpreshuffle:csrc/ck_gemm_a8w8_bpreshuffle:op_tests/test_gemm_a8w8.py:python3 csrc/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_tune.py -i aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv -o aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv"
+  #"ck_gemm_a4w4_blockscale:csrc/ck_gemm_a4w4_blockscale:op_tests/test_gemm_a4w4_blockscale.py:python3 csrc/ck_gemm_a4w4_blockscale/gemm_a4w4_blockscale_tune.py -i aiter/configs/a4w4_blockscale_untuned_gemm.csv -o aiter/configs/a4w4_blockscale_tuned_gemm.csv"
 )
 
 for job in "${tune_jobs[@]}"; do
