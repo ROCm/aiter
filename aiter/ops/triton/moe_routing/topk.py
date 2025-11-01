@@ -9,7 +9,7 @@ def topk_forward(x, k, apply_softmax=True, dim=1, return_bitmatrix=True, y_indx=
     x_shape = [x.shape[0], x.shape[1]]
     cdiv = lambda a, b: (a + b - 1) // b
     BLOCK_M = 32
-    BLOCK_N = 32
+    BLOCK_N = 128
     BLOCK_S = 128
     BLOCK_SP = 128
     assert len(x.shape) == 2
@@ -52,7 +52,7 @@ def topk_forward(x, k, apply_softmax=True, dim=1, return_bitmatrix=True, y_indx=
         scratchpad_partials, BLOCK_SP, sp_blocks, sp_size,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,  # tunable parameter
         APPLY_SOFTMAX=apply_softmax, N_EXPTS_PAD=n_cols_pad, N_EXPTS_ACT=k,  # constants
-        num_warps=2
+        num_warps=8
     )
     bitmatrix_shape = [n_rows, n_cols_words * 32]
     bitmatrix = Bitmatrix(bitmatrix, shape=bitmatrix_shape, scratchpad=scratchpad, scratchpad_partials=scratchpad_partials)

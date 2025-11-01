@@ -103,7 +103,7 @@ def _topk_forward(X, stride_xm,  # inputs
     if pid < s_blocks:
         tl.store(S + BLOCK_S * pid + tl.arange(0, BLOCK_S), tl.zeros([BLOCK_S], tl.int32))
     elif pid < s_blocks + sp_blocks:
-        offs = BLOCK_S * (pid - s_blocks) + tl.arange(0, BLOCK_SP)
+        offs = BLOCK_SP * (pid - s_blocks) + tl.arange(0, BLOCK_SP)
         tl.store(SP + offs, tl.zeros([BLOCK_SP], tl.int32), mask=offs < sp_size)
 
     if pid * BLOCK_M >= n_rows:
