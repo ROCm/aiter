@@ -21,8 +21,7 @@
 namespace topk {
 namespace utils {
 
-constexpr int WARP_SIZE                     = 64;
-constexpr unsigned long long FULL_WARP_MASK = 0xffffffffffffffffULL;
+constexpr int WAVE_SIZE = 64;
 
 // Supported types
 template <typename T>
@@ -163,7 +162,7 @@ __inline__ __host__ __device__ constexpr int integer_log2(T n, int p = 0)
 __inline__ __host__ __device__ constexpr int calc_capacity(int k)
 {
     int capacity = utils::ceil_to_power_of_2(k);
-    return (capacity < WARP_SIZE) ? WARP_SIZE : capacity;
+    return (capacity < WAVE_SIZE) ? WAVE_SIZE : capacity;
 }
 
 } // namespace utils
@@ -289,8 +288,8 @@ struct BitonicMerge
     __device__ static void merge(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
     {
         static_assert(utils::is_power_of_2(size));
-        static_assert(size >= 2 * utils::WARP_SIZE);
-        constexpr int arr_len = size / utils::WARP_SIZE;
+        static_assert(size >= 2 * utils::WAVE_SIZE);
+        constexpr int arr_len = size / utils::WAVE_SIZE;
 
         constexpr int stride = arr_len / 2;
         for(int i = 0; i < stride; ++i)
@@ -322,8 +321,8 @@ struct BitonicSort
     __device__ static void sort(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
     {
         static_assert(utils::is_power_of_2(size));
-        static_assert(size >= 2 * utils::WARP_SIZE);
-        constexpr int arr_len = size / utils::WARP_SIZE;
+        static_assert(size >= 2 * utils::WAVE_SIZE);
+        constexpr int arr_len = size / utils::WAVE_SIZE;
 
         BitonicSort<size / 2, true, T, idxT>::sort(val_arr, idx_arr);
         BitonicSort<size / 2, false, T, idxT>::sort(val_arr + arr_len / 2, idx_arr + arr_len / 2);
@@ -545,7 +544,7 @@ template <typename T, typename idxT, int stage, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride <= 2), void>::type
 sort_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (utils::WARP_SIZE - 1);
+    const int lane = threadIdx.x & (utils::WAVE_SIZE - 1);
     bool reverse   = (lane >> stage) & 2;
     bool is_second = lane & stride;
 
@@ -567,7 +566,7 @@ template <typename T, typename idxT, int stage, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride > 2 && stride <= 8), void>::type
 sort_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (utils::WARP_SIZE - 1);
+    const int lane = threadIdx.x & (utils::WAVE_SIZE - 1);
     bool reverse   = (lane >> stage) & 2;
     bool is_second = lane & stride;
 
@@ -596,7 +595,7 @@ template <typename T, typename idxT, int stage, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride > 8), void>::type
 sort_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (utils::WARP_SIZE - 1);
+    const int lane = threadIdx.x & (utils::WAVE_SIZE - 1);
     bool reverse   = (lane >> stage) & 2;
     bool is_second = lane & stride;
 
@@ -652,7 +651,7 @@ template <bool ascending, typename T, typename idxT, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride <= 2), void>::type
 merge_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (utils::WARP_SIZE - 1);
+    const int lane = threadIdx.x & (utils::WAVE_SIZE - 1);
     bool is_second = lane & stride;
     T& val         = *val_arr;
     idxT& idx      = *idx_arr;
@@ -673,7 +672,7 @@ template <bool ascending, typename T, typename idxT, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride > 2 && stride <= 8), void>::type
 merge_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (utils::WARP_SIZE - 1);
+    const int lane = threadIdx.x & (utils::WAVE_SIZE - 1);
     bool is_second = lane & stride;
     T& val         = *val_arr;
     idxT& idx      = *idx_arr;
@@ -701,7 +700,7 @@ template <bool ascending, typename T, typename idxT, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride > 8), void>::type
 merge_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (topk::utils::WARP_SIZE - 1);
+    const int lane = threadIdx.x & (topk::utils::WAVE_SIZE - 1);
     bool is_second = lane & stride;
     T& val         = *val_arr;
     idxT& idx      = *idx_arr;
@@ -776,431 +775,516 @@ buffer_load(const SrcT* p_src_wave,
 
 } // namespace buffer_load_helpers
 
-// --- Warp-Level Sorting Primitives ---
+// --- Wave-Level Priority Selection Primitives (AMD/HIP Optimized) ---
 
-template <int capacity, bool greater, typename T, typename IdxT>
-class WarpSort
+// Forward declarations for algorithm strategy traits
+template <int capacity, bool descending, typename T, typename IdxT>
+struct WaveFilterStrategy;
+
+template <int capacity, bool descending, typename T, typename IdxT>
+struct WaveBatchStrategy;
+
+template <int capacity, bool descending, typename T, typename IdxT>
+struct WaveIterativeStrategy;
+
+// WaveBuffer: Manages per-wave register storage for priority candidates
+template <int capacity, typename T, typename IdxT>
+struct WaveBuffer
 {
-    public:
-    __device__ WarpSort(IdxT k, T dummy)
-        : lane_(threadIdx.x % utils::WARP_SIZE), k_(k), dummy_(dummy)
+    static constexpr int slots_per_lane = capacity / utils::WAVE_SIZE;
+    static_assert(capacity >= utils::WAVE_SIZE && utils::is_power_of_2(capacity),
+                  "Capacity must be power-of-2 and >= wave size");
+
+    T priorities[slots_per_lane];
+    IdxT positions[slots_per_lane];
+    int lane_id;
+    IdxT target_count;
+    T sentinel;
+
+    __device__ WaveBuffer(IdxT k, T sentinel_value)
+        : lane_id(threadIdx.x & (utils::WAVE_SIZE - 1)), target_count(k), sentinel(sentinel_value)
     {
-        static_assert(capacity >= utils::WARP_SIZE && utils::is_power_of_2(capacity));
 #pragma unroll
-        for(int i = 0; i < max_elements_per_thread_; ++i)
+        for(int i = 0; i < slots_per_lane; ++i)
         {
-            values_[i] = dummy_;
+            priorities[i] = sentinel;
         }
     }
 
-    __device__ void
-    load_sorted(const T* __restrict__ in, const IdxT* __restrict__ in_idx, IdxT start)
+    __device__ inline void reset_slot(int slot, T val = {}, IdxT pos = {})
     {
-        IdxT idx = start + utils::WARP_SIZE - 1 - lane_;
+        priorities[slot] = val;
+        positions[slot]  = pos;
+    }
+
+    __device__ inline void flush_results(T* __restrict__ out_vals,
+                                         IdxT* __restrict__ out_indices) const
+    {
 #pragma unroll
-        for(int i = max_elements_per_thread_ - 1; i >= 0; --i, idx += utils::WARP_SIZE)
+        for(int i = 0; i < slots_per_lane; ++i)
         {
-            if(idx < start + k_)
+            const IdxT global_slot = i * utils::WAVE_SIZE + lane_id;
+            if(global_slot < target_count)
             {
-                T t = in[idx];
-                if(numeric::is_preferred<greater>(t, values_[i]))
+                out_vals[global_slot]    = priorities[i];
+                out_indices[global_slot] = positions[i];
+            }
+        }
+    }
+};
+
+// AlgorithmTraits: Define behavior for each strategy
+template <typename StrategyType>
+struct AlgorithmTraits
+{
+    static constexpr bool uses_shared_memory       = false;
+    static constexpr bool requires_synchronization = false;
+    static constexpr const char* name              = "Unknown";
+};
+
+// Helper for merging sorted sequences (used by multiple strategies)
+template <int capacity, bool descending, typename T, typename IdxT>
+struct WaveMergeHelper
+{
+    __device__ static void merge_sorted_range(WaveBuffer<capacity, T, IdxT>& buffer,
+                                              const T* __restrict__ in,
+                                              const IdxT* __restrict__ in_idx,
+                                              IdxT start)
+    {
+        IdxT idx = start + utils::WAVE_SIZE - 1 - buffer.lane_id;
+#pragma unroll
+        for(int i = buffer.slots_per_lane - 1; i >= 0; --i, idx += utils::WAVE_SIZE)
+        {
+            if(idx < start + buffer.target_count)
+            {
+                T candidate = in[idx];
+                if(numeric::is_preferred<descending>(candidate, buffer.priorities[i]))
                 {
-                    values_[i]  = t;
-                    indices_[i] = in_idx[idx];
+                    buffer.priorities[i] = candidate;
+                    buffer.positions[i]  = in_idx[idx];
                 }
             }
         }
-        sorting::BitonicMerge<capacity, !greater, T, IdxT>::merge(values_, indices_);
+        sorting::BitonicMerge<capacity, !descending, T, IdxT>::merge(buffer.priorities,
+                                                                     buffer.positions);
     }
-
-    __device__ void dump(T* __restrict__ out, IdxT* __restrict__ out_idx) const
-    {
-#pragma unroll
-        for(int i = 0; i < max_elements_per_thread_; ++i)
-        {
-            IdxT out_i = i * utils::WARP_SIZE + lane_;
-            if(out_i < k_)
-            {
-                out[out_i] = values_[i];
-                out_idx[out_i] = indices_[i];
-            }
-        }
-    }
-
-    protected:
-    static constexpr int max_elements_per_thread_ = capacity / utils::WARP_SIZE;
-    T values_[max_elements_per_thread_];
-    IdxT indices_[max_elements_per_thread_];
-    const int lane_;
-    const IdxT k_;
-    const T dummy_;
 };
 
-template <int capacity, bool greater, typename T, typename IdxT>
-class WarpSelect : public WarpSort<capacity, greater, T, IdxT>
+// WaveFilterStrategy: Ballot-based filtering with dynamic batching (AMD-optimized)
+template <int capacity, bool descending, typename T, typename IdxT>
+class WaveFilterStrategy
 {
     public:
-    __device__ WarpSelect(IdxT k, T dummy)
-        : WarpSort<capacity, greater, T, IdxT>(k, dummy),
-          k_th_(dummy),
-          k_th_lane_((k - 1) % utils::WARP_SIZE)
+    __device__ WaveFilterStrategy(IdxT k, T sentinel_val)
+        : buffer_(k, sentinel_val),
+          threshold_(sentinel_val),
+          threshold_lane_((k - 1) & (utils::WAVE_SIZE - 1)),
+          batch_len_(0)
     {
+        // Setup shared memory staging area for ballot-filtered candidates
         extern __shared__ char smem_buf[];
-        const int num_warps = blockDim.x / utils::WARP_SIZE;
-        const int warp_id   = threadIdx.x / utils::WARP_SIZE;
-        values_smem_        = reinterpret_cast<T*>(smem_buf);
-        values_smem_ += warp_id * utils::WARP_SIZE;
-        indices_smem_ =
-            reinterpret_cast<IdxT*>(smem_buf + utils::round_up_to_multiple_of<16>(
-                                                   num_warps * sizeof(T) * utils::WARP_SIZE));
-        indices_smem_ += warp_id * utils::WARP_SIZE;
+        const int num_waves = blockDim.x / utils::WAVE_SIZE;
+        const int wave_id   = threadIdx.x / utils::WAVE_SIZE;
+        staging_vals_       = reinterpret_cast<T*>(smem_buf) + wave_id * utils::WAVE_SIZE;
+        const size_t vals_size =
+            utils::round_up_to_multiple_of<16>(num_waves * sizeof(T) * utils::WAVE_SIZE);
+        staging_indices_ =
+            reinterpret_cast<IdxT*>(smem_buf + vals_size) + wave_id * utils::WAVE_SIZE;
     }
 
-    __device__ void add(const T* __restrict__ in, IdxT start, IdxT end)
+    __device__ void process_range(const T* __restrict__ in, IdxT start, IdxT end)
     {
-        const IdxT n                = end - start;
-        const IdxT whole            = n & ~(static_cast<IdxT>(utils::WARP_SIZE) - 1);
-        const IdxT padded           = (n == whole) ? n : (whole + utils::WARP_SIZE);
-        const IdxT end_aligned      = start + whole;
-        const IdxT end_for_fullwarp = start + padded;
+        const IdxT n           = end - start;
+        const IdxT aligned     = n & ~(utils::WAVE_SIZE - 1);
+        const IdxT padded      = (n == aligned) ? n : (aligned + utils::WAVE_SIZE);
+        const IdxT end_aligned = start + aligned;
+        const IdxT end_padded  = start + padded;
 
-        for(IdxT i = start + this->lane_; i < end_aligned; i += utils::WARP_SIZE)
+        for(IdxT i = start + buffer_.lane_id; i < end_aligned; i += utils::WAVE_SIZE)
         {
-            add(in[i], i);
+            filter_and_batch(in[i], i);
         }
 
-        for(IdxT i = end_aligned + this->lane_; i < end_for_fullwarp; i += utils::WARP_SIZE)
+        for(IdxT i = end_aligned + buffer_.lane_id; i < end_padded; i += utils::WAVE_SIZE)
         {
-            T val = (i < end) ? in[i] : this->dummy_;
-            add(val, i);
+            T val = (i < end) ? in[i] : buffer_.sentinel;
+            filter_and_batch(val, i);
         }
     }
 
-    __device__ void add(T val, IdxT idx)
+    __device__ void filter_and_batch(T candidate, IdxT position)
     {
-        const bool do_add   = numeric::is_preferred<greater>(val, k_th_);
-        const uint64_t mask = __ballot(do_add);
+        const bool passes     = numeric::is_preferred<descending>(candidate, threshold_);
+        const uint64_t ballot = __ballot(passes);
 
-        if(mask == 0)
-        {
+        if(ballot == 0)
             return;
-        }
 
-        const int prefix    = __popcll(mask & ((1ull << this->lane_) - 1));
-        const int base      = smem_buf_len_;
-        const int pos       = base + prefix;
-        const bool in_place = do_add && (pos < utils::WARP_SIZE);
+        const int lane_offset = __popcll(ballot & ((1ull << buffer_.lane_id) - 1));
+        const int batch_base  = batch_len_;
+        const int slot        = batch_base + lane_offset;
+        const bool fits       = passes && (slot < utils::WAVE_SIZE);
 
-        if(in_place)
+        if(fits)
         {
-            values_smem_[pos]  = val;
-            indices_smem_[pos] = idx;
+            staging_vals_[slot]    = candidate;
+            staging_indices_[slot] = position;
         }
 
-        const int total = __popcll(mask);
-        smem_buf_len_   = base + total;
+        const int ballot_count = __popcll(ballot);
+        batch_len_             = batch_base + ballot_count;
 
-        if(smem_buf_len_ >= utils::WARP_SIZE)
+        if(batch_len_ >= utils::WAVE_SIZE)
         {
             __builtin_amdgcn_wave_barrier();
-            merge_buf_(values_smem_[this->lane_], indices_smem_[this->lane_]);
-            smem_buf_len_ -= utils::WARP_SIZE;
+            integrate_batch(staging_vals_[buffer_.lane_id], staging_indices_[buffer_.lane_id]);
+            batch_len_ -= utils::WAVE_SIZE;
         }
 
-        const bool overflow = do_add && !in_place;
+        const bool overflow = passes && !fits;
         if(overflow)
         {
-            const int new_pos      = pos - utils::WARP_SIZE;
-            values_smem_[new_pos]  = val;
-            indices_smem_[new_pos] = idx;
+            staging_vals_[slot - utils::WAVE_SIZE]    = candidate;
+            staging_indices_[slot - utils::WAVE_SIZE] = position;
         }
         __builtin_amdgcn_wave_barrier();
     }
 
-    __device__ void done()
+    __device__ void finalize()
     {
-        if(smem_buf_len_)
+        if(batch_len_)
         {
-            T val    = (this->lane_ < smem_buf_len_) ? values_smem_[this->lane_] : this->dummy_;
-            IdxT idx = (this->lane_ < smem_buf_len_) ? indices_smem_[this->lane_] : 0;
-            merge_buf_(val, idx);
+            T val =
+                (buffer_.lane_id < batch_len_) ? staging_vals_[buffer_.lane_id] : buffer_.sentinel;
+            IdxT idx = (buffer_.lane_id < batch_len_) ? staging_indices_[buffer_.lane_id] : 0;
+            integrate_batch(val, idx);
         }
         __syncthreads();
     }
 
+    __device__ void emit_results(T* __restrict__ out, IdxT* __restrict__ out_idx) const
+    {
+        buffer_.flush_results(out, out_idx);
+    }
+
+    __device__ void
+    merge_sorted_input(const T* __restrict__ in, const IdxT* __restrict__ in_idx, IdxT start)
+    {
+        WaveMergeHelper<capacity, descending, T, IdxT>::merge_sorted_range(
+            buffer_, in, in_idx, start);
+    }
+
     private:
-    // Helper function to perform shuffle based on type
-    __forceinline__ __device__ T shfl(T val, int lane)
+    __forceinline__ __device__ T wave_broadcast(T val, int src_lane) const
     {
         if constexpr(sizeof(T) == 4)
-        {
-            // 32-bit types (float, int32_t)
-            return __builtin_bit_cast(T, __shfl(__builtin_bit_cast(int, val), lane));
-        }
+            return __builtin_bit_cast(T, __shfl(__builtin_bit_cast(int, val), src_lane));
         else if constexpr(sizeof(T) == 8)
-        {
-            // 64-bit types (int64_t, double)
-            return __builtin_bit_cast(T, __shfl(__builtin_bit_cast(long long, val), lane));
-        }
+            return __builtin_bit_cast(T, __shfl(__builtin_bit_cast(long long, val), src_lane));
         else if constexpr(sizeof(T) == 2)
         {
-            // 16-bit types (_Float16, __bf16)
-            unsigned int val_u32      = __builtin_bit_cast(unsigned short, val);
-            unsigned int result_u32   = __shfl(val_u32, lane);
-            unsigned short result_u16 = static_cast<unsigned short>(result_u32);
-            return __builtin_bit_cast(T, result_u16);
+            unsigned int tmp = __builtin_bit_cast(unsigned short, val);
+            return __builtin_bit_cast(T, static_cast<unsigned short>(__shfl(tmp, src_lane)));
         }
         else
         {
-            static_assert(sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8,
-                          "shfl_xor only supports 16-bit, 32-bit, and 64-bit types.");
+            static_assert(sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8);
             __builtin_unreachable();
         }
     }
 
-    __device__ void set_k_th_()
+    __device__ void refresh_threshold()
     {
-        k_th_ = shfl(this->values_[this->max_elements_per_thread_ - 1], k_th_lane_);
+        const int last_slot = buffer_.slots_per_lane - 1;
+        threshold_          = wave_broadcast(buffer_.priorities[last_slot], threshold_lane_);
     }
 
-    __device__ void merge_buf_(T val, IdxT idx)
+    __device__ void integrate_batch(T val, IdxT pos)
     {
-        sorting::BitonicSort<utils::WARP_SIZE, greater, T, IdxT>::sort(&val, &idx);
-        T& old_val = this->values_[this->max_elements_per_thread_ - 1];
-        if(numeric::is_preferred<greater>(val, old_val))
+        sorting::BitonicSort<utils::WAVE_SIZE, descending, T, IdxT>::sort(&val, &pos);
+        T& weakest = buffer_.priorities[buffer_.slots_per_lane - 1];
+        if(numeric::is_preferred<descending>(val, weakest))
         {
-            old_val                                            = val;
-            this->indices_[this->max_elements_per_thread_ - 1] = idx;
+            weakest                                       = val;
+            buffer_.positions[buffer_.slots_per_lane - 1] = pos;
         }
-        sorting::BitonicMerge<capacity, !greater, T, IdxT>::merge(this->values_, this->indices_);
-        set_k_th_();
+        sorting::BitonicMerge<capacity, !descending, T, IdxT>::merge(buffer_.priorities,
+                                                                     buffer_.positions);
+        refresh_threshold();
     }
 
-    using WarpSort<capacity, greater, T, IdxT>::max_elements_per_thread_;
-    using WarpSort<capacity, greater, T, IdxT>::values_;
-    using WarpSort<capacity, greater, T, IdxT>::indices_;
-    using WarpSort<capacity, greater, T, IdxT>::lane_;
-    using WarpSort<capacity, greater, T, IdxT>::k_;
-    using WarpSort<capacity, greater, T, IdxT>::dummy_;
-
-    T* values_smem_;
-    IdxT* indices_smem_;
-    int smem_buf_len_ = 0;
-    T k_th_;
-    const int k_th_lane_;
+    WaveBuffer<capacity, T, IdxT> buffer_;
+    T* staging_vals_;
+    IdxT* staging_indices_;
+    int batch_len_;
+    T threshold_;
+    const int threshold_lane_;
 };
 
-template <int capacity, bool greater, typename T, typename IdxT>
-class WarpBitonic : public WarpSort<capacity, greater, T, IdxT>
+// Trait specialization for WaveFilterStrategy
+template <int capacity, bool descending, typename T, typename IdxT>
+struct AlgorithmTraits<WaveFilterStrategy<capacity, descending, T, IdxT>>
+{
+    static constexpr bool uses_shared_memory       = true;
+    static constexpr bool requires_synchronization = true;
+    static constexpr const char* name              = "WaveFilterStrategy";
+};
+
+// WaveBatchStrategy: Batches data and uses bitonic sort for streaming inputs
+template <int capacity, bool descending, typename T, typename IdxT>
+class WaveBatchStrategy
 {
     public:
-    __device__ WarpBitonic(IdxT k, T dummy)
-        : WarpSort<capacity, greater, T, IdxT>(k, dummy), buf_len_(0)
+    __device__ WaveBatchStrategy(IdxT k, T sentinel_val) : buffer_(k, sentinel_val), batch_fill_(0)
     {
     }
 
-    __device__ void add(const T* __restrict__ in, IdxT start, IdxT end)
+    __device__ void process_range(const T* __restrict__ in, IdxT start, IdxT end)
     {
-        add_first_(in, start, end);
+        initialize_from_input_(in, start, end);
         start += capacity;
         while(start < end)
         {
-            add_extra_(in, start, end);
-            merge_();
+            load_and_compete_(in, start, end);
             start += capacity;
         }
     }
 
-    __device__ void add(T val, IdxT idx)
+    __device__ void accumulate_single(T candidate, IdxT position)
     {
 #pragma unroll
-        for(int i = 0; i < this->max_elements_per_thread_; ++i)
+        for(int i = 0; i < buffer_.slots_per_lane; ++i)
         {
-            if(i == buf_len_)
+            if(i == batch_fill_)
             {
-                val_buf_[i] = val;
-                idx_buf_[i] = idx;
+                temp_priorities_[i] = candidate;
+                temp_positions_[i]  = position;
             }
         }
-        ++buf_len_;
-        if(buf_len_ == this->max_elements_per_thread_)
+        ++batch_fill_;
+        if(batch_fill_ == buffer_.slots_per_lane)
         {
-            sorting::BitonicSort<capacity, greater, T, IdxT>::sort(val_buf_, idx_buf_);
-            merge_();
-            buf_len_ = 0;
+            sorting::BitonicSort<capacity, descending, T, IdxT>::sort(temp_priorities_,
+                                                                      temp_positions_);
+            merge_batches_();
+            batch_fill_ = 0;
         }
     }
 
-    __device__ void done()
+    __device__ void finalize()
     {
-        if(buf_len_ != 0)
+        if(batch_fill_ != 0)
         {
 #pragma unroll
-            for(int i = 0; i < this->max_elements_per_thread_; ++i)
+            for(int i = 0; i < buffer_.slots_per_lane; ++i)
             {
-                if(i >= buf_len_)
+                if(i >= batch_fill_)
                 {
-                    val_buf_[i] = this->dummy_;
+                    temp_priorities_[i] = buffer_.sentinel;
                 }
             }
-            sorting::BitonicSort<capacity, greater, T, IdxT>::sort(val_buf_, idx_buf_);
-            merge_();
+            sorting::BitonicSort<capacity, descending, T, IdxT>::sort(temp_priorities_,
+                                                                      temp_positions_);
+            merge_batches_();
         }
     }
 
-    private:
-    __device__ void add_first_(const T* __restrict__ in, IdxT start, IdxT end)
+    __device__ void emit_results(T* __restrict__ out, IdxT* __restrict__ out_idx) const
     {
-        IdxT idx = start + this->lane_;
-#pragma unroll
-        for(int i = 0; i < this->max_elements_per_thread_; ++i, idx += utils::WARP_SIZE)
-        {
-            if(idx < end)
-            {
-                this->values_[i]  = in[idx];
-                this->indices_[i] = idx;
-            }
-        }
-        sorting::BitonicSort<capacity, !greater, T, IdxT>::sort(this->values_, this->indices_);
+        buffer_.flush_results(out, out_idx);
     }
-
-    __device__ void add_extra_(const T* __restrict__ in, IdxT start, IdxT end)
-    {
-        IdxT idx = start + this->lane_;
-#pragma unroll
-        for(int i = 0; i < this->max_elements_per_thread_; ++i, idx += utils::WARP_SIZE)
-        {
-            val_buf_[i] = (idx < end) ? in[idx] : this->dummy_;
-            idx_buf_[i] = idx;
-        }
-        sorting::BitonicSort<capacity, greater, T, IdxT>::sort(val_buf_, idx_buf_);
-    }
-
-    __device__ void merge_()
-    {
-#pragma unroll
-        for(int i = 0; i < this->max_elements_per_thread_; ++i)
-        {
-            if(numeric::is_preferred<greater>(val_buf_[i], this->values_[i]))
-            {
-                this->values_[i]  = val_buf_[i];
-                this->indices_[i] = idx_buf_[i];
-            }
-        }
-        sorting::BitonicMerge<capacity, !greater, T, IdxT>::merge(this->values_, this->indices_);
-    }
-
-    using WarpSort<capacity, greater, T, IdxT>::max_elements_per_thread_;
-    using WarpSort<capacity, greater, T, IdxT>::values_;
-    using WarpSort<capacity, greater, T, IdxT>::indices_;
-    using WarpSort<capacity, greater, T, IdxT>::lane_;
-    using WarpSort<capacity, greater, T, IdxT>::k_;
-    using WarpSort<capacity, greater, T, IdxT>::dummy_;
-
-    T val_buf_[max_elements_per_thread_];
-    IdxT idx_buf_[max_elements_per_thread_];
-    int buf_len_;
-};
-
-template <int capacity, bool greater, typename T, typename IdxT>
-class WarpMerge : public WarpSort<capacity, greater, T, IdxT>
-{
-    public:
-    __device__ WarpMerge(IdxT k, T dummy) : WarpSort<capacity, greater, T, IdxT>(k, dummy) {}
 
     __device__ void
-    add(const T* __restrict__ in, const IdxT* __restrict__ in_idx, IdxT start, IdxT end)
+    merge_sorted_input(const T* __restrict__ in, const IdxT* __restrict__ in_idx, IdxT start)
     {
-        IdxT idx       = start + this->lane_;
-        IdxT first_end = (start + this->k_ < end) ? (start + this->k_) : end;
+        WaveMergeHelper<capacity, descending, T, IdxT>::merge_sorted_range(
+            buffer_, in, in_idx, start);
+    }
+
+    private:
+    __device__ void initialize_from_input_(const T* __restrict__ in, IdxT start, IdxT end)
+    {
+        IdxT pos = start + buffer_.lane_id;
 #pragma unroll
-        for(int i = 0; i < this->max_elements_per_thread_; ++i, idx += utils::WARP_SIZE)
+        for(int i = 0; i < buffer_.slots_per_lane; ++i, pos += utils::WAVE_SIZE)
         {
-            if(idx < first_end)
+            if(pos < end)
             {
-                this->values_[i]  = in[idx];
-                this->indices_[i] = in_idx[idx];
+                buffer_.priorities[i] = in[pos];
+                buffer_.positions[i]  = pos;
             }
         }
-        for(start += this->k_; start < end; start += this->k_)
+        sorting::BitonicSort<capacity, !descending, T, IdxT>::sort(buffer_.priorities,
+                                                                   buffer_.positions);
+    }
+
+    __device__ void load_and_compete_(const T* __restrict__ in, IdxT start, IdxT end)
+    {
+        IdxT pos = start + buffer_.lane_id;
+#pragma unroll
+        for(int i = 0; i < buffer_.slots_per_lane; ++i, pos += utils::WAVE_SIZE)
         {
-            this->load_sorted(in, in_idx, start);
+            temp_priorities_[i] = (pos < end) ? in[pos] : buffer_.sentinel;
+            temp_positions_[i]  = pos;
+        }
+        sorting::BitonicSort<capacity, descending, T, IdxT>::sort(temp_priorities_,
+                                                                  temp_positions_);
+        merge_batches_();
+    }
+
+    __device__ void merge_batches_()
+    {
+#pragma unroll
+        for(int i = 0; i < buffer_.slots_per_lane; ++i)
+        {
+            if(numeric::is_preferred<descending>(temp_priorities_[i], buffer_.priorities[i]))
+            {
+                buffer_.priorities[i] = temp_priorities_[i];
+                buffer_.positions[i]  = temp_positions_[i];
+            }
+        }
+        sorting::BitonicMerge<capacity, !descending, T, IdxT>::merge(buffer_.priorities,
+                                                                     buffer_.positions);
+    }
+
+    WaveBuffer<capacity, T, IdxT> buffer_;
+    static constexpr int slots_per_lane_ = capacity / utils::WAVE_SIZE;
+    T temp_priorities_[slots_per_lane_];
+    IdxT temp_positions_[slots_per_lane_];
+    int batch_fill_;
+};
+
+// Trait specialization for WaveBatchStrategy
+template <int capacity, bool descending, typename T, typename IdxT>
+struct AlgorithmTraits<WaveBatchStrategy<capacity, descending, T, IdxT>>
+{
+    static constexpr bool uses_shared_memory       = false;
+    static constexpr bool requires_synchronization = false;
+    static constexpr const char* name              = "WaveBatchStrategy";
+};
+
+// WaveIterativeStrategy: Iteratively merges pre-sorted k-sized chunks
+template <int capacity, bool descending, typename T, typename IdxT>
+class WaveIterativeStrategy
+{
+    public:
+    __device__ WaveIterativeStrategy(IdxT k, T sentinel_val) : buffer_(k, sentinel_val) {}
+
+    __device__ void process_sorted_chunks(const T* __restrict__ in,
+                                          const IdxT* __restrict__ in_idx,
+                                          IdxT start,
+                                          IdxT end)
+    {
+        IdxT pos = start + buffer_.lane_id;
+        IdxT chunk_end =
+            (start + buffer_.target_count < end) ? (start + buffer_.target_count) : end;
+#pragma unroll
+        for(int i = 0; i < buffer_.slots_per_lane; ++i, pos += utils::WAVE_SIZE)
+        {
+            if(pos < chunk_end)
+            {
+                buffer_.priorities[i] = in[pos];
+                buffer_.positions[i]  = in_idx[pos];
+            }
+        }
+        for(start += buffer_.target_count; start < end; start += buffer_.target_count)
+        {
+            merge_sorted_input(in, in_idx, start);
         }
     }
 
-    __device__ void done() {}
+    __device__ void finalize() {}
+
+    __device__ void emit_results(T* __restrict__ out, IdxT* __restrict__ out_idx) const
+    {
+        buffer_.flush_results(out, out_idx);
+    }
+
+    __device__ void
+    merge_sorted_input(const T* __restrict__ in, const IdxT* __restrict__ in_idx, IdxT start)
+    {
+        WaveMergeHelper<capacity, descending, T, IdxT>::merge_sorted_range(
+            buffer_, in, in_idx, start);
+    }
 
     private:
-    using WarpSort<capacity, greater, T, IdxT>::max_elements_per_thread_;
-    using WarpSort<capacity, greater, T, IdxT>::values_;
-    using WarpSort<capacity, greater, T, IdxT>::indices_;
-    using WarpSort<capacity, greater, T, IdxT>::lane_;
-    using WarpSort<capacity, greater, T, IdxT>::k_;
-    using WarpSort<capacity, greater, T, IdxT>::dummy_;
+    WaveBuffer<capacity, T, IdxT> buffer_;
 };
 
-// Type trait to check if a template class is WarpSelect
-template <template <int, bool, typename, typename> class WarpSortClass>
-struct is_warp_select : std::false_type
+// Trait specialization for WaveIterativeStrategy
+template <int capacity, bool descending, typename T, typename IdxT>
+struct AlgorithmTraits<WaveIterativeStrategy<capacity, descending, T, IdxT>>
+{
+    static constexpr bool uses_shared_memory       = false;
+    static constexpr bool requires_synchronization = false;
+    static constexpr const char* name              = "WaveIterativeStrategy";
+};
+
+// Type trait to check if a strategy uses shared memory
+template <template <int, bool, typename, typename> class StrategyClass>
+struct strategy_uses_shared_memory : std::false_type
 {
 };
 
 template <>
-struct is_warp_select<WarpSelect> : std::true_type
+struct strategy_uses_shared_memory<WaveFilterStrategy> : std::true_type
 {
 };
 
-// --- Block-Level Logic ---
+// --- Workgroup-Level Coordinator (AMD terminology for "Block") ---
 
-template <template <int, bool, typename, typename> class WarpSortImpl,
+template <template <int, bool, typename, typename> class StrategyImpl,
           int capacity,
-          bool greater,
+          bool descending,
           typename T,
           typename IdxT>
-class WarpSortBlockWide
+class WorkgroupTopKCoordinator
 {
     public:
-    __device__ WarpSortBlockWide(IdxT k, T dummy, void* smem_buf)
-        : queue_(k, dummy), k_(k), dummy_(dummy)
+    __device__ WorkgroupTopKCoordinator(IdxT k, T sentinel, void* smem_buf)
+        : strategy_(k, sentinel), k_(k), sentinel_(sentinel)
     {
-        const int num_warps = blockDim.x / utils::WARP_SIZE;
+        const int num_waves = blockDim.x / utils::WAVE_SIZE;
 
-        // WarpSelect uses shared memory internally for its own buffers
-        // We need to allocate OUR reduction buffers AFTER WarpSelect's memory
-        size_t warp_select_smem_size = 0;
-        if constexpr(is_warp_select<WarpSortImpl>::value)
+        // WaveFilterStrategy needs shared memory for staging
+        // We allocate reduction buffers AFTER strategy's internal memory
+        size_t strategy_smem_size = 0;
+        if constexpr(strategy_uses_shared_memory<StrategyImpl>::value)
         {
-            // WarpSelect allocates: num_warps * WARP_SIZE elements for values and indices
-            warp_select_smem_size =
-                utils::round_up_to_multiple_of<16>(num_warps * sizeof(T) * utils::WARP_SIZE) +
-                num_warps * sizeof(IdxT) * utils::WARP_SIZE;
+            // WaveFilterStrategy uses: num_waves * WAVE_SIZE for staging
+            strategy_smem_size =
+                utils::round_up_to_multiple_of<16>(num_waves * sizeof(T) * utils::WAVE_SIZE) +
+                num_waves * sizeof(IdxT) * utils::WAVE_SIZE;
         }
 
-        // Our reduction buffers start AFTER WarpSelect's internal buffers
-        val_smem_ = reinterpret_cast<T*>(reinterpret_cast<char*>(smem_buf) + warp_select_smem_size);
-        idx_smem_ = reinterpret_cast<IdxT*>(
-            reinterpret_cast<char*>(smem_buf) + warp_select_smem_size +
-            utils::round_up_to_multiple_of<16>(num_warps / 2 * sizeof(T) * k_));
+        // Reduction buffers start AFTER strategy's internal buffers
+        reduction_priorities_ =
+            reinterpret_cast<T*>(reinterpret_cast<char*>(smem_buf) + strategy_smem_size);
+        reduction_positions_ = reinterpret_cast<IdxT*>(
+            reinterpret_cast<char*>(smem_buf) + strategy_smem_size +
+            utils::round_up_to_multiple_of<16>(num_waves / 2 * sizeof(T) * k_));
     }
 
-    __device__ void
-    add(const T* __restrict__ in, const IdxT* __restrict__ in_idx, IdxT start, IdxT end)
+    __device__ void process_sorted_chunks(const T* __restrict__ in,
+                                          const IdxT* __restrict__ in_idx,
+                                          IdxT start,
+                                          IdxT end)
     {
-        static_assert(std::is_same_v<WarpSortImpl<capacity, greater, T, IdxT>,
-                                     WarpMerge<capacity, greater, T, IdxT>>);
-        int num_warps     = blockDim.x / utils::WARP_SIZE;
-        const int warp_id = threadIdx.x / utils::WARP_SIZE;
-        IdxT len_per_warp = (end - start - 1) / num_warps + 1;
-        len_per_warp      = ((len_per_warp - 1) / k_ + 1) * k_;
-        IdxT warp_start   = start + warp_id * len_per_warp;
-        IdxT warp_end     = std::min(warp_start + len_per_warp, end);
-        queue_.add(in, in_idx, warp_start, warp_end);
+        static_assert(std::is_same_v<StrategyImpl<capacity, descending, T, IdxT>,
+                                     WaveIterativeStrategy<capacity, descending, T, IdxT>>);
+        int num_waves     = blockDim.x / utils::WAVE_SIZE;
+        const int wave_id = threadIdx.x / utils::WAVE_SIZE;
+        IdxT len_per_wave = (end - start - 1) / num_waves + 1;
+        len_per_wave      = ((len_per_wave - 1) / k_ + 1) * k_;
+        IdxT wave_start   = start + wave_id * len_per_wave;
+        IdxT wave_end     = std::min(wave_start + len_per_wave, end);
+        strategy_.process_sorted_chunks(in, in_idx, wave_start, wave_end);
     }
 
-    __device__ void add(const T* __restrict__ in, IdxT start, IdxT end)
+    __device__ void process_unsorted(const T* __restrict__ in, IdxT start, IdxT end)
     {
-        if constexpr(std::is_same_v<WarpSortImpl<capacity, greater, T, IdxT>,
-                                    WarpSelect<capacity, greater, T, IdxT>>)
+        if constexpr(std::is_same_v<StrategyImpl<capacity, descending, T, IdxT>,
+                                    WaveFilterStrategy<capacity, descending, T, IdxT>>)
         {
             const IdxT n      = end - start;
             const IdxT tid    = threadIdx.x;
@@ -1237,7 +1321,7 @@ class WarpSortBlockWide
 #pragma unroll
                     for(IdxT idx = 0; idx < tile; ++idx)
                     {
-                        queue_.add(arr[idx / elements][idx % elements], i + idx);
+                        strategy_.filter_and_batch(arr[idx / elements][idx % elements], i + idx);
                     }
                     idx = i;
                 }
@@ -1256,8 +1340,8 @@ class WarpSortBlockWide
                     {
                         const auto val = (i + idx < end)
                                              ? _Float16(arr[idx / elements][idx % elements])
-                                             : dummy_;
-                        queue_.add(val, i + idx);
+                                             : sentinel_;
+                        strategy_.filter_and_batch(val, i + idx);
                     }
                 }
             }
@@ -1283,8 +1367,9 @@ class WarpSortBlockWide
 #pragma unroll
                     for(IdxT idx = 0; idx < tile; ++idx)
                     {
-                        const auto val = (i + idx < end) ? arr[idx / elements][idx % elements] : dummy_;
-                        queue_.add(val, i + idx);
+                        const auto val =
+                            (i + idx < end) ? arr[idx / elements][idx % elements] : sentinel_;
+                        strategy_.filter_and_batch(val, i + idx);
                     }
                 }
             }
@@ -1296,61 +1381,63 @@ class WarpSortBlockWide
                 __builtin_unreachable();
             }
         }
-        else if constexpr(std::is_same_v<WarpSortImpl<capacity, greater, T, IdxT>,
-                                         WarpBitonic<capacity, greater, T, IdxT>>)
+        else if constexpr(std::is_same_v<StrategyImpl<capacity, descending, T, IdxT>,
+                                         WaveBatchStrategy<capacity, descending, T, IdxT>>)
         {
-            int num_warps     = blockDim.x / utils::WARP_SIZE;
-            const int warp_id = threadIdx.x / utils::WARP_SIZE;
-            IdxT len_per_warp = (end - start - 1) / num_warps + 1;
-            len_per_warp      = utils::round_up_to_multiple_of<utils::WARP_SIZE>(len_per_warp);
-            IdxT warp_start   = start + warp_id * len_per_warp;
-            IdxT warp_end     = std::min(warp_start + len_per_warp, end);
-            this->queue_.add(in, warp_start, warp_end);
+            int num_waves     = blockDim.x / utils::WAVE_SIZE;
+            const int wave_id = threadIdx.x / utils::WAVE_SIZE;
+            IdxT len_per_wave = (end - start - 1) / num_waves + 1;
+            len_per_wave      = utils::round_up_to_multiple_of<utils::WAVE_SIZE>(len_per_wave);
+            IdxT wave_start   = start + wave_id * len_per_wave;
+            IdxT wave_end     = std::min(wave_start + len_per_wave, end);
+            strategy_.process_range(in, wave_start, wave_end);
         }
     }
 
-    __device__ void done()
+    __device__ void finalize_and_reduce()
     {
-        queue_.done();
-        int num_warps     = blockDim.x / utils::WARP_SIZE;
-        const int warp_id = threadIdx.x / utils::WARP_SIZE;
-        while(num_warps > 1)
+        strategy_.finalize();
+        int num_waves     = blockDim.x / utils::WAVE_SIZE;
+        const int wave_id = threadIdx.x / utils::WAVE_SIZE;
+        while(num_waves > 1)
         {
-            int half_num_warps = (num_warps + 1) / 2;
-            if(warp_id < num_warps && warp_id >= half_num_warps)
+            int half_num_waves = (num_waves + 1) / 2;
+            if(wave_id < num_waves && wave_id >= half_num_waves)
             {
-                int dst_warp_id = warp_id - half_num_warps;
-                queue_.dump(val_smem_ + dst_warp_id * k_, idx_smem_ + dst_warp_id * k_);
+                int target_wave = wave_id - half_num_waves;
+                strategy_.emit_results(reduction_priorities_ + target_wave * k_,
+                                       reduction_positions_ + target_wave * k_);
             }
             __syncthreads();
-            if(warp_id < num_warps / 2)
+            if(wave_id < num_waves / 2)
             {
-                queue_.load_sorted(val_smem_, idx_smem_, warp_id * k_);
+                strategy_.merge_sorted_input(
+                    reduction_priorities_, reduction_positions_, wave_id * k_);
             }
             __syncthreads();
-            num_warps = half_num_warps;
+            num_waves = half_num_waves;
         }
     }
 
-    __device__ void dump(T* __restrict__ out, IdxT* __restrict__ out_idx) const
+    __device__ void write_output(T* __restrict__ out, IdxT* __restrict__ out_idx) const
     {
-        if(threadIdx.x < utils::WARP_SIZE)
+        if(threadIdx.x < utils::WAVE_SIZE)
         {
-            queue_.dump(out, out_idx);
+            strategy_.emit_results(out, out_idx);
         }
     }
 
     private:
-    WarpSortImpl<capacity, greater, T, IdxT> queue_;
-    int k_;
-    T dummy_;
-    T* val_smem_;
-    IdxT* idx_smem_;
+    StrategyImpl<capacity, descending, T, IdxT> strategy_;
+    IdxT k_;
+    T sentinel_;
+    T* reduction_priorities_;
+    IdxT* reduction_positions_;
 };
 
 // --- Kernel and Launch Logic ---
 
-template <template <int, bool, typename, typename> class WarpSortClass,
+template <template <int, bool, typename, typename> class StrategyClass,
           int capacity,
           bool greater,
           typename T,
@@ -1366,9 +1453,9 @@ __global__ void __launch_bounds__(512, 2) block_kernel(const T* __restrict__ in,
 {
     extern __shared__ char smem_buf[];
     const int num_of_block        = gridDim.x / batch_size;
-    // TODO: For now, WarpSelect always uses single-block mode.
-    const IdxT len_per_block      = std::is_same_v<WarpSortClass<capacity, greater, T, IdxT>,
-                                              WarpSelect<capacity, greater, T, IdxT>>
+    // TODO: For now, WaveFilterStrategy always uses single-block mode.
+    const IdxT len_per_block      = std::is_same_v<StrategyClass<capacity, greater, T, IdxT>,
+                                              WaveFilterStrategy<capacity, greater, T, IdxT>>
                                         ? len
                                         : (len - 1) / num_of_block + 1;
     const int batch_id            = blockIdx.x / num_of_block;
@@ -1376,51 +1463,52 @@ __global__ void __launch_bounds__(512, 2) block_kernel(const T* __restrict__ in,
     IdxT start                    = block_id_in_a_batch * len_per_block;
     IdxT end                      = std::min(start + len_per_block, len);
 
-    WarpSortBlockWide<WarpSortClass, capacity, greater, T, IdxT> queue(k, dummy, smem_buf);
-    if constexpr(std::is_same_v<WarpSortClass<capacity, greater, T, IdxT>,
-                                WarpMerge<capacity, greater, T, IdxT>>)
+    WorkgroupTopKCoordinator<StrategyClass, capacity, greater, T, IdxT> coordinator(
+        k, dummy, smem_buf);
+    if constexpr(std::is_same_v<StrategyClass<capacity, greater, T, IdxT>,
+                                WaveIterativeStrategy<capacity, greater, T, IdxT>>)
     {
-        queue.add(in + static_cast<size_t>(batch_id) * len,
-                  in_idx + static_cast<size_t>(batch_id) * len,
-                  start,
-                  end);
+        coordinator.process_sorted_chunks(in + static_cast<size_t>(batch_id) * len,
+                                          in_idx + static_cast<size_t>(batch_id) * len,
+                                          start,
+                                          end);
     }
     else
     {
-        queue.add(in + static_cast<size_t>(batch_id) * len, start, end);
+        coordinator.process_unsorted(in + static_cast<size_t>(batch_id) * len, start, end);
     }
-    queue.done();
-    queue.dump(out + static_cast<size_t>(blockIdx.x) * k,
-               out_idx + static_cast<size_t>(blockIdx.x) * k);
+    coordinator.finalize_and_reduce();
+    coordinator.write_output(out + static_cast<size_t>(blockIdx.x) * k,
+                             out_idx + static_cast<size_t>(blockIdx.x) * k);
 }
 
 template <bool greater,
           int Capacity,
           template <int, bool, typename, typename>
-          class WarpSortClass,
+          class StrategyClass,
           typename T,
           typename IdxT>
 auto find_block_kernel_helper(int capacity)
 {
-    if constexpr(Capacity == utils::WARP_SIZE)
+    if constexpr(Capacity == utils::WAVE_SIZE)
     {
-        return greater ? block_kernel<WarpSortClass, utils::WARP_SIZE, true, T, IdxT>
-                       : block_kernel<WarpSortClass, utils::WARP_SIZE, false, T, IdxT>;
+        return greater ? block_kernel<StrategyClass, utils::WAVE_SIZE, true, T, IdxT>
+                       : block_kernel<StrategyClass, utils::WAVE_SIZE, false, T, IdxT>;
     }
     else
     {
         if(capacity == Capacity)
         {
-            return greater ? block_kernel<WarpSortClass, Capacity, true, T, IdxT>
-                           : block_kernel<WarpSortClass, Capacity, false, T, IdxT>;
+            return greater ? block_kernel<StrategyClass, Capacity, true, T, IdxT>
+                           : block_kernel<StrategyClass, Capacity, false, T, IdxT>;
         }
-        return find_block_kernel_helper<greater, Capacity / 2, WarpSortClass, T, IdxT>(capacity);
+        return find_block_kernel_helper<greater, Capacity / 2, StrategyClass, T, IdxT>(capacity);
     }
 }
 
 template <bool greater,
           template <int, bool, typename, typename>
-          class WarpSortClass,
+          class StrategyClass,
           typename T,
           typename IdxT>
 auto find_block_kernel(int k)
@@ -1429,91 +1517,90 @@ auto find_block_kernel(int k)
     assert(capacity <= buffer_load_helpers::MAX_CAPACITY);
     return find_block_kernel_helper<greater,
                                     buffer_load_helpers::MAX_CAPACITY,
-                                    WarpSortClass,
+                                    StrategyClass,
                                     T,
                                     IdxT>(capacity);
 }
 
 template <typename T, typename IdxT>
-int calc_smem_size_for_block_wide(int num_of_warp, IdxT k)
+int calc_smem_size_for_block_wide(int num_wave, IdxT k)
 {
     // Base size for reduction buffers
-    int n = std::max<int>(num_of_warp / 2 * k, num_of_warp * utils::WARP_SIZE);
+    int n         = std::max<int>(num_wave / 2 * k, num_wave * utils::WAVE_SIZE);
     int base_size = utils::round_up_to_multiple_of<16>(n * sizeof(T)) + n * sizeof(IdxT);
     return base_size;
 }
 
 template <typename T, typename IdxT>
-int calc_smem_size_for_warp_select(int num_of_warp)
+int calc_smem_size_for_wave_filter(int num_wave)
 {
-    // WarpSelect's internal shared memory: num_warps * WARP_SIZE elements for values and indices
-    int val_size = utils::round_up_to_multiple_of<16>(num_of_warp * sizeof(T) * utils::WARP_SIZE);
-    int idx_size = num_of_warp * sizeof(IdxT) * utils::WARP_SIZE;
+    // WaveFilterStrategy's internal shared memory: num_wave * WAVE_SIZE elements for staging
+    int val_size = utils::round_up_to_multiple_of<16>(num_wave * sizeof(T) * utils::WAVE_SIZE);
+    int idx_size = num_wave * sizeof(IdxT) * utils::WAVE_SIZE;
     return val_size + idx_size;
 }
 
-template <template <int, bool, typename, typename> class WarpSortClass, typename T, typename IdxT>
+template <template <int, bool, typename, typename> class StrategyClass, typename T, typename IdxT>
 void calc_launch_parameter_by_occupancy(IdxT k, int* block_size, int* min_grid_size)
 {
-    auto func      = find_block_kernel<true, WarpSortClass, T, IdxT>(k);
+    auto func      = find_block_kernel<true, StrategyClass, T, IdxT>(k);
     auto calc_smem = [k](int bs) {
-        return calc_smem_size_for_block_wide<T, IdxT>(bs / utils::WARP_SIZE, k);
+        return calc_smem_size_for_block_wide<T, IdxT>(bs / utils::WAVE_SIZE, k);
     };
     HIP_CHECK(
         hipOccupancyMaxPotentialBlockSizeVariableSMem(min_grid_size, block_size, func, calc_smem));
 }
 
-template <template <int, bool, typename, typename> class WarpSortClass>
+template <template <int, bool, typename, typename> class StrategyClass>
 struct LaunchThreshold
 {
 };
 
 template <>
-struct LaunchThreshold<WarpSelect>
+struct LaunchThreshold<WaveFilterStrategy>
 {
-    static constexpr int len_factor_for_multi_block  = 2;
-    static constexpr int len_factor_for_single_block = 256;
+    static constexpr int multi_block_factor  = 2;
+    static constexpr int single_block_factor = 256;
 };
 
 template <>
-struct LaunchThreshold<WarpBitonic>
+struct LaunchThreshold<WaveBatchStrategy>
 {
-    static constexpr int len_factor_for_choosing     = 4;
-    static constexpr int len_factor_for_multi_block  = 2;
-    static constexpr int len_factor_for_single_block = 4;
+    static constexpr int choosing_factor     = 4;
+    static constexpr int multi_block_factor  = 2;
+    static constexpr int single_block_factor = 4;
 };
 
-template <template <int, bool, typename, typename> class WarpSortClass, typename T, typename IdxT>
-void calc_launch_parameter(
-    int batch_size, IdxT len, IdxT k, int* p_num_of_block, int* p_num_of_warp)
+template <template <int, bool, typename, typename> class StrategyClass, typename T, typename IdxT>
+void calc_launch_parameter(int batch_size, IdxT len, IdxT k, int* p_num_of_block, int* p_num_wave)
 {
     const int capacity = utils::calc_capacity(k);
     int block_size     = 0;
     int min_grid_size  = 0;
-    calc_launch_parameter_by_occupancy<WarpSortClass, T, IdxT>(k, &block_size, &min_grid_size);
+    calc_launch_parameter_by_occupancy<StrategyClass, T, IdxT>(k, &block_size, &min_grid_size);
 
-    int num_of_warp;
+    int num_wave;
     int num_of_block;
     if(batch_size < min_grid_size)
     {
-        num_of_warp              = block_size / utils::WARP_SIZE;
+        num_wave                 = block_size / utils::WAVE_SIZE;
         num_of_block             = min_grid_size / batch_size;
         IdxT len_per_block       = (len - 1) / num_of_block + 1;
-        IdxT len_per_warp        = (len_per_block - 1) / num_of_warp + 1;
-        len_per_warp             = utils::round_up_to_multiple_of<utils::WARP_SIZE>(len_per_warp);
-        len_per_block            = len_per_warp * num_of_warp;
+        IdxT len_per_wave        = (len_per_block - 1) / num_wave + 1;
+        len_per_wave             = utils::round_up_to_multiple_of<utils::WAVE_SIZE>(len_per_wave);
+        len_per_block            = len_per_wave * num_wave;
         num_of_block             = (len - 1) / len_per_block + 1;
-        constexpr int len_factor = LaunchThreshold<WarpSortClass>::len_factor_for_multi_block;
-        if(len_per_warp < static_cast<IdxT>(capacity * len_factor))
+        constexpr int len_factor = LaunchThreshold<StrategyClass>::multi_block_factor;
+        if(len_per_wave < static_cast<IdxT>(capacity * len_factor))
         {
-            len_per_warp  = capacity * len_factor;
-            len_per_block = num_of_warp * len_per_warp;
+            len_per_wave  = capacity * len_factor;
+            len_per_block = num_wave * len_per_wave;
             if(len_per_block > len)
             {
                 len_per_block = len;
             }
             num_of_block = (len - 1) / len_per_block + 1;
-            num_of_warp  = (len_per_block - 1) / len_per_warp + 1;
+            num_wave     = (len_per_block - 1) / len_per_wave + 1;
         }
     }
     else
@@ -1531,50 +1618,51 @@ void calc_launch_parameter(
             {
                 block_size = 1;
             }
-            block_size = utils::round_up_to_multiple_of<utils::WARP_SIZE>(block_size);
+            block_size = utils::round_up_to_multiple_of<utils::WAVE_SIZE>(block_size);
         }
-        num_of_warp              = block_size / utils::WARP_SIZE;
-        IdxT len_per_warp        = (len - 1) / num_of_warp + 1;
-        len_per_warp             = utils::round_up_to_multiple_of<utils::WARP_SIZE>(len_per_warp);
-        num_of_warp              = (len - 1) / len_per_warp + 1;
-        constexpr int len_factor = LaunchThreshold<WarpSortClass>::len_factor_for_single_block;
-        if(len_per_warp < static_cast<IdxT>(capacity * len_factor))
+        num_wave                 = block_size / utils::WAVE_SIZE;
+        IdxT len_per_wave        = (len - 1) / num_wave + 1;
+        len_per_wave             = utils::round_up_to_multiple_of<utils::WAVE_SIZE>(len_per_wave);
+        num_wave                 = (len - 1) / len_per_wave + 1;
+        constexpr int len_factor = LaunchThreshold<StrategyClass>::single_block_factor;
+        if(len_per_wave < static_cast<IdxT>(capacity * len_factor))
         {
-            len_per_warp = capacity * len_factor;
-            num_of_warp  = (len - 1) / len_per_warp + 1;
+            len_per_wave = capacity * len_factor;
+            num_wave     = (len - 1) / len_per_wave + 1;
         }
     }
     *p_num_of_block = num_of_block;
-    *p_num_of_warp  = utils::round_up_to_multiple_of<4>(num_of_warp);
+    *p_num_wave     = utils::round_up_to_multiple_of<4>(num_wave);
 }
 
 template <typename T, typename IdxT>
-void calc_launch_parameter_for_merge(IdxT len, IdxT k, int* num_of_block, int* num_of_warp)
+void calc_launch_parameter_for_merge(IdxT len, IdxT k, int* num_of_block, int* num_wave)
 {
     *num_of_block     = 1;
     int block_size    = 0;
     int min_grid_size = 0;
-    calc_launch_parameter_by_occupancy<WarpMerge, T, IdxT>(k, &block_size, &min_grid_size);
-    *num_of_warp      = block_size / utils::WARP_SIZE;
-    IdxT len_per_warp = (len - 1) / (*num_of_warp) + 1;
-    len_per_warp      = ((len_per_warp - 1) / k + 1) * k;
-    *num_of_warp      = (len - 1) / len_per_warp + 1;
+    calc_launch_parameter_by_occupancy<WaveIterativeStrategy, T, IdxT>(
+        k, &block_size, &min_grid_size);
+    *num_wave         = block_size / utils::WAVE_SIZE;
+    IdxT len_per_wave = (len - 1) / (*num_wave) + 1;
+    len_per_wave      = ((len_per_wave - 1) / k + 1) * k;
+    *num_wave         = (len - 1) / len_per_wave + 1;
 }
 
 template <bool greater,
           template <int, bool, typename, typename>
-          class WarpSortClass,
+          class StrategyClass,
           typename T,
           typename IdxT>
-void warp_sort_topk_impl(int num_of_block,
-                         int num_of_warp,
-                         const T* __restrict__ in,
-                         int batch_size,
-                         IdxT len,
-                         IdxT k,
-                         T* __restrict__ out,
-                         IdxT* __restrict__ out_idx,
-                         hipStream_t stream)
+void topk_kernel_launcher(int num_of_block,
+                          int num_wave,
+                          const T* __restrict__ in,
+                          int batch_size,
+                          IdxT len,
+                          IdxT k,
+                          T* __restrict__ out,
+                          IdxT* __restrict__ out_idx,
+                          hipStream_t stream)
 {
     T* tmp_val             = nullptr;
     IdxT* tmp_idx          = nullptr;
@@ -1591,17 +1679,17 @@ void warp_sort_topk_impl(int num_of_block,
     T dummy                = numeric::get_sentinel_value<greater, T>();
     T* result_val          = (num_of_block == 1) ? out : tmp_val;
     IdxT* result_idx       = (num_of_block == 1) ? out_idx : tmp_idx;
-    int block_dim          = num_of_warp * utils::WARP_SIZE;
+    int block_dim          = num_wave * utils::WAVE_SIZE;
 
-    // Calculate shared memory size: reduction buffers + WarpSelect's internal memory
-    int smem_size = calc_smem_size_for_block_wide<T, IdxT>(num_of_warp, k);
-    if constexpr(is_warp_select<WarpSortClass>::value)
+    // Calculate shared memory size: reduction buffers + WaveFilterStrategy's internal memory
+    int smem_size = calc_smem_size_for_block_wide<T, IdxT>(num_wave, k);
+    if constexpr(strategy_uses_shared_memory<StrategyClass>::value)
     {
-        // WarpSelect uses shared memory internally, add its memory requirements
-        smem_size += calc_smem_size_for_warp_select<T, IdxT>(num_of_warp);
+        // WaveFilterStrategy uses shared memory internally, add its memory requirements
+        smem_size += calc_smem_size_for_wave_filter<T, IdxT>(num_wave);
     }
 
-    auto block_kernel_func = find_block_kernel<greater, WarpSortClass, T, IdxT>(k);
+    auto block_kernel_func = find_block_kernel<greater, StrategyClass, T, IdxT>(k);
 
     block_kernel_func<<<batch_size * num_of_block, block_dim, smem_size, stream>>>(
         in, static_cast<IdxT*>(nullptr), batch_size, len, k, result_val, result_idx, dummy);
@@ -1609,10 +1697,10 @@ void warp_sort_topk_impl(int num_of_block,
     if(num_of_block > 1)
     {
         len = k * num_of_block;
-        calc_launch_parameter_for_merge<T, IdxT>(len, k, &num_of_block, &num_of_warp);
-        block_dim              = num_of_warp * utils::WARP_SIZE;
-        smem_size              = calc_smem_size_for_block_wide<T, IdxT>(num_of_warp, k);
-        auto merge_kernel_func = find_block_kernel<greater, WarpMerge, T, IdxT>(k);
+        calc_launch_parameter_for_merge<T, IdxT>(len, k, &num_of_block, &num_wave);
+        block_dim              = num_wave * utils::WAVE_SIZE;
+        smem_size              = calc_smem_size_for_block_wide<T, IdxT>(num_wave, k);
+        auto merge_kernel_func = find_block_kernel<greater, WaveIterativeStrategy, T, IdxT>(k);
 
         merge_kernel_func<<<batch_size * num_of_block, block_dim, smem_size, stream>>>(
             tmp_val, tmp_idx, batch_size, len, k, out, out_idx, dummy);
@@ -1623,7 +1711,7 @@ void warp_sort_topk_impl(int num_of_block,
 }
 
 template <bool greater, typename T, typename IdxT>
-void WarpSortTopk(int batch_size,
+void AdaptiveTopK(int batch_size,
                   IdxT len,
                   IdxT k,
                   const T* __restrict__ in,
@@ -1634,22 +1722,23 @@ void WarpSortTopk(int batch_size,
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
     const int capacity = utils::calc_capacity(k);
     int num_of_block   = 0;
-    int num_of_warp    = 0;
+    int num_wave       = 0;
 
-    calc_launch_parameter<WarpBitonic, T, IdxT>(batch_size, len, k, &num_of_block, &num_of_warp);
-    int len_per_warp = (num_of_block * num_of_warp == 0) ? len : len / (num_of_block * num_of_warp);
+    calc_launch_parameter<WaveBatchStrategy, T, IdxT>(batch_size, len, k, &num_of_block, &num_wave);
+    int len_per_wave = (num_of_block * num_wave == 0) ? len : len / (num_of_block * num_wave);
 
-    if(len_per_warp <=
-       static_cast<IdxT>(capacity) * LaunchThreshold<WarpBitonic>::len_factor_for_choosing)
+    if(len_per_wave <=
+       static_cast<IdxT>(capacity) * LaunchThreshold<WaveBatchStrategy>::choosing_factor)
     {
-        warp_sort_topk_impl<greater, WarpBitonic, T, IdxT>(
-            num_of_block, num_of_warp, in, batch_size, len, k, out, out_idx, stream);
+        topk_kernel_launcher<greater, WaveBatchStrategy, T, IdxT>(
+            num_of_block, num_wave, in, batch_size, len, k, out, out_idx, stream);
     }
     else
     {
-        calc_launch_parameter<WarpSelect, T, IdxT>(batch_size, len, k, &num_of_block, &num_of_warp);
-        warp_sort_topk_impl<greater, WarpSelect, T, IdxT>(
-            num_of_block, num_of_warp, in, batch_size, len, k, out, out_idx, stream);
+        calc_launch_parameter<WaveFilterStrategy, T, IdxT>(
+            batch_size, len, k, &num_of_block, &num_wave);
+        topk_kernel_launcher<greater, WaveFilterStrategy, T, IdxT>(
+            num_of_block, num_wave, in, batch_size, len, k, out, out_idx, stream);
     }
 }
 
@@ -1688,12 +1777,12 @@ void topk_plain(torch::Tensor& values,   // [batch, len]
 
         if(largest)
         {
-            topk::WarpSortTopk<true, input_dtype, IdxT>(
+            topk::AdaptiveTopK<true, input_dtype, IdxT>(
                 batch, len, topk, values_kernel_ptr, topk_out_kernel_ptr, topk_ids_ptr, stream);
         }
         else
         {
-            topk::WarpSortTopk<false, input_dtype, IdxT>(
+            topk::AdaptiveTopK<false, input_dtype, IdxT>(
                 batch, len, topk, values_kernel_ptr, topk_out_kernel_ptr, topk_ids_ptr, stream);
         }
     });
