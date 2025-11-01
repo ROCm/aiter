@@ -76,6 +76,8 @@ CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_f32(fp32_t a, fp32_t b, 
     // permute high bits and low bits to match the order of the original vector
     asm volatile("v_cvt_scalef32_pk_fp4_f32 %0, %1, %2, %3" : "=v"(c) : "v"(b), "v"(a), "v"(scale));
     return bit_cast<fp4x2_t>(bit_cast<int8x2_t>(c[0])[0]);
+#else
+    return fp4x2_t{};
 #endif
 }
 CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_f16(fp16x2_v a, fp32_t scale)
@@ -85,6 +87,8 @@ CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_f16(fp16x2_v a, fp32_t s
     // permute high bits and low bits to match the order of the original vector
     asm volatile("v_cvt_scalef32_pk_fp4_f16 %0, %1, %2" : "=v"(c) : "v"(a), "v"(scale));
     return bit_cast<fp4x2_t>(bit_cast<int8x2_t>(c[0])[0]);
+#else
+    return fp4x2_t{};
 #endif
 }
 CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_bf16(bf16x2_v a, fp32_t scale)
@@ -94,6 +98,8 @@ CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_bf16(bf16x2_v a, fp32_t 
     // permute high bits and low bits to match the order of the original vector
     asm volatile("v_cvt_scalef32_pk_fp4_bf16 %0, %1, %2" : "=v"(c) : "v"(a), "v"(scale));
     return bit_cast<fp4x2_t>(bit_cast<int8x2_t>(c[0])[0]);
+#else
+    return fp4x2_t{};
 #endif
 }
 
