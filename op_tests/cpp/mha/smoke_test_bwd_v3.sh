@@ -100,14 +100,19 @@ run_gfx950_bwd_v3() {
     for prec in "bf16" "fp16" ; do
     for mask in 0 1 2 ; do
     for v3_atomic_fp32 in 1 0 ; do
+    for hdim in 72 96 112 120 192 ; do
     for batch in 1 3 ; do
     for head in 2 4 ; do
-    for hdim in 72 96 112 120 ; do
     for sq in 13 62 174 ; do
-    for sk in 65 174 299 577 799; do
+    for sk in 65 174 299 577 799 ; do
     for perm in 0 1 ; do
 
-    $EXE -prec=$prec -b=$batch -h=$head -h_k=2 -d=$hdim -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
+    hdim_v=$hdim
+    if [ $hdim -eq 192 ]; then
+        hdim_v=128
+    fi
+
+    $EXE -prec=$prec -b=$batch -h=$head -h_k=2 -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
 
     done
     done
