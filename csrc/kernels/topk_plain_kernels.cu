@@ -1139,6 +1139,13 @@ class WarpMerge : public WarpSort<capacity, greater, T, IdxT>
     using WarpSort<capacity, greater, T, IdxT>::dummy_;
 };
 
+// Type trait to check if a template class is WarpSelect
+template <template <int, bool, typename, typename> class WarpSortClass>
+struct is_warp_select : std::false_type {};
+
+template <>
+struct is_warp_select<WarpSelect> : std::true_type {};
+
 // --- Block-Level Logic ---
 
 template <template <int, bool, typename, typename> class WarpSortImpl,
@@ -1152,10 +1159,24 @@ class WarpSortBlockWide
     __device__ WarpSortBlockWide(IdxT k, T dummy, void* smem_buf)
         : queue_(k, dummy), k_(k), dummy_(dummy)
     {
-        val_smem_           = static_cast<T*>(smem_buf);
         const int num_warps = blockDim.x / utils::WARP_SIZE;
-        idx_smem_           = reinterpret_cast<IdxT*>(
-            reinterpret_cast<char*>(smem_buf) +
+
+        // WarpSelect uses shared memory internally for its own buffers
+        // We need to allocate OUR reduction buffers AFTER WarpSelect's memory
+        size_t warp_select_smem_size = 0;
+        if constexpr(is_warp_select<WarpSortImpl>::value)
+        {
+            // WarpSelect allocates: num_warps * WARP_SIZE elements for values and indices
+            warp_select_smem_size = utils::round_up_to_multiple_of<16>(
+                                       num_warps * sizeof(T) * utils::WARP_SIZE) +
+                                   num_warps * sizeof(IdxT) * utils::WARP_SIZE;
+        }
+
+        // Our reduction buffers start AFTER WarpSelect's internal buffers
+        val_smem_ = reinterpret_cast<T*>(
+            reinterpret_cast<char*>(smem_buf) + warp_select_smem_size);
+        idx_smem_ = reinterpret_cast<IdxT*>(
+            reinterpret_cast<char*>(smem_buf) + warp_select_smem_size +
             utils::round_up_to_multiple_of<16>(num_warps / 2 * sizeof(T) * k_));
     }
 
@@ -1342,7 +1363,7 @@ __global__ void __launch_bounds__(512, 2) block_kernel(const T* __restrict__ in,
 {
     extern __shared__ char smem_buf[];
     const int num_of_block        = gridDim.x / batch_size;
-    const IdxT len_per_block      = len;
+    const IdxT len_per_block      = len;  // TODO: "(len - 1) / num_of_block + 1" for multi-block
     const int batch_id            = blockIdx.x / num_of_block;
     const int block_id_in_a_batch = blockIdx.x % num_of_block;
     IdxT start                    = block_id_in_a_batch * len_per_block;
@@ -1409,8 +1430,19 @@ auto find_block_kernel(int k)
 template <typename T, typename IdxT>
 int calc_smem_size_for_block_wide(int num_of_warp, IdxT k)
 {
+    // Base size for reduction buffers
     int n = std::max<int>(num_of_warp / 2 * k, num_of_warp * utils::WARP_SIZE);
-    return utils::round_up_to_multiple_of<16>(n * sizeof(T)) + n * sizeof(IdxT);
+    int base_size = utils::round_up_to_multiple_of<16>(n * sizeof(T)) + n * sizeof(IdxT);
+    return base_size;
+}
+
+template <typename T, typename IdxT>
+int calc_smem_size_for_warp_select(int num_of_warp)
+{
+    // WarpSelect's internal shared memory: num_warps * WARP_SIZE elements for values and indices
+    int val_size = utils::round_up_to_multiple_of<16>(num_of_warp * sizeof(T) * utils::WARP_SIZE);
+    int idx_size = num_of_warp * sizeof(IdxT) * utils::WARP_SIZE;
+    return val_size + idx_size;
 }
 
 template <template <int, bool, typename, typename> class WarpSortClass, typename T, typename IdxT>
@@ -1539,11 +1571,29 @@ void warp_sort_topk_impl(int num_of_block,
 {
     T* tmp_val             = nullptr;
     IdxT* tmp_idx          = nullptr;
+
+    // Allocate temporary buffers if multi-block reduction is needed
+    if(num_of_block > 1)
+    {
+        size_t tmp_size = sizeof(T) * num_of_block * k * batch_size;
+        size_t idx_size = sizeof(IdxT) * num_of_block * k * batch_size;
+        HIP_CHECK(hipMalloc(&tmp_val, tmp_size));
+        HIP_CHECK(hipMalloc(&tmp_idx, idx_size));
+    }
+
     T dummy                = numeric::get_sentinel_value<greater, T>();
     T* result_val          = (num_of_block == 1) ? out : tmp_val;
     IdxT* result_idx       = (num_of_block == 1) ? out_idx : tmp_idx;
     int block_dim          = num_of_warp * utils::WARP_SIZE;
-    int smem_size          = calc_smem_size_for_block_wide<T, IdxT>(num_of_warp, k);
+
+    // Calculate shared memory size: reduction buffers + WarpSelect's internal memory (if applicable)
+    int smem_size = calc_smem_size_for_block_wide<T, IdxT>(num_of_warp, k);
+    if constexpr(is_warp_select<WarpSortClass>::value)
+    {
+        // WarpSelect uses shared memory internally, add its memory requirements
+        smem_size += calc_smem_size_for_warp_select<T, IdxT>(num_of_warp);
+    }
+
     auto block_kernel_func = find_block_kernel<greater, WarpSortClass, T, IdxT>(k);
 
     block_kernel_func<<<batch_size * num_of_block, block_dim, smem_size, stream>>>(
@@ -1559,6 +1609,9 @@ void warp_sort_topk_impl(int num_of_block,
 
         merge_kernel_func<<<batch_size * num_of_block, block_dim, smem_size, stream>>>(
             tmp_val, tmp_idx, batch_size, len, k, out, out_idx, dummy);
+
+        HIP_CHECK(hipFree(tmp_val));
+        HIP_CHECK(hipFree(tmp_idx));
     }
 }
 
