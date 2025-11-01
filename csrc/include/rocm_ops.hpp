@@ -260,7 +260,25 @@
           py::arg("kv_cache"),                                                      \
           py::arg("slot_mapping"),                                                  \
           py::arg("kv_cache_dtype"),                                                \
-          py::arg("scale"));
+          py::arg("scale"));                                                        \
+    m.def("indexer_k_quant_and_cache",                                              \
+          &aiter::indexer_k_quant_and_cache,                                        \
+          "indexer_k_quant_and_cache(Tensor k, Tensor kv_cache,"                    \
+          "                     Tensor slot_mapping,"                               \
+          "                     int64_t quant_block_size,"                          \
+          "                     std::string& scale_fmt) -> ()",                     \
+          py::arg("k"),                                                             \
+          py::arg("kv_cache"),                                                      \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("quant_block_size"),                                              \
+          py::arg("scale_fmt"));                                                    \
+    m.def("cp_gather_indexer_k_quant_cache",                                        \
+          &aiter::cp_gather_indexer_k_quant_cache,                                  \
+          py::arg("kv_cache"),                                                      \
+          py::arg("dst_k"),                                                         \
+          py::arg("dst_scale"),                                                     \
+          py::arg("block_table"),                                                   \
+          py::arg("cu_seq_lens"));
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
     m.def("init_custom_ar",                                                                    \
