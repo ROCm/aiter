@@ -64,7 +64,7 @@ def get_gfx_custom_op_core() -> int:
                     except KeyError:
                         raise KeyError(
                             f'Unknown GPU architecture: {line.split(":")[-1].strip()}. '
-                            f"Supported architectures: {list(gfx_mapping.values())}"
+                            f"Supported architectures: {list(gfx_mapping.keys())}"
                         )
 
         except Exception as e:
@@ -76,7 +76,7 @@ def get_gfx_custom_op_core() -> int:
     except KeyError:
         raise KeyError(
             f"Unknown GPU architecture: {gfx}. "
-            f"Supported architectures: {list(gfx_mapping.values())}"
+            f"Supported architectures: {list(gfx_mapping.keys())}"
         )
 
 
