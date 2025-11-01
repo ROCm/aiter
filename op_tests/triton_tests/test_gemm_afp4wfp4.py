@@ -22,6 +22,17 @@ def shuffle_scales(scales: torch.Tensor):
     return scales_shuffled
 
 
+def un_shuffle_scales(scales_shuffled: torch.Tensor):
+    scales = scales_shuffled.clone()
+    sm, sn = scales.shape
+    scales = scales.view(sm * 32, sn // 32)
+    sm, sn = scales.shape
+    scales = scales.view(sm // 32, sn // 8, 4, 16, 2, 2, 1)
+    scales = scales.permute(0, 5, 3, 1, 4, 2, 6).contiguous()
+    scales = scales.view(sm, sn)
+    return scales
+
+
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
 
@@ -67,10 +78,7 @@ def generate_gemm_afp4wfp4_inputs(
 
     w = w_low | w_high << 4
     # Scale of 1.0 in e8m0, bias 127.
-    if M >= 32 and shuffle_scales_fg:
-        M_pad = (M + 255) // 256 * 256
-    else:
-        M_pad = M
+    M_pad = (M + 255) // 256 * 256
     x_scales = torch.randint(
         124, 128, (K // SCALE_GROUP_SIZE, M_pad), dtype=torch.uint8, device="cuda"
     )
@@ -162,6 +170,10 @@ def get_x_vals():
     x_vals += [(v, 16384, 53248) for v in [1, 8, 16, 32, 64, 128, 256]]
     x_vals += [(v, 18432, 16384) for v in [1, 8, 16, 32, 64, 128, 256]]
     x_vals += [(v, 16384, 16384) for v in [1, 8, 16, 32, 64, 128, 256]]
+    x_vals += [(v, 10240, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
+    x_vals += [(v, 8192, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
+    x_vals += [(v, 57344, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
+    x_vals += [(v, 8192, 28672) for v in [1, 2, 4, 8, 16, 32, 64]]
     x_vals += [(1, 1, 32)]  # minimal case
     return x_vals
 
@@ -269,11 +281,22 @@ def test_gemm_afp4_wfp4(
     if shuffle_scales_fg and shuffle_weight_fg:
         if output:
             triton_out = gemm_afp4wfp4_preshuffled_weight_scales(
-                x, w_triton, x_scales_triton, w_scales_triton, dtype, y
+                x,
+                w_triton,
+                x_scales_triton,
+                w_scales_triton,
+                dtype,
+                y,
+                use_aot=(dtype == torch.bfloat16 and layout == "TN"),
             )
         else:
             triton_out = gemm_afp4wfp4_preshuffled_weight_scales(
-                x, w_triton, x_scales_triton, w_scales_triton, dtype
+                x,
+                w_triton,
+                x_scales_triton,
+                w_scales_triton,
+                dtype,
+                use_aot=(dtype == torch.bfloat16 and layout == "TN"),
             )
     elif shuffle_scales_fg and not shuffle_weight_fg:
         if output:
