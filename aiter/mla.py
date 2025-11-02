@@ -181,6 +181,8 @@ def mla_decode_fwd(
     if num_kv_splits is None:
         num_kv_splits = get_cu_num()
 
+    io_tranformed = False
+
     if not persistent_mode:
         MAYBE_FINAL_OUT = True
 
@@ -247,7 +249,6 @@ def mla_decode_fwd(
             **extra_kargs,
         )
     else:
-        io_tranformed = False
         if nhead == 16 or kv_buffer.dtype == get_fp8_e4m3_dtype():
             # Natively support cases
             pass
