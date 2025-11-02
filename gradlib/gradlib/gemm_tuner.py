@@ -177,7 +177,7 @@ if __name__ == "__main__":
         try:
             process = mp.Process(target=runGemmTuner, args=(), daemon=False)
             process.start()
-            process.join(timeout=600)
+            process.join()
             if process.exitcode != 0:
                 time.sleep(0.5 * retries)
                 print(
