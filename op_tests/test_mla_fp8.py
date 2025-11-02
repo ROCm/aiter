@@ -187,7 +187,7 @@ def test_mla(
     )
 
     # for none absorb (mha)
-    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
     us_asm = None
@@ -384,7 +384,7 @@ parser.add_argument(
     "-qn",
     "--qk_nope_head_dim",
     type=int,
-    default=512,
+    default=128,
     help="""qk nope head dim.
     e.g.: -qn 512""",
 )
