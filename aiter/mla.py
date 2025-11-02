@@ -97,7 +97,7 @@ def _fwd_kernel_stage2_asm(
 
 
 @functools.lru_cache()
-def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q):
+def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     if num_kv_splits is None:
         cu_num = get_cu_num()
         avg_kv = total_kv / bs
@@ -116,6 +116,19 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q):
         num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
     get_mgc = {16: 16, 128: 16}
+
+    get_block_n_fp8 = { 16: 128,
+                        32: 128,
+                        48: 64,
+                        64: 64,
+                       128: 32,
+                       256: 32,
+                       384: 32,
+                       512: 32 }
+
+    if dtype == get_fp8_e4m3_dtype():
+        min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
+        num_kv_splits = min(num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n)
 
     assert nhead in get_mgc, f"{nhead=} not supported"
     mgc = get_mgc[nhead]
@@ -160,7 +173,7 @@ def mla_decode_fwd(
     persistent_mode = work_meta_data is not None
 
     if num_kv_splits_indptr is None and not persistent_mode:
-        num_kv_splits, mgc = get_meta_param(None, bs, total_kv, nhead, max_seqlen_q)
+        num_kv_splits, mgc = get_meta_param(None, bs, total_kv, nhead, max_seqlen_q, q.dtype)
         num_kv_splits_indptr = torch.arange(
             0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device=device
         )
@@ -168,37 +181,22 @@ def mla_decode_fwd(
     if num_kv_splits is None:
         num_kv_splits = get_cu_num()
 
-    MAYBE_FINAL_OUT = True
-    io_tranformed = False
-    if nhead == 16 and max_seqlen_q == 1:
-        # special case for 16 heads and max_seqlen_q == 1
-        MAYBE_FINAL_OUT = False
-    elif nhead == 16 or (nhead == 128 and kv_buffer.dtype == get_fp8_e4m3_dtype()):
-        # Natively support cases
-        pass
-    elif nhead in range(32, 512 + 1, 16) and persistent_mode and max_seqlen_q == 1:
-        # we use nhead=16 to simulate such cases by customized metadata
-        # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
-        total_s = ori_total_s * (ori_nhead // 16)
-        nhead = 16
-        q = q.view(total_s, nhead, -1)
-        o = o.view(total_s, nhead, -1)
-        io_tranformed = True
-    else:
-        assert False, f"{nhead=} and {max_seqlen_q=} not supported"
-
-    logits = torch.empty(
-        (total_s, num_kv_splits, nhead, v_head_dim),
-        dtype=dtypes.fp32,
-        device=device,
-    )
-
-    attn_lse = torch.empty(
-        (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
-    )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
-
     if not persistent_mode:
+        MAYBE_FINAL_OUT = True
+
+        if nhead == 16 and max_seqlen_q == 1:
+            MAYBE_FINAL_OUT = False
+
+        logits = torch.zeros(
+            (total_s, num_kv_splits, nhead, v_head_dim),
+            dtype=dtypes.fp32,
+            device=device,
+        )
+        attn_lse = torch.empty(
+            (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
+        )
+        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
@@ -249,6 +247,31 @@ def mla_decode_fwd(
             **extra_kargs,
         )
     else:
+        io_tranformed = False
+        if nhead == 16 or kv_buffer.dtype == get_fp8_e4m3_dtype():
+            # Natively support cases
+            pass
+        elif nhead in range(32, 512 + 1, 16) and persistent_mode and max_seqlen_q == 1:
+            # we use nhead=16 to simulate such cases by customized metadata
+            # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
+            total_s = ori_total_s * (ori_nhead // 16)
+            nhead = 16
+            q = q.view(total_s, nhead, -1)
+            o = o.view(total_s, nhead, -1)
+            io_tranformed = True
+        else:
+            assert False, f"{nhead=} and {max_seqlen_q=} not supported"
+
+        logits = torch.zeros(
+            (total_s, num_kv_splits, nhead, v_head_dim),
+            dtype=dtypes.fp32,
+            device=device,
+        )
+        attn_lse = torch.empty(
+            (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
+        )
+        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,

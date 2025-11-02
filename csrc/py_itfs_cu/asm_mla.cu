@@ -128,6 +128,7 @@ void mla_decode_stage1_asm_fwd(
     }
 	args.ptr_RP = output.data_ptr();
 
+
     // std::cout << "mla args" << std::endl;
     // std::cout << "ptr_R: " << args.ptr_R << std::endl;
     // std::cout << "ptr_LSE: " << args.ptr_LSE << std::endl;
@@ -233,6 +234,11 @@ void mla_decode_stage1_asm_fwd(
         args.ptr_QSCALE  = q_scale.value().data_ptr();
         args.ptr_KVSCALE = kv_scale.value().data_ptr();
 
+        if(!persistent && kv_split == 1)
+        {
+            args.ptr_R = output.data_ptr();
+        }
+
         if(gqa_ratio == 16)
         {
             if(persistent)
@@ -269,10 +275,6 @@ void mla_decode_stage1_asm_fwd(
             }
             else
             {
-                if(kv_split == 1)
-		{
-                    args.ptr_R = output.data_ptr();
-		}
                 if(max_seqlen_q == 1)
                 {
                     sub_Q = 128;
@@ -311,23 +313,24 @@ void mla_decode_stage1_asm_fwd(
                 // assert(false);
                 sub_Q = 128;
                 static AiterAsmKernel impl_fp8(
-                    "_ZN5aiter28mla_a8w8_qh16_gqaratio128_psE",
-                    "/mla/mla_a8w8_qh16_gqaratio128_ps.co");
+                    "_ZN5aiter34mla_a8w8_qh128_m32x4_n16x2_msk0_psE",
+                    "/mla/mla_a8w8_qh128_m32x4_n16x2_msk0_ps.co");
                 impl_ptr = &impl_fp8;
             }
             else
             {
                 sub_Q = 128;
                 static AiterAsmKernel impl_fp8(
-                    "_ZN5aiter25mla_a8w8_qh16_gqaratio128E",
-                    "/mla/mla_a8w8_qh16_gqaratio128.co");
+                    "_ZN5aiter31mla_a8w8_qh128_m32x4_n16x2_msk1E",
+                    "/mla/mla_a8w8_qh128_m32x4_n16x2_msk1.co");
                 impl_ptr = &impl_fp8;
             }
         }
 
     }
 
-    // TORCH_CHECK(impl_ptr != nullptr, __func__, ": unsupport current Q_type:", Q.scalar_type());
+    TORCH_CHECK(impl_ptr != nullptr, __func__,
+        ": unsupport current data type or shape. please refer to asm_mla.cu");
 
     int bdx = 256;
     int gdx = (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
