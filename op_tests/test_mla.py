@@ -17,6 +17,7 @@ torch.set_printoptions(sci_mode=False)
 # qdtype bf16, kdtype bf16: nhead16, nhead128
 # qdtype fp8, kdtype fp8: nhead16, nhead128
 
+
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
@@ -205,7 +206,9 @@ def test_mla(
     out_dtype = torch.bfloat16
 
     us_aiter = None
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and batch_size * ctx_lens * nhead < 256 * 8192 * 16:
+    if (
+        dtype == torch.bfloat16 and kvtype == torch.bfloat16
+    ) and batch_size * ctx_lens * nhead < 256 * 8192 * 16:
         us_aiter = test_normal_prefill()
     torch.cuda.empty_cache()
     # absorb init
@@ -267,7 +270,7 @@ def test_mla(
         #     msg=f"mla_prefill-absorb    [torch vs    triton]:{us_torch:>8.2f} us vs {us_triton:>8.2f} us......",
         # )
 
-        out_asm = torch.empty((total_qo, nhead, v_head_dim), dtype=torch.bfloat16).fill_(-1)
+        out_asm = torch.empty((total_qo, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
         (attn_logits, attn_lse), us_asm = run_perftest(
             aiter.mla.mla_prefill_fwd,
             q,
@@ -289,7 +292,9 @@ def test_mla(
         return us_asm
 
     us_asm = None
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and batch_size * ctx_lens * nhead < 32 * 8192 * 16:
+    if (
+        dtype == torch.bfloat16 and kvtype == torch.bfloat16
+    ) and batch_size * ctx_lens * nhead < 32 * 8192 * 16:
         us_asm = test_absorb_prefill()
     torch.cuda.empty_cache()
 
@@ -387,7 +392,6 @@ def test_mla(
         err, us_asm_decode = test_absorb_decode_bf16()
         print("us_asm_decode:", us_asm_decode)
 
-
     def test_absorb_decode_fp8():
         if dtype != get_fp8_e4m3_dtype() and nhead == 128:
             aiter.logger.info("don't support this case:\n")
@@ -436,16 +440,14 @@ def test_mla(
         return err, us_asm_decode
 
     if kvtype == get_fp8_e4m3_dtype() and nhead in [16, 128]:
-        err, us_asm_decode = (
-            test_absorb_decode_fp8()
-        )
+        err, us_asm_decode = test_absorb_decode_fp8()
         print("us_asm_decode:", us_asm_decode)
 
     flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
     bytes = (
         total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
         + total_q * nhead * qk_head_dim * (torch.finfo(dtype).bits // 8)
-        + total_q * nhead * v_head_dim  * (torch.finfo(out_dtype).bits // 8)
+        + total_q * nhead * v_head_dim * (torch.finfo(out_dtype).bits // 8)
     )
 
     return {

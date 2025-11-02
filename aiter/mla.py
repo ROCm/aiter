@@ -117,18 +117,22 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
 
     get_mgc = {16: 16, 128: 16}
 
-    get_block_n_fp8 = { 16: 128,
-                        32: 128,
-                        48: 64,
-                        64: 64,
-                       128: 32,
-                       256: 32,
-                       384: 32,
-                       512: 32 }
+    get_block_n_fp8 = {
+        16: 128,
+        32: 128,
+        48: 64,
+        64: 64,
+        128: 32,
+        256: 32,
+        384: 32,
+        512: 32,
+    }
 
     if dtype == get_fp8_e4m3_dtype():
         min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
-        num_kv_splits = min(num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n)
+        num_kv_splits = min(
+            num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n
+        )
 
     assert nhead in get_mgc, f"{nhead=} not supported"
     mgc = get_mgc[nhead]
@@ -173,7 +177,9 @@ def mla_decode_fwd(
     persistent_mode = work_meta_data is not None
 
     if num_kv_splits_indptr is None and not persistent_mode:
-        num_kv_splits, mgc = get_meta_param(None, bs, total_kv, nhead, max_seqlen_q, q.dtype)
+        num_kv_splits, mgc = get_meta_param(
+            None, bs, total_kv, nhead, max_seqlen_q, q.dtype
+        )
         num_kv_splits_indptr = torch.arange(
             0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device=device
         )

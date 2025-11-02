@@ -20,6 +20,7 @@ torch.set_printoptions(sci_mode=False)
 # qdtype fp8, kdtype fp8: nhead16, nhead128
 # qdtype fp8, kdtype bf16: nhead16
 
+
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
@@ -467,7 +468,7 @@ def test_mla(
         converted_indices,
         decode_qlen,
     )
-    total_kv = new_kv_indptr[-1].item() # change into pertoken total_kv
+    total_kv = new_kv_indptr[-1].item()  # change into pertoken total_kv
     out_ref, lse_ref = torch_mla_extend(
         q,
         kv_buffer,
@@ -480,7 +481,6 @@ def test_mla(
         is_causal=False,
         dtype=out_dtype,
     )
-
 
     def test_sparse_mla_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -520,7 +520,9 @@ def test_mla(
 
     err = None
     us_asm_decode = 10000000000
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and ((nhead in [16]) or (max_seqlen_qo == 1 and nhead in range(32, 512 + 1, 16))):
+    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
+        (nhead in [16]) or (max_seqlen_qo == 1 and nhead in range(32, 512 + 1, 16))
+    ):
         err, us_asm_decode = test_sparse_mla_bf16()
 
     def test_absorb_decode_fp8():
@@ -592,17 +594,17 @@ def test_mla(
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
 
-    if kvtype == get_fp8_e4m3_dtype() and ((nhead in [16, 128]) or (max_seqlen_qo == 1 and nhead in range(32, 512 + 1, 16))):
-        err, us_asm_decode = (
-            test_absorb_decode_fp8()
-        )
+    if kvtype == get_fp8_e4m3_dtype() and (
+        (nhead in [16, 128]) or (max_seqlen_qo == 1 and nhead in range(32, 512 + 1, 16))
+    ):
+        err, us_asm_decode = test_absorb_decode_fp8()
         print("us_asm_decode:", us_asm_decode)
 
     flops = total_kv * nhead * (qk_head_dim + v_head_dim) * 2
     bytes = (
         total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
         + total_q * nhead * qk_head_dim * (torch.finfo(dtype).bits // 8)
-        + total_q * nhead * v_head_dim  * (torch.finfo(out_dtype).bits // 8)
+        + total_q * nhead * v_head_dim * (torch.finfo(out_dtype).bits // 8)
     )
 
     return {
