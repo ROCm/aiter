@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+
+#include <pybind11/pybind11.h>
+namespace py = pybind11;
 
 #define ACTIVATION_PYBIND                               \
     m.def("silu_and_mul",                               \
@@ -932,12 +936,12 @@
           py::arg("sorted_weights") = std::nullopt);                           \
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
-#define MOE_TOPK_PYBIND                                                        \
-    m.def("topk_sigmoid",                                                      \
-          &aiter::topk_sigmoid,                                                \
-          py::arg("topk_weights"),                                             \
-          py::arg("topk_indices"),                                             \
-          py::arg("gating_output"),                                            \
+#define MOE_TOPK_PYBIND             \
+    m.def("topk_sigmoid",           \
+          &aiter::topk_sigmoid,     \
+          py::arg("topk_weights"),  \
+          py::arg("topk_indices"),  \
+          py::arg("gating_output"), \
           "Apply topk sigmoid to the gating outputs.");
 
 #define MOE_SORTING_PYBIND                             \
@@ -1241,11 +1245,11 @@
           "hipb_findallsols",                                                      \
           py::arg("mat1"),                                                         \
           py::arg("mat2"),                                                         \
-          py::arg("bias")      = std::nullopt,                                     \
-          py::arg("out_dtype") = std::nullopt,                                     \
-          py::arg("scaleA")    = std::nullopt,                                     \
-          py::arg("scaleB")    = std::nullopt,                                     \
-          py::arg("scaleC")    = std::nullopt,                                     \
+          py::arg("bias")        = std::nullopt,                                   \
+          py::arg("out_dtype")   = std::nullopt,                                   \
+          py::arg("scaleA")      = std::nullopt,                                   \
+          py::arg("scaleB")      = std::nullopt,                                   \
+          py::arg("scaleC")      = std::nullopt,                                   \
           py::arg("bpreshuffle") = false);                                         \
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
 

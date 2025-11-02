@@ -1551,7 +1551,7 @@ def _write_ninja_file_to_build_library(
     # But we can't use this now because all aiter op based on torch
     # which means pybind11 related build flags must from torch now
     common_cflags = []
-    if torch_exclude and is_python_module:
+    if is_python_module:
         import pybind11
 
         extra_include_paths.append(pybind11.get_include())
@@ -1575,9 +1575,9 @@ def _write_ninja_file_to_build_library(
             common_cflags.append(f"-DTORCH_EXTENSION_NAME={name}")
         else:
             common_cflags.append(f"-DTORCH_EXTENSION_NAME=aiter_")
-        common_cflags.append("-DTORCH_API_INCLUDE_EXTENSION_H")
-        common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
-        common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
+        # common_cflags.append("-DTORCH_API_INCLUDE_EXTENSION_H")
+        # common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
+        # common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
 
     # Windows does not understand `-isystem` and quotes flags later.
     common_cflags += [f"-I{shlex.quote(include)}" for include in user_includes]
