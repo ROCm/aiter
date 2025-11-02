@@ -551,8 +551,8 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         # Combine masks
         combined_mask = boundary_mask & causal_mask
 
-        # Apply masking to QK scores (if [0, SEQUENCE_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -1e38 other than -inf)
-        qk_matrix = tl.where(combined_mask, qk_matrix, float(-1e38))
+        # Apply masking to QK scores (if [0, SEQUENCE_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
+        qk_matrix = tl.where(combined_mask, qk_matrix, float(-3.4e38))
 
         # ==================== Softmax Computation ====================
         # Compute new maximum logits
@@ -1213,8 +1213,8 @@ def paged_attention_decode_v2_gluon_fp8(
 
         boundary_mask = boundary_mask & causal_mask
 
-        # Apply masking to attention scores (if [0, SEQUENCE_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -1e38 other than -inf)
-        attention_scores = tl.where(boundary_mask, attention_scores, float(-1e38))
+        # Apply masking to attention scores (if [0, SEQUENCE_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
+        attention_scores = tl.where(boundary_mask, attention_scores, float(-3.4e38))
 
         # ==================== SOFTMAX COMPUTATION ====================
         # Update running maximum for numerical stability
@@ -2154,7 +2154,7 @@ def paged_attention_decode(
             and query_scale.dtype == aiter.dtypes.fp32
         ), f"query_scale tensor only support dtype == {aiter.dtypes.fp32}, but got query_scale.dtype == {query_scale.dtype}"
 
-        if len(query_scale.shape) == 1 and query_scale.shape[0] == 1:
+        if query_scale.numel() == 1:
             # Per-tensor quantization
             query_quant_mode = 0
         else:
@@ -2178,7 +2178,7 @@ def paged_attention_decode(
             and value_scale.dtype == aiter.dtypes.fp32
         ), f"value_scale tensor only support dtype == {aiter.dtypes.fp32}, but got value_scale.dtype == {value_scale.dtype}"
 
-        if len(key_scale.shape) == 1 and key_scale.shape[0] == 1:
+        if key_scale.numel() == 1:
             # Per-tensor quantization
             kv_quant_mode = 0
         else:

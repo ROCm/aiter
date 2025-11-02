@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+import pytest
 
 import aiter
 from aiter import dtypes
@@ -28,6 +29,8 @@ from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8 import (
 
 
 TRITON_VERSION = triton.__version__
+USE_TORCH_FLASH_REF = True
+# USE_TORCH_FLASH_REF = False
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -41,6 +44,29 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8": torch.uint8,
 }
 
+# Test configuration parameters
+DATA_TYPE_OPTIONS = ["bf16"]
+QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
+TRANS_V_OPTIONS = [0, 1]
+KV_VARLEN_OPTIONS = [0, 1]
+
+# BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+# HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1), (64, 4)]
+# QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+# CONTEXT_LENGTH_OPTIONS = [512, 4096, 4097]
+# BATCH_SIZE_OPTIONS = [4, 80, 128]
+
+BLOCK_SIZE_OPTIONS = [16]
+HEAD_CONFIGURATIONS = [(16, 1)]
+# BLOCK_SIZE_OPTIONS = [1024]
+# HEAD_CONFIGURATIONS = [(10, 1)]
+
+HEAD_DIMENSION_OPTIONS = [128]
+QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+CONTEXT_LENGTH_OPTIONS = [4096]
+BATCH_SIZE_OPTIONS = [4, 128]
+# DATA_TYPE_OPTIONS = [dtypes.d_dtypes[key] for key in DATA_TYPE_OPTIONS]
+
 # Triton to PyTorch dtype mapping
 TL_TO_TORCH_DTYPE = {tl.bfloat16: torch.bfloat16, tl.float16: torch.float16}
 TORCH_TO_TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
@@ -52,9 +78,6 @@ def setup_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-
-
-setup_seed(123)
 
 
 # Convert version string to comparable tuple format
@@ -129,6 +152,8 @@ def compare_arrays(
     max_diff_thr = max_diff_thr.max()
     print(f"diff.abs.max={diff.max()}")
     print(f"max_diff_thr={max_diff_thr}")
+    result["max_diff"] = diff.max()
+    result["max_diff_thr"] = max_diff_thr
 
     # Find top k differences
     flat_diff = diff.flatten()
@@ -181,8 +206,8 @@ def compare_arrays(
     # for stat in result['threshold_stats']:
     #     print(f"{stat['range']}: {stat['count']} ({stat['percentage']:.2f}%)")
 
-    print("\nNaN info:")
-    print(result["nan_info"])
+    # print("\nNaN info:")
+    # print(result["nan_info"])
 
     return result
 
@@ -247,6 +272,8 @@ def create_kv_cache(
             key_cache.uniform_(*UNIFORM_RANGE)
         else:
             raise ValueError(f"Does not support key cache of type {cache_dtype}")
+        # key_cache = torch.randn(size=key_cache_shape, dtype=torch_dtype, device=device)
+        # # key_cache *= 10.0
         key_caches.append(key_cache)
 
     value_cache_shape = (num_blocks, num_heads, head_size, block_size)
@@ -259,6 +286,10 @@ def create_kv_cache(
             value_cache.uniform_(*UNIFORM_RANGE)
         else:
             raise ValueError(f"Does not support value cache of type {cache_dtype}")
+        # value_cache = torch.randn(
+        #     size=value_cache_shape, dtype=torch_dtype, device=device
+        # )
+        # # value_cache *= 10.0
         value_caches.append(value_cache)
 
     return key_caches, value_caches
@@ -273,30 +304,32 @@ def reference_masked_attention(
     is_causal: bool = True,
 ) -> torch.Tensor:
     """Reference implementation of masked attention."""
+    query = query.to(torch.float32)
+    key = key.to(torch.float32)
+    value = value.to(torch.float32)
     num_query_heads = query.shape[1]
     num_kv_heads = key.shape[1]
 
     key = key.repeat_interleave(num_query_heads // num_kv_heads, dim=1)
     value = value.repeat_interleave(num_query_heads // num_kv_heads, dim=1)
 
-    attention_scores = (
-        torch.einsum("qhd,khd->hqk", query.float(), key.float()) * softmax_scale
-    )
+    attention_scores = torch.einsum("qhd,khd->hqk", query, key) * softmax_scale
 
     if is_causal:
         query_len = query.shape[0]
         key_len = key.shape[0]
         attention_bias = torch.zeros(
-            query_len, key_len, dtype=query.dtype, device=query.device
+            query_len, key_len, dtype=torch.float32, device=query.device
         )
         causal_mask = torch.ones(
             query_len, key_len, dtype=torch.bool, device=query.device
         ).tril(diagonal=key_len - query_len)
-        attention_bias.masked_fill_(causal_mask.logical_not(), float("-inf"))
+        # attention_bias.masked_fill_(causal_mask.logical_not(), float(-3.4e38))
+        attention_bias.masked_fill_(causal_mask.logical_not(), float(-3.4e38))
         attention_scores += attention_bias
 
     attention_weights = torch.softmax(attention_scores, dim=-1)
-    output = torch.einsum("hqk,khd->qhd", attention_weights.float(), value.float())
+    output = torch.einsum("hqk,khd->qhd", attention_weights, value)
     return output.to(output_dtype)
 
 
@@ -369,9 +402,361 @@ def torch_mha_extend(
     return torch.cat(outputs)
 
 
+def torch_mha_extend_flashattn_style(
+    query: torch.Tensor,  # [num_seqs, num_q_heads, head_size] - FP8
+    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size//x, block_size, x] - FP8
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, block_size] or transposed - FP8
+    block_tables: torch.Tensor,  # [num_seqs, max_blocks]
+    sequence_lengths: torch.Tensor,  # [num_seqs]
+    softmax_scale: float,
+    q_seq_len: int,
+    query_scale: Optional[
+        torch.Tensor
+    ] = None,  # per-tensor [1] or per-token [num_seqs, num_q_heads, 1]
+    key_scale: Optional[
+        torch.Tensor
+    ] = None,  # per-tensor [1] or per-token [num_blocks, num_kv_heads, block_size, 1]
+    value_scale: Optional[torch.Tensor] = None,  # same as key_scale
+    alibi_slopes: Optional[torch.Tensor] = None,  # [num_kv_heads, query_group_size]
+    output_dtype: torch.dtype = torch.bfloat16,
+    kv_block_size: int = 16,
+    sequence_partition_size: int = 256,
+    is_causal: bool = True,
+) -> torch.Tensor:
+    """
+    Reference implementation mimicking Triton's two-stage paged attention decode with FP8.
+    """
+    assert query.dtype == aiter.dtypes.fp8
+    assert key_cache.dtype == aiter.dtypes.fp8
+    assert value_cache.dtype == aiter.dtypes.fp8
+
+    num_seqs, num_q_heads_total, head_size = query.shape
+    num_blocks, num_kv_heads, _, _, _ = key_cache.shape
+    query_group_size = num_q_heads_total // num_kv_heads
+    query_group_size_ori = query_group_size // q_seq_len
+    assert num_q_heads_total % num_kv_heads == 0
+
+    # Determine value layout
+    value_transposed = len(value_cache.shape) == 5
+
+    # Reconstruct full key/value per sequence
+    max_seq_len = sequence_lengths.max().item()
+    max_num_partitions = (
+        max_seq_len + sequence_partition_size - 1
+    ) // sequence_partition_size
+
+    # Output buffers (same as Triton)
+    intermediate_shape = (num_seqs, num_kv_heads, max_num_partitions, query_group_size)
+    max_logits = torch.full(
+        intermediate_shape, -float("inf"), dtype=torch.float32, device=query.device
+    )
+    exp_sums = torch.zeros(intermediate_shape, dtype=torch.float32, device=query.device)
+    partial_output = torch.zeros(
+        (*intermediate_shape, head_size), dtype=output_dtype, device=query.device
+    )
+
+    FP8_MAX = torch.finfo(aiter.dtypes.fp8).max
+    # print(f"q_seq_len={q_seq_len}")
+    # print(f"query_scale.shape={query_scale.shape}")
+    # print(f"key_scale.shape={key_scale.shape}")
+    # print(f"value_scale.shape={value_scale.shape}")
+    # print(f"query_scale.numel()={query_scale.numel()}")
+    # print(f"key_scale.numel()={key_scale.numel()}")
+    # print(f"value_scale.numel()={value_scale.numel()}")
+
+    # Quant mode detection
+    query_quant_mode = -1
+    if query_scale is not None:
+        query_quant_mode = 0 if query_scale.numel() == 1 else 1
+
+    kv_quant_mode = -1
+    if key_scale is not None and value_scale is not None:
+        kv_quant_mode = 0 if key_scale.numel() == 1 else 1
+
+    # Flatten caches for easy indexing
+    # key_cache: [num_blocks, num_kv_heads, head_size//x, block_size, x] -> [num_blocks * block_size, num_kv_heads, head_size]
+    x = key_cache.shape[-1]
+    key_cache_flat = (
+        key_cache.permute(0, 3, 1, 2, 4).contiguous().view(-1, num_kv_heads, head_size)
+    )
+    if value_transposed:
+        # [num_blocks, num_kv_heads, block_size//x, head_size, x] -> [num_blocks * block_size, num_kv_heads, head_size]
+        x_v = value_cache.shape[-1]
+        value_cache_flat = (
+            value_cache.permute(0, 2, 4, 1, 3)
+            .contiguous()
+            .view(-1, num_kv_heads, head_size)
+        )
+    else:
+        # [num_blocks, num_kv_heads, head_size, block_size] -> [num_blocks * block_size, num_kv_heads, head_size]
+        value_cache_flat = (
+            value_cache.permute(0, 3, 1, 2)
+            .contiguous()
+            .view(-1, num_kv_heads, head_size)
+        )
+
+    # Precompute block -> token mapping
+    for seq_idx in range(num_seqs):
+        seq_len = sequence_lengths[seq_idx].item()
+        block_table = block_tables[seq_idx]  # [max_blocks]
+
+        # Build token -> physical index mapping
+        num_tokens = seq_len
+        block_indices = torch.arange(num_tokens, device=query.device) // kv_block_size
+        token_offsets = torch.arange(num_tokens, device=query.device) % kv_block_size
+        physical_block_ids = block_table[block_indices]  # [num_tokens]
+        physical_token_indices = (
+            physical_block_ids * kv_block_size + token_offsets
+        )  # [num_tokens]
+
+        # Extract per-seq query
+        q = query[seq_idx].view(
+            num_kv_heads, query_group_size, head_size
+        )  # [num_kv_heads, query_group_size, head_size]
+        q_scale = 0
+        if query_quant_mode >= 0:
+            if query_quant_mode == 0:
+                q_scale = query_scale.item()
+            else:
+                q_scale = query_scale[seq_idx].view(
+                    num_kv_heads, query_group_size, 1
+                )  # [num_kv_heads, query_group_size, 1]
+        q_fp32 = q.to(torch.float32)
+
+        # Process each partition
+        for part_idx in range(max_num_partitions):
+            part_start = part_idx * sequence_partition_size
+            part_end = min(part_start + sequence_partition_size, seq_len)
+            if part_start >= seq_len:
+                continue
+
+            # Process in compute blocks of 256 tokens (KV_COMPUTE_BLOCK_SIZE=256)
+            compute_block_size = 256
+            num_compute_blocks = (
+                part_end - part_start + compute_block_size - 1
+            ) // compute_block_size
+
+            part_shape = (num_kv_heads, query_group_size)
+            max_logits_part = torch.full(
+                (*part_shape, 1),
+                -float("inf"),
+                dtype=torch.float32,
+                device=query.device,
+            )
+            exp_sums_part = torch.zeros(
+                *part_shape, 1, dtype=torch.float32, device=query.device
+            )
+            output_part = torch.zeros(
+                (*part_shape, head_size), dtype=torch.float32, device=query.device
+            )
+            for cb in range(num_compute_blocks):
+                cb_start = part_start + cb * compute_block_size
+                cb_end = min(cb_start + compute_block_size, part_end)
+                if cb_start >= cb_end:
+                    break
+                cb_len = cb_end - cb_start
+
+                token_range = torch.arange(cb_start, cb_end, device=query.device)
+                indices = physical_token_indices[token_range]  # [cb_len]
+
+                # Gather K/V
+                k = key_cache_flat[indices]  # [cb_len, num_kv_heads, head_size]
+                v = value_cache_flat[indices]  # [cb_len, num_kv_heads, head_size]
+
+                k_scale_vals = 0
+                v_scale_vals = 0
+                # Apply scales
+                if kv_quant_mode >= 0:
+                    if kv_quant_mode == 0:
+                        k_scale_vals = key_scale.item()
+                        v_scale_vals = value_scale.item()
+                    else:
+                        # key_scale: [num_blocks, num_kv_heads, block_size, 1]
+                        block_ids = physical_block_ids[token_range]
+                        offsets = token_offsets[token_range]
+                        k_scale_vals = key_scale[
+                            block_ids, :, offsets, 0
+                        ]  # [cb_len, num_kv_heads]
+                        v_scale_vals = value_scale[
+                            block_ids, :, offsets, 0
+                        ]  # [cb_len, num_kv_heads]
+                        k_scale_vals = k_scale_vals.reshape(
+                            cb_len, num_kv_heads, 1
+                        ).permute(
+                            1, 2, 0
+                        )  # [num_kv_heads, 1, cb_len]
+                        v_scale_vals = v_scale_vals.reshape(
+                            cb_len, num_kv_heads, 1
+                        ).permute(
+                            1, 2, 0
+                        )  # [num_kv_heads, 1, cb_len]
+
+                qk_scale = 0
+                if query_quant_mode >= 0:
+                    # [num_kv_heads, query_group_size, cb_len]
+                    if kv_quant_mode >= 0:
+                        qk_scale = softmax_scale * q_scale * k_scale_vals
+                    else:
+                        qk_scale = softmax_scale * q_scale
+                else:
+                    if kv_quant_mode >= 0:
+                        qk_scale = softmax_scale * k_scale_vals
+                    else:
+                        qk_scale = softmax_scale
+
+                k_fp32 = k.to(torch.float32)
+                v_fp32 = v.to(torch.float32)
+
+                # Compute QK = q @ k^T  --> [num_kv_heads, query_group_size, cb_len]
+                # q_fp32: [num_kv_heads, query_group_size, head], k_fp32: [cb_len, num_kv_heads, head]
+                qk = torch.einsum(
+                    "hqd,khd->hqk", q_fp32, k_fp32
+                )  # [num_kv_heads, query_group_size, cb_len]
+
+                # import pdb
+                # pdb.set_trace()
+
+                qk = qk * qk_scale
+
+                # ALiBi bias
+                if alibi_slopes is not None:
+                    # alibi_slopes: [num_kv_heads, query_group_size]
+                    slopes = alibi_slopes[
+                        :, :query_group_size
+                    ]  # [num_kv_heads, query_group_size]
+                    positions = token_range.unsqueeze(0).unsqueeze(0)  # [1,1,cb_len]
+                    # In Triton: alibi_bias = slope * (col - kv_len + 1)
+                    alibi_bias = slopes.unsqueeze(-1) * (
+                        positions - seq_len + 1
+                    )  # [num_kv_heads, query_group_size, cb_len]
+                    qk += alibi_bias
+
+                # Causal mask
+                if is_causal:
+                    q_positions = torch.arange(
+                        query_group_size, device=query.device
+                    )  # [query_group_size]
+                    valid_mask = (
+                        q_seq_len
+                        - 1
+                        - q_positions[:, None] // query_group_size_ori
+                        + token_range[None, :]
+                        < seq_len
+                    )  # [query_group_size, cb_len]
+                    valid_mask = valid_mask[None, :, :]  # [1, query_group_size, cb_len]
+                    # valid_mask = token_range < seq_len  # [cb_len]
+                    qk = qk.masked_fill(~valid_mask, -3.4e38)
+
+                # Compute local max and exp
+                current_max = qk.max(
+                    dim=-1, keepdim=True
+                ).values  # [num_kv_heads, query_group_size, 1]
+                new_max = torch.maximum(
+                    max_logits_part, current_max
+                )  # [num_kv_heads, query_group_size, 1]
+                acc_scale = torch.exp(max_logits_part - new_max)
+
+                # Compute attention probs
+                probs = torch.exp(
+                    qk - new_max
+                )  # [num_kv_heads, query_group_size, cb_len]
+                exp_sums_part = acc_scale * exp_sums_part + probs.sum(
+                    dim=-1, keepdim=True
+                )  # [num_kv_heads, query_group_size, 1]
+
+                # Handle value scaling for FP8 (Triton special logic)
+                if kv_quant_mode == 1 and value_cache.dtype == aiter.dtypes.fp8:
+                    valid_v_scale = v_scale_vals
+                    v_scale_max = valid_v_scale.max(
+                        dim=-1, keepdim=True
+                    ).values  # [num_kv_heads, 1, 1]
+                    # Avoid division by zero
+                    # v_scale_max = torch.clamp(v_scale_max, min=1e-12)
+                    v_scale_vals = (
+                        v_scale_vals * FP8_MAX / v_scale_max
+                    )  # [num_kv_heads, 1, cb_len]
+                    probs_scaled = (
+                        v_scale_vals * probs
+                    )  # [num_kv_heads, query_group_size, cb_len]
+                    prob_scale = v_scale_max / FP8_MAX  # [num_kv_heads, 1, 1]
+                else:
+                    probs_scaled = FP8_MAX * probs
+                    prob_scale = v_scale_vals / FP8_MAX
+
+                probs_scaled = probs_scaled.to(aiter.dtypes.fp8).to(torch.float32)
+                # Compute PV = probs @ v
+                # probs_scaled: [num_kv_heads, query_group_size, cb_len], v_fp32: [cb_len, num_kv_heads, head]
+                pv = torch.einsum(
+                    "hqk,khd->hqd", probs_scaled, v_fp32
+                )  # [num_kv_heads, query_group_size, head]
+
+                # Accumulate with rescaling
+                output_part = (
+                    acc_scale * output_part
+                )  # [num_kv_heads, query_group_size, head]
+                output_part += prob_scale * pv
+
+                max_logits_part = new_max
+
+            exp_sums_part_reciprocal = 1.0 / exp_sums_part
+            output_part = output_part * exp_sums_part_reciprocal
+            # Store back
+            max_logits[seq_idx, :, part_idx, :] = max_logits_part.squeeze(-1)
+            exp_sums[seq_idx, :, part_idx, :] = exp_sums_part.squeeze(-1)
+            partial_output[seq_idx, :, part_idx, :, :] = output_part.to(output_dtype)
+
+    # ====== REDUCE STAGE ======
+    final_output = torch.zeros(
+        (num_seqs, num_q_heads_total, head_size),
+        dtype=output_dtype,
+        device=query.device,
+    )
+
+    for seq_idx in range(num_seqs):
+        seq_len = sequence_lengths[seq_idx].item()
+        num_parts = (seq_len + sequence_partition_size - 1) // sequence_partition_size
+
+        # Global max across partitions
+        global_max = (
+            max_logits[seq_idx, :, :num_parts, :].max(dim=1).values
+        )  # [num_kv_heads, query_group_size]
+
+        # Rescale exp_sums
+        exp_sums_local = exp_sums[
+            seq_idx, :, :num_parts, :
+        ]  # [num_kv_heads, num_parts, query_group_size]
+        max_local = max_logits[
+            seq_idx, :, :num_parts, :
+        ]  # [num_kv_heads, num_parts, query_group_size]
+        exp_sums_rescaled = exp_sums_local * torch.exp(
+            max_local - global_max.unsqueeze(1)
+        )  # [num_kv_heads, num_parts, query_group_size]
+        global_exp_sum = exp_sums_rescaled.sum(
+            dim=1
+        )  # [num_kv_heads, query_group_size]
+
+        # Avoid division by zero
+        # global_exp_sum = torch.clamp(global_exp_sum, min=1e-12)
+
+        # Weighted sum of partial outputs
+        weights = exp_sums_rescaled / global_exp_sum.unsqueeze(
+            1
+        )  # [num_kv_heads, num_parts, query_group_size]
+        partial_seq = partial_output[
+            seq_idx, :, :num_parts, :, :
+        ]  # [num_kv_heads, num_parts, query_group_size, head]
+        weighted = (partial_seq * weights.unsqueeze(-1)).sum(
+            dim=1
+        )  # [num_kv_heads, query_group_size, head]
+
+        final_output[seq_idx] = weighted.view(num_q_heads_total, head_size)
+
+    return final_output
+
+
 def quantize_kv_cache_symmetric(
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
+    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     quant_dtype: torch.dtype,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
@@ -442,18 +827,36 @@ def quantize_kv_cache_symmetric(
 
 
 def quantize_kv_cache_per_tensor(
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
+    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     quant_dtype: torch.dtype,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     """Apply per-tensor quantization to KV cache."""
     num_blocks, num_heads, head_dim, block_size = value_cache.shape
+    elements_per_vector = 16 // quant_dtype.itemsize
+
+    key_cache_reshaped = (
+        key_cache.permute(0, 1, 3, 2, 4)
+        .reshape(num_blocks, num_heads, block_size, -1)
+        .contiguous()
+    )
+    key_cache_reshaped = (
+        key_cache_reshaped.view(
+            num_blocks,
+            num_heads,
+            block_size,
+            head_dim // elements_per_vector,
+            elements_per_vector,
+        )
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
 
     # Per-tensor quantization for keys
     quantized_keys, key_scales_original = per_tensor_quant(
-        key_cache, quant_dtype=quant_dtype
+        key_cache_reshaped, quant_dtype=quant_dtype
     )
     # Per-tensor quantization for values
     quantized_values, value_scales_original = per_tensor_quant(
@@ -505,6 +908,7 @@ def run_aiter_assembly_kernel(
 
 def shuffle_value_cache_layout(value_cache: torch.Tensor) -> torch.Tensor:
     """Shuffle value cache layout for optimized memory access."""
+    # value_cache: [num_blocks, num_kv_heads, head_size, kv_block_size]
     elements_per_vector = 16 // value_cache.element_size()
     num_blocks, num_kv_heads, head_size, block_size = value_cache.shape
 
@@ -516,6 +920,7 @@ def shuffle_value_cache_layout(value_cache: torch.Tensor) -> torch.Tensor:
         elements_per_vector,
     )
 
+    # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     value_cache_shuffled = value_cache_reshaped.permute(0, 1, 3, 2, 4).contiguous()
     return value_cache_shuffled
 
@@ -560,7 +965,8 @@ def run_gluon_fp8_kernel(
 
 
 @benchmark()
-def test_paged_attention_decode_gluon(
+# def test_run_pa_gluon(
+def run_pa_gluon_test(
     context_lengths: int,
     batch_size: int,
     num_heads: Tuple[int, int],
@@ -568,11 +974,16 @@ def test_paged_attention_decode_gluon(
     block_size: int,
     data_type: torch.dtype,
     query_length: int,
-    trans_v: bool,
-    quant_mode: str = "per_token",  # "per_token" or "per_tensor"
+    quant_mode: str,
+    trans_v: int,
+    kv_varlen: int,
+    # quant_mode: str = "per_token",  # "per_token" or "per_tensor"
+    # trans_v: int = 0,
+    # kv_varlen: int = 0,
 ) -> Dict[str, Union[float, str]]:
     """Test paged attention decode with assembly and gluon implementations."""
     results = {}
+    setup_seed(123)
     seed = 0
     device = "cuda:0"
     torch.set_default_device(device)
@@ -603,12 +1014,15 @@ def test_paged_attention_decode_gluon(
     )
     query.uniform_(*UNIFORM_RANGE)
 
-    # kv_len_list = [context_lengths] * batch_size
-    kv_len_list = [random.randint(1, context_lengths) for _ in range(batch_size)]
-    sequence_lengths = torch.tensor(
-        kv_len_list, dtype=torch.int32, device=device
-    )
-    print(sequence_lengths)
+    if kv_varlen:
+        # kv_len_list = [random.randint(1, context_lengths) for _ in range(batch_size)]
+        kv_len_list = [
+            random.randint(query_length, context_lengths) for _ in range(batch_size)
+        ]
+    else:
+        kv_len_list = [context_lengths] * batch_size
+    sequence_lengths = torch.tensor(kv_len_list, dtype=torch.int32, device=device)
+    # print(f"sequence_lengths={sequence_lengths}")
 
     block_tables_list = []
     for _ in range(batch_size):
@@ -669,7 +1083,7 @@ def test_paged_attention_decode_gluon(
             key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
         )
 
-    # Reference
+    # Reference (original)
     reference_output_quant = torch_mha_extend(
         query,
         quantized_keys,
@@ -680,6 +1094,13 @@ def test_paged_attention_decode_gluon(
         key_scale_factors_flat,
         value_scale_factors_flat,
     )
+
+    # print(f"quantized_keys.shape={quantized_keys.shape}")
+    # print(f"quantized_keys.dtype={quantized_keys.dtype}")
+    # print(f"block_tables.shape={block_tables.shape}")
+    # print(f"block_tables[0]={block_tables[0]}")
+    # print(f"quantized_keys[0, 0, 1, 0]([batch_id, kv_head_id, seq_id, hd_id])={quantized_keys[block_tables[0, 0], 0, 0, 1, 0].to(torch.float32)}")
+    # print(f"quantized_keys[0, 0, 1, 1]([batch_id, kv_head_id, seq_id, hd_id])={quantized_keys[block_tables[0, 0], 0, 0, 1, 1].to(torch.float32)}")
 
     if trans_v:
         quantized_values = shuffle_value_cache_layout(quantized_values)
@@ -720,6 +1141,50 @@ def test_paged_attention_decode_gluon(
             # For per-tensor, query_scale is already a scalar, no need to reshape
             pass
 
+    if USE_TORCH_FLASH_REF:
+        # Reference (flash attention style - mimicking Triton kernel)
+        reference_output_flashattn = torch_mha_extend_flashattn_style(
+            quantized_query_gluon,
+            quantized_keys,
+            quantized_values,
+            block_tables,
+            sequence_lengths,
+            softmax_scale,
+            query_length,
+            query_scale=query_scale_gluon,
+            key_scale=key_scale_original,
+            value_scale=value_scale_original,
+            kv_block_size=block_size,
+            sequence_partition_size=256,
+        )
+        if query_length > 1:
+            reference_output_flashattn = reference_output_flashattn.reshape(
+                batch_size, num_kv_heads, query_length, query_group_size, head_size
+            )
+            reference_output_flashattn = reference_output_flashattn.transpose(
+                1, 2
+            ).reshape(
+                batch_size * query_length, num_kv_heads * query_group_size, head_size
+            )
+        print(f"\n=== Comparing Two Reference Implementations ===")
+        ref_diff = (
+            (reference_output_quant - reference_output_flashattn).abs().max().item()
+        )
+        print(f"Original ref vs FlashAttn-style ref: max diff = {ref_diff:.6e}")
+        compare_arrays(
+            reference_output_flashattn.to(torch.float32).detach().cpu().numpy(),
+            reference_output_quant.to(torch.float32).detach().cpu().numpy(),
+        )
+        out_flashattn_ref_md5 = hashlib.md5(
+            reference_output_flashattn.contiguous()
+            .view(torch.uint8)
+            .detach()
+            .cpu()
+            .numpy()
+            .tobytes()
+        ).hexdigest()
+        print(f"out_flashattn_ref_md5={out_flashattn_ref_md5}")
+
     # Test Gluon
     pa_gluon_fp8_op = paged_attention_decode_gluon_fp8_triton34
     triton_version = parse_version(TRITON_VERSION)
@@ -757,22 +1222,41 @@ def test_paged_attention_decode_gluon(
         )
 
     gluon_time = gluon_results["total_triton_time"]
-    gluon_error = checkAllclose(
+
+    # Compare with original reference
+    gluon_error_vs_orig = checkAllclose(
         reference_output_quant,
         final_gluon_output,
         atol=fp8_tolerance,
         rtol=fp8_tolerance,
-        msg=f"[PyTorch vs Gluon_FP8][{quant_mode}]: {gluon_time:>8.2f} us......",
+        msg=f"[PyTorch vs Gluon_FP8][{quant_mode}] (vs orig ref): {gluon_time:>8.2f} us......",
     )
-    compare_arrays(
+    print("\n=== Detailed Error Analysis ===")
+    print("Gluon vs Original Ref:")
+    diff_result = compare_arrays(
         final_gluon_output.to(torch.float32).detach().cpu().numpy(),
         reference_output_quant.to(torch.float32).detach().cpu().numpy(),
     )
+    if diff_result["max_diff_thr"] < 5e-2:
+        print("gluon_vs_torch_ref PASSED")
+    else:
+        print("gluon_vs_torch_ref FAILED")
     results[f"us_gluon_fp8"] = gluon_time
-    results[f"err_gluon_fp8"] = gluon_error
+    results[f"err_gluon_fp8_vs_orig"] = gluon_error_vs_orig
+
+    if USE_TORCH_FLASH_REF:
+        print("\nGluon vs FlashAttn-style Ref:")
+        diff_result = compare_arrays(
+            final_gluon_output.to(torch.float32).detach().cpu().numpy(),
+            reference_output_flashattn.to(torch.float32).detach().cpu().numpy(),
+        )
+        if diff_result["max_diff_thr"] < 1e-3:
+            print("gluon_vs_torch_flash_ref PASSED")
+        else:
+            print("gluon_vs_torch_flash_ref FAILED")
 
     # MD5 hash
-    reference_hash = hashlib.md5(
+    out_ref_md5 = hashlib.md5(
         reference_output_quant.contiguous()
         .view(torch.uint8)
         .detach()
@@ -788,7 +1272,7 @@ def test_paged_attention_decode_gluon(
         .numpy()
         .tobytes()
     ).hexdigest()
-    print(f"out_ref_md5={reference_hash}")
+    print(f"out_ref_md5={out_ref_md5}")
     print(f"gluon_fp8_output_md5={gluon_hash}")
 
     # Bandwidth
@@ -837,15 +1321,26 @@ def test_paged_attention_decode_gluon(
             rtol=fp8_tolerance,
             msg=f"[PyTorch vs AIT_Assembly][{quant_mode}]: {assembly_time:>8.2f} us......",
         )
+        print("\nAIT_Assembly vs Original Ref:")
         compare_arrays(
             assembly_output.to(torch.float32).detach().cpu().numpy(),
             reference_output_quant.to(torch.float32).detach().cpu().numpy(),
         )
-        # print("compare gluon_fp8 and asm")
+        # print("\nAIT_Assembly vs FlashAttn-style Ref:")
         # compare_arrays(
-        #     final_gluon_output.to(torch.float32).detach().cpu().numpy(),
         #     assembly_output.to(torch.float32).detach().cpu().numpy(),
+        #     reference_output_flashattn.to(torch.float32).detach().cpu().numpy(),
         # )
+        assembly_md5 = hashlib.md5(
+            assembly_output.contiguous()
+            .view(torch.uint8)
+            .detach()
+            .cpu()
+            .numpy()
+            .tobytes()
+        ).hexdigest()
+        print(f"assembly_md5={assembly_md5}")
+
         results[f"us_asm_fp8"] = assembly_time
         assembly_bandwidth = (
             batch_size
@@ -909,15 +1404,16 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("-b", "--batch_size", type=int, default=None, help="Batch size")
     parser.add_argument("--block_size", type=int, default=None, help="Block size")
     parser.add_argument(
-        "--trans_v", action="store_true", help="Transpose value cache layout"
-    )
-    parser.add_argument(
         "--quant_mode",
         type=str,
         choices=["per_token", "per_tensor", "both"],
-        default="both",
+        default=None,
         help="Quantization mode: per_token, per_tensor, or both",
     )
+    parser.add_argument(
+        "--trans_v", type=int, default=None, help="Transpose value cache layout"
+    )
+    parser.add_argument("--kv_varlen", type=int, default=None, help="KV use varlen")
 
     return parser
 
@@ -930,6 +1426,9 @@ def process_arguments(args: argparse.Namespace) -> tuple:
     context_lengths = CONTEXT_LENGTH_OPTIONS
     batch_sizes = BATCH_SIZE_OPTIONS
     query_lengths = QUERY_LENGTH_OPTIONS
+    quant_mode = QUANT_MODE_OPTIONS
+    trans_v = TRANS_V_OPTIONS
+    kv_varlen = KV_VARLEN_OPTIONS
 
     if args.dtype is not None:
         data_types = [dtypes.d_dtypes[args.dtype]]
@@ -946,6 +1445,14 @@ def process_arguments(args: argparse.Namespace) -> tuple:
         batch_sizes = [args.batch_size]
     if args.block_size is not None:
         block_sizes = [args.block_size]
+    if args.block_size is not None:
+        block_sizes = [args.block_size]
+    if args.quant_mode is not None:
+        quant_mode = [args.quant_mode]
+    if args.trans_v is not None:
+        trans_v = [args.trans_v]
+    if args.quant_mode is not None:
+        kv_varlen = [args.kv_varlen]
 
     return (
         data_types,
@@ -954,20 +1461,22 @@ def process_arguments(args: argparse.Namespace) -> tuple:
         context_lengths,
         batch_sizes,
         query_lengths,
-        args.trans_v,
-        args.quant_mode,
+        quant_mode,
+        trans_v,
+        kv_varlen,
     )
 
 
-def run_tests(
+def run_multi_pa_gluon_test(
     data_types,
     block_sizes,
     head_configs,
     context_lengths,
     batch_sizes,
     query_lengths,
-    trans_v,
     quant_mode,
+    trans_v,
+    kv_varlen,
 ) -> pd.DataFrame:
     """Run all tests."""
     results = []
@@ -980,36 +1489,33 @@ def run_tests(
         * len(query_lengths)
     )
     current = 0
-
-    # Determine which quantization modes to test
-    if quant_mode == "both":
-        quant_modes_to_test = ["per_token", "per_tensor"]
-    else:
-        quant_modes_to_test = [quant_mode]
-
-    for qm in quant_modes_to_test:
-        for dt in data_types:
-            for bs in block_sizes:
-                for hc in head_configs:
-                    for cl in context_lengths:
-                        for bsz in batch_sizes:
-                            for ql in query_lengths:
-                                current += 1
-                                print(
-                                    f"\n[{current}/{total * len(quant_modes_to_test)}] Testing: dtype={dt}, block_size={bs}, heads={hc}, ctx_len={cl}, batch={bsz}, qlen={ql}, quant_mode={qm}"
-                                )
-                                result = test_paged_attention_decode_gluon(
-                                    context_lengths=cl,
-                                    batch_size=bsz,
-                                    num_heads=hc,
-                                    head_size=HEAD_DIMENSION,
-                                    block_size=bs,
-                                    data_type=dt,
-                                    query_length=ql,
-                                    trans_v=trans_v,
-                                    quant_mode=qm,
-                                )
-                                results.append(result)
+    for trans_v_mode in trans_v:
+        for kv_varlen_mode in kv_varlen:
+            for qm in quant_mode:
+                for dt in data_types:
+                    for bs in block_sizes:
+                        for hc in head_configs:
+                            for cl in context_lengths:
+                                for bsz in batch_sizes:
+                                    for ql in query_lengths:
+                                        for head_size in HEAD_DIMENSION_OPTIONS:
+                                            current += 1
+                                            print(
+                                                f"\n[{current}/{total * len(quant_mode)}] Testing: dtype={dt}, block_size={bs}, heads={hc}, ctx_len={cl}, batch={bsz}, qlen={ql}, quant_mode={qm}"
+                                            )
+                                            result = run_pa_gluon_test(
+                                                context_lengths=cl,
+                                                batch_size=bsz,
+                                                num_heads=hc,
+                                                head_size=head_size,
+                                                block_size=bs,
+                                                data_type=dt,
+                                                query_length=ql,
+                                                quant_mode=qm,
+                                                trans_v=trans_v_mode,
+                                                kv_varlen=kv_varlen_mode,
+                                            )
+                                            results.append(result)
 
     return pd.DataFrame(results)
 
@@ -1026,46 +1532,80 @@ def main():
         context_lengths,
         batch_sizes,
         query_lengths,
-        trans_v,
         quant_mode,
+        trans_v,
+        kv_varlen,
     ) = process_arguments(args)
 
-    results_df = run_tests(
+    results_df = run_multi_pa_gluon_test(
         data_types,
         block_sizes,
         head_configs,
         context_lengths,
         batch_sizes,
         query_lengths,
-        trans_v,
         quant_mode,
+        trans_v,
+        kv_varlen,
     )
 
-    output_file = f"test_paged_attention_decode_gluon{'_trans_v' if trans_v else ''}.triton.{TRITON_VERSION}.quant_{quant_mode}.csv"
+    output_file = f"run_pa_gluon_test{'_trans_v' if trans_v else ''}.triton.{TRITON_VERSION}.quant_{quant_mode}.csv"
     results_df.to_csv(output_file, index=False)
     print(f"\nResults saved to {output_file}")
     print(f"\nSummary:\n{results_df}")
 
 
+# @pytest.mark.parametrize("block_size", BLOCK_SIZE_OPTIONS)
+# @pytest.mark.parametrize("num_heads", HEAD_CONFIGURATIONS)
+# @pytest.mark.parametrize("head_size", HEAD_DIMENSION_OPTIONS)
+# @pytest.mark.parametrize("data_type_str", DATA_TYPE_OPTIONS)
+# @pytest.mark.parametrize("query_length", QUERY_LENGTH_OPTIONS)
+# @pytest.mark.parametrize("context_length", CONTEXT_LENGTH_OPTIONS)
+# @pytest.mark.parametrize("batch_size", BATCH_SIZE_OPTIONS)
+# @pytest.mark.parametrize("quant_mode", QUANT_MODE_OPTIONS)
+# @pytest.mark.parametrize("trans_v", TRANS_V_OPTIONS)
+# @pytest.mark.parametrize("kv_varlen", KV_VARLEN_OPTIONS)
+# def test_pa_gluon(
+#     block_size: int,
+#     num_heads: Tuple[int, int],
+#     head_size: int,
+#     data_type_str: str,
+#     query_length: int,
+#     context_length: int,
+#     batch_size: int,
+#     quant_mode: str,
+#     trans_v: int,
+#     kv_varlen: int,
+# ):
+#     """
+#     Pytest-compatible version of run_pa_gluon_test.
+
+#     This function uses the same default parameters as the main function
+#     but is designed to work with pytest for automated testing.
+#     """
+#     # Convert data type string to torch dtype
+#     data_type = dtypes.d_dtypes[data_type_str]
+
+#     # Call the original test function with all parameters
+#     results = run_pa_gluon_test(
+#         context_lengths=context_length,
+#         batch_size=batch_size,
+#         num_heads=num_heads,
+#         head_size=head_size,
+#         block_size=block_size,
+#         data_type=data_type,
+#         query_length=query_length,
+#         quant_mode=quant_mode,
+#         trans_v=trans_v,
+#         kv_varlen=kv_varlen,
+#     )
+
+#     # Assert that the test completed successfully
+#     # Check if gluon implementation passed
+#     gluon_error = results.get("err_gluon_fp8_vs_orig", 0)
+#     assert gluon_error == 0, f"gluon implementation test FAILED!"
+
+
 if __name__ == "__main__":
-    # Configuration parameters
-    # HEAD_DIMENSION = 128
-    # BLOCK_SIZE_OPTIONS = [16, 64, 1024]
-    # DATA_TYPE_OPTIONS = ["bf16"]
-    # HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1), (64, 4)]
-    # QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    # CONTEXT_LENGTH_OPTIONS = [512, 4096, 4097]
-    # BATCH_SIZE_OPTIONS = [4, 80, 128]
-
-    BLOCK_SIZE_OPTIONS = [16]
-    HEAD_CONFIGURATIONS = [(16, 1)]
-    # BLOCK_SIZE_OPTIONS = [1024]
-    # HEAD_CONFIGURATIONS = [(10, 1)]
-
-    HEAD_DIMENSION = 128
-    DATA_TYPE_OPTIONS = ["bf16"]
-    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    CONTEXT_LENGTH_OPTIONS = [4096]
-    BATCH_SIZE_OPTIONS = [4, 128]
-
-    main()
+    # main()
+    pass
