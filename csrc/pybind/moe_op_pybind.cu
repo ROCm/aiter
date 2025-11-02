@@ -4,8 +4,4 @@
 #include "moe_op.h"
 #include "rocm_ops.hpp"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
-{
-    AITER_ENUM_PYBIND;
-    MOE_OP_PYBIND;
-}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { MOE_OP_PYBIND; }

@@ -303,7 +303,7 @@ void register_buffer(fptr_t _fa,
     fa->register_buffer(handles, offsets, t.data_ptr());
 }
 
-std::vector<at::Tensor> get_graph_buffer_ipc_meta(fptr_t _fa)
+std::tuple<torch::Tensor, torch::Tensor> get_graph_buffer_ipc_meta(fptr_t _fa)
 {
     auto fa                      = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     auto [handle_bytes, offsets] = fa->get_graph_buffer_ipc_meta();

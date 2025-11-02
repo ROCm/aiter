@@ -326,32 +326,32 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     return args;
 }
 
-
-std::vector<at::Tensor>
-mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
-               const at::Tensor &k,            // [total_k, hk, d]
-               const at::Tensor &v,            // [total_k, hk, d]
-               const at::Tensor &cu_seqlens_q, // [b+1]
-               std::optional<const at::Tensor> &cu_seqlens_k, // [b+1]
-               int max_seqlen_q,
-               int max_seqlen_k,
-               int min_seqlen_q,
-               float p_dropout,
-               float softmax_scale,
-               float logits_soft_cap,
-               bool zero_tensors,
-               bool is_causal,
-               int window_size_left,
-               int window_size_right,
-               bool return_softmax_lse,
-               bool return_dropout_randval,
-               std::optional<at::Tensor> out_,                // [total_q, hq, d]
-               std::optional<const at::Tensor> block_table_,  // [hq] or [b, hq]
-               std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
-               std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-               std::optional<at::Generator> gen_,
-               std::optional<const at::Tensor> cu_seqlens_q_padded_, // [b+1] physical starts with PAD
-               std::optional<const at::Tensor> cu_seqlens_k_padded_) // [b+1]
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> 
+mha_varlen_fwd(
+    at::Tensor& q,                                 // [total_q, hq, d]
+    const at::Tensor& k,                           // [total_k, hk, d]
+    const at::Tensor& v,                           // [total_k, hk, d]
+    const at::Tensor& cu_seqlens_q,                // [b+1]
+    std::optional<const at::Tensor>& cu_seqlens_k, // [b+1]
+    int max_seqlen_q,
+    int max_seqlen_k,
+    int min_seqlen_q,
+    float p_dropout,
+    float softmax_scale,
+    float logits_soft_cap,
+    bool zero_tensors,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    bool return_softmax_lse,
+    bool return_dropout_randval,
+    std::optional<at::Tensor> out_,                // [total_q, hq, d]
+    std::optional<const at::Tensor> block_table_,  // [hq] or [b, hq]
+    std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
+    std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
+    std::optional<at::Generator> gen_,
+    std::optional<const at::Tensor> cu_seqlens_q_padded_, // [b+1] physical starts with PAD
+    std::optional<const at::Tensor> cu_seqlens_k_padded_) // [b+1]
 {
     auto q_dtype = q.scalar_type();
     bool isQKVFp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
