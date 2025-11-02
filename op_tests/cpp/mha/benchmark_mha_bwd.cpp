@@ -155,7 +155,8 @@ auto create_args(int argc, char* argv[])
             "if set to 0 will use atomic fp16/bf16(w/o convert_dq kernel) when bwd_v3 is set to 1")
         .insert("v3_bf16_cvt",
                 "1",
-                "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ");
+                "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
+        .insert("is_v3_check", "0", "if set to 1, check whether the input scenarios is supported by the asm kernel.");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -262,6 +263,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     bool bwd_v3         = arg_parser.get_bool("bwd_v3");
     bool v3_atomic_fp32 = arg_parser.get_bool("v3_atomic_fp32");
     int v3_bf16_cvt     = arg_parser.get_int("v3_bf16_cvt");
+    bool is_v3_check    = arg_parser.get_bool("is_v3_check");
 
     ck_tile::stream_config stream_config{nullptr,
                                          true,
@@ -645,7 +647,10 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                     deterministic,
                                     bwd_v3,
                                     v3_atomic_fp32,
-                                    v3_bf16_cvt);
+                                    v3_bf16_cvt,
+                                    nullptr,
+                                    nullptr,
+                                    is_v3_check);
     if(ave_time < 0)
     {
         std::cout << ", not supported yet" << std::flush << std::endl;
