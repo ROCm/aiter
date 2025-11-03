@@ -1899,7 +1899,7 @@ void AdaptiveTopK(int batch_size,
 } // namespace topk
 
 void topk_plain(torch::Tensor& values,   // [batch, len]
-                torch::Tensor& topk_ids, // [batch, len]
+                torch::Tensor& topk_ids, // [batch, k]
                 int topk,
                 bool largest)
 {
