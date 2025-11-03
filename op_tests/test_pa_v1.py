@@ -128,10 +128,13 @@ def ref_masked_attention(
     scale: float,
     attn_mask: Optional[torch.Tensor] = None,
     logits_soft_cap: float = 0.0,
+    sliding_window: int = 0,
 ) -> torch.Tensor:
     attn_weights = scale * torch.einsum("qhd,khd->hqk", query, key).float()
     if attn_mask is not None:
         attn_weights = attn_weights + attn_mask.float()
+    if sliding_window:
+        attn_weights[:,:,:-sliding_window] = -1e38
     if 0 < logits_soft_cap:
         attn_weights = logits_soft_cap * torch.tanh(attn_weights / logits_soft_cap)
     attn_weights = torch.softmax(attn_weights, dim=-1).to(value.dtype)
@@ -214,6 +217,7 @@ def run_torch(
     k_scale,
     v_scale,
     num_queries_per_kv,
+    sliding_window
 ):
     output = torch.zeros_like(query)
     num_query_heads = query.shape[1]
@@ -255,7 +259,7 @@ def run_torch(
             alibi_bias = (position_ids - seq_len + 1).float()
             alibi_bias = alibi_slopes.view(-1, 1, 1) * alibi_bias.view(1, 1, -1)
 
-        out = ref_masked_attention(q, keys, values, scale, alibi_bias, logits_soft_cap)
+        out = ref_masked_attention(q, keys, values, scale, alibi_bias, logits_soft_cap, sliding_window=sliding_window)
         out = out.view(num_query_heads, head_size)
         output[i].copy_(out, non_blocking=True)
     return output, 1
@@ -277,6 +281,7 @@ def run_aiter(
     logits_soft_cap,
     k_scale,
     v_scale,
+    sliding_window,
     mtp=1,
 ):
     # copied from ops.PagedAttention.forward_decode()
@@ -326,6 +331,7 @@ def run_aiter(
         logits_soft_cap,
         k_scale,
         v_scale,
+        sliding_window,
         fp8_out_scale if cpa_fp8_out else None,
         _PARTITION_SIZE_ROCM,
     )
@@ -422,6 +428,7 @@ DUMP_OUTPUT = False  # whether to dump output
 @pytest.mark.parametrize("quant_cache_dtype", [None, dtypes.fp8, dtypes.i8])
 @pytest.mark.parametrize("seed", [0])
 @pytest.mark.parametrize("device", ["cuda:0"])
+@pytest.mark.parametrize("sliding_window", [0, 10])
 def test_paged_attention(
     ctx_lens: int,
     num_seqs: int,
@@ -437,6 +444,7 @@ def test_paged_attention(
     quant_cache_dtype: torch.dtype,
     seed: int,
     device: str,
+    sliding_window: int,
 ) -> None:
     if pa_variant == PAVariant.Shomy:
         if quant_cache_dtype is not None:
@@ -448,6 +456,7 @@ def test_paged_attention(
             or block_size != 16
             or dtype is not dtypes.bf16
             or quant_cache_dtype not in [None, dtypes.i8]
+            or sliding_window != 0
         ):
             pytest.skip()
     elif pa_variant == PAVariant.Naive:
@@ -523,6 +532,7 @@ def test_paged_attention(
             k_scale,
             v_scale,
             num_queries_per_kv,
+            sliding_window,
         )
         cu_query_lens = torch.arange(0, num_seqs + 1, dtype=torch.int)
 
@@ -546,6 +556,7 @@ def test_paged_attention(
             logits_soft_cap,
             k_scale,
             v_scale,
+            sliding_window
         )
         assert (
             checkAllclose(out_golden, out_aiter, msg=f"golden vs aiter:{time_aiter}")
@@ -643,4 +654,5 @@ if __name__ == "__main__":
             quant_cache_dtype,
             0,
             "cuda:0",
+            0
         )

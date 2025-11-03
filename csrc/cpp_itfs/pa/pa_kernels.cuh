@@ -11,6 +11,7 @@ template <typename scalar_t,
           bool ALIBI_ENABLED,
           int GQA_RATIO,
           int MTP,
+          bool HAS_SLIDING_WINDOW,
           typename AttentionVariant>
 __inline__ __device__ void
 _paged_attention_kernel(const int* block_table_seq,
@@ -36,7 +37,8 @@ _paged_attention_kernel(const int* block_table_seq,
                         const float* q_scale_ptr,
                         const float* k_scale_ptr,
                         const float* v_scale_ptr,
-                        const AttentionVariant* variant)
+                        const AttentionVariant* variant,
+                        const int sliding_window = 0)
 {
     const int seq_idx                = blockIdx.x;
     const int partition_idx          = blockIdx.y;
@@ -463,6 +465,27 @@ _paged_attention_kernel(const int* block_table_seq,
     // calculate qk_max and exp_sum per warp and write to shared memory
     float qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD]  = {{-FLT_MAX}};
     float exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {{0.0f}};
+
+    if constexpr(HAS_SLIDING_WINDOW)
+    {
+        for(int mtp = 0; mtp < mtp_loop; mtp++)
+        {
+            for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
+            {
+                for(int token_depth = 0; token_depth < TLOOP; token_depth++)
+                {
+                    const int local_token_idx = qkout_token_idx + token_depth * 16;
+                    for (int i = 0; i < 4; i++)
+                    {
+                        float tmp = d_out[gqa_ratio_loop][mtp][token_depth][i];
+                        if (local_token_idx + i <= context_len - sliding_window)
+                            tmp = -FLT_MAX;
+                        d_out[gqa_ratio_loop][mtp][token_depth][i] = tmp;
+                    }
+                }
+            }
+        }
+    }
 
     for(int mtp = 0; mtp < mtp_loop; mtp++)
     {
