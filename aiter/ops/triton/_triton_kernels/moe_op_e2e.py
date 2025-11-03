@@ -342,7 +342,8 @@ def e2e_moe_kernel(
         w2_scale = tl.load(W2_scale + off_experts)
 
     num_k2 = tl.cdiv(K, BLOCK_SIZE_K2)
-    for k2 in tl.range(0, num_k2, num_stages=1 if use_fp8_w8a8 else None):
+    # TODO: add num_stages > 1 support for use_fp8_w8a8. Now produces a compile error.
+    for k2 in tl.range(0, num_k2, num_stages=1 if not use_fp8_w8a8 else None):
         w2 = tl.load(
             w2_ptrs + k2 * BLOCK_SIZE_K2 * stride_w2k,
         )
