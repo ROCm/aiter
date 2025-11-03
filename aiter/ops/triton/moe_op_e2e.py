@@ -71,9 +71,10 @@ def e2e_moe(
         assert W1_scale is not None
         assert W2_scale is not None
         if block_shape is None:
-            output = torch.zeros(A.shape, device=A.device, dtype=torch.float8_e4m3fnuz)
+            output = torch.zeros(A.shape, device=A.device, dtype=W1.dtype)
             A_scale = torch.zeros(1, device=A.device, dtype=torch.float32)
             A, A_scale = _MOE_A_QUANT_FUNC(output, A, A_scale)
+            block_n, block_k = None, None
         else:
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
@@ -145,8 +146,8 @@ def e2e_moe(
         Out.stride(1),
         Out.stride(2),
         Intermediate.stride(1) if return_intermediate else 0,
-        A_scale.stride(0) if A_scale is not None else 0,
-        A_scale.stride(1) if A_scale is not None else 0,
+        A_scale.stride(0) if A_scale is not None and block_shape is not None else 0,
+        A_scale.stride(1) if A_scale is not None and block_shape is not None else 0,
         W1_scale.stride(0) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
         W1_scale.stride(1) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
         W1_scale.stride(2) if W1_scale is not None and W1_scale.ndim >= 2 else 0,
@@ -168,6 +169,7 @@ def e2e_moe(
         EVEN_K2,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         use_fp8_w8a8=use_fp8_w8a8,
+        use_block_scale=block_shape is not None,
         NUM_XCDS=get_num_xcds(),
         SKINNY=SKINNY,
         dtype=torch_to_triton_dtype[dtype],  # mma dtype

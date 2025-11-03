@@ -95,6 +95,7 @@ def e2e_moe_kernel(
     EVEN_K: tl.constexpr,
     EVEN_K2: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
+    use_block_scale: tl.constexpr, 
     use_fp8_w8a8: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -184,7 +185,7 @@ def e2e_moe_kernel(
     BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
 
     # how many scaling factors along block dimensions. Needed for broadcasting
-    if use_fp8_w8a8:
+    if use_fp8_w8a8 and use_block_scale:
         num_scales_along_n: tl.constexpr = (BLOCK_SIZE_HALF + group_n - 1) // group_n
         num_scales_along_k2: tl.constexpr = (BLOCK_SIZE_K2 + group_k - 1) // group_k
         num_scales_along_k1: tl.constexpr = (BLOCK_SIZE_K1 + group_k - 1) // group_k
@@ -215,7 +216,7 @@ def e2e_moe_kernel(
     silu_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=tl.float32)
     mul_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_HALF), dtype=tl.float32)
 
-    if use_fp8_w8a8:
+    if use_fp8_w8a8 and use_block_scale:
         a_scale_ptrs = A_scale + (offs_token[:, None] // top_k * stride_asm)
         i0s = pid_n * (BLOCK_SIZE_HALF // group_n) + tl.arange(0, num_scales_along_n)
         i1s = i0s + ((N // 2) // group_n)
@@ -249,14 +250,18 @@ def e2e_moe_kernel(
             )
 
         if use_fp8_w8a8:
-            w1_scale = tl.load(w1_i0_scale_ptrs)
+            if use_block_scale:
+                w1_scale = tl.load(w1_i0_scale_ptrs)
 
-            # if num_scales_along_n > 1: # singleton dimension get automatic broadcast
-            w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
+                # if num_scales_along_n > 1: # singleton dimension get automatic broadcast
+                w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
 
-            a_scale = tl.load(
-                a_scale_ptrs, mask=token_mask[:, None], other=0.0
-            )
+                a_scale = tl.load(
+                    a_scale_ptrs, mask=token_mask[:, None], other=0.0
+                )
+            else:
+                w1_scale = tl.load(W1_scale + off_experts)
+                a_scale = tl.load(A_scale)
 
             silu_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
         else:
@@ -273,8 +278,9 @@ def e2e_moe_kernel(
             )
 
         if use_fp8_w8a8:
-            w1_scale = tl.load(w1_i1_scale_ptrs)
-            w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
+            if use_block_scale:
+                w1_scale = tl.load(w1_i1_scale_ptrs)
+                w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
             mul_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
         else:
             mul_acc = tl.dot(a, w1, acc=mul_acc)
@@ -282,7 +288,7 @@ def e2e_moe_kernel(
         a_ptrs += BLOCK_SIZE_K1 * stride_ak
         w1_ptrs_i0 += BLOCK_SIZE_K1 * stride_w1k
         w1_ptrs_i1 += BLOCK_SIZE_K1 * stride_w1k
-        if use_fp8_w8a8:
+        if use_fp8_w8a8 and use_block_scale:
             w1_i0_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_w1sk
             w1_i1_scale_ptrs += BLOCK_SIZE_K1 // group_k *stride_w1sk
             a_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_ask
@@ -308,8 +314,6 @@ def e2e_moe_kernel(
     else:
         acc = acc.to(dtype)
 
-    
-
     offs_w2n = (tl.arange(0, BLOCK_SIZE_HALF) + pid_n * (BLOCK_SIZE_HALF)) % (N // 2)
 
     w2_ptrs = (
@@ -318,7 +322,7 @@ def e2e_moe_kernel(
         + (offs_k2[None, :] * stride_w2k + offs_w2n[:, None] * stride_w2n)
     )
 
-    if use_fp8_w8a8:
+    if use_fp8_w8a8 and use_block_scale:
         # offs_w2_sn = offs_w2n // group_n
         # instead load only the unique scaling factors and broadcast.
         offs_w2_sn = (pid_n * BLOCK_SIZE_HALF) // group_n + tl.arange(
@@ -333,31 +337,32 @@ def e2e_moe_kernel(
 
     out_ptrs = Out + stride_om * offs_token[:, None] + offs_k2[None, :] * stride_ok
 
-    
-
     num_k2 = tl.cdiv(K, BLOCK_SIZE_K2)
     for k2 in tl.range(0, num_k2, num_stages=1):
         w2 = tl.load(
             w2_ptrs + k2 * BLOCK_SIZE_K2 * stride_w2k,
         )
         if use_fp8_w8a8:
-            w2_scale = tl.load(
-                w2_scale_ptrs + (k2 * BLOCK_SIZE_K2) // group_k * stride_w2sk,
-            )  # (num_scales_along_n, num_scales_along_k2)
-            w2_scale = group_broadcast(
-                w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0
-            )
-            # broadcasted shape along n depends on if num_scales_along_n > 1 or not as singleton dimension not get broadcasted.
-            if num_scales_along_n > 1:
+            if use_block_scale:
+                w2_scale = tl.load(
+                    w2_scale_ptrs + (k2 * BLOCK_SIZE_K2) // group_k * stride_w2sk,
+                )  # (num_scales_along_n, num_scales_along_k2)
                 w2_scale = group_broadcast(
-                    w2_scale,
-                    num_scales_along_n * group_n,
-                    num_scales_along_k2,
-                    group_k,
-                    1,
+                    w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0
                 )
+                # broadcasted shape along n depends on if num_scales_along_n > 1 or not as singleton dimension not get broadcasted.
+                if num_scales_along_n > 1:
+                    w2_scale = group_broadcast(
+                        w2_scale,
+                        num_scales_along_n * group_n,
+                        num_scales_along_k2,
+                        group_k,
+                        1,
+                    )
+                else:
+                    w2_scale = group_broadcast(w2_scale, 1, num_scales_along_k2, group_k, 1)
             else:
-                w2_scale = group_broadcast(w2_scale, 1, num_scales_along_k2, group_k, 1)
+                w2_scale = tl.load(W2_scale + off_experts)
 
             w2 = (w2.to(tl.float32) * w2_scale.to(tl.float32)).to(tl.bfloat16)
             out = tl.dot(acc, w2)
@@ -376,7 +381,6 @@ def e2e_moe_kernel(
             out_mask = token_mask[:, None] & (
                 offs_k2[None, :] < (K - k2 * BLOCK_SIZE_K2)
             )
-
         
         if SKINNY:
             # Skinny means that there is only one pid along N (i.e. BLOCK_SIZE_N >= N).
