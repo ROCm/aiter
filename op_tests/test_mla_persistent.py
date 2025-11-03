@@ -96,8 +96,8 @@ def torch_mla_extend(
     q_scale=None,
     kv_scale=None,
 ):
-    is_fp8_q = q.dtype == get_fp8_e4m3_dtype()
-    is_fp8_kvc = kvc_cache.dtype == get_fp8_e4m3_dtype()
+    is_fp8_q = q.dtype == dtypes.fp8
+    is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
 
     if is_fp8_q:
         q = q.to(torch.float)
@@ -151,6 +151,8 @@ def test_mla(
     varlen,
     mtp,
 ):
+    ret = {}
+
     out_dtype = torch.bfloat16
     kv_max_sz = (
         65536 * 32
@@ -311,28 +313,22 @@ def test_mla(
         )
         return err, us_asm_decode
 
-    err = None
-    us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead == 16:
-        err, us_asm_decode = test_absorb_decode_bf16()
-        print("us_asm_decode:", us_asm_decode)
-
     def test_absorb_decode_fp8():
-        if dtype != get_fp8_e4m3_dtype() and nhead == 128:
+        if dtype != dtypes.fp8 and nhead == 128:
             aiter.logger.info("don't support this case:\n")
             return None, 1e12
 
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
-        q_fp8 = q.to(get_fp8_e4m3_dtype())
+        q_fp8 = q.to(dtypes.fp8)
         q_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         kv_buffer_fp8 = kv_buffer.to(kvtype)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
-            q_fp8 if dtype == get_fp8_e4m3_dtype() else q,
+            q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8,
             qo_indptr,
             kv_indptr,
@@ -348,7 +344,7 @@ def test_mla(
 
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
-            q_fp8 if dtype == get_fp8_e4m3_dtype() else q,
+            q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
             out_asm,
             qo_indptr,
@@ -386,9 +382,14 @@ def test_mla(
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
 
-    if kvtype == get_fp8_e4m3_dtype() and nhead in [16, 128]:
+    err = None
+    us_asm_decode = 1e12
+    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead == 16:
+        err, us_asm_decode = test_absorb_decode_bf16()
+    elif kvtype == dtypes.fp8 and nhead in [16, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
-        print("us_asm_decode:", us_asm_decode)
+    ret["decode:err"] = err
+    ret["decode:asm_576"] = us_asm_decode
 
     flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
     bytes = (
@@ -397,14 +398,12 @@ def test_mla(
         + total_q * nhead * v_head_dim * (torch.finfo(out_dtype).bits // 8)
     )
 
-    return {
-        "decode:flops": flops,
-        "decode:bytes": bytes,
-        "decode:err": err,
-        "decode:asm_576": us_asm_decode,
-        "decode:TFLOPS": flops / us_asm_decode / 1e6,
-        "decode:TB/s": bytes / us_asm_decode / 1e6,
-    }
+    ret["decode:flops"] = flops
+    ret["decode:bytes"] = bytes
+    ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
+    ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
+
+    return ret
 
 
 kv_lora_rank = 512

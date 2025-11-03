@@ -187,7 +187,7 @@ def mla_decode_fwd(
     if num_kv_splits is None:
         num_kv_splits = get_cu_num()
 
-    io_tranformed = False
+    io_transformed = False
 
     if not persistent_mode:
         MAYBE_FINAL_OUT = True
@@ -265,7 +265,7 @@ def mla_decode_fwd(
             nhead = 16
             q = q.view(total_s, nhead, -1)
             o = o.view(total_s, nhead, -1)
-            io_tranformed = True
+            io_transformed = True
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
@@ -309,7 +309,7 @@ def mla_decode_fwd(
             final_lse,
         )
 
-    if io_tranformed:
+    if io_transformed:
         logits = logits.view(ori_total_s, num_kv_splits, ori_nhead, v_head_dim)
         q = q.view(ori_total_s, ori_nhead, -1)
         o = o.view(ori_total_s, ori_nhead, -1)
