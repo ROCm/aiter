@@ -158,7 +158,6 @@ def test_fmoe(
     M, _ = topk_ids.shape
 
     BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
-    BLOCK_SIZE_M = 256
     if qType == aiter.QuantType.per_128x128:
         BLOCK_SIZE_M = 64
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
@@ -330,6 +329,42 @@ def test_fmoe(
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
     a2_qt = a2_qt.view(token, topk, -1)
 
+    ### specific for asm fp4x2
+    if qType == aiter.QuantType.per_1x32:
+        input_t = torch.randn((token, inter_dim), dtype=dtype)
+        a1_qt_t, a1_scale_t = torch_quant(input_t, quant_dtype=AQDType)
+        w1_t = torch.randn((E, model_dim * 2, inter_dim), dtype=dtype)
+        w2_t = torch.randn((E, inter_dim, model_dim), dtype=dtype)
+        w1_qt_t, w1_scale_t = torch_quant(w1_t, quant_dtype=WQDType)
+        w2_qt_t, w2_scale_t = torch_quant(w2_t, quant_dtype=WQDType)
+        out1_ref_t = torch_moe_stage1(
+            a1_qt_t,
+            w1_qt_t,
+            w2_qt_t,
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            activation=actType,
+            quant_type=qType,
+            a1_scale=a1_scale_t,
+            w1_scale=w1_scale_t,
+            doweight=doweight_stage1,
+        )
+        a2_qt_t, a2_scale_t = torch_quant(out1_ref_t, quant_dtype=AQDType)
+        a2_qt_t = a2_qt_t.view(token, topk, -1)
+        out2_ref_t = torch_moe_stage2(
+            a2_qt_t,
+            w1_qt_t,  # E, model_dim*2, inter_dim
+            w2_qt_t,  # E, inter_dim, model_dim
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            quant_type=qType,
+            w2_scale=w2_scale_t,
+            a2_scale=a2_scale_t,
+            doweight=not doweight_stage1,
+        )
+
     out2_ref = torch_moe_stage2(
         a2_qt,
         w1_qt,  # E, inter_dim*2, model_dim
@@ -398,7 +433,7 @@ def test_fmoe(
         sorted_weights=sorted_weights,
     )
     checkAllclose(
-        out2_ref,
+        out2_ref_t,
         out2_asm,
         msg=f"[perf] asm_moe_stage2:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
