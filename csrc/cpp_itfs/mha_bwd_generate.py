@@ -115,10 +115,12 @@ V3_MULTI_TARGET_API = """
 
 def get_v3_api():
     gfx_list = get_gfx_list()
-    if len(gfx_list) == 1:
-        return f"t = {gfx_list[0]}::fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded, is_v3_api_check);"
-    else:
+    if "gfx942" in gfx_list and "gfx950" in gfx_list:
         return V3_MULTI_TARGET_API
+    elif "gfx942" in gfx_list:
+        return """if (get_gpu_arch() == "gfx942") { t = gfx942::fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded, is_v3_api_check); }"""
+    elif "gfx950" in gfx_list:
+        return """if (get_gpu_arch() == "gfx950") { t = gfx950::fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded, is_v3_api_check); }"""
 
 
 V3_API = get_v3_api()
