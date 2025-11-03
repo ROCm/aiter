@@ -1,4 +1,4 @@
-# AITER GEMM Benchmark - Enhanced CLI
+# AITER GEMM Benchmark
 
 ## Docker Setup
 
