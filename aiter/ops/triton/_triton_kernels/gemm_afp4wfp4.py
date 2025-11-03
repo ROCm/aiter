@@ -53,6 +53,21 @@ _gemm_afp4wfp4_reduce_repr = make_kernel_repr(
 )
 
 
+_gemm_afp4wfp4_preshuffled_weight_scales_repr = make_kernel_repr(
+    "_gemm_afp4_wfp4_kernel_preshuffled_weight_scales",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "cache_modifier",
+    ],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -419,7 +434,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
     }
 )
-@triton.jit
+@triton.jit(repr=_gemm_afp4wfp4_preshuffled_weight_scales_repr)
 def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
     a_ptr,
     b_ptr,
