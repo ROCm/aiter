@@ -10,7 +10,7 @@ from setuptools import Distribution, setup
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0,f"{this_dir}/aiter/")
+sys.path.insert(0, f"{this_dir}/aiter/")
 from concurrent.futures import ThreadPoolExecutor
 
 from jit import core
