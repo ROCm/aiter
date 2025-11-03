@@ -947,14 +947,23 @@ float fmha_bwd_v3_group_(const ck_tile::stream_config& s, fmha_bwd_args a, const
     args.ptr_do             = a.do_ptr;
     args.ptr_lse            = a.lse_ptr;
     args.ptr_d              = a.d_ptr;
-    args.ptr_qseq           = a.seqstart_q_ptr;
-    args.ptr_kseq           = a.seqstart_k_ptr;
-    args.ptr_qseq_padded    = seqlen_q_padded == nullptr
-                            ? a.seqstart_q_ptr
-                            : seqlen_q_padded;
-    args.ptr_kseq_padded    = seqlen_k_padded == nullptr
-                            ? a.seqstart_k_ptr
-                            : seqlen_k_padded;
+
+    if (a.cu_seqlen_k_ptr && a.seqstart_k_ptr) {
+        args.ptr_kseq_padded    = a.seqstart_k_ptr;
+        args.ptr_kseq           = a.cu_seqlen_k_ptr;
+    } else {
+        args.ptr_kseq           = a.seqstart_k_ptr;
+        args.ptr_kseq_padded    = a.seqstart_k_ptr;
+    }
+
+    if (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) {
+        args.ptr_qseq_padded    = a.seqstart_q_ptr;
+        args.ptr_qseq           = a.cu_seqlen_q_ptr;
+    } else {
+        args.ptr_qseq           = a.seqstart_q_ptr;
+        args.ptr_qseq_padded    = a.seqstart_q_ptr;
+    }
+
     args.scalar             = a.scale;
     args.log2e              = ck_tile::log2e_v<float>;
     args.ratio              = a.nhead_q / a.nhead_k;
@@ -1104,14 +1113,22 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
     args.BAs_dv             = a.batch_stride_dv * 2;
     args.Seqs_dv            = a.stride_dv * 2;
     args.Hs_lsed            = a.nhead_stride_lsed * 4;
-    args.ptr_qseq           = a.seqstart_q_ptr;
-    args.ptr_kseq           = a.seqstart_k_ptr;
-    args.ptr_qseq_padded    = seqlen_q_padded == nullptr
-                            ? a.seqstart_q_ptr
-                            : seqlen_q_padded;
-    args.ptr_kseq_padded    = seqlen_k_padded == nullptr
-                            ? a.seqstart_k_ptr
-                            : seqlen_k_padded;
+
+    if (a.cu_seqlen_k_ptr && a.seqstart_k_ptr) {
+        args.ptr_kseq_padded    = a.seqstart_k_ptr;
+        args.ptr_kseq           = a.cu_seqlen_k_ptr;
+    } else {
+        args.ptr_kseq           = a.seqstart_k_ptr;
+        args.ptr_kseq_padded    = a.seqstart_k_ptr;
+    }
+
+    if (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) {
+        args.ptr_qseq_padded    = a.seqstart_q_ptr;
+        args.ptr_qseq           = a.cu_seqlen_q_ptr;
+    } else {
+        args.ptr_qseq           = a.seqstart_q_ptr;
+        args.ptr_qseq_padded    = a.seqstart_q_ptr;
+    }
     args.max_seqlen_dq     = a.max_seqlen_q;
 
     auto traits = fmha_bwd_v3_traits{a.batch,
@@ -1178,14 +1195,22 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
     args.BAs_dv             = a.batch_stride_dv * 2;
     args.Seqs_dv            = a.stride_dv * 2;
     args.Hs_lsed            = a.nhead_stride_lsed * 4;
-    args.ptr_qseq           = a.seqstart_q_ptr;
-    args.ptr_kseq           = a.seqstart_k_ptr;
-    args.ptr_qseq_padded    = seqlen_q_padded == nullptr
-                            ? a.seqstart_q_ptr
-                            : seqlen_q_padded;
-    args.ptr_kseq_padded    = seqlen_k_padded == nullptr
-                            ? a.seqstart_k_ptr
-                            : seqlen_k_padded;
+
+    if (a.cu_seqlen_k_ptr && a.seqstart_k_ptr) {
+        args.ptr_kseq_padded    = a.seqstart_k_ptr;
+        args.ptr_kseq           = a.cu_seqlen_k_ptr;
+    } else {
+        args.ptr_kseq           = a.seqstart_k_ptr;
+        args.ptr_kseq_padded    = a.seqstart_k_ptr;
+    }
+
+    if (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) {
+        args.ptr_qseq_padded    = a.seqstart_q_ptr;
+        args.ptr_qseq           = a.cu_seqlen_q_ptr;
+    } else {
+        args.ptr_qseq           = a.seqstart_q_ptr;
+        args.ptr_qseq_padded    = a.seqstart_q_ptr;
+    }
     args.max_seqlen_dq     = (a.max_seqlen_q + 15) / 16 * 16;
 
     fmha_bwd_dq_shuffle_args dq_shuffule_args;
@@ -1200,10 +1225,15 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a, 
     dq_shuffule_args.Seqs_dq            = a.stride_dq * 2;
     dq_shuffule_args.seqlen_q           = a.seqlen_q;
     dq_shuffule_args.head_dim           = a.hdim_q;
-    dq_shuffule_args.ptr_qseq           = a.seqstart_q_ptr;
-    dq_shuffule_args.ptr_qseq_padded    = seqlen_q_padded == nullptr
-                                        ? a.seqstart_q_ptr
-                                        : seqlen_q_padded;
+
+    if (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) {
+        dq_shuffule_args.ptr_qseq_padded    = a.seqstart_q_ptr;
+        dq_shuffule_args.ptr_qseq           = a.cu_seqlen_q_ptr;
+    } else {
+        dq_shuffule_args.ptr_qseq           = a.seqstart_q_ptr;
+        dq_shuffule_args.ptr_qseq_padded    = a.seqstart_q_ptr;
+    }
+
     dq_shuffule_args.max_seqlen_dq     = (a.max_seqlen_q + 15) / 16 * 16;
 
     auto traits = fmha_bwd_v3_traits{a.batch,

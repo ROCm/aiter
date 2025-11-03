@@ -395,8 +395,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
             : std::array<ck_tile::index_t, 4>{1, 1, 1, 1} /* dummy shape for simplifying code */);
     ck_tile::HostTensor<AccDataType> dq_acc_host(
         std::array<ck_tile::index_t, 5>{nsplits, shape_batch, nhead, shape_seqlen_q, hdim_q});
-    ck_tile::HostTensor<QGradDataType> dq_acc_host_a16(std::array<ck_tile::index_t, 5>{
-        nsplits, batch, nhead, a16_dq_acc_seq, a16_dq_acc_hdim});
+    ck_tile::HostTensor<QGradDataType> dq_acc_host_a16(
+        std::array<ck_tile::index_t, 5>{nsplits, batch, nhead, a16_dq_acc_seq, a16_dq_acc_hdim});
 
     if(init_method == 0)
     {
@@ -578,6 +578,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              dq_acc_buf.GetDeviceBuffer(),
                              seqstart_q.GetDeviceBuffer(),
                              seqstart_k.GetDeviceBuffer(),
+                             nullptr,
+                             nullptr,
+                             nullptr,
                              nullptr,
                              shape_seqlen_q,
                              shape_seqlen_k,
