@@ -101,20 +101,19 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
-                         nullptr,
-                         nullptr,
-                         cu_seqlens_q.data_ptr(), // seqstart_q
-                         cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k
-                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_kpads
-                         nullptr,
-                         nullptr,
+                         cu_seqlens_q.data_ptr(), // seqstart_q_ptr (cumulative physical)
+                         cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k_ptr
+                         nullptr, // seqlen_q_ptr (per-sequence logical, not used here)
+                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr
+                         nullptr, // cu_seqlen_q_ptr (not used in this mode)
+                         nullptr, // cu_seqlen_k_ptr (not used in this mode)
                          total_q,
                          total_k,
                          b,
                          max_seqlen_q,
                          d,             // hdim_q
                          d_v,           // hdim_v
-                         h,             // nhead
+                         h,             // nhead_q
                          h_k,           // nhead_k
                          softmax_scale, // scale_s
                          1,             // scale_p
