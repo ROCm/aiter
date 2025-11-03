@@ -60,114 +60,54 @@ struct __attribute__((packed)) KernelArgs
     p2 _p22;
 };
 
-struct kargs_struct
+struct __attribute__((packed)) KernelStage2Args
 {
     void* o_buf;
-    int pad_00;
-    int pad_01;
+    p2 _p0;
     void* a_buf;
-    int pad_10;
-    int pad_11;
+    p2 _p1;
     void* tk_num_buf;
-    int pad_20;
-    int pad_21;
+    p2 _p2;
     void* b_buf;
-    int pad_30;
-    int pad_31;
+    p2 _p3;
     void* as_buf;
-    int pad_40;
-    int pad_41;
+    p2 _p4;
     void* bs_buf;
-    int pad_50;
-    int pad_51;
+    p2 _p5;
     void* tk_buf;
-    int pad_60;
-    int pad_61;
+    p2 _p6;
     void* w_buf;
-    int pad_70;
-    int pad_71;
+    p2 _p7;
     void* expt_buf;
-    int pad_80;
-    int pad_81;
+    p2 _p8;
     int model_dim;
-    int pad_90;
-    int pad_91;
-    int pad_92;
+    p3 _p9;
     int inter_dim;
-    int pad_a0;
-    int pad_a1;
-    int pad_a2;
+    p3 _p10;
     int tokens;
-    int pad_b0;
-    int pad_b1;
-    int pad_b2;
+    p3 _p11;
     int experts;
-    int pad_c0;
-    int pad_c1;
-    int pad_c2;
+    p3 _p12;
     int stride_a;
-    int pad_d0;
-    int pad_d1;
-    int pad_d2;
+    p3 _p13;
     int stride_b;
-    int pad_e0;
-    int pad_e1;
-    int pad_e2;
+    p3 _p14;
     int stride_o;
-    int pad_f0;
-    int pad_f1;
-    int pad_f2;
+    p3 _p15;
     int stride_expt_b;
-    int pad_g0;
-    int pad_g1;
-    int pad_g2;
+    p3 _p16;
     int stride_expt_bs;
-    int pad_h0;
-    int pad_h1;
-    int pad_h2;
+    p3 _p17;
     int topks;
-    int pad_i0;
-    int pad_i1;
-    int pad_i2;
+    p3 _p18;
     void* dbg_i32;
-    int pad_j0;
-    int pad_j1;
+    p2 _p19;
     void* dbg_f32;
-    int pad_k0;
-    int pad_k1;
+    p2 _p20;
     void* dbg_f16;
-    int pad_l0;
-    int pad_l1;
+    p2 _p21;
     void* dbg_lds;
-    int pad_m0;
-    int pad_m1;
-
-    auto remove_pad() const
-    {
-        return std::tie(o_buf,
-                        a_buf,
-                        tk_num_buf,
-                        b_buf,
-                        as_buf,
-                        bs_buf,
-                        tk_buf,
-                        w_buf,
-                        expt_buf,
-                        model_dim,
-                        inter_dim,
-                        tokens,
-                        experts,
-                        stride_a,
-                        stride_b,
-                        stride_o,
-                        stride_expt_b,
-                        stride_expt_bs,
-                        topks,
-                        dbg_i32,
-                        dbg_f32,
-                        dbg_f16,
-                        dbg_lds);
-    }
+    p2 _p22;
 };
 
 static CFG* get_cfg(torch::Tensor& inp,
@@ -541,87 +481,30 @@ void moe_stage2_g1u1(
     TORCH_CHECK(
         block_m == cfg.tile_M, __func__, " kernel: ", cfg.name, " need block_m == ", cfg.tile_M);
 
-    kargs_struct kargs{
-        out.data_ptr(),
-        0,
-        0,
-        input.data_ptr(),
-        0,
-        0,
-        num_valid_ids.data_ptr(),
-        0,
-        0,
-        w2.data_ptr(),
-        0,
-        0,
-        a2_scale.value().data_ptr(),
-        0,
-        0,
-        w2_scale.value().data_ptr(),
-        0,
-        0,
-        sorted_token_ids.data_ptr(),
-        0,
-        0,
-        sorted_expert_ids.data_ptr(),
-        0,
-        0,
-        sorted_weights.value().data_ptr(),
-        0,
-        0,
-        model_dim,
-        0,
-        0,
-        0,
-        hidden_dim,
-        0,
-        0,
-        0,
-        token_cnt,
-        0,
-        0,
-        0,
-        eprt,
-        0,
-        0,
-        0,
-        stride_a,
-        0,
-        0,
-        0,
-        stride_b,
-        0,
-        0,
-        0,
-        stride_o,
-        0,
-        0,
-        0,
-        stride_exprt_b,
-        0,
-        0,
-        0,
-        stride_exprt_b_scale,
-        0,
-        0,
-        0,
-        topk,
-        0,
-        0,
-        0,
-        nullptr,
-        0,
-        0,
-        nullptr,
-        0,
-        0,
-        nullptr,
-        0,
-        0,
-        nullptr,
-        0,
-        0,
-    };
+    KernelStage2Args kargs;
+    kargs.o_buf          = out.data_ptr();
+    kargs.a_buf          = input.data_ptr();
+    kargs.tk_num_buf     = num_valid_ids.data_ptr();
+    kargs.b_buf          = w2.data_ptr();
+    kargs.as_buf         = a2_scale.value().data_ptr();
+    kargs.bs_buf         = w2_scale.value().data_ptr();
+    kargs.tk_buf         = sorted_token_ids.data_ptr();
+    kargs.w_buf          = sorted_weights.value().data_ptr();
+    kargs.expt_buf       = sorted_expert_ids.data_ptr();
+    kargs.model_dim      = model_dim;
+    kargs.inter_dim      = hidden_dim;
+    kargs.tokens         = token_cnt;
+    kargs.experts        = eprt;
+    kargs.stride_a       = stride_a;
+    kargs.stride_b       = stride_b;
+    kargs.stride_o       = stride_o;
+    kargs.stride_expt_b  = stride_exprt_b;
+    kargs.stride_expt_bs = stride_exprt_b_scale;
+    kargs.topks          = topk;
+    kargs.dbg_i32        = nullptr;
+    kargs.dbg_f32        = nullptr;
+    kargs.dbg_f16        = nullptr;
+    kargs.dbg_lds        = nullptr;
 
     int bdx         = 256;
     int gdx         = ((hidden_dim + sub_D - 1) / sub_D);
