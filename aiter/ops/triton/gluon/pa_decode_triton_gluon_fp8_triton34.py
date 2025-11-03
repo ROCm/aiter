@@ -30,7 +30,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     output_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size, head_size]
     query_ptr,  # [num_seqs, num_kv_heads * query_group_size, head_size]
-    key_cache_ptr,  # [num_blocks, num_kv_heads, head_size/x, kv_block_size, x]
+    key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache_ptr,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     sequence_lengths_ptr,  # [num_seqs]
@@ -74,7 +74,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     KV_QUANT_MODE: tl.constexpr,
     KV_COMPUTE_BLOCK_SIZE: tl.constexpr,
     FP8_MAX_VALUE: tl.constexpr,
-    VALUE_TRANSPOSED: tl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size/x, head_size, x]
+    VALUE_TRANSPOSED: tl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     IS_CAUSAL: tl.constexpr,
 ):
     """
@@ -385,6 +385,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         kv_sub_sequence_start_index = (
             kv_sequence_start_index + kv_block_index * KV_COMPUTE_BLOCK_SIZE
         )
+
         block_table_id = kv_sub_sequence_start_index // KV_BLOCK_SIZE
         current_page_offset = page_offset + kv_block_index * KV_COMPUTE_BLOCK_SIZE
 
@@ -567,16 +568,24 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         exp_sums = accumulator_scale * exp_sums + gl.sum(attention_probs, axis=1)
 
         # ==================== Value Scaling for FP8 ====================
-        probability_scale = 1.0
         if value_block.dtype.is_fp8():
             if KV_QUANT_MODE == 1:
                 # Per-token quantization scaling
-                value_scale_max = gl.max(value_scale_value, axis=0)
+                # Create mask for valid tokens (exclude padding/invalid tokens)
+                valid_token_mask = qk_column_offsets < kv_sequence_length
+                # Mask out value_scale of invalid tokens
+                masked_value_scale = tl.where(
+                    valid_token_mask, value_scale_value, float(-3.4e38)
+                )
+                value_scale_max = gl.max(masked_value_scale, axis=0)
                 value_scale_value = (
                     value_scale_value * float(FP8_MAX_VALUE) / value_scale_max
                 )
                 attention_probs = value_scale_value[None, :] * attention_probs
                 probability_scale = value_scale_max / float(FP8_MAX_VALUE)
+            else:
+                attention_probs *= float(FP8_MAX_VALUE)
+                probability_scale = value_scale_value / float(FP8_MAX_VALUE)
 
         # Convert attention probabilities to appropriate data type
         if CONTIGUOUS_KV_ELEMENTS_16B_LOAD == 16:
@@ -608,12 +617,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         attention_output = gl.amd.cdna3.mfma(
             attention_probs_converted, value_block_converted, pv_accumulator
         )
-
-        # Apply value quantization scaling
-        if KV_QUANT_MODE == 0:
-            attention_accumulator += value_scale_value * attention_output
-        elif KV_QUANT_MODE == 1:
-            attention_accumulator += probability_scale * attention_output
+        attention_accumulator += probability_scale * attention_output
 
         # Update maximum logits for next iteration
         max_logits = new_max_logits
@@ -666,7 +670,7 @@ def paged_attention_decode_v2_gluon_fp8(
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     output_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size, head_size]
     query_ptr,  # [num_seqs, num_kv_heads * query_group_size, head_size]
-    key_cache_ptr,  # [num_blocks, num_kv_heads, head_size/x, kv_block_size, x]
+    key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache_ptr,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     sequence_lengths_ptr,  # [num_seqs]
@@ -710,7 +714,7 @@ def paged_attention_decode_v2_gluon_fp8(
     KV_QUANT_MODE: tl.constexpr,
     KV_COMPUTE_BLOCK_SIZE: tl.constexpr,
     FP8_MAX_VALUE: tl.constexpr,
-    VALUE_TRANSPOSED: tl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size/x, head_size, x]
+    VALUE_TRANSPOSED: tl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     IS_CAUSAL: tl.constexpr,
 ):
     """
@@ -1053,7 +1057,9 @@ def paged_attention_decode_v2_gluon_fp8(
         block_indices = gl.arange(
             0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout
         )
-        masked_block_indices = gl.where(block_indices < num_kv_blocks, block_indices, 0)
+        # Create mask for valid blocks
+        valid_block_mask = block_indices < num_kv_blocks
+        masked_block_indices = gl.where(valid_block_mask, block_indices, 0)
         block_table_start_ptr = block_tables_ptr + sequence_idx * stride_block_table_seq
         kv_block_numbers = gl.amd.cdna3.buffer_load(
             ptr=block_table_start_ptr + kv_block_start_idx, offsets=masked_block_indices
@@ -1070,7 +1076,8 @@ def paged_attention_decode_v2_gluon_fp8(
             + contiguous_kv_element_offsets[None, None, None, :]
         )
         key_tensor = gl.amd.cdna3.buffer_load(
-            ptr=key_cache_ptr, offsets=key_block_offsets
+            ptr=key_cache_ptr,
+            offsets=key_block_offsets,
         )
 
         # Load key quantization scales if needed
@@ -1121,7 +1128,8 @@ def paged_attention_decode_v2_gluon_fp8(
                 + value_dim3_offsets[None, None, None, :]
             )
             value_tensor = gl.amd.cdna3.buffer_load(
-                ptr=value_cache_ptr, offsets=value_block_offsets
+                ptr=value_cache_ptr,
+                offsets=value_block_offsets,
             )
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
@@ -1141,7 +1149,8 @@ def paged_attention_decode_v2_gluon_fp8(
                 + value_dim2_offsets[None, None, :]
             )
             value_tensor = gl.amd.cdna3.buffer_load(
-                ptr=value_cache_ptr, offsets=value_block_offsets
+                ptr=value_cache_ptr,
+                offsets=value_block_offsets,
             )
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 2, 1])
@@ -1156,6 +1165,16 @@ def paged_attention_decode_v2_gluon_fp8(
             dtype=gl.float32,
             layout=qk_mfma_layout,
         )
+
+        # if sequence_idx == 0 \
+        #     and kv_head_idx == 0 \
+        #     and sequence_partition_idx == 0:
+        #     print("query_tensor=", query_tensor.to(tl.float32))
+        #     print("key_tensor=", key_tensor.to(tl.float32))
+        # if QUERY_QUANT_MODE == 0 and KV_QUANT_MODE == 0:
+        #     print("QKV_per_tensor")
+        # else:
+        #     print("QKV_per_token")
 
         # Convert layouts for MFMA operation
         query_converted = gl.convert_layout(query_tensor, layout=qk_lhs_operand_layout)
@@ -1235,12 +1254,22 @@ def paged_attention_decode_v2_gluon_fp8(
         if value_tensor.dtype.is_fp8():
             if KV_QUANT_MODE == 1:
                 # Per-token quantization scaling
-                value_scale_max = gl.max(value_scale_value, axis=0)
+                # Create mask for valid tokens
+                valid_token_mask = qk_column_offsets < kv_sequence_length
+                # Mask out value_scale of invalid tokens
+                masked_value_scale = tl.where(
+                    valid_token_mask, value_scale_value, float(-3.4e38)
+                )
+                value_scale_max = gl.max(masked_value_scale, axis=0)
+
                 value_scale_value = (
                     value_scale_value * float(FP8_MAX_VALUE) / value_scale_max
                 )
                 attention_probs = value_scale_value[None, :] * attention_probs
                 probability_scale = value_scale_max / float(FP8_MAX_VALUE)
+            else:
+                attention_probs *= float(FP8_MAX_VALUE)
+                probability_scale = value_scale_value / float(FP8_MAX_VALUE)
 
         # Convert attention probabilities to appropriate data type
         if CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD == 16:
@@ -1270,12 +1299,7 @@ def paged_attention_decode_v2_gluon_fp8(
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
         )
-
-        # Apply value quantization scaling
-        if KV_QUANT_MODE == 0:
-            attention_accumulator += value_scale_value * attention_output
-        elif KV_QUANT_MODE == 1:
-            attention_accumulator += probability_scale * attention_output
+        attention_accumulator += probability_scale * attention_output
 
         # Update running maximum for next iteration
         max_logits = new_max_logits
@@ -1697,7 +1721,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     output_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size, head_size]
     query_ptr,  # [num_seqs, num_kv_heads * query_group_size, head_size]
-    key_cache_ptr,  # [num_blocks, num_kv_heads, head_size/x, kv_block_size, x]
+    key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache_ptr,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     sequence_lengths_ptr,  # [num_seqs]
@@ -1972,9 +1996,9 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
 def paged_attention_decode(
     output: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
     query: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
-    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size/x, kv_block_size, x]
+    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or
-    # [num_blocks, num_kv_heads, kv_block_size/x, head_size, x]
+    # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     sequence_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
@@ -2005,12 +2029,12 @@ def paged_attention_decode(
 
     key_cache : torch.Tensor
         Paged key cache in block layout
-        Shape: [num_blocks, num_kv_heads, head_size/x, kv_block_size, x]
+        Shape: [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
 
     value_cache : torch.Tensor
         Paged value cache in block layout
         Shape: [num_blocks, num_kv_heads, head_size, kv_block_size] or
-               [num_blocks, num_kv_heads, kv_block_size/x, head_size, x]
+               [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
 
     sequence_lengths : torch.Tensor
         Current sequence lengths for each sequence

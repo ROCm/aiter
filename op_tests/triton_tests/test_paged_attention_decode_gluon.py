@@ -44,6 +44,11 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8": torch.uint8,
 }
 
+# Triton to PyTorch dtype mapping
+TL_TO_TORCH_DTYPE = {tl.bfloat16: torch.bfloat16, tl.float16: torch.float16}
+TORCH_TO_TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
+
+
 # Test configuration parameters
 DATA_TYPE_OPTIONS = ["bf16"]
 QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
@@ -56,20 +61,16 @@ KV_VARLEN_OPTIONS = [0, 1]
 # CONTEXT_LENGTH_OPTIONS = [512, 4096, 4097]
 # BATCH_SIZE_OPTIONS = [4, 80, 128]
 
-BLOCK_SIZE_OPTIONS = [16]
-HEAD_CONFIGURATIONS = [(16, 1)]
-# BLOCK_SIZE_OPTIONS = [1024]
-# HEAD_CONFIGURATIONS = [(10, 1)]
+# BLOCK_SIZE_OPTIONS = [16]
+# HEAD_CONFIGURATIONS = [(16, 1)]
+BLOCK_SIZE_OPTIONS = [1024]
+HEAD_CONFIGURATIONS = [(10, 1)]
 
 HEAD_DIMENSION_OPTIONS = [128]
 QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
 CONTEXT_LENGTH_OPTIONS = [4096]
 BATCH_SIZE_OPTIONS = [4, 128]
 # DATA_TYPE_OPTIONS = [dtypes.d_dtypes[key] for key in DATA_TYPE_OPTIONS]
-
-# Triton to PyTorch dtype mapping
-TL_TO_TORCH_DTYPE = {tl.bfloat16: torch.bfloat16, tl.float16: torch.float16}
-TORCH_TO_TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
 
 
 def setup_seed(seed: int) -> None:
@@ -439,6 +440,10 @@ def torch_mha_extend_flashattn_style(
     # Determine value layout
     value_transposed = len(value_cache.shape) == 5
 
+    compute_block_size = 256
+    if kv_block_size > sequence_partition_size and value_transposed:
+        compute_block_size = 128
+
     # Reconstruct full key/value per sequence
     max_seq_len = sequence_lengths.max().item()
     max_num_partitions = (
@@ -530,8 +535,6 @@ def torch_mha_extend_flashattn_style(
             if part_start >= seq_len:
                 continue
 
-            # Process in compute blocks of 256 tokens (KV_COMPUTE_BLOCK_SIZE=256)
-            compute_block_size = 256
             num_compute_blocks = (
                 part_end - part_start + compute_block_size - 1
             ) // compute_block_size
@@ -925,6 +928,67 @@ def shuffle_value_cache_layout(value_cache: torch.Tensor) -> torch.Tensor:
     return value_cache_shuffled
 
 
+def prepare_gluon_query_and_scale(
+    quantized_query: torch.Tensor,
+    query_scale_factors: torch.Tensor,
+    reference_output_quant: torch.Tensor,
+    batch_size: int,
+    query_length: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Prepare inputs for Gluon kernel by reshaping and transposing tensors.
+
+    Args:
+        quantized_query: Quantized query tensor [batch_size * query_length, num_query_heads, head_size]
+        query_scale_factors: Query scale factors [batch_size * query_length, num_query_heads, 1] or scalar
+        reference_output_quant: Reference output tensor [batch_size * query_length, num_query_heads, head_size]
+        batch_size: Batch size
+        query_length: Query sequence length
+        num_query_heads: Number of query heads
+        num_kv_heads: Number of key-value heads
+        head_size: Head dimension size
+
+    Returns:
+        Tuple of (quantized_query_gluon, query_scale_gluon, output_gluon)
+    """
+    quantized_query_gluon = quantized_query
+    query_scale_gluon = query_scale_factors
+    output_gluon = torch.empty_like(reference_output_quant)
+
+    if query_length > 1:
+        query_group_size = num_query_heads // num_kv_heads
+
+        # Reshape and transpose query tensor for Gluon kernel
+        quantized_query_gluon = quantized_query.reshape(
+            batch_size, query_length, num_kv_heads, query_group_size, head_size
+        )
+        quantized_query_gluon = quantized_query_gluon.transpose(1, 2).reshape(
+            batch_size, num_kv_heads * query_length * query_group_size, head_size
+        )
+
+        # Reshape and transpose output tensor for Gluon kernel
+        output_gluon = output_gluon.reshape(
+            batch_size, query_length, num_kv_heads, query_group_size, head_size
+        )
+        output_gluon = output_gluon.transpose(1, 2).reshape(
+            batch_size, num_kv_heads * query_length * query_group_size, head_size
+        )
+
+        # Handle query scale factors based on quantization mode
+        if len(query_scale_factors.shape) > 1:  # per-token quantization
+            query_scale_gluon = query_scale_factors.reshape(
+                batch_size, query_length, num_kv_heads, query_group_size, 1
+            )
+            query_scale_gluon = query_scale_gluon.transpose(1, 2).reshape(
+                batch_size, num_kv_heads * query_length * query_group_size, 1
+            )
+
+    return quantized_query_gluon, query_scale_gluon, output_gluon
+
+
 def run_gluon_fp8_kernel(
     pa_gluon_fp8_op,
     output: torch.Tensor,
@@ -965,7 +1029,6 @@ def run_gluon_fp8_kernel(
 
 
 @benchmark()
-# def test_run_pa_gluon(
 def run_pa_gluon_test(
     context_lengths: int,
     batch_size: int,
@@ -977,9 +1040,6 @@ def run_pa_gluon_test(
     quant_mode: str,
     trans_v: int,
     kv_varlen: int,
-    # quant_mode: str = "per_token",  # "per_token" or "per_tensor"
-    # trans_v: int = 0,
-    # kv_varlen: int = 0,
 ) -> Dict[str, Union[float, str]]:
     """Test paged attention decode with assembly and gluon implementations."""
     results = {}
@@ -1095,51 +1155,28 @@ def run_pa_gluon_test(
         value_scale_factors_flat,
     )
 
-    # print(f"quantized_keys.shape={quantized_keys.shape}")
-    # print(f"quantized_keys.dtype={quantized_keys.dtype}")
-    # print(f"block_tables.shape={block_tables.shape}")
-    # print(f"block_tables[0]={block_tables[0]}")
     # print(f"quantized_keys[0, 0, 1, 0]([batch_id, kv_head_id, seq_id, hd_id])={quantized_keys[block_tables[0, 0], 0, 0, 1, 0].to(torch.float32)}")
     # print(f"quantized_keys[0, 0, 1, 1]([batch_id, kv_head_id, seq_id, hd_id])={quantized_keys[block_tables[0, 0], 0, 0, 1, 1].to(torch.float32)}")
 
     if trans_v:
         quantized_values = shuffle_value_cache_layout(quantized_values)
-        print(f"Transformed quantized_values.shape={quantized_values.shape}")
+        # print(f"Transformed quantized_values.shape={quantized_values.shape}")
 
     fp8_tolerance = 5e-2
 
     # Prepare for Gluon kernel
-    quantized_query_gluon = quantized_query
-    query_scale_gluon = query_scale_factors
-    gluon_output = torch.empty_like(reference_output_quant)
-
-    if query_length > 1:
-        query_group_size = num_query_heads // num_kv_heads
-
-        quantized_query_gluon = quantized_query.reshape(
-            batch_size, query_length, num_kv_heads, query_group_size, head_size
+    quantized_query_gluon, query_scale_gluon, output_gluon = (
+        prepare_gluon_query_and_scale(
+            quantized_query,
+            query_scale_factors,
+            reference_output_quant,
+            batch_size,
+            query_length,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
         )
-        quantized_query_gluon = quantized_query_gluon.transpose(1, 2).reshape(
-            batch_size, num_kv_heads * query_length * query_group_size, head_size
-        )
-
-        gluon_output = gluon_output.reshape(
-            batch_size, query_length, num_kv_heads, query_group_size, head_size
-        )
-        gluon_output = gluon_output.transpose(1, 2).reshape(
-            batch_size, num_kv_heads * query_length * query_group_size, head_size
-        )
-
-        if len(query_scale_factors.shape) > 1:  # per-token quantization
-            query_scale_gluon = query_scale_factors.reshape(
-                batch_size, query_length, num_kv_heads, query_group_size, 1
-            )
-            query_scale_gluon = query_scale_gluon.transpose(1, 2).reshape(
-                batch_size, num_kv_heads * query_length * query_group_size, 1
-            )
-        else:  # per-tensor quantization
-            # For per-tensor, query_scale is already a scalar, no need to reshape
-            pass
+    )
 
     if USE_TORCH_FLASH_REF:
         # Reference (flash attention style - mimicking Triton kernel)
@@ -1158,6 +1195,7 @@ def run_pa_gluon_test(
             sequence_partition_size=256,
         )
         if query_length > 1:
+            query_group_size = num_query_heads // num_kv_heads
             reference_output_flashattn = reference_output_flashattn.reshape(
                 batch_size, num_kv_heads, query_length, query_group_size, head_size
             )
@@ -1170,7 +1208,7 @@ def run_pa_gluon_test(
         ref_diff = (
             (reference_output_quant - reference_output_flashattn).abs().max().item()
         )
-        print(f"Original ref vs FlashAttn-style ref: max diff = {ref_diff:.6e}")
+        print(f"FlashAttn-style Ref vs Original Ref: max diff = {ref_diff:.6e}")
         compare_arrays(
             reference_output_flashattn.to(torch.float32).detach().cpu().numpy(),
             reference_output_quant.to(torch.float32).detach().cpu().numpy(),
@@ -1195,7 +1233,7 @@ def run_pa_gluon_test(
         print(f"pa_gluon_fp8_op==paged_attention_decode_gluon_fp8_triton34")
     gluon_results = run_gluon_fp8_kernel(
         pa_gluon_fp8_op,
-        gluon_output,
+        output_gluon,
         quantized_query_gluon,
         quantized_keys,
         quantized_values,
@@ -1212,12 +1250,12 @@ def run_pa_gluon_test(
         alibi_slopes=None,
     )
 
-    final_gluon_output = gluon_output
+    final_output_gluon = output_gluon
     if query_length > 1:
-        final_gluon_output = gluon_output.reshape(
+        final_output_gluon = output_gluon.reshape(
             batch_size, num_kv_heads, query_length, query_group_size, head_size
         )
-        final_gluon_output = final_gluon_output.transpose(1, 2).reshape(
+        final_output_gluon = final_output_gluon.transpose(1, 2).reshape(
             batch_size * query_length, num_kv_heads * query_group_size, head_size
         )
 
@@ -1226,7 +1264,7 @@ def run_pa_gluon_test(
     # Compare with original reference
     gluon_error_vs_orig = checkAllclose(
         reference_output_quant,
-        final_gluon_output,
+        final_output_gluon,
         atol=fp8_tolerance,
         rtol=fp8_tolerance,
         msg=f"[PyTorch vs Gluon_FP8][{quant_mode}] (vs orig ref): {gluon_time:>8.2f} us......",
@@ -1234,7 +1272,7 @@ def run_pa_gluon_test(
     print("\n=== Detailed Error Analysis ===")
     print("Gluon vs Original Ref:")
     diff_result = compare_arrays(
-        final_gluon_output.to(torch.float32).detach().cpu().numpy(),
+        final_output_gluon.to(torch.float32).detach().cpu().numpy(),
         reference_output_quant.to(torch.float32).detach().cpu().numpy(),
     )
     if diff_result["max_diff_thr"] < 5e-2:
@@ -1247,7 +1285,7 @@ def run_pa_gluon_test(
     if USE_TORCH_FLASH_REF:
         print("\nGluon vs FlashAttn-style Ref:")
         diff_result = compare_arrays(
-            final_gluon_output.to(torch.float32).detach().cpu().numpy(),
+            final_output_gluon.to(torch.float32).detach().cpu().numpy(),
             reference_output_flashattn.to(torch.float32).detach().cpu().numpy(),
         )
         if diff_result["max_diff_thr"] < 1e-3:
@@ -1265,7 +1303,7 @@ def run_pa_gluon_test(
         .tobytes()
     ).hexdigest()
     gluon_hash = hashlib.md5(
-        final_gluon_output.contiguous()
+        final_output_gluon.contiguous()
         .view(torch.uint8)
         .detach()
         .cpu()
@@ -1451,7 +1489,7 @@ def process_arguments(args: argparse.Namespace) -> tuple:
         quant_mode = [args.quant_mode]
     if args.trans_v is not None:
         trans_v = [args.trans_v]
-    if args.quant_mode is not None:
+    if args.kv_varlen is not None:
         kv_varlen = [args.kv_varlen]
 
     return (
@@ -1501,7 +1539,7 @@ def run_multi_pa_gluon_test(
                                         for head_size in HEAD_DIMENSION_OPTIONS:
                                             current += 1
                                             print(
-                                                f"\n[{current}/{total * len(quant_mode)}] Testing: dtype={dt}, block_size={bs}, heads={hc}, ctx_len={cl}, batch={bsz}, qlen={ql}, quant_mode={qm}"
+                                                f"\n[{current}/{total * len(quant_mode)}] Testing: trans_v={trans_v_mode}, kv_varlen={kv_varlen_mode}, quant_mode={qm}, data_type={dt}, block_size={bs}, num_heads={hc}, context_lengths={cl}, batch_size={bsz}, query_length={ql}, head_size={head_size}"
                                             )
                                             result = run_pa_gluon_test(
                                                 context_lengths=cl,
@@ -1549,7 +1587,7 @@ def main():
         kv_varlen,
     )
 
-    output_file = f"run_pa_gluon_test{'_trans_v' if trans_v else ''}.triton.{TRITON_VERSION}.quant_{quant_mode}.csv"
+    output_file = f"run_pa_gluon_test.triton.{TRITON_VERSION}.csv"
     results_df.to_csv(output_file, index=False)
     print(f"\nResults saved to {output_file}")
     print(f"\nSummary:\n{results_df}")
