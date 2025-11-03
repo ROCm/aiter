@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from torch import Tensor, Generator
-from typing import Optional, Tuple, Any
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
+from typing import Any, Optional, Tuple
+
+import torch
+from torch import Generator, Tensor
+
+from ..jit.core import AITER_CSRC_DIR, CK_DIR, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
-import torch
 
 
 def cmdGenFunc_mha_fwd(
@@ -1506,10 +1508,11 @@ def _flash_attn_backward(
         ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= not deterministic or is_950_1block
-        ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
-
+        ret &= (
+            (hdim_q > 64 and hdim_q <= 128)
+            or (hdim_q == 192 and hdim_v == 128 and nmask)
+        ) and hdim_q % 8 == 0
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
