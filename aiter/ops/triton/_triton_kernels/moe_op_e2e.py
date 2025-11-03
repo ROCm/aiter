@@ -30,14 +30,12 @@ def group_broadcast(
       in groups along the specified dimension.
     """
     if broadcast_dim == 0:
-        assert xM > 0, "broadcast_dim must be specified"
         if xM > 1:
             x = x.reshape(xM, 1, xN)
             x = tl.broadcast_to(x, (xM, group_size, xN))
             x = x.reshape(xM * group_size, xN)
         # else: singleton dimension, no need to broadcast
     else:
-        assert xN > 0, "broadcast_dim must be specified"
         if xN > 1:
             x = x.reshape(xM, xN, 1)
             x = tl.broadcast_to(x, (xM, xN, group_size))
@@ -251,14 +249,13 @@ def e2e_moe_kernel(
             )
 
         if use_fp8_w8a8:
-            start_k = (k1 * BLOCK_SIZE_K1) // group_k
-            w1_scale = tl.load(w1_i0_scale_ptrs + start_k * stride_w1sk)
+            w1_scale = tl.load(w1_i0_scale_ptrs)
 
             # if num_scales_along_n > 1: # singleton dimension get automatic broadcast
             w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
 
             a_scale = tl.load(
-                a_scale_ptrs + start_k * stride_ask, mask=token_mask[:, None], other=0.0
+                a_scale_ptrs, mask=token_mask[:, None], other=0.0
             )
 
             silu_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
@@ -276,7 +273,7 @@ def e2e_moe_kernel(
             )
 
         if use_fp8_w8a8:
-            w1_scale = tl.load(w1_i1_scale_ptrs + start_k * stride_w1sk)
+            w1_scale = tl.load(w1_i1_scale_ptrs)
             w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
             mul_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
         else:
@@ -285,6 +282,10 @@ def e2e_moe_kernel(
         a_ptrs += BLOCK_SIZE_K1 * stride_ak
         w1_ptrs_i0 += BLOCK_SIZE_K1 * stride_w1k
         w1_ptrs_i1 += BLOCK_SIZE_K1 * stride_w1k
+        if use_fp8_w8a8:
+            w1_i0_scale_ptrs += stride_w1sk
+            w1_i1_scale_ptrs += stride_w1sk
+            a_scale_ptrs += stride_ask
 
     # gated activation
     silu_acc = _silu_exp2(silu_acc)
