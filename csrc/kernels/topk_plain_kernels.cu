@@ -1245,8 +1245,8 @@ class WorkgroupTopKCoordinator
         : strategy_(k, sentinel), k_(k), sentinel_(sentinel)
     {
         const int num_waves = blockDim.x / utils::WAVE_SIZE;
-        reduction_priorities_ = reinterpret_cast<T*>(smem_buf);
-        reduction_positions_ = reinterpret_cast<IdxT*>(
+        val                 = reinterpret_cast<T*>(smem_buf);
+        pos                 = reinterpret_cast<IdxT*>(
             reinterpret_cast<char*>(smem_buf) +
             utils::round_up_to_multiple_of<16>(num_waves / 2 * sizeof(T) * k_));
     }
@@ -1391,14 +1391,12 @@ class WorkgroupTopKCoordinator
             if(wave_id < num_waves && wave_id >= half_num_waves)
             {
                 int target_wave = wave_id - half_num_waves;
-                strategy_.emit_results(reduction_priorities_ + target_wave * k_,
-                                       reduction_positions_ + target_wave * k_);
+                strategy_.emit_results(val + target_wave * k_, pos + target_wave * k_);
             }
             __syncthreads();
             if(wave_id < num_waves / 2)
             {
-                strategy_.merge_sorted_input(
-                    reduction_priorities_, reduction_positions_, wave_id * k_);
+                strategy_.merge_sorted_input(val, pos, wave_id * k_);
             }
             __syncthreads();
             num_waves = half_num_waves;
@@ -1417,8 +1415,8 @@ class WorkgroupTopKCoordinator
     StrategyImpl<capacity, descending, T, IdxT> strategy_;
     IdxT k_;
     T sentinel_;
-    T* reduction_priorities_;
-    IdxT* reduction_positions_;
+    T* val;
+    IdxT* pos;
 };
 
 // --- Kernel and Launch Logic ---

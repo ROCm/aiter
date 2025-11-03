@@ -61,11 +61,16 @@ def test_topk(
         id_ref,
         id_aiter,
         msg=(
-            f"topk_ids Performance Comparison:\n"
-            f"  {'Method':<10} {'Time (μs)':>12}\n"
-            f"  {'-'*10} {'-'*12}\n"
-            f"  {'golden':<10} {us_ref:>12.2f}\n"
-            f"  {'aiter':<10} {us_aiter:>12.2f}\n"
+            "topk_ids Performance Comparison:\n"
+            "  {:<10} {:>12}\n"
+            "  {:<10} {:>12}\n"
+            "  {:<10} {:>12.2f}\n"
+            "  {:<10} {:>12.2f}\n".format(
+                "Method", "Time (μs)",
+                "-"*10, "-"*12,
+                "golden", us_ref,
+                "aiter", us_aiter
+            )
         ),
     )
 
@@ -94,8 +99,10 @@ def run_test_suite():
                             continue
 
                         print(
-                            f"\nTesting: batch_size={batch_size}, hiddensize={hiddensize}, "
-                            f"topk={topk}, largest={largest}, dtype={dtype}"
+                            "\nTesting: batch_size={}, hiddensize={}, "
+                            "topk={}, largest={}, dtype={}".format(
+                                batch_size, hiddensize, topk, largest, dtype
+                            )
                         )
 
                         try:
@@ -108,56 +115,56 @@ def run_test_suite():
                             )
 
                             results.append({
-                                'batch_size': batch_size,
-                                'hiddensize': hiddensize,
-                                'topk': topk,
-                                'largest': largest,
-                                'dtype': str(dtype),
-                                'error': ret['err'],
-                                'time_us': ret['us'],
-                                'status': 'PASS'
+                                "batch_size": batch_size,
+                                "hiddensize": hiddensize,
+                                "topk": topk,
+                                "largest": largest,
+                                "dtype": str(dtype),
+                                "error": ret["err"],
+                                "time_us": ret["us"],
+                                "status": "PASS"
                             })
                         except Exception as e:
-                            aiter.logger.error(f"Test failed: {e}")
+                            aiter.logger.error("Test failed: {}".format(e))
                             results.append({
-                                'batch_size': batch_size,
-                                'hiddensize': hiddensize,
-                                'topk': topk,
-                                'largest': largest,
-                                'dtype': str(dtype),
-                                'error': None,
-                                'time_us': None,
-                                'status': f'FAIL: {str(e)}'
+                                "batch_size": batch_size,
+                                "hiddensize": hiddensize,
+                                "topk": topk,
+                                "largest": largest,
+                                "dtype": str(dtype),
+                                "error": None,
+                                "time_us": None,
+                                "status": "FAIL: {}".format(str(e))
                             })
 
     df = pd.DataFrame(results)
 
     # Display summary statistics
-    aiter.logger.info(f"\n{'='*80}")
-    aiter.logger.info(f"Test Summary")
-    aiter.logger.info(f"{'='*80}")
-    aiter.logger.info(f"Total tests run: {len(df)}")
-    aiter.logger.info(f"Passed: {len(df[df['status'] == 'PASS'])}")
-    aiter.logger.info(f"Failed: {len(df[df['status'] != 'PASS'])}")
-    aiter.logger.info(f"\n{df}")
+    aiter.logger.info("\n{}".format("="*80))
+    aiter.logger.info("Test Summary")
+    aiter.logger.info("{}".format("="*80))
+    aiter.logger.info("Total tests run: {}".format(len(df)))
+    aiter.logger.info("Passed: {}".format(len(df[df["status"] == "PASS"])))
+    aiter.logger.info("Failed: {}".format(len(df[df["status"] != "PASS"])))
+    aiter.logger.info("\n{}".format(df))
 
     # Save results to CSV
     output_file = "topk_test_results.csv"
     df.to_csv(output_file, index=False)
-    aiter.logger.info(f"\nResults saved to: {output_file}")
+    aiter.logger.info("\nResults saved to: {}".format(output_file))
 
     # Display performance summary for passed tests
-    if len(df[df['status'] == 'PASS']) > 0:
-        passed_df = df[df['status'] == 'PASS'].copy()
-        aiter.logger.info(f"\n{'='*80}")
-        aiter.logger.info(f"Performance Summary (Passed Tests)")
-        aiter.logger.info(f"{'='*80}")
-        aiter.logger.info(f"\nAverage time by batch size:")
-        aiter.logger.info(passed_df.groupby('batch_size')['time_us'].mean())
-        aiter.logger.info(f"\nAverage time by hiddensize:")
-        aiter.logger.info(passed_df.groupby('hiddensize')['time_us'].mean())
-        aiter.logger.info(f"\nAverage time by topk:")
-        aiter.logger.info(passed_df.groupby('topk')['time_us'].mean())
+    if len(df[df["status"] == "PASS"]) > 0:
+        passed_df = df[df["status"] == "PASS"].copy()
+        aiter.logger.info("\n{}".format("="*80))
+        aiter.logger.info("Performance Summary (Passed Tests)")
+        aiter.logger.info("{}".format("="*80))
+        aiter.logger.info("\nAverage time by batch size:")
+        aiter.logger.info(passed_df.groupby("batch_size")["time_us"].mean())
+        aiter.logger.info("\nAverage time by hiddensize:")
+        aiter.logger.info(passed_df.groupby("hiddensize")["time_us"].mean())
+        aiter.logger.info("\nAverage time by topk:")
+        aiter.logger.info(passed_df.groupby("topk")["time_us"].mean())
 
     return df
 
@@ -183,7 +190,8 @@ if __name__ == "__main__":
         topk = 64
         largest = True
 
-        print(f"Running single test: batch_size={batch_size}, hiddensize={hiddensize}, topk={topk}")
+        print("Running single test: batch_size={}, hiddensize={}, topk={}".format(
+            batch_size, hiddensize, topk))
         ret = test_topk(
             batch_size,
             hiddensize,
@@ -191,7 +199,7 @@ if __name__ == "__main__":
             largest,
             dtypes.fp32,
         )
-        aiter.logger.info(f"Result: error={ret['err']}, time={ret['us']:.2f} μs")
+        aiter.logger.info("Result: error={}, time={:.2f} μs".format(ret["err"], ret["us"]))
     else:
         # Run full test suite
         df = run_test_suite()
