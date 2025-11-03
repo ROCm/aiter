@@ -593,8 +593,8 @@ def get_2stage_cfgs(
                 run_1stage = token < 256
             
             # Pre-shuffle moe mxfp4 tuned configuration
-            if q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2:
-                run_1stage = False if token < 32 else True
+            # if q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2:
+            #     run_1stage = False if token < 32 else True
                 
         block_m = (
             BLOCK_SIZE_M
