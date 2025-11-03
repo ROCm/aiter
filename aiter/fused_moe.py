@@ -928,10 +928,10 @@ def asm_stage2(
 ):
     dtype = dtypes.bf16  # out.dtype, asm only support bf16
     if quant_type != QuantType.per_1x32:
-        print('only support fp4 in MoE stage2 asm')
-        assert(0)
+        print("only support fp4 in MoE stage2 asm")
+        assert 0
     device = out.device
-    token_num, _= out.shape
+    token_num, _ = out.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
     if quant_type == QuantType.per_Tensor:
@@ -959,7 +959,6 @@ def asm_stage2(
         sorted_weights=sorted_weights,
     )
     return out
-
 
 
 def torch_moe(
