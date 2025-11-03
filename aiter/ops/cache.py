@@ -84,3 +84,34 @@ def reshape_and_cache_with_block_quant_for_asm_pa(
     asm_layout: bool,
     ori_block_size: int = 128,  # [128/256]
 ) -> None: ...
+
+
+@compile_ops("module_cache")
+def concat_and_cache_mla(
+    kv_c: Tensor,
+    k_pe: Tensor,
+    kv_cache: Tensor,
+    slot_mapping: Tensor,
+    kv_cache_dtype: str,
+    scale: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_cache")
+def indexer_k_quant_and_cache(
+    k: Tensor,
+    kv_cache: Tensor,
+    slot_mapping: Tensor,
+    quant_block_size: int,
+    scale_fmt: str,
+) -> None: ...
+
+
+@compile_ops("module_cache")
+def cp_gather_indexer_k_quant_cache(
+    kv_cache: Tensor,
+    dst_k: Tensor,
+    dst_scale: Tensor,
+    block_table: Tensor,
+    cu_seq_lens: Tensor,
+) -> None: ...

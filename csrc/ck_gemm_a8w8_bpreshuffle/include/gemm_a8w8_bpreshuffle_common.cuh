@@ -13,9 +13,9 @@
 #include <numeric>
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/extension.h>
 
 #include "ck/ck.hpp"
@@ -140,23 +140,23 @@ using DeviceGemmHelperF8Flatmm =
     ck::tensor_operation::device::DeviceGemmMultiD_Xdl_CShuffle_V3_BPreshuffle
     // clang-format off
          <A0Layout, B0Layout, DsLayout, ELayout,
-          A0DataType, B0DataType, DsDataType, EDataType, AccDataType, CShuffleDataType, 
+          A0DataType, B0DataType, DsDataType, EDataType, AccDataType, CShuffleDataType,
           AElementOp,  BElementOp, CDEElementOp, GemmSpec, BlockSize,
-          MPerBlock, NPerBlock, KPerBlock, 
-          AK1, BK1, 
-          MPerXDL, NPerXDL, 
-          MXdlPerWave, NXdlPerWave, 
-          ABlockTransferThreadClusterLengths_AK0_M_AK1, 
-          S<1, 0, 2>, S<1, 0, 2>, 
-          2, AK1, AK1, 0, 
-          BBlockTransferThreadClusterLengths_BK0_N_BK1, 
-          S<1, 0, 2>, S<1, 0, 2>, 
-          2, BK1, BK1, 0, 
+          MPerBlock, NPerBlock, KPerBlock,
+          AK1, BK1,
+          MPerXDL, NPerXDL,
+          MXdlPerWave, NXdlPerWave,
+          ABlockTransferThreadClusterLengths_AK0_M_AK1,
+          S<1, 0, 2>, S<1, 0, 2>,
+          2, AK1, AK1, 0,
+          BBlockTransferThreadClusterLengths_BK0_N_BK1,
+          S<1, 0, 2>, S<1, 0, 2>,
+          2, BK1, BK1, 0,
           CSHUFFLE_MX_PER_WAVE_PERSHUFFLE,
-          CSHUFFLE_NX_PER_WAVE_PERSHUFFLE, 
-          CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock, 
-          CDEShuffleBlockTransferScalarPerVectors,  
-          BlkGemmPipeSched, 
+          CSHUFFLE_NX_PER_WAVE_PERSHUFFLE,
+          CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock,
+          CDEShuffleBlockTransferScalarPerVectors,
+          BlkGemmPipeSched,
           BlkGemmPipelineVer, A0DataType>;
 
 template <typename DDataType, typename EDataType, typename DeviceGemmInstance>
@@ -205,7 +205,7 @@ __forceinline__ torch::Tensor gemm_a8w8_bpreshuffle_impl(
 
     TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 
-    invoker.Run(argument, StreamConfig{at::cuda::getCurrentCUDAStream().stream()});
+    invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStream()});
     return Y;
 }
 

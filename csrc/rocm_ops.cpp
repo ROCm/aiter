@@ -4,6 +4,7 @@
 #include "aiter_enum.h"
 #include "aiter_operator.h"
 #include "aiter_unary.h"
+#include "asm_gemm_a16w16.h"
 #include "asm_gemm_a4w4.h"
 #include "asm_gemm_a8w8.h"
 #include "attention.h"
@@ -17,6 +18,7 @@
 #include "communication_asm.h"
 #include "custom.h"
 #include "custom_all_reduce.h"
+#include "deepgemm.h"
 #include "gemm_a4w4_blockscale.h"
 #include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
@@ -33,6 +35,7 @@
 #include "rmsnorm.h"
 #include "rocsolgemm.cuh"
 #include "rope.h"
+#include "sample.h"
 #include "smoothquant.h"
 #include <torch/extension.h>
 
@@ -71,6 +74,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     // BATCHED_GEMM_A8W8_TUNE_PYBIND;
     GEMM_A8W8_ASM_PYBIND;
     GEMM_A4W4_ASM_PYBIND;
+    GEMM_A16W16_ASM_PYBIND;
     ACTIVATION_PYBIND;
     ATTENTION_ASM_MLA_PYBIND;
     ATTENTION_CK_PYBIND;
@@ -84,6 +88,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     ATTENTION_RAGGED_PYBIND;
     ATTENTION_V1_PYBIND;
     MOE_OP_PYBIND;
+    MOE_TOPK_PYBIND;
     ROPE_GENERAL_FWD_PYBIND;
     ROPE_GENERAL_BWD_PYBIND;
     ROPE_POS_FWD_PYBIND;
@@ -95,7 +100,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     CUSTOM_ALL_REDUCE_PYBIND;
     QUICK_ALL_REDUCE_PYBIND;
     CACHE_PYBIND;
+    SAMPLE_PYBIND;
     HIPBSOLGEMM_PYBIND;
     ROCSOLGEMM_PYBIND;
+    DEEPGEMM_PYBIND;
 }
 #endif

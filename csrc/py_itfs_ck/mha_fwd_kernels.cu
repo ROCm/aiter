@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
@@ -32,7 +32,9 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    at::Tensor dropout_randval,
                                    float softmax_scale,
                                    float p_dropout,
-                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                   const std::optional<at::Tensor> &cu_seqlens_q_,
+                                   const std::optional<at::Tensor> &cu_seqlens_kv_)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -85,6 +87,9 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
+    const ck_tile::index_t *cu_seqlen_q_ptr = cu_seqlens_q_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_q_.value().data_ptr<int32_t>()) : nullptr;
+    const ck_tile::index_t *cu_seqlen_kv_ptr = cu_seqlens_kv_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_kv_.value().data_ptr<int32_t>()) : nullptr;
+
     return mha_fwd_args{q.data_ptr(),
                          k.data_ptr(),
                          v.data_ptr(),
@@ -92,9 +97,13 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
+                         cu_seqlen_q_ptr,
+                         cu_seqlen_kv_ptr,
                          nullptr, // seqstart_q
                          nullptr, // seqstart_k
                          nullptr,
+                         nullptr, // seqstart_padded_q_ptr
+                         nullptr, // seqstart_padded_k_ptr
                          seqlen_q,
                          seqlen_k,
                          b,
@@ -147,6 +156,8 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         int window_size_right,
         bool return_softmax_lse,
         bool return_dropout_randval,
+        std::optional<at::Tensor> cu_seqlens_q_,
+        std::optional<at::Tensor> cu_seqlens_kv_,
         std::optional<at::Tensor> out_,          // [b, sq, hq, d_v]
         std::optional<const at::Tensor> bias_,   // [sq, sk]
         std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
@@ -254,7 +265,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    at::cuda::CUDAGuard device_guard{q.device()};
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
     bool has_lse = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
@@ -292,7 +303,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
 
     if (seqlen_k > 0) {
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
-        auto stream = at::cuda::getCurrentHIPStream().stream();
+        auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
         auto args =
@@ -317,7 +328,9 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                 p,
                 softmax_scale,
                 p_dropout,
-                drop_seed_offset);
+                drop_seed_offset,
+                cu_seqlens_q_,
+                cu_seqlens_kv_);
 
         float t = aiter::mha_fwd(args,
                                  stream_config,

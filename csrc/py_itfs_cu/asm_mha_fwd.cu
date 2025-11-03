@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
@@ -92,9 +92,13 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
+                         nullptr, // cu_seqlen_q_ptr
+                         nullptr, // cu_seqlen_kv_ptr
                          nullptr, // seqstart_q
                          nullptr, // seqstart_k
-                         nullptr,
+                         nullptr, // seqlen_k_ptr
+                         nullptr, // seqstart_padded_q_ptr
+                         nullptr, // seqstart_padded_k_ptr
                          seqlen_q,
                          seqlen_k,
                          b,
@@ -241,7 +245,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    at::cuda::CUDAGuard device_guard{q.device()};
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
     bool has_lse = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
@@ -279,7 +283,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
 
     if (seqlen_k > 0) {
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
-        auto stream = at::cuda::getCurrentHIPStream().stream();
+        auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
         auto args =

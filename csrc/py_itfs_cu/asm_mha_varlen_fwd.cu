@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
@@ -64,12 +64,12 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
     ck_tile::index_t nhead_stride_lse = has_lse ? softmax_lse.stride(0) : 0;
     ck_tile::index_t nhead_stride_randval = has_dropout_randval ? dropout_randval.stride(0) : 0;
 
-    ck_tile::index_t batch_stride_q = total_q * q.stride(0);
-    ck_tile::index_t batch_stride_k = total_k * k.stride(0);
-    ck_tile::index_t batch_stride_v = total_k * v.stride(0);
-    ck_tile::index_t batch_stride_o = total_q * out.stride(0);
-    ck_tile::index_t batch_stride_lse = has_lse ? h * softmax_lse.stride(0) : 0;
-    ck_tile::index_t batch_stride_randval = has_dropout_randval ? h * dropout_randval.stride(0) : 0;
+    ck_tile::index_t batch_stride_q = 0;
+    ck_tile::index_t batch_stride_k = 0;
+    ck_tile::index_t batch_stride_v = 0;
+    ck_tile::index_t batch_stride_o = 0;
+    ck_tile::index_t batch_stride_lse = 0;
+    ck_tile::index_t batch_stride_randval = 0;
 
     void *bias_ptr = nullptr;
     ck_tile::index_t stride_bias = 0;
@@ -101,9 +101,13 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
+                         nullptr,
+                         nullptr,
                          cu_seqlens_q.data_ptr(), // seqstart_q
                          cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k
                          seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_kpads
+                         nullptr,
+                         nullptr,
                          total_q,
                          total_k,
                          b,
@@ -293,7 +297,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    at::cuda::CUDAGuard device_guard{q.device()};
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
     bool has_lse = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
@@ -340,7 +344,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     std::optional<const at::Tensor> seqlens_k = std::nullopt;
     
     if (max_seqlen_k > 0) {
-        auto stream = at::cuda::getCurrentHIPStream().stream();
+        auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
         TORCH_CHECK(cu_seqlens_k.has_value(), "cu_seqlens_k must be provided if paged_KV is false");

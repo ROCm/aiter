@@ -61,3 +61,11 @@ def str2tuple(v):
         return tuple(int(p.strip()) for p in parts)
     except Exception as e:
         raise argparse.ArgumentTypeError(f"invalid format of input: {v}") from e
+
+
+def str2Dtype(v):
+    try:
+        parts = v.strip("()").split(",")
+        return list(d_dtypes[p.strip()] for p in parts)
+    except Exception as e:
+        raise argparse.ArgumentTypeError(f"invalid format of data type: {v}") from e

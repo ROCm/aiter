@@ -112,7 +112,7 @@ torch::Tensor
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "{name}.cuh"
+#include "impl/{name}.cuh"
 
 template torch::Tensor
 {name}<{dtypes}>(

@@ -114,15 +114,20 @@ def _attention_inner(
     offs_n,
     BLOCK_M,
     BLOCK_N,
-    HEAD_DIM,
+    HEAD_DIM_ORIG: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     local_iter,
     local_iter_end,
+    use_64_indexing: tl.constexpr,
 ):
     """
     Performs attention calculation for an (maybe partial) output tile
     """
+    # Define head-dimension mask for padded dims
+    offs_k_local = tl.arange(0, HEAD_DIM)
+    mask_k_cols_local = offs_k_local < HEAD_DIM_ORIG
     for l_iter in range(local_iter, local_iter_end):
-        k = tl.load(k_ptrs)
+        k = tl.load(k_ptrs, mask=mask_k_cols_local[:, None], other=0.0)
         qk = tl.dot(q, k) * qk_scale
 
         if causal:
@@ -152,7 +157,7 @@ def _attention_inner(
 
         # Update accumulator
         acc = acc * alpha[:, None]
-        v = tl.load(v_ptrs)
+        v = tl.load(v_ptrs, mask=mask_k_cols_local[None, :], other=0.0)
         acc += tl.dot(p.to(v.dtype), v)
 
         # Update stats
@@ -160,9 +165,16 @@ def _attention_inner(
         l_i = l_i * alpha + l_ij
         m_i = m_ij.to(m_i.dtype)
 
-        # update k/v pointer
-        v_ptrs += BLOCK_N * stride_vn
-        k_ptrs += BLOCK_N * stride_kn
+        # update k/v pointer with optional 64-bit indexing to avoid overflow
+        if use_64_indexing:
+            BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
+            stride_kn64 = tl.full((), stride_kn, tl.int64)
+            stride_vn64 = tl.full((), stride_vn, tl.int64)
+            v_ptrs += BLOCK_N64 * stride_vn64
+            k_ptrs += BLOCK_N64 * stride_kn64
+        else:
+            v_ptrs += BLOCK_N * stride_vn
+            k_ptrs += BLOCK_N * stride_kn
     return m_i, l_i, acc
 
 
@@ -222,10 +234,12 @@ def la_persistent(
     stride_om,  # n_ctx_q
     stride_oh,  # Head
     stride_on,  # head_dim
+    n_ctx_q_rows,
     stride_oph,  # total_programs
     stride_opm,  # n_ctx_q
     stride_opn,  # head_dim
     HEADS_PER_XCD: tl.constexpr,
+    HEAD_DIM_ORIG: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -243,6 +257,11 @@ def la_persistent(
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
     max_output_tile_cnt: tl.constexpr,
+    num_heads_q: tl.constexpr,
+    num_heads_k: tl.constexpr,
+    gqa_group_size: tl.constexpr,
+    use_64_indexing: tl.constexpr,
+    RAGGED_BATCH: tl.constexpr,
 ):
     if is_pod:
         current_pid = pod_pid
@@ -321,6 +340,7 @@ def la_persistent(
                 xcd_id=xcd_id,
                 HEADS_PER_XCD=HEADS_PER_XCD,
                 HEAD_DIM=HEAD_DIM,
+                HEAD_DIM_ORIG=HEAD_DIM_ORIG,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 MASKED_BLOCKS=MASKED_BLOCKS,
@@ -335,6 +355,9 @@ def la_persistent(
                 max_tiles_per_wg=max_tiles_per_wg,
                 tiles_per_head=tiles_per_head,
                 num_splits=num_splits,
+                gqa_group_size=gqa_group_size,
+                use_64_indexing=use_64_indexing,
+                RAGGED_BATCH=RAGGED_BATCH,
             )
 
 
@@ -372,6 +395,7 @@ def la_persistent_inner(
     xcd_id,  # The XCD the pid belongs to
     HEADS_PER_XCD,
     HEAD_DIM: tl.constexpr,
+    HEAD_DIM_ORIG: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MASKED_BLOCKS: tl.constexpr,
@@ -386,6 +410,9 @@ def la_persistent_inner(
     max_tiles_per_wg: tl.constexpr,
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
+    gqa_group_size: tl.constexpr,
+    use_64_indexing: tl.constexpr,
+    RAGGED_BATCH: tl.constexpr,
 ):
 
     tl.assume(stride_qm > 0)  # n_ctx_q
@@ -444,23 +471,30 @@ def la_persistent_inner(
             tile_head_idx * batch_size + tile_batch_idx
         ) * num_m_blocks + per_head_tile_idx
     else:
-        tile_idx = (
-            tile_head_idx * batch_size
-        )  # Output tile idx, 1 output tile per head per batch
-        tile_iter = tile_head_idx * tiles_per_head
-        if batch_size == 1:
-            req_size = tiles_per_head
+        if not RAGGED_BATCH:
+            group_size = tiles_per_head // batch_size
+            tile_batch_idx = (iter % tiles_per_head) // group_size
+            tile_idx = tile_head_idx * batch_size + tile_batch_idx
+            tile_iter = tile_head_idx * tiles_per_head + (tile_batch_idx * group_size)
+            tile_iter_end = tile_iter + group_size
         else:
-            req_size = tl.load(batch_num_block_n)
-        tile_iter_end = tile_iter + req_size
-        for b in range(1, batch_size):
-            next_req_size = tl.load(batch_num_block_n + b)
-            local_head_iter = iter % tiles_per_head
-            if (local_head_iter < next_req_size) and (local_head_iter >= req_size):
-                tile_iter = tile_iter + req_size
-                tile_idx = tile_idx + b
-                tile_iter_end = tile_iter + (next_req_size - req_size)
-            req_size = next_req_size
+            tile_idx = (
+                tile_head_idx * batch_size
+            )  # Output tile idx, 1 output tile per head per batch
+            tile_iter = tile_head_idx * tiles_per_head
+            if batch_size == 1:
+                req_size = tiles_per_head
+            else:
+                req_size = tl.load(batch_num_block_n)
+            tile_iter_end = tile_iter + req_size
+            for b in range(1, batch_size):
+                next_req_size = tl.load(batch_num_block_n + b)
+                local_head_iter = iter % tiles_per_head
+                if (local_head_iter < next_req_size) and (local_head_iter >= req_size):
+                    tile_iter = tile_iter + req_size
+                    tile_idx = tile_idx + b
+                    tile_iter_end = tile_iter + (next_req_size - req_size)
+                req_size = next_req_size
     # Local lean tile ID within a loop of an output tile
     local_iter = iter - tile_iter
     local_iter_end = tl.minimum(tile_iter_end, cta_end_tile_gid) - tile_iter
@@ -478,14 +512,19 @@ def la_persistent_inner(
     # Q/K/V/O offsets calculation needs global head index.
     # When XCD_REMAP=False, xcd_id=0
     tile_head_idx_global = HEADS_PER_XCD * xcd_id + tile_head_idx
+    # Map Q head index to K/V head index via GQA grouping
+    tile_khead_idx_global = tile_head_idx_global // gqa_group_size
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, HEAD_DIM)
+    mask_k_cols = offs_k < HEAD_DIM_ORIG
 
-    if causal:
+    if causal or not RAGGED_BATCH:
+        # Prefill or non RAGGED_BATCH
         b_seq_size = tile_batch_idx * num_n_blocks
     else:
+        # Decode with RAGGED_BATCH
         tile_batch_idx = tile_idx % batch_size
         b_seq_size = 0
         if tile_batch_idx > 0:
@@ -493,18 +532,40 @@ def la_persistent_inner(
                 batch_num_block_n + tile_batch_idx - 1
             )  # Previous batch size
 
-    k_offs = (
-        (b_seq_size + local_iter) * BLOCK_N * stride_kn
-        + tile_head_idx_global * stride_kh
-        + offs_n[None, :] * stride_kn
-        + offs_k[:, None] * stride_kk
-    )
-    v_offs = (
-        (b_seq_size + local_iter) * BLOCK_N * stride_vn
-        + tile_head_idx_global * stride_vh
-        + offs_n[:, None] * stride_vn
-        + offs_k[None, :] * stride_vk
-    )
+    if use_64_indexing:
+        BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
+        stride_kn64 = tl.full((), stride_kn, tl.int64)
+        stride_vn64 = tl.full((), stride_vn, tl.int64)
+        stride_kh64 = tl.full((), stride_kh, tl.int64)
+        stride_vh64 = tl.full((), stride_vh, tl.int64)
+        stride_kk64 = tl.full((), stride_kk, tl.int64)
+        stride_vk64 = tl.full((), stride_vk, tl.int64)
+        bn64 = tl.full((), b_seq_size, tl.int64) + tl.full((), local_iter, tl.int64)
+        k_offs = (
+            (bn64 * BLOCK_N64) * stride_kn64
+            + tl.full((), tile_khead_idx_global, tl.int64) * stride_kh64
+            + offs_n[None, :] * stride_kn64
+            + offs_k[:, None] * stride_kk64
+        )
+        v_offs = (
+            (bn64 * BLOCK_N64) * stride_vn64
+            + tl.full((), tile_khead_idx_global, tl.int64) * stride_vh64
+            + offs_n[:, None] * stride_vn64
+            + offs_k[None, :] * stride_vk64
+        )
+    else:
+        k_offs = (
+            (b_seq_size + local_iter) * BLOCK_N * stride_kn
+            + tile_khead_idx_global * stride_kh
+            + offs_n[None, :] * stride_kn
+            + offs_k[:, None] * stride_kk
+        )
+        v_offs = (
+            (b_seq_size + local_iter) * BLOCK_N * stride_vn
+            + tile_khead_idx_global * stride_vh
+            + offs_n[:, None] * stride_vn
+            + offs_k[None, :] * stride_vk
+        )
 
     k_ptrs = K + k_offs
     k_ptrs = tl.multiple_of(k_ptrs, (16, 1))
@@ -518,12 +579,27 @@ def la_persistent_inner(
         q_idx = tile_batch_idx
         q_start_m = 0
 
-    q_offs = (
-        q_idx * BLOCK_M * stride_qm
-        + tile_head_idx_global * stride_qh
-        + offs_m[:, None] * stride_qm
-        + offs_k[None, :] * stride_qk
-    )
+    if use_64_indexing:
+        q_idx64 = tl.full((), q_idx, tl.int64)
+        BLOCK_M64 = tl.full((), BLOCK_M, tl.int64)
+        stride_qm64 = tl.full((), stride_qm, tl.int64)
+        stride_qk64 = tl.full((), stride_qk, tl.int64)
+        th64 = tl.full((), tile_head_idx_global, tl.int64) * tl.full(
+            (), stride_qh, tl.int64
+        )
+        q_offs = (
+            q_idx64 * BLOCK_M64 * stride_qm64
+            + th64
+            + offs_m[:, None] * stride_qm64
+            + offs_k[None, :] * stride_qk64
+        )
+    else:
+        q_offs = (
+            q_idx * BLOCK_M * stride_qm
+            + tile_head_idx_global * stride_qh
+            + offs_m[:, None] * stride_qm
+            + offs_k[None, :] * stride_qk
+        )
     q_ptrs = Q + q_offs
     q_ptrs = tl.multiple_of(q_ptrs, (1, 16))
 
@@ -531,7 +607,7 @@ def la_persistent_inner(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    q = tl.load(q_ptrs)
+    q = tl.load(q_ptrs, mask=mask_k_cols[None, :], other=0.0)
 
     m_i, l_i, acc = _attention_inner(
         q,
@@ -550,9 +626,11 @@ def la_persistent_inner(
         offs_n,
         BLOCK_M,
         BLOCK_N,
-        HEAD_DIM,
-        local_iter,
-        local_iter_end,
+        HEAD_DIM_ORIG=HEAD_DIM_ORIG,
+        HEAD_DIM=HEAD_DIM,
+        local_iter=local_iter,
+        local_iter_end=local_iter_end,
+        use_64_indexing=use_64_indexing,
     )
 
     # initialize pointer to m and l
@@ -565,12 +643,27 @@ def la_persistent_inner(
         # Update pointers of partial results Mp[cta], Lp[cta], Op[cta]
         mp_ptrs = Mp + current_pid * BLOCK_M + offs_m
         lp_ptrs = Lp + current_pid * BLOCK_M + offs_m
-        op_ptrs = (
-            Op
-            + current_pid * stride_oph  # stride_oph is total_program dimension
-            + offs_m[:, None] * stride_opm
-            + offs_k[None, :] * stride_opn
-        )
+        if use_64_indexing:
+            current_pid64 = tl.full((), current_pid, tl.int64)
+            BLOCK_M64 = tl.full((), BLOCK_M, tl.int64)
+            stride_oph64 = tl.full((), stride_oph, tl.int64)
+            stride_opm64 = tl.full((), stride_opm, tl.int64)
+            stride_opn64 = tl.full((), stride_opn, tl.int64)
+            offs_m64 = tl.full([BLOCK_M], 0, tl.int64) + tl.cast(offs_m, tl.int64)
+            offs_k64 = tl.full([HEAD_DIM], 0, tl.int64) + tl.cast(offs_k, tl.int64)
+            op_ptrs = (
+                Op
+                + current_pid64 * stride_oph64
+                + offs_m64[:, None] * stride_opm64
+                + offs_k64[None, :] * stride_opn64
+            )
+        else:
+            op_ptrs = (
+                Op
+                + current_pid * stride_oph  # stride_oph is total_program dimension
+                + offs_m[:, None] * stride_opm
+                + offs_k[None, :] * stride_opn
+            )
 
         tl.store(mp_ptrs, m_i, cache_modifier=".wt")
         tl.store(lp_ptrs, l_i, cache_modifier=".wt")
@@ -676,19 +769,41 @@ def la_persistent_inner(
                 offs_mplp = temp_pid * BLOCK_M + offs_m
                 mp_ptrs = Mp + offs_mplp
                 lp_ptrs = Lp + offs_mplp
-                op_ptrs0 = (
-                    Op
-                    + temp_pid * stride_oph
-                    + offs_m[:, None] * stride_opm
-                    + tl.arange(0, HEAD_DIM // 2)[None, :] * stride_opn
-                )
-                op_ptrs1 = (
-                    Op
-                    + temp_pid * stride_oph
-                    + offs_m[:, None] * stride_opm
-                    + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2)
-                    * stride_opn
-                )
+                if use_64_indexing:
+                    temp_pid64 = tl.full((), temp_pid, tl.int64)
+                    stride_oph64 = tl.full((), stride_oph, tl.int64)
+                    stride_opm64 = tl.full((), stride_opm, tl.int64)
+                    stride_opn64 = tl.full((), stride_opn, tl.int64)
+                    offs_m64 = tl.cast(offs_m, tl.int64)
+                    offs0 = tl.arange(0, HEAD_DIM // 2)
+                    offs0_64 = tl.cast(offs0, tl.int64)
+                    offs1_64 = offs0_64 + tl.full((), HEAD_DIM // 2, tl.int64)
+                    op_ptrs0 = (
+                        Op
+                        + temp_pid64 * stride_oph64
+                        + offs_m64[:, None] * stride_opm64
+                        + offs0_64[None, :] * stride_opn64
+                    )
+                    op_ptrs1 = (
+                        Op
+                        + temp_pid64 * stride_oph64
+                        + offs_m64[:, None] * stride_opm64
+                        + offs1_64[None, :] * stride_opn64
+                    )
+                else:
+                    op_ptrs0 = (
+                        Op
+                        + temp_pid * stride_oph
+                        + offs_m[:, None] * stride_opm
+                        + tl.arange(0, HEAD_DIM // 2)[None, :] * stride_opn
+                    )
+                    op_ptrs1 = (
+                        Op
+                        + temp_pid * stride_oph
+                        + offs_m[:, None] * stride_opm
+                        + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2)
+                        * stride_opn
+                    )
 
                 m_cta = tl.load(mp_ptrs, cache_modifier=".cv")
                 l_cta = tl.load(lp_ptrs, cache_modifier=".cv")
@@ -715,25 +830,57 @@ def la_persistent_inner(
         # host CTA write final result to memory
         # acc = acc / l_i[:, None]
         # tl.store(o_ptrs, acc.to(Out.type.element_ty))
-        o_ptrs0 = (
-            Out
-            + q_idx * BLOCK_M * stride_om
-            + tile_head_idx_global * stride_oh
-            + offs_m[:, None] * stride_om
-            + tl.arange(0, HEAD_DIM // 2)[None, :] * stride_on
-        )
-        o_ptrs1 = (
-            Out
-            + q_idx * BLOCK_M * stride_om
-            + tile_head_idx_global * stride_oh
-            + offs_m[:, None] * stride_om
-            + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2) * stride_on
-        )
+        if use_64_indexing:
+            q_idx64 = tl.full((), q_idx, tl.int64)
+            BLOCK_M64 = tl.full((), BLOCK_M, tl.int64)
+            stride_om64 = tl.full((), stride_om, tl.int64)
+            stride_on64 = tl.full((), stride_on, tl.int64)
+            th64 = tl.full((), tile_head_idx_global, tl.int64) * tl.full(
+                (), stride_oh, tl.int64
+            )
+            offs0 = tl.arange(0, HEAD_DIM // 2)
+            offs0_64 = tl.cast(offs0, tl.int64)
+            offs1_64 = offs0_64 + tl.full((), HEAD_DIM // 2, tl.int64)
+
+            o_ptrs0 = (
+                Out
+                + q_idx64 * BLOCK_M64 * stride_om64
+                + th64
+                + offs_m[:, None] * stride_om64
+                + offs0_64[None, :] * stride_on64
+            )
+            o_ptrs1 = (
+                Out
+                + q_idx64 * BLOCK_M64 * stride_om64
+                + th64
+                + offs_m[:, None] * stride_om64
+                + offs1_64[None, :] * stride_on64
+            )
+        else:
+            o_ptrs0 = (
+                Out
+                + q_idx * BLOCK_M * stride_om
+                + tile_head_idx_global * stride_oh
+                + offs_m[:, None] * stride_om
+                + tl.arange(0, HEAD_DIM // 2)[None, :] * stride_on
+            )
+            o_ptrs1 = (
+                Out
+                + q_idx * BLOCK_M * stride_om
+                + tile_head_idx_global * stride_oh
+                + offs_m[:, None] * stride_om
+                + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2) * stride_on
+            )
 
         acc0 = acc0 / l_i[:, None]
         acc1 = acc1 / l_i[:, None]
-        tl.store(o_ptrs0, acc0.to(Out.type.element_ty))
-        tl.store(o_ptrs1, acc1.to(Out.type.element_ty))
+        COLS_HALF: tl.constexpr = HEAD_DIM // 2
+        offs0 = tl.arange(0, COLS_HALF)
+        offs1 = tl.arange(0, COLS_HALF) + COLS_HALF
+        mask_cols0 = offs0 < HEAD_DIM_ORIG
+        mask_cols1 = offs1 < HEAD_DIM_ORIG
+        tl.store(o_ptrs0, acc0.to(Out.type.element_ty), mask=mask_cols0[None, :])
+        tl.store(o_ptrs1, acc1.to(Out.type.element_ty), mask=mask_cols1[None, :])
 
     # update iter
     iter = iter + (local_iter_end - local_iter)

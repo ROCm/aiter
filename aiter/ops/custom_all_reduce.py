@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import List, Optional, Tuple
+
 import torch
-from typing import List
-from ..jit.core import (
-    compile_ops,
-)
+
+from ..jit.core import compile_ops
 
 MD_NAME = "module_custom_all_reduce"
 
@@ -17,19 +17,38 @@ def init_custom_ar(
     handles: List[torch.Tensor],
     offsets: List[int],
     rank: int,
-    full_nvlink: bool,
+    fully_connected: bool,
 ) -> int: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def all_reduce_reg(
-    _fa: int, inp: torch.Tensor, out: torch.Tensor, open_fp8_quant: bool
+def all_reduce(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    open_fp8_quant: bool,
+    reg_buffer: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def all_reduce_unreg(
+def all_gather_reg(_fa: int, inp: torch.Tensor, out: torch.Tensor) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def all_gather_unreg(
     _fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def fused_allreduce_rmsnorm(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    reg_buffer: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 
@@ -155,7 +174,7 @@ def register_buffer(
 
 # def gen_get_graph_buffer_ipc_meta_fake_tensors(_fa: int) -> List[torch.Tensor]:
 
-#     handle_sz = 64  # sizeof(cudaIpcMemHandle_t) is 64 byte
+#     handle_sz = 64  # sizeof(hipIpcMemHandle_t) is 64 byte
 #     num_buffers = 4  # ???
 #     handles = torch.empty((handle_sz * num_buffers,), dtype=torch.uint8, device="cuda")
 
@@ -165,7 +184,7 @@ def register_buffer(
 
 
 @compile_ops("module_custom_all_reduce")
-def get_graph_buffer_ipc_meta(_fa: int) -> tuple[torch.Tensor, torch.Tensor]: ...
+def get_graph_buffer_ipc_meta(_fa: int) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
 @compile_ops("module_custom_all_reduce")

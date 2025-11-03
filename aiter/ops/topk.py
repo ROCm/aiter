@@ -3,7 +3,7 @@
 
 # user interface
 
-from typing import List
+from typing import Tuple
 import torch
 from ..jit.core import (
     compile_ops,
@@ -48,7 +48,7 @@ def gen_moe_fused_gate_fake_tensor(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     output = torch.empty_like(
         topk_weights, dtype=topk_weights.dtype, device=topk_weights.device
     )
@@ -69,7 +69,7 @@ def moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> List[torch.Tensor]: ...
+) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def biased_grouped_topk(
@@ -84,7 +84,7 @@ def biased_grouped_topk(
 ):
     token_num = gating_output.shape[0]
     cu_num = get_cu_num()
-    if token_num <= cu_num * 48:
+    if token_num <= cu_num * 212:
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
@@ -194,3 +194,27 @@ def grouped_topk_torch(
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
+
+
+@compile_ops("module_topk_per_row")
+def topk_per_row(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+) -> None: ...
+
+
+@compile_ops("module_topk_per_row")
+def topk_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seqLens: torch.Tensor,
+    indices: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+) -> None: ...

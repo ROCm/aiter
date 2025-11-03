@@ -14,21 +14,76 @@
 #include <utility>
 #include <vector>
 
-template <typename T>
-std::ostream& operator<<(std::ostream& os, const std::vector<T>& v)
+// This function is copied from ck commit 4d041837ade7ae01900a0442d939f80b723b1631
+std::vector<int32_t> to_seqstarts_(ck_tile::span<const int32_t> seqlens)
 {
-    using size_type = typename std::vector<T>::size_type;
-
-    os << "[";
-    for(size_type idx = 0; idx < v.size(); ++idx)
+    std::vector<int32_t> seqstarts = {0};
+    for(int32_t seqlen : seqlens)
     {
-        if(0 < idx)
-        {
-            os << ", ";
-        }
-        os << v[idx];
+        seqstarts.push_back(seqstarts.back() + seqlen);
     }
-    return os << "]";
+    assert(seqstarts.size() == seqlens.size() + 1);
+    return seqstarts;
+}
+
+std::vector<int32_t> generate_seqlens(mode_enum mode,
+                                      unsigned count,
+                                      int32_t seqlen_avg,
+                                      int32_t seqlen_min = -1, // if not negative, clamp min
+                                      int32_t seqlen_max = -1, // if not negative, clamp max
+                                      std::optional<unsigned> seed = std::nullopt)
+{
+    assert(0 < count);
+
+    seqlen_min = (0 < seqlen_min ? seqlen_min : 1);
+    seqlen_max = (0 < seqlen_max ? seqlen_max : std::numeric_limits<int32_t>::max());
+    assert(seqlen_min <= seqlen_max);
+
+    std::vector<int32_t> seqlens(count, std::clamp(seqlen_avg, seqlen_min, seqlen_max));
+
+    if(mode == mode_enum::group && 1 < count)
+    {
+        using size_type = std::vector<int32_t>::size_type;
+
+        std::mt19937 random_engine(seed.has_value() ? *seed : std::random_device{}());
+        std::uniform_int_distribution<size_type> idx_dist(0, count - 1);
+        auto next_idx = std::bind(idx_dist, std::ref(random_engine));
+
+        std::uniform_int_distribution<size_type> step_dist(1, count - 1);
+        auto next_step = std::bind(step_dist, std::ref(random_engine));
+
+        for(unsigned repeat = seqlen_avg * (count / 2); 0 < repeat; --repeat)
+        {
+            const size_type to_decrease = next_idx();
+            // make sure each elements of seqlens is in range [seqlen_min, seqlen_max]
+            if(seqlens[to_decrease] == seqlen_min)
+            {
+                continue;
+            }
+
+            const size_type to_increase = (to_decrease + next_step()) % count;
+
+            if(seqlens[to_increase] >= seqlen_max)
+            {
+                continue;
+            }
+
+            --seqlens[to_decrease];
+            ++seqlens[to_increase];
+        }
+    }
+
+    return seqlens;
+}
+
+std::vector<int32_t> generate_seqstarts(mode_enum mode,
+                                        unsigned count,
+                                        int32_t seqlen_avg,
+                                        int32_t seqlen_min           = -1,
+                                        int32_t seqlen_max           = -1,
+                                        std::optional<unsigned> seed = std::nullopt)
+{
+    return to_seqstarts_(generate_seqlens(mode, count, seqlen_avg, seqlen_min, seqlen_max, seed));
 }
 
 auto create_args(int argc, char* argv[])
@@ -100,7 +155,8 @@ auto create_args(int argc, char* argv[])
             "if set to 0 will use atomic fp16/bf16(w/o convert_dq kernel) when bwd_v3 is set to 1")
         .insert("v3_bf16_cvt",
                 "1",
-                "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ");
+                "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
+        .insert("is_v3_check", "0", "if set to 1, check whether the input scenarios is supported by the asm kernel.");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -207,6 +263,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     bool bwd_v3         = arg_parser.get_bool("bwd_v3");
     bool v3_atomic_fp32 = arg_parser.get_bool("v3_atomic_fp32");
     int v3_bf16_cvt     = arg_parser.get_int("v3_bf16_cvt");
+    bool is_v3_check    = arg_parser.get_bool("is_v3_check");
 
     ck_tile::stream_config stream_config{nullptr,
                                          true,
@@ -297,7 +354,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
         deterministic ? ck_tile::integer_divide_ceil(max_seqlen_k, kN0) : 1;
     const ck_tile::index_t a16_dq_acc_seq =
         v3_atomic_fp32 ? shape_seqlen_q : (mode == mode_enum::batch ? (seqlen_q + 15) / 16 * 16 : (max_seqlen_q + 15) / 16 * 16);
-    const ck_tile::index_t a16_dq_acc_hdim = v3_atomic_fp32 ? hdim_q : 128;
+    // hdim_q = 192 pipline currently don't support hdim padding
+    const ck_tile::index_t a16_dq_acc_hdim = v3_atomic_fp32 ? hdim_q : hdim_q == 192? 192: 128;
 
     ck_tile::HostTensor<QDataType> q_host(
         get_lengths(i_perm, shape_batch, nhead, shape_seqlen_q, hdim_q));
@@ -590,7 +648,10 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                     deterministic,
                                     bwd_v3,
                                     v3_atomic_fp32,
-                                    v3_bf16_cvt);
+                                    v3_bf16_cvt,
+                                    nullptr,
+                                    nullptr,
+                                    is_v3_check);
     if(ave_time < 0)
     {
         std::cout << ", not supported yet" << std::flush << std::endl;

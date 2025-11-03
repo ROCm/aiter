@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
@@ -230,7 +230,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
     if (is_causal) { window_size_right = 0; }
 
     bool is_dropout = p_dropout > 0.0;
-    auto stream = at::cuda::getCurrentHIPStream().stream();
+    auto stream = at::hip::getCurrentHIPStream();
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -322,21 +322,21 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         dv = torch::empty_like(v);
     }
 
-    at::cuda::CUDAGuard device_guard{q.device()};
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
 
     if (!deterministic) {
-        dq_accum = torch::zeros({1, batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({1, batch_size, seqlen_q, num_heads, head_size_q}, opts.dtype(at::kFloat));
     } else {
-        const ck_tile::index_t kN0 = head_size_v <= 128 ? 128 : 64;
+        const ck_tile::index_t kN0 = head_size_q <= 128 ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(seqlen_k, kN0);
         if (mask.type == mask_enum::no_mask) 
-            dq_accum = torch::empty({nsplits, batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(at::kFloat));
+            dq_accum = torch::empty({nsplits, batch_size, seqlen_q, num_heads, head_size_q}, opts.dtype(at::kFloat));
         else  // Some block may be skipped with causal mask and dq are not set to zeros
-            dq_accum = torch::zeros({nsplits, batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(at::kFloat));
+            dq_accum = torch::zeros({nsplits, batch_size, seqlen_q, num_heads, head_size_q}, opts.dtype(at::kFloat));
     }
 
     at::Tensor dk_expanded, dv_expanded;
