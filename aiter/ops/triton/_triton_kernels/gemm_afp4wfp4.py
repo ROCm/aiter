@@ -22,7 +22,6 @@ _gemm_afp4wfp4_repr = make_kernel_repr(
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
-        "GRID_MN",
         "cache_modifier",
     ],
 )
@@ -38,7 +37,6 @@ _gemm_afp4wfp4_preshuffled_repr = make_kernel_repr(
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
-        "GRID_MN",
         "cache_modifier",
     ],
 )
