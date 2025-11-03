@@ -1245,23 +1245,9 @@ class WorkgroupTopKCoordinator
         : strategy_(k, sentinel), k_(k), sentinel_(sentinel)
     {
         const int num_waves = blockDim.x / utils::WAVE_SIZE;
-
-        // WaveFilterStrategy needs shared memory for staging
-        // We allocate reduction buffers AFTER strategy's internal memory
-        size_t strategy_smem_size = 0;
-        if constexpr(strategy_uses_shared_memory<StrategyImpl>::value)
-        {
-            // WaveFilterStrategy uses: num_waves * WAVE_SIZE for staging
-            strategy_smem_size =
-                utils::round_up_to_multiple_of<16>(num_waves * sizeof(T) * utils::WAVE_SIZE) +
-                num_waves * sizeof(IdxT) * utils::WAVE_SIZE;
-        }
-
-        // Reduction buffers start AFTER strategy's internal buffers
-        reduction_priorities_ =
-            reinterpret_cast<T*>(reinterpret_cast<char*>(smem_buf) + strategy_smem_size);
+        reduction_priorities_ = reinterpret_cast<T*>(smem_buf);
         reduction_positions_ = reinterpret_cast<IdxT*>(
-            reinterpret_cast<char*>(smem_buf) + strategy_smem_size +
+            reinterpret_cast<char*>(smem_buf) +
             utils::round_up_to_multiple_of<16>(num_waves / 2 * sizeof(T) * k_));
     }
 
@@ -1531,15 +1517,6 @@ int calc_smem_size_for_block_wide(int num_wave, IdxT k)
     return base_size;
 }
 
-template <typename T, typename IdxT>
-int calc_smem_size_for_wave_filter(int num_wave)
-{
-    // WaveFilterStrategy's internal shared memory: num_wave * WAVE_SIZE elements for staging
-    int val_size = utils::round_up_to_multiple_of<16>(num_wave * sizeof(T) * utils::WAVE_SIZE);
-    int idx_size = num_wave * sizeof(IdxT) * utils::WAVE_SIZE;
-    return val_size + idx_size;
-}
-
 template <template <int, bool, typename, typename> class StrategyClass, typename T, typename IdxT>
 void calc_launch_parameter_by_occupancy(IdxT k, int* block_size, int* min_grid_size)
 {
@@ -1681,13 +1658,7 @@ void topk_kernel_launcher(int num_of_block,
     IdxT* result_idx       = (num_of_block == 1) ? out_idx : tmp_idx;
     int block_dim          = num_wave * utils::WAVE_SIZE;
 
-    // Calculate shared memory size: reduction buffers + WaveFilterStrategy's internal memory
     int smem_size = calc_smem_size_for_block_wide<T, IdxT>(num_wave, k);
-    if constexpr(strategy_uses_shared_memory<StrategyClass>::value)
-    {
-        // WaveFilterStrategy uses shared memory internally, add its memory requirements
-        smem_size += calc_smem_size_for_wave_filter<T, IdxT>(num_wave);
-    }
 
     auto block_kernel_func = find_block_kernel<greater, StrategyClass, T, IdxT>(k);
 
