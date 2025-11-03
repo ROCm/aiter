@@ -1,5 +1,25 @@
 # AITER GEMM Benchmark - Enhanced CLI
 
+## Docker Setup
+
+### Build Docker Image
+```bash
+docker build -t aiter-benchmark .
+```
+
+### Run Benchmarks
+```bash
+# Default help
+docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined \
+  --group-add video --ipc=host --shm-size 16G aiter-benchmark
+
+# Run specific benchmark
+docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined \
+  --group-add video --ipc=host --shm-size 16G \
+  -v $(pwd):/output -w /output \
+  aiter-benchmark python3 /workspace/aiter/benchmark_gemm.py --kernel gemm_a4w4_asm --shapes "2048,8192,8192"
+```
+
 ## Changes Made
 
 Added command-line arguments to `benchmark_gemm.py`:
@@ -60,5 +80,3 @@ M,N,K,dtype,backend,time_us,TFLOPS,GB/s
 2048,8192,8192,a4w4,ASM,67.52,4070.999,1118.13
 2048,8192,8192,a8w8_fp8,CK,125.12,2196.897,938.62
 ```
-
-Appended rows integrate seamlessly with existing data!
