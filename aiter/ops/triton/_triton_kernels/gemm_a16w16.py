@@ -18,9 +18,13 @@ _gemm_a16w16_repr = make_kernel_repr(
         "GROUP_SIZE_M",
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
         "cache_modifier",
         "activation",
         "use_activation",
+        "ADD_BIAS",
+        "SKIP_REDUCE",
     ],
 )
 
