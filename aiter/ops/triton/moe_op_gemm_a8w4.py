@@ -44,7 +44,7 @@ def allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, 
         y_rows = scatter_indx.src_indx.shape[0] // routing_data.n_expts_act # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
-    if block_m == 16:
+    if block_m == 16 or scatter_indx:
         matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
     else:
         matmul_output = torch.zeros(matmul_shape, device=x.device, dtype=out_dtype)
