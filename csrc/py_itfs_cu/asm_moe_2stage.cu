@@ -466,9 +466,9 @@ void moe_stage1_g1u1(
 }
 
 void moe_stage2_g1u1(
-    torch::Tensor& input,             // [token, topK, inter_dim] M N
-    torch::Tensor& w1,                // [expert, inter_dim*2, model_dim] N,K
-    torch::Tensor& w2,                // [expert, model_dim, inter_dim]
+    torch::Tensor& input,             // [token, topK, inter_dim] M,M N
+    torch::Tensor& w1,                // [expert, inter_dim*2, model_dim] E,N,K
+    torch::Tensor& w2,                // [expert, model_dim, inter_dim] E,K,N
     torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
     torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
     torch::Tensor& num_valid_ids,     // [1]
@@ -490,20 +490,20 @@ void moe_stage2_g1u1(
 
     CFG* config_map = get_stage2_cfg(input, out, w2, quant_type, sorted_weights.has_value());
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    int K_trans    = w2.size(2);
-    int N_trans    = w2.size(1);
-    int model_dim  = K_trans * 2;
-    int hidden_dim = N_trans;
+    int K          = w2.size(1);
+    int N          = w2.size(2);
+    int model_dim  = N; // K N exchanged in asm kernel
+    int hidden_dim = K;
     int sub_X_cnt  = sorted_expert_ids.size(0);
     int token_cnt  = input.size(0);
     int topk       = input.size(1);
     int eprt       = w1.size(0);
     // prepare kernel args
-    int stride_o             = hidden_dim * out.element_size();        // ROW
-    int stride_a             = input.stride(0) * input.element_size(); // ROW
-    int stride_b             = model_dim * w2.element_size();          // COL
-    int stride_exprt_b       = hidden_dim * model_dim;                 // COL
-    int stride_exprt_b_scale = hidden_dim * (model_dim / 32);          // COL
+    int stride_o             = K * out.element_size();   // ROW
+    int stride_a             = N * input.element_size(); // ROW
+    int stride_b             = N * w2.element_size();    // COL
+    int stride_exprt_b       = K * N;                    // COL
+    int stride_exprt_b_scale = N * (K / 32);             // COL
 
     stride_a /= 2;
     stride_b /= 2;
@@ -629,6 +629,15 @@ void moe_stage2_g1u1(
     int gdz         = 1;
     size_t arg_size = sizeof(kargs);
 
+    std::cout << "out:" << kargs.o_buf << std::endl;
+    std::cout << "a:" << kargs.a_buf << std::endl;
+    std::cout << "b:" << kargs.b_buf << std::endl;
+    std::cout << "tk_num_buf:" << kargs.tk_num_buf << std::endl;
+    std::cout << "as_buf:" << kargs.as_buf << std::endl;
+    std::cout << "bs_buf:" << kargs.bs_buf << std::endl;
+    std::cout << "tk_buf:" << kargs.tk_buf << std::endl;
+    std::cout << "w_buf:" << kargs.w_buf << std::endl;
+    std::cout << "expt_buf:" << kargs.expt_buf << std::endl;
     std::cout << "model_dim:" << kargs.model_dim << std::endl;
     std::cout << "inter_dim:" << kargs.inter_dim << std::endl;
     std::cout << "tokens:" << kargs.tokens << std::endl;
