@@ -1935,19 +1935,41 @@ def _rope_fwd_2d_kernel_neox(
     # store output
     tl.store(out_ptr + offs_x, out)
 
+
 @triton.jit
 def _rope_fwd_3d_kernel(
-    x_ptr, freqs_real_ptr, freqs_imag_ptr, grid_sizes_ptr, out_ptr,
-    stride_x_b, stride_x_l, stride_x_n, stride_x_c,
-    stride_freqs_s, stride_freqs_c,
-    stride_grid_b, stride_grid_d,
-    stride_out_b, stride_out_l, stride_out_n, stride_out_c,
-    L: tl.constexpr, N_HEADS: tl.constexpr, C: tl.constexpr, c_total: tl.constexpr,
-    sp_size: tl.constexpr, sp_rank: tl.constexpr,
-    max_freq_seq_len: tl.constexpr, s_per_rank: tl.constexpr,
-    pad_freq_val_r: tl.constexpr, pad_freq_val_i: tl.constexpr,
-    BLOCK_L: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr,
-    C1: tl.constexpr, C2: tl.constexpr,
+    x_ptr,
+    freqs_real_ptr,
+    freqs_imag_ptr,
+    grid_sizes_ptr,
+    out_ptr,
+    stride_x_b,
+    stride_x_l,
+    stride_x_n,
+    stride_x_c,
+    stride_freqs_s,
+    stride_freqs_c,
+    stride_grid_b,
+    stride_grid_d,
+    stride_out_b,
+    stride_out_l,
+    stride_out_n,
+    stride_out_c,
+    L: tl.constexpr,
+    N_HEADS: tl.constexpr,
+    C: tl.constexpr,
+    c_total: tl.constexpr,
+    sp_size: tl.constexpr,
+    sp_rank: tl.constexpr,
+    max_freq_seq_len: tl.constexpr,
+    s_per_rank: tl.constexpr,
+    pad_freq_val_r: tl.constexpr,
+    pad_freq_val_i: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    C1: tl.constexpr,
+    C2: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -1963,17 +1985,20 @@ def _rope_fwd_3d_kernel(
     # head mask
     n_mask = pid_n < N_HEADS
 
-    # broadcast to  (BLOCK_L, 1, BLOCK_C) 
+    # broadcast to  (BLOCK_L, 1, BLOCK_C)
     l_b = tl.broadcast_to(l_off[:, None], (BLOCK_L, BLOCK_C))
     c_b = tl.broadcast_to(c_off[None, :], (BLOCK_L, BLOCK_C))
 
     # read grid_sizes
-    f_grid = tl.load(grid_sizes_ptr + pid_b * stride_grid_b + 0 * stride_grid_d,
-                    mask=n_mask, other=0)
-    h_grid = tl.load(grid_sizes_ptr + pid_b * stride_grid_b + 1 * stride_grid_d,
-                    mask=n_mask, other=0)
-    w_grid = tl.load(grid_sizes_ptr + pid_b * stride_grid_b + 2 * stride_grid_d,
-                    mask=n_mask, other=0)
+    f_grid = tl.load(
+        grid_sizes_ptr + pid_b * stride_grid_b + 0 * stride_grid_d, mask=n_mask, other=0
+    )
+    h_grid = tl.load(
+        grid_sizes_ptr + pid_b * stride_grid_b + 1 * stride_grid_d, mask=n_mask, other=0
+    )
+    w_grid = tl.load(
+        grid_sizes_ptr + pid_b * stride_grid_b + 2 * stride_grid_d, mask=n_mask, other=0
+    )
     h_w = h_grid * w_grid
 
     global_tid = sp_rank * s_per_rank + l_b
@@ -1985,8 +2010,7 @@ def _rope_fwd_3d_kernel(
     h_idx = tl.where(valid_global_tid, rem // w_grid, 0)
     w_idx = tl.where(valid_global_tid, rem % w_grid, 0)
 
-    freq_row = tl.where(c_b < C1, f_idx,
-                       tl.where(c_b < C1 + C2, h_idx, w_idx))
+    freq_row = tl.where(c_b < C1, f_idx, tl.where(c_b < C1 + C2, h_idx, w_idx))
     freq_row = tl.where(freq_row >= max_freq_seq_len, max_freq_seq_len - 1, freq_row)
 
     mask_rope = s_mask[:, None] & c_mask[None, :] & n_mask & valid_global_tid[:, :]
@@ -2014,4 +2038,3 @@ def _rope_fwd_3d_kernel(
 
     tl.store(out_ptr + off_out_r, out_r, mask=mask_rope)
     tl.store(out_ptr + off_out_i, out_i, mask=mask_rope)
-
