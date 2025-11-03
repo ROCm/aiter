@@ -177,11 +177,11 @@ def _attn_fwd_inner(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if HAS_PE:
             qk += tl.dot(q_pe, k_pe)
+        qk += tl.dot(q, k)
         if IS_FP8:
-            qk += tl.dot(q, k) * descale_q * descale_k
+            qk = qk * (qk_scale * descale_q * descale_k)
         else:
-            qk += tl.dot(q, k)
-        qk = qk * qk_scale
+            qk = qk * qk_scale
         if IS_CAUSAL:
             causal_boundary = start_n + offs_n_causal
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
