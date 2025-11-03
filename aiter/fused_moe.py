@@ -940,7 +940,6 @@ def asm_stage2(
         quant_type = QuantType.per_Token
 
     tmp_out = out
-
     aiter.moe_stage2_g1u1(
         input,
         w1,
@@ -955,8 +954,8 @@ def asm_stage2(
         ksplit=ksplit,
         activation=activation,
         quant_type=quant_type,
-        a1_scale=a1_scale,
-        w1_scale=w1_scale,
+        a2_scale=a2_scale,
+        w2_scale=w2_scale,
         sorted_weights=sorted_weights,
     )
     return out

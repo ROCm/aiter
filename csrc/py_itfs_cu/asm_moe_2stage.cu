@@ -466,7 +466,7 @@ void moe_stage1_g1u1(
 }
 
 void moe_stage2_g1u1(
-    torch::Tensor& input,             // [token, topK, inter_dim]
+    torch::Tensor& input,             // [token, topK, inter_dim] M N
     torch::Tensor& w1,                // [expert, inter_dim*2, model_dim] N,K
     torch::Tensor& w2,                // [expert, model_dim, inter_dim]
     torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
@@ -490,13 +490,28 @@ void moe_stage2_g1u1(
 
     CFG* config_map = get_stage2_cfg(input, out, w2, quant_type, sorted_weights.has_value());
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    int model_dim  = w2.size(1);
-    int hidden_dim = inter_dim;
+    int K_trans    = w2.size(2);
+    int N_trans    = w2.size(1);
+    int model_dim  = K_trans * 2;
+    int hidden_dim = N_trans;
     int sub_X_cnt  = sorted_expert_ids.size(0);
+    int token_cnt  = input.size(0);
+    int topk       = input.size(1);
+    int eprt       = w1.size(0);
+    // prepare kernel args
+    int stride_o             = hidden_dim * out.element_size();        // ROW
+    int stride_a             = input.stride(0) * input.element_size(); // ROW
+    int stride_b             = model_dim * w2.element_size();          // COL
+    int stride_exprt_b       = hidden_dim * model_dim;                 // COL
+    int stride_exprt_b_scale = hidden_dim * (model_dim / 32);          // COL
+
+    stride_a /= 2;
+    stride_b /= 2;
+    stride_exprt_b /= 2;
 
     if(kernelName.empty())
     {
-        kernelName = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map);
+        kernelName = get_heuristic_kernel(sub_X_cnt, hidden_dim, block_m, config_map);
     }
 
     AiterAsmKernel* impl_ptr = nullptr;
@@ -507,9 +522,9 @@ void moe_stage2_g1u1(
         const char* name    = cfg.name.c_str();
         const char* co_name = cfg.co_name.c_str();
 
-        TORCH_CHECK(inter_dim % cfg.tile_N == 0,
+        TORCH_CHECK(hidden_dim % cfg.tile_N == 0,
                     "ASM kernel " + std::string(name) +
-                        " is not supported for inter_dim = " + std::to_string(inter_dim));
+                        " is not supported for inter_dim = " + std::to_string(hidden_dim));
 
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
@@ -521,25 +536,10 @@ void moe_stage2_g1u1(
     else
         TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
 
-    int token_cnt   = input.size(0);
-    int topk        = out.size(1);
-    int dim         = w2.size(1);
-    int eprt        = w1.size(0);
     const auto& cfg = it->second;
-    uint32_t sub_GU = cfg.tile_N;
+    uint32_t sub_D  = cfg.tile_N;
     TORCH_CHECK(
         block_m == cfg.tile_M, __func__, " kernel: ", cfg.name, " need block_m == ", cfg.tile_M);
-
-    // prepare kernel args
-    int stride_o             = out.stride(0) * out.element_size();     // ROW
-    int stride_a             = input.stride(0) * input.element_size(); // ROW
-    int stride_b             = inter_dim * w2.element_size();          // COL
-    int stride_exprt_b       = hidden_dim * dim;                       // COL
-    int stride_exprt_b_scale = hidden_dim * (dim / 32);                // COL
-
-    stride_a /= 2;
-    stride_b /= 2;
-    stride_exprt_b /= 2;
 
     kargs_struct kargs{
         out.data_ptr(),
@@ -566,7 +566,7 @@ void moe_stage2_g1u1(
         sorted_expert_ids.data_ptr(),
         0,
         0,
-        sorted_expert_ids.data_ptr(),
+        sorted_weights.value().data_ptr(),
         0,
         0,
         model_dim,
@@ -623,25 +623,25 @@ void moe_stage2_g1u1(
         0,
     };
 
-    int bdx = 256;
-    int gdx = ((hidden_dim + sub_GU - 1) / sub_GU);
-    int gdy = sub_X_cnt;
-    int gdz = 1;
-
-    // std::cout << "dim:" << args.dim << std::endl;
-    // std::cout << "hidden:" << args.hidden_dim << std::endl;
-    // std::cout << "token:" << args.token_cnt << std::endl;
-    // std::cout << "eprt:" << args.eprt_cnt << std::endl;
-    // std::cout << "Xs:" << args.Xs << std::endl;
-    // std::cout << "GUs:" << args.GUs << std::endl;
-    // std::cout << "Os:" << args.Os << std::endl;
-    // std::cout << "GUs:" << args.eGUs << std::endl;
-    // std::cout << "GUQs:" << args.eGUQs << std::endl;
-    // std::cout << "SMQs:" << args.eSMQs << std::endl;
-    // std::cout << "topk:" << args.topk << std::endl;
-    // std::cout << "splitk:" << args.splitk << std::endl;
-    // printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
+    int bdx         = 256;
+    int gdx         = ((hidden_dim + sub_D - 1) / sub_D);
+    int gdy         = sub_X_cnt;
+    int gdz         = 1;
     size_t arg_size = sizeof(kargs);
+
+    std::cout << "model_dim:" << kargs.model_dim << std::endl;
+    std::cout << "inter_dim:" << kargs.inter_dim << std::endl;
+    std::cout << "tokens:" << kargs.tokens << std::endl;
+    std::cout << "experts:" << kargs.experts << std::endl;
+    std::cout << "stride_a:" << kargs.stride_a << std::endl;
+    std::cout << "stride_b:" << kargs.stride_b << std::endl;
+    std::cout << "stride_o:" << kargs.stride_o << std::endl;
+    std::cout << "stride_expt_b:" << kargs.stride_expt_b << std::endl;
+    std::cout << "stride_expt_bs:" << kargs.stride_expt_bs << std::endl;
+    std::cout << "topks:" << kargs.topks << std::endl;
+    std::cout << "arg_size:" << arg_size << std::endl;
+    printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
+
     impl_ptr->launch_kernel({&kargs,
                              &arg_size,
                              gdx, // gdx

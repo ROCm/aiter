@@ -19,6 +19,8 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
     get_block_size_M,
+    asm_stage1,
+    asm_stage2,
 )
 
 
@@ -156,6 +158,7 @@ def test_fmoe(
     M, _ = topk_ids.shape
 
     BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
+    BLOCK_SIZE_M = 256
     if qType == aiter.QuantType.per_128x128:
         BLOCK_SIZE_M = 64
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
@@ -280,35 +283,42 @@ def test_fmoe(
     # )
     # ######################## stage 1 end ###########
 
-    # if WQDType != torch.int4:
-    #     # asm int4 2 stage not support yet
-    #     if qType == aiter.QuantType.per_Tensor:
-    #         a1_scale = a1_scale.view(1).repeat(token)
-    #         w1_scale = w1_scale.view(E, 1).repeat(1, w1.shape[-2])
-
-    #     out1_asm = torch.empty((token, topk, inter_dim), dtype=dtype)
-    #     _, us = run_perftest(
-    #         asm_stage1,
-    #         a1_qt,
-    #         shuffle_weight(w1_qt, (16, 16)),
-    #         shuffle_weight(w2_qt, (16, 16)),
-    #         sorted_ids,
-    #         sorted_expert_ids,
-    #         num_valid_ids,
-    #         out1_asm,
-    #         topk,
-    #         kernelName="fmoe_stage1_bf16_pertokenFp8_g1u1_128x128_pf2",
-    #         w1_scale=w1_scale,
-    #         a1_scale=a1_scale,
-    #         activation=actType,
-    #         quant_type=qType,
-    #         block_m=BLOCK_SIZE_M,
-    #     )
-    #     checkAllclose(
-    #         out1_ref,
-    #         out1_asm,
-    #         msg=f"[perf] asm_moe_stage1:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
-    #     )
+    if WQDType != torch.int4:
+        # asm int4 2 stage not support yet
+        if qType == aiter.QuantType.per_Tensor:
+            a1_scale = a1_scale.view(1).repeat(token)
+            w1_scale = w1_scale.view(E, 1).repeat(1, w1.shape[-2])
+        a1_qt_shuffle, a1_scale_shuffle = aiter.per_1x32_f4_quant(input, shuffle=False)
+        BLOCK_SIZE_M = 256
+        out1_asm = torch.empty((token, topk, inter_dim), dtype=dtype)
+        _, us = run_perftest(
+            asm_stage1,
+            a1_qt,
+            shuffle_weight(w1_qt, (16, 16)),
+            shuffle_weight(w2_qt, (16, 16)),
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            out1_asm,
+            topk,
+            kernelName="_ZN5aiter52fmoe_stage1_bf16_pertokenFp4_blockscale_g1u1_256x128E",
+            a1_scale=fp4_utils.moe_mxfp4_sort(
+                a1_scale_shuffle,
+                sorted_ids,
+                num_valid_ids,
+                a1_qt.shape[0],
+                256,
+            ),
+            w1_scale=fp4_utils.e8m0_shuffle(w1_scale),
+            activation=actType,
+            quant_type=qType,
+            block_m=BLOCK_SIZE_M,
+        )
+        checkAllclose(
+            out1_ref,
+            out1_asm,
+            msg=f"[perf] asm_moe_stage1:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        )
 
     # ######################## stage 2 start ###########
     if qType == aiter.QuantType.per_128x128:
@@ -367,6 +377,31 @@ def test_fmoe(
     #     msg=f"[perf]  ck_moe_stage2:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     # )
     # ######################## stage 2 end ###########
+    # a2_qt_shuffle, a2_scale_shuffle = aiter.per_1x32_f4_quant(a2_qt, shuffle=False)
+    out2_asm = torch.empty((token, inter_dim), dtype=dtype)
+    _, us = run_perftest(
+        asm_stage2,
+        a2_qt,
+        shuffle_weight(w1_qt, (16, 16)),
+        shuffle_weight(w2_qt, (16, 16)),
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        out2_asm,
+        topk,
+        kernelName="_ZN5aiter52fmoe_stage2_bf16_pertokenFp4_blockscale_g1u1_256x256E",  # _ZN5aiter52fmoe_stage2_bf16_pertokenFp4_blockscale_g1u1_256x256E
+        w2_scale=fp4_utils.e8m0_shuffle(w2_scale),
+        a2_scale=a2_scale,
+        activation=actType,
+        quant_type=qType,
+        block_m=256,  # BLOCK_SIZE_M
+        sorted_weights=sorted_weights,
+    )
+    checkAllclose(
+        out2_ref,
+        out2_asm,
+        msg=f"[perf] asm_moe_stage2:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+    )
 
     # # ######################## fused 2 stage #########
     # out2_ck, us = run_perftest(
