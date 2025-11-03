@@ -13,6 +13,7 @@ from ..jit.core import (
     AITER_CONFIG_GEMM_A8W8_FILE,
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE,
     AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+    AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE,
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
     AITER_LOG_TUNED_CONFIG,
 )
@@ -73,6 +74,30 @@ def gemm_a8w8_bpreshuffle_ck(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
 ) -> torch.Tensor: ...
+
+
+def gen_gemm_a8w8_bpreshuffle_cktile_fake_tensors(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+) -> torch.Tensor:
+    return Out
+
+
+@compile_ops(
+    "module_gemm_a8w8_bpreshuffle_cktile",
+    fc_name="gemm_a8w8_bpreshuffle_cktile",
+    gen_fake=gen_gemm_a8w8_bpreshuffle_cktile_fake_tensors,
+)
+def gemm_a8w8_bpreshuffle_cktile(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+) -> Tensor: ...
 
 
 def gen_gemm_a8w8_asm_fake_tensors(
@@ -578,3 +603,45 @@ def gemm_a8w8_blockscale_bpreshuffle_tune(
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
+
+
+def gemm_a8w8_bpreshuffle_CKTILE(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    bias: Optional[Tensor] = None,
+    dtype=torch.float16,
+    check=False,
+):
+    assert dtype in [
+        torch.bfloat16,
+        torch.float16,
+    ], f"Output {dtype=} is currently not supported in gemm_a8w8_bpreshuffle_CKTILE"
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    k = XQ.shape[-1]
+
+    # get_bpreshuffle_GEMM_config(
+    #     m, n, k, dtypes.fp8, AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+    # )
+    get_CKGEMM_config(m, n, k, AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE)
+    assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle_CKTILE only support fp8 now"
+    assert bias is None, "gemm_a8w8_bpreshuffle_CKTILE does not support bias now"
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
+
+
+@compile_ops(
+    "module_gemm_a8w8_bpreshuffle_cktile_tune",
+    fc_name="gemm_a8w8_bpreshuffle_cktile_tune",
+)
+def gemm_a8w8_bpreshuffle_cktile_tune(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    kernelId: int,
+    splitK: int = 0,
+) -> Tensor: ...

@@ -22,6 +22,7 @@
 #include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
 #include "gemm_a8w8_bpreshuffle.h"
+#include "gemm_a8w8_bpreshuffle_cktile.h"
 #include "gemm_common.h"
 #include "hipbsolgemm.cuh"
 #include "moe_ck.h"
@@ -34,8 +35,8 @@
 #include "rmsnorm.h"
 #include "rocsolgemm.cuh"
 #include "rope.h"
-#include "smoothquant.h"
 #include "sample.h"
+#include "smoothquant.h"
 #include <torch/extension.h>
 
 // #include "torch/mha_batch_prefill.h"
