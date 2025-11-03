@@ -253,16 +253,12 @@ def e2e_moe_kernel(
                 other=0.0,
             )
 
-        if use_fp8_w8a8:
-            if use_block_scale:
-                w1_scale = tl.load(w1_i0_scale_ptrs)
-
-                # if num_scales_along_n > 1: # singleton dimension get automatic broadcast
-                w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
-
-                a_scale = tl.load(
-                    a_scale_ptrs, mask=token_mask[:, None], other=0.0
-                )
+        if use_fp8_w8a8 and use_block_scale:
+            w1_scale = tl.load(w1_i0_scale_ptrs)
+            w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
+            a_scale = tl.load(
+                a_scale_ptrs, mask=token_mask[:, None], other=0.0
+            )
 
             silu_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
         else:
@@ -277,11 +273,9 @@ def e2e_moe_kernel(
                 mask=(offs_k1[:, None] < K - k1 * BLOCK_SIZE_K1),
                 other=0.0,
             )
-
-        if use_fp8_w8a8:
-            if use_block_scale:
-                w1_scale = tl.load(w1_i1_scale_ptrs)
-                w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
+        if use_fp8_w8a8 and use_block_scale:
+            w1_scale = tl.load(w1_i1_scale_ptrs)
+            w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
             mul_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
         else:
             mul_acc = tl.dot(a, w1, acc=mul_acc)
@@ -294,6 +288,10 @@ def e2e_moe_kernel(
             w1_i1_scale_ptrs += BLOCK_SIZE_K1 // group_k *stride_w1sk
             a_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_ask
 
+    if use_fp8_w8a8 and not use_block_scale:
+        silu_acc = silu_acc * a_scale * w1_scale
+        mul_acc = mul_acc * a_scale * w1_scale
+    
     # gated activation
     silu_acc = _silu_exp2(silu_acc)
     acc = silu_acc * mul_acc
@@ -352,11 +350,11 @@ def e2e_moe_kernel(
                 w2_scale = tl.load(
                     w2_scale_ptrs + (k2 * BLOCK_SIZE_K2) // group_k * stride_w2sk,
                 )  # (num_scales_along_n, num_scales_along_k2)
-                w2_scale = group_broadcast(
-                    w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0
-                )
-                # broadcasted shape along n depends on if num_scales_along_n > 1 or not as singleton dimension not get broadcasted.
+                # only need to do descale before dot if inner dimension (n) spans multiple scale values
                 if num_scales_along_n > 1:
+                    w2_scale = group_broadcast(
+                        w2_scale, num_scales_along_n, num_scales_along_k2, group_n, 0
+                    )
                     w2_scale = group_broadcast(
                         w2_scale,
                         num_scales_along_n * group_n,
@@ -364,15 +362,16 @@ def e2e_moe_kernel(
                         group_k,
                         1,
                     )
+                    w2 = w2.to(tl.float32) * w2_scale.to(tl.float32)
                 else:
                     w2_scale = group_broadcast(w2_scale, 1, num_scales_along_k2, group_k, 1)
-                w2 = w2 * w2_scale.to(tl.float32)
+
             w2 = w2.to(tl.bfloat16)
             out = tl.dot(acc, w2)
         else:
             out = tl.dot(acc, w2)
 
-        if use_fp8_w8a8 and not use_block_scale:
+        if use_fp8_w8a8 and ((not use_block_scale) or num_scales_along_n == 1):
             out = out * w2_scale
 
         if MUL_ROUTED_WEIGHT:
