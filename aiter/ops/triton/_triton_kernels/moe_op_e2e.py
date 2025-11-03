@@ -338,7 +338,7 @@ def e2e_moe_kernel(
     out_ptrs = Out + stride_om * offs_token[:, None] + offs_k2[None, :] * stride_ok
 
     num_k2 = tl.cdiv(K, BLOCK_SIZE_K2)
-    for k2 in tl.range(0, num_k2, num_stages=1):
+    for k2 in tl.range(0, num_k2, num_stages=1 if use_fp8_w8a8 else None):
         w2 = tl.load(
             w2_ptrs + k2 * BLOCK_SIZE_K2 * stride_w2k,
         )
