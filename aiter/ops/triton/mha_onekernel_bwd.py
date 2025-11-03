@@ -6,11 +6,6 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-import jax
-import jax.numpy as jnp
-import jax_triton as jt
-
-from utils.logger import AiterTritonLogger
 from _triton_kernels.mha_onekernel_bwd_kernel import (
     _bwd_preprocess,
     bwd_kernel_causal,
@@ -19,39 +14,31 @@ from _triton_kernels.mha_onekernel_bwd_kernel import (
 )
 
 
-_LOGGER = AiterTritonLogger()
-
-
-def safe_tensor(x):
-    if x is None:
-        return jnp.zeros((1,), dtype=jnp.int32)
-    return x
-
-
 def flash_attn_onekernel_backward(
-    # Input tensors
-    do: jnp.ndarray,
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    o: jnp.ndarray,
-    softmax_lse: jnp.ndarray,
-    # Output tensors
-    dq: jnp.ndarray,
-    dk: jnp.ndarray,
-    dv: jnp.ndarray,
-    dbias: jnp.ndarray,
-    # Configurations
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    dbias: torch.Tensor,
     sm_scale: float,
-    alibi_slopes: Optional[jnp.ndarray],
+    alibi_slopes: Optional[torch.Tensor],
     causal: bool,
-    cu_seqlens_q: Optional[jnp.ndarray],
-    cu_seqlens_k: Optional[jnp.ndarray],
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
     philox_seed: Optional[int] = 0,
     philox_offset: Optional[int] = 0,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+    descale_v: Optional[torch.Tensor] = None,
+    descale_do: Optional[torch.Tensor] = None,
     USE_INT64_STRIDES: Optional[bool] = False,
     config: Optional[Dict[str, any]] = None,
 ):
@@ -66,16 +53,28 @@ def flash_attn_onekernel_backward(
         (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     )
 
-    IS_VARLEN = True if cu_seqlens_q is not None else False
+    IS_FP8 = _is_fp8(q)
+    if IS_FP8:
+        FP8_MAX = torch.finfo(q.dtype).max
+        descale_strides = (
+            descale_q.stride(0),
+            descale_k.stride(0),
+            descale_v.stride(0),
+            descale_do.stride(0),
+        )
+    else:
+        FP8_MAX = None
+        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = (
+            stride_descale_do_z
+        ) = None
+        descale_strides = (
+            stride_descale_q_z,
+            stride_descale_k_z,
+            stride_descale_v_z,
+            stride_descale_do_z,
+        )
 
-    q_strides_in = jt.strides_from_shape(q.shape)
-    k_strides_in = jt.strides_from_shape(k.shape)
-    v_strides_in = jt.strides_from_shape(v.shape)
-    o_strides_in = jt.strides_from_shape(o.shape)
-    dq_strides_in = jt.strides_from_shape(dq.shape)
-    dk_strides_in = jt.strides_from_shape(dk.shape)
-    dv_strides_in = jt.strides_from_shape(dv.shape)
-    do_strides_in = jt.strides_from_shape(do.shape)
+    IS_VARLEN = True if cu_seqlens_q is not None else False
 
     # get strides and shape
     if IS_VARLEN:
@@ -87,46 +86,45 @@ def flash_attn_onekernel_backward(
             q.shape[2],
         )
         _, num_k_heads = max_seqlen_k, k.shape[1]
-        num_k_heads = k.shape[1]
-        q_strides = (0, q_strides_in[1], q_strides_in[0], q_strides_in[2])
-        k_strides = (0, k_strides_in[1], k_strides_in[0], k_strides_in[2])
-        v_strides = (0, v_strides_in[1], v_strides_in[0], v_strides_in[2])
-        o_strides = (0, o_strides_in[1], o_strides_in[0], o_strides_in[2])
-        dq_strides = (0, dq_strides_in[1], dq_strides_in[0], dq_strides_in[2])
-        dk_strides = (0, dk_strides_in[1], dk_strides_in[0], dk_strides_in[2])
-        dv_strides = (0, dv_strides_in[1], dv_strides_in[0], dv_strides_in[2])
-        do_strides = (0, do_strides_in[1], do_strides_in[0], do_strides_in[2])
+        q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
+        q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
+        k_strides = (0, k.stride(1), k.stride(0), k.stride(2))
+        v_strides = (0, v.stride(1), v.stride(0), v.stride(2))
+        o_strides = (0, o.stride(1), o.stride(0), o.stride(2))
+        dq_strides = (0, dq.stride(1), dq.stride(0), dq.stride(2))
+        dk_strides = (0, dk.stride(1), dk.stride(0), dk.stride(2))
+        dv_strides = (0, dv.stride(1), dv.stride(0), dv.stride(2))
+        do_strides = (0, do.stride(1), do.stride(0), do.stride(2))
     else:
         # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim]
         batch, seqlen_q, num_q_heads, head_sz = q.shape
-        num_k_heads = k.shape[2]
-        q_strides = (q_strides_in[0], q_strides_in[2], q_strides_in[1], q_strides_in[3])
-        k_strides = (k_strides_in[0], k_strides_in[2], k_strides_in[1], k_strides_in[3])
-        v_strides = (v_strides_in[0], v_strides_in[2], v_strides_in[1], v_strides_in[3])
-        o_strides = (o_strides_in[0], o_strides_in[2], o_strides_in[1], o_strides_in[3])
-        dq_strides = (dq_strides_in[0], dq_strides_in[2], dq_strides_in[1], dq_strides_in[3])
-        dk_strides = (dk_strides_in[0], dk_strides_in[2], dk_strides_in[1], dk_strides_in[3])
-        dv_strides = (dv_strides_in[0], dv_strides_in[2], dv_strides_in[1], dv_strides_in[3])
-        do_strides = (do_strides_in[0], do_strides_in[2], do_strides_in[1], do_strides_in[3])
+        _, num_k_heads = k.shape[1], k.shape[2]
+        q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
+        k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
+        v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
+        o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
+        dq_strides = (dq.stride(0), dq.stride(2), dq.stride(1), dq.stride(3))
+        dk_strides = (dk.stride(0), dk.stride(2), dk.stride(1), dk.stride(3))
+        dv_strides = (dv.stride(0), dv.stride(2), dv.stride(1), dv.stride(3))
+        do_strides = (do.stride(0), do.stride(2), do.stride(1), do.stride(3))
 
     # BLOCK_D_MODEL, BLOCK_D_MODEL_POW2
     # padding for head_dim. Power of 2 or 16
     BLOCK_D_MODEL_POW2 = triton.next_power_of_2(head_sz)
     BLOCK_D_MODEL_POW2 = max(BLOCK_D_MODEL_POW2, 16)
 
-    # init delta
-    delta = jnp.zeros_like(softmax_lse)
-    delta_strides_in = jt.strides_from_shape(delta.shape)
-    if IS_VARLEN:
-        # [total_tokens, num_q_heads, seqlen_q]
-        delta_strides = (0, delta_strides_in[1], delta_strides_in[0])
-    else:
-        # [batch, num_q_heads, seqlen_q]
-        delta_strides = delta_strides_in
-
     # Configs
     if config is None:
         config = _get_config()
+
+    # init delta
+    delta = torch.zeros_like(softmax_lse)
+    if IS_VARLEN:
+        # [total_tokens, num_q_heads, seqlen_q]
+        delta_strides = (0, delta.stride(1), delta.stride(0))
+    else:
+        # [batch, num_q_heads, seqlen_q]
+        delta_strides = delta.stride()
 
     # preprocess
     # compute D(delta) = rowsum(dO*O). Note, multiplication is element-wise.
@@ -135,37 +133,32 @@ def flash_attn_onekernel_backward(
         batch,
         num_q_heads,
     )
-    out_shape = jax.ShapeDtypeStruct(shape=delta.shape, dtype=delta.dtype)
-
-    metaparams_pre = dict(
-        BLOCK_M=config["preprocess_kernel"]["PRE_BLOCK"],
-        BLOCK_D_MODEL=head_sz,
-        BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
-        IS_VARLEN=IS_VARLEN,
-    )
-
-    delta = jt.triton_call(
+    _bwd_preprocess[pre_grid](
         o,
         do,
         delta,
         *o_strides,
         *delta_strides,
-        safe_tensor(cu_seqlens_q),
+        descale_strides[3],
+        cu_seqlens_q,
         max_seqlen_q,
-        kernel=_bwd_preprocess,
-        grid=pre_grid,
-        out_shape=out_shape,
-        **metaparams_pre
+        descale_do,
+        BLOCK_M=config["preprocess_kernel"]["PRE_BLOCK"],
+        BLOCK_D_MODEL=head_sz,
+        BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
+        IS_VARLEN=IS_VARLEN,
+        IS_FP8=IS_FP8,
     )
 
     # dropout_mask
     use_dropout = dropout_p > 0.0
     if use_dropout:
-        dropout_mask = jnp.zeros(
+        dropout_mask = torch.zeros(
             (batch, num_q_heads, max_seqlen_q, max_seqlen_k),
-            dtype=jnp.float32,
+            device=q.device,
+            dtype=torch.float32,
         )
-        dropout_strides = jt.strides_from_shape(dropout_mask.shape)
+        dropout_strides = dropout_mask.stride()
     else:
         dropout_mask = None
         dropout_strides = (0, 0, 0, 0)
@@ -173,19 +166,6 @@ def flash_attn_onekernel_backward(
     seqlen = max(max_seqlen_q, max_seqlen_k)
 
     config_onekernel = config["onekernel"]
-
-    metaparams = dict(
-        HEAD_DIM=head_sz,
-        ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
-        ENABLE_DROPOUT=use_dropout,
-        IS_VARLEN=IS_VARLEN,
-        USE_ALIBI=use_alibi,
-        USE_EXP2=True,
-        DEBUG_TRITON=False,
-        DEBUG_TRITON_DETAIL=False,
-        USE_INT64_STRIDES=USE_INT64_STRIDES,
-    )
-
     grid = (
         num_k_heads,
         triton.cdiv(seqlen, config_onekernel["BLOCK_N1"]),
@@ -193,83 +173,166 @@ def flash_attn_onekernel_backward(
     )
 
     if causal:
-        kernel = bwd_kernel_causal
+        bwd_kernel_causal[grid](
+            q,
+            k,
+            v,
+            sm_scale,
+            do,
+            dq,
+            dk,
+            dv,
+            softmax_lse,
+            delta,
+            *q_strides,
+            *k_strides,
+            *v_strides,
+            *dq_strides,
+            *dk_strides,
+            *dv_strides,
+            *delta_strides,
+            *do_strides,
+            *dropout_strides,
+            *descale_strides,
+            stride_az,
+            stride_ah,
+            num_q_heads,
+            num_k_heads,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_mask,
+            dropout_p,
+            philox_seed,
+            philox_offset,
+            alibi_slopes,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_do,
+            HEAD_DIM=head_sz,
+            ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
+            ENABLE_DROPOUT=use_dropout,
+            IS_VARLEN=IS_VARLEN,
+            USE_ALIBI=use_alibi,
+            USE_EXP2=True,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
+            FP8_OUTPUT=False,
+            DEBUG_TRITON=False,
+            DEBUG_TRITON_DETAIL=False,
+            USE_INT64_STRIDES=USE_INT64_STRIDES,
+            **config_onekernel,
+        )
     else:
-        kernel = bwd_kernel_noncausal
+        bwd_kernel_noncausal[grid](
+            q,
+            k,
+            v,
+            sm_scale,
+            do,
+            dq,
+            dk,
+            dv,
+            softmax_lse,
+            delta,
+            *q_strides,
+            *k_strides,
+            *v_strides,
+            *dq_strides,
+            *dk_strides,
+            *dv_strides,
+            *delta_strides,
+            *do_strides,
+            *dropout_strides,
+            *descale_strides,
+            stride_az,
+            stride_ah,
+            num_q_heads,
+            num_k_heads,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_mask,
+            dropout_p,
+            philox_seed,
+            philox_offset,
+            alibi_slopes,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_do,
+            HEAD_DIM=head_sz,
+            ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
+            ENABLE_DROPOUT=use_dropout,
+            IS_VARLEN=IS_VARLEN,
+            USE_ALIBI=use_alibi,
+            USE_EXP2=True,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
+            FP8_OUTPUT=False,
+            DEBUG_TRITON=False,
+            DEBUG_TRITON_DETAIL=False,
+            USE_INT64_STRIDES=USE_INT64_STRIDES,
+            **config_onekernel,
+        )
 
-    out_shape = [
-        jax.ShapeDtypeStruct(shape=dk.shape, dtype=dk.dtype),
-        jax.ShapeDtypeStruct(shape=dv.shape, dtype=dv.dtype),
-        jax.ShapeDtypeStruct(shape=dq.shape, dtype=dq.dtype),        
-    ]
-
-    dq, dk, dv = jt.triton_call(
-        # Input tensors
-        q, k, v,
-        do,
-        softmax_lse, 
-        delta,
-        # Output tensors
-        dq, dk, dv,
-        # Strides
-        *q_strides,
-        *k_strides,
-        *v_strides,
-        *dq_strides,
-        *dk_strides,
-        *dv_strides,
-        *delta_strides,
-        *do_strides,
-        *dropout_strides,
-        stride_az,
-        stride_ah,
-        # Configurations
-        sm_scale,
-        num_q_heads,
-        num_k_heads,
-        safe_tensor(cu_seqlens_q),
-        safe_tensor(cu_seqlens_k),
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_mask,
-        dropout_p,
-        philox_seed,
-        philox_offset,
-        alibi_slopes,
-        kernel=kernel,
-        out_shape=out_shape,
-        grid=grid,
-        **metaparams,
-        **config_onekernel
-    )
-
-    return dq, dk, dv
+    return delta
 
 
-# MHA shape
+def mha_fwd_reference(q, k, v, causal=True, sm_scale=None):
+    """Reference forward using PyTorch to produce out and softmax_lse.
+
+    Returns:
+        out: [B, H, S, D]
+        softmax_lse: [B, H, S]  (logsumexp per query)
+    """
+    B, H, S, D = q.shape
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(D)
+
+    # [B, H, S, D] @ [B, H, D, S] -> [B, H, S, S]
+    logits = torch.matmul(q, k.transpose(-1, -2)) * sm_scale
+
+    # causal mask: allow j <= i
+    if causal:
+        # mask shape [Lq, Lk]
+        mask = torch.triu(torch.ones(S, S, device=q.device, dtype=torch.bool), diagonal=1)
+        logits = logits.masked_fill(mask, float('-inf'))
+
+    # logsumexp for numerical stability
+    max_score, _ = torch.max(logits, dim=-1, keepdim=True)
+    exp_scores = torch.exp(logits - max_score)
+    denom = torch.sum(exp_scores, dim=-1, keepdim=True)
+    softmax_lse = torch.log(denom) + max_score.squeeze(-1)  # [B,H,S]
+
+    # softmax normalization
+    p = exp_scores / denom  # [B,H,S,S]
+
+    # output
+    out = torch.matmul(p, v)  # [B,H,S,D]
+    return out, softmax_lse
+
+
 BATCH_SIZE: int = 2
-SEQ_LEN: int = 1024
 NUM_HEADS: int = 64
+SEQ_LEN: int = 4096
 HEAD_SIZE: int = 128
-
-MHA_SHAPE: tuple[int, int, int, int] = (BATCH_SIZE, SEQ_LEN, NUM_HEADS, HEAD_SIZE)
+MHA_SHAPE: tuple[int, int, int, int] = (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_SIZE)
 assert all(dim > 0 for dim in MHA_SHAPE)
-
-# MHA dtype
-MHA_DTYPE = jnp.float32
-
+MHA_DTYPE = torch.float32
 RNG_SEED = 42
 
 
 def main(unused_argv):
-    # generate random key
-    key = jax.random.PRNGKey(RNG_SEED)
-    q_key, k_key, v_key, do_key = jax.random.split(key, 4)
+    # generate input data, causal = True
+    torch.manual_seed(RNG_SEED)
 
-    # fwd inputs
-    q = jax.random.normal(q_key, MHA_SHAPE, dtype=MHA_DTYPE)
-    k = jax.random.normal(k_key, MHA_SHAPE, dtype=MHA_DTYPE)
-    v = jax.random.normal(v_key, MHA_SHAPE, dtype=MHA_DTYPE)
+    q = torch.randn(MHA_SHAPE, dtype=MHA_DTYPE)
+    k = torch.randn(MHA_SHAPE, dtype=MHA_DTYPE)
+    v = torch.randn(MHA_SHAPE, dtype=MHA_DTYPE)
 
     # configurations
     sm_scale = HEAD_SIZE ** -0.5
@@ -277,19 +340,21 @@ def main(unused_argv):
     alibi_slopes = None
     cu_seqlens_q = cu_seqlens_k = None
     max_seqlen_q = max_seqlen_k = SEQ_LEN
-    dropout_p = 0.2
+    dropout_p = 0.0
 
     # save fwd outputs for bwd
     o, softmax_lse = mha_fwd_reference(q, k, v, sm_scale=sm_scale, causal=causal)
-    do = jax.random.normal(do_key, o.shape, dtype=MHA_DTYPE)
+
+    # random upstream gradient
+    do = torch.randn_like(q)  # only when D_v == D_q
 
     # bwd outputs
-    dq = jnp.zeros_like(q)
-    dk = jnp.zeros_like(k)
-    dv = jnp.zeros_like(v)
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
 
-    # jax-triton mha fused bwd
-    dq, dk, dv = flash_attn_onekernel_backward(
+    # Triton results
+    dq, dk, dv = flash_attn_fused_backward(
         # Input tensors
         do=do,
         q=q,
@@ -316,15 +381,9 @@ def main(unused_argv):
         # USE_INT64_STRIDES=False,
         # config=config,
     )
-
-    dq_ref, dk_ref, dv_ref = jax_attn_bwd_reference(q,k,v)
-
-    # numeric check (allow fp16 tolerance)
-    atol = 1e-2 if MHA_DTYPE in (jnp.float16, jnp.bfloat16) else 1e-3
-    max_diff = jnp.max(jnp.abs(dq - dq_ref))
-        
-    assert jnp.allclose(dq, dq_ref, atol=atol), \
-        f"Max diff ({max_diff}) exceeds tolerance (atol={atol})"
+    
+    dq.block_until_ready()
+    print(dq)
 
 
 if __name__ == "__main__":

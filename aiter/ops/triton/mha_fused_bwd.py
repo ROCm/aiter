@@ -10,17 +10,12 @@ import jax
 import jax.numpy as jnp
 import jax_triton as jt
 
-from utils.logger import AiterTritonLogger
 from _triton_kernels.mha_fused_bwd_kernel import (
     _bwd_preprocess,
     _bwd_kernel_dkdvdq_causal,
     _bwd_kernel_dkdvdq_noncausal,
     _get_config,
 )
-
-
-_LOGGER = AiterTritonLogger()
-
 
 def safe_tensor(x):
     if x is None:
@@ -275,18 +270,13 @@ def mha_fwd_reference(q, k, v, causal=True, sm_scale=None):
     return out, softmax_lse
 
 
-# MHA shape
 BATCH_SIZE: int = 2
 SEQ_LEN: int = 1024
 NUM_HEADS: int = 64
 HEAD_SIZE: int = 128
-
 MHA_SHAPE: tuple[int, int, int, int] = (BATCH_SIZE, SEQ_LEN, NUM_HEADS, HEAD_SIZE)
 assert all(dim > 0 for dim in MHA_SHAPE)
-
-# MHA dtype
 MHA_DTYPE = jnp.float32
-
 RNG_SEED = 42
 
 
@@ -345,6 +335,9 @@ def main(unused_argv):
         # USE_INT64_STRIDES=False,
         # config=config,
     )
+    
+    dq.block_until_ready()
+    print(dq)
 
 
 if __name__ == "__main__":
