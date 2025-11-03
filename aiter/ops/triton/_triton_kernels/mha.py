@@ -150,8 +150,7 @@ def _attn_fwd_inner(
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
         # TODO: This can be optimized to only be true for the padded block.
-        # mask = tl.full([BLOCK_M, BLOCK_N], True, dtype=tl.int1)
-        mask = tl.full([1, 1], True, dtype=tl.int1)
+        mask = tl.full([BLOCK_M, BLOCK_N], True, dtype=tl.int1)
         if MASK_STEPS:
             # If this is the last block / iteration, we want to
             # mask if the sequence length is not a multiple of block size
@@ -173,11 +172,11 @@ def _attn_fwd_inner(
         q_mask = OFFS_M[:, None] < seqlen_q
         k_mask = (start_n + tl.arange(0, BLOCK_N))[None, :] < seqlen_k
         p_mask = q_mask & k_mask
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk_scale = SM_SCALE * RCP_LN2
+        # -- compute qk ----
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if HAS_PE:
             qk += tl.dot(q_pe, k_pe)
-        # -- compute qk ----
         if IS_FP8:
             qk += tl.dot(q, k) * descale_q * descale_k
         else:
@@ -862,16 +861,14 @@ def _get_config(
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict["default"] = config
+    fwd_cfg = _get_config._config_dict["default"]["fwd"]
+    has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
     # TODO: pe + dropout is not tuned
-    if (
-        has_pe
-        and (enable_dropout or dtype == torch.float32)
-        and "pe_dropout_or_fp32" in _get_config._config_dict["default"]["fwd"]
-    ):
-        return _get_config._config_dict["default"]["fwd"]["pe_dropout_or_fp32"]
-    elif has_pe and "pe" in _get_config._config_dict["default"]["fwd"]:
-        return _get_config._config_dict["default"]["fwd"]["pe"]
+    if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
+        return fwd_cfg["pe_dropout_or_fp32"]
+    elif has_pe and "pe" in fwd_cfg:
+        return fwd_cfg["pe"]
     elif enable_dropout or dtype == torch.float32:
-        return _get_config._config_dict["default"]["fwd"]["dropout_or_fp32"]
+        return fwd_cfg["dropout_or_fp32"]
     else:
-        return _get_config._config_dict["default"]["fwd"]["default"]
+        return fwd_cfg["default"]
