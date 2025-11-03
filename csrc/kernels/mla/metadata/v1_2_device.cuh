@@ -364,6 +364,12 @@ __global__ void kn_get_mla_metadata_v1_2_no_split(
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
     int32_t sum_blocks = 0;
+
+    for (int32_t bid = lane_idx; bid < params.ori_seqlen_qo - 1; bid += ck_tile::get_warp_size())
+    {
+        p_lds_kv_indptr[bid] = 0;
+    }
+
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
         int bid_ori = [&]() {
@@ -385,7 +391,7 @@ __global__ void kn_get_mla_metadata_v1_2_no_split(
         }
         else
         {
-            p_lds_kv_indptr[bid] = kv_end;
+            p_lds_kv_indptr[bid + params.ori_seqlen_qo - 1] = kv_end;
         }
 
         const int32_t num_blocks = int32_t((seqlen_kv + 15) >> 4);
@@ -419,7 +425,7 @@ __global__ void kn_get_mla_metadata_v1_2_no_split(
     int32_t curr_kv_block = 0;      // #blocks handled by previous cu part(s)
 
     int32_t curr_kv_begin  = 0;
-    int32_t curr_kv_end    = Traits::kIsSparse ? p_lds_seqlens_kv[0] : p_lds_kv_indptr[0];
+    int32_t curr_kv_end    = Traits::kIsSparse ? p_lds_seqlens_kv[0] : p_lds_kv_indptr[params.ori_seqlen_qo - 1];
     int32_t curr_kv_seqlen = curr_kv_end - curr_kv_begin;
 
     int32_t num_works = 0;
@@ -485,8 +491,8 @@ __global__ void kn_get_mla_metadata_v1_2_no_split(
                     }
                     else
                     {
-                        curr_kv_begin  = curr_kv_end;
-                        curr_kv_end    = p_lds_kv_indptr[curr_batch];
+                        curr_kv_begin  = p_lds_kv_indptr[curr_batch - 1];
+                        curr_kv_end    = p_lds_kv_indptr[curr_batch + params.ori_seqlen_qo - 1];
                         curr_kv_seqlen = curr_kv_end - curr_kv_begin;
                     }
                 }
@@ -618,6 +624,7 @@ void get_mla_metadata_v1_2_device(
         if (topk == -1)
         {
             constexpr bool kIsSparse = false;
+            params.ori_seqlen_qo = 1;
             MLA_UNI_SEQLEN_DISPATCHER(
                 kn_get_mla_metadata_v1_2_no_split<Traits>
                     <<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params)
@@ -637,13 +644,13 @@ void get_mla_metadata_v1_2_device(
     }
     else
     {
+        params.num_batches = uni_seqlen_qo * params.num_batches;
+        params.uni_seqlen_qo = 1;
+        params.ori_seqlen_qo = uni_seqlen_qo;
         constexpr bool kQoSplits = true;
         if (topk == -1)
         {
             constexpr bool kIsSparse = false;
-            params.num_batches = uni_seqlen_qo * params.num_batches;
-            params.uni_seqlen_qo = 1;
-            params.ori_seqlen_qo = uni_seqlen_qo;
 
             MLA_UNI_SEQLEN_DISPATCHER(
                 kn_get_mla_metadata_v1_2_no_split<Traits>
@@ -652,9 +659,6 @@ void get_mla_metadata_v1_2_device(
         }
         else
         {
-            params.num_batches = uni_seqlen_qo * params.num_batches;
-            params.uni_seqlen_qo = 1;
-            params.ori_seqlen_qo = uni_seqlen_qo;
             constexpr bool kIsSparse = true;
             MLA_UNI_SEQLEN_DISPATCHER(
                 kn_get_mla_metadata_v1_2_no_split<Traits>

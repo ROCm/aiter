@@ -31,7 +31,7 @@ def cal_diff(
     RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
     amax_diff = (x - y).abs().max().item()
-    # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
+    print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
     else:
@@ -187,7 +187,7 @@ def test_mla(
     )
 
     # for none absorb (mha)
-    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
     us_asm = None
@@ -276,7 +276,7 @@ def test_mla(
         "kv_granularity": max(page_size, 16),
         "max_seqlen_qo": max_seqlen_qo,
         "uni_seqlen_qo": mtp,
-        # "fast_mode": 1,
+        "fast_mode": 1,
     }
     # _, us_asm_decode = run_perftest(
     #     aiter.get_mla_metadata_v1,
@@ -296,7 +296,8 @@ def test_mla(
     )
 
     # print(work_indptr)
-    # print(work_info_set[: work_indptr[-1]])
+
+    print(work_info_set[: work_indptr[-1]])
     # print(reduce_indptr)
     # print(reduce_final_map)
     # print(reduce_partial_map)
@@ -332,9 +333,8 @@ def test_mla(
     #               msg=f'attn_logits [golden vs aiter_asm]')
     # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
     flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
-    bytes = (
-        total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
-    ) * (torch.finfo(dtype).bits // 8)
+    bytes = (total_kv * nhead_kv * qk_head_dim + total_q * nhead * qk_head_dim) + \
+        total_q * nhead * v_head_dim * (torch.finfo(dtype).bits // 8)
     err = checkAllclose(
         out_ref,
         out_asm,
@@ -384,7 +384,7 @@ parser.add_argument(
     "-qn",
     "--qk_nope_head_dim",
     type=int,
-    default=512,
+    default=128,
     help="""qk nope head dim.
     e.g.: -qn 512""",
 )
