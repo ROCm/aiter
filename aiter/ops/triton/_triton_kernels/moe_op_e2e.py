@@ -366,11 +366,14 @@ def e2e_moe_kernel(
                     )
                 else:
                     w2_scale = group_broadcast(w2_scale, 1, num_scales_along_k2, group_k, 1)
-
-            w2 = (w2.to(tl.float32) * w2_scale.to(tl.float32)).to(tl.bfloat16)
+                w2 = w2 * w2_scale.to(tl.float32)
+            w2 = w2.to(tl.bfloat16)
             out = tl.dot(acc, w2)
         else:
             out = tl.dot(acc, w2)
+
+        if use_fp8_w8a8 and not use_block_scale:
+            out = out * w2_scale
 
         if MUL_ROUTED_WEIGHT:
             moe_weight = tl.load(
