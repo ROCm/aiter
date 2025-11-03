@@ -303,16 +303,13 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
 
     if (!deterministic) {
         if (is_v3_atomic_fp32) {
-            dq_accum = torch::zeros({1, batch_size, num_heads, seqlen_q, head_size_v}, opts.dtype(at::kFloat));
+            dq_accum = torch::zeros({1, batch_size, num_heads, seqlen_q, head_size_q}, opts.dtype(at::kFloat));
         } else {
-            // When atomic16, padding dq_accum seqlen to 16x, head dim to 128
+            // When atomic16, padding dq_accum seqlen to 16x, head dim to 128/192
             // In this case, dq_accum could have any layout, we set it to be `bhsd`
-            dq_accum = torch::zeros({1, batch_size, num_heads, (seqlen_q + 15) / 16 * 16, 128}, opts.dtype(q_dtype));
+            int padded_head_size_q = head_size_q == 192? 192: 128;
+            dq_accum = torch::zeros({1, batch_size, num_heads, (seqlen_q + 15) / 16 * 16, padded_head_size_q}, opts.dtype(q_dtype));
         }
-    } else {
-        const ck_tile::index_t kN0 = head_size_v <= 128 ? 128 : 64;
-        const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(seqlen_k, kN0);
-        dq_accum = torch::zeros({nsplits, batch_size, num_heads, seqlen_q, head_size_v}, opts.dtype(at::kFloat));
     }
 
     at::Tensor dk_expanded, dv_expanded;
