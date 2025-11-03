@@ -1502,10 +1502,11 @@ def _flash_attn_backward(
         ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= not deterministic or is_950_1block
-        ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
-
+        ret &= (
+            (hdim_q > 64 and hdim_q <= 128)
+            or (hdim_q == 192 and hdim_v == 128 and nmask)
+        ) and hdim_q % 8 == 0
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()

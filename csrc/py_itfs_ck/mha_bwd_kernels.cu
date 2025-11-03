@@ -329,14 +329,14 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
     at::Tensor dq_accum;
 
     if (!deterministic) {
-        dq_accum = torch::zeros({1, batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({1, batch_size, seqlen_q, num_heads, head_size_q}, opts.dtype(at::kFloat));
     } else {
-        const ck_tile::index_t kN0 = head_size_v <= 128 ? 128 : 64;
+        const ck_tile::index_t kN0 = head_size_q <= 128 ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(seqlen_k, kN0);
         if (mask.type == mask_enum::no_mask) 
-            dq_accum = torch::empty({nsplits, batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(at::kFloat));
+            dq_accum = torch::empty({nsplits, batch_size, seqlen_q, num_heads, head_size_q}, opts.dtype(at::kFloat));
         else  // Some block may be skipped with causal mask and dq are not set to zeros
-            dq_accum = torch::zeros({nsplits, batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(at::kFloat));
+            dq_accum = torch::zeros({nsplits, batch_size, seqlen_q, num_heads, head_size_q}, opts.dtype(at::kFloat));
     }
 
     at::Tensor dk_expanded, dv_expanded;
