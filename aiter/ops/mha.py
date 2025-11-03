@@ -1416,7 +1416,8 @@ def can_impl_fmha_v3_bwd(
         return ret
 
     # basic
-    ret = alibi_slopes is None
+    ret = get_gfx() == "gfx942"
+    ret &= alibi_slopes is None
     ret &= bias is None
     ret &= dbias is None
     ret &= dropout_p == 0.0
@@ -2028,7 +2029,8 @@ def _flash_attn_varlen_backward(
 
     def can_impl_fmha_v3_bwd():
         # basic
-        ret = alibi_slopes is None
+        ret = get_gfx() == "gfx942"
+        ret &= alibi_slopes is None
         # ret &= bias is None
         # ret &= dbias is None
         ret &= dropout_p == 0.0
