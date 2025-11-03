@@ -1,5 +1,35 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+//
+// ============================================================================
+// TOP-K KERNEL IMPLEMENTATION FOR AMD GPUS
+// ============================================================================
+//
+// This file implements three adaptive strategies for efficient Top-K selection:
+//
+// 1. WaveFilterStrategy - Ballot-based filtering for large, sparse datasets
+//    - Uses __ballot() to identify and compact passing candidates
+//    - Accumulates filtered candidates in shared memory staging buffer
+//    - Ideal when most values don't make it into Top-K
+//
+// 2. WaveBatchStrategy - Bitonic sort/merge for moderate datasets
+//    - Loads capacity-sized chunks, sorts, and merges using bitonic properties
+//    - Pure register-based, no shared memory overhead
+//    - Ideal when most values need consideration
+//
+// 3. WaveIterativeStrategy - Efficient merging of pre-sorted chunks
+//    - Assumes input is already sorted in k-sized chunks
+//    - Used for multi-block reduction phase
+//
+// AMD GPU Optimizations Used:
+//   - DPP (Data Parallel Primitives) for small-stride shuffles (≤8)
+//   - Wave intrinsics (__ballot, __popcll, __shfl) for parallel operations
+//   - Buffer load instructions for coalesced memory access
+//   - Bitonic sort/merge leveraging wave-level parallelism
+//   - Med3 intrinsics for branchless min/max operations
+//
+// See detailed examples and explanations inline with each strategy class.
+// ============================================================================
 
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -776,6 +806,33 @@ buffer_load(const SrcT* p_src_wave,
 } // namespace buffer_load_helpers
 
 // --- Wave-Level Priority Selection Primitives (AMD/HIP Optimized) ---
+//
+// THREE STRATEGIES FOR TOP-K SELECTION:
+//
+// 1. WaveFilterStrategy (lines ~873-1050)
+//    - Uses ballot-based filtering to skip irrelevant candidates
+//    - Best for: Large datasets where len_per_wave > capacity × 4
+//    - Uses shared memory for staging
+//    - Example: Finding top 100 from 1 million elements (most filtered out)
+//
+// 2. WaveBatchStrategy (lines ~1075-1242)
+//    - Processes data in capacity-sized batches with bitonic sort
+//    - Best for: Moderate datasets where len_per_wave ≤ capacity × 4
+//    - Register-only, no shared memory
+//    - Example: Finding top 100 from 10,000 elements
+//
+// 3. WaveIterativeStrategy (lines ~1244-1310)
+//    - Merges pre-sorted k-sized chunks iteratively
+//    - Best for: Multi-block reduction (merging results from multiple blocks)
+//    - Used in second pass when first pass produces multiple results
+//    - Example: Combining top-100 results from 8 different blocks
+//
+// Selection logic (see AdaptiveTopK, lines ~1750-1780):
+//   - Compute len_per_wave based on launch configuration
+//   - If len_per_wave ≤ capacity × 4: Use WaveBatchStrategy
+//   - If len_per_wave > capacity × 4: Use WaveFilterStrategy
+//   - For multi-block reduction: Always use WaveIterativeStrategy
+//
 
 // Forward declarations for algorithm strategy traits
 template <int capacity, bool descending, typename T, typename IdxT>
@@ -846,6 +903,31 @@ struct AlgorithmTraits
 template <int capacity, bool descending, typename T, typename IdxT>
 struct WaveMergeHelper
 {
+    // Merges a sorted k-element chunk with the buffer's existing Top-K
+    // EXAMPLE (finding Top-4 largest, capacity=64, k=4):
+    //   Wave-distributed storage (64 lanes, each lane holds slots_per_lane=1 value):
+    //     Lanes 0-3: [80, 85, 90, 95] (current top-4, in ascending order)
+    //     Lanes 4-63: [-∞, -∞, ...] (sentinels)
+    //   Input chunk: in[start+0]=65, in[start+1]=70, in[start+2]=75, in[start+3]=100
+    //
+    //   Element-wise comparison (reads input in reverse, idx = start + 63 - lane_id):
+    //     Lane 0: idx=start+63 (out of range, skip)
+    //     ...
+    //     Lane 60: idx=start+3, reads 65, compares with -∞ → update to 65
+    //     Lane 61: idx=start+2, reads 70, compares with -∞ → update to 70
+    //     Lane 62: idx=start+1, reads 75, compares with -∞ → update to 75
+    //     Lane 63: idx=start+0, reads 100, compares with -∞ → update to 100
+    //
+    //   After element-wise updates (before merge):
+    //     Lanes: [80,85,90,95, -∞,...,-∞, 65,70,75,100]
+    //             ↑ lanes 0-3    ↑lanes 4-59 ↑lanes 60-63
+    //
+    //   BitonicMerge (ascending) redistributes across all lanes:
+    //     Result: [-∞,...,-∞, 65,70,75,80,85,90,95,100]
+    //             ↑lanes 0-55 ↑──── lanes 56-63 ────↑
+    //
+    //   Extract top-k=4 (last 4 in ascending order):
+    //     Lanes 60-63 now contain: [85, 90, 95, 100]
     __device__ static void merge_sorted_range(WaveBuffer<capacity, T, IdxT>& buffer,
                                               const T* __restrict__ in,
                                               const IdxT* __restrict__ in_idx,
@@ -871,6 +953,25 @@ struct WaveMergeHelper
 };
 
 // WaveFilterStrategy: Ballot-based filtering with dynamic batching (AMD-optimized)
+//
+// EXAMPLE: Finding Top-4 largest from [50, 10, 5, 80, 3, 90, 2, 95, 1, 70, ...]
+//
+// Initial state:
+//   buffer_ = [-∞, -∞, -∞, -∞], threshold_ = -∞
+//
+// Pass 1 (elements 0-63, all pass threshold=-∞):
+//   ballot = 0xFFFFFFFFFFFFFFFF (all 64 bits set)
+//   staging fills: [50, 10, 5, 80, ..., 95, 90, ...]
+//   integrate → buffer_ = [50, 80, 90, 95], threshold_ = 50
+//
+// Pass 2 (elements 64-127, only 3 pass threshold=50):
+//   Lane 3: 60 > 50 (✓), Lane 19: 100 > 50 (✓), Lane 32: 70 > 50 (✓)
+//   ballot = 0x0000000100080008 (sparse! only 3 bits set)
+//   lane_offset computed via __popcll: Lane 3→0, Lane 19→1, Lane 32→2
+//   staging accumulates: [60, 100, 70, ?, ?, ...], batch_len_ = 3
+//   (waits for more candidates to fill to 64)
+//
+// ... Continue until batch_len_ >= 64, then integrate ...
 template <int capacity, bool descending, typename T, typename IdxT>
 class WaveFilterStrategy
 {
@@ -882,14 +983,14 @@ class WaveFilterStrategy
           batch_len_(0)
     {
         // Setup shared memory staging area for ballot-filtered candidates
-        extern __shared__ char smem_buf[];
+        extern __shared__ char lds_buf[];
         const int num_waves = blockDim.x / utils::WAVE_SIZE;
         const int wave_id   = threadIdx.x / utils::WAVE_SIZE;
-        staging_vals_       = reinterpret_cast<T*>(smem_buf) + wave_id * utils::WAVE_SIZE;
+        staging_vals_       = reinterpret_cast<T*>(lds_buf) + wave_id * utils::WAVE_SIZE;
         const size_t vals_size =
             utils::round_up_to_multiple_of<16>(num_waves * sizeof(T) * utils::WAVE_SIZE);
         staging_indices_ =
-            reinterpret_cast<IdxT*>(smem_buf + vals_size) + wave_id * utils::WAVE_SIZE;
+            reinterpret_cast<IdxT*>(lds_buf + vals_size) + wave_id * utils::WAVE_SIZE;
     }
 
     __device__ void process_range(const T* __restrict__ in, IdxT start, IdxT end)
@@ -914,12 +1015,24 @@ class WaveFilterStrategy
 
     __device__ void filter_and_batch(T candidate, IdxT position)
     {
+        // EXAMPLE: threshold_=50, candidates=[15,10,60,8,...,100,...,70]
+        //   Lane 0: 15<50 → passes=false
+        //   Lane 2: 60>50 → passes=true
+        //   Lane 19: 100>50 → passes=true
+        //   Lane 32: 70>50 → passes=true
+        //   ballot = 0x0000000100080004 (3 bits set at positions 2,19,32)
         const bool passes     = numeric::is_preferred<descending>(candidate, threshold_);
         const uint64_t ballot = __ballot(passes);
 
         if(ballot == 0)
             return;
 
+        // Compact passing candidates using parallel prefix sum via __popcll
+        // EXAMPLE: ballot=0x0000000100080004, batch_len_=5 (5 already in staging)
+        //   Lane 2: lane_offset=0 (0 bits before pos 2), slot=5+0=5 → staging[5]=60
+        //   Lane 19: lane_offset=1 (1 bit before pos 19), slot=5+1=6 → staging[6]=100
+        //   Lane 32: lane_offset=2 (2 bits before pos 32), slot=5+2=7 → staging[7]=70
+        //   batch_len_ = 5 + 3 = 8 (8 candidates accumulated now)
         const int lane_offset = __popcll(ballot & ((1ull << buffer_.lane_id) - 1));
         const int batch_base  = batch_len_;
         const int slot        = batch_base + lane_offset;
@@ -952,6 +1065,14 @@ class WaveFilterStrategy
 
     __device__ void finalize()
     {
+        // Handle remaining candidates in staging buffer after all inputs processed
+        // EXAMPLE: After processing all inputs, batch_len_=17 (partial batch)
+        //   staging_vals_ = [60, 55, 72, ..., 85, ?, ?, ...]
+        //                    ↑──── 17 valid ────↑  ↑─ unused
+        //   Pad with sentinels to make full wave:
+        //     Lanes 0-16: real values [60, 55, 72, ...]
+        //     Lanes 17-63: sentinels [-∞, -∞, ...] (neutral, won't affect Top-K)
+        //   Then integrate_batch() processes all 64 lanes safely
         if(batch_len_)
         {
             T val =
@@ -1031,6 +1152,33 @@ struct AlgorithmTraits<WaveFilterStrategy<capacity, descending, T, IdxT>>
 };
 
 // WaveBatchStrategy: Batches data and uses bitonic sort for streaming inputs
+//
+// EXAMPLE: Finding Top-4 largest from [5, 2, 8, 1, 9, 3, 7, 4, 6, 10, 11, 12]
+//          (capacity=8, processes 8 elements at a time)
+//
+// Step 1: Initialize with first 8 elements
+//   Load:    [5, 2, 8, 1, 9, 3, 7, 4]
+//   Sort ascending:  buffer_ = [1, 2, 3, 4, 5, 7, 8, 9]
+//
+// Step 2: Load next chunk [6, 10, 11, 12] (padded to 8 with -∞)
+//   Load:    [6, 10, 11, 12, -∞, -∞, -∞, -∞]
+//   Sort descending:  temp_ = [12, 11, 10, 6, -∞, -∞, -∞, -∞]
+//
+// Step 3: Element-wise merge creates bitonic sequence
+//   buffer_[0]=1 vs temp_[0]=12 → buffer_[0]=12
+//   buffer_[1]=2 vs temp_[1]=11 → buffer_[1]=11
+//   buffer_[2]=3 vs temp_[2]=10 → buffer_[2]=10
+//   buffer_[3]=4 vs temp_[3]=6  → buffer_[3]=6
+//   buffer_[4]=5 vs temp_[4]=-∞ → buffer_[4]=5
+//   buffer_[5]=7 vs temp_[5]=-∞ → buffer_[5]=7
+//   buffer_[6]=8 vs temp_[6]=-∞ → buffer_[6]=8
+//   buffer_[7]=9 vs temp_[7]=-∞ → buffer_[7]=9
+//   Result: buffer_ = [12, 11, 10, 6, 5, 7, 8, 9]  (bitonic)
+//
+// Step 4: BitonicMerge restores sorted order
+//   buffer_ = [5, 6, 7, 8, 9, 10, 11, 12]  (ascending)
+//
+// Final: Extract Top-4 largest = [9, 10, 11, 12]
 template <int capacity, bool descending, typename T, typename IdxT>
 class WaveBatchStrategy
 {
@@ -1134,6 +1282,12 @@ class WaveBatchStrategy
 
     __device__ void merge_batches_()
     {
+        // Element-wise comparison creates a bitonic sequence, then merge sorts it
+        // EXAMPLE (finding largest):
+        //   buffer_ = [1, 2, 3, 4]  (ascending from previous iteration)
+        //   temp_   = [12, 11, 10, 6]  (descending from current batch sort)
+        //   After element-wise: buffer_ = [12, 11, 10, 6]  (take all from temp_)
+        //   After BitonicMerge: buffer_ = [6, 10, 11, 12]  (ascending again)
 #pragma unroll
         for(int i = 0; i < buffer_.slots_per_lane; ++i)
         {
@@ -1164,6 +1318,35 @@ struct AlgorithmTraits<WaveBatchStrategy<capacity, descending, T, IdxT>>
 };
 
 // WaveIterativeStrategy: Iteratively merges pre-sorted k-sized chunks
+//
+// EXAMPLE: Finding Top-4 largest from 3 pre-sorted chunks (k=4 each, capacity=64)
+//   Input chunks (each sorted ascending, result of previous WaveBatchStrategy):
+//     Chunk 0: [80, 85, 90, 95]
+//     Chunk 1: [65, 70, 75, 100]
+//     Chunk 2: [55, 60, 88, 110]
+//
+// Step 1: Initialize with first chunk (wave-distributed)
+//   Lane 0 loads in[start+0]=80
+//   Lane 1 loads in[start+1]=85
+//   Lane 2 loads in[start+2]=90
+//   Lane 3 loads in[start+3]=95
+//   Lanes 4-63: [-∞, -∞, ...]
+//   Wave state: [80, 85, 90, 95, -∞×60]
+//
+// Step 2: Merge chunk 1 using merge_sorted_range
+//   Lanes 60-63 read chunk 1 (in reverse): [65, 70, 75, 100]
+//   Before merge: [80,85,90,95, -∞×56, 65,70,75,100]
+//   BitonicMerge redistributes: [-∞×56, 65,70,75,80,85,90,95,100]
+//   Top-4 now in lanes 60-63: [85, 90, 95, 100]
+//
+// Step 3: Merge chunk 2
+//   Current: [-∞×56, 85,90,95,100, -∞×4]  (after redistribution to lanes 0-3)
+//   Lanes 60-63 read chunk 2: [55, 60, 88, 110]
+//   Before merge: [85,90,95,100, -∞×56, 55,60,88,110]
+//   BitonicMerge: [-∞×56, 55,60,85,88,90,95,100,110]
+//   Top-4 in last positions: [90, 95, 100, 110]
+//
+// Final: Top-4 largest = [90, 95, 100, 110]
 template <int capacity, bool descending, typename T, typename IdxT>
 class WaveIterativeStrategy
 {
@@ -1241,13 +1424,13 @@ template <template <int, bool, typename, typename> class StrategyImpl,
 class WorkgroupTopKCoordinator
 {
     public:
-    __device__ WorkgroupTopKCoordinator(IdxT k, T sentinel, void* smem_buf)
+    __device__ WorkgroupTopKCoordinator(IdxT k, T sentinel, void* lds_buf)
         : strategy_(k, sentinel), k_(k), sentinel_(sentinel)
     {
         const int num_waves = blockDim.x / utils::WAVE_SIZE;
-        val                 = reinterpret_cast<T*>(smem_buf);
+        val                 = reinterpret_cast<T*>(lds_buf);
         pos                 = reinterpret_cast<IdxT*>(
-            reinterpret_cast<char*>(smem_buf) +
+            reinterpret_cast<char*>(lds_buf) +
             utils::round_up_to_multiple_of<16>(num_waves / 2 * sizeof(T) * k_));
     }
 
@@ -1435,7 +1618,7 @@ __global__ void __launch_bounds__(512, 2) block_kernel(const T* __restrict__ in,
                                                        IdxT* __restrict__ out_idx,
                                                        T dummy)
 {
-    extern __shared__ char smem_buf[];
+    extern __shared__ char lds_buf[];
     const int num_of_block        = gridDim.x / batch_size;
     // TODO: For now, WaveFilterStrategy always uses single-block mode.
     const IdxT len_per_block      = std::is_same_v<StrategyClass<capacity, greater, T, IdxT>,
@@ -1448,7 +1631,7 @@ __global__ void __launch_bounds__(512, 2) block_kernel(const T* __restrict__ in,
     IdxT end                      = std::min(start + len_per_block, len);
 
     WorkgroupTopKCoordinator<StrategyClass, capacity, greater, T, IdxT> coordinator(
-        k, dummy, smem_buf);
+        k, dummy, lds_buf);
     if constexpr(std::is_same_v<StrategyClass<capacity, greater, T, IdxT>,
                                 WaveIterativeStrategy<capacity, greater, T, IdxT>>)
     {
@@ -1507,7 +1690,7 @@ auto find_block_kernel(int k)
 }
 
 template <typename T, typename IdxT>
-int calc_smem_size_for_block_wide(int num_wave, IdxT k)
+int calc_lds_size_for_block_wide(int num_wave, IdxT k)
 {
     // Base size for reduction buffers
     int n         = std::max<int>(num_wave / 2 * k, num_wave * utils::WAVE_SIZE);
@@ -1519,11 +1702,11 @@ template <template <int, bool, typename, typename> class StrategyClass, typename
 void calc_launch_parameter_by_occupancy(IdxT k, int* block_size, int* min_grid_size)
 {
     auto func      = find_block_kernel<true, StrategyClass, T, IdxT>(k);
-    auto calc_smem = [k](int bs) {
-        return calc_smem_size_for_block_wide<T, IdxT>(bs / utils::WAVE_SIZE, k);
+    auto calc_lds  = [k](int bs) {
+        return calc_lds_size_for_block_wide<T, IdxT>(bs / utils::WAVE_SIZE, k);
     };
     HIP_CHECK(
-        hipOccupancyMaxPotentialBlockSizeVariableSMem(min_grid_size, block_size, func, calc_smem));
+        hipOccupancyMaxPotentialBlockSizeVariableSMem(min_grid_size, block_size, func, calc_lds));
 }
 
 template <template <int, bool, typename, typename> class StrategyClass>
@@ -1656,11 +1839,11 @@ void topk_kernel_launcher(int num_of_block,
     IdxT* result_idx       = (num_of_block == 1) ? out_idx : tmp_idx;
     int block_dim          = num_wave * utils::WAVE_SIZE;
 
-    int smem_size = calc_smem_size_for_block_wide<T, IdxT>(num_wave, k);
+    int lds_size = calc_lds_size_for_block_wide<T, IdxT>(num_wave, k);
 
     auto block_kernel_func = find_block_kernel<greater, StrategyClass, T, IdxT>(k);
 
-    block_kernel_func<<<batch_size * num_of_block, block_dim, smem_size, stream>>>(
+    block_kernel_func<<<batch_size * num_of_block, block_dim, lds_size, stream>>>(
         in, static_cast<IdxT*>(nullptr), batch_size, len, k, result_val, result_idx, dummy);
 
     if(num_of_block > 1)
@@ -1668,10 +1851,10 @@ void topk_kernel_launcher(int num_of_block,
         len = k * num_of_block;
         calc_launch_parameter_for_merge<T, IdxT>(len, k, &num_of_block, &num_wave);
         block_dim              = num_wave * utils::WAVE_SIZE;
-        smem_size              = calc_smem_size_for_block_wide<T, IdxT>(num_wave, k);
+        lds_size               = calc_lds_size_for_block_wide<T, IdxT>(num_wave, k);
         auto merge_kernel_func = find_block_kernel<greater, WaveIterativeStrategy, T, IdxT>(k);
 
-        merge_kernel_func<<<batch_size * num_of_block, block_dim, smem_size, stream>>>(
+        merge_kernel_func<<<batch_size * num_of_block, block_dim, lds_size, stream>>>(
             tmp_val, tmp_idx, batch_size, len, k, out, out_idx, dummy);
 
         HIP_CHECK(hipFree(tmp_val));
