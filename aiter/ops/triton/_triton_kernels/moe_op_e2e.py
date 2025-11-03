@@ -227,6 +227,10 @@ def e2e_moe_kernel(
             W1_scale + off_experts * stride_w1se + i1s[None, :] * stride_w1sn
         )
 
+    if use_fp8_w8a8 and not use_block_scale:
+        w1_scale = tl.load(W1_scale + off_experts)
+        a_scale = tl.load(A_scale)
+
     num_k1 = tl.cdiv(K, BLOCK_SIZE_K1)
     for k1 in tl.range(0, num_k1):
         # pipeline silu acc and mul acc so they can use the same LDS for weight loading
@@ -259,9 +263,6 @@ def e2e_moe_kernel(
                 a_scale = tl.load(
                     a_scale_ptrs, mask=token_mask[:, None], other=0.0
                 )
-            else:
-                w1_scale = tl.load(W1_scale + off_experts)
-                a_scale = tl.load(A_scale)
 
             silu_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
         else:
@@ -337,6 +338,9 @@ def e2e_moe_kernel(
 
     out_ptrs = Out + stride_om * offs_token[:, None] + offs_k2[None, :] * stride_ok
 
+    if use_fp8_w8a8 and not use_block_scale:
+        w2_scale = tl.load(W2_scale + off_experts)
+
     num_k2 = tl.cdiv(K, BLOCK_SIZE_K2)
     for k2 in tl.range(0, num_k2, num_stages=1 if use_fp8_w8a8 else None):
         w2 = tl.load(
@@ -361,8 +365,6 @@ def e2e_moe_kernel(
                     )
                 else:
                     w2_scale = group_broadcast(w2_scale, 1, num_scales_along_k2, group_k, 1)
-            else:
-                w2_scale = tl.load(W2_scale + off_experts)
 
             w2 = (w2.to(tl.float32) * w2_scale.to(tl.float32)).to(tl.bfloat16)
             out = tl.dot(acc, w2)
