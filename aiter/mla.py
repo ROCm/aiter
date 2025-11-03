@@ -195,7 +195,7 @@ def mla_decode_fwd(
         if nhead == 16 and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
 
-        logits = torch.zeros(
+        logits = torch.empty(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -269,7 +269,7 @@ def mla_decode_fwd(
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
-        logits = torch.zeros(
+        logits = torch.empty(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
