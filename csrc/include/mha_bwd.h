@@ -386,7 +386,8 @@ struct fmha_bwd_v3_traits
     int ts_dq = 64;
 };
 
-template <ck_tile::index_t HDim_,
+template <ck_tile::index_t HDim_q_,
+          ck_tile::index_t HDim_v_,
           typename DataType_,
           int mask_type_,
           bool kIsAtomic32_,
@@ -397,7 +398,8 @@ template <ck_tile::index_t HDim_,
           GPUArch GPUArch_>
 struct fmha_bwd_dq_dk_dv_v3_traits_
 {
-    static constexpr ck_tile::index_t HDim    = HDim_;
+    static constexpr ck_tile::index_t HDim_q  = HDim_q_;
+    static constexpr ck_tile::index_t HDim_v  = HDim_v_;
     using DataType                            = ck_tile::remove_cvref_t<DataType_>;
     static constexpr int mask_type            = mask_type_;
     static constexpr bool kIsAtomic32         = kIsAtomic32_;
