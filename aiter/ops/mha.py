@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from torch import Tensor, Generator
-from typing import Optional, Tuple, Any
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
+from typing import Any, Optional, Tuple
+
+import torch
+from torch import Generator, Tensor
+
+from ..jit.core import AITER_CSRC_DIR, CK_DIR, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
-import torch
 
 
 def cmdGenFunc_mha_fwd(
@@ -977,11 +979,83 @@ def cmdGenFunc_mha_batch_prefill(
     }
 
 
+def gen_mha_varlen_bwd_fake_tensors_common(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    max_seqlen_q: int,
+    zero_tensors: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+):
+    num_heads = q.size(1)
+
+    batch_size = cu_seqlens_q.numel() - 1
+    dq_ = torch.empty_like(q)
+    dk_ = torch.empty_like(k)
+    dv_ = torch.empty_like(v)
+    if dq is not None:
+        dq_ = dq
+    else:
+        dq_ = torch.empty_like(q)
+
+    if dk is not None:
+        dk_ = dk
+    else:
+        dk_ = torch.empty_like(k)
+
+    if dv is not None:
+        dv_ = dv
+    else:
+        dv_ = torch.empty_like(v)
+
+    softmax_d = torch.empty(batch_size, num_heads, max_seqlen_q, dtype=torch.float)
+
+    if zero_tensors:
+        dq_.zero_()
+        softmax_d.zero_()
+
+    return dq_, dk_, dv_, softmax_d
+
+
+def gen_mha_varlen_bwd_fake_tensors(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    return gen_mha_varlen_bwd_fake_tensors_common(
+        q, k, v, cu_seqlens_q, max_seqlen_q, zero_tensors, dq, dk, dv
+    )
+    # return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
+
+
 @compile_ops(
     "module_mha_varlen_bwd",
     fc_name="mha_varlen_bwd",
     gen_func=cmdGenFunc_mha_varlen_bwd,
-    gen_fake=gen_mha_bwd_fake_tensors,
+    gen_fake=gen_mha_varlen_bwd_fake_tensors,
 )
 def mha_varlen_bwd(
     dout: Tensor,
@@ -1037,7 +1111,10 @@ def gen_fmha_v3_varlen_bwd_fake_tensor(
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ):
-    return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
+    return gen_mha_varlen_bwd_fake_tensors_common(
+        q, k, v, cu_seqlens_q, max_seqlen_q, zero_tensors, dq, dk, dv
+    )
+    # return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
 
 @compile_ops(
@@ -1425,10 +1502,11 @@ def _flash_attn_backward(
         ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= not deterministic or is_950_1block
-        ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
-
+        ret &= (
+            (hdim_q > 64 and hdim_q <= 128)
+            or (hdim_q == 192 and hdim_v == 128 and nmask)
+        ) and hdim_q % 8 == 0
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
