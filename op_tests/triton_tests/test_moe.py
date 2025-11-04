@@ -1237,4 +1237,4 @@ def test_moe_e2e(
 
 
 if __name__ == "__main__":
-    test_moe_e2e(33, 1536, 4096, 8, 128, False, True, 128, 128, torch.bfloat16, 1)
+    test_moe_e2e(32, 1536, 4096, 8, 128, False, False, None, None, torch.bfloat16, 8)
