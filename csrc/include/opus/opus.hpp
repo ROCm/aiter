@@ -550,6 +550,36 @@ template <typename S> OPUS_H_D constexpr auto make_layout(S&& s) { return make_l
 template <typename S> OPUS_H_D constexpr auto               make_layout_packed(S&& s) { return make_layout(std::forward<S>(s), packed_shape_to_stride(s)); } // same as single arg make_layout
 template <typename Sx, typename Sz> OPUS_H_D constexpr auto make_layout_packed(Sx&& s, Sz&& c) { return make_layout(std::forward<Sx>(s), packed_shape_to_stride(s), std::forward<Sz>(c)); }
 
+template <typename Layout>
+OPUS_H_D constexpr auto layout_to_issue_space()
+{
+    using maybe_coord = std::conditional_t<std::is_same_v<typename Layout::Coord, false_type>, typename Layout::Shape, typename Layout::Coord>;
+    constexpr auto issue_space_y = pickup_shape(typename Layout::Shape{}, maybe_coord{}, underscore{});
+    using issue_space = std::conditional_t<std::is_same_v<typename Layout::Coord, false_type>, typename Layout::Shape, remove_cvref_t<decltype(issue_space_y)>>;
+    return issue_space{};
+}
+
+template<typename issue_space, int vec = 1>
+OPUS_H_D constexpr auto vectorize_issue_space(issue_space, number<vec> = {})
+{
+    constexpr index_t vec_from_issue_space = get<size<issue_space>() - 1>(issue_space{}).value;     // here we get the original last dim length(which should be y dim)
+    static_assert(vec_from_issue_space % vec == 0, "please make sure requested vec size can be dividable of vec from issue space");
+
+    constexpr auto issue_space_vec = transform_tuple_with_idx([&](auto item, auto index){           // modify the last dim, divide it by vec. Result is still a tuple
+        if constexpr (index.value == size<issue_space>() - 1) return number<item.value / vec_from_issue_space>{};
+        else                                                  return item;    }, issue_space{});
+
+    return issue_space_vec;
+}
+
+template <typename Layout, index_t vec = 1>
+OPUS_H_D constexpr auto layout_to_vectorized_issue_space(number<vec> = {})
+{
+    constexpr auto issue_space = layout_to_issue_space<Layout>();
+    constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+    static_assert(size<decltype(issue_space_vec)>() == Layout::coord_rank);
+    return issue_space_vec;
+}
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // vector, a wrapper for __attribute__((ext_vector_type(*)))
 template <typename V_, index_t N_> // V_ must be literal type, otherwise clang ext_vector_type will not recognize
@@ -845,23 +875,13 @@ struct gmem {
     template<index_t vec = 1, typename Layout, index_t aux = 0, std::enable_if_t<is_layout_v<Layout>, bool> = true>
     OPUS_D auto load(const Layout& u, int s_os = 0/* do we really need this? */, number<aux> = {})
     {
-        using maybe_coord = std::conditional_t<std::is_same_v<typename Layout::Coord, false_type>, typename Layout::Shape, typename Layout::Coord>;
-        constexpr auto issue_space_y = pickup_shape(typename Layout::Shape{}, maybe_coord{}, underscore{});
-        using issue_space = std::conditional_t<std::is_same_v<typename Layout::Coord, false_type>, typename Layout::Shape, remove_cvref_t<decltype(issue_space_y)>>;
-
-        constexpr index_t vec_from_issue_space = get<size<issue_space>() - 1>(issue_space{}).value;     // here we get the original last dim length(which should be y dim)
-        static_assert(vec_from_issue_space % vec == 0, "please make sure requested vec size can be dividable of vec from issue space");
-
-        constexpr auto issue_space_vec = transform_tuple_with_idx([&](auto item, auto index){           // modify the last dim, divide it by vec. Result is still a tuple
-            if constexpr (index.value == size<issue_space>() - 1) return number<item.value / vec_from_issue_space>{};
-            else                                                  return item;    }, issue_space{});
-
-        static_assert(size<decltype(issue_space_vec)>() == Layout::coord_rank);
-        constexpr index_t r_elem = [&](){ index_t n = 1; static_for<size<decltype(issue_space_vec)>()>([&](auto i){ n *= get<i>(issue_space_vec); }); return n; }();
+        constexpr auto issue_space = layout_to_issue_space<Layout>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
 
 #if OPUS_TILE_CONTAINER == 0
-        constexpr auto u_r = make_layout(issue_space{});                      // we use this layout to describe the register layout
-        vector_t<scalar_type, vec * vector_size * r_elem> r;                                      // local scratch to host the loaded register, and return it
+        constexpr auto u_r = make_layout(issue_space);                      // we use this layout to describe the register layout
+        vector_t<scalar_type, vec * vector_size * r_elem.value> r;          // local scratch to host the loaded register, and return it
         static_ford(issue_space_vec, [&](auto ... ids){
             auto tmp = load<vec>(u(ids...), s_os, number<aux>{});
             constexpr index_t u_rs = u_r(ids...);
@@ -870,7 +890,7 @@ struct gmem {
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         constexpr auto u_r = make_layout(issue_space_vec);                      // we use this layout to describe the register layout
-        array<vector_type<vec>, r_elem> r;                                      // local scratch to host the loaded register, and return it
+        array<vector_type<vec>, r_elem.value> r;                                      // local scratch to host the loaded register, and return it
         static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = load<vec>(u(ids...), s_os, number<aux>{}); }); // issue the loading instruction multiple times
         return r;
 #endif
@@ -879,20 +899,10 @@ struct gmem {
     template<index_t vec = 1, typename V, typename Layout, index_t aux = 0, std::enable_if_t<((is_array_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
     OPUS_D void store(const V& x, const Layout& u, int s_os = 0/* do we really need this? */, number<aux> = {})
     {
-        using maybe_coord = std::conditional_t<std::is_same_v<typename Layout::Coord, false_type>, typename Layout::Shape, typename Layout::Coord>;
-        constexpr auto issue_space_y = pickup_shape(typename Layout::Shape{}, maybe_coord{}, underscore{});
-        using issue_space = std::conditional_t<std::is_same_v<typename Layout::Coord, false_type>, typename Layout::Shape, remove_cvref_t<decltype(issue_space_y)>>;
+        constexpr auto issue_space = layout_to_issue_space<Layout>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
 
-        constexpr index_t vec_from_issue_space = get<size<issue_space>() - 1>(issue_space{}).value;     // here we get the original last dim length(which should be y dim)
-        static_assert(vec_from_issue_space % vec == 0, "please make sure requested vec size can be dividable of vec from issue space");
-
-        constexpr auto issue_space_vec = transform_tuple_with_idx([&](auto item, auto index){           // modify the last dim, divide it by vec. Result is still a tuple
-            if constexpr (index.value == size<issue_space>() - 1) return number<item.value / vec_from_issue_space>{};
-            else                                                  return item;    }, issue_space{});
-
-        static_assert(size<decltype(issue_space_vec)>() == Layout::coord_rank);
-
-        constexpr auto u_r = make_layout(issue_space{});                      // we use this layout to describe the register layout
+        constexpr auto u_r = make_layout(issue_space);                      // we use this layout to describe the register layout
 #if OPUS_TILE_CONTAINER == 0
         auto a_ = x;
 #elif OPUS_TILE_CONTAINER == 1
