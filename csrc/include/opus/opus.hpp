@@ -446,7 +446,17 @@ template<typename R, typename T, std::enable_if_t<is_tuple_v<T>, bool> = true>
 OPUS_H_D constexpr auto reduce_tuple(const T & t) { return  impl::reduce_tuple_impl<R>(t, make_index_seq<size<T>()>{}); }
 template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto reduce_tuple_sum(const T & t) { return reduce_tuple<opus::plus>(t); }
 template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto reduce_tuple_mul(const T & t) { return reduce_tuple<opus::multiplies>(t); }
+} // namespace opus
 
+// implementing the "tuple-like binding protocol", don't use below directly
+namespace std {
+template <typename... Ts> struct tuple_size<opus::tuple<Ts...>>       : std::integral_constant<std::size_t, sizeof...(Ts)> {};
+template <typename... Ts> struct tuple_size<const opus::tuple<Ts...>> : std::integral_constant<std::size_t, sizeof...(Ts)> {};
+template <std::size_t I, typename... Ts> struct tuple_element<I, opus::tuple<Ts...>>       : std::tuple_element<I, std::tuple<Ts...>> {};
+template <std::size_t I, typename... Ts> struct tuple_element<I, const opus::tuple<Ts...>> : std::tuple_element<I, const std::tuple<Ts...>> {};
+} // namespace std
+
+namespace opus {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // transforms
 template<typename X, typename Y, index_t... Is> constexpr auto embed(const X& x, const Y& y, seq<Is...>) { return ( ... + (get<Is>(x) * get<Is>(y))); }
@@ -898,6 +908,15 @@ struct gmem {
 
 template<typename T_>
 OPUS_D decltype(auto) make_gmem(const T_* ptr, uint32_t size = 0xffffffff, uint32_t config = buffer_default_config()) { return gmem<T_>{ptr, size, config}; }
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// waitcnt
+// vmcnt=0~63([15:14],[3:0]), lgkmcnt=0~15([11:8]), expcnt=0~7([6:4])
+template <index_t vmcnt, index_t lgkmcnt, index_t expcnt = 7>
+OPUS_D void s_waitcnt(number<vmcnt>, number<lgkmcnt>, number<expcnt> = {})
+{   __builtin_amdgcn_s_waitcnt((((0b110000 & vmcnt) << (14 - 4)) | (0b1111 & vmcnt)) | ((0b111 & expcnt) << 4) | ((0b1111 & lgkmcnt) << 8)); }
+
+template <index_t vmcnt>   OPUS_D void s_waitcnt_vmcnt(number<vmcnt>) { s_waitcnt(number<vmcnt>{}, number<15>{}); }
+template <index_t lgkmcnt> OPUS_D void s_waitcnt_lgkmcnt(number<lgkmcnt>) { s_waitcnt(number<63>{}, number<lgkmcnt>{}); }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // mfma
