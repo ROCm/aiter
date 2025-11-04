@@ -55,6 +55,7 @@ def e2e_moe(
     block_shape: Optional[List[int]] = None,
     config: Optional[Dict[str, Any]] = None,
     return_intermediate: Optional[bool] = False,
+    pertoken_quant_a: Optional[bool] = False,
 ) -> None:
     """
     #TODO: Add doc
@@ -68,25 +69,26 @@ def e2e_moe(
     assert sorted_token_ids.stride(0) == 1
 
     if use_fp8_w8a8:
+        assert A_scale is not None
         assert W1_scale is not None
         assert W2_scale is not None
         if block_shape is None:
-            output = torch.zeros(A.shape, device=A.device, dtype=W1.dtype)
-            A_scale = torch.zeros(1, device=A.device, dtype=torch.float32)
-            A, A_scale = _MOE_A_QUANT_FUNC(output, A, A_scale)
+            # output = torch.zeros(A.shape, device=A.device, dtype=W1.dtype)
+            # A_scale = torch.zeros(1, device=A.device, dtype=torch.float32)
+            # A, A_scale = _MOE_A_QUANT_FUNC(output, A, A_scale)
             block_n, block_k = None, None
         else:
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
 
-            assert (
-                config["BLOCK_SIZE_K1"] <= block_k
-            ), "BLOCK_SIZE_K1 must be <= group_k when using fp8"
-            assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
-            assert triton.cdiv(W1.shape[-2], block_n) == W1_scale.shape[-2]
-            assert triton.cdiv(W1.shape[-1], block_k) == W1_scale.shape[-1]
-            assert triton.cdiv(W2.shape[-1], block_n) == W2_scale.shape[-1]
-            assert triton.cdiv(W2.shape[-2], block_k) == W2_scale.shape[-2]
+        assert (
+            config["BLOCK_SIZE_K1"] <= block_k
+        ), "BLOCK_SIZE_K1 must be <= group_k when using fp8"
+        assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
+        assert triton.cdiv(W1.shape[-2], block_n) == W1_scale.shape[-2]
+        assert triton.cdiv(W1.shape[-1], block_k) == W1_scale.shape[-1]
+        assert triton.cdiv(W2.shape[-1], block_n) == W2_scale.shape[-1]
+        assert triton.cdiv(W2.shape[-2], block_k) == W2_scale.shape[-2]
     else:
         assert A_scale is None
         assert W1_scale is None
@@ -94,6 +96,8 @@ def e2e_moe(
         block_n, block_k = 0, 0
 
     EM = sorted_token_ids.shape[0]
+    print("A", A.shape)
+    print("config", config)
     if A.shape[0] < config["BLOCK_SIZE_M"]:
         # optimize for small batch_size.
         # We assume that top_ids of each token is unique, so
@@ -180,6 +184,7 @@ def e2e_moe(
         ),  # atomics need to be done in fp32
         **config,
         return_intermediate=return_intermediate,
+        PER_TOKEN_QUANT_A=pertoken_quant_a,
     )
 
     if return_intermediate:

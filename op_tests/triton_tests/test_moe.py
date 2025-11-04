@@ -633,8 +633,15 @@ def input_helper_e2e(
     dtype,
     fp8_w8a8: bool,
     blockshape=None,
+    pertoken=False,
     tp=1,
 ):
+    
+    if pertoken:
+        assert fp8_w8a8, "per-token quantization only supported for fp8_w8a8"
+        assert blockshape is None or blockshape[-1] == K, "per-token quantization requires weight quantization blockshape for K to be None or K"
+    
+    
     a = torch.randn((M, K), dtype=dtype, device="cuda")
     w1 = torch.rand((E, N, K), dtype=dtype, device="cuda")
     w2 = torch.rand((E, K, N // 2), dtype=dtype, device="cuda")
@@ -645,8 +652,11 @@ def input_helper_e2e(
     if fp8_w8a8:
         w1, _, w1_scale = quantize_fp8(w1, dim=(0,), blockshape=blockshape)
         w2, _, w2_scale = quantize_fp8(w2, dim=(0,), blockshape=blockshape)
-        if blockshape is not None:
-            blockshape_k = blockshape[1]
+        # if blockshape is not None:
+        if pertoken:
+            a, _, a_scale = quantize_fp8_a(a, a.shape[-1])
+        elif blockshape is not None:
+            blockshape_k = blockshape[-1]
             a, _, a_scale = quantize_fp8_a(a, blockshape_k)
 
     c = torch.zeros((M, top_k, K), dtype=dtype, device="cuda")
@@ -1101,6 +1111,7 @@ def test_fused_moe_gelu(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("blockshape_n, blockshape_k", [(128, 128), (None, None)])
 @pytest.mark.parametrize("tp", [1, 8])
+@pytest.mark.parametrize("pertoken", [True])
 def test_moe_e2e(
     M: int,
     N: int,
@@ -1113,12 +1124,18 @@ def test_moe_e2e(
     blockshape_k: int,
     dtype,
     tp,
+    pertoken,
 ):
     torch.manual_seed(20)
     torch.set_printoptions(threshold=100000)
     blockshape = None
+    pertoken = pertoken and fp8_w8a8
     if blockshape_n is not None and blockshape_k is not None:
         blockshape = (blockshape_n, blockshape_k)
+    # adjust blockshape for per-token quantization
+    if pertoken and blockshape is not None:
+        blockshape = (blockshape_n, K)
+    
     (
         a,
         w1,
@@ -1143,8 +1160,10 @@ def test_moe_e2e(
         fp8_w8a8=fp8_w8a8,
         blockshape=blockshape,
         tp=tp,
+        pertoken=pertoken,
     )
-
+    print("a", a.shape)
+    print("config", config)
     # tensor parallel slicing
     if tp > 1:
         w1 = w1[:, : N // tp, :].contiguous()
@@ -1188,6 +1207,7 @@ def test_moe_e2e(
         blockshape,
         config,
         return_intermediate=True,
+        pertoken_quant_a=pertoken,
     )
 
     # validate correctness by comparing to the outputs of two torch gemms
@@ -1237,4 +1257,5 @@ def test_moe_e2e(
 
 
 if __name__ == "__main__":
-    test_moe_e2e(32, 1536, 4096, 8, 128, False, False, None, None, torch.bfloat16, 8)
+    test_moe_e2e(33, 1536, 4096, 8, 128, False, True, 128, 128, torch.bfloat16, 8, True)
+    # test_moe_e2e(32, 1536, 4096, 8, 128, False, False, None, None, torch.bfloat16, 8, True)

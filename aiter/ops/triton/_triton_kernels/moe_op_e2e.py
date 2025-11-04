@@ -108,6 +108,7 @@ def e2e_moe_kernel(
     dtype: tl.constexpr,
     out_dtype: tl.constexpr,
     return_intermediate: tl.constexpr = False,
+    PER_TOKEN_QUANT_A: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -190,6 +191,11 @@ def e2e_moe_kernel(
         num_scales_along_k2: tl.constexpr = (BLOCK_SIZE_K2 + group_k - 1) // group_k
         num_scales_along_k1: tl.constexpr = (BLOCK_SIZE_K1 + group_k - 1) // group_k
         tl.static_assert(num_scales_along_k1 == 1, "BLOCK_SIZE_K1 must be <= group_k")
+        if PER_TOKEN_QUANT_A:
+            tl.static_assert(
+                group_k is None or group_k == K,
+                "per-token quantization requires group k to be None or K",
+            )
 
     offs_i0 = tl.arange(0, BLOCK_SIZE_HALF).to(tl.int64)
     offs_i1 = (tl.arange(0, BLOCK_SIZE_HALF) + N // 2).to(tl.int64)
@@ -229,7 +235,10 @@ def e2e_moe_kernel(
 
     if use_fp8_w8a8 and not use_block_scale:
         w1_scale = tl.load(W1_scale + off_experts)
-        a_scale = tl.load(A_scale)
+        if PER_TOKEN_QUANT_A:
+            a_scale = tl.load(A_scale + (offs_token[:, None] // top_k * stride_asm))
+        else:
+            a_scale = tl.load(A_scale)
 
     num_k1 = tl.cdiv(K, BLOCK_SIZE_K1)
     for k1 in tl.range(0, num_k1, num_stages=2):
