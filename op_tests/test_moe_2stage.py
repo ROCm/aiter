@@ -225,6 +225,9 @@ def shuffle_mxfp4_weight(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
     Returns: shuffled tensor of shape [experts_cnt, N0*2, K0, KLane, NLane, KPack]
     """
     # print("gemm shape:", src.shape)
+    src_type = src.dtype
+    if hasattr(torch, "float4_e2m1fn_x2") and src_type == torch.float4_e2m1fn_x2:
+        src = src.view(torch.uint8)
     experts_cnt, N, K_pk = src.shape
     if gate_up:
         N = N // 2
@@ -242,7 +245,7 @@ def shuffle_mxfp4_weight(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
         src_reshaped = src.view(experts_cnt, N0, NLane, K0, KLane, KPack)
         interleaved = src_reshaped.permute(0, 1, 3, 4, 2, 5).contiguous().view(*src.shape)
     # print("interleaved shape:", interleaved.shape)
-    return interleaved.contiguous()
+    return interleaved.contiguous().view(src_type)
 
 def shuffle_mxfp4_scale(src: torch.Tensor, experts_cnt: int, gate_up: bool) -> torch.Tensor:
     n_experts, k_ = src.shape
@@ -442,7 +445,10 @@ def test_fmoe(
     )
 
     # # ######################## ck stage 1 start ###########
-    out1_ck = torch.empty((token, topk, inter_dim), dtype=dtype)
+    if WQDType == dtypes.fp4x2 or AQDType == dtypes.fp4x2:
+        out1_ck = torch.zeros((token, topk, inter_dim), dtype=dtype)
+    else:
+        out1_ck = torch.empty((token, topk, inter_dim), dtype=dtype)
 
     # out1_ck, us1 = run_perftest(
     #     ck_moe_stage1,
@@ -565,7 +571,10 @@ def test_fmoe(
     # # )
     # # checkAllclose(out_ref, out2_ref, msg="[torch] 1_stage vs 2_stage")
 
-    out2_ck = torch.empty((token, model_dim), dtype=dtype)
+    if WQDType == dtypes.fp4x2 or AQDType == dtypes.fp4x2:
+       out2_ck = torch.zeros((token, model_dim), dtype=dtype)
+    else: 
+        out2_ck = torch.empty((token, model_dim), dtype=dtype)
 
     # # cktil2stage
     _, us2 = run_perftest(

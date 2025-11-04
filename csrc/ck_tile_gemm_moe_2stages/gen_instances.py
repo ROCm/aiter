@@ -73,12 +73,12 @@ torch::Tensor
     torch::Tensor& sorted_expert_ids,
     torch::Tensor& max_token_ids,
     int topk,
-    std::optional<int> n_padded_zeros  = 0,
-    std::optional<int> k_padded_zeros  = 0,
-    std::optional<torch::Tensor> topk_weight  = std::nullopt,
-    std::optional<torch::Tensor> x_scale      = std::nullopt,
-    std::optional<torch::Tensor> w_scale      = std::nullopt,
-    std::optional<torch::Tensor> exp_bias     = std::nullopt)
+    std::optional<int> n_padded_zeros,
+    std::optional<int> k_padded_zeros,
+    std::optional<torch::Tensor> topk_weight,
+    std::optional<torch::Tensor> x_scale,
+    std::optional<torch::Tensor> w_scale,
+    std::optional<torch::Tensor> exp_bias)
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
     int NumTokens = XQ.size(0);
@@ -186,7 +186,7 @@ torch::Tensor
 
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "{name}.cuh"
+#include "../impl/{name}.cuh"
 
 template torch::Tensor
 {name}<{dtypes}>(

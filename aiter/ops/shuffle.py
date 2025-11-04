@@ -44,6 +44,9 @@ def shuffle_mxfp4_weight(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
         Returns: shuffled tensor of shape [experts_cnt, N0*2, K0, KLane, NLane, KPack]
         """
         # print("gemm shape:", src.shape)
+        src_type = src.dtype
+        if hasattr(torch, "float4_e2m1fn_x2") and src_type == torch.float4_e2m1fn_x2:
+            src = src.view(torch.uint8)
         experts_cnt, N, K_pk = src.shape
         if gate_up:
             N = N // 2
@@ -59,7 +62,7 @@ def shuffle_mxfp4_weight(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
             src_reshaped = src.view(experts_cnt, N0, NLane, K0, KLane, KPack)
             interleaved = src_reshaped.permute(0, 1, 3, 4, 2, 5).contiguous().view(*src.shape)
         # print("interleaved shape:", interleaved.shape)
-        return interleaved.contiguous()
+        return interleaved.contiguous().view(src_type)
     
 
 def shuffle_mxfp4_scale(src: torch.Tensor, gate_up: bool) -> torch.Tensor:

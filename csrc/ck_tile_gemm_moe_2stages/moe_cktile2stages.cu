@@ -73,6 +73,31 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
                         std::optional<torch::Tensor> exp_bias,
                         std::optional<int> block_m)
 {
+    //     // ========== 添加调试打印 ==========
+    // std::cout << "========== cktile_moe_gemm1 Debug Info ==========" << std::endl;
+    // std::cout << "XQ dtype: " << XQ.dtype() << std::endl;
+    // std::cout << "WQ dtype: " << WQ.dtype() << std::endl;
+    // std::cout << "Y dtype: " << Y.dtype() << std::endl;
+    // std::cout << "x_scale has_value: " << (x_scale.has_value() ? "true" : "false") << std::endl;
+    // if (x_scale.has_value()) {
+    //     std::cout << "x_scale dtype: " << x_scale.value().dtype() << std::endl;
+    // }
+    // std::cout << "w_scale has_value: " << (w_scale.has_value() ? "true" : "false") << std::endl;
+    // if (w_scale.has_value()) {
+    //     std::cout << "w_scale dtype: " << w_scale.value().dtype() << std::endl;
+    // }
+    // std::cout << "exp_bias has_value: " << (exp_bias.has_value() ? "true" : "false") << std::endl;
+    // if (exp_bias.has_value()) {
+    //     std::cout << "exp_bias dtype: " << exp_bias.value().dtype() << std::endl;
+    // }
+    // std::cout << "topk_weight has_value: " << (topk_weight.has_value() ? "true" : "false") << std::endl;
+    // if (topk_weight.has_value()) {
+    //     std::cout << "topk_weight dtype: " << topk_weight.value().dtype() << std::endl;
+    // }
+    // std::cout << "M=" << sorted_ids.size(0) << ", N=" << WQ.size(1) << ", K=" << XQ.size(-1) << std::endl;
+    // std::cout << "===============================================" << std::endl;
+    // // ========== 调试打印结束 ==========
+
             
     TORCH_CHECK(Y.dtype() == at::ScalarType::BFloat16 || Y.dtype() == at::ScalarType::Half,
                 "Out dtype only support BFloat16/Float16!");
@@ -106,19 +131,27 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
         //     moe_dispatch<fp8, fp8, float, bf16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
         // }
     }
-    else if ((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) && (WQ.dtype() == at::ScalarType::Byte)) //a16w4
+    else if ((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) && (WQ.dtype() == torch_fp4x2)) //a16w4
     {
+        // std::cout << "DEBUG: Entering A16W4 branch" << std::endl;
         // if (Y.dtype() == at::ScalarType::Half)
         // {
         //    moe_dispatch<fp16, pk_fp4, float, fp16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
         // }
         if (Y.dtype() == at::ScalarType::BFloat16)
         {
+            // std::cout << "DEBUG: Calling moe_dispatch with BF16 output" << std::endl;
             moe_dispatch<bf16, pk_fp4, float, bf16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
         }
     }
     else
     {
+        // std::cout << "DEBUG: Falling into unsupported dtype branch!" << std::endl;
+        // std::cout << "DEBUG: XQ.dtype()=" << XQ.dtype() << std::endl;
+        // std::cout << "DEBUG: WQ.dtype()=" << WQ.dtype() << std::endl;
+        // std::cout << "DEBUG: at::ScalarType::BFloat16=" << at::ScalarType::BFloat16 << std::endl;
+        // std::cout << "DEBUG: at::ScalarType::Half=" << at::ScalarType::Half << std::endl;
+        // std::cout << "DEBUG: at::ScalarType::Byte=" << torch_fp4x2 << std::endl;
         TORCH_CHECK(false, "Unsupported scales/output dtype!");
     }
     return Y;
@@ -165,7 +198,7 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
         //     moe_dispatch<fp8, fp8, float, bf16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
         // }
     }
-    else if ((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) && (WQ.dtype() == at::ScalarType::Byte)) //a16w4
+    else if ((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) && (WQ.dtype() == torch_fp4x2)) //a16w4
     {
         // if (Y.dtype() == at::ScalarType::Half)
         // {
