@@ -304,16 +304,26 @@ def torch_moe_gemm2(
 
     E, K, N_HALF = b.shape
 
+    # num_scales_along_n = 1
     if fp8_w8a8 and use_block_scale:
-        # dequantize w2
-        b_scale = b_scale.repeat_interleave(blockshape_k, dim=1).repeat_interleave(blockshape_n, dim=2)[:, :K, :N_HALF]  # (E, K, N_HALF)
-        b = b.to(torch.float32) * b_scale.to(torch.float32)
+        num_scales_along_n = b_scale.shape[2]
+        b_scale = b_scale.repeat_interleave(blockshape_k, dim=1)[:, :K]
+        # only need to dequantize before dot if the inner dimension spans multiple scales
+        if num_scales_along_n > 1:
+            b_scale = b_scale.repeat_interleave(blockshape_n, dim=2)[:, :, :N_HALF]  # (E, K, N_HALF)
+            b = b.to(torch.float32) * b_scale.to(torch.float32)
 
     b_indexed = b[topk_ids]
 
     out = torch.einsum(
         "men,mekn->mek", a.to(torch.bfloat16), b_indexed.to(torch.bfloat16)
     )
+
+    if fp8_w8a8 and (not use_block_scale or num_scales_along_n == 1):
+        if not use_block_scale:
+            out = out * b_scale[topk_ids].unsqueeze(-1)
+        else:
+            out = out * b_scale[topk_ids].squeeze(-1)
 
     if routed_weight:
         out = out * topk_weights.unsqueeze(-1)
@@ -625,7 +635,6 @@ def input_helper_e2e(
     blockshape=None,
     tp=1,
 ):
-
     a = torch.randn((M, K), dtype=dtype, device="cuda")
     w1 = torch.rand((E, N, K), dtype=dtype, device="cuda")
     w2 = torch.rand((E, K, N // 2), dtype=dtype, device="cuda")
@@ -1090,7 +1099,7 @@ def test_fused_moe_gelu(
 @pytest.mark.parametrize("routed_weight", [False])
 @pytest.mark.parametrize("fp8_w8a8", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("blockshape_n, blockshape_k", [(128, 128)])
+@pytest.mark.parametrize("blockshape_n, blockshape_k", [(128, 128), (None, None)])
 @pytest.mark.parametrize("tp", [1, 8])
 def test_moe_e2e(
     M: int,
@@ -1107,7 +1116,9 @@ def test_moe_e2e(
 ):
     torch.manual_seed(20)
     torch.set_printoptions(threshold=100000)
-    blockshape = (blockshape_n, blockshape_k)
+    blockshape = None
+    if blockshape_n is not None and blockshape_k is not None:
+        blockshape = (blockshape_n, blockshape_k)
     (
         a,
         w1,
@@ -1138,7 +1149,7 @@ def test_moe_e2e(
     if tp > 1:
         w1 = w1[:, : N // tp, :].contiguous()
         w2 = w2[:, :, : (N // 2 // tp)].contiguous()
-        if fp8_w8a8:
+        if fp8_w8a8 and blockshape is not None:
             num_w1_scales_per_gpu = triton.cdiv(N // tp, blockshape[0])
             w1_scale = w1_scale[:, :num_w1_scales_per_gpu].contiguous()
             num_w2_scales_per_gpu = triton.cdiv((N // 2) // tp, blockshape[0])
@@ -1226,4 +1237,4 @@ def test_moe_e2e(
 
 
 if __name__ == "__main__":
-    test_moe_e2e(32, 64, 64, 1, 1, False, True, 128, 128, torch.bfloat16, 1)
+    test_moe_e2e(33, 1536, 4096, 8, 128, False, True, 128, 128, torch.bfloat16, 1)
