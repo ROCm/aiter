@@ -15,8 +15,21 @@ env:
   DOCKER_IMAGE: "rocm/pytorch:latest"
 
 jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
   define-runners:
     runs-on: ubuntu-latest
+    needs: [check-signal]
     outputs:
       standard_runners: ${{ steps.machines.outputs.standard_runners }}
       multigpu_runners: ${{ steps.machines.outputs.multigpu_runners }}
@@ -91,14 +104,14 @@ jobs:
           --name aiter_test \
           ${{ env.DOCKER_IMAGE }}
 
-      - name: Setup-Triton
+      - name: Setup Aiter
         run: |
           set -ex
-          echo "Setting up Triton..."
+          echo "Setting up Aiter..."
           docker exec \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/build_triton.sh
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
       
       - name: Tests
         run: |
@@ -177,7 +190,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/build_triton.sh
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
       
       - name: Tests
         run: |
