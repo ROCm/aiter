@@ -580,6 +580,40 @@ OPUS_H_D constexpr auto layout_to_vectorized_issue_space(number<vec> = {})
     static_assert(size<decltype(issue_space_vec)>() == Layout::coord_rank);
     return issue_space_vec;
 }
+
+// this function is usually not constexpr. pre-compute all the offset under current layout
+template<index_t vec, typename Layout>
+OPUS_H_D constexpr auto layout_to_offsets(const Layout& u) {
+    constexpr auto issue_space_vec = layout_to_vectorized_issue_space<Layout>(number<vec>{});
+    constexpr index_t num_issues = get<0>(reduce_tuple_mul(issue_space_vec)).value;
+    array<index_t, num_issues> offsets;
+
+    constexpr auto u_linear = make_layout(issue_space_vec);
+    static_ford(issue_space_vec, [&](auto ... ids){ offsets[u_linear(ids...)] = u(ids...); });
+    return offsets;
+}
+
+template<index_t vec, typename Layout>
+struct layout_c : public remove_cvref_t<Layout> {
+    using base = remove_cvref_t<Layout>;
+
+    static constexpr auto issue_space_vec = layout_to_vectorized_issue_space<base>(number<vec>{});
+    static constexpr index_t num_issues = get<0>(reduce_tuple_mul(issue_space_vec)).value;
+
+    template<typename Shape, typename Stride, typename Coord = false_type>
+    OPUS_H_D constexpr layout_c(const Shape& shape, const Stride& stride, const Coord& coord = {}) : base(shape, stride, coord), offsets{layout_to_offsets(*this)}{}
+
+    template<typename Shape, typename Stride, typename Coord = false_type>
+    OPUS_H_D constexpr layout_c(Shape&& shape, Stride&& stride, Coord&& coord = {}) : base(shape, stride, coord), offsets{layout_to_offsets(*this)}{}
+
+    OPUS_H_D constexpr void inc(index_t offset) { static_for<num_issues>([&](auto i){ offsets[i] += offset; }); }
+    OPUS_H_D constexpr layout_c& operator+=(index_t offset) { inc(offset); return *this; }
+
+    array<index_t, num_issues> offsets;
+};
+
+template<index_t vec, typename Layout> using layout_with_cached_offset = layout_c<vec, Layout>;
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // vector, a wrapper for __attribute__((ext_vector_type(*)))
 template <typename V_, index_t N_> // V_ must be literal type, otherwise clang ext_vector_type will not recognize
