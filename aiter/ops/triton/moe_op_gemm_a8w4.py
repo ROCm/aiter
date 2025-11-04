@@ -44,10 +44,7 @@ def allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, 
         y_rows = scatter_indx.src_indx.shape[0] // routing_data.n_expts_act # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
-    if block_m == 16 or scatter_indx:
-        matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
-    else:
-        matmul_output = torch.zeros(matmul_shape, device=x.device, dtype=out_dtype)
+    matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
     if scatter_indx or split_k > 1:
         final_output = torch.empty(final_shape, device=x.device, dtype=out_dtype)
     else:
@@ -255,7 +252,7 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map[block_m]
     # spmd grid
-    if unpadded_N:
+    if unpadded_N and block_m == 16:
         N = unpadded_N
     if unpadded_K and block_m == 16:
         K = unpadded_K
