@@ -28,9 +28,10 @@
       "top_k": 2
     }
   },
-  "mistral": {
+  "mixtral": {
     "7B": {
       "hidden_size": 4096,
+      "moe_intermediate_size": 14336,
       "intermediate_size": 14336,
       "num_attention_heads": 32,
       "num_key_value_heads": 8,
@@ -40,6 +41,7 @@
     },
     "22B": {
       "hidden_size": 6144,
+      "moe_intermediate_size": 16384,
       "intermediate_size": 16384,
       "num_attention_heads": 48,
       "num_key_value_heads": 8,
@@ -53,13 +55,52 @@
     "V3": {
       "hidden_size": 7168,
       "intermediate_size": 18432,
+      "moe_intermediate_size": 2048,
       "num_attention_heads": 128,
       "num_key_value_heads": 128,
       "vocab_size": 129280,
       "moe_layer_freq": 1,
       "n_routed_experts": 256,
       "num_expert": 256,
-      "top_k": 4
+      "top_k": 8
+    }
+  },
+  "llama4": {
+    "maverick": {
+      "hidden_size": 5120,
+      "intermediate_size": 16384,
+      "num_expert": 128,
+      "top_k": 1,
+      "n_routed_experts": 128,
+      "moe_intermediate_size": 8192
+    }
+  },
+  "qwen3": {
+    "15B" : {
+      "hidden_size": 2048,
+      "intermediate_size": 6144,
+      "moe_intermediate_size": 768,
+      "n_routed_experts": 128,
+      "num_expert": 128,
+      "top_k": 8
+    },
+    "235B" : {
+      "hidden_size": 4096,
+      "intermediate_size": 12288,
+      "moe_intermediate_size": 1536,
+      "n_routed_experts": 128,
+      "num_expert": 128,
+      "top_k": 8
+    }
+  },
+  "qwen3next": {
+    "80B" : {
+      "hidden_size": 2048,
+      "intermediate_size": 5120,
+      "moe_intermediate_size": 512,
+      "n_routed_experts": 512,
+      "num_expert": 512,
+      "top_k": 10
     }
   }
 }

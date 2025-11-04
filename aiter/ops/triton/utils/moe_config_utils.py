@@ -119,3 +119,88 @@ def get_optimal_moe_config_func(
         use_fp8_w8a8,
         use_int4_w4a16,
     )
+
+
+@functools.lru_cache
+def get_e2e_moe_configs(
+    N: Optional[int], dtype: Optional[str]
+) -> Optional[Dict[int, Any]]:
+    # First look up if an optimized configuration is available in the configs
+    # directory for the specific N and dtype
+    dtype_str = "DEFAULT" if dtype is None else dtype
+    device = arch_info.get_device()
+    config_file_path = (
+        f"{AITER_TRITON_CONFIGS_PATH}/moe/{device}-MOE-e2e-N={N}-{dtype_str}.json"
+    )
+
+    if os.path.exists(config_file_path):
+        with open(config_file_path) as f:
+            # If a configuration has been found, return it
+            return {key: val for key, val in json.load(f).items()}
+
+    # If no optimized configuration is available, we will use the default
+    # configuration for the dtype
+    warnings.warn(
+        f"No finetuned end-to-end MoE configuration found for N={N} and dtype={dtype_str}. Tried searching at: {config_file_path}."
+    )
+
+    default_config_file_path = (
+        f"{AITER_TRITON_CONFIGS_PATH}/moe/{device}-MOE-e2e-{dtype_str}.json"
+    )
+
+    if os.path.exists(default_config_file_path):
+        with open(default_config_file_path) as f:
+            # If a configuration has been found, return it
+            return {key: val for key, val in json.load(f).items()}
+
+    warnings.warn(
+        f"No end-to-end MoE configuration found for dtype={dtype_str}. Tried searching at: {default_config_file_path}. Using hardcoded default configuration."
+    )
+
+    return None
+
+
+def get_optimal_moe_e2e_config(
+    N: int,
+    dtype: torch.dtype,
+    # blockscale fp8
+    use_fp8_w8a8: Optional[bool] = False,
+    M: int = 1,
+):
+    dtype_str = get_config_dtype_str(dtype, use_fp8_w8a8=use_fp8_w8a8)
+    configs = get_e2e_moe_configs(N, dtype_str)
+    if configs is not None:
+        if configs:
+            if M < M_THRESHOLD_SMALL:
+                config = configs["small_M"]
+            elif M < M_THRESHOLD_MEDIUM:
+                config = configs["medium_M"]
+            else:
+                config = configs["large_M"]
+    else:
+        if dtype == torch.float32:
+            config = {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K1": 32,
+                "BLOCK_SIZE_K2": 32,
+                "GROUP_SIZE_M": 1,
+            }
+        else:
+            config = {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K1": 128,
+                "BLOCK_SIZE_K2": 128,
+                "GROUP_SIZE_M": 1,
+            }
+
+    return config
+
+
+def get_optimal_moe_e2e_config_func(
+    N: int,
+    dtype: torch.dtype,
+    use_fp8_w8a8: Optional[bool] = False,
+):
+    return functools.partial(get_optimal_moe_e2e_config, N, dtype, use_fp8_w8a8)

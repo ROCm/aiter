@@ -9,6 +9,8 @@ import time
 import tempfile
 import re
 import matplotlib.pyplot as plt
+import inspect
+from pathlib import Path
 
 # Base directory where configs are located
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
@@ -366,3 +368,8 @@ def get_dtype_bytes(dtype):
         return 1
     else:
         raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def get_caller_name_no_ext():
+    caller_file = inspect.stack()[1].filename  # full path of caller
+    return Path(caller_file).stem  # filename without extension
