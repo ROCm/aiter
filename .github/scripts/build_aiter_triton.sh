@@ -24,7 +24,7 @@ if [[ "$BUILD_TRITON" == "1" ]]; then
     cd triton
     pip install -r python/requirements.txt
     pip install filecheck
-    MAX_JOBS=64 pip install .
+    MAX_JOBS=64 pip --retries=5 install .
     cd ..
 else
     echo
