@@ -281,9 +281,9 @@ def e2e_moe_kernel(
         w1_ptrs_i0_k = w1_ptrs_i0 + k1 * BLOCK_SIZE_K1 * stride_w1k
         w1_ptrs_i1_k = w1_ptrs_i1 + k1 * BLOCK_SIZE_K1 * stride_w1k
         if use_fp8_w8a8 and use_block_scale:
-            w1_i0_scale_ptrs_k = w1_i0_scale_ptrs + (k1 * BLOCK_SIZE_K1) // group_k * stride_w1sk
-            w1_i1_scale_ptrs_k = w1_i1_scale_ptrs + (k1 * BLOCK_SIZE_K1) // group_k * stride_w1sk
-            a_scale_ptrs_k = a_scale_ptrs + k1 * BLOCK_SIZE_K1 * stride_ask
+            w1_i0_scale_ptrs_k = w1_i0_scale_ptrs + k1 * BLOCK_SIZE_K1 // group_k * stride_w1sk
+            w1_i1_scale_ptrs_k = w1_i1_scale_ptrs + k1 * BLOCK_SIZE_K1 // group_k * stride_w1sk
+            a_scale_ptrs_k = a_scale_ptrs + k1 * BLOCK_SIZE_K1 // group_k * stride_ask
 
         # pipeline silu acc and mul acc so they can use the same LDS for weight loading
 

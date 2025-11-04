@@ -11,12 +11,16 @@ from aiter import logger
 from aiter import ActivationType, QuantType, dtypes
 from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.moe_op_e2e import e2e_moe
 
 # from aiter import get_torch_quant as get_quant
 from aiter import get_hip_quant as get_quant
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.jit.core import AITER_ROOT_DIR, PY, get_asm_dir, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num
+import os
+
+USE_TRITON_E2E_MOE = os.getenv("USE_TRITON_E2E_MOE", "False").lower() in ('true', '1')
 
 BLOCK_SIZE_M = 32
 
@@ -176,29 +180,52 @@ def fused_moe(
             num_local_tokens=num_local_tokens,
         )
     else:
-        return fused_moe_2stages(
-            hidden_states,
-            w1,
-            w2,
-            topk,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            isG1U1,
-            block_size_M,
-            activation=activation,
-            quant_type=quant_type,
-            doweight_stage1=doweight_stage1,
-            q_dtype_a=q_dtype_a,
-            q_dtype_w=q_dtype_w,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-            num_local_tokens=num_local_tokens,
-        )
+        if USE_TRITON_E2E_MOE:
+            pass
+            # return e2e_moe(
+            #     hidden_states,
+            #     w1,
+            #     w2,
+            #     _,
+            #     a1_scale,
+            #     w1_scale,
+            #     w2_scale,
+            #     sorted_weights,
+            #     sorted_ids,
+            #     topk_ids,
+            #     sorted_expert_ids,
+            #     num_tokens_post_padded,
+            #     False,
+            #     topk,
+            #     use_fp8_w8a8: bool,
+            #     block_shape: Optional[List[int]] = None,
+            #     None,
+            #     False,
+            #     )
+        else:
+            return fused_moe_2stages(
+                hidden_states,
+                w1,
+                w2,
+                topk,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                isG1U1,
+                block_size_M,
+                activation=activation,
+                quant_type=quant_type,
+                doweight_stage1=doweight_stage1,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                num_local_tokens=num_local_tokens,
+            )
 
 
 def fused_moe_1stage(
