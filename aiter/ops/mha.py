@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from torch import Tensor, Generator
-from typing import Optional, Tuple, Any
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
+from typing import Any, Optional, Tuple
+
+import torch
+from torch import Generator, Tensor
+
+from ..jit.core import AITER_CSRC_DIR, CK_DIR, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
-import torch
 
 
 def cmdGenFunc_mha_fwd(
@@ -846,6 +848,8 @@ def cmdGenFunc_mha_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    cu_seqlens_q_padded: Optional[Tensor] = None,
+    cu_seqlens_k_padded: Optional[Tensor] = None,
 ) -> dict[str, Any]:
     md_name = "mha_varlen_bwd"
     filter1 = "*"  # get_bwd_dot_do_o_blobs()
@@ -977,11 +981,83 @@ def cmdGenFunc_mha_batch_prefill(
     }
 
 
+def gen_mha_varlen_bwd_fake_tensors_common(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    max_seqlen_q: int,
+    zero_tensors: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+):
+    num_heads = q.size(1)
+
+    batch_size = cu_seqlens_q.numel() - 1
+    dq_ = torch.empty_like(q)
+    dk_ = torch.empty_like(k)
+    dv_ = torch.empty_like(v)
+    if dq is not None:
+        dq_ = dq
+    else:
+        dq_ = torch.empty_like(q)
+
+    if dk is not None:
+        dk_ = dk
+    else:
+        dk_ = torch.empty_like(k)
+
+    if dv is not None:
+        dv_ = dv
+    else:
+        dv_ = torch.empty_like(v)
+
+    softmax_d = torch.empty(batch_size, num_heads, max_seqlen_q, dtype=torch.float)
+
+    if zero_tensors:
+        dq_.zero_()
+        softmax_d.zero_()
+
+    return dq_, dk_, dv_, softmax_d
+
+
+def gen_mha_varlen_bwd_fake_tensors(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    return gen_mha_varlen_bwd_fake_tensors_common(
+        q, k, v, cu_seqlens_q, max_seqlen_q, zero_tensors, dq, dk, dv
+    )
+    # return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
+
+
 @compile_ops(
     "module_mha_varlen_bwd",
     fc_name="mha_varlen_bwd",
     gen_func=cmdGenFunc_mha_varlen_bwd,
-    gen_fake=gen_mha_bwd_fake_tensors,
+    gen_fake=gen_mha_varlen_bwd_fake_tensors,
 )
 def mha_varlen_bwd(
     dout: Tensor,
@@ -1007,6 +1083,8 @@ def mha_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    cu_seqlens_q_padded: Optional[Tensor] = None,
+    cu_seqlens_k_padded: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -1036,8 +1114,13 @@ def gen_fmha_v3_varlen_bwd_fake_tensor(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    cu_seqlens_q_padded: Optional[Tensor] = None,
+    cu_seqlens_k_padded: Optional[Tensor] = None,
 ):
-    return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
+    return gen_mha_varlen_bwd_fake_tensors_common(
+        q, k, v, cu_seqlens_q, max_seqlen_q, zero_tensors, dq, dk, dv
+    )
+    # return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
 
 @compile_ops(
@@ -1054,8 +1137,6 @@ def fmha_v3_varlen_bwd(
     softmax_lse: Tensor,
     cu_seqlens_q: Tensor,
     cu_seqlens_k: Tensor,
-    # cu_seqlens_q_padded: Tensor,
-    # cu_seqlens_k_padded: Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
@@ -1073,6 +1154,8 @@ def fmha_v3_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    cu_seqlens_q_padded: Optional[Tensor] = None,
+    cu_seqlens_k_padded: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -1425,10 +1508,11 @@ def _flash_attn_backward(
         ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= not deterministic or is_950_1block
-        ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
-
+        ret &= (
+            (hdim_q > 64 and hdim_q <= 128)
+            or (hdim_q == 192 and hdim_v == 128 and nmask)
+        ) and hdim_q % 8 == 0
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
@@ -1874,10 +1958,6 @@ def _flash_attn_varlen_backward(
     dv: Optional[torch.Tensor],
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    #  FIXME: this two args currently not support on ck side
-    # and has no host code on aiter side
-    # cu_seqlens_q_padded: Tensor,
-    # cu_seqlens_k_padded: Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
@@ -1891,6 +1971,8 @@ def _flash_attn_varlen_backward(
     is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
     zero_tensors: bool = False,
+    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 
     (_, nhead_q, hdim_q) = q.shape
@@ -1999,8 +2081,6 @@ def _flash_attn_varlen_backward(
             softmax_lse,
             cu_seqlens_q,
             cu_seqlens_k,
-            # cu_seqlens_q_padded,
-            # cu_seqlens_k_padded,
             max_seqlen_q,
             max_seqlen_k,
             dropout_p,
@@ -2018,6 +2098,8 @@ def _flash_attn_varlen_backward(
             alibi_slopes,
             rng_state,
             None,
+            cu_seqlens_q_padded,
+            cu_seqlens_k_padded,
         )
     else:
         (
@@ -2049,6 +2131,8 @@ def _flash_attn_varlen_backward(
             alibi_slopes,
             rng_state,
             None,
+            cu_seqlens_q_padded,
+            cu_seqlens_k_padded,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
@@ -2138,6 +2222,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.head_size_q_og = head_size_q_og
             ctx.is_v3_atomic_fp32 = is_v3_atomic_fp32
             ctx.how_v3_bf16_cvt = how_v3_bf16_cvt
+            ctx.cu_seqlens_q_padded = cu_seqlens_q_padded
+            ctx.cu_seqlens_k_padded = cu_seqlens_k_padded
 
         out = out_padded[..., :head_size_v_og]
 
@@ -2194,6 +2280,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             rng_state=rng_state,
             is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
             how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
+            cu_seqlens_q_padded=ctx.cu_seqlens_q_padded,
+            cu_seqlens_k_padded=ctx.cu_seqlens_k_padded,
         )
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
