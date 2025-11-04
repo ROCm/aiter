@@ -144,9 +144,9 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         and otype == dtypes.fp32
         and (k % 64 == 0)
         # and (n % 64 == 0)
-        and (m in [64, 80, 128, 150, 192, 220, 256, 384, 448, 512])
-        and (n == 256)
-        and (k == 5120 or k == 7168)
+        # and (m in [64, 80, 128, 150, 192, 220, 256, 384, 448, 512])
+        # and (n == 256)
+        # and (k == 5120 or k == 7168)
         and bias == None
     ):
         # wshuffle = shuffle_weight(weight, layout=(16, 16))
