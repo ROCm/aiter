@@ -90,7 +90,7 @@ get_heuristic_kernel(int M,
                     ((M + cfg.tileM - 1) / cfg.tileM) * (N / cfg.tileN); // M-orient support OOB
                 if(pure_tg_num < num_cu)
                 {
-                    int max_split = num_cu / pure_tg_num;
+                    int max_split = (num_cu / pure_tg_num) < 64 ? (num_cu / pure_tg_num) : 64;
                     for(int i = max_split; i >= 1; i--)
                     {
                         if(K % 64 == 0)
@@ -204,15 +204,16 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
 
     // 2.1 static dict
     std::string selectedKernelName = kernelName.value_or("");
-    int selectedksplit = splitK.value_or(0) ?: 1;
-    if (!kernelName.has_value() || kernelName == "") {
+    int selectedksplit             = splitK.value_or(0) ?: 1;
+    if(!kernelName.has_value() || kernelName == "")
+    {
 
         auto it_sel        = get_heuristic_kernel(Mdim,
-                                       Ndim,
-                                       Kdim,
-                                       config_map,
-                                       splitK.has_value() ? splitK : std::nullopt,
-                                       kernelName.has_value() ? kernelName : std::nullopt);
+                                           Ndim,
+                                           Kdim,
+                                           config_map,
+                                           splitK.has_value() ? splitK : std::nullopt,
+                                           kernelName.has_value() ? kernelName : std::nullopt);
         selectedKernelName = std::get<0>(it_sel);
         selectedksplit     = std::get<1>(it_sel);
     }
@@ -265,7 +266,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
 
     if(selectedksplit > 1)
     {
-        // out.zero_();
+        out.zero_();
         int k_per_tg = Kdim / selectedksplit;
         gdz          = selectedksplit;
     }

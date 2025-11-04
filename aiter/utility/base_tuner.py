@@ -6,7 +6,7 @@ import argparse
 import torch
 import pandas as pd
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from aiter import logger
 import traceback
 from operator import itemgetter
@@ -37,6 +37,7 @@ class TunerCommon:
         dtypes.fp4x2: 1,
         torch.uint8: 1,
         torch.uint32: 4,
+        dtypes.fp32: 4,
         torch.int4: 1 / 2,
         torch.float8_e4m3fnuz: 1,
         torch.float8_e4m3fn: 1,
@@ -76,6 +77,7 @@ class TunerCommon:
             "-i",
             "--untune_file",
             default=defaults["untune_file"],
+            dest="untune_file",
             required=False,
             help="input",
         )
@@ -83,6 +85,7 @@ class TunerCommon:
             "-o",
             "--tune_file",
             default=defaults["tune_file"],
+            dest="tune_file",
             required=False,
             help="output: tuning result store this file",
         )
@@ -151,7 +154,7 @@ class TunerCommon:
 
     @abstractmethod
     def getKernelName(self, kernel_id):
-        """??kernel name"""
+        """obtain name of the kernel from its id"""
         pass
 
     @abstractmethod
@@ -325,8 +328,10 @@ class TunerCommon:
             print(self.success)
         logger.info("Failed shapes:")
         print(self.failed)
+
+        tunedf_subset = tunedf[self.untunedf.columns].astype(self.untunedf.dtypes)
         mask = self.untunedf.apply(tuple, axis=1).isin(
-            tunedf[self.untunedf.columns].apply(tuple, axis=1)
+            tunedf_subset.apply(tuple, axis=1)
         )
         self.remain_untuned = self.untunedf[~mask]
         logger.info("untuned shapes:")
@@ -345,6 +350,7 @@ class TunerCommon:
     def run(self, args, fast_mode=False):
         """tuner run function"""
         self.pre_process(args)
+        print(self.untunedf)
         if args.verbose:
             logger.info(f"args: {args}")
         if len(self.untunedf) == 0:
@@ -435,7 +441,7 @@ class GemmCommonTuner(TunerCommon):
         info, time, err_ratio = results
         if time == -1:
             return -1, -1
-        cu_num, m, n, k = info[0]
+        cu_num, m, n, k, *rest = info[0]
         flop = m * n * k * 2
         tflops = round(flop / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes
@@ -474,7 +480,10 @@ class GemmCommonTuner(TunerCommon):
                 }
             )
             temp = pd.DataFrame(key_dict)
-            resultdf = pd.concat([resultdf, temp], ignore_index=True)
+            if resultdf.empty:
+                resultdf = temp
+            else:
+                resultdf = pd.concat([resultdf, temp], ignore_index=True)
         return resultdf
 
     def result_to_csv(self, resultdf, file, concat=False):
@@ -488,7 +497,7 @@ class GemmCommonTuner(TunerCommon):
             [self.success, resultdf[resultdf["us"] != self.INVALID_TIME]],
             ignore_index=True,
         )
-        update_tunedf = self.success
+        update_tunedf = resultdf[resultdf["us"] != self.INVALID_TIME]  # self.success
         if not concat:
             resultdf = self.update_tunedf(old_df, update_tunedf)
         else:

@@ -121,7 +121,8 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         else:
             avg_d = None
 
-    if quantDtype != dtypes.i8 and get_gfx() == "gfx942":
+    if quantDtype == dtypes.fp8 and get_gfx() == "gfx942" and dtype == dtypes.bf16:
+        # hipb_mm bpreshuffle only supports bfloat16 as output type
         init_hipblas()
         e, avg_e = run_aiter_hip_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
         e = e + bias
