@@ -390,7 +390,7 @@ def _bwd_dq_inner(
 
 
 @triton.jit
-def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nheads_q)
+def _bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nheads_q)
     # Input tensors
     Q, K, V,
     DO,
@@ -925,7 +925,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
 
 
 @triton.jit
-def bwd_kernel_noncausal(
+def _bwd_kernel_noncausal(
     # Input tensors
     Q, K, V,
     DO,

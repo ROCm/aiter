@@ -17,6 +17,7 @@ from _triton_kernels.mha_fused_bwd_kernel import (
     _get_config,
 )
 
+
 def safe_tensor(x):
     if x is None:
         return jnp.zeros((1,), dtype=jnp.int32)
@@ -50,10 +51,6 @@ def flash_attn_fused_backward(
     USE_INT64_STRIDES: Optional[bool] = False,
     config: Optional[Dict[str, any]] = None,
 ):
-    _LOGGER.info(
-        f"FLASH_ATTN_FUSED_BKWD: do={tuple(do.shape)} q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} "
-        + f"dq={tuple(dq.shape)}  dk={tuple(dk.shape)}  dv={tuple(dv.shape)}"
-    )
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
 
@@ -330,10 +327,6 @@ def main(unused_argv):
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         dropout_p=dropout_p,
-        # philox_seed=philox_seed,
-        # philox_offset=philox_offset,
-        # USE_INT64_STRIDES=False,
-        # config=config,
     )
     
     dq.block_until_ready()
