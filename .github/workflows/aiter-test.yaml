@@ -190,7 +190,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/build_aiter_triton.sh
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
       
       - name: Tests
         run: |
