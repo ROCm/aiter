@@ -77,11 +77,16 @@ def fused_moe(
     e2e_fused=False,
     tp=1,
     stage="stage1",
+    pertoken_quant_a=False,
 ):
     moe_fn = triton_moe_silu if silu_fused else triton_moe
     block_shape_k = (
         128 if (block_shape is None or not block_shape[1]) else block_shape[1]
     )
+
+    if pertoken_quant_a:
+        assert fp8_w8a8, "Per-token quantization is only supported for FP8 W8A8."
+        assert e2e_fused, "Per-token quantization is only supported for e2e fused MoE."
 
     if e2e_fused:
         (
@@ -107,6 +112,7 @@ def fused_moe(
             dtype=dtype,
             fp8_w8a8=fp8_w8a8,
             blockshape=block_shape,
+            pertoken=pertoken_quant_a,
             tp=tp,
         )
 
@@ -138,6 +144,7 @@ def fused_moe(
             fp8_w8a8,
             block_shape=block_shape,
             config=config,
+            pertoken_quant_a=pertoken_quant_a,
         )
 
     elif int4_w4a16:
@@ -271,6 +278,8 @@ def run_benchmark(args):
 
     assert not (e2e_fused and silu_fused)
 
+
+
     if silu_fused or e2e_fused:
         args.no_bench_stage2 = True
 
@@ -342,6 +351,7 @@ def run_benchmark(args):
             e2e_fused=e2e_fused,
             tp=args.tp,
             stage=stage,
+            pertoken_quant_a=args.per_token_quant_a,
         )
         # num_expert_loaded: len(torch.unique(expert_ids))
         # max_expert_loaded = min(E, top_k * M)
@@ -445,6 +455,8 @@ def parse_args():
     parser.add_argument(
         "-block_shape", nargs=2, type=int, default=None, help="block shape n and k"
     )
+    parser.add_argument(
+        "-per_token_quant_a", action="store_true", default=False, help="Per-token quantization for input. Per tensor for weights (or blockscale if -block_shape is set).")
 
     parser.add_argument("-routed_weight", action="store_true", default=False)
     parser.add_argument("-int8_w8a16", action="store_true", default=False)

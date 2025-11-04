@@ -73,22 +73,19 @@ def e2e_moe(
         assert W1_scale is not None
         assert W2_scale is not None
         if block_shape is None:
-            # output = torch.zeros(A.shape, device=A.device, dtype=W1.dtype)
-            # A_scale = torch.zeros(1, device=A.device, dtype=torch.float32)
-            # A, A_scale = _MOE_A_QUANT_FUNC(output, A, A_scale)
-            block_n, block_k = None, None
+            block_n, block_k = 0, 0
         else:
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
-
-        assert (
-            config["BLOCK_SIZE_K1"] <= block_k
-        ), "BLOCK_SIZE_K1 must be <= group_k when using fp8"
-        assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
-        assert triton.cdiv(W1.shape[-2], block_n) == W1_scale.shape[-2]
-        assert triton.cdiv(W1.shape[-1], block_k) == W1_scale.shape[-1]
-        assert triton.cdiv(W2.shape[-1], block_n) == W2_scale.shape[-1]
-        assert triton.cdiv(W2.shape[-2], block_k) == W2_scale.shape[-2]
+            assert (
+                config["BLOCK_SIZE_K1"] <= block_k
+            ), "BLOCK_SIZE_K1 must be <= group_k when using fp8"
+            assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
+            assert triton.cdiv(W1.shape[-2], block_n) == W1_scale.shape[-2]
+            assert triton.cdiv(W1.shape[-1], block_k) == W1_scale.shape[-1]
+            assert triton.cdiv(W2.shape[-1], block_n) == W2_scale.shape[-1]
+            assert triton.cdiv(W2.shape[-2], block_k) == W2_scale.shape[-2]
+        
     else:
         assert A_scale is None
         assert W1_scale is None

@@ -24,6 +24,7 @@ from aiter.ops.triton.utils.moe_config_utils import (
     get_optimal_moe_e2e_config_func,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
@@ -652,9 +653,9 @@ def input_helper_e2e(
     w2_scale = None
 
     if fp8_w8a8:
-        # E, N, K
+        # scales for tensor E, N, K: E, N//blockshape_n, K//blockshape_k
         w1, _, w1_scale = quantize_fp8(w1, dim=(0,), blockshape=blockshape)
-        # E, K, N//2
+        # scales for tensor E, K, N//2: E, K//blockshape_k, N//2//blockshape_n 
         blockshape_stage2 = None
         if blockshape is not None:
             blockshape_stage2 = (blockshape[1], blockshape[0])
@@ -665,6 +666,10 @@ def input_helper_e2e(
         elif blockshape is not None:
             blockshape_k = blockshape[-1]
             a, _, a_scale = quantize_fp8_a(a, blockshape_k)
+        else:
+            a_scale = torch.zeros(1, device=a.device, dtype=torch.float32)
+            output = torch.zeros(a.shape, device=a.device, dtype=w1.dtype)
+            a, a_scale = dynamic_per_tensor_quant_fp8_i8(output, a, a_scale)
 
     c = torch.zeros((M, top_k, K), dtype=dtype, device="cuda")
 
@@ -1118,7 +1123,7 @@ def test_fused_moe_gelu(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("blockshape_n, blockshape_k", [(128, 128), (None, None)])
 @pytest.mark.parametrize("tp", [1, 8])
-@pytest.mark.parametrize("pertoken", [True])
+@pytest.mark.parametrize("pertoken", [False])
 def test_moe_e2e(
     M: int,
     N: int,
@@ -1262,5 +1267,4 @@ def test_moe_e2e(
 
 
 if __name__ == "__main__":
-    test_moe_e2e(33, 1536, 4096, 8, 128, False, True, 128, 128, torch.bfloat16, 8, True)
-    # test_moe_e2e(32, 1536, 4096, 8, 128, False, False, None, None, torch.bfloat16, 8, True)
+    test_moe_e2e(33, 1536, 4096, 8, 128, False, True, None, None, torch.bfloat16, 8, False)
