@@ -29,6 +29,7 @@ def fused_rms_fp8_group_quant(
     dtype_quant=fp8_dtype,
     res1=None,
     output_unquantized_inp1=False,
+    transpose_scale=False,
 ):
     """
     This op contains several steps:
@@ -39,10 +40,14 @@ def fused_rms_fp8_group_quant(
 
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
+    - transpose_scale: If True, return scale with shape (M, cdiv(N1, group_size)) but stored in
+                      column-major (transposed) memory layout. Equivalent to:
+                      scale.transpose(0, 1).contiguous().view(*scale.shape)
 
     Returns:
     - out1_fp8: The output matrix with shape (M, N1).
     - out1_bs: The output matrix with shape (M, cdiv(N1, group_size)).
+              When transpose_scale=True, has column-major memory layout (transposed storage).
     - out1: The output matrix with shape (M, N1).
     - out2: The output matrix with shape (M, N2).
     - out_res1: The output matrix with shape (M, N1).
@@ -60,11 +65,20 @@ def fused_rms_fp8_group_quant(
     else:
         N2 = 0
     out1_fp8 = torch.empty((M, N1), dtype=dtype_quant, device=inp1.device)
-    out1_bs = torch.empty(
-        (M, (N1 + group_size - 1) // group_size),
-        dtype=torch.float32,
-        device=inp1.device,
-    )
+    num_bs_cols = (N1 + group_size - 1) // group_size
+    if transpose_scale:
+        # Create with transposed shape for direct transposed storage
+        out1_bs = torch.empty(
+            (num_bs_cols, M),
+            dtype=torch.float32,
+            device=inp1.device,
+        )
+    else:
+        out1_bs = torch.empty(
+            (M, num_bs_cols),
+            dtype=torch.float32,
+            device=inp1.device,
+        )
 
     out2 = None
     out2_row_stride = 0
@@ -117,6 +131,15 @@ def fused_rms_fp8_group_quant(
         if torch.is_floating_point(out1_fp8)
         else torch.iinfo(out1_fp8.dtype).max
     )
+
+    # When transpose_scale=True, swap the strides to write directly in transposed layout
+    if transpose_scale:
+        out1_bs_row_stride = out1_bs.stride(1)
+        out1_bs_col_stride = out1_bs.stride(0)
+    else:
+        out1_bs_row_stride = out1_bs.stride(0)
+        out1_bs_col_stride = out1_bs.stride(1)
+
     _fused_rms_fp8_group_quant_kernel[(M,)](
         inp1,
         inp1_weight,
@@ -141,8 +164,8 @@ def fused_rms_fp8_group_quant(
         res1_col_stride,
         out1_fp8.stride(0),
         out1_fp8.stride(1),
-        out1_bs.stride(0),
-        out1_bs.stride(1),
+        out1_bs_row_stride,
+        out1_bs_col_stride,
         out2_row_stride,
         out2_col_stride,
         out_res1_row_stride,
@@ -158,6 +181,10 @@ def fused_rms_fp8_group_quant(
         FIRST_INPUT_OUT=output_unquantized_inp1,
         num_warps=num_warps,
     )
+    # When transpose_scale=True, view the transposed buffer back to original shape
+    # This keeps shape (M, num_bs_cols) but with column-major memory layout
+    if transpose_scale:
+        out1_bs = out1_bs.view(M, num_bs_cols)
 
     return (out1_fp8, out1_bs), out1, out2, out_res1
 
