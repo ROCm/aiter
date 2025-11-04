@@ -104,14 +104,14 @@ jobs:
           --name aiter_test \
           ${{ env.DOCKER_IMAGE }}
 
-      - name: Setup-Triton
+      - name: Setup Aiter
         run: |
           set -ex
-          echo "Setting up Triton..."
+          echo "Setting up Aiter..."
           docker exec \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/build_triton.sh
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
       
       - name: Tests
         run: |
@@ -190,7 +190,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/build_triton.sh
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
       
       - name: Tests
         run: |
