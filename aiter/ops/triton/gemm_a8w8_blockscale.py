@@ -69,7 +69,7 @@ def gemm_a8w8_blockscale(
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
             dtype=torch.float32,
-            device=y.device if y is not None else x.device,
+            device=x.device,
         )
     else:
         y_pp = None
