@@ -308,7 +308,7 @@ def e2e_moe_kernel(
         offs_in = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
         i_ptrs = Intermediate + stride_im * offs_token[:, None] + offs_in[None, :]
         i_mask = token_mask[:, None] & (offs_in[None, :] < N // 2)
-        tl.store(i_ptrs, acc.to(out_dtype), mask=i_mask)
+        tl.store(i_ptrs, silu_acc.to(out_dtype), mask=i_mask)
 
     if use_fp8_w8a8:
         silu_acc = silu_acc.to(tl.bfloat16)
