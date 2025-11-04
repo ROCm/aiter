@@ -96,8 +96,6 @@ def e2e_moe(
         block_n, block_k = 0, 0
 
     EM = sorted_token_ids.shape[0]
-    print("A", A.shape)
-    print("config", config)
     if A.shape[0] < config["BLOCK_SIZE_M"]:
         # optimize for small batch_size.
         # We assume that top_ids of each token is unique, so

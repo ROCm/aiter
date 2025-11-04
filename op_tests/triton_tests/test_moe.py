@@ -354,12 +354,14 @@ def quantize_fp8(
         e, n, k = tensor.shape
         # Reshape to merge the second and third dimensions (n direction)
         # and the fourth and fifth dimensions (k direction)
+        sN = triton.cdiv(n, blockshape_n)
+        sK = triton.cdiv(k, blockshape_k)
         tensor = tensor.reshape(
-            e, n // blockshape_n, blockshape_n, k // blockshape_k, blockshape_k
+            e, sN, blockshape_n, sK, blockshape_k
         )
         tensor = tensor.permute(0, 2, 4, 1, 3)
         tensor = tensor.reshape(
-            e, blockshape_n * blockshape_k, n // blockshape_n, k // blockshape_k
+            e, blockshape_n * blockshape_k, sN, sK
         )
         max_vals = torch.max(tensor, 1, keepdim=True).values
     else:
@@ -378,11 +380,11 @@ def quantize_fp8(
 
     if use_block_scale:
         tensor_quantized = tensor_quantized.reshape(
-            e, blockshape_n, blockshape_k, n // blockshape_n, k // blockshape_k
+            e, blockshape_n, blockshape_k, sN, sK
         )
         tensor_quantized = tensor_quantized.permute(0, 3, 1, 4, 2)
         tensor_quantized = tensor_quantized.reshape(e, n, k)
-        scale = scale.reshape(e, n // blockshape_n, k // blockshape_k)
+        scale = scale.reshape(e, sN, sK)
     else:
         scale = scale.squeeze(dim=quantize_dim)
 
@@ -650,8 +652,13 @@ def input_helper_e2e(
     w2_scale = None
 
     if fp8_w8a8:
+        # E, N, K
         w1, _, w1_scale = quantize_fp8(w1, dim=(0,), blockshape=blockshape)
-        w2, _, w2_scale = quantize_fp8(w2, dim=(0,), blockshape=blockshape)
+        # E, K, N//2
+        blockshape_stage2 = None
+        if blockshape is not None:
+            blockshape_stage2 = (blockshape[1], blockshape[0])
+        w2, _, w2_scale = quantize_fp8(w2, dim=(0,), blockshape=blockshape_stage2)
         # if blockshape is not None:
         if pertoken:
             a, _, a_scale = quantize_fp8_a(a, a.shape[-1])
@@ -1162,8 +1169,6 @@ def test_moe_e2e(
         tp=tp,
         pertoken=pertoken,
     )
-    print("a", a.shape)
-    print("config", config)
     # tensor parallel slicing
     if tp > 1:
         w1 = w1[:, : N // tp, :].contiguous()

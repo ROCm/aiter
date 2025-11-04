@@ -193,8 +193,8 @@ def e2e_moe_kernel(
         tl.static_assert(num_scales_along_k1 == 1, "BLOCK_SIZE_K1 must be <= group_k")
         if PER_TOKEN_QUANT_A:
             tl.static_assert(
-                group_k is None or group_k == K,
-                "per-token quantization requires group k to be None or K",
+                group_k == K,
+                "per-token quantization requires group k to be K",
             )
 
     offs_i0 = tl.arange(0, BLOCK_SIZE_HALF).to(tl.int64)
@@ -246,9 +246,9 @@ def e2e_moe_kernel(
         w1_ptrs_i0_k = w1_ptrs_i0 + k1 * BLOCK_SIZE_K1 * stride_w1k
         w1_ptrs_i1_k = w1_ptrs_i1 + k1 * BLOCK_SIZE_K1 * stride_w1k
         if use_fp8_w8a8 and use_block_scale:
-            w1_i0_scale_ptrs_k = w1_i0_scale_ptrs + (k1 * BLOCK_SIZE_K1) // group_k * stride_w1sk
-            w1_i1_scale_ptrs_k = w1_i1_scale_ptrs + (k1 * BLOCK_SIZE_K1) // group_k * stride_w1sk
-            a_scale_ptrs_k = a_scale_ptrs + k1 * BLOCK_SIZE_K1 * stride_ask
+            w1_i0_scale_ptrs_k = w1_i0_scale_ptrs + k1 * BLOCK_SIZE_K1 // group_k * stride_w1sk
+            w1_i1_scale_ptrs_k = w1_i1_scale_ptrs + k1 * BLOCK_SIZE_K1 // group_k * stride_w1sk
+            a_scale_ptrs_k = a_scale_ptrs + k1 * BLOCK_SIZE_K1 // group_k * stride_ask
 
         # pipeline silu acc and mul acc so they can use the same LDS for weight loading
 
@@ -305,24 +305,24 @@ def e2e_moe_kernel(
     
     # gated activation
     silu_acc = _silu_exp2(silu_acc)
-    silu_acc = silu_acc * mul_acc
-
-    silu_acc = tl.where(
-        (pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)[None, :]) < N // 2,
-        silu_acc,
-        0.0,
-    )
+    acc = silu_acc * mul_acc
 
     if return_intermediate:
         offs_in = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
         i_ptrs = Intermediate + stride_im * offs_token[:, None] + offs_in[None, :]
         i_mask = token_mask[:, None] & (offs_in[None, :] < N // 2)
-        tl.store(i_ptrs, silu_acc.to(out_dtype), mask=i_mask)
+        tl.store(i_ptrs, acc.to(out_dtype), mask=i_mask)
+
+    acc = tl.where(
+        (pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)[None, :]) < N // 2,
+        acc,
+        0.0,
+    )
 
     if use_fp8_w8a8:
-        silu_acc = silu_acc.to(tl.bfloat16)
+        acc = acc.to(tl.bfloat16)
     else:
-        silu_acc = silu_acc.to(dtype)
+        acc = acc.to(dtype)
 
     offs_w2n = (tl.arange(0, BLOCK_SIZE_HALF) + pid_n * (BLOCK_SIZE_HALF)) % (N // 2)
 
@@ -378,9 +378,9 @@ def e2e_moe_kernel(
                     w2_scale = group_broadcast(w2_scale, 1, num_scales_along_k2, group_k, 1)
 
             w2 = w2.to(tl.bfloat16)
-            out = tl.dot(silu_acc, w2)
+            out = tl.dot(acc, w2)
         else:
-            out = tl.dot(silu_acc, w2)
+            out = tl.dot(acc, w2)
 
         if use_fp8_w8a8 and ((not use_block_scale) or num_scales_along_n == 1):
             out = out * w2_scale
