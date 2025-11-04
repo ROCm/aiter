@@ -232,32 +232,40 @@ def e2e_moe_kernel(
         a_scale = tl.load(A_scale)
 
     num_k1 = tl.cdiv(K, BLOCK_SIZE_K1)
-    for k1 in tl.range(0, num_k1):
+    for k1 in tl.range(0, num_k1, num_stages=2):
+        a_ptrs_k = a_ptrs + k1 * BLOCK_SIZE_K1 * stride_ak
+        w1_ptrs_i0_k = w1_ptrs_i0 + k1 * BLOCK_SIZE_K1 * stride_w1k
+        w1_ptrs_i1_k = w1_ptrs_i1 + k1 * BLOCK_SIZE_K1 * stride_w1k
+        if use_fp8_w8a8 and use_block_scale:
+            w1_i0_scale_ptrs_k = w1_i0_scale_ptrs + (k1 * BLOCK_SIZE_K1) // group_k * stride_w1sk
+            w1_i1_scale_ptrs_k = w1_i1_scale_ptrs + (k1 * BLOCK_SIZE_K1) // group_k * stride_w1sk
+            a_scale_ptrs_k = a_scale_ptrs + k1 * BLOCK_SIZE_K1 * stride_ask
+
         # pipeline silu acc and mul acc so they can use the same LDS for weight loading
 
         # silu acc
         if EVEN_K:
-            a = tl.load(a_ptrs, mask=(token_mask[:, None]), other=0.0)
-            w1 = tl.load(w1_ptrs_i0)
+            a = tl.load(a_ptrs_k, mask=(token_mask[:, None]), other=0.0)
+            w1 = tl.load(w1_ptrs_i0_k)
         else:
             a = tl.load(
-                a_ptrs,
+                a_ptrs_k,
                 mask=(
                     token_mask[:, None] & (offs_k1[None, :] < K - k1 * BLOCK_SIZE_K1)
                 ),
                 other=0.0,
             )
             w1 = tl.load(
-                w1_ptrs_i0,
+                w1_ptrs_i0_k,
                 mask=(offs_k1[:, None] < K - k1 * BLOCK_SIZE_K1),
                 other=0.0,
             )
 
         if use_fp8_w8a8 and use_block_scale:
-            w1_scale = tl.load(w1_i0_scale_ptrs)
+            w1_scale = tl.load(w1_i0_scale_ptrs_k)
             w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
             a_scale = tl.load(
-                a_scale_ptrs, mask=token_mask[:, None], other=0.0
+                a_scale_ptrs_k, mask=token_mask[:, None], other=0.0
             )
 
             silu_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
@@ -266,7 +274,7 @@ def e2e_moe_kernel(
 
         # mul acc
         if EVEN_K:
-            w1 = tl.load(w1_ptrs_i1)
+            w1 = tl.load(w1_ptrs_i1_k)
         else:
             w1 = tl.load(
                 w1_ptrs_i1,
@@ -274,19 +282,13 @@ def e2e_moe_kernel(
                 other=0.0,
             )
         if use_fp8_w8a8 and use_block_scale:
-            w1_scale = tl.load(w1_i1_scale_ptrs)
+            w1_scale = tl.load(w1_i1_scale_ptrs_k)
             w1_scale = group_broadcast(w1_scale, 1, num_scales_along_n, group_n, 1)
             mul_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
         else:
             mul_acc = tl.dot(a, w1, acc=mul_acc)
 
-        a_ptrs += BLOCK_SIZE_K1 * stride_ak
-        w1_ptrs_i0 += BLOCK_SIZE_K1 * stride_w1k
-        w1_ptrs_i1 += BLOCK_SIZE_K1 * stride_w1k
-        if use_fp8_w8a8 and use_block_scale:
-            w1_i0_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_w1sk
-            w1_i1_scale_ptrs += BLOCK_SIZE_K1 // group_k *stride_w1sk
-            a_scale_ptrs += BLOCK_SIZE_K1 // group_k * stride_ask
+        
 
     if use_fp8_w8a8 and not use_block_scale:
         silu_acc = silu_acc * a_scale * w1_scale
@@ -294,11 +296,11 @@ def e2e_moe_kernel(
     
     # gated activation
     silu_acc = _silu_exp2(silu_acc)
-    acc = silu_acc * mul_acc
+    silu_acc = silu_acc * mul_acc
 
-    acc = tl.where(
+    silu_acc = tl.where(
         (pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)[None, :]) < N // 2,
-        acc,
+        silu_acc,
         0.0,
     )
 
@@ -309,9 +311,9 @@ def e2e_moe_kernel(
         tl.store(i_ptrs, acc.to(out_dtype), mask=i_mask)
 
     if use_fp8_w8a8:
-        acc = acc.to(tl.bfloat16)
+        silu_acc = silu_acc.to(tl.bfloat16)
     else:
-        acc = acc.to(dtype)
+        silu_acc = silu_acc.to(dtype)
 
     offs_w2n = (tl.arange(0, BLOCK_SIZE_HALF) + pid_n * (BLOCK_SIZE_HALF)) % (N // 2)
 
@@ -367,9 +369,9 @@ def e2e_moe_kernel(
                     w2_scale = group_broadcast(w2_scale, 1, num_scales_along_k2, group_k, 1)
 
             w2 = w2.to(tl.bfloat16)
-            out = tl.dot(acc, w2)
+            out = tl.dot(silu_acc, w2)
         else:
-            out = tl.dot(acc, w2)
+            out = tl.dot(silu_acc, w2)
 
         if use_fp8_w8a8 and ((not use_block_scale) or num_scales_along_n == 1):
             out = out * w2_scale
@@ -399,3 +401,5 @@ def e2e_moe_kernel(
                 out,
                 mask=out_mask
             )
+
+        
