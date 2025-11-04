@@ -93,10 +93,20 @@ def update_config_files(file_path: str, merge_name: str):
             print(f"path {i+1}: {path} (not exist)")
     merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
     ## get keys from untuned file to drop_duplicates
-    untuned_name = merge_name.replace("tuned", "untuned")
-    untunedf = pd.read_csv(f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv")
-    keys = untunedf.columns
-    merge_df = merge_df.drop_duplicates(subset=keys, keep="last")
+    untuned_name = (
+        re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
+        if re.search(r"(?:_)?tuned$", merge_name)
+        else merge_name.replace("tuned", "untuned")
+    )
+    untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
+    if os.path.exists(untuned_path):
+        untunedf = pd.read_csv(untuned_path)
+        keys = untunedf.columns
+        merge_df = merge_df.drop_duplicates(subset=keys, keep="last")
+    else:
+        logger.warning(
+            f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
+        )
     new_file_path = f"/tmp/{merge_name}.csv"
     merge_df.to_csv(new_file_path, index=False)
     return new_file_path
