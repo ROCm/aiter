@@ -14,6 +14,12 @@ from _triton_kernels.mha_onekernel_bwd_kernel import (
 )
 
 
+def safe_tensor(x, dtype = torch.int32, device = torch.device('cuda')):
+    if x is None:
+        return torch.zeros((1,), dtype=dtype, device=device)
+    return x.to(device)
+
+
 def flash_attn_onekernel_backward(
     do: torch.Tensor,
     q: torch.Tensor,
@@ -108,7 +114,8 @@ def flash_attn_onekernel_backward(
         do,
         delta,
         *o_strides,
-        cu_seqlens_q,
+        *delta_strides,
+        safe_tensor(cu_seqlens_q),
         max_seqlen_q,
         BLOCK_M=config["preprocess_kernel"]["PRE_BLOCK"],
         BLOCK_D_MODEL=head_sz,
@@ -138,6 +145,8 @@ def flash_attn_onekernel_backward(
         batch,
     )
 
+    print("q_strides",q_strides)
+
     if causal:
         _bwd_kernel_causal[grid](
             q,
@@ -163,8 +172,8 @@ def flash_attn_onekernel_backward(
             stride_ah,
             num_q_heads,
             num_k_heads,
-            cu_seqlens_q,
-            cu_seqlens_k,
+            safe_tensor(cu_seqlens_q),
+            safe_tensor(cu_seqlens_k),
             max_seqlen_q,
             max_seqlen_k,
             dropout_mask,
@@ -208,8 +217,8 @@ def flash_attn_onekernel_backward(
             stride_ah,
             num_q_heads,
             num_k_heads,
-            cu_seqlens_q,
-            cu_seqlens_k,
+            safe_tensor(cu_seqlens_q),
+            safe_tensor(cu_seqlens_k),
             max_seqlen_q,
             max_seqlen_k,
             dropout_mask,
@@ -294,6 +303,10 @@ def main(unused_argv):
     dq = torch.zeros_like(q)
     dk = torch.zeros_like(k)
     dv = torch.zeros_like(v)
+
+    # move all tensors to device
+    device = torch.device('cuda')  # in rocm, maps to the hip
+    do, q, k, v, o, softmax_lse = [x.to(device) for x in (do, q, k, v, o, softmax_lse)]
 
     # Triton results
     dq, dk, dv = flash_attn_onekernel_backward(
