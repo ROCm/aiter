@@ -61,7 +61,7 @@ jobs:
           docker exec \
           -w /workspace \
           operators_tuning_test \
-          ./.github/scripts/build_triton.sh
+          bash -c "REBUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
       - name: Show Computing Units
         run: |
