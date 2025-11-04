@@ -9,7 +9,7 @@
     "waves_per_eu": 1,
     "matrix_instr_nonkdim": 16,
     "cache_modifier": ".ca",
-    "NUM_KSPLIT": 4
+    "NUM_KSPLIT": 1
   },
   "M_LEQ_128": {
     "BLOCK_SIZE_M": 64,
@@ -21,7 +21,7 @@
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 16,
     "cache_modifier": ".ca",
-    "NUM_KSPLIT": 2
+    "NUM_KSPLIT": 1
   },
   "M_LEQ_256": {
     "BLOCK_SIZE_M": 128,

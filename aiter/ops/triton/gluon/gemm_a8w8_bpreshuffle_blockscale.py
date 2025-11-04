@@ -134,7 +134,7 @@ def _gemm_a8w8_blockscale_kernel(
     )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=cdna_version,
-        instr_shape=[16, 16],
+        instr_shape=[16, 16, 32],
         transposed=True,
         warps_per_cta=[1, NUM_WARPS],
     )

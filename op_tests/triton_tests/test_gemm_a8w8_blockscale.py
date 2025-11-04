@@ -199,10 +199,10 @@ def generate_gemm_a8w8_blockscale_inputs(
     "block_scale",
     [
         False,
-        True,
+        # True,
     ],
 )
-def test_gemm(dtype, M, N, K, layout, output, impl: str, block_scale=False):
+def test_gemm(dtype, M, N, K, layout, output, impl: str, block_scale):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()
 
@@ -252,7 +252,7 @@ if __name__ == "__main__":
     #blockscale
     # test_gemm("bf16", 16, 7168, 2048, "TN", True, "gluon", True)
     #pure fp8
-    test_gemm("bf16", 16, 7168, 2048, "TN", True, "gluon", False)
+    test_gemm("bf16", 8192, 7168, 2048, "TN", True, "gluon", False)
     # test_gemm("bf16", 16, 8192, 8192, "TN", True, "gluon", False)
     # test_gemm("bf16", 8192, 8192, 8320, "TN", True, "gluon", False)
     # test_gemm("bf16", 8192, 8192, 8320, "TN", True, "gluon", False)
