@@ -317,6 +317,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                  mask.type,
                                  bias_type,
                                  has_lse,
+                                 false,
                                  true);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }

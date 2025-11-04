@@ -19,6 +19,9 @@ def cmdGenFunc_mha_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    q_descale_scalar: float,
+    k_descale_scalar: float,
+    v_descale_scalar: float,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -149,6 +152,9 @@ def gen_mha_fwd_fake_tensors(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    q_descale_scalar: float,
+    k_descale_scalar: float,
+    v_descale_scalar: float,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -178,6 +184,9 @@ def mha_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    q_descale_scalar: float,
+    k_descale_scalar: float,
+    v_descale_scalar: float,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -307,6 +316,7 @@ def cmdGenFunc_mha_varlen_fwd(
         else:
             md_name += "_dropout"
             filter_fwd += "_dropout*"
+        # TODO - squant and nsquant (wait for ck rename)
         if min_seqlen_q == 0:
             md_name += "_nskip"
             filter_fwd += "_nskip*"
@@ -1164,6 +1174,9 @@ def _flash_attn_forward(
     causal: bool,
     window_size_left: int,
     window_size_right: int,
+    q_descale_scalar: float,
+    k_descale_scalar: float,
+    v_descale_scalar: float,
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
     return_lse: bool,
@@ -1236,6 +1249,9 @@ def _flash_attn_forward(
             causal,
             window_size_left,
             window_size_right,
+            q_descale_scalar,
+            k_descale_scalar,
+            v_descale_scalar,
             return_lse,
             return_softmax,
             cu_seqlens_q,
@@ -1613,6 +1629,9 @@ class FlashAttnFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=int(window_size[0]),
             window_size_right=int(window_size[1]),
+            q_descale_scalar=1.0,
+            k_descale_scalar=1.0,
+            v_descale_scalar=1.0,
             bias=bias,
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
@@ -2638,6 +2657,9 @@ def flash_attn_fp8_pertensor_func(
     q,
     k,
     v,
+    q_descale,
+    k_descale,
+    v_descale,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softmax_scale=None,
@@ -2660,6 +2682,9 @@ def flash_attn_fp8_pertensor_func(
         causal=causal,
         window_size_left=int(window_size[0]),
         window_size_right=int(window_size[1]),
+        q_descale_scalar=q_descale,
+        k_descale_scalar=k_descale,
+        v_descale_scalar=v_descale,
         bias=None,
         alibi_slopes=None,
         return_lse=False,

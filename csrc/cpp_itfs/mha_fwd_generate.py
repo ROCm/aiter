@@ -39,6 +39,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                                   bool has_dropout,
                                   bool use_ext_asm,
                                   int how_v3_bf16_cvt = 1,
+                                  bool is_qkv_fp8 = false,
                                   bool skip_min_seqlen_q = false)
 {{
     return mha_fwd_traits(head_size_q,
@@ -52,6 +53,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                           has_dropout,
                           use_ext_asm,
                           how_v3_bf16_cvt,
+                          is_qkv_fp8,
                           skip_min_seqlen_q);
 }}
 
@@ -87,6 +89,7 @@ float mha_fwd(mha_fwd_args args,
               mask_enum mask_type,
               bias_enum bias_type,
               bool has_lse,
+              bool is_qkv_fp8,
               bool use_ext_asm,
               int how_v3_bf16_cvt,
               const void* seqstart_q_padding_ptr,
@@ -107,6 +110,7 @@ float mha_fwd(mha_fwd_args args,
                                      has_dropout,
                                      use_ext_asm,
                                      how_v3_bf16_cvt,
+                                     is_qkv_fp8,
                                      args.min_seqlen_q != 0);
     float t = -1;
     {F_inner_dispatch}
