@@ -281,25 +281,44 @@ def mla_decode_fwd(
         )
         final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
 
-        aiter.mla_decode_stage1_asm_fwd(
-            q,
-            kv_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            num_kv_splits_indptr,
-            work_meta_data,
-            work_indptr,
-            work_info_set,
-            max_seqlen_q,
-            sm_scale,
-            logits,
-            attn_lse,
-            o,
-            q_scale,
-            kv_scale,
-        )
+        if q.size(0) * q.size(1) // bs == 128:
+            from aiter.ops.triton.gluon.mla_fwd_m128 import mla_fwd_m128
+
+            mla_fwd_m128(
+                q,
+                qo_indptr,
+                kv_buffer,
+                kv_indptr,
+                kv_indices,
+                o,
+                logits,
+                attn_lse,
+                work_indptr,
+                work_info_set,
+                sm_scale,
+                max_seqlen_q,
+                512,
+            )
+        else:
+            aiter.mla_decode_stage1_asm_fwd(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                num_kv_splits_indptr,
+                work_meta_data,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                sm_scale,
+                logits,
+                attn_lse,
+                o,
+                q_scale,
+                kv_scale,
+            )
 
         aiter.mla_reduce_v1(
             logits,
