@@ -1,6 +1,7 @@
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def fp8_mqa_logits_kernel(
     Q_ptr,  # fp8e4m3 [seq_len, H, D]
@@ -34,21 +35,12 @@ def fp8_mqa_logits_kernel(
 
     # load Q[BLOCK_Q, NUM_HEADS, HEAD_SIZE]
     q_ptrs = (
-        Q_ptr
-        + row_id * stride_q_s
-        + h_inds * stride_q_h
-        + d_inds[None, :] * stride_q_d
+        Q_ptr + row_id * stride_q_s + h_inds * stride_q_h + d_inds[None, :] * stride_q_d
     )
 
-    q_block = tl.load(
-        q_ptrs, cache_modifier=".cg"
-    )
-    w_ptrs = (
-        weights_ptr + row_id * stride_w_s + h_inds * stride_w_h
-    )
-    w_block = tl.load(w_ptrs, cache_modifier=".cg").to(
-        tl.float32
-    )
+    q_block = tl.load(q_ptrs, cache_modifier=".cg")
+    w_ptrs = weights_ptr + row_id * stride_w_s + h_inds * stride_w_h
+    w_block = tl.load(w_ptrs, cache_modifier=".cg").to(tl.float32)
 
     # Load start/end for each row in this block
     start_ind = tl.load(cu_start_ptr + row_id)
@@ -61,18 +53,13 @@ def fp8_mqa_logits_kernel(
     logits_row_ptrs = logits_ptr + row_id * stride_logits_s
     kv_col_offsets = tl.arange(0, BLOCK_KV) + start_ind
     kv_ptrs = (
-            KV_ptr
-            + kv_col_offsets[None, :] * stride_kv_s
-            + d_inds[:, None] * stride_kv_d
-        )
-    
+        KV_ptr + kv_col_offsets[None, :] * stride_kv_s + d_inds[:, None] * stride_kv_d
+    )
+
     kv_scales_ptrs = kv_scales_ptr + kv_col_offsets
 
-    logits_ptrs = (
-        logits_row_ptrs
-        + kv_col_offsets * stride_logits_k
-    )  
-    
+    logits_ptrs = logits_row_ptrs + kv_col_offsets * stride_logits_k
+
     # Loop over KV tiles
     for _ in tl.range(start_ind, unmasked_end_ind, BLOCK_KV):
         kv_block = tl.load(kv_ptrs)
