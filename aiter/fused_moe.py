@@ -12,7 +12,9 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.moe_op_e2e import e2e_moe
-
+from aiter.ops.triton.utils.moe_config_utils import (
+    get_optimal_moe_e2e_config_func,
+)
 # from aiter import get_torch_quant as get_quant
 from aiter import get_hip_quant as get_quant
 from aiter.utility.fp4_utils import moe_mxfp4_sort
@@ -138,8 +140,18 @@ def fused_moe(
         activation,
         doweight_stage1,
     )
-
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
+
+    if not metadata.run_1stage and USE_TRITON_E2E_MOE:
+
+        moe_config_func = get_optimal_moe_e2e_config_func(
+            inter_dim, dtype, use_fp8_w8a8=quant_type != QuantType.No
+        )
+
+        triton_config = moe_config_func(M)
+
+        block_size_M = triton_config["BLOCK_SIZE_M"]
+
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
@@ -181,27 +193,32 @@ def fused_moe(
         )
     else:
         if USE_TRITON_E2E_MOE:
-            pass
-            # return e2e_moe(
-            #     hidden_states,
-            #     w1,
-            #     w2,
-            #     _,
-            #     a1_scale,
-            #     w1_scale,
-            #     w2_scale,
-            #     sorted_weights,
-            #     sorted_ids,
-            #     topk_ids,
-            #     sorted_expert_ids,
-            #     num_tokens_post_padded,
-            #     False,
-            #     topk,
-            #     use_fp8_w8a8: bool,
-            #     block_shape: Optional[List[int]] = None,
-            #     None,
-            #     False,
-            #     )
+            # pass
+            return fused_moe_2stages_triton_e2e(
+                hidden_states,
+                w1,
+                w2,
+                topk,
+                sorted_ids,
+                topk_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                isG1U1,
+                block_size_M,
+                activation=activation,
+                quant_type=quant_type,
+                doweight_stage1=doweight_stage1,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                num_local_tokens=num_local_tokens,
+                triton_config=triton_config
+                )
         else:
             return fused_moe_2stages(
                 hidden_states,
@@ -564,6 +581,64 @@ def get_2stage_cfgs(
         run_1stage,
     )
 
+
+def fused_moe_2stages_triton_e2e(
+    hidden_states,
+    w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+    w2,  # [expert(local_expert:EP), dim, inter_dim]
+    topk,
+    sorted_ids,
+    topk_ids,
+    sorted_weights,
+    sorted_expert_ids,
+    num_valid_ids,
+    moe_out,
+    isG1U1,
+    block_size_M,
+    activation=ActivationType.Silu,
+    quant_type=QuantType.No,
+    doweight_stage1=False,
+    # following for quant
+    q_dtype_a=None,
+    q_dtype_w=None,
+    w1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
+    w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
+    a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
+    a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+    num_local_tokens: Optional[torch.tensor] = None,
+    triton_config = None
+):
+    quant_func = get_quant(quant_type)
+
+    use_fp8_w8a8 = quant_type != QuantType.No
+
+    token_num, _ = hidden_states.shape
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+
+    dtype = moe_out.dtype
+    device = hidden_states.device
+
+    return e2e_moe(
+        hidden_states,
+        w1,
+        w2,
+        moe_out,
+        a1_scale,
+        w1_scale,
+        w2_scale,
+        sorted_weights,
+        sorted_ids,
+        topk_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        False,
+        topk,
+        use_fp8_w8a8,
+        # TODO block_scale quantization
+        (),
+        triton_config,
+        False,
+        )
 
 def fused_moe_2stages(
     hidden_states,
