@@ -394,7 +394,7 @@ def fused_reduce_act_mul_fp8_group_quant(
             x2: (SPK, M, 2*N1), dtype = fp32.
 
         if x is 2-dim,
-            x: (M, N2), dtype = fp16 or bf16.
+            x: (M, 2*N1), dtype = fp16 or bf16.
             x2 must be None
             the kernel is essentially identical to aiter.ops.triton.activation.act_mul_and_fp8_group_quant
 
@@ -412,7 +412,9 @@ def fused_reduce_act_mul_fp8_group_quant(
             y_scale: (M, cdiv(N1, group_size)), dtype = fp32
             y2: (M, N2), dtype = dtype
     """
-    _LOGGER.info(f"FUSED_REDUCTION_ACT_MUL_FP8_GROUP_QUANT: x={tuple(x.shape)}")
+    _LOGGER.info(
+        f"FUSED_REDUCTION_ACT_MUL_FP8_GROUP_QUANT: x={tuple(x.shape)} activation={activation}"
+    )
 
     assert (
         x.dim() == 2 or x.dim() == 3

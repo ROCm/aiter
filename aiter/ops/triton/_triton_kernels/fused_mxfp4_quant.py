@@ -253,3 +253,217 @@ def _fused_flatten_mxfp4_quant(
         out_block_scales,
         mask=block_scale_offs < tl.cdiv(N2, MXFP4_QUANT_BLOCK_SIZE),
     )
+
+
+@triton.heuristics(
+    {
+        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M1"] == 0
+        and args["N1"] % (args["BLOCK_SIZE_N1"] * args["NUM_ITER"]) == 0,
+    }
+)
+@triton.jit
+def _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel(
+    x_ptr,
+    y_ptr,
+    y_scale_ptr,
+    x2_ptr,
+    y2_ptr,
+    stride_x_spk,
+    stride_x_m,
+    stride_x_n,
+    stride_y_m,
+    stride_y_n,
+    stride_y_scale_m,
+    stride_y_scale_n,
+    stride_x2_spk,
+    stride_x2_m,
+    stride_x2_n,
+    stride_y2_m,
+    stride_y2_n,
+    M,
+    N1,
+    N2,
+    BLOCK_SIZE_M1: tl.constexpr,
+    BLOCK_SIZE_N1: tl.constexpr,
+    BLOCK_SIZE_M2: tl.constexpr,
+    BLOCK_SIZE_N2: tl.constexpr,
+    NUM_ITER: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    EVEN_M_N: tl.constexpr,
+    SCALING_MODE: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    scaleN: tl.constexpr,
+    scaleM_pad: tl.constexpr,
+    scaleN_pad: tl.constexpr,
+    SHUFFLE: tl.constexpr,
+    X_HAS_SPLITK: tl.constexpr,
+    X_NUM_KSPLIT: tl.constexpr,
+    X_NUM_KSPLIT_POW2: tl.constexpr,
+):
+
+    tl.assume(stride_x_spk > 0)
+    tl.assume(stride_x_m > 0)
+    tl.assume(stride_x_n > 0)
+    tl.assume(stride_y_m > 0)
+    tl.assume(stride_y_n > 0)
+    tl.assume(stride_y_scale_m > 0)
+    tl.assume(stride_y_scale_n > 0)
+    tl.assume(stride_x2_spk > 0)
+    tl.assume(stride_x2_m > 0)
+    tl.assume(stride_x2_n > 0)
+    tl.assume(stride_y2_m > 0)
+    tl.assume(stride_y2_n > 0)
+
+    all_pid = tl.program_id(axis=0)
+    num_pid_m1 = tl.cdiv(M, BLOCK_SIZE_M1)
+    num_pid_n1 = tl.cdiv(N1, BLOCK_SIZE_N1 * NUM_ITER)
+    num_pid_1 = num_pid_m1 * num_pid_n1
+
+    if X_HAS_SPLITK and all_pid >= num_pid_1:
+        pid2 = all_pid - num_pid_1
+        num_pid_n2 = tl.cdiv(N2, BLOCK_SIZE_N2)
+        pid_m2 = pid2 // num_pid_n2
+        pid_n2 = pid2 % num_pid_n2
+        offs_m2 = (pid_m2 * BLOCK_SIZE_M2 + tl.arange(0, BLOCK_SIZE_M2)) % M
+        offs_n2 = (pid_n2 * BLOCK_SIZE_N2 + tl.arange(0, BLOCK_SIZE_N2)) % N2
+        offs_spk = tl.arange(0, X_NUM_KSPLIT_POW2)
+        x2_ptrs = (
+            x2_ptr
+            + offs_spk[:, None, None] * stride_x2_spk
+            + offs_m2[None, :, None] * stride_x2_m
+            + offs_n2[None, None, :] * stride_x2_n
+        )
+        if X_NUM_KSPLIT_POW2 == X_NUM_KSPLIT:
+            x2 = tl.load(x2_ptrs)
+        else:
+            x2 = tl.load(
+                x2_ptrs, mask=offs_spk[:, None, None] < X_NUM_KSPLIT, other=0.0
+            )
+        x2 = tl.sum(x2, axis=0)
+
+        x2 = x2.to(y2_ptr.type.element_ty)
+
+        y2_out_ptrs = (
+            y2_ptr + (offs_m2[:, None] * stride_y2_m) + (offs_n2[None, :] * stride_y2_n)
+        )
+
+        tl.store(y2_out_ptrs, x2)
+        return
+
+    pid_m = all_pid // num_pid_n1
+    start_n = all_pid % num_pid_n1 * NUM_ITER
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N1 // MXFP4_QUANT_BLOCK_SIZE
+
+    offs_spk = None
+    if X_HAS_SPLITK:
+        offs_spk = tl.arange(0, X_NUM_KSPLIT_POW2)
+
+    for pid_n in tl.range(start_n, min(start_n + NUM_ITER, N1), num_stages=NUM_STAGES):
+        x_offs_m = pid_m * BLOCK_SIZE_M1 + tl.arange(0, BLOCK_SIZE_M1)
+        x_offs_n = pid_n * BLOCK_SIZE_N1 + tl.arange(0, BLOCK_SIZE_N1)
+
+        mask = None
+        other = None
+        if X_HAS_SPLITK:
+            x_ptrs = (
+                x_ptr
+                + offs_spk[:, None, None] * stride_x_spk
+                + x_offs_m[None, :, None] * stride_x_m
+                + x_offs_n[None, None, :] * stride_x_n
+            )
+            if X_NUM_KSPLIT_POW2 != X_NUM_KSPLIT and not EVEN_M_N:
+                mask = (
+                    (offs_spk[:, None, None] < X_NUM_KSPLIT)
+                    & (x_offs_m[None, :, None] < M)
+                    & (x_offs_n[None, None, :] < N1)
+                )
+                other = 0.0
+            elif not (X_NUM_KSPLIT_POW2 == X_NUM_KSPLIT):
+                mask = offs_spk[:, None, None] < X_NUM_KSPLIT
+                other = 0.0
+            elif not EVEN_M_N:
+                mask = (x_offs_m[None, :, None] < M) & (x_offs_n[None, None, :] < N1)
+                other = 0.0
+        else:
+            x_ptrs = (
+                x_ptr + x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
+            )
+            if not EVEN_M_N:
+                mask = (x_offs_m[:, None] < M) & (x_offs_n[None, :] < N1)
+                other = 0.0
+
+        x = tl.load(
+            x_ptrs,
+            mask=mask,
+            other=other,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        x_mul = tl.load(
+            x_ptrs + N1 * stride_x_n,
+            mask=mask,
+            other=other,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+
+        if X_HAS_SPLITK:
+            x = tl.sum(x, axis=0)
+            x_mul = tl.sum(x_mul, axis=0)
+
+        # x = _apply_activation_from_str(a, ACTIVATION) * b
+        x = ACTIVATION(x) * x_mul
+
+        y, y_scale = _mxfp4_quant_op(
+            x, BLOCK_SIZE_N1, BLOCK_SIZE_M1, MXFP4_QUANT_BLOCK_SIZE
+        )
+
+        out_offs_m = pid_m * BLOCK_SIZE_M1 + tl.arange(0, BLOCK_SIZE_M1)
+        # out_offs_m = x_offs_m
+        out_offs_n = pid_n * BLOCK_SIZE_N1 // 2 + tl.arange(0, BLOCK_SIZE_N1 // 2)
+        out_offs = out_offs_m[:, None] * stride_y_m + out_offs_n[None, :] * stride_y_n
+
+        if EVEN_M_N:
+            tl.store(y_ptr + out_offs, y)
+        else:
+            out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N1 // 2))[None, :]
+            tl.store(y_ptr + out_offs, y, mask=out_mask)
+
+        bs_offs_m = pid_m * BLOCK_SIZE_M1 + tl.arange(0, BLOCK_SIZE_M1)
+        # bs_offs_m = x_offs_m
+        bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
+        if SHUFFLE:
+            bs_offs_0 = bs_offs_m[:, None] // 32
+            bs_offs_1 = bs_offs_m[:, None] % 32
+            bs_offs_2 = bs_offs_1 % 16
+            bs_offs_1 = bs_offs_1 // 16
+            bs_offs_3 = bs_offs_n[None, :] // 8
+            bs_offs_4 = bs_offs_n[None, :] % 8
+            bs_offs_5 = bs_offs_4 % 4
+            bs_offs_4 = bs_offs_4 // 4
+            bs_offs = (
+                bs_offs_1
+                + bs_offs_4 * 2
+                + bs_offs_2 * 2 * 2
+                + bs_offs_5 * 2 * 2 * 16
+                + bs_offs_3 * 2 * 2 * 16 * 4
+                + bs_offs_0 * 2 * 16 * scaleN
+            )
+            bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
+            bs_mask = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[
+                None, :
+            ]
+            y_scale = tl.where(bs_mask1, y_scale, 127)
+        else:
+            bs_offs = (
+                bs_offs_m[:, None] * stride_y_scale_m
+                + bs_offs_n[None, :] * stride_y_scale_n
+            )
+            bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
+        if EVEN_M_N:
+            tl.store(y_scale_ptr + bs_offs, y_scale)
+        else:
+            tl.store(
+                y_scale_ptr + bs_offs,
+                y_scale,
+                mask=bs_mask,
+            )
