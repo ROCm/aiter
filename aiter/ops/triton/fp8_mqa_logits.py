@@ -28,7 +28,6 @@ def fp8_mqa_logits(
     """
     # TODO (cagri): double check what value to put for causally masked logits, 0 or -inf?
     # TODO (cagri): Tune/optimize
-    BLOCK_Q = 1
     BLOCK_KV = 128
     seq_len, num_heads, head_size = Q.shape
     seq_len_kv = KV.shape[0]
@@ -47,7 +46,7 @@ def fp8_mqa_logits(
     stride_kv_s, stride_kv_d = KV.stride()
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
-    fp8_mqa_logits_kernel[(triton.cdiv(seq_len, BLOCK_Q),)](
+    fp8_mqa_logits_kernel[(seq_len,)](
         Q_ptr=Q,
         KV_ptr=KV,
         kv_scales_ptr=kv_scales,
@@ -68,11 +67,11 @@ def fp8_mqa_logits(
         stride_w_h=stride_w_h,
         stride_logits_s=stride_logits_s,
         stride_logits_k=stride_logits_k,
-        BLOCK_Q=BLOCK_Q,
         BLOCK_KV=BLOCK_KV,
         num_warps=4,
         num_stages=1,
         waves_per_eu=2,
+        matrix_instr_nonkdim=16,
     )
 
     return logits
