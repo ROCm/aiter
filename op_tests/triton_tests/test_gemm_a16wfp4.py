@@ -93,7 +93,8 @@ def get_x_vals():
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(32, 512, 7168)]
     x_vals += [(1, 1280, 8192)]
-    x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case
+    x_vals += [(v, 7168, 2048) for v in [1, 4, 8, 32, 64, 128]]
+    # x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal casem TODO: fix 
     return x_vals
 
 
