@@ -270,18 +270,18 @@ def torch_compile_guard(
             else:
                 new_input = "(Tensor dummy, " + input_part[1:]
 
-        return_int = False
+        return_non_tensor = False
         return_annotation = sig.return_annotation
-        if return_annotation is int:
+        if return_annotation in [int, bool, float]:
             output_part = "(Tensor, " + output_part + ")"
-            return_int = True
+            return_non_tensor = True
 
         schema = f"{new_input} -> {output_part}".strip()
 
         loadName = calling_func.__name__
 
         def abstract_impl(*args, custom_build_args={}, **kwargs):
-            if return_int:
+            if return_non_tensor:
                 return torch.empty(1, device=device), 1
             if gen_fake is not None:
                 return gen_fake(*args, **kwargs)
@@ -290,12 +290,12 @@ def torch_compile_guard(
         def outer_wrapper(*args, **kwargs):
             return (
                 wrapper(*args, **kwargs)
-                if not return_int
+                if not return_non_tensor
                 else (torch.empty(1, device=device), wrapper(*args, **kwargs))
             )
 
         def abstract_impl_dummy(dummy, *args, custom_build_args={}, **kwargs):
-            if return_int:
+            if return_non_tensor:
                 return torch.empty(1, device=device), 1
             if gen_fake is not None:
                 return gen_fake(*args, **kwargs)
@@ -304,7 +304,7 @@ def torch_compile_guard(
         def outer_wrapper_dummy(dummy, *args, **kwargs):
             return (
                 wrapper(*args, **kwargs)
-                if not return_int
+                if not return_non_tensor
                 else (torch.empty(1, device=device), wrapper(*args, **kwargs))
             )
 
@@ -333,7 +333,7 @@ def torch_compile_guard(
                     torch.empty(1, device=device), *args, **kwargs
                 )
             )
-            return result[1] if return_int else result
+            return result[1] if return_non_tensor else result
 
         return wrapper_custom
 
