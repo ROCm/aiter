@@ -170,17 +170,23 @@ def get_v3_api():
     v3_arch_list = [arch for arch in ["gfx942", "gfx950"] if arch in gfx_list]
 
     if len(v3_arch_list) == 0:
-        return "" # no v3 support
+        return ""  # no v3 support
     if len(gfx_list) == 1:
         return f"t = {gfx_list[0]}::{v3_call};"
 
     api = """{
         const std::string gpu_arch = get_gpu_arch();"""
     for arch in v3_arch_list:
-        api=api + f"""
+        api = (
+            api
+            + f"""
         if (gpu_arch == "{arch}") {{ t = {arch}::{v3_call}; }}"""
-    api = api + """
+        )
+    api = (
+        api
+        + """
     }"""
+    )
     return api
 
 
