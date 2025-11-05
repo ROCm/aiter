@@ -68,7 +68,7 @@ def test_topk(
         id_triton,
         msg=(
             f"topk_ids Performance Comparison:\n"
-            f"  {'Method':<10} {'Time (μs)':>12}\n"
+            f"  {'Method':<10} {'Time (us)':>12}\n"
             f"  {'-'*10} {'-'*12}\n"
             f"  {'golden':<10} {us_ref:>12.2f}\n"
             f"  {'triton':<10} {us_triton:>12.2f}\n"
@@ -89,7 +89,7 @@ def test_topk(
         id_aiter,
         msg=(
             f"topk_ids Performance Comparison:\n"
-            f"  {'Method':<10} {'Time (μs)':>12}\n"
+            f"  {'Method':<10} {'Time (us)':>12}\n"
             f"  {'-'*10} {'-'*12}\n"
             f"  {'golden':<10} {us_ref:>12.2f}\n"
             f"  {'triton':<10} {us_triton:>12.2f}\n"
@@ -97,26 +97,45 @@ def test_topk(
         ),
     )
 
-    return {"err": err, "us": us_aiter}
+    return {"err": err, "us_aiter": us_aiter, "us_torch": us_ref, "us_triton": us_triton}
 
 
-# BATCH_SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 16, 1335]
-# DIM2 = [16, 128256]
-# K = [2, 8]
-
-batch_size = 1000
-hiddensize = 100000
+BATCH_SIZES = [100, 1000, 10000]
+HIDDENSIZES = [10000, 100000]
 topk = 64
 largest = True
 
 df = []
-ret = test_topk(
-    batch_size,
-    hiddensize,
-    topk,
-    largest,
-    dtypes.fp32,
-)
+for batch_size in BATCH_SIZES:
+    for hiddensize in HIDDENSIZES:
+        print(f"\n{'='*60}")
+        print(f"Testing: batch_size={batch_size}, hiddensize={hiddensize}, topk={topk}")
+        print(f"{'='*60}")
+        ret = test_topk(
+            batch_size,
+            hiddensize,
+            topk,
+            largest,
+            dtypes.fp32,
+        )
+        df.append({
+            "batch_size": batch_size,
+            "hiddensize": hiddensize,
+            "topk": topk,
+            "error": ret["err"],
+            "time_us (aiter)": ret["us_aiter"],
+            "time_us (torch)": ret["us_torch"],
+            "time_us (triton)": ret["us_triton"],
+        })
+
 df = pd.DataFrame(df)
 
-aiter.logger.info(f"summary:\n{df}")
+# Add speedup columns
+df["speedup (aiter vs torch)"] = df["time_us (torch)"] / df["time_us (aiter)"]
+df["speedup (aiter vs triton)"] = df["time_us (triton)"] / df["time_us (aiter)"]
+
+print("\n" + "="*60)
+print("SUMMARY")
+print("="*60)
+aiter.logger.info(f"\n{df.to_string(index=False)}")
+
