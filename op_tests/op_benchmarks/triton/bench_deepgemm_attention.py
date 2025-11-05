@@ -209,6 +209,7 @@ def run_benchmark(args: argparse.Namespace):
         device_properties = torch.cuda.get_device_properties(gpu)
         cu_num = device_properties.multi_processor_count
         schedule_metadata = aiter.get_paged_mqa_logits_metadata(context_lens, blocksize, cu_num) if args.ps else None
+        print(schedule_metadata)
 
         prefix_sum_context_lens = torch.zeros(
             (batch_size + 1,), device="cuda", dtype=torch.int32

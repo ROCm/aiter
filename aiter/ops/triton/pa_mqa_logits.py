@@ -44,6 +44,7 @@ if triton.__version__ >= "3.5.0":
         _gluon_deepgemm_fp8_paged_mqa_logits,
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
         _gluon_deepgemm_fp8_paged_mqa_logits_ps,
+        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_ps,
     )
 
     enable_gluon_pa_mqa_logits = True
@@ -281,7 +282,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     options = {
         "num_warps": 4,
         "waves_per_eu": WavePerEU,
-        "num_stages": 2,
+        "num_stages": 1,
         "num_ctas": 1,
         "cluster_dims": [1, 1, 1],
         "arch": "gfx942",
@@ -306,7 +307,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             else _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle
         )
     else:
-        kernel_fn = _gluon_deepgemm_fp8_paged_mqa_logits_ps
+        kernel_fn = (
+            _gluon_deepgemm_fp8_paged_mqa_logits_ps
+            if not Preshuffle
+            else _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_ps
+        )
 
     src = ASTSource(
         fn=kernel_fn,
