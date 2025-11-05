@@ -72,7 +72,32 @@ def fused_moe_silu(
     config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    #TODO: Add doc
+    Fused MoE computation with SiLU activation and optional quantization.
+
+    Args:
+        A (torch.Tensor): Input activations with shape (num_tokens, hidden_dim).
+        B (torch.Tensor): Expert weights with shape (num_experts, hidden_dim, intermediate_dim).
+        C (torch.Tensor): Output tensor with shape (num_tokens, top_k, intermediate_dim).
+        A_scale (Optional[torch.Tensor]): Scale for A in FP8 mode with shape (1,) or (num_tokens, num_groups).
+        B_scale (Optional[torch.Tensor]): Scale for B with shape (num_experts, ...) for quantized modes.
+        B_zp (Optional[torch.Tensor]): Zero point for B in INT4/INT8 modes.
+        topk_weights (torch.Tensor): Routing weights for top-k experts with shape (num_tokens, top_k).
+        topk_ids (torch.Tensor): Top-k expert IDs per token with shape (num_tokens, top_k).
+        sorted_token_ids (torch.Tensor): Token IDs sorted by expert assignment.
+        expert_ids (torch.Tensor): Expert ID for each sorted token.
+        num_tokens_post_padded (torch.Tensor): Total tokens after block-size padding with shape (1,).
+        mul_routed_weight (bool): Multiply output by routing weights.
+        top_k (int): Number of experts per token.
+        compute_type (tl.dtype): Computation dtype for accumulation.
+        use_fp8_w8a8 (bool): Use FP8 quantization for weights and activations.
+        use_int8_w8a16 (bool): Use INT8 weights with higher precision activations.
+        use_int4_w4a16 (bool): Use INT4 weights with higher precision activations.
+        block_shape (Optional[List[int]]): Block shape [block_n, block_k] for grouped quantization.
+        config (Optional[Dict[str, Any]]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M).
+
+    Returns:
+        None. Results written in-place to C with SiLU activation applied.
     """
     _LOGGER.info(
         f"FUSED_MOE_SILU:  A={tuple(A.shape)}  B={tuple(B.shape)}  C={tuple(C.shape)} "
@@ -141,7 +166,7 @@ def fused_moe_silu(
                 num_tokens_post_padded,
                 B.shape[1],
                 A.shape[1],
-                EM,
+                EM,  # it's not being used in the kernel
                 topk_ids.numel(),
                 A.stride(0),
                 A.stride(1),
@@ -185,7 +210,7 @@ def fused_moe_silu(
                 num_tokens_post_padded,
                 B.shape[1],
                 A.shape[1],
-                EM,
+                EM,  # it's not being used in the kernel
                 topk_ids.numel(),
                 A.stride(0),
                 A.stride(1),
@@ -235,7 +260,7 @@ def fused_moe_silu(
                 num_tokens_post_padded,
                 B.shape[1],
                 A.shape[1] - _PADDING_SIZE,
-                sorted_token_ids.shape[0],
+                sorted_token_ids.shape[0],  # (EM) it's not being used in the kernel
                 topk_ids.numel(),
                 A.stride(0),
                 A.stride(1),
@@ -277,7 +302,7 @@ def fused_moe_silu(
                 num_tokens_post_padded,
                 B.shape[1],
                 A.shape[1] - _PADDING_SIZE,
-                EM,
+                EM,  # it's not being used in the kernel
                 topk_ids.numel(),
                 A.stride(0),
                 A.stride(1),

@@ -3,7 +3,7 @@
 
 import torch
 import triton
-import triton.language as tl
+# import triton.language as tl
 from typing import Any, Dict, Optional
 
 from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
@@ -70,7 +70,31 @@ def e2e_moe(
     config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    #TODO: Add doc
+    End-to-end fused MoE computation with up-projection (W1) and down-projection (W2) in single kernel.
+
+    Args:
+        A (torch.Tensor): Input activations with shape (num_tokens, hidden_dim).
+        W1 (torch.Tensor): Up-projection expert weights with shape (num_experts, hidden_dim, intermediate_dim).
+        W2 (torch.Tensor): Down-projection expert weights with shape (num_experts, intermediate_dim, hidden_dim).
+        Intermediate (torch.Tensor): Intermediate buffer for up-projection results.
+        C (torch.Tensor): Output tensor with shape (num_tokens, hidden_dim).
+        A_scale (Optional[torch.Tensor]): Scale for A in FP8 mode.
+        W1_scale (Optional[torch.Tensor]): Scale for W1 in quantized modes.
+        W2_scale (Optional[torch.Tensor]): Scale for W2 in quantized modes.
+        topk_weights (torch.Tensor): Routing weights for top-k experts with shape (num_tokens, top_k).
+        sorted_token_ids (torch.Tensor): Token IDs sorted by expert assignment.
+        topk_ids: Top-k expert IDs per token with shape (num_tokens, top_k).
+        expert_ids (torch.Tensor): Expert ID for each sorted token.
+        num_tokens_post_padded (torch.Tensor): Total tokens after block-size padding with shape (1,).
+        mul_routed_weight (bool): Multiply output by routing weights.
+        top_k (int): Number of experts per token.
+        use_fp8_w8a8 (bool): Use FP8 quantization for weights and activations.
+        use_int8_w8a16 (bool): Use INT8 weights with higher precision activations.
+        config (Optional[Dict[str, Any]]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K1, BLOCK_SIZE_K2, GROUP_SIZE_M).
+
+    Returns:
+        None. Results written in-place to C.
     """
     _LOGGER.info(
         f"MOE_E2E:  A={tuple(A.shape)}  W1={tuple(W1.shape)}  W2={tuple(W2.shape)}  topk_weights={tuple(topk_weights.shape)}"

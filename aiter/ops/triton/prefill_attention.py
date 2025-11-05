@@ -23,7 +23,7 @@ It supporst page size = 1.
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
 import triton
-import triton.language as tl
+# import triton.language as tl
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.prefill_attention import _fwd_kernel
 
@@ -34,10 +34,20 @@ def context_attention_fwd(
     q, k, v, o, b_start_loc, b_seq_len, max_input_len, is_causal=True
 ):
     """
-    q, k, v: [b * s, head, head_dim]
-    b_start_loc: [b]
-    b_seq_len: [b]
-    out: [b * s, head, head_dim]
+    Memory-efficient attention for prefill with page size = 1.
+
+    Args:
+        q (torch.Tensor): Query tensor with shape (total_tokens, num_q_heads, head_dim).
+        k (torch.Tensor): Key tensor with shape (total_tokens, num_kv_heads, head_dim).
+        v (torch.Tensor): Value tensor with shape (total_tokens, num_kv_heads, head_dim).
+        o (torch.Tensor): Output tensor with shape (total_tokens, num_q_heads, head_dim).
+        b_start_loc (torch.Tensor): Start location for each sequence with shape (batch_size,).
+        b_seq_len (torch.Tensor): Sequence length for each batch with shape (batch_size,).
+        max_input_len (int): Maximum sequence length in the batch.
+        is_causal (bool): Apply causal masking.
+
+    Returns:
+        None. Results written in-place to o.
     """
     _LOGGER.info(
         f"PREFILL_ATTENTION: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"

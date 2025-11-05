@@ -1,6 +1,6 @@
 import torch
 import triton
-import triton.language as tl
+# import triton.language as tl
 from aiter.ops.triton._triton_kernels.softmax import _softmax_kernel_online
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -9,17 +9,13 @@ _LOGGER = AiterTritonLogger()
 
 def softmax(x):
     """
-    Computes the row-wise softmax of a 2D input tensor.
+    Computes row-wise softmax of a 2D input tensor.
 
-    Key parameters:
-        x (torch.Tensor): A 2D input tensor.
+    Args:
+        x (torch.Tensor): Input tensor with shape (n_rows, n_cols). Must be on GPU.
 
     Returns:
-        torch.Tensor: A tensor of the same shape as 'x', where softmax has been
-        applied along the last dimension (row-wise).
-
-    Note:
-        - The input tensor 'x' must reside on the GPU.
+        torch.Tensor: Output with same shape as x, softmax applied along last dimension.
     """
     _LOGGER.info(f"SOFTMAX: x={tuple(x.shape)}")
     n_rows, n_cols = x.shape
@@ -40,7 +36,7 @@ def softmax(x):
         x,
         x.stride(0),
         y.stride(0),
-        n_rows,
+        n_rows,  # it's not being used in the kernel
         n_cols,
         BLOCK_SIZE,
         waves_per_eu=waves_per_eu,

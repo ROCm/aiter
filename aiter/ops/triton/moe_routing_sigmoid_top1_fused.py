@@ -4,7 +4,7 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
+# import triton.language as tl
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.moe_routing_sigmoid_top1_fused import (
     _routing_sigmoid_top1_kernel,
@@ -17,6 +17,21 @@ _LOGGER = AiterTritonLogger()
 def routing_sigmoid_top1(
     x, w, topk, fused_shared_experts=False, config: Optional[dict[str, any]] = None
 ):
+    """
+    Computes top-1 MoE routing with sigmoid activation for expert selection.
+
+    Args:
+        x (torch.Tensor): Input activations with shape (batch_size, seq_len, hidden_dim) or (M, K).
+        w (torch.Tensor): Routing weights with shape (hidden_dim, num_experts).
+        topk (int): Number of experts to select. Must be 1.
+        fused_shared_experts (bool): Include shared expert (always selected) alongside top-1.
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_M, BLOCK_K).
+
+    Returns:
+        tuple: (topk_ids, topk_weights)
+            - topk_ids (torch.Tensor): Selected expert IDs with shape (M, topk) or (M, topk+1) if fused_shared_experts.
+            - topk_weights (torch.Tensor): Routing weights (sigmoid scores) with shape (M, topk) or (M, topk+1).
+    """
     _LOGGER.info(
         f"ROUTING_SIGMOID_TOP1:  x={tuple(x.shape)}  w={tuple(w.shape)}  topk={topk} "
     )

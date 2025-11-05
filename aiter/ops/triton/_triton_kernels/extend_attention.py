@@ -51,7 +51,7 @@ _fwd_kernel_extend_repr = make_kernel_repr(
         "STORE_TRANSPOSE",
         "NUM_Q_HEADS",
         "NUM_BLOCKS",
-        "BATCH",
+        # "BATCH",
         "NUM_XCDS",
     ],
 )
@@ -98,7 +98,7 @@ def _fwd_kernel(
     STORE_TRANSPOSE: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
-    BATCH: tl.constexpr,
+    # BATCH: tl.constexpr,
     NUM_XCDS: tl.constexpr,
 ):
     workgroup_id = tl.program_id(0)  # workgroup index

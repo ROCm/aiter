@@ -20,7 +20,7 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
+# import triton.language as tl
 
 
 from aiter.ops.triton.prefill_attention import context_attention_fwd
@@ -51,9 +51,30 @@ def extend_attention_fwd(
     config: Optional[dict[str, any]] = None,
 ):
     """
-    q_extend, k_extend, v_extend, o_extend: contiguous tensors
+    Attention for prefill with KV cache (extend phase).
+    Supports page size = 1 and variable-length sequences with prefix caching.
 
-    k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
+    Args:
+        q_extend (torch.Tensor): Query tensor for extend tokens with shape (total_extend_tokens, num_q_heads, head_dim).
+        k_extend (torch.Tensor): Key tensor for extend tokens with shape (total_extend_tokens, num_kv_heads, head_dim).
+        v_extend (torch.Tensor): Value tensor for extend tokens with shape (total_extend_tokens, num_kv_heads, head_dim).
+        o_extend (torch.Tensor): Output tensor for extend tokens with shape (total_extend_tokens, num_q_heads, head_dim).
+        k_buffer (torch.Tensor): KV cache buffer containing prefix + extend keys with shape (total_tokens, num_kv_heads, head_dim).
+        v_buffer (torch.Tensor): KV cache buffer containing prefix + extend values with shape (total_tokens, num_kv_heads, head_dim).
+        qo_indptr (torch.Tensor): Index pointer for query/output sequences with shape (batch_size + 1,).
+        kv_indptr (torch.Tensor): Index pointer for KV cache sequences with shape (batch_size + 1,).
+        kv_indices (torch.Tensor): Indices mapping into KV cache buffer.
+        custom_mask (Optional[torch.Tensor]): Custom attention mask tensor.
+        is_causal (bool): Apply causal masking.
+        mask_indptr (torch.Tensor): Index pointer for custom mask.
+        max_len_extend (int): Maximum extend sequence length in batch.
+        sm_scale (Optional[float]): Softmax scale, defaults to 1/sqrt(head_dim).
+        logit_cap (float): Cap logits to prevent overflow.
+        skip_prefix_custom_mask (bool): Skip custom mask for prefix portion.
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_M, BLOCK_N).
+
+    Returns:
+        None. Results written in-place to o_extend.
     """
     _LOGGER.info(
         f"EXTEND_ATTENTION_FWD: q_extend={tuple(q_extend.shape)} k_extend={tuple(k_extend.shape)} v_extend={tuple(v_extend.shape)} "
@@ -133,7 +154,7 @@ def extend_attention_fwd(
         STORE_TRANSPOSE=True,
         NUM_Q_HEADS=head_num,
         NUM_BLOCKS=num_blocks,
-        BATCH=batch_size,
+        # BATCH=batch_size,
         NUM_XCDS=get_num_xcds(),
         # num_warps=num_warps,
         # num_stages=num_stages,
@@ -152,6 +173,23 @@ def redundant_attention(
     b_seq_len_prefix,
     max_len_in_batch,
 ):
+    """
+    Alternative attention computation for extend tokens using full buffer reconstruction.
+
+    Args:
+        q_extend (torch.Tensor): Query tensor for extend tokens with shape (total_extend_tokens, num_q_heads, head_dim).
+        o_extend (torch.Tensor): Output tensor for extend tokens with shape (total_extend_tokens, num_q_heads, head_dim).
+        k_buffer (torch.Tensor): KV cache buffer for keys with shape (total_tokens, num_kv_heads, head_dim).
+        v_buffer (torch.Tensor): KV cache buffer for values with shape (total_tokens, num_kv_heads, head_dim).
+        b_req_idx (torch.Tensor): Batch request indices with shape (batch_size,).
+        b_start_loc (torch.Tensor): Start locations for each sequence with shape (batch_size,).
+        b_seq_len (torch.Tensor): Total sequence lengths (prefix + extend) with shape (batch_size,).
+        b_seq_len_prefix (torch.Tensor): Prefix sequence lengths with shape (batch_size,).
+        max_len_in_batch (int): Maximum sequence length in the batch.
+
+    Returns:
+        None. Results written in-place to o_extend.
+    """
     _LOGGER.info(
         f"REDUNDANT_ATTENTION: q_extend={tuple(q_extend.shape)} o_extend={tuple(o_extend.shape)} \
         k_buffer={tuple(k_buffer.shape)} v_buffer={tuple(v_buffer.shape)}"

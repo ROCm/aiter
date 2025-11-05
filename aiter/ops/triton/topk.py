@@ -11,8 +11,9 @@ import math
 import torch
 import triton
 import triton.language as tl
-import triton.language.core as core
-from triton.language.standard import _log2, zeros_like
+
+# import triton.language.core as core
+# from triton.language.standard import _log2, zeros_like
 from aiter.ops.triton._triton_kernels.topk import (
     _topk_kernel,
     topk_stage1_kernel,
@@ -173,6 +174,20 @@ def topk(
     sorted: bool = True,
     tiny_row_thresh: int = MAX_TINY_ROW,
 ):
+    """
+    Selects k largest elements along last dimension using 1-stage or 2-stage algorithm.
+
+    Args:
+        x (torch.Tensor): Input tensor with shape (B, M). Must be 2D.
+        k (int): Number of top elements to select.
+        dim (int): Dimension to reduce. Must be -1 (last dimension).
+        largest (bool): Select largest elements. Must be True.
+        sorted (bool): Return sorted results. Must be True.
+        tiny_row_thresh (int): Threshold for choosing 1-stage vs 2-stage algorithm.
+
+    Returns:
+        tuple: (values, indices) both with shape (B, k), sorted in descending order.
+    """
     _LOGGER.info(f"TOPK: x={tuple(x.shape)}, k={k}, largest={largest}, sorted={sorted}")
     if dim < 0:
         dim += x.ndim

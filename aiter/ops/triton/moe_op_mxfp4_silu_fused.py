@@ -36,7 +36,31 @@ def fused_moe_mxfp4_silu(
     compute_type: tl.dtype,
 ) -> None:
     """
-    #TODO: Add doc
+    Fused MoE computation with MXFP4 quantization and SiLU activation.
+
+    Args:
+        A (torch.Tensor): Input activations with shape (num_tokens, hidden_dim). FP4 or higher precision.
+        B (torch.Tensor): Expert weights with shape (num_experts, hidden_dim, intermediate_dim). MXFP4 format.
+        C (torch.Tensor): Output tensor with shape (num_tokens, intermediate_dim).
+        A_scale (torch.Tensor): Per-tensor or per-group scale for A.
+        B_scale (torch.Tensor): Per-group scale for B with shape (num_experts, ...).
+        A_mx_scale (torch.Tensor): Microscale (E8M0) scale for A if A is MXFP4.
+        B_mx_scale (torch.Tensor): Microscale (E8M0) scale for B.
+        topk_weights (torch.Tensor): Routing weights for top-k experts with shape (num_tokens, top_k).
+        topk_ids (torch.Tensor): Top-k expert IDs per token with shape (num_tokens, top_k).
+        sorted_token_ids (torch.Tensor): Token IDs sorted by expert assignment.
+        expert_ids (torch.Tensor): Expert ID for each sorted token.
+        num_tokens_post_padded (torch.Tensor): Total tokens after block-size padding with shape (1,).
+        mul_routed_weight (bool): Multiply output by routing weights.
+        top_k (int): Number of experts per token.
+        swizzle_mx_a (bool): Enable swizzled layout for A microscales.
+        swizzle_mx_b (bool): Enable swizzled layout for B microscales.
+        config (Dict[str, Any]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M).
+        compute_type (tl.dtype): Computation dtype for accumulation.
+
+    Returns:
+        None. Results written in-place to C with SiLU activation applied.
     """
     _LOGGER.info(
         f"MOE_OP_MXFP4:  A={tuple(A.shape)}  B={tuple(B.shape)}  C={tuple(C.shape)} "
@@ -91,7 +115,7 @@ def fused_moe_mxfp4_silu(
         num_tokens_post_padded,
         B.shape[1],
         A.shape[1],
-        EM,
+        EM,  # it's not being used in the kernel
         topk_ids.numel(),
         A.stride(0),
         A.stride(1),

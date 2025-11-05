@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import triton
-import triton.language as tl
+# import triton
+# import triton.language as tl
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.moe_align_block_size import (
     _moe_align_block_size_stage1_kernel,
@@ -27,6 +27,20 @@ def moe_align_block_size_triton(
     expert_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor,
 ) -> None:
+    """
+    Aligns and sorts MoE tokens by expert assignment with block-size padding for efficient computation.
+
+    Args:
+        topk_ids (torch.Tensor): Top-k expert assignments per token with shape (num_tokens, topk).
+        num_experts (int): Total number of experts.
+        block_size (int): Block size for alignment and padding.
+        sorted_token_ids (torch.Tensor): Output tensor for sorted token indices.
+        expert_ids (torch.Tensor): Output tensor for expert ID per sorted token.
+        num_tokens_post_pad (torch.Tensor): Output tensor for total tokens after padding with shape (1,).
+
+    Returns:
+        None. Results written in-place to sorted_token_ids, expert_ids, and num_tokens_post_pad.
+    """
     _LOGGER.info(
         f"MOE_ALIGN_BLOCK_SIZE_TRITON:  topk_ids={tuple(topk_ids.shape)} num_experts={num_experts}  sorted_token_ids={tuple(sorted_token_ids.shape)} "
         + "block_size={block_size} expert_ids={tuple(expert_ids.shape)} num_tokens_post_pad={tuple(num_tokens_post_pad.shape)}"
