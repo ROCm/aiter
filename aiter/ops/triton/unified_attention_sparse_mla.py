@@ -1,5 +1,5 @@
 from aiter.ops.triton._triton_kernels.unified_attention_sparse_mla import (
-    kernel_unified_attention_sparse_mla_2d,
+    _kernel_unified_attention_sparse_mla_2d,
 )
 
 
@@ -57,7 +57,7 @@ def unified_attention_sparse_mla(
     TILE_SIZE = block_size
     num_stages_2d = 1
     num_warps = 4
-    kernel_unified_attention_sparse_mla_2d[(total_num_q_blocks,)](
+    _kernel_unified_attention_sparse_mla_2d[(total_num_q_blocks,)](
         output_ptr=out,
         query_ptr=q,
         key_cache_ptr=k,

@@ -2,7 +2,7 @@ import torch
 import math
 import triton
 
-from aiter.ops.triton._triton_kernels.fp8_mqa_logits import fp8_mqa_logits_kernel
+from aiter.ops.triton._triton_kernels.fp8_mqa_logits import _fp8_mqa_logits_kernel
 
 
 def fp8_mqa_logits(
@@ -46,7 +46,7 @@ def fp8_mqa_logits(
     stride_kv_s, stride_kv_d = KV.stride()
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
-    fp8_mqa_logits_kernel[(seq_len,)](
+    _fp8_mqa_logits_kernel[(seq_len,)](
         Q_ptr=Q,
         KV_ptr=KV,
         kv_scales_ptr=kv_scales,

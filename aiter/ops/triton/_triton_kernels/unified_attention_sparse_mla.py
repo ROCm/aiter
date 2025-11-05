@@ -39,7 +39,7 @@ def find_seq_idx(
 
 
 @triton.jit
-def kernel_unified_attention_sparse_mla_2d(
+def _kernel_unified_attention_sparse_mla_2d(
     output_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]
     query_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]
     key_cache_ptr,  # [num_blks, blk_size, 1, KV_LORA_RANK + ROPE_RANK]
