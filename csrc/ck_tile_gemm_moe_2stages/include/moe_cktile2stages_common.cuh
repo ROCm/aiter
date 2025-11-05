@@ -18,9 +18,6 @@
 #include <iostream>
 #include <numeric>
 
-// #include <ATen/cuda/CUDAContext.h>
-// #include <c10/cuda/CUDAGuard.h>
-// #include <c10/cuda/CUDAStream.h>
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
@@ -287,9 +284,8 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
         // }
         // else
         // {
-        ave_time = ck_tile::launch_kernel(s,
-                                          ck_tile::make_kernel<FlatmmConfig::kBlockPerCu>(
-                                              Kernel{}, grids, blocks, 0, kargs));
+        ave_time = ck_tile::launch_kernel(
+            s, ck_tile::make_kernel<FlatmmConfig::kBlockPerCu>(Kernel{}, grids, blocks, 0, kargs));
         // }
         // return ave_time;
     };
