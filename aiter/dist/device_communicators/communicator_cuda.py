@@ -161,7 +161,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def fused_allreduce_rmsnorm(self, input_, weight_, eps) -> torch.Tensor:
         n = input_.shape[-1]
         can_use_fuse_ar_rms = (
-            n <= 16384 and input_.numel() * input_.element_size() < 8 * 1024 * 8192
+            n <= 16384
+            and input_.numel() * input_.element_size() < 8 * 1024 * 8192
+            and self.world_size != 6
         )
         ca_comm = self.ca_comm
         if (
@@ -174,7 +176,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert out is not None
             return out
         # call split kernel
-        ar_out = all_reduce(input_)
+        ar_out = self.all_reduce(input_)
         out = torch.empty_like(ar_out)
         residual_out = torch.empty_like(ar_out)
         from aiter import rmsnorm2d_fwd_with_add

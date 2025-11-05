@@ -1489,17 +1489,17 @@ namespace aiter
   name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
                                                  rank_, size);
 
-#define dispatch(ngpus, name)   \
-    do                          \
-    {                           \
-      if (bytes % 128 == 0)     \
-      {                         \
-        KL(ngpus, name)         \
-      }                         \
-      else                      \
-      {                         \
-        KL(ngpus, name##_naive) \
-      }                         \
+#define dispatch(ngpus, name)                   \
+    do                                          \
+    {                                           \
+      if (bytes % 128 == 0 && world_size_ != 6) \
+      {                                         \
+        KL(ngpus, name)                         \
+      }                                         \
+      else                                      \
+      {                                         \
+        KL(ngpus, name##_naive)                 \
+      }                                         \
     } while(0)
 
 #define REDUCE_CASE(ngpus)                         \
