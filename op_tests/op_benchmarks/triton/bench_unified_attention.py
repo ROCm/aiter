@@ -30,18 +30,18 @@ def input_helper(
     """Helper function to generate input tensors for unified attention testing."""
     max_query_len = max(query_lens)
     max_kv_len = max(kv_lens)
-    
+
     # Generate query tensor
     query = torch.randn(
         sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
     )
-    
+
     # Generate key and value caches
     key_cache = torch.randn(
         num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
     )
     value_cache = torch.randn_like(key_cache)
-    
+
     # Optionally quantize to fp8
     maybe_quantized_query = query
     maybe_quantized_key_cache = key_cache
@@ -49,24 +49,24 @@ def input_helper(
     q_descale = None
     k_descale = None
     v_descale = None
-    
+
     if q_dtype is not None:
         maybe_quantized_query = query.to(q_dtype)
         maybe_quantized_key_cache = key_cache.to(q_dtype)
         maybe_quantized_value_cache = value_cache.to(q_dtype)
-        
+
         scale_shape = (num_seqs, num_kv_heads)
         k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
         v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
-    
+
     # Generate cumulative query lengths
     cu_query_lens = torch.tensor(
         [0] + query_lens, dtype=torch.int32, device="cuda"
     ).cumsum(dim=0, dtype=torch.int32)
-    
+
     # Generate kv lengths tensor
     kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
-    
+
     # Generate block tables
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
     block_tables = torch.randint(
@@ -76,13 +76,13 @@ def input_helper(
         dtype=torch.int32,
         device="cuda",
     )
-    
+
     # Generate sinks
     sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
-    
+
     # Output tensor
     output = torch.empty_like(query)
-    
+
     return (
         maybe_quantized_query,
         maybe_quantized_key_cache,
@@ -108,7 +108,7 @@ def model_benchmark_configs(args):
         models="llama3,deepseek" if args.model is None else args.model,
     )
     ua_configs = []
-    
+
     for model_name, config in configs.items():
         num_query_heads = config["num_attention_heads"]
         num_kv_heads = (
@@ -117,7 +117,7 @@ def model_benchmark_configs(args):
             else config["num_key_value_heads"]
         )
         head_size = config["hidden_size"] // num_query_heads
-        
+
         # Use provided seq lens or default values
         if args.seq_pattern == "decode":
             # Decode: batch of single-token queries with varying context lengths
@@ -143,12 +143,12 @@ def model_benchmark_configs(args):
                 [random.randint(512, 2048) for _ in range(decode_seqs)]
                 + query_lens[decode_seqs:]
             )
-        
+
         ua_configs.append(
-            (model_name, num_seqs, tuple(query_lens), tuple(kv_lens), 
+            (model_name, num_seqs, tuple(query_lens), tuple(kv_lens),
              num_query_heads, num_kv_heads, head_size)
         )
-    
+
     return ua_configs
 
 
@@ -157,7 +157,7 @@ def custom_benchmark_configs(args):
     num_query_heads = args.hq
     num_kv_heads = args.hk if args.hk else num_query_heads
     head_size = args.d if args.d else 128
-    
+
     if args.seq_pattern == "decode":
         num_seqs = args.b if args.b else 16
         query_lens = [1] * num_seqs
@@ -172,7 +172,7 @@ def custom_benchmark_configs(args):
         prefill_seqs = num_seqs - decode_seqs
         query_lens = [1] * decode_seqs + [args.sq if args.sq else 256] * prefill_seqs
         kv_lens = [args.sk if args.sk else 1024] * decode_seqs + query_lens[decode_seqs:]
-    
+
     return [
         ("custom", num_seqs, tuple(query_lens), tuple(kv_lens),
          num_query_heads, num_kv_heads, head_size)
@@ -182,7 +182,7 @@ def custom_benchmark_configs(args):
 def run_benchmark(args):
     dtype = arg_to_torch_dtype[args.dtype]
     q_dtype = e4m3_dtype if args.fp8 else None
-    
+
     # Determine benchmark configurations
     if args.model:
         x_vals_list = model_benchmark_configs(args)
@@ -190,10 +190,10 @@ def run_benchmark(args):
     else:
         x_vals_list = custom_benchmark_configs(args)
         x_names = ["config", "num_seqs", "query_lens", "kv_lens", "HQ", "HK", "HEAD_DIM"]
-    
+
     line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
     line_vals = ["time", "tflops", "bandwidth"]
-    
+
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
@@ -205,7 +205,7 @@ def run_benchmark(args):
         plot_name=get_caller_name_no_ext(),
         args={},
     )
-    
+
     @triton.testing.perf_report([benchmark])
     def bench_unified_attention(
         num_seqs, query_lens, kv_lens, HQ, HK, HEAD_DIM, metric, model=None, config=None
@@ -214,11 +214,11 @@ def run_benchmark(args):
         num_blocks = args.num_blocks if args.num_blocks else 8192
         sliding_window = args.sliding_window
         soft_cap = args.soft_cap
-        
+
         # Convert tuples back to lists
         query_lens = list(query_lens)
         kv_lens = list(kv_lens)
-        
+
         # Generate inputs
         (
             query,
@@ -246,11 +246,11 @@ def run_benchmark(args):
             dtype,
             q_dtype,
         )
-        
+
         # Softmax scale
         scale = HEAD_DIM**-0.5
         window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
-        
+
         # Define the kernel function
         def fn():
             unified_attention(
@@ -272,37 +272,45 @@ def run_benchmark(args):
                 v_descale=v_descale,
                 sinks=sinks if args.use_sinks else None,
             )
-        
+
         # Benchmark the kernel
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
-        
+
         # Calculate FLOPs
         # For each sequence: 2 * query_len * kv_len * num_query_heads * (2 * head_size)
         # The factor of 2 comes from: QK^T matmul + softmax(QK^T)V matmul
         # Each matmul is roughly 2 * M * N * K FLOPs
+        # For causal attention, only lower triangular elements are computed (~half)
         total_flops = 0.0
         for q_len, kv_len in zip(query_lens, kv_lens):
-            # QK^T: (q_len, head_size) @ (head_size, kv_len) = 2 * q_len * kv_len * head_size per head
-            # Softmax(QK^T)V: (q_len, kv_len) @ (kv_len, head_size) = 2 * q_len * kv_len * head_size per head
-            total_flops += 2.0 * HQ * q_len * kv_len * HEAD_DIM * 2
-        
+            # For causal attention, calculate valid elements in the causal mask
+            if q_len > kv_len:
+                # All kv_len tokens are visible to all queries
+                valid_out_elements = (kv_len**2 + kv_len) / 2
+            else:
+                # Triangular mask: q_len * kv_len - upper_triangular_zeros
+                valid_out_elements = q_len * kv_len - ((q_len**2 - q_len) / 2)
+            
+            # QK^T and softmax(QK^T)V: 2 operations, each with 2*valid_elements*head_size FLOPs per head
+            total_flops += valid_out_elements * HQ * HEAD_DIM * 2.0 * 2
+
         # Calculate memory traffic
         q_size = sum(query_lens) * HQ * HEAD_DIM * get_dtype_bytes(dtype)
         k_size = num_blocks * block_size * HK * HEAD_DIM * get_dtype_bytes(dtype)
         v_size = num_blocks * block_size * HK * HEAD_DIM * get_dtype_bytes(dtype)
         o_size = sum(query_lens) * HQ * HEAD_DIM * get_dtype_bytes(dtype)
         block_table_size = num_seqs * ((max_kv_len + block_size - 1) // block_size) * 4
-        
+
         # Read: q, k_cache, v_cache, block_tables
         mem_read = q_size + k_size + v_size + block_table_size
         # Write: output
         mem_write = o_size
         mem = mem_read + mem_write
-        
+
         # Calculate metrics
         bandwidth = mem / ms * 1e-6  # GB/s
         tflops = total_flops / ms * 1e-9  # TFLOPS
-        
+
         # Return the requested metric
         if metric == "time":
             return ms
@@ -312,7 +320,7 @@ def run_benchmark(args):
             return bandwidth
         else:
             raise ValueError("Unknown metric: " + metric)
-    
+
     bench_unified_attention.run(save_path="." if args.o else None, print_data=True)
 
 
@@ -386,18 +394,18 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
-    
+
     # Validate arguments
     if not args.model and args.hq == 0:
         print("Error: Must specify either --model or provide custom config with -hq")
         return 1
-    
+
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         fun = lambda: run_benchmark(args)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
-    
+
     run_benchmark(args)
 
 
