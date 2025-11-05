@@ -178,7 +178,7 @@ def flash_attn_onekernel_backward(
             dropout_p,
             philox_seed,
             philox_offset,
-            alibi_slopes,
+            safe_tensor(alibi_slopes),
             HEAD_DIM=head_sz,
             ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
             ENABLE_DROPOUT=use_dropout,
@@ -223,7 +223,7 @@ def flash_attn_onekernel_backward(
             dropout_p,
             philox_seed,
             philox_offset,
-            alibi_slopes,
+            safe_tensor(alibi_slopes),
             HEAD_DIM=head_sz,
             ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
             ENABLE_DROPOUT=use_dropout,
@@ -265,10 +265,10 @@ def mha_fwd_reference(q, k, v, causal=True, sm_scale=None):
     return out, softmax_lse
 
 
-BATCH_SIZE: int = 2
-NUM_HEADS: int = 64
-SEQ_LEN: int = 4096
-HEAD_SIZE: int = 128
+BATCH_SIZE: int = 1
+NUM_HEADS: int = 32
+SEQ_LEN: int = 1024
+HEAD_SIZE: int = 64
 MHA_SHAPE: tuple[int, int, int, int] = (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_SIZE)
 assert all(dim > 0 for dim in MHA_SHAPE)
 MHA_DTYPE = torch.float32
