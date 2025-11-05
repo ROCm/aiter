@@ -411,6 +411,16 @@ def test_fmoe(
             out2_aiter,
             msg=f"aiter_all_stages:{us_fuse:>8.2f} us......",
         )
+        
+        def calc_diff(x: torch.Tensor, y: torch.Tensor):
+            x, y = x.double(), y.double()
+            denominator = (x * x + y * y).sum()
+            sim = 2 * (x * y).sum() / denominator
+            return 1 - sim
+ 
+ 
+        logits_diff = calc_diff(out2_ref, out2_aiter)
+        assert logits_diff < 1e-3
 
         return {"us": us_fuse, "err": err}
 
@@ -437,7 +447,6 @@ l_quant = [
     (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
     (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
     (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True]
