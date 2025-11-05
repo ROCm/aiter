@@ -58,7 +58,9 @@ template <typename T>
 struct is_supported_type
 {
     static constexpr bool value = std::is_same_v<T, _Float16> || std::is_same_v<T, __bf16> ||
-                                  std::is_same_v<T, float> || std::is_same_v<T, int>;
+                                  std::is_same_v<T, float> || std::is_same_v<T, int> ||
+                                  std::is_same_v<T, ck_tile::fp16_t> || std::is_same_v<T, ck_tile::bf16_t> ||
+                                  std::is_same_v<T, ck_tile::fp32_t> || std::is_same_v<T, ck_tile::index_t>;
 };
 
 template <typename T>
@@ -209,7 +211,7 @@ template <typename T>
 __inline__ constexpr T get_lower_bound()
 {
     static_assert(utils::is_supported_type_v<T>,
-                  "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
+                  "Unsupported type T: only _Float16, __bf16, float, int, and ck_tile types are implemented");
     if constexpr(std::is_floating_point_v<T> && std::is_signed_v<T>)
     {
         return -std::numeric_limits<T>::infinity();
@@ -221,6 +223,26 @@ __inline__ constexpr T get_lower_bound()
     else if constexpr(std::is_same_v<T, __bf16>)
     {
         return -__bf16(0x7F80);
+    }
+    else if constexpr(std::is_same_v<T, ck_tile::fp16_t>)
+    {
+        // fp16: negative infinity
+        return -ck_tile::numeric<ck_tile::fp16_t>::max();
+    }
+    else if constexpr(std::is_same_v<T, ck_tile::bf16_t>)
+    {
+        // bf16: negative infinity
+        return -ck_tile::numeric<ck_tile::bf16_t>::max();
+    }
+    else if constexpr(std::is_same_v<T, ck_tile::fp32_t>)
+    {
+        // fp32: negative infinity
+        return -ck_tile::numeric<ck_tile::fp32_t>::max();
+    }
+    else if constexpr(std::is_same_v<T, ck_tile::index_t>)
+    {
+        // index_t (int32): most negative value
+        return ck_tile::numeric<ck_tile::index_t>::min();
     }
     else
     {
@@ -270,8 +292,12 @@ __inline__ constexpr T get_sentinel_value()
 {
     if constexpr(FindLargest)
     {
+        // Allow ck_tile types even though they may have unsigned underlying representation
         static_assert(
-            !std::is_unsigned_v<T>,
+            !std::is_unsigned_v<T> ||
+            std::is_same_v<T, ck_tile::fp16_t> ||
+            std::is_same_v<T, ck_tile::bf16_t> ||
+            std::is_same_v<T, ck_tile::fp32_t>,
             "Cannot determine a meaningful lower bound for finding the 'largest' unsigned value. "
             "The lowest value is 0, which is a poor sentinel.");
         return get_lower_bound<T>();
