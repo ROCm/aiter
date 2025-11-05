@@ -30,6 +30,15 @@ def fp8_mqa_logits_kernel(
 ):
     row_id = tl.program_id(0)
 
+    tl.assume(row_id >= 0)
+    tl.assume(stride_q_s > 0)
+    tl.assume(stride_q_h > 0)
+    tl.assume(stride_q_d > 0)
+    tl.assume(stride_kv_s > 0)
+    tl.assume(stride_kv_d > 0)
+    tl.assume(stride_w_s > 0)
+    tl.assume(stride_w_h > 0)
+
     h_inds = tl.arange(0, NUM_HEADS)[:, None]
     d_inds = tl.arange(0, HEAD_SIZE)
 
