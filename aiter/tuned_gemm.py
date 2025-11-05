@@ -310,7 +310,7 @@ class TunedGemm:
     def __init__(self):
         self.extensions_created = False
         self.save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
-        self.untune_path = f"{this_dir}/configs/untuned_gemm.csv"
+        self.untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
         self.tune_path = AITER_CONFIG_GEMM_BF16_FILE
 
     def mm(

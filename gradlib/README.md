@@ -20,9 +20,9 @@ By gradlib, we can confirm the parameter of GEMMs with best performance in the s
     AITER_TUNE_GEMM=1 python {workload_tests}
    `
 
-    then shapes will be captured in aiter/configs/untuned_gemm.csv
-2. to tune GEMMs in aiter/configs/untuned_gemm.csv,
-    You can find the results of this tuning in `aiter/configs/tuned_gemm.csv`.
+    then shapes will be captured in aiter/configs/bf16_untuned_gemm.csv
+2. to tune GEMMs in aiter/configs/bf16_untuned_gemm.csv,
+    You can find the results of this tuning in `aiter/configs/bf16_tuned_gemm.csv`.
     |**cu_num**|**M**|**N**|**K**|**bias**|   **dtype**  | **outdtype** |**scaleAB**|**libtype**|**solidx**|**splitK**|**soltimes**|**kernelName**|**tflops**|**bw**|
     |----------|-----|-----|-----|--------|--------------|--------------|-----------|-----------|----------|----------|------------|--------------|----------|------|
     |80        |128  |1536 |7168 |  False |torch.bfloat16|torch.float32 | False     | hipblast  |667788    |0         | 10.6       | xxxxxxx      |  xx      | xx   |
@@ -37,6 +37,6 @@ By gradlib, we can confirm the parameter of GEMMs with best performance in the s
    run
    
    ` 
-    python3 gradlib/gradlib/gemm_tuner.py --tuned_file aiter/configs/tuned_gemm.csv  --input_file aiter/configs/untuned_gemm.csv
+    python3 gradlib/gradlib/gemm_tuner.py --tuned_file aiter/configs/bf16_tuned_gemm.csv  --input_file aiter/configs/bf16_untuned_gemm.csv
    `
 3. then run your test as normal~
