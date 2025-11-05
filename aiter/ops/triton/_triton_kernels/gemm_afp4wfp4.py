@@ -67,6 +67,7 @@ _gemm_afp4wfp4_reduce_repr = make_kernel_repr(
     ],
 )
 
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
