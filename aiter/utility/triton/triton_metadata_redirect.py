@@ -164,4 +164,3 @@ def with_custom_metadata_path(dir):
         return original_func
 
     return decorator
-

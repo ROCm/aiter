@@ -16,6 +16,7 @@ from aiter.test_mha_common import (
     attn_bias_from_alibi_slopes,
     ck_randval_to_dropout_mask,
     convert_flash_attn_S_to_softmax,
+    generate_qkv,
 )
 
 
@@ -47,7 +48,7 @@ def run_torch(
     else:
         attn_bias = None
 
-    out, _ = attention_ref(
+    out, _, softmax_lse = attention_ref(
         q,
         k,
         v,
@@ -63,16 +64,16 @@ def run_torch(
     )
 
     if dout is None:
-        return out
+        return out, softmax_lse
     elif bias is not None:
         dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
         # If seqlen_q > seqlen_k with mask, pytorch will output NaN.
         # Align with ck behavior here
         dbias = torch.nan_to_num(dbias, nan=0.0)
-        return out, dq, dk, dv, dbias
+        return out, softmax_lse, dq, dk, dv, dbias
     else:
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, dq, dk, dv, None
+        return out, softmax_lse, dq, dk, dv, None
 
 
 def run_ck(
@@ -91,7 +92,7 @@ def run_ck(
     cu_seqlens_q=None,
     cu_seqlens_kv=None,
 ):
-    (out, _, S_dmask), us_fwd = run_perftest(
+    (out, softmax_lse, S_dmask), us_fwd = run_perftest(
         aiter.flash_attn_func,
         q,
         k,
@@ -107,6 +108,7 @@ def run_ck(
         return_attn_probs,
         cu_seqlens_q,
         cu_seqlens_kv,
+        num_rotate_args=1,
     )
 
     if dropout_p > 0.0:
@@ -130,7 +132,7 @@ def run_ck(
         dropout_mask = None
 
     if dout is None:
-        return out, dropout_mask, us_fwd
+        return out, softmax_lse, dropout_mask, us_fwd
     elif bias is not None:
         (dq, dk, dv, dbias), us_bwd = run_perftest(
             torch.autograd.grad,
@@ -140,7 +142,7 @@ def run_ck(
             retain_graph=True,
             num_rotate_args=1,
         )
-        return out, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd)
+        return out, softmax_lse, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd)
     else:
         (dq, dk, dv), us_bwd = run_perftest(
             torch.autograd.grad,
@@ -150,9 +152,10 @@ def run_ck(
             retain_graph=True,
             num_rotate_args=1,
         )
-        return out, dropout_mask, dq, dk, dv, None, (us_fwd, us_bwd)
+        return out, softmax_lse, dropout_mask, dq, dk, dv, None, (us_fwd, us_bwd)
 
 
+@pytest.mark.parametrize("input_layout", ["BSHD", "BHSD", "SBHD", "KVPACKED"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("deterministic", [True, False])
@@ -176,6 +179,7 @@ def run_ck(
         (192, 192),
         (224, 224),
         (256, 256),
+        (192, 128),
     ],
 )
 @pytest.mark.parametrize(
@@ -207,6 +211,7 @@ def test_flash_attn_output(
     deterministic,
     mha_type,
     dtype,
+    input_layout,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -239,6 +244,31 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
+    (
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        q,
+        k,
+        v,
+        _,
+        _,
+        _,
+    ) = generate_qkv(
+        q,
+        k,
+        v,
+        None,
+        None,
+        kvpacked=(input_layout == "KVPACKED"),
+        qkvpacked=(input_layout == "QKVPACKED"),
+        input_layout=input_layout,
+    )
+
     attn_bias = None
     alibi_slopes = None
     if bias_type == "bias":
@@ -258,7 +288,7 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
-    out, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd) = run_ck(
+    out, softmax_lse, dropout_mask, dq, dk, dv, dbias, (us_fwd, us_bwd) = run_ck(
         q,
         k,
         v,
@@ -273,7 +303,7 @@ def test_flash_attn_output(
         return_attn_probs,
     )
 
-    out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
+    out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
         q,
         k,
         v,
@@ -286,7 +316,7 @@ def test_flash_attn_output(
         window_size,
     )
 
-    out_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
+    out_pt, softmax_lse_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
         q,
         k,
         v,
@@ -305,6 +335,15 @@ def test_flash_attn_output(
     print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
     assert (out - out_ref).abs().max().item() <= out_tol
+
+    print(f"softmax_lse max diff: {(softmax_lse - softmax_lse_ref).abs().max().item()}")
+    print(
+        f"softmax_lse Pytorch max diff: {(softmax_lse_pt - softmax_lse_ref).abs().max().item()}"
+    )
+    softmax_lse_tol = max(
+        2 * (softmax_lse_pt - softmax_lse_ref).abs().max().item(), 0.01
+    )
+    # assert (softmax_lse - softmax_lse_ref).abs().max().item() <= softmax_lse_tol
 
     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
     print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
@@ -327,18 +366,26 @@ def test_flash_attn_output(
         dbias_tol = max(10 * (dbias_pt - dbias_ref).abs().max().item(), 0.01)
         assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
 
-    fwd_flop = nheads * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+    fwd_flop = (
+        batch_size
+        * nheads
+        * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+    )
     dtype_bytes = torch.finfo(dtype).bits // 8
     fwd_num_bytes = (
-        nheads
+        batch_size
+        * nheads
         * dtype_bytes
         * (seqlen_q * d + seqlen_k * d + seqlen_k * d_v + seqlen_q * d_v)
     )
-    bwd_flop = nheads * (
-        seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2
+    bwd_flop = (
+        batch_size
+        * nheads
+        * (seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2)
     )
     bwd_num_bytes = (
-        2 * fwd_num_bytes + nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
+        2 * fwd_num_bytes
+        + batch_size * nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
     )
     ret = {}
     ret["fwd_us"] = us_fwd
@@ -351,7 +398,7 @@ def test_flash_attn_output(
 
 
 @benchmark()
-def test_fa_output_benchmark(
+def flash_attn_output_benchmark(
     batch_size,
     nheads,
     seqlen_q,
@@ -365,6 +412,7 @@ def test_fa_output_benchmark(
     deterministic,
     mha_type,
     dtype,
+    input_layout,
 ):
     return test_flash_attn_output(
         batch_size,
@@ -380,6 +428,7 @@ def test_fa_output_benchmark(
         deterministic,
         mha_type,
         dtype,
+        input_layout,
     )
 
 
@@ -410,6 +459,7 @@ def test_fa_output_benchmark(
         (192, 192),
         (224, 224),
         (256, 256),
+        (192, 128),
     ],
 )
 @pytest.mark.parametrize(
@@ -525,7 +575,7 @@ def test_flash_attn_seq_padding(
         alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=dtypes.fp32)
 
     # 2. Run CK with cu_seqlens (forward pass only)
-    out, _, _ = run_ck(
+    out, _, _, _ = run_ck(
         q,
         k,
         v,
@@ -543,7 +593,7 @@ def test_flash_attn_seq_padding(
     )
 
     # 3. Run Torch with padding_mask (forward pass only)
-    out_ref = run_torch(
+    out_ref, _ = run_torch(
         q,
         k,
         v,
@@ -558,7 +608,7 @@ def test_flash_attn_seq_padding(
         key_padding_mask=key_padding_mask,
     )
 
-    out_pt = run_torch(
+    out_pt, _ = run_torch(
         q,
         k,
         v,
@@ -627,9 +677,6 @@ def test_flash_attn_seq_padding(
     assert diff <= out_tol
 
 
-l_dtype = ["bf16", "fp16"]
-l_dim = [32, 40, 64, 111, 128, 160]
-l_mha_type = ["mha", "mqa", "gqa"]
 l_causal = [False, True]
 l_local = [False, True]
 l_deterministic = [False, True]
@@ -671,20 +718,20 @@ parser.add_argument(
     e.g.: -k 1024""",
 )
 parser.add_argument(
-    "-qk",
-    "--d_qk",
-    type=int,
-    default=None,
+    "-d_qk_v",
+    type=dtypes.str2tuple,
+    nargs="+",
+    default=[
+        (32, 32),
+        (40, 40),
+        (64, 64),
+        (111, 111),
+        (128, 128),
+        (160, 160),
+        (192, 128),
+    ],
     help="""Dimension of query and key. Default is None.
-    e.g.: -qk 256""",
-)
-parser.add_argument(
-    "-v",
-    "--d_v",
-    type=int,
-    default=128,
-    help="""Dimension of value. Default is 128.
-    e.g.: -v 256""",
+    e.g.: -qk_v 256,256""",
 )
 parser.add_argument(
     "-p",
@@ -733,7 +780,9 @@ parser.add_argument(
     "-m",
     "--mha_type",
     type=str,
-    default=None,
+    nargs="+",
+    choices=["mha", "mqa", "gqa"],
+    default=["mha", "mqa", "gqa"],
     help="""Type of multi-head attention.
     e.g.: -m mha""",
 )
@@ -741,83 +790,77 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=str,
-    default=None,
+    nargs="+",
+    choices=["bf16", "fp16"],
+    default=["bf16", "fp16"],
     help="""Data type.
     e.g.: -d bf16""",
 )
-
+parser.add_argument(
+    "-i",
+    "--input_layout",
+    type=str,
+    choices=["BSHD", "BHSD", "SBHD", "QKVPACKED", "KVPACKED"],
+    default="BSHD",
+    help="""input_layout.
+    e.g.: -i BSHD""",
+)
 if __name__ == "__main__":
     args = parser.parse_args()
-    if args.dtype is not None:
-        l_dtype = [dtypes.d_dtypes[args.dtype]]
-    else:
-        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-        args.dtype = "bf16"
 
-    if args.d_qk is not None:
-        l_dim = [args.d_qk]
-    else:
-        args.d_qk = 128
-    if args.mha_type is not None:
-        l_mha_type = [args.mha_type]
-    else:
-        args.mha_type = "mha"
     if args.causal is not None:
         l_causal = [args.causal]
-    else:
-        args.causal = False
+
     if args.local is not None:
         l_local = [args.local]
-    else:
-        args.local = False
+
     if args.deterministic is not None:
         l_deterministic = [args.deterministic]
-    else:
-        args.deterministic = False
+
     collected = []
     for (
         dtype,
-        dim,
+        (dim_qk, dim_v),
         mha_type,
         causal,
         local,
         deterministic,
     ) in itertools.product(
-        l_dtype, l_dim, l_mha_type, l_causal, l_local, l_deterministic
+        args.dtype, args.d_qk_v, args.mha_type, l_causal, l_local, l_deterministic
     ):
-        ret = test_fa_output_benchmark(
+        ret = flash_attn_output_benchmark(
             args.batch_size,
             args.nheads,
             args.seqlen_q,
             args.seqlen_k,
-            dim,
-            dim,
+            dim_qk,
+            dim_v,
             args.dropout_p,
             causal,
             local,
             args.bias_type,
             deterministic,
             mha_type,
-            dtype,
+            dtypes.d_dtypes[dtype],
+            args.input_layout,
         )
         collected.append(ret)
+        test_flash_attn_seq_padding(
+            "mixed",
+            args.batch_size,
+            args.nheads,
+            args.seqlen_q,
+            args.seqlen_k,
+            dim_qk,
+            dim_v,
+            args.dropout_p,
+            causal,
+            local,
+            args.bias_type if args.bias_type != "bias" else "no",
+            deterministic,
+            mha_type,
+            dtypes.d_dtypes[dtype],
+        )
 
     df = pd.DataFrame(collected)
     aiter.logger.info(f"mha summary:\n{df}")
-
-    test_flash_attn_seq_padding(
-        "mixed",
-        args.batch_size,
-        args.nheads,
-        args.seqlen_q,
-        args.seqlen_k,
-        args.d_qk,
-        args.d_v,
-        args.dropout_p,
-        args.causal,
-        args.local,
-        args.bias_type if args.bias_type != "bias" else "no",
-        args.deterministic,
-        args.mha_type,
-        dtype,
-    )

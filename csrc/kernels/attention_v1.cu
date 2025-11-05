@@ -2,8 +2,8 @@
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 #include "attention_v1.h"
 #include "attention_common.cuh"
@@ -291,8 +291,8 @@ void paged_attention_custom_launcher(torch::Tensor& out,
 
     dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
     dim3 block(NTHR);
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(query));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     // mfma4 kernel is faster than mfma16 for gqa_ratio <= 4
     switch(gqa_ratio)

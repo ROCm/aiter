@@ -16,8 +16,8 @@
  */
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_bf16.h>
 #include "hip_compat.h"
 #include "attention.h"
@@ -2249,8 +2249,8 @@ void paged_attention_custom_launcher(
   constexpr int NTHR = 256; //PARTITION_SIZE;
   dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
   dim3 block(NTHR);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(query));
+  const hipStream_t stream = at::hip::getCurrentHIPStream();
   switch (gqa_ratio) {
     case 1:
       //LAUNCH_CUSTOM_ATTENTION(1);

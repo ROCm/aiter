@@ -38,6 +38,7 @@ if triton.__version__ >= "3.5.0":
         _deepgemm_fp8_paged_mqa_logits_stage1,
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
         _deepgemm_fp8_paged_mqa_logits,
+        _deepgemm_fp8_paged_mqa_logits_ragged_k,
     )
     from aiter.ops.triton.gluon.pa_mqa_logits import (
         _gluon_deepgemm_fp8_paged_mqa_logits,
@@ -53,8 +54,9 @@ else:
         _deepgemm_fp8_paged_mqa_logits_stage1,
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
         _deepgemm_fp8_paged_mqa_logits,
-        # _gluon_deepgemm_fp8_paged_mqa_logits,
-        # _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
+        _deepgemm_fp8_paged_mqa_logits_ragged_k,
+        _gluon_deepgemm_fp8_paged_mqa_logits,
+        _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
     )
 
     assert triton.__version__ < "3.4.0"
@@ -286,6 +288,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "backend_name": "hip",
         "warp_size": 64,
         "name": "_gluon_deepgemm_fp8_paged_mqa_logits",
+        "name": (
+            "_gluon_deepgemm_fp8_paged_mqa_logits"
+            if not Preshuffle
+            else "_gluon_deepgemm_fp8_paged_mqa_logits_preshuffle"
+        ),
     }
 
     kv_cache_attr = []
@@ -517,4 +524,3 @@ def deepgemm_fp8_paged_mqa_logits(
         )
 
     return triton.runtime.cache.get_cache_manager(kernel.hash).key
-

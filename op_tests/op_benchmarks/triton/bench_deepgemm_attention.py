@@ -288,14 +288,10 @@ def run_benchmark(args: argparse.Namespace):
                 kv_num_block, kv_block_Size, _, kv_index_dim = kv_cache_fp8.size()
 
                 split_kv_cache = kv_cache_fp8.view(-1, blocksize * kv_index_dim)
-                split_kv_cache_data, split_kv_cache_scale = (
-                    split_kv_cache[..., : kv_block_Size * index_dim],
-                    split_kv_cache[..., kv_block_Size * index_dim :],
-                )
                 split_kv_cache_data = shuffle_weight(
-                    split_kv_cache_data.contiguous().view(
-                        [kv_num_block, kv_block_Size, index_dim]
-                    )
+                    split_kv_cache[..., : kv_block_Size * index_dim]
+                    .contiguous()
+                    .view([kv_num_block, kv_block_Size, index_dim])
                 )
                 split_kv_cache[..., : kv_block_Size * index_dim] = (
                     split_kv_cache_data.view(kv_num_block, kv_block_Size * index_dim)
@@ -448,4 +444,3 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     run_benchmark(args)
-

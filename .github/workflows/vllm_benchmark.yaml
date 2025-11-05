@@ -19,9 +19,22 @@ env:
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
 jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
   build_vllm_image:
     if: ${{ !github.event.pull_request.head.repo.fork }}
-    runs-on: aiter-k8s-build
+    needs: [check-signal]
+    runs-on: aiter-1gpu-runner
 
     steps:
       - name: Checkout aiter repo
@@ -100,10 +113,10 @@ jobs:
       - name: Checkout vLLM repo with retry
         uses: nick-fields/retry@v2
         with:
-          timeout_minutes: 5
+          timeout_minutes: 20
           max_attempts: 3
           command: |
-            git clone --branch ${{ env.VLLM_BRANCH }} ${{ env.VLLM_REPOSITORY_URL }}
+            git clone --depth=1 --branch ${{ env.VLLM_BRANCH }} ${{ env.VLLM_REPOSITORY_URL }}
 
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}

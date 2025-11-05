@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
@@ -119,9 +119,12 @@ fmha_bwd_args get_asm_fmha_bwd_args(const mask_info &mask,
                          dv.data_ptr(),
                          nullptr, // dbias
                          dq_acc.data_ptr(), // dq_acc
-                         nullptr, // seqstart_q
-                         nullptr, // seqstart_k
-                         nullptr, // seqlen_k_ptr
+                         nullptr, // seqstart_q_ptr (batch mode)
+                         nullptr, // seqstart_k_ptr (batch mode)
+                         nullptr, // seqlen_q_ptr (batch mode)
+                         nullptr, // seqlen_k_ptr (batch mode)
+                         nullptr, // cu_seqlen_q_ptr (batch mode)
+                         nullptr, // cu_seqlen_k_ptr (batch mode)
                          seqlen_q,
                          seqlen_k,
                          b,
@@ -129,7 +132,7 @@ fmha_bwd_args get_asm_fmha_bwd_args(const mask_info &mask,
                          seqlen_k, // max_seqlen_k
                          hdim_q, // hdim_q
                          hdim_v, // hdim_v
-                         h, // nhead
+                         h, // nhead_q
                          h_k, // nhead_k
                          softmax_scale,
                          stride_q,
@@ -203,7 +206,7 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
     if (is_causal) { window_size_right = 0; }
 
     bool is_dropout = p_dropout > 0.0;
-    auto stream = at::cuda::getCurrentHIPStream().stream();
+    auto stream = at::hip::getCurrentHIPStream();
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -295,7 +298,7 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
         dv = torch::empty_like(v);
     }
 
-    at::cuda::CUDAGuard device_guard{q.device()};
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
@@ -303,16 +306,13 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
 
     if (!deterministic) {
         if (is_v3_atomic_fp32) {
-            dq_accum = torch::zeros({1, batch_size, num_heads, seqlen_q, head_size_v}, opts.dtype(at::kFloat));
+            dq_accum = torch::zeros({1, batch_size, num_heads, seqlen_q, head_size_q}, opts.dtype(at::kFloat));
         } else {
-            // When atomic16, padding dq_accum seqlen to 16x, head dim to 128
+            // When atomic16, padding dq_accum seqlen to 16x, head dim to 128/192
             // In this case, dq_accum could have any layout, we set it to be `bhsd`
-            dq_accum = torch::zeros({1, batch_size, num_heads, (seqlen_q + 15) / 16 * 16, 128}, opts.dtype(q_dtype));
+            int padded_head_size_q = head_size_q == 192? 192: 128;
+            dq_accum = torch::zeros({1, batch_size, num_heads, (seqlen_q + 15) / 16 * 16, padded_head_size_q}, opts.dtype(q_dtype));
         }
-    } else {
-        const ck_tile::index_t kN0 = head_size_v <= 128 ? 128 : 64;
-        const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(seqlen_k, kN0);
-        dq_accum = torch::zeros({nsplits, batch_size, num_heads, seqlen_q, head_size_v}, opts.dtype(at::kFloat));
     }
 
     at::Tensor dk_expanded, dv_expanded;
