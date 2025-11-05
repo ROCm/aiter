@@ -13,7 +13,7 @@ from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
 )
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter import dtypes
 
 MD_NAME = "module_attention"
 
@@ -362,15 +362,15 @@ def get_mla_metadata_info_v1(
     max_qo_tiles_per_batch = (
         int(math.ceil(max_seqlen_qo * num_head_qo / 64))
         if num_head_qo == 16
-        or (num_head_qo == 128 and kv_dtype == get_fp8_e4m3_dtype())
+        or (num_head_qo == 128 and kv_dtype == dtypes.fp8)
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
 
     if fast_mode:
-        max_work = (batch_size + cu_num) * max_qo_tiles_per_batch
-        max_split_tiles = min(batch_size + cu_num, (cu_num - 1) * 2) * max_qo_tiles_per_batch
+        max_work = tile_cnt + cu_num - 1
+        max_split_tiles = min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
     else:
         max_work = tile_cnt * cu_num
         max_split_tiles = tile_cnt * cu_num
