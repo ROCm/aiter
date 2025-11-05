@@ -29,7 +29,7 @@ from aiter.utility.mp_tuner import mp_tuner
 from functools import lru_cache
 from aiter.jit.core import get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num
-from aiter.jit.core import AITER_CONFIG_GEMM_BF16_FILE, get_asm_dir
+from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.utility.base_tuner import GemmCommonTuner
 
 aiter.rocb_create_extension()
@@ -554,7 +554,7 @@ class Gemm:
 class GemmTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
-        "tune_file": f"{AITER_CONFIG_GEMM_BF16_FILE}",
+        "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
         "untune_file": "aiter/configs/untuned_gemm.csv",
         "batch": 1,
     }
@@ -563,7 +563,7 @@ class GemmTuner(GemmCommonTuner):
         self.parser.add_argument(
             "--tuned_file",
             type=str,
-            default=os.getenv("GTUNE_TUNED", AITER_CONFIG_GEMM_BF16_FILE),
+            default=os.getenv("GTUNE_TUNED", AITER_CONFIG_GEMM_BF16),
             dest="tune_file",
             help="output file for tuned gemm solutions",
         )
@@ -686,7 +686,7 @@ class GemmTuner(GemmCommonTuner):
                             outdtype=str(ds["outdtype"]),
                             scaleAB=ds["scaleAB"],
                         )
-            self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+            self.tunedf = self.get_tuned_gemm_list(self.get_out_file(args.tune_file))
             self.untunedf["cu_num"] = self.get_cu_num()
             untunedf_cols = self.untunedf.columns
             if len(self.tunedf) != 0:

@@ -1849,7 +1849,7 @@ class FmoeTuner(TunerCommon):
                 failedf = pd.DataFrame(ret, columns=self.columns)
                 self.failed = pd.concat([self.failed, failedf], axis=0)
                 continue
-            profileDF["total_us"] = round(profileDF["us1"] + profileDF["us2"], 4)
+            profileDF["us"] = round(profileDF["us1"] + profileDF["us2"], 4)
             results = profileDF.apply(
                 lambda row: self.calculate(
                     (
@@ -1857,7 +1857,7 @@ class FmoeTuner(TunerCommon):
                         "",
                         row["kernelName1"],
                         row["block_m"],
-                        row["total_us"],
+                        row["us"],
                         row["err1"],
                     )
                 ),
@@ -1869,9 +1869,9 @@ class FmoeTuner(TunerCommon):
             profileDF.drop(["tflops1", "tflops2", "bw1", "bw2"], axis=1, inplace=True)
             profileDF["err1"] = profileDF["err1"].apply(lambda x: f"{x:.1%}")
             profileDF["err2"] = profileDF["err2"].apply(lambda x: f"{x:.1%}")
-            best_one = profileDF.loc[profileDF["total_us"].idxmin()].copy()
+            best_one = profileDF.loc[profileDF["us"].idxmin()].copy()
             print(
-                f"Tuning result for {key} is {best_one['block_m'] ,best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'],  best_one['run_1stage']} {best_one['total_us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
+                f"Tuning result for {key} is {best_one['block_m'] ,best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'],  best_one['run_1stage']} {best_one['us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
             )
             best_one["act_type"] = str(best_one["act_type"])
             best_one["q_type"] = str(best_one["q_type"])
@@ -1900,7 +1900,9 @@ class FmoeTuner(TunerCommon):
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
 
             if not args.all or args.last:
-                self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+                self.tunedf = self.get_tuned_gemm_list(
+                    self.get_out_file(args.tune_file)
+                )
             else:
                 self.tunedf = None
             self.untunedf["cu_num"] = self.get_cu_num()
@@ -1941,7 +1943,7 @@ if __name__ == "__main__":
         "us2",
         "kernelName2",
         "err2",
-        "total_us",
+        "us",
         "run_1stage",
         "tflops",
         "bw",
