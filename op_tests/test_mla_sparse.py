@@ -424,7 +424,7 @@ def test_mla(
         work_info_set_size,
         dtype=work_info_set_type,
         device="cuda",
-    ).fill_(-1)
+    )
     reduce_indptr = torch.empty(
         reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
     )

@@ -249,7 +249,7 @@ def test_mla(
         work_info_set_size,
         dtype=work_info_set_type,
         device="cuda",
-    ).fill_(-1)
+    )
     reduce_indptr = torch.empty(
         reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
     )
@@ -384,7 +384,9 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead == 16:
+    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
+        nhead == 16 or (nhead in range(32, 128, 16) and mtp == 1)
+    ):
         err, us_asm_decode = test_absorb_decode_bf16()
     elif kvtype == dtypes.fp8 and nhead in [16, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
@@ -413,7 +415,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 1), (16, 2), (16, 4), (128, 2)]
+list_nhead = [(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
