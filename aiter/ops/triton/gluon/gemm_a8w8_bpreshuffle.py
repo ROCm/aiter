@@ -520,7 +520,7 @@ def _gemm_a8w8_ptpc2(
             )
             
         # smem_a.store(a)
-        gl.amd.cdna4.async_copy.async_wait(0)
+        # gl.amd.cdna4.async_copy.async_wait(4)
 
 
         acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
@@ -533,7 +533,7 @@ def _gemm_a8w8_ptpc2(
 
         offs_ks_step = BLOCK_SIZE_K // GROUP_K  # could be replaced by a constant 1
         # cur_b = b.permute(0, 2, 1, 3).reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
-        cur_b = b.permute(2, 0, 3, 1).reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
+        # cur_b = b.permute(2, 0, 3, 1).reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
         for k in range(pid_k * num_k_iter, ((pid_k + 1) * num_k_iter) - 1):
             
             if k % 2 == 0:
@@ -547,7 +547,9 @@ def _gemm_a8w8_ptpc2(
             offs_a += BLOCK_SIZE_K * stride_ak
             # offs_b += BLOCK_SIZE_K * stride_bk * 16
             offs_b += BLOCK_SIZE_K * 16
-
+            gl.amd.cdna4.async_copy.async_wait(0)
+            cur_a = smem_read.load(layout=dot_a_layout)
+            cur_b = b.permute(2, 0, 3, 1).reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -584,7 +586,7 @@ def _gemm_a8w8_ptpc2(
                 )
             # smem_b.store(b)
             # cur_a = smem_a.load(layout=dot_a_layout)
-            cur_a = smem_read.load(layout=dot_a_layout)
+            
             if EVEN_K:
                 b = gl.amd.cdna4.buffer_load(
                     ptr=b_ptr,
@@ -605,8 +607,8 @@ def _gemm_a8w8_ptpc2(
             cur_b_fma = gl.convert_layout(cur_b, layout=dot_b_layout)
             acc = gl.amd.cdna4.mfma(cur_a, cur_b_fma, acc)
             # smem_a.store(a)
-            gl.amd.cdna4.async_copy.async_wait(0)
-            cur_b = b.permute(2, 0, 3, 1).reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
+            # gl.amd.cdna4.async_copy.async_wait(4)
+            # cur_b = b.permute(2, 0, 3, 1).reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
 
         # ======= Epilogue ========
         # smem_b.store(b)
@@ -615,7 +617,9 @@ def _gemm_a8w8_ptpc2(
             smem_read = smem_a
         else:
             smem_read = smem_a_1
+        gl.amd.cdna4.async_copy.async_wait(0)
         cur_a = smem_read.load(layout=dot_a_layout)
+        cur_b = b.permute(2, 0, 3, 1).reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
         # cur_b = smem_b.load(layout=dot_b_layout)
             
         # print("b:",b.to(gl.float32))
