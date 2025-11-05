@@ -1900,7 +1900,9 @@ class FmoeTuner(TunerCommon):
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
 
             if not args.all or args.last:
-                self.tunedf = self.get_tuned_gemm_list(self.get_out_file(args.tune_file))
+                self.tunedf = self.get_tuned_gemm_list(
+                    self.get_out_file(args.tune_file)
+                )
             else:
                 self.tunedf = None
             self.untunedf["cu_num"] = self.get_cu_num()

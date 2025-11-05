@@ -178,10 +178,6 @@ class TunerCommon:
 
     def get_out_file(self, tuned_file):
         """if there are multiple tuned file, then write tuning result to the first file"""
-        print("tuned file is ", tuned_file)
-        if tuned_file:
-            path_list = tuned_file.split(os.pathsep)
-            print("path_list is ", path_list)
         path_list = tuned_file.split(os.pathsep) if tuned_file else []
         assert path_list, f"output tuned file is empty"
         return path_list[0]
@@ -387,7 +383,6 @@ class TunerCommon:
             for i in range(0, len(self.untunedf), batch_size):
                 batch = self.untunedf.iloc[i : i + batch_size].reset_index(drop=True)
                 processed_batches += 1
-                print(batch)
                 all_results = self.tune(batch, self.tunedf, args)
                 if all_results:
                     results = self.post_process(all_results, args, topk)
