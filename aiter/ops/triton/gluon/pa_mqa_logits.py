@@ -422,6 +422,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         + gl.arange(0, HiddenDim, layout=gl.SliceLayout(1, mfma_layout_b)) // 16 * 256
     )[:, None] + (
         gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b)) % 16 * 16
+        + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
+        % KVBlockSize
+        // 16
+        * 16
+        * 128
     )[
         None, :
     ]
