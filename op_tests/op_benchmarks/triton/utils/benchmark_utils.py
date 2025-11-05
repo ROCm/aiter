@@ -324,33 +324,38 @@ def parse_vgpr_usage(file_path, table_start="result-table-name"):
 
 
 def print_vgpr(fun, table_start="result-table-name"):
-    # Create a temporary file
-    with tempfile.NamedTemporaryFile(mode="w+", delete=False) as temp_file:
-        output_file = temp_file.name
+    try:
+        # Create a temporary file
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as temp_file:
+            output_file = temp_file.name
+            # Redirect stdout and stderr to the temporary file
+            sys.stdout = temp_file
+            sys.stderr = temp_file
+        
+            os.environ["AMDGCN_ENABLE_DUMP"] = "1"
+            os.environ["TRITON_ALWAYS_COMPILE"] = "1"
+            os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+            fun()  # run the function
+            sys.stdout.flush()
+            sys.stderr.flush()
 
-        # Redirect stdout and stderr to the temporary file
-        sys.stdout = temp_file
-        sys.stderr = temp_file
+        # Restore stdout and stderr to normal
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
 
-        os.environ["AMDGCN_ENABLE_DUMP"] = "1"
-        os.environ["TRITON_ALWAYS_COMPILE"] = "1"
-        os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
-        fun()  # run the function
+        time.sleep(0.5)  # Ensure everything is written before reading
 
-        sys.stdout.flush()
-        sys.stderr.flush()
+        # Parse and print relevant output
+        parse_vgpr_usage(output_file, table_start)
 
-    # Restore stdout and stderr to normal
-    sys.stdout = sys.__stdout__
-    sys.stderr = sys.__stderr__
+        # Remove the temporary file
+        os.unlink(output_file)
 
-    time.sleep(0.5)  # Ensure everything is written before reading
-
-    # Parse and print relevant output
-    parse_vgpr_usage(output_file, table_start)
-
-    # Remove the temporary file
-    os.unlink(output_file)
+    except Exception as e:
+            # Restore stdout and stderr to normal before printing error
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+            print(f"Error occurred during function execution: {e}")
 
 
 def get_dtype_bytes(dtype):
