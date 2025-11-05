@@ -69,7 +69,8 @@ def _gemm_afp4_wfp4_pre_quant_kernel(
     GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
+    """
+    Kernel for computing the matmul C = A x B.
     A and B inputs are in the microscale fp4 (mxfp4) format.
     A_scales and B_scales are in e8m0 format.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)

@@ -32,8 +32,14 @@ _gemm_afp4_wfp4_reduce_repr = make_kernel_repr(
     [
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
-        "ACTUAL_KSPLIT",
-        "MAX_KSPLIT",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "RAW_MASKED_LOADS",
+        "cache_modifier",
     ],
 )
 
@@ -80,7 +86,8 @@ def _gemm_a8wfp4_kernel(
     RAW_MASKED_LOADS: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
+    """
+    Kernel for computing the matmul C = A x B.
     A is in fp8 e4m3 format.
     B is in the microscale fp4 (mxfp4) format.
     A_scales and B_scales are in e8m0 format.

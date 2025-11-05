@@ -42,17 +42,6 @@ _gemm_afp4wfp4_preshuffled_repr = make_kernel_repr(
 )
 
 
-_gemm_afp4wfp4_reduce_repr = make_kernel_repr(
-    "_gemm_afp4_wfp4_reduce_kernel",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "ACTUAL_KSPLIT",
-        "MAX_KSPLIT",
-    ],
-)
-
-
 _gemm_afp4wfp4_preshuffled_weight_scales_repr = make_kernel_repr(
     "_gemm_afp4_wfp4_kernel_preshuffled_weight_scales",
     [
@@ -67,6 +56,16 @@ _gemm_afp4wfp4_preshuffled_weight_scales_repr = make_kernel_repr(
     ],
 )
 
+
+_gemm_afp4wfp4_reduce_repr = make_kernel_repr(
+    "_gemm_afp4_wfp4_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
 
 @triton.heuristics(
     {
@@ -106,7 +105,8 @@ def _gemm_afp4_wfp4_kernel(
     EVEN_K: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
+    """
+    Kernel for computing the matmul C = A x B.
     A and B inputs are in the microscale fp4 (mxfp4) format.
     A_scales and B_scales are in e8m0 format.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -261,7 +261,8 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
     EVEN_K: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
+    """
+    Kernel for computing the matmul C = A x B.
     A and B inputs are in the microscale fp4 (mxfp4) format.
     A_scales and B_scales are in e8m0 format.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -465,7 +466,8 @@ def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
     EVEN_K: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
+    """
+    Kernel for computing the matmul C = A x B.
     A and B inputs are in the microscale fp4 (mxfp4) format.
     A_scales and B_scales are in e8m0 format.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
