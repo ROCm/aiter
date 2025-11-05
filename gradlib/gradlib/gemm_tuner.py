@@ -31,7 +31,6 @@ import time
 import multiprocessing as mp
 import gc
 
-aiter.rocb_create_extension()
 aiter.hipb_create_extension()
 
 
