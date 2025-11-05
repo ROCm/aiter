@@ -34,6 +34,8 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           at::Tensor softmax_lse,
                                           at::Tensor dropout_randval,
                                           float softmax_scale,
+                                          float scale_p,
+                                          float scale_o,
                                           float logits_soft_cap,
                                           float p_dropout,
                                           std::pair<uint64_t*, uint64_t*> drop_seed_offset,
@@ -96,7 +98,7 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
         bias_ptr = alibi_slopes.data_ptr();
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
-    
+
     // Validate padded seqstart arrays if provided: shape [b+1], 1D, contiguous, int32/int64, monotonic
     auto validate_and_maybe_convert = [&](std::optional<const at::Tensor> &opt_seqstarts,
                                           const char *name) -> const ck_tile::index_t* {
@@ -123,58 +125,58 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     const ck_tile::index_t *seqstart_padded_k_ptr = validate_and_maybe_convert(cu_seqlens_k_padded_, "cu_seqlens_k_padded");
 
     return mha_fwd_args{q.data_ptr(),
-                         k.data_ptr(),
-                         v.data_ptr(),
-                         bias_ptr,
-                         has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
-                         has_lse ? softmax_lse.data_ptr() : nullptr,
-                         out.data_ptr(),
-                         nullptr, // cu_seqlen_q_ptr (batch mode only)
-                         nullptr, // cu_seqlen_kv_ptr (batch mode only)
-                         cu_seqlens_q.data_ptr(), // seqstart_q
-                         cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k
-                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_kpads
-                         seqstart_padded_q_ptr,
-                         seqstart_padded_k_ptr,
-                         total_q,
-                         total_k,
-                         b,
-                         max_seqlen_q,
-                         d,             // hdim_q
-                         d_v,           // hdim_v
-                         h,             // nhead
-                         h_k,           // nhead_k
-                         softmax_scale, // scale_s
-                         1,             // scale_p
-                         1,             // scale_o
-                         logits_soft_cap,
-                         stride_q,
-                         stride_k,
-                         stride_v,
-                         stride_bias,
-                         stride_randval,
-                         stride_o,
-                         nhead_stride_q,
-                         nhead_stride_k,
-                         nhead_stride_v,
-                         nhead_stride_bias,
-                         nhead_stride_randval,
-                         nhead_stride_lse,
-                         nhead_stride_o,
-                         batch_stride_q,
-                         batch_stride_k,
-                         batch_stride_v,
-                         batch_stride_bias,
-                         batch_stride_randval,
-                         batch_stride_lse,
-                         batch_stride_o,
-                         mask.left,
-                         mask.right,
-                         static_cast<ck_tile::index_t>(mask.type),
-                         min_seqlen_q,
-                         p_dropout,
-                         has_dropout_randval,
-                         drop_seed_offset};
+                        k.data_ptr(),
+                        v.data_ptr(),
+                        bias_ptr,
+                        has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
+                        has_lse ? softmax_lse.data_ptr() : nullptr,
+                        out.data_ptr(),
+                        nullptr, // cu_seqlen_q_ptr (batch mode only)
+                        nullptr, // cu_seqlen_kv_ptr (batch mode only)
+                        cu_seqlens_q.data_ptr(), // seqstart_q
+                        cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k
+                        seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_kpads
+                        seqstart_padded_q_ptr,
+                        seqstart_padded_k_ptr,
+                        total_q,
+                        total_k,
+                        b,
+                        max_seqlen_q,
+                        d,             // hdim_q
+                        d_v,           // hdim_v
+                        h,             // nhead
+                        h_k,           // nhead_k
+                        softmax_scale, // scale_s
+                        scale_p,
+                        scale_o,
+                        logits_soft_cap,
+                        stride_q,
+                        stride_k,
+                        stride_v,
+                        stride_bias,
+                        stride_randval,
+                        stride_o,
+                        nhead_stride_q,
+                        nhead_stride_k,
+                        nhead_stride_v,
+                        nhead_stride_bias,
+                        nhead_stride_randval,
+                        nhead_stride_lse,
+                        nhead_stride_o,
+                        batch_stride_q,
+                        batch_stride_k,
+                        batch_stride_v,
+                        batch_stride_bias,
+                        batch_stride_randval,
+                        batch_stride_lse,
+                        batch_stride_o,
+                        mask.left,
+                        mask.right,
+                        static_cast<ck_tile::index_t>(mask.type),
+                        min_seqlen_q,
+                        p_dropout,
+                        has_dropout_randval,
+                        drop_seed_offset};
 }
 
 fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
@@ -343,6 +345,9 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                bool is_causal,
                int window_size_left,
                int window_size_right,
+               float q_descale,
+               float k_descale,
+               float v_descale,
                bool return_softmax_lse,
                bool return_dropout_randval,
                std::optional<at::Tensor> out_,                // [total_q, hq, d]
@@ -354,9 +359,9 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                std::optional<const at::Tensor> cu_seqlens_k_padded_) // [b+1]
 {
     auto q_dtype = q.scalar_type();
-    bool isQKVFp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
+    bool is_qkv_fp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
 
-    TORCH_CHECK(q_dtype == at::ScalarType::Half || q_dtype == at::ScalarType::BFloat16 || isQKVFp8,
+    TORCH_CHECK(q_dtype == at::ScalarType::Half || q_dtype == at::ScalarType::BFloat16 || is_qkv_fp8,
                 "FlashAttention only support fp16, bf16 and fp8_e4m3 data type");
 
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
@@ -367,10 +372,24 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         q_dtype_str = "fp16";
     else if (q_dtype == at::ScalarType::BFloat16)
         q_dtype_str = "bf16";
-    else if (isQKVFp8)
+    else if (is_qkv_fp8)
         q_dtype_str = "fp8bf16"; // only support bf16 out for fp8
 
-    // TODO - support descale
+    float scale_p = 1.0f;
+    float scale_o = 1.0f;
+    if (is_qkv_fp8)
+    {
+        softmax_scale = softmax_scale * q_descale * k_descale;
+
+        if (q_dtype == at::ScalarType::Float8_e4m3fn)
+            scale_p = std::numeric_limits<at::Float8_e4m3fn>::max();
+        else if (q_dtype == at::ScalarType::Float8_e4m3fnuz)
+            scale_p = std::numeric_limits<at::Float8_e4m3fnuz>::max();
+        else
+            TORCH_CHECK(false, "unsupported fp8 dtype");
+
+        scale_o = v_descale / scale_p; // Assume output is bf16
+    }
 
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     if (cu_seqlens_k.has_value()) {
@@ -393,6 +412,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         CHECK_DEVICE(block_table);
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
         TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
+        TORCH_CHECK(!is_qkv_fp8, "Paged KV does not support FP8 input for now");
     }
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -471,7 +491,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         CHECK_SHAPE(cu_seqlens_k.value(), batch_size + 1);
     }
     auto opts = q.options();
-    auto out_type = isQKVFp8 ? at::ScalarType::BFloat16 : q_dtype;
+    auto out_type = is_qkv_fp8 ? at::ScalarType::BFloat16 : q_dtype;
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -610,6 +630,8 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     softmax_lse,
                     p,
                     softmax_scale,
+                    scale_p,
+                    scale_o,
                     logits_soft_cap,
                     p_dropout,
                     drop_seed_offset,
@@ -623,6 +645,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                                      mask.type,
                                      bias_type,
                                      has_lse,
+                                     is_qkv_fp8,
                                      false, // use_ext_asm
                                      1,     // how_v3_bf16_cvt
                                      args.seqstart_padded_q_ptr,

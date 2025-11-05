@@ -93,7 +93,7 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
         bias_ptr = alibi_slopes.data_ptr();
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
-    
+
     return mha_fwd_args{q.data_ptr(),
                          k.data_ptr(),
                          v.data_ptr(),
@@ -342,7 +342,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
             aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
     }
     std::optional<const at::Tensor> seqlens_k = std::nullopt;
-    
+
     if (max_seqlen_k > 0) {
         auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
@@ -384,6 +384,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                                 mask.type,
                                 bias_type,
                                 has_lse,
+                                false,
                                 true,
                                 how_v3_bf16_cvt);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd 3");
@@ -393,7 +394,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
-    
+
     return {out, softmax_lse, p, rng_state};
 }
 

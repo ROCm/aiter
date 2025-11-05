@@ -29,12 +29,18 @@ def run_ck(
     min_seqlen_q,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
+    q_descale=1.0,
+    k_descale=1.0,
+    v_descale=1.0,
 ):
     if q.dtype == dtypes.fp8 and k.dtype == dtypes.fp8 and v.dtype == dtypes.fp8:
         return aiter.flash_attn_varlen_fp8_pertensor_func(
             q,
             k,
             v,
+            q_descale,
+            k_descale,
+            v_descale,
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q,
@@ -158,9 +164,9 @@ def test_flash_attn_varlen_output(
     v.requires_grad_(False)
 
     # TODO - Support descale
-    q_quant, _ = per_tensor_quant(q, scale=torch.tensor(1), quant_dtype=quant_dtype)
-    k_quant, _ = per_tensor_quant(k, scale=torch.tensor(1), quant_dtype=quant_dtype)
-    v_quant, _ = per_tensor_quant(v, scale=torch.tensor(1), quant_dtype=quant_dtype)
+    q_quant, q_descale = per_tensor_quant(q, quant_dtype=quant_dtype)
+    k_quant, k_descale = per_tensor_quant(k, quant_dtype=quant_dtype)
+    v_quant, v_descale = per_tensor_quant(v, quant_dtype=quant_dtype)
 
     out = run_ck(
         q_quant,
@@ -173,6 +179,9 @@ def test_flash_attn_varlen_output(
         min_seqlen_q,
         causal,
         window_size,
+        q_descale.item(),
+        k_descale.item(),
+        v_descale.item(),
     )
 
     out_ref = run_ck(
