@@ -172,8 +172,5 @@ def test_gemm_a16wfp4(
         y = gemm_a16wfp4(x, w, w_scales, atomic_add=atomic_add, dtype=y_dtype).to(dtype)
 
     torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
-
-    # print()
-    # print(torch_out)
-    # print(y)
+    
     torch.testing.assert_close(torch_out, y)
