@@ -140,7 +140,7 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         mgc = 64
 
     num_kv_splits_indptr = torch.arange(
-        0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device=device
+        0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
     )
 
     return num_kv_splits, mgc, num_kv_splits_indptr

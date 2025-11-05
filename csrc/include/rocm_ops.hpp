@@ -1328,7 +1328,8 @@ namespace py = pybind11;
           py::arg("max_seqlen_qo") = -1,                \
           py::arg("uni_seqlen_qo") = -1,                \
           py::arg("fast_mode") = true,                  \
-          py::arg("topk") = -1);                        \
+          py::arg("topk") = -1,                         \
+          py::arg("max_split_per_batch") = -1);         \
     m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
 
 #define MLA_REDUCE_PYBIND                             \
