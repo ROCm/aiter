@@ -143,11 +143,11 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         dtype == dtypes.bf16
         and otype == dtypes.fp32
         and (k % 64 == 0)
-        # and (n % 64 == 0)
-        and (m in [64, 80, 128, 150, 192, 220, 256, 384, 448, 512])
-        and (n == 256)
-        and (k == 5120 or k == 7168)
-        and bias == None
+        and (n % 64 == 0)  # N % tileN == 0
+        # and (m in [64, 80, 128, 150, 192, 220, 256, 384, 448, 512])
+        # and (n == 256)
+        # and (k == 5120 or k == 7168)
+        and bias is None
     ):
         # wshuffle = shuffle_weight(weight, layout=(16, 16))
         # out_asm = torch.empty((m + 191) // 192 * 192, n, dtype=otype)
