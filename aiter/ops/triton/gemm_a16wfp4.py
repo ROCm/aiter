@@ -82,12 +82,7 @@ def gemm_a16wfp4(
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         config["NUM_KSPLIT"] = 1
-
-    # if M < 4:
-    #     config["BLOCK_SIZE_M"] = 1
-
-    if N <= 512:
-        config["BLOCK_SIZE_N"] = 32
+    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 256)
 
     if config["NUM_KSPLIT"] > 1 and not atomic_add:
         y_pp = torch.empty(
