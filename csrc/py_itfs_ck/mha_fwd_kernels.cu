@@ -156,9 +156,9 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         bool is_causal,
         int window_size_left,
         int window_size_right,
-        float q_descale_scalar,
-        float k_descale_scalar,
-        float v_descale_scalar,
+        float q_descale,
+        float k_descale,
+        float v_descale,
         bool return_softmax_lse,
         bool return_dropout_randval,
         std::optional<at::Tensor> cu_seqlens_q_,
@@ -189,7 +189,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     float scale_o = 1.0f;
     if (is_qkv_fp8)
     {
-        softmax_scale = softmax_scale * q_descale_scalar * k_descale_scalar;
+        softmax_scale = softmax_scale * q_descale * k_descale;
 
         if (q_dtype == at::ScalarType::Float8_e4m3fn)
             scale_p = std::numeric_limits<at::Float8_e4m3fn>::max();
@@ -198,9 +198,8 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         else
             TORCH_CHECK(false, "unsupported fp8 dtype");
 
-        scale_o = v_descale_scalar / scale_p; // Assume output is bf16
+        scale_o = v_descale / scale_p; // Assume output is bf16
     }
-    // TODO - set do_fp8_static_quant to true in fmha_fwd_traits
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
 
