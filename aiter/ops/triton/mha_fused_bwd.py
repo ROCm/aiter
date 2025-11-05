@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import jax_triton as jt
 
-from _triton_kernels.mha_fused_bwd_kernel import (
+from _triton_kernels.mha_fused_bwd import (
     _bwd_preprocess,
     _bwd_kernel_dkdvdq_causal,
     _bwd_kernel_dkdvdq_noncausal,

@@ -6,7 +6,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from _triton_kernels.mha_onekernel_bwd_kernel import (
+from _triton_kernels.mha_onekernel_bwd import (
     _bwd_preprocess,
     _bwd_kernel_causal,
     _bwd_kernel_noncausal,
@@ -332,6 +332,7 @@ def main(unused_argv):
     )
     
     dq.block_until_ready()
+    print(dq)
 
 
 if __name__ == "__main__":
