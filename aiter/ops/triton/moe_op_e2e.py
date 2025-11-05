@@ -11,6 +11,7 @@ from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton._triton_kernels.moe_op_e2e import e2e_moe_kernel
+import warnings
 
 _LOGGER = AiterTritonLogger()
 
@@ -114,8 +115,9 @@ def e2e_moe(
     out_dtype = Out.dtype
     # if the intermediate token dimension is small enough, we can try to fit the whole thing in shared memory
     SKINNY = pid_n == 1
-
+    
     if not SKINNY:
+        warnings.warn("Intermediate token dimension is not skinny; atomics will be performed in fp32.", UserWarning)
         Out = Out.to(torch.float32)  # atomics need to be done in fp32
 
     if return_intermediate:

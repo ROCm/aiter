@@ -139,7 +139,7 @@ def get_e2e_moe_configs(
     config_file_path = (
         f"{AITER_TRITON_CONFIGS_PATH}/moe/{device}-MOE-e2e-N={N}-{dtype_str}.json"
     )
-
+    print(f"Looking for e2e MoE config at: {config_file_path}")
 
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
@@ -175,7 +175,7 @@ def get_optimal_moe_e2e_config(
     use_fp8_w8a8: Optional[bool] = False,
     M: int = 1,
 ):
-    N = triton.next_power_of_2(N//2)
+    N = triton.next_power_of_2(N)
     dtype_str = get_config_dtype_str(dtype, use_fp8_w8a8=use_fp8_w8a8)
     configs = get_e2e_moe_configs(N, dtype_str)
     if configs is not None:
