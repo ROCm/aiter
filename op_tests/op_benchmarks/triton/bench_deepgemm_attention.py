@@ -184,9 +184,9 @@ def run_benchmark(args: argparse.Namespace):
 
         max_model_len = 2 * avg_kv_length
         num_blocks = max_model_len
-        blocksize = 16 if args.kv_preshuffle else 1
+        blocksize = args.blocksize if args.kv_preshuffle else 1
 
-        assert blocksize == 1 or blocksize == 16, "Only blocksize 1 or 16 is supported."
+        assert blocksize == 1 or args.kv_preshuffle and blocksize % 16 == 0
 
         var_ratio = 0.0
         context_lens = (
@@ -270,7 +270,7 @@ def run_benchmark(args: argparse.Namespace):
         )
 
         if kv_storage_kind == "non_ragged_k":
-            Preshuffle = blocksize == 16
+            Preshuffle = blocksize % 16 == 0
 
             if Preshuffle:
                 kv_num_block, kv_block_Size, _, kv_index_dim = kv_cache_fp8.size()
@@ -416,6 +416,12 @@ if __name__ == "__main__":
         "--kv_preshuffle",
         action="store_true",
         help="Enable KV cache preshuffle, also change blocksize to 16",
+    )
+    parser.add_argument(
+        "--blocksize",
+        type=int,
+        default=16,
+        help="KVCache block size, only used when kv_preshuffle is enabled, must be multiple of 16",
     )
 
     args = parser.parse_args()

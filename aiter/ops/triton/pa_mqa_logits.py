@@ -374,6 +374,10 @@ def deepgemm_fp8_paged_mqa_logits(
 
     assert ChunkK % KVBlockSize == 0
     assert block_Size == KVBlockSize
+    if Preshuffle:
+        assert (
+            KVBlockSize % 16 == 0
+        ), "Preshuffle mode only support KVBlockSize aligned to 16."
 
     kv_cache = kv_cache.view(-1, KVBlockSize * index_dim)
     kv_cache_fp8, kv_cache_scale = (
