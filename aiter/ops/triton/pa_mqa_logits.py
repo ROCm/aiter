@@ -367,18 +367,18 @@ def deepgemm_fp8_paged_mqa_logits(
     kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
     kv_cache_scale = kv_cache_scale.view(torch.float32)
 
-    is_padded_mode = kv_cache_fp8.stride(0) % 16 == 0
-    kernel = _compile_deepgemm_fp8_paged_mqa_logits(
-        ChunkQ=heads,
-        ChunkK=ChunkK,
-        KVBlockSize=KVBlockSize,
-        HiddenDim=hidden_dim,
-        is_padded_mode=is_padded_mode,
-        WavePerEU=WavePerEU,
-    )
-
     grid = (batch_size * next_n * SplitKV, 1, 1)
+    kernel = None
     if enable_gluon_pa_mqa_logits:
+        is_padded_mode = kv_cache_fp8.stride(0) % 16 == 0
+        kernel = _compile_deepgemm_fp8_paged_mqa_logits(
+            ChunkQ=heads,
+            ChunkK=ChunkK,
+            KVBlockSize=KVBlockSize,
+            HiddenDim=hidden_dim,
+            is_padded_mode=is_padded_mode,
+            WavePerEU=WavePerEU,
+        )
         if enable_jit_gluon_pa_mqa_logits_kernel:
             kernel[grid](
                 batch_size,
