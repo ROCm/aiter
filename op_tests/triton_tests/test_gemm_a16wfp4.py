@@ -93,8 +93,7 @@ def get_x_vals():
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(32, 512, 7168)]
     x_vals += [(1, 1280, 8192)]
-    x_vals = [(1, 1, SCALE_GROUP_SIZE)]  # minimal case
-    x_vals += [(1, 1, SCALE_GROUP_SIZE * 4)]  # minimal case
+    x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case
     return x_vals
 
 
@@ -145,13 +144,9 @@ def run_torch(x, w, w_scales, dtype):
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
-# @pytest.mark.parametrize("layout", ["TN"])
 @pytest.mark.parametrize("output", [True, False])
-# @pytest.mark.parametrize("output", [True])
 @pytest.mark.parametrize("atomic_add", [True, False])
-# @pytest.mark.parametrize("atomic_add", [False])
 def test_gemm_a16wfp4(
     M: int, N: int, K: int, dtype, layout, output: bool, atomic_add: bool
 ):
