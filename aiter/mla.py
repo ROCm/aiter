@@ -270,12 +270,14 @@ def mla_decode_fwd(
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
         logits = torch.empty(
-            (total_s, num_kv_splits, nhead, v_head_dim),
+            (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
         )
         attn_lse = torch.empty(
-            (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
+            (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
+            dtype=dtypes.fp32,
+            device=device,
         )
         final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
 
@@ -310,7 +312,10 @@ def mla_decode_fwd(
         )
 
     if io_transformed:
-        logits = logits.view(ori_total_s, num_kv_splits, ori_nhead, v_head_dim)
+        if persistent_mode:
+            logits = logits.view(-1, 1, ori_nhead, v_head_dim)
+        else:
+            logits = logits.view(ori_total_s, num_kv_splits, ori_nhead, v_head_dim)
         q = q.view(ori_total_s, ori_nhead, -1)
         o = o.view(ori_total_s, ori_nhead, -1)
 

@@ -12,6 +12,7 @@ import traceback
 from operator import itemgetter
 import time
 from aiter import dtypes
+from aiter import core
 
 INVALID_TIME = -1
 
@@ -175,15 +176,20 @@ class TunerCommon:
         filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
         return filtered_df
 
+    def get_out_file(self, tuned_file):
+        """if there are multiple tuned file, then write tuning result to the first file"""
+        path_list = tuned_file.split(os.pathsep) if tuned_file else []
+        assert path_list, f"output tuned file is empty"
+        return path_list[0]
+
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
-        path_list = tuned_gemm_file.split(os.pathsep) if tuned_gemm_file else []
-        assert len(path_list) <= 1, f"tuning to multiple files is not supported"
-        if os.path.exists(tuned_gemm_file):
-            column_order = pd.read_csv(tuned_gemm_file, nrows=0).columns.tolist()
-            tunedf = pd.read_csv(tuned_gemm_file)
+        all_tuned_file = core.update_config_files(tuned_gemm_file, self.name)
+        if os.path.exists(all_tuned_file):
+            column_order = pd.read_csv(all_tuned_file, nrows=0).columns.tolist()
+            tunedf = pd.read_csv(all_tuned_file)
             tunedf = tunedf[column_order]
         else:
-            print(f"Not exist tuned file: {tuned_gemm_file}")
+            print(f"Not exist tuned file: {all_tuned_file}")
             columns = self.columns if not columns else columns
             tunedf = pd.DataFrame(columns=columns)
         return tunedf
@@ -192,7 +198,7 @@ class TunerCommon:
         """get retune gemm list from tune_file and untune_file"""
         if args.untune_file is None:
             raise ValueError("untune_file must be specified for retuning")
-        if args.tune_file == args.untune_file:
+        if self.get_out_file(args.tune_file) == args.untune_file:
             # retune all shapes in tune_file
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
             self.tunedf = self.untunedf[self.untunedf["cu_num"] != self.get_cu_num()]
@@ -351,12 +357,15 @@ class TunerCommon:
         """tuner run function"""
         self.pre_process(args)
         print(self.untunedf)
+        output_file = self.get_out_file(args.tune_file)
         if args.verbose:
             logger.info(f"args: {args}")
         if len(self.untunedf) == 0:
             # self.update_tflops_bw(args.tune_file)
-            self.sortResults(args.tune_file, args.sort, self.keys)
-            logger.info(f"no shapes to be tuned, skip tuning")
+            self.sortResults(output_file, args.sort, self.keys)
+            logger.info(
+                f"no shapes to be tuned, skip tuning, tuned file is {args.tune_file}"
+            )
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
         batch_size = min(args.batch, len(self.untunedf))
         total_batches = (len(self.untunedf) + batch_size - 1) // batch_size
@@ -364,6 +373,7 @@ class TunerCommon:
             logger.info(
                 f"total shapes to be tuned: {len(self.untunedf) }, total_batches: {total_batches}, batch_size: {batch_size}"
             )
+            logger.info(f"results will be written to {output_file}")
         processed_batches = 0
         results = []
         topk = -1 if fast_mode else 1
@@ -376,13 +386,15 @@ class TunerCommon:
                 all_results = self.tune(batch, self.tunedf, args)
                 if all_results:
                     results = self.post_process(all_results, args, topk)
-                    self.result_to_csv(results, args.tune_file, not args.all)
+                    self.result_to_csv(results, output_file, not args.all)
                     logger.info(
                         f"processed {processed_batches} batches of {total_batches}, Processing Status ====> {round(processed_batches / total_batches,2)*100:.1f}% tuned in {self.name}"
                     )
                 else:
-                    logger.info("tune result is none or all shape is tuned!")
-            self.sortResults(args.tune_file, args.sort, self.keys)
+                    logger.info(
+                        f"tune result is none or all shape is tuned in {args.tune_file}!"
+                    )
+            self.sortResults(output_file, args.sort, self.keys)
         except KeyboardInterrupt:
             tuning_status = "Interrupted"
             logger.error(
