@@ -156,7 +156,7 @@ parser.add_argument(
     type=int,
     default=5,
     help="""Number of heads. Default is 5.
-    e.g.: -n 1""",
+    e.g.: -nk 1""",
 )
 parser.add_argument(
     "-q",
@@ -175,21 +175,14 @@ parser.add_argument(
     e.g.: -k 1024""",
 )
 parser.add_argument(
-    "-qk",
-    "--d_qk",
+    "-d",
+    "--d_qkv",
     type=int,
     default=128,
     help="""Dimension of query and key. Default is 128.
-    e.g.: -qk 256""",
+    e.g.: -d 128""",
 )
-parser.add_argument(
-    "-v",
-    "--d_v",
-    type=int,
-    default=128,
-    help="""Dimension of value. Default is 128.
-    e.g.: -v 256""",
-)
+
 parser.add_argument(
     "-c",
     "--causal",
@@ -213,8 +206,8 @@ if __name__ == "__main__":
         args.nheads_k,
         args.seqlen_q,
         args.seqlen_k,
-        args.d_qk,
-        args.d_v,
+        args.d_qkv,
+        args.d_qkv,
         args.causal,
         args.local,
     )
