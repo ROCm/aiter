@@ -384,7 +384,9 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (nhead == 16 or (nhead in range(32, 128, 16) and mtp == 1)):
+    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
+        nhead == 16 or (nhead in range(32, 128, 16) and mtp == 1)
+    ):
         err, us_asm_decode = test_absorb_decode_bf16()
     elif kvtype == dtypes.fp8 and nhead in [16, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
