@@ -360,7 +360,7 @@ def get_mla_metadata_info_v1(
     cu_num = device_properties.multi_processor_count
 
     max_qo_tiles_per_batch = (
-        int(math.ceil(max_seqlen_qo * num_head_qo / 64))
+        int(math.ceil(max_seqlen_qo * num_head_qo / 128))
         if num_head_qo == 16 or (num_head_qo == 128 and kv_dtype == dtypes.fp8)
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
