@@ -60,16 +60,16 @@
     "cache_modifier": ".ca"
   },
   "medium_M6017": {
-    "BLOCK_SIZE_M": 64,
-    "BLOCK_SIZE_N": 256,
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 128,
-    "GROUP_SIZE_M": 2,
-    "NUM_KSPLIT": 1,
+    "GROUP_SIZE_M": 9,
+    "matrix_instr_nonkdim": 32,
     "num_warps": 4,
     "num_stages": 1,
-    "waves_per_eu": 2,
-    "matrix_instr_nonkdim": 16,
-    "cache_modifier": ".ca"
+    "waves_per_eu": 0,
+    "cache_modifier": null,
+    "NUM_KSPLIT": 1
   },
   "any": {
     "BLOCK_SIZE_M": 128,
