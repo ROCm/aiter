@@ -145,8 +145,6 @@ def flash_attn_onekernel_backward(
         batch,
     )
 
-    print("q_strides",q_strides)
-
     if causal:
         _bwd_kernel_causal[grid](
             q,
@@ -334,7 +332,6 @@ def main(unused_argv):
     )
     
     dq.block_until_ready()
-    print(dq)
 
 
 if __name__ == "__main__":
