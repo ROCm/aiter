@@ -138,7 +138,12 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     mgc = get_mgc[nhead]
     if max_seqlen_q == 1 and nhead == 16:
         mgc = 64
-    return num_kv_splits, mgc
+
+    num_kv_splits_indptr = torch.arange(
+        0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device=device
+    )
+
+    return num_kv_splits, mgc, num_kv_splits_indptr
 
 
 def mla_decode_fwd(
@@ -177,15 +182,9 @@ def mla_decode_fwd(
     persistent_mode = work_meta_data is not None
 
     if num_kv_splits_indptr is None and not persistent_mode:
-        num_kv_splits, mgc = get_meta_param(
+        num_kv_splits, mgc, num_kv_splits_indptr = get_meta_param(
             None, bs, total_kv, nhead, max_seqlen_q, q.dtype
         )
-        num_kv_splits_indptr = torch.arange(
-            0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device=device
-        )
-
-    if num_kv_splits is None:
-        num_kv_splits = get_cu_num()
 
     io_transformed = False
 
@@ -255,6 +254,8 @@ def mla_decode_fwd(
             **extra_kargs,
         )
     else:
+        if num_kv_splits is None:
+            num_kv_splits = get_cu_num()
         if nhead == 16 or (nhead == 128 and kv_buffer.dtype == get_fp8_e4m3_dtype()):
             # Natively support cases
             pass
