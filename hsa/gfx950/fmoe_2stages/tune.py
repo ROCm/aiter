@@ -192,7 +192,7 @@ if __name__ == "__main__":
         "us2",
         "kernelName2",
         "err2",
-        "total_us",
+        "us",
         "run_1stage",
         "tflops",
         "bw",
