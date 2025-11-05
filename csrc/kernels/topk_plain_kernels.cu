@@ -1083,7 +1083,7 @@ class WaveFilterStrategy
         __syncthreads();
     }
 
-    __device__ void emit_results(T* __restrict__ out, IdxT* __restrict__ out_idx) const
+    __device__ void emit_results_to_lds(T* __restrict__ out, IdxT* __restrict__ out_idx) const
     {
         buffer_.flush_results(out, out_idx);
     }
@@ -1238,7 +1238,7 @@ class WaveSortMergeStrategy
         }
     }
 
-    __device__ void emit_results(T* __restrict__ out, IdxT* __restrict__ out_idx) const
+    __device__ void emit_results_to_lds(T* __restrict__ out, IdxT* __restrict__ out_idx) const
     {
         buffer_.flush_results(out, out_idx);
     }
@@ -1379,7 +1379,7 @@ class WaveIterativeStrategy
 
     __device__ void finalize() {}
 
-    __device__ void emit_results(T* __restrict__ out, IdxT* __restrict__ out_idx) const
+    __device__ void emit_results_to_lds(T* __restrict__ out, IdxT* __restrict__ out_idx) const
     {
         buffer_.flush_results(out, out_idx);
     }
@@ -1469,11 +1469,8 @@ class WorkgroupTopKCoordinator
                 constexpr IdxT repetition = 2;
                 constexpr IdxT tile       = elements * repetition;
                 const IdxT block_tile     = blockDim.x * tile;
-                const IdxT end_aligned =
-                    start + utils::round_up_to_multiple_of(n_aligned, block_tile);
+                const IdxT end_aligned    = start + utils::round_up_to_multiple_of(n, block_tile);
                 const IdxT tail = end_aligned - block_tile;
-
-                IdxT idx = start + tid * tile - stride * tile;
 
                 using VecType = std::conditional_t<std::is_same_v<T, __bf16>,
                                                    buffer_load_helpers::bf16x8_t,
@@ -1486,33 +1483,20 @@ class WorkgroupTopKCoordinator
                     for(IdxT idx = 0; idx < repetition; ++idx)
                     {
                         arr[idx] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
-                            in, i + idx * elements, n_aligned);
+                            in, i + idx * elements, n);
                     }
 #pragma unroll
                     for(IdxT idx = 0; idx < tile; ++idx)
                     {
                         strategy_.filter_and_stage(arr[idx / elements][idx % elements], i + idx);
                     }
-                    idx = i;
                 }
 
-                // tail
-                for(IdxT i = idx + stride * tile; i < end_aligned; i += stride * tile)
+                // tail - element-by-element to avoid out-of-bounds loads
+                for(IdxT i = tail + tid; i < end_aligned; i += stride)
                 {
-#pragma unroll
-                    for(IdxT idx = 0; idx < repetition; ++idx)
-                    {
-                        arr[idx] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
-                            in, i + idx * elements, n_aligned);
-                    }
-#pragma unroll
-                    for(IdxT idx = 0; idx < tile; ++idx)
-                    {
-                        const auto val = (i + idx < end)
-                                             ? _Float16(arr[idx / elements][idx % elements])
-                                             : sentinel_;
-                        strategy_.filter_and_stage(val, i + idx);
-                    }
+                    const auto val = (i < end) ? in[i] : sentinel_;
+                    strategy_.filter_and_stage(val, i);
                 }
             }
             else if(std::is_same_v<T, float> || std::is_same_v<T, int>)
@@ -1520,7 +1504,7 @@ class WorkgroupTopKCoordinator
                 constexpr IdxT repetition = 2;
                 constexpr IdxT tile = elements * repetition;
                 const IdxT block_tile = blockDim.x * tile;
-                const IdxT end_aligned  = start + utils::round_up_to_multiple_of(n_aligned, block_tile);
+                const IdxT end_aligned    = start + utils::round_up_to_multiple_of(n, block_tile);
 
                 using VecType = std::conditional_t<std::is_same_v<T, float>,
                                                    buffer_load_helpers::floatx4_t,
@@ -1532,7 +1516,7 @@ class WorkgroupTopKCoordinator
                     for(IdxT idx = 0; idx < repetition; ++idx)
                     {
                         arr[idx] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
-                            in, i + idx * elements, n_aligned);
+                            in, i + idx * elements, n);
                     }
 #pragma unroll
                     for(IdxT idx = 0; idx < tile; ++idx)
@@ -1575,7 +1559,7 @@ class WorkgroupTopKCoordinator
             if(wave_id < num_waves && wave_id >= half_num_waves)
             {
                 int target_wave = wave_id - half_num_waves;
-                strategy_.emit_results(val + target_wave * k_, pos + target_wave * k_);
+                strategy_.emit_results_to_lds(val + target_wave * k_, pos + target_wave * k_);
             }
             __syncthreads();
             if(wave_id < num_waves / 2)
@@ -1591,7 +1575,7 @@ class WorkgroupTopKCoordinator
     {
         if(threadIdx.x < utils::WAVE_SIZE)
         {
-            strategy_.emit_results(out, out_idx);
+            strategy_.emit_results_to_lds(out, out_idx);
         }
     }
 
@@ -1693,6 +1677,7 @@ auto find_block_kernel(int k)
 template <typename T, typename IdxT>
 int calc_lds_size_for_block_wide(int num_wave, IdxT k)
 {
+    // TODO: "num_wave / 2 * k" shoud be enough
     // Base size for reduction buffers
     int n         = std::max<int>(num_wave / 2 * k, num_wave * utils::WAVE_SIZE);
     int base_size = utils::round_up_to_multiple_of<16>(n * sizeof(T)) + n * sizeof(IdxT);
