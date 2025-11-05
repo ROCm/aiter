@@ -74,7 +74,7 @@ def init_data(n_tokens, n_expts_tot, dtype=torch.float16, device="cuda"):
     return logits
 
 
-n_tokens = [371, 255, 256, 4096, 1023, 1024, 911]
+n_tokens = [371, 255, 256, 4096, 1023, 1024, 911, 64, 8192]
 
 @pytest.mark.parametrize("n_tokens", n_tokens)
 @pytest.mark.parametrize("n_expts_tot, n_expts_act", [(128, 4), (128, 32), (1500, 8)])
@@ -110,11 +110,8 @@ def test_op(n_tokens, n_expts_tot, n_expts_act, sm_first, use_expt_indx):
     tri_expt_data = tri_routing_data.expt_data
     assert_equal(ref_expt_data.hist, tri_expt_data.hist)
     assert_equal(ref_expt_data.token_offs_raw, tri_expt_data.token_offs_raw)
-    assert len(ref_expt_data.token_offs_pad) == len(tri_expt_data.token_offs_pad)
-    assert len(ref_expt_data.block_pid_map) == len(tri_expt_data.block_pid_map)
-    for block_m in ref_expt_data.token_offs_pad.keys():
-        assert_equal(ref_expt_data.token_offs_pad[block_m], tri_expt_data.token_offs_pad[block_m])
-        assert_equal(ref_expt_data.block_pid_map[block_m], tri_expt_data.block_pid_map[block_m])
+    assert_equal(ref_expt_data.token_offs_pad, tri_expt_data.token_offs_pad)
+    assert_equal(ref_expt_data.block_pid_map, tri_expt_data.block_pid_map)
 
     assert ref_routing_data.n_expts_tot == ref_routing_data.n_expts_tot
     assert ref_routing_data.n_expts_act == ref_routing_data.n_expts_act

@@ -1,3 +1,4 @@
+import math
 import torch
 import triton
 from dataclasses import dataclass, field
@@ -33,19 +34,19 @@ class ExptData:
     # token_offs_raw[i] is the offset of the first token routed
     # to expert i in an expert-sorted array
     token_offs_raw: torch.Tensor
-    # token_offs_pad[block][i] is the offset of the first token routed
+    # token_offs_pad[i] is the offset of the first token routed
     # to expert i in an expert-sorted array, assuming histogram
-    # rounded to the next multiple of `block`
-    token_offs_pad: dict[int, torch.Tensor]
-    # block_id_map[block] contain one value for each `pid`` launched by
-    # the matrix multiplication kernel launched with BLOCK_M=block:
+    # rounded to the next multiple of `block_m`
+    token_offs_pad: torch.Tensor
+    # block_id_map contain one value for each `pid`` launched by
+    # the matrix multiplication kernel launched with block_m:
     # - the value is -1 if the `pid` has no work to do
     # - otherwise, the value is two int16 (packed as an int32) that
     #   correspond respectively to (1) the expert assigned to
     #   the tokens processed by this pid; (2) the block assigned to the
     #   tokens processed by this pid (think `pid_m` in a regular matmul)
     # see `test_routing.py` for a reference implementation and more details
-    block_pid_map: dict[int, torch.Tensor]
+    block_pid_map: torch.Tensor
 
     def __post_init__(self):
         if self.hist is not None:
@@ -53,25 +54,19 @@ class ExptData:
         if self.token_offs_raw is not None:
             assert self.token_offs_raw.dtype == torch.int32
         if self.token_offs_pad is not None:
-            for v in self.token_offs_pad.values():
-                assert v.dtype == torch.int32
+            assert self.token_offs_pad.dtype == torch.int32
         if self.block_pid_map is not None:
-            for v in self.block_pid_map.values():
-                assert v.dtype == torch.int32
+            assert self.block_pid_map.dtype == torch.int32
 
 
 @dataclass
 class RoutingData:
+    block_m: int = field()
     gate_scal: torch.Tensor = field()
     expt_hist: torch.Tensor = field()
     n_expts_tot: int = field()
     n_expts_act: int = field()
     expt_data: ExptData = None
-
-    # Used to make perf annotation cleaner: when we use expert sharding, we can
-    # use this to tell the "expected" number of local tokens per expert, because
-    # the actual number can vary per each input.
-    expected_tokens_per_expt: int = field(default=None)
 
     def n_blocks(self, n_rows, block_m):
         if n_rows <= self.n_expts_tot:
@@ -85,8 +80,8 @@ class RoutingData:
 # --------------------------
 
 
-def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, HIST_BLOCK_M):
-    INDX_OFFS_BLOCK_M = 512
+def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M):
+    BLOCK_N = 128
     MEMSET_BLOCK = 1024
     cdiv = triton.cdiv
 
@@ -106,8 +101,8 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, HIST_BLOCK_M):
     gate_indx = combined_indx[n_gates:]
     gate_scal = torch.empty(n_gates, dtype=dtype, device=device)
 
-    token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1a, MEMSET_BLOCK_A, HIST2_BLOCK_M, block_m_log2_start, block_m_num = _compute_expt_data_internal(
-        hist, n_expts_tot, n_gates)
+    token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1a, MEMSET_BLOCK_A, block_m_log2 = _compute_expt_data_internal(
+        hist, n_expts_tot, n_gates, block_m)
 
     blocks1b = cdiv(n_tokens, HIST_BLOCK_M)
 
@@ -120,9 +115,9 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, HIST_BLOCK_M):
         HIST_BLOCK_M, n_expts_act,  # constants
         hist, hist.shape[0], n_expts_tot,  # inputs
         token_offs_combined, token_offs_combined.stride(0),  #
-        blocks1a, block_pid_map, block_pid_map.stride(0), block_pid_map.shape[1],  #
-        block_m_log2_start, SIZES=block_m_num, BLOCK_A=MEMSET_BLOCK_A,  # optimization parameters
-        BLOCK_N=512,  # tunable parameters
+        blocks1a, block_pid_map, block_pid_map.shape[0],  #
+        block_m_log2, BLOCK_A=MEMSET_BLOCK_A,  # optimization parameters
+        BLOCK_N=BLOCK_N, EQUAL_N=(hist.shape[0] == BLOCK_N), # tunable parameters
         num_warps=2
     )
 
@@ -139,47 +134,32 @@ def log2_power_of_two(x):
     return x.bit_length() - 1
 
 
-block_m_log2_start = 4
-
-
-def _compute_expt_data_internal(expt_hist, n_expts_tot, n_gates):
+def _compute_expt_data_internal(expt_hist, n_expts_tot, n_gates, block_m):
 
     MEMSET_BLOCK = 512
-    HIST2_BLOCK_M = 512
     device = expt_hist.device
-    n_expts_tot = n_expts_tot
     cdiv = triton.cdiv
-    # block_ms are all powers-of-two between 16 and 128 (inclusive)
-    block_m_log2_end = 9 #if is_hip() else 8
-    block_m_num = block_m_log2_end - block_m_log2_start
+    block_m_log2 = log2_power_of_two(block_m)
     if n_gates <= n_expts_tot:
         max_n_tiles = n_gates
     else:
-        max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // 2**block_m_log2_start)
+        max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // block_m)
     # allocate memory
     pad = lambda x: cdiv(x, MEMSET_BLOCK) * MEMSET_BLOCK
     dtype = torch.int32
 
-    token_offs_combined = torch.empty((block_m_num + 1, pad(n_expts_tot + 1)), dtype=dtype, device=device)
+    token_offs_combined = torch.empty((2, pad(n_expts_tot + 1)), dtype=dtype, device=device)
 
     token_offs_raw = token_offs_combined[0][:n_expts_tot + 1]
-    token_offs_pad = token_offs_combined[1:]
+    token_offs_pad = token_offs_combined[1]
 
-    block_pid_map = torch.empty((block_m_num, pad(max_n_tiles)), dtype=dtype, device=device)
-    memset_grid = torch.numel(block_pid_map) // MEMSET_BLOCK  # exact division
+    block_pid_map = torch.empty((pad(max_n_tiles),), dtype=dtype, device=device)
     # compute outputs
-    token_offs_pad = token_offs_pad[:, :n_expts_tot + 1]
-    block_pid_map = block_pid_map[:, :max_n_tiles]
+    token_offs_pad = token_offs_pad[:n_expts_tot + 1]
+    block_pid_map = block_pid_map[:max_n_tiles]
 
-    blocks1 = n_expts_tot * block_m_num + 1
-    return token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1, MEMSET_BLOCK, HIST2_BLOCK_M, block_m_log2_start, block_m_num
-
-
-def _unpack_into_dict(x):
-
-    block_m_log2_end = block_m_log2_start + x.shape[0]
-    x = {2**j: x[i, :] for i, j in enumerate(range(block_m_log2_start, block_m_log2_end))}
-    return x
+    blocks1 = n_expts_tot + 1
+    return token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1, MEMSET_BLOCK, block_m_log2
 
 
 # --------------------------
@@ -194,18 +174,19 @@ def routing(logits, n_expts_act, sm_first=False, expt_indx=None):
     if sm_first:
         logits = torch.softmax(logits, dim=-1)
     expt_scal, expt_indx, bitmatrix = topk(logits, n_expts_act, apply_softmax=not sm_first, y_indx=expt_indx, HIST_BLOCK_M=HIST_BLOCK_M)
-    n_expts_tot = logits.shape[-1]
-    
+
+    num_tokens, n_expts_tot = logits.shape
+    m = num_tokens * n_expts_act
+    tokens_per_expt = max(1, m // n_expts_tot)
+    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
     hist, topk_indx, gate_indx, gate_scal, token_offs_raw, token_offs_pad, block_pid_map = sort_tokens(
-        expt_scal, expt_indx, n_expts_tot, bitmatrix, HIST_BLOCK_M)
-    token_offs_pad = _unpack_into_dict(token_offs_pad)
-    block_pid_map = _unpack_into_dict(block_pid_map)
+        expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
 
     # pack the matmul data structure
     gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
     scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
-    return RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data), gather_indx, scatter_indx
+    return RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data), gather_indx, scatter_indx
 
 
 # --------------------------
@@ -213,37 +194,31 @@ def routing(logits, n_expts_act, sm_first=False, expt_indx=None):
 # --------------------------
 
 
-def compute_expt_data_torch(hist, n_expts_tot, n_gates):
+def compute_expt_data_torch(hist, n_expts_tot, n_gates, block_m):
     # offset for each experts
     device = hist.device
     token_offs_raw = torch.cumsum(hist, dim=0)
     token_offs_raw = torch.cat((torch.zeros(1, device=device), token_offs_raw))
     token_offs_raw = token_offs_raw.int()
     # maximum number of tiles for all values of `block_m` considered
-    block_ms = [16, 32, 64, 128]
-    #if is_hip():
-    block_ms.append(256)
     if n_gates <= n_expts_tot:
         max_n_tiles = n_gates
     else:
         # ceil_div(n_gates - n_experts + 1, d_tile) + n_experts - 1
         # ceil_div(x, y): -(-x // y)
-        max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // min(block_ms))
+        max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // block_m)
     # fill up tile offset/infos for each block
-    token_offs_pad = dict()
-    block_pid_map = dict()
-    for block_m in block_ms:
-        n_tiles = (hist + block_m - 1) // block_m  # matmul blocks needed
-        token_offs_pad[block_m] = torch.cumsum(n_tiles, dim=0)
-        token_offs_pad[block_m] = torch.cat((torch.zeros(1, device=device), token_offs_pad[block_m]))
-        token_offs_pad[block_m] = token_offs_pad[block_m].int()
-        # compute data required to drive ragged batch matmul
-        block_pid_map[block_m] = -torch.ones(max_n_tiles, device=device)
-        for e in range(n_expts_tot):
-            offset = token_offs_pad[block_m][e]
-            for b in range(n_tiles[e]):
-                block_pid_map[block_m][offset + b] = (b << 16) + e
-        block_pid_map[block_m] = block_pid_map[block_m].int()
+    n_tiles = (hist + block_m - 1) // block_m  # matmul blocks needed
+    token_offs_pad = torch.cumsum(n_tiles, dim=0)
+    token_offs_pad = torch.cat((torch.zeros(1, device=device), token_offs_pad))
+    token_offs_pad = token_offs_pad.int()
+    # compute data required to drive ragged batch matmul
+    block_pid_map = -torch.ones(max_n_tiles, device=device)
+    for e in range(n_expts_tot):
+        offset = token_offs_pad[e]
+        for b in range(n_tiles[e]):
+            block_pid_map[offset + b] = (b << 16) + e
+    block_pid_map = block_pid_map.int()
     return ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
 
 
@@ -284,5 +259,7 @@ def routing_torch(logits, n_expts_act, sm_first=False, expt_indx=None):
     gather_indx = GatherIndx(src_indx=topk_indx.int(), dst_indx=gate_indx.int())
     scatter_indx = ScatterIndx(src_indx=gate_indx.int(), dst_indx=topk_indx.int())
     # compute expt_data
-    expt_data = compute_expt_data_torch(hist, n_expts_tot, n_gates_pad)
-    return RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data), gather_indx, scatter_indx
+    tokens_per_expt = max(1, n_gates_pad // n_expts_tot)
+    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    expt_data = compute_expt_data_torch(hist, n_expts_tot, n_gates_pad, block_m)
+    return RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data), gather_indx, scatter_indx

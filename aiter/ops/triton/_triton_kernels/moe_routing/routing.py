@@ -18,18 +18,24 @@ def _keyed_add(x, y):
 
 @triton.jit
 def _routing_compute_indx(pid_m, GatherIndx, ScatterIndx, GateScal, ExptScal, ExptIndx, PartialOffs, stride_pm,
-                          stride_pn, TokensStart, n_tokens, ExpertHist, hist_size, BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr, N_EXPTS_ACT: tl.constexpr):
+                          stride_pn, TokensStart, n_tokens, ExpertHist, hist_size, BLOCK_N: tl.constexpr, EQUAL_N: tl.constexpr, BLOCK_M: tl.constexpr, N_EXPTS_ACT: tl.constexpr):
 
-    loop_iterations = (hist_size + BLOCK_N - 1) // BLOCK_N
-    x = tl.zeros([BLOCK_N], ExpertHist.dtype.element_ty)
-    for i in range(loop_iterations):
-        offs_n = i * BLOCK_N + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < hist_size
-        hist2 = tl.load(ExpertHist + offs_n, mask=mask_n)
-        tok_starts = tl.cumsum(hist2, 0) - hist2 + x
-        x += tl.sum(hist2, 0)
-        tl.store(TokensStart + offs_n, tok_starts, mask=mask_n)
-        offs_n += BLOCK_N
+    if EQUAL_N:
+        offs_n = tl.arange(0, BLOCK_N)
+        hist2 = tl.load(ExpertHist + offs_n) 
+        tok_starts = tl.cumsum(hist2, 0) - hist2 
+        tl.store(TokensStart + offs_n, tok_starts)
+    else:
+        loop_iterations = (hist_size + BLOCK_N - 1) // BLOCK_N
+        x = tl.zeros([BLOCK_N], ExpertHist.dtype.element_ty)
+        offs_n = tl.arange(0, BLOCK_N)
+        for i in range(loop_iterations):
+            mask_n = offs_n < hist_size
+            hist2 = tl.load(ExpertHist + offs_n, mask=mask_n)
+            tok_starts = tl.cumsum(hist2, 0) - hist2 + x
+            x += tl.sum(hist2, 0)
+            tl.store(TokensStart + offs_n, tok_starts, mask=mask_n)
+            offs_n += BLOCK_N
 
     if isinstance(n_tokens, tl.tensor) and n_tokens.dtype.is_ptr():
         n_tokens = tl.load(n_tokens)
@@ -68,15 +74,14 @@ def _combined_routing(GatherIndx, ScatterIndx, GateScal, ExptScal, ExptIndx, Par
                         TokensStart, n_tokens, BLOCK_M: tl.constexpr, N_EXPTS_ACT: tl.constexpr,
                         ExpertHist, hist_size,
                         n_expts_tot, MDStarts, tile_starts_stridem,
-                        blocks1a, MDTileInfo, tile_info_stridem, max_num_tiles, first_tile_dim_log2, SIZES: tl.constexpr, BLOCK_A: tl.constexpr,
-                        BLOCK_N: tl.constexpr):
+                        blocks1a, MDTileInfo, max_num_tiles, tile_dim_log2: tl.constexpr, BLOCK_A: tl.constexpr,
+                        BLOCK_N: tl.constexpr, EQUAL_N: tl.constexpr):
 
     pid = tl.program_id(0)
 
     if pid < blocks1a:
-        _expt_data_compute(ExpertHist, n_expts_tot, MDStarts, tile_starts_stridem, MDTileInfo, tile_info_stridem, max_num_tiles, first_tile_dim_log2,
-                          SIZES, BLOCK_A)
+        _expt_data_compute(pid, ExpertHist, n_expts_tot, MDStarts, tile_starts_stridem, MDTileInfo, max_num_tiles, tile_dim_log2, BLOCK_A)
     else:
         pid -= blocks1a
         _routing_compute_indx(pid, GatherIndx, ScatterIndx, GateScal, ExptScal, ExptIndx, PartialOffs, stride_pm,
-                              stride_pn, TokensStart, n_tokens, ExpertHist, hist_size, BLOCK_N, BLOCK_M, N_EXPTS_ACT)
+                              stride_pn, TokensStart, n_tokens, ExpertHist, hist_size, BLOCK_N, EQUAL_N, BLOCK_M, N_EXPTS_ACT)

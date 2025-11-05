@@ -58,15 +58,7 @@ def get_kernel_config(
     k,
     routing_data
 ):
-    # tokens per expert
-    if routing_data is None:
-        tokens_per_expt = m
-    elif routing_data.expected_tokens_per_expt is None:
-        tokens_per_expt = max(1, m // routing_data.n_expts_tot)
-    else:
-        tokens_per_expt = routing_data.expected_tokens_per_expt
-
-    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
     xcd_swizzle = num_xcds
@@ -248,9 +240,9 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
     expt_data = routing_data.expt_data
     block_m = config["block_m"]
     expt_hist = None if expt_data is None else expt_data.hist
-    expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[block_m][-1]
+    expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
-    expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map[block_m]
+    expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
     # spmd grid
     if unpadded_N and block_m == 16:
         N = unpadded_N
