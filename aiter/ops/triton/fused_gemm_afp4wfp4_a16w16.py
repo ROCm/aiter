@@ -153,7 +153,6 @@ def fused_gemm_afp4wfp4_a16w16(
             )
         ),
     )
-    _LOGGER.info(f"{M}, {N_fp4}, {N_bf16}, {K}, {is_fp4_preshuffled}, {config}")
     selected_kernel = (
         _fused_gemm_afp4wfp4_preshuffled_weight_scales_a16w16_kernel
         if is_fp4_preshuffled

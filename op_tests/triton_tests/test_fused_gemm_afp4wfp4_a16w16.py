@@ -74,9 +74,6 @@ def get_x_vals():
         for n1 in [256, 512]
         for m in [1, 8, 32, 64, 128, 8192]
     ]
-    x_vals = [
-        (32, 512, 256, 7168),
-    ]
     return x_vals
 
 
@@ -106,14 +103,12 @@ def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):
         shuffle_scales_fg=fp4_shuffle,
         shuffle_weight_fg=fp4_shuffle,
     )
-    print(x_fp4.shape, x_fp4_scale.shape, x_fp4_scale_triton.shape)
 
     x_bf16, w_bf16, bias_bf16, _, y_bf16 = generate_gemm_a16w16_inputs(
         M, N2, K, dtype, output=output, bias=True
     )
     bias_bf16 = torch.randn((N2,), dtype=bias_bf16.dtype, device=bias_bf16.device)
-    # bias_fp4 = torch.randn((N1,), dtype=bias_bf16.dtype, device=bias_bf16.device)
-    bias_fp4 = None
+    bias_fp4 = torch.randn((N1,), dtype=bias_bf16.dtype, device=bias_bf16.device)
     y_torch_fp4, y_torch_bf16 = run_torch(
         x_fp4,
         w_fp4,
