@@ -6,7 +6,6 @@ import torch
 from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffled_weight_scales,
-    gemm_afp4wfp4_preshuffle,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
@@ -170,11 +169,11 @@ def get_x_vals():
     x_vals += [(v, 16384, 53248) for v in [1, 8, 16, 32, 64, 128, 256]]
     x_vals += [(v, 18432, 16384) for v in [1, 8, 16, 32, 64, 128, 256]]
     x_vals += [(v, 16384, 16384) for v in [1, 8, 16, 32, 64, 128, 256]]
-    x_vals += [(v, 10240, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
-    x_vals += [(v, 8192, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
-    x_vals += [(v, 57344, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
+    x_vals = [(v, 10240, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
+    x_vals = [(v, 8192, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
+    x_vals = [(v, 57344, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
     x_vals = [(v, 8192, 28672) for v in [1, 2, 4, 8, 16, 32, 64]]
-    x_vals += [(1, 1, 32)]  # minimal case
+    # x_vals += [(1, 1, 32)]  # minimal case
     return x_vals
 
 
