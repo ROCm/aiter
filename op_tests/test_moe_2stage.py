@@ -101,12 +101,11 @@ def ck_moe_stage2(
     D = w2.shape[1]
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
-    out = torch.empty(
+    out = torch.zeros(
         (token_num, D),
         dtype=dtype,
         device=hidden_states.device,
     )
-    out.fill_(0)
     aiter.ck_moe_stage2_fwd(
         hidden_states,
         w1,
@@ -624,23 +623,23 @@ def test_fmoe(
         activation=actType,
         doweight_stage1=doweight_stage1,
     )
-    checkAllclose(
+    err = checkAllclose(
         out2_ref,
         out2_ck,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
-    return {"gemm1(us)": us1, "gemm2(us)": us2}
-        def calc_diff(x: torch.Tensor, y: torch.Tensor):
-            x, y = x.double(), y.double()
-            denominator = (x * x + y * y).sum()
-            sim = 2 * (x * y).sum() / denominator
-            return 1 - sim
+    # return {"gemm1(us)": us1, "gemm2(us)": us2}
+    def calc_diff(x: torch.Tensor, y: torch.Tensor):
+        x, y = x.double(), y.double()
+        denominator = (x * x + y * y).sum()
+        sim = 2 * (x * y).sum() / denominator
+        return 1 - sim
 
-        logits_diff = calc_diff(out2_ref, out2_aiter)
-        assert logits_diff < 1e-3
+    logits_diff = calc_diff(out2_ref, out2_ck)
+    assert logits_diff < 1e-3
 
-        return {"us": us_fuse, "err": err}
+    return {"us": us2, "err": err}
 
 
 l_dtype = ["bf16", "fp16"][:1]
@@ -749,7 +748,7 @@ parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    default=256,
+    default=8,
     help="""Number of experts.
     e.g.: -e 8""",
 )
@@ -758,7 +757,7 @@ parser.add_argument(
     "-k",
     "--topk",
     type=int,
-    default=8,
+    default=2,
     help="""Number of top experts.
     e.g.: -k 2""",
 )
