@@ -1257,7 +1257,7 @@ def _flash_attn_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-@torch_compile_guard()
+@torch_compile_guard(mutates_args=[])
 def can_impl_fmha_v3_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
