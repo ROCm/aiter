@@ -649,6 +649,7 @@ _gemm_afp4wfp4_reduce_repr = make_kernel_repr(
 )
 
 
+@triton.heuristics({})  # dummy heuristics to invoke kernel re-naming
 @triton.jit(repr=_gemm_afp4wfp4_reduce_repr)
 def _gemm_afp4wfp4_reduce_kernel(
     c_in_ptr,
