@@ -294,8 +294,8 @@ def torch_compile_guard(
                 else:
                     return gen_fake(*args, **kwargs)
             if return_non_tensor:
-                return torch.empty(1, device=device), wrapper(*args, **kwargs)
-            return wrapper(*args, **kwargs)
+                return torch.empty(1, device=device), calling_func(*args, **kwargs)
+            return calling_func(*args, **kwargs)
 
         def outer_wrapper(*args, **kwargs):
             return (
@@ -311,8 +311,8 @@ def torch_compile_guard(
                 else:
                     return gen_fake(*args, **kwargs)
             if return_non_tensor:
-                return torch.empty(1, device=device), wrapper(*args, **kwargs)
-            return wrapper(*args, **kwargs)
+                return torch.empty(1, device=device), calling_func(*args, **kwargs)
+            return calling_func(*args, **kwargs)
 
         def outer_wrapper_dummy(dummy, *args, **kwargs):
             return (
