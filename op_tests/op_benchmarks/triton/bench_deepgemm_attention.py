@@ -149,9 +149,26 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
     line_names = ["non_ragged_k"]
     line_args = "kv_storage_kind"
 
-    x_vals_list = [
-        (args.batch, args.mtp + 1, args.heads, args.index_dim, args.kv_length)
-    ]
+    if args.perf:
+        x_vals_list = [
+            (1, 2, 64, 128, 16384),
+            (1, 2, 64, 128, 32768),
+            (1, 2, 64, 128, 65536),
+            (2, 2, 64, 128, 16384),
+            (2, 2, 64, 128, 32768),
+            (2, 2, 64, 128, 65536),
+            (4, 2, 64, 128, 16384),
+            (4, 2, 64, 128, 32768),
+            (4, 2, 64, 128, 65536),
+            (1, 1, 64, 128, 65536),
+            (2, 1, 64, 128, 65536),
+            (4, 1, 64, 128, 65536),
+            (8, 1, 64, 128, 65536),
+        ]
+    else:
+        x_vals_list = [
+            (args.batch, args.mtp + 1, args.heads, args.index_dim, args.kv_length)
+        ]
 
     configs = []
     configs.append(
@@ -411,6 +428,10 @@ if __name__ == "__main__":
         "-aot",
         action="store_true",
         help="Save compiled triton kernel for later AOT use",
+    )
+    parser.add_argument(
+        "--perf",
+        action="store_true",
     )
     parser.add_argument(
         "--kv_preshuffle",
