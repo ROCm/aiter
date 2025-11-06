@@ -207,8 +207,8 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 _CKGEMM_CONFIG_CACHE = None
 
 
-@torch_compile_guard()
-def get_CKGEMM_config_(tuned_file: str = None) -> None:
+@functools.lru_cache(maxsize=1024)
+def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
     if tuned_file is None:
         tuned_file = "a8w8_tuned_gemm.csv"
     global _CKGEMM_CONFIG_CACHE
@@ -220,13 +220,6 @@ def get_CKGEMM_config_(tuned_file: str = None) -> None:
         _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
             ["cu_num", "M", "N", "K"]
         ).to_dict("index")
-
-    return None
-
-
-@functools.lru_cache(maxsize=1024)
-def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
-    get_CKGEMM_config_(tuned_file)
 
     cu_num = get_cu_num()
 
@@ -344,15 +337,28 @@ def gemm_a8w8_ASM(
     return gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, kernelName, bias, splitK=1)
 
 
+def gemm_a8w8_CK_fake(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    bias: Optional[Tensor] = None,
+    dtype: torch.dtype = dtypes.bf16,
+    splitK: Optional[int] = None,
+) -> Tensor:
+    return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_CK_fake)
 def gemm_a8w8_CK(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
     bias: Optional[Tensor] = None,
-    dtype=dtypes.bf16,
+    dtype: torch.dtype = dtypes.bf16,
     splitK: Optional[int] = None,
-):
+) -> Tensor:
     # assert dtype in [
     #     dtypes.bf16,
     #     dtypes.fp16,
@@ -410,7 +416,7 @@ def gemm_a8w8_blockscale_fake(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    dtype=dtypes.bf16,
+    dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled=False,
 ) -> torch.Tensor:
     m = XQ.shape[0]
@@ -465,9 +471,24 @@ def flatmm_a8w8_blockscale_ASM(
     return flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
 
+def gemm_a8w8_blockscale_bpreshuffle_fake(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def gemm_a8w8_blockscale_bpreshuffle(
-    XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, dtype=dtypes.bf16
-):
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
