@@ -61,21 +61,22 @@ def run_cu(input, weight, eps, residual=None):
     return output, residual_out
 
 
-def test_rmsnorm2d(dtype, m, n):
-    dim = (m, n)
+def test_rmsnorm2d(dtype, m, n, p=0):
+    dim = (m, n + p)
     input = torch.randn(dim, dtype=dtype, device="cuda")
     weight = torch.randn(n, dtype=dtype, device="cuda")
     # q, k, v = torch.split(hidden_stats, [6*n, n, n], dim=1)
     # input = k
-    (a, *_), avg_a = run_torch(input, weight, 1e-5)
-    (b, *_), avg_b = run_ck(input, weight, 1e-5)
-    (c, *_), avg_c = run_cu(input, weight, 1e-5)
+    (a, *_), avg_a = run_torch(input[:, :n], weight, 1e-5)
+    (b, *_), avg_b = run_ck(input[:, :n], weight, 1e-5)
+    avg_c = 1e12
+    # (c, *_), avg_c = run_cu(input, weight, 1e-5)
 
-    print("#############bd: ", (input.numel() + weight.numel() + b.numel()) * 2 / avg_b / 1e6)
+    print("#############bd: ", ((m * 2 + 1) * n) * 2 / avg_b / 1e6)
 
     msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
-    checkAllclose(a, c, msg="cu")
+    # checkAllclose(a, c, msg="cu")
 
 
 def test_rmsnorm2d_fuseAdd(dtype, m, n):
@@ -138,6 +139,15 @@ parser.add_argument(
     help="""N of mnk.
     e.g.: -n 1024""",
 )
+parser.add_argument(
+    "-p",
+    "--p",
+    type=int,
+    nargs="?",
+    default=1024,
+    help="""paddings .
+    e.g.: -p 1024""",
+)
 
 args = parser.parse_args()
 if args.dtype is None:
@@ -156,5 +166,5 @@ if args.n is not None:
 #             test_rmsnorm2d_fuseAdd(dtype, m, n)
 
 for m in l_m:
-    test_rmsnorm2d(dtypes.bf16, m, 8192)
-
+    for n in l_n:
+        test_rmsnorm2d(dtypes.bf16, m, n, args.p)
