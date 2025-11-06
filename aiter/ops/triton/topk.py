@@ -12,8 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
-# import triton.language.core as core
-# from triton.language.standard import _log2, zeros_like
+
 from aiter.ops.triton._triton_kernels.topk import (
     _topk_kernel,
     topk_stage1_kernel,
