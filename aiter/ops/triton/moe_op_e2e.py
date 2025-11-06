@@ -10,7 +10,7 @@ from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
-from aiter.ops.triton._triton_kernels.moe_op_e2e import e2e_moe_kernel
+from aiter.ops.triton._triton_kernels.moe_op_e2e import e2e_moe_kernel, e2e_moe_kernel_fp8, e2e_moe_kernel_fp8_blockscale
 import warnings
 
 _LOGGER = AiterTritonLogger()
@@ -68,12 +68,15 @@ def e2e_moe(
     )
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+    use_block_scale = block_shape is not None
+    if use_block_scale:
+        assert use_fp8_w8a8, "Block scale works with fp8"
 
     if use_fp8_w8a8:
         assert A_scale is not None
         assert W1_scale is not None
         assert W2_scale is not None
-        if block_shape is None:
+        if not use_block_scale:
             block_n, block_k = 0, 0
         else:
             assert len(block_shape) == 2
@@ -102,7 +105,7 @@ def e2e_moe(
         EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
 
     M = A.shape[0]
-    N = W1.shape[1]
+    N = W2.shape[-1]
     K = A.shape[1] - _PADDING_SIZE
     EVEN_K1 = K % config["BLOCK_SIZE_K1"] == 0
     EVEN_K2 = K % config["BLOCK_SIZE_K2"] == 0
@@ -122,12 +125,22 @@ def e2e_moe(
 
     if return_intermediate:
         Intermediate = torch.zeros(
-            (M, top_k, N // 2), dtype=torch.float32, device="cuda"
+            (M, top_k, N), dtype=torch.float32, device="cuda"
         )
     else:
         Intermediate = None
 
-    e2e_moe_kernel[grid](
+    # kernel development is divided into 3 versions for clarity
+    if use_block_scale: # blockscale fp8
+        kernel_fn = e2e_moe_kernel_fp8_blockscale
+    elif use_fp8_w8a8: # per tensor fp8, per token fp8
+        kernel_fn = e2e_moe_kernel_fp8
+    else: # bf16, f16, f32
+        kernel_fn = e2e_moe_kernel
+    
+    config["BLOCK_SIZE_N"] = min(config["BLOCK_SIZE_N"], triton.next_power_of_2(N))
+
+    kernel_fn[grid](
         A,
         W1,
         W2,

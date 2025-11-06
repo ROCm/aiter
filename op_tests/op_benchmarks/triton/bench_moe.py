@@ -7,7 +7,7 @@ from aiter.ops.triton.moe_op import fused_moe as triton_moe
 from aiter.ops.triton.moe_op_e2e import e2e_moe as triton_e2e_moe
 from aiter.ops.triton.moe_op_silu_fused import fused_moe_silu as triton_moe_silu
 from op_tests.triton_tests.test_moe import input_helper, input_helper_int4_w4a16
-from op_tests.triton_tests.test_moe import input_helper_e2e
+from op_tests.triton_tests.test_moe_e2e_fused import input_helper_e2e
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
@@ -34,11 +34,11 @@ def model_benchmark_configs(args):
                 f"Missing MoE keys ('moe_intermediate_size', 'hidden_size', 'num_expert', 'top_k') in model configuration for {model_name}: skipping this model."
             )
         else:
-            N1 = config["moe_intermediate_size"]  # // args.tp
+            N1 = config["moe_intermediate_size"] * 2  # // args.tp
             K1 = config["hidden_size"]
             if not no_bench_stage2:
                 N2 = config["hidden_size"]
-                K2 = config["moe_intermediate_size"] // 2  # // args.tp
+                K2 = config["moe_intermediate_size"]  # // args.tp
 
             E = config["num_expert"]
             top_k = config["top_k"]
@@ -327,7 +327,7 @@ def run_benchmark(args):
         line_vals=line_vals,
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-"), ("green", "-")],
-        ylabel="ms / TFLOPS / GB/s",
+        ylabel="",
         plot_name=get_caller_name_no_ext(),
         args={},
     )
