@@ -115,7 +115,6 @@ def fused_moe_mxfp4_silu(
         num_tokens_post_padded,
         B.shape[1],
         A.shape[1],
-        EM,  # it's not being used in the kernel
         topk_ids.numel(),
         A.stride(0),
         A.stride(1),

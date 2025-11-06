@@ -353,7 +353,6 @@ def _fused_moe_persistent_kernel_gptq_awq(
     # Matrix dimensions
     N: tl.constexpr,
     K: tl.constexpr,
-    EM,
     num_valid_tokens,
     # The stride variables represent how much to increase the ptr by when
     # moving by 1 element in a particular dimension. E.g. `stride_am` is
@@ -582,7 +581,6 @@ def _fused_moe_kernel(
     # Matrix dimensions
     N,
     K,
-    EM,
     num_valid_tokens,
     # The stride variables represent how much to increase the ptr by when
     # moving by 1 element in a particular dimension. E.g. `stride_am` is
@@ -790,7 +788,6 @@ def _fused_moe_persistent_kernel(
     # Matrix dimensions
     N,
     K,
-    EM,
     num_valid_tokens,
     # The stride variables represent how much to increase the ptr by when
     # moving by 1 element in a particular dimension. E.g. `stride_am` is

@@ -3,7 +3,6 @@
 
 import torch
 import triton
-# import triton.language as tl
 from typing import Any, Dict, Optional
 
 from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
@@ -184,7 +183,6 @@ def e2e_moe(
             expert_ids,
             num_tokens_post_padded,
             topk_ids.numel(),
-            EM,
             N,
             K,
             EVEN_K,
@@ -193,7 +191,6 @@ def e2e_moe(
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             NUM_SMS=NUM_SMS,
-            NUM_XCDS=get_num_xcds(),
             **config,
         )
 

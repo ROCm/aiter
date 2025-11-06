@@ -1,6 +1,5 @@
 import torch
 import triton
-# import triton.language as tl
 from aiter.ops.triton._triton_kernels.softmax import _softmax_kernel_online
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -36,7 +35,6 @@ def softmax(x):
         x,
         x.stride(0),
         y.stride(0),
-        n_rows,  # it's not being used in the kernel
         n_cols,
         BLOCK_SIZE,
         waves_per_eu=waves_per_eu,

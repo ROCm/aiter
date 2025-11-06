@@ -20,7 +20,6 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 from typing import Optional
 import torch
 import triton
-# import triton.language as tl
 
 
 from aiter.ops.triton.prefill_attention import context_attention_fwd
@@ -144,8 +143,6 @@ def extend_attention_fwd(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         BLOCK_DV=BLOCK_DV,
-        # BLOCK_M=BLOCK_M,
-        # BLOCK_N=BLOCK_N,
         Lq=Lq,
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
@@ -154,10 +151,7 @@ def extend_attention_fwd(
         STORE_TRANSPOSE=True,
         NUM_Q_HEADS=head_num,
         NUM_BLOCKS=num_blocks,
-        # BATCH=batch_size,
         NUM_XCDS=get_num_xcds(),
-        # num_warps=num_warps,
-        # num_stages=num_stages,
         **config,
     )
 

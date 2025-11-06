@@ -61,7 +61,6 @@ def _fused_moe_kernel_mxfp4(
     # Matrix dimensions
     N,
     K,
-    EM,
     num_valid_tokens,
     # Strides
     stride_am,

@@ -168,7 +168,6 @@ def fused_moe(
                 num_tokens_post_padded,
                 B.shape[1],
                 A.shape[1],
-                EM,  # it's not being used in the kernel
                 topk_ids.numel(),
                 A.stride(0),
                 A.stride(1),
@@ -261,7 +260,6 @@ def fused_moe(
                 num_tokens_post_padded,
                 B.shape[1],
                 A.shape[1] - _PADDING_SIZE,
-                sorted_token_ids.shape[0],  # (EM) it's not being used in the kernel
                 topk_ids.numel(),
                 A.stride(0),
                 A.stride(1),
@@ -303,7 +301,6 @@ def fused_moe(
                 num_tokens_post_padded,
                 B.shape[1],
                 A.shape[1] - _PADDING_SIZE,
-                EM,  # it's not being used in the kernel
                 topk_ids.numel(),
                 A.stride(0),
                 A.stride(1),

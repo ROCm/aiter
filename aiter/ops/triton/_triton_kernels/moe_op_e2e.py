@@ -38,7 +38,6 @@ _e2e_moe_persistent_kernel_repr = make_kernel_repr(
     "e2e_moe_persistent_kernel",
     [
         "top_k",
-        "EM",
         "N",
         "K",
         "EVEN_K",
@@ -52,7 +51,6 @@ _e2e_moe_persistent_kernel_repr = make_kernel_repr(
         "BLOCK_SIZE_K1",
         "BLOCK_SIZE_K2",
         "NUM_SMS",
-        "NUM_XCDS",
     ],
 )
 
@@ -393,7 +391,6 @@ def e2e_moe_persistent_kernel(
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
     num_valid_tokens,
-    EM: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
     EVEN_K: tl.constexpr,
@@ -407,7 +404,6 @@ def e2e_moe_persistent_kernel(
     BLOCK_SIZE_K1: tl.constexpr,  # original block_size_k
     BLOCK_SIZE_K2: tl.constexpr,  # outputs (EM, BLOCK_SIZE_K2)
     NUM_SMS: tl.constexpr,
-    NUM_XCDS: tl.constexpr,
 ):
     start_m = tl.program_id(axis=0)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)

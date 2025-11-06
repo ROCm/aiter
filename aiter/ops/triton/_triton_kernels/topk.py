@@ -5,7 +5,6 @@
 # https://github.com/FlagOpen/FlagGems/blob/master/src/flag_gems/ops/topk.py
 
 #  Top-K on GPU:  1-stage (tiny rows) + 2-stage (large rows) Triton kernels,
-import math
 import triton
 import triton.language as tl
 import triton.language.core as core

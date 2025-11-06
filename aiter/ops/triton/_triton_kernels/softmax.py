@@ -17,7 +17,6 @@ def _softmax_kernel_online(
     input_ptr,
     input_row_stride,
     output_row_stride,
-    n_rows,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
 ):
