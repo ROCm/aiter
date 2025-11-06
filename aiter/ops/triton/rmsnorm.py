@@ -15,6 +15,7 @@ from aiter.ops.triton._triton_kernels.rmsnorm import (
     _quant_fused_add_rmsnorm_kernel,
     _rmsnorm_bwd_triton,
     _rmsnorm_bwd_dg_reduce_triton,
+    _rmsnorm_kernel_large_m_small_n,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -528,3 +529,42 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
         USE_BLOCKED,
         NUM_PRGMS,
     )
+
+
+def rmsnorm_large_m_small_n(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+    return_rsigma: bool = False,
+):
+    assert x.ndim == 2 and weight.ndim == 1 and x.shape[1] == weight.shape[0]
+    x, weight = x.contiguous(), weight.contiguous()
+    M, N = x.shape
+    y = torch.empty_like(x)
+    rsigma = (
+        torch.empty(M, dtype=torch.float32, device=x.device) if return_rsigma else None
+    )
+
+    BLOCK_N = triton.next_power_of_2(N)
+    BLOCK_M = min(16384 // BLOCK_N, 32)
+    BLOCK_M = max(BLOCK_M, 8)
+
+    grid = (triton.cdiv(M, BLOCK_M),)
+    _rmsnorm_kernel_large_m_small_n[grid](
+        x,
+        y,
+        weight,
+        rsigma,
+        M,
+        N,
+        eps,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=8,
+        num_stages=2,
+    )
+    return (y, rsigma) if return_rsigma else y
