@@ -631,6 +631,16 @@ def test_fmoe(
     )
 
     return {"gemm1(us)": us1, "gemm2(us)": us2}
+        def calc_diff(x: torch.Tensor, y: torch.Tensor):
+            x, y = x.double(), y.double()
+            denominator = (x * x + y * y).sum()
+            sim = 2 * (x * y).sum() / denominator
+            return 1 - sim
+
+        logits_diff = calc_diff(out2_ref, out2_aiter)
+        assert logits_diff < 1e-3
+
+        return {"us": us_fuse, "err": err}
 
 
 l_dtype = ["bf16", "fp16"][:1]

@@ -13,7 +13,7 @@ from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
 )
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter import dtypes
 
 MD_NAME = "module_attention"
 
@@ -359,33 +359,30 @@ def get_mla_metadata_info_v1(
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
 
-    reduce_batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     max_qo_tiles_per_batch = (
-        int(math.ceil(max_seqlen_qo * num_head_qo / 64))
-        if num_head_qo == 16
-        or (num_head_qo == 128 and kv_dtype == get_fp8_e4m3_dtype())
+        int(math.ceil(max_seqlen_qo * num_head_qo / 128))
+        if num_head_qo == 16 or (num_head_qo == 128 and kv_dtype == dtypes.fp8)
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
+    batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
+    tile_cnt = batch_size * max_qo_tiles_per_batch
+
+    if fast_mode:
+        max_work = tile_cnt + cu_num - 1
+        max_split_tiles = (
+            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
+        )
+    else:
+        max_work = tile_cnt * cu_num
+        max_split_tiles = tile_cnt * cu_num
 
     return (
         ((2), torch.uint64),  # work_metadata_ptrs
         ((cu_num + 1), torch.int32),  # work_indptr
-        (
-            (batch_size * max_qo_tiles_per_batch * cu_num, 8),
-            torch.int32,
-        ),  # work_info_set
-        (
-            (reduce_batch_size * max_qo_tiles_per_batch + 1),
-            torch.int32,
-        ),  # reduce_indptr
-        (
-            (reduce_batch_size * max_qo_tiles_per_batch, 2),
-            torch.int32,
-        ),  # reduce_final_map
-        (
-            (reduce_batch_size * max_qo_tiles_per_batch * cu_num),
-            torch.int32,
-        ),  # reduce_partial_map
+        ((max_work, 8), torch.int32),  # work_info_set
+        ((tile_cnt + 1), torch.int32),  # reduce_indptr
+        ((tile_cnt, 2), torch.int32),  # reduce_final_map
+        (max_split_tiles, torch.int32),  # reduce_partial_map
     )
 
 
