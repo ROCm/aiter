@@ -270,15 +270,28 @@ def get_bpreshuffle_GEMM_config(
     return config
 
 
+def gemm_a8w8_fake(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    bias: Optional[Tensor] = None,
+    dtype: torch.dtype = dtypes.bf16,
+    splitK: Optional[int] = None,
+) -> Tensor:
+    return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_fake)
 def gemm_a8w8(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
     bias: Optional[Tensor] = None,
-    dtype=dtypes.bf16,
+    dtype: torch.dtype = dtypes.bf16,
     splitK: Optional[int] = None,
-):
+) -> Tensor:
     # assert dtype in [
     #     dtypes.bf16,
     #     dtypes.fp16,
@@ -337,19 +350,6 @@ def gemm_a8w8_ASM(
     return gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, kernelName, bias, splitK=1)
 
 
-def gemm_a8w8_CK_fake(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    bias: Optional[Tensor] = None,
-    dtype: torch.dtype = dtypes.bf16,
-    splitK: Optional[int] = None,
-) -> Tensor:
-    return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
-
-
-@torch_compile_guard(gen_fake=gemm_a8w8_CK_fake)
 def gemm_a8w8_CK(
     XQ: Tensor,
     WQ: Tensor,
@@ -376,15 +376,28 @@ def gemm_a8w8_CK(
     return gemm_a8w8_ck(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
 
 
+def gemm_a8w8_bpreshuffle_fake(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    bias: Optional[Tensor] = None,
+    dtype: torch.dtype = dtypes.bf16,
+    check: bool = False,
+) -> Tensor:
+    return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_bpreshuffle_fake)
 def gemm_a8w8_bpreshuffle(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
     bias: Optional[Tensor] = None,
-    dtype=torch.float16,
-    check=False,
-):
+    dtype: torch.dtype = dtypes.bf16,
+    check: bool = False,
+) -> Tensor:
     assert dtype in [
         torch.bfloat16,
         torch.float16,
