@@ -1,6 +1,7 @@
 import torch
 import pytest
 from aiter.ops.triton.fused_fp8_quant import (
+    fused_rms_fp8_per_tensor_static_quant,
     fused_rms_fp8_group_quant,
     fused_flatten_fp8_group_quant,
     fused_reduce_act_mul_fp8_group_quant,
@@ -45,6 +46,13 @@ def per_token_fp8_group_quant(x, dtype_quant, group_size=128):
     return x_quant, x_scale
 
 
+def per_tensor_fp8_static_quant(x, dtype_quant, x_scale):
+    DTYPE_MAX = torch.finfo(dtype_quant).max
+    scale_recip = 1.0 / x_scale
+    x_quant = torch.clamp(x * scale_recip, -DTYPE_MAX, DTYPE_MAX).to(dtype_quant)
+    return x_quant
+
+
 def upcast(x, s, dtype, group_size=128):
     x_N = x.shape[1]
     x = x.reshape(-1, x_N // group_size, group_size).to(torch.float32) * s.reshape(
@@ -71,6 +79,54 @@ def generate_fused_rms_quant_data(M, N1, N2, dtype=torch.bfloat16):
     w2 = torch.ones((N2,), dtype=torch.float32, device="cuda")
     res1 = torch.randn((M, N1), dtype=dtype, device="cuda") / 10
     return x1, w1, x2, w2, res1
+
+
+def run_torch_rms_fp8_per_tensor_static_quant(
+    x1, w1, eps1, x2, w2, eps2, res1, dtype_quant, x1_scale
+):
+    s = x1 + res1
+    y1 = rmsnorm(s, w1, eps1)
+    y2 = rmsnorm(x2, w2, eps2)
+    y1_q = per_tensor_fp8_static_quant(y1, dtype_quant, x1_scale)
+    return y1_q, y1.to(x1.dtype), y2.to(x1.dtype), s.to(x1.dtype)
+
+
+@pytest.mark.parametrize("M", [1, 32, 256])
+@pytest.mark.parametrize("N1, N2", [(128, 128), (128, 7168), (7168, 7168)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_rms_fp8_per_tensor_static_quant(M: int, N1: int, N2: int, dtype):
+    dtype_quant = aiter.dtypes.fp8
+    scale = torch.randn(1, dtype=torch.float32, device="cuda")
+    x1, w1, x2, w2, res1 = generate_fused_rms_quant_data(M, N1, N2, dtype)
+
+    y1_q_torch, y1_torch, y2_torch, y1_res_torch = (
+        run_torch_rms_fp8_per_tensor_static_quant(
+            x1, w1, 1e-6, x2, w2, 1e-6, res1, dtype_quant, scale
+        )
+    )
+
+    y1_q_triton, y1_triton, y2_triton, y1_res_triton = (
+        fused_rms_fp8_per_tensor_static_quant(
+            x1,
+            w1,
+            1e-6,
+            scale,
+            inp2=x2,
+            inp2_weight=w2,
+            inp2_epsilon=1e-6,
+            dtype_quant=dtype_quant,
+            res1=res1,
+            output_unquantized_inp1=True,
+        )
+    )
+
+    torch.testing.assert_close(y1_torch, y1_triton, atol=0.1, rtol=0.1)
+    torch.testing.assert_close(y2_torch, y2_triton, atol=0.1, rtol=0.1)
+    torch.testing.assert_close(y1_res_torch, y1_res_triton, atol=0.1, rtol=0.1)
+
+    y1_upcast_torch = y1_q_torch.to(torch.float32) * scale
+    y1_upcast_triton = y1_q_triton.to(torch.float32) * scale
+    torch.testing.assert_close(y1_upcast_torch, y1_upcast_triton, atol=0.1, rtol=0.1)
 
 
 @pytest.mark.parametrize("M", [1, 32, 256])
