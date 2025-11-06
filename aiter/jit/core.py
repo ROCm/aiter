@@ -102,7 +102,11 @@ def update_config_files(file_path: str, merge_name: str):
     if os.path.exists(untuned_path):
         untunedf = pd.read_csv(untuned_path)
         keys = untunedf.columns
-        merge_df = merge_df.drop_duplicates(subset=keys, keep="last")
+        merge_df = (
+            merge_df.sort_values("us")
+            .drop_duplicates(subset=keys, keep="first")
+            .reset_index(drop=True)
+        )
     else:
         logger.warning(
             f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
@@ -112,9 +116,10 @@ def update_config_files(file_path: str, merge_name: str):
     return new_file_path
 
 
-def get_config_file(env_name, tuned_file_name):
+# @functools.lru_cache(maxsize=1)
+def get_config_file(env_name, default_file, tuned_file_name):
     config_env_file = os.getenv(env_name)
-    default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
+    # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
     from pathlib import Path
 
     if not config_env_file:
@@ -130,44 +135,95 @@ def get_config_file(env_name, tuned_file_name):
         else:
             tuned_files = ":".join(str(p) for p in op_tuned_file_list)
             tuned_files = default_file + ":" + tuned_files
-            print(f"merge tuned file under model_configs/ and configs/")
+            print(f"merge tuned file under model_configs/ and configs/ ", tuned_files)
             config_file = update_config_files(tuned_files, tuned_file_name)
     else:
         config_file = update_config_files(config_env_file, tuned_file_name)
-        print(f"get {env_name} from environment ", config_file)
+        # print(f"get config file from environment ", config_file)
     return config_file
 
 
+AITER_CONFIG_GEMM_A4W4 = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
+)
+AITER_CONFIG_FMOE = os.getenv(
+    "AITER_CONFIG_FMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
+    "AITER_CONFIG_A8W8_BATCHED_GEMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv",
+)
+
+AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
+    "AITER_CONFIG_BF16_BATCHED_GEMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_BF16 = os.getenv(
+    "AITER_CONFIG_GEMM_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_gemm.csv",
+)
 AITER_CONFIG_GEMM_A4W4_FILE = get_config_file(
-    "AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm"
+    "AITER_CONFIG_GEMM_A4W4", AITER_CONFIG_GEMM_A4W4, "a4w4_blockscale_tuned_gemm"
 )
 
 AITER_CONFIG_GEMM_A8W8_FILE = get_config_file(
-    "AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm"
+    "AITER_CONFIG_GEMM_A8W8", AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
 )
 AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE = get_config_file(
-    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE", "a8w8_bpreshuffle_tuned_gemm"
+    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
+    AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE,
+    "a8w8_bpreshuffle_tuned_gemm",
 )
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE = get_config_file(
-    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", "a8w8_blockscale_tuned_gemm"
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
+    "a8w8_blockscale_tuned_gemm",
 )
-AITER_CONFIG_FMOE_FILE = get_config_file("AITER_CONFIG_FMOE", "tuned_fmoe")
+AITER_CONFIG_FMOE_FILE = get_config_file(
+    "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+)
 
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE = get_config_file(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
     "a8w8_blockscale_bpreshuffle_tuned_gemm",
 )
 
 AITER_CONFIG_A8W8_BATCHED_GEMM_FILE = get_config_file(
-    "AITER_CONFIG_A8W8_BATCHED_GEMM", "a8w8_tuned_batched_gemm"
+    "AITER_CONFIG_A8W8_BATCHED_GEMM",
+    AITER_CONFIG_A8W8_BATCHED_GEMM,
+    "a8w8_tuned_batched_gemm",
 )
 
 AITER_CONFIG_BF16_BATCHED_GEMM_FILE = get_config_file(
-    "AITER_CONFIG_BATCHED_GEMM_BF16", "bf16_tuned_batched_gemm"
+    "AITER_CONFIG_BF16_BATCHED_GEMM",
+    AITER_CONFIG_BF16_BATCHED_GEMM,
+    "bf16_tuned_batched_gemm",
 )
 
 AITER_CONFIG_GEMM_BF16_FILE = get_config_file(
-    "AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"
+    "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
 )
 
 # config_env end here
