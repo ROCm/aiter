@@ -72,6 +72,10 @@ def _flash_attn_forward(
             q.shape[1],
         )
         num_k_heads = k.shape[1]
+
+        assert (
+            num_q_heads <= num_k_heads
+        ), "Grouped query and multi-query attention not supported yet in Gluon"
         q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
         k_strides = (0, k.stride(1), k.stride(0), k.stride(2))
         v_strides = (0, v.stride(1), v.stride(0), v.stride(2))

@@ -648,14 +648,12 @@ def parse_args():
     parser.add_argument(
         "-gluon",
         action="store_true",
-        help="Use Gluon implementation (experimental, requires latest Triton from main). Currently limited to the following config: \\n"
-        + "-layout = thd \\n"
-        + "-mode = fwd \\n"
-        + "-fp8 = False \\n"
-        + "-causal = True or False \\n"
-        + "-dtype = fp16"
-        + "dropout = None"
-        + "alibi = None",
+        help="Use Gluon implementation (experimental, requires latest Triton from main). Currently limited to the following config: \n"
+        + "-layout = thd \n"
+        + "-mode = fwd \n"
+        + "-fp8 = False \n"
+        + "-causal = True or False \n"
+        + "-dtype = fp16",
     )
     return parser.parse_args()
 
@@ -667,8 +665,25 @@ arg_to_torch_dtype = {
 }
 
 
+def validate_gluon_params(args):
+    if args.gluon:
+        if args.layout is not None:
+            assert args.layout == "thd", "Gluon MHA only supports thd layout."
+
+        assert args.mode == "fwd", "Gluon MHA only supports forward mode."
+
+        assert not args.fp8, "Gluon MHA does not support FP8."
+
+        assert args.dtype == "fp16", "Gluon MHA only supports fp16 data type."
+
+        assert not args.model, "Gluon MHA currently does not support model configs."
+
+
 def main():
     args = parse_args()
+
+    if args.gluon:
+        validate_gluon_params(args)
 
     if args.model:
         if args.causal is None:  # User didn't specify -causal
