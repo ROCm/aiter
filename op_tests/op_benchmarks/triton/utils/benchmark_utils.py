@@ -331,7 +331,7 @@ def print_vgpr(fun, table_start="result-table-name"):
             # Redirect stdout and stderr to the temporary file
             sys.stdout = temp_file
             sys.stderr = temp_file
-        
+
             os.environ["AMDGCN_ENABLE_DUMP"] = "1"
             os.environ["TRITON_ALWAYS_COMPILE"] = "1"
             os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
@@ -352,10 +352,10 @@ def print_vgpr(fun, table_start="result-table-name"):
         os.unlink(output_file)
 
     except Exception as e:
-            # Restore stdout and stderr to normal before printing error
-            sys.stdout = sys.__stdout__
-            sys.stderr = sys.__stderr__
-            print(f"Error occurred during function execution: {e}")
+        # Restore stdout and stderr to normal before printing error
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        print(f"Error occurred during function execution: {e}")
 
 
 def get_dtype_bytes(dtype):

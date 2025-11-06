@@ -62,11 +62,13 @@ def torch_moe_gemm2(
         b_scale = b_scale.repeat_interleave(blockshape_k, dim=1)[:, :K]
         # only need to dequantize before dot if the inner dimension spans multiple scales
         if num_scales_along_n > 1:
-            b_scale = b_scale.repeat_interleave(blockshape_n, dim=2)[:, :, :N]  # (E, K, N_HALF)
+            b_scale = b_scale.repeat_interleave(blockshape_n, dim=2)[
+                :, :, :N
+            ]  # (E, K, N_HALF)
             b = b.to(torch.float32) * b_scale.to(torch.float32)
 
     b_indexed = b[topk_ids]
-    
+
     out = torch.einsum(
         "men,mekn->mek", a.to(torch.bfloat16), b_indexed.to(torch.bfloat16)
     )
@@ -95,14 +97,15 @@ def input_helper_e2e(
     pertoken=False,
     tp=1,
 ):
-    
+
     if pertoken:
         assert fp8_w8a8, "per-token quantization only supported for fp8_w8a8"
-        assert blockshape is None or blockshape[-1] == K, "per-token quantization requires weight quantization blockshape for K to be None or K"
-    
-    
+        assert (
+            blockshape is None or blockshape[-1] == K
+        ), "per-token quantization requires weight quantization blockshape for K to be None or K"
+
     a = torch.randn((M, K), dtype=dtype, device="cuda")
-    w1 = torch.rand((E, N*2, K), dtype=dtype, device="cuda")
+    w1 = torch.rand((E, N * 2, K), dtype=dtype, device="cuda")
     w2 = torch.rand((E, K, N), dtype=dtype, device="cuda")
     a_scale = None
     w1_scale = None
@@ -111,19 +114,19 @@ def input_helper_e2e(
     if fp8_w8a8:
         # scales for tensor E, N, K: E, N//blockshape_n, K//blockshape_k
         w1, _, w1_scale = quantize_fp8(w1, dim=(0,), blockshape=blockshape)
-        # scales for tensor E, K, N//2: E, K//blockshape_k, N//2//blockshape_n 
+        # scales for tensor E, K, N//2: E, K//blockshape_k, N//2//blockshape_n
         blockshape_stage2 = None
         if blockshape is not None:
             blockshape_stage2 = (blockshape[1], blockshape[0])
         w2, _, w2_scale = quantize_fp8(w2, dim=(0,), blockshape=blockshape_stage2)
-        
+
         # a_scale takes shape
-        if pertoken: # (M, 1)
+        if pertoken:  # (M, 1)
             a, _, a_scale = quantize_fp8_a(a, a.shape[-1])
-        elif blockshape is not None: # (M, K // blockshape_k)
+        elif blockshape is not None:  # (M, K // blockshape_k)
             blockshape_k = blockshape[-1]
             a, _, a_scale = quantize_fp8_a(a, blockshape_k)
-        else: # (1,)
+        else:  # (1,)
             a_scale = torch.zeros(1, device=a.device, dtype=torch.float32)
             output = torch.zeros(a.shape, device=a.device, dtype=w1.dtype)
             a, a_scale = dynamic_per_tensor_quant_fp8_i8(output, a, a_scale)
@@ -162,7 +165,6 @@ def input_helper_e2e(
     )
 
 
-
 @pytest.mark.parametrize(
     "M, N, K, top_k, E",
     [
@@ -196,7 +198,7 @@ def test_moe_e2e(
     blockshape_n: int,
     blockshape_k: int,
     dtype,
-    tp
+    tp,
 ):
     pertoken = False
     torch.manual_seed(20)
@@ -208,7 +210,7 @@ def test_moe_e2e(
     # adjust blockshape for per-token quantization
     if pertoken and blockshape is not None:
         blockshape = (blockshape_n, K)
-    
+
     (
         a,
         w1,
@@ -237,10 +239,10 @@ def test_moe_e2e(
     )
     # tensor parallel slicing
     if tp > 1:
-        w1 = w1[:, : N*2 // tp, :].contiguous()
+        w1 = w1[:, : N * 2 // tp, :].contiguous()
         w2 = w2[:, :, : (N // tp)].contiguous()
         if fp8_w8a8 and blockshape is not None:
-            num_w1_scales_per_gpu = triton.cdiv(N*2 // tp, blockshape[0])
+            num_w1_scales_per_gpu = triton.cdiv(N * 2 // tp, blockshape[0])
             w1_scale = w1_scale[:, :num_w1_scales_per_gpu].contiguous()
             num_w2_scales_per_gpu = triton.cdiv(N // tp, blockshape[0])
             w2_scale = w2_scale[:, :, :num_w2_scales_per_gpu].contiguous()
@@ -290,11 +292,11 @@ def test_moe_e2e(
         blockshape=blockshape,
     )
     torch_intermediate = torch_intermediate.to(torch.float32)
-    torch_intermediate = torch_silu_and_mul_ref(torch_intermediate.view(-1, N*2))
+    torch_intermediate = torch_silu_and_mul_ref(torch_intermediate.view(-1, N * 2))
     torch_intermediate = torch_intermediate.view(M, top_k, N)
 
     torch_out = torch.empty_like(triton_out)
-    
+
     torch_out = torch_moe_gemm2(
         triton_intermediate,  # (acceptable) precision errors from the first gemm accumulate here
         # torch_intermediate,
@@ -309,9 +311,12 @@ def test_moe_e2e(
         blockshape=blockshape,
     )
 
-    torch.testing.assert_close(triton_intermediate, torch_intermediate, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(
+        triton_intermediate, torch_intermediate, atol=1e-1, rtol=1e-1
+    )
     # Print both outputs in scientific notation for consistency
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
 
 @pytest.mark.parametrize(
     "M, N, K, top_k, E",
@@ -348,7 +353,7 @@ def test_moe_e2e_fp8(
     blockshape_k: int,
     dtype,
     tp,
-    pertoken
+    pertoken,
 ):
     torch.manual_seed(20)
     # torch.set_printoptions(threshold=100000)
@@ -359,7 +364,7 @@ def test_moe_e2e_fp8(
     # adjust blockshape for per-token quantization
     if pertoken and blockshape is not None:
         blockshape = (blockshape_n, K)
-    
+
     (
         a,
         w1,
@@ -441,9 +446,9 @@ def test_moe_e2e_fp8(
         blockshape=blockshape,
     )
     torch_intermediate = torch_intermediate.to(torch.float32)
-    torch_intermediate = torch_silu_and_mul_ref(torch_intermediate.view(-1, N*2))
+    torch_intermediate = torch_silu_and_mul_ref(torch_intermediate.view(-1, N * 2))
     torch_intermediate = torch_intermediate.view(M, top_k, N)
-    
+
     torch_out = torch.empty_like(triton_out)
     torch_out = torch_moe_gemm2(
         triton_intermediate,  # (acceptable) precision errors from the first gemm accumulate here
@@ -458,7 +463,9 @@ def test_moe_e2e_fp8(
         fp8_w8a8,
         blockshape=blockshape,
     )
-    torch.testing.assert_close(triton_intermediate, torch_intermediate, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(
+        triton_intermediate, torch_intermediate, atol=1e-1, rtol=1e-1
+    )
     # Print both outputs in scientific notation for consistency
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
@@ -484,7 +491,7 @@ def test_moe_e2e_fp8(
 @pytest.mark.parametrize("fp8_w8a8", [True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("blockshape_n, blockshape_k", [(128, 128)])
-@pytest.mark.parametrize("tp", [1,8])
+@pytest.mark.parametrize("tp", [1, 8])
 @pytest.mark.parametrize("pertoken", [False])
 def test_moe_e2e_fp8_blockscale(
     M: int,
@@ -498,7 +505,7 @@ def test_moe_e2e_fp8_blockscale(
     blockshape_k: int,
     dtype,
     tp,
-    pertoken
+    pertoken,
 ):
     torch.manual_seed(20)
     # torch.set_printoptions(threshold=100000)
@@ -509,7 +516,7 @@ def test_moe_e2e_fp8_blockscale(
     # adjust blockshape for per-token quantization
     if pertoken and blockshape is not None:
         blockshape = (blockshape_n, K)
-    
+
     (
         a,
         w1,
@@ -591,9 +598,9 @@ def test_moe_e2e_fp8_blockscale(
         blockshape=blockshape,
     )
     torch_intermediate = torch_intermediate.to(torch.float32)
-    torch_intermediate = torch_silu_and_mul_ref(torch_intermediate.view(-1, N*2))
+    torch_intermediate = torch_silu_and_mul_ref(torch_intermediate.view(-1, N * 2))
     torch_intermediate = torch_intermediate.view(M, top_k, N)
-    
+
     torch_out = torch.empty_like(triton_out)
     torch_out = torch_moe_gemm2(
         triton_intermediate,  # (acceptable) precision errors from the first gemm accumulate here
@@ -608,14 +615,20 @@ def test_moe_e2e_fp8_blockscale(
         fp8_w8a8,
         blockshape=blockshape,
     )
-    torch.testing.assert_close(triton_intermediate, torch_intermediate, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(
+        triton_intermediate, torch_intermediate, atol=1e-1, rtol=1e-1
+    )
     # Print both outputs in scientific notation for consistency
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
 if __name__ == "__main__":
     test_moe_e2e(
-        3, 2048, 4096, 2, 8,
+        3,
+        2048,
+        4096,
+        2,
+        8,
         routed_weight=False,
         fp8_w8a8=False,
         blockshape_n=None,

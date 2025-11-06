@@ -10,7 +10,11 @@ from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
-from aiter.ops.triton._triton_kernels.moe_op_e2e import e2e_moe_kernel, e2e_moe_kernel_fp8, e2e_moe_kernel_fp8_blockscale
+from aiter.ops.triton._triton_kernels.moe_op_e2e import (
+    e2e_moe_kernel,
+    e2e_moe_kernel_fp8,
+    e2e_moe_kernel_fp8_blockscale,
+)
 import warnings
 
 _LOGGER = AiterTritonLogger()
@@ -89,7 +93,7 @@ def e2e_moe(
             assert triton.cdiv(W1.shape[-1], block_k) == W1_scale.shape[-1]
             assert triton.cdiv(W2.shape[-1], block_n) == W2_scale.shape[-1]
             assert triton.cdiv(W2.shape[-2], block_k) == W2_scale.shape[-2]
-        
+
     else:
         assert A_scale is None
         assert W1_scale is None
@@ -118,26 +122,27 @@ def e2e_moe(
     out_dtype = Out.dtype
     # if the intermediate token dimension is small enough, we can try to fit the whole thing in shared memory
     SKINNY = pid_n == 1
-    
+
     if not SKINNY:
-        warnings.warn("Intermediate token dimension is not skinny; atomics will be performed in fp32.", UserWarning)
+        warnings.warn(
+            "Intermediate token dimension is not skinny; atomics will be performed in fp32.",
+            UserWarning,
+        )
         Out = Out.to(torch.float32)  # atomics need to be done in fp32
 
     if return_intermediate:
-        Intermediate = torch.zeros(
-            (M, top_k, N), dtype=torch.float32, device="cuda"
-        )
+        Intermediate = torch.zeros((M, top_k, N), dtype=torch.float32, device="cuda")
     else:
         Intermediate = None
 
     # kernel development is divided into 3 versions for clarity
-    if use_block_scale: # blockscale fp8
+    if use_block_scale:  # blockscale fp8
         kernel_fn = e2e_moe_kernel_fp8_blockscale
-    elif use_fp8_w8a8: # per tensor fp8, per token fp8
+    elif use_fp8_w8a8:  # per tensor fp8, per token fp8
         kernel_fn = e2e_moe_kernel_fp8
-    else: # bf16, f16, f32
+    else:  # bf16, f16, f32
         kernel_fn = e2e_moe_kernel
-    
+
     config["BLOCK_SIZE_N"] = min(config["BLOCK_SIZE_N"], triton.next_power_of_2(N))
 
     kernel_fn[grid](

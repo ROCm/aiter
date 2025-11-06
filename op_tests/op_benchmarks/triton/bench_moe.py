@@ -278,8 +278,6 @@ def run_benchmark(args):
 
     assert not (e2e_fused and silu_fused)
 
-
-
     if silu_fused or e2e_fused:
         args.no_bench_stage2 = True
 
@@ -456,7 +454,11 @@ def parse_args():
         "-block_shape", nargs=2, type=int, default=None, help="block shape n and k"
     )
     parser.add_argument(
-        "-per_token_quant_a", action="store_true", default=False, help="Per-token quantization for input. Per tensor for weights (or blockscale if -block_shape is set).")
+        "-per_token_quant_a",
+        action="store_true",
+        default=False,
+        help="Per-token quantization for input. Per tensor for weights (or blockscale if -block_shape is set).",
+    )
 
     parser.add_argument("-routed_weight", action="store_true", default=False)
     parser.add_argument("-int8_w8a16", action="store_true", default=False)

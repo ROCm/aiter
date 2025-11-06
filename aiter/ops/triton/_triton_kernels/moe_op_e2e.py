@@ -93,7 +93,7 @@ def e2e_moe_kernel(
     EVEN_K: tl.constexpr,
     EVEN_K2: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
-    use_block_scale: tl.constexpr, 
+    use_block_scale: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -214,7 +214,6 @@ def e2e_moe_kernel(
                 other=0.0,
             )
 
-
         silu_acc = tl.dot(a, w1, acc=silu_acc)
 
         # mul acc
@@ -235,7 +234,7 @@ def e2e_moe_kernel(
     if return_intermediate:
         offs_in = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         i_ptrs = Intermediate + stride_im * offs_token[:, None] + offs_in[None, :]
-        i_mask = token_mask[:, None] & (offs_in[None, :] < N )
+        i_mask = token_mask[:, None] & (offs_in[None, :] < N)
         tl.store(i_ptrs, acc.to(out_dtype), mask=i_mask)
 
     acc = tl.where(
@@ -246,7 +245,7 @@ def e2e_moe_kernel(
 
     acc = acc.to(dtype)
 
-    offs_w2n = (tl.arange(0, BLOCK_SIZE_N) + pid_n * (BLOCK_SIZE_N)) % (N )
+    offs_w2n = (tl.arange(0, BLOCK_SIZE_N) + pid_n * (BLOCK_SIZE_N)) % (N)
 
     w2_ptrs = (
         W2
@@ -273,7 +272,7 @@ def e2e_moe_kernel(
             out_mask = token_mask[:, None] & (
                 offs_k2[None, :] < (K - k2 * BLOCK_SIZE_K2)
             )
-        
+
         if SKINNY:
             # Skinny means that there is only one pid along N (i.e. BLOCK_SIZE_N >= N).
             # Thus we don't need atomics, as there is only workgroup updating a output location.
@@ -281,13 +280,7 @@ def e2e_moe_kernel(
             tl.store(out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok, out, mask=out_mask)
         else:
             out = out.to(tl.float32)  # atomics need to be done in fp32
-            tl.atomic_add(
-                out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok,
-                out,
-                mask=out_mask
-            )
-
-        
+            tl.atomic_add(out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok, out, mask=out_mask)
 
 
 @triton.heuristics(
@@ -339,7 +332,7 @@ def e2e_moe_kernel_fp8(
     EVEN_K: tl.constexpr,
     EVEN_K2: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
-    use_block_scale: tl.constexpr, 
+    use_block_scale: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -496,7 +489,7 @@ def e2e_moe_kernel_fp8(
     if return_intermediate:
         offs_in = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         i_ptrs = Intermediate + stride_im * offs_token[:, None] + offs_in[None, :]
-        i_mask = token_mask[:, None] & (offs_in[None, :] < N )
+        i_mask = token_mask[:, None] & (offs_in[None, :] < N)
         tl.store(i_ptrs, acc.to(out_dtype), mask=i_mask)
 
     acc = tl.where(
@@ -507,7 +500,7 @@ def e2e_moe_kernel_fp8(
 
     acc = acc.to(tl.bfloat16)
 
-    offs_w2n = (tl.arange(0, BLOCK_SIZE_N) + pid_n * (BLOCK_SIZE_N)) % (N )
+    offs_w2n = (tl.arange(0, BLOCK_SIZE_N) + pid_n * (BLOCK_SIZE_N)) % (N)
 
     w2_ptrs = (
         W2
@@ -543,7 +536,7 @@ def e2e_moe_kernel_fp8(
             out_mask = token_mask[:, None] & (
                 offs_k2[None, :] < (K - k2 * BLOCK_SIZE_K2)
             )
-        
+
         if SKINNY:
             # Skinny means that there is only one pid along N (i.e. BLOCK_SIZE_N >= N).
             # Thus we don't need atomics, as there is only workgroup updating a output location.
@@ -551,13 +544,8 @@ def e2e_moe_kernel_fp8(
             tl.store(out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok, out, mask=out_mask)
         else:
             out = out.to(tl.float32)  # atomics need to be done in fp32
-            tl.atomic_add(
-                out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok,
-                out,
-                mask=out_mask
-            )
+            tl.atomic_add(out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok, out, mask=out_mask)
 
-        
 
 @triton.heuristics(
     {
@@ -608,7 +596,7 @@ def e2e_moe_kernel_fp8_blockscale(
     EVEN_K: tl.constexpr,
     EVEN_K2: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
-    use_block_scale: tl.constexpr, 
+    use_block_scale: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -700,7 +688,7 @@ def e2e_moe_kernel_fp8_blockscale(
         tl.static_assert(
             group_k == K,
             "per-token quantization requires group k to be K",
-            )
+        )
 
     offs_i0 = tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     offs_i1 = (tl.arange(0, BLOCK_SIZE_N) + N).to(tl.int64)
@@ -729,41 +717,41 @@ def e2e_moe_kernel_fp8_blockscale(
 
     # if use_fp8_w8a8 and use_block_scale:
     a_scale_ptrs = A_scale + (offs_token[:, None] // top_k * stride_asm)
-    
-    i0s = (pid_n * (BLOCK_SIZE_N // group_n) + tl.arange(0, num_scales_along_bn))
-    i0s = i0s % num_scales_along_n # wrap around if N is not multiple of group_n
-    i1s = (i0s + (N // group_n)) 
-    
-    w1_i0_scale_ptrs = (
-        W1_scale + off_experts * stride_w1se + i0s[None, :] * stride_w1sn
-    )
-    w1_i1_scale_ptrs = (
-        W1_scale + off_experts * stride_w1se + i1s[None, :] * stride_w1sn
-    )
+
+    i0s = pid_n * (BLOCK_SIZE_N // group_n) + tl.arange(0, num_scales_along_bn)
+    i0s = i0s % num_scales_along_n  # wrap around if N is not multiple of group_n
+    i1s = i0s + (N // group_n)
+
+    w1_i0_scale_ptrs = W1_scale + off_experts * stride_w1se + i0s[None, :] * stride_w1sn
+    w1_i1_scale_ptrs = W1_scale + off_experts * stride_w1se + i1s[None, :] * stride_w1sn
     # We only need to descale inside the loop if loop K has varying scales
     VARYING_K_SCALE: tl.constexpr = (not PER_TOKEN_QUANT_A) and (K > group_k)
-    if not VARYING_K_SCALE: # otherwise load the scales and descale outside the loop
-        w1_i0_scale = tl.load(
-            w1_i0_scale_ptrs
+    if not VARYING_K_SCALE:  # otherwise load the scales and descale outside the loop
+        w1_i0_scale = tl.load(w1_i0_scale_ptrs)
+        w1_i0_scale = repeat_interleave_triton(
+            w1_i0_scale, 1, num_scales_along_bn, group_n, 1
         )
-        w1_i0_scale = repeat_interleave_triton(w1_i0_scale, 1, num_scales_along_bn, group_n, 1)
-        w1_i1_scale = tl.load(
-            w1_i1_scale_ptrs
+        w1_i1_scale = tl.load(w1_i1_scale_ptrs)
+        w1_i1_scale = repeat_interleave_triton(
+            w1_i1_scale, 1, num_scales_along_bn, group_n, 1
         )
-        w1_i1_scale = repeat_interleave_triton(w1_i1_scale, 1, num_scales_along_bn, group_n, 1)
         if PER_TOKEN_QUANT_A:
             a_scale = tl.load(a_scale_ptrs, mask=token_mask[:, None], other=0.0)
         else:
             a_scale = tl.load(A_scale)
-    
+
     num_k1 = tl.cdiv(K, BLOCK_SIZE_K1)
     for k1 in tl.range(0, num_k1):
         a_ptrs_k = a_ptrs + k1 * BLOCK_SIZE_K1 * stride_ak
         w1_ptrs_i0_k = w1_ptrs_i0 + k1 * BLOCK_SIZE_K1 * stride_w1k
         w1_ptrs_i1_k = w1_ptrs_i1 + k1 * BLOCK_SIZE_K1 * stride_w1k
         # scale ptrs
-        w1_i0_scale_ptrs_k = w1_i0_scale_ptrs + k1 * BLOCK_SIZE_K1 // group_k * stride_w1sk
-        w1_i1_scale_ptrs_k = w1_i1_scale_ptrs + k1 * BLOCK_SIZE_K1 // group_k * stride_w1sk
+        w1_i0_scale_ptrs_k = (
+            w1_i0_scale_ptrs + k1 * BLOCK_SIZE_K1 // group_k * stride_w1sk
+        )
+        w1_i1_scale_ptrs_k = (
+            w1_i1_scale_ptrs + k1 * BLOCK_SIZE_K1 // group_k * stride_w1sk
+        )
         a_scale_ptrs_k = a_scale_ptrs + k1 * BLOCK_SIZE_K1 // group_k * stride_ask
 
         # pipeline silu acc and mul acc so they can use the same LDS for weight loading
@@ -787,10 +775,10 @@ def e2e_moe_kernel_fp8_blockscale(
 
         if VARYING_K_SCALE:
             w1_scale = tl.load(w1_i0_scale_ptrs_k)
-            w1_scale = repeat_interleave_triton(w1_scale, 1, num_scales_along_bn, group_n, 1)
-            a_scale = tl.load(
-                a_scale_ptrs_k, mask=token_mask[:, None], other=0.0
+            w1_scale = repeat_interleave_triton(
+                w1_scale, 1, num_scales_along_bn, group_n, 1
             )
+            a_scale = tl.load(a_scale_ptrs_k, mask=token_mask[:, None], other=0.0)
             silu_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
         else:
             silu_acc = tl.dot(a, w1, acc=silu_acc)
@@ -806,7 +794,9 @@ def e2e_moe_kernel_fp8_blockscale(
             )
         if VARYING_K_SCALE:
             w1_scale = tl.load(w1_i1_scale_ptrs_k)
-            w1_scale = repeat_interleave_triton(w1_scale, 1, num_scales_along_bn, group_n, 1)
+            w1_scale = repeat_interleave_triton(
+                w1_scale, 1, num_scales_along_bn, group_n, 1
+            )
             mul_acc += tl.dot(a, w1, out_dtype=tl.float32) * a_scale * w1_scale
         else:
             mul_acc = tl.dot(a, w1, acc=mul_acc)
@@ -833,7 +823,7 @@ def e2e_moe_kernel_fp8_blockscale(
 
     acc = acc.to(tl.bfloat16)
 
-    offs_w2n = (tl.arange(0, BLOCK_SIZE_N) + pid_n * (BLOCK_SIZE_N)) % (N )
+    offs_w2n = (tl.arange(0, BLOCK_SIZE_N) + pid_n * (BLOCK_SIZE_N)) % (N)
 
     w2_ptrs = (
         W2
@@ -843,9 +833,7 @@ def e2e_moe_kernel_fp8_blockscale(
 
     # offs_w2_sn = offs_w2n // group_n
     # instead load only the unique scaling factors and broadcast.
-    offs_w2_sn = (pid_n * BLOCK_SIZE_N) // group_n + tl.arange(
-        0, num_scales_along_bn
-    )
+    offs_w2_sn = (pid_n * BLOCK_SIZE_N) // group_n + tl.arange(0, num_scales_along_bn)
     # ... + tl.arange(0, num_scales_along_bn) * group_n // group_n = ... + tl.arange(0, num_scales_along_bn)
     w2_scale_ptrs = (
         W2_scale + off_experts * stride_w2se + offs_w2_sn[:, None] * stride_w2sn
@@ -879,7 +867,9 @@ def e2e_moe_kernel_fp8_blockscale(
             )
             w2 = w2.to(tl.float32) * w2_scale.to(tl.float32)
         else:
-            w2_scale = repeat_interleave_triton(w2_scale, 1, num_scales_along_bk2, group_k, 1)
+            w2_scale = repeat_interleave_triton(
+                w2_scale, 1, num_scales_along_bk2, group_k, 1
+            )
 
         w2 = w2.to(tl.bfloat16)
         out = tl.dot(acc, w2)
@@ -899,7 +889,7 @@ def e2e_moe_kernel_fp8_blockscale(
             out_mask = token_mask[:, None] & (
                 offs_k2[None, :] < (K - k2 * BLOCK_SIZE_K2)
             )
-        
+
         if SKINNY:
             # Skinny means that there is only one pid along N (i.e. BLOCK_SIZE_N >= N).
             # Thus we don't need atomics, as there is only workgroup updating a output location.
@@ -907,9 +897,4 @@ def e2e_moe_kernel_fp8_blockscale(
             tl.store(out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok, out, mask=out_mask)
         else:
             out = out.to(tl.float32)  # atomics need to be done in fp32
-            tl.atomic_add(
-                out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok,
-                out,
-                mask=out_mask
-            )
-
+            tl.atomic_add(out_ptrs + k2 * BLOCK_SIZE_K2 * stride_ok, out, mask=out_mask)

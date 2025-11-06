@@ -146,7 +146,7 @@ def torch_moe_ref(
         scale_matrix = a_scale_expanded * b_scale_expanded
         # (M*top_k, sK, N)
         # apply scales, then reduce over sK
-        
+
         # temp = c_fp8 * scale_matrix
         c = (c_fp8 * scale_matrix).sum(dim=1).reshape(-1, N)
         # (M*top_k, N)
@@ -161,7 +161,7 @@ def torch_moe_ref(
 
     if fp8_w8a8 and not use_block_scale:
         # pertoken
-        if len(a_scale.shape)==2:
+        if len(a_scale.shape) == 2:
             a_scale = a_scale.unsqueeze(-1)
 
         c = c * b_scale[topk_ids].unsqueeze(-1)
@@ -315,7 +315,9 @@ def torch_moe_gemm2(
         b_scale = b_scale.repeat_interleave(blockshape_k, dim=1)[:, :K]
         # only need to dequantize before dot if the inner dimension spans multiple scales
         if num_scales_along_n > 1:
-            b_scale = b_scale.repeat_interleave(blockshape_n, dim=2)[:, :, :N_HALF]  # (E, K, N_HALF)
+            b_scale = b_scale.repeat_interleave(blockshape_n, dim=2)[
+                :, :, :N_HALF
+            ]  # (E, K, N_HALF)
             b = b.to(torch.float32) * b_scale.to(torch.float32)
 
     b_indexed = b[topk_ids]
@@ -361,13 +363,9 @@ def quantize_fp8(
         # and the fourth and fifth dimensions (k direction)
         sN = triton.cdiv(n, blockshape_n)
         sK = triton.cdiv(k, blockshape_k)
-        tensor = tensor.reshape(
-            e, sN, blockshape_n, sK, blockshape_k
-        )
+        tensor = tensor.reshape(e, sN, blockshape_n, sK, blockshape_k)
         tensor = tensor.permute(0, 2, 4, 1, 3)
-        tensor = tensor.reshape(
-            e, blockshape_n * blockshape_k, sN, sK
-        )
+        tensor = tensor.reshape(e, blockshape_n * blockshape_k, sN, sK)
         max_vals = torch.max(tensor, 1, keepdim=True).values
     else:
         quantize_dim = [i for i in range(tensor.dim()) if i not in dim]
@@ -629,7 +627,6 @@ def input_helper_int4_w4a16(
         num_tokens_post_padded,
         config,
     )
-
 
 
 # Note: TODO These 2 result in accuracy issues (64, 14336, 4096, 2, 8), (1, 1024, 16384, 1, 2)
@@ -1025,6 +1022,3 @@ def test_fused_moe_gelu(
         print(f"torch_out={torch_out}")
     # Validate correctness
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
-
-
-
