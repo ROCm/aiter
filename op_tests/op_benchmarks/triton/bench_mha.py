@@ -648,7 +648,14 @@ def parse_args():
     parser.add_argument(
         "-gluon",
         action="store_true",
-        help="Use Gluon implementation (experimental, requires latest Triton from main)",
+        help="Use Gluon implementation (experimental, requires latest Triton from main). Currently limited to the following config: \\n"
+        + "-layout = thd \\n"
+        + "-mode = fwd \\n"
+        + "-fp8 = False \\n"
+        + "-causal = True or False \\n"
+        + "-dtype = fp16"
+        + "dropout = None"
+        + "alibi = None",
     )
     return parser.parse_args()
 

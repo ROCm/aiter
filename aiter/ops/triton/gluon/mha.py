@@ -9,8 +9,6 @@ import triton.experimental.gluon as gluon
 import triton.experimental.gluon.language as gl
 
 import aiter.ops.triton.utils.types as types
-from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
-from aiter.ops.triton.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.gluon._gluon_kernels.mha import _attn_fwd, _get_config
@@ -20,6 +18,8 @@ from aiter.ops.triton.mha import (
     _USE_FUSED_BWD_KERNEL,
     _USE_INT64_STRIDES,
 )
+
+_LOGGER = AiterTritonLogger()
 
 
 def _flash_attn_forward(
@@ -80,12 +80,9 @@ def _flash_attn_forward(
         # Layout is bshd.
         # q and k are [batch, seq_len, num_head, head_dim_qk].
         # v is [batch, seq_len, num_head, head_dim_v].
-        batch, seqlen_q, num_q_heads = q.shape[:-1]
-        num_k_heads = k.shape[2]
-        q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
-        k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
-        v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
-        o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
+        raise NotImplementedError(
+            "Flash Attention with bshd/bhsd layout is not implemented yet for Gluon"
+        )
 
     qk_head_dim = q.shape[-1]
     v_head_dim = v.shape[-1]
@@ -102,8 +99,8 @@ def _flash_attn_forward(
         IS_FP8 and pe_head_dim == 0
     ), "Positional encoding doesn't support FP8."
 
-    # softmax_lse [batch, num_q_heads, seqlen_q]
     if is_varlen:
+        # softmax_lse [total_tokens, num_q_heads]
         softmax_lse = torch.zeros(
             (q.shape[0], num_q_heads), device=q.device, dtype=torch.float32
         )
@@ -113,10 +110,9 @@ def _flash_attn_forward(
             softmax_lse.stride(0),
         )
     else:
-        softmax_lse = torch.zeros(
-            (batch, num_q_heads, max_seqlen_q), device=q.device, dtype=torch.float32
+        raise NotImplementedError(
+            "Flash Attention with bshd/bhsd layout is not implemented yet for Gluon"
         )
-        stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
 
     # exp_scores [batch, num_q_heads, seqlen_q, seqlen_k]
     enable_dropout = dropout_p > 0.0
@@ -148,28 +144,7 @@ def _flash_attn_forward(
     if config is None:
         config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
 
-    """
-    # Tuned for MI300x
-    config = {
-        "BLOCK_M": 128,
-        "BLOCK_N": 64,
-        "waves_per_eu": 2,
-        "num_warps": 4,
-        "num_ctas": 1,
-        "num_stages": 1,
-    }
-    # Dropout significantly increases VGPR usage so use small tiles
-    if enable_dropout or q.dtype == torch.float32:
-        config = {
-            "BLOCK_M": 32,
-            "BLOCK_N": 32,
-            "waves_per_eu": 1,
-            "num_warps": 2,
-            "num_ctas": 1,
-            "num_stages": 1,
-        }
-    """
-
+    # Flash Attention 2: we also launch blocks over sequence length
     grid = lambda META: (  # noqa: E731
         batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
     )
@@ -249,54 +224,9 @@ class _FlashAttnFunc(torch.autograd.Function):
         is_grad_enabled,
         config=None,
     ):
-        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_og = q.size(3)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
-            _flash_attn_forward(
-                q,
-                k,
-                v,
-                dropout_p,
-                softmax_scale,
-                causal=causal,
-                window_size_left=int(window_size[0]),
-                window_size_right=int(window_size[1]),
-                bias=bias,
-                alibi_slopes=alibi_slopes,
-                return_lse=return_lse,
-                return_softmax=return_softmax and dropout_p > 0,
-                max_seqlen_q=q.shape[1],
-                max_seqlen_k=k.shape[1],
-                config=config,
-            )
+        raise NotImplementedError(
+            "Flash Attention with bshd/bhsd layout is not implemented yet for Gluon"
         )
-
-        if is_grad:
-            ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
-            ctx.philox_seed = philox_seed
-            ctx.philox_offset = philox_offset
-            ctx.dropout_p = dropout_p
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.bias = bias
-            ctx.window_size = window_size
-            ctx.alibi_slopes = alibi_slopes
-            ctx.deterministic = deterministic
-
-        out = out_padded[..., :head_size_og]
-        result = [out]
-        if return_lse:
-            result.append(softmax_lse)
-        if return_softmax:
-            result.append(S_dmask)
-
-        return result[0] if len(result) == 1 else tuple(result)
 
     @staticmethod
     def backward(ctx, do, *args):
@@ -318,7 +248,9 @@ def flash_attn_func(
     return_attn_probs=False,
     config: Optional[dict[str, any]] = None,
 ):
-    pass
+    raise NotImplementedError(
+        "Flash Attention with bshd/bhsd layout is not implemented yet for Gluon"
+    )
 
 
 class _FlashAttnFP8Func(torch.autograd.Function):
@@ -339,73 +271,9 @@ class _FlashAttnFP8Func(torch.autograd.Function):
         is_grad_enabled,
         config=None,
     ):
-        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_og = q.size(3)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-
-        # cast input to fp8
-        fp8_dtype = types.get_fp8_e4m3_dtype()
-        q_fp8, descale_q = _cast_to_fp8(q, fp8_dtype, "bshd")
-        k_fp8, descale_k = _cast_to_fp8(k, fp8_dtype, "bshd")
-        v_fp8, descale_v = _cast_to_fp8(v, fp8_dtype, "bshd")
-
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
-            _flash_attn_forward(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                dropout_p,
-                softmax_scale,
-                causal=causal,
-                window_size_left=int(window_size[0]),
-                window_size_right=int(window_size[1]),
-                bias=None,
-                alibi_slopes=alibi_slopes,
-                return_lse=return_lse,
-                return_softmax=return_softmax and dropout_p > 0,
-                max_seqlen_q=q.shape[1],
-                max_seqlen_k=k.shape[1],
-                cu_seqlens_q=None,
-                cu_seqlens_k=None,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                config=config,
-            )
+        raise NotImplementedError(
+            "Flash Attention with bshd/bhsd layout is not implemented yet for Gluon"
         )
-
-        if is_grad:
-            ctx.save_for_backward(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                out_padded,
-                softmax_lse,
-                descale_q,
-                descale_k,
-                descale_v,
-            )
-            ctx.philox_seed = philox_seed
-            ctx.philox_offset = philox_offset
-            ctx.dropout_p = dropout_p
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.alibi_slopes = alibi_slopes
-
-        out = out_padded[..., :head_size_og]
-        result = [out]
-        if return_lse:
-            result.append(softmax_lse)
-        if return_softmax:
-            result.append(S_dmask)
-
-        return result[0] if len(result) == 1 else tuple(result)
 
     @staticmethod
     def backward(ctx, do, *args):
@@ -426,7 +294,9 @@ def flash_attn_fp8_func(
     return_attn_probs=False,
     config: Optional[dict[str, any]] = None,
 ):
-    pass
+    raise NotImplementedError(
+        "Flash Attention with bshd/bhsd layout is not implemented yet for Gluon"
+    )
 
 
 class _FlashAttnVarlenFunc(torch.autograd.Function):
@@ -533,6 +403,65 @@ def flash_attn_varlen_func(
     out=None,
     config: Optional[dict[str, any]] = None,
 ):
+    """dropout_p should be set to 0.0 during evaluation
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
+    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
+    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between
+    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+
+    Arguments:
+        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
+        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into kv.
+        max_seqlen_q: int. Maximum query sequence length in the batch.
+        max_seqlen_k: int. Maximum key sequence length in the batch.
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        bias: (seqlen_q, seqlen_k)
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
+            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
+            is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
+           testing only. The returned probabilities are not guaranteed to be correct
+           (they might not have the right scaling).
+    Return:
+        out: (total, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax (possibly with different scaling). It also encodes the dropout
+            pattern (negative means that location was dropped, nonnegative means it was kept).
+    """
+
+    _LOGGER.info(
+        f"FLASH_ATTN_VARLEN:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+    )
     pass
 
 
@@ -559,76 +488,7 @@ class _FlashAttnVarlenFP8Func(torch.autograd.Function):
         is_grad_enabled,
         config=None,
     ):
-        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_og = q.size(2)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-
-        # cast input to fp8
-        fp8_dtype = types.get_fp8_e4m3_dtype()
-        q_fp8, descale_q = _cast_varlen_to_fp8(q, fp8_dtype, cu_seqlens=cu_seqlens_q)
-        k_fp8, descale_k = _cast_varlen_to_fp8(k, fp8_dtype, cu_seqlens=cu_seqlens_k)
-        v_fp8, descale_v = _cast_varlen_to_fp8(v, fp8_dtype, cu_seqlens=cu_seqlens_k)
-
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
-            _flash_attn_forward(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                dropout_p,
-                softmax_scale,
-                causal=causal,
-                window_size_left=int(window_size[0]),
-                window_size_right=int(window_size[1]),
-                bias=None,
-                alibi_slopes=alibi_slopes,
-                return_lse=return_lse,
-                return_softmax=return_softmax and dropout_p > 0,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                config=config,
-            )
-        )
-        if is_grad:
-            ctx.save_for_backward(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                out_padded,
-                softmax_lse,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                descale_q,
-                descale_k,
-                descale_v,
-            )
-            ctx.max_seqlen_q = max_seqlen_q
-            ctx.max_seqlen_k = max_seqlen_k
-            ctx.philox_seed = philox_seed
-            ctx.philox_offset = philox_offset
-            ctx.dropout_p = dropout_p
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.alibi_slopes = alibi_slopes
-
-        out = out_padded[..., :head_size_og]
-        result = [out]
-        if return_lse:
-            result.append(softmax_lse)
-        if return_softmax:
-            result.append(S_dmask)
-
-        return result[0] if len(result) == 1 else tuple(result)
+        raise NotImplementedError("FP8 not implemented for Gluon")
 
     @staticmethod
     def backward(ctx, do, *args):
@@ -654,4 +514,4 @@ def flash_attn_varlen_fp8_func(
     block_table=None,
     config: Optional[dict[str, any]] = None,
 ):
-    pass
+    raise NotImplementedError("FP8 not implemented for Gluon")
