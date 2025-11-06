@@ -33,6 +33,7 @@ def _fused_rms_mxfp4_quant_kernel(
     out1_bs_ptr,
     out2_ptr,
     out_res1_ptr,
+    out1_ptr,
     eps1,
     eps2,
     M,
@@ -46,12 +47,14 @@ def _fused_rms_mxfp4_quant_kernel(
     out1_bs_stride_n,
     out2_stride_m,
     out_res1_stride_m,
+    out1_stride_m,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_N2: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     HAS_SECOND_INPUT: tl.constexpr,
     FIRST_INPUT_RES: tl.constexpr,
+    FIRST_INPUT_OUT: tl.constexpr,
     SCALE_N: tl.constexpr,
     SCALE_M_PAD: tl.constexpr,
     SCALE_N_PAD: tl.constexpr,
@@ -139,6 +142,14 @@ def _fused_rms_mxfp4_quant_kernel(
     w1 = tl.load(w1_ptr + x_offs_n, mask=w_mask1, other=w_other1).to(tl.float32)
 
     norm1 = _rmsmorm_op(x1, w1, N1, eps1)
+
+    if FIRST_INPUT_OUT:
+        tl.store(
+            out1_ptr + x_offs_m[:, None] * out1_stride_m + x_offs_n[None, :],
+            norm1,
+            mask=mask1,
+        )
+
     out1_fp4, bs_e8m0 = _mxfp4_quant_op(
         norm1, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
     )
