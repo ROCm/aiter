@@ -74,10 +74,9 @@ def _kernel_unified_attention_sparse_mla_2d(
     ALL_DECODE: tl.constexpr = False,
 ):
     """
-    TODO(cagri):
-    -- Cleanup needed for variables related to num_queries_per_kv
+    TODO:
     -- Masking can be simplified
-    -- Tests fail when all topk indices are all -1, not likely to be the case in practice probably?
+    -- Tests fail when all topk indices are all -1, not likely to be the case in practice
     """
     # only one query per program
     # these can be removed but keeps the kernel similar to the MHA way
@@ -159,7 +158,6 @@ def _kernel_unified_attention_sparse_mla_2d(
         valid_t = (tile_start + offs_t) < topk_count
 
         # load top-k token positions for this query
-        # TODO(cagri): use proper stride instead of topk_count
         topk_row_ptr = topk_indices_ptr + q_ind * topk_count
         topk_pos = tl.load(topk_row_ptr + tile_start + offs_t, mask=valid_t, other=0)
         # ignore -1, means not valid

@@ -26,12 +26,10 @@ def fp8_mqa_logits(
     Returns:
     logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
     """
-    # TODO (cagri): double check what value to put for causally masked logits, 0 or -inf?
-    # TODO (cagri): Tune/optimize
     BLOCK_KV = 128
     seq_len, num_heads, head_size = Q.shape
     seq_len_kv = KV.shape[0]
-    # TODO (cagri): Currently assuming num_heads and head_size is power of 2.
+    # TODO: Currently assuming num_heads and head_size is power of 2.
     assert num_heads & (num_heads - 1) == 0, "num q. heads should be power of 2."
     assert head_size & (head_size - 1) == 0, "head size should be power of 2."
     # Initialize with -inf because of causal masking
