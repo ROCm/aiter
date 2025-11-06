@@ -24,6 +24,7 @@ from aiter import dtypes, ActivationType, QuantType
 from aiter.test_common import checkAllclose, run_perftest
 from aiter.utility.dtypes import str2tuple
 from aiter.fused_moe import moe_sorting, torch_moe_stage1, torch_moe_stage2, get_2stage_cfgs
+from aiter.ops.shuffle import shuffle_weight
 
 
 def run_2stage_moe(
@@ -46,7 +47,7 @@ def run_2stage_moe(
     torch.manual_seed(42)
     
     # Generate input data
-    input = torch.randn((num_tokens, hidden_dim), dtype=dtype, device="cuda")
+    input = 0.1 * torch.randn((num_tokens, hidden_dim), dtype=dtype, device="cuda")
     
     # Generate weights
     if use_fp8_blockscale:
@@ -79,13 +80,15 @@ def run_2stage_moe(
         a2_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
     else:
         # BF16 case
-        w1 = torch.randn((num_experts, inter_dim * 2, hidden_dim), dtype=dtype, device="cuda")
-        w2 = torch.randn((num_experts, hidden_dim, inter_dim), dtype=dtype, device="cuda")
+        w1 = 0.1 * torch.randn((num_experts, inter_dim * 2, hidden_dim), dtype=dtype, device="cuda")
+        w2 = 0.1 * torch.randn((num_experts, hidden_dim, inter_dim), dtype=dtype, device="cuda")
         w1_scale = None
         w2_scale = None
         a1_scale = None
         a2_scale = None
         quant_type = QuantType.No
+    w1_shuffle = shuffle_weight(w1.clone())
+    w2_shuffle = shuffle_weight(w2.clone())
     
     # Generate routing scores and compute topk using torch (to avoid module loading issues)
     score = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
@@ -149,8 +152,8 @@ def run_2stage_moe(
     inter_ck, us_stage1 = run_perftest(
         metadata.stage1,
         input,
-        w1,
-        w2,
+        w1_shuffle,
+        w2_shuffle,
         sorted_token_ids,
         sorted_expert_ids,
         num_valid_ids,
@@ -185,13 +188,11 @@ def run_2stage_moe(
     
     # CK implementation using metadata.stage2
     output_out = torch.empty((num_tokens, hidden_dim), dtype=dtype, device="cuda")
-    output_out.fill_(0)
-    
     output_ck, us_stage2 = run_perftest(
         metadata.stage2,
         inter_ck,
-        w1,
-        w2,
+        w1_shuffle,
+        w2_shuffle,
         sorted_token_ids,
         sorted_expert_ids,
         num_valid_ids,
@@ -203,7 +204,7 @@ def run_2stage_moe(
         sorted_weights=sorted_weights,
         num_iters=10,
         num_warmup=2,
-        needTrace=True,
+        needTrace=False,
     )
     
     # Check correctness for stage 2
