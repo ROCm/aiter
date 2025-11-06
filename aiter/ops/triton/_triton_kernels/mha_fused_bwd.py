@@ -1,16 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Dict
 import functools
 import json
-import torch
 import triton
 import triton.language as tl
 
-from utils._triton import arch_info
-from utils.core import AITER_TRITON_CONFIGS_PATH
-from utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ..utils._triton.pid_preprocessing import remap_xcd
 
 
 # This function computes delta given output Out and gradient DO
@@ -20,18 +16,18 @@ from utils._triton.pid_preprocessing import pid_grid, remap_xcd
 # Delta: (batch, nheads_q, max_seqlens_q), same as softmax_lse defined at
 @triton.jit
 def _bwd_preprocess(
-    # Input tensors
     o_ptr,
     do_ptr,  # noqa: E741
-    # Output tensors
     delta_ptr,
-    # Strides
-    stride_o_b, stride_o_h, stride_o_m, stride_o_k,
-    stride_delta_b, stride_delta_h, stride_delta_m,
-    # Configurations
+    stride_o_b,
+    stride_o_h,
+    stride_o_m,
+    stride_o_k,
+    stride_delta_b,
+    stride_delta_h,
+    stride_delta_m,
     cu_seqlens_q,
     max_seqlen_q,
-    # Meta-parameters
     BLOCK_M: tl.constexpr,
     BLOCK_D_MODEL: tl.constexpr,
     BLOCK_D_MODEL_POW2: tl.constexpr,
@@ -90,20 +86,25 @@ def _bwd_preprocess(
 
 @triton.jit
 def _bwd_dkdvdq_inner(
-    # Output tensors
-    dk, dv, DQ,    # output gradients
-    # Input tensors
-    Q, k, v,        # fwd inputs
-    DO,             # upstream gradient
-    M, D,           # softmax caches for bwd
-    # Strides
-    stride_q_m, stride_q_k,
-    stride_dq_m, stride_dq_k,
-    stride_do_m, stride_do_k,
-    stride_dropout_m, stride_dropout_n,
-    stride_deltam,
-    # Configurations
+    dk,
+    dv,
+    Q,
+    k,
+    v,
+    DO,
+    DQ,
+    M,
+    D,
     sm_scale,
+    stride_q_m,
+    stride_q_k,
+    stride_dq_m,
+    stride_dq_k,
+    stride_do_m,
+    stride_do_k,
+    stride_dropout_m,
+    stride_dropout_n,
+    stride_deltam,
     dropout_p,
     philox_seed,
     batch_philox_offset,
@@ -113,7 +114,6 @@ def _bwd_dkdvdq_inner(
     start_n,
     start_m,
     num_steps,
-    # Meta-parameters
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D_MODEL: tl.constexpr,
@@ -256,24 +256,47 @@ def _bwd_dkdvdq_inner(
 
 @triton.jit
 def _bwd_kernel_dkdvdq_causal(
-    # Input tensors
-    q_ptr, k_ptr, v_ptr,
-    do_ptr,
-    m_ptr, 
-    delta_ptr,
-    # Output tensors
-    dq_ptr, dk_ptr, dv_ptr,
-    # Strides
-    stride_q_b_in, stride_q_h_in, stride_q_m_in, stride_q_k_in,
-    stride_k_b_in, stride_k_h_in, stride_k_n_in, stride_k_k_in,
-    stride_v_b_in, stride_v_h_in, stride_v_n_in, stride_v_k_in,
-    stride_dk_b_in, stride_dk_h_in, stride_dk_n_in, stride_dk_k_in,
-    stride_dq_b_in, stride_dq_h_in, stride_dq_m_in, stride_dq_k_in,
-    stride_delta_b_in, stride_delta_h_in, stride_delta_m_in,
-    stride_do_b_in, stride_do_h_in, stride_do_m_in, stride_do_k_in,
-    stride_dropout_b_in, stride_dropout_h_in, stride_dropout_m_in, stride_dropout_n_in,
-    # Configurations
+    q_ptr,
+    k_ptr,
+    v_ptr,
     sm_scale,
+    do_ptr,
+    dk_ptr,
+    dv_ptr,
+    dq_ptr,
+    m_ptr,
+    delta_ptr,
+    stride_q_b_in,
+    stride_q_h_in,
+    stride_q_m_in,
+    stride_q_k_in,
+    stride_k_b_in,
+    stride_k_h_in,
+    stride_k_n_in,
+    stride_k_k_in,
+    stride_v_b_in,
+    stride_v_h_in,
+    stride_v_n_in,
+    stride_v_k_in,
+    stride_dk_b_in,
+    stride_dk_h_in,
+    stride_dk_n_in,
+    stride_dk_k_in,
+    stride_dq_b_in,
+    stride_dq_h_in,
+    stride_dq_m_in,
+    stride_dq_k_in,
+    stride_delta_b_in,
+    stride_delta_h_in,
+    stride_delta_m_in,
+    stride_do_b_in,
+    stride_do_h_in,
+    stride_do_m_in,
+    stride_do_k_in,
+    stride_dropout_b_in,
+    stride_dropout_h_in,
+    stride_dropout_m_in,
+    stride_dropout_n_in,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -282,7 +305,6 @@ def _bwd_kernel_dkdvdq_causal(
     dropout_p,
     philox_seed,
     philox_offset_base_in,
-    # Meta-parameters
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     BATCH,
@@ -501,30 +523,34 @@ def _bwd_kernel_dkdvdq_causal(
     # if unaligned start_m is negative, the current N-tile has no block on the
     #   diagonal of causal mask, so everything have no causal mask
     dk, dv = _bwd_dkdvdq_inner(
-        # Output tensors
-        dk, dv, dq_ptr_adj,
-        # Input tensors
-        q_ptr_adj, k, v,
+        dk,
+        dv,  # output tensors
+        q_ptr_adj,
+        k,
+        v,
         do_ptr_adj,
+        dq_ptr_adj,
         m_ptr_adj,
         delta_ptr_adj,
-        # Strides
-        stride_q_m, stride_q_k,  # strides for q
-        stride_dq_m, stride_dq_k,  # strides for dq
-        stride_do_m, stride_do_k,  # strides for do
-        stride_dropout_m, stride_dropout_n,  # strides for dropout
+        sm_scale,  # input tensors
+        stride_q_m,
+        stride_q_k,  # strides for q
+        stride_dq_m,
+        stride_dq_k,  # strides for q
+        stride_do_m,
+        stride_do_k,  # strides for o
+        stride_dropout_m,
+        stride_dropout_n,  # strides for dropout
         stride_delta_m,
-        # Configurations
-        sm_scale,
         dropout_p,
         philox_seed,
         batch_philox_offset,
         dropout_offset,  #
-        seqlen_q, seqlen_k,  # max sequence length for q and k
+        seqlen_q,
+        seqlen_k,  # max sequence length for q and k
         start_n,
         start_m,
         num_steps,  # iteration numbers
-        # Meta-parameters
         MASK_BLOCK_M,
         BLOCK_N,  # block dim
         BLOCK_D_MODEL,
@@ -538,30 +564,34 @@ def _bwd_kernel_dkdvdq_causal(
     num_steps = tl.cdiv(seqlen_q - start_m, BLOCK_M)
 
     dk, dv = _bwd_dkdvdq_inner(
-        # Output tensors
-        dk, dv, dq_ptr_adj,
-        # Input tensors
-        q_ptr_adj, k, v,
+        dk,
+        dv,  # output tensors
+        q_ptr_adj,
+        k,
+        v,
         do_ptr_adj,
+        dq_ptr_adj,
         m_ptr_adj,
         delta_ptr_adj,
-        # Strides
-        stride_q_m, stride_q_k,  # strides for q
-        stride_dq_m, stride_dq_k,  # strides for q
-        stride_do_m, stride_do_k,  # strides for o
-        stride_dropout_m, stride_dropout_n,  # strides for dropout
+        sm_scale,  # input tensors
+        stride_q_m,
+        stride_q_k,  # strides for q
+        stride_dq_m,
+        stride_dq_k,  # strides for dq
+        stride_do_m,
+        stride_do_k,  # strides for o
+        stride_dropout_m,
+        stride_dropout_n,  # strides for dropout
         stride_delta_m,
-        # Configurations
-        sm_scale,
         dropout_p,
         philox_seed,
         batch_philox_offset,
         dropout_offset,  #
-        seqlen_q, seqlen_k,  # max sequence length for q and k
+        seqlen_q,
+        seqlen_k,  # max sequence length for q and k
         start_n,
         start_m,
         num_steps,  # iteration numbers
-        # Meta-parameters
         BLOCK_M,
         BLOCK_N,  # block dim
         BLOCK_D_MODEL,
@@ -586,24 +616,47 @@ def _bwd_kernel_dkdvdq_causal(
 
 @triton.jit
 def _bwd_kernel_dkdvdq_noncausal(
-    # Input tensors
-    Q, K, V,
-    DO,
-    M, 
-    Delta,
-    # Output tensors
-    DQ, DK, DV,
-    # Strides
-    stride_qb_in, stride_qh_in, stride_qm_in, stride_qk_in,
-    stride_kb_in, stride_kh_in, stride_kn_in, stride_kk_in,
-    stride_vb_in, stride_vh_in, stride_vn_in, stride_vk_in,
-    stride_dkb_in, stride_dkh_in, stride_dkn_in, stride_dkk_in,
-    stride_dqb_in, stride_dqh_in, stride_dqm_in, stride_dqk_in,
-    stride_deltab_in, stride_deltah_in, stride_deltam_in,
-    stride_dob_in, stride_doh_in, stride_dom_in, stride_dok_in,
-    stride_dropoutb_in, stride_dropouth_in, stride_dropoutm_in, stride_dropoutn_in,
-    # Configurations
+    Q,
+    K,
+    V,
     sm_scale,
+    DO,
+    DK,
+    DV,
+    DQ,
+    M,
+    Delta,
+    stride_qb_in,
+    stride_qh_in,
+    stride_qm_in,
+    stride_qk_in,
+    stride_kb_in,
+    stride_kh_in,
+    stride_kn_in,
+    stride_kk_in,
+    stride_vb_in,
+    stride_vh_in,
+    stride_vn_in,
+    stride_vk_in,
+    stride_dkb_in,
+    stride_dkh_in,
+    stride_dkn_in,
+    stride_dkk_in,
+    stride_dqb_in,
+    stride_dqh_in,
+    stride_dqm_in,
+    stride_dqk_in,
+    stride_deltab_in,
+    stride_deltah_in,
+    stride_deltam_in,
+    stride_dob_in,
+    stride_doh_in,
+    stride_dom_in,
+    stride_dok_in,
+    stride_dropoutb_in,
+    stride_dropouth_in,
+    stride_dropoutm_in,
+    stride_dropoutn_in,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -612,7 +665,6 @@ def _bwd_kernel_dkdvdq_noncausal(
     dropout_p,
     philox_seed,
     philox_offset,
-    # Meta-parameters
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     BATCH,
@@ -772,21 +824,25 @@ def _bwd_kernel_dkdvdq_noncausal(
         num_steps = tl.cdiv(seqlen_q, BLOCK_M)
 
         dk, dv = _bwd_dkdvdq_inner(
-            # Output tensors
-            dk, dv, DQ_ptr,
-            # Input tensors
-            Q_ptr, k, v,
+            dk,
+            dv,
+            Q_ptr,
+            k,
+            v,
             DO_ptr,
+            DQ_ptr,
             M_ptr,
             Delta_ptr,
-            # Strides
-            stride_qm, stride_qk,
-            stride_dqm, stride_dqk,
-            stride_dom, stride_dok,
-            stride_dropoutm, stride_dropoutn,
-            stride_deltam,
-            # Configurations
             sm_scale,
+            stride_qm,
+            stride_qk,
+            stride_dqm,
+            stride_dqk,
+            stride_dom,
+            stride_dok,
+            stride_dropoutm,
+            stride_dropoutn,
+            stride_deltam,
             dropout_p,
             philox_seed,
             batch_philox_offset,
@@ -796,7 +852,6 @@ def _bwd_kernel_dkdvdq_noncausal(
             start_n,
             start_m,
             num_steps,
-            # Meta-parameters
             BLOCK_M,
             BLOCK_N,
             BLOCK_D_MODEL,
@@ -821,9 +876,12 @@ def _bwd_kernel_dkdvdq_noncausal(
 @functools.lru_cache(maxsize=1024)
 def _get_config():
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
+        import os
+        dev = "MI300X"  # only support MI300X and MI350X now
         _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        TRITON_CONFIGS_PATH = os.path.abspath(f"{this_dir}/../configs")
+        fpath = f"{TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config

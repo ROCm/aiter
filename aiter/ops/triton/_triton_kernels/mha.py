@@ -7,8 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.pid_preprocessing import remap_xcd
 
 
@@ -349,9 +347,6 @@ def _attn_fwd(
         stride_on = tl.cast(stride_on_in, tl.int64)
         stride_alibi_z = tl.cast(stride_alibi_z_in, tl.int64)
         stride_alibi_h = tl.cast(stride_alibi_h_in, tl.int64)
-
-        # NOTE: philox offset is need in dropout pointer calculations
-        philox_offset_base = tl.cast(philox_offset_base_in, tl.int64)
         stride_sd_z = tl.cast(stride_sd_z_in, tl.int64)
         stride_sd_h = tl.cast(stride_sd_h_in, tl.int64)
         stride_sd_m = tl.cast(stride_sd_m_in, tl.int64)
@@ -359,6 +354,8 @@ def _attn_fwd(
         stride_lse_z = tl.cast(stride_lse_z_in, tl.int64)
         stride_lse_h = tl.cast(stride_lse_h_in, tl.int64)
         stride_lse_m = tl.cast(stride_lse_m_in, tl.int64)
+        # NOTE: philox offset is need in dropout pointer calculations
+        philox_offset_base = tl.cast(philox_offset_base_in, tl.int64)
     else:
         stride_qz = stride_qz_in
         stride_qm = stride_qm_in
@@ -378,7 +375,6 @@ def _attn_fwd(
         stride_on = stride_on_in
         stride_alibi_z = stride_alibi_z_in
         stride_alibi_h = stride_alibi_h_in
-        philox_offset_base = philox_offset_base_in
         stride_sd_z = stride_sd_z_in
         stride_sd_h = stride_sd_h_in
         stride_sd_m = stride_sd_m_in
@@ -386,6 +382,7 @@ def _attn_fwd(
         stride_lse_z = stride_lse_z_in
         stride_lse_h = stride_lse_h_in
         stride_lse_m = stride_lse_m_in
+        philox_offset_base = philox_offset_base_in
 
     tl.assume(stride_qz_in >= 0)
     tl.assume(stride_qh_in >= 0)
@@ -399,8 +396,6 @@ def _attn_fwd(
     tl.assume(stride_vh_in >= 0)
     tl.assume(stride_vn_in >= 0)
     tl.assume(stride_vk_in >= 0)
-    # NOTE: philox offset is need in dropout pointer calculations
-    tl.assume(philox_offset_base_in >= 0)
     tl.assume(stride_sd_z_in >= 0)
     tl.assume(stride_sd_h_in >= 0)
     tl.assume(stride_sd_m_in >= 0)
@@ -408,6 +403,8 @@ def _attn_fwd(
     tl.assume(stride_lse_z_in >= 0)
     tl.assume(stride_lse_h_in >= 0)
     tl.assume(stride_lse_m_in >= 0)
+    # NOTE: philox offset is need in dropout pointer calculations
+    tl.assume(philox_offset_base_in >= 0)
 
     if VARLEN:
         cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
@@ -796,9 +793,12 @@ def _get_config(
     has_pe: bool = False,
 ):
     if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
+        import os
+        dev = "MI300X"  # only support MI300X and MI350X now
         _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        TRITON_CONFIGS_PATH = os.path.abspath(f"{this_dir}/../configs")
+        fpath = f"{TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict["default"] = config

@@ -7,9 +7,6 @@ import triton
 import triton.language as tl
 
 import aiter.ops.triton.utils.types as types
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -66,33 +63,46 @@ def _flash_attn_forward(
 
     is_varlen = True if cu_seqlens_q is not None else False
 
-    o = torch.zeros_like(q)
+    o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=q.dtype, device=q.device)
     if is_varlen:
-        # Layout for q,k,v is thd ie [total_tokens, num_head, head_dim]
-        batch, seqlen_q, num_q_heads, head_sz = (
+        # Layout is thd.
+        # q and k are [total_tokens, num_head, head_dim_qk].
+        # v is [total_tokens, num_head, head_dim_v].
+        batch, seqlen_q, num_q_heads = (
             len(cu_seqlens_q) - 1,
             max_seqlen_q,
             q.shape[1],
-            q.shape[2],
         )
-        seqlen_k, num_k_heads = max_seqlen_k, k.shape[1]
+        num_k_heads = k.shape[1]
         q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
         k_strides = (0, k.stride(1), k.stride(0), k.stride(2))
         v_strides = (0, v.stride(1), v.stride(0), v.stride(2))
         o_strides = (0, o.stride(1), o.stride(0), o.stride(2))
     else:
-        # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim]
-        batch, seqlen_q, num_q_heads, head_sz = q.shape
-        seqlen_k = k.shape[1]
+        # Layout is bshd.
+        # q and k are [batch, seq_len, num_head, head_dim_qk].
+        # v is [batch, seq_len, num_head, head_dim_v].
+        batch, seqlen_q, num_q_heads = q.shape[:-1]
         num_k_heads = k.shape[2]
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
         k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
         v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
         o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
 
+    qk_head_dim = q.shape[-1]
+    v_head_dim = v.shape[-1]
+    pe_head_dim = qk_head_dim - v_head_dim
     # padding for head_dim. Power of 2 or 16
-    BLOCK_DMODEL_POW2 = triton.next_power_of_2(head_sz)
-    BLOCK_DMODEL_POW2 = max(BLOCK_DMODEL_POW2, 16)
+    BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(v_head_dim), 16)
+    BLOCK_DMODEL_PE_POW2 = (
+        0 if pe_head_dim == 0 else max(triton.next_power_of_2(pe_head_dim), 16)
+    )
+    assert (pe_head_dim == 0 and BLOCK_DMODEL_PE_POW2 == 0) or (
+        v_head_dim == BLOCK_DMODEL_POW2 and pe_head_dim == BLOCK_DMODEL_PE_POW2
+    ), "Positional encoding support requires NOPE and PE head sizes to be unpadded powers of 2."
+    assert (not IS_FP8) or (
+        IS_FP8 and pe_head_dim == 0
+    ), "Positional encoding doesn't support FP8."
 
     # softmax_lse [batch, num_q_heads, seqlen_q]
     if is_varlen:
@@ -138,7 +148,7 @@ def _flash_attn_forward(
         dropout_mask = None
 
     if config is None:
-        config = _get_config(enable_dropout, q.dtype)
+        config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
 
     """
     # Tuned for MI300x
@@ -170,9 +180,6 @@ def _flash_attn_forward(
         q,
         k,
         v,
-        descale_q,
-        descale_k,
-        descale_v,
         o,
         alibi_slopes,
         s_dmask,
@@ -181,9 +188,6 @@ def _flash_attn_forward(
         *q_strides,
         *k_strides,
         *v_strides,
-        descale_q.stride(0) if descale_q is not None else 0,
-        descale_k.stride(0) if descale_k is not None else 0,
-        descale_v.stride(0) if descale_v is not None else 0,
         *o_strides,
         alibi_slopes.stride(0) if alibi_slopes is not None else 0,
         alibi_slopes.stride(1) if alibi_slopes is not None else 0,
@@ -205,8 +209,9 @@ def _flash_attn_forward(
         IS_CAUSAL=causal,
         NUM_Q_HEADS=num_q_heads,
         NUM_K_HEADS=num_k_heads,
-        BLOCK_DMODEL=head_sz,
+        BLOCK_DMODEL=v_head_dim,
         BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+        BLOCK_DMODEL_PE=pe_head_dim,
         RETURN_SCORES=return_softmax,
         ENABLE_DROPOUT=enable_dropout,
         VARLEN=is_varlen,
