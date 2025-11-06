@@ -534,13 +534,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     o = gl.maximum(o, 0.0)
     o = o * scale_weight[:, None]
 
-    mask = (
-        context_idx
-        + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-        <= context_length - next_n + pid_next_n
-    )
-    o = tl.where(mask[None, :], o, float("-inf"))
-
     logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
     gl.amd.cdna3.buffer_store(
         logits,
@@ -602,14 +595,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         o = o * k_scale_f[None, :]
         o = gl.maximum(o, 0.0)
         o = o * scale_weight[:, None]
-
-        mask = (
-            context_idx
-            + ChunkKPerStage
-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            <= context_length - next_n + pid_next_n
-        )
-        o = tl.where(mask[None, :], o, float("-inf"))
 
         logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
         gl.amd.cdna3.buffer_store(
@@ -674,14 +659,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         o = gl.maximum(o, 0.0)
         o = o * scale_weight[:, None]
 
-        mask = (
-            context_idx
-            + ChunkK
-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            <= context_length - next_n + pid_next_n
-        )
-        o = tl.where(mask[None, :], o, float("-inf"))
-
         logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
 
         gl.amd.cdna3.buffer_store(
@@ -693,10 +670,6 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                 + ChunkK
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
-            mask=context_idx
-            + ChunkK
-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            >= split_context_start,
         )
 
     context_idx = split_context_start + split_context_length - ChunkK
