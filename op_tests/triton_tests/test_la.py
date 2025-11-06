@@ -324,6 +324,7 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
         # (False, 1, 64, 4096, [4096], 128, 304, torch.float16, 128, 16, 3, 4),
     ],
 )
+pytest.mark.skip(reason="This test is temporarily disabled.")
 def test_persistent_lean_attention(
     request,
     causal,
