@@ -645,8 +645,6 @@ _gemm_afp4wfp4_reduce_repr = make_kernel_repr(
         "BLOCK_SIZE_N",
         "ACTUAL_KSPLIT",
         "MAX_KSPLIT",
-        "num_warps",
-        "waves_per_eu",
     ],
 )
 
