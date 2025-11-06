@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -22,13 +23,19 @@ from ..dist.parallel_state import (
 logger = logging.getLogger("aiter")
 
 
-def init_dist_env(world_size, rankID):
+def init_dist_env(
+    world_size: int,
+    rankID: int,
+    backend: str = "cpu:gloo,cuda:nccl",
+    distributed_init_method: Optional[str] = "env://",
+):
     set_custom_all_reduce(True)
     init_distributed_environment(
         world_size=world_size,
         rank=rankID,
+        distributed_init_method=distributed_init_method,
         # distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
-        backend="cpu:gloo,cuda:nccl",
+        backend=backend,
         local_rank=rankID,
     )
     ensure_model_parallel_initialized(world_size, 1)

@@ -937,10 +937,10 @@ def init_distributed_environment(
             update_environment_variables(
                 {"HIP_VISIBLE_DEVICES": (",".join(map(str, range(world_size))))}
             )
-        # this backend is used for WORLD
+
         torch.distributed.init_process_group(
             backend=backend,
-            # init_method=distributed_init_method,
+            init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
         )
