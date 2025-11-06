@@ -29,6 +29,20 @@ _gemm_a16w16_repr = make_kernel_repr(
 )
 
 
+_gemm_a16w16_reduce_repr = make_kernel_repr(
+    "_gemm_a16w16_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+        "activation",
+        "use_activation",
+        "ADD_BIAS",
+    ],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["SPLITK_BLOCK_SIZE"]) == 0)
@@ -169,7 +183,7 @@ def _gemm_a16_w16_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(repr=_gemm_a16w16_reduce_repr)
 def _gemm_a16w16_reduce_kernel(
     bias_ptr,
     c_in_ptr,
