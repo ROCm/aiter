@@ -110,8 +110,8 @@ a16w16_gemm1_kernels_list_gfx950= {
      13: kernelInstanceGEMM1(       256,        128,       64,       64,     1,       4,        1,),
      14: kernelInstanceGEMM1(       256,        256,       64,       64,     1,       4,        1,),
      # extras
-     21: kernelInstanceGEMM1(       256,        128,       32,       64,     1,       4,        1,),
-     22: kernelInstanceGEMM1(       256,        256,       32,       64,     1,       4,        1,),
+     #  21: kernelInstanceGEMM1(       256,        128,       32,       64,     2,       2,        1,),
+     #  22: kernelInstanceGEMM1(       256,        256,       32,       64,     2,       2,        1,),
 }
 
 a16w16_gemm1_kernels_list= {
@@ -133,8 +133,8 @@ a16w16_gemm1_kernels_list= {
      13: kernelInstanceGEMM1(       256,        128,       64,       64,     1,       4,        1,),
      14: kernelInstanceGEMM1(       256,        256,       64,       64,     1,       4,        1,),
      # extras
-     21: kernelInstanceGEMM1(       256,        128,       32,       64,     1,       4,        1,),
-     22: kernelInstanceGEMM1(       256,        256,       32,       64,     1,       4,        1,),
+     #  21: kernelInstanceGEMM1(       256,        128,       32,       64,     2,       2,        1,),
+     #  22: kernelInstanceGEMM1(       256,        256,       32,       64,     2,       2,        1,),
 }
 # gemm1 out:bf16/fp16 AB:fp8/i8
 a8w8_gemm1_kernels_list_gfx950= {
