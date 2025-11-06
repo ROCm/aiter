@@ -28,6 +28,7 @@ def fused_rms_mxfp4_quant(
     res1: Optional[torch.Tensor] = None,
     shuffle: Optional[bool] = False,
     scale_shuffle_padding: Optional[bool] = False,
+    output_unquantized_inp1=False,
 ):
     """
     This op contains several steps:
@@ -83,6 +84,12 @@ def fused_rms_mxfp4_quant(
         device=x1.device,
     )
 
+    out1 = None
+    out1_stride_m = 0
+    if output_unquantized_inp1:
+        out1 = torch.empty((M, N1), dtype=x1.dtype, device=x1.device)
+        out1_stride_m = out1.stride(0)
+
     out_res1 = None
     res1_stride_m = 0
     out_res1_stride_m = 0
@@ -110,6 +117,7 @@ def fused_rms_mxfp4_quant(
         out1_bs,
         out2,
         out_res1,
+        out1,
         x1_epsilon,
         x2_epsilon,
         M,
@@ -122,12 +130,14 @@ def fused_rms_mxfp4_quant(
         *out1_bs.stride(),
         out2_stride_m,
         out_res1_stride_m,
+        out1_stride_m,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_N2=BLOCK_SIZE_N2,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         HAS_SECOND_INPUT=(x2 is not None),
         FIRST_INPUT_RES=(res1 is not None),
+        FIRST_INPUT_OUT=output_unquantized_inp1,
         SCALE_N=SCALE_N_valid,
         SCALE_M_PAD=(SCALE_M if use_scale_shuffle_padding else 1),
         SCALE_N_PAD=SCALE_N,
@@ -135,7 +145,7 @@ def fused_rms_mxfp4_quant(
         SHUFFLE_PAD=use_scale_shuffle_padding,
     )
 
-    return (out1_fp4, out1_bs), out2, out_res1
+    return (out1_fp4, out1_bs), out1, out2, out_res1
 
 
 def fused_flatten_mxfp4_quant(

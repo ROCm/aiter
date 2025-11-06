@@ -36,6 +36,7 @@ def calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, eps=1e-6, shuffle=F
         x1 = res1_out = x1 + resid1
         res1_out = res1_out.to(orig_dtype)
     x1 = rmsnorm(x1, rms1_w, eps)
+    out1 = x1.to(orig_dtype)
     out1_fp4, out1_scale = torch_dynamic_mxfp4_quant(x1)
 
     out2 = None
@@ -58,7 +59,7 @@ def calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, eps=1e-6, shuffle=F
         out1_scale = shuffle_scales(out1_scale_pad)
         out1_scale = out1_scale.view(out1_scale.shape[0] * 32, -1)
 
-    return (out1_fp4, out1_scale), out2, res1_out
+    return (out1_fp4, out1_scale), out1, out2, res1_out
 
 
 def convert_mxfp4_to_fp32(x, x_scales):
@@ -148,11 +149,11 @@ def test_fused_rms_quant(
         res1=res1,
         dtype=dtype,
     )
-    (x1_fp4_torch, x1_scales_torch), x2_torch, res1_out_torch = (
+    (y1_fp4_torch, y1_scales_torch), y1_torch, y2_torch, y1_res_torch = (
         calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, shuffle=shuffle)
     )
 
-    (x1_fp4_triton, x1_scales_triton), x2_triton, res1_out_triton = (
+    (y1_fp4_triton, y1_scales_triton), y1_triton, y2_triton, y1_res_triton = (
         fused_rms_mxfp4_quant(
             x1,
             rms1_w,
@@ -163,31 +164,35 @@ def test_fused_rms_quant(
             resid1,
             shuffle=shuffle,
             scale_shuffle_padding=scale_shuffle_padding,
+            output_unquantized_inp1=True,
         )
     )
 
+    if y1_triton is not None:
+        torch.testing.assert_close(y1_torch, y1_triton)
+
     if shuffle:
-        x1_scales_triton = un_shuffle_scales(
-            x1_scales_triton.view(x1_scales_triton.shape[0] // 32, -1)
+        y1_scales_triton = un_shuffle_scales(
+            y1_scales_triton.view(y1_scales_triton.shape[0] // 32, -1)
         )
-        x1_scales_torch = un_shuffle_scales(
-            x1_scales_torch.view(x1_scales_torch.shape[0] // 32, -1)
+        y1_scales_torch = un_shuffle_scales(
+            y1_scales_torch.view(y1_scales_torch.shape[0] // 32, -1)
         )
 
     scaleN_valid = (N1 + 31) // 32
-    x1_scales_triton = x1_scales_triton[:M, :scaleN_valid]
-    x1_scales_torch = x1_scales_torch[:M, :scaleN_valid]
+    y1_scales_triton = y1_scales_triton[:M, :scaleN_valid]
+    y1_scales_torch = y1_scales_torch[:M, :scaleN_valid]
 
-    if x2_triton is not None:
-        torch.testing.assert_close(x2_torch, x2_triton)
+    if y2_triton is not None:
+        torch.testing.assert_close(y2_torch, y2_triton)
 
-    if res1_out_triton is not None:
-        torch.testing.assert_close(res1_out_torch, res1_out_triton)
+    if y1_res_triton is not None:
+        torch.testing.assert_close(y1_res_torch, y1_res_triton)
 
-    res_fp32_torch = convert_mxfp4_to_fp32(x1_fp4_torch, x1_scales_torch)
-    res_fp32_triton = convert_mxfp4_to_fp32(x1_fp4_triton, x1_scales_triton)
+    y1_fp32_torch = convert_mxfp4_to_fp32(y1_fp4_torch, y1_scales_torch)
+    y1_fp32_triton = convert_mxfp4_to_fp32(y1_fp4_triton, y1_scales_triton)
 
-    torch.testing.assert_close(res_fp32_torch, res_fp32_triton)
+    torch.testing.assert_close(y1_fp32_torch, y1_fp32_triton)
 
 
 def run_torch_reduce_act_mul_mxfp4_group_quant(x, x2, activation, dtype, shuffle):
