@@ -71,6 +71,8 @@ def test_rmsnorm2d(dtype, m, n):
     (b, *_), avg_b = run_ck(input, weight, 1e-5)
     (c, *_), avg_c = run_cu(input, weight, 1e-5)
 
+    print("#############bd: ", (input.numel() + weight.numel() + b.numel()) * 2 / avg_b / 1e6)
+
     msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
     checkAllclose(a, c, msg="cu")
@@ -100,12 +102,6 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
     # checkAllclose(res_a, res_d, atol=0.01, msg='cu res check')
 
 
-# for dtype in [dtypes.fp16, dtypes.bf16]:
-#     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-#         for n in [4096, 8192, 16384, 32768, 65536]:
-#             test_rmsnorm2d(dtype, m, n)
-test_rmsnorm2d(dtypes.bf16, 32768, 8192)
-
 l_dtype = ["fp16", "bf16"]
 l_m = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 l_n = [4096, 8192, 16384, 32768, 65536]
@@ -129,7 +125,7 @@ parser.add_argument(
     "--m",
     type=int,
     nargs="?",
-    default=None,
+    default=32768,
     help="""M of mnk.
     e.g.: -m 32""",
 )
@@ -138,24 +134,27 @@ parser.add_argument(
     "--n",
     type=int,
     nargs="?",
-    default=None,
+    default=8192,
     help="""N of mnk.
     e.g.: -n 1024""",
 )
 
-# args = parser.parse_args()
-# if args.dtype is None:
-#     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-# else:
-#     l_dtype = [dtypes.d_dtypes[args.dtype]]
-# if args.m is not None:
-#     l_m = [args.m]
-# if args.n is not None:
-#     l_n = [args.n]
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.m is not None:
+    l_m = [args.m]
+if args.n is not None:
+    l_n = [args.n]
 #
 # print("\nstart fuse add test")
 # for dtype in l_dtype:
 #     for m in l_m:
 #         for n in l_n:
 #             test_rmsnorm2d_fuseAdd(dtype, m, n)
+
+for m in l_m:
+    test_rmsnorm2d(dtypes.bf16, m, 8192)
 
