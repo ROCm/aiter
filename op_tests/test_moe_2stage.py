@@ -411,14 +411,13 @@ def test_fmoe(
             out2_aiter,
             msg=f"aiter_all_stages:{us_fuse:>8.2f} us......",
         )
-        
+
         def calc_diff(x: torch.Tensor, y: torch.Tensor):
             x, y = x.double(), y.double()
             denominator = (x * x + y * y).sum()
             sim = 2 * (x * y).sum() / denominator
             return 1 - sim
- 
- 
+
         logits_diff = calc_diff(out2_ref, out2_aiter)
         assert logits_diff < 1e-3
 
