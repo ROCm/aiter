@@ -11,8 +11,6 @@ from triton.compiler.compiler import compile
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.test_common import perftest
-
 
 TEST_NUM_ITERS = 101
 
@@ -376,8 +374,6 @@ def compile_ttgir_with_triton(ttgir_content: str):
         os.unlink(ttgir_path)
 
 
-@perftest()
-# @perftest(num_iters=TEST_NUM_ITERS)
 def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     grid,
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
@@ -501,7 +497,6 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
         )
 
 
-@perftest()
 def _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
     grid,
     out_ptr,  # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
@@ -579,9 +574,6 @@ def paged_attention_decode(
     #     max_num_partitions == 1 or num_seqs * num_q_heads > 512
     # )
     use_v1 = False
-    print("***************************************************")
-    print(f"k_scale.numel()={k_scale.numel()}")
-    print("***************************************************")
     if k_scale.numel() > 1:
         if use_v1:
             paged_attn_decode_v1_per_token_quant(
@@ -1071,38 +1063,7 @@ def paged_attn_decode_v2(
         *shape_info, head_sz, dtype=output.dtype, device=output.device
     )
 
-    # compute_type2 = gl.bfloat16
-    print(f"grid={grid}")
-    print(f"query.shape={query.shape}")
-    print(f"key_cache.shape={key_cache.shape}")
-    print(f"value_cache.shape={value_cache.shape}")
-    print(f"output.shape={output.shape}")
-    print(f"block_tables.shape={block_tables.shape}")
-    print(f"query.dtype={query.dtype}")
-    print(f"key_cache.dtype={key_cache.dtype}")
-    print(f"value_cache.dtype={value_cache.dtype}")
-    print(f"output.dtype={output.dtype}")
-    print(f"block_tables.dtype={block_tables.dtype}")
-    input_config = dict(
-        scale=scale,
-        max_num_partitions=max_num_partitions,
-        kv_type=compute_type,
-        compute_type=compute_type,
-        HEAD_SZ=head_sz,
-        # HEAD_SZ_POW2=head_sz_pow2,
-        QUERY_GRP_SZ=query_grp_sz,
-        # QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
-        KV_BLK_SZ=kv_blk_sz,
-        # KV_BLK_SZ_POW2=kv_blk_sz_pow2,
-        SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-        stride_logits_s=tmp_output.stride(0),
-        stride_logits_nh=tmp_output.stride(1),
-        stride_logits_p=tmp_output.stride(2),
-        stride_logits_g=tmp_output.stride(3),
-    )
-    print(input_config)
-
-    _, decode_time = _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
+    _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
         grid,
         exp_sums,
         max_logits,
@@ -1141,7 +1102,7 @@ def paged_attn_decode_v2(
         SLIDING_WINDOW=sliding_window,
     )
     grid = (num_seqs, num_kv_heads, 1)
-    _, reduce_time = _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
+    _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
         grid,
         output,
         exp_sums,
@@ -1165,12 +1126,9 @@ def paged_attn_decode_v2(
     )
 
     return {
-        "triton_decode": decode_time,
-        "triton_reduce": reduce_time,
         "tmp_output": tmp_output,
         "exp_sums": exp_sums,
         "max_logits": max_logits,
-        "triton": decode_time + reduce_time,
     }
 
 

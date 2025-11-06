@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import os
 import argparse
 import random
-from typing import List, Optional, Tuple, Union, Dict
+from typing import List, Optional, Tuple, Union
 import hashlib
-import numpy as np
 
 import pandas as pd
 import torch
@@ -13,7 +11,6 @@ import triton
 
 import aiter
 from aiter import dtypes
-from aiter import paged_attn as ops
 from aiter import pertoken_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 
@@ -394,6 +391,7 @@ def asm_V_shuffle(VC):
     return VC
 
 
+@perftest()
 def run_triton(
     output: torch.Tensor,  # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
     query: torch.Tensor,  # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
@@ -414,7 +412,7 @@ def run_triton(
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
 ) -> None:
-    result = paged_attention_decode_gluon(
+    paged_attention_decode_gluon(
         output,
         query,
         key_cache,
@@ -431,7 +429,7 @@ def run_triton(
         sinks=sinks,
         sliding_window=sliding_window,
     )
-    return output, result
+    return output
 
 
 # def run_triton_fp8(
@@ -637,7 +635,7 @@ def test_pa_mtp(
         sinks=sinks,
         sliding_window=sliding_window,
     )
-    us_triton = us_triton["triton"]
+    # us_triton = us_triton["triton"]
     err_triton_noquant = checkAllclose(
         out_ref_noquant,
         triton_output,
