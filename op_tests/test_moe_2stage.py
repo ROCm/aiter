@@ -608,7 +608,7 @@ def test_fmoe(
     # ######################## stage 2 end ###########
 
     # # ######################## fused 2 stage #########
-    us1=0
+    us1 = 0
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
@@ -631,9 +631,8 @@ def test_fmoe(
     )
 
     return {"gemm1(us)": us1, "gemm2(us)": us2}
-seed = 1
-torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
+
+
 l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
 l_dim = [(7168, 256)]
@@ -713,7 +712,7 @@ parser.add_argument(
     4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
     5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8""",
 )
-torch.cuda.manual_seed_all(1)
+
 parser.add_argument(
     "-a",
     "--act",
