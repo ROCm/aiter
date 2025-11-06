@@ -17,9 +17,11 @@ from aiter.test_mha_common import (
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_evaluation_unit,
     get_model_configs,
     print_vgpr,
     get_caller_name_no_ext,
+    get_evaluation_label,
 )
 
 
@@ -144,14 +146,7 @@ def create_benchmark_configs(custom, args):
             plot_name = f"fused-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
-    if args.metric == "time":
-        unit = "ms"
-    elif args.metric == "throughput":
-        unit = "TFLOPS"
-    elif args.metric == "bandwidth":
-        unit = "GB/s"
-    else:
-        raise ValueError("Unknown metric: " + args.metric)
+    unit = get_evaluation_unit(args.metric)
 
     if mode == "bwd":
         if args.fused_bwd:
@@ -178,7 +173,7 @@ def create_benchmark_configs(custom, args):
             line_vals=line_vals,
             line_names=line_vals,
             styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
-            ylabel=unit,
+            ylabel=get_evaluation_label(args.metric, space=True),
             plot_name=plot_name,
             args=extra_args,
         )
@@ -536,9 +531,9 @@ def run_benchmark(custom, args):
         mem = mem_read + mem_write
 
         # return ms
-        if "ms" in provider:
+        if args.metric == "time":
             return ms
-        elif "TFLOPS" in provider:
+        elif args.metric == "throughput":
             return total_flops / ms * 1e-9
         else:  # GB/s
             return mem / ms * 1e-6

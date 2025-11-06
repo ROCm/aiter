@@ -34,6 +34,24 @@ def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
     return x, weight, out_dtype, y
 
 
+def run_torch(x, w, N, activation):
+    torch_out = F.linear(x, w, bias=None)
+    if activation == "gelu":
+        gating = F.gelu(torch_out[:, : N // 2])
+    elif activation == "gelu_tanh":
+        gating = F.gelu(torch_out[:, : N // 2], approximate="tanh")
+    elif activation == "silu" or activation == "silu_exp2":
+        gating = F.silu(torch_out[:, : N // 2])
+    elif activation == "relu":
+        gating = F.relu(torch_out[:, : N // 2])
+    elif activation is None:
+        gating = torch_out[:, : N // 2]
+    else:
+        raise Exception(f"Unsupported activation: {activation}")
+    torch_y = torch_out[:, N // 2 :]
+    return gating * torch_y
+
+
 @pytest.mark.parametrize(
     "activation", ["gelu", "gelu_tanh", "silu", "silu_exp2", "relu", None]
 )
@@ -52,21 +70,7 @@ def test_gemm_a16_w16_gated(M: int, N: int, K: int, dtype, output, layout, activ
         M, N, K, dtype, layout=layout, output=output
     )
 
-    torch_out = F.linear(x, w, bias=None)
-    if activation == "gelu":
-        gating = F.gelu(torch_out[:, : N // 2])
-    elif activation == "gelu_tanh":
-        gating = F.gelu(torch_out[:, : N // 2], approximate="tanh")
-    elif activation == "silu" or activation == "silu_exp2":
-        gating = F.silu(torch_out[:, : N // 2])
-    elif activation == "relu":
-        gating = F.relu(torch_out[:, : N // 2])
-    elif activation is None:
-        gating = torch_out[:, : N // 2]
-    else:
-        raise Exception(f"Unsupported activation: {activation}")
-    torch_y = torch_out[:, N // 2 :]
-    torch_out = gating * torch_y
+    torch_out = run_torch(x, w, N, activation)
 
     if output:
         triton_out = gemm_a16w16_gated(

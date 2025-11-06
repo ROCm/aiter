@@ -156,6 +156,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # group, where we always have either custom allreduce or pynccl.
         out = input_.clone()
         torch.distributed.all_reduce(out, group=self.device_group)
+<<<<<<< HEAD
+=======
         return out
 
     def fused_allreduce_rmsnorm(self, input_, weight_, eps) -> torch.Tensor:
@@ -188,6 +190,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             eps,
             0,
         )
+>>>>>>> main
         return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
