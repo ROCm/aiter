@@ -369,11 +369,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     context_length = gl.load(context_len_ptr + pid_batch)
 
     context_chunk_num = tl.cdiv(context_length, ChunkK)
-    split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)
-
-    split_context_start = (pid_split_kv * split_context_chunk_num) * ChunkK
+    split_context_chunk_num = context_chunk_num // SplitKV
+    residual_context_chunks = context_chunk_num % SplitKV
+    split_context_start = (
+        pid_split_kv * split_context_chunk_num * ChunkK
+        + min(pid_split_kv, residual_context_chunks) * ChunkK
+    )
     split_context_length = min(
-        context_length - split_context_start, split_context_chunk_num * ChunkK
+        context_length - split_context_start,
+        split_context_chunk_num * ChunkK
+        + (ChunkK if pid_split_kv < residual_context_chunks else 0),
     )
 
     if split_context_length <= 0:
