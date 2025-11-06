@@ -11,7 +11,7 @@ import triton.language as tl
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.fused_gemm_afp4wfp4_a16w16 import (
     _fused_gemm_afp4wfp4_a16w16_kernel,
-    _fused_gemm_afp4wfp4_preshuffled_weight_scales_a16w16_kernel,
+    _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel,
     _fused_gemm_afp4wfp4_a16w16_reduce_kernel,
     _get_config,
 )
@@ -154,7 +154,7 @@ def fused_gemm_afp4wfp4_a16w16(
         ),
     )
     selected_kernel = (
-        _fused_gemm_afp4wfp4_preshuffled_weight_scales_a16w16_kernel
+        _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel
         if is_fp4_preshuffled
         else _fused_gemm_afp4wfp4_a16w16_kernel
     )

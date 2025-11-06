@@ -11,6 +11,24 @@ import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
+
+
+_fused_gemm_afp4wfp4_a16w16_repr = make_kernel_repr(
+    "_fused_gemm_afp4wfp4_a16w16_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "cache_modifier",
+        "NUM_KSPLIT",
+    ],
+)
 
 
 @triton.heuristics(
@@ -24,7 +42,7 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
         * triton.cdiv(args["N_bf16"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_gemm_afp4wfp4_a16w16_repr)
 def _fused_gemm_afp4wfp4_a16w16_kernel(
     # Pointers to matrices
     a_fp4_ptr,
@@ -70,6 +88,10 @@ def _fused_gemm_afp4wfp4_a16w16_kernel(
     ADD_BIAS_FP4: tl.constexpr,
     ADD_BIAS_BF16: tl.constexpr,
     EVEN_K: tl.constexpr,
+    num_warps: tl.constexpr,
+    num_stages: tl.constexpr,
+    waves_per_eu: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr,
     GRID_MN_FP4: tl.constexpr,
     GRID_MN_BF16: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
@@ -292,6 +314,23 @@ def _fused_gemm_afp4wfp4_a16w16_kernel(
             tl.store(c_bf16_ptrs, c_bf16, mask=c_bf16_mask)
 
 
+_fused_gemm_afp4wfp4_preshuffle_a16w16_repr = make_kernel_repr(
+    "_fused_gemm_afp4wfp4_preshuffle_a16w16_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "cache_modifier",
+        "NUM_KSPLIT",
+    ],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -303,8 +342,8 @@ def _fused_gemm_afp4wfp4_a16w16_kernel(
         * triton.cdiv(args["N_bf16"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
-def _fused_gemm_afp4wfp4_preshuffled_weight_scales_a16w16_kernel(
+@triton.jit(repr=_fused_gemm_afp4wfp4_preshuffle_a16w16_repr)
+def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel(
     # Pointers to matrices
     a_fp4_ptr,
     b_fp4_ptr,
@@ -349,6 +388,10 @@ def _fused_gemm_afp4wfp4_preshuffled_weight_scales_a16w16_kernel(
     ADD_BIAS_FP4: tl.constexpr,
     ADD_BIAS_BF16: tl.constexpr,
     EVEN_K: tl.constexpr,
+    num_warps: tl.constexpr,
+    num_stages: tl.constexpr,
+    waves_per_eu: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr,
     GRID_MN_FP4: tl.constexpr,
     GRID_MN_BF16: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
