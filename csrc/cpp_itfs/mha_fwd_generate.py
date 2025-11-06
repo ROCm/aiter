@@ -38,7 +38,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                                   bool has_lse,
                                   bool has_dropout,
                                   bool use_ext_asm,
-                                  int how_v3_bf16_cvt = 1,
+                                  int how_v3_bf16_cvt,
                                   bool skip_min_seqlen_q = false)
 {{
     return mha_fwd_traits(head_size_q,
