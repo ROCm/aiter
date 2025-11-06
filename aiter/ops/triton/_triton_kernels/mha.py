@@ -10,7 +10,6 @@ import triton.language as tl
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.pid_preprocessing import remap_xcd
-from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 
 
 @triton.jit
@@ -98,9 +97,6 @@ def _attn_fwd_inner(
     masked_blocks,
     n_extra_tokens,
     alibi_slope,
-    descale_q,
-    descale_k,
-    descale_v,
     OFFS_M: tl.constexpr,
     OFFS_N: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -114,8 +110,6 @@ def _attn_fwd_inner(
     ENABLE_DROPOUT: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
     PADDED_HEAD: tl.constexpr,
-    IS_FP8: tl.constexpr,
-    FP8_MAX: tl.constexpr,
     ENABLE_PIPELINING: tl.constexpr,
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
@@ -173,12 +167,9 @@ def _attn_fwd_inner(
         p_mask = q_mask & k_mask
 
         # -- compute qk ----
-        if IS_FP8:
-            qk += tl.dot(q, k) * descale_q * descale_k
-        else:
-            qk += tl.dot(q, k)
-            if HAS_PE:
-                qk += tl.dot(q_pe, k_pe)
+        qk += tl.dot(q, k)
+        if HAS_PE:
+            qk += tl.dot(q_pe, k_pe)
 
         if IS_CAUSAL:
             causal_boundary = start_n + offs_n_causal
@@ -236,13 +227,7 @@ def _attn_fwd_inner(
         # update m_i and l_i
         m_i = m_ij
 
-        if IS_FP8:
-            scale_p, descale_p = _compute_fp8_scaling_factors(p, FP8_MAX)
-            acc += (
-                tl.dot((p * scale_p).to(v.type.element_ty), v) * descale_p * descale_v
-            )
-        else:
-            acc += tl.dot(p.to(v.type.element_ty), v)
+        acc += tl.dot(p.to(v.type.element_ty), v)
 
         k_ptrs += BLOCK_N * stride_kn
         if HAS_PE:
@@ -263,9 +248,6 @@ def _attn_fwd(
     q_ptr: torch.Tensor,
     k_ptr: torch.Tensor,
     v_ptr: torch.Tensor,
-    descale_q_ptr: torch.Tensor,
-    descale_k_ptr: torch.Tensor,
-    descale_v_ptr: torch.Tensor,
     out_ptr: torch.Tensor,
     alibi_slopes_ptr: torch.Tensor,
     s_dmask_ptr: torch.Tensor,
@@ -283,9 +265,6 @@ def _attn_fwd(
     stride_vh_in,
     stride_vn_in,
     stride_vk_in,
-    stride_descale_q_z_in,
-    stride_descale_k_z_in,
-    stride_descale_v_z_in,
     stride_oz_in,
     stride_oh_in,
     stride_om_in,
@@ -317,8 +296,6 @@ def _attn_fwd(
     BLOCK_DMODEL_PE: tl.constexpr,  # it's zero or a power of 2
     RETURN_SCORES: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
-    IS_FP8: tl.constexpr,
-    FP8_MAX: tl.constexpr,
     VARLEN: tl.constexpr,
     BATCH,
     NUM_XCD: tl.constexpr,
@@ -366,10 +343,6 @@ def _attn_fwd(
         stride_vh = tl.cast(stride_vh_in, tl.int64)
         stride_vn = tl.cast(stride_vn_in, tl.int64)
         stride_vk = tl.cast(stride_vk_in, tl.int64)
-        if IS_FP8:
-            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
-            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
-            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
         stride_oz = tl.cast(stride_oz_in, tl.int64)
         stride_oh = tl.cast(stride_oh_in, tl.int64)
         stride_om = tl.cast(stride_om_in, tl.int64)
@@ -399,9 +372,6 @@ def _attn_fwd(
         stride_vh = stride_vh_in
         stride_vn = stride_vn_in
         stride_vk = stride_vk_in
-        stride_descale_q_z = stride_descale_q_z_in
-        stride_descale_k_z = stride_descale_k_z_in
-        stride_descale_v_z = stride_descale_v_z_in
         stride_oz = stride_oz_in
         stride_oh = stride_oh_in
         stride_om = stride_om_in
@@ -429,16 +399,6 @@ def _attn_fwd(
     tl.assume(stride_vh_in >= 0)
     tl.assume(stride_vn_in >= 0)
     tl.assume(stride_vk_in >= 0)
-    if IS_FP8:
-        tl.assume(stride_descale_q_z_in >= 0)
-        tl.assume(stride_descale_k_z_in >= 0)
-        tl.assume(stride_descale_v_z_in >= 0)
-        tl.assume(stride_oz_in >= 0)
-        tl.assume(stride_oh_in >= 0)
-        tl.assume(stride_om_in >= 0)
-        tl.assume(stride_on_in >= 0)
-        tl.assume(stride_alibi_z_in >= 0)
-        tl.assume(stride_alibi_h_in >= 0)
     # NOTE: philox offset is need in dropout pointer calculations
     tl.assume(philox_offset_base_in >= 0)
     tl.assume(stride_sd_z_in >= 0)
@@ -626,13 +586,6 @@ def _attn_fwd(
     else:
         q_pe = None
 
-    if IS_FP8:
-        descale_q = tl.load(descale_q_ptr + off_z * stride_descale_q_z + off_q_head)
-        descale_k = tl.load(descale_k_ptr + off_z * stride_descale_k_z + off_k_head)
-        descale_v = tl.load(descale_v_ptr + off_z * stride_descale_v_z + off_k_head)
-    else:
-        descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
-
     n_extra_tokens = 0
     if seqlen_k < BLOCK_N:
         n_extra_tokens = BLOCK_N - seqlen_k
@@ -686,9 +639,6 @@ def _attn_fwd(
             0,
             0,
             alibi_slope,
-            descale_q,
-            descale_k,
-            descale_v,
             offs_m,
             offs_n,
             BLOCK_M,
@@ -702,8 +652,6 @@ def _attn_fwd(
             ENABLE_DROPOUT=ENABLE_DROPOUT,
             RETURN_SCORES=RETURN_SCORES,
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
             ENABLE_PIPELINING=True,
         )
         block_min = block_max
@@ -749,9 +697,6 @@ def _attn_fwd(
             masked_blocks,
             n_extra_tokens,
             alibi_slope,
-            descale_q,
-            descale_k,
-            descale_v,
             offs_m,
             offs_n,
             BLOCK_M,
@@ -765,8 +710,6 @@ def _attn_fwd(
             ENABLE_DROPOUT=ENABLE_DROPOUT,
             RETURN_SCORES=RETURN_SCORES,
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
             ENABLE_PIPELINING=False,
         )
     # epilogue

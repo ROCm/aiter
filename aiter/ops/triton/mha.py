@@ -209,8 +209,6 @@ def _flash_attn_forward(
         BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
         RETURN_SCORES=return_softmax,
         ENABLE_DROPOUT=enable_dropout,
-        # IS_FP8=IS_FP8,
-        # FP8_MAX=FP8_MAX,
         VARLEN=is_varlen,
         BATCH=batch,
         NUM_XCD=get_num_xcds(),
