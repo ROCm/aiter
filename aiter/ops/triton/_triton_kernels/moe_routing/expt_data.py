@@ -8,52 +8,60 @@ def _cdiv_pow2(n, log2_k):
 
 
 @triton.jit
-def _expt_data_compute(pid, Hist, n_expts_tot, MDStarts, tile_starts_stridem, MDTileInfo, max_num_tiles, tile_dim_log2: tl.constexpr, BLOCK: tl.constexpr):
-    
-    if pid == 0:
-        x_tile = tl.zeros([BLOCK], dtype=MDStarts.dtype.element_ty)
-        Tile_ptrs = MDStarts + tl.arange(0, BLOCK)
-
-        for i in range(0, n_expts_tot + 1, BLOCK):
-            offs_n = tl.arange(0, BLOCK) + i
-            mask_n0 = offs_n < n_expts_tot
-            hist_tok = tl.load(Hist + offs_n, mask=mask_n0, other=0)
-
-            tile_starts = tl.cumsum(hist_tok, 0) + x_tile
-            x_tile += tl.sum(hist_tok, 0).to(MDStarts.dtype.element_ty)
-            tl.store(Tile_ptrs, tile_starts - hist_tok)
-            Tile_ptrs += BLOCK
-
-    else:
-
-        expt_id = pid - 1
-        MDStarts += tile_starts_stridem
-        x_tile = tl.zeros([BLOCK], dtype=MDStarts.dtype.element_ty)
-        Tile_ptrs = MDStarts + tl.arange(0, BLOCK)
+def _expt_data_compute_stage1(pid, Hist, n_expts_tot, TokenStart, TileStart, MDTileInfo, max_num_tiles, n_gates, tile_dim_log2: tl.constexpr, BLOCK: tl.constexpr, EQUAL_BLOCK: tl.constexpr):
+    if EQUAL_BLOCK:
         offs_n = tl.arange(0, BLOCK)
-
-        for i in range(0, n_expts_tot + 1, BLOCK):
-            mask_n0 = offs_n < n_expts_tot
-            hist_tok = tl.load(Hist + offs_n, mask=mask_n0, other=0)
-            hist_tile = _cdiv_pow2(hist_tok, tile_dim_log2)
-
-            tile_starts = tl.cumsum(hist_tile, 0) + x_tile
-            x_tile += tl.sum(hist_tile, 0).to(MDStarts.dtype.element_ty)
-            tl.store(Tile_ptrs, tile_starts - hist_tile)
-            Tile_ptrs += BLOCK
+        hist_token = tl.load(Hist + offs_n) 
+        hist_tile = _cdiv_pow2(hist_token, tile_dim_log2)
+        token_starts = tl.cumsum(hist_token, 0) - hist_token
+        tile_starts = tl.cumsum(hist_tile, 0) - hist_tile
+        tl.store(TokenStart + offs_n, token_starts)
+        tl.store(TileStart + offs_n, tile_starts)
+    else:
+        token_acc = tl.zeros([BLOCK], dtype=TokenStart.dtype.element_ty)
+        tile_acc = tl.zeros([BLOCK], dtype=TileStart.dtype.element_ty)
+        offs_n = tl.arange(0, BLOCK)
+        for i in range(0, n_expts_tot, BLOCK): 
+            mask_n = offs_n < n_expts_tot
+            hist_token = tl.load(Hist + offs_n, mask=mask_n, other=0)
+            hist_tile = _cdiv_pow2(hist_token, tile_dim_log2)
+            token_starts = tl.cumsum(hist_token, 0) - hist_token + token_acc
+            tile_starts = tl.cumsum(hist_tile, 0) - hist_tile + tile_acc
+            token_acc += tl.sum(hist_token, 0)
+            tile_acc += tl.sum(hist_tile, 0)
+            tl.store(TokenStart + offs_n, token_starts) 
+            tl.store(TileStart + offs_n, tile_starts)
             offs_n += BLOCK
-        
-        n_tokens = tl.load(Hist + expt_id)
-        n_blocks = _cdiv_pow2(n_tokens, tile_dim_log2)
-        tile_off = tl.load(MDStarts + expt_id)
 
-        for block_off in range(0, n_blocks, BLOCK):
-            block_offs = block_off + tl.arange(0, BLOCK)
-            data = (block_offs << 16) + expt_id
-            tl.store(MDTileInfo + tile_off + block_offs, data, mask=block_offs < n_blocks)
+    if pid == 0:
+        tl.store(TokenStart + n_expts_tot, n_gates)
 
-        if expt_id == n_expts_tot - 1:
-            tile_off = tl.load(MDStarts + n_expts_tot)
-            for block_off in range(tile_off, max_num_tiles, BLOCK):
-                block_offs = block_off + tl.arange(0, BLOCK)
-                tl.store(MDTileInfo + block_offs, 0xffffffff, mask=block_offs < max_num_tiles)
+        hist_tok_last = tl.load(Hist + n_expts_tot - 1)
+        hist_tile_last = _cdiv_pow2(hist_tok_last, tile_dim_log2)
+        tile_off_last = tl.load(TileStart + n_expts_tot - 1) + hist_tile_last
+        tl.store(TileStart + n_expts_tot, tile_off_last)
+
+        MEMSET_BLOCK: tl.constexpr = 16
+        for block_off in range(tile_off_last, max_num_tiles, MEMSET_BLOCK):
+            block_offs = block_off + tl.arange(0, MEMSET_BLOCK)
+            tl.store(MDTileInfo + block_offs, 0xffffffff, mask=block_offs < max_num_tiles)
+
+
+@triton.jit
+def _expt_data_compute_stage2(pid, Hist, TileStart, TileInfo, tile_dim_log2: tl.constexpr):
+
+    expt_id = pid
+    
+    n_tokens = tl.load(Hist + expt_id)
+    if n_tokens == 0: 
+        return
+    BLOCK: tl.constexpr = 8
+    n_blocks = _cdiv_pow2(n_tokens, tile_dim_log2)
+    TileInfo += tl.load(TileStart + expt_id)
+
+    n_blocks = _cdiv_pow2(n_tokens, tile_dim_log2)
+    block_offs = tl.arange(0, BLOCK)
+    for i in range(0, n_blocks, BLOCK):
+        data = (block_offs << 16) + expt_id
+        tl.store(TileInfo + block_offs, data, mask=block_offs < n_blocks)
+        block_offs += BLOCK

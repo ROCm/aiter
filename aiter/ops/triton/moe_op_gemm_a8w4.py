@@ -9,7 +9,7 @@ import triton
 from enum import Enum, auto
 import math
 from aiter.ops.triton.moe_routing.routing import GatherIndx, RoutingData, ScatterIndx
-from aiter.ops.triton._triton_kernels._moe_op_gemm_a8w4 import _moe_gemm_a8w4, _reduce_grouped, _downcast_to_static_fp8
+from aiter.ops.triton._triton_kernels.moe_op_gemm_a8w4 import _moe_gemm_a8w4, _reduce_grouped, _downcast_to_static_fp8
 
 
 # -----------------------------------------------------------------------------

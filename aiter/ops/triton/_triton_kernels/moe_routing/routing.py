@@ -1,7 +1,7 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.moe_routing.expt_data import _expt_data_compute
+from aiter.ops.triton._triton_kernels.moe_routing.expt_data import _expt_data_compute_stage1, _expt_data_compute_stage2
 
 
 @triton.jit
@@ -18,70 +18,70 @@ def _keyed_add(x, y):
 
 @triton.jit
 def _routing_compute_indx(pid_m, GatherIndx, ScatterIndx, GateScal, ExptScal, ExptIndx, PartialOffs, stride_pm,
-                          stride_pn, TokensStart, n_tokens, ExpertHist, hist_size, BLOCK_N: tl.constexpr, EQUAL_N: tl.constexpr, BLOCK_M: tl.constexpr, N_EXPTS_ACT: tl.constexpr):
-
-    if EQUAL_N:
-        offs_n = tl.arange(0, BLOCK_N)
-        hist2 = tl.load(ExpertHist + offs_n) 
-        tok_starts = tl.cumsum(hist2, 0) - hist2 
-        tl.store(TokensStart + offs_n, tok_starts)
-    else:
-        loop_iterations = (hist_size + BLOCK_N - 1) // BLOCK_N
-        x = tl.zeros([BLOCK_N], ExpertHist.dtype.element_ty)
-        offs_n = tl.arange(0, BLOCK_N)
-        for i in range(loop_iterations):
-            mask_n = offs_n < hist_size
-            hist2 = tl.load(ExpertHist + offs_n, mask=mask_n)
-            tok_starts = tl.cumsum(hist2, 0) - hist2 + x
-            x += tl.sum(hist2, 0)
-            tl.store(TokensStart + offs_n, tok_starts, mask=mask_n)
-            offs_n += BLOCK_N
-
-    if isinstance(n_tokens, tl.tensor) and n_tokens.dtype.is_ptr():
-        n_tokens = tl.load(n_tokens)
-    n_gates = n_tokens * N_EXPTS_ACT
+                          stride_pn, TokensStart, n_gates, BLOCK_M: tl.constexpr, EVEN_M: tl.constexpr, N_EXPTS_ACT: tl.constexpr):
 
     tl.static_assert(N_EXPTS_ACT * BLOCK_M <= 32768)
 
     local_offs = tl.arange(0, N_EXPTS_ACT * BLOCK_M)
     offs = pid_m * BLOCK_M * N_EXPTS_ACT + local_offs
-    expert = tl.load(ExptIndx + offs, mask=(offs < n_gates), other=-1).to(tl.uint32)
+    if EVEN_M:
+        expert = tl.load(ExptIndx + offs).to(tl.uint32)
+    else:
+        expert = tl.load(ExptIndx + offs, mask=(offs < n_gates), other=-1).to(tl.uint32)
 
     # stable-sort by expert ID:
     kv_pairs = ((expert << 16) | local_offs).to(tl.uint32)
     kv_pairs = tl.sort(kv_pairs, 0)
     expert = kv_pairs >> 16
     offs = pid_m * BLOCK_M * N_EXPTS_ACT + (kv_pairs & 0xffff)
-    mask = expert != 0xffff
-    gate_scal = tl.load(ExptScal + offs, mask=mask)
 
-    # compute run lengths in expert-sorted order:
-    x = (kv_pairs & 0xffff0000 | 0x00000001)
-    expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
-    exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xffff
+    if EVEN_M:
+        mask = expert != 0xffff
+        gate_scal = tl.load(ExptScal + offs)
 
-    gates = tl.load(PartialOffs + pid_m * stride_pm + expert * stride_pn, mask=mask)
-    gates += tl.load(TokensStart + expert, mask=mask)
-    gates += exclusive_run_lengths
+        # compute run lengths in expert-sorted order:
+        x = (kv_pairs & 0xffff0000 | 0x00000001)
+        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
+        exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xffff
 
-    tl.store(ScatterIndx + offs, gates, mask=mask)
-    tl.store(GatherIndx + gates, offs, mask=mask)
-    tl.store(GateScal + gates, gate_scal, mask=mask)
+        gates = tl.load(PartialOffs + pid_m * stride_pm + expert * stride_pn)
+        gates += tl.load(TokensStart + expert)
+        gates += exclusive_run_lengths
+
+        tl.store(ScatterIndx + offs, gates)
+        tl.store(GatherIndx + gates, offs)
+        tl.store(GateScal + gates, gate_scal)
+    else:
+        mask = expert != 0xffff
+        gate_scal = tl.load(ExptScal + offs, mask=mask)
+
+        # compute run lengths in expert-sorted order:
+        x = (kv_pairs & 0xffff0000 | 0x00000001)
+        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
+        exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xffff
+
+        gates = tl.load(PartialOffs + pid_m * stride_pm + expert * stride_pn, mask=mask)
+        gates += tl.load(TokensStart + expert, mask=mask)
+        gates += exclusive_run_lengths
+
+        tl.store(ScatterIndx + offs, gates, mask=mask)
+        tl.store(GatherIndx + gates, offs, mask=mask)
+        tl.store(GateScal + gates, gate_scal, mask=mask)
 
 
 @triton.jit
 def _combined_routing(GatherIndx, ScatterIndx, GateScal, ExptScal, ExptIndx, PartialOffs, stride_pm, stride_pn,
-                        TokensStart, n_tokens, BLOCK_M: tl.constexpr, N_EXPTS_ACT: tl.constexpr,
-                        ExpertHist, hist_size,
-                        n_expts_tot, MDStarts, tile_starts_stridem,
-                        blocks1a, MDTileInfo, max_num_tiles, tile_dim_log2: tl.constexpr, BLOCK_A: tl.constexpr,
-                        BLOCK_N: tl.constexpr, EQUAL_N: tl.constexpr):
+                        n_gates, BLOCK_M: tl.constexpr, EVEN_M: tl.constexpr, N_EXPTS_ACT: tl.constexpr,
+                        ExpertHist, n_expts_tot, TokenStart, TileStart,
+                        blocks1a, MDTileInfo, max_num_tiles, tile_dim_log2: tl.constexpr, BLOCK_A: tl.constexpr, EQUAL_A: tl.constexpr):
 
     pid = tl.program_id(0)
 
+    _expt_data_compute_stage1(pid, ExpertHist, n_expts_tot, TokenStart, TileStart, MDTileInfo, max_num_tiles, n_gates, tile_dim_log2, BLOCK_A, EQUAL_A)
+
     if pid < blocks1a:
-        _expt_data_compute(pid, ExpertHist, n_expts_tot, MDStarts, tile_starts_stridem, MDTileInfo, max_num_tiles, tile_dim_log2, BLOCK_A)
+        _expt_data_compute_stage2(pid, ExpertHist, TileStart, MDTileInfo, tile_dim_log2)
     else:
         pid -= blocks1a
         _routing_compute_indx(pid, GatherIndx, ScatterIndx, GateScal, ExptScal, ExptIndx, PartialOffs, stride_pm,
-                              stride_pn, TokensStart, n_tokens, ExpertHist, hist_size, BLOCK_N, EQUAL_N, BLOCK_M, N_EXPTS_ACT)
+                              stride_pn, TokenStart, n_gates, BLOCK_M, EVEN_M, N_EXPTS_ACT)
