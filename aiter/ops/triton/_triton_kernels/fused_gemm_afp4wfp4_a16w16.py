@@ -684,6 +684,19 @@ def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel(
             tl.store(c_bf16_ptrs, c_bf16, mask=c_bf16_mask)
 
 
+_gemm_afp4wfp4_reduce_repr = make_kernel_repr(
+    "_gemm_afp4wfp4_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+        "ADD_BIAS_FP4",
+        "ADD_BIAS_BF16",
+    ],
+)
+
+
 @triton.jit
 def _fused_gemm_afp4wfp4_a16w16_reduce_kernel(
     bias_fp4_ptr,

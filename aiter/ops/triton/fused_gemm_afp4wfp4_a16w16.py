@@ -217,7 +217,7 @@ def fused_gemm_afp4wfp4_a16w16(
             return y_fp4_pp, y_bf16_pp
         REDUCE_BLOCK_SIZE_M = 32
         REDUCE_BLOCK_SIZE_N = 32
-        ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
+        ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"] // 2)
 
         grid_reduce = (
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
@@ -248,7 +248,7 @@ def fused_gemm_afp4wfp4_a16w16(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS_fp4=(bias_fp4 is not None),
+            ADD_BIAS_FP4=(bias_fp4 is not None),
             ADD_BIAS_BF16=(bias_bf16 is not None),
         )
 

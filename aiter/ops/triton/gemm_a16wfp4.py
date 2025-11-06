@@ -13,7 +13,7 @@ from aiter.ops.triton._triton_kernels.gemm_a16wfp4 import (
     _get_config,
 )
 from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
-    _gemm_afp4_wfp4_reduce_kernel,
+    _gemm_afp4wfp4_reduce_kernel,
 )
 from aiter.ops.triton.gemm_afp4wfp4 import (
     get_splitk,
@@ -133,7 +133,7 @@ def gemm_a16wfp4(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_afp4_wfp4_reduce_kernel[grid_reduce](
+        _gemm_afp4wfp4_reduce_kernel[grid_reduce](
             y_pp,
             y,
             M,
