@@ -18,7 +18,6 @@ _topk_kernel_repr = make_kernel_repr(
         "M",
         "K",
         "BLOCK",
-        "FILL_VALUE",
     ],
 )
 
@@ -28,7 +27,6 @@ _topk_stage1_kernel_repr = make_kernel_repr(
         "N",
         "CHUNK_SIZE",
         "DESCENDING",
-        "FILL_VALUE",
     ],
 )
 
@@ -39,8 +37,6 @@ _topk_stage2_kernel_repr = make_kernel_repr(
         "N",
         "BLOCK_SIZE",
         "DESCENDING",
-        "FILL_VALUE",
-        "MASK_INDEX_VAL",
     ],
 )
 
