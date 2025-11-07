@@ -112,7 +112,7 @@ def fused_moe(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
-):    
+):
     if not block_size_M:
         block_size_M = -1
     return fused_moe_(
@@ -653,24 +653,28 @@ def get_2stage_cfgs(
             ksplit,
             run_1stage,
         )
-    if dtype in [dtypes.bf16, dtypes.fp16] and q_type == QuantType.per_1x32 and activation == ActivationType.Swiglu:
+    if (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Swiglu
+    ):
         return MOEMetadata(
-        functools.partial(
-            cktile_moe_stage1,
-            n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
-            k_pad_zeros=hidden_pad // 128 * 128,
-            bias1=bias1,
-        ),
-        functools.partial(
-            cktile_moe_stage2,
-            n_pad_zeros=hidden_pad // 64 * 64,
-            k_pad_zeros=intermediate_pad // 128 * 128,
-            bias2=bias2,
-        ),
-        16 if token < 2048 else 32,
-        ksplit,
-        False,
-    )
+            functools.partial(
+                cktile_moe_stage1,
+                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
+                k_pad_zeros=hidden_pad // 128 * 128,
+                bias1=bias1,
+            ),
+            functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                bias2=bias2,
+            ),
+            16 if token < 2048 else 32,
+            ksplit,
+            False,
+        )
     if (
         "ck2stages" in kernelName1
         or (q_type == QuantType.per_1x128 and doweight_stage1)
@@ -779,10 +783,12 @@ def fused_moe_2stages(
         bias1,
         bias2,
     )
-    if quant_type == QuantType.per_1x32 \
-            and dtype in [dtypes.bf16, dtypes.fp16] \
-            and w1.dtype == dtypes.fp4x2 \
-            and activation == ActivationType.Swiglu:
+    if (
+        quant_type == QuantType.per_1x32
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and w1.dtype == dtypes.fp4x2
+        and activation == ActivationType.Swiglu
+    ):
         a1 = hidden_states.to(dtype)
         a1_scale = None
     elif quant_type == QuantType.per_1x32:
@@ -826,7 +832,7 @@ def fused_moe_2stages(
             dtype=dtype,
             device=device,
         )
-        
+
     a2 = metadata.stage1(
         a1,
         w1,
@@ -842,9 +848,11 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
 
-    if quant_type == QuantType.per_1x32 \
-            and dtype in [dtypes.bf16, dtypes.fp16] \
-            and w1.dtype == dtypes.fp4x2:
+    if (
+        quant_type == QuantType.per_1x32
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and w1.dtype == dtypes.fp4x2
+    ):
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
@@ -1037,7 +1045,7 @@ def torch_moe(
     return (out * topk_weight.view(B, -1, 1)).sum(dim=1).to(dtype)
 
 
-#temp workaround for swiglu
+# temp workaround for swiglu
 def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0):
     # Clamp the input values
     x_glu = x_glu.clamp(min=None, max=limit)
@@ -1253,12 +1261,14 @@ def cktile_moe_stage1(
     token_num = hidden_states.shape[0]
     _, n1, k1 = w1.shape
     _, k2, n2 = w2.shape
-    D = n2 if k2 == k1 else n2*2 #bit4 format
+    D = n2 if k2 == k1 else n2 * 2  # bit4 format
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
     if w1.dtype is torch.uint32:
         D = D * 8
-    out = torch.empty((token_num, topk, D), dtype=hidden_states.dtype, device=hidden_states.device)
+    out = torch.empty(
+        (token_num, topk, D), dtype=hidden_states.dtype, device=hidden_states.device
+    )
     # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
@@ -1277,7 +1287,7 @@ def cktile_moe_stage1(
         block_m,
     )
     return out
-    
+
 
 def cktile_moe_stage2(
     a2,
