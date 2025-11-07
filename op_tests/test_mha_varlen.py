@@ -703,7 +703,7 @@ def test_varlen_flash_attn_seq_padding(
     nheads = 9
     device = "cuda"
 
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 8)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     if nheads % nheads_k != 0:
         pytest.skip("nheads must be divisible by nheads_k")
 
