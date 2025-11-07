@@ -1,7 +1,10 @@
 import torch
 import triton
 from typing import Type
-from aiter.ops.triton._triton_kernels.moe_routing.bitmatrix import _sum_bitmatrix_memset, _sum_bitmatrix_rows
+from aiter.ops.triton._triton_kernels.moe_routing.bitmatrix import (
+    _sum_bitmatrix_memset,
+    _sum_bitmatrix_rows,
+)
 from dataclasses import dataclass, fields
 
 
@@ -38,8 +41,8 @@ class Bitmatrix:
 def clear_sums(n_cols, device, MEMSET_BLOCK=512):
     cdiv = triton.cdiv
     blocks = cdiv(n_cols, MEMSET_BLOCK)
-    out_ret = torch.empty((blocks * MEMSET_BLOCK, ), device=device, dtype=torch.int32)
-    _sum_bitmatrix_memset[(blocks, )](out_ret, MEMSET_BLOCK)
+    out_ret = torch.empty((blocks * MEMSET_BLOCK,), device=device, dtype=torch.int32)
+    _sum_bitmatrix_memset[(blocks,)](out_ret, MEMSET_BLOCK)
     return out_ret
 
 
@@ -48,7 +51,7 @@ def sum_bitmatrix_rows(x, out_ret, partials_block_size=None):
     cdiv = triton.cdiv
     PARTIALS_BLOCK_M = partials_block_size
     n_rows, n_cols = x.shape
-    assert out_ret.shape == (n_cols, )
+    assert out_ret.shape == (n_cols,)
 
     TILE_SIZE = 8
     BLOCK_MM = PARTIALS_BLOCK_M * TILE_SIZE
@@ -59,14 +62,21 @@ def sum_bitmatrix_rows(x, out_ret, partials_block_size=None):
 
     # output tensors
     _sum_bitmatrix_rows[(pids_x, pids_y)](
-        x.data, n_rows, x.data.stride(0), x.data.stride(1),  # input
+        x.data,
+        n_rows,
+        x.data.stride(0),
+        x.data.stride(1),  # input
         out_ret,  # output [final reduction]
-        out_partials, out_partials.stride(0), out_partials.stride(1),
-        out_partials.shape[1], pids_x,  # output [partial reductions]
-        BLOCK_M=PARTIALS_BLOCK_M, BLOCK_MM=BLOCK_MM,  # constants
-        num_warps=8)
+        out_partials,
+        out_partials.stride(0),
+        out_partials.stride(1),
+        out_partials.shape[1],
+        pids_x,  # output [partial reductions]
+        BLOCK_M=PARTIALS_BLOCK_M,
+        BLOCK_MM=BLOCK_MM,  # constants
+        num_warps=8,
+    )
 
-    out_partials = out_partials[:cdiv(n_rows, PARTIALS_BLOCK_M), :]
+    out_partials = out_partials[: cdiv(n_rows, PARTIALS_BLOCK_M), :]
 
     return out_ret, out_partials
-

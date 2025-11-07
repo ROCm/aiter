@@ -29,12 +29,16 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
     # cast to float32:
     ref = ref.to(torch.float32).detach()
     tri = tri.to(torch.float32).detach()
-    assert ref.shape == tri.shape, f"Tensors must have same size {ref.shape=} {tri.shape=}"
+    assert (
+        ref.shape == tri.shape
+    ), f"Tensors must have same size {ref.shape=} {tri.shape=}"
 
     # deal with infinite elements:
     inf_mask_ref = torch.isinf(ref)
     inf_mask_tri = torch.isinf(tri)
-    assert torch.equal(inf_mask_ref, inf_mask_tri), "Tensor must have same infinite elements"
+    assert torch.equal(
+        inf_mask_ref, inf_mask_tri
+    ), "Tensor must have same infinite elements"
     refn = torch.where(inf_mask_ref, 0, ref)
     trin = torch.where(inf_mask_tri, 0, tri)
 
@@ -51,15 +55,23 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
     rms_err = torch.sqrt(torch.square(rel_err).mean()).item()
 
     if verbose:
-        print("%s maximum relative error = %s (threshold = %s)" % (description, max_err, maxtol))
-        print("%s RMS relative error = %s (threshold = %s)" % (description, rms_err, rmstol))
+        print(
+            "%s maximum relative error = %s (threshold = %s)"
+            % (description, max_err, maxtol)
+        )
+        print(
+            "%s RMS relative error = %s (threshold = %s)"
+            % (description, rms_err, rmstol)
+        )
 
     if max_err > maxtol:
         bad_idxs = torch.nonzero(rel_err > maxtol)
         num_nonzero = bad_idxs.size(0)
         bad_idxs = bad_idxs[:1000]
-        print("%d / %d mismatched elements (shape = %s) at coords %s" %
-              (num_nonzero, rel_err.numel(), tuple(rel_err.shape), bad_idxs.tolist()))
+        print(
+            "%d / %d mismatched elements (shape = %s) at coords %s"
+            % (num_nonzero, rel_err.numel(), tuple(rel_err.shape), bad_idxs.tolist())
+        )
 
         bad_idxs = bad_idxs.unbind(-1)
         print("ref values: ", ref[tuple(bad_idxs)].cpu())
@@ -76,6 +88,7 @@ def init_data(n_tokens, n_expts_tot, dtype=torch.float16, device="cuda"):
 
 n_tokens = [4, 7, 8, 64, 255, 256, 371, 911, 1023, 1024, 4096, 8192]
 
+
 @pytest.mark.parametrize("n_tokens", n_tokens)
 @pytest.mark.parametrize("n_expts_tot, n_expts_act", [(128, 4), (128, 32), (1500, 8)])
 @pytest.mark.parametrize("use_expt_indx", [False, True])
@@ -84,7 +97,9 @@ def test_op(n_tokens, n_expts_tot, n_expts_act, sm_first, use_expt_indx):
     device = "cuda"
     torch.manual_seed(2)
     n_gates_raw = n_tokens * n_expts_act
-    tri_logits = init_data(n_tokens, n_expts_tot, device=device, dtype=torch.float32).detach()
+    tri_logits = init_data(
+        n_tokens, n_expts_tot, device=device, dtype=torch.float32
+    ).detach()
     tri_logits[n_tokens:, :] = float("inf")  # should not be used
     ref_logits = tri_logits.clone().detach()
 
@@ -96,14 +111,20 @@ def test_op(n_tokens, n_expts_tot, n_expts_act, sm_first, use_expt_indx):
         ref_expt_indx = tri_expt_indx[:n_tokens]
     else:
         tri_expt_indx = ref_expt_indx = None
-    ref_routing_data, ref_gather, ref_scatter = routing_torch(ref_logits, n_expts_act, sm_first, ref_expt_indx)
-    tri_routing_data, tri_gather, tri_scatter = routing(tri_logits, n_expts_act, sm_first, tri_expt_indx)
+    ref_routing_data, ref_gather, ref_scatter = routing_torch(
+        ref_logits, n_expts_act, sm_first, ref_expt_indx
+    )
+    tri_routing_data, tri_gather, tri_scatter = routing(
+        tri_logits, n_expts_act, sm_first, tri_expt_indx
+    )
 
     def _assert_indx_equal(ref, tri):
-        assert_equal(ref, tri[:len(ref)])
-        assert torch.all(tri[len(ref):] == -1)
+        assert_equal(ref, tri[: len(ref)])
+        assert torch.all(tri[len(ref) :] == -1)
 
-    assert_close(ref_routing_data.gate_scal, tri_routing_data.gate_scal[:n_gates_raw], 2e-2, 4e-3)
+    assert_close(
+        ref_routing_data.gate_scal, tri_routing_data.gate_scal[:n_gates_raw], 2e-2, 4e-3
+    )
     assert_equal(ref_routing_data.expt_hist, tri_routing_data.expt_hist)
 
     ref_expt_data = ref_routing_data.expt_data
@@ -122,6 +143,7 @@ def test_op(n_tokens, n_expts_tot, n_expts_act, sm_first, use_expt_indx):
 
 def bench_routing():
     import triton.profiler as proton
+
     n_tokens = 8192
     n_expts_tot, n_expts_act = 128, 4
     tri_logits = init_data(n_tokens, n_expts_tot)
@@ -132,6 +154,7 @@ def bench_routing():
     proton.finalize()
     try:
         import os
+
         os.system("proton-viewer -m time/ms routing.hatchet")
     except Exception:
         pass

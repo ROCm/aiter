@@ -8,10 +8,22 @@ def _cdiv_pow2(n, log2_k):
 
 
 @triton.jit
-def _expt_data_compute_stage1(pid, Hist, n_expts_tot, TokenStart, TileStart, MDTileInfo, max_num_tiles, n_gates, tile_dim_log2: tl.constexpr, BLOCK: tl.constexpr, EQUAL_BLOCK: tl.constexpr):
+def _expt_data_compute_stage1(
+    pid,
+    Hist,
+    n_expts_tot,
+    TokenStart,
+    TileStart,
+    MDTileInfo,
+    max_num_tiles,
+    n_gates,
+    tile_dim_log2: tl.constexpr,
+    BLOCK: tl.constexpr,
+    EQUAL_BLOCK: tl.constexpr,
+):
     if EQUAL_BLOCK:
         offs_n = tl.arange(0, BLOCK)
-        hist_token = tl.load(Hist + offs_n) 
+        hist_token = tl.load(Hist + offs_n)
         hist_tile = _cdiv_pow2(hist_token, tile_dim_log2)
         token_starts = tl.cumsum(hist_token, 0) - hist_token
         tile_starts = tl.cumsum(hist_tile, 0) - hist_tile
@@ -21,7 +33,7 @@ def _expt_data_compute_stage1(pid, Hist, n_expts_tot, TokenStart, TileStart, MDT
         token_acc = tl.zeros([BLOCK], dtype=TokenStart.dtype.element_ty)
         tile_acc = tl.zeros([BLOCK], dtype=TileStart.dtype.element_ty)
         offs_n = tl.arange(0, BLOCK)
-        for i in range(0, n_expts_tot, BLOCK): 
+        for i in range(0, n_expts_tot, BLOCK):
             mask_n = offs_n < n_expts_tot
             hist_token = tl.load(Hist + offs_n, mask=mask_n, other=0)
             hist_tile = _cdiv_pow2(hist_token, tile_dim_log2)
@@ -29,7 +41,7 @@ def _expt_data_compute_stage1(pid, Hist, n_expts_tot, TokenStart, TileStart, MDT
             tile_starts = tl.cumsum(hist_tile, 0) - hist_tile + tile_acc
             token_acc += tl.sum(hist_token, 0)
             tile_acc += tl.sum(hist_tile, 0)
-            tl.store(TokenStart + offs_n, token_starts) 
+            tl.store(TokenStart + offs_n, token_starts)
             tl.store(TileStart + offs_n, tile_starts)
             offs_n += BLOCK
 
@@ -44,16 +56,20 @@ def _expt_data_compute_stage1(pid, Hist, n_expts_tot, TokenStart, TileStart, MDT
         MEMSET_BLOCK: tl.constexpr = 16
         for block_off in range(tile_off_last, max_num_tiles, MEMSET_BLOCK):
             block_offs = block_off + tl.arange(0, MEMSET_BLOCK)
-            tl.store(MDTileInfo + block_offs, 0xffffffff, mask=block_offs < max_num_tiles)
+            tl.store(
+                MDTileInfo + block_offs, 0xFFFFFFFF, mask=block_offs < max_num_tiles
+            )
 
 
 @triton.jit
-def _expt_data_compute_stage2(pid, Hist, TileStart, TileInfo, tile_dim_log2: tl.constexpr):
+def _expt_data_compute_stage2(
+    pid, Hist, TileStart, TileInfo, tile_dim_log2: tl.constexpr
+):
 
     expt_id = pid
-    
+
     n_tokens = tl.load(Hist + expt_id)
-    if n_tokens == 0: 
+    if n_tokens == 0:
         return
     BLOCK: tl.constexpr = 8
     n_blocks = _cdiv_pow2(n_tokens, tile_dim_log2)

@@ -45,7 +45,7 @@ def matmul_launch_metadata(grid, kernel, args):
             # recreate inverse GatherIndx.
             dst = torch.full_like(gindx, -1)
             idx = torch.arange(len(gindx), device=gindx.device, dtype=torch.int32)
-            mask = (gindx != -1)
+            mask = gindx != -1
             dst[gindx[mask]] = idx[mask]
             n_read_rows = (dst.view((-1, n_expts_act)) != -1).any(dim=1).sum()
         else:
@@ -82,8 +82,12 @@ def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: tl.constexpr):
 
 
 @triton.jit
-def unswizzle_mx_scale_cdna4(x, BLOCK_N: tl.constexpr, MX_SCALE_BLOCK_K: tl.constexpr,
-                             N_PRESHUFFLE_FACTOR: tl.constexpr = 32):
+def unswizzle_mx_scale_cdna4(
+    x,
+    BLOCK_N: tl.constexpr,
+    MX_SCALE_BLOCK_K: tl.constexpr,
+    N_PRESHUFFLE_FACTOR: tl.constexpr = 32,
+):
     x = x.reshape(BLOCK_N // N_PRESHUFFLE_FACTOR, MX_SCALE_BLOCK_K // 8, 4, 16, 2, 2, 1)
     x = x.permute(0, 5, 3, 1, 4, 2, 6)
     x = x.reshape(BLOCK_N, MX_SCALE_BLOCK_K)
@@ -120,14 +124,25 @@ def _compute_quant(tensor, scale):
 
 
 @triton.jit
-def _downcast_to_static_fp8(x_ptr, stride_x_m, stride_x_n,
-                      y_ptr, stride_y_m, stride_y_n,
-                      scale_ptr,
-                      M, N,
-                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+def _downcast_to_static_fp8(
+    x_ptr,
+    stride_x_m,
+    stride_x_n,
+    y_ptr,
+    stride_y_m,
+    stride_y_n,
+    scale_ptr,
+    M,
+    N,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
 
     x_dtype: tl.constexpr = x_ptr.dtype.element_ty
-    tl.static_assert((x_dtype == tl.bfloat16) or (x_dtype == tl.float16) or (x_dtype == tl.float32), f"{x_dtype=} must be bfloat16 or float16 or float32")
+    tl.static_assert(
+        (x_dtype == tl.bfloat16) or (x_dtype == tl.float16) or (x_dtype == tl.float32),
+        f"{x_dtype=} must be bfloat16 or float16 or float32",
+    )
 
     pid_m = tl.program_id(0).to(tl.int64)
     pid_n = tl.program_id(1).to(tl.int64)
@@ -156,34 +171,48 @@ def _downcast_to_static_fp8(x_ptr, stride_x_m, stride_x_n,
 
 
 @triton.jit
-def _reduce_grouped(X, stride_xb: tl.uint64, stride_xm: tl.uint64, stride_xn,  #
-                    Out, stride_om: tl.uint64, stride_on,  # output tensor
-                    InIndx, B, N,  #
-                    # fused activation function
-                    APPLY_SWIGLU: tl.constexpr, alpha, limit, ACTIVATION_REDUCTION_N: tl.constexpr,
-                    K: tl.constexpr, BLOCK_N: tl.constexpr, EVEN_N: tl.constexpr):
-    
+def _reduce_grouped(
+    X,
+    stride_xb: tl.uint64,
+    stride_xm: tl.uint64,
+    stride_xn,  #
+    Out,
+    stride_om: tl.uint64,
+    stride_on,  # output tensor
+    InIndx,
+    B,
+    N,  #
+    # fused activation function
+    APPLY_SWIGLU: tl.constexpr,
+    alpha,
+    limit,
+    ACTIVATION_REDUCTION_N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EVEN_N: tl.constexpr,
+):
+
     pid_t = tl.program_id(1)
     pid_n = tl.program_id(0)
-    
+
     BLOCK_N_OUT: tl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
     start = pid_t * K
     # load indices into a tuple
     if InIndx is None:
-        indxs = (pid_t, )
+        indxs = (pid_t,)
     else:
         indxs = ()
         for i in tl.static_range(0, K):
-            indxs = indxs + (tl.load(InIndx + start + i), )
+            indxs = indxs + (tl.load(InIndx + start + i),)
     XPtrs = X + (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) * stride_xn
     OutPtrs = Out + (pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT)) * stride_on
 
     acc = tl.zeros([BLOCK_N_OUT], dtype=tl.float32)
-    x_n_mask = pid_n * BLOCK_N + tl.arange(0, BLOCK_N) < N 
+    x_n_mask = pid_n * BLOCK_N + tl.arange(0, BLOCK_N) < N
     # accumulate contributions for this tile
     for i in tl.static_range(0, K):
         curr = tl.zeros([BLOCK_N], dtype=tl.float32)
-        # iterate over split_k partial values        
+        # iterate over split_k partial values
         for b in tl.range(0, B):
             x_row_ptr = XPtrs + indxs[i] * stride_xm + b * stride_xb
             if EVEN_N:
@@ -201,7 +230,7 @@ def _reduce_grouped(X, stride_xb: tl.uint64, stride_xm: tl.uint64, stride_xn,  #
         acc += curr
     # Compute per-32-col MXFP scales for this tile if requested
     Nrem = N // ACTIVATION_REDUCTION_N
-    
+
     # write-back for this tile
     out_ptr = OutPtrs + pid_t * stride_om
     if EVEN_N:
@@ -213,32 +242,61 @@ def _reduce_grouped(X, stride_xb: tl.uint64, stride_xm: tl.uint64, stride_xn,  #
 
 @triton.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a8w4(
-             Y, stride_y_k, stride_y_m, stride_y_n,
-             X, stride_x_m, stride_x_k,
-             XMxScale, stride_x_mx_m, stride_x_mx_k,
-             W, stride_w_e, stride_w_k, stride_w_n,
-             WMxScale, stride_w_mx_e, stride_w_mx_k, stride_w_mx_n,
-             X_static_scale, Quant_static_scale,
-             B, stride_b_e, # Bias
-             Gammas,
-             N, K, # shapes
-             # expt data
-             GatherIndx,
-             ExptHist, ExptOffs, ExptOffsSum, ExptData,
-             # true grid size
-             grid_m, grid_n,
-             # fused activation function
-             APPLY_SWIGLU: tl.constexpr, alpha, limit, ACTIVATION_REDUCTION_N: tl.constexpr,
-             # MoE config
-             N_EXPTS_ACT: tl.constexpr,
-             # optimization config
-             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-             GROUP_M: tl.constexpr, XCD_SWIZZLE: tl.constexpr,
-             # One of ["CDNA4", None]
-             SWIZZLE_MX_SCALE: tl.constexpr,
-             EVEN_K: tl.constexpr, MASK_K_LIMIT: tl.constexpr, SPLIT_K: tl.constexpr,
-             W_CACHE_MODIFIER: tl.constexpr,
-             UPCAST_INDICES: tl.constexpr = False):
+    Y,
+    stride_y_k,
+    stride_y_m,
+    stride_y_n,
+    X,
+    stride_x_m,
+    stride_x_k,
+    XMxScale,
+    stride_x_mx_m,
+    stride_x_mx_k,
+    W,
+    stride_w_e,
+    stride_w_k,
+    stride_w_n,
+    WMxScale,
+    stride_w_mx_e,
+    stride_w_mx_k,
+    stride_w_mx_n,
+    X_static_scale,
+    Quant_static_scale,
+    B,
+    stride_b_e,  # Bias
+    Gammas,
+    N,
+    K,  # shapes
+    # expt data
+    GatherIndx,
+    ExptHist,
+    ExptOffs,
+    ExptOffsSum,
+    ExptData,
+    # true grid size
+    grid_m,
+    grid_n,
+    # fused activation function
+    APPLY_SWIGLU: tl.constexpr,
+    alpha,
+    limit,
+    ACTIVATION_REDUCTION_N: tl.constexpr,
+    # MoE config
+    N_EXPTS_ACT: tl.constexpr,
+    # optimization config
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    XCD_SWIZZLE: tl.constexpr,
+    # One of ["CDNA4", None]
+    SWIZZLE_MX_SCALE: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    MASK_K_LIMIT: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    W_CACHE_MODIFIER: tl.constexpr,
+    UPCAST_INDICES: tl.constexpr = False,
+):
 
     tl.assume(stride_y_k >= 0)
     tl.assume(stride_y_m >= 0)
@@ -267,12 +325,18 @@ def _moe_gemm_a8w4(
     MX_PACK_DIVISOR: tl.constexpr = 32
     w_type: tl.constexpr = W.dtype.element_ty
     tl.static_assert(w_type == tl.uint8, "mx_weight_ptr must be uint8 or fp8")
-    tl.static_assert(WMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8")
-    tl.static_assert(BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR")
+    tl.static_assert(
+        WMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8"
+    )
+    tl.static_assert(
+        BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR"
+    )
     x_type: tl.constexpr = X.dtype.element_ty
     if is_x_microscaled:
         tl.static_assert(x_type == tl.float8e4nv, "mx_act_ptr must be float8e4nv")
-        tl.static_assert(XMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8")
+        tl.static_assert(
+            XMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8"
+        )
 
     OUT_BLOCK_N: tl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
     yN = N // ACTIVATION_REDUCTION_N
@@ -297,7 +361,7 @@ def _moe_gemm_a8w4(
     pid_emnk = pid
     if XCD_SWIZZLE != 1:
         pid_emnk = xcd_swizzle(pid_emnk, total_actual_tiles, XCD_SWIZZLE)
-    #pid_e = pid_emnk // (unpadded_m * grid_n * SPLIT_K)
+    # pid_e = pid_emnk // (unpadded_m * grid_n * SPLIT_K)
     pid_mnk = pid_emnk % (unpadded_m * grid_n * SPLIT_K)
     pid_k = pid_mnk % SPLIT_K
     pid_mn = pid_mnk // SPLIT_K
@@ -327,7 +391,11 @@ def _moe_gemm_a8w4(
         # no needs to bounds-check here because `offs_x_m` wraps around M dim
         offs_x_m = tl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
     offs_x_k = BLOCK_K * pid_k + tl.arange(0, BLOCK_K)
-    XPtrs = X + offs_x_m.to(index_type)[:, None] * stride_x_m + offs_x_k.to(index_type)[None, :] * stride_x_k
+    XPtrs = (
+        X
+        + offs_x_m.to(index_type)[:, None] * stride_x_m
+        + offs_x_k.to(index_type)[None, :] * stride_x_k
+    )
 
     W_K_DIVISOR: tl.constexpr = 2
     W_N_DIVISOR: tl.constexpr = 1
@@ -346,23 +414,39 @@ def _moe_gemm_a8w4(
         PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N: tl.constexpr = BLOCK_N
     offs_w_n_scale = (pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N)) % N
-    offs_w_n_scale = tl.max_contiguous(tl.multiple_of(offs_w_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N)
+    offs_w_n_scale = tl.max_contiguous(
+        tl.multiple_of(offs_w_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N
+    )
     # K dimension must be the last dimension for the scales
     offs_w_k_scale = PACKED_MX_BLOCK * pid_k + tl.arange(0, PACKED_MX_BLOCK)
-    WMxScalePtrs = WMxScale + offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
+    WMxScalePtrs = (
+        WMxScale
+        + offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
+        + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
+    )
 
     # B pointers
     offs_w_n = pid_n * PACKED_BLOCK_N_W + tl.arange(0, PACKED_BLOCK_N_W)
-    offs_w_n = tl.max_contiguous(tl.multiple_of(offs_w_n % (N // W_N_DIVISOR), PACKED_BLOCK_N_W), PACKED_BLOCK_N_W)
+    offs_w_n = tl.max_contiguous(
+        tl.multiple_of(offs_w_n % (N // W_N_DIVISOR), PACKED_BLOCK_N_W),
+        PACKED_BLOCK_N_W,
+    )
     offs_w_k = PACKED_BLOCK_K_W * pid_k + tl.arange(0, PACKED_BLOCK_K_W)
     W += expt_id * stride_w_e
-    WPtrs = W + (offs_w_k.to(index_type)[:, None] * stride_w_k + offs_w_n.to(index_type)[None, :] * stride_w_n)
+    WPtrs = W + (
+        offs_w_k.to(index_type)[:, None] * stride_w_k
+        + offs_w_n.to(index_type)[None, :] * stride_w_n
+    )
 
     if is_x_microscaled:
         if GatherIndx is None:
             XMxScale += start_m * stride_x_mx_m
         offs_x_k_scale = MX_SCALE_BLOCK_K * pid_k + tl.arange(0, MX_SCALE_BLOCK_K)
-        XMxScalePtrs = XMxScale + offs_x_m.to(index_type)[:, None] * stride_x_mx_m + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
+        XMxScalePtrs = (
+            XMxScale
+            + offs_x_m.to(index_type)[:, None] * stride_x_mx_m
+            + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
+        )
 
     num_k_iter = tl.cdiv(K, BLOCK_K * SPLIT_K)
     if not EVEN_K:
@@ -379,11 +463,17 @@ def _moe_gemm_a8w4(
         else:
             x_scales = tl.full((BLOCK_M, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
-            w_scales = unswizzle_mx_scale_cdna4(tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER), BLOCK_N, MX_SCALE_BLOCK_K)
+            w_scales = unswizzle_mx_scale_cdna4(
+                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+            )
         else:
             w_scales = tl.load(WMxScalePtrs)
 
-        acc = tl.dot_scaled(x, x_scales, "e4m3", w, w_scales, "e2m1", acc=acc, fast_math=True)
+        acc = tl.dot_scaled(
+            x, x_scales, "e4m3", w, w_scales, "e2m1", acc=acc, fast_math=True
+        )
 
         WMxScalePtrs += (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
         if is_x_microscaled:
@@ -401,18 +491,26 @@ def _moe_gemm_a8w4(
             mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
 
         x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0.0)
-        w = tl.load(WPtrs, mask=mask_w_k[:, None], other=0, cache_modifier=W_CACHE_MODIFIER)
+        w = tl.load(
+            WPtrs, mask=mask_w_k[:, None], other=0, cache_modifier=W_CACHE_MODIFIER
+        )
 
         if is_x_microscaled:
             x_scales = tl.load(XMxScalePtrs, mask=mask_x_k_scale[None, :])
         else:
             x_scales = tl.full((BLOCK_M, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
-            w_scales = unswizzle_mx_scale_cdna4(tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER), BLOCK_N, MX_SCALE_BLOCK_K)
+            w_scales = unswizzle_mx_scale_cdna4(
+                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+            )
         else:
             w_scales = tl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
 
-        acc = tl.dot_scaled(x, x_scales, "e4m3", w, w_scales, "e2m1", acc=acc, fast_math=True)
+        acc = tl.dot_scaled(
+            x, x_scales, "e4m3", w, w_scales, "e2m1", acc=acc, fast_math=True
+        )
 
     # scalar fp8 scale
     if X_static_scale is not None:
@@ -431,11 +529,17 @@ def _moe_gemm_a8w4(
         acc = acc + bias[None, :]
     if APPLY_SWIGLU and SPLIT_K == 1:
         out = _swiglu(acc, alpha, limit)
-        tl.static_assert(out.shape[1] == OUT_BLOCK_N, f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})")
+        tl.static_assert(
+            out.shape[1] == OUT_BLOCK_N,
+            f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
+        )
         offs_y_n = OUT_BLOCK_N * pid_n + tl.arange(0, OUT_BLOCK_N)
         mask_n = offs_y_n < yN
     else:
-        tl.static_assert(ACTIVATION_REDUCTION_N == 1, "Activation reduction must be 1 if no activation fn is provided")
+        tl.static_assert(
+            ACTIVATION_REDUCTION_N == 1,
+            "Activation reduction must be 1 if no activation fn is provided",
+        )
         out = acc
     if Gammas is not None:
         gammas = tl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
@@ -446,6 +550,10 @@ def _moe_gemm_a8w4(
     # write-back
     Y += start_m * stride_y_m
     offs_y_m = offs_m
-    YPtrs = Y + offs_y_m.to(index_type)[:, None] * stride_y_m + offs_y_n.to(index_type)[None, :] * stride_y_n
+    YPtrs = (
+        Y
+        + offs_y_m.to(index_type)[:, None] * stride_y_m
+        + offs_y_n.to(index_type)[None, :] * stride_y_n
+    )
     mask = mask_m[:, None] & mask_n[None, :]
     tl.store(YPtrs, out, mask=mask)

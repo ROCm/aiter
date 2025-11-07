@@ -50,7 +50,11 @@ class RoutingData:
         if n_rows <= self.n_expts_tot:
             return n_rows
         else:
-            return triton.cdiv(max(n_rows - self.n_expts_tot + 1, 0), block_m) + self.n_expts_tot - 1
+            return (
+                triton.cdiv(max(n_rows - self.n_expts_tot + 1, 0), block_m)
+                + self.n_expts_tot
+                - 1
+            )
 
 
 # --------------------------
@@ -76,25 +80,49 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
     gate_indx = combined_indx[n_gates:]
     gate_scal = torch.empty(n_gates, dtype=dtype, device=device)
 
-    token_offs_raw, token_offs_pad, block_pid_map, blocks1a, BLOCK_A, block_m_log2 = _compute_expt_data_internal(
-        n_expts_tot, n_gates, block_m, device)
+    token_offs_raw, token_offs_pad, block_pid_map, blocks1a, BLOCK_A, block_m_log2 = (
+        _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device)
+    )
 
     blocks1b = cdiv(n_tokens, HIST_BLOCK_M)
 
     indx_offs = partial_hist
 
-    _combined_routing[(blocks1a + blocks1b, )](
-        topk_indx, gate_indx, gate_scal,  # outputs
-        expt_scal, expt_indx, indx_offs, indx_offs.stride(0), indx_offs.stride(1),  # inputs
+    _combined_routing[(blocks1a + blocks1b,)](
+        topk_indx,
+        gate_indx,
+        gate_scal,  # outputs
+        expt_scal,
+        expt_indx,
+        indx_offs,
+        indx_offs.stride(0),
+        indx_offs.stride(1),  # inputs
         n_gates,  # input shape
-        HIST_BLOCK_M, n_tokens % HIST_BLOCK_M == 0, n_expts_act,  # constants
-        hist, n_expts_tot, token_offs_raw, token_offs_pad,  #
-        blocks1a, block_pid_map, block_pid_map.shape[0],  #
-        block_m_log2, BLOCK_A=BLOCK_A, EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
-        num_warps=1
+        HIST_BLOCK_M,
+        n_tokens % HIST_BLOCK_M == 0,
+        n_expts_act,  # constants
+        hist,
+        n_expts_tot,
+        token_offs_raw,
+        token_offs_pad,  #
+        blocks1a,
+        block_pid_map,
+        block_pid_map.shape[0],  #
+        block_m_log2,
+        BLOCK_A=BLOCK_A,
+        EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
+        num_warps=1,
     )
 
-    return hist, topk_indx, gate_indx, gate_scal, token_offs_raw, token_offs_pad, block_pid_map
+    return (
+        hist,
+        topk_indx,
+        gate_indx,
+        gate_scal,
+        token_offs_raw,
+        token_offs_pad,
+        block_pid_map,
+    )
 
 
 # --------------------------
@@ -119,16 +147,18 @@ def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
     pad = lambda x: cdiv(x, BLOCK) * BLOCK
     dtype = torch.int32
 
-    token_offs_combined = torch.empty((2, pad(n_expts_tot + 1)), dtype=dtype, device=device)
+    token_offs_combined = torch.empty(
+        (2, pad(n_expts_tot + 1)), dtype=dtype, device=device
+    )
 
-    token_offs_raw = token_offs_combined[0][:n_expts_tot + 1]
-    token_offs_pad = token_offs_combined[1][:n_expts_tot + 1]
+    token_offs_raw = token_offs_combined[0][: n_expts_tot + 1]
+    token_offs_pad = token_offs_combined[1][: n_expts_tot + 1]
 
-    #block_pid_map = torch.empty((pad(max_n_tiles),), dtype=dtype, device=device)
+    # block_pid_map = torch.empty((pad(max_n_tiles),), dtype=dtype, device=device)
     block_pid_map = torch.empty((max_n_tiles,), dtype=dtype, device=device)
-    #block_pid_map = block_pid_map[:max_n_tiles]
+    # block_pid_map = block_pid_map[:max_n_tiles]
 
-    blocks1 = n_expts_tot 
+    blocks1 = n_expts_tot
     return token_offs_raw, token_offs_pad, block_pid_map, blocks1, BLOCK, block_m_log2
 
 
@@ -141,22 +171,40 @@ def routing(logits, n_expts_act, sm_first=False, expt_indx=None):
     HIST_BLOCK_M = 32
 
     from .topk import topk
+
     if sm_first:
         logits = torch.softmax(logits, dim=-1)
-    expt_scal, expt_indx, bitmatrix = topk(logits, n_expts_act, apply_softmax=not sm_first, y_indx=expt_indx, HIST_BLOCK_M=HIST_BLOCK_M)
+    expt_scal, expt_indx, bitmatrix = topk(
+        logits,
+        n_expts_act,
+        apply_softmax=not sm_first,
+        y_indx=expt_indx,
+        HIST_BLOCK_M=HIST_BLOCK_M,
+    )
 
     num_tokens, n_expts_tot = logits.shape
     m = num_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
-    hist, topk_indx, gate_indx, gate_scal, token_offs_raw, token_offs_pad, block_pid_map = sort_tokens(
-        expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
+    (
+        hist,
+        topk_indx,
+        gate_indx,
+        gate_scal,
+        token_offs_raw,
+        token_offs_pad,
+        block_pid_map,
+    ) = sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
 
     # pack the matmul data structure
     gather_indx = topk_indx
     scatter_indx = gate_indx
-    return RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data), gather_indx, scatter_indx
+    return (
+        RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data),
+        gather_indx,
+        scatter_indx,
+    )
 
 
 # --------------------------
@@ -224,7 +272,9 @@ def routing_torch(logits, n_expts_act, sm_first=False, expt_indx=None):
     topk_indx = torch.argsort(expt_indx, stable=True)
     gate_indx = torch.argsort(topk_indx, stable=True)
     gate_scal = expt_scal[topk_indx]
-    hist = torch.histc(expt_indx, bins=n_expts_tot, max=n_expts_tot - 1).int()  # histogram of tokens over experts
+    hist = torch.histc(
+        expt_indx, bins=n_expts_tot, max=n_expts_tot - 1
+    ).int()  # histogram of tokens over experts
     # pack the matmul data structure
     gather_indx = topk_indx.int()
     scatter_indx = gate_indx.int()
@@ -232,4 +282,8 @@ def routing_torch(logits, n_expts_act, sm_first=False, expt_indx=None):
     tokens_per_expt = max(1, n_gates_pad // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
     expt_data = compute_expt_data_torch(hist, n_expts_tot, n_gates_pad, block_m)
-    return RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data), gather_indx, scatter_indx
+    return (
+        RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data),
+        gather_indx,
+        scatter_indx,
+    )

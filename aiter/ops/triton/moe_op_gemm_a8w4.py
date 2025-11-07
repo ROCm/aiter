@@ -9,7 +9,11 @@ import triton
 from enum import Enum, auto
 import math
 from aiter.ops.triton.moe_routing.routing import RoutingData
-from aiter.ops.triton._triton_kernels.moe_op_gemm_a8w4 import _moe_gemm_a8w4, _reduce_grouped, _downcast_to_static_fp8
+from aiter.ops.triton._triton_kernels.moe_op_gemm_a8w4 import (
+    _moe_gemm_a8w4,
+    _reduce_grouped,
+    _downcast_to_static_fp8,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -29,7 +33,18 @@ def should_upcast_indices(*args):
     return any(tensor is not None and can_overflow_int32(tensor) for tensor in args)
 
 
-def allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, routing_data, gather_indx, scatter_indx, block_m, split_k):
+def allocate_output(
+    x,
+    w,
+    out_dtype,
+    reduction_n_matmul,
+    reduction_n_reduction,
+    routing_data,
+    gather_indx,
+    scatter_indx,
+    block_m,
+    split_k,
+):
     # ---- output ------
     N = w.shape[-1]
     # by default - M is number of rows in the activations
@@ -41,7 +56,9 @@ def allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, 
     if routing_data.n_expts_act == 1 or scatter_indx is None:
         y_rows = M
     else:
-        y_rows = scatter_indx.shape[0] // routing_data.n_expts_act # compressed number of rows
+        y_rows = (
+            scatter_indx.shape[0] // routing_data.n_expts_act
+        )  # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
     matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
@@ -52,12 +69,7 @@ def allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, 
     return matmul_output, final_output
 
 
-def get_kernel_config(
-    m,
-    n,
-    k,
-    routing_data
-):
+def get_kernel_config(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -88,7 +100,7 @@ def get_kernel_config(
         "split_k": split_k,
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1
+        "kpack": 1,
     }
     return ret
 
@@ -118,18 +130,34 @@ def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
     grid_m = triton.cdiv(x.shape[0], BLOCK_M)
     grid_n = triton.cdiv(x.shape[1], BLOCK_N)
 
-    _downcast_to_static_fp8[(grid_m, grid_n)](x, x.stride(0), x.stride(1),
-                                            y, y.stride(0), y.stride(1),
-                                            scale,
-                                            M, N, BLOCK_M, BLOCK_N,
-                                            num_warps=8)
+    _downcast_to_static_fp8[(grid_m, grid_n)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        y,
+        y.stride(0),
+        y.stride(1),
+        scale,
+        M,
+        N,
+        BLOCK_M,
+        BLOCK_N,
+        num_warps=8,
+    )
 
     return y
 
 
-def reduce_grouped(x: torch.Tensor, indx: torch.Tensor, out: torch.Tensor,
-                   apply_swiglu = False, alpha = 1.0, limit = 1.0, reduction_n = 1,
-                   out_dtype: bool = None):
+def reduce_grouped(
+    x: torch.Tensor,
+    indx: torch.Tensor,
+    out: torch.Tensor,
+    apply_swiglu=False,
+    alpha=1.0,
+    limit=1.0,
+    reduction_n=1,
+    out_dtype: bool = None,
+):
     """
     In-place grouped row reduction.
 
@@ -170,37 +198,55 @@ def reduce_grouped(x: torch.Tensor, indx: torch.Tensor, out: torch.Tensor,
     assert x.shape[-1] % reduction_n == 0
     BLOCK_N = 512
     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
-    
+
     _reduce_grouped[(num_blocks, num_groups)](
-        x, x.stride(0), x.stride(1), x.stride(2),  #
-        out, out.stride(0), out.stride(1),  #
+        x,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),  #
+        out,
+        out.stride(0),
+        out.stride(1),  #
         indx,  #
-        x.shape[0], x.shape[-1],  #
-        apply_swiglu, alpha, limit, reduction_n,
-        BLOCK_N=BLOCK_N, EVEN_N=(x.shape[-1] % BLOCK_N == 0), K=K,  #
+        x.shape[0],
+        x.shape[-1],  #
+        apply_swiglu,
+        alpha,
+        limit,
+        reduction_n,
+        BLOCK_N=BLOCK_N,
+        EVEN_N=(x.shape[-1] % BLOCK_N == 0),
+        K=K,  #
         num_warps=2,  #
     )
     return out
+
 
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
 
-def moe_gemm_a8w4(x, w, x_scales, w_scales, 
-               x_static_scale = None, quant_static_scale = None,
-               bias = None,
-               routing_data: RoutingData | None = None,
-               gather_indx = None,
-               scatter_indx = None,
-               gammas = None,
-               swizzle_mx_scale = None,
-               out_dtype = torch.bfloat16,
-               apply_swiglu = False,
-               alpha = 1.0,
-               limit = 1.0,
-               unpadded_N = None,
-               unpadded_K = None
-               ):
+
+def moe_gemm_a8w4(
+    x,
+    w,
+    x_scales,
+    w_scales,
+    x_static_scale=None,
+    quant_static_scale=None,
+    bias=None,
+    routing_data: RoutingData | None = None,
+    gather_indx=None,
+    scatter_indx=None,
+    gammas=None,
+    swizzle_mx_scale=None,
+    out_dtype=torch.bfloat16,
+    apply_swiglu=False,
+    alpha=1.0,
+    limit=1.0,
+    unpadded_N=None,
+    unpadded_K=None,
+):
     """
     Y[:, :] = 0.
     for e in num_experts:
@@ -208,7 +254,8 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
     """
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     x_has_mx = x_scales is not None
-    if x_has_mx: assert x.stride(-1) == 1, "'x' must be row-major when it has data-type mxfp"
+    if x_has_mx:
+        assert x.stride(-1) == 1, "'x' must be row-major when it has data-type mxfp"
     if x_has_mx:
         stride_x_mx_m = x_scales.stride(0)
         stride_x_mx_k = x_scales.stride(1)
@@ -236,7 +283,18 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
         apply_swiglu_reduction = False
         reduction_n_reduction = 1
     # allocate output memory
-    y, y_final = allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, routing_data, gather_indx, scatter_indx, config["block_m"], config["split_k"])
+    y, y_final = allocate_output(
+        x,
+        w,
+        out_dtype,
+        reduction_n_matmul,
+        reduction_n_reduction,
+        routing_data,
+        gather_indx,
+        scatter_indx,
+        config["block_m"],
+        config["split_k"],
+    )
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
     expt_data = routing_data.expt_data
@@ -258,19 +316,42 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
     _moe_gemm_a8w4[(grid,)](
-        y, y.stride(0), y.stride(1), y.stride(2),
-        x, x.stride(0), x.stride(1),
-        x_scales, stride_x_mx_m, stride_x_mx_k,
-        w, w.stride(0), w.stride(1), w.stride(2),
-        w_scales, w_scales.stride(0), w_scales.stride(1), w_scales.stride(2),
-        x_static_scale, quant_static_scale,
-        bias, stride_bias,
+        y,
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        x,
+        x.stride(0),
+        x.stride(1),
+        x_scales,
+        stride_x_mx_m,
+        stride_x_mx_k,
+        w,
+        w.stride(0),
+        w.stride(1),
+        w.stride(2),
+        w_scales,
+        w_scales.stride(0),
+        w_scales.stride(1),
+        w_scales.stride(2),
+        x_static_scale,
+        quant_static_scale,
+        bias,
+        stride_bias,
         gammas,
-        N, K,
+        N,
+        K,
         gather_indx,
-        expt_hist, expt_token_offs_raw, expt_hist_sum, expt_block_pid_map,
-        grid_m, grid_n,
-        apply_swiglu_matmul, alpha, limit, reduction_n_matmul,
+        expt_hist,
+        expt_token_offs_raw,
+        expt_hist_sum,
+        expt_block_pid_map,
+        grid_m,
+        grid_n,
+        apply_swiglu_matmul,
+        alpha,
+        limit,
+        reduction_n_matmul,
         routing_data.n_expts_act,
         config["block_m"],
         config["block_n"],
@@ -287,21 +368,31 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
         UPCAST_INDICES=should_upcast_indices(x, w, y),
         waves_per_eu=config["waves_per_eu"],
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        kpack=config["kpack"])
+        kpack=config["kpack"],
+    )
     # Build grouped reduction inputs in a uniform way
-    group_indx = None if scatter_indx is None else scatter_indx.view(-1, routing_data.n_expts_act)
+    group_indx = (
+        None
+        if scatter_indx is None
+        else scatter_indx.view(-1, routing_data.n_expts_act)
+    )
     y_final = reduce_grouped(
         y,
         group_indx,
         y_final,
-        apply_swiglu_reduction, alpha, limit, reduction_n_reduction,
+        apply_swiglu_reduction,
+        alpha,
+        limit,
+        reduction_n_reduction,
         out_dtype=out_dtype,
     )
     return y_final
 
+
 # -----------------------------------------------------------------------------
 # Reference Implementation
 # -----------------------------------------------------------------------------
+
 
 def swiglu_torch(a, alpha, limit):
     a_gelu = a[..., ::2]
@@ -316,15 +407,18 @@ def swiglu_torch(a, alpha, limit):
     return out
 
 
-def moe_gemm_torch(x, w, bias,
-                 routing_data: RoutingData = None,
-                 gather_indx = None,
-                 scatter_indx = None,
-                 gammas = None,
-                 apply_swiglu = False,
-                 alpha = 1.0,
-                 limit = 1.0
-                 ):
+def moe_gemm_torch(
+    x,
+    w,
+    bias,
+    routing_data: RoutingData = None,
+    gather_indx=None,
+    scatter_indx=None,
+    gammas=None,
+    apply_swiglu=False,
+    alpha=1.0,
+    limit=1.0,
+):
     assert x.dtype.itemsize > 1
     assert w.dtype.itemsize > 1
     if bias is not None and bias.ndim == 1:
@@ -365,5 +459,5 @@ def moe_gemm_torch(x, w, bias,
     src_idx = scatter_indx.view(-1, n_expts_act)
     for i in range(n_rows):
         out[i, :] = y[src_idx[i], :].float().sum(0)
-        
+
     return out

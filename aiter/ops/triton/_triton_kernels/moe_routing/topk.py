@@ -4,7 +4,9 @@ import triton.language as tl
 
 @triton.jit
 def get_topmask_and_fullmask(x):
-    tl.static_assert(x.dtype.is_int_unsigned(), "floating-point value must be passed as bits")
+    tl.static_assert(
+        x.dtype.is_int_unsigned(), "floating-point value must be passed as bits"
+    )
     tm: tl.constexpr = 1 << (-1 + x.dtype.primitive_bitwidth)
     fm: tl.constexpr = (1 << x.dtype.primitive_bitwidth) - 1
     tm_arr = tl.full(x.shape, tm, dtype=x.dtype)
@@ -36,8 +38,16 @@ def key_to_indx(indx, N_EXPTS_PAD: tl.constexpr):
 
 
 @triton.jit
-def streaming_topk(X, stride_xm, n_expts_tot, offs_m, mask_m, N_EXPTS_PAD: tl.constexpr, N_EXPTS_ACT: tl.constexpr,
-                   BLOCK_N: tl.constexpr):
+def streaming_topk(
+    X,
+    stride_xm,
+    n_expts_tot,
+    offs_m,
+    mask_m,
+    N_EXPTS_PAD: tl.constexpr,
+    N_EXPTS_ACT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
     x_nbits: tl.constexpr = X.dtype.element_ty.primitive_bitwidth
     x_utype: tl.constexpr = tl.dtype(f"uint{x_nbits}")
     if x_nbits < 16:
@@ -87,21 +97,40 @@ def streaming_topk(X, stride_xm, n_expts_tot, offs_m, mask_m, N_EXPTS_PAD: tl.co
 
 
 @triton.jit
-def _topk(X, stride_xm,  # inputs
-                  Yv, Yi, stride_ym,  # topk values/indices
-                  USE_PROVIDED_INDX: tl.constexpr, Bits, stride_rm, stride_rn,  # bitmatrix
-                  n_rows, n_expts_tot,  # shape
-                  S, BLOCK_S: tl.constexpr, s_blocks,  # thing to memset
-                  SP, BLOCK_SP: tl.constexpr, sp_blocks, sp_size,
-                  APPLY_SOFTMAX: tl.constexpr,  # constant
-                  BLOCK_M: tl.constexpr, N_EXPTS_PAD: tl.constexpr, N_EXPTS_ACT: tl.constexpr, BLOCK_N: tl.constexpr):
+def _topk(
+    X,
+    stride_xm,  # inputs
+    Yv,
+    Yi,
+    stride_ym,  # topk values/indices
+    USE_PROVIDED_INDX: tl.constexpr,
+    Bits,
+    stride_rm,
+    stride_rn,  # bitmatrix
+    n_rows,
+    n_expts_tot,  # shape
+    S,
+    BLOCK_S: tl.constexpr,
+    s_blocks,  # thing to memset
+    SP,
+    BLOCK_SP: tl.constexpr,
+    sp_blocks,
+    sp_size,
+    APPLY_SOFTMAX: tl.constexpr,  # constant
+    BLOCK_M: tl.constexpr,
+    N_EXPTS_PAD: tl.constexpr,
+    N_EXPTS_ACT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
 
     pid = tl.program_id(0)
     if isinstance(n_rows, tl.tensor) and n_rows.dtype.is_ptr():
         n_rows = tl.load(n_rows)
 
     if pid < s_blocks:
-        tl.store(S + BLOCK_S * pid + tl.arange(0, BLOCK_S), tl.zeros([BLOCK_S], tl.int32))
+        tl.store(
+            S + BLOCK_S * pid + tl.arange(0, BLOCK_S), tl.zeros([BLOCK_S], tl.int32)
+        )
     elif pid < s_blocks + sp_blocks:
         offs = BLOCK_SP * (pid - s_blocks) + tl.arange(0, BLOCK_SP)
         tl.store(SP + offs, tl.zeros([BLOCK_SP], tl.int32), mask=offs < sp_size)
@@ -124,12 +153,22 @@ def _topk(X, stride_xm,  # inputs
         Xv_ptrs = X + offs_m[:, None] * stride_xm + y_indices
         y_values = tl.load(Xv_ptrs, mask=mask_m)
     else:
-        y_values, y_indices = streaming_topk(X, stride_xm, n_expts_tot, offs_m, mask_m,  #
-                                             N_EXPTS_PAD, N_EXPTS_ACT, BLOCK_N)
+        y_values, y_indices = streaming_topk(
+            X,
+            stride_xm,
+            n_expts_tot,
+            offs_m,
+            mask_m,  #
+            N_EXPTS_PAD,
+            N_EXPTS_ACT,
+            BLOCK_N,
+        )
 
     # normalize selected values
     if APPLY_SOFTMAX:
-        y_values = tl.softmax(y_values.to(tl.float32), dim=1, keep_dims=True).to(x_dtype)
+        y_values = tl.softmax(y_values.to(tl.float32), dim=1, keep_dims=True).to(
+            x_dtype
+        )
 
     # write back
     Yv_ptrs = Yv + offs_m[:, None] * stride_ym + offs_y_n[None, :]
@@ -144,7 +183,9 @@ def _topk(X, stride_xm,  # inputs
     loop_iterations = N_EXPTS_PAD // BLOCK_N
     for i in range(loop_iterations):
         offs_r_n = tl.arange(0, BLOCK_N // 32) + i * (BLOCK_N // 32)
-        y2 = tl.where(y_div[:, :, None] == offs_r_n[None, None, :], (1 << y_rem)[:, :, None], 0)
+        y2 = tl.where(
+            y_div[:, :, None] == offs_r_n[None, None, :], (1 << y_rem)[:, :, None], 0
+        )
         r = tl.reduce_or(y2, axis=1)
         BitsPtrs = Bits + offs_m[:, None] * stride_rm + offs_r_n[None, :] * stride_rn
         tl.store(BitsPtrs, r, mask=mask_m)
