@@ -381,10 +381,6 @@ def test_fmoe(
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
-    # elif WQDType != dtypes.fp4x2 and (get_gfx() in ["gfx950"]):
-    #     inst_K = 128 // w1_qt_aiter.element_size()
-    #     w1_qt_aiter = shuffle_weight_NK(w1_qt_aiter, 16, inst_K)
-    #     w2_qt_aiter = shuffle_weight_NK(w2_qt_aiter, 16, inst_K)
     elif WQDType != dtypes.fp4x2:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))

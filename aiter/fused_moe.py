@@ -529,6 +529,7 @@ def get_2stage_cfgs(
         cfg_2stages = pd.read_csv(tune_file)
         cfg_2stages = cfg_2stages.set_index(
             [
+                "cu_num",
                 "token",
                 "model_dim",
                 "inter_dim",
