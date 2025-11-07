@@ -1320,6 +1320,7 @@ namespace py = pybind11;
         .value("No", ActivationType::No)                 \
         .value("Silu", ActivationType::Silu)             \
         .value("Gelu", ActivationType::Gelu)             \
+        .value("Swiglu", ActivationType::Swiglu)         \
         .export_values();                                \
     pybind11::implicitly_convertible<int, QuantType>();  \
     pybind11::implicitly_convertible<int, ActivationType>();
