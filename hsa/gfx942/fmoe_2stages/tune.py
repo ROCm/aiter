@@ -1459,7 +1459,7 @@ class FmoeTuner(TunerCommon):
             not doweight_stage1,
         )
         for blockM in blockMs:
-            if blockM in [32, 64, 128] and use_g1u1:
+            if blockM in [16, 32, 64, 128] and use_g1u1:
                 for kernel in ck_stage1_kernels.values():
                     if kernel.MPerBlock != blockM:
                         continue
@@ -1568,7 +1568,7 @@ class FmoeTuner(TunerCommon):
         args,
     ):
         mp_num = args.mp
-        blockMs = [32, 64, 128]
+        blockMs = [16, 32, 64, 128]
         args = self.keys
         print(untunedf[args])
         tasks = []

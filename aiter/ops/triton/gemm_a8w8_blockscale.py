@@ -28,19 +28,23 @@ def gemm_a8w8_blockscale(
     skip_reduce: Optional[bool] = False,
 ):
     """
-    Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
+    Computes 8 bit matrix multiplication Y = X @ W^T using block-wise quantization scales.
+    Each block along K and N dimensions has independent scale factors for fine-grained quantization.
 
-    Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
-    - X_scale: Scale tensor for X with shape (M, *scale_k).
-    - W_scale: Scale tensor for W with shape (**scale_n, *scale_k).
+    Args:
+        x (torch.Tensor): INT8 input matrix with shape (M, K).
+        w (torch.Tensor): INT8 weight matrix with shape (N, K), internally transposed.
+        x_scale (torch.Tensor): Block-wise scale for x with shape (M, scale_k).
+            scale_k = ceil(K / scale_block_size_k).
+        w_scale (torch.Tensor): Block-wise scale for w with shape (scale_n, scale_k).
+            scale_n = ceil(N / scale_block_size_n).
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
-
-    *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k -> ceil_div(K, scale_block_size_k)
-    **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n -> ceil_div(N, scale_block_size_n)
+        torch.Tensor: Output with shape (M, N).
     """
     _LOGGER.info(
         f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
