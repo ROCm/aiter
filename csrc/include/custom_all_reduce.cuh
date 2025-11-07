@@ -976,6 +976,7 @@ namespace aiter
   template <typename T, int tnum, int n_loop>
   __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm_naive(
       RankSignals sg,
+      T* __restrict__ residual_out,
       T* __restrict__ results,
       T* __restrict__ weight,
       float eps,
@@ -1028,6 +1029,7 @@ namespace aiter
         }
         int write_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
         *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
+        *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp[n_iter];
       }
     }
   }
@@ -1039,6 +1041,7 @@ namespace aiter
   template <typename T, int tnum, int n_loop>
   __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(
       RankSignals sg,
+      T* __restrict__ residual_out,
       T* __restrict__ results,
       T* __restrict__ weight,
       float eps,
@@ -1096,6 +1099,7 @@ namespace aiter
           }
           int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
           *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
+          *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp[n_iter];
         }
       }
     }
@@ -1104,6 +1108,7 @@ namespace aiter
   template <typename T, int n_loop>
   __global__ void __launch_bounds__(256, 1) local_device_load_rmsnorm_512n(
       RankSignals sg,
+      T* __restrict__ residual_out,
       T* __restrict__ results,
       T* __restrict__ weight,
       float eps,
@@ -1156,6 +1161,7 @@ namespace aiter
         }
         int write_idx = bid * 64 * n_loop + n_iter * 64 + lane_id;
         *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
+        *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp[n_iter];
       }
     }
   }
@@ -1489,17 +1495,17 @@ namespace aiter
   name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
                                                  rank_, size);
 
-#define dispatch(ngpus, name)   \
-    do                          \
-    {                           \
-      if (bytes % 128 == 0)     \
-      {                         \
-        KL(ngpus, name)         \
-      }                         \
-      else                      \
-      {                         \
-        KL(ngpus, name##_naive) \
-      }                         \
+#define dispatch(ngpus, name)                   \
+    do                                          \
+    {                                           \
+      if (bytes % 128 == 0 && world_size_ != 6) \
+      {                                         \
+        KL(ngpus, name)                         \
+      }                                         \
+      else                                      \
+      {                                         \
+        KL(ngpus, name##_naive)                 \
+      }                                         \
     } while(0)
 
 #define REDUCE_CASE(ngpus)                         \
@@ -1581,7 +1587,7 @@ namespace aiter
   }
 
   template <typename T>
-  void dispatchFusedAllReduceRMSNorm(hipStream_t stream, T* input, T* output, T* weight, float eps, int m, int n)
+  void dispatchFusedAllReduceRMSNorm(hipStream_t stream, T* input, T* residual_out, T* output, T* weight, float eps, int m, int n)
   {
     auto d = packed_t<T>::P::size;
     int size = m * n;
@@ -1627,12 +1633,12 @@ namespace aiter
       grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
     };
 
-#define launch_fused_allreduce_rmsnorm(template_kernel)                                   \
-    do                                                                                    \
-    {                                                                                     \
-      auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);                   \
-      setGrid(naive_grid_size, kernel_ptr);                                               \
-      template_kernel<<<grid, block, 0, stream>>>(sg_, output, weight, eps, rank_, m, n); \
+#define launch_fused_allreduce_rmsnorm(template_kernel)                                                 \
+    do                                                                                                  \
+    {                                                                                                   \
+      auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);                                 \
+      setGrid(naive_grid_size, kernel_ptr);                                                             \
+      template_kernel<<<grid, block, 0, stream>>>(sg_, residual_out, output, weight, eps, rank_, m, n); \
     } while (0)
 
     if (n_bytes % 1024 == 0)
