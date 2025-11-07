@@ -44,8 +44,6 @@ def moe_sorting(
     device = topk_ids.device
     M, topk = topk_ids.shape
     max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
-    if M * topk <= num_experts:
-        max_num_tokens_padded = M * topk * block_size
 
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     sorted_ids = torch.empty((max_num_tokens_padded,), dtype=dtypes.i32, device=device)
