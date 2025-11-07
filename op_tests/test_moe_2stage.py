@@ -688,7 +688,7 @@ l_tokenNum = [
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu]
 l_quant = [
-    (aiter.QuantType.No, None, None), # a16w16
+    (aiter.QuantType.No, None, None),  # a16w16
     (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
@@ -824,7 +824,7 @@ for (
         dtypes.fp4x2,
     ):
         for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
-             for m in l_tokenNum:
+            for m in l_tokenNum:
                 ret = test_fmoe(
                     dtype,
                     m,
