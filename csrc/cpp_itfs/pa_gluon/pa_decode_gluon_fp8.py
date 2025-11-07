@@ -20,7 +20,7 @@ import aiter
 import torch
 
 
-def compile(
+def compile_attention_kernel(
     query_seq_len: int,
     head_size: int,
     query_group_size: int,
@@ -45,13 +45,11 @@ def compile(
              fp8_max_value, value_transposed, is_causal, compute_type),
         )
 
-    # if not_built(func_name):
-    if True:
+    if not_built(func_name):
         head_size_pow2 = triton.next_power_of_2(head_size)
         query_group_size_pow2 = triton.next_power_of_2(query_group_size)
         kv_block_size_pow2 = triton.next_power_of_2(kv_block_size)
         query_group_size_original = query_group_size
-        print(f"query_group_size_pow2={query_group_size_pow2}")
         if query_group_size_pow2 < 16:
             query_group_size_pow2 = 16
 
@@ -69,7 +67,6 @@ def compile(
             "*fp32:16",  # query_scale
             "*fp32:16",  # key_scale
             "*fp32:16",  # value_scale
-            # "*fp32:16",  # alibi_slopes
             "i32",       # stride_max_logits_seq
             "i32",       # stride_max_logits_head
             "i32",       # stride_max_logits_part
@@ -112,10 +109,13 @@ def compile(
             f"{is_causal}",
         ]
         signature = ",".join(signature_parts)
+        gluon_kernel_name = "paged_attention_decode_v2_gluon_fp8"
+        if kv_block_size > sequence_partition_size:
+            gluon_kernel_name = "paged_attention_decode_v2_gluon_large_block_fp8"
 
         compile_args = CompileGluonArgs(
             path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_triton_gluon_fp8.py",
-            kernel_name="paged_attention_decode_v2_gluon_fp8",
+            kernel_name=gluon_kernel_name,
             signature=signature,
             grid="num_seqs,num_kv_heads,max_num_partitions",
             num_warps=4,
@@ -134,8 +134,6 @@ def compile(
         with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_gluon_fp8.cpp.jinja", "r") as f:
             src_template = Template(f.read())
 
-        # kernel_name = "paged_attention_decode_v2_gluon_fp8"
-        kernel_name = "pa_dddddddddddddddddddddd"
         current_dir = os.path.dirname(__file__)
         return compile_template_op(
             src_template,
@@ -143,7 +141,7 @@ def compile(
             [current_dir + "/../utils.h", current_dir + "/../../include", triton_header],
             [triton_source],
             triton_header=triton_header,
-            kernel_name=kernel_name,
+            kernel_name=md_name,
             triton_kernel=triton_kernel,
             func_name=func_name,
         )
@@ -165,8 +163,7 @@ def compile_reduce_kernel(
             (head_size, query_group_size, sequence_partition_size, max_num_seq_partitions),
         )
 
-    # if not_built(func_name):
-    if True:
+    if not_built(func_name):
         head_size_pow2 = triton.next_power_of_2(head_size)
         query_group_size_pow2 = triton.next_power_of_2(query_group_size)
         max_num_seq_partitions_pow2 = triton.next_power_of_2(max_num_seq_partitions)
@@ -203,8 +200,7 @@ def compile_reduce_kernel(
             path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_triton_gluon_fp8.py",
             kernel_name="paged_attention_decode_v2_reduce_kernel",
             signature=signature,
-            # grid="num_seqs,num_kv_heads,1",
-            grid="num_seqs,1,1",
+            grid="num_seqs,num_kv_heads,1",
             num_warps=4,
             num_stages=2,
             out_name=md_name,
@@ -221,7 +217,6 @@ def compile_reduce_kernel(
         with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_reduce_kernel.cpp.jinja", "r") as f:
             src_template = Template(f.read())
 
-        kernel_name = "paged_attention_decode_v2_reduce_kernel"
         current_dir = os.path.dirname(__file__)
         return compile_template_op(
             src_template,
@@ -229,7 +224,7 @@ def compile_reduce_kernel(
             [current_dir + "/../utils.h", current_dir + "/../../include", triton_header],
             [triton_source],
             triton_header=triton_header,
-            kernel_name=kernel_name,
+            kernel_name=md_name,
             triton_kernel=triton_kernel,
             func_name=func_name,
         )
@@ -252,29 +247,28 @@ def pa_decode_gluon_fp8(
     query_scale: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    num_sequence_partitions: int = 0,
+    exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
+    max_logits: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
+    temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size, head_size]
     alibi_slopes: torch.Tensor = None,
 ) -> dict:
-    # Debug: Print function call parameters
-    print("\n=== DEBUG: pa_decode_gluon_fp8 Function Call ===")
-    print("Input tensor parameters:")
-    print(f"  output: shape={output.shape}, dtype={output.dtype}")
-    print(f"  query: shape={query.shape}, dtype={query.dtype}")
-    print(f"  key_cache: shape={key_cache.shape}, dtype={key_cache.dtype}")
-    print(f"  value_cache: shape={value_cache.shape}, dtype={value_cache.dtype}")
-    print(f"  sequence_lengths: shape={sequence_lengths.shape}, dtype={sequence_lengths.dtype}")
-    print(f"  block_tables: shape={block_tables.shape}, dtype={block_tables.dtype}")
-    print(f"  query_scale: shape={query_scale.shape if query_scale is not None else 'None'}, dtype={query_scale.dtype if query_scale is not None else 'None'}")
-    print(f"  key_scale: shape={key_scale.shape if key_scale is not None else 'None'}, dtype={key_scale.dtype if key_scale is not None else 'None'}")
-    print(f"  value_scale: shape={value_scale.shape if value_scale is not None else 'None'}, dtype={value_scale.dtype if value_scale is not None else 'None'}")
-    print(f"  alibi_slopes: shape={alibi_slopes.shape if alibi_slopes is not None else 'None'}, dtype={alibi_slopes.dtype if alibi_slopes is not None else 'None'}")
-
-    print("\nScalar parameters:")
-    print(f"  softmax_scale: {softmax_scale}")
-    print(f"  query_sequence_length: {query_sequence_length}")
-    print(f"  max_sequence_length: {max_sequence_length}")
-    print(f"  compute_type: {compute_type}")
-    print(f"  num_sequence_partitions: {num_sequence_partitions}")
+    # # Debug: Print function call parameters
+    # print("\n=== DEBUG: pa_decode_gluon_fp8 Function Call ===")
+    # print("Input tensor parameters:")
+    # print(f"  output: shape={output.shape}, dtype={output.dtype}")
+    # print(f"  query: shape={query.shape}, dtype={query.dtype}")
+    # print(f"  key_cache: shape={key_cache.shape}, dtype={key_cache.dtype}")
+    # print(f"  value_cache: shape={value_cache.shape}, dtype={value_cache.dtype}")
+    # print(f"  sequence_lengths: shape={sequence_lengths.shape}, dtype={sequence_lengths.dtype}")
+    # print(f"  block_tables: shape={block_tables.shape}, dtype={block_tables.dtype}")
+    # print(f"  query_scale: shape={query_scale.shape if query_scale is not None else 'None'}, dtype={query_scale.dtype if query_scale is not None else 'None'}")
+    # print(f"  key_scale: shape={key_scale.shape if key_scale is not None else 'None'}, dtype={key_scale.dtype if key_scale is not None else 'None'}")
+    # print(f"  value_scale: shape={value_scale.shape if value_scale is not None else 'None'}, dtype={value_scale.dtype if value_scale is not None else 'None'}")
+    # print("\nScalar parameters:")
+    # print(f"  softmax_scale: {softmax_scale}")
+    # print(f"  query_sequence_length: {query_sequence_length}")
+    # print(f"  max_sequence_length: {max_sequence_length}")
+    # print(f"  compute_type: {compute_type}")
 
     # Extract tensor dimensions
     num_sequences = query.shape[0]
@@ -293,34 +287,12 @@ def pa_decode_gluon_fp8(
     equivalent_query_group_size_pow2 = triton.next_power_of_2(
         equivalent_query_group_size
     )
-    kv_block_size_pow2 = triton.next_power_of_2(kv_block_size)
-    head_size_pow2 = triton.next_power_of_2(head_size)
 
     # Determine if causal masking is needed
     is_causal = query_sequence_length > 1
 
     # Calculate elements per 16B load based on data type
     kv_elements_per_16b = 16 // key_cache.dtype.itemsize
-
-    # Configure execution grid
-    grid = (num_sequences, num_kv_heads, max_num_partitions)
-    intermediate_shape = (
-        num_sequences,
-        num_kv_heads,
-        max_num_partitions,
-        equivalent_query_group_size,
-    )
-
-    # Initialize intermediate tensors for attention computation
-    max_logits = torch.zeros(
-        intermediate_shape, dtype=torch.float32, device=output.device
-    )
-    exp_sums = torch.zeros(
-        intermediate_shape, dtype=torch.float32, device=output.device
-    )
-    temporary_output = torch.zeros(
-        *intermediate_shape, head_size, dtype=output.dtype, device=output.device
-    )
 
     # Adjust query group size to power of 2 with constraints
     if equivalent_query_group_size <= 16:
@@ -439,29 +411,28 @@ def pa_decode_gluon_fp8(
     if value_transposed and kv_block_size > 256:
         kv_compute_block_size = 128
 
-    # Debug: Print compile parameters
-    print("\n=== DEBUG: Main Kernel Compile Parameters ===")
-    compile_params = {
-        "query_seq_len": query_sequence_length,
-        "head_size": head_size,
-        "query_group_size": equivalent_query_group_size,
-        "kv_block_size": kv_block_size,
-        "sequence_partition_size": 256,
-        "kv_16b_element_count": kv_elements_per_16b,
-        "query_quant_mode": query_quant_mode,
-        "kv_quant_mode": kv_quant_mode,
-        "kv_compute_block_size": kv_compute_block_size,
-        "fp8_max_value": fp8_max_value,
-        "value_transposed": int(value_transposed),
-        "is_causal": int(is_causal),
-        "compute_type": compute_type,
-    }
-    for key, value in compile_params.items():
-        print(f"  {key}: {value}")
-    sys.stdout.flush()
+    # print("\n=== DEBUG: attention_kernel Compile Parameters ===")
+    # compile_params = {
+    #     "query_seq_len": query_sequence_length,
+    #     "head_size": head_size,
+    #     "query_group_size": equivalent_query_group_size,
+    #     "kv_block_size": kv_block_size,
+    #     "sequence_partition_size": 256,
+    #     "kv_16b_element_count": kv_elements_per_16b,
+    #     "query_quant_mode": query_quant_mode,
+    #     "kv_quant_mode": kv_quant_mode,
+    #     "kv_compute_block_size": kv_compute_block_size,
+    #     "fp8_max_value": fp8_max_value,
+    #     "value_transposed": int(value_transposed),
+    #     "is_causal": int(is_causal),
+    #     "compute_type": compute_type,
+    # }
+    # for key, value in compile_params.items():
+    #     print(f"  {key}: {value}")
+    # sys.stdout.flush()
 
     # Compile the kernel
-    func = compile(
+    func = compile_attention_kernel(
         query_seq_len=query_sequence_length,
         head_size=head_size,
         query_group_size=equivalent_query_group_size,
@@ -478,48 +449,46 @@ def pa_decode_gluon_fp8(
         md_name="pa_decode_gluon_fp8",
     )
 
-    # Debug: Print main kernel execution parameters
-    print("\n=== DEBUG: Main Kernel Execution Parameters ===")
-    print("Tensor parameters:")
-    print(f"  exp_sums: shape={exp_sums.shape}, dtype={exp_sums.dtype}")
-    print(f"  max_logits: shape={max_logits.shape}, dtype={max_logits.dtype}")
-    print(f"  temporary_output: shape={temporary_output.shape}, dtype={temporary_output.dtype}")
-    print(f"  query: shape={query.shape}, dtype={query.dtype}")
-    print(f"  key_cache: shape={key_cache.shape}, dtype={key_cache.dtype}")
-    print(f"  value_cache: shape={value_cache.shape}, dtype={value_cache.dtype}")
-    print(f"  block_tables: shape={block_tables.shape}, dtype={block_tables.dtype}")
-    print(f"  sequence_lengths: shape={sequence_lengths.shape}, dtype={sequence_lengths.dtype}")
-    print(f"  query_scale: shape={query_scale.shape if query_scale is not None else 'None'}, dtype={query_scale.dtype if query_scale is not None else 'None'}")
-    print(f"  key_scale: shape={key_scale.shape if key_scale is not None else 'None'}, dtype={key_scale.dtype if key_scale is not None else 'None'}")
-    print(f"  value_scale: shape={value_scale.shape if value_scale is not None else 'None'}, dtype={value_scale.dtype if value_scale is not None else 'None'}")
-    print(f"  alibi_slopes: shape={alibi_slopes.shape if alibi_slopes is not None else 'None'}, dtype={alibi_slopes.dtype if alibi_slopes is not None else 'None'}")
-
-    print("\nScalar parameters:")
-    print(f"  softmax_scale: {softmax_scale}")
-    print(f"  exp_sums.stride(0): {exp_sums.stride(0)}")
-    print(f"  exp_sums.stride(1): {exp_sums.stride(1)}")
-    print(f"  exp_sums.stride(2): {exp_sums.stride(2)}")
-    print(f"  temporary_output.stride(0): {temporary_output.stride(0)}")
-    print(f"  temporary_output.stride(1): {temporary_output.stride(1)}")
-    print(f"  temporary_output.stride(2): {temporary_output.stride(2)}")
-    print(f"  temporary_output.stride(3): {temporary_output.stride(3)}")
-    print(f"  query.stride(0): {query.stride(0)}")
-    print(f"  query.stride(1): {query.stride(1)}")
-    print(f"  key_cache.stride(0): {key_cache.stride(0)}")
-    print(f"  key_cache.stride(1): {key_cache.stride(1)}")
-    print(f"  key_cache.stride(2): {key_cache.stride(2)}")
-    print(f"  key_cache.stride(3): {key_cache.stride(3)}")
-    print(f"  value_cache.stride(0): {value_cache.stride(0)}")
-    print(f"  value_cache.stride(1): {value_cache.stride(1)}")
-    print(f"  value_cache.stride(2): {value_cache.stride(2)}")
-    print(f"  block_tables.stride(0): {block_tables.stride(0)}")
-    print(f"  query_scale_stride_0: {query_scale_stride_0}")
-    print(f"  key_scale_stride_0: {key_scale_stride_0}")
-    print(f"  key_scale_stride_1: {key_scale_stride_1}")
-    print(f"  num_sequences: {num_sequences}")
-    print(f"  num_kv_heads: {num_kv_heads}")
-    print(f"  max_num_partitions: {max_num_partitions}")
-    sys.stdout.flush()
+    # # Debug: Print main kernel execution parameters
+    # print("\n=== DEBUG: Main Kernel Execution Parameters ===")
+    # print("Tensor parameters:")
+    # print(f"  exp_sums: shape={exp_sums.shape}, dtype={exp_sums.dtype}")
+    # print(f"  max_logits: shape={max_logits.shape}, dtype={max_logits.dtype}")
+    # print(f"  temporary_output: shape={temporary_output.shape}, dtype={temporary_output.dtype}")
+    # print(f"  query: shape={query.shape}, dtype={query.dtype}")
+    # print(f"  key_cache: shape={key_cache.shape}, dtype={key_cache.dtype}")
+    # print(f"  value_cache: shape={value_cache.shape}, dtype={value_cache.dtype}")
+    # print(f"  block_tables: shape={block_tables.shape}, dtype={block_tables.dtype}")
+    # print(f"  sequence_lengths: shape={sequence_lengths.shape}, dtype={sequence_lengths.dtype}")
+    # print(f"  query_scale: shape={query_scale.shape if query_scale is not None else 'None'}, dtype={query_scale.dtype if query_scale is not None else 'None'}")
+    # print(f"  key_scale: shape={key_scale.shape if key_scale is not None else 'None'}, dtype={key_scale.dtype if key_scale is not None else 'None'}")
+    # print(f"  value_scale: shape={value_scale.shape if value_scale is not None else 'None'}, dtype={value_scale.dtype if value_scale is not None else 'None'}")
+    # print("\nScalar parameters:")
+    # print(f"  softmax_scale: {softmax_scale}")
+    # print(f"  exp_sums.stride(0): {exp_sums.stride(0)}")
+    # print(f"  exp_sums.stride(1): {exp_sums.stride(1)}")
+    # print(f"  exp_sums.stride(2): {exp_sums.stride(2)}")
+    # print(f"  temporary_output.stride(0): {temporary_output.stride(0)}")
+    # print(f"  temporary_output.stride(1): {temporary_output.stride(1)}")
+    # print(f"  temporary_output.stride(2): {temporary_output.stride(2)}")
+    # print(f"  temporary_output.stride(3): {temporary_output.stride(3)}")
+    # print(f"  query.stride(0): {query.stride(0)}")
+    # print(f"  query.stride(1): {query.stride(1)}")
+    # print(f"  key_cache.stride(0): {key_cache.stride(0)}")
+    # print(f"  key_cache.stride(1): {key_cache.stride(1)}")
+    # print(f"  key_cache.stride(2): {key_cache.stride(2)}")
+    # print(f"  key_cache.stride(3): {key_cache.stride(3)}")
+    # print(f"  value_cache.stride(0): {value_cache.stride(0)}")
+    # print(f"  value_cache.stride(1): {value_cache.stride(1)}")
+    # print(f"  value_cache.stride(2): {value_cache.stride(2)}")
+    # print(f"  block_tables.stride(0): {block_tables.stride(0)}")
+    # print(f"  query_scale_stride_0: {query_scale_stride_0}")
+    # print(f"  key_scale_stride_0: {key_scale_stride_0}")
+    # print(f"  key_scale_stride_1: {key_scale_stride_1}")
+    # print(f"  num_sequences: {num_sequences}")
+    # print(f"  num_kv_heads: {num_kv_heads}")
+    # print(f"  max_num_partitions: {max_num_partitions}")
+    # sys.stdout.flush()
 
     # Execute the kernel
     func(
@@ -536,7 +505,6 @@ def pa_decode_gluon_fp8(
             query_scale,
             key_scale,
             value_scale,
-            # alibi_slopes,
             exp_sums.stride(0),
             exp_sums.stride(1),
             exp_sums.stride(2),
@@ -564,18 +532,16 @@ def pa_decode_gluon_fp8(
         )
     )
 
-    # ==================== REDUCTION KERNEL EXECUTION ====================
-    # Debug: Print reduce kernel compile parameters
-    print("\n=== DEBUG: Reduce Kernel Compile Parameters ===")
-    reduce_compile_params = {
-        "head_size": head_size,
-        "query_group_size": equivalent_query_group_size,
-        "sequence_partition_size": 256,
-        "max_num_seq_partitions": max_num_partitions,
-    }
-    for key, value in reduce_compile_params.items():
-        print(f"  {key}: {value}")
-    sys.stdout.flush()
+    # print("\n=== DEBUG: reduce_kernel Compile Parameters ===")
+    # reduce_compile_params = {
+    #     "head_size": head_size,
+    #     "query_group_size": equivalent_query_group_size,
+    #     "sequence_partition_size": 256,
+    #     "max_num_seq_partitions": max_num_partitions,
+    # }
+    # for key, value in reduce_compile_params.items():
+    #     print(f"  {key}: {value}")
+    # sys.stdout.flush()
 
     # Compile and execute the reduction kernel
     reduce_func = compile_reduce_kernel(
@@ -586,28 +552,28 @@ def pa_decode_gluon_fp8(
         md_name="pa_decode_reduce_kernel",
     )
 
-    # Debug: Print reduce kernel execution parameters
-    print("\n=== DEBUG: Reduce Kernel Execution Parameters ===")
-    print("Tensor parameters:")
-    print(f"  output: shape={output.shape}, dtype={output.dtype}")
-    print(f"  exp_sums: shape={exp_sums.shape}, dtype={exp_sums.dtype}")
-    print(f"  max_logits: shape={max_logits.shape}, dtype={max_logits.dtype}")
-    print(f"  temporary_output: shape={temporary_output.shape}, dtype={temporary_output.dtype}")
-    print(f"  sequence_lengths: shape={sequence_lengths.shape}, dtype={sequence_lengths.dtype}")
+    # # Debug: Print reduce kernel execution parameters
+    # print("\n=== DEBUG: Reduce Kernel Execution Parameters ===")
+    # print("Tensor parameters:")
+    # print(f"  output: shape={output.shape}, dtype={output.dtype}")
+    # print(f"  exp_sums: shape={exp_sums.shape}, dtype={exp_sums.dtype}")
+    # print(f"  max_logits: shape={max_logits.shape}, dtype={max_logits.dtype}")
+    # print(f"  temporary_output: shape={temporary_output.shape}, dtype={temporary_output.dtype}")
+    # print(f"  sequence_lengths: shape={sequence_lengths.shape}, dtype={sequence_lengths.dtype}")
 
-    print("\nScalar parameters:")
-    print(f"  output.stride(0): {output.stride(0)}")
-    print(f"  output.stride(1): {output.stride(1)}")
-    print(f"  exp_sums.stride(0): {exp_sums.stride(0)}")
-    print(f"  exp_sums.stride(1): {exp_sums.stride(1)}")
-    print(f"  exp_sums.stride(2): {exp_sums.stride(2)}")
-    print(f"  temporary_output.stride(0): {temporary_output.stride(0)}")
-    print(f"  temporary_output.stride(1): {temporary_output.stride(1)}")
-    print(f"  temporary_output.stride(2): {temporary_output.stride(2)}")
-    print(f"  temporary_output.stride(3): {temporary_output.stride(3)}")
-    print(f"  num_sequences: {num_sequences}")
-    print(f"  num_kv_heads: {num_kv_heads}")
-    sys.stdout.flush()
+    # print("\nScalar parameters:")
+    # print(f"  output.stride(0): {output.stride(0)}")
+    # print(f"  output.stride(1): {output.stride(1)}")
+    # print(f"  exp_sums.stride(0): {exp_sums.stride(0)}")
+    # print(f"  exp_sums.stride(1): {exp_sums.stride(1)}")
+    # print(f"  exp_sums.stride(2): {exp_sums.stride(2)}")
+    # print(f"  temporary_output.stride(0): {temporary_output.stride(0)}")
+    # print(f"  temporary_output.stride(1): {temporary_output.stride(1)}")
+    # print(f"  temporary_output.stride(2): {temporary_output.stride(2)}")
+    # print(f"  temporary_output.stride(3): {temporary_output.stride(3)}")
+    # print(f"  num_sequences: {num_sequences}")
+    # print(f"  num_kv_heads: {num_kv_heads}")
+    # sys.stdout.flush()
 
     # Execute the reduction kernel
     reduce_func(
@@ -631,23 +597,6 @@ def pa_decode_gluon_fp8(
             torch.cuda.current_stream(output.device),
         )
     )
-    output_md5 = hashlib.md5(
-        output.contiguous()
-        .view(torch.uint8)
-        .detach()
-        .cpu()
-        .numpy()
-        .tobytes()
-    ).hexdigest()
-    print(f"  output nan_cnt: {torch.isnan(output).sum().item()}")
-    print(f"  output md5: {output_md5}")
-
-    # Return timing information (simplified for now)
-    return {
-        "triton_decode_time": 0.0,  # Placeholder - would need actual timing
-        "triton_reduce_time": 0.0,  # Placeholder - would need actual timing
-        "total_triton_time": 0.0,   # Placeholder - would need actual timing
-    }
 
 
 if __name__ == "__main__":
@@ -669,4 +618,4 @@ if __name__ == "__main__":
     parser.add_argument("--compute_type", type=str, required=True)
     parser.add_argument("--func_name", type=str, default=None)
     args = parser.parse_args()
-    compile(**vars(args))
+    compile_attention_kernel(**vars(args))

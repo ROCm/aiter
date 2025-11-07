@@ -10,11 +10,10 @@ void {{func_name}}(void* exp_sums_ptr,           // [num_seqs, num_kv_heads, max
                     void* value_cache_ptr,        // [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
                     void* block_tables_ptr,       // [num_seqs, max_num_blocks_per_seq]
                     void* sequence_lengths_ptr,   // [num_seqs]
-                    float softmax_scale,
+                    double softmax_scale,
                     void* query_scale,            // [num_seqs, num_kv_heads * query_group_size, 1]
                     void* key_scale,              // [num_blocks, num_kv_heads, kv_block_size, 1]
                     void* value_scale,            // [num_blocks, num_kv_heads, kv_block_size, 1]
-                    // void* alibi_slopes_ptr,
                     int stride_max_logits_seq,
                     int stride_max_logits_head,
                     int stride_max_logits_part,
@@ -51,11 +50,10 @@ void {{func_name}}(void* exp_sums_ptr,           // [num_seqs, num_kv_heads, max
                     void* value_cache_ptr,        // [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
                     void* block_tables_ptr,       // [num_seqs, max_num_blocks_per_seq]
                     void* sequence_lengths_ptr,   // [num_seqs]
-                    float softmax_scale,
+                    double softmax_scale,
                     void* query_scale,            // [num_seqs, num_kv_heads * query_group_size, 1]
                     void* key_scale,              // [num_blocks, num_kv_heads, kv_block_size, 1]
                     void* value_scale,            // [num_blocks, num_kv_heads, kv_block_size, 1]
-                    // void* alibi_slopes_ptr,
                     int stride_max_logits_seq,
                     int stride_max_logits_head,
                     int stride_max_logits_part,
@@ -84,7 +82,6 @@ void {{func_name}}(void* exp_sums_ptr,           // [num_seqs, num_kv_heads, max
     {{triton_kernel}}(reinterpret_cast<hipStream_t>(stream), exp_sums_ptr, max_logits_ptr, output_ptr, query_ptr, key_cache_ptr, value_cache_ptr,
                       block_tables_ptr, sequence_lengths_ptr, softmax_scale, query_scale, key_scale, value_scale,
                       stride_max_logits_seq, stride_max_logits_head, stride_max_logits_part,
-                    //   alibi_slopes_ptr, stride_max_logits_seq, stride_max_logits_head, stride_max_logits_part,
                       stride_output_seq, stride_output_head, stride_output_part, stride_output_group,
                       stride_query_seq, stride_query_head, stride_key_block, stride_key_head, stride_key_head_split,
                       stride_key_block_elem, stride_value_block, stride_value_head, stride_value_head_size,
