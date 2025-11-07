@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+from typing import Optional
 
 import torch
 from torch import Tensor
-from typing import Optional
+
 from ..jit.core import compile_ops
 
 MD_NAME = "module_norm"
@@ -43,8 +45,8 @@ def layer_norm(
 def layernorm2d_fwd(
     input: Tensor,
     # normalized_shape: List[int],
-    weight: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
+    weight: Tensor,
+    bias: Tensor,
     epsilon: float = 1e-5,
     x_bias: Optional[Tensor] = None,
 ) -> Tensor: ...

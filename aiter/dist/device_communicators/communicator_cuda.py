@@ -38,18 +38,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
             CustomAllreduce,
         )
 
-        # from aiter.dist.device_communicators.pynccl import PyNcclCommunicator
-
         # from aiter.dist.device_communicators.symm_mem import SymmMemCommunicator
 
         self.pynccl_comm = None
-        # if self.world_size > 1:
-        #     self.pynccl_comm = PyNcclCommunicator(
-        #         group=self.cpu_group,
-        #         device=self.device,
-        #     )
-        #     if is_symmetric_memory_enabled():
-        #         register_nccl_symmetric_ops(self.pynccl_comm)
+        if self.world_size > 1:
+            from aiter.dist.device_communicators.communicator_pynccl import (
+                PyNcclCommunicator,
+            )
+
+            self.pynccl_comm = PyNcclCommunicator(
+                group=self.cpu_group,
+                device=self.device,
+            )
+            # if is_symmetric_memory_enabled():
+            #     register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm = None
@@ -70,8 +72,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # ),
             )
 
-        # if current_platform.is_rocm():
-        if True and self.world_size > 1:
+        if self.world_size > 1:
             from aiter.dist.device_communicators.quick_all_reduce import (
                 QuickAllReduce,
             )
@@ -118,14 +119,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 )
 
     def all_reduce(self, input_, ca_fp8_quant: bool = False) -> torch.Tensor:
-        # since currently we perform copy input -> symm_input -> out-of-place AR
-        # return symm_output, we don't need to check if input is symmetric
-        if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
-            self.pynccl_comm.world_size, input_
-        ):
-            out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
-            if out is not None:
-                return out
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
@@ -153,19 +146,48 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert out is not None
             return out
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is None or pynccl_comm.disabled:
-            out = input_.clone()
-            torch.distributed.all_reduce(out, group=self.device_group)
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            out = pynccl_comm.all_reduce(input_)
+            assert out is not None
             return out
-        assert pynccl_comm is not None
-        out = pynccl_comm.all_reduce(input_)
-        if out is None:
-            # fall back to the default all-reduce using PyTorch.
-            # this usually happens during testing.
-            # when we run the model, allreduce only happens for the TP
-            # group, where we always have either custom allreduce or pynccl.
-            out = input_.clone()
-            torch.distributed.all_reduce(out, group=self.device_group)
+        # fall back to the default all-reduce using PyTorch.
+        # this usually happens during testing.
+        # when we run the model, allreduce only happens for the TP
+        # group, where we always have either custom allreduce or pynccl.
+        out = input_.clone()
+        torch.distributed.all_reduce(out, group=self.device_group)
+        return out
+
+    def fused_allreduce_rmsnorm(self, input_, weight_, eps) -> torch.Tensor:
+        n = input_.shape[-1]
+        can_use_fuse_ar_rms = (
+            n <= 16384 and input_.numel() * input_.element_size() < 8 * 1024 * 8192
+        )
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_)
+            and can_use_fuse_ar_rms
+        ):
+            out = ca_comm.custom_fused_ar_rms(input_, weight_, eps)
+            assert out is not None
+            return out
+        # call split kernel
+        ar_out = all_reduce(input_)
+        out = torch.empty_like(ar_out)
+        residual_out = torch.empty_like(ar_out)
+        from aiter import rmsnorm2d_fwd_with_add
+
+        rmsnorm2d_fwd_with_add(
+            out,
+            ar_out,
+            input_,
+            residual_out,
+            weight_,
+            eps,
+            0,
+        )
         return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
@@ -259,6 +281,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def destroy(self):
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
+        if self.qr_comm is not None:
+            self.qr_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.all2all_manager is not None:

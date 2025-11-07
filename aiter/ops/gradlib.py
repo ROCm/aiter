@@ -23,6 +23,7 @@ def gen_hipb_mm_fake_tensor(
     scaleA: Optional[torch.Tensor] = None,
     scaleB: Optional[torch.Tensor] = None,
     scaleOut: Optional[torch.Tensor] = None,
+    bpreshuffle: Optional[bool] = None,
 ):
     mat1_sizes = mat1.size()
     mat2_sizes = mat2.size()
@@ -58,6 +59,7 @@ def hipb_findallsols(
     scaleA: Optional[torch.Tensor] = None,
     scaleB: Optional[torch.Tensor] = None,
     scaleC: Optional[torch.Tensor] = None,
+    bpreshuffle: bool = False,
 ) -> list[int]: ...
 
 
