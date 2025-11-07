@@ -287,7 +287,7 @@ a4w4_gemm2_kernels_list= {
      0: kernelInstanceGEMM2(       256,        32,        128,       128,     1,       4,         3,),
      1: kernelInstanceGEMM2(       256,        64,        128,       128,     1,       4,         3,),
      2: kernelInstanceGEMM2(       256,       128,        128,       128,     1,       4,         3,),
-     4: kernelInstanceGEMM2(        64,        32,         64,       128,     1,       1,         1,),
+     4: kernelInstanceGEMM2(        64,        32,         32,       128,     1,       1,         1,),
      5: kernelInstanceGEMM2(        64,        64,         128,       128,     1,       1,         3,),
      6: kernelInstanceGEMM2(        64,       128,        128,       128,     1,       1,         3,),
     #  7: kernelInstanceGEMM2(      256,       256,         64,       128,     2,       2,         3,),
