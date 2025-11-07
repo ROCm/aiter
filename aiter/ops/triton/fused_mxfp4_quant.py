@@ -289,37 +289,30 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         device=x.device,
     )
 
-    # for large N values
-    if M <= 32:
-        NUM_ITER = 1
-        BLOCK_SIZE_M1 = min(8, triton.next_power_of_2(M))
-        BLOCK_SIZE_N1 = 128
-        NUM_WARPS = 1 if BLOCK_SIZE_M1 < 4 else 4
-        NUM_STAGES = 1
-    else:
-        NUM_ITER = 1
-        BLOCK_SIZE_M1 = 16
-        BLOCK_SIZE_N1 = 256
-        NUM_WARPS = 4
-        NUM_STAGES = 1
+    NUM_ITER = 1
+    NUM_WARPS = 4
+    NUM_STAGES = 1
+
+    BLOCK_SIZE_M1 = 1 if M <= 128 else 4
+    BLOCK_SIZE_M2 = 1 if M <= 128 else 4
 
     # for small N values
     if N_half <= 1024:
-        NUM_ITER = 1
-        NUM_STAGES = 1
-        NUM_WARPS = 4
-        BLOCK_SIZE_N1 = min(256, triton.next_power_of_2(N_half))
-        # BLOCK_SIZE_N needs to be multiple of 32
-        BLOCK_SIZE_N1 = max(32, BLOCK_SIZE_N1)
-        BLOCK_SIZE_M1 = min(8, triton.next_power_of_2(N_half))
+        BLOCK_SIZE_N1 = 32
+    else:
+        BLOCK_SIZE_N1 = 128
+
+    if N2 <= 256:
+        BLOCK_SIZE_N2 = 8
+    elif N2 <= 1024:
+        BLOCK_SIZE_N2 = 32
+    else:
+        BLOCK_SIZE_N2 = 128
 
     # shuffle requires block sizes to be multiple of 32
     if shuffle:
         BLOCK_SIZE_M1 = triton.cdiv(BLOCK_SIZE_M1, 32) * 32
         BLOCK_SIZE_N1 = triton.cdiv(BLOCK_SIZE_N1, 32) * 32
-
-    BLOCK_SIZE_M2 = 1 if M <= 128 else 4
-    BLOCK_SIZE_N2 = 16
 
     num_pid = triton.cdiv(M, BLOCK_SIZE_M1) * triton.cdiv(
         N_half, BLOCK_SIZE_N1 * NUM_ITER
