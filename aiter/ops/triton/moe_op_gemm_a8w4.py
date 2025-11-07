@@ -323,58 +323,45 @@ def moe_gemm_torch(x, w, bias,
                  alpha = 1.0,
                  limit = 1.0
                  ):
-    is_input_batched = x.ndim == 3
     assert x.dtype.itemsize > 1
     assert w.dtype.itemsize > 1
-    if is_input_batched:
-        assert gather_indx is None, "gather not supported in batched mode"
-        assert scatter_indx is None, "scatter not supported in batched mode"
-        assert routing_data is None, "routing not supported in batched mode"
-        assert w.ndim == 3 and w.shape[0] == x.shape[0]
     if bias is not None and bias.ndim == 1:
         bias = bias.view(1, *bias.shape)
     if w.ndim == 2:
         w = w.view(1, *w.shape)
-    if x.ndim == 2:
-        x = x.view(1, *x.shape)
-    if routing_data is None:
-        routing_data = RoutingData(None, None, w.shape[0], 1)
     n_expts_act = routing_data.n_expts_act
     # memory offsets
-    if routing_data.n_expts_tot > 1 and not is_input_batched:
+    if routing_data.n_expts_tot > 1:
         sizes = routing_data.expt_hist
         off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32)
         off[1:] = torch.cumsum(sizes, 0)
         offs = list(itertools.pairwise(off))
     else:
-        offs = [[0, x.shape[1]] for _ in range(w.shape[0])]
+        offs = [[0, x.shape[0]] for _ in range(w.shape[0])]
     # compute
-    n_rows = x.shape[1] if gather_indx is None else gather_indx.dst_indx.shape[0]
+    n_rows = x.shape[0] if gather_indx is None else gather_indx.dst_indx.shape[0]
     n_cols = w.shape[-1] // 2 if apply_swiglu else w.shape[-1]
-    y = torch.zeros((x.shape[0], n_rows, n_cols), device=x.device, dtype=x.dtype)
+    y = torch.zeros((n_rows, n_cols), device=x.device, dtype=x.dtype)
     for i, (lo, hi) in enumerate(offs):
         if gather_indx is None:
             idx = torch.arange(lo, hi, device=x.device)
         else:
             idx = gather_indx.src_indx[lo:hi] // n_expts_act
-        batch = i if is_input_batched else 0
-        out = torch.matmul(x[batch, idx, :].float(), w[i].float())
+        out = torch.matmul(x[idx, :].float(), w[i].float())
         if bias is not None:
             out += bias[i, :]
         if apply_swiglu:
             out = swiglu_torch(out, alpha, limit)
         if gammas is not None:
             out *= gammas[lo:hi, None]
-        y[batch, lo:hi, :] = out
-    if not is_input_batched:
-        y = y.view(y.shape[1], y.shape[2])
+        y[lo:hi, :] = out
     if scatter_indx is None:
         return y
     # accumulate output from all experts
     n_rows = y.shape[0] // n_expts_act
     out = torch.zeros((n_rows, y.shape[-1]), dtype=torch.float32, device=x.device)
-    for i, (lo, hi) in enumerate(offs):
-        dst_idx = scatter_indx.dst_indx[lo:hi] // n_expts_act
-        msk = dst_idx != -1
-        out[dst_idx[msk], :] += y[lo:hi, :][msk, :].float()
+    src_idx = scatter_indx.src_indx.view(-1, n_expts_act)
+    for i in range(n_rows):
+        out[i, :] = y[src_idx[i], :].float().sum(0)
+        
     return out
