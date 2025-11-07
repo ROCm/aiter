@@ -172,6 +172,8 @@ def run_2stage_moe(
     
     # ========== Stage 2 ==========
     # Reference implementation using the function from fused_moe.py
+    # NOTE: Both stage2 implementations should use the same intermediate tensor
+    # to isolate stage 2 correctness from any stage 1 numerical differences
     output_ref = torch_moe_stage2(
         inter_ref,
         w1,
@@ -187,16 +189,36 @@ def run_2stage_moe(
     )
     
     # CK implementation using metadata.stage2
-    output_out = torch.empty((num_tokens, hidden_dim), dtype=dtype, device="cuda")
-    output_ck, us_stage2 = run_perftest(
-        metadata.stage2,
-        inter_ck,
+    # Use inter_ref (not inter_ck) to test stage 2 in isolation
+    # NOTE: Stage 2 kernel uses AtomicAdd, so we need fresh output buffers for run_perftest
+    # to avoid accumulation across iterations. We'll call it once for validation.
+    output_out_validation = torch.zeros((num_tokens, hidden_dim), dtype=dtype, device="cuda")
+    output_ck = metadata.stage2(
+        inter_ref,
         w1_shuffle,
         w2_shuffle,
         sorted_token_ids,
         sorted_expert_ids,
         num_valid_ids,
-        output_out,
+        output_out_validation,
+        topk,
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+        block_m=block_size,
+        sorted_weights=sorted_weights,
+    )
+    
+    # For performance measurement, create fresh buffers for each iteration
+    output_out_perf = torch.zeros((num_tokens, hidden_dim), dtype=dtype, device="cuda")
+    _, us_stage2 = run_perftest(
+        metadata.stage2,
+        inter_ref,
+        w1_shuffle,
+        w2_shuffle,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        output_out_perf,
         topk,
         w2_scale=w2_scale,
         a2_scale=a2_scale,
@@ -204,6 +226,7 @@ def run_2stage_moe(
         sorted_weights=sorted_weights,
         num_iters=10,
         num_warmup=2,
+        num_rotate_args=12,  # Force creating 12 separate output buffers
         needTrace=False,
     )
     
