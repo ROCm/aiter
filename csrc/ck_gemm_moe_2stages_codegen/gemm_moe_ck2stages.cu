@@ -32,7 +32,11 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::
         }
         std::cout << "[aiter] ck kernel not found: " << kernelName << std::endl;
     }
-    const char* moe_env_value = std::getenv("AITER_MXFP4_MOE_SF");
+
+    std::string moe_env_value = "0";
+    if (const char* env = std::getenv("AITER_MXFP4_MOE_SF")) {
+         moe_env_value = std::string(env);
+    }
     bool use_mxfp4_moe_preshuffle = std::string(moe_env_value) == "1";
 
     if constexpr (stage == 1)
