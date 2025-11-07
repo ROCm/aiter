@@ -26,6 +26,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
+from aiter.fused_moe_bf16_asm import fused_moe_stage1_tkw1
 
 BLOCK_SIZE_M = 32
 
@@ -104,6 +105,8 @@ def fused_moe(
     num_local_tokens: Optional[torch.tensor] = None,
     moe_sorting_dispatch_policy=0,
     dtype=None,
+    a16=False,
+    per_tensor_quant_scale=None
 ):
     if not block_size_M:
         block_size_M = -1
@@ -125,6 +128,8 @@ def fused_moe(
         num_local_tokens=num_local_tokens,
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
         dtype=dtype,
+        a16=a16,
+        per_tensor_quant_scale=per_tensor_quant_scale
     )
 
 
@@ -148,6 +153,8 @@ def fused_moe_fake(
     num_local_tokens: Optional[torch.Tensor] = None,
     moe_sorting_dispatch_policy: bool = 0,
     dtype: Optional[torch.dtype] = None,
+    a16=False,
+    per_tensor_quant_scale=None
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -178,6 +185,8 @@ def fused_moe_(
     num_local_tokens: Optional[torch.Tensor] = None,
     moe_sorting_dispatch_policy: bool = 0,
     dtype: Optional[torch.dtype] = None,
+    a16=False,
+    per_tensor_quant_scale=None
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -236,7 +245,7 @@ def fused_moe_(
         moe_sorting_dispatch_policy,
     )
 
-    if metadata.run_1stage:
+    if metadata.run_1stage and not doweight_stage1:
         assert (
             doweight_stage1 == False
         ), "doweight_stage1 not support in fused_moe_1stage"
@@ -259,6 +268,18 @@ def fused_moe_(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             num_local_tokens=num_local_tokens,
+        )
+    elif metadata.run_1stage and doweight_stage1:
+        return metadata.stage1(
+            hidden_states,
+            w1, w2,
+            topk_weight, topk_ids,
+            w1_scale, w2_scale,
+            a1_scale, a2_scale,
+            a16,
+            per_tensor_quant_scale,
+            expert_mask,
+            activation
         )
     else:
         return fused_moe_2stages(
@@ -611,13 +632,24 @@ def get_2stage_cfgs(
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
-    if run_1stage:
+    if run_1stage and not doweight_stage1:
         return MOEMetadata(
             functools.partial(
                 fused_moe_1stage,
                 kernelName=kernelName1,
                 activation=activation,
                 quant_type=q_type,
+            ),
+            None,
+            block_m,
+            ksplit,
+            run_1stage,
+        )
+    if run_1stage and doweight_stage1:
+        return MOEMetadata(
+            functools.partial(
+                fused_moe_stage1_tkw1,
+                kernelName=kernelName1
             ),
             None,
             block_m,

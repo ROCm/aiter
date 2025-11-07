@@ -8,6 +8,7 @@ import aiter
 from aiter import logger
 from aiter import pertoken_quant, get_hip_quant
 from aiter import ActivationType, QuantType, dtypes
+from aiter.fused_moe import fused_moe
 
 BLOCK_SIZE_M = 32
 
@@ -263,8 +264,8 @@ def asm_moe(
         #   fc2_smooth_scale)
     return moe_buf
 
-
-def asm_moe_tkw1(
+# TODO: move into fused_moe.py when module is deleted
+def fused_moe_stage1_tkw1(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
     w2,  # [expert(local_expert:EP), dim, inter_dim]
@@ -279,6 +280,7 @@ def asm_moe_tkw1(
     per_tensor_quant_scale=None,
     expert_mask=None,
     activation=ActivationType.Silu,
+    kernelName: str = ""
 ):
     E, model_dim, inter_dim = w2.shape
     global_E = E
@@ -410,12 +412,40 @@ def asm_moe_tkw1(
             a8_scale,
             fc1_scale,
             fc2_scale,
-            "",
+            kernelName,
             fc2_smooth_scale,
             activation,
         )
         #   fc2_smooth_scale)
     return moe_buf
+
+
+def asm_moe_tkw1(
+    hidden_states,
+    w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+    w2,  # [expert(local_expert:EP), dim, inter_dim]
+    topk_weight,
+    topk_ids,
+    # following for int8 quant
+    fc1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
+    fc2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
+    fc1_smooth_scale=None,  # [expert(local_expert:EP), 1, model_dim]
+    fc2_smooth_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+    a16=False,
+    per_tensor_quant_scale=None,
+    expert_mask=None,
+    activation=ActivationType.Silu,
+):
+    return fused_moe(
+        hidden_states, w1, w2, topk_weight, topk_ids,
+        expert_mask=expert_mask,
+        activation=activation,
+        doweight_stage1=True,
+        w1_scale=fc1_scale, w2_scale=fc2_scale,
+        a1_scale=fc1_smooth_scale, a2_scale=fc2_smooth_scale,
+        a16=a16,
+        per_tensor_quant_scale=per_tensor_quant_scale
+    )
 
 
 def get_block_size(token, topk, expert):
