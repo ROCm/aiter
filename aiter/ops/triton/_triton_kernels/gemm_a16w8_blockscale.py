@@ -6,37 +6,10 @@ import json
 import os
 import triton
 import triton.language as tl
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
-from ..utils._triton.kernel_repr import make_kernel_repr
-
-
-_gemm_a8w8_per_token_scale_repr = make_kernel_repr(
-    "_gemm_a8w8_per_token_scale_kernel",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "BLOCK_SIZE_K",
-        "GROUP_SIZE_M",
-        "NUM_KSPLIT",
-        "SPLITK_BLOCK_SIZE",
-        "EVEN_K",
-        "GRID_MN",
-        "cache_modifier",
-    ],
-)
-
-
-_gemm_a8w8_per_token_scale_reduce_repr = make_kernel_repr(
-    "_gemm_a8w8_per_token_scale_reduce_kernel",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "ACTUAL_KSPLIT",
-        "MAX_KSPLIT",
-    ],
-)
+from aiter.ops.triton._triton_kernels.fused_fp8_quant import _fp8_quant_op
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 @triton.heuristics(
@@ -46,13 +19,12 @@ _gemm_a8w8_per_token_scale_reduce_repr = make_kernel_repr(
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit(repr=_gemm_a8w8_per_token_scale_repr)
-def _gemm_a8w8_per_token_scale_kernel(
+@triton.jit
+def _gemm_a16w8_blockscale_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
     c_ptr,
-    a_scale_ptr,
     b_scale_ptr,
     # Matrix dimensions
     M,
@@ -69,11 +41,11 @@ def _gemm_a8w8_per_token_scale_kernel(
     stride_ck,
     stride_cm,
     stride_cn,
-    stride_ascale_m,
-    stride_ascale_k,
     stride_bscale_k,
     stride_bscale_n,
     # Meta-parameters
+    GROUP_K: tl.constexpr,
+    GROUP_N: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -82,6 +54,9 @@ def _gemm_a8w8_per_token_scale_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    PREQUANT: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+    DTYPE_MIN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -108,8 +83,6 @@ def _gemm_a8w8_per_token_scale_kernel(
     tl.assume(stride_ck > 0)
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
-    tl.assume(stride_ascale_m > 0)
-    tl.assume(stride_ascale_k > 0)
     tl.assume(stride_bscale_k > 0)
     tl.assume(stride_bscale_n > 0)
 
@@ -123,8 +96,6 @@ def _gemm_a8w8_per_token_scale_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
-
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
@@ -136,6 +107,7 @@ def _gemm_a8w8_per_token_scale_kernel(
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
 
+        # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
 
         # Create pointers for first block of A and B input matrices
@@ -151,8 +123,12 @@ def _gemm_a8w8_per_token_scale_kernel(
         )
 
         # Create pointers for the scales
-        a_scale = tl.load(a_scale_ptr + offs_am * stride_ascale_m)
-        b_scale = tl.load(b_scale_ptr + offs_bn * stride_bscale_n)
+        offs_ks = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
+        offs_bsn = offs_bn // GROUP_N
+        b_scale_ptrs = (
+            b_scale_ptr + offs_ks * stride_bscale_k + offs_bsn * stride_bscale_n
+        )
+        offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
@@ -171,14 +147,31 @@ def _gemm_a8w8_per_token_scale_kernel(
                     b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
                 )
 
-            # Perform dot operation and apply scale
-            accumulator += tl.dot(a, b, input_precision="ieee")
+            b_scale = tl.load(b_scale_ptrs)
+
+            if PREQUANT:
+                a, a_scale = _fp8_quant_op(
+                    a, BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_K, DTYPE_MAX, DTYPE_MIN
+                )
+                a = a.to(b_ptr.type.element_ty).reshape(BLOCK_SIZE_M, BLOCK_SIZE_K)
+                a_scale = a_scale.reshape(BLOCK_SIZE_M)
+                accumulator += (
+                    tl.dot(a, b, input_precision="ieee")
+                    * a_scale[:, None]
+                    * b_scale[None, :]
+                )
+            else:
+                b = b.to(a_ptr.type.element_ty)
+                accumulator += tl.dot(a, b, input_precision="ieee") * b_scale[None, :]
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
-        accumulator *= a_scale[:, None] * b_scale[None, :]
+            # k_cur = k * BLOCK_SIZE_K // GROUP_K
+            # k_nxt = (k + 1) * BLOCK_SIZE_K // GROUP_K
+            # offs_ks = k_nxt - k_cur
+            b_scale_ptrs += offs_ks_step * stride_bscale_k
 
         c = accumulator.to(c_ptr.type.element_ty)
 
@@ -195,62 +188,6 @@ def _gemm_a8w8_per_token_scale_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit(repr=_gemm_a8w8_per_token_scale_reduce_repr)
-def _gemm_a8w8_per_token_scale_reduce_kernel(
-    c_in_ptr,
-    c_out_ptr,
-    M,
-    N,
-    stride_c_in_k,
-    stride_c_in_m,
-    stride_c_in_n,
-    stride_c_out_m,
-    stride_c_out_n,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    ACTUAL_KSPLIT: tl.constexpr,
-    MAX_KSPLIT: tl.constexpr,
-):
-
-    tl.assume(stride_c_in_k > 0)
-    tl.assume(stride_c_in_m > 0)
-    tl.assume(stride_c_in_n > 0)
-    tl.assume(stride_c_out_m > 0)
-    tl.assume(stride_c_out_n > 0)
-
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
-
-    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, MAX_KSPLIT)
-    c_in_ptrs = (
-        c_in_ptr
-        + (offs_k[:, None, None] * stride_c_in_k)
-        + (offs_m[None, :, None] * stride_c_in_m)
-        + (offs_n[None, None, :] * stride_c_in_n)
-    )
-
-    if ACTUAL_KSPLIT == MAX_KSPLIT:
-        c = tl.load(c_in_ptrs)
-    else:
-        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
-    c = tl.sum(c, axis=0)
-
-    c = c.to(c_out_ptr.type.element_ty)
-
-    c_out_ptrs = (
-        c_out_ptr
-        + (offs_m[:, None] * stride_c_out_m)
-        + (offs_n[None, :] * stride_c_out_n)
-    )
-
-    tl.store(c_out_ptrs, c)
-
-
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
@@ -260,7 +197,7 @@ def _get_config(
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
         _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8W8_PER_TOKEN_SCALE.json"
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W8_BLOCKSCALE.json"
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict["default"] = config
@@ -268,12 +205,33 @@ def _get_config(
     key = f"{N}_{K}"
     if key not in _get_config._config_dict.keys():
         dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8W8_PER_TOKEN_SCALE-N={N}-K={K}.json"
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W8_BLOCKSCALE-N={N}-K={K}.json"
         if os.path.exists(fpath):
             with open(fpath, "r") as file:
                 config = json.load(file)
                 _get_config._config_dict[key] = config
         else:
             key = "default"  # fall back to default config
+
+    if M < 16 and "small" in _get_config._config_dict[key]:
+        return _get_config._config_dict[key]["small"]
+    elif M < 32 and "small_M16" in _get_config._config_dict[key]:
+        return _get_config._config_dict[key]["small_M16"]
+    elif M <= 128:
+        BLK_M = triton.next_power_of_2(M)
+        if BLK_M == 32 and "medium_M32" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_M32"]
+        elif BLK_M == 64 and "medium_M64" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_M64"]
+        elif BLK_M == 128 and "medium_M128" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_M128"]
+    elif M <= 256 and "large" in _get_config._config_dict[key]:
+        return _get_config._config_dict[key]["large"]
+    else:
+        BLK_M = triton.next_power_of_2(M)
+        if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
+        elif "xlarge" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["xlarge"]
 
     return _get_config._config_dict[key]["any"]
