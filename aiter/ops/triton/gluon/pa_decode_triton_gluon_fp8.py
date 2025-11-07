@@ -38,7 +38,6 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     query_scale,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    # alibi_slopes_ptr,
     stride_max_logits_seq,
     stride_max_logits_head,
     stride_max_logits_part,
@@ -397,16 +396,6 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
             0, KV_COMPUTE_BLOCK_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
         )
 
-        # ==================== ALiBi Slopes Handling ====================
-        if alibi_slopes_ptr is None:
-            alibi_slope_values = gl.zeros([QUERY_GROUP_SIZE_POW2], dtype=gl.float32)
-        else:
-            alibi_slope_values = gl.amd.cdna3.buffer_load(
-                ptr=alibi_slopes_ptr + kv_head_idx * QUERY_GROUP_SIZE,
-                offsets=qk_row_offsets,
-                mask=qk_row_offsets < QUERY_GROUP_SIZE,
-            )
-
         # ==================== Block Table Lookup ====================
         block_tables_start_ptr = (
             block_tables_ptr + sequence_idx * stride_block_table_seq
@@ -528,14 +517,6 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         # Apply scaling to QK scores
         qk_matrix = qk_scale_value * qk_matrix
 
-        # ==================== ALiBi Bias Application ====================
-        if alibi_slopes_ptr is not None:
-            alibi_bias = (
-                alibi_slope_values[:, None]
-                * (qk_column_offsets - kv_sequence_length + 1)[None, :]
-            ).to(gl.float32)
-            qk_matrix += alibi_bias
-
         # ==================== Attention Masking ====================
         # Create boundary mask for valid query groups
         boundary_mask = qk_row_offsets[:, None] < QUERY_GROUP_SIZE
@@ -634,7 +615,8 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
     # Apply final scaling to attention accumulator
     attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
-    attention_accumulator = attention_accumulator.to(COMPUTE_TYPE)
+    # attention_accumulator = attention_accumulator.to(COMPUTE_TYPE)
+    attention_accumulator = attention_accumulator.to(gl.bfloat16)
 
     # Store results to output buffers
     gl.amd.cdna3.buffer_store(
@@ -681,7 +663,6 @@ def paged_attention_decode_v2_gluon_fp8(
     query_scale,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    # alibi_slopes_ptr,
     stride_max_logits_seq,
     stride_max_logits_head,
     stride_max_logits_part,
@@ -743,7 +724,6 @@ def paged_attention_decode_v2_gluon_fp8(
         query_scale: Query quantization scales
         key_scale: Key quantization scales
         value_scale: Value quantization scales
-        alibi_slopes_ptr: Pointer to ALiBi slopes for attention bias
         Various stride parameters for tensor access
         Compile-time constants for kernel configuration
 
@@ -1049,16 +1029,6 @@ def paged_attention_decode_v2_gluon_fp8(
             0, KV_COMPUTE_BLOCK_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
         )
 
-        # # Load ALiBi slopes if provided
-        # if alibi_slopes_ptr is None:
-        #     alibi_slope_values = gl.zeros([QUERY_GROUP_SIZE_POW2], dtype=gl.float32)
-        # else:
-        #     alibi_slope_values = gl.amd.cdna3.buffer_load(
-        #         ptr=alibi_slopes_ptr + kv_head_idx * QUERY_GROUP_SIZE,
-        #         offsets=qk_row_offsets,
-        #         mask=qk_row_offsets < QUERY_GROUP_SIZE,
-        #     )
-
         # Load KV block indices from block table
         block_indices = gl.arange(
             0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout
@@ -1210,14 +1180,6 @@ def paged_attention_decode_v2_gluon_fp8(
                 qk_scale_value = softmax_scale
 
         attention_scores = qk_scale_value * attention_scores
-
-        # # Apply ALiBi biases if provided
-        # if alibi_slopes_ptr is not None:
-        #     alibi_bias = (
-        #         alibi_slope_values[:, None]
-        #         * (qk_column_offsets - kv_sequence_length + 1)[None, :]
-        #     ).to(gl.float32)
-        #     attention_scores += alibi_bias
 
         # ==================== ATTENTION MASKING ====================
         # Create boundary mask for valid sequence positions
@@ -1745,7 +1707,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     query_scale,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    alibi_slopes_ptr,
     stride_max_logits_seq,
     stride_max_logits_head,
     stride_max_logits_part,
@@ -1875,7 +1836,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             query_scale,
             key_scale,
             value_scale,
-            # alibi_slopes_ptr,
             stride_max_logits_seq,
             stride_max_logits_head,
             stride_max_logits_part,
@@ -2029,7 +1989,9 @@ def paged_attention_decode(
     query_scale: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    num_sequence_partitions: int = 0,
+    exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
+    max_logits: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
+    temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size, head_size]
     alibi_slopes: torch.Tensor = None,
 ) -> None:
     """
@@ -2089,12 +2051,6 @@ def paged_attention_decode(
         Quantization scales for values
         Shape: [1] (per-tensor) or [num_blocks, num_kv_heads, kv_block_size, 1] (per-token)
 
-    num_sequence_partitions : int, optional
-        Number of sequence partitions (future use), by default 0
-
-    alibi_slopes : torch.Tensor, optional
-        ALiBi attention bias slopes, by default None
-
     Returns
     -------
     dict
@@ -2128,23 +2084,23 @@ def paged_attention_decode(
 
     # Configure execution grid
     grid = (num_sequences, num_kv_heads, max_num_partitions)
-    intermediate_shape = (
-        num_sequences,
-        num_kv_heads,
-        max_num_partitions,
-        equivalent_query_group_size,
-    )
+    # intermediate_shape = (
+    #     num_sequences,
+    #     num_kv_heads,
+    #     max_num_partitions,
+    #     equivalent_query_group_size,
+    # )
 
-    # Initialize intermediate tensors for attention computation
-    max_logits = torch.zeros(
-        intermediate_shape, dtype=torch.float32, device=output.device
-    )
-    exp_sums = torch.zeros(
-        intermediate_shape, dtype=torch.float32, device=output.device
-    )
-    temporary_output = torch.zeros(
-        *intermediate_shape, head_size, dtype=output.dtype, device=output.device
-    )
+    # # Initialize intermediate tensors for attention computation
+    # max_logits = torch.zeros(
+    #     intermediate_shape, dtype=torch.float32, device=output.device
+    # )
+    # exp_sums = torch.zeros(
+    #     intermediate_shape, dtype=torch.float32, device=output.device
+    # )
+    # temporary_output = torch.zeros(
+    #     *intermediate_shape, head_size, dtype=output.dtype, device=output.device
+    # )
 
     # Adjust query group size to power of 2 with constraints
     if equivalent_query_group_size <= 16:
@@ -2258,67 +2214,62 @@ def paged_attention_decode(
         fp8_max_value = torch.finfo(aiter.dtypes.fp8).max
 
     # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
-    # _, decode_execution_time = (
-    _ = (
-        _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
-            grid,
-            exp_sums,
-            max_logits,
-            temporary_output,
-            query,
-            key_cache,
-            value_cache,
-            block_tables,
-            sequence_lengths,
-            softmax_scale,
-            query_scale,
-            key_scale,
-            value_scale,
-            alibi_slopes,
-            exp_sums.stride(0),
-            exp_sums.stride(1),
-            exp_sums.stride(2),
-            temporary_output.stride(0),
-            temporary_output.stride(1),
-            temporary_output.stride(2),
-            temporary_output.stride(3),
-            query.stride(0),
-            query.stride(1),
-            key_cache.stride(0),
-            key_cache.stride(1),
-            key_cache.stride(2),
-            key_cache.stride(3),
-            value_cache.stride(0),
-            value_cache.stride(1),
-            value_cache.stride(2),
-            block_tables.stride(0),
-            query_scale_stride_0,
-            key_scale_stride_0,
-            key_scale_stride_1,
-            kv_type=compute_type,
-            QUERY_SEQ_LEN=query_sequence_length,
-            COMPUTE_TYPE=compute_type,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_POW2=head_size_pow2,
-            QUERY_GROUP_SIZE_ORIGINAL=query_group_size,
-            QUERY_GROUP_SIZE=equivalent_query_group_size,
-            QUERY_GROUP_SIZE_POW2=equivalent_query_group_size_pow2,
-            KV_BLOCK_SIZE=kv_block_size,
-            KV_BLOCK_SIZE_POW2=kv_block_size_pow2,
-            SEQUENCE_PARTITION_SIZE=_SEQUENCE_PARTITION_SIZE,
-            KV_16B_ELEMENT_COUNT=kv_elements_per_16b,
-            QUERY_QUANT_MODE=query_quant_mode,
-            KV_QUANT_MODE=kv_quant_mode,
-            FP8_MAX_VALUE=fp8_max_value,
-            VALUE_TRANSPOSED=value_transposed,
-            IS_CAUSAL=is_causal,
-        )
+    _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
+        grid,
+        exp_sums,
+        max_logits,
+        temporary_output,
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        sequence_lengths,
+        softmax_scale,
+        query_scale,
+        key_scale,
+        value_scale,
+        exp_sums.stride(0),
+        exp_sums.stride(1),
+        exp_sums.stride(2),
+        temporary_output.stride(0),
+        temporary_output.stride(1),
+        temporary_output.stride(2),
+        temporary_output.stride(3),
+        query.stride(0),
+        query.stride(1),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        key_cache.stride(3),
+        value_cache.stride(0),
+        value_cache.stride(1),
+        value_cache.stride(2),
+        block_tables.stride(0),
+        query_scale_stride_0,
+        key_scale_stride_0,
+        key_scale_stride_1,
+        kv_type=compute_type,
+        QUERY_SEQ_LEN=query_sequence_length,
+        COMPUTE_TYPE=compute_type,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_POW2=head_size_pow2,
+        QUERY_GROUP_SIZE_ORIGINAL=query_group_size,
+        QUERY_GROUP_SIZE=equivalent_query_group_size,
+        QUERY_GROUP_SIZE_POW2=equivalent_query_group_size_pow2,
+        KV_BLOCK_SIZE=kv_block_size,
+        KV_BLOCK_SIZE_POW2=kv_block_size_pow2,
+        SEQUENCE_PARTITION_SIZE=_SEQUENCE_PARTITION_SIZE,
+        KV_16B_ELEMENT_COUNT=kv_elements_per_16b,
+        QUERY_QUANT_MODE=query_quant_mode,
+        KV_QUANT_MODE=kv_quant_mode,
+        FP8_MAX_VALUE=fp8_max_value,
+        VALUE_TRANSPOSED=value_transposed,
+        IS_CAUSAL=is_causal,
     )
 
     # ==================== REDUCTION KERNEL EXECUTION ====================
     grid = (num_sequences, num_kv_heads, 1)
-    # _, reduce_execution_time = _paged_attention_decode_v2_reduce_kernel_wrapper(
-    _ = _paged_attention_decode_v2_reduce_kernel_wrapper(
+    _paged_attention_decode_v2_reduce_kernel_wrapper(
         grid,
         output,
         exp_sums,
@@ -2342,14 +2293,3 @@ def paged_attention_decode(
         MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
         MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
     )
-
-    # ==================== RETURN RESULTS AND TIMING INFORMATION ====================
-    return {
-        # "final_output": output,
-        # "exponential_sums": exp_sums,
-        # "maximum_logits": max_logits,
-        # "temporary_output": temporary_output,
-        # "triton_decode_time": decode_execution_time,
-        # "triton_reduce_time": reduce_execution_time,
-        # "total_triton_time": decode_execution_time + reduce_execution_time,
-    }
