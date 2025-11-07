@@ -1489,23 +1489,18 @@ struct WaveTopkFilter
         }
         else if(std::is_same_v<T, float> || std::is_same_v<T, int>)
         {
-            constexpr IdxT repetition = 2;
-            constexpr IdxT tile       = elements * repetition;
-            const IdxT block_tile     = blockDim.x * tile;
-            const IdxT end_aligned    = start + utils::round_up_to_multiple_of(n, block_tile);
+            constexpr IdxT tile    = elements;
+            const IdxT block_tile  = blockDim.x * tile;
+            const IdxT end_aligned = start + utils::round_up_to_multiple_of(n, block_tile);
 
             using VecType = std::conditional_t<std::is_same_v<T, float>,
                                                buffer_load_helpers::floatx4_t,
                                                buffer_load_helpers::int32x4_t>;
-            VecType arr[repetition];
+            VecType arr[2];
+            arr[0] = buffer_load_helpers::buffer_load<VecType, cache_policy>(in, start + tid * tile, n);
             for(IdxT i = start + tid * tile; i < end_aligned; i += stride * tile)
             {
-#pragma unroll
-                for(IdxT idx = 0; idx < repetition; ++idx)
-                {
-                    arr[idx] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
-                        in, i + idx * elements, n);
-                }
+                arr[1] = buffer_load_helpers::buffer_load<VecType, cache_policy>(in, i + stride * tile, n);
 #pragma unroll
                 for(IdxT idx = 0; idx < tile; ++idx)
                 {
@@ -1513,6 +1508,7 @@ struct WaveTopkFilter
                         (i + idx < end) ? arr[idx / elements][idx % elements] : buffer_.sentinel;
                     filter_and_stage(val, i + idx);
                 }
+                arr[0] = arr[1];
             }
         }
 
