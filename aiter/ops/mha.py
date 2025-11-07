@@ -202,6 +202,7 @@ def gen_fmha_v3_fwd_fake_tensors(
     window_size_right: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
+    how_v3_bf16_cvt: int,
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
@@ -226,6 +227,7 @@ def fmha_v3_fwd(
     window_size_right: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
+    how_v3_bf16_cvt: int,
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
@@ -1176,6 +1178,7 @@ def _flash_attn_forward(
     alibi_slopes: Optional[torch.Tensor],
     return_lse: bool,
     return_softmax: bool,
+    how_v3_bf16_cvt: Optional[int] = 1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1229,6 +1232,7 @@ def _flash_attn_forward(
             window_size_right,
             return_lse,
             return_softmax,
+            how_v3_bf16_cvt,
             None,
             bias,
             alibi_slopes,
@@ -1626,6 +1630,7 @@ class FlashAttnFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
+            how_v3_bf16_cvt=how_v3_bf16_cvt,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
         )
@@ -1742,6 +1747,7 @@ def flash_attn_func(
     deterministic=True,
     return_lse=False,
     return_attn_probs=False,
+    how_v3_bf16_cvt=1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
 ):
@@ -1811,7 +1817,7 @@ def flash_attn_func(
         return_attn_probs,
         torch.is_grad_enabled(),
         True,  # is_v3_atomic_fp32
-        1,  # how_v3_bf16_cvt
+        how_v3_bf16_cvt,
         cu_seqlens_q,
         cu_seqlens_kv,
     )
@@ -2352,6 +2358,7 @@ def flash_attn_varlen_func(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
+    how_v3_bf16_cvt=1,
     block_table=None,
     out=None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
@@ -2445,7 +2452,7 @@ def flash_attn_varlen_func(
         cu_seqlens_q_padded,
         cu_seqlens_k_padded,
         True,
-        1,
+        how_v3_bf16_cvt,
     )
 
 

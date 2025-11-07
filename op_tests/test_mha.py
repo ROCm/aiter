@@ -104,10 +104,11 @@ def run_ck(
         bias,
         alibi_slopes,
         deterministic,
-        return_lse,
-        return_attn_probs,
-        cu_seqlens_q,
-        cu_seqlens_kv,
+        return_lse=return_lse,
+        return_attn_probs=return_attn_probs,
+        how_v3_bf16_cvt=1,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
         num_rotate_args=1,
     )
 
