@@ -472,20 +472,21 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
         % KVBlockSize,
     )
-    context_kv_idx_next_0 = gl.amd.cdna3.buffer_load(
-        ptr=kv_indices,
-        offsets=pid_batch * max_block_len
-        + (context_idx + ChunkK) // KVBlockSize
-        + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
-        // KVBlockSize,
-    )
 
     _amd_iglp_sched_group_barrier(DS_READ, 4, 0)
     _amd_iglp_sched_group_barrier(BUFFER_LOAD, 4, 0)
     _amd_iglp_sched_group_barrier(DS_READ, 2, 0)
     _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
     _amd_iglp_sched_group_barrier(DS_READ, 2, 0)
-    _amd_iglp_sched_group_barrier(BUFFER_LOAD, 2, 0)
+
+    if context_idx + ChunkK < split_context_start + split_context_length:
+        context_kv_idx_next_0 = gl.amd.cdna3.buffer_load(
+            ptr=kv_indices,
+            offsets=pid_batch * max_block_len
+            + (context_idx + ChunkK) // KVBlockSize
+            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
+            // KVBlockSize,
+        )
     #!=----------------------------
     _amd_iglp_sched_barrier(0x0)
     #!=----------------------------

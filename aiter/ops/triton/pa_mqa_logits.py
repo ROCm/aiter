@@ -68,6 +68,7 @@ from aiter.utility.triton.triton_metadata_redirect import (
     AOTMetadataContext,
 )
 from aiter import dtypes
+from ...jit.utils.chip_info import get_gfx
 
 
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
@@ -244,17 +245,21 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     is_padded_mode: bool,
     WavePerEU: int = 2,
 ):
-    target = GPUTarget("hip", "gfx942", 64)
+    gfx_version = get_gfx()
+    assert gfx_version == "gfx942" or gfx_version == "gfx950"
+    target = GPUTarget("hip", gfx_version, 64)
+
+    gfx_fp8_pointer = "*fp8e4b8" if gfx_version == "gfx942" else "*fp8e4nv"
 
     fn_signature = {
         "batch_size": "i32",
         "next_n": "i32",
         "heads_num": "i32",
-        "Q_buffer": "*fp8e4b8",
+        "Q_buffer": gfx_fp8_pointer,
         "stride_q_batch": "i32",
         "stride_q_next_n": "i32",
         "stride_q_heads": "i32",
-        "KV_buffer": "*fp8e4b8",
+        "KV_buffer": gfx_fp8_pointer,
         "stride_k_seq": "i32",
         "scale_buffer": "*fp32",
         "stride_scale_seq": "i32",
@@ -281,7 +286,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "num_stages": 2,
         "num_ctas": 1,
         "cluster_dims": [1, 1, 1],
-        "arch": "gfx942",
+        "arch": gfx_version,
         "backend_name": "hip",
         "warp_size": 64,
         "name": (
@@ -385,7 +390,7 @@ def deepgemm_fp8_paged_mqa_logits(
         kv_cache[..., : KVBlockSize * hidden_dim],
         kv_cache[..., KVBlockSize * hidden_dim :],
     )
-    kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
+    kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
     kv_cache_scale = kv_cache_scale.view(torch.float32)
 
     grid = (batch_size * next_n * SplitKV, 1, 1)
