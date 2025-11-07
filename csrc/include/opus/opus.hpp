@@ -215,7 +215,7 @@ template<index_t... N, typename F> OPUS_H_D constexpr void static_ford(tuple<num
 // array, enhanced C like array style. convenient for cases like assign one array to another
 template <typename T, index_t N>
 struct array {
-    using value_type = remove_cv_t<T>;
+    using value_type = remove_cvref_t<T>;
     using type = array<value_type, N>;
 #if 0   // don't define following, just let me be trivially copyable class
     OPUS_H_D constexpr array() = default;
@@ -235,7 +235,9 @@ struct array {
     OPUS_H_D static constexpr bool empty() { return size() == 0; }
     OPUS_H_D static constexpr index_t size() { return N; }
 
-    value_type content[N];
+    // we need this "content" member to have a default value, so that the implicitly defined constructor could be constexpr
+    // see: https://en.cppreference.com/w/cpp/language/constexpr.html#constexpr_constructor
+    value_type content[N] {};
 };
 
 template <typename T, index_t N>
@@ -510,8 +512,8 @@ struct layout : public tuple<remove_cvref_t<Shape_>, remove_cvref_t<Stride_>, re
         else          return rank - tuple_count<underscore>(Coord{});
     }();
 
-    OPUS_H_D constexpr layout(const Shape& shape, const Stride& stride, const Coord& coord = {}) : base(shape, stride, coord), linear_offset(0){}
-    OPUS_H_D constexpr layout(Shape&& shape, Stride&& stride, Coord&& coord = {}) : base(shape, stride, coord), linear_offset(0){}
+    OPUS_H_D constexpr layout(const Shape& shape, const Stride& stride, const Coord& coord = {}) : base(shape, stride, coord){}
+    OPUS_H_D constexpr layout(Shape&& shape, Stride&& stride, Coord&& coord = {}) : base(shape, stride, coord){}
 
     // get ith element from shape/stride. if no I, then get the shape/stride as tuple
     template <int... I> OPUS_H_D constexpr decltype(auto) shape()        { return get<0,I...>(static_cast<base&>(*this)); }
@@ -526,29 +528,88 @@ struct layout : public tuple<remove_cvref_t<Shape_>, remove_cvref_t<Stride_>, re
 
     template <typename InCoord, std::enable_if_t<is_tuple_v<InCoord>, bool> = true>
     OPUS_H_D constexpr decltype(auto) operator()(InCoord&& c) const {
-        if constexpr (std::is_same_v<Coord, false_type>) return linear_offset + coord_to_linear(*this, c);
-        else                                             return linear_offset + coord_to_linear(*this, merge_peepholed_tuple(coord(), c));
-    }
+        if constexpr (std::is_same_v<Coord, false_type>) return coord_to_linear(*this, c);
+        else                                             return coord_to_linear(*this, merge_peepholed_tuple(coord(), c)); }
+};
+
+template <typename Layout> struct layout_linear;
+template<index_t cached_vec_, typename Layout> struct layout_cached;
+
+// use cached_vec to dispatch which layout implementation. cached_vec < 0 : "layout", cached_vec == 0 : "layout_linear", cached_vec > 0 : "layout_cached"
+template <index_t cached_vec = 0, typename Sx, typename Sy> OPUS_H_D constexpr auto make_layout(Sx&& s, Sy&& t) {
+    if      constexpr (cached_vec < 0)  return layout<Sx, Sy>(std::forward<Sx>(s), std::forward<Sy>(t));
+    else if constexpr (cached_vec == 0) return layout_linear<layout<Sx, Sy>>(std::forward<Sx>(s), std::forward<Sy>(t));
+    else                                return layout_cached<cached_vec, layout<Sx, Sy>>(std::forward<Sx>(s), std::forward<Sy>(t)); }
+template <index_t cached_vec = 0, typename Sx, typename Sy, typename Sz>
+OPUS_H_D constexpr auto                       make_layout(Sx&& s, Sy&& t, Sz&& c) {
+    if constexpr (cached_vec < 0)  return layout<Sx, Sy, Sz>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c));
+    if constexpr (cached_vec == 0) return layout_linear<layout<Sx, Sy, Sz>>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c));
+    else                           return layout_cached<cached_vec, layout<Sx, Sy, Sz>>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c)); }
+template <index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true>
+OPUS_H_D constexpr auto                       make_layout(Ts&&... ss) { return make_layout<cached_vec>(opus::make_tuple(ss...), packed_shape_to_stride(opus::make_tuple(ss...))); }
+template <index_t cached_vec = 0, typename S> OPUS_H_D constexpr auto make_layout(S&& s) { return make_layout<cached_vec>(std::forward<S>(s), packed_shape_to_stride(s)); }
+
+template <index_t cached_vec = 0, typename S> OPUS_H_D constexpr auto               make_layout_packed(S&& s) { return make_layout<cached_vec>(std::forward<S>(s), packed_shape_to_stride(s)); } // same as single arg make_layout
+template <index_t cached_vec = 0, typename Sx, typename Sz> OPUS_H_D constexpr auto make_layout_packed(Sx&& s, Sz&& c) { return make_layout<cached_vec>(std::forward<Sx>(s), packed_shape_to_stride(s), std::forward<Sz>(c)); }
+
+template <typename Layout>
+struct layout_linear : public remove_cvref_t<Layout>{
+    using base = remove_cvref_t<Layout>;
+
+    template<typename Shape, typename Stride, typename Coord = false_type>
+    OPUS_H_D constexpr layout_linear(const Shape& shape, const Stride& stride, const Coord& coord = {}) : base(shape, stride, coord), linear_offset(0){}
+
+    template<typename Shape, typename Stride, typename Coord = false_type>
+    OPUS_H_D constexpr layout_linear(Shape&& shape, Stride&& stride, Coord&& coord = {}) : base(shape, stride, coord), linear_offset(0){}
+
+    template <typename... Cs, std::enable_if_t<(!is_tuple_v<Cs> && ...), bool> = true>
+    OPUS_H_D constexpr decltype(auto) operator()(Cs&&... cs) const { return this->operator()(opus::make_tuple(std::forward<Cs>(cs)...)); }
+
+    template <typename InCoord, std::enable_if_t<is_tuple_v<InCoord>, bool> = true>
+    OPUS_H_D constexpr decltype(auto) operator()(InCoord&& c) const {
+        if constexpr (std::is_same_v<typename base::Coord, false_type>) return linear_offset + coord_to_linear(*this, c);
+        else                                             return linear_offset + coord_to_linear(*this, merge_peepholed_tuple(base::coord(), c)); }
 
     OPUS_H_D constexpr void inc(index_t offset) { linear_offset += offset; }
-    OPUS_H_D constexpr layout& operator+=(index_t offset) { inc(offset); return *this; }
+    OPUS_H_D constexpr layout_linear& operator+=(index_t offset) { inc(offset); return *this; }
 
     index_t linear_offset;
 };
 
+template <index_t vec, typename Layout> OPUS_H_D constexpr auto layout_to_vectorized_issue_space();
+template<index_t vec, typename Layout> OPUS_H_D constexpr auto layout_to_offsets(const Layout& u);
+
+template<index_t cached_vec_, typename Layout>
+struct layout_cached : public remove_cvref_t<Layout> {
+    using base = remove_cvref_t<Layout>;
+    static constexpr index_t cached_vec = cached_vec_;
+
+    static constexpr auto issue_space_vec = layout_to_vectorized_issue_space<cached_vec, base>();
+    static constexpr index_t num_issues = get<0>(reduce_tuple_mul(issue_space_vec)).value;
+
+    template<typename Shape, typename Stride, typename Coord = false_type>
+    OPUS_H_D constexpr layout_cached(const Shape& shape, const Stride& stride, const Coord& coord = {}) : base(shape, stride, coord), offsets{layout_to_offsets<cached_vec>(static_cast<base>(*this))}{}
+
+    template<typename Shape, typename Stride, typename Coord = false_type>
+    OPUS_H_D constexpr layout_cached(Shape&& shape, Stride&& stride, Coord&& coord = {}) : base(shape, stride, coord), offsets{layout_to_offsets<cached_vec>(static_cast<base>(*this))}{}
+
+    template <typename... Cs, std::enable_if_t<(!is_tuple_v<Cs> && ...), bool> = true>
+    OPUS_H_D constexpr decltype(auto) operator()(Cs&&... cs) const { return this->operator()(opus::make_tuple(std::forward<Cs>(cs)...)); }
+
+    template <typename InCoord, std::enable_if_t<is_tuple_v<InCoord>, bool> = true>
+    OPUS_H_D constexpr decltype(auto) operator()(InCoord&& c) const { constexpr auto u_linear = make_layout<-1>(issue_space_vec); return offsets[u_linear(c)]; }
+
+    OPUS_H_D constexpr void inc(index_t offset) { static_for<num_issues>([&](auto i){ offsets[i] += offset; }); }
+    OPUS_H_D constexpr layout_cached& operator+=(index_t offset) { inc(offset); return *this; }
+
+    array<index_t, num_issues> offsets;
+};
+
 template<typename T> struct is_layout : false_type {};
 template<typename X, typename Y, typename Z> struct is_layout<layout<X, Y, Z>> : true_type {};
+template<index_t cached_vec, typename Layout> struct is_layout<layout_cached<cached_vec, Layout>> : true_type {};
+template<typename Layout> struct is_layout<layout_linear<Layout>> : true_type {};
 template<typename T> constexpr bool is_layout_v = is_layout<remove_cvref_t<T>>::value;
-
-template <typename Sx, typename Sy> OPUS_H_D constexpr auto make_layout(Sx&& s, Sy&& t) { return layout<Sx, Sy>(std::forward<Sx>(s), std::forward<Sy>(t)); }
-template <typename Sx, typename Sy, typename Sz>
-OPUS_H_D constexpr auto                       make_layout(Sx&& s, Sy&& t, Sz&& c) { return layout<Sx, Sy, Sz>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c)); }
-template <typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true>
-OPUS_H_D constexpr auto                       make_layout(Ts&&... ss) { return make_layout(opus::make_tuple(ss...), packed_shape_to_stride(opus::make_tuple(ss...))); }
-template <typename S> OPUS_H_D constexpr auto make_layout(S&& s) { return make_layout(std::forward<S>(s), packed_shape_to_stride(s)); }
-
-template <typename S> OPUS_H_D constexpr auto               make_layout_packed(S&& s) { return make_layout(std::forward<S>(s), packed_shape_to_stride(s)); } // same as single arg make_layout
-template <typename Sx, typename Sz> OPUS_H_D constexpr auto make_layout_packed(Sx&& s, Sz&& c) { return make_layout(std::forward<Sx>(s), packed_shape_to_stride(s), std::forward<Sz>(c)); }
 
 template <typename Layout>
 OPUS_H_D constexpr auto layout_to_issue_space()
@@ -572,8 +633,8 @@ OPUS_H_D constexpr auto vectorize_issue_space(issue_space, number<vec> = {})
     return issue_space_vec;
 }
 
-template <typename Layout, index_t vec = 1>
-OPUS_H_D constexpr auto layout_to_vectorized_issue_space(number<vec> = {})
+template <index_t vec, typename Layout>
+OPUS_H_D constexpr auto layout_to_vectorized_issue_space()
 {
     constexpr auto issue_space = layout_to_issue_space<Layout>();
     constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
@@ -584,35 +645,14 @@ OPUS_H_D constexpr auto layout_to_vectorized_issue_space(number<vec> = {})
 // this function is usually not constexpr. pre-compute all the offset under current layout
 template<index_t vec, typename Layout>
 OPUS_H_D constexpr auto layout_to_offsets(const Layout& u) {
-    constexpr auto issue_space_vec = layout_to_vectorized_issue_space<Layout>(number<vec>{});
+    constexpr auto issue_space_vec = layout_to_vectorized_issue_space<vec, Layout>();
     constexpr index_t num_issues = get<0>(reduce_tuple_mul(issue_space_vec)).value;
     array<index_t, num_issues> offsets;
 
-    constexpr auto u_linear = make_layout(issue_space_vec);
+    constexpr auto u_linear = make_layout<-1>(issue_space_vec);
     static_ford(issue_space_vec, [&](auto ... ids){ offsets[u_linear(ids...)] = u(ids...); });
     return offsets;
 }
-
-template<index_t vec, typename Layout>
-struct layout_c : public remove_cvref_t<Layout> {
-    using base = remove_cvref_t<Layout>;
-
-    static constexpr auto issue_space_vec = layout_to_vectorized_issue_space<base>(number<vec>{});
-    static constexpr index_t num_issues = get<0>(reduce_tuple_mul(issue_space_vec)).value;
-
-    template<typename Shape, typename Stride, typename Coord = false_type>
-    OPUS_H_D constexpr layout_c(const Shape& shape, const Stride& stride, const Coord& coord = {}) : base(shape, stride, coord), offsets{layout_to_offsets(*this)}{}
-
-    template<typename Shape, typename Stride, typename Coord = false_type>
-    OPUS_H_D constexpr layout_c(Shape&& shape, Stride&& stride, Coord&& coord = {}) : base(shape, stride, coord), offsets{layout_to_offsets(*this)}{}
-
-    OPUS_H_D constexpr void inc(index_t offset) { static_for<num_issues>([&](auto i){ offsets[i] += offset; }); }
-    OPUS_H_D constexpr layout_c& operator+=(index_t offset) { inc(offset); return *this; }
-
-    array<index_t, num_issues> offsets;
-};
-
-template<index_t vec, typename Layout> using layout_with_cached_offset = layout_c<vec, Layout>;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // vector, a wrapper for __attribute__((ext_vector_type(*)))
@@ -914,7 +954,7 @@ struct gmem {
         constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
 
 #if OPUS_TILE_CONTAINER == 0
-        constexpr auto u_r = make_layout(issue_space);                      // we use this layout to describe the register layout
+        constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;          // local scratch to host the loaded register, and return it
         static_ford(issue_space_vec, [&](auto ... ids){
             auto tmp = load<vec>(u(ids...), s_os, number<aux>{});
@@ -923,7 +963,7 @@ struct gmem {
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
-        constexpr auto u_r = make_layout(issue_space_vec);                      // we use this layout to describe the register layout
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);                      // we use this layout to describe the register layout
         array<vector_type<vec>, r_elem.value> r;                                      // local scratch to host the loaded register, and return it
         static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = load<vec>(u(ids...), s_os, number<aux>{}); }); // issue the loading instruction multiple times
         return r;
@@ -936,7 +976,7 @@ struct gmem {
         constexpr auto issue_space = layout_to_issue_space<Layout>();
         constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
 
-        constexpr auto u_r = make_layout(issue_space);                      // we use this layout to describe the register layout
+        constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
 #if OPUS_TILE_CONTAINER == 0
         auto a_ = x;
 #elif OPUS_TILE_CONTAINER == 1
@@ -1091,7 +1131,6 @@ OPUS_D constexpr auto unfold_p_coord(const Dim&, const Coord& coord) {
     return unfold_p_coord_impl(flatten_dim, coord, number<0>{}, make_index_seq<size<decltype(flatten_dim)>()>{});
 }
 
-//
 template<typename Dim, typename Shape, typename Stride>
 OPUS_D constexpr auto unfold_x_stride(const Dim&, const Shape&, const Stride& stride) {
     constexpr auto flatten_dim = flatten_tuple(Dim{});
@@ -1114,29 +1153,29 @@ OPUS_D constexpr auto unfold_x_stride(const Dim&, const Shape&, const Stride& st
     OPUS_D static constexpr auto p_shape_b() { return p_shape(shape_b(), dim_b()); }           \
     OPUS_D static constexpr auto p_shape_c() { return p_shape(shape_c(), dim_c()); }           \
                                                                                                \
-    OPUS_D constexpr auto layout_a() { return make_layout(shape_a());}                         \
-    OPUS_D constexpr auto layout_b() { return make_layout(shape_b());}                         \
-    OPUS_D constexpr auto layout_c() { return make_layout(shape_c());}                         \
-                                                                                               \
-    template<typename S> OPUS_D constexpr auto layout_a(S&& stride) { return opus::make_layout(shape_a(), unfold_x_stride(dim_a(), shape_a(), stride));} \
-    template<typename S> OPUS_D constexpr auto layout_b(S&& stride) { return opus::make_layout(shape_b(), unfold_x_stride(dim_b(), shape_b(), stride));} \
-    template<typename S> OPUS_D constexpr auto layout_c(S&& stride) { return opus::make_layout(shape_c(), unfold_x_stride(dim_c(), shape_c(), stride));} \
-    /* Note, all the coord passed in must be p_coord*/                                                                               \
-    template<typename S, typename C> OPUS_D constexpr auto layout_a(S&& stride, C&& z) { OPUS_KP_(dim_a); return opus::make_layout(shape_a(), unfold_x_stride(dim_a(), shape_a(), stride), opus::unfold_p_coord(dim_a(), z));}  \
-    template<typename S, typename C> OPUS_D constexpr auto layout_b(S&& stride, C&& z) { OPUS_KP_(dim_b); return opus::make_layout(shape_b(), unfold_x_stride(dim_b(), shape_b(), stride), opus::unfold_p_coord(dim_b(), z));}  \
-    template<typename S, typename C> OPUS_D constexpr auto layout_c(S&& stride, C&& z) { OPUS_KP_(dim_c); return opus::make_layout(shape_c(), unfold_x_stride(dim_c(), shape_c(), stride), opus::unfold_p_coord(dim_c(), z));}  \
-                                                                                                                                                              \
-    template<typename C> OPUS_D constexpr auto layout_a_packed(C&& z) { OPUS_KP_(dim_a); return make_layout_packed(shape_a(), opus::unfold_p_coord(dim_a(), z));} \
-    template<typename C> OPUS_D constexpr auto layout_b_packed(C&& z) { OPUS_KP_(dim_b); return make_layout_packed(shape_b(), opus::unfold_p_coord(dim_b(), z));} \
-    template<typename C> OPUS_D constexpr auto layout_c_packed(C&& z) { OPUS_KP_(dim_c); return make_layout_packed(shape_c(), opus::unfold_p_coord(dim_c(), z));} \
-                                                                                                                                                              \
-    template<typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_a(Ts&&... strides) {return layout_a(opus::make_tuple(strides...)); }  \
-    template<typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_b(Ts&&... strides) {return layout_b(opus::make_tuple(strides...)); }  \
-    template<typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_c(Ts&&... strides) {return layout_c(opus::make_tuple(strides...)); }  \
-                                                                                    \
-    OPUS_D constexpr auto y_layout_a() { return make_layout(y_shape_a());}          \
-    OPUS_D constexpr auto y_layout_b() { return make_layout(y_shape_b());}          \
-    OPUS_D constexpr auto y_layout_c() { return make_layout(y_shape_c());}
+    template<index_t cached_vec = 0> OPUS_D constexpr auto layout_a() { return make_layout<cached_vec>(shape_a());}                         \
+    template<index_t cached_vec = 0> OPUS_D constexpr auto layout_b() { return make_layout<cached_vec>(shape_b());}                         \
+    template<index_t cached_vec = 0> OPUS_D constexpr auto layout_c() { return make_layout<cached_vec>(shape_c());}                         \
+                                                                                                                                            \
+    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_a(S&& stride) { return make_layout<cached_vec>(shape_a(), unfold_x_stride(dim_a(), shape_a(), stride));} \
+    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_b(S&& stride) { return make_layout<cached_vec>(shape_b(), unfold_x_stride(dim_b(), shape_b(), stride));} \
+    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_c(S&& stride) { return make_layout<cached_vec>(shape_c(), unfold_x_stride(dim_c(), shape_c(), stride));} \
+    /* Note, all the coord passed in must be p_coord*/                                                                                      \
+    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_a(S&& stride, C&& z) { OPUS_KP_(dim_a); return make_layout<cached_vec>(shape_a(), unfold_x_stride(dim_a(), shape_a(), stride), opus::unfold_p_coord(dim_a(), z));}  \
+    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_b(S&& stride, C&& z) { OPUS_KP_(dim_b); return make_layout<cached_vec>(shape_b(), unfold_x_stride(dim_b(), shape_b(), stride), opus::unfold_p_coord(dim_b(), z));}  \
+    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_c(S&& stride, C&& z) { OPUS_KP_(dim_c); return make_layout<cached_vec>(shape_c(), unfold_x_stride(dim_c(), shape_c(), stride), opus::unfold_p_coord(dim_c(), z));}  \
+                                                                                                                                                                                                        \
+    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_a_packed(C&& z) { OPUS_KP_(dim_a); return make_layout_packed<cached_vec>(shape_a(), opus::unfold_p_coord(dim_a(), z));}   \
+    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_b_packed(C&& z) { OPUS_KP_(dim_b); return make_layout_packed<cached_vec>(shape_b(), opus::unfold_p_coord(dim_b(), z));}   \
+    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_c_packed(C&& z) { OPUS_KP_(dim_c); return make_layout_packed<cached_vec>(shape_c(), opus::unfold_p_coord(dim_c(), z));}   \
+                                                                                                                                                                                                        \
+    template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_a(Ts&&... strides) {return layout_a<cached_vec>(opus::make_tuple(strides...)); }  \
+    template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_b(Ts&&... strides) {return layout_b<cached_vec>(opus::make_tuple(strides...)); }  \
+    template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_c(Ts&&... strides) {return layout_c<cached_vec>(opus::make_tuple(strides...)); }  \
+                                                                                                                                    \
+    template<index_t cached_vec = 0> OPUS_D constexpr auto y_layout_a() { return make_layout<cached_vec>(y_shape_a());}             \
+    template<index_t cached_vec = 0> OPUS_D constexpr auto y_layout_b() { return make_layout<cached_vec>(y_shape_b());}             \
+    template<index_t cached_vec = 0> OPUS_D constexpr auto y_layout_c() { return make_layout<cached_vec>(y_shape_c());}
 
 // Note: any class to support adaptor need include OPUS_ADAPTOR_LAYOUT_API_DEFINE and implement shape_a()/shape_b()/shape_c()
 // P indicates dim cross thread, Y indicates dim within thread, this is X layout (X=P+Y) view the tensor as a whole
@@ -1325,25 +1364,25 @@ OPUS_D decltype(auto) make_tiled_mma(ES, TS, WS, WA&& = {}, TA&& = {}) {
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// partition
-template<typename M> OPUS_D constexpr auto partition_layout_a(M&& mma) { return mma.layout_a(); }
-template<typename M> OPUS_D constexpr auto partition_layout_b(M&& mma) { return mma.layout_b(); }
-template<typename M> OPUS_D constexpr auto partition_layout_c(M&& mma) { return mma.layout_c(); }
+// partition, use cached_vec to dispatch which layout implementation. cached_vec < 0 : "layout", cached_vec == 0 : "layout_linear", cached_vec > 0 : "layout_cached"
+template<index_t cached_vec = 0, typename M> OPUS_D constexpr auto partition_layout_a(M&& mma) { return mma.template layout_a<cached_vec>(); }
+template<index_t cached_vec = 0, typename M> OPUS_D constexpr auto partition_layout_b(M&& mma) { return mma.template layout_b<cached_vec>(); }
+template<index_t cached_vec = 0, typename M> OPUS_D constexpr auto partition_layout_c(M&& mma) { return mma.template layout_c<cached_vec>(); }
 
-template<typename M, typename S, std::enable_if_t<is_tuple_v<S>, bool> = true> OPUS_D constexpr auto partition_layout_a(M&& mma, S&& x_stride) { return mma.layout_a(std::forward<S>(x_stride)); }
-template<typename M, typename S, std::enable_if_t<is_tuple_v<S>, bool> = true> OPUS_D constexpr auto partition_layout_b(M&& mma, S&& x_stride) { return mma.layout_b(std::forward<S>(x_stride)); }
-template<typename M, typename S, std::enable_if_t<is_tuple_v<S>, bool> = true> OPUS_D constexpr auto partition_layout_c(M&& mma, S&& x_stride) { return mma.layout_c(std::forward<S>(x_stride)); }
+template<index_t cached_vec = 0, typename M, typename S, std::enable_if_t<is_tuple_v<S>, bool> = true> OPUS_D constexpr auto partition_layout_a(M&& mma, S&& x_stride) { return mma.template layout_a<cached_vec>(std::forward<S>(x_stride)); }
+template<index_t cached_vec = 0, typename M, typename S, std::enable_if_t<is_tuple_v<S>, bool> = true> OPUS_D constexpr auto partition_layout_b(M&& mma, S&& x_stride) { return mma.template layout_b<cached_vec>(std::forward<S>(x_stride)); }
+template<index_t cached_vec = 0, typename M, typename S, std::enable_if_t<is_tuple_v<S>, bool> = true> OPUS_D constexpr auto partition_layout_c(M&& mma, S&& x_stride) { return mma.template layout_c<cached_vec>(std::forward<S>(x_stride)); }
 
-template<typename M, typename S, typename C, std::enable_if_t<is_tuple_v<S> && is_tuple_v<C>, bool> = true>
-OPUS_D constexpr auto partition_layout_a(M&& mma, S&& x_stride, C&& p_coord) { return mma.layout_a(std::forward<S>(x_stride), std::forward<C>(p_coord)); }
-template<typename M, typename S, typename C, std::enable_if_t<is_tuple_v<S> && is_tuple_v<C>, bool> = true>
-OPUS_D constexpr auto partition_layout_b(M&& mma, S&& x_stride, C&& p_coord) { return mma.layout_b(std::forward<S>(x_stride), std::forward<C>(p_coord)); }
-template<typename M, typename S, typename C, std::enable_if_t<is_tuple_v<S> && is_tuple_v<C>, bool> = true>
-OPUS_D constexpr auto partition_layout_c(M&& mma, S&& x_stride, C&& p_coord) { return mma.layout_c(std::forward<S>(x_stride), std::forward<C>(p_coord)); }
+template<index_t cached_vec = 0, typename M, typename S, typename C, std::enable_if_t<is_tuple_v<S> && is_tuple_v<C>, bool> = true>
+OPUS_D constexpr auto partition_layout_a(M&& mma, S&& x_stride, C&& p_coord) { return mma.template layout_a<cached_vec>(std::forward<S>(x_stride), std::forward<C>(p_coord)); }
+template<index_t cached_vec = 0, typename M, typename S, typename C, std::enable_if_t<is_tuple_v<S> && is_tuple_v<C>, bool> = true>
+OPUS_D constexpr auto partition_layout_b(M&& mma, S&& x_stride, C&& p_coord) { return mma.template layout_b<cached_vec>(std::forward<S>(x_stride), std::forward<C>(p_coord)); }
+template<index_t cached_vec = 0, typename M, typename S, typename C, std::enable_if_t<is_tuple_v<S> && is_tuple_v<C>, bool> = true>
+OPUS_D constexpr auto partition_layout_c(M&& mma, S&& x_stride, C&& p_coord) { return mma.template layout_c<cached_vec>(std::forward<S>(x_stride), std::forward<C>(p_coord)); }
 
-template<typename M, typename C, std::enable_if_t<is_tuple_v<C>, bool> = true> OPUS_D constexpr auto partition_layout_a_packed(M&& mma, C&& p_coord) { return mma.layout_a_packed(std::forward<C>(p_coord)); }
-template<typename M, typename C, std::enable_if_t<is_tuple_v<C>, bool> = true> OPUS_D constexpr auto partition_layout_b_packed(M&& mma, C&& p_coord) { return mma.layout_b_packed(std::forward<C>(p_coord)); }
-template<typename M, typename C, std::enable_if_t<is_tuple_v<C>, bool> = true> OPUS_D constexpr auto partition_layout_c_packed(M&& mma, C&& p_coord) { return mma.layout_c_packed(std::forward<C>(p_coord)); }
+template<index_t cached_vec = 0, typename M, typename C, std::enable_if_t<is_tuple_v<C>, bool> = true> OPUS_D constexpr auto partition_layout_a_packed(M&& mma, C&& p_coord) { return mma.template layout_a_packed<cached_vec>(std::forward<C>(p_coord)); }
+template<index_t cached_vec = 0, typename M, typename C, std::enable_if_t<is_tuple_v<C>, bool> = true> OPUS_D constexpr auto partition_layout_b_packed(M&& mma, C&& p_coord) { return mma.template layout_b_packed<cached_vec>(std::forward<C>(p_coord)); }
+template<index_t cached_vec = 0, typename M, typename C, std::enable_if_t<is_tuple_v<C>, bool> = true> OPUS_D constexpr auto partition_layout_c_packed(M&& mma, C&& p_coord) { return mma.template layout_c_packed<cached_vec>(std::forward<C>(p_coord)); }
 #undef OPUS_KP_
 // clang-format on
 } // namespace
