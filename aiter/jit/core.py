@@ -68,7 +68,81 @@ AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
 
+
 # config_env start here
+def update_config_files(file_path: str, merge_name: str):
+    path_list = file_path.split(os.pathsep) if file_path else []
+    if len(path_list) <= 1:
+        return file_path
+    df_list = []
+    ## merge config files
+    ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
+    import pandas as pd
+
+    df_list.append(pd.read_csv(path_list[0]))
+    for i, path in enumerate(path_list[1:]):
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            ## check columns
+            assert (
+                df.columns.tolist() == df_list[0].columns.tolist()
+            ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
+
+            df_list.append(df)
+        else:
+            print(f"path {i+1}: {path} (not exist)")
+    merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+    ## get keys from untuned file to drop_duplicates
+    untuned_name = (
+        re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
+        if re.search(r"(?:_)?tuned$", merge_name)
+        else merge_name.replace("tuned", "untuned")
+    )
+    untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
+    if os.path.exists(untuned_path):
+        untunedf = pd.read_csv(untuned_path)
+        keys = untunedf.columns
+        merge_df = (
+            merge_df.sort_values("us")
+            .drop_duplicates(subset=keys, keep="first")
+            .reset_index(drop=True)
+        )
+    else:
+        logger.warning(
+            f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
+        )
+    new_file_path = f"/tmp/{merge_name}.csv"
+    merge_df.to_csv(new_file_path, index=False)
+    return new_file_path
+
+
+# @functools.lru_cache(maxsize=1)
+def get_config_file(env_name, default_file, tuned_file_name):
+    config_env_file = os.getenv(env_name)
+    # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
+    from pathlib import Path
+
+    if not config_env_file:
+        model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
+        op_tuned_file_list = [
+            p
+            for p in model_config_dir.glob(f"*{tuned_file_name}*")
+            if (p.is_file() and "untuned" not in str(p))
+        ]
+
+        if not op_tuned_file_list:
+            config_file = default_file
+        else:
+            tuned_files = ":".join(str(p) for p in op_tuned_file_list)
+            tuned_files = default_file + ":" + tuned_files
+            print(f"merge tuned file under model_configs/ and configs/ ", tuned_files)
+            config_file = update_config_files(tuned_files, tuned_file_name)
+    else:
+        config_file = update_config_files(config_env_file, tuned_file_name)
+        # print(f"get config file from environment ", config_file)
+    return config_file
+
+
 AITER_CONFIG_GEMM_A4W4 = os.getenv(
     "AITER_CONFIG_GEMM_A4W4",
     f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
@@ -101,7 +175,7 @@ AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
 )
 
 AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
-    "AITER_CONFIG_BATCHED_GEMM_BF16",
+    "AITER_CONFIG_BF16_BATCHED_GEMM",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
 )
 
@@ -109,62 +183,49 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_gemm.csv",
 )
-
-
-def update_config_files(file_path: str, merge_name: str):
-    path_list = file_path.split(os.pathsep) if file_path else []
-    if len(path_list) <= 1:
-        return file_path
-    df_list = []
-    ## merge config files
-    ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
-    import pandas as pd
-
-    df_list.append(pd.read_csv(path_list[0]))
-    for i, path in enumerate(path_list[1:]):
-        if os.path.exists(path):
-            df = pd.read_csv(path)
-            ## check columns
-            assert (
-                df.columns.tolist() == df_list[0].columns.tolist()
-            ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
-
-            df_list.append(df)
-        else:
-            print(f"path {i+1}: {path} (not exist)")
-    merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
-    merge_df = merge_df.drop_duplicates(keep="last")
-    new_file_path = f"/tmp/{merge_name}.csv"
-    merge_df.to_csv(new_file_path, index=False)
-    return new_file_path
-
-
-AITER_CONFIG_GEMM_A4W4_FILE = update_config_files(
-    AITER_CONFIG_GEMM_A4W4, "a4w4_blockscale_tuned_gemm"
+AITER_CONFIG_GEMM_A4W4_FILE = get_config_file(
+    "AITER_CONFIG_GEMM_A4W4", AITER_CONFIG_GEMM_A4W4, "a4w4_blockscale_tuned_gemm"
 )
-AITER_CONFIG_GEMM_A8W8_FILE = update_config_files(
-    AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
+
+AITER_CONFIG_GEMM_A8W8_FILE = get_config_file(
+    "AITER_CONFIG_GEMM_A8W8", AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
 )
-AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE = update_config_files(
-    AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE, "a8w8_bpreshuffle_tuned_gemm"
+AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE = get_config_file(
+    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
+    AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE,
+    "a8w8_bpreshuffle_tuned_gemm",
 )
-AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE = update_config_files(
-    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE, "a8w8_blockscale_tuned_gemm"
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE = get_config_file(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
+    "a8w8_blockscale_tuned_gemm",
 )
-AITER_CONFIG_FMOE_FILE = update_config_files(AITER_CONFIG_FMOE, "tuned_fmoe")
-AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE = update_config_files(
+AITER_CONFIG_FMOE_FILE = get_config_file(
+    "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+)
+
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE = get_config_file(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
     "a8w8_blockscale_bpreshuffle_tuned_gemm",
 )
-AITER_CONFIG_A8W8_BATCHED_GEMM_FILE = update_config_files(
-    AITER_CONFIG_A8W8_BATCHED_GEMM, "a8w8_tuned_batched_gemm"
+
+AITER_CONFIG_A8W8_BATCHED_GEMM_FILE = get_config_file(
+    "AITER_CONFIG_A8W8_BATCHED_GEMM",
+    AITER_CONFIG_A8W8_BATCHED_GEMM,
+    "a8w8_tuned_batched_gemm",
 )
-AITER_CONFIG_BF16_BATCHED_GEMM_FILE = update_config_files(
-    AITER_CONFIG_BF16_BATCHED_GEMM, "bf16_tuned_batched_gemm"
+
+AITER_CONFIG_BF16_BATCHED_GEMM_FILE = get_config_file(
+    "AITER_CONFIG_BF16_BATCHED_GEMM",
+    AITER_CONFIG_BF16_BATCHED_GEMM,
+    "bf16_tuned_batched_gemm",
 )
-AITER_CONFIG_GEMM_BF16_FILE = update_config_files(
-    AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+
+AITER_CONFIG_GEMM_BF16_FILE = get_config_file(
+    "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
 )
+
 # config_env end here
 
 find_aiter = importlib.util.find_spec("aiter")
@@ -761,6 +822,13 @@ def compile_ops(
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
                     doc_str = doc_str.replace("list[", "List[")
+                    doc_str = doc_str.replace("tuple[", "Tuple[")
+                    doc_str = doc_str.replace("collections.abc.Sequence[", "List[")
+                    doc_str = doc_str.replace("typing.SupportsInt", "int")
+                    doc_str = doc_str.replace("typing.SupportsFloat", "float")
+                    # A|None  -->  Optional[A]
+                    pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
+                    doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
                     for el in enum_types:
                         doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {
@@ -769,9 +837,7 @@ def compile_ops(
                         "torch": torch,
                         "typing": typing,
                     }
-                    if sys.version_info < (3, 10):
-                        pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
-                        doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
+
                     exec(
                         f"from aiter import*\ndef {doc_str}: pass",
                         namespace,
