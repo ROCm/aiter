@@ -161,10 +161,12 @@ def _reduce_grouped(X, stride_xb: tl.uint64, stride_xm: tl.uint64, stride_xn,  #
                     InIndx, B, N,  #
                     # fused activation function
                     APPLY_SWIGLU: tl.constexpr, alpha, limit, ACTIVATION_REDUCTION_N: tl.constexpr,
-                    K: tl.constexpr, BLOCK_N: tl.constexpr):
-    pid_t = tl.program_id(0)
+                    K: tl.constexpr, BLOCK_N: tl.constexpr, EVEN_N: tl.constexpr):
+    
+    pid_t = tl.program_id(1)
+    pid_n = tl.program_id(0)
+    
     BLOCK_N_OUT: tl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
-    # persistent along N: single program on N, iterate tiles of size BLOCK_N
     start = pid_t * K
     # load indices into a tuple
     if InIndx is None:
@@ -173,40 +175,40 @@ def _reduce_grouped(X, stride_xb: tl.uint64, stride_xm: tl.uint64, stride_xn,  #
         indxs = ()
         for i in tl.static_range(0, K):
             indxs = indxs + (tl.load(InIndx + start + i), )
-    # determine first valid topk row
-    fi = indxs[(K - 1)]
-    for i in tl.static_range(K - 2, -1, -1):
-        fi = tl.where(indxs[i] != -1, indxs[i], fi)
-    # record overwritten row index (may be -1 if none)
-    XPtrs = X + tl.arange(0, BLOCK_N) * stride_xn
-    OutPtrs = Out + tl.arange(0, BLOCK_N_OUT) * stride_on
-    for n_curr in tl.range(0, N, BLOCK_N, num_stages=4):
-        acc = tl.zeros([BLOCK_N_OUT], dtype=tl.float32)
-        x_n_mask = tl.arange(0, BLOCK_N) < N - n_curr
-        # accumulate contributions for this tile
-        for i in tl.static_range(0, K):
-            curr = tl.zeros([BLOCK_N], dtype=tl.float32)
-            # iterate over split_k partial values
-            for b in tl.range(0, B):
-                is_valid = indxs[i] != -1
-                x_row_ptr = XPtrs + indxs[i] * stride_xm + b * stride_xb
-                vals = tl.load(x_row_ptr, mask=x_n_mask & is_valid, other=0.0)
-                vals = vals.to(tl.float32)
-                curr += vals
-            # apply nonlinearity to split-k output
-            if APPLY_SWIGLU:
-                curr = _swiglu(curr[None, :], alpha, limit)
-            curr = tl.reshape(curr, [curr.shape[-1]])
-            # update final accumulator
-            acc += curr
-        # Compute per-32-col MXFP scales for this tile if requested
-        Nrem = (N - n_curr) // ACTIVATION_REDUCTION_N
-        out_n_mask = tl.arange(0, BLOCK_N_OUT) < Nrem
-        # write-back for this tile
-        out_ptr = OutPtrs + pid_t * stride_om
+    XPtrs = X + (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) * stride_xn
+    OutPtrs = Out + (pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT)) * stride_on
+
+    acc = tl.zeros([BLOCK_N_OUT], dtype=tl.float32)
+    x_n_mask = pid_n * BLOCK_N + tl.arange(0, BLOCK_N) < N 
+    # accumulate contributions for this tile
+    for i in tl.static_range(0, K):
+        curr = tl.zeros([BLOCK_N], dtype=tl.float32)
+        # iterate over split_k partial values        
+        for b in tl.range(0, B):
+            x_row_ptr = XPtrs + indxs[i] * stride_xm + b * stride_xb
+            if EVEN_N:
+                vals = tl.load(x_row_ptr)
+            else:
+                vals = tl.load(x_row_ptr, mask=x_n_mask, other=0.0)
+            vals = vals.to(tl.float32)
+            curr += vals
+
+        # apply nonlinearity to split-k output
+        if APPLY_SWIGLU:
+            curr = _swiglu(curr[None, :], alpha, limit)
+        curr = tl.reshape(curr, [curr.shape[-1]])
+        # update final accumulator
+        acc += curr
+    # Compute per-32-col MXFP scales for this tile if requested
+    Nrem = N // ACTIVATION_REDUCTION_N
+    
+    # write-back for this tile
+    out_ptr = OutPtrs + pid_t * stride_om
+    if EVEN_N:
+        tl.store(out_ptr, acc)
+    else:
+        out_n_mask = pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT) < Nrem
         tl.store(out_ptr, acc, mask=out_n_mask)
-        XPtrs += BLOCK_N * stride_xn
-        OutPtrs += BLOCK_N_OUT * stride_on
 
 
 @triton.jit(launch_metadata=matmul_launch_metadata)

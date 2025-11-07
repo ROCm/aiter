@@ -169,14 +169,16 @@ def reduce_grouped(x: torch.Tensor, indx: torch.Tensor, out: torch.Tensor,
     out_dtype = x.dtype if out_dtype is None else out_dtype
     assert x.shape[-1] % reduction_n == 0
     BLOCK_N = 512
-    _reduce_grouped[(num_groups, )](
+    num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
+    
+    _reduce_grouped[(num_blocks, num_groups)](
         x, x.stride(0), x.stride(1), x.stride(2),  #
         out, out.stride(0), out.stride(1),  #
         indx,  #
         x.shape[0], x.shape[-1],  #
         apply_swiglu, alpha, limit, reduction_n,
-        BLOCK_N=BLOCK_N, K=K,  #
-        num_warps=1,  #
+        BLOCK_N=BLOCK_N, EVEN_N=(x.shape[-1] % BLOCK_N == 0), K=K,  #
+        num_warps=2,  #
     )
     return out
 
