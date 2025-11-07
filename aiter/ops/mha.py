@@ -1270,7 +1270,7 @@ def _flash_attn_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-@torch_compile_guard()
+# @torch_compile_guard(mutates_args=[])
 def can_impl_fmha_v3_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -1449,6 +1449,42 @@ def can_impl_fmha_v3_bwd(
     return ret
 
 
+def _flash_attn_backward_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: Optional[torch.Tensor],
+    dk: Optional[torch.Tensor],
+    dv: Optional[torch.Tensor],
+    dbias: Optional[torch.Tensor],
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    deterministic: bool,
+    rng_state: Optional[torch.Tensor] = None,
+    is_v3_atomic_fp32: Optional[bool] = True,
+    how_v3_bf16_cvt: Optional[int] = 1,
+) -> torch.Tensor:
+    batch_size = q.size(0)
+    seqlen_q = q.size(1)
+    num_heads = q.size(2)
+
+    softmax_d = torch.empty(
+        (batch_size, num_heads, seqlen_q),  # {batch_size, num_heads, seqlen_q}
+        dtype=torch.float32,
+        device=q.device,
+    )
+    return softmax_d
+
+
+@torch_compile_guard(gen_fake=_flash_attn_backward_fake)
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
