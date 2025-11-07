@@ -3,7 +3,6 @@
 
 import functools
 import os
-import sys
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -591,11 +590,7 @@ def get_2stage_cfgs(
                 run_1stage = token > 32
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
-            
-            # Pre-shuffle moe mxfp4 tuned configuration
-            # if q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2:
-            #     run_1stage = False if token < 32 else True
-                
+
         block_m = (
             BLOCK_SIZE_M
             if run_1stage
