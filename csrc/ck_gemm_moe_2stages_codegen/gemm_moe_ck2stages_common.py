@@ -320,7 +320,6 @@ bit16_list = ["B16", "F16", "b16", "f16"]
 bit4_list = ["I4", "i4", "FP4X2", "fp4x2"]
 QuantType_list = [3, 4]
 
-bns_or_preslf = True
 
 def get_gemm1_kernels_list(
     Adtype: str,
@@ -357,10 +356,10 @@ def get_gemm1_kernels_list(
     ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
-        if bns_or_preslf:
-            tag = "a4w4_bns"
-        else:
+        if int(os.getenv("AITER_MXFP4_MOE_SF", 0)) == 1:
             tag = "a4w4"
+        else:
+            tag = "a4w4_bns"
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm1_kernels_dict[tag]
@@ -422,10 +421,10 @@ def get_gemm2_kernels_list(
     ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
-        if bns_or_preslf:
-            tag = "a4w4_bns"
-        else:
+        if int(os.getenv("AITER_MXFP4_MOE_SF", 0)) == 1:
             tag = "a4w4"
+        else:
+            tag = "a4w4_bns"
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm2_kernels_dict[tag]

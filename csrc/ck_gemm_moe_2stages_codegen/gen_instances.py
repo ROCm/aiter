@@ -45,7 +45,7 @@ gemm1_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage1_heuristic_dispatch(int block_m, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage)
+MoeKernel moe_stage1_heuristic_dispatch(int block_m, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool b_preshuffle=true)
 {{
 """
 
@@ -54,7 +54,7 @@ gemm2_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage)
+MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool b_preshuffle=true)
 {{
 """
 
@@ -177,7 +177,8 @@ A4W4_gemm1_heuristic_dispatch = """
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+        && {Quant} == quant
+        && b_preshuffle == true)
     {{
         if (block_m == 32)
         {{
@@ -368,7 +369,8 @@ A4W4_gemm2_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+        && {Quant} == quant
+        && b_preshuffle == true)
     {{
         if (inter_dim <= 256)
         {{
@@ -622,8 +624,7 @@ class ck_moe_2stage_gemm_codegen:
         )
 
         f_lookUpTable = os.path.join(self.working_path, "gemm_moe_ck2stages_lookup.h")
-        print("tag")
-        print(tag)
+
         # breakpoint()
         with open(f_lookUpTable, "a") as f_lookup:
             for kernel in kernel_list:

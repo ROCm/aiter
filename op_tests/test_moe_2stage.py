@@ -11,6 +11,7 @@ from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 import argparse
 import pandas as pd
+import os
 
 from aiter.fused_moe import (
     fused_topk,
@@ -119,7 +120,6 @@ def ck_moe_stage2(
     )
     return out
 
-bns_or_preslf = True
 
 @benchmark()
 def test_fmoe(
@@ -136,7 +136,6 @@ def test_fmoe(
     use_g1u1=False,
     doweight_stage1=False,
 ):
-    global bns_or_preslf
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = aiter.get_torch_quant(qType)
@@ -250,7 +249,7 @@ def test_fmoe(
                 shuffle_weight(w2_qt_aiter, (16, 16), use_int4=True)
             )
         )
-    elif WQDType != dtypes.fp4x2 or not bns_or_preslf:
+    elif WQDType != dtypes.fp4x2 or int(os.getenv("AITER_MXFP4_MOE_SF", 0)) == 1:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
     # # ######################## ck stage 1 start ###########
