@@ -128,7 +128,6 @@ def test_ragged_layout_trans(bs, max_seq_len, nheads, hdim, dtype):
         device="cuda",
     )
     seq_lens_sum = seq_lens_ptr.sum()
-    seq_lens_max = seq_lens_ptr.max()
 
     stride = next_power_of_2(max_seq_len)
 
@@ -177,7 +176,7 @@ def test_ragged_layout_trans(bs, max_seq_len, nheads, hdim, dtype):
     # read cache directly
     k_ref = torch.empty(seq_lens_sum * nheads * hdim, dtype=dtype, device="cuda")
 
-    v_ref = torch.empty(seq_lens_sum, nheads * hdim, dtype=dtype, device="cuda")
+    v_ref = torch.empty(seq_lens_sum * nheads * hdim, dtype=dtype, device="cuda")
 
     n_elements = nheads * hdim
     read_sequential_cache_v1[(bs,)](
@@ -239,7 +238,7 @@ if __name__ == "__main__":
     # 1) Random cases
     num_cases = 100
 
-    for i in range(num_cases):
+    for _ in range(num_cases):
         bs = random.randint(min_batch_size, max_batch_size)
         seq_len = 2 ** random.randint(min_seq_len, max_seq_len)
         hdim = 2 ** random.randint(min_head_dim, max_head_dim)
