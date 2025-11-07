@@ -70,11 +70,11 @@ def paged_attention_v1(
     logits_soft_cap: float,
     k_scale,
     v_scale,
-    sliding_window: int,
     fp8_out_scale=None,
     partition_size: int = 256,
     mtp: int = 1,
     q_scale=None,
+    sliding_window: int = 0,
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types

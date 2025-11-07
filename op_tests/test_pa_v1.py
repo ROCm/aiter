@@ -281,8 +281,8 @@ def run_aiter(
     logits_soft_cap,
     k_scale,
     v_scale,
-    sliding_window,
     mtp=1,
+    sliding_window=0,
 ):
     # copied from ops.PagedAttention.forward_decode()
     _PARTITION_SIZE_ROCM = 256
@@ -331,9 +331,9 @@ def run_aiter(
         logits_soft_cap,
         k_scale,
         v_scale,
-        sliding_window,
         fp8_out_scale if cpa_fp8_out else None,
         _PARTITION_SIZE_ROCM,
+        sliding_window=sliding_window,
     )
     if cpa_fp8_out:
         return output.view(num_seqs, num_heads * head_size)
@@ -556,7 +556,7 @@ def test_paged_attention(
             logits_soft_cap,
             k_scale,
             v_scale,
-            sliding_window
+            sliding_window=sliding_window
         )
         assert (
             checkAllclose(out_golden, out_aiter, msg=f"golden vs aiter:{time_aiter}")

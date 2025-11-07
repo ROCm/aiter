@@ -89,6 +89,7 @@ void {{func_name}}(void* out_ptr,
                                             {{"true" if alibi_enabled else "false"}},           
                                             gqa_ratio,
                                             {{mtp}},
+                                            decltype(variant),
                                             {{"true" if sliding_window_enabled else "false"}}>               
     <<<grid, block, 0, reinterpret_cast<hipStream_t>(stream)>>>(reinterpret_cast<{{dtype}}*>(query_ptr),                      
                                     reinterpret_cast<{{kv_dtype}}*>(key_cache_ptr),                  

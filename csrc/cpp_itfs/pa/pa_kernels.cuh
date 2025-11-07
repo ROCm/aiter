@@ -11,8 +11,8 @@ template <typename scalar_t,
           bool ALIBI_ENABLED,
           int GQA_RATIO,
           int MTP,
-          bool HAS_SLIDING_WINDOW,
-          typename AttentionVariant>
+          typename AttentionVariant,
+          bool SLIDING_WINDOW_ENABLED>
 __inline__ __device__ void
 _paged_attention_kernel(const int* block_table_seq,
                         const int64_t query_loc,
@@ -466,7 +466,7 @@ _paged_attention_kernel(const int* block_table_seq,
     float qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD]  = {{-FLT_MAX}};
     float exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {{0.0f}};
 
-    if constexpr(HAS_SLIDING_WINDOW)
+    if constexpr(SLIDING_WINDOW_ENABLED)
     {
         for(int mtp = 0; mtp < mtp_loop; mtp++)
         {
