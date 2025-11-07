@@ -29,6 +29,17 @@ _batched_gemm_afp4_wfp4_pre_quant_repr = make_kernel_repr(
 )
 
 
+_batched_gemm_afp4_wfp4_pre_quant_reduce_repr = make_kernel_repr(
+    "_batched_gemm_afp4_wfp4_pre_quant_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -71,7 +82,8 @@ def _batched_gemm_afp4_wfp4_pre_quant_kernel(
     GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
+    """
+    Kernel for computing the matmul C = A x B.
     A and B inputs are in the microscale fp4 (mxfp4) format.
     A_scales and B_scales are in e8m0 format.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -201,7 +213,7 @@ def _batched_gemm_afp4_wfp4_pre_quant_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(repr=_batched_gemm_afp4_wfp4_pre_quant_reduce_repr)
 def _batched_gemm_afp4_wfp4_pre_quant_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
