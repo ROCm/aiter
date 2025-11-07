@@ -891,7 +891,7 @@ def fused_moe_2stages(
             num_rows_factor=topk,
         )
         a2 = a2.view(token_num, topk, inter_dim)
-        
+
     metadata.stage2(
         a2,
         w1,
