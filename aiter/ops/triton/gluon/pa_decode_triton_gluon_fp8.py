@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import math
-from typing import Optional, Dict, Tuple
 import tempfile
-import subprocess
 import os
-import sys
 
 import triton
 import triton.language as tl
@@ -1022,6 +1018,18 @@ def paged_attention_decode_v2_gluon_fp8(
     SEQUENCE_PARTITION_KV_BLOCKS: gl.constexpr = (
         SEQUENCE_PARTITION_SIZE // KV_BLOCK_SIZE
     )
+    # Load KV block indices from block table
+    block_indices = gl.arange(0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout)
+
+    # Load ALiBi slopes if provided
+    if alibi_slopes_ptr is None:
+        alibi_slope_values = gl.zeros([QUERY_GROUP_SIZE_POW2], dtype=gl.float32)
+    else:
+        alibi_slope_values = gl.amd.cdna3.buffer_load(
+            ptr=alibi_slopes_ptr + kv_head_idx * QUERY_GROUP_SIZE,
+            offsets=qk_row_offsets,
+            mask=qk_row_offsets < QUERY_GROUP_SIZE,
+        )
 
     # Process KV sequence in compute blocks
     for kv_compute_idx in range(KV_COMPUTE_BLOCK_COUNT):
@@ -1043,20 +1051,6 @@ def paged_attention_decode_v2_gluon_fp8(
             0, KV_COMPUTE_BLOCK_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
         )
 
-        # Load ALiBi slopes if provided
-        if alibi_slopes_ptr is None:
-            alibi_slope_values = gl.zeros([QUERY_GROUP_SIZE_POW2], dtype=gl.float32)
-        else:
-            alibi_slope_values = gl.amd.cdna3.buffer_load(
-                ptr=alibi_slopes_ptr + kv_head_idx * QUERY_GROUP_SIZE,
-                offsets=qk_row_offsets,
-                mask=qk_row_offsets < QUERY_GROUP_SIZE,
-            )
-
-        # Load KV block indices from block table
-        block_indices = gl.arange(
-            0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout
-        )
         # Create mask for valid blocks
         valid_block_mask = block_indices < num_kv_blocks
         masked_block_indices = gl.where(valid_block_mask, block_indices, 0)
@@ -1109,54 +1103,6 @@ def paged_attention_decode_v2_gluon_fp8(
         # Reshape key tensor for matrix multiplication
         key_tensor = gl.permute(key_tensor, [1, 3, 0, 2])
         key_tensor = gl.reshape(key_tensor, [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE])
-
-        # ==================== VALUE LOADING AND PROCESSING ====================
-        if VALUE_TRANSPOSED:
-            # Load values from transposed cache layout
-            kv_block_numbers_reshaped = gl.convert_layout(
-                kv_block_numbers,
-                layout=gl.SliceLayout(
-                    1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
-                ),
-            )
-            value_block_offsets = (
-                kv_block_numbers_reshaped[:, None, None, None] * stride_value_block
-                + kv_head_idx * stride_value_head
-                + value_dim1_offsets[None, :, None, None] * stride_value_head_size
-                + value_dim2_offsets[None, None, :, None]
-                * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
-                + value_dim3_offsets[None, None, None, :]
-            )
-            value_tensor = gl.amd.cdna3.buffer_load(
-                ptr=value_cache_ptr,
-                offsets=value_block_offsets,
-            )
-            # Permute and reshape for matrix multiplication
-            value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
-            value_tensor = gl.reshape(
-                value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
-            )
-        else:
-            # Load values from standard cache layout
-            kv_block_numbers_reshaped = gl.convert_layout(
-                kv_block_numbers,
-                layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
-            )
-            value_block_offsets = (
-                kv_block_numbers_reshaped[:, None, None] * stride_value_block
-                + kv_head_idx * stride_value_head
-                + value_dim1_offsets[None, :, None] * stride_value_head_size
-                + value_dim2_offsets[None, None, :]
-            )
-            value_tensor = gl.amd.cdna3.buffer_load(
-                ptr=value_cache_ptr,
-                offsets=value_block_offsets,
-            )
-            # Permute and reshape for matrix multiplication
-            value_tensor = gl.permute(value_tensor, [0, 2, 1])
-            value_tensor = gl.reshape(
-                value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
-            )
 
         # ==================== ATTENTION SCORE COMPUTATION ====================
         # Initialize QK accumulator
@@ -1248,7 +1194,53 @@ def paged_attention_decode_v2_gluon_fp8(
             (attention_scores - new_max_logits[:, None]) * LOG2_E
         )
         exp_sums = accumulator_scale * exp_sums + gl.sum(attention_probs, axis=1)
-
+        # ==================== VALUE LOADING AND PROCESSING ====================
+        if VALUE_TRANSPOSED:
+            # Load values from transposed cache layout
+            kv_block_numbers_reshaped = gl.convert_layout(
+                kv_block_numbers,
+                layout=gl.SliceLayout(
+                    1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
+                ),
+            )
+            value_block_offsets = (
+                kv_block_numbers_reshaped[:, None, None, None] * stride_value_block
+                + kv_head_idx * stride_value_head
+                + value_dim1_offsets[None, :, None, None] * stride_value_head_size
+                + value_dim2_offsets[None, None, :, None]
+                * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
+                + value_dim3_offsets[None, None, None, :]
+            )
+            value_tensor = gl.amd.cdna3.buffer_load(
+                ptr=value_cache_ptr,
+                offsets=value_block_offsets,
+            )
+            # Permute and reshape for matrix multiplication
+            value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
+            value_tensor = gl.reshape(
+                value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
+            )
+        else:
+            # Load values from standard cache layout
+            kv_block_numbers_reshaped = gl.convert_layout(
+                kv_block_numbers,
+                layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
+            )
+            value_block_offsets = (
+                kv_block_numbers_reshaped[:, None, None] * stride_value_block
+                + kv_head_idx * stride_value_head
+                + value_dim1_offsets[None, :, None] * stride_value_head_size
+                + value_dim2_offsets[None, None, :]
+            )
+            value_tensor = gl.amd.cdna3.buffer_load(
+                ptr=value_cache_ptr,
+                offsets=value_block_offsets,
+            )
+            # Permute and reshape for matrix multiplication
+            value_tensor = gl.permute(value_tensor, [0, 2, 1])
+            value_tensor = gl.reshape(
+                value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
+            )
         # ==================== VALUE ACCUMULATION ====================
         # Handle value quantization scaling for FP8
         if value_tensor.dtype.is_fp8():
