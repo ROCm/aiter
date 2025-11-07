@@ -654,5 +654,5 @@ if __name__ == "__main__":
             quant_cache_dtype,
             0,
             "cuda:0",
-            0
+            10
         )

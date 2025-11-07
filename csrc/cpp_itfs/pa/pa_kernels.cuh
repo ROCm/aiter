@@ -441,6 +441,27 @@ _paged_attention_kernel(const int* block_table_seq,
             }
         }
     }
+    // apply sliding window
+    if constexpr(SLIDING_WINDOW_ENABLED)
+    {
+        for(int token_depth = 0; token_depth < TLOOP; token_depth++)
+        {
+            const int local_token_idx = qkout_token_idx + token_depth * 16;
+            for(int mtp = 0; mtp < mtp_loop; mtp++)
+            {
+                for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
+                {
+                    for(int i = 0; i < 4; i++)
+                    {
+                        float tmp = d_out[gqa_ratio_loop][mtp][token_depth][i];
+                        if (local_token_idx + i < context_len - sliding_window)
+                            tmp = -FLT_MAX;
+                        d_out[gqa_ratio_loop][mtp][token_depth][i] = tmp;
+                    }
+                }
+            }
+        }
+    }
     // apply soft-capping to logits
     for(int token_depth = 0; token_depth < TLOOP; token_depth++)
     {
@@ -465,27 +486,6 @@ _paged_attention_kernel(const int* block_table_seq,
     // calculate qk_max and exp_sum per warp and write to shared memory
     float qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD]  = {{-FLT_MAX}};
     float exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {{0.0f}};
-
-    if constexpr(SLIDING_WINDOW_ENABLED)
-    {
-        for(int mtp = 0; mtp < mtp_loop; mtp++)
-        {
-            for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
-            {
-                for(int token_depth = 0; token_depth < TLOOP; token_depth++)
-                {
-                    const int local_token_idx = qkout_token_idx + token_depth * 16;
-                    for (int i = 0; i < 4; i++)
-                    {
-                        float tmp = d_out[gqa_ratio_loop][mtp][token_depth][i];
-                        if (local_token_idx + i <= context_len - sliding_window)
-                            tmp = -FLT_MAX;
-                        d_out[gqa_ratio_loop][mtp][token_depth][i] = tmp;
-                    }
-                }
-            }
-        }
-    }
 
     for(int mtp = 0; mtp < mtp_loop; mtp++)
     {
