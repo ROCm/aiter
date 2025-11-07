@@ -128,7 +128,7 @@ def fused_allreduce_rmsnorm_fake(
 @torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
 def fused_allreduce_rmsnorm_(
     inp: torch.Tensor, w: torch.Tensor, eps: float, group_name: str
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -348,14 +348,14 @@ class GroupCoordinator:
 
     def fused_allreduce_rmsnorm(
         self, input_: torch.Tensor, weight_: torch.Tensor, eps: float
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         return fused_allreduce_rmsnorm_(
             input_, weight_, eps, group_name=self.unique_name
         )
 
     def _fused_allreduce_rmsnorm_out_place(
         self, input_: torch.Tensor, weight_: torch.Tensor, eps: float
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_allreduce_rmsnorm(input_, weight_, eps)
@@ -861,6 +861,7 @@ def get_pp_group() -> GroupCoordinator:
 
 
 from typing import Optional
+
 _DP: Optional[GroupCoordinator] = None
 
 
