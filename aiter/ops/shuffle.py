@@ -46,7 +46,7 @@ def shuffle_weight_NK(
     return x_.view(*x.shape)
 
 
-def shuffle_mxfp4_weight(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.Tensor:
+def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.Tensor:
     """
     src: shape [experts_cnt, N, K_pk], where K_pk = K // 2
     Returns: shuffled tensor of shape [experts_cnt, N0*2, K0, KLane, NLane, KPack]
@@ -79,7 +79,7 @@ def shuffle_mxfp4_weight(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
     return interleaved.contiguous().view(src_type)
 
 
-def shuffle_mxfp4_scale(
+def shuffle_scale_a16w4(
     src: torch.Tensor, experts_cnt: int, gate_up: bool
 ) -> torch.Tensor:
     n_experts, k_ = src.shape

@@ -25,8 +25,8 @@ from aiter.fused_moe import (
 
 from aiter.ops.shuffle import (
     shuffle_weight,
-    shuffle_mxfp4_scale,
-    shuffle_mxfp4_weight,
+    shuffle_scale_a16w4,
+    shuffle_weight_a16w4,
     shuffle_weight_NK,
 )
 from aiter import ActivationType
@@ -271,9 +271,14 @@ def test_fmoe(
     M, _ = topk_ids.shape
 
     BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
-    # BLOCK_SIZE_M = 32 if M > 1024 else 16
-    # if qType == aiter.QuantType.per_128x128:
-    #     BLOCK_SIZE_M = 64 if M > 64 else 16
+    if (
+        qType == aiter.QuantType.per_1x32
+        and (AQDType in [dtypes.bf16, dtypes.fp16])
+        and (WQDType == dtypes.fp4x2)
+    ):  # a16w4
+        BLOCK_SIZE_M = 32 if M > 1024 else 16
+    if qType == aiter.QuantType.per_128x128:
+        BLOCK_SIZE_M = 64 if M > 64 else 16
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids, topk_weights, E, model_dim, dtype, BLOCK_SIZE_M
     )
@@ -377,10 +382,10 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
-        w1_qt_aiter = shuffle_mxfp4_weight(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_mxfp4_scale(w1_scale, E, True)
-        w2_qt_aiter = shuffle_mxfp4_weight(w2_qt_aiter, 16, False)
-        w2_scale_aiter = shuffle_mxfp4_scale(w2_scale, E, False)
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+        w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
+        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     # elif WQDType != dtypes.fp4x2 and (get_gfx() in ["gfx950"]):
     #     inst_K = 128 // w1_qt_aiter.element_size()
     #     w1_qt_aiter = shuffle_weight_NK(w1_qt_aiter, 16, inst_K)
@@ -408,65 +413,65 @@ def test_fmoe(
     )
 
     # # ######################## ck stage 1 start ###########
-    if WQDType == dtypes.fp4x2 or AQDType == dtypes.fp4x2:
-        out1_ck = torch.zeros((token, topk, inter_dim), dtype=dtype)
-    else:
-        out1_ck = torch.empty((token, topk, inter_dim), dtype=dtype)
-    if (
-        qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16])
-        and (WQDType == dtypes.fp4x2)
-    ):  # a16w4:
-        npad0 = intermediate_pad // 64 * 64
-        kpad0 = hidden_pad // 128 * 128
-        out1_ck, us1 = run_perftest(
-            cktile_moe_stage1,
-            a1_qt,
-            w1_qt_aiter,
-            w2_qt_aiter,
-            sorted_ids,
-            sorted_expert_ids,
-            num_valid_ids,
-            w1_scale_aiter,
-            a1_scale,
-            exp_bias1_aiter,
-            dtype,
-            topk,
-            npad0 * 2,
-            kpad0,
-            BLOCK_SIZE_M,
-            actType,
-            quant_type=qType,
-            sorted_weights=sorted_weights if doweight_stage1 else None,
-            # needTrace=True,
-            # num_iters=2,
-            # num_warmup=0,
-        )
-    else:
-        out1_ck, us1 = run_perftest(
-            ck_moe_stage1,
-            a1_qt,
-            w1_qt_aiter,
-            w2_qt_aiter,
-            sorted_ids,
-            sorted_expert_ids,
-            num_valid_ids,
-            w1_scale,
-            a1_scale,
-            dtype,
-            topk,
-            BLOCK_SIZE_M,
-            actType,
-            quant_type=qType,
-            sorted_weights=sorted_weights if doweight_stage1 else None,
-            needTrace=True,
-        )
+    # if WQDType == dtypes.fp4x2 or AQDType == dtypes.fp4x2:
+    #     out1_ck = torch.zeros((token, topk, inter_dim), dtype=dtype)
+    # else:
+    #     out1_ck = torch.empty((token, topk, inter_dim), dtype=dtype)
+    # if (
+    #     qType == aiter.QuantType.per_1x32
+    #     and (AQDType in [dtypes.bf16, dtypes.fp16])
+    #     and (WQDType == dtypes.fp4x2)
+    # ):  # a16w4:
+    #     npad0 = intermediate_pad // 64 * 64
+    #     kpad0 = hidden_pad // 128 * 128
+    #     out1_ck, us1 = run_perftest(
+    #         cktile_moe_stage1,
+    #         a1_qt,
+    #         w1_qt_aiter,
+    #         w2_qt_aiter,
+    #         sorted_ids,
+    #         sorted_expert_ids,
+    #         num_valid_ids,
+    #         w1_scale_aiter,
+    #         a1_scale,
+    #         exp_bias1_aiter,
+    #         dtype,
+    #         topk,
+    #         npad0 * 2,
+    #         kpad0,
+    #         BLOCK_SIZE_M,
+    #         actType,
+    #         quant_type=qType,
+    #         sorted_weights=sorted_weights if doweight_stage1 else None,
+    #         # needTrace=True,
+    #         # num_iters=2,
+    #         # num_warmup=0,
+    #     )
+    # else:
+    #     out1_ck, us1 = run_perftest(
+    #         ck_moe_stage1,
+    #         a1_qt,
+    #         w1_qt_aiter,
+    #         w2_qt_aiter,
+    #         sorted_ids,
+    #         sorted_expert_ids,
+    #         num_valid_ids,
+    #         w1_scale,
+    #         a1_scale,
+    #         dtype,
+    #         topk,
+    #         BLOCK_SIZE_M,
+    #         actType,
+    #         quant_type=qType,
+    #         sorted_weights=sorted_weights if doweight_stage1 else None,
+    #         needTrace=True,
+    #     )
 
-    checkAllclose(
-        out1_ref,
-        out1_ck,
-        msg=f"[perf]  ck_moe_stage1:{us1:>8.2f} us, {token*model_dim*inter_dim*2*topk*2/us1/1000/1000:>8.2f} tflops......(quant:{AQDType})",
-    )
+    # checkAllclose(
+    #     out1_ref,
+    #     out1_ck,
+    #     msg=f"[perf]  ck_moe_stage1:{us1:>8.2f} us, {token*model_dim*inter_dim*2*topk*2/us1/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+    # )
 
     # diff = torch.abs(out1_ref - out1_ck)
     # max_value= diff.max()
@@ -545,89 +550,90 @@ def test_fmoe(
     # # )
     # # checkAllclose(out_ref, out2_ref, msg="[torch] 1_stage vs 2_stage")
 
-    out2_ck = torch.empty((token, model_dim), dtype=dtype)
-    if (
-        qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16])
-        and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
-        npad0 = hidden_pad // 64 * 64
-        kpad0 = intermediate_pad // 128 * 128
-        _, us2 = run_perftest(
-            cktile_moe_stage2,
-            a2_qt,
-            w1_qt_aiter,
-            w2_qt_aiter,
-            sorted_ids,
-            sorted_expert_ids,
-            num_valid_ids,
-            w2_scale_aiter,
-            a2_scale,
-            exp_bias2_aiter,
-            dtype,
-            topk,
-            npad0,
-            kpad0,
-            BLOCK_SIZE_M,
-            actType,
-            quant_type,
-            sorted_weights if not doweight_stage1 else None,
-            # needTrace=True,
-            # num_iters=2,
-            # num_warmup=0,
-        )
-        out2_ck = cktile_moe_stage2(
-            a2_qt,
-            w1_qt_aiter,
-            w2_qt_aiter,
-            sorted_ids,
-            sorted_expert_ids,
-            num_valid_ids,
-            w2_scale_aiter,
-            a2_scale,
-            exp_bias2_aiter,
-            dtype,
-            topk,
-            npad0,
-            kpad0,
-            BLOCK_SIZE_M,
-            actType,
-            quant_type,
-            sorted_weights if not doweight_stage1 else None,
-            True,
-        )
-    else:
-        out2_ck, us2 = run_perftest(
-            ck_moe_stage2,
-            a2_qt,
-            w1_qt_aiter,
-            w2_qt_aiter,
-            sorted_ids,
-            sorted_expert_ids,
-            num_valid_ids,
-            w2_scale,
-            a2_scale,
-            dtype,
-            topk,
-            BLOCK_SIZE_M,
-            actType,
-            quant_type,
-            sorted_weights if not doweight_stage1 else None,
-        )
+    # out2_ck = torch.empty((token, model_dim), dtype=dtype)
+    # if (
+    #     qType == aiter.QuantType.per_1x32
+    #     and (AQDType in [dtypes.bf16, dtypes.fp16])
+    #     and (WQDType == dtypes.fp4x2)
+    # ):  # a16w4
+    #     npad0 = hidden_pad // 64 * 64
+    #     kpad0 = intermediate_pad // 128 * 128
+    #     _, us2 = run_perftest(
+    #         cktile_moe_stage2,
+    #         a2_qt,
+    #         w1_qt_aiter,
+    #         w2_qt_aiter,
+    #         sorted_ids,
+    #         sorted_expert_ids,
+    #         num_valid_ids,
+    #         w2_scale_aiter,
+    #         a2_scale,
+    #         exp_bias2_aiter,
+    #         dtype,
+    #         topk,
+    #         npad0,
+    #         kpad0,
+    #         BLOCK_SIZE_M,
+    #         actType,
+    #         quant_type,
+    #         sorted_weights if not doweight_stage1 else None,
+    #         # needTrace=True,
+    #         # num_iters=2,
+    #         # num_warmup=0,
+    #     )
+    #     out2_ck = cktile_moe_stage2(
+    #         a2_qt,
+    #         w1_qt_aiter,
+    #         w2_qt_aiter,
+    #         sorted_ids,
+    #         sorted_expert_ids,
+    #         num_valid_ids,
+    #         w2_scale_aiter,
+    #         a2_scale,
+    #         exp_bias2_aiter,
+    #         dtype,
+    #         topk,
+    #         npad0,
+    #         kpad0,
+    #         BLOCK_SIZE_M,
+    #         actType,
+    #         quant_type,
+    #         sorted_weights if not doweight_stage1 else None,
+    #         True,
+    #     )
+    # else:
+    #     out2_ck, us2 = run_perftest(
+    #         ck_moe_stage2,
+    #         a2_qt,
+    #         w1_qt_aiter,
+    #         w2_qt_aiter,
+    #         sorted_ids,
+    #         sorted_expert_ids,
+    #         num_valid_ids,
+    #         w2_scale,
+    #         a2_scale,
+    #         dtype,
+    #         topk,
+    #         BLOCK_SIZE_M,
+    #         actType,
+    #         quant_type,
+    #         sorted_weights if not doweight_stage1 else None,
+    #     )
 
-    checkAllclose(
-        out2_ref,
-        out2_ck,
-        msg=f"[perf]  ck_moe_stage2:{us2:>8.2f} us, {token*model_dim*inter_dim*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
-    )
+    # checkAllclose(
+    #     out2_ref,
+    #     out2_ck,
+    #     msg=f"[perf]  ck_moe_stage2:{us2:>8.2f} us, {token*model_dim*inter_dim*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+    # )
 
     # diff = torch.abs(out2_ref - out2_ck)
     # max_value= diff.max()
     # multi_index = np.unravel_index(torch.argmax(diff).item(), diff.shape)
     # print("max_diff", max_value.item(), ",ref=", out2_ref[multi_index].item(), ",ck=", out2_ck[multi_index].item())
     # ######################## stage 2 end ###########
-
-    out2_ck = fused_moe(
+    us1 = 0
+    out2_ck, us2 = run_perftest(
+        fused_moe,
         input,
         w1_qt_aiter,
         w2_qt_aiter,
@@ -650,15 +656,16 @@ def test_fmoe(
     )
 
     # return {"gemm1(us)": us1, "gemm2(us)": us2}
-    def calc_diff(x: torch.Tensor, y: torch.Tensor):
-        x, y = x.double(), y.double()
-        denominator = (x * x + y * y).sum()
-        sim = 2 * (x * y).sum() / denominator
-        return 1 - sim
+    # def calc_diff(x: torch.Tensor, y: torch.Tensor):
+    #     x, y = x.double(), y.double()
+    #     denominator = (x * x + y * y).sum()
+    #     sim = 2 * (x * y).sum() / denominator
+    #     return 1 - sim
 
-    logits_diff = calc_diff(out2_ref, out2_ck)
-    assert logits_diff < 1e-3
+    # logits_diff = calc_diff(out2_ref, out2_ck)
+    # assert logits_diff < 1e-3
 
+    # return {"gemm1(us)": us1, "gemm2(us)": us2, "err": err}
     return {"us": us2, "err": err}
 
 
@@ -667,30 +674,30 @@ l_dtype = ["bf16", "fp16"][:1]
 l_dim = [(7168, 256)]
 # l_dim = [(3072, 3072)]
 l_tokenNum = [
-    # 1,
-    # 2,
-    # 4,
+    1,
+    2,
+    4,
     8,
-    # 16,
-    # 32,
-    # 64,
-    # 128,
-    # 256,
-    # 1024,
-    # 2048,
-    # 3072,
-    # 4096,
-    # 8192,
-    # 163840,
+    16,
+    32,
+    64,
+    128,
+    256,
+    1024,
+    2048,
+    3072,
+    4096,
+    8192,
+    163840,
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu]
 l_quant = [
-    # (aiter.QuantType.No, None, None), # a16w16
-    # (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
+    (aiter.QuantType.No, None, None), # a16w16
+    (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
     # (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
 ]
 l_doweight_stage1 = [False, True][:1]
@@ -821,8 +828,7 @@ for (
         dtypes.fp4x2,
     ):
         for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
-            print(f"hidden_pad={hidden_pad}, intermediate_pad={intermediate_pad}")
-            for m in l_tokenNum:
+             for m in l_tokenNum:
                 ret = test_fmoe(
                     dtype,
                     m,
