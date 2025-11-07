@@ -1,0 +1,57 @@
+#include "{{triton_header}}"
+
+
+extern "C" {
+void {{func_name}}(void* Q,                 //   [num_seqs, num_heads, head_size]
+                    void* KV,                //   [num_page, page_size, num_kv_heads, head_size]
+                    void* qo_indptr,         //   [batch_size+1]
+                    void* kv_indptr,         //   [batch_size+1]
+                    void* kv_page_indices,   //   [num_page_used]
+                    void* kv_last_page_lens, //   [batch_size]
+                    int max_seqlen_q,
+                    float softmax_scale,
+                    // following are output
+                    void* logits, //[batch_size, num_kv_splits, num_heads, v_head_dim]
+                    void* attn_lse,   //[batch_size, num_kv_splits, num_heads,  1]
+                    void* output,
+                    int num_seqs,
+                    int num_heads,
+                    int num_kv_heads,
+                    int stride_Q,
+                    int stride_Page,
+                    int attn_lse_stride_0,
+                    int attn_lse_stride_1,
+                    int attn_lse_stride_2,
+                    int output_stride_0,
+                    int output_stride_1,
+                    void* stream
+                    );
+}
+
+
+void {{func_name}}(void* Q,                 //   [num_seqs, num_heads, head_size]
+                    void* KV,                //   [num_page, page_size, num_kv_heads, head_size]
+                    void* qo_indptr,         //   [batch_size+1]
+                    void* kv_indptr,         //   [batch_size+1]
+                    void* kv_page_indices,   //   [num_page_used]
+                    void* kv_last_page_lens, //   [batch_size]
+                    int max_seqlen_q,
+                    float softmax_scale,
+                    // following are output
+                    void* logits, //[batch_size, num_kv_splits, num_heads, v_head_dim]
+                    void* attn_lse,   //[batch_size, num_kv_splits, num_heads,  1]
+                    void* output,
+                    int num_seqs,
+                    int num_heads,
+                    int num_kv_heads,
+                    int q_stride_0,
+                    int kv_stride_0,
+                    int attn_lse_stride_0,
+                    int attn_lse_stride_1,
+                    int attn_lse_stride_2,
+                    int output_stride_0,
+                    int output_stride_1,
+                    void* stream
+                    ){
+    {{triton_kernel}}(reinterpret_cast<hipStream_t>(stream), logits, attn_lse, output, qo_indptr, kv_indptr, attn_lse_stride_0, attn_lse_stride_2, attn_lse_stride_1, output_stride_0, output_stride_1, num_seqs, num_heads, max_seqlen_q);
+}

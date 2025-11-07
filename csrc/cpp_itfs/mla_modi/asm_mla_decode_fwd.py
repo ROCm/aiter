@@ -16,7 +16,7 @@ import functools
 
 MD_NAME = "asm_mla_decode_fwd"
 warpSize = 64
-with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/mla/asm_mla_decode_fwd.cpp.jinja", "r") as f:
+with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/mla_modi/asm_mla_decode_fwd.cpp.jinja", "r") as f:
     src_template = Template(f.read())
 
 mgcs = {16: 64, 128: 16}
@@ -54,14 +54,15 @@ def compile(
 
     # if not_built(func_name):
     if True:
-        if gqa_ratio == 128:
-            hsaco_path = f"{AITER_CORE_DIR}/hsa/{GPU_ARCH}/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co"
-            kernel_name = "_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E"
-        else:
-            hsaco_path = f"{AITER_CORE_DIR}/hsa/{GPU_ARCH}/mla/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co"
-            kernel_name = "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E"
+        # if gqa_ratio == 128:
+        #     hsaco_path = f"{AITER_CORE_DIR}/hsa/{GPU_ARCH}/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co"
+        #     kernel_name = "_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E"
+        # else:
+        #     hsaco_path = f"{AITER_CORE_DIR}/hsa/{GPU_ARCH}/mla/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co"
+        #     kernel_name = "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E"
 
-        bin_size, bin_data = transfer_hsaco(hsaco_path)
+        # bin_size, bin_data = transfer_hsaco(hsaco_path)
+
         compile_args = CompileArgs(
             path=f"{AITER_CORE_DIR}/aiter/mla.py",
             kernel_name="_fwd_kernel_stage2_asm",
@@ -83,6 +84,7 @@ def compile(
         # import pdb
         # pdb.set_trace()
 
+        kernel_name = "_fwd_kernel_stage2_asm"
         current_dir = os.path.dirname(__file__)
         # print(f"current_dir={current_dir}")
         return compile_template_op(
@@ -90,8 +92,6 @@ def compile(
             MD_NAME,
             [current_dir + "/../utils.h", current_dir + "/../../include", triton_header],
             [triton_source],
-            bin_size=bin_size,
-            bin_data=bin_data,
             page_size=page_size,
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,
