@@ -153,9 +153,17 @@ template<index_t Start, index_t End, index_t Step>  struct __make_index_seq<seq<
     using seq_type = typename __steped_integer_seq<Start, Step, typename __make_index_seq< seq<(End-Start)/Step> >::seq_type>::seq_type;
 };
 } // namespace impl
-
 // make_index_seq<5> -> seq<0,1,2,3,4> | make_index_seq<4, 9> -> seq<4,5,6,7,8> | make_index_seq<4, 8, 2> -> seq<4, 6>
 template<index_t...Is> using make_index_seq = typename impl::__make_index_seq<seq<Is...>>::seq_type;
+
+namespace impl {
+template<index_t Value, index_t N>
+struct __make_repeated_seq {
+    template<index_t... I> static constexpr auto __make(seq<I...>) { return seq<(void(I), Value)...>{}; }
+    using seq_type = decltype(__make(make_index_seq<N>{}));
+};
+} // namespace impl
+template<index_t V, index_t N> using make_repeated_seq = typename impl::__make_repeated_seq<V, N>::seq_type;
 
 template<index_t...Xs, index_t...Ys> OPUS_H_D constexpr auto concat_seq(seq<Xs...>, seq<Ys...>) { return seq<Xs..., Ys...>{}; }
 
@@ -212,7 +220,7 @@ template <class... T> struct tuple;
 template<index_t... N, typename F> OPUS_H_D constexpr void static_ford(tuple<number<N>...>, F f) { impl::static_ford_impl<seq<N...>>{}(f); }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// array, enhanced C like array style. convenient for cases like assign one array to another
+// array, enhanced C like array style
 template <typename T, index_t N>
 struct array {
     using value_type = remove_cvref_t<T>;
@@ -351,6 +359,12 @@ OPUS_H_D constexpr decltype(auto) get(T&& t) { return get<I1, Is...>(get<I0>(std
 template <typename... T> OPUS_H_D constexpr auto make_tuple(T&&... xs) { return tuple<remove_cvref_t<T>...>(std::forward<T>(xs)...); }
 
 namespace impl {
+template <typename T, index_t... Is> OPUS_H_D constexpr auto make_repeated_tuple(T&& x, seq<Is...>) { return opus::make_tuple((void(Is), std::forward<T>(x))...); }
+} // namespace impl
+template <index_t N, typename T> OPUS_H_D constexpr auto make_repeated_tuple(T&& x) { return impl::make_repeated_tuple(std::forward<T>(x), make_index_seq<N>{}); }
+template <typename T, index_t N> OPUS_H_D constexpr auto make_repeated_tuple(T&& x, number<N>) { return impl::make_repeated_tuple(std::forward<T>(x), make_index_seq<N>{}); }
+
+namespace impl {
 template <class T0, class T1, index_t... I0, index_t... I1>
 OPUS_H_D constexpr auto concat_tuple(T0 const& t0, T1 const& t1, seq<I0...>, seq<I1...>) { return opus::make_tuple(get<I0>(t0)..., get<I1>(t1)...); }
 template <class T0, class T1, class T2, index_t... I0, index_t... I1, index_t...I2>
@@ -376,6 +390,53 @@ template <typename T> static constexpr bool is_tuple_v = is_tuple<remove_cvref_t
 template<typename T> OPUS_H_D constexpr std::enable_if_t<is_tuple_v<T>, index_t> size(T&&) { return remove_cvref_t<T>::size(); /* tuple size */}
 template<typename T> OPUS_H_D constexpr std::enable_if_t<is_tuple_v<T>, index_t> size()    { return remove_cvref_t<T>::size(); /* tuple size */}
 
+template <typename T, std::enable_if_t<!is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto explode_tuple(const T& t) { return opus::make_tuple(t); }
+template <typename T, index_t... Is> OPUS_H_D constexpr auto                                 explode_tuple(const T&, seq<Is...>);
+template <typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto  explode_tuple(const T& t) { return explode_tuple(t, make_index_seq<size<T>()>{}); }
+template <typename T, index_t... Is> OPUS_H_D constexpr auto                                 explode_tuple(const T& t, seq<Is...>) { return concat_tuple(explode_tuple(get<Is>(t))...); }
+
+template <typename T, index_t... Is> OPUS_H_D constexpr auto flatten_tuple(const T& t, seq<Is...>) { return concat_tuple(explode_tuple(get<Is>(t))...); }
+template <typename T> OPUS_H_D constexpr auto                flatten_tuple(const T& t) { return flatten_tuple(t, make_index_seq<size<T>()>{}); }
+
+namespace impl {
+template<typename Outer, typename Inner, index_t...Is>
+OPUS_H_D constexpr auto embed_nested_tuple_impl(const Outer& ot, const Inner& it, seq<Is...>) { return opus::make_tuple(concat_tuple(get<Is>(ot), get<Is>(it))...); }
+
+template<typename TargetType, typename T, index_t...Is>
+OPUS_H_D constexpr auto tuple_count_impl(seq<Is...>) { return (number<std::is_same_v<remove_cvref_t<decltype(get<Is>(T{}))>, remove_cvref_t<TargetType>> ? 1 : 0>{} + ...); }
+}
+// Outer: tuple<tuple<X, X>, tuple<Y>>,  Inner: tuple<tuple<Z>, tuple<W>> => tuple<tuple<X, X, Z>, tuple<Y, W>>
+template<typename Outer, typename Inner>
+OPUS_H_D constexpr auto embed_nested_tuple(const Outer& ot, const Inner& it) {
+    static_assert(size<Outer>() == size<Inner>());
+    return impl::embed_nested_tuple_impl(ot, it, make_index_seq<size<Outer>()>{});
+}
+
+template< typename TargetType, typename T, std::enable_if_t<is_tuple_v<T>, bool> = true>
+OPUS_H_D constexpr index_t tuple_count(const T& t) { return impl::tuple_count_impl<TargetType, remove_cvref_t<T>>(make_index_seq<size<T>()>{}).value; }
+
+template< typename TargetType, typename T, std::enable_if_t<is_tuple_v<T>, bool> = true>
+OPUS_H_D constexpr index_t tuple_count() { return impl::tuple_count_impl<TargetType, remove_cvref_t<T>>(make_index_seq<size<T>()>{}).value; }
+
+template<index_t...Is> OPUS_H_D constexpr auto seq_to_tuple(seq<Is...>) { return opus::make_tuple(number<Is>{}...); }
+
+template<index_t...Is>                                             OPUS_H_D constexpr auto to_tuple(seq<Is...>) { return opus::make_tuple(number<Is>{}...); }
+template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto to_tuple(const T& t) { return t; }
+
+namespace impl {
+template <typename R, typename T>            OPUS_H_D constexpr auto reduce_tuple_impl(const T& t, seq<>)  { return t; }
+template <typename R, typename T, index_t I> OPUS_H_D constexpr auto reduce_tuple_impl(const T& t, seq<I>) { return t; }
+
+template <typename R, typename T, index_t I0, index_t I1, index_t... Is>
+OPUS_H_D constexpr auto reduce_tuple_impl(const T& t, seq<I0, I1, Is...>) {
+    return reduce_tuple_impl<R>(opus::make_tuple(R{}(get<I0>(t), get<I1>(t)), get<Is>(t)...), make_index_seq<sizeof...(Is) + 1>{});
+}
+}
+template<typename R, typename T, std::enable_if_t<is_tuple_v<T>, bool> = true>
+OPUS_H_D constexpr auto reduce_tuple(const T & t) { return  impl::reduce_tuple_impl<R>(t, make_index_seq<size<T>()>{}); }
+template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto reduce_tuple_sum(const T & t) { return reduce_tuple<opus::plus>(t); }
+template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto reduce_tuple_mul(const T & t) { return reduce_tuple<opus::multiplies>(t); }
+
 namespace impl {
 template<typename, typename, typename> struct to_peepholed_seq;
 
@@ -399,55 +460,13 @@ OPUS_H_D constexpr decltype(auto) merge_peepholed_tuple_impl(PeepholedTuple&& pt
 // (Peepholed)tuple<*, *, _, *, _> + (Income)tuple<#, @> -> tuple<*, *, #, *, @>.  "_"(underscore) indicate a peephole for income tuple to chime in
 template<typename PeepholedTuple, typename IncomeTuple>
 OPUS_H_D constexpr decltype(auto) merge_peepholed_tuple(PeepholedTuple&& pt, IncomeTuple&& it) {
-    constexpr auto income_seq =  impl::to_peepholed_seq< remove_cvref_t<PeepholedTuple>,
-                                                        make_index_seq<opus::size<PeepholedTuple>()>,
-                                                        number<opus::size<IncomeTuple>()> >{}(number<0>{});
-    return impl::merge_peepholed_tuple_impl(std::forward<PeepholedTuple>(pt), std::forward<IncomeTuple>(it), make_index_seq<opus::size<PeepholedTuple>()>{}, income_seq);
+    if constexpr (tuple_count<underscore, PeepholedTuple>() == 0) return pt;
+    else {
+        constexpr auto income_seq =  impl::to_peepholed_seq< remove_cvref_t<PeepholedTuple>,        make_index_seq<opus::size<PeepholedTuple>()>,
+                                                             number<opus::size<IncomeTuple>()> >{}(number<0>{});
+        return impl::merge_peepholed_tuple_impl(std::forward<PeepholedTuple>(pt), std::forward<IncomeTuple>(it), make_index_seq<opus::size<PeepholedTuple>()>{}, income_seq);
+    }
 }
-
-template <typename T, std::enable_if_t<!is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto explode_tuple(const T& t) { return opus::make_tuple(t); }
-template <typename T, index_t... Is> OPUS_H_D constexpr auto                                 explode_tuple(const T&, seq<Is...>);
-template <typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto  explode_tuple(const T& t) { return explode_tuple(t, make_index_seq<size<T>()>{}); }
-template <typename T, index_t... Is> OPUS_H_D constexpr auto                                 explode_tuple(const T& t, seq<Is...>) { return concat_tuple(explode_tuple(get<Is>(t))...); }
-
-template <typename T, index_t... Is> OPUS_H_D constexpr auto flatten_tuple(const T& t, seq<Is...>) { return concat_tuple(explode_tuple(get<Is>(t))...); }
-template <typename T> OPUS_H_D constexpr auto                flatten_tuple(const T& t) { return flatten_tuple(t, make_index_seq<size<T>()>{}); }
-
-namespace impl {
-template<typename Outer, typename Inner, index_t...Is>
-OPUS_H_D constexpr auto embed_nested_tuple_impl(const Outer& ot, const Inner& it, seq<Is...>) { return opus::make_tuple(concat_tuple(get<Is>(ot), get<Is>(it))...); }
-
-template<typename TargetType, typename T, index_t...Is>
-OPUS_H_D constexpr auto tuple_count_impl(const T& t, seq<Is...>) { return (number<std::is_same_v<remove_cvref_t<decltype(get<Is>(t))>, remove_cvref_t<TargetType>> ? 1 : 0>{} + ...); }
-}
-// Outer: tuple<tuple<X, X>, tuple<Y>>,  Inner: tuple<tuple<Z>, tuple<W>> => tuple<tuple<X, X, Z>, tuple<Y, W>>
-template<typename Outer, typename Inner>
-OPUS_H_D constexpr auto embed_nested_tuple(const Outer& ot, const Inner& it) {
-    static_assert(size<Outer>() == size<Inner>());
-    return impl::embed_nested_tuple_impl(ot, it, make_index_seq<size<Outer>()>{});
-}
-
-template< typename TargetType, typename T>
-OPUS_H_D constexpr index_t tuple_count(const T& t) { return impl::tuple_count_impl<TargetType>(t, make_index_seq<size<T>()>{}).value; }
-
-template<index_t...Is> OPUS_H_D constexpr auto seq_to_tuple(seq<Is...>) { return opus::make_tuple(number<Is>{}...); }
-
-template<index_t...Is>                                             OPUS_H_D constexpr auto to_tuple(seq<Is...>) { return opus::make_tuple(number<Is>{}...); }
-template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto to_tuple(const T& t) { return t; }
-
-namespace impl {
-template <typename R, typename T>            OPUS_H_D constexpr auto reduce_tuple_impl(const T& t, seq<>)  { return t; }
-template <typename R, typename T, index_t I> OPUS_H_D constexpr auto reduce_tuple_impl(const T& t, seq<I>) { return t; }
-
-template <typename R, typename T, index_t I0, index_t I1, index_t... Is>
-OPUS_H_D constexpr auto reduce_tuple_impl(const T& t, seq<I0, I1, Is...>) {
-    return reduce_tuple_impl<R>(opus::make_tuple(R{}(get<I0>(t), get<I1>(t)), get<Is>(t)...), make_index_seq<sizeof...(Is) + 1>{});
-}
-}
-template<typename R, typename T, std::enable_if_t<is_tuple_v<T>, bool> = true>
-OPUS_H_D constexpr auto reduce_tuple(const T & t) { return  impl::reduce_tuple_impl<R>(t, make_index_seq<size<T>()>{}); }
-template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto reduce_tuple_sum(const T & t) { return reduce_tuple<opus::plus>(t); }
-template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto reduce_tuple_mul(const T & t) { return reduce_tuple<opus::multiplies>(t); }
 } // namespace opus
 
 // implementing the "tuple-like binding protocol", don't use below directly
@@ -465,11 +484,8 @@ template<typename X, typename Y, index_t... Is> constexpr auto embed(const X& x,
 template<typename X, typename Y>                constexpr auto embed(const X& x, const Y& y) { return embed(x, y, make_index_seq<X::size()>{}); }
 
 namespace impl {
-template <typename F, typename X, index_t... Is>
-OPUS_H_D constexpr auto transform_tuple_impl(F f, const X& x, seq<Is...>) { return opus::make_tuple(f(get<Is>(x))...); }
-
-template <typename F, typename X, index_t... Is>
-OPUS_H_D constexpr auto transform_tuple_with_idx_impl(F f, const X& x, seq<Is...>) { return opus::make_tuple(f(get<Is>(x), number<Is>{})...); }
+template <typename F, typename X, index_t... Is> OPUS_H_D constexpr auto transform_tuple_impl(F f, const X& x, seq<Is...>) { return opus::make_tuple(f(get<Is>(x))...); }
+template <typename F, typename X, index_t... Is> OPUS_H_D constexpr auto transform_tuple_with_idx_impl(F f, const X& x, seq<Is...>) { return opus::make_tuple(f(get<Is>(x), number<Is>{})...); }
 } // namespace impl
 // f(auto item)
 template <typename F, typename X> OPUS_H_D constexpr auto transform_tuple(F f, const X& x) { return impl::transform_tuple_impl(f, x, make_index_seq<size<X>()>{}); }
@@ -612,30 +628,28 @@ template<typename Layout> struct is_layout<layout_linear<Layout>> : true_type {}
 template<typename T> constexpr bool is_layout_v = is_layout<remove_cvref_t<T>>::value;
 
 template <typename Layout>
-OPUS_H_D constexpr auto layout_to_issue_space()
-{
+OPUS_H_D constexpr auto layout_to_issue_space() {
     using maybe_coord = std::conditional_t<std::is_same_v<typename Layout::Coord, false_type>, typename Layout::Shape, typename Layout::Coord>;
-    constexpr auto issue_space_y = pickup_shape(typename Layout::Shape{}, maybe_coord{}, underscore{});
-    using issue_space = std::conditional_t<std::is_same_v<typename Layout::Coord, false_type>, typename Layout::Shape, remove_cvref_t<decltype(issue_space_y)>>;
+    using issue_space_y = remove_cvref_t<decltype(pickup_shape(typename Layout::Shape{}, maybe_coord{}, underscore{}))>;
+    using single_issue_space = remove_cvref_t<decltype(make_repeated_tuple(number<1>{}, number<size<typename Layout::Shape>()>{}))>;
+    using fallback_issue_space_y = std::conditional_t<std::is_same_v<issue_space_y, opus::tuple<>>, single_issue_space, issue_space_y>;
+    using issue_space = std::conditional_t<std::is_same_v<typename Layout::Coord, false_type>, single_issue_space, fallback_issue_space_y>;
     return issue_space{};
 }
 
 template<typename issue_space, int vec = 1>
-OPUS_H_D constexpr auto vectorize_issue_space(issue_space, number<vec> = {})
-{
+OPUS_H_D constexpr auto vectorize_issue_space(issue_space, number<vec> = {}) {
     constexpr index_t vec_from_issue_space = get<size<issue_space>() - 1>(issue_space{}).value;     // here we get the original last dim length(which should be y dim)
     static_assert(vec_from_issue_space % vec == 0, "please make sure requested vec size can be dividable of vec from issue space");
 
     constexpr auto issue_space_vec = transform_tuple_with_idx([&](auto item, auto index){           // modify the last dim, divide it by vec. Result is still a tuple
         if constexpr (index.value == size<issue_space>() - 1) return number<item.value / vec_from_issue_space>{};
         else                                                  return item;    }, issue_space{});
-
     return issue_space_vec;
 }
 
 template <index_t vec, typename Layout>
-OPUS_H_D constexpr auto layout_to_vectorized_issue_space()
-{
+OPUS_H_D constexpr auto layout_to_vectorized_issue_space() {
     constexpr auto issue_space = layout_to_issue_space<Layout>();
     constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
     static_assert(size<decltype(issue_space_vec)>() == Layout::coord_rank);
@@ -744,19 +758,15 @@ OPUS_H_D constexpr auto to_vector(const T& t) { return impl::to_vector_impl(t, m
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // slice
 namespace impl {
-template<typename C, index_t...Is, std::enable_if_t<is_vector_v<C>, bool> = true> OPUS_H_D constexpr auto slice_impl(C&& container, seq<Is...>) { return opus::make_vector(get<Is>(container)...); }
-template<typename C, index_t...Is, std::enable_if_t<is_array_v<C>, bool> = true>  OPUS_H_D constexpr auto slice_impl(C&& container, seq<Is...>) { return opus::make_array(get<Is>(container)...); }
-template<typename C, index_t...Is, std::enable_if_t<is_tuple_v<C>, bool> = true>  OPUS_H_D constexpr auto slice_impl(C&& container, seq<Is...>) { return opus::make_tuple(get<Is>(container)...); }
+template<typename C, index_t...Is, std::enable_if_t<is_vector_v<C>, bool> = true> OPUS_H_D constexpr auto slice_impl(C&& c, seq<Is...>) { return opus::make_vector(get<Is>(c)...); }
+template<typename C, index_t...Is, std::enable_if_t<is_array_v<C>, bool> = true>  OPUS_H_D constexpr auto slice_impl(C&& c, seq<Is...>) { return opus::make_array(get<Is>(c)...); }
+template<typename C, index_t...Is, std::enable_if_t<is_tuple_v<C>, bool> = true>  OPUS_H_D constexpr auto slice_impl(C&& c, seq<Is...>) { return opus::make_tuple(get<Is>(c)...); }
 
 template<index_t len, typename C, typename...Ts, std::enable_if_t<is_vector_v<C>, bool> = true>
-OPUS_H_D constexpr auto slice_impl_i(C&& container, Ts... ss) {
-    vector_t<typename vector_traits<C>::dtype, len> r;  index_t d = 0;  static_for([&](auto i){r[d++] = container[i]; }, ss...);  return r;
-}
+OPUS_H_D constexpr auto slice_impl_i(C&& c, Ts... ss) { vector_t<typename vector_traits<C>::dtype, len> r;  index_t d = 0;  static_for([&](auto i){r[d++] = c[i]; }, ss...);  return r; }
 
 template<index_t len, typename C, typename...Ts, std::enable_if_t<is_array_v<C>, bool> = true>
-OPUS_H_D constexpr auto slice_impl_i(C&& container, Ts... ss) {
-    array<typename C::value_type, len> r;  index_t d = 0;  static_for([&](auto i){r[d++] = container[i]; }, ss...);  return r;
-}
+OPUS_H_D constexpr auto slice_impl_i(C&& c, Ts... ss) { array<typename C::value_type, len> r;  index_t d = 0;  static_for([&](auto i){r[d++] = c[i]; }, ss...);  return r; }
 
 template<typename C, typename V, index_t...Ds, index_t...Ss, std::enable_if_t<(is_vector_v<C> || is_array_v<C> || is_tuple_v<C>), bool> = true>
 OPUS_H_D constexpr auto set_slice_impl(C&& dst_c, V&& src_c, seq<Ds...>, seq<Ss...>) { ((  dst_c[Ds] = src_c[Ss]), ...); }
@@ -765,19 +775,19 @@ OPUS_H_D constexpr auto set_slice_impl(C&& dst_c, V&& src_c, seq<Ds...>, seq<Ss.
 // static/dynamic slice. SS could be either number<x>, or const integer. Note tuple type does not support dynamic slice (ss is integral)
 // (1).[end] : 0.... end, (2).[start, end] : start...end, (3).[start, end, step], start...end but with step as interval (default is 1)
 template<typename C, typename... S, std::enable_if_t<is_vector_v<C> && (is_constant_v<S> && ...), bool> = true>
-OPUS_H_D constexpr auto slice(C&& container, S&&...ss) { return impl::slice_impl(std::forward<C>(container), make_index_seq<(S::value) ...>{}); }
+OPUS_H_D constexpr auto slice(C&& c, S&&...ss) { return impl::slice_impl(std::forward<C>(c), make_index_seq<(S::value) ...>{}); }
 
 template<index_t len, typename C, typename... S, std::enable_if_t<is_vector_v<C> && (std::is_integral_v<S> && ...), bool> = true>
-OPUS_H_D constexpr auto slice(C&& container, S&&...ss) { return impl::slice_impl_i<len>(std::forward<C>(container), ss...); }
+OPUS_H_D constexpr auto slice(C&& c, S&&...ss) { return impl::slice_impl_i<len>(std::forward<C>(c), ss...); }
 
 template<typename C, typename... S, std::enable_if_t<is_array_v<C> && (is_constant_v<S> && ...), bool> = true>
-OPUS_H_D constexpr auto slice(C&& container, S&&...ss) { return impl::slice_impl(std::forward<C>(container), make_index_seq<(S::value) ...>{}); }
+OPUS_H_D constexpr auto slice(C&& c, S&&...ss) { return impl::slice_impl(std::forward<C>(c), make_index_seq<(S::value) ...>{}); }
 
 template<index_t len, typename C, typename... S, std::enable_if_t<is_array_v<C> && (std::is_integral_v<S> && ...), bool> = true>
-OPUS_H_D constexpr auto slice(C&& container, S&&...ss) { return impl::slice_impl_i<len>(std::forward<C>(container), ss...); }
+OPUS_H_D constexpr auto slice(C&& c, S&&...ss) { return impl::slice_impl_i<len>(std::forward<C>(c), ss...); }
 
 template<typename C, typename... S, std::enable_if_t<is_tuple_v<C> && (is_constant_v<S> && ...), bool> = true>
-OPUS_H_D constexpr auto slice(C&& container, S&&...ss) { return impl::slice_impl(std::forward<C>(container), make_index_seq<(S::value) ...>{}); }
+OPUS_H_D constexpr auto slice(C&& c, S&&...ss) { return impl::slice_impl(std::forward<C>(c), make_index_seq<(S::value) ...>{}); }
 
 template<typename C, typename V, typename... S, std::enable_if_t<(is_vector_v<C> || is_array_v<C> || is_tuple_v<C>) && (is_constant_v<S> && ...), bool> = true>
 OPUS_H_D constexpr auto set_slice(C&& dst_c, V&& src_c, S&&...ss) {
@@ -815,6 +825,8 @@ REGISTER_DTYPE(i16 , int16_t)
 REGISTER_DTYPE(i8  , int8_t)
 REGISTER_DTYPE(u8  , uint8_t)
 
+template<typename C, typename... S, std::enable_if_t<is_dtype_v<C> && (is_constant_v<S> && ...), bool> = true>
+OPUS_H_D constexpr auto slice(C&& container, S&&...ss) { return container; }    // TODO: fallback slice a normal value does nonthing
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // type cast
 OPUS_D bf16_t fp32_to_bf16_rtn_asm(const float& x) {
@@ -990,8 +1002,82 @@ struct gmem {
     __amdgpu_buffer_rsrc_t cached_rsrc;
 };
 
+template<typename T_> OPUS_D decltype(auto) make_gmem(const T_* ptr, uint32_t size = 0xffffffff, uint32_t config = buffer_default_config()) { return gmem<T_>{ptr, size, config}; }
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// smem load/store related. TODO: tr_load
 template<typename T_>
-OPUS_D decltype(auto) make_gmem(const T_* ptr, uint32_t size = 0xffffffff, uint32_t config = buffer_default_config()) { return gmem<T_>{ptr, size, config}; }
+struct smem {
+    using T = remove_cvref_t<T_>;
+    using scalar_type = typename vector_traits<T>::dtype;
+    static constexpr index_t vector_size = vector_traits<T>::size();
+    template<index_t vec = 1> using vector_type = vector_t<scalar_type, vec * vector_size>;
+
+    OPUS_D smem(void* ptr_) : ptr(reinterpret_cast<char*>(ptr_)) {}
+
+    template<index_t vec = 1> OPUS_D auto _load(int v_os/* in unit of byte*/) { using type = vector_type<vec>; return *reinterpret_cast<type*>(ptr + v_os); }
+
+    template<index_t vec = 1, typename V>
+    OPUS_D void _store(const V& x, int v_os/* in unit of byte*/) {
+        static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check");
+        using type = vector_type<vec>;
+        *reinterpret_cast<type*>(ptr + v_os) = __builtin_bit_cast(type, x);
+    }
+
+    template<index_t vec = 1> OPUS_D auto load(int v_os) { return _load<vec>(v_os * sizeof(T)); }
+
+    template<index_t vec = 1, typename V, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>
+    OPUS_D void store(const V& x, int v_os) {
+        static_assert(std::is_same_v<typename vector_traits<V>::dtype, scalar_type>, "scalar type must be same for the data to be stored" );
+        static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check" );
+        _store<vec>(x, v_os * sizeof(T));
+    }
+
+    // bulk load API, give me a Shape of this tile, will issue multiple load instruction based on the y-shape space
+    template<index_t vec = 1, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
+    OPUS_D auto load(const Layout& u)
+    {
+        constexpr auto issue_space = layout_to_issue_space<Layout>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+
+#if OPUS_TILE_CONTAINER == 0
+        constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
+        vector_t<scalar_type, vec * vector_size * r_elem.value> r;          // local scratch to host the loaded register, and return it
+        static_ford(issue_space_vec, [&](auto ... ids){
+            auto tmp = load<vec>(u(ids...));
+            constexpr index_t u_rs = u_r(ids...);
+            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
+        });
+        return r;
+#elif OPUS_TILE_CONTAINER == 1
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);                      // we use this layout to describe the register layout
+        array<vector_type<vec>, r_elem.value> r;                                      // local scratch to host the loaded register, and return it
+        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = load<vec>(u(ids...)); }); // issue the loading instruction multiple times
+        return r;
+#endif
+    }
+
+    template<index_t vec = 1, typename V, typename Layout, std::enable_if_t<((is_array_v<V> || is_dtype_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
+    OPUS_D void store(const V& x, const Layout& u)
+    {
+        constexpr auto issue_space = layout_to_issue_space<Layout>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+
+        constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
+#if OPUS_TILE_CONTAINER == 0
+        auto a_ = x;
+#elif OPUS_TILE_CONTAINER == 1
+        auto a_ = to_array(x);
+#endif
+        static_ford(issue_space_vec, [&](auto ... ids){ // issue the loading instruction multiple times
+            auto v_ = slice(a_, number<u_r(ids...)>{}, number<u_r(ids...) + vec>{});
+            store<vec>(v_, u(ids...));
+        });
+    }
+    char * ptr; // in unit of byte
+};
+
+template<typename T_> OPUS_D decltype(auto) make_smem(T_* ptr) { return smem<T_>{ptr}; }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // waitcnt
 // vmcnt=0~63([15:14],[3:0]), lgkmcnt=0~15([11:8]), expcnt=0~7([6:4])
