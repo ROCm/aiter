@@ -6,7 +6,7 @@ from aiter import ragged_layout_trans
 
 GLOBAL_BLOCK_SIZE = 512
 
-# copy rom SGLang
+# copy from SGLang
 @triton.jit
 def create_flashinfer_kv_indices_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
