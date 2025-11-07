@@ -217,7 +217,7 @@ void all_gather_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer,
 }
 
 void _fused_allreduce_rmsnorm(
-    fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, torch::Tensor& w, int eps, int m, int n, hipStream_t stream)
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual_out, torch::Tensor& out, torch::Tensor& w, int eps, int m, int n, hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     TORCH_CHECK(_is_weak_contiguous(out));
@@ -226,6 +226,7 @@ void _fused_allreduce_rmsnorm(
     case at::ScalarType::Float: {
         fa->dispatchFusedAllReduceRMSNorm<float>(stream,
                              reinterpret_cast<float*>(inp.data_ptr()),
+                             reinterpret_cast<float*>(residual_out.data_ptr()),
                              reinterpret_cast<float*>(out.data_ptr()),
                              reinterpret_cast<float*>(w.data_ptr()),
                              eps, m, n);
@@ -234,6 +235,7 @@ void _fused_allreduce_rmsnorm(
     case at::ScalarType::Half: {
         fa->dispatchFusedAllReduceRMSNorm<half>(stream,
                              reinterpret_cast<half*>(inp.data_ptr()),
+                             reinterpret_cast<half*>(residual_out.data_ptr()),
                              reinterpret_cast<half*>(out.data_ptr()),
                              reinterpret_cast<half*>(w.data_ptr()),
                              eps, m, n);
@@ -243,6 +245,7 @@ void _fused_allreduce_rmsnorm(
     case at::ScalarType::BFloat16: {
         fa->dispatchFusedAllReduceRMSNorm<__hip_bfloat16>(stream,
                              reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
+                             reinterpret_cast<__hip_bfloat16*>(residual_out.data_ptr()),
                              reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
                              reinterpret_cast<__hip_bfloat16*>(w.data_ptr()),
                              eps, m, n);
@@ -256,6 +259,7 @@ void _fused_allreduce_rmsnorm(
 
 void fused_allreduce_rmsnorm(fptr_t _fa,
                 torch::Tensor& inp,
+                torch::Tensor& res_out,
                 torch::Tensor& out,
                 torch::Tensor& w,
                 float eps,
@@ -278,11 +282,11 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                                 input_size,
                                 hipMemcpyDeviceToDevice,
                                 stream));
-        _fused_allreduce_rmsnorm(_fa, reg_buffer.value(), out, w, eps, m, n, stream);
+        _fused_allreduce_rmsnorm(_fa, reg_buffer.value(), res_out, out, w, eps, m, n, stream);
     }
     else
     {
-      _fused_allreduce_rmsnorm(_fa, inp, out, w, eps, m, n, stream);
+      _fused_allreduce_rmsnorm(_fa, inp, res_out, out, w, eps, m, n, stream);
     }
 }
 
