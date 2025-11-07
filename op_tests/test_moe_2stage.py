@@ -100,12 +100,11 @@ def ck_moe_stage2(
     D = w2.shape[1]
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
-    out = torch.empty(
+    out = torch.zeros(
         (token_num, D),
         dtype=dtype,
         device=hidden_states.device,
     )
-    out.fill_(0)
     aiter.ck_moe_stage2_fwd(
         hidden_states,
         w1,
@@ -635,6 +634,7 @@ def test_fmoe(
 
     return {"us": us2, "err": err}
 
+
 l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
 l_dim = [(7168, 256)]
@@ -721,7 +721,7 @@ parser.add_argument(
     4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
     5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8""",
 )
-torch.cuda.manual_seed_all(1)
+
 parser.add_argument(
     "-a",
     "--act",
