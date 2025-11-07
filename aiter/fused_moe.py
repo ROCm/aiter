@@ -26,7 +26,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from aiter.fused_moe_bf16_asm import fused_moe_stage1_tkw1
+#from aiter.fused_moe_bf16_asm import fused_moe_stage1_tkw1
 
 BLOCK_SIZE_M = 32
 
@@ -153,8 +153,8 @@ def fused_moe_fake(
     num_local_tokens: Optional[torch.Tensor] = None,
     moe_sorting_dispatch_policy: bool = 0,
     dtype: Optional[torch.dtype] = None,
-    a16=False,
-    per_tensor_quant_scale=None
+    a16: bool = False,
+    per_tensor_quant_scale: torch.Tensor = None
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -185,8 +185,8 @@ def fused_moe_(
     num_local_tokens: Optional[torch.Tensor] = None,
     moe_sorting_dispatch_policy: bool = 0,
     dtype: Optional[torch.dtype] = None,
-    a16=False,
-    per_tensor_quant_scale=None
+    a16: bool = False,
+    per_tensor_quant_scale: torch.Tensor = None
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -465,6 +465,10 @@ fused_moe_1stage_dict = {
     {
         (ActivationType.Silu,    QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True) : aiter.fmoe_g1u1,
         (ActivationType.Silu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_fp8_blockscale_g1u1,
+        (ActivationType.Silu,          QuantType.No,   dtypes.bf16,    dtypes.bf16,   dtypes.bf16,   False) : aiter.fmoe,
+        #(ActivationType.Silu,          QuantType.No,   dtypes.bf16,    dtypes.fp8,     dtypes.fp8,    True) : aiter.fmoe_fp8_g1u1_a16,
+        (ActivationType.Silu,          QuantType.No,   dtypes.bf16,     dtypes.i8,     dtypes.i8,    False) : aiter.fmoe_int8_g1u0_a16,
+        (ActivationType.Silu,          QuantType.No,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_g1u1_tkw1,
     }
 }
 # fmt: on
@@ -612,6 +616,19 @@ def get_2stage_cfgs(
                 run_1stage = token > 32
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
+        elif (
+            doweight_stage1
+            and (
+                activation,
+                q_type,
+                dtype,
+                q_dtype_a,
+                q_dtype_w,
+                use_g1u1,
+            )
+            in fused_moe_1stage_dict[get_gfx()]
+        ):
+            run_1stage = True
         block_m = (
             BLOCK_SIZE_M
             if run_1stage
@@ -645,10 +662,10 @@ def get_2stage_cfgs(
             ksplit,
             run_1stage,
         )
-    if run_1stage and doweight_stage1:
+    elif run_1stage and doweight_stage1:
         return MOEMetadata(
             functools.partial(
-                fused_moe_stage1_tkw1,
+                aiter.fused_moe_bf16_asm.fused_moe_stage1_tkw1,
                 kernelName=kernelName1
             ),
             None,
