@@ -69,7 +69,7 @@ def fp8_mqa_logits(
         num_warps=4,
         num_stages=2,
         waves_per_eu=2,
-        matrix_instr_nonkdim=16,
+        matrix_instr_nonkdim=32,
     )
 
     return logits
