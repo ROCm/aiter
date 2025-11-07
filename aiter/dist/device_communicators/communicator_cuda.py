@@ -158,7 +158,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
-    def fused_allreduce_rmsnorm(self, input_, weight_, eps) -> torch.Tensor:
+    def fused_allreduce_rmsnorm(
+        self, input_, weight_, eps
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         n = input_.shape[-1]
         can_use_fuse_ar_rms = (
             n <= 16384
@@ -172,9 +174,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_custom_ar(input_)
             and can_use_fuse_ar_rms
         ):
-            out = ca_comm.custom_fused_ar_rms(input_, weight_, eps)
+            res_out, out = ca_comm.custom_fused_ar_rms(input_, weight_, eps)
             assert out is not None
-            return out
+            assert res_out is not None
+            return res_out, out
         # call split kernel
         ar_out = self.all_reduce(input_)
         out = torch.empty_like(ar_out)
@@ -190,7 +193,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             eps,
             0,
         )
-        return out
+        return residual_out, out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
