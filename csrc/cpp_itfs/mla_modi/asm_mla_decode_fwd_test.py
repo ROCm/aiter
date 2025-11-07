@@ -6,7 +6,7 @@ import aiter
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 import random
 import itertools
-from csrc.cpp_itfs.mla.asm_mla_decode_fwd import asm_mla_decode_fwd
+from csrc.cpp_itfs.mla_modi.asm_mla_decode_fwd import asm_mla_decode_fwd
 import pandas as pd
 
 torch.set_default_device("cuda")
@@ -141,50 +141,6 @@ def test_mla(
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
-    # ############################## normal: prefill
-    def test_normal_prefill():
-        q = torch.randn((total_qo, nhead, qk_head_dim), dtype=dtype)
-        k = torch.randn((total_kv, nhead, qk_head_dim), dtype=dtype)
-        v = torch.randn((total_kv, nhead, v_head_dim), dtype=dtype)
-
-        out_ref, us_ref = run_perftest(
-            torch_mha_extend,
-            q,
-            k,
-            v,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            sm_scale,
-            dtype=dtype,
-            num_iters=2,
-            num_warmup=0,
-        )
-        out_aiter, us_aiter = run_perftest(
-            aiter.flash_attn_varlen_func,
-            q,
-            k,
-            v,
-            qo_indptr,
-            kv_indptr,
-            max_seqlen_qo,
-            max_seqlen_kv,
-            softmax_scale=sm_scale,
-            causal=True,
-        )
-        flop = (
-            batch_size
-            * nhead
-            * 2
-            * (ctx_lens * qk_head_dim * ctx_lens + ctx_lens * ctx_lens * v_head_dim)
-        )
-        checkAllclose(
-            out_ref,
-            out_aiter,
-            msg=f"mla_prefill-normal    [torch vs  aiter_ck]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us...... {flop/us_aiter/1000/1000:>8.2f} TFlops",
-        )
-        return us_aiter
-
     us_aiter = None
     # if batch_size * ctx_lens * nhead < 256 * 8192 * 16:
     #     us_aiter = test_normal_prefill()
@@ -195,88 +151,8 @@ def test_mla(
     v_head_dim = kv_lora_rank
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
-    # test prefill
-    # ############################## absorb: prefill
-    def test_absorb_prefill():
-        q = torch.randn((total_qo, nhead, qk_head_dim), dtype=dtype)
-
-        out_ref, us_torch = run_perftest(
-            torch_mla_extend,
-            q,
-            kv_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            sm_scale,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            dtype=dtype,
-            num_iters=2,
-            num_warmup=0,
-        )
-
-        # #triton version
-        # prefix_indptr = kv_indptr - qo_indptr
-        # tmp = kv_indptr[1:] - seq_lens_qo
-        # tmp_inpptr, _ = torch.concat([kv_indptr[1:], tmp]).sort()
-        # prefix_kv_indices = kv_indices.tensor_split(tmp_inpptr.tolist())
-        # extend_kv_indices = torch.concat(
-        #     [el for i, el in enumerate(prefix_kv_indices) if i % 2 == 1]
-        # )
-        # prefix_kv_indices = torch.concat(
-        #     [el for i, el in enumerate(prefix_kv_indices) if i % 2 == 0]
-        # )
-        # extend_kvc = torch.index_select(kv_buffer, 0, extend_kv_indices)
-        # out_triton = torch.empty((total_qo, nhead, v_head_dim), dtype=dtype).fill_(-1)
-        # _, us_triton = run_perftest(
-        #     mla_extend_ref.extend_attention_fwd,
-        #     q,
-        #     extend_kvc,
-        #     extend_kvc[..., :kv_lora_rank],
-        #     out_triton,
-        #     kv_buffer,
-        #     kv_buffer[..., :kv_lora_rank],
-        #     qo_indptr,
-        #     prefix_indptr,
-        #     prefix_kv_indices,
-        #     None,
-        #     None,
-        #     max_seqlen_qo,
-        #     sm_scale,
-        #     num_iters=5,
-        # )
-        # checkAllclose(
-        #     out_ref,
-        #     out_triton,
-        #     msg=f"mla_prefill-absorb    [torch vs    triton]:{us_torch:>8.2f} us vs {us_triton:>8.2f} us......",
-        # )
-
-        out_asm = torch.empty((total_qo, nhead, v_head_dim), dtype=dtype).fill_(-1)
-        (attn_logits, attn_lse), us_asm = run_perftest(
-            aiter.mla.mla_prefill_fwd,
-            q,
-            kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
-            out_asm,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            max_seqlen_qo,
-            sm_scale,
-        )
-
-        checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_prefill-absorb    [torch vs aiter_asm]:{us_torch:>8.2f} us vs {us_asm:>8.2f} us......",
-        )
-        return us_asm
-
     us_asm = None
-    # if batch_size * ctx_lens * nhead < 32 * 8192 * 16:
-    #     us_asm = test_absorb_prefill()
     torch.cuda.empty_cache()
-
     # ############################## absorb: decode
     # seq_lens_qo = torch.randint(1, 5, (batch_size,), dtype=torch.int)
     if nhead == 16 and mtp != 1:
@@ -305,40 +181,6 @@ def test_mla(
         num_warmup=0,
     )
 
-    # Triton implementation
-    # if mtp == 1:
-    #     if qk_head_dim != v_head_dim:
-    #         out_triton = q.new_empty((total_q, nhead, v_head_dim)).fill_(-1)
-    #     else:
-    #         out_triton = torch.empty_like(q)
-
-    #     num_kv_splits = 16
-    #     attn_logits = torch.empty(
-    #         (total_q, nhead, num_kv_splits, v_head_dim + 1),
-    #         dtype=dtypes.fp32,
-    #     )
-    #     _, us_ref = run_perftest(
-    #         mla_decode_ref.decode_attention_fwd,
-    #         q,
-    #         kv_buffer,
-    #         kv_buffer[..., :kv_lora_rank],
-    #         out_triton,
-    #         kv_indptr,
-    #         kv_indices,
-    #         attn_logits,
-    #         num_kv_splits,
-    #         sm_scale,
-    #         num_iters=5,
-    #     )
-    #     # logits_ref, lse_ref = attn_logits.split([v_head_dim, 1], dim=-1)
-    #     # logits_ref = rearrange(logits_ref, "bs h sp d -> bs sp h d")
-    #     # lse_ref = rearrange(lse_ref, "bs h sp d -> bs sp h d")
-    #     checkAllclose(
-    #         out_ref,
-    #         out_triton,
-    #         msg=f"mla_decode-absorb    [golden vs    triton]:{us_torch_decode:>8.2f} us vs {us_ref:>8.2f} us......",
-    #     )
-
     # aiter implementation
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
     out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
@@ -356,12 +198,6 @@ def test_mla(
         sm_scale,
     )
 
-    # print(f"{out_ref.view(total_q, -1)=}")
-    # print(f"{out_asm.view(total_q, -1)=}")
-    # checkAllclose(logits_ref, attn_logits,
-    #               msg=f'attn_logits [golden vs aiter_asm]')
-    # checkAllclose(lse_ref, attn_lse,
-    #               msg=f'attn_lse    [golden vs aiter_asm]')
     flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
     bytes = (
         total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
