@@ -241,12 +241,12 @@ def test_fmoe(
     if WQDType == torch.int4:  # int4 w quant
         w1_qt_aiter = rearrange_4bit_elements(
             convert_int8_to_uint32_int4(
-                shuffle_weight(w1_qt_aiter, (16, 16), use_int4=True)
+                shuffle_weight(w1_qt_aiter, (16, 16))
             )
         )
         w2_qt_aiter = rearrange_4bit_elements(
             convert_int8_to_uint32_int4(
-                shuffle_weight(w2_qt_aiter, (16, 16), use_int4=True)
+                shuffle_weight(w2_qt_aiter, (16, 16))
             )
         )
     elif WQDType != dtypes.fp4x2 or int(os.getenv("AITER_MXFP4_MOE_SF", 0)) == 1:
