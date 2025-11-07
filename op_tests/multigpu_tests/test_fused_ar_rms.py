@@ -62,8 +62,11 @@ def fused_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
         graph = torch.cuda.CUDAGraph()
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_fused_allreduce_rmsnorm(x, weight, eps)
+                res_out, out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x, weight, eps
+                )
         out.fill_(0)
+        res_out.fill_(0)
 
         @perftest()
         def run_ca():
@@ -75,7 +78,8 @@ def fused_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
 
         @perftest()
         def run_ca(x):
-            return tensor_model_parallel_fused_allreduce_rmsnorm(x, weight, eps)
+            res_out, out = tensor_model_parallel_fused_allreduce_rmsnorm(x, weight, eps)
+            return out
 
         out = run_ca(x)
 
@@ -113,7 +117,7 @@ def get_acc_value_with_cudagraph(tp_size, pp_size, rankID, x, weight, eps, loop_
     with graph_capture() as gc:
         with torch.cuda.graph(graph, stream=gc.stream):
             # out = torch.empty_like(x)
-            out = tensor_model_parallel_fused_allreduce_rmsnorm(x, weight, eps)
+            res_out, out = tensor_model_parallel_fused_allreduce_rmsnorm(x, weight, eps)
     out.fill_(0)
 
     def run_ca():
@@ -154,7 +158,7 @@ def get_acc_value_only(tp_size, pp_size, rankID, x, weight, eps, loop_time=1):
     torch.cuda.synchronize()
 
     for i in range(loop_time):
-        out = tensor_model_parallel_fused_allreduce_rmsnorm(x, weight, eps)
+        res, out = tensor_model_parallel_fused_allreduce_rmsnorm(x, weight, eps)
 
     # destroy
     if dist.is_initialized():
@@ -238,19 +242,6 @@ def split_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
     return out
 
 
-def run_cu(input, weight, eps, device_id):
-    device = f"cuda:{device_id}"
-    input = input.to(device)
-    weight = weight.to(device)
-
-    @perftest()
-    def compute():
-        output = torch.empty_like(input)
-        aiter.rms_norm_cu(output, input, weight, eps)
-
-    return compute()
-
-
 @benchmark()
 def test_split_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -275,7 +266,6 @@ def test_split_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
             pool.apply_async(
                 split_ar_rmsnorm, args=(tp_size, pp_size, i, x, weight, eps, withGraph)
             )
-            # pool.apply_async(run_cu, args=(x, weight, eps, i))
         )
     pool.close()
     pool.join()
@@ -320,7 +310,6 @@ def test_fused_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
             pool.apply_async(
                 fused_ar_rmsnorm, args=(tp_size, pp_size, i, x, weight, eps, withGraph)
             )
-            # pool.apply_async(run_cu, args=(x, weight, eps, i))
         )
     pool.close()
     pool.join()

@@ -340,6 +340,7 @@ class CustomAllreduce:
         self,
         inp: torch.Tensor,
         *,
+        res_out: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         w: torch.Tensor,
         eps: float,
@@ -347,15 +348,18 @@ class CustomAllreduce:
     ):
         if out is None:
             out = torch.empty_like(inp)
+        if res_out is None:
+            res_out = torch.empty_like(inp)
         ops.fused_allreduce_rmsnorm(
             self._ptr,
             inp,
+            res_out,
             out,
             w,
             eps,
             None if registered else self.buffer,
         )
-        return out
+        return res_out, out
 
     def custom_fused_ar_rms(
         self, input: torch.Tensor, weight: torch.Tensor, eps: float
@@ -367,7 +371,7 @@ class CustomAllreduce:
             if torch.cuda.is_current_stream_capturing():
                 return self.fused_ar_rms(input, w=weight, eps=eps, registered=True)
             else:
-                return torch.empty_like(input)
+                return torch.empty_like(input), torch.empty_like(input)
         else:
             return self.fused_ar_rms(input, w=weight, eps=eps, registered=False)
 
