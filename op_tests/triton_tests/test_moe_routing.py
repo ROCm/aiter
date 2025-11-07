@@ -116,10 +116,8 @@ def test_op(n_tokens, n_expts_tot, n_expts_act, sm_first, use_expt_indx):
     assert ref_routing_data.n_expts_tot == ref_routing_data.n_expts_tot
     assert ref_routing_data.n_expts_act == ref_routing_data.n_expts_act
 
-    _assert_indx_equal(ref_gather.src_indx, tri_gather.src_indx)
-    _assert_indx_equal(ref_gather.dst_indx, tri_gather.dst_indx)
-    _assert_indx_equal(ref_scatter.src_indx, tri_scatter.src_indx)
-    _assert_indx_equal(ref_scatter.dst_indx, tri_scatter.dst_indx)
+    _assert_indx_equal(ref_gather, tri_gather)
+    _assert_indx_equal(ref_scatter, tri_scatter)
 
 
 def bench_routing():

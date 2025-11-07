@@ -8,7 +8,7 @@ import torch
 import triton
 from enum import Enum, auto
 import math
-from aiter.ops.triton.moe_routing.routing import GatherIndx, RoutingData, ScatterIndx
+from aiter.ops.triton.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe_op_gemm_a8w4 import _moe_gemm_a8w4, _reduce_grouped, _downcast_to_static_fp8
 
 
@@ -36,16 +36,16 @@ def allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, 
     M = x.shape[-2]
     # if the activations are gathered, then M is number of gather indices
     if gather_indx is not None:
-        M = gather_indx.src_indx.shape[0]
+        M = gather_indx.shape[0]
     # final output
     if routing_data.n_expts_act == 1 or scatter_indx is None:
         y_rows = M
     else:
-        y_rows = scatter_indx.src_indx.shape[0] // routing_data.n_expts_act # compressed number of rows
+        y_rows = scatter_indx.shape[0] // routing_data.n_expts_act # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
     matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
-    if scatter_indx or split_k > 1:
+    if scatter_indx is not None or split_k > 1:
         final_output = torch.empty(final_shape, device=x.device, dtype=out_dtype)
     else:
         final_output = None
@@ -188,8 +188,8 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
                x_static_scale = None, quant_static_scale = None,
                bias = None,
                routing_data: RoutingData | None = None,
-               gather_indx: GatherIndx | None = None,
-               scatter_indx: ScatterIndx | None = None,
+               gather_indx = None,
+               scatter_indx = None,
                gammas = None,
                swizzle_mx_scale = None,
                out_dtype = torch.bfloat16,
@@ -214,7 +214,7 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
         stride_x_mx_m = 0
         stride_x_mx_k = 0
     # determine shapes
-    M = x.shape[-2] if gather_indx is None else gather_indx.src_indx.shape[0]
+    M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
     # compute optimization flags
     config = get_kernel_config(M, N, K, routing_data)
@@ -265,7 +265,7 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
         bias, stride_bias,
         gammas,
         N, K,
-        None if gather_indx is None else gather_indx.src_indx,
+        gather_indx,
         expt_hist, expt_token_offs_raw, expt_hist_sum, expt_block_pid_map,
         grid_m, grid_n,
         apply_swiglu_matmul, alpha, limit, reduction_n_matmul,
@@ -287,7 +287,7 @@ def moe_gemm_a8w4(x, w, x_scales, w_scales,
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
         kpack=config["kpack"])
     # Build grouped reduction inputs in a uniform way
-    group_indx = None if scatter_indx is None else scatter_indx.src_indx.view(-1, routing_data.n_expts_act)
+    group_indx = None if scatter_indx is None else scatter_indx.view(-1, routing_data.n_expts_act)
     y_final = reduce_grouped(
         y,
         group_indx,
@@ -316,8 +316,8 @@ def swiglu_torch(a, alpha, limit):
 
 def moe_gemm_torch(x, w, bias,
                  routing_data: RoutingData = None,
-                 gather_indx: GatherIndx = None,
-                 scatter_indx: ScatterIndx = None,
+                 gather_indx = None,
+                 scatter_indx = None,
                  gammas = None,
                  apply_swiglu = False,
                  alpha = 1.0,
@@ -339,14 +339,14 @@ def moe_gemm_torch(x, w, bias,
     else:
         offs = [[0, x.shape[0]] for _ in range(w.shape[0])]
     # compute
-    n_rows = x.shape[0] if gather_indx is None else gather_indx.dst_indx.shape[0]
+    n_rows = x.shape[0] if gather_indx is None else gather_indx.shape[0]
     n_cols = w.shape[-1] // 2 if apply_swiglu else w.shape[-1]
     y = torch.zeros((n_rows, n_cols), device=x.device, dtype=x.dtype)
     for i, (lo, hi) in enumerate(offs):
         if gather_indx is None:
             idx = torch.arange(lo, hi, device=x.device)
         else:
-            idx = gather_indx.src_indx[lo:hi] // n_expts_act
+            idx = gather_indx[lo:hi] // n_expts_act
         out = torch.matmul(x[idx, :].float(), w[i].float())
         if bias is not None:
             out += bias[i, :]
@@ -360,7 +360,7 @@ def moe_gemm_torch(x, w, bias,
     # accumulate output from all experts
     n_rows = y.shape[0] // n_expts_act
     out = torch.zeros((n_rows, y.shape[-1]), dtype=torch.float32, device=x.device)
-    src_idx = scatter_indx.src_indx.view(-1, n_expts_act)
+    src_idx = scatter_indx.view(-1, n_expts_act)
     for i in range(n_rows):
         out[i, :] = y[src_idx[i], :].float().sum(0)
         

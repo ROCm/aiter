@@ -6,28 +6,6 @@ from aiter.ops.triton._triton_kernels.moe_routing.routing import _combined_routi
 
 
 @dataclass
-class GatherIndx:
-    """
-    Indices for an operation that performs:
-    Y = X[src_idx, :]
-    """
-    # array such that `dst_idx[src_idx] = arange(0, N)`
-    src_indx: torch.Tensor
-    dst_indx: torch.Tensor
-
-
-@dataclass
-class ScatterIndx:
-    """
-    Indices for an operation that performs:
-    Y[dst_idx, :] = X
-    """
-    # array such that `dst_idx[src_idx] = arange(0, N)`
-    src_indx: torch.Tensor
-    dst_indx: torch.Tensor
-
-
-@dataclass
 class ExptData:
     # hist[i] is the number of tokens routed to expert i
     hist: torch.Tensor
@@ -176,8 +154,8 @@ def routing(logits, n_expts_act, sm_first=False, expt_indx=None):
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
 
     # pack the matmul data structure
-    gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
-    scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
+    gather_indx = topk_indx
+    scatter_indx = gate_indx
     return RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data), gather_indx, scatter_indx
 
 
@@ -248,8 +226,8 @@ def routing_torch(logits, n_expts_act, sm_first=False, expt_indx=None):
     gate_scal = expt_scal[topk_indx]
     hist = torch.histc(expt_indx, bins=n_expts_tot, max=n_expts_tot - 1).int()  # histogram of tokens over experts
     # pack the matmul data structure
-    gather_indx = GatherIndx(src_indx=topk_indx.int(), dst_indx=gate_indx.int())
-    scatter_indx = ScatterIndx(src_indx=gate_indx.int(), dst_indx=topk_indx.int())
+    gather_indx = topk_indx.int()
+    scatter_indx = gate_indx.int()
     # compute expt_data
     tokens_per_expt = max(1, n_gates_pad // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
