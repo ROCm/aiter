@@ -2,22 +2,23 @@ import os
 import sys
 import hashlib
 from jinja2 import Template
-from csrc.cpp_itfs.utils import (
-    compile_template_op,
-    transfer_hsaco,
-    AITER_CORE_DIR,
-    GPU_ARCH,
-    get_default_func_name,
-    not_built,
-    run_lib,
-)
-from csrc.cpp_itfs.torch_utils import torch_to_c_types
-from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import compile_gluon_kernel, CompileGluonArgs
-from triton.tools.compile import compile_kernel, CompileArgs
 import triton
 import functools
 import aiter
 import torch
+import triton
+import triton.language as tl
+
+from triton.tools.compile import compile_kernel, CompileArgs
+from csrc.cpp_itfs.torch_utils import torch_to_c_types
+from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import compile_gluon_kernel, CompileGluonArgs
+from csrc.cpp_itfs.utils import (
+    compile_template_op,
+    AITER_CORE_DIR,
+    get_default_func_name,
+    not_built,
+    run_lib,
+)
 
 
 def compile_attention_kernel(
@@ -33,7 +34,7 @@ def compile_attention_kernel(
     fp8_max_value: float,
     value_transposed: int,
     is_causal: int,
-    compute_type: str,
+    compute_type: tl.dtype,
     md_name: str,
     func_name: str = None,
 ):
@@ -46,12 +47,7 @@ def compile_attention_kernel(
         )
 
     if not_built(func_name):
-        head_size_pow2 = triton.next_power_of_2(head_size)
-        query_group_size_pow2 = triton.next_power_of_2(query_group_size)
-        kv_block_size_pow2 = triton.next_power_of_2(kv_block_size)
         query_group_size_original = query_group_size
-        if query_group_size_pow2 < 16:
-            query_group_size_pow2 = 16
 
         # Build signature based on kernel parameters
         signature_parts = [
@@ -93,12 +89,9 @@ def compile_attention_kernel(
             f"{query_seq_len}",
             # f"{compute_type}",
             f"{head_size}",
-            f"{head_size_pow2}",
             f"{query_group_size_original}",
             f"{query_group_size}",
-            f"{query_group_size_pow2}",
             f"{kv_block_size}",
-            f"{kv_block_size_pow2}",
             f"{sequence_partition_size}",
             f"{kv_16b_element_count}",
             f"{query_quant_mode}",
@@ -131,14 +124,13 @@ def compile_attention_kernel(
             elif output_file.suffix == ".cpp":
                 triton_source = output_file
 
-        with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_gluon_fp8.cpp.jinja", "r") as f:
+        with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_attention_kernel.cpp.jinja", "r") as f:
             src_template = Template(f.read())
 
-        current_dir = os.path.dirname(__file__)
         return compile_template_op(
             src_template,
             md_name,
-            [current_dir + "/../utils.h", current_dir + "/../../include", triton_header],
+            [triton_header],
             [triton_source],
             triton_header=triton_header,
             kernel_name=md_name,
@@ -164,10 +156,6 @@ def compile_reduce_kernel(
         )
 
     if not_built(func_name):
-        head_size_pow2 = triton.next_power_of_2(head_size)
-        query_group_size_pow2 = triton.next_power_of_2(query_group_size)
-        max_num_seq_partitions_pow2 = triton.next_power_of_2(max_num_seq_partitions)
-
         # Build signature based on kernel parameters
         signature_parts = [
             "*bf16:16",  # output_ptr
@@ -187,12 +175,9 @@ def compile_reduce_kernel(
             "i32",       # num_seqs
             "i32",       # num_kv_heads
             f"{head_size}",
-            f"{head_size_pow2}",
             f"{query_group_size}",
-            f"{query_group_size_pow2}",
             f"{sequence_partition_size}",
             f"{max_num_seq_partitions}",
-            f"{max_num_seq_partitions_pow2}",
         ]
         signature = ",".join(signature_parts)
 
@@ -217,11 +202,10 @@ def compile_reduce_kernel(
         with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_reduce_kernel.cpp.jinja", "r") as f:
             src_template = Template(f.read())
 
-        current_dir = os.path.dirname(__file__)
         return compile_template_op(
             src_template,
             md_name,
-            [current_dir + "/../utils.h", current_dir + "/../../include", triton_header],
+            [triton_header],
             [triton_source],
             triton_header=triton_header,
             kernel_name=md_name,
@@ -269,6 +253,7 @@ def pa_decode_gluon_fp8(
     # print(f"  query_sequence_length: {query_sequence_length}")
     # print(f"  max_sequence_length: {max_sequence_length}")
     # print(f"  compute_type: {compute_type}")
+    # sys.stdout.flush()
 
     # Extract tensor dimensions
     num_sequences = query.shape[0]
@@ -284,23 +269,12 @@ def pa_decode_gluon_fp8(
 
     # Calculate equivalent group sizes for kernel configuration
     equivalent_query_group_size = query_sequence_length * query_group_size
-    equivalent_query_group_size_pow2 = triton.next_power_of_2(
-        equivalent_query_group_size
-    )
 
     # Determine if causal masking is needed
     is_causal = query_sequence_length > 1
 
     # Calculate elements per 16B load based on data type
     kv_elements_per_16b = 16 // key_cache.dtype.itemsize
-
-    # Adjust query group size to power of 2 with constraints
-    if equivalent_query_group_size <= 16:
-        equivalent_query_group_size_pow2 = 16
-    else:
-        equivalent_query_group_size_pow2 = triton.next_power_of_2(
-            equivalent_query_group_size
-        )
 
     # Validate input params constraint
     assert (
@@ -316,8 +290,8 @@ def pa_decode_gluon_fp8(
         output.dtype == aiter.dtypes.bf16
     ), f"output tensor only support dtype == {aiter.dtypes.bf16}, but got output.dtype == {output.dtype}"
     assert (
-        equivalent_query_group_size_pow2 <= 64
-    ), f"equivalent_query_group_size_pow2={equivalent_query_group_size_pow2} exceeds maximum of 64"
+        equivalent_query_group_size <= 64
+    ), f"equivalent_query_group_size={equivalent_query_group_size} exceeds maximum of 64"
     assert kv_block_size in [
         16,
         64,
@@ -446,7 +420,7 @@ def pa_decode_gluon_fp8(
         value_transposed=int(value_transposed),
         is_causal=int(is_causal),
         compute_type=compute_type,
-        md_name="pa_decode_gluon_fp8",
+        md_name="pa_decode_attention_kernel",
     )
 
     # # Debug: Print main kernel execution parameters
