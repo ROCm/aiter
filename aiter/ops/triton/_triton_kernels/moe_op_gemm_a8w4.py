@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
+from aiter.ops.triton._triton_kernels.quant_moe import _compute_static_fp8_quant
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -113,61 +114,6 @@ def _swiglu(input, alpha, limit):
         linear = clip(linear, limit, clip_lower=True)
     s = gelu / (1 + tl.exp2(-1.44269504089 * alpha * gelu))
     return tl.fma(s, linear, s)  # (s * (linear + 1))
-
-
-@triton.jit
-def _compute_quant(tensor, scale):
-    tensor = tensor.to(tl.float32)
-    tensor = tensor / scale
-    tensor = tensor.to(tl.float8e4nv)
-    return tensor
-
-
-@triton.jit
-def _downcast_to_static_fp8(
-    x_ptr,
-    stride_x_m,
-    stride_x_n,
-    y_ptr,
-    stride_y_m,
-    stride_y_n,
-    scale_ptr,
-    M,
-    N,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-
-    x_dtype: tl.constexpr = x_ptr.dtype.element_ty
-    tl.static_assert(
-        (x_dtype == tl.bfloat16) or (x_dtype == tl.float16) or (x_dtype == tl.float32),
-        f"{x_dtype=} must be bfloat16 or float16 or float32",
-    )
-
-    pid_m = tl.program_id(0).to(tl.int64)
-    pid_n = tl.program_id(1).to(tl.int64)
-
-    start_m = pid_m * BLOCK_M
-    start_n = pid_n * BLOCK_N
-
-    x_ptr += start_m * stride_x_m + start_n * stride_x_n
-    y_ptr += start_m * stride_y_m + start_n * stride_y_n
-
-    offs_m = tl.arange(0, BLOCK_M)[None, :].to(tl.int64)
-    offs_n = tl.arange(0, BLOCK_N)[:, None].to(tl.int64)
-
-    mask_m = start_m + offs_m < M
-    mask_n = start_n + offs_n < N
-    mask_xy = mask_m & mask_n
-
-    offs_x = offs_m * stride_x_m + offs_n * stride_x_n
-    offs_y = offs_m * stride_y_m + offs_n * stride_y_n
-
-    x = tl.load(x_ptr + offs_x, mask=mask_xy)
-
-    y = _compute_quant(x, tl.load(scale_ptr))
-
-    tl.store(y_ptr + offs_y, y, mask=mask_xy)
 
 
 @triton.jit
@@ -546,7 +492,7 @@ def _moe_gemm_a8w4(
         out *= gammas[:, None]
     # quant
     if Quant_static_scale is not None:
-        out = _compute_quant(out, tl.load(Quant_static_scale))
+        out = _compute_static_fp8_quant(out, tl.load(Quant_static_scale))
     # write-back
     Y += start_m * stride_y_m
     offs_y_m = offs_m

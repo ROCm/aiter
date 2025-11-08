@@ -12,7 +12,6 @@ from aiter.ops.triton.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4,
     _reduce_grouped,
-    _downcast_to_static_fp8,
 )
 
 
@@ -116,36 +115,6 @@ def swizzle_scales(data):
     E = block_shape[0]
     data = data.reshape(E, N // 32, SCALE_K * 32)
     return data.transpose(-1, -2)
-
-
-def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
-    M, N = x.shape
-    y = torch.empty((M, N), dtype=torch.float8_e4m3fn, device="cuda")
-
-    BLOCK_M = min(triton.next_power_of_2(M), 128)
-    if M <= 4096:
-        BLOCK_N = 32
-    else:
-        BLOCK_N = 64
-    grid_m = triton.cdiv(x.shape[0], BLOCK_M)
-    grid_n = triton.cdiv(x.shape[1], BLOCK_N)
-
-    _downcast_to_static_fp8[(grid_m, grid_n)](
-        x,
-        x.stride(0),
-        x.stride(1),
-        y,
-        y.stride(0),
-        y.stride(1),
-        scale,
-        M,
-        N,
-        BLOCK_M,
-        BLOCK_N,
-        num_warps=8,
-    )
-
-    return y
 
 
 def reduce_grouped(

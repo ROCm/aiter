@@ -16,11 +16,14 @@ from aiter.ops.triton.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     moe_gemm_torch,
     swizzle_scales,
-    downcast_to_static_fp8,
 )
 
 # numerics utilities
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, upcast_from_mxfp
+from aiter.ops.triton.quant_moe import (
+    downcast_to_static_fp8,
+    downcast_to_mxfp,
+    upcast_from_mxfp,
+)
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
