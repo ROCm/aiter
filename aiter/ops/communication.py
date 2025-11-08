@@ -24,11 +24,17 @@ logger = logging.getLogger("aiter")
 
 
 def init_dist_env(
-    world_size: int,
+    tensor_model_parallel_size: int,
     rankID: int,
     backend: str = "cpu:gloo,cuda:nccl",
     distributed_init_method: Optional[str] = "env://",
+    local_rank: int = -1,
+    data_parallel_size: int = 1,
+    data_parallel_rank: int = 0,
 ):
+    pipeline_model_parallel_size = 1
+    # world_size is TPxPP
+    world_size = pipeline_model_parallel_size * tensor_model_parallel_size
     set_custom_all_reduce(True)
     init_distributed_environment(
         world_size=world_size,
@@ -36,19 +42,27 @@ def init_dist_env(
         distributed_init_method=distributed_init_method,
         # distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
         backend=backend,
-        local_rank=rankID,
+        local_rank=local_rank,
+        data_parallel_size=data_parallel_size,
+        data_parallel_rank=data_parallel_rank,
     )
-    ensure_model_parallel_initialized(world_size, 1)
+    ensure_model_parallel_initialized(
+        tensor_model_parallel_size,
+        pipeline_model_parallel_size,
+        data_parallel_size=data_parallel_size,
+    )
 
-    if world_size > 1:
+    if tensor_model_parallel_size > 1:
         # hack custom_allreduce
         tp_grp = get_tp_group()
         ca_comm = tp_grp.device_communicator.ca_comm
         # signal
-        signal = torch.zeros(world_size * 64, dtype=torch.int64, device=rankID)
+        signal = torch.zeros(
+            tensor_model_parallel_size * 64, dtype=torch.int64, device=rankID
+        )
         ca_comm.signal = signal
         ca_comm.register_buffer(signal)
-    logger.debug(f"RANK: {rankID}/{world_size} init_dist_env...")
+    logger.debug(f"RANK: {rankID}/{tensor_model_parallel_size} init_dist_env...")
 
 
 def destroy_dist_env():
