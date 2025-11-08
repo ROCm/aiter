@@ -105,6 +105,14 @@ def fused_gemm_afp4wfp4_a16w16(
         config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
         config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
         config["NUM_KSPLIT"] = NUM_KSPLIT
+        config["NUM_KSPLIT"] = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"] // 2)
+    else:
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+        config["NUM_KSPLIT"] = 1
 
     if y_fp4 is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y_fp4 = torch.empty((M, N_fp4), dtype=dtype, device=x_fp4.device)
@@ -124,13 +132,8 @@ def fused_gemm_afp4wfp4_a16w16(
             device=x_bf16.device,
         )
     else:
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_fp4_pp = None
         y_bf16_pp = None
-
-    if config["BLOCK_SIZE_K"] >= 2 * K:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if is_fp4_preshuffled:
