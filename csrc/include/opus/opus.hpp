@@ -33,7 +33,7 @@
 #endif
 
 #ifndef OPUS_TILE_CONTAINER
-#define OPUS_TILE_CONTAINER 0 // 0:ext-vector 1:array
+#define OPUS_TILE_CONTAINER 0 // 0:vector, 1:array of vector, 2:flattened array
 #endif
 
 namespace opus {
@@ -706,6 +706,12 @@ template<typename D, typename... Types> using vector_return_type = opus::vector_
 }
 template<typename D = void, typename... Types> constexpr impl::vector_return_type<D, Types...> make_vector(Types&&... t) { return {std::forward<Types>(t)...}; }
 
+namespace impl {
+template <typename T, index_t... Is> OPUS_H_D constexpr auto make_repeated_vector(T&& x, seq<Is...>) { return opus::make_vector((void(Is), std::forward<T>(x))...); }
+} // namespace impl
+template <index_t N, typename T> OPUS_H_D constexpr auto make_repeated_vector(T&& x) { return impl::make_repeated_vector(std::forward<T>(x), make_index_seq<N>{}); }
+template <typename T, index_t N> OPUS_H_D constexpr auto make_repeated_vector(T&& x, number<N>) { return impl::make_repeated_vector(std::forward<T>(x), make_index_seq<N>{}); }
+
 // vector type can't return reference! error: non-const reference cannot bind to vector element
 template <index_t I, typename T, std::enable_if_t<is_vector_v<T>, bool> = true> OPUS_H_D constexpr typename vector_traits<T>::dtype get(T const& t) { static_assert(I < vector_traits<T>::size()); return t[I]; }
 template <index_t I, typename T, std::enable_if_t<is_vector_v<T>, bool> = true> OPUS_H_D constexpr typename vector_traits<T>::dtype get(T&& t)      { static_assert(I < vector_traits<T>::size()); return t[I]; }
@@ -953,8 +959,12 @@ struct gmem {
     template<index_t vec = 1, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>   // os in unit of T and cast to vector with vec
     OPUS_D void store(const V& x, int v_os, int s_os = 0, number<aux> = {}) {
         static_assert(std::is_same_v<typename vector_traits<V>::dtype, scalar_type>, "scalar type must be same for the data to be stored" );
-        static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check" );
-        _store<vec>(x, v_os * sizeof(T), s_os * sizeof(T), number<aux>{});
+        if constexpr (is_dtype_v<V> && (vec * vector_size) % vector_traits<V>::size() == 0) {
+            _store<vec>(make_repeated_vector(x, number<vec * vector_size / vector_traits<V>::size()>{}), v_os * sizeof(T));
+        } else {
+            static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check" );
+            _store<vec>(x, v_os * sizeof(T));
+        }
     }
 
     // bulk load API, give me a Shape of this tile, will issue multiple load instruction based on the y-shape space
@@ -990,7 +1000,9 @@ struct gmem {
 
         constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
 #if OPUS_TILE_CONTAINER == 0
-        auto a_ = x;
+        auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
+                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
+                         else if constexpr (is_vector_v<V>) return x; }();
 #elif OPUS_TILE_CONTAINER == 1
         auto a_ = to_array(x);
 #endif
@@ -1028,8 +1040,12 @@ struct smem {
     template<index_t vec = 1, typename V, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>
     OPUS_D void store(const V& x, int v_os) {
         static_assert(std::is_same_v<typename vector_traits<V>::dtype, scalar_type>, "scalar type must be same for the data to be stored" );
-        static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check" );
-        _store<vec>(x, v_os * sizeof(T));
+        if constexpr (is_dtype_v<V> && (vec * vector_size) % vector_traits<V>::size() == 0) {
+            _store<vec>(make_repeated_vector(x, number<vec * vector_size / vector_traits<V>::size()>{}), v_os * sizeof(T));
+        } else {
+            static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check" );
+            _store<vec>(x, v_os * sizeof(T));
+        }
     }
 
     // bulk load API, give me a Shape of this tile, will issue multiple load instruction based on the y-shape space
@@ -1065,7 +1081,9 @@ struct smem {
 
         constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
 #if OPUS_TILE_CONTAINER == 0
-        auto a_ = x;
+        auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
+                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
+                         else if constexpr (is_vector_v<V>) return x; }();
 #elif OPUS_TILE_CONTAINER == 1
         auto a_ = to_array(x);
 #endif
