@@ -125,9 +125,6 @@ def compile_gluon_kernel(args: CompileGluonArgs):
     constants = {kernel.arg_names[i]: constexpr(s) for i, s in enumerate(signature)}
     constants = {k: v for k, v in constants.items() if v is not None}
 
-    # import pdb
-    # pdb.set_trace()
-
     for key, value in hints.items():
         if value == 1:
             constants[kernel.arg_names[key[0]]] = value

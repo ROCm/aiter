@@ -1,0 +1,820 @@
+import os
+import sys
+import hashlib
+import functools
+import aiter
+import numpy as np
+import argparse
+import random
+import torch
+import triton
+import triton.language as tl
+
+from triton.tools.compile import compile_kernel, CompileArgs
+from jinja2 import Template
+from aiter.test_common import perftest, run_perftest
+from aiter import pertoken_quant, per_tensor_quant
+from csrc.cpp_itfs.torch_utils import torch_to_c_types
+from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import compile_gluon_kernel, CompileGluonArgs
+from csrc.cpp_itfs.utils import (
+    compile_template_op,
+    AITER_CORE_DIR,
+    get_default_func_name,
+    not_built,
+    run_lib,
+)
+from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8 import (
+    paged_attention_decode_v2_gluon_fp8,
+    paged_attention_decode_v2_gluon_large_block_fp8,
+)
+from csrc.cpp_itfs.pa_gluon.pa_decode_gluon_test import (
+    torch_attention_compute,
+    create_kv_cache,
+    quantize_kv_cache_symmetric,
+    quantize_kv_cache_per_tensor,
+    shuffle_value_cache_layout,
+)
+
+
+# Global configuration from reference implementation
+UNIFORM_RANGE = (-1, 1)
+TORCH_TO_TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
+
+
+def setup_seed(seed: int) -> None:
+    """Set random seed for reproducibility."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+def tensor_to_hash(tensor: torch.Tensor, algorithm: str = 'md5') -> str:
+    """
+    Convert a PyTorch tensor to a hash value using the specified algorithm.
+    
+    Args:
+        tensor (torch.Tensor): Input tensor
+        algorithm (str): Hash algorithm, defaults to 'md5',
+                        options: 'md5', 'sha1', 'sha256', etc.
+        
+    Returns:
+        str: Hexadecimal string representation of the hash value
+    """
+    hash_func = getattr(hashlib, algorithm)()
+    
+    # Process tensor data
+    tensor_data = (
+        tensor.contiguous()
+        .view(torch.uint8)
+        .detach()
+        .cpu()
+        .numpy()
+        .tobytes()
+    )
+    
+    hash_func.update(tensor_data)
+    return hash_func.hexdigest()
+
+
+def compile_attention_kernel(
+    query_seq_len: int,
+    head_size: int,
+    query_group_size: int,
+    kv_block_size: int,
+    sequence_partition_size: int,
+    kv_16b_element_count: int,
+    query_quant_mode: int,
+    kv_quant_mode: int,
+    kv_compute_block_size: int,
+    fp8_max_value: float,
+    value_transposed: int,
+    is_causal: int,
+    compute_type: tl.dtype,
+    md_name: str,
+    func_name: str = None,
+):
+    """Compile the attention kernel for paged attention decode."""
+    if func_name is None:
+        func_name = get_default_func_name(
+            md_name,
+            (query_seq_len, head_size, query_group_size, kv_block_size, sequence_partition_size,
+             kv_16b_element_count, query_quant_mode, kv_quant_mode, kv_compute_block_size,
+             fp8_max_value, value_transposed, is_causal, compute_type),
+        )
+
+    # if not_built(func_name):
+    if True:
+        query_group_size_original = query_group_size
+
+        # Build signature based on kernel parameters
+        signature_parts = [
+            "*fp32:16",  # exp_sums_ptr
+            "*fp32:16",  # max_logits_ptr
+            "*bf16:16",  # output_ptr
+            "*fp8e4b8:16",   # query_ptr
+            "*fp8e4b8:16",   # key_cache_ptr
+            "*fp8e4b8:16",   # value_cache_ptr
+            "*i32:16",   # block_tables_ptr
+            "*i32:16",   # sequence_lengths_ptr
+            "fp32",      # softmax_scale
+            "*fp32:16",  # query_scale
+            "*fp32:16",  # key_scale
+            "*fp32:16",  # value_scale
+            "i32",       # stride_max_logits_seq
+            "i32",       # stride_max_logits_head
+            "i32",       # stride_max_logits_part
+            "i32",       # stride_output_seq
+            "i32",       # stride_output_head
+            "i32",       # stride_output_part
+            "i32",       # stride_output_group
+            "i32",       # stride_query_seq
+            "i32",       # stride_query_head
+            "i32",       # stride_key_block
+            "i32",       # stride_key_head
+            "i32",       # stride_key_head_split
+            "i32",       # stride_key_block_elem
+            "i32",       # stride_value_block
+            "i32",       # stride_value_head
+            "i32",       # stride_value_head_size
+            "i32",       # stride_block_table_seq
+            "i32",       # query_scale_stride_0
+            "i32",       # kv_scale_stride_0
+            "i32",       # kv_scale_stride_1
+            "i32",       # num_seqs
+            "i32",       # num_kv_heads
+            "i32",       # max_num_partitions
+            f"{query_seq_len}",
+            f"{head_size}",
+            f"{query_group_size_original}",
+            f"{query_group_size}",
+            f"{kv_block_size}",
+            f"{sequence_partition_size}",
+            f"{kv_16b_element_count}",
+            f"{query_quant_mode}",
+            f"{kv_quant_mode}",
+            f"{kv_compute_block_size}",
+            f"{fp8_max_value}",
+            f"{value_transposed}",
+            f"{is_causal}",
+        ]
+        signature = ",".join(signature_parts)
+        gluon_kernel_name = "paged_attention_decode_v2_gluon_fp8"
+        if kv_block_size > sequence_partition_size:
+            gluon_kernel_name = "paged_attention_decode_v2_gluon_large_block_fp8"
+
+        compile_args = CompileGluonArgs(
+            path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_triton_gluon_fp8.py",
+            kernel_name=gluon_kernel_name,
+            signature=signature,
+            grid="num_seqs,num_kv_heads,max_num_partitions",
+            num_warps=4,
+            num_ctas=1,
+            out_name=md_name,
+        )
+        triton_kernel, output_files = compile_gluon_kernel(compile_args)
+        triton_header = None
+        triton_source = None
+        for output_file in output_files:
+            if output_file.suffix == ".h":
+                triton_header = output_file
+            elif output_file.suffix == ".cpp":
+                triton_source = output_file
+
+        with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_attention_kernel.cpp.jinja", "r") as f:
+            src_template = Template(f.read())
+
+        return compile_template_op(
+            src_template,
+            md_name,
+            [triton_header],
+            [triton_source],
+            triton_header=triton_header,
+            kernel_name=md_name,
+            triton_kernel=triton_kernel,
+            func_name=func_name,
+        )
+    else:
+        return run_lib(func_name)
+
+
+@perftest()
+def run_compiled_attention_kernel(
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    temporary_output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    softmax_scale: float,
+    query_scale: torch.Tensor,
+    key_scale: torch.Tensor,
+    value_scale: torch.Tensor,
+    num_sequences: int,
+    num_kv_heads: int,
+    max_num_partitions: int,
+    query_seq_len: int,
+    head_size: int,
+    query_group_size: int,
+    kv_block_size: int,
+    sequence_partition_size: int,
+    kv_16b_element_count: int,
+    query_quant_mode: int,
+    kv_quant_mode: int,
+    kv_compute_block_size: int,
+    fp8_max_value: float,
+    value_transposed: int,
+    is_causal: int,
+    compute_type: str,
+    md_name: str,
+    func_name: str = None,
+):
+    """
+    Compile and run the compiled attention kernel with perftest timing
+    """
+    func = compile_attention_kernel(
+        query_seq_len=query_seq_len,
+        head_size=head_size,
+        query_group_size=query_group_size,
+        kv_block_size=kv_block_size,
+        sequence_partition_size=sequence_partition_size,
+        kv_16b_element_count=kv_16b_element_count,
+        query_quant_mode=query_quant_mode,
+        kv_quant_mode=kv_quant_mode,
+        kv_compute_block_size=kv_compute_block_size,
+        fp8_max_value=fp8_max_value,
+        value_transposed=int(value_transposed),
+        is_causal=int(is_causal),
+        compute_type=compute_type,
+        md_name=md_name,
+        func_name=func_name,
+    )
+
+    func(
+        *torch_to_c_types(
+            exp_sums,
+            max_logits,
+            temporary_output,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            sequence_lengths,
+            softmax_scale,
+            query_scale,
+            key_scale,
+            value_scale,
+            exp_sums.stride(0),
+            exp_sums.stride(1),
+            exp_sums.stride(2),
+            temporary_output.stride(0),
+            temporary_output.stride(1),
+            temporary_output.stride(2),
+            temporary_output.stride(3),
+            query.stride(0),
+            query.stride(1),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            key_cache.stride(3),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            value_cache.stride(2),
+            block_tables.stride(0),
+            query_scale.stride(0) if query_scale is not None else 0,
+            key_scale.stride(0) if key_scale is not None else 0,
+            key_scale.stride(1) if key_scale is not None else 0,
+            num_sequences,
+            num_kv_heads,
+            max_num_partitions,
+            torch.cuda.current_stream(exp_sums.device),
+        )
+    )
+
+
+@perftest()
+def run_direct_attention_kernel(
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    temporary_output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    softmax_scale: float,
+    query_scale: torch.Tensor,
+    key_scale: torch.Tensor,
+    value_scale: torch.Tensor,
+    query_seq_len: int,
+    head_size: int,
+    query_group_size: int,
+    kv_block_size: int,
+    sequence_partition_size: int,
+    kv_16b_element_count: int,
+    query_quant_mode: int,
+    kv_quant_mode: int,
+    fp8_max_value: float,
+    value_transposed: int,
+    is_causal: int,
+    compute_type: str,
+):
+    """
+    Directly call the attention kernel from pa_decode_triton_gluon_fp8.py with perftest timing
+    """
+    num_seqs = exp_sums.shape[0]
+    num_kv_heads = exp_sums.shape[1]
+    max_num_partitions = exp_sums.shape[2]
+
+    # Configure grid
+    grid = (num_seqs, num_kv_heads, max_num_partitions)
+
+    # Determine compute block size
+    kv_compute_block_size = 256
+    if value_transposed and kv_block_size > 256:
+        kv_compute_block_size = 128
+
+    # Select kernel based on block size
+    if kv_block_size > sequence_partition_size:
+        # Use large block kernel
+        kernel = paged_attention_decode_v2_gluon_large_block_fp8
+    else:
+        # Use standard kernel
+        kernel = paged_attention_decode_v2_gluon_fp8
+
+    # Launch the kernel directly
+    kernel[grid](
+        exp_sums,
+        max_logits,
+        temporary_output,
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        sequence_lengths,
+        softmax_scale,
+        query_scale,
+        key_scale,
+        value_scale,
+        exp_sums.stride(0),
+        exp_sums.stride(1),
+        exp_sums.stride(2),
+        temporary_output.stride(0),
+        temporary_output.stride(1),
+        temporary_output.stride(2),
+        temporary_output.stride(3),
+        query.stride(0),
+        query.stride(1),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        key_cache.stride(3),
+        value_cache.stride(0),
+        value_cache.stride(1),
+        value_cache.stride(2),
+        block_tables.stride(0),
+        query_scale.stride(0) if query_scale is not None else 0,
+        key_scale.stride(0) if key_scale is not None else 0,
+        key_scale.stride(1) if key_scale is not None else 0,
+        num_seqs,
+        num_kv_heads,
+        max_num_partitions,
+        QUERY_SEQ_LEN=query_seq_len,
+        HEAD_SIZE=head_size,
+        QUERY_GROUP_SIZE_ORIGINAL=query_group_size,
+        QUERY_GROUP_SIZE=query_group_size,
+        KV_BLOCK_SIZE=kv_block_size,
+        SEQUENCE_PARTITION_SIZE=sequence_partition_size,
+        KV_16B_ELEMENT_COUNT=kv_16b_element_count,
+        QUERY_QUANT_MODE=query_quant_mode,
+        KV_QUANT_MODE=kv_quant_mode,
+        KV_COMPUTE_BLOCK_SIZE=kv_compute_block_size,
+        FP8_MAX_VALUE=fp8_max_value,
+        VALUE_TRANSPOSED=value_transposed,
+        IS_CAUSAL=is_causal,
+    )
+
+
+def test_attention_kernel(kernel_type: str = "compiled"):
+    """Test the attention kernel with provided parameters.
+
+    Args:
+        kernel_type: Type of kernel to test - "compiled" or "direct"
+    """
+    print(f"\n=== Testing Attention Kernel (Type: {kernel_type}) ===")
+    setup_seed(123)
+    device = "cuda:0"
+    max_sequence_length = 16384
+
+    context_lengths = 4096
+    batch_size = 128
+    num_heads = (16, 2)
+    head_size = 128
+    block_size = 16
+    data_type = torch.bfloat16
+    query_length = 1
+    quant_mode = "per_token"
+    sequence_partition_size = 256
+    trans_v = True
+    kv_varlen = False
+    kv_compute_block_size = 256
+    compute_type = TORCH_TO_TL_DTYPE[data_type]
+    kv_16b_element_count = 16 // data_type.itemsize
+
+    # ==================== FP8 CONFIGURATION ====================
+    fp8_max_value = 1.0
+    if quant_mode is not None:
+        kv_16b_element_count = 16 // aiter.dtypes.fp8.itemsize
+        fp8_max_value = torch.finfo(aiter.dtypes.fp8).max
+
+    # Derived parameters
+    num_query_heads, num_kv_heads = num_heads
+    query_seq_len = query_length
+    query_group_size = num_query_heads // num_kv_heads
+    kv_block_size = block_size
+
+    # Set quantization modes based on quant_mode parameter
+    query_quant_mode = 1 if quant_mode == "per_token" else 0  # 1 for per-token, 0 for per-tensor
+    kv_quant_mode = 1 if quant_mode == "per_token" else 0    # 1 for per-token, 0 for per-tensor
+    value_transposed = 1 if trans_v else 0
+
+    # Determine if causal masking is needed
+    is_causal = query_length > 1
+    num_sequences = batch_size
+    max_num_partitions = (context_lengths + sequence_partition_size - 1) // sequence_partition_size
+    softmax_scale = 1.0 / (head_size**0.5)
+
+    # Calculate block table dimensions
+    max_blocks_per_sequence = (max_sequence_length + block_size - 1) // block_size
+    total_blocks = max_blocks_per_sequence * batch_size
+    blocks_per_sequence = (context_lengths + block_size - 1) // block_size
+
+    # Create intermediate tensors for attention computation
+    equivalent_query_group_size = query_length * (num_query_heads // num_kv_heads)
+    intermediate_shape = (num_sequences, num_kv_heads, max_num_partitions, equivalent_query_group_size)
+
+    exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=device)
+    max_logits = torch.empty(intermediate_shape, dtype=torch.float32, device=device)
+    temporary_output = torch.empty(*intermediate_shape, head_size, dtype=data_type, device=device)
+
+    # Create query tensor following reference approach
+    total_queries = batch_size * query_length
+    qkv_tensor = torch.randn(
+        total_queries, num_query_heads + 2 * num_kv_heads, head_size, dtype=data_type, device=device
+    )
+    query, key, value = torch.split(
+        qkv_tensor, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
+    )
+    query.uniform_(*UNIFORM_RANGE)
+
+    # Create key and value caches
+    key_caches, value_caches = create_kv_cache(
+        total_blocks,
+        block_size,
+        1,
+        num_kv_heads,
+        head_size,
+        "auto",
+        data_type,
+        0,  # seed
+        device,
+    )
+    key_cache, value_cache = key_caches[0], value_caches[0]
+
+    # Quantization based on mode
+    if quant_mode == "per_token":
+        # Per-token quantization for query
+        quantized_query, query_scale_factors = pertoken_quant(
+            query, quant_dtype=aiter.dtypes.fp8
+        )
+
+        # Per-token quantization for KV cache
+        (
+            quantized_keys,
+            key_scale_factors_flat,
+            quantized_values,
+            value_scale_factors_flat,
+            key_scale_original,
+            value_scale_original,
+        ) = quantize_kv_cache_symmetric(
+            key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
+        )
+    else:  # per_tensor
+        # Per-tensor quantization for query
+        quantized_query, query_scale_factors = per_tensor_quant(
+            query, quant_dtype=aiter.dtypes.fp8
+        )
+
+        # Per-tensor quantization for KV cache
+        (
+            quantized_keys,
+            key_scale_factors_flat,
+            quantized_values,
+            value_scale_factors_flat,
+            key_scale_original,
+            value_scale_original,
+        ) = quantize_kv_cache_per_tensor(
+            key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
+        )
+
+    # Reshape query for Gluon kernel format
+    query_group_size = num_query_heads // num_kv_heads
+    quantized_query_gluon = quantized_query
+    query_scale_gluon = query_scale_factors
+
+    if query_length > 1:
+        quantized_query_gluon = quantized_query.reshape(
+            batch_size, query_length, num_kv_heads, query_group_size, head_size
+        )
+        quantized_query_gluon = quantized_query_gluon.transpose(1, 2).reshape(
+            batch_size, num_kv_heads * query_length * query_group_size, head_size
+        )
+
+        if len(query_scale_factors.shape) > 1:  # per-token quantization
+            query_scale_gluon = query_scale_factors.reshape(
+                batch_size, query_length, num_kv_heads, query_group_size, 1
+            )
+            query_scale_gluon = query_scale_gluon.transpose(1, 2).reshape(
+                batch_size, num_kv_heads * query_length * query_group_size, 1
+            )
+
+    # Transpose value cache if required
+    if trans_v:
+        quantized_values = shuffle_value_cache_layout(quantized_values)
+
+    # Create sequence lengths and block tables
+    if kv_varlen:
+        kv_len_list = [random.randint(query_length, context_lengths) for _ in range(batch_size)]
+    else:
+        kv_len_list = [context_lengths] * batch_size
+    sequence_lengths = torch.tensor(kv_len_list, dtype=torch.int32, device=device)
+
+    block_tables_list = []
+    for _ in range(batch_size):
+        block_table = [
+            random.randint(0, total_blocks - 1) for _ in range(blocks_per_sequence)
+        ]
+        block_tables_list.append(block_table)
+    block_tables = torch.tensor(block_tables_list, dtype=torch.int32, device=device)
+
+    # Assign to variables used by the kernel
+    query = quantized_query_gluon
+    key_cache = quantized_keys
+    value_cache = quantized_values
+    query_scale = query_scale_gluon
+    key_scale = key_scale_original
+    value_scale = value_scale_original
+
+    # print("\n=== Attention Kernel Compile Parameters ===")
+    # compile_params = {
+    #     "query_seq_len": query_seq_len,
+    #     "head_size": head_size,
+    #     "query_group_size": query_group_size,
+    #     "kv_block_size": kv_block_size,
+    #     "sequence_partition_size": sequence_partition_size,
+    #     "kv_16b_element_count": kv_16b_element_count,
+    #     "query_quant_mode": query_quant_mode,
+    #     "kv_quant_mode": kv_quant_mode,
+    #     "kv_compute_block_size": kv_compute_block_size,
+    #     "fp8_max_value": fp8_max_value,
+    #     "value_transposed": int(value_transposed),
+    #     "is_causal": int(is_causal),
+    #     "compute_type": compute_type,
+    # }
+    # for key, value in compile_params.items():
+    #     print(f"  {key}: {value}")
+
+    # print("\n=== Attention Kernel Execution Parameters ===")
+    # print("Tensor parameters:")
+    # print(f"  exp_sums: shape={exp_sums.shape}, dtype={exp_sums.dtype}")
+    # print(f"  max_logits: shape={max_logits.shape}, dtype={max_logits.dtype}")
+    # print(f"  temporary_output: shape={temporary_output.shape}, dtype={temporary_output.dtype}")
+    # print(f"  query: shape={query.shape}, dtype={query.dtype}")
+    # print(f"  key_cache: shape={key_cache.shape}, dtype={key_cache.dtype}")
+    # print(f"  value_cache: shape={value_cache.shape}, dtype={value_cache.dtype}")
+    # print(f"  sequence_lengths: shape={sequence_lengths.shape}, dtype={sequence_lengths.dtype}")
+    # print(f"  block_tables: shape={block_tables.shape}, dtype={block_tables.dtype}")
+    # print(f"  query_scale: shape={query_scale.shape}, dtype={query_scale.dtype}")
+    # print(f"  key_scale: shape={key_scale.shape}, dtype={key_scale.dtype}")
+    # print(f"  value_scale: shape={value_scale.shape}, dtype={value_scale.dtype}")
+
+    # Execute kernel based on selected type
+    if kernel_type == "compiled":
+        # Compile and run the compiled kernel
+        print("\n=== Running Compiled Kernel ===")
+        _, compiled_time = run_compiled_attention_kernel(
+            exp_sums,
+            max_logits,
+            temporary_output,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            sequence_lengths,
+            softmax_scale,
+            query_scale,
+            key_scale,
+            value_scale,
+            num_sequences,
+            num_kv_heads,
+            max_num_partitions,
+            query_seq_len=query_seq_len,
+            head_size=head_size,
+            query_group_size=query_group_size,
+            kv_block_size=kv_block_size,
+            sequence_partition_size=sequence_partition_size,
+            kv_16b_element_count=kv_16b_element_count,
+            query_quant_mode=query_quant_mode,
+            kv_quant_mode=kv_quant_mode,
+            kv_compute_block_size=kv_compute_block_size,
+            fp8_max_value=fp8_max_value,
+            value_transposed=value_transposed,
+            is_causal=is_causal,
+            compute_type=compute_type,
+            md_name="pa_decode_attention_kernel",
+        )
+        print(f"Compiled kernel execution time: {compiled_time:.2f} us/iter")
+    elif kernel_type == "direct":
+        # Directly call the kernel from pa_decode_triton_gluon_fp8.py
+        print("\n=== Running Direct Kernel ===")
+        _, direct_time = run_direct_attention_kernel(
+            exp_sums,
+            max_logits,
+            temporary_output,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            sequence_lengths,
+            softmax_scale,
+            query_scale,
+            key_scale,
+            value_scale,
+            query_seq_len,
+            head_size,
+            query_group_size,
+            kv_block_size,
+            sequence_partition_size,
+            kv_16b_element_count,
+            query_quant_mode,
+            kv_quant_mode,
+            fp8_max_value,
+            value_transposed,
+            is_causal,
+            compute_type,
+        )
+        print(f"Direct kernel execution time: {direct_time:.2f} us/iter")
+    else:
+        raise ValueError(f"Unknown kernel type: {kernel_type}")
+
+    # Check for NaN values
+    exp_sums_nan_cnt = torch.isnan(exp_sums).sum().item()
+    max_logits_nan_cnt = torch.isnan(max_logits).sum().item()
+    temporary_output_nan_cnt = torch.isnan(temporary_output).sum().item()
+
+    print("\n=== Checking Results ===")
+    print(f"exp_sums NaN count: {exp_sums_nan_cnt}")
+    print(f"max_logits NaN count: {max_logits_nan_cnt}")
+    print(f"temporary_output NaN count: {temporary_output_nan_cnt}")
+
+    # Compare with torch_attention_compute reference
+    print("\n=== Comparing with Reference Implementation ===")
+
+    # Run reference implementation
+    ref_exp_sums, ref_max_logits, ref_temporary_output = torch_attention_compute(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_tables=block_tables,
+        sequence_lengths=sequence_lengths,
+        softmax_scale=softmax_scale,
+        q_seq_len=query_seq_len,
+        query_scale=query_scale,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        output_dtype=torch.bfloat16,
+        kv_block_size=kv_block_size,
+        sequence_partition_size=sequence_partition_size,
+        is_causal=bool(is_causal),
+    )
+
+    # Compare exp_sums
+    print("\n--- Comparing exp_sums ---")
+    diff_exp_sums = (exp_sums - ref_exp_sums).abs()
+    max_diff_exp_sums = diff_exp_sums.max().item()
+    mean_diff_exp_sums = diff_exp_sums.mean().item()
+    print(f"Max difference: {max_diff_exp_sums:.6e}")
+    print(f"Mean difference: {mean_diff_exp_sums:.6e}")
+
+    # Compare max_logits
+    print("\n--- Comparing max_logits ---")
+    diff_max_logits = (max_logits - ref_max_logits).abs()
+    max_diff_max_logits = diff_max_logits.max().item()
+    mean_diff_max_logits = diff_max_logits.mean().item()
+    print(f"Max difference: {max_diff_max_logits:.6e}")
+    print(f"Mean difference: {mean_diff_max_logits:.6e}")
+
+    # Compare temporary_output
+    print("\n--- Comparing temporary_output ---")
+    diff_temporary_output = (temporary_output - ref_temporary_output).abs()
+    max_diff_temporary_output = diff_temporary_output.max().item()
+    mean_diff_temporary_output = diff_temporary_output.mean().item()
+    print(f"Max difference: {max_diff_temporary_output:.6e}")
+    print(f"Mean difference: {mean_diff_temporary_output:.6e}")
+
+    # Detailed error analysis for temporary_output (largest tensor)
+    if max_diff_temporary_output > 1e-4:
+        print("\n=== Detailed Error Analysis (temporary_output) ===")
+        # Find top 5 differences
+        flat_diff = diff_temporary_output.flatten()
+        top_k = 5
+        top_k_indices = torch.topk(flat_diff, top_k).indices
+
+        print(f"Top {top_k} differences:")
+        for i in range(top_k):
+            idx = top_k_indices[i]
+            orig_idx = np.unravel_index(idx.cpu().numpy(), temporary_output.shape)
+            print(f"  Position {orig_idx}: kernel={temporary_output[orig_idx].item():.6f}, ref={ref_temporary_output[orig_idx].item():.6f}, diff={flat_diff[idx].item():.6e}")
+
+    # Test results
+    tolerance = 5e-3
+    all_passed = True
+
+    print("\n=== Test Results ===")
+    if max_diff_exp_sums < tolerance:
+        print(f"✅ exp_sums TEST PASSED: Max difference ({max_diff_exp_sums:.6e}) < tolerance ({tolerance})")
+    else:
+        print(f"❌ exp_sums TEST FAILED: Max difference ({max_diff_exp_sums:.6e}) >= tolerance ({tolerance})")
+        all_passed = False
+
+    if max_diff_max_logits < tolerance:
+        print(f"✅ max_logits TEST PASSED: Max difference ({max_diff_max_logits:.6e}) < tolerance ({tolerance})")
+    else:
+        print(f"❌ max_logits TEST FAILED: Max difference ({max_diff_max_logits:.6e}) >= tolerance ({tolerance})")
+        all_passed = False
+
+    if max_diff_temporary_output < tolerance:
+        print(f"✅ temporary_output TEST PASSED: Max difference ({max_diff_temporary_output:.6e}) < tolerance ({tolerance})")
+    else:
+        print(f"❌ temporary_output TEST FAILED: Max difference ({max_diff_temporary_output:.6e}) >= tolerance ({tolerance})")
+        all_passed = False
+
+    # MD5 hashes for verification
+    ref_exp_sums_md5 = tensor_to_hash(ref_exp_sums)
+    ref_max_logits_md5 = tensor_to_hash(ref_max_logits)
+    ref_temporary_output_md5 = tensor_to_hash(ref_temporary_output)
+    exp_sums_md5 = tensor_to_hash(exp_sums)
+    # exp_sums_sha256 = tensor_to_hash(exp_sums, 'sha256')
+    max_logits_md5 = tensor_to_hash(max_logits)
+    temporary_output_md5 = tensor_to_hash(temporary_output)
+    print(f"Reference exp_sums MD5: {ref_exp_sums_md5}")
+    print(f"Reference max_logits MD5: {ref_max_logits_md5}")
+    print(f"Reference temporary_output MD5: {ref_temporary_output_md5}")
+    print(f"exp_sums MD5: {exp_sums_md5}")
+    # print(f"exp_sums SHA256: {exp_sums_sha256}")
+    print(f"max_logits MD5: {max_logits_md5}")
+    print(f"temporary_output MD5: {temporary_output_md5}")
+
+    # Test result
+    if all_passed:
+        print(f"\n✅ OVERALL TEST PASSED: All comparisons within tolerance and no NaN values detected")
+        return True
+    else:
+        print(f"\n❌ OVERALL TEST FAILED: Some comparisons failed or NaN values detected")
+        return False
+
+
+def main():
+    """Main function with command line argument parsing."""
+    parser = argparse.ArgumentParser(description="Test paged attention kernel")
+    parser.add_argument(
+        "--kernel-type",
+        type=str,
+        choices=["compiled", "direct"],
+        default="compiled",
+        help="Type of kernel to test: 'compiled' (default) or 'direct'"
+    )
+    parser.add_argument(
+        "--num-iters",
+        type=int,
+        default=101,
+        help="Number of iterations for performance testing"
+    )
+    parser.add_argument(
+        "--num-warmup",
+        type=int,
+        default=2,
+        help="Number of warmup iterations"
+    )
+
+    args = parser.parse_args()
+
+    # Run the test
+    result = test_attention_kernel(kernel_type=args.kernel_type)
+    sys.exit(0 if result else 1)
+
+
+if __name__ == "__main__":
+    main()

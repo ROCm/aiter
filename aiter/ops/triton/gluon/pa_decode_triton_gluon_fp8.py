@@ -64,12 +64,9 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     QUERY_SEQ_LEN: tl.constexpr,
     # COMPUTE_TYPE: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
-    HEAD_SIZE_POW2: tl.constexpr,
     QUERY_GROUP_SIZE_ORIGINAL: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
-    QUERY_GROUP_SIZE_POW2: tl.constexpr,
     KV_BLOCK_SIZE: tl.constexpr,
-    KV_BLOCK_SIZE_POW2: tl.constexpr,
     SEQUENCE_PARTITION_SIZE: tl.constexpr,
     KV_16B_ELEMENT_COUNT: tl.constexpr,
     QUERY_QUANT_MODE: tl.constexpr,
@@ -102,16 +99,16 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         f"QUERY_SEQ_LEN={QUERY_SEQ_LEN}, Do not support QUERY_SEQ_LEN > 4",
     )
     gl.static_assert(
-        QUERY_GROUP_SIZE_POW2 <= 64,
-        f"QUERY_GROUP_SIZE_POW2={QUERY_GROUP_SIZE_POW2}, Do not support QUERY_GROUP_SIZE_POW2 > 64",
-    )
-    gl.static_assert(
         SEQUENCE_PARTITION_SIZE == 256,
         f"SEQUENCE_PARTITION_SIZE={SEQUENCE_PARTITION_SIZE}, Only support SEQUENCE_PARTITION_SIZE == 256",
     )
     gl.static_assert(
         KV_BLOCK_SIZE == 1024,
         f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE == 1024",
+    )
+    gl.static_assert(
+        QUERY_GROUP_SIZE <= 64,
+        f"QUERY_GROUP_SIZE={QUERY_GROUP_SIZE}, Do not support QUERY_GROUP_SIZE > 64",
     )
 
     # Data type validation
@@ -128,6 +125,14 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     # ==================== Constants and Configuration ====================
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential calculations
     CONTIGUOUS_KV_ELEMENTS_16B_LOAD: gl.constexpr = KV_16B_ELEMENT_COUNT
+
+    # Calculate power-of-2 values internally
+    HEAD_SIZE_POW2: gl.constexpr = triton.next_power_of_2(HEAD_SIZE)
+    if QUERY_GROUP_SIZE < 16:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = 16
+    else:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(QUERY_GROUP_SIZE)
+
     KEY_HEAD_SIZE_POW2_SPLIT: gl.constexpr = (
         HEAD_SIZE_POW2 // CONTIGUOUS_KV_ELEMENTS_16B_LOAD
     )
@@ -689,12 +694,9 @@ def paged_attention_decode_v2_gluon_fp8(
     QUERY_SEQ_LEN: tl.constexpr,
     # COMPUTE_TYPE: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
-    HEAD_SIZE_POW2: tl.constexpr,
     QUERY_GROUP_SIZE_ORIGINAL: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
-    QUERY_GROUP_SIZE_POW2: tl.constexpr,
     KV_BLOCK_SIZE: tl.constexpr,
-    KV_BLOCK_SIZE_POW2: tl.constexpr,
     SEQUENCE_PARTITION_SIZE: tl.constexpr,
     KV_16B_ELEMENT_COUNT: tl.constexpr,
     QUERY_QUANT_MODE: tl.constexpr,
@@ -738,8 +740,8 @@ def paged_attention_decode_v2_gluon_fp8(
         f"QUERY_SEQ_LEN={QUERY_SEQ_LEN}, Only support QUERY_SEQ_LEN <= 4",
     )
     gl.static_assert(
-        QUERY_GROUP_SIZE_POW2 <= 64,
-        f"QUERY_GROUP_SIZE_POW2={QUERY_GROUP_SIZE_POW2}, Only support QUERY_GROUP_SIZE_POW2 <= 64",
+        QUERY_GROUP_SIZE <= 64,
+        f"QUERY_GROUP_SIZE={QUERY_GROUP_SIZE}, Only support QUERY_GROUP_SIZE <= 64",
     )
     gl.static_assert(
         KV_BLOCK_SIZE == 16 or KV_BLOCK_SIZE == 64,
@@ -760,13 +762,20 @@ def paged_attention_decode_v2_gluon_fp8(
     # ==================== CONSTANTS AND CONFIGURATION ====================
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential conversion
     CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD: gl.constexpr = KV_16B_ELEMENT_COUNT
+
+    # Calculate power-of-2 values internally
+    HEAD_SIZE_POW2: gl.constexpr = triton.next_power_of_2(HEAD_SIZE)
+    if QUERY_GROUP_SIZE < 16:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = 16
+    else:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(QUERY_GROUP_SIZE)
+
     K_HEAD_SIZE_SPLITS: gl.constexpr = (
         HEAD_SIZE_POW2 // CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
     )
     MAX_NUM_KV_BLOCKS_PER_COMPUTE: gl.constexpr = KV_COMPUTE_BLOCK_SIZE // KV_BLOCK_SIZE
 
     # ==================== MEMORY LAYOUT DEFINITIONS ====================
-
     # Query tensor layout - optimized for sequential access
     blocked_query_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
@@ -1321,12 +1330,9 @@ def paged_attention_decode_v2_reduce_gluon(
     stride_logits_part,
     stride_logits_group,
     HEAD_SIZE: tl.constexpr,
-    HEAD_SIZE_POW2: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
-    QUERY_GROUP_SIZE_POW2: tl.constexpr,
     SEQUENCE_PARTITION_SIZE: tl.constexpr,
     MAX_NUM_SEQ_PARTITIONS: tl.constexpr,
-    MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr,
     USE_SINK_TOKENS: tl.constexpr,
 ):
     """
@@ -1348,6 +1354,14 @@ def paged_attention_decode_v2_reduce_gluon(
         Various stride parameters for tensor access
         Compile-time constants for kernel configuration
     """
+    # Calculate power-of-2 values internally
+    HEAD_SIZE_POW2: gl.constexpr = triton.next_power_of_2(HEAD_SIZE)
+    MAX_NUM_SEQ_PARTITIONS_POW2: gl.constexpr = triton.next_power_of_2(MAX_NUM_SEQ_PARTITIONS)
+    if QUERY_GROUP_SIZE < 16:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = 16
+    else:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(QUERY_GROUP_SIZE)
+
     # ==================== INITIALIZATION AND LAYOUT CONFIGURATION ====================
     sequence_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
@@ -1513,12 +1527,9 @@ def paged_attention_decode_v2_reduce_kernel(
     num_seqs,
     num_kv_heads,
     HEAD_SIZE: tl.constexpr,
-    HEAD_SIZE_POW2: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
-    QUERY_GROUP_SIZE_POW2: tl.constexpr,
     SEQUENCE_PARTITION_SIZE: tl.constexpr,
     MAX_NUM_SEQ_PARTITIONS: tl.constexpr,
-    MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr,
 ):
     """
     Triton reduction kernel for paged attention decode that combines partial results.
@@ -1540,6 +1551,14 @@ def paged_attention_decode_v2_reduce_kernel(
     """
     # Mathematical constant for exponential calculations
     LOG2_E: tl.constexpr = 1.4426950408889634
+
+    # Calculate power-of-2 values internally
+    HEAD_SIZE_POW2: tl.constexpr = triton.next_power_of_2(HEAD_SIZE)
+    MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr = triton.next_power_of_2(MAX_NUM_SEQ_PARTITIONS)
+    if QUERY_GROUP_SIZE < 16:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = 16
+    else:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(QUERY_GROUP_SIZE)
 
     # ==================== INITIALIZATION ====================
     sequence_idx = tl.program_id(0)
@@ -1731,12 +1750,9 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     QUERY_SEQ_LEN,
     COMPUTE_TYPE,
     HEAD_SIZE,
-    HEAD_SIZE_POW2,
     QUERY_GROUP_SIZE_ORIGINAL,
     QUERY_GROUP_SIZE,
-    QUERY_GROUP_SIZE_POW2,
     KV_BLOCK_SIZE,
-    KV_BLOCK_SIZE_POW2,
     SEQUENCE_PARTITION_SIZE,
     KV_16B_ELEMENT_COUNT,
     QUERY_QUANT_MODE,
@@ -1803,6 +1819,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             print(f"Compilation failed: {e}")
     else:
         # Production path - select and launch appropriate kernel
+        QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(QUERY_GROUP_SIZE)
         KV_COMPUTE_BLOCK_SIZE = 256
         waves_per_eu = 1
 
@@ -1862,12 +1879,9 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             QUERY_SEQ_LEN=QUERY_SEQ_LEN,
             # COMPUTE_TYPE=COMPUTE_TYPE,
             HEAD_SIZE=HEAD_SIZE,
-            HEAD_SIZE_POW2=HEAD_SIZE_POW2,
             QUERY_GROUP_SIZE_ORIGINAL=QUERY_GROUP_SIZE_ORIGINAL,
             QUERY_GROUP_SIZE=QUERY_GROUP_SIZE,
-            QUERY_GROUP_SIZE_POW2=QUERY_GROUP_SIZE_POW2,
             KV_BLOCK_SIZE=KV_BLOCK_SIZE,
-            KV_BLOCK_SIZE_POW2=KV_BLOCK_SIZE_POW2,
             SEQUENCE_PARTITION_SIZE=SEQUENCE_PARTITION_SIZE,
             KV_16B_ELEMENT_COUNT=KV_16B_ELEMENT_COUNT,
             QUERY_QUANT_MODE=QUERY_QUANT_MODE,
@@ -1899,12 +1913,9 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
     stride_logits_part,
     stride_logits_group,
     HEAD_SIZE,
-    HEAD_SIZE_POW2,
     QUERY_GROUP_SIZE,
-    QUERY_GROUP_SIZE_POW2,
     SEQUENCE_PARTITION_SIZE,
     MAX_NUM_SEQ_PARTITIONS,
-    MAX_NUM_SEQ_PARTITIONS_POW2,
 ):
     """
     Wrapper function for paged attention reduction kernel with kernel selection.
@@ -1937,12 +1948,9 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             stride_logits_part,
             stride_logits_group,
             HEAD_SIZE=HEAD_SIZE,
-            HEAD_SIZE_POW2=HEAD_SIZE_POW2,
             QUERY_GROUP_SIZE=QUERY_GROUP_SIZE,
-            QUERY_GROUP_SIZE_POW2=QUERY_GROUP_SIZE_POW2,
             SEQUENCE_PARTITION_SIZE=SEQUENCE_PARTITION_SIZE,
             MAX_NUM_SEQ_PARTITIONS=MAX_NUM_SEQ_PARTITIONS,
-            MAX_NUM_SEQ_PARTITIONS_POW2=MAX_NUM_SEQ_PARTITIONS_POW2,
             USE_SINK_TOKENS=False,
         )
     else:
@@ -1965,12 +1973,9 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             num_seqs=grid[0],
             num_kv_heads=grid[1],
             HEAD_SIZE=HEAD_SIZE,
-            HEAD_SIZE_POW2=HEAD_SIZE_POW2,
             QUERY_GROUP_SIZE=QUERY_GROUP_SIZE,
-            QUERY_GROUP_SIZE_POW2=QUERY_GROUP_SIZE_POW2,
             SEQUENCE_PARTITION_SIZE=SEQUENCE_PARTITION_SIZE,
             MAX_NUM_SEQ_PARTITIONS=MAX_NUM_SEQ_PARTITIONS,
-            MAX_NUM_SEQ_PARTITIONS_POW2=MAX_NUM_SEQ_PARTITIONS_POW2,
         )
 
 
@@ -1985,7 +1990,7 @@ def paged_attention_decode(
     softmax_scale: float,
     query_sequence_length: int,
     max_sequence_length: int,
-    compute_type,
+    compute_type: tl.dtype,
     query_scale: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -2070,11 +2075,6 @@ def paged_attention_decode(
 
     # Calculate equivalent group sizes for kernel configuration
     equivalent_query_group_size = query_sequence_length * query_group_size
-    equivalent_query_group_size_pow2 = triton.next_power_of_2(
-        equivalent_query_group_size
-    )
-    kv_block_size_pow2 = triton.next_power_of_2(kv_block_size)
-    head_size_pow2 = triton.next_power_of_2(head_size)
 
     # Determine if causal masking is needed
     is_causal = query_sequence_length > 1
@@ -2084,31 +2084,6 @@ def paged_attention_decode(
 
     # Configure execution grid
     grid = (num_sequences, num_kv_heads, max_num_partitions)
-    # intermediate_shape = (
-    #     num_sequences,
-    #     num_kv_heads,
-    #     max_num_partitions,
-    #     equivalent_query_group_size,
-    # )
-
-    # # Initialize intermediate tensors for attention computation
-    # max_logits = torch.zeros(
-    #     intermediate_shape, dtype=torch.float32, device=output.device
-    # )
-    # exp_sums = torch.zeros(
-    #     intermediate_shape, dtype=torch.float32, device=output.device
-    # )
-    # temporary_output = torch.zeros(
-    #     *intermediate_shape, head_size, dtype=output.dtype, device=output.device
-    # )
-
-    # Adjust query group size to power of 2 with constraints
-    if equivalent_query_group_size <= 16:
-        equivalent_query_group_size_pow2 = 16
-    else:
-        equivalent_query_group_size_pow2 = triton.next_power_of_2(
-            equivalent_query_group_size
-        )
 
     # Validate input params constraint
     assert (
@@ -2124,8 +2099,8 @@ def paged_attention_decode(
         output.dtype == aiter.dtypes.bf16
     ), f"output tensor only support dtype == {aiter.dtypes.bf16}, but got output.dtype == {output.dtype}"
     assert (
-        equivalent_query_group_size_pow2 <= 64
-    ), f"equivalent_query_group_size_pow2={equivalent_query_group_size_pow2} exceeds maximum of 64"
+        equivalent_query_group_size <= 64
+    ), f"equivalent_query_group_size={equivalent_query_group_size} exceeds maximum of 64"
     assert kv_block_size in [
         16,
         64,
@@ -2252,12 +2227,9 @@ def paged_attention_decode(
         QUERY_SEQ_LEN=query_sequence_length,
         COMPUTE_TYPE=compute_type,
         HEAD_SIZE=head_size,
-        HEAD_SIZE_POW2=head_size_pow2,
         QUERY_GROUP_SIZE_ORIGINAL=query_group_size,
         QUERY_GROUP_SIZE=equivalent_query_group_size,
-        QUERY_GROUP_SIZE_POW2=equivalent_query_group_size_pow2,
         KV_BLOCK_SIZE=kv_block_size,
-        KV_BLOCK_SIZE_POW2=kv_block_size_pow2,
         SEQUENCE_PARTITION_SIZE=_SEQUENCE_PARTITION_SIZE,
         KV_16B_ELEMENT_COUNT=kv_elements_per_16b,
         QUERY_QUANT_MODE=query_quant_mode,
@@ -2286,10 +2258,7 @@ def paged_attention_decode(
         temporary_output.stride(2),
         temporary_output.stride(3),
         HEAD_SIZE=head_size,
-        HEAD_SIZE_POW2=head_size_pow2,
         QUERY_GROUP_SIZE=equivalent_query_group_size,
-        QUERY_GROUP_SIZE_POW2=equivalent_query_group_size_pow2,
         SEQUENCE_PARTITION_SIZE=_SEQUENCE_PARTITION_SIZE,
         MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
-        MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
     )
