@@ -97,13 +97,6 @@ def fused_gemm_afp4wfp4_a16w16(
     if config is None:
         config = _get_config(M, N_fp4, N_bf16, K, is_fp4_preshuffled)
 
-    if y_fp4 is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
-        y_fp4 = torch.empty((M, N_fp4), dtype=dtype, device=x_fp4.device)
-
-    if y_bf16 is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
-        y_bf16 = torch.empty((M, N_bf16), dtype=dtype, device=x_bf16.device)
-
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
@@ -113,15 +106,22 @@ def fused_gemm_afp4wfp4_a16w16(
         config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
         config["NUM_KSPLIT"] = NUM_KSPLIT
 
+    if y_fp4 is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
+        y_fp4 = torch.empty((M, N_fp4), dtype=dtype, device=x_fp4.device)
+
+    if y_bf16 is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
+        y_bf16 = torch.empty((M, N_bf16), dtype=dtype, device=x_bf16.device)
+
+    if config["NUM_KSPLIT"] > 1:
         y_fp4_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N_fp4),
             dtype=torch.float32,
-            device=y_fp4.device if y_fp4 is not None else x_fp4.device,
+            device=x_fp4.device,
         )
         y_bf16_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N_bf16),
             dtype=torch.float32,
-            device=y_bf16.device if y_bf16 is not None else x_bf16.device,
+            device=x_bf16.device,
         )
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
