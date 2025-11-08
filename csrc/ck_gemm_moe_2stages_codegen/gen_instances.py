@@ -45,7 +45,7 @@ gemm1_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage1_heuristic_dispatch(int block_m, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage)
+MoeKernel moe_stage1_heuristic_dispatch(int block_m, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool b_preshuffle=true)
 {{
 """
 
@@ -54,7 +54,7 @@ gemm2_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage)
+MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool b_preshuffle=true)
 {{
 """
 
@@ -177,6 +177,40 @@ A4W4_gemm1_heuristic_dispatch = """
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
+        && {Quant} == quant
+        && b_preshuffle == true)
+    {{
+        if (block_m == 32)
+        {{
+            return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else if (block_m == 64)
+        {{
+            return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else if (block_m == 128)
+        {{
+            return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else
+        {{
+            TORCH_CHECK(
+                false,
+                "Unsupported block_m value for moe heuristic dispatch: ",
+                block_m);
+        }}
+    }}
+#endif
+
+"""
+
+A4W4_bns_gemm1_heuristic_dispatch = """
+#if defined(__Float4_e2m1fn_x2)
+    if (dtype_checker<{A0DataType}>{{}}(x_dtype)
+        && dtype_checker<{B0DataType}>{{}}(w_dtype)
+        && dtype_checker<{EDataType}>{{}}(y_dtype)
+        && {ActOP} == act_op
+        && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
         if (block_m == 32)
@@ -202,7 +236,6 @@ A4W4_gemm1_heuristic_dispatch = """
 #endif
 
 """
-
 
 A8W8_blockscale_gemm1_heuristic_dispatch = """
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
@@ -336,6 +369,63 @@ A4W4_gemm2_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
+        && {Quant} == quant
+        && b_preshuffle == true)
+    {{
+        if (inter_dim <= 256)
+        {{
+            if (block_m == 32)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 32, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 64)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 64, 64, 128, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 128)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 64, 128, 128, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else
+            {{
+                TORCH_CHECK(
+                    false,
+                    "Unsupported block_m value for moe heuristic dispatch: ",
+                    block_m);
+            }}
+        }}
+        else
+        {{
+            if (block_m == 32)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 64)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 128)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else
+            {{
+                TORCH_CHECK(
+                    false,
+                    "Unsupported block_m value for moe heuristic dispatch: ",
+                    block_m);
+            }}
+        }}
+    }}
+#endif
+"""
+
+A4W4_bns_gemm2_heuristic_dispatch = """
+#if defined(__Float4_e2m1fn_x2)
+    if (dtype_checker<{A0DataType}>{{}}(x_dtype)
+        && dtype_checker<{B0DataType}>{{}}(w_dtype)
+        && dtype_checker<{EDataType}>{{}}(y_dtype)
+        && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
         if (inter_dim <= 256)
@@ -385,7 +475,6 @@ A4W4_gemm2_heuristic_dispatch = """
     }}
 #endif
 """
-
 
 A8W8_blockscale_gemm2_heuristic_dispatch = """
 
@@ -442,6 +531,10 @@ heuristic_dispatch_dict = {
     "a4w4": [
         A4W4_gemm1_heuristic_dispatch,
         A4W4_gemm2_heuristic_dispatch,
+    ],
+    "a4w4_bns": [
+        A4W4_bns_gemm1_heuristic_dispatch,
+        A4W4_bns_gemm2_heuristic_dispatch,
     ],
 }
 
@@ -531,6 +624,8 @@ class ck_moe_2stage_gemm_codegen:
         )
 
         f_lookUpTable = os.path.join(self.working_path, "gemm_moe_ck2stages_lookup.h")
+
+        # breakpoint()
         with open(f_lookUpTable, "a") as f_lookup:
             for kernel in kernel_list:
                 ## generate instance
@@ -543,7 +638,10 @@ class ck_moe_2stage_gemm_codegen:
                 if self.quant_type in [4, 5]:
                     quanttype = "_blockscale"
                 elif "FP4" in self.a_dtype:
-                    quanttype = "_mxfp4"
+                    if "bns" in tag:
+                        quanttype = "_mxfp4_bns"
+                    else:
+                        quanttype = "_mxfp4"
                 else:
                     quanttype = ""
                 if not os.path.exists(f_instance):

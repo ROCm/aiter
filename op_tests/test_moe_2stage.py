@@ -11,6 +11,7 @@ from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 import argparse
 import pandas as pd
+import os
 import numpy as np
 
 from aiter.fused_moe import (
@@ -174,7 +175,7 @@ def test_fmoe(
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
-    elif WQDType != dtypes.fp4x2:
+    elif WQDType != dtypes.fp4x2 or int(os.getenv("AITER_MXFP4_MOE_SF", 0)) == 1:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)

@@ -3,7 +3,6 @@
 
 import functools
 import os
-import sys
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -619,6 +618,7 @@ def get_2stage_cfgs(
                 run_1stage = token > 32
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
+
         block_m = (
             BLOCK_SIZE_M
             if run_1stage

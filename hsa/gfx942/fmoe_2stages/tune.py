@@ -4,8 +4,6 @@
 import torch
 import aiter
 import pandas as pd
-import argparse
-import time
 import os
 import sys
 from aiter import QuantType
@@ -16,7 +14,6 @@ from aiter.fused_moe import (
     asm_stage1,
     torch_moe_stage1,
     torch_moe_stage2,
-    fused_moe_1stage_dict,
     torch_moe,
 )
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
@@ -33,6 +30,7 @@ from aiter.utility import fp4_utils
 import torch.nn.functional as F
 from einops import rearrange
 from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
@@ -137,6 +135,14 @@ class FmoeTuner(TunerCommon):
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
 
+        a1_scale = moe_mxfp4_sort(
+            a1_scale,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token_num,
+            block_size=blockM,
+        )
+
         out = torch.empty(
             (token_num, topk, inter_dim),
             dtype=dtype,
@@ -152,7 +158,7 @@ class FmoeTuner(TunerCommon):
             out,
             topk,
             kernelName,
-            w1_scale,
+            fp4_utils.e8m0_shuffle(w1_scale),
             a1_scale,
             blockM,
             sorted_weights,
@@ -189,6 +195,14 @@ class FmoeTuner(TunerCommon):
         model_dim = w2_qt_shffle_ck.shape[1]
         token_num = a2_qt.shape[0]
 
+        a2_scale = moe_mxfp4_sort(
+            a2_scale[: token_num * topk, :].view(token_num, topk, -1),
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token_num,
+            block_size=blockM,
+        )
+
         out = torch.zeros(
             (token_num, model_dim),
             dtype=dtype,
@@ -204,7 +218,9 @@ class FmoeTuner(TunerCommon):
             out,
             topk,
             kernelName,
-            w2_scale,
+            fp4_utils.e8m0_shuffle(
+                w2_scale
+            ),  # e8m0_shuffle will do nothing if it's a fp32
             a2_scale,
             blockM,
             sorted_weights,
@@ -400,6 +416,7 @@ class FmoeTuner(TunerCommon):
             and activation == ActivationType.Silu
             and not isG1U1
             or doweight_stage1
+            or quant_type == QuantType.per_1x32
         ):
             print("not support No Quant Silu G1U0 1 stage tuning!")
         else:
@@ -436,9 +453,12 @@ class FmoeTuner(TunerCommon):
         w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype)
         w1_qt, w1_scale = FmoeTuner.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
         w2_qt, w2_scale = FmoeTuner.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
-        w1_qt = w1_qt.view(w1.shape)
-        w2_qt = w2_qt.view(w2.shape)
-
+        if q_dtype_w is not dtypes.fp4x2:
+            w1_qt = w1_qt.view(w1.shape)
+            w2_qt = w2_qt.view(w2.shape)
+        else:
+            w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+            w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
         score = torch.randn((token, expert), dtype=dtype)
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
         if q_type == QuantType.per_1x128:
@@ -1032,6 +1052,59 @@ class FmoeTuner(TunerCommon):
         return out.sum(dim=1).to(dtype)
 
     @staticmethod
+    def torch_moe_2stages(
+        hidden_states,
+        w1,  # E, inter_dim*2, model_dim
+        w2,  # E, model_dim, inter_dim
+        topk_weight,
+        topk_ids,
+        a1_scale=None,
+        w1_scale=None,
+        w2_scale=None,
+        dtype=dtypes.fp16,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.No,
+        doweight_stage1=False,
+    ):
+        ref1 = torch_moe_stage1(
+            hidden_states,
+            w1,  # E, inter_dim*2, model_dim
+            w2,  # E, model_dim, inter_dim
+            topk_weight,
+            topk_ids,
+            dtype=dtype,
+            activation=activation,
+            quant_type=quant_type,
+            a1_scale=a1_scale,
+            w1_scale=w1_scale,
+            doweight=doweight_stage1,
+        )
+        AQDType = hidden_states.dtype
+
+        if quant_type == aiter.QuantType.per_1x128:
+            a2_qt, a2_scale = aiter.pertoken_quant(
+                ref1.view(hidden_states.shape[0], -1, 128), quant_dtype=AQDType
+            )
+        else:
+            torch_quant = aiter.get_torch_quant(quant_type)
+            a2_qt, a2_scale = torch_quant(ref1, quant_dtype=AQDType)
+        a2_qt = a2_qt.view(ref1.shape[0], ref1.shape[1], -1)
+
+        ref2 = torch_moe_stage2(
+            a2_qt,
+            w1,  # E, inter_dim*2, model_dim
+            w2,  # E, model_dim, inter_dim
+            topk_weight,
+            topk_ids,
+            dtype=dtype,
+            quant_type=quant_type,
+            a2_scale=a2_scale,
+            w2_scale=w2_scale,
+            doweight=not doweight_stage1,
+        )
+        return ref2
+
+    @staticmethod
     def torch_moe_blockscale(
         hidden_states,
         w1,  # [expert, inter_dim*2, model_dim]
@@ -1289,7 +1362,7 @@ class FmoeTuner(TunerCommon):
                         (
                             FmoeTuner.torch_moe_blockscale
                             if q_type == QuantType.per_1x128
-                            else FmoeTuner.torch_moe_test
+                            else FmoeTuner.torch_moe_2stages
                         ),
                         (
                             (
@@ -1300,10 +1373,11 @@ class FmoeTuner(TunerCommon):
                             )
                             if q_type == QuantType.per_1x128
                             else (
-                                [0, 12, 13, 14, 15, 10, 11, 16, 17],
+                                [1, 12, 13, 14, 15, 9, 10, 11],
+                                dtype,
                                 act_type,
+                                q_type,
                                 doweight_stage1,
-                                q_dtype_a,
                             )
                         ),
                         {},
