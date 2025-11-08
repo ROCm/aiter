@@ -1429,7 +1429,10 @@ template <int capacity, bool descending, typename T, typename IdxT>
 struct WaveTopkFilter
 {
     __device__ WaveTopkFilter(IdxT k, T sentinel)
-        : buffer_(k, sentinel), threshold_lane_((k - 1) & (utils::WAVE_SIZE - 1)), staging_count_(0)
+        : buffer_(k, sentinel),
+          threshold_(sentinel),
+          threshold_lane_((k - 1) & (utils::WAVE_SIZE - 1)),
+          staging_count_(0)
     {
         extern __shared__ char lds_buf[];
         const int num_waves = blockDim.x / utils::WAVE_SIZE;
