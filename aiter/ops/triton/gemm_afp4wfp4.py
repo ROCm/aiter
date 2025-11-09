@@ -9,7 +9,7 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
     _gemm_afp4wfp4_kernel,
-    _gemm_afp4wfp4_kernel_preshuffled_scales,
+    _gemm_afp4wfp4_kernel_preshuffle_scales,
     _gemm_afp4wfp4_preshuffle_kernel,
     _gemm_afp4wfp4_reduce_kernel,
     _get_config,

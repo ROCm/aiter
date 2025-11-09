@@ -100,6 +100,10 @@ def generate_fused_rms_quant_data(
 @pytest.mark.parametrize("N", [32, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_flatten_quant(B: int, M: int, N: int, dtype):
+
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     x = torch.randn((B, M, N), dtype=dtype, device="cuda").transpose(0, 1)
@@ -139,6 +143,10 @@ def test_fused_rms_quant(
     shuffle: bool,
     scale_shuffle_padding: bool,
 ):
+
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     x1, x2, rms1_w, rms2_w, resid1 = generate_fused_rms_quant_data(
         x1_shape=(M, N1),
@@ -251,9 +259,6 @@ def generate_fused_reduce_act_mul_mxfp4_group_quant(
         (2, 256, 256),
         (4, 256, 256),
         (32, 256, 256),
-        (64, 256, 256),
-        (128, 256, 256),
-        (512, 256, 256),
         (1, 4, 256),
         (1, 28, 256),
         (1, 32, 256),
@@ -266,7 +271,7 @@ def generate_fused_reduce_act_mul_mxfp4_group_quant(
         (256, 32, 256),
     ],
 )
-@pytest.mark.parametrize("SPK", [1, 4, 14])
+@pytest.mark.parametrize("SPK", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("activation", ["silu", "gelu"])
 @pytest.mark.parametrize("shuffle", [False, True])

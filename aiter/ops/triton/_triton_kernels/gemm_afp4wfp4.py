@@ -189,7 +189,7 @@ def _gemm_afp4wfp4_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-_gemm_afp4wfp4_preshuffled_scales_repr = make_kernel_repr(
+_gemm_afp4wfp4_preshuffle_scales_repr = make_kernel_repr(
     "_gemm_afp4wfp4_preshuffle_kernel",
     [
         "BLOCK_SIZE_M",
@@ -213,8 +213,8 @@ _gemm_afp4wfp4_preshuffled_scales_repr = make_kernel_repr(
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
     }
 )
-@triton.jit(repr=_gemm_afp4wfp4_preshuffled_scales_repr)
-def _gemm_afp4_wfp4_kernel_preshuffled_scales(
+@triton.jit(repr=_gemm_afp4wfp4_preshuffle_scales_repr)
+def _gemm_afp4wfp4_kernel_preshuffle_scales(
     a_ptr,
     b_ptr,
     c_ptr,
