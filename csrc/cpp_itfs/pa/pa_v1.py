@@ -141,7 +141,7 @@ def paged_attention_v1(
         logits_soft_cap_enabled,
         partition_size,
         mtp,
-        sliding_window_enabled=sliding_window_enabled
+        sliding_window_enabled=sliding_window_enabled,
     )
 
     alibi_slopes_ptr = (

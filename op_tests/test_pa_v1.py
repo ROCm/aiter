@@ -134,7 +134,7 @@ def ref_masked_attention(
     if attn_mask is not None:
         attn_weights = attn_weights + attn_mask.float()
     if sliding_window:
-        attn_weights[:,:,:-sliding_window] = -1e38
+        attn_weights[:, :, :-sliding_window] = -1e38
     if 0 < logits_soft_cap:
         attn_weights = logits_soft_cap * torch.tanh(attn_weights / logits_soft_cap)
     attn_weights = torch.softmax(attn_weights, dim=-1).to(value.dtype)
@@ -217,7 +217,7 @@ def run_torch(
     k_scale,
     v_scale,
     num_queries_per_kv,
-    sliding_window
+    sliding_window,
 ):
     output = torch.zeros_like(query)
     num_query_heads = query.shape[1]
@@ -259,7 +259,14 @@ def run_torch(
             alibi_bias = (position_ids - seq_len + 1).float()
             alibi_bias = alibi_slopes.view(-1, 1, 1) * alibi_bias.view(1, 1, -1)
 
-        out = ref_masked_attention(q, keys, values, scale, alibi_bias, logits_soft_cap, sliding_window=sliding_window)
+        out = ref_masked_attention(q,
+                                   keys,
+                                   values,
+                                   scale,
+                                   alibi_bias,
+                                   logits_soft_cap,
+                                   sliding_window=sliding_window,
+                                   )
         out = out.view(num_query_heads, head_size)
         output[i].copy_(out, non_blocking=True)
     return output, 1
@@ -556,7 +563,7 @@ def test_paged_attention(
             logits_soft_cap,
             k_scale,
             v_scale,
-            sliding_window=sliding_window
+            sliding_window=sliding_window,
         )
         assert (
             checkAllclose(out_golden, out_aiter, msg=f"golden vs aiter:{time_aiter}")
@@ -654,5 +661,5 @@ if __name__ == "__main__":
             quant_cache_dtype,
             0,
             "cuda:0",
-            10
+            10,
         )
