@@ -138,7 +138,6 @@ def batched_gemm_a16wfp4(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),
     )
-    # print(x.shape, w.shape, y.shape, config)
     _batched_gemm_a16wfp4_kernel[grid](
         x,
         w,
