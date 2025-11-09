@@ -259,14 +259,15 @@ def run_torch(
             alibi_bias = (position_ids - seq_len + 1).float()
             alibi_bias = alibi_slopes.view(-1, 1, 1) * alibi_bias.view(1, 1, -1)
 
-        out = ref_masked_attention(q,
-                                   keys,
-                                   values,
-                                   scale,
-                                   alibi_bias,
-                                   logits_soft_cap,
-                                   sliding_window=sliding_window,
-                                   )
+        out = ref_masked_attention(
+            q,
+            keys,
+            values,
+            scale,
+            alibi_bias,
+            logits_soft_cap,
+            sliding_window=sliding_window,
+        )
         out = out.view(num_query_heads, head_size)
         output[i].copy_(out, non_blocking=True)
     return output, 1
