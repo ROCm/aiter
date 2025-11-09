@@ -175,7 +175,6 @@ class Case:
     n: int
     k: int
     act_dtype_str: str
-    weight_dtype_str: str
     n_expts_tot: int = 1
     n_expts_act: int = 1
     hbm_swizzling: bool = False
@@ -186,41 +185,17 @@ class Case:
     [
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
-            Case(
-                32,
-                3072,
-                6144,
-                "float8_e4m3fn",
-                "mxfloat4_e2m1",
-                128,
-                4,
-                hbm_swizzling=True,
-            ),
-            Case(4096, 3072, 3072, "float8_e4m3fn", "mxfloat4_e2m1", 128, 4),
-            Case(
-                16,
-                1024,
-                1024,
-                "mxfloat8_e4m3fn",
-                "mxfloat4_e2m1",
-                128,
-                4,
-                hbm_swizzling=True,
-            ),
-            Case(4096, 1024, 1024, "mxfloat8_e4m3fn", "mxfloat4_e2m1", 128, 4),
-            Case(
-                16,
-                256,
-                256,
-                "mxfloat8_e4m3fn",
-                "mxfloat4_e2m1",
-                128,
-                4,
-                hbm_swizzling=True,
-            ),
-            Case(4096, 256, 256, "mxfloat8_e4m3fn", "mxfloat4_e2m1", 128, 4),
-            Case(1000, 704, 800, "mxfloat8_e4m3fn", "mxfloat4_e2m1", 8, 2),
-            Case(300, 400, 800, "mxfloat8_e4m3fn", "mxfloat4_e2m1", 8, 4),
+            Case(32, 6144, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(8192, 3072, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4, 1024, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(1024, 3072, 512, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4096, 3072, 3072, "float8_e4m3fn", 128, 4),
+            Case(16, 1024, 1024, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4096, 1024, 1024, "mxfloat8_e4m3fn", 128, 4),
+            Case(16, 256, 256, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4096, 256, 256, "mxfloat8_e4m3fn", 128, 4),
+            Case(1000, 704, 800, "mxfloat8_e4m3fn", 8, 2),
+            Case(300, 400, 800, "mxfloat8_e4m3fn", 8, 4),
         ]
     ],
 )
@@ -248,22 +223,14 @@ def test_op(
     n_expts_tot,
     n_expts_act,
     act_dtype_str,
-    weight_dtype_str,
     hbm_swizzling,
     device="cuda",
 ):
 
-    if (
-        "float8" in act_dtype_str
-        and "mx" in weight_dtype_str
-        and get_arch() != "gfx950"
-    ):
+    if get_arch() != "gfx950":
         pytest.skip("float8 x mx only supported on CDNA4")
 
-    if (
-        "float8_e4m3fnuz" in (weight_dtype_str, act_dtype_str)
-        and get_arch() != "gfx942"
-    ):
+    if "float8_e4m3fnuz" in act_dtype_str and get_arch() != "gfx942":
         pytest.skip("float8_e4m3fnuz only tested on AMD CDNA3 Platform")
 
     if hbm_swizzling:
@@ -271,8 +238,6 @@ def test_op(
             pytest.skip(
                 "Scale preshuffling on AMD GPU has not been emulated on non-CDNA4 arch yet."
             )
-        if "mx" not in weight_dtype_str:
-            pytest.skip("Non-scale swizzling not supported on CDNA4 yet")
         if n % 32 != 0 or k % (32 * 8) != 0:
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
@@ -280,6 +245,7 @@ def test_op(
 
     torch.manual_seed(0)
 
+    weight_dtype_str = "mxfloat4_e2m1"
     weight_mxfp = weight_dtype_str.startswith("mx")
     if weight_mxfp:
         weight_dtype_str = weight_dtype_str[2:]
