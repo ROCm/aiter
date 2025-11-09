@@ -94,7 +94,7 @@ def get_x_vals():
     x_vals += [(32, 512, 7168)]
     x_vals += [(1, 1280, 8192)]
     x_vals += [(v, 7168, 2048) for v in [1, 4, 8, 32, 64, 128]]
-    # x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal casem TODO: fix 
+    # x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case, TODO: fix
     return x_vals
 
 
@@ -172,5 +172,5 @@ def test_gemm_a16wfp4(
         y = gemm_a16wfp4(x, w, w_scales, atomic_add=atomic_add, dtype=y_dtype).to(dtype)
 
     torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
-    
+
     torch.testing.assert_close(torch_out, y)

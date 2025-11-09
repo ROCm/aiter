@@ -49,7 +49,7 @@ def gemm_a16wfp4(
     """
 
     _LOGGER.info(
-        f"GEMM_AFP4WFP4_PRE_QUANT_ATOMIC: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w_scales.shape)} "
+        f"GEMM_A16WFP4: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w_scales.shape)} "
     )
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
