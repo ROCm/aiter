@@ -128,16 +128,17 @@ __device__ bool processHistogramStep(const float* logits,
     }
 
     // Fetch elements one-by-one.
-    for(int idx = rowStart + threadIdx.x * Vector; idx < rowEnd;
-        idx += kNumThreadsPerBlock * Vector)
+    for(int vecIdx = (rowStart / Vector) + threadIdx.x; vecIdx < (rowEnd + Vector - 1) / Vector;
+        vecIdx += kNumThreadsPerBlock)
     {
-        int64_t offset = (idx / Vector) * stride1;
-        auto v         = reinterpret_cast<const VectorType*>(logits)[offset];
-
+        auto v         = reinterpret_cast<const VectorType*>(logits)[vecIdx];
 #pragma unroll
         for(int j = 0; j < Vector; j++)
         {
-            float logit  = (idx + j) < rowEnd ? v[j] : -INFINITY;
+            int vIdx = vecIdx * Vector + j;
+            if(vIdx >= rowEnd)
+                break;
+            float logit = v[j];
             if(isPartialMatch<patternShift>(logit, logitPattern))
             {
                 uint32_t binIdx = extractBinIdx<step>(logit);
@@ -208,18 +209,18 @@ __device__ bool processHistogramStep(const float* logits,
     thresholdBinIdx = smemThresholdBinIdx[0];
 
     // Fetch elements one-by-one and populate the shared memory buffers.
-    for(int idx = rowStart + threadIdx.x * Vector; idx < rowEnd;
-        idx += kNumThreadsPerBlock * Vector)
+    for(int vecIdx = (rowStart / Vector) + threadIdx.x; vecIdx < (rowEnd + Vector - 1) / Vector;
+        vecIdx += kNumThreadsPerBlock)
     {
         // Compute the vector offset for coalesced VectorType load
-        int64_t vecOffset = (idx / Vector) * stride1;
-        VectorType v      = reinterpret_cast<const VectorType*>(logits)[vecOffset];
-
+        auto v = reinterpret_cast<const VectorType*>(logits)[vecIdx];
 #pragma unroll
         for(int j = 0; j < Vector; j++)
         {
-            int vIdx = idx + j;
-            float logit  = vIdx < rowEnd ? v[j] : -INFINITY;
+            int vIdx = vecIdx * Vector + j;
+            if(vIdx >= rowEnd)
+                break;
+            float logit = v[j];
 
             // Check for pattern match
             if(!isPartialMatch<patternShift>(logit, logitPattern))
@@ -584,7 +585,7 @@ static __global__ void topk_per_row_decode(
 
 } // namespace aiter
 
-void topk_per_row(const torch::Tensor& logits,
+void top_k_per_row_prefill(const torch::Tensor& logits,
                   const torch::Tensor& rowStarts,
                   const torch::Tensor& rowEnds,
                   torch::Tensor& indices,
@@ -655,7 +656,7 @@ void topk_per_row(const torch::Tensor& logits,
     }
 }
 
-void topk_per_row_decode(const torch::Tensor& logits,
+void top_k_per_row_decode(const torch::Tensor& logits,
                          int64_t next_n,
                          const torch::Tensor& seqLens,
                          torch::Tensor& indices,
