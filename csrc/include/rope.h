@@ -139,6 +139,25 @@ void rope_cached_positions_offsets_2c_fwd_impl(
     const bool           nope_first
 );
 
+void rope_cached_positions_offsets_2c_fwd_cachekv_impl(
+    torch::Tensor&       output_x,                  // [s, b, h, d]
+    torch::Tensor&       output_y,                  // [s, b, h, d]
+    const torch::Tensor& input_x,                   // [s, b, h, d]
+    const torch::Tensor& input_y,                   // [s, b, h, d]
+    const torch::Tensor& value,                     // [s, b, h, d]
+    torch::Tensor&       key_cache,                 // [num_blocks, h, d/x, block_size, x]
+    torch::Tensor&       value_cache,               // [num_blocks, h, d, block_size]
+    const torch::Tensor& cos,                       // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const torch::Tensor& sin,                       // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const torch::Tensor& positions,                 // [s, b]
+    const torch::Tensor& offsets,                   // [s, b]
+    const int32_t        rotate_style,              // 0: NEOX style, 1: GPT-J style
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first,
+    const torch::Tensor& slot_mapping,              // [s*b]
+    const bool           asm_layout
+)
+
 void rope_thd_fwd_impl(
     torch::Tensor&       output,                    // [t, h, d]
     const torch::Tensor& input,                     // [t, h, d]

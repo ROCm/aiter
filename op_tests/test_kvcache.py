@@ -271,94 +271,94 @@ def test_reshape_and_cache(
     )
     return ret
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Test different data types of quant.",
+    )
+    parser.add_argument(
+        "-t",
+        "--test",
+        type=str,
+        choices=["bf16tobf16", "fp16tofp8", "fp16toi8", "bf16toi8"],
+        default=["bf16tobf16", "fp16tofp8", "fp16toi8", "bf16toi8"],
+        nargs="*",
+        help="""select which test to run, default is all
+        e.g.: -t fp16tofp8""",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch_size",
+        type=int,
+        nargs="*",
+        default=[64, 128, 257],
+        help="""Batch size. Default is 2.
+        e.g.: -b 16""",
+    )
+    parser.add_argument(
+        "-c",
+        "--ctx",
+        type=int,
+        nargs="*",
+        default=[4097, 12800],
+        help="""num of context lenth.
+        e.g.: -c 32""",
+    )
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="Test different data types of quant.",
-)
-parser.add_argument(
-    "-t",
-    "--test",
-    type=str,
-    choices=["bf16tobf16", "fp16tofp8", "fp16toi8", "bf16toi8"],
-    default=["bf16tobf16", "fp16tofp8", "fp16toi8", "bf16toi8"],
-    nargs="*",
-    help="""select which test to run, default is all
-    e.g.: -t fp16tofp8""",
-)
-parser.add_argument(
-    "-b",
-    "--batch_size",
-    type=int,
-    nargs="*",
-    default=[64, 128, 257],
-    help="""Batch size. Default is 2.
-    e.g.: -b 16""",
-)
-parser.add_argument(
-    "-c",
-    "--ctx",
-    type=int,
-    nargs="*",
-    default=[4097, 12800],
-    help="""num of context lenth.
-    e.g.: -c 32""",
-)
-
-args = parser.parse_args()
-df = []
-for (
-    test,
-    bs,
-    ctx,
-) in itertools.product(args.test, args.batch_size, args.ctx):
-    if test == "bf16tobf16":
-        print("\nstart quant bf16->bf16")
-        ret = test_reshape_and_cache(
-            ctx,
-            bs,
-            (8, 1),
-            128,
-            16,
-            dtypes.bf16,
-            dtypes.bf16,
-        )
-    elif test == "fp16tofp8":
-        print("\nstart quant fp16->fp8")
-        ret = test_reshape_and_cache(
-            ctx,
-            bs,
-            (8, 1),
-            128,
-            16,
-            dtypes.fp16,
-            dtypes.fp8,
-        )
-    elif test == "fp16toi8":
-        print("\nstart quant fp16->i8")
-        ret = test_reshape_and_cache(
-            ctx,
-            bs,
-            (8, 1),
-            128,
-            16,
-            dtypes.fp16,
-            dtypes.i8,
-        )
-    elif test == "bf16toi8":
-        print("\nstart quant bf16->i8")
-        ret = test_reshape_and_cache(
-            ctx,
-            bs,
-            (10, 1),
-            128,
-            16,
-            dtypes.bf16,
-            dtypes.i8,
-        )
-    else:
-        raise ValueError(f"Unknown test type: {test}")
-    df.append(ret)
-df = pd.DataFrame(df)
-# df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")
-aiter.logger.info(f"summary:\n{df}")
+    args = parser.parse_args()
+    df = []
+    for (
+        test,
+        bs,
+        ctx,
+    ) in itertools.product(args.test, args.batch_size, args.ctx):
+        if test == "bf16tobf16":
+            print("\nstart quant bf16->bf16")
+            ret = test_reshape_and_cache(
+                ctx,
+                bs,
+                (8, 1),
+                128,
+                16,
+                dtypes.bf16,
+                dtypes.bf16,
+            )
+        elif test == "fp16tofp8":
+            print("\nstart quant fp16->fp8")
+            ret = test_reshape_and_cache(
+                ctx,
+                bs,
+                (8, 1),
+                128,
+                16,
+                dtypes.fp16,
+                dtypes.fp8,
+            )
+        elif test == "fp16toi8":
+            print("\nstart quant fp16->i8")
+            ret = test_reshape_and_cache(
+                ctx,
+                bs,
+                (8, 1),
+                128,
+                16,
+                dtypes.fp16,
+                dtypes.i8,
+            )
+        elif test == "bf16toi8":
+            print("\nstart quant bf16->i8")
+            ret = test_reshape_and_cache(
+                ctx,
+                bs,
+                (10, 1),
+                128,
+                16,
+                dtypes.bf16,
+                dtypes.i8,
+            )
+        else:
+            raise ValueError(f"Unknown test type: {test}")
+        df.append(ret)
+    df = pd.DataFrame(df)
+    # df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")
+    aiter.logger.info(f"summary:\n{df}")

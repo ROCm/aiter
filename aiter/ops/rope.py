@@ -986,6 +986,41 @@ def rope_cached_positions_offsets_2c_fwd_inplace(
         nope_first,
     )
 
+def rope_cached_positions_offsets_2c_fwd_inplace_cachekv(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    offsets: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part: bool,
+    nope_first: bool,
+    slot_mapping: Tensor,
+    asm_layout: bool,
+) -> Tensor:
+    rope_cached_positions_offsets_2c_fwd_cachekv_impl(
+        query,
+        key,
+        query,
+        key,
+        value,
+        k_cache,
+        v_cache,
+        cos,
+        sin,
+        positions,
+        offsets,
+        rotate_style,
+        reuse_freqs_front_part,
+        nope_first,
+        slot_mapping,
+        asm_layout,
+    )
+
 
 def rope_thd_fwd(
     input: Tensor,

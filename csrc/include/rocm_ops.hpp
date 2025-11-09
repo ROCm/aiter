@@ -1089,7 +1089,8 @@
     m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl);                 \
     m.def("rope_cached_positions_2c_fwd_impl", &rope_cached_positions_2c_fwd_impl);           \
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
-    m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
+    m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl); \
+    m.def("rope_cached_positions_offsets_2c_fwd_cachekv_impl", &rope_cached_positions_offsets_2c_fwd_cachekv_impl);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
