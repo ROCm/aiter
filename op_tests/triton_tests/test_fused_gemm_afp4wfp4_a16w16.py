@@ -13,6 +13,7 @@ from op_tests.triton_tests.test_gemm_afp4wfp4 import (
 from op_tests.triton_tests.test_gemm_afp4wfp4 import run_torch as run_torch_fp4
 from op_tests.triton_tests.test_gemm_a16w16 import generate_gemm_a16w16_inputs
 import torch.nn.functional as F
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
 def run_torch(
@@ -83,6 +84,10 @@ def get_x_vals():
 @pytest.mark.parametrize("skip_reduce", [True, False])
 @pytest.mark.parametrize("fp4_shuffle", [True, False])
 def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):
+
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
     (
         x_fp4,
         w_fp4,
