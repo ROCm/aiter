@@ -32,7 +32,7 @@ def tensor_model_parallel_all_reduce(
 
 def tensor_model_parallel_fused_allreduce_rmsnorm(
     input_: torch.Tensor, weight_: torch.Tensor, eps: float
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     return get_tp_group().fused_allreduce_rmsnorm(input_, weight_, eps)
 
 
