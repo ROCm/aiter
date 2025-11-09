@@ -211,7 +211,8 @@ def _batched_gemm_a16wfp4_kernel(
             b_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_bsk
 
         if HAVE_Y_SCALE:
-            c = c * c_scale_rcprl
+            accumulator = accumulator * c_scale_rcprl
+
         c = accumulator.to(c_ptr.type.element_ty)
 
         # Write back the block of the output matrix C with masks.

@@ -99,7 +99,6 @@ def gemm_a16wfp4(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),
     )
-    _LOGGER.info(f"{config}")
     _gemm_a16wfp4_kernel[grid](
         x,
         w,
