@@ -158,7 +158,10 @@ def _gemm_a16wfp4_kernel(
                     other=0,
                 )
                 b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
+                    b_ptrs,
+                    mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2),
+                    other=0,
+                    cache_modifier=cache_modifier,
                 )
 
             a, a_scales = _mxfp4_quant_op(a_bf16, BLOCK_SIZE_K, BLOCK_SIZE_M, 32)
@@ -447,8 +450,10 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    if M < 32:
+    if M < 16:
         config = _get_config._config_dict[key]["small"]
+    elif M < 32:
+        config = _get_config._config_dict[key]["small_M16"]
     elif M <= 128:
         BLK_M = triton.next_power_of_2(M)
         if BLK_M == 32:
