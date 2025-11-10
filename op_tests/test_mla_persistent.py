@@ -518,8 +518,8 @@ parser.add_argument(
     "--max_split_per_batch",
     type=int,
     nargs="*",
-    default=[i for i in range(1, 80)],
-    help="""max split num for per batch.
+    default=32,
+    help="""kv seqlens max split num for per batch.
     e.g.: -ms 32""",
 )
 parser.add_argument(

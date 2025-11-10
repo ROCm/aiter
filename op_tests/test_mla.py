@@ -124,6 +124,7 @@ def test_mla(
     page_size,
     varlen,
     decode_qlen,
+    split_per_batch=None,
 ):
     ret = {}
 
@@ -377,6 +378,7 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
+            num_kv_splits=split_per_batch,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -423,6 +425,7 @@ def test_mla(
             sm_scale,
             q_scale=q_scale,
             kv_scale=kv_scale,
+            num_kv_splits=split_per_batch,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -567,6 +570,15 @@ parser.add_argument(
     e.g.: -n 16,1""",
 )
 parser.add_argument(
+    "-splits",
+    "--split_per_batch",
+    type=int,
+    nargs="*",
+    default=[None],
+    help="""kv seqlens split num for per batch.
+    e.g.: -ms 32""",
+)
+parser.add_argument(
     "--varlen",
     action="store_true",
     help="""variable kv seqlens per batch. Default: False.
@@ -583,8 +595,8 @@ if args.nhead is not None:
 
 for nhead, decode_qlen in list_nhead:
     df = []
-    for dtype, kvtype, ctx_len, batch_size in itertools.product(
-        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize
+    for dtype, kvtype, ctx_len, batch_size, split_per_batch in itertools.product(
+        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
     ):
         ret = test_mla(
             ctx_len,
@@ -599,6 +611,7 @@ for nhead, decode_qlen in list_nhead:
             args.block_size,
             varlen=args.varlen,
             decode_qlen=decode_qlen,
+            split_per_batch=split_per_batch,
         )
         df.append(ret)
     df = pd.DataFrame(df)

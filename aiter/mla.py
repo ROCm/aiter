@@ -181,14 +181,13 @@ def mla_decode_fwd(
 
     persistent_mode = work_meta_data is not None
 
-    if num_kv_splits_indptr is None and not persistent_mode:
-        num_kv_splits, mgc, num_kv_splits_indptr = get_meta_param(
-            None, bs, total_kv, nhead, max_seqlen_q, q.dtype
-        )
-
     io_transformed = False
 
     if not persistent_mode:
+        num_kv_splits, mgc, num_kv_splits_indptr = get_meta_param(
+            num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
+        )
+
         MAYBE_FINAL_OUT = True
 
         if nhead == 16 and max_seqlen_q == 1:
