@@ -60,6 +60,7 @@ def batched_gemm_afp4wfp4_pre_quant(
     By, _, _ = y.shape
     assert Bx == Bw == By
     Batch = Bx
+    w = w.transpose(1, 2)
 
     if config is None:
         config = _get_config(M, N, K)
