@@ -9,7 +9,7 @@ import triton
 from enum import Enum, auto
 import math
 from aiter.ops.triton.moe_routing.routing import GatherIndx, RoutingData, ScatterIndx
-from aiter.ops.triton._triton_kernels._moe_op_gemm_a4w4 import _moe_gemm_a4w4, _reduce_grouped, _downcast_to_static_fp4
+from aiter.ops.triton._triton_kernels._moe_op_gemm_a4w4 import _moe_gemm_a4w4, _reduce_grouped
 
 
 # -----------------------------------------------------------------------------
@@ -44,7 +44,10 @@ def allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, 
         y_rows = scatter_indx.src_indx.shape[0] // routing_data.n_expts_act # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
-    matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
+    if block_m == 16 or scatter_indx:
+        matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
+    else:
+        matmul_output = torch.zeros(matmul_shape, device=x.device, dtype=out_dtype)
     if scatter_indx or split_k > 1:
         final_output = torch.empty(final_shape, device=x.device, dtype=out_dtype)
     else:
@@ -58,7 +61,15 @@ def get_kernel_config(
     k,
     routing_data
 ):
-    block_m = routing_data.block_m
+    # tokens per expert
+    if routing_data is None:
+        tokens_per_expt = m
+    elif routing_data.expected_tokens_per_expt is None:
+        tokens_per_expt = max(1, m // routing_data.n_expts_tot)
+    else:
+        tokens_per_expt = routing_data.expected_tokens_per_expt
+
+    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
     group_m = 4
     num_xcds = 8
     xcd_swizzle = num_xcds
@@ -67,7 +78,7 @@ def get_kernel_config(
 
     split_k = 1
     if block_m == 16:
-        block_n = 128
+        block_n = 256
         block_k = 256
         num_warps = 4
     else:
@@ -104,34 +115,6 @@ def swizzle_scales(data):
     E = block_shape[0]
     data = data.reshape(E, N // 32, SCALE_K * 32)
     return data.transpose(-1, -2)
-
-
-def downcast_to_static_fp4(x: torch.Tensor, scale: torch.Tensor):
-    """
-    x: [M, N] (bf16/fp16/fp32)
-    scale: scalar tensor; static activation scale for encode/decode
-
-    Returns a packed uint8 [M, N//2] where each uint8 contains two FP4 em21  
-    """
-    M, N = x.shape
-    N_packed = (N + 1) // 2     # accomodate for odd N
-    y = torch.empty((M, N_packed), dtype=torch.uint8, device="cuda")
-
-    BLOCK_M = min(triton.next_power_of_2(M), 128)
-    if M <= 4096:
-        BLOCK_N = 32
-    else:
-        BLOCK_N = 64
-    grid_m = triton.cdiv(x.shape[0], BLOCK_M)
-    grid_n = triton.cdiv(x.shape[1], BLOCK_N)
-
-    _downcast_to_static_fp4[(grid_m, grid_n)](x, x.stride(0), x.stride(1),
-                                            y, y.stride(0), y.stride(1),
-                                            scale,
-                                            M, N, BLOCK_M, BLOCK_N,
-                                            num_warps=8)
-
-    return y
 
 
 def reduce_grouped(x: torch.Tensor, indx: torch.Tensor, out: torch.Tensor,
@@ -222,7 +205,7 @@ def moe_gemm_a4w4(x, w, x_scales, w_scales,
         stride_x_mx_k = 0
     # determine shapes
     M = x.shape[-2] if gather_indx is None else gather_indx.src_indx.shape[0]
-    K, N = x.shape[-1], w.shape[-1]
+    K, N = x.shape[-1] * 2, w.shape[-1]
     # compute optimization flags
     config = get_kernel_config(M, N, K, routing_data)
     if apply_swiglu and config["split_k"] > 1:
@@ -247,11 +230,11 @@ def moe_gemm_a4w4(x, w, x_scales, w_scales,
     expt_data = routing_data.expt_data
     block_m = config["block_m"]
     expt_hist = None if expt_data is None else expt_data.hist
-    expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
+    expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[block_m][-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
-    expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
+    expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map[block_m]
     # spmd grid
-    if unpadded_N and block_m == 16:
+    if unpadded_N:
         N = unpadded_N
     if unpadded_K and block_m == 16:
         K = unpadded_K
