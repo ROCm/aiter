@@ -958,7 +958,7 @@ def init_distributed_environment(
         # setting, where we can use rank as local rank
         if distributed_init_method == "env://":
             # local_rank = envs.LOCAL_RANK
-            local_rank = os.environ.get("LOCAL_RANK", "0")
+            local_rank = os.environ.get("LOCAL_RANK", rank)
         else:
             local_rank = rank
     global _WORLD
