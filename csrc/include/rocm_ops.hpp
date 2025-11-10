@@ -321,6 +321,7 @@ namespace py = pybind11;
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("out"),                                                                      \
+          py::arg("use_new"),                                                                  \
           py::arg("open_fp8_quant"),                                                           \
           py::arg("reg_buffer") = std::nullopt);                                               \
     m.def("fused_allreduce_rmsnorm",                                                           \

@@ -81,7 +81,7 @@ bool _is_weak_contiguous(torch::Tensor& t)
 }
 
 void _all_reduce(
-    fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, hipStream_t stream, bool open_fp8_quant)
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, hipStream_t stream, bool use_new, bool open_fp8_quant)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     TORCH_CHECK(_is_weak_contiguous(out));
@@ -91,7 +91,7 @@ void _all_reduce(
         fa->allreduce<float>(stream,
                              reinterpret_cast<float*>(inp.data_ptr()),
                              reinterpret_cast<float*>(out.data_ptr()),
-                             out.numel());
+                             out.numel(), use_new);
         break;
     }
     case at::ScalarType::Half: {
@@ -111,7 +111,7 @@ void _all_reduce(
             fa->allreduce<half>(stream,
                                 reinterpret_cast<half*>(inp.data_ptr()),
                                 reinterpret_cast<half*>(out.data_ptr()),
-                                out.numel());
+                                out.numel(), use_new);
         }
         break;
     }
@@ -120,7 +120,7 @@ void _all_reduce(
         fa->allreduce<__hip_bfloat16>(stream,
                                       reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
                                       reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
-                                      out.numel());
+                                      out.numel(), use_new);
         break;
     }
 #endif
@@ -132,6 +132,7 @@ void _all_reduce(
 void all_reduce(fptr_t _fa,
                 torch::Tensor& inp,
                 torch::Tensor& out,
+                bool use_new,
                 bool open_fp8_quant,
                 std::optional<torch::Tensor> reg_buffer)
 {
@@ -150,11 +151,11 @@ void all_reduce(fptr_t _fa,
                                 input_size,
                                 hipMemcpyDeviceToDevice,
                                 stream));
-        _all_reduce(_fa, reg_buffer.value(), out, stream, open_fp8_quant);
+        _all_reduce(_fa, reg_buffer.value(), out, stream, use_new, open_fp8_quant);
     }
     else
     {
-        _all_reduce(_fa, inp, out, stream, open_fp8_quant);
+        _all_reduce(_fa, inp, out, stream, use_new, open_fp8_quant);
     }
     
 
