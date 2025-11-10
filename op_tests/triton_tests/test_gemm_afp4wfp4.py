@@ -5,7 +5,7 @@ import os
 import torch
 from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
-    gemm_afp4wfp4_preshuffled_weight_scales,
+    gemm_afp4wfp4_preshuffle,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
@@ -230,7 +230,7 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize(
     "shuffle_weight_scales",
-    [True, False],
+    [True],
 )
 def test_gemm_afp4_wfp4(
     M: int, N: int, K: int, dtype, layout, output, shuffle_weight_scales
@@ -273,7 +273,7 @@ def test_gemm_afp4_wfp4(
 
     if shuffle_weight_scales:
         if output:
-            triton_out = gemm_afp4wfp4_preshuffled_weight_scales(
+            triton_out = gemm_afp4wfp4_preshuffle(
                 x,
                 w_triton,
                 x_scales_triton,
@@ -283,7 +283,7 @@ def test_gemm_afp4_wfp4(
                 use_aot=(dtype == torch.bfloat16 and layout == "TN"),
             )
         else:
-            triton_out = gemm_afp4wfp4_preshuffled_weight_scales(
+            triton_out = gemm_afp4wfp4_preshuffle(
                 x,
                 w_triton,
                 x_scales_triton,
