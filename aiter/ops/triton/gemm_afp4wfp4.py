@@ -326,7 +326,7 @@ def gemm_afp4wfp4_preshuffled_scales(
     return y
 
 
-def gemm_afp4wfp4_preshuffled_weight_scales(
+def gemm_afp4wfp4_preshuffle(
     x,
     w,
     x_scales,
@@ -498,3 +498,19 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
         )
 
     return y
+
+
+def gemm_afp4wfp4_preshuffled_weight_scales(
+    x,
+    w,
+    x_scales,
+    w_scales,
+    dtype: Optional[float] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+    use_aot: Optional[bool] = True,
+):
+    _LOGGER.info(
+        "gemm_afp4wfp4_preshuffled_weight_scales will be deprecated in future AITER release, please switch to gemm_afp4wfp4_preshuffle"
+    )
+    return gemm_afp4wfp4_preshuffle(x, w, x_scales, w_scales, dtype, y, config, use_aot)

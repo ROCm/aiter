@@ -1,7 +1,7 @@
 import torch
 import pytest
-from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
-    batched_gemm_afp4wfp4_pre_quant,
+from aiter.ops.triton.batched_gemm_a16wfp4 import (
+    batched_gemm_a16wfp4,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
@@ -9,9 +9,7 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 SCALE_GROUP_SIZE = 32
 
 
-def generate_batched_gemm_afp4wfp4_pre_quant_inputs(
-    B, M, N, K, dtype, layout="TN", output=False
-):
+def generate_batched_gemm_a16wfp4_inputs(B, M, N, K, dtype, layout="TN", output=False):
     """
     Returns:
         - x: (B, M, K)
@@ -175,20 +173,18 @@ def run_torch(x, w, w_scales, dtype):
 @pytest.mark.parametrize("B, M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
-def test_batched_gemm_afp4_wfp4_pre_quant(
-    B: int, M: int, N: int, K: int, layout, dtype
-):
+def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, x_scales, w_scales, out = generate_batched_gemm_afp4wfp4_pre_quant_inputs(
+    x, w, x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
         B, M, N, K, dtype, layout=layout, output=True
     )
 
     torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
-    batched_gemm_afp4wfp4_pre_quant(x, w, w_scales, dtype, out)
+    batched_gemm_a16wfp4(x, w, w_scales, dtype, out, transpose_bm=False, prequant=True)
 
     torch.testing.assert_close(torch_out, out)
