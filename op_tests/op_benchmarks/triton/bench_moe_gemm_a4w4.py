@@ -10,7 +10,7 @@ import torch
 import argparse
 from aiter.ops.triton.moe_routing.routing import routing
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.moe_op_gemm_a4w4 import moe_gemm_a4w4, swizzle_scales, downcast_to_static_fp4
+from aiter.ops.triton.moe_op_gemm_a4w4 import moe_gemm_a4w4, swizzle_scales
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
@@ -89,7 +89,6 @@ def quantize(x, dtype):
         fp8e4_dtype = torch.float8_e4m3fn if get_arch() != "gfx942" else torch.float8_e4m3fnuz
         x, scale = downcast_to_mxfp(x, fp8e4_dtype, axis=1)
         return x, scale
-    # TODO: implement dtype=fp4
     else:
         assert dtype == "mx4", f"{dtype=}"
         x, scale = downcast_to_mxfp(x.to(torch.bfloat16), torch.uint8, axis=1)
@@ -101,6 +100,8 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     dev = f"cuda:{rank}"
 
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
+    assert x_dtype == "mx4", f"FP4 (E2M1) is disabled for x_dtype, got {x_dtype}"
+    assert w_dtype == "mx4", f"FP4 (E2M1) is disabled for x_dtype, got {w_dtype}"
 
     # -- init data --
     # weights
@@ -122,31 +123,21 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     # -- benchmark --
     x_dtype_str = x_dtype
     x_dtype = torch.float8_e4m3fn
-    # special treatment of fp8_e4m3 on AMD CDNA3 because it uses fp8_e4m3fnuz
-    if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
-        x_dtype = torch.float8_e4m3fnuz
 
     reps = 100
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
     xg = x
-    if x_dtype_str == "fp4":
-        static_scale = torch.tensor(1e-4, device=dev)
     # run layer
     fpath = Path(tempfile.mktemp())
     proton.start(str(fpath), hook="triton")
     for i in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg)
         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
-        if x_dtype_str == "fp4":
-            x = downcast_to_static_fp4(x, static_scale)
-            x = moe_gemm_a4w4(x, w1, None, w1_scale, static_scale, static_scale, b1, rdata, gather_indx=gather_indx, swizzle_mx_scale=swizzle_mx_scale1, out_dtype=x_dtype, apply_swiglu=True)
-            x = moe_gemm_a4w4(x, w2, None, w2_scale, static_scale, None, b2, rdata, scatter_indx=scatter_indx, swizzle_mx_scale=swizzle_mx_scale2)
-        else:
-            assert x_dtype_str == "mx4"
-            x, _, x_scale = quantize(x, x_dtype_str)
-            x = moe_gemm_a4w4(x, w1, x_scale, w1_scale, None, None, b1, rdata, gather_indx=gather_indx, swizzle_mx_scale="CDNA4_SCALE", apply_swiglu=True)
-            x, _, x_scale = quantize(x, x_dtype_str)
-            x = moe_gemm_a4w4(x, w2, x_scale, w2_scale, None, None, b2, rdata, scatter_indx=scatter_indx, swizzle_mx_scale="CDNA4_SCALE")
+        assert x_dtype_str == "mx4"
+        x, x_scale = quantize(x, x_dtype_str)
+        x = moe_gemm_a4w4(x, w1, x_scale, w1_scale, None, None, b1, rdata, gather_indx=gather_indx, swizzle_mx_scale="CDNA4_SCALE", apply_swiglu=True)
+        x, x_scale = quantize(x, x_dtype_str)
+        x = moe_gemm_a4w4(x, w2, x_scale, w2_scale, None, None, b2, rdata, scatter_indx=scatter_indx, swizzle_mx_scale="CDNA4_SCALE")
     proton.finalize()
     return parse_profile(fpath.with_suffix(".hatchet"), useful_op_regex=op_regex, reps=reps)
 
@@ -187,7 +178,7 @@ def parse_args():
     parser.add_argument(
         "--act-dtype",
         type=str,
-        default="fp4",
+        default="mx4",
         help="Activation dtype, fp4 or mx4.",
     )
     args = parser.parse_args()
