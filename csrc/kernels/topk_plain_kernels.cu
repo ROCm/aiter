@@ -42,6 +42,7 @@
 #include "ck_tile/core.hpp"
 #include "dispatch_utils.h"
 #include "py_itfs_common.h"
+#include "quick_all_reduce_base.h"
 
 #define HIP_CHECK(val)                                \
     {                                                 \
@@ -771,38 +772,6 @@ using bf16x8_t  = uint16_t __attribute__((ext_vector_type(8)));
 using halfx8_t  = _Float16 __attribute__((ext_vector_type(8)));
 using index_t   = uint32_t;
 
-template <typename T, ck_tile::amd_buffer_coherence_enum coherence>
-__device__ __forceinline__ T buffer_load_dwordx4(const int32x4_t& src_wave_buffer_resource,
-                                                 index_t src_thread_addr_offset_bytes,
-                                                 index_t src_wave_addr_offset)
-{
-    static_assert(sizeof(T) == 16, "T must be 128 bits (4 dwords)");
-
-    int32x4_t tmp = ck_tile::llvm_amdgcn_raw_buffer_load_i32x4(src_wave_buffer_resource,
-                                                               src_thread_addr_offset_bytes,
-                                                               src_wave_addr_offset,
-                                                               static_cast<index_t>(coherence));
-    return __builtin_bit_cast(T, tmp);
-}
-
-template <typename ReturnT,
-          ck_tile::amd_buffer_coherence_enum coherence,
-          typename SrcT,
-          typename IdxT>
-__device__ __forceinline__ ReturnT
-buffer_load(const SrcT* p_src_wave,
-            IdxT base_idx0,          // index of the first element
-            IdxT element_space_size) // total number of elements in buffer
-{
-    static_assert(sizeof(ReturnT) == 16, "ReturnT must be 128 bits (4 dwords)");
-
-    const int32x4_t srsrc = ck_tile::make_wave_buffer_resource(
-        p_src_wave, static_cast<uint32_t>(element_space_size * sizeof(SrcT)));
-    const index_t voffset_bytes = static_cast<index_t>(base_idx0 * sizeof(SrcT));
-    ReturnT packed              = buffer_load_dwordx4<ReturnT, coherence>(srsrc, voffset_bytes, 0);
-    return packed;
-}
-
 } // namespace buffer_load_helpers
 
 // --- Wave-Level Priority Selection Primitives (AMD/HIP Optimized) ---
@@ -1423,7 +1392,8 @@ struct WaveTopkFilter
             reinterpret_cast<IdxT*>(lds_buf + vals_size) + wave_id * utils::WAVE_SIZE;
     }
 
-    __device__ void sort(const T* __restrict__ in, IdxT start, IdxT end)
+    __device__ void
+    sort(const T* __restrict__ in, IdxT batch_start, IdxT start, IdxT end, IdxT total_len)
     {
         static_assert(utils::is_supported_type_v<T>,
                       "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
@@ -1446,14 +1416,17 @@ struct WaveTopkFilter
                                                buffer_load_helpers::bf16x8_t,
                                                buffer_load_helpers::halfx8_t>;
 
+            aiter::BufferResource src_buffer(const_cast<T*>(in), batch_start * sizeof(T));
+            uint32_t src_offset = (batch_start + start) * sizeof(T) + tid * sizeof(VecType);
+
             VecType arr[repetition];
             for(IdxT i = start + tid * tile; i < tail; i += stride * tile)
             {
 #pragma unroll
                 for(IdxT idx = 0; idx < repetition; ++idx)
                 {
-                    arr[idx] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
-                        in, i + idx * elements, n);
+                    arr[idx] = aiter::buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
+                    src_offset += stride * sizeof(VecType);
                 }
 #pragma unroll
                 for(IdxT idx = 0; idx < tile; ++idx)
@@ -1471,30 +1444,30 @@ struct WaveTopkFilter
         }
         else if(std::is_same_v<T, float> || std::is_same_v<T, int>)
         {
-            constexpr IdxT repetition = 2;
-            constexpr IdxT tile       = elements * repetition;
+            constexpr IdxT tile       = elements;
             const IdxT block_tile     = blockDim.x * tile;
             const IdxT end_aligned    = start + utils::round_up_to_multiple_of(n, block_tile);
 
             using VecType = std::conditional_t<std::is_same_v<T, float>,
                                                buffer_load_helpers::floatx4_t,
                                                buffer_load_helpers::int32x4_t>;
-            VecType arr[repetition];
+
+            aiter::BufferResource src_buffer(const_cast<T*>(in), total_len * sizeof(T));
+            uint32_t src_offset = (batch_start + start) * sizeof(T) + tid * sizeof(VecType);
+
+            VecType arr[2];
+            arr[0] = aiter::buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
             for(IdxT i = start + tid * tile; i < end_aligned; i += stride * tile)
             {
-#pragma unroll
-                for(IdxT idx = 0; idx < repetition; ++idx)
-                {
-                    arr[idx] = buffer_load_helpers::buffer_load<VecType, cache_policy>(
-                        in, i + idx * elements, n);
-                }
+                src_offset += stride * sizeof(VecType);
+                arr[1] = aiter::buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
 #pragma unroll
                 for(IdxT idx = 0; idx < tile; ++idx)
                 {
-                    const auto val =
-                        (i + idx < end) ? arr[idx / elements][idx % elements] : buffer_.sentinel;
+                    const auto val = (i + idx < end) ? arr[0][idx] : buffer_.sentinel;
                     filter_and_stage(val, i + idx);
                 }
+                arr[0] = arr[1];
             }
         }
 
@@ -1643,20 +1616,23 @@ struct BlockTopkFilter
     }
 
     __device__ void operator()(const T* __restrict__ in,
+                               IdxT batch_start,
                                T* __restrict__ out,
                                IdxT* __restrict__ out_idx,
                                IdxT start,
-                               IdxT end)
+                               IdxT end,
+                               IdxT total_len)
     {
-        sort(in, start, end);
+        sort(in, batch_start, start, end, total_len);
         reduce();
         store(out, out_idx);
     }
 
     // Sort the results within each wave
-    __device__ void sort(const T* __restrict__ in, IdxT start, IdxT end)
+    __device__ void
+    sort(const T* __restrict__ in, IdxT batch_start, IdxT start, IdxT end, IdxT total_len)
     {
-        wave_topk_.sort(in, start, end);
+        wave_topk_.sort(in, batch_start, start, end, total_len);
     }
 
     // Reduce the results via LDS
@@ -1715,15 +1691,18 @@ __global__ void __launch_bounds__(512, 2) topk_filter_kernel(const T* __restrict
     const int block_id_in_a_batch = blockIdx.x % block_per_batch;
     // TODO: Consider multiple blocks
     const IdxT len_per_block = len;
+    const IdxT batch_start   = batch_id * len;
     IdxT start               = block_id_in_a_batch * len_per_block;
     IdxT end                 = std::min(start + len_per_block, len);
 
     BlockTopkFilter<capacity, greater, T, IdxT> topk(k, sentinel, lds_buf);
-    topk(in + static_cast<size_t>(batch_id) * len,
+    topk(in,
+         batch_start,
          out + static_cast<size_t>(blockIdx.x) * k,
          out_idx + static_cast<size_t>(blockIdx.x) * k,
          start,
-         end);
+         end,
+         batch_size * len);
 }
 
 // WaveTopkMerge: Iteratively merges pre-sorted k-sized chunks
