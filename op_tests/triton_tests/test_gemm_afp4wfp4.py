@@ -230,7 +230,7 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize(
     "shuffle_weight_scales",
-    [True],
+    [True, False],
 )
 def test_gemm_afp4_wfp4(
     M: int, N: int, K: int, dtype, layout, output, shuffle_weight_scales
