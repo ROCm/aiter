@@ -3,12 +3,13 @@ import functools
 import json
 import os
 import triton
+import torch
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from triton import language as tl
-
+from aiter.ops.triton.utils.device_info import get_num_xcds
 _LOGGER = AiterTritonLogger()
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -20,7 +21,7 @@ from triton.experimental.gluon import language as gl
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@gluon.jit
 def _gemm_a8w8_kernel(
     # Pointers to matrices
     a_ptr,
@@ -76,9 +77,41 @@ def _gemm_a8w8_kernel(
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
-    pid = remap_xcd(pid, GRID_MN)
+    ## pid remapping on xcds
+    # Number of pids per XCD in the new arrangement
+    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+    # When GRID_MN cannot divide NUM_XCDS, some xcds will have
+    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
+    # We calculate the number of xcds that have pids_per_xcd pids as
+    # tall_xcds
+    tall_xcds = GRID_MN % NUM_XCDS
+    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+    # Compute current XCD and local pid within the XCD
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    # Calculate new pid based on the new grouping
+    # Note that we need to consider the following two cases:
+    # 1. the current pid is on a tall xcd
+    # 2. the current pid is on a short xcd
+    if xcd < tall_xcds:
+        pid = xcd * pids_per_xcd + local_pid
+    else:
+        pid = (
+            tall_xcds * pids_per_xcd
+            + (xcd - tall_xcds) * (pids_per_xcd - 1)
+            + local_pid
+        )
 
-    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+    if GROUP_SIZE_M == 1:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + (pid % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
 
     threads_per_elem_mk: gl.constexpr = triton.cdiv(
         BLOCK_SIZE_M * BLOCK_SIZE_K // (NUM_WARPS * 64), 16
@@ -299,3 +332,93 @@ def _gemm_a8w8_kernel(
     gl.amd.cdna4.buffer_store(
         stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask
     )
+
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8W8.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    return _get_config._config_dict["any"]
+
+def gemm_a8w8(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    dtype: Optional[float] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+):
+    """
+    Computes 8 bit matrix multiplication Y = (X @ W^T) * (x_scale * w_scale) with optional bias.
+    INT8 inputs are scaled back to higher precision using per-tensor scale factors.
+
+    Args:
+        x (torch.Tensor): INT8 input matrix with shape (M, K).
+        w (torch.Tensor): INT8 weight matrix with shape (N, K), internally transposed.
+        x_scale (torch.Tensor): Scale factor for x with shape (M, 1) or (M,).
+        w_scale (torch.Tensor): Scale factor for w with shape (1, N) or (N,).
+        bias (Optional[torch.Tensor]): Bias vector with shape (N,).
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M).
+
+    Returns:
+        torch.Tensor: Output with shape (M, N) in higher precision format.
+    """
+
+    _LOGGER.info(
+        f"GEMM_A8W8: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+    )
+
+    # Check constraints.
+    assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
+
+    M, K = x.shape
+    N, K = w.shape
+
+    # Transpose w (kernel expects (K, N))
+    w = w.T
+
+    if y is None:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
+
+    if config is None:
+        config = _get_config(M, N, K)
+
+    grid = (
+        triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
+    )
+    _gemm_a8w8_kernel[grid](
+        x,
+        w,
+        x_scale,
+        w_scale,
+        bias,
+        y,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        y.stride(0),
+        y.stride(1),
+        bias is not None,
+        NUM_XCDS=get_num_xcds(),
+        NUM_WARPS=config["num_warps"],
+        **config,
+    )
+
+    return y
