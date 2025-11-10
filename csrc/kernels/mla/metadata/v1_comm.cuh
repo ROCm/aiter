@@ -236,7 +236,7 @@ public:
         p_seqlens_qo_indptr_(p_seqlens_qo_indptr)
     { }
 
-    CK_TILE_DEVICE constexpr bool is_unique()
+    CK_TILE_HOST_DEVICE static constexpr bool is_unique()
     {
         return Traits::kUniSeqlenQo >= 0;
     }
