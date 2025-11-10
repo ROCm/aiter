@@ -2214,6 +2214,81 @@ template <typename Op,
           int32_t RotateStyle,
           bool ReuseFreqsFrontPart,
           bool NopeFirst,
+          bool StrideDXEq1,
+          bool StrideDYEq1,
+          typename scalar_t,
+          typename scalar_f_t>
+__global__ void
+kn_entry_2c_value_sbhd_cached_indirect2_inplace(scalar_t* __restrict__ p_inout_x,
+                                                scalar_t* __restrict__ p_inout_y,
+                                                const scalar_t* __restrict__ p_value,
+                                                scalar_t* __restrict__ p_cache_y,
+                                                scalar_t* __restrict__ p_cache_value,
+                                                const scalar_f_t* __restrict__ p_cos,
+                                                const scalar_f_t* __restrict__ p_sin,
+                                                const int64_t* __restrict__ p_indirect_buffer_0,
+                                                const int64_t* __restrict__ p_indirect_buffer_1,
+                                                const int64_t* __restrict__ p_slot_mapping,
+                                                const int32_t max_position,
+                                                const int32_t block_size,
+                                                const int32_t x,
+                                                const int32_t size_h_x,
+                                                const int32_t size_h_y,
+                                                const int32_t size_h_v,
+                                                const int32_t size_d,
+                                                const int32_t size_f, // size of last dimension of freqs.
+                                                const int32_t stride_x_s,
+                                                const int32_t stride_x_b,
+                                                const int32_t stride_x_h,
+                                                const int32_t stride_x_d,
+                                                const int32_t stride_y_s,
+                                                const int32_t stride_y_b,
+                                                const int32_t stride_y_h,
+                                                const int32_t stride_y_d)
+{
+    const uint64_t sid    = blockIdx.x;
+    const uint64_t bid    = blockIdx.y;
+    const uint64_t ib_idx = sid * gridDim.y + bid;
+    const int64_t pos     = p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx];
+
+    if((pos >= 0) && (pos < max_position))
+    {
+        const uint64_t offset_x = sid * stride_x_s + bid * stride_x_b;
+        const uint64_t offset_y = sid * stride_y_s + bid * stride_y_b;
+        const int64_t offset_f  = pos * size_f;
+
+        Op::template apply_2c<RotateStyle,
+                              ReuseFreqsFrontPart,
+                              NopeFirst,
+                              true,
+                              StrideDXEq1,
+                              StrideDYEq1,
+                              StrideDXEq1,
+                              StrideDYEq1>(p_inout_x + offset_x,
+                                           p_inout_y + offset_y,
+                                           p_inout_x + offset_x,
+                                           p_inout_y + offset_y,
+                                           p_cos + offset_f,
+                                           p_sin + offset_f,
+                                           size_h_x,
+                                           size_h_y,
+                                           size_d,
+                                           size_f,
+                                           stride_x_h,
+                                           stride_x_d,
+                                           stride_y_h,
+                                           stride_y_d,
+                                           stride_x_h,
+                                           stride_x_d,
+                                           stride_y_h,
+                                           stride_y_d);
+    }
+}
+
+template <typename Op,
+          int32_t RotateStyle,
+          bool ReuseFreqsFrontPart,
+          bool NopeFirst,
           bool StrideDOutEq1,
           bool StrideDInEq1,
           typename scalar_t,
@@ -3491,6 +3566,111 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                          stride_oy_b,
                                          stride_oy_h,
                                          stride_oy_d););
+    }
+}
+
+template <typename Op,
+          int32_t RotateStyle,
+          bool ReuseFreqsFrontPart,
+          bool NopeFirst,
+          typename scalar_t,
+          typename scalar_f_t>
+void dispatch_2c_value_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
+                                            scalar_t* __restrict__ p_output_y,
+                                            const scalar_t* __restrict__ p_input_x,
+                                            const scalar_t* __restrict__ p_input_y,
+                                            const scalar_t* __restrict__ p_value,
+                                            scalar_t* __restrict__ p_cache_y,
+                                            scalar_t* __restrict__ p_cache_value,
+                                            const scalar_f_t* __restrict__ p_cos,
+                                            const scalar_f_t* __restrict__ p_sin,
+                                            const int64_t* __restrict__ p_indirect_buffer_0,
+                                            const int64_t* __restrict__ p_indirect_buffer_1,
+                                            const int64_t* __restrict__ p_slot_mapping,
+                                            const int32_t max_position,
+                                            const int32_t block_size,
+                                            const int32_t x,
+                                            const int32_t size_s,
+                                            const int32_t size_b,
+                                            const int32_t size_h_x,
+                                            const int32_t size_h_y,
+                                            const int32_t size_h_v,
+                                            const int32_t size_d,
+                                            const int32_t size_f, // size of last dimension of freqs.
+                                            const int32_t stride_ix_s,
+                                            const int32_t stride_ix_b,
+                                            const int32_t stride_ix_h,
+                                            const int32_t stride_ix_d,
+                                            const int32_t stride_iy_s,
+                                            const int32_t stride_iy_b,
+                                            const int32_t stride_iy_h,
+                                            const int32_t stride_iy_d,
+                                            const int32_t stride_ox_s,
+                                            const int32_t stride_ox_b,
+                                            const int32_t stride_ox_h,
+                                            const int32_t stride_ox_d,
+                                            const int32_t stride_oy_s,
+                                            const int32_t stride_oy_b,
+                                            const int32_t stride_oy_h,
+                                            const int32_t stride_oy_d)
+{
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    const dim3 grid(size_s, size_b);
+    const dim3 block(C10_WARP_SIZE, size_h_x < 16 ? 4 : 8);
+
+    if((p_output_x == p_input_x) && (p_output_y == p_input_y))
+    {
+        assert(stride_ix_s == stride_ox_s);
+        assert(stride_ix_b == stride_ox_b);
+        assert(stride_ix_h == stride_ox_h);
+        assert(stride_ix_d == stride_ox_d);
+        assert(stride_iy_s == stride_oy_s);
+        assert(stride_iy_b == stride_oy_b);
+        assert(stride_iy_h == stride_oy_h);
+        assert(stride_iy_d == stride_oy_d);
+
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+            RotateStyle,
+            stride_ix_d,
+            stride_iy_d,
+            kn_entry_2c_value_sbhd_cached_indirect2_inplace<Op,
+                                                            RotateStyle,
+                                                            ReuseFreqsFrontPart,
+                                                            NopeFirst,
+                                                            Stride0Eq1,
+                                                            Stride1Eq1>
+            <<<grid, block, 0, stream>>>(p_output_x,
+                                         p_output_y,
+                                         p_value,
+                                         p_cache_y,
+                                         p_cache_value,
+                                         p_cos,
+                                         p_sin,
+                                         p_indirect_buffer_0,
+                                         p_indirect_buffer_1,
+                                         p_slot_mapping,
+                                         max_position,
+                                         block_size,
+                                         x,
+                                         size_h_x,
+                                         size_h_y,
+                                         size_h_v,
+                                         size_d,
+                                         size_f,
+                                         stride_ix_s,
+                                         stride_ix_b,
+                                         stride_ix_h,
+                                         stride_ix_d,
+                                         stride_iy_s,
+                                         stride_iy_b,
+                                         stride_iy_h,
+                                         stride_iy_d););
+    }
+    else
+    {
+        TORCH_CHECK(false,
+                    "No corresponding kernel yet");
     }
 }
 

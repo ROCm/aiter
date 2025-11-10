@@ -325,6 +325,31 @@ void rope_cached_positions_offsets_2c_fwd_impl(
             stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d););
 }
 
+/**
+ * @brief Compute Rotational Positional Encoding on 2 channels: @param input_x and @param input_y. Results are written
+ *        in @param output_x and @param output_y respectively. Then, cache rotated @param output_y to @param key_cache
+ *        and @param value to @param value_cache.
+ *        Cosine and sine of frequency should have been calculated and specified in @param cos and @param sin.
+ *        @param positions and @param offsets are indirect buffers storing the index of value in @param cos and
+ *        @param sin used to calculate with current input element. The corresponding values in @param positions and
+ *        @param offsets are added together to get the final index. @param slot_mapping is for kvcache location, 
+ *        and @param asm_layout for kvcache layout.
+ *
+ * @param output_x     [s, b, h, d]
+ * @param output_y     [s, b, h, d]
+ * @param input_x      [s, b, h, d]
+ * @param input_y      [s, b, h, d]
+ * @param value        [s, b, h, d]
+ * @param key_cache    [num_blocks, h, d/x, block_size, x]
+ * @param value_cache  [num_blocks, h, d, block_size]
+ * @param cos          [max_pos, 1, 1, d // 2] if @param reuse_freqs_front_part else [max_pos, 1, 1, d]
+ * @param sin          [max_pos, 1, 1, d // 2] if @param reuse_freqs_front_part else [max_pos, 1, 1, d]
+ * @param positions    [s, b]
+ * @param offsets      [s, b]
+ * @param rotate_style 0: NEOX style, 1: GPT-J style
+ * @param nope_first   If true, back part in last dimension of input is rotated. Otherwise, the front part is rotated.
+ * @param slot_mapping [s*b]
+ */
 void rope_cached_positions_offsets_2c_fwd_cachekv_impl(
     torch::Tensor&       output_x,                  // [s, b, h, d]
     torch::Tensor&       output_y,                  // [s, b, h, d]
@@ -344,5 +369,72 @@ void rope_cached_positions_offsets_2c_fwd_cachekv_impl(
     const bool           asm_layout
 )
 {
-    
+    // Get sizes of input and output
+    const int32_t size_s     = min(min(input_x.size(0), positions.size(0)), offsets.size(0));
+    const int32_t size_b     = min(min(input_x.size(1), positions.size(1)), offsets.size(1));
+    const int32_t size_h_x   = input_x.size(2);
+    const int32_t size_h_y   = input_y.size(2);
+    const int32_t size_h_v   = value.size(2);
+    const int32_t size_d     = input_x.size(3);
+    const int32_t size_f     = cos.size(3);
+    const int32_t block_size = key_cache.size(3);
+    const int32_t x          = key_cache.size(4);
+
+    // Get strides of input
+    const int32_t stride_ix_s = input_x.stride(0);
+    const int32_t stride_ix_b = input_x.stride(1);
+    const int32_t stride_ix_h = input_x.stride(2);
+    const int32_t stride_ix_d = input_x.stride(3);
+    const int32_t stride_iy_s = input_y.stride(0);
+    const int32_t stride_iy_b = input_y.stride(1);
+    const int32_t stride_iy_h = input_y.stride(2);
+    const int32_t stride_iy_d = input_y.stride(3);
+    const int32_t stride_iv_s = value.stride(0);
+    const int32_t stride_iv_b = value.stride(1); // value stride in cache kernel
+    const int32_t stride_iv_h = value.stride(2);
+    const int32_t stride_iv_d = value.stride(3);
+
+    // Get strides of output
+    const int32_t stride_ox_s = output_x.stride(0);
+    const int32_t stride_ox_b = output_x.stride(1);
+    const int32_t stride_ox_h = output_x.stride(2);
+    const int32_t stride_ox_d = output_x.stride(3);
+    const int32_t stride_oy_s = output_y.stride(0);
+    const int32_t stride_oy_b = output_y.stride(1);
+    const int32_t stride_oy_h = output_y.stride(2);
+    const int32_t stride_oy_d = output_y.stride(3);
+
+    // Get strides of positions and offsets
+    assert(1 == positions.stride(1) && 2 == positions.dim());
+    assert(1 == offsets.stride(1)   && 2 == offsets.dim());
+    const int32_t max_position = cos.size(0);
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input_x));
+    DISPATCH_ROPE_TYPES_PARAMS(
+        input_x.scalar_type(),
+        cos.scalar_type(),
+        rotate_style,
+        reuse_freqs_front_part,
+        nope_first,
+        "dispatch_2c_value_sbhd_cached_indirect2<OpCachedFwd, ...>",
+        dispatch_2c_value_sbhd_cached_indirect2<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+            output_x.data_ptr<scalar_t_0>(),
+            output_y.data_ptr<scalar_t_0>(),
+            input_x.data_ptr<scalar_t_0>(),
+            input_y.data_ptr<scalar_t_0>(),
+            value.data_ptr<scalar_t_0>(),
+            key_cache.data_ptr<scalar_t_0>(),
+            value_cache.data_ptr<scalar_t_0>(),
+            cos.data_ptr<scalar_t_1>(),
+            sin.data_ptr<scalar_t_1>(),
+            positions.data_ptr<int64_t>(),
+            offsets.data_ptr<int64_t>(),
+            slot_mapping.data_ptr<int64_t>(),
+            max_position, block_size, x,
+            size_s, size_b, size_h_x, size_h_y, size_h_v, size_d,
+            size_f, // size of last dimension of freqs.
+            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+            stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+            stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d););
 }
