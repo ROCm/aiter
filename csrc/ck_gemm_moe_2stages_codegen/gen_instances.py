@@ -625,7 +625,6 @@ class ck_moe_2stage_gemm_codegen:
 
         f_lookUpTable = os.path.join(self.working_path, "gemm_moe_ck2stages_lookup.h")
 
-        # breakpoint()
         with open(f_lookUpTable, "a") as f_lookup:
             for kernel in kernel_list:
                 ## generate instance
@@ -638,7 +637,7 @@ class ck_moe_2stage_gemm_codegen:
                 if self.quant_type in [4, 5]:
                     quanttype = "_blockscale"
                 elif "FP4" in self.a_dtype:
-                    if "bns" in tag:
+                    if "bns" in self.a_dtype:
                         quanttype = "_mxfp4_bns"
                     else:
                         quanttype = "_mxfp4"
