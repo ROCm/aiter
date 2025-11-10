@@ -41,3 +41,4 @@ def test_ff_a16w16_gated(
         activation=activation,
         y_init="empty",
     )
+
