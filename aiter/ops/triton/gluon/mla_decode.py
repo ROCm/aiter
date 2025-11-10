@@ -985,7 +985,7 @@ def _fwd_grouped_kernel_stage1_n32_prefetch_k(
         # threads_per_warp=[16, 4],
         # warps_per_cta=[4, 1],
         # order=[1, 0],
-        size_per_thread=[4, 8],  # 64 * 512
+        size_per_thread=[2, 8],  # 64 * 512
         threads_per_warp=[8, 8],
         warps_per_cta=[1, 4],
         order=[1, 0],
@@ -1004,12 +1004,12 @@ def _fwd_grouped_kernel_stage1_n32_prefetch_k(
         order=[1, 0],
     )
 
-    # blocked_k: gl.constexpr = gl.DistributedLinearLayout( # 128x256
-    #     reg_bases=((0,0,0,1), (0,0,0,2), (0,0,0,4), (0,1,0,0), (0,8,0,0), (4,0,0,0), (8,0,0,0)), # 16 x 8
-    #     lane_bases=((0,0,1,0), (0,0,2,0), (0,0,4,0), (0,0,8,0), (0,2,0,0), (0,4,0,0)), # 64
-    #     warp_bases=((1,0,0,0), (2,0,0,0)), # 4
+    # blocked_ld_k_nope_kn: gl.constexpr = gl.DistributedLinearLayout( # 128x256
+    #     reg_bases=((0, 1), (0, 2), (0, 4), (0, 8), (1, 0), (2, 0), (4, 0)), # 16 x 8
+    #     lane_bases=((0, 1), (0, 8), (1, 0), (8, 0)),
+    #     warp_bases=((0, 1), (0, 4), (1, 0)), # 4
     #     block_bases=[], # 8
-    #     shape=[64, 512],
+    #     shape=[32, 256],
     # )
 
     blocked_ld_k_rope_kn: gl.constexpr = gl.BlockedLayout(  # max 16 * 576 for per wave
@@ -1333,7 +1333,432 @@ def _fwd_grouped_kernel_stage1_n32_prefetch_k(
         cur_k1 = smem_kv1.load(layout=dot_k_layout)
         cur_k2 = smem_kv2.load(layout=dot_k_layout)
 
-    if True:
+    # smem_kv1 = smem_kv1.permute([1, 0])
+    # smem_kv2 = smem_kv2.permute([1, 0])
+    smem_kv1 = smem_kv1._reinterpret(
+        K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
+    smem_kv2 = smem_kv2._reinterpret(
+        K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
+
+    smem_kv1.store(kv1)
+    smem_kv2.store(kv2)
+
+    qk = gl.amd.cdna3.mfma(q0, cur_k1, zeros)
+    qk = gl.amd.cdna3.mfma(q1, cur_k2, qk)
+
+    cur_k_pe = smem_k_rope.load(layout=dot_k_layout)
+
+    qk = gl.amd.cdna3.mfma(q_pe, cur_k_pe, qk)
+
+    cur_k1 = smem_kv1.load(layout=dot_v_layout)
+    cur_k2 = smem_kv2.load(layout=dot_v_layout)
+
+    qk *= sm_scale
+
+    n_e_max = gl.convert_layout(gl.max(qk, 1), gl.SliceLayout(1, mfma_layout_qk))
+
+    n_e_max = gl.maximum(n_e_max, e_max)
+    re_scale = tl.math.exp2((e_max - n_e_max) * log2e)
+    p = tl.math.exp2((qk - n_e_max[:, None]) * log2e)
+    smem_p.store(p.to(q0.dtype))
+
+    acc1 = acc1 * re_scale[:, None]
+    acc2 = acc2 * re_scale[:, None]
+    e_sum = e_sum * re_scale + gl.sum(p, 1)
+    cur_p = smem_p.load(layout=dot_p_layout)
+    e_max = n_e_max
+
+    acc1 = gl.amd.cdna3.mfma(cur_p, cur_k1, acc1)
+    acc2 = gl.amd.cdna3.mfma(cur_p, cur_k2, acc2)
+
+    smem_kv1._keep_alive()
+    smem_kv2._keep_alive()
+
+    acc = gl.join(acc1, acc2)
+    acc  = gl.permute(acc, (0, 2, 1))
+    acc = gl.reshape(acc, (BLOCK_H, BLOCK_C))
+    acc = gl.convert_layout(acc, mfma_layout_kv)
+
+    smem_o = gl.allocate_shared_memory(
+        Att_Out.type.element_ty, [BLOCK_H, kv_lora_rank], layout=shared_q
+    )
+
+    e_sum = 1 / e_sum
+    smem_o.store(acc * e_sum[:, None])
+    # smem_o.store(acc)
+    cur_o = smem_o.load(layout=blocked_q_nope_mk)
+
+    offs_mid_o = (
+        cur_batch * stride_mid_ob
+        + cur_head[:, None] * stride_mid_oh
+        + split_kv_id * stride_mid_os
+        + offs_c[None, :]
+    )
+    # offs_mid_o = (
+    #     cur_batch * stride_mid_ob
+    #     + offs_om[:, None] * stride_mid_oh
+    #     + split_kv_id * stride_mid_os
+    #     + offs_on[None, :]
+    # )
+
+    gl.amd.cdna3.buffer_store(
+        stored_value=cur_o,
+        # stored_value=acc / e_sum[:, None],
+        ptr=Att_Out,
+        offsets=offs_mid_o,
+        # mask=(mask_om[:, none]) & (mask_on[none, :]),
+    )
+
+    offs_mid_lse = (
+        cur_batch * stride_mid_lse_b
+        + offs_om * stride_mid_lse_h
+        + split_kv_id * stride_mid_lse_s 
+    )
+
+    gl.amd.cdna3.buffer_store(
+        stored_value=e_max - gl.log(e_sum),
+        ptr=Att_Lse,
+        offsets=offs_mid_lse,
+        # mask=mask_om,
+    )
+
+@gluon.jit
+def _fwd_grouped_kernel_stage1_n32_prefetch_k_fp8(
+    Q,  # Holds [Q_NOPE; Q_PE], b x h x (d+r)
+    K_Buffer,  # Holds [KV; K_PE], b*s x (c+r)
+    V_buffer,  # Holds [KV], b*s x (c)
+    sm_scale,
+    kv_indptr,
+    kv_indices,
+    Att_Out,  # b x h x NUM_KV_SPLITS x (kv_lora_rank)
+    Att_Lse,  # b x h x NUM_KV_SPLITS x (1)
+    stride_qb,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_vbs,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_mid_lse_b,
+    stride_mid_lse_h,
+    stride_mid_lse_s,
+    kv_lora_rank: gl.constexpr,
+    qk_rope_head_dim: gl.constexpr,
+    kv_group_num: gl.constexpr,
+    q_head_num: gl.constexpr,
+    batch: gl.constexpr,
+    logit_cap: gl.constexpr,
+    max_qo_len: gl.constexpr,
+    BLOCK_C: gl.constexpr,
+    BLOCK_R: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    num_q_head_blk = gl.cdiv(q_head_num, BLOCK_H)
+
+    pid_head_kv_split = pid % (num_q_head_blk * NUM_KV_SPLITS)
+    pid_head_kv_split = remap_xcd(pid_head_kv_split, (num_q_head_blk * NUM_KV_SPLITS))
+
+    cur_head_id = pid_head_kv_split % num_q_head_blk
+    split_kv_id = (pid_head_kv_split // num_q_head_blk) % NUM_KV_SPLITS
+
+    log2e: gl.constexpr = 1.4426950408889634
+
+    cur_batch = (pid // (num_q_head_blk * NUM_KV_SPLITS)) % batch
+
+    cur_batch_kv = cur_batch # // (max_qo_len // 2)
+    cur_batch_kv_start_idx = gl.load(kv_indptr + cur_batch_kv)
+    cur_batch_seq_len = gl.load(kv_indptr + cur_batch_kv + 1) - cur_batch_kv_start_idx
+
+    blocked_q_nope_mk: gl.constexpr = gl.BlockedLayout(  # max 64 * 512 in
+        # size_per_thread=[1, 128],  # 64 * 576
+        # threads_per_warp=[16, 4],
+        # warps_per_cta=[4, 1],
+        # order=[1, 0],
+        size_per_thread=[2, 8],  # 64 * 512
+        threads_per_warp=[8, 8],
+        warps_per_cta=[1, 4],
+        order=[1, 0],
+    )
+    blocked_q_rope_mk: gl.constexpr = gl.BlockedLayout(  # max 64 * 64 in
+        size_per_thread=[1, 4],  # 64 * 576
+        threads_per_warp=[16, 4],
+        warps_per_cta=[1, 4],
+        order=[1, 0],
+    )
+
+    blocked_ld_k_nope_kn: gl.constexpr = gl.BlockedLayout(  # max 16 * 576 for per wave
+        size_per_thread=[4, 8],  # 64 * 512
+        threads_per_warp=[8, 8],
+        warps_per_cta=[1, 4],
+        order=[1, 0],
+    )
+
+    # blocked_ld_k_nope_kn: gl.constexpr = gl.DistributedLinearLayout( # 128x256
+    #     reg_bases=((0, 1), (0, 2), (0, 4), (0, 8), (1, 0), (2, 0), (4, 0)), # 16 x 8
+    #     lane_bases=((0, 1), (0, 8), (1, 0), (8, 0)),
+    #     warp_bases=((0, 1), (0, 4), (1, 0)), # 4
+    #     block_bases=[], # 8
+    #     shape=[32, 256],
+    # )
+
+    blocked_ld_k_rope_kn: gl.constexpr = gl.BlockedLayout(  # max 16 * 576 for per wave
+        # size_per_thread=[1, 4],
+        # threads_per_warp=[16, 4],
+        # warps_per_cta=[1, 4],
+        # order=[0, 1],
+        size_per_thread=[1, 8],  # 64 * 576
+        threads_per_warp=[32, 2],
+        warps_per_cta=[1, 4],
+        order=[1, 0],
+        # size_per_thread=[8, 1],
+        # threads_per_warp=[4, 16],
+        # warps_per_cta=[4, 1],
+        # order=[0, 1],
+    )
+    # mfma_layout_a_linear: gl.constexpr = gl.DistributedLinearLayout( # 64x128
+    #     reg_bases=((0,1), (0,2), (0,4), (0,8), (16,0), (32,0), (0,64)),
+    #     lane_bases=((1,0), (2,0), (4,0), (8,0), (0,16), (0,32)),
+    #     warp_bases=((0,0), (0,0)),
+    #     block_bases=[],
+    #     shape=[64, 128],
+    # )
+    # mfma_layout_b_linear: gl.constexpr = gl.DistributedLinearLayout( # 128x256
+    #     reg_bases=((1,0), (2,0), (4,0), (8,0), (0,64), (0,128), (64,0)),
+    #     lane_bases=((0,1), (0,2), (0,4), (0,8), (16,0), (32,0)),
+    #     warp_bases=((0,16), (0,32)),
+    #     block_bases=[],
+    #     shape=[128, 256],
+    # )
+
+    shared_q: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=8, per_phase=1, max_phase=16, order=[1, 0]
+    )
+    shared_k: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=8, per_phase=1, max_phase=16, order=[0, 1]
+    )
+    shared_v: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=8, per_phase=1, max_phase=16, order=[1, 0]
+    )
+
+    # smem_k_rope_2 = gl.allocate_shared_memory(
+    #     K_Buffer.type.element_ty, [qk_rope_head_dim, 16], layout=shared_k
+    # )
+
+    smem_q0_nope = gl.allocate_shared_memory(
+        Q.type.element_ty, [BLOCK_H, kv_lora_rank // 2], layout=shared_q
+    )
+    smem_q1_nope = gl.allocate_shared_memory(
+        Q.type.element_ty, [BLOCK_H, kv_lora_rank // 2], layout=shared_q
+    )
+    smem_q_rope = gl.allocate_shared_memory(
+        Q.type.element_ty, [BLOCK_H, qk_rope_head_dim], layout=shared_q
+    )
+
+    smem_p = gl.allocate_shared_memory(
+        Q.type.element_ty, [BLOCK_H, BLOCK_N], layout=shared_q
+    )
+
+    mfma_layout_qk: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+    )
+    mfma_layout_kv: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+    )
+
+    dot_q_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout_qk, k_width=16
+    )
+    dot_k_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout_qk, k_width=16
+    )
+
+    dot_p_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout_kv, k_width=4
+    )
+    dot_v_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout_kv, k_width=4
+    )
+
+    if BLOCK_H < kv_group_num:
+        VALID_BLOCK_H: gl.constexpr = BLOCK_H
+    else:
+        VALID_BLOCK_H: gl.constexpr = kv_group_num
+
+    cur_head = cur_head_id * VALID_BLOCK_H + gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope_mk)
+    )
+    mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    mask_h = mask_h & (cur_head < q_head_num)
+
+    cur_N = cur_head_id * VALID_BLOCK_H + gl.arange(
+        0, BLOCK_N, layout=gl.SliceLayout(1, blocked_ld_k_nope_kn)
+    )
+
+    cur_N_pe = cur_head_id * VALID_BLOCK_H + gl.arange(
+        0, BLOCK_N, layout=gl.SliceLayout(1, blocked_ld_k_rope_kn)
+    )
+
+    cur_head_pe = gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_rope_mk)
+    )
+    mask_h_pe = cur_head_pe < VALID_BLOCK_H
+    mask_h_pe = mask_h_pe & (cur_head_pe < q_head_num)
+
+    offs_c = gl.arange(
+        0, BLOCK_C, layout=gl.SliceLayout(0, blocked_q_nope_mk)
+    )
+
+    offs_om = gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout_kv)
+    )
+    mask_om = offs_om < VALID_BLOCK_H
+    mask_om = mask_om & (offs_om < q_head_num)
+    offs_on = gl.arange(
+        0, BLOCK_C, layout=gl.SliceLayout(0, mfma_layout_kv)
+    )
+    mask_on = offs_on < kv_lora_rank
+
+    offs_qk_r = gl.arange(
+        kv_lora_rank,
+        kv_lora_rank + BLOCK_R,
+        layout=gl.SliceLayout(0, blocked_q_rope_mk)
+    )  # to get the k_pe
+
+    # offs_k_c = gl.arange(
+    #     0, BLOCK_C, layout=gl.SliceLayout(0, blocked_ld_k_nope_kn)
+    # )
+    offs_k_c = gl.arange(
+        0, 256, layout=gl.SliceLayout(0, blocked_ld_k_nope_kn)
+    )
+    offs_k_r = gl.arange(
+        kv_lora_rank,
+        kv_lora_rank + BLOCK_R,
+        layout=gl.SliceLayout(0, blocked_ld_k_rope_kn)
+    )  # to get the k_pe
+
+    off_q_pe = (
+        cur_batch * stride_qb + cur_head_pe[:, None] * stride_qh + offs_qk_r[None, :]
+    )
+    offs_q = cur_batch * stride_qb + cur_head[:, None] * stride_qh + offs_c[None, :]
+
+    mask_c = offs_c < kv_lora_rank
+    mask_k_c = offs_k_c < kv_lora_rank
+    mask_qk_r = offs_qk_r < (kv_lora_rank + qk_rope_head_dim)
+    mask_k_r = offs_k_r < (kv_lora_rank + qk_rope_head_dim)
+
+    kv_len_per_split = gl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+    q = gl.amd.cdna3.buffer_load(
+        ptr=Q,
+        offsets=offs_q,
+        mask=(mask_h[:, None]) & (mask_c[None, :]),
+    )
+    q_pe = gl.amd.cdna3.buffer_load(
+        ptr=Q,
+        offsets=off_q_pe,
+        mask=(mask_h_pe[:, None]) & (mask_qk_r[None, :]),
+    )
+    kv_pe_loc = gl.load(
+        kv_indices + split_kv_start + cur_N_pe + cur_batch_kv_start_idx,
+    )
+
+    kv_loc = gl.load(
+        kv_indices + split_kv_start + cur_batch_kv_start_idx + cur_N,
+    )
+
+    q = gl.reshape(q, [BLOCK_H, 2, BLOCK_C // 2])
+    q = gl.permute(q, (0, 2, 1))
+    q0, q1 = gl.split(q)
+
+    smem_q0_nope.store(q0)
+    smem_q1_nope.store(q1)
+    q0 = smem_q0_nope.load(layout=dot_q_layout)
+    q1 = smem_q1_nope.load(layout=dot_q_layout)
+
+    smem_q_rope.store(q_pe)
+    q_pe = smem_q_rope.load(layout=dot_q_layout)
+
+    smem_q0_nope._keep_alive()
+    smem_q1_nope._keep_alive()
+    smem_q_rope._keep_alive()
+
+    # smem_v = gl.allocate_shared_memory(
+    #     K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_k
+    # )
+    smem_k_rope = gl.allocate_shared_memory(
+        K_Buffer.type.element_ty, [qk_rope_head_dim, BLOCK_N], layout=shared_k
+    )
+
+    acc1 = gl.zeros([BLOCK_H, BLOCK_C // 2], dtype=gl.float32,
+        layout=mfma_layout_kv,
+    )
+    acc2 = gl.zeros([BLOCK_H, BLOCK_C // 2], dtype=gl.float32,
+        layout=mfma_layout_kv,
+    )
+
+    zeros = gl.zeros(
+        (BLOCK_H, BLOCK_N), dtype=gl.float32, layout=mfma_layout_qk,
+    )
+
+    offs_buf_kv = kv_loc[:, None] * stride_buf_kbs + offs_k_c[None, :]
+    offs_buf_k_pe = kv_pe_loc[:, None] * stride_buf_kbs + offs_k_r[None, :]
+
+    kv1 = gl.amd.cdna3.buffer_load(
+        ptr=K_Buffer,
+        offsets=offs_buf_kv,
+    )  # the shared latent tensor for keys and values
+    kv2 = gl.amd.cdna3.buffer_load(
+        ptr=K_Buffer,
+        offsets=offs_buf_kv + 256,
+    )  # the shared latent tensor for keys and values
+
+    smem_kv1 = gl.allocate_shared_memory(
+        K_Buffer.type.element_ty, [kv_lora_rank // 2, BLOCK_N], layout=shared_k
+    )
+    smem_kv2 = gl.allocate_shared_memory(
+        K_Buffer.type.element_ty, [kv_lora_rank // 2, BLOCK_N], layout=shared_k
+    )
+
+    smem_kv1.store(kv1.T)
+    smem_kv2.store(kv2.T)
+
+    k_pe = gl.amd.cdna3.buffer_load(
+        ptr=K_Buffer,
+        offsets=offs_buf_k_pe,
+    )  # positional embedding part of keys
+
+    e_sum = gl.arange(0, BLOCK_H, layout = gl.SliceLayout(1, mfma_layout_qk)).to(gl.float32) * float(0)
+    e_max = e_sum - float("inf")
+
+    # cur_k1 = gl.convert_layout(kv1.T, layout=dot_k_layout)
+    # cur_k2 = gl.convert_layout(kv2.T, layout=dot_k_layout)
+
+    cur_k1 = smem_kv1.load(layout=dot_k_layout)
+    cur_k2 = smem_kv2.load(layout=dot_k_layout)
+
+    smem_k_rope.store(k_pe.T)
+    gl.amd.cdna3.sched_barrier(0x0)
+    split_kv_start += BLOCK_N
+
+    for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+
+        kv_pe_loc = gl.load(
+            kv_indices + start_n + cur_N_pe + cur_batch_kv_start_idx,
+        )
+        kv_loc = gl.load(
+            kv_indices + start_n + cur_batch_kv_start_idx + cur_N,
+        )
+
+        cur_k_pe = smem_k_rope.load(layout=dot_k_layout)
+
+        qk = gl.amd.cdna3.mfma(q0, cur_k1, zeros)
+        qk = gl.amd.cdna3.mfma(q1, cur_k2, qk)
+
         # smem_kv1 = smem_kv1.permute([1, 0])
         # smem_kv2 = smem_kv2.permute([1, 0])
         smem_kv1 = smem_kv1._reinterpret(
@@ -1344,15 +1769,27 @@ def _fwd_grouped_kernel_stage1_n32_prefetch_k(
         smem_kv1.store(kv1)
         smem_kv2.store(kv2)
 
-        qk = gl.amd.cdna3.mfma(q0, cur_k1, zeros)
-        qk = gl.amd.cdna3.mfma(q1, cur_k2, qk)
+        offs_buf_k_pe = kv_pe_loc[:, None] * stride_buf_kbs + offs_k_r[None, :]
+        k_pe = gl.amd.cdna3.buffer_load(
+            ptr=K_Buffer,
+            offsets=offs_buf_k_pe,
+        )  # positional embedding part of keys
 
-        cur_k_pe = smem_k_rope.load(layout=dot_k_layout)
+        offs_buf_kv = kv_loc[:, None] * stride_buf_kbs + offs_k_c[None, :]
+
+        kv1 = gl.amd.cdna3.buffer_load(
+            ptr=K_Buffer,
+            offsets=offs_buf_kv,
+        )
+        kv2 = gl.amd.cdna3.buffer_load(
+            ptr=K_Buffer,
+            offsets=offs_buf_kv + 256,
+        )
+
+        # smem_kv1._keep_alive()
+        # smem_kv2._keep_alive()
 
         qk = gl.amd.cdna3.mfma(q_pe, cur_k_pe, qk)
-
-        cur_k1 = smem_kv1.load(layout=dot_v_layout)
-        cur_k2 = smem_kv2.load(layout=dot_v_layout)
 
         qk *= sm_scale
 
@@ -1362,6 +1799,19 @@ def _fwd_grouped_kernel_stage1_n32_prefetch_k(
         re_scale = tl.math.exp2((e_max - n_e_max) * log2e)
         p = tl.math.exp2((qk - n_e_max[:, None]) * log2e)
         smem_p.store(p.to(q0.dtype))
+        cur_k1 = smem_kv1.load(layout=dot_v_layout)
+        cur_k2 = smem_kv2.load(layout=dot_v_layout)
+
+        # smem_kv1 = smem_kv1.permute([1, 0])
+        # smem_kv2 = smem_kv2.permute([1, 0])
+        smem_kv1 = smem_kv1._reinterpret(
+            K_Buffer.type.element_ty, [kv_lora_rank // 2, BLOCK_N], layout=shared_k)
+        smem_kv2 = smem_kv2._reinterpret(
+            K_Buffer.type.element_ty, [kv_lora_rank // 2, BLOCK_N], layout=shared_k)
+
+        smem_kv1.store(kv1.T)
+        smem_kv2.store(kv2.T)
+        smem_k_rope.store(k_pe.T)
 
         acc1 = acc1 * re_scale[:, None]
         acc2 = acc2 * re_scale[:, None]
@@ -1371,6 +1821,47 @@ def _fwd_grouped_kernel_stage1_n32_prefetch_k(
 
         acc1 = gl.amd.cdna3.mfma(cur_p, cur_k1, acc1)
         acc2 = gl.amd.cdna3.mfma(cur_p, cur_k2, acc2)
+
+        cur_k1 = smem_kv1.load(layout=dot_k_layout)
+        cur_k2 = smem_kv2.load(layout=dot_k_layout)
+
+    # smem_kv1 = smem_kv1.permute([1, 0])
+    # smem_kv2 = smem_kv2.permute([1, 0])
+    smem_kv1 = smem_kv1._reinterpret(
+        K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
+    smem_kv2 = smem_kv2._reinterpret(
+        K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank // 2], layout=shared_v)
+
+    smem_kv1.store(kv1)
+    smem_kv2.store(kv2)
+
+    qk = gl.amd.cdna3.mfma(q0, cur_k1, zeros)
+    qk = gl.amd.cdna3.mfma(q1, cur_k2, qk)
+
+    cur_k_pe = smem_k_rope.load(layout=dot_k_layout)
+
+    qk = gl.amd.cdna3.mfma(q_pe, cur_k_pe, qk)
+
+    cur_k1 = smem_kv1.load(layout=dot_v_layout)
+    cur_k2 = smem_kv2.load(layout=dot_v_layout)
+
+    qk *= sm_scale
+
+    n_e_max = gl.convert_layout(gl.max(qk, 1), gl.SliceLayout(1, mfma_layout_qk))
+
+    n_e_max = gl.maximum(n_e_max, e_max)
+    re_scale = tl.math.exp2((e_max - n_e_max) * log2e)
+    p = tl.math.exp2((qk - n_e_max[:, None]) * log2e)
+    smem_p.store(p.to(q0.dtype))
+
+    acc1 = acc1 * re_scale[:, None]
+    acc2 = acc2 * re_scale[:, None]
+    e_sum = e_sum * re_scale + gl.sum(p, 1)
+    cur_p = smem_p.load(layout=dot_p_layout)
+    e_max = n_e_max
+
+    acc1 = gl.amd.cdna3.mfma(cur_p, cur_k1, acc1)
+    acc2 = gl.amd.cdna3.mfma(cur_p, cur_k2, acc2)
 
     smem_kv1._keep_alive()
     smem_kv2._keep_alive()

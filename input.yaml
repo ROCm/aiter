@@ -5,7 +5,7 @@ jobs:
        kernel_iteration_range: "[1, [3-4]]"
        output_file: out
        output_directory: triton_mla 
-       output_format: [csv, pftrace]
+       output_format: [pftrace]
        truncate_kernels: true
        sys_trace: true # enable for pftrace and otf2
        advanced_thread_trace: true # enable for att and ui folder

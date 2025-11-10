@@ -16,6 +16,9 @@ import aiter
 from aiter.ops.triton.gluon.mla_decode import (
     decode_attention_fwd_grouped,
 )
+from aiter.ops.triton.gluon.mla_decode_fp8 import (
+    decode_attention_fwd_grouped as decode_attention_fwd_grouped_fp8,
+)
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_mla_decode import ref_preprocess
 from aiter.test_common import checkAllclose, run_perftest
@@ -28,6 +31,20 @@ arg_to_torch_dtype = {
 }
 
 torch.set_default_device("cuda")
+
+def cal_diff(
+    x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
+) -> None:
+    x, y = x.double(), y.double()
+    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    amax_diff = (x - y).abs().max().item()
+    print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
+    if use_fp8:
+        assert cos_diff < 3e-2
+    else:
+        assert cos_diff < 1e-5
+
 
 def input_helper(
     B,
@@ -102,6 +119,8 @@ def ref_masked_attention(
         scale *= q_scale * kv_scale
 
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
+    # import pdb;pdb.set_trace()
+    # print(attn_weights[:,:, :27])
     if is_causal:
         s_q = query.shape[0]
         s_k = key.shape[0]
@@ -123,6 +142,9 @@ def ref_masked_attention(
         attn_weights_fp8 = attn_weights_exp.to(torch.float8_e4m3fnuz)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
 
+    
+    # import pdb;pdb.set_trace()
+    # print(attn_weights_exp[:,:, :27])
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
 
     out = out / l.transpose(0,1).unsqueeze(-1)
@@ -143,8 +165,8 @@ def torch_mla_extend(
     qk_rope_head_dim,
     dtype,
     is_causal=True,
-    q_scale=None,
-    kv_scale=None,
+    q_scale=1,
+    kv_scale=1,
 ):
     is_fp8 = q.dtype == torch.float8_e4m3fnuz
 
@@ -164,6 +186,7 @@ def torch_mla_extend(
         q = qs[i]
         k = kvc
         v, _ = torch.split(kvc, [kv_lora_rank, qk_rope_head_dim], dim=-1)
+        # print(i)
         o, lse = ref_masked_attention(q,
                                       k,
                                       v,
@@ -326,9 +349,11 @@ def run_benchmark(args: argparse.Namespace):
                 mtp=mtp,
             )
         )
+  
+        # kv_cache = torch.ones_like(kv_cache)
 
+        q = torch.ones_like(q)
         k_input, v_input = ref_preprocess(kv_cache, kv_lora_rank)
-
 
         qo_indptr = torch.zeros(BATCH + 1, dtype=torch.int, device=device)
 
@@ -340,9 +365,12 @@ def run_benchmark(args: argparse.Namespace):
         max_seqlen_qo = seq_lens_qo.max().item()
         qo_indptr[1 : BATCH + 1] = torch.cumsum(seq_lens_qo, dim=0)
 
+        q_fp8 = q.to(torch.float8_e4m3fnuz)
+        kv_cache_fp8 = kv_cache.to(torch.float8_e4m3fnuz)
+
         out_ref, lse_ref = torch_mla_extend(
-            q.reshape(-1, H, 576),
-            kv_cache.reshape(-1, 1, 576),
+            q_fp8.reshape(-1, H, 576),
+            kv_cache_fp8.reshape(-1, 1, 576),
             qo_indptr,
             kv_indptr,
             kv_indices,
@@ -395,21 +423,41 @@ def run_benchmark(args: argparse.Namespace):
             BATCH * (mtp + 1) * out_elems * out_tri.element_size()
         )
 
-        mem = bytes_read + bytes_written
+        mem = bytes_read / 2 + bytes_written
         # print(mem)
 
-        q_fp8 = q.to(torch.float8_e4m3fnuz)
-        k_input_fp8 = k_input.to(torch.float8_e4m3fnuz)
-        v_input_fp8 = v_input.to(torch.float8_e4m3fnuz)
         # ms = triton.testing.do_bench(
+        # _, us = run_perftest(
+        # # lambda: decode_attention_fwd_grouped(
+        # #     q_fp8.reshape(-1, H * 2, 576),
+        # #     k_input_fp8,
+        # #     v_input_fp8,
+        #     decode_attention_fwd_grouped,
+        #     q.reshape(-1, H * (mtp + 1), 576),
+        #     k_input,
+        #     v_input,
+        #     out_tri,
+        #     kv_indptr,
+        #     kv_indices,
+        #     kv_lora_rank,
+        #     attn_logits,
+        #     attn_lse,
+        #     num_kv_splits,
+        #     sm_scale,
+        #     logit_cap,
+        #     mtp,
+        #     # ),
+        #     # warmup=25,
+        #     # rep=100,
+        # )
         _, us = run_perftest(
         # lambda: decode_attention_fwd_grouped(
         #     q_fp8.reshape(-1, H * 2, 576),
         #     k_input_fp8,
         #     v_input_fp8,
-            decode_attention_fwd_grouped,
-            q.reshape(-1, H * (mtp + 1), 576),
-            k_input,
+            decode_attention_fwd_grouped_fp8,
+            q_fp8.reshape(-1, H * (mtp + 1), 576),
+            kv_cache_fp8.reshape(-1, 1, 576),
             v_input,
             out_tri,
             kv_indptr,
@@ -425,24 +473,41 @@ def run_benchmark(args: argparse.Namespace):
             # warmup=25,
             # rep=100,
         )
-        ms = us / 1000
+        # print(lse_ref)
+        # decode_attention_fwd_grouped_fp8(
+        #     q_fp8.reshape(-1, H * (mtp + 1), 576),
+        #     kv_cache_fp8.reshape(-1, 1, 576),
+        #     v_input,
+        #     out_tri,
+        #     kv_indptr,
+        #     kv_indices,
+        #     kv_lora_rank,
+        #     attn_logits,
+        #     attn_lse,
+        #     num_kv_splits,
+        #     sm_scale,
+        #     logit_cap,
+        #     mtp,
+        #     # ),
+        #     # warmup=25,
+        #     # rep=100,
+        # )
         # import pdb;pdb.set_trace()
+        ms = us / 1000
 
         checkAllclose(out_ref, out_tri,
             msg=f"mla_decode-absorb    [golden vs triton]: {ms * 1000} us......",
         )
 
+        cal_diff(out_ref, out_tri, "out", True)
+        # import pdb;pdb.set_trace()
+
         # Return exactly one scalar depending on which metric is active
-        if metric == "time":
-            return ms
-        elif metric == "throughput":
-            tflops = total_flops / ms * 1e-9
-            return tflops
-        elif metric == "bandwidth":
-            bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-            return bandwidth
-        else:
-            raise ValueError("Unknown metric: " + metric)
+        tflops = total_flops / ms * 1e-9
+        bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
+        print(f"{tflops=}")
+        print(f"{bandwidth=}")
+        return bandwidth
 
     bench_mla.run(save_path=".", print_data=True, show_plots=False)
 
