@@ -1198,7 +1198,7 @@ void calc_launch_parameter_for_merge(IdxT len, IdxT k, int* block_per_batch, int
 template <int capacity, bool descending, typename T, typename IdxT>
 struct WaveTopkSort
 {
-    __device__ WaveTopkSort(IdxT k, T sentinel) : buffer_(k, sentinel), chunk_fill_(0) {}
+    __device__ WaveTopkSort(IdxT k, T sentinel) : buffer_(k, sentinel) {}
 
     __device__ void sort(const T* __restrict__ in, IdxT start, IdxT end)
     {
@@ -1209,8 +1209,6 @@ struct WaveTopkSort
             process_next_chunk(in, start, end);
             start += capacity;
         }
-
-        finalize();
     }
 
     // Store to lds
@@ -1257,24 +1255,6 @@ struct WaveTopkSort
         merge_sorted_chunks_();
     }
 
-    __device__ void finalize()
-    {
-        if(chunk_fill_ != 0)
-        {
-#pragma unroll
-            for(int i = 0; i < buffer_.slots_per_lane; ++i)
-            {
-                if(i >= chunk_fill_)
-                {
-                    temp_priorities_[i] = buffer_.sentinel;
-                }
-            }
-            sorting::BitonicSort<capacity, descending, T, IdxT>::sort(temp_priorities_,
-                                                                      temp_positions_);
-            merge_sorted_chunks_();
-        }
-    }
-
     __device__ void merge_sorted_chunks_()
     {
         // Element-wise comparison creates a bitonic sequence, then merge sorts it
@@ -1300,7 +1280,6 @@ struct WaveTopkSort
     static constexpr int slots_per_lane_ = capacity / utils::WAVE_SIZE;
     T temp_priorities_[slots_per_lane_];
     IdxT temp_positions_[slots_per_lane_];
-    int chunk_fill_;
 };
 
 template <int capacity, bool descending, typename T, typename IdxT>
@@ -1743,10 +1722,10 @@ __global__ void __launch_bounds__(512, 2) topk_filter_kernel(const T* __restrict
          end);
 }
 
-// WaveTopkMergeStrategy: Iteratively merges pre-sorted k-sized chunks
+// WaveTopkMerge: Iteratively merges pre-sorted k-sized chunks
 //
 // EXAMPLE: Finding Top-4 largest from 3 pre-sorted chunks (k=4 each, capacity=64)
-//   Input chunks (each sorted ascending, result of previous WaveTopkSortStrategy):
+//   Input chunks (each sorted ascending, result of previous WaveTopkSort):
 //     Chunk 0: [80, 85, 90, 95]
 //     Chunk 1: [65, 70, 75, 100]
 //     Chunk 2: [55, 60, 88, 110]
@@ -1958,14 +1937,17 @@ void topk_kernel_launcher(int block_per_batch,
 
     if(block_per_batch > 1)
     {
+        // Length is the total number of topk results of multiple blocks
         len = k * block_per_batch;
+
+        // Launch single block in merge phase
         calc_launch_parameter_for_merge<T, IdxT>(len, k, &block_per_batch, &wave_per_block);
         block_dim = wave_per_block * utils::WAVE_SIZE;
         lds_size  = calc_lds_size_for_block_wide<T, IdxT>(wave_per_block, k);
 
         auto topk_merge_kernel =
             get_kernel_function_pointer<greater, BlockTopkMerge, T, IdxT>(capacity);
-        topk_merge_kernel<<<batch_size * block_per_batch, block_dim, lds_size, stream>>>(
+        topk_merge_kernel<<<batch_size, block_dim, lds_size, stream>>>(
             tmp_val, tmp_idx, batch_size, len, k, out, out_idx, sentinel);
 
         HIP_CHECK(hipFree(tmp_val));
@@ -2002,7 +1984,6 @@ void AdaptiveTopK(int batch_size,
     {
         calc_launch_parameter<BlockTopkFilter, T, IdxT>(
             batch_size, len, k, &block_per_batch, &wave_per_block);
-        block_per_batch = 1;
         topk_kernel_launcher<greater, BlockTopkFilter, T, IdxT>(
             block_per_batch, wave_per_block, in, batch_size, len, k, out, out_idx, stream);
     }
