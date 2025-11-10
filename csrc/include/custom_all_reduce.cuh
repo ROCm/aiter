@@ -1554,11 +1554,11 @@ namespace aiter
       if ((world_size_ <= 4 && bytes < 512 * 1024) ||      \
           (world_size_ <= 8 && bytes < 256 * 1024))        \
       {                                                    \
-        KL(ngpus, cross_device_reduce_1stage);             \
+        KL(ngpus, cross_device_reduce_1stage_naive);             \
       }                                                    \
       else                                                 \
       {                                                    \
-        KL(ngpus, cross_device_reduce_2stage);             \
+        KL(ngpus, cross_device_reduce_2stage_naive);             \
       }                                                    \
     }                                                      \
     break;                                                 \
