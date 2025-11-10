@@ -23,6 +23,7 @@ def test_ff_a16w16_ungated(
         y_init="empty",
     )
 
+
 # Test
 @pytest.mark.parametrize("activation", ["gelu_tanh", "silu_exp2", "relu", None])
 @pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", get_x_vals())
