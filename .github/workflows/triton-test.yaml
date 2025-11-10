@@ -8,6 +8,7 @@ on:
     paths:
       - "aiter/ops/triton/**"
       - "op_tests/triton_tests/**"
+      - ".github/workflows/triton-test.yaml"
   workflow_dispatch:
 
 concurrency:
