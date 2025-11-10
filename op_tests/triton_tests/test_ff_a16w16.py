@@ -24,7 +24,6 @@ def test_ff_a16w16_ungated(
     )
 
 
-# Test
 @pytest.mark.parametrize("activation", ["gelu_tanh", "silu_exp2", "relu", None])
 @pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
