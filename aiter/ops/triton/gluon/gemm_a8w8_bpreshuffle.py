@@ -469,7 +469,22 @@ def _gemm_a8w8_ptpc2(
         offs_a = offs_am[:, None] * stride_am + offs_ak_split[None, :] * stride_ak
 
         # Create pointers for the scales
-
+        offs_b = offs_b0[:, None, None, None]  + offs_b1[None, :, None, None] * 16 +  offs_b2[None, None, :, None] * 256 + (offs_b3[None, None, None, :] * 16 + pid_n * BLOCK_SIZE_N) * stride_bn
+        if EVEN_K:
+            b = gl.amd.cdna4.buffer_load(
+                ptr=b_ptr,
+                offsets=offs_b,
+                # mask=offs_bn[None, :] < N,
+                cache=cache_modifier,
+            )
+        else:
+            b = gl.amd.cdna4.buffer_load(
+                ptr=b_ptr,
+                offsets=offs_b,
+                # mask=(offs_bk[:, None] < K - (pid_k * num_k_iter * BLOCK_SIZE_K))
+                # & (offs_bn[None, :] < N),
+                cache=cache_modifier,
+            )
         if EVEN_K:
             # a = gl.amd.cdna4.buffer_load(
             #     ptr=a_ptr,
@@ -502,22 +517,6 @@ def _gemm_a8w8_ptpc2(
                 offs_am[:, None] < M,
                 cache_modifier=cache_modifier,
             )
-        offs_b = offs_b0[:, None, None, None]  + offs_b1[None, :, None, None] * 16 +  offs_b2[None, None, :, None] * 256 + (offs_b3[None, None, None, :] * 16 + pid_n * BLOCK_SIZE_N) * stride_bn
-        if EVEN_K:
-            b = gl.amd.cdna4.buffer_load(
-                ptr=b_ptr,
-                offsets=offs_b,
-                # mask=offs_bn[None, :] < N,
-                cache=cache_modifier,
-            )
-        else:
-            b = gl.amd.cdna4.buffer_load(
-                ptr=b_ptr,
-                offsets=offs_b,
-                # mask=(offs_bk[:, None] < K - (pid_k * num_k_iter * BLOCK_SIZE_K))
-                # & (offs_bn[None, :] < N),
-                cache=cache_modifier,
-            )
             
         # smem_a.store(a)
         # gl.amd.cdna4.async_copy.async_wait(4)
@@ -536,7 +535,7 @@ def _gemm_a8w8_ptpc2(
         # cur_b = b.permute(2, 0, 3, 1).reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
         for k in range(pid_k * num_k_iter, ((pid_k + 1) * num_k_iter) - 1):
             
-            if k % 2 == 0:
+            if (k - pid_k * num_k_iter) % 2 == 0:
                 smem_read = smem_a
                 smem_write = smem_a_1
             else:
@@ -547,11 +546,28 @@ def _gemm_a8w8_ptpc2(
             offs_a += BLOCK_SIZE_K * stride_ak
             # offs_b += BLOCK_SIZE_K * stride_bk * 16
             offs_b += BLOCK_SIZE_K * 16
-            gl.amd.cdna4.async_copy.async_wait(0)
-            cur_a = smem_read.load(layout=dot_a_layout)
-            cur_b = b.permute(2, 0, 3, 1).reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
+            
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
+            gl.amd.cdna4.async_copy.async_wait(4)
+            cur_b = b.permute(2, 0, 3, 1).reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
+            gl.amd.cdna4.async_copy.async_wait(0)
+            cur_a = smem_read.load(layout=dot_a_layout)
+            if EVEN_K:
+                b = gl.amd.cdna4.buffer_load(
+                    ptr=b_ptr,
+                    offsets=offs_b,
+                    # mask=offs_bn[None, :] < N,
+                    cache=cache_modifier,
+                )
+            else:
+                b = gl.amd.cdna4.buffer_load(
+                    ptr=b_ptr,
+                    offsets=offs_b,
+                    # mask=(offs_bk[:, None] < K - (k + 1) * BLOCK_SIZE_K)
+                    # & (offs_bn[None, :] < N),
+                    cache=cache_modifier,
+                )          
             if EVEN_K:
                 # a = gl.amd.cdna4.buffer_load(
                 #     ptr=a_ptr,
@@ -586,24 +602,8 @@ def _gemm_a8w8_ptpc2(
                 )
             # smem_b.store(b)
             # cur_a = smem_a.load(layout=dot_a_layout)
-            
-            if EVEN_K:
-                b = gl.amd.cdna4.buffer_load(
-                    ptr=b_ptr,
-                    offsets=offs_b,
-                    # mask=offs_bn[None, :] < N,
-                    cache=cache_modifier,
-                )
-            else:
-                b = gl.amd.cdna4.buffer_load(
-                    ptr=b_ptr,
-                    offsets=offs_b,
-                    # mask=(offs_bk[:, None] < K - (k + 1) * BLOCK_SIZE_K)
-                    # & (offs_bn[None, :] < N),
-                    cache=cache_modifier,
-                )
+
             # cur_b = smem_b.load(layout=dot_b_layout)
-            
             cur_b_fma = gl.convert_layout(cur_b, layout=dot_b_layout)
             acc = gl.amd.cdna4.mfma(cur_a, cur_b_fma, acc)
             # smem_a.store(a)
