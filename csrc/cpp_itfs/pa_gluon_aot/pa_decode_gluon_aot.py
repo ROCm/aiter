@@ -24,9 +24,6 @@ from csrc.cpp_itfs.utils import (
 )
 
 
-TRITON_VERSION = triton.__version__
-
-
 def parse_version(version_str):
     """Parse version string into comparable tuple format, handling possible development version suffixes"""
     # Remove potential suffixes like .dev, +git etc.
@@ -41,6 +38,7 @@ def parse_version(version_str):
             break
 
     return tuple(parts)
+TRITON_VERSION = parse_version(triton.__version__)
 
 
 def compile_attention_reduce_kernel(
@@ -193,8 +191,7 @@ def compile_attention_reduce_kernel(
         reduce_signature = ",".join(reduce_signature_parts)
 
         reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel_triton34"
-        triton_version = parse_version(TRITON_VERSION)
-        if triton_version > (3, 4, 0):
+        if TRITON_VERSION > (3, 4, 0):
             reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel"
 
         reduce_compile_args = CompileArgs(

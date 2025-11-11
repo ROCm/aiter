@@ -186,8 +186,8 @@ def test_mla(
         return us_aiter
 
     us_aiter = None
-    # if batch_size * ctx_lens * nhead < 256 * 8192 * 16:
-    #     us_aiter = test_normal_prefill()
+    if batch_size * ctx_lens * nhead < 256 * 8192 * 16:
+        us_aiter = test_normal_prefill()
     torch.cuda.empty_cache()
     # absorb init
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
@@ -273,8 +273,8 @@ def test_mla(
         return us_asm
 
     us_asm = None
-    # if batch_size * ctx_lens * nhead < 32 * 8192 * 16:
-    #     us_asm = test_absorb_prefill()
+    if batch_size * ctx_lens * nhead < 32 * 8192 * 16:
+        us_asm = test_absorb_prefill()
     torch.cuda.empty_cache()
 
     # ############################## absorb: decode
@@ -388,9 +388,9 @@ qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
 list_dtype = [(torch.bfloat16, torch.bfloat16)]
-list_ctx_len = [21, 64, 256, 512, 1200, 3200, 5200, 8192][:1]
-list_batch_size = [1, 3, 5, 16, 32, 64, 128, 256][:1]
-list_nhead = [(16, 1), (128, 2)][:1]
+list_ctx_len = [21, 64, 256, 512, 1200, 3200, 5200, 8192][:]
+list_batch_size = [1, 3, 5, 16, 32, 64, 128, 256][:]
+list_nhead = [(16, 1), (128, 2)][:]
 
 
 for nhead, mtp in list_nhead:

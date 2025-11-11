@@ -12,6 +12,7 @@ from triton.tools.compile import compile_kernel, CompileArgs
 from jinja2 import Template
 from aiter.test_common import perftest, run_perftest
 from aiter.ops.triton.gluon.pa_decode_gluon import (
+    paged_attention_decode_v2_reduce_kernel_triton34,
     paged_attention_decode_v2_reduce_kernel,
 )
 from csrc.cpp_itfs.torch_utils import torch_to_c_types
@@ -30,6 +31,23 @@ from csrc.cpp_itfs.utils import (
 
 # os.environ['TRITON_CACHE_DIR'] = '/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache'
 # compile_reduce_kernel_count = 0
+
+
+def parse_version(version_str):
+    """Parse version string into comparable tuple format, handling possible development version suffixes"""
+    # Remove potential suffixes like .dev, +git etc.
+    version_str = version_str.split("+")[0].split("-")[0]
+
+    # Split version number and convert to integers
+    parts = []
+    for part in version_str.split("."):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            break
+
+    return tuple(parts)
+TRITON_VERSION = parse_version(triton.__version__)
 
 
 def setup_seed(seed: int) -> None:
@@ -110,9 +128,13 @@ def compile_reduce_kernel(
         ]
         signature = ",".join(signature_parts)
 
+        reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel_triton34"
+        if TRITON_VERSION > (3, 4, 0):
+            reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel"
+
         compile_args = CompileArgs(
             path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
-            kernel_name="paged_attention_decode_v2_reduce_kernel",
+            kernel_name=reduce_kernel_name,
             signature=signature,
             grid="num_seqs,num_kv_heads,1",
             num_warps=4,
@@ -216,12 +238,15 @@ def run_direct_kernel(
     """
     num_seqs = output.shape[0]
     num_kv_heads = exp_sums.shape[1]
-
     # Configure grid
     grid = (num_seqs, num_kv_heads, 1)
 
+    kernel = paged_attention_decode_v2_reduce_kernel_triton34
+    if TRITON_VERSION > (3, 4, 0):
+        kernel = paged_attention_decode_v2_reduce_kernel
+
     # Launch the kernel directly
-    paged_attention_decode_v2_reduce_kernel[grid](
+    kernel[grid](
         output,
         exp_sums,
         max_logits,
