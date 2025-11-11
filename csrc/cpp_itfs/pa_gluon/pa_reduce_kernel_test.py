@@ -11,9 +11,14 @@ import argparse
 from triton.tools.compile import compile_kernel, CompileArgs
 from jinja2 import Template
 from aiter.test_common import perftest, run_perftest
-from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8 import paged_attention_decode_v2_reduce_kernel
+from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8 import (
+    paged_attention_decode_v2_reduce_kernel,
+)
 from csrc.cpp_itfs.torch_utils import torch_to_c_types
-from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import compile_gluon_kernel, CompileGluonArgs
+from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
+    compile_gluon_kernel,
+    CompileGluonArgs,
+)
 from csrc.cpp_itfs.utils import (
     compile_template_op,
     AITER_CORE_DIR,
@@ -23,6 +28,10 @@ from csrc.cpp_itfs.utils import (
 )
 
 
+# os.environ['TRITON_CACHE_DIR'] = '/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache'
+# compile_reduce_kernel_count = 0
+
+
 def setup_seed(seed: int) -> None:
     """Set random seed for reproducibility."""
     torch.manual_seed(seed)
@@ -30,39 +39,32 @@ def setup_seed(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
 
 
-def tensor_to_hash(tensor: torch.Tensor, algorithm: str = 'md5') -> str:
+def tensor_to_hash(tensor: torch.Tensor, algorithm: str = "md5") -> str:
     """
     Convert a PyTorch tensor to a hash value using the specified algorithm.
-    
+
     Args:
         tensor (torch.Tensor): Input tensor
         algorithm (str): Hash algorithm, defaults to 'md5',
                         options: 'md5', 'sha1', 'sha256', etc.
-        
+
     Returns:
         str: Hexadecimal string representation of the hash value
     """
     hash_func = getattr(hashlib, algorithm)()
-    
+
     # Process tensor data
-    tensor_data = (
-        tensor.contiguous()
-        .view(torch.uint8)
-        .detach()
-        .cpu()
-        .numpy()
-        .tobytes()
-    )
-    
+    tensor_data = tensor.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()
+
     hash_func.update(tensor_data)
     return hash_func.hexdigest()
 
 
 def compile_reduce_kernel(
-    head_size: int,
     query_group_size: int,
-    sequence_partition_size: int,
+    head_size: int,
     max_num_seq_partitions: int,
+    sequence_partition_size: int,
     md_name: str,
     func_name: str = None,
 ):
@@ -70,33 +72,41 @@ def compile_reduce_kernel(
     if func_name is None:
         func_name = get_default_func_name(
             md_name,
-            (head_size, query_group_size, sequence_partition_size, max_num_seq_partitions),
+            (
+                query_group_size,
+                head_size,
+                max_num_seq_partitions,
+                sequence_partition_size,
+            ),
         )
 
-    # if not_built(func_name):
-    if True:
+    # global compile_reduce_kernel_count
+    # compile_reduce_kernel_count += 1
+
+    if not_built(func_name):
+        # if compile_reduce_kernel_count == 1:
         # Build signature based on kernel parameters
         signature_parts = [
             "*bf16:16",  # output_ptr
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
             "*bf16:16",  # logits_ptr
-            "*i32:16",   # sequence_lengths_ptr
-            "i32",       # stride_output_seq
-            "i32",       # stride_output_head
-            "i32",       # stride_exp_sums_seq
-            "i32",       # stride_exp_sums_head
-            "i32",       # stride_exp_sums_part
-            "i32",       # stride_logits_seq
-            "i32",       # stride_logits_head
-            "i32",       # stride_logits_part
-            "i32",       # stride_logits_group
-            "i32",       # num_seqs
-            "i32",       # num_kv_heads
-            f"{head_size}",
+            "*i32:16",  # context_lengths_ptr
+            "i32",  # stride_output_seq
+            "i32",  # stride_output_head
+            "i32",  # stride_exp_sums_seq
+            "i32",  # stride_exp_sums_head
+            "i32",  # stride_exp_sums_part
+            "i32",  # stride_logits_seq
+            "i32",  # stride_logits_head
+            "i32",  # stride_logits_part
+            "i32",  # stride_logits_group
+            "i32",  # num_seqs
+            "i32",  # num_kv_heads
             f"{query_group_size}",
-            f"{sequence_partition_size}",
+            f"{head_size}",
             f"{max_num_seq_partitions}",
+            f"{sequence_partition_size}",
         ]
         signature = ",".join(signature_parts)
 
@@ -105,7 +115,6 @@ def compile_reduce_kernel(
             kernel_name="paged_attention_decode_v2_reduce_kernel",
             signature=signature,
             grid="num_seqs,num_kv_heads,1",
-            # grid="num_seqs,1,1",
             num_warps=4,
             num_stages=2,
             out_name=md_name,
@@ -119,7 +128,10 @@ def compile_reduce_kernel(
             elif output_file.suffix == ".cpp":
                 triton_source = output_file
 
-        with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_reduce_kernel.cpp.jinja", "r") as f:
+        with open(
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_reduce_kernel.cpp.jinja",
+            "r",
+        ) as f:
             src_template = Template(f.read())
 
         kernel_name = "paged_attention_decode_v2_reduce_kernel"
@@ -143,13 +155,13 @@ def run_compiled_kernel(
     exp_sums: torch.Tensor,
     max_logits: torch.Tensor,
     temporary_output: torch.Tensor,
-    sequence_lengths: torch.Tensor,
+    context_lengths: torch.Tensor,
     num_sequences: int,
     num_kv_heads: int,
-    head_size: int,
     query_group_size: int,
-    sequence_partition_size: int,
+    head_size: int,
     max_num_seq_partitions: int,
+    sequence_partition_size: int,
     md_name: str,
     func_name: str = None,
 ):
@@ -157,10 +169,10 @@ def run_compiled_kernel(
     Compile and run the compiled kernel with perftest timing
     """
     reduce_func = compile_reduce_kernel(
-        head_size=head_size,
         query_group_size=query_group_size,
-        sequence_partition_size=sequence_partition_size,
+        head_size=head_size,
         max_num_seq_partitions=max_num_seq_partitions,
+        sequence_partition_size=sequence_partition_size,
         md_name=md_name,
     )
 
@@ -170,7 +182,7 @@ def run_compiled_kernel(
             exp_sums,
             max_logits,
             temporary_output,
-            sequence_lengths,
+            context_lengths,
             output.stride(0),
             output.stride(1),
             exp_sums.stride(0),
@@ -193,11 +205,11 @@ def run_direct_kernel(
     exp_sums: torch.Tensor,
     max_logits: torch.Tensor,
     temporary_output: torch.Tensor,
-    sequence_lengths: torch.Tensor,
-    head_size: int,
+    context_lengths: torch.Tensor,
     query_group_size: int,
-    sequence_partition_size: int,
+    head_size: int,
     max_num_seq_partitions: int,
+    sequence_partition_size: int,
 ):
     """
     Directly call the paged_attention_decode_v2_reduce_kernel with perftest timing
@@ -214,7 +226,7 @@ def run_direct_kernel(
         exp_sums,
         max_logits,
         temporary_output,
-        sequence_lengths,
+        context_lengths,
         output.stride(0),
         output.stride(1),
         exp_sums.stride(0),
@@ -226,10 +238,10 @@ def run_direct_kernel(
         temporary_output.stride(3),
         num_seqs,
         num_kv_heads,
-        HEAD_SIZE=head_size,
         QUERY_GROUP_SIZE=query_group_size,
-        SEQUENCE_PARTITION_SIZE=sequence_partition_size,
+        HEAD_SIZE=head_size,
         MAX_NUM_SEQ_PARTITIONS=max_num_seq_partitions,
+        SEQUENCE_PARTITION_SIZE=sequence_partition_size,
     )
 
 
@@ -238,7 +250,7 @@ def torch_reduce_reference(
     exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
     max_logits: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
     temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size, head_size]
-    sequence_lengths: torch.Tensor,  # [num_seqs]
+    context_lengths: torch.Tensor,  # [num_seqs]
     sequence_partition_size: int = 256,
 ) -> torch.Tensor:
     """
@@ -252,7 +264,7 @@ def torch_reduce_reference(
     # final_output = torch.empty_like(output)
 
     for seq_idx in range(num_seqs):
-        seq_len = sequence_lengths[seq_idx].item()
+        seq_len = context_lengths[seq_idx].item()
         num_parts = (seq_len + sequence_partition_size - 1) // sequence_partition_size
 
         # Global max across partitions
@@ -302,14 +314,16 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
     print(f"\n=== Testing Reduce Kernel (Type: {kernel_type}) ===")
     setup_seed(123)
 
-    # Parameters from the provided debug information
-    head_size = 128
+    query_sequence_length = 1
     query_group_size = 8
-    sequence_partition_size = 256
+    head_size = 128
     max_num_seq_partitions = 16
+    sequence_partition_size = 256
     num_sequences = 128
     num_kv_heads = 2
     # num_kv_heads = 1
+
+    equivalent_query_group_size = query_sequence_length * query_group_size
 
     # print("\n=== Reduce Kernel Compile Parameters ===")
     # print(f"  head_size: {head_size}")
@@ -319,16 +333,39 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
 
     # Create test tensors with the provided shapes
     # output = torch.zeros((num_sequences, num_kv_heads * query_group_size, head_size),
-    output = torch.empty((num_sequences, num_kv_heads * query_group_size, head_size),
-                        dtype=torch.bfloat16, device='cuda')
-    exp_sums = torch.zeros((num_sequences, num_kv_heads, max_num_seq_partitions, query_group_size),
-                          dtype=torch.float32, device='cuda')
-    max_logits = torch.zeros((num_sequences, num_kv_heads, max_num_seq_partitions, query_group_size),
-                            dtype=torch.float32, device='cuda')
-    temporary_output = torch.zeros((num_sequences, num_kv_heads, max_num_seq_partitions, query_group_size, head_size),
-                                  dtype=torch.bfloat16, device='cuda')
-    sequence_lengths = torch.randint(1, sequence_partition_size * max_num_seq_partitions,
-                                    (num_sequences,), dtype=torch.int32, device='cuda')
+    output = torch.empty(
+        (num_sequences, num_kv_heads * query_group_size, head_size),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    exp_sums = torch.zeros(
+        (num_sequences, num_kv_heads, max_num_seq_partitions, query_group_size),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    max_logits = torch.zeros(
+        (num_sequences, num_kv_heads, max_num_seq_partitions, query_group_size),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    temporary_output = torch.zeros(
+        (
+            num_sequences,
+            num_kv_heads,
+            max_num_seq_partitions,
+            query_group_size,
+            head_size,
+        ),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    context_lengths = torch.randint(
+        1,
+        sequence_partition_size * max_num_seq_partitions,
+        (num_sequences,),
+        dtype=torch.int32,
+        device="cuda",
+    )
 
     # Initialize with random data for testing
     torch.manual_seed(42)
@@ -342,7 +379,7 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
     # print(f"  exp_sums: shape={exp_sums.shape}, dtype={exp_sums.dtype}")
     # print(f"  max_logits: shape={max_logits.shape}, dtype={max_logits.dtype}")
     # print(f"  temporary_output: shape={temporary_output.shape}, dtype={temporary_output.dtype}")
-    # print(f"  sequence_lengths: shape={sequence_lengths.shape}, dtype={sequence_lengths.dtype}")
+    # print(f"  context_lengths: shape={context_lengths.shape}, dtype={context_lengths.dtype}")
 
     # print("\nScalar parameters:")
     # print(f"  output.stride(0): {output.stride(0)}")
@@ -363,8 +400,8 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
         exp_sums,
         max_logits,
         temporary_output,
-        sequence_lengths,
-        sequence_partition_size
+        context_lengths,
+        sequence_partition_size,
     )
 
     # Execute kernel based on selected type
@@ -376,13 +413,13 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
             exp_sums,
             max_logits,
             temporary_output,
-            sequence_lengths,
+            context_lengths,
             num_sequences,
             num_kv_heads,
+            query_group_size=equivalent_query_group_size,
             head_size=head_size,
-            query_group_size=query_group_size,
-            sequence_partition_size=sequence_partition_size,
             max_num_seq_partitions=max_num_seq_partitions,
+            sequence_partition_size=sequence_partition_size,
             md_name="pa_decode_reduce_kernel",
         )
         print(f"Compiled kernel execution time: {compiled_time:.2f} us/iter")
@@ -394,11 +431,11 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
             exp_sums,
             max_logits,
             temporary_output,
-            sequence_lengths,
-            head_size,
+            context_lengths,
             query_group_size,
-            sequence_partition_size,
+            head_size,
             max_num_seq_partitions,
+            sequence_partition_size,
         )
         print(f"Direct kernel execution time: {direct_time:.2f} us/iter")
     else:
@@ -437,15 +474,21 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
         for i in range(top_k):
             idx = top_k_indices[i]
             orig_idx = np.unravel_index(idx.cpu().numpy(), output.shape)
-            print(f"  Position {orig_idx}: kernel={output[orig_idx].item():.6f}, ref={reference_output[orig_idx].item():.6f}, diff={flat_diff[idx].item():.6e}")
+            print(
+                f"  Position {orig_idx}: kernel={output[orig_idx].item():.6f}, ref={reference_output[orig_idx].item():.6f}, diff={flat_diff[idx].item():.6e}"
+            )
 
     # Test result
     # tolerance = 1e-4
     tolerance = 5e-3
     if max_diff < tolerance:
-        print(f"\n✅ TEST PASSED: Max difference ({max_diff:.6e}) < tolerance ({tolerance})")
+        print(
+            f"\n✅ TEST PASSED: Max difference ({max_diff:.6e}) < tolerance ({tolerance})"
+        )
     else:
-        print(f"\n❌ TEST FAILED: Max difference ({max_diff:.6e}) >= tolerance ({tolerance})")
+        print(
+            f"\n❌ TEST FAILED: Max difference ({max_diff:.6e}) >= tolerance ({tolerance})"
+        )
 
     return {
         "max_diff": max_diff,
@@ -454,7 +497,7 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
         "reference_nan_cnt": reference_nan_cnt,
         "output_md5": output_md5,
         "reference_md5": reference_md5,
-        "passed": max_diff < tolerance
+        "passed": max_diff < tolerance,
     }
 
 
@@ -466,19 +509,16 @@ def main():
         type=str,
         choices=["compiled", "direct"],
         default="compiled",
-        help="Type of kernel to test: 'compiled' (default) or 'direct'"
+        help="Type of kernel to test: 'compiled' (default) or 'direct'",
     )
     parser.add_argument(
         "--num-iters",
         type=int,
         default=101,
-        help="Number of iterations for performance testing"
+        help="Number of iterations for performance testing",
     )
     parser.add_argument(
-        "--num-warmup",
-        type=int,
-        default=2,
-        help="Number of warmup iterations"
+        "--num-warmup", type=int, default=2, help="Number of warmup iterations"
     )
 
     args = parser.parse_args()

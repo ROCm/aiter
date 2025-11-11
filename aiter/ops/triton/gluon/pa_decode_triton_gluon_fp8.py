@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
+import os
+import sys
 import math
 from typing import Optional, Dict, Tuple
 import tempfile
 import subprocess
-import os
-import sys
 
 import triton
 import triton.language as tl
@@ -15,13 +14,10 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 import torch
 import aiter
-from aiter.test_common import perftest
 
 
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
-
-_SEQUENCE_PARTITION_SIZE = 256
 
 
 @gluon.jit
@@ -33,7 +29,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache_ptr,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
-    sequence_lengths_ptr,  # [num_seqs]
+    context_lengths_ptr,  # [num_seqs]
     softmax_scale,
     query_scale,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -61,20 +57,19 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     num_seqs,
     num_kv_heads,
     max_num_partitions,
-    QUERY_SEQ_LEN: tl.constexpr,
-    # COMPUTE_TYPE: tl.constexpr,
-    HEAD_SIZE: tl.constexpr,
-    QUERY_GROUP_SIZE_ORIGINAL: tl.constexpr,
-    QUERY_GROUP_SIZE: tl.constexpr,
-    KV_BLOCK_SIZE: tl.constexpr,
-    SEQUENCE_PARTITION_SIZE: tl.constexpr,
-    KV_16B_ELEMENT_COUNT: tl.constexpr,
-    QUERY_QUANT_MODE: tl.constexpr,
-    KV_QUANT_MODE: tl.constexpr,
-    KV_COMPUTE_BLOCK_SIZE: tl.constexpr,
-    FP8_MAX_VALUE: tl.constexpr,
-    VALUE_TRANSPOSED: tl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
-    IS_CAUSAL: tl.constexpr,
+    COMPUTE_TYPE: gl.constexpr,
+    QUERY_SEQ_LEN: gl.constexpr,
+    QUERY_GROUP_SIZE_ORIGINAL: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    KV_BLOCK_SIZE: gl.constexpr,
+    KV_16B_ELEMENT_COUNT: gl.constexpr,
+    SEQUENCE_PARTITION_SIZE: gl.constexpr,
+    KV_COMPUTE_BLOCK_SIZE: gl.constexpr,
+    QUERY_QUANT_MODE: gl.constexpr,
+    KV_QUANT_MODE: gl.constexpr,
+    FP8_MAX_VALUE: gl.constexpr,
+    VALUE_TRANSPOSED: gl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+    IS_CAUSAL: gl.constexpr,
 ):
     """
     Gluon-based paged attention decode kernel with FP8 support for large blocks.
@@ -93,6 +88,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         Various pointers to tensors and configuration parameters as described above.
     """
 
+    QUERY_GROUP_SIZE: gl.constexpr = QUERY_SEQ_LEN * QUERY_GROUP_SIZE_ORIGINAL
     # ==================== Validation Checks ====================
     gl.static_assert(
         QUERY_SEQ_LEN <= 4,
@@ -376,7 +372,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     )
 
     # ==================== Sequence Length Handling ====================
-    kv_sequence_length = gl.load(sequence_lengths_ptr + sequence_idx)
+    kv_sequence_length = gl.load(context_lengths_ptr + sequence_idx)
     kv_sequence_start_index = sequence_partition_idx * SEQUENCE_PARTITION_SIZE
 
     # Early return if this partition is beyond sequence length
@@ -620,8 +616,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
     # Apply final scaling to attention accumulator
     attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
-    # attention_accumulator = attention_accumulator.to(COMPUTE_TYPE)
-    attention_accumulator = attention_accumulator.to(gl.bfloat16)
+    attention_accumulator = attention_accumulator.to(COMPUTE_TYPE)
 
     # Store results to output buffers
     gl.amd.cdna3.buffer_store(
@@ -663,7 +658,7 @@ def paged_attention_decode_v2_gluon_fp8(
     key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache_ptr,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
-    sequence_lengths_ptr,  # [num_seqs]
+    context_lengths_ptr,  # [num_seqs]
     softmax_scale,
     query_scale,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -691,20 +686,19 @@ def paged_attention_decode_v2_gluon_fp8(
     num_seqs,
     num_kv_heads,
     max_num_partitions,
-    QUERY_SEQ_LEN: tl.constexpr,
-    # COMPUTE_TYPE: tl.constexpr,
-    HEAD_SIZE: tl.constexpr,
-    QUERY_GROUP_SIZE_ORIGINAL: tl.constexpr,
-    QUERY_GROUP_SIZE: tl.constexpr,
-    KV_BLOCK_SIZE: tl.constexpr,
-    SEQUENCE_PARTITION_SIZE: tl.constexpr,
-    KV_16B_ELEMENT_COUNT: tl.constexpr,
-    QUERY_QUANT_MODE: tl.constexpr,
-    KV_QUANT_MODE: tl.constexpr,
-    KV_COMPUTE_BLOCK_SIZE: tl.constexpr,
-    FP8_MAX_VALUE: tl.constexpr,
-    VALUE_TRANSPOSED: tl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
-    IS_CAUSAL: tl.constexpr,
+    COMPUTE_TYPE: gl.constexpr,
+    QUERY_SEQ_LEN: gl.constexpr,
+    QUERY_GROUP_SIZE_ORIGINAL: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    KV_BLOCK_SIZE: gl.constexpr,
+    KV_16B_ELEMENT_COUNT: gl.constexpr,
+    SEQUENCE_PARTITION_SIZE: gl.constexpr,
+    KV_COMPUTE_BLOCK_SIZE: gl.constexpr,
+    QUERY_QUANT_MODE: gl.constexpr,
+    KV_QUANT_MODE: gl.constexpr,
+    FP8_MAX_VALUE: gl.constexpr,
+    VALUE_TRANSPOSED: gl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+    IS_CAUSAL: gl.constexpr,
 ):
     """
     Paged Attention Decode Kernel with FP8/BF16 support for AMD GPUs.
@@ -721,7 +715,7 @@ def paged_attention_decode_v2_gluon_fp8(
         key_cache_ptr: Pointer to key cache in block layout
         value_cache_ptr: Pointer to value cache in block layout
         block_tables_ptr: Pointer to block tables mapping sequences to physical blocks
-        sequence_lengths_ptr: Pointer to sequence lengths for each sequence
+        context_lengths_ptr: Pointer to sequence lengths for each sequence
         softmax_scale: Scaling factor for softmax
         query_scale: Query quantization scales
         key_scale: Key quantization scales
@@ -734,6 +728,7 @@ def paged_attention_decode_v2_gluon_fp8(
         and supports both FP8 and BF16 data types with various quantization modes.
     """
 
+    QUERY_GROUP_SIZE: gl.constexpr = QUERY_SEQ_LEN * QUERY_GROUP_SIZE_ORIGINAL
     # ==================== VALIDATION CHECKS ====================
     gl.static_assert(
         QUERY_SEQ_LEN <= 4,
@@ -1006,7 +1001,7 @@ def paged_attention_decode_v2_gluon_fp8(
     )
 
     # ==================== SEQUENCE PROCESSING ====================
-    kv_sequence_length = gl.load(sequence_lengths_ptr + sequence_idx)
+    kv_sequence_length = gl.load(context_lengths_ptr + sequence_idx)
     kv_sequence_start_idx = sequence_partition_idx * SEQUENCE_PARTITION_SIZE
     if kv_sequence_start_idx >= kv_sequence_length:
         return  # No computation needed for this partition
@@ -1288,8 +1283,7 @@ def paged_attention_decode_v2_gluon_fp8(
         exp_sums_reciprocal[:, None], layout=pv_mfma_layout
     )
     attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
-    # attention_accumulator = attention_accumulator.to(COMPUTE_TYPE)
-    attention_accumulator = attention_accumulator.to(gl.bfloat16)
+    attention_accumulator = attention_accumulator.to(COMPUTE_TYPE)
 
     # Store results to global memory
     gl.amd.cdna3.buffer_store(
@@ -1318,7 +1312,7 @@ def paged_attention_decode_v2_reduce_gluon(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
     logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
-    sequence_lengths_ptr,  # [num_seqs]
+    context_lengths_ptr,  # [num_seqs]
     sink_token_ptr,  # [num_query_heads]
     stride_output_seq,
     stride_output_head,
@@ -1329,11 +1323,11 @@ def paged_attention_decode_v2_reduce_gluon(
     stride_logits_head,
     stride_logits_part,
     stride_logits_group,
-    HEAD_SIZE: tl.constexpr,
-    QUERY_GROUP_SIZE: tl.constexpr,
-    SEQUENCE_PARTITION_SIZE: tl.constexpr,
-    MAX_NUM_SEQ_PARTITIONS: tl.constexpr,
-    USE_SINK_TOKENS: tl.constexpr,
+    QUERY_GROUP_SIZE: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    MAX_NUM_SEQ_PARTITIONS: gl.constexpr,
+    SEQUENCE_PARTITION_SIZE: gl.constexpr,
+    USE_SINK_TOKENS: gl.constexpr,
 ):
     """
     Gluon-based reduction kernel for paged attention decode that combines partial results.
@@ -1349,14 +1343,16 @@ def paged_attention_decode_v2_reduce_gluon(
         exp_sums_ptr: Exponential sums from partial computations
         max_logits_ptr: Maximum logits from partial computations
         logits_ptr: Partial logit tensors from each sequence partition
-        sequence_lengths_ptr: Sequence lengths for each sequence
+        context_lengths_ptr: Sequence lengths for each sequence
         sink_token_ptr: Sink token values for attention (optional)
         Various stride parameters for tensor access
         Compile-time constants for kernel configuration
     """
     # Calculate power-of-2 values internally
     HEAD_SIZE_POW2: gl.constexpr = triton.next_power_of_2(HEAD_SIZE)
-    MAX_NUM_SEQ_PARTITIONS_POW2: gl.constexpr = triton.next_power_of_2(MAX_NUM_SEQ_PARTITIONS)
+    MAX_NUM_SEQ_PARTITIONS_POW2: gl.constexpr = triton.next_power_of_2(
+        MAX_NUM_SEQ_PARTITIONS
+    )
     if QUERY_GROUP_SIZE < 16:
         QUERY_GROUP_SIZE_POW2: gl.constexpr = 16
     else:
@@ -1366,7 +1362,7 @@ def paged_attention_decode_v2_reduce_gluon(
     sequence_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
     num_query_heads_total = gl.num_programs(1) * QUERY_GROUP_SIZE
-    sequence_length = gl.load(sequence_lengths_ptr + sequence_idx)
+    sequence_length = gl.load(context_lengths_ptr + sequence_idx)
     num_partitions = gl.cdiv(sequence_length, SEQUENCE_PARTITION_SIZE)
 
     # Select optimal memory layout based on maximum partition count
@@ -1514,7 +1510,7 @@ def paged_attention_decode_v2_reduce_kernel(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
     logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
-    sequence_lengths_ptr,  # [num_seqs]
+    context_lengths_ptr,  # [num_seqs]
     stride_output_seq,
     stride_output_head,
     stride_exp_sums_seq,
@@ -1526,10 +1522,10 @@ def paged_attention_decode_v2_reduce_kernel(
     stride_logits_group,
     num_seqs,
     num_kv_heads,
-    HEAD_SIZE: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
-    SEQUENCE_PARTITION_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
     MAX_NUM_SEQ_PARTITIONS: tl.constexpr,
+    SEQUENCE_PARTITION_SIZE: tl.constexpr,
 ):
     """
     Triton reduction kernel for paged attention decode that combines partial results.
@@ -1545,7 +1541,7 @@ def paged_attention_decode_v2_reduce_kernel(
         exp_sums_ptr: Exponential sums from partial computations
         max_logits_ptr: Maximum logits from partial computations
         logits_ptr: Partial logit tensors from each sequence partition
-        sequence_lengths_ptr: Sequence lengths for each sequence
+        context_lengths_ptr: Sequence lengths for each sequence
         Various stride parameters for tensor access
         Compile-time constants for kernel configuration
     """
@@ -1554,7 +1550,9 @@ def paged_attention_decode_v2_reduce_kernel(
 
     # Calculate power-of-2 values internally
     HEAD_SIZE_POW2: tl.constexpr = triton.next_power_of_2(HEAD_SIZE)
-    MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr = triton.next_power_of_2(MAX_NUM_SEQ_PARTITIONS)
+    MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr = triton.next_power_of_2(
+        MAX_NUM_SEQ_PARTITIONS
+    )
     if QUERY_GROUP_SIZE < 16:
         QUERY_GROUP_SIZE_POW2: gl.constexpr = 16
     else:
@@ -1564,7 +1562,7 @@ def paged_attention_decode_v2_reduce_kernel(
     sequence_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
-    kv_sequence_length = tl.load(sequence_lengths_ptr + sequence_idx)
+    kv_sequence_length = tl.load(context_lengths_ptr + sequence_idx)
     num_partitions = tl.cdiv(kv_sequence_length, SEQUENCE_PARTITION_SIZE)
 
     # Generate coordinate ranges
@@ -1711,7 +1709,6 @@ def compile_ttgir_with_triton(ttgir_content: str):
             os.unlink(ttgir_file_path)
 
 
-# @perftest()
 def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     grid,
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
@@ -1721,7 +1718,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache_ptr,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
-    sequence_lengths_ptr,  # [num_seqs]
+    context_lengths_ptr,  # [num_seqs]
     softmax_scale,
     query_scale,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -1746,15 +1743,13 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     query_scale_stride_0,
     kv_scale_stride_0,
     kv_scale_stride_1,
-    kv_type,
-    QUERY_SEQ_LEN,
     COMPUTE_TYPE,
-    HEAD_SIZE,
+    QUERY_SEQ_LEN,
     QUERY_GROUP_SIZE_ORIGINAL,
-    QUERY_GROUP_SIZE,
+    HEAD_SIZE,
     KV_BLOCK_SIZE,
-    SEQUENCE_PARTITION_SIZE,
     KV_16B_ELEMENT_COUNT,
+    SEQUENCE_PARTITION_SIZE,
     QUERY_QUANT_MODE,
     KV_QUANT_MODE,
     FP8_MAX_VALUE,
@@ -1772,11 +1767,13 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         parameters for Triton compilation and execution.
     """
     # Debug compilation path - kept for development and debugging purposes
-    if 0:
-        ttgir_file_path = os.path.join(
-            os.path.dirname(__file__),
-            "./thread_trace/triton_gen_asm/pa_decode_v2_fp8/pa_decode_v2_fp8.ttgir",
-        )
+    # if 0:
+    if 1:
+        # ttgir_file_path = os.path.join(
+        #     os.path.dirname(__file__),
+        #     "/mnt/raid0/heyanguang/code/fa_triton/aiter/paged_attention_decode_v2_gluon_fp8.ttgir",
+        # )
+        ttgir_file_path = "/mnt/raid0/heyanguang/code/fa_triton/aiter/paged_attention_decode_v2_gluon_fp8.ttgir"
         with open(ttgir_file_path, "r") as f:
             ttgir_content = f.read()
         try:
@@ -1789,7 +1786,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 key_cache_ptr,
                 value_cache_ptr,
                 block_tables_ptr,
-                sequence_lengths_ptr,
+                context_lengths_ptr,
                 softmax_scale,
                 query_scale,
                 key_scale,
@@ -1814,11 +1811,15 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 query_scale_stride_0,
                 kv_scale_stride_0,
                 kv_scale_stride_1,
+                grid[0],
+                grid[1],
+                grid[2],
             )
         except Exception as e:
             print(f"Compilation failed: {e}")
     else:
         # Production path - select and launch appropriate kernel
+        QUERY_GROUP_SIZE: gl.constexpr = QUERY_SEQ_LEN * QUERY_GROUP_SIZE_ORIGINAL
         QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(QUERY_GROUP_SIZE)
         KV_COMPUTE_BLOCK_SIZE = 256
         waves_per_eu = 1
@@ -1848,7 +1849,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             key_cache_ptr,
             value_cache_ptr,
             block_tables_ptr,
-            sequence_lengths_ptr,
+            context_lengths_ptr,
             softmax_scale,
             query_scale,
             key_scale,
@@ -1876,17 +1877,16 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             num_seqs=grid[0],
             num_kv_heads=grid[1],
             max_num_partitions=grid[2],
+            COMPUTE_TYPE=COMPUTE_TYPE,
             QUERY_SEQ_LEN=QUERY_SEQ_LEN,
-            # COMPUTE_TYPE=COMPUTE_TYPE,
-            HEAD_SIZE=HEAD_SIZE,
             QUERY_GROUP_SIZE_ORIGINAL=QUERY_GROUP_SIZE_ORIGINAL,
-            QUERY_GROUP_SIZE=QUERY_GROUP_SIZE,
+            HEAD_SIZE=HEAD_SIZE,
             KV_BLOCK_SIZE=KV_BLOCK_SIZE,
-            SEQUENCE_PARTITION_SIZE=SEQUENCE_PARTITION_SIZE,
             KV_16B_ELEMENT_COUNT=KV_16B_ELEMENT_COUNT,
+            SEQUENCE_PARTITION_SIZE=SEQUENCE_PARTITION_SIZE,
+            KV_COMPUTE_BLOCK_SIZE=KV_COMPUTE_BLOCK_SIZE,
             QUERY_QUANT_MODE=QUERY_QUANT_MODE,
             KV_QUANT_MODE=KV_QUANT_MODE,
-            KV_COMPUTE_BLOCK_SIZE=KV_COMPUTE_BLOCK_SIZE,
             FP8_MAX_VALUE=FP8_MAX_VALUE,
             VALUE_TRANSPOSED=VALUE_TRANSPOSED,
             IS_CAUSAL=IS_CAUSAL,
@@ -1895,14 +1895,13 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         )
 
 
-# @perftest()
 def _paged_attention_decode_v2_reduce_kernel_wrapper(
     grid,
     output_ptr,  # [num_seqs, num_kv_heads, query_group_size, head_size]
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
     logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
-    sequence_lengths_ptr,  # [num_seqs]
+    context_lengths_ptr,  # [num_seqs]
     stride_output_seq,
     stride_output_head,
     stride_exp_sums_seq,
@@ -1912,10 +1911,10 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
     stride_logits_head,
     stride_logits_part,
     stride_logits_group,
-    HEAD_SIZE,
     QUERY_GROUP_SIZE,
-    SEQUENCE_PARTITION_SIZE,
+    HEAD_SIZE,
     MAX_NUM_SEQ_PARTITIONS,
+    SEQUENCE_PARTITION_SIZE,
 ):
     """
     Wrapper function for paged attention reduction kernel with kernel selection.
@@ -1936,7 +1935,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             exp_sums_ptr,
             max_logits_ptr,
             logits_ptr,
-            sequence_lengths_ptr,
+            context_lengths_ptr,
             None,  # sink_token_ptr not used in this configuration
             stride_output_seq,
             stride_output_head,
@@ -1947,10 +1946,10 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             stride_logits_head,
             stride_logits_part,
             stride_logits_group,
-            HEAD_SIZE=HEAD_SIZE,
             QUERY_GROUP_SIZE=QUERY_GROUP_SIZE,
-            SEQUENCE_PARTITION_SIZE=SEQUENCE_PARTITION_SIZE,
+            HEAD_SIZE=HEAD_SIZE,
             MAX_NUM_SEQ_PARTITIONS=MAX_NUM_SEQ_PARTITIONS,
+            SEQUENCE_PARTITION_SIZE=SEQUENCE_PARTITION_SIZE,
             USE_SINK_TOKENS=False,
         )
     else:
@@ -1960,7 +1959,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             exp_sums_ptr,
             max_logits_ptr,
             logits_ptr,
-            sequence_lengths_ptr,
+            context_lengths_ptr,
             stride_output_seq,
             stride_output_head,
             stride_exp_sums_seq,
@@ -1972,10 +1971,10 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             stride_logits_group,
             num_seqs=grid[0],
             num_kv_heads=grid[1],
-            HEAD_SIZE=HEAD_SIZE,
             QUERY_GROUP_SIZE=QUERY_GROUP_SIZE,
-            SEQUENCE_PARTITION_SIZE=SEQUENCE_PARTITION_SIZE,
+            HEAD_SIZE=HEAD_SIZE,
             MAX_NUM_SEQ_PARTITIONS=MAX_NUM_SEQ_PARTITIONS,
+            SEQUENCE_PARTITION_SIZE=SEQUENCE_PARTITION_SIZE,
         )
 
 
@@ -1985,11 +1984,12 @@ def paged_attention_decode(
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or
     # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
-    sequence_lengths: torch.Tensor,  # [num_seqs]
+    context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
     query_sequence_length: int,
     max_sequence_length: int,
+    sequence_partition_size: int,
     compute_type: tl.dtype,
     query_scale: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -2024,8 +2024,8 @@ def paged_attention_decode(
         Shape: [num_blocks, num_kv_heads, head_size, kv_block_size] or
                [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
 
-    sequence_lengths : torch.Tensor
-        Current sequence lengths for each sequence
+    context_lengths : torch.Tensor
+        Current context lengths for each sequence
         Shape: [num_seqs]
 
     block_tables : torch.Tensor
@@ -2067,7 +2067,7 @@ def paged_attention_decode(
     num_query_heads_total = num_query_heads_total // query_sequence_length
     num_kv_heads = key_cache.shape[1]
     max_num_partitions = int(
-        (max_sequence_length + _SEQUENCE_PARTITION_SIZE - 1) // _SEQUENCE_PARTITION_SIZE
+        (max_sequence_length + sequence_partition_size - 1) // sequence_partition_size
     )
     head_size = query.shape[-1]
     kv_block_size = key_cache.shape[-2]
@@ -2198,7 +2198,7 @@ def paged_attention_decode(
         key_cache,
         value_cache,
         block_tables,
-        sequence_lengths,
+        context_lengths,
         softmax_scale,
         query_scale,
         key_scale,
@@ -2223,15 +2223,13 @@ def paged_attention_decode(
         query_scale_stride_0,
         key_scale_stride_0,
         key_scale_stride_1,
-        kv_type=compute_type,
-        QUERY_SEQ_LEN=query_sequence_length,
         COMPUTE_TYPE=compute_type,
+        QUERY_SEQ_LEN=query_sequence_length,
         HEAD_SIZE=head_size,
         QUERY_GROUP_SIZE_ORIGINAL=query_group_size,
-        QUERY_GROUP_SIZE=equivalent_query_group_size,
         KV_BLOCK_SIZE=kv_block_size,
-        SEQUENCE_PARTITION_SIZE=_SEQUENCE_PARTITION_SIZE,
         KV_16B_ELEMENT_COUNT=kv_elements_per_16b,
+        SEQUENCE_PARTITION_SIZE=sequence_partition_size,
         QUERY_QUANT_MODE=query_quant_mode,
         KV_QUANT_MODE=kv_quant_mode,
         FP8_MAX_VALUE=fp8_max_value,
@@ -2247,7 +2245,7 @@ def paged_attention_decode(
         exp_sums,
         max_logits,
         temporary_output,
-        sequence_lengths,
+        context_lengths,
         output.stride(0),
         output.stride(1),
         exp_sums.stride(0),
@@ -2257,8 +2255,8 @@ def paged_attention_decode(
         temporary_output.stride(1),
         temporary_output.stride(2),
         temporary_output.stride(3),
-        HEAD_SIZE=head_size,
         QUERY_GROUP_SIZE=equivalent_query_group_size,
-        SEQUENCE_PARTITION_SIZE=_SEQUENCE_PARTITION_SIZE,
+        HEAD_SIZE=head_size,
         MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
+        SEQUENCE_PARTITION_SIZE=sequence_partition_size,
     )

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import sys
 import hashlib
@@ -6,6 +8,7 @@ import aiter
 import numpy as np
 import argparse
 import random
+import tempfile
 import torch
 import triton
 import triton.language as tl
@@ -15,7 +18,10 @@ from jinja2 import Template
 from aiter.test_common import perftest, run_perftest
 from aiter import pertoken_quant, per_tensor_quant
 from csrc.cpp_itfs.torch_utils import torch_to_c_types
-from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import compile_gluon_kernel, CompileGluonArgs
+from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
+    compile_gluon_kernel,
+    CompileGluonArgs,
+)
 from csrc.cpp_itfs.utils import (
     compile_template_op,
     AITER_CORE_DIR,
@@ -39,6 +45,8 @@ from csrc.cpp_itfs.pa_gluon.pa_decode_gluon_test import (
 # Global configuration from reference implementation
 UNIFORM_RANGE = (-1, 1)
 TORCH_TO_TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
+# os.environ['TRITON_CACHE_DIR'] = '/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache'
+# compile_reduce_kernel_count = 0
 
 
 def setup_seed(seed: int) -> None:
@@ -49,48 +57,86 @@ def setup_seed(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
 
 
-def tensor_to_hash(tensor: torch.Tensor, algorithm: str = 'md5') -> str:
+def tensor_to_hash(tensor: torch.Tensor, algorithm: str = "md5") -> str:
     """
     Convert a PyTorch tensor to a hash value using the specified algorithm.
-    
+
     Args:
         tensor (torch.Tensor): Input tensor
         algorithm (str): Hash algorithm, defaults to 'md5',
                         options: 'md5', 'sha1', 'sha256', etc.
-        
+
     Returns:
         str: Hexadecimal string representation of the hash value
     """
     hash_func = getattr(hashlib, algorithm)()
-    
+
     # Process tensor data
-    tensor_data = (
-        tensor.contiguous()
-        .view(torch.uint8)
-        .detach()
-        .cpu()
-        .numpy()
-        .tobytes()
-    )
-    
+    tensor_data = tensor.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()
+
     hash_func.update(tensor_data)
     return hash_func.hexdigest()
 
 
+def compile_ttgir_with_triton(ttgir_content: str):
+    """
+    Compile TTGIR (Triton Tensor IR) content to executable artifact.
+
+    This function takes TTGIR string content, writes it to a temporary file,
+    and compiles it using the Triton compiler. The temporary file is cleaned up
+    after compilation regardless of success or failure.
+
+    Args:
+        ttgir_content (str): The TTGIR (Triton Tensor IR) code as a string
+                             to be compiled.
+
+    Returns:
+        object: The compiled artifact from the Triton compiler.
+
+    Raises:
+        Exception: Any exception raised during the compilation process
+                  will be propagated to the caller.
+
+    Note:
+        This function uses a temporary file to work with the Triton compiler
+        which expects file input. The file is automatically deleted after
+        compilation to avoid leaving temporary files on disk.
+    """
+    # Create a temporary file to store the TTGIR content
+    # Using NamedTemporaryFile with delete=False to control deletion manually
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".ttgir", delete=False
+    ) as temp_file:
+        # Write TTGIR content to temporary file
+        temp_file.write(ttgir_content)
+        ttgir_file_path = temp_file.name
+
+    try:
+        # Compile the TTGIR file using Triton compiler
+        # This converts the intermediate representation to executable code
+        compiled_artifact = triton.compiler.compiler.compile(ttgir_file_path)
+        return compiled_artifact
+
+    finally:
+        # Ensure temporary file is cleaned up even if compilation fails
+        # This prevents leaving temporary files on the filesystem
+        if os.path.exists(ttgir_file_path):
+            os.unlink(ttgir_file_path)
+
+
 def compile_attention_kernel(
+    compute_type: tl.dtype,
     query_seq_len: int,
-    head_size: int,
     query_group_size: int,
+    head_size: int,
     kv_block_size: int,
-    sequence_partition_size: int,
     kv_16b_element_count: int,
+    sequence_partition_size: int,
     query_quant_mode: int,
     kv_quant_mode: int,
-    kv_compute_block_size: int,
     fp8_max_value: float,
     value_transposed: int,
     is_causal: int,
-    compute_type: tl.dtype,
     md_name: str,
     func_name: str = None,
 ):
@@ -98,62 +144,92 @@ def compile_attention_kernel(
     if func_name is None:
         func_name = get_default_func_name(
             md_name,
-            (query_seq_len, head_size, query_group_size, kv_block_size, sequence_partition_size,
-             kv_16b_element_count, query_quant_mode, kv_quant_mode, kv_compute_block_size,
-             fp8_max_value, value_transposed, is_causal, compute_type),
+            (
+                compute_type,
+                query_seq_len,
+                query_group_size,
+                head_size,
+                kv_block_size,
+                kv_16b_element_count,
+                sequence_partition_size,
+                query_quant_mode,
+                kv_quant_mode,
+                fp8_max_value,
+                value_transposed,
+                is_causal,
+            ),
         )
 
-    # if not_built(func_name):
-    if True:
-        query_group_size_original = query_group_size
+    # global compile_reduce_kernel_count
+    # compile_reduce_kernel_count += 1
+
+    if not_built(func_name):
+        # if compile_reduce_kernel_count == 1:
+        equivalent_query_group_size = query_seq_len * query_group_size
+        equi_query_group_size_pow2 = triton.next_power_of_2(equivalent_query_group_size)
+        kv_compute_block_size = 256
+        waves_per_eu = 1
+        # Select kernel implementation based on block size
+        if kv_block_size > sequence_partition_size:
+            # Use big block kernel for large block sizes
+            if value_transposed:
+                # Use smaller compute block size for better performance with transposed values
+                kv_compute_block_size = 128
+        else:
+            # Use standard kernel for normal block sizes
+            # Configure waves per EU based on query group size
+            if equi_query_group_size_pow2 == 64:
+                waves_per_eu = 3
+            else:
+                waves_per_eu = 4
 
         # Build signature based on kernel parameters
         signature_parts = [
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
             "*bf16:16",  # output_ptr
-            "*fp8e4b8:16",   # query_ptr
-            "*fp8e4b8:16",   # key_cache_ptr
-            "*fp8e4b8:16",   # value_cache_ptr
-            "*i32:16",   # block_tables_ptr
-            "*i32:16",   # sequence_lengths_ptr
-            "fp32",      # softmax_scale
+            "*fp8e4b8:16",  # query_ptr
+            "*fp8e4b8:16",  # key_cache_ptr
+            "*fp8e4b8:16",  # value_cache_ptr
+            "*i32:16",  # block_tables_ptr
+            "*i32:16",  # sequence_lengths_ptr
+            "fp32:16",  # softmax_scale
             "*fp32:16",  # query_scale
             "*fp32:16",  # key_scale
             "*fp32:16",  # value_scale
-            "i32",       # stride_max_logits_seq
-            "i32",       # stride_max_logits_head
-            "i32",       # stride_max_logits_part
-            "i32",       # stride_output_seq
-            "i32",       # stride_output_head
-            "i32",       # stride_output_part
-            "i32",       # stride_output_group
-            "i32",       # stride_query_seq
-            "i32",       # stride_query_head
-            "i32",       # stride_key_block
-            "i32",       # stride_key_head
-            "i32",       # stride_key_head_split
-            "i32",       # stride_key_block_elem
-            "i32",       # stride_value_block
-            "i32",       # stride_value_head
-            "i32",       # stride_value_head_size
-            "i32",       # stride_block_table_seq
-            "i32",       # query_scale_stride_0
-            "i32",       # kv_scale_stride_0
-            "i32",       # kv_scale_stride_1
-            "i32",       # num_seqs
-            "i32",       # num_kv_heads
-            "i32",       # max_num_partitions
+            "i32",  # stride_max_logits_seq
+            "i32",  # stride_max_logits_head
+            "i32",  # stride_max_logits_part
+            "i32",  # stride_output_seq
+            "i32",  # stride_output_head
+            "i32",  # stride_output_part
+            "i32",  # stride_output_group
+            "i32",  # stride_query_seq
+            "i32",  # stride_query_head
+            "i32",  # stride_key_block
+            "i32",  # stride_key_head
+            "i32",  # stride_key_head_split
+            "i32",  # stride_key_block_elem
+            "i32",  # stride_value_block
+            "i32",  # stride_value_head
+            "i32",  # stride_value_head_size
+            "i32",  # stride_block_table_seq
+            "i32",  # query_scale_stride_0
+            "i32",  # kv_scale_stride_0
+            "i32",  # kv_scale_stride_1
+            "i32",  # num_seqs
+            "i32",  # num_kv_heads
+            "i32",  # max_num_partitions
+            f"{str(compute_type)}",
             f"{query_seq_len}",
-            f"{head_size}",
-            f"{query_group_size_original}",
             f"{query_group_size}",
+            f"{head_size}",
             f"{kv_block_size}",
-            f"{sequence_partition_size}",
             f"{kv_16b_element_count}",
+            f"{sequence_partition_size}",
+            f"{kv_compute_block_size}",
             f"{query_quant_mode}",
             f"{kv_quant_mode}",
-            f"{kv_compute_block_size}",
             f"{fp8_max_value}",
             f"{value_transposed}",
             f"{is_causal}",
@@ -181,7 +257,10 @@ def compile_attention_kernel(
             elif output_file.suffix == ".cpp":
                 triton_source = output_file
 
-        with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_attention_kernel.cpp.jinja", "r") as f:
+        with open(
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_attention_kernel.cpp.jinja",
+            "r",
+        ) as f:
             src_template = Template(f.read())
 
         return compile_template_op(
@@ -207,7 +286,7 @@ def run_compiled_attention_kernel(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
-    sequence_lengths: torch.Tensor,
+    context_lengths: torch.Tensor,
     softmax_scale: float,
     query_scale: torch.Tensor,
     key_scale: torch.Tensor,
@@ -216,14 +295,13 @@ def run_compiled_attention_kernel(
     num_kv_heads: int,
     max_num_partitions: int,
     query_seq_len: int,
-    head_size: int,
     query_group_size: int,
+    head_size: int,
     kv_block_size: int,
-    sequence_partition_size: int,
     kv_16b_element_count: int,
+    sequence_partition_size: int,
     query_quant_mode: int,
     kv_quant_mode: int,
-    kv_compute_block_size: int,
     fp8_max_value: float,
     value_transposed: int,
     is_causal: int,
@@ -235,19 +313,18 @@ def run_compiled_attention_kernel(
     Compile and run the compiled attention kernel with perftest timing
     """
     func = compile_attention_kernel(
+        compute_type=compute_type,
         query_seq_len=query_seq_len,
-        head_size=head_size,
         query_group_size=query_group_size,
+        head_size=head_size,
         kv_block_size=kv_block_size,
-        sequence_partition_size=sequence_partition_size,
         kv_16b_element_count=kv_16b_element_count,
+        sequence_partition_size=sequence_partition_size,
         query_quant_mode=query_quant_mode,
         kv_quant_mode=kv_quant_mode,
-        kv_compute_block_size=kv_compute_block_size,
         fp8_max_value=fp8_max_value,
         value_transposed=int(value_transposed),
         is_causal=int(is_causal),
-        compute_type=compute_type,
         md_name=md_name,
         func_name=func_name,
     )
@@ -261,7 +338,7 @@ def run_compiled_attention_kernel(
             key_cache,
             value_cache,
             block_tables,
-            sequence_lengths,
+            context_lengths,
             softmax_scale,
             query_scale,
             key_scale,
@@ -303,23 +380,23 @@ def run_direct_attention_kernel(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
-    sequence_lengths: torch.Tensor,
+    context_lengths: torch.Tensor,
     softmax_scale: float,
     query_scale: torch.Tensor,
     key_scale: torch.Tensor,
     value_scale: torch.Tensor,
+    compute_type: tl.dtype,
     query_seq_len: int,
-    head_size: int,
     query_group_size: int,
+    head_size: int,
     kv_block_size: int,
-    sequence_partition_size: int,
     kv_16b_element_count: int,
+    sequence_partition_size: int,
     query_quant_mode: int,
     kv_quant_mode: int,
     fp8_max_value: float,
     value_transposed: int,
     is_causal: int,
-    compute_type: str,
 ):
     """
     Directly call the attention kernel from pa_decode_triton_gluon_fp8.py with perftest timing
@@ -327,74 +404,182 @@ def run_direct_attention_kernel(
     num_seqs = exp_sums.shape[0]
     num_kv_heads = exp_sums.shape[1]
     max_num_partitions = exp_sums.shape[2]
-
     # Configure grid
     grid = (num_seqs, num_kv_heads, max_num_partitions)
 
-    # Determine compute block size
-    kv_compute_block_size = 256
-    if value_transposed and kv_block_size > 256:
-        kv_compute_block_size = 128
+    query_scale_stride_0 = 0
+    key_scale_stride_0 = 0
+    key_scale_stride_1 = 0
 
-    # Select kernel based on block size
-    if kv_block_size > sequence_partition_size:
-        # Use large block kernel
-        kernel = paged_attention_decode_v2_gluon_large_block_fp8
+    # Configure query quantization
+    if query_scale is not None:
+        assert (
+            isinstance(query_scale, torch.Tensor)
+            and query_scale.dtype == aiter.dtypes.fp32
+        ), f"query_scale tensor only support dtype == {aiter.dtypes.fp32}, but got query_scale.dtype == {query_scale.dtype}"
+
+        if query_scale.numel() == 1:
+            pass
+        else:
+            # Per-token quantization
+            assert (
+                len(query_scale.shape) == 3
+            ), f"Expected 3D query_scale tensor, but got shape {query_scale.shape}"
+            assert (
+                query_scale.shape[-1] == 1
+            ), f"Expected query_scale.shape[-1] == 1, but got query_scale.shape[-1]={query_scale.shape[-1]}"
+            query_quant_mode = 1
+            query_scale_stride_0 = query_scale.stride(0)
+
+    # Configure KV quantization
+    if key_scale is not None and value_scale is not None:
+        assert (
+            isinstance(key_scale, torch.Tensor) and key_scale.dtype == aiter.dtypes.fp32
+        ), f"key_scale tensor only support dtype == {aiter.dtypes.fp32}, but got key_scale.dtype == {key_scale.dtype}"
+        assert (
+            isinstance(value_scale, torch.Tensor)
+            and value_scale.dtype == aiter.dtypes.fp32
+        ), f"value_scale tensor only support dtype == {aiter.dtypes.fp32}, but got value_scale.dtype == {value_scale.dtype}"
+
+        if key_scale.numel() == 1:
+            pass
+        else:
+            # Per-token quantization
+            assert (
+                len(key_scale.shape) == 4
+            ), f"Expected 4D key_scale tensor, but got shape {key_scale.shape}"
+            assert (
+                key_scale.shape[-1] == 1
+            ), f"Expected key_scale.shape[-1] == 1, but got key_scale.shape[-1]={key_scale.shape[-1]}"
+            key_scale_stride_0 = key_scale.stride(0)
+            key_scale_stride_1 = key_scale.stride(1)
+
+        # Validate KV scale shape consistency
+        assert (
+            key_scale.shape == value_scale.shape
+        ), f"Key and value scales must have same shape, but got key: {key_scale.shape}, value: {value_scale.shape}"
+
+    # Debug compilation path - kept for development and debugging purposes
+    # if 1:
+    if 0:
+        ttgir_file_path = "/mnt/raid0/heyanguang/code/fa_triton/aiter/paged_attention_decode_v2_gluon_fp8.ttgir"
+        with open(ttgir_file_path, "r") as f:
+            ttgir_content = f.read()
+        try:
+            compiled_kernel = compile_ttgir_with_triton(ttgir_content)
+            compiled_kernel[grid](
+                exp_sums,
+                max_logits,
+                temporary_output,
+                query,
+                key_cache,
+                value_cache,
+                block_tables,
+                context_lengths,
+                softmax_scale,
+                query_scale,
+                key_scale,
+                value_scale,
+                exp_sums.stride(0),
+                exp_sums.stride(1),
+                exp_sums.stride(2),
+                temporary_output.stride(0),
+                temporary_output.stride(1),
+                temporary_output.stride(2),
+                temporary_output.stride(3),
+                query.stride(0),
+                query.stride(1),
+                key_cache.stride(0),
+                key_cache.stride(1),
+                key_cache.stride(2),
+                key_cache.stride(3),
+                value_cache.stride(0),
+                value_cache.stride(1),
+                value_cache.stride(2),
+                block_tables.stride(0),
+                query_scale_stride_0,
+                key_scale_stride_0,
+                key_scale_stride_1,
+                grid[0],
+                grid[1],
+                grid[2],
+            )
+        except Exception as e:
+            print(f"Compilation failed: {e}")
     else:
+        equivalent_query_group_size = query_seq_len * query_group_size
+        equi_query_group_size_pow2 = triton.next_power_of_2(equivalent_query_group_size)
+        kv_compute_block_size = 256
+        waves_per_eu = 1
+
         # Use standard kernel
         kernel = paged_attention_decode_v2_gluon_fp8
+        # Select kernel implementation based on block size
+        if kv_block_size > sequence_partition_size:
+            # Use large block kernel
+            kernel = paged_attention_decode_v2_gluon_large_block_fp8
+            if value_transposed:
+                # Use smaller compute block size for better performance with transposed values
+                kv_compute_block_size = 128
+        else:
+            # Use standard kernel for normal block sizes
+            # Configure waves per EU based on query group size
+            if equi_query_group_size_pow2 == 64:
+                waves_per_eu = 3
+            else:
+                waves_per_eu = 4
 
-    # Launch the kernel directly
-    kernel[grid](
-        exp_sums,
-        max_logits,
-        temporary_output,
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
-        sequence_lengths,
-        softmax_scale,
-        query_scale,
-        key_scale,
-        value_scale,
-        exp_sums.stride(0),
-        exp_sums.stride(1),
-        exp_sums.stride(2),
-        temporary_output.stride(0),
-        temporary_output.stride(1),
-        temporary_output.stride(2),
-        temporary_output.stride(3),
-        query.stride(0),
-        query.stride(1),
-        key_cache.stride(0),
-        key_cache.stride(1),
-        key_cache.stride(2),
-        key_cache.stride(3),
-        value_cache.stride(0),
-        value_cache.stride(1),
-        value_cache.stride(2),
-        block_tables.stride(0),
-        query_scale.stride(0) if query_scale is not None else 0,
-        key_scale.stride(0) if key_scale is not None else 0,
-        key_scale.stride(1) if key_scale is not None else 0,
-        num_seqs,
-        num_kv_heads,
-        max_num_partitions,
-        QUERY_SEQ_LEN=query_seq_len,
-        HEAD_SIZE=head_size,
-        QUERY_GROUP_SIZE_ORIGINAL=query_group_size,
-        QUERY_GROUP_SIZE=query_group_size,
-        KV_BLOCK_SIZE=kv_block_size,
-        SEQUENCE_PARTITION_SIZE=sequence_partition_size,
-        KV_16B_ELEMENT_COUNT=kv_16b_element_count,
-        QUERY_QUANT_MODE=query_quant_mode,
-        KV_QUANT_MODE=kv_quant_mode,
-        KV_COMPUTE_BLOCK_SIZE=kv_compute_block_size,
-        FP8_MAX_VALUE=fp8_max_value,
-        VALUE_TRANSPOSED=value_transposed,
-        IS_CAUSAL=is_causal,
-    )
+        # Launch the kernel directly
+        kernel[grid](
+            exp_sums,
+            max_logits,
+            temporary_output,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            softmax_scale,
+            query_scale,
+            key_scale,
+            value_scale,
+            exp_sums.stride(0),
+            exp_sums.stride(1),
+            exp_sums.stride(2),
+            temporary_output.stride(0),
+            temporary_output.stride(1),
+            temporary_output.stride(2),
+            temporary_output.stride(3),
+            query.stride(0),
+            query.stride(1),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            key_cache.stride(3),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            value_cache.stride(2),
+            block_tables.stride(0),
+            query_scale_stride_0,
+            key_scale_stride_0,
+            key_scale_stride_1,
+            num_seqs,
+            num_kv_heads,
+            max_num_partitions,
+            COMPUTE_TYPE=compute_type,
+            QUERY_SEQ_LEN=query_seq_len,
+            QUERY_GROUP_SIZE_ORIGINAL=query_group_size,
+            HEAD_SIZE=head_size,
+            KV_BLOCK_SIZE=kv_block_size,
+            KV_16B_ELEMENT_COUNT=kv_16b_element_count,
+            SEQUENCE_PARTITION_SIZE=sequence_partition_size,
+            KV_COMPUTE_BLOCK_SIZE=kv_compute_block_size,
+            QUERY_QUANT_MODE=query_quant_mode,
+            KV_QUANT_MODE=kv_quant_mode,
+            FP8_MAX_VALUE=fp8_max_value,
+            VALUE_TRANSPOSED=value_transposed,
+            IS_CAUSAL=is_causal,
+        )
 
 
 def test_attention_kernel(kernel_type: str = "compiled"):
@@ -408,7 +593,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     device = "cuda:0"
     max_sequence_length = 16384
 
-    context_lengths = 4096
+    context_length = 4096
     batch_size = 128
     num_heads = (16, 2)
     head_size = 128
@@ -419,7 +604,6 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     sequence_partition_size = 256
     trans_v = True
     kv_varlen = False
-    kv_compute_block_size = 256
     compute_type = TORCH_TO_TL_DTYPE[data_type]
     kv_16b_element_count = 16 // data_type.itemsize
 
@@ -436,33 +620,50 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     kv_block_size = block_size
 
     # Set quantization modes based on quant_mode parameter
-    query_quant_mode = 1 if quant_mode == "per_token" else 0  # 1 for per-token, 0 for per-tensor
-    kv_quant_mode = 1 if quant_mode == "per_token" else 0    # 1 for per-token, 0 for per-tensor
+    query_quant_mode = (
+        1 if quant_mode == "per_token" else 0
+    )  # 1 for per-token, 0 for per-tensor
+    kv_quant_mode = (
+        1 if quant_mode == "per_token" else 0
+    )  # 1 for per-token, 0 for per-tensor
     value_transposed = 1 if trans_v else 0
 
     # Determine if causal masking is needed
     is_causal = query_length > 1
     num_sequences = batch_size
-    max_num_partitions = (context_lengths + sequence_partition_size - 1) // sequence_partition_size
+    max_num_partitions = (
+        context_length + sequence_partition_size - 1
+    ) // sequence_partition_size
     softmax_scale = 1.0 / (head_size**0.5)
 
     # Calculate block table dimensions
     max_blocks_per_sequence = (max_sequence_length + block_size - 1) // block_size
     total_blocks = max_blocks_per_sequence * batch_size
-    blocks_per_sequence = (context_lengths + block_size - 1) // block_size
+    blocks_per_sequence = (context_length + block_size - 1) // block_size
 
     # Create intermediate tensors for attention computation
     equivalent_query_group_size = query_length * (num_query_heads // num_kv_heads)
-    intermediate_shape = (num_sequences, num_kv_heads, max_num_partitions, equivalent_query_group_size)
+    intermediate_shape = (
+        num_sequences,
+        num_kv_heads,
+        max_num_partitions,
+        equivalent_query_group_size,
+    )
 
     exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=device)
     max_logits = torch.empty(intermediate_shape, dtype=torch.float32, device=device)
-    temporary_output = torch.empty(*intermediate_shape, head_size, dtype=data_type, device=device)
+    temporary_output = torch.empty(
+        *intermediate_shape, head_size, dtype=data_type, device=device
+    )
 
     # Create query tensor following reference approach
     total_queries = batch_size * query_length
     qkv_tensor = torch.randn(
-        total_queries, num_query_heads + 2 * num_kv_heads, head_size, dtype=data_type, device=device
+        total_queries,
+        num_query_heads + 2 * num_kv_heads,
+        head_size,
+        dtype=data_type,
+        device=device,
     )
     query, key, value = torch.split(
         qkv_tensor, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
@@ -520,7 +721,6 @@ def test_attention_kernel(kernel_type: str = "compiled"):
         )
 
     # Reshape query for Gluon kernel format
-    query_group_size = num_query_heads // num_kv_heads
     quantized_query_gluon = quantized_query
     query_scale_gluon = query_scale_factors
 
@@ -546,10 +746,12 @@ def test_attention_kernel(kernel_type: str = "compiled"):
 
     # Create sequence lengths and block tables
     if kv_varlen:
-        kv_len_list = [random.randint(query_length, context_lengths) for _ in range(batch_size)]
+        kv_len_list = [
+            random.randint(query_length, context_length) for _ in range(batch_size)
+        ]
     else:
-        kv_len_list = [context_lengths] * batch_size
-    sequence_lengths = torch.tensor(kv_len_list, dtype=torch.int32, device=device)
+        kv_len_list = [context_length] * batch_size
+    context_lengths = torch.tensor(kv_len_list, dtype=torch.int32, device=device)
 
     block_tables_list = []
     for _ in range(batch_size):
@@ -594,7 +796,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     # print(f"  query: shape={query.shape}, dtype={query.dtype}")
     # print(f"  key_cache: shape={key_cache.shape}, dtype={key_cache.dtype}")
     # print(f"  value_cache: shape={value_cache.shape}, dtype={value_cache.dtype}")
-    # print(f"  sequence_lengths: shape={sequence_lengths.shape}, dtype={sequence_lengths.dtype}")
+    # print(f"  context_lengths: shape={context_lengths.shape}, dtype={context_lengths.dtype}")
     # print(f"  block_tables: shape={block_tables.shape}, dtype={block_tables.dtype}")
     # print(f"  query_scale: shape={query_scale.shape}, dtype={query_scale.dtype}")
     # print(f"  key_scale: shape={key_scale.shape}, dtype={key_scale.dtype}")
@@ -612,7 +814,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
             key_cache,
             value_cache,
             block_tables,
-            sequence_lengths,
+            context_lengths,
             softmax_scale,
             query_scale,
             key_scale,
@@ -621,14 +823,13 @@ def test_attention_kernel(kernel_type: str = "compiled"):
             num_kv_heads,
             max_num_partitions,
             query_seq_len=query_seq_len,
-            head_size=head_size,
             query_group_size=query_group_size,
+            head_size=head_size,
             kv_block_size=kv_block_size,
-            sequence_partition_size=sequence_partition_size,
             kv_16b_element_count=kv_16b_element_count,
+            sequence_partition_size=sequence_partition_size,
             query_quant_mode=query_quant_mode,
             kv_quant_mode=kv_quant_mode,
-            kv_compute_block_size=kv_compute_block_size,
             fp8_max_value=fp8_max_value,
             value_transposed=value_transposed,
             is_causal=is_causal,
@@ -647,23 +848,23 @@ def test_attention_kernel(kernel_type: str = "compiled"):
             key_cache,
             value_cache,
             block_tables,
-            sequence_lengths,
+            context_lengths,
             softmax_scale,
             query_scale,
             key_scale,
             value_scale,
+            compute_type,
             query_seq_len,
-            head_size,
             query_group_size,
+            head_size,
             kv_block_size,
-            sequence_partition_size,
             kv_16b_element_count,
+            sequence_partition_size,
             query_quant_mode,
             kv_quant_mode,
             fp8_max_value,
             value_transposed,
             is_causal,
-            compute_type,
         )
         print(f"Direct kernel execution time: {direct_time:.2f} us/iter")
     else:
@@ -688,7 +889,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
         key_cache=key_cache,
         value_cache=value_cache,
         block_tables=block_tables,
-        sequence_lengths=sequence_lengths,
+        context_lengths=context_lengths,
         softmax_scale=softmax_scale,
         q_seq_len=query_seq_len,
         query_scale=query_scale,
@@ -736,7 +937,9 @@ def test_attention_kernel(kernel_type: str = "compiled"):
         for i in range(top_k):
             idx = top_k_indices[i]
             orig_idx = np.unravel_index(idx.cpu().numpy(), temporary_output.shape)
-            print(f"  Position {orig_idx}: kernel={temporary_output[orig_idx].item():.6f}, ref={ref_temporary_output[orig_idx].item():.6f}, diff={flat_diff[idx].item():.6e}")
+            print(
+                f"  Position {orig_idx}: kernel={temporary_output[orig_idx].item():.6f}, ref={ref_temporary_output[orig_idx].item():.6f}, diff={flat_diff[idx].item():.6e}"
+            )
 
     # Test results
     tolerance = 5e-3
@@ -744,21 +947,33 @@ def test_attention_kernel(kernel_type: str = "compiled"):
 
     print("\n=== Test Results ===")
     if max_diff_exp_sums < tolerance:
-        print(f"✅ exp_sums TEST PASSED: Max difference ({max_diff_exp_sums:.6e}) < tolerance ({tolerance})")
+        print(
+            f"✅ exp_sums TEST PASSED: Max difference ({max_diff_exp_sums:.6e}) < tolerance ({tolerance})"
+        )
     else:
-        print(f"❌ exp_sums TEST FAILED: Max difference ({max_diff_exp_sums:.6e}) >= tolerance ({tolerance})")
+        print(
+            f"❌ exp_sums TEST FAILED: Max difference ({max_diff_exp_sums:.6e}) >= tolerance ({tolerance})"
+        )
         all_passed = False
 
     if max_diff_max_logits < tolerance:
-        print(f"✅ max_logits TEST PASSED: Max difference ({max_diff_max_logits:.6e}) < tolerance ({tolerance})")
+        print(
+            f"✅ max_logits TEST PASSED: Max difference ({max_diff_max_logits:.6e}) < tolerance ({tolerance})"
+        )
     else:
-        print(f"❌ max_logits TEST FAILED: Max difference ({max_diff_max_logits:.6e}) >= tolerance ({tolerance})")
+        print(
+            f"❌ max_logits TEST FAILED: Max difference ({max_diff_max_logits:.6e}) >= tolerance ({tolerance})"
+        )
         all_passed = False
 
     if max_diff_temporary_output < tolerance:
-        print(f"✅ temporary_output TEST PASSED: Max difference ({max_diff_temporary_output:.6e}) < tolerance ({tolerance})")
+        print(
+            f"✅ temporary_output TEST PASSED: Max difference ({max_diff_temporary_output:.6e}) < tolerance ({tolerance})"
+        )
     else:
-        print(f"❌ temporary_output TEST FAILED: Max difference ({max_diff_temporary_output:.6e}) >= tolerance ({tolerance})")
+        print(
+            f"❌ temporary_output TEST FAILED: Max difference ({max_diff_temporary_output:.6e}) >= tolerance ({tolerance})"
+        )
         all_passed = False
 
     # MD5 hashes for verification
@@ -779,10 +994,14 @@ def test_attention_kernel(kernel_type: str = "compiled"):
 
     # Test result
     if all_passed:
-        print(f"\n✅ OVERALL TEST PASSED: All comparisons within tolerance and no NaN values detected")
+        print(
+            f"\n✅ OVERALL TEST PASSED: All comparisons within tolerance and no NaN values detected"
+        )
         return True
     else:
-        print(f"\n❌ OVERALL TEST FAILED: Some comparisons failed or NaN values detected")
+        print(
+            f"\n❌ OVERALL TEST FAILED: Some comparisons failed or NaN values detected"
+        )
         return False
 
 
@@ -794,19 +1013,16 @@ def main():
         type=str,
         choices=["compiled", "direct"],
         default="compiled",
-        help="Type of kernel to test: 'compiled' (default) or 'direct'"
+        help="Type of kernel to test: 'compiled' (default) or 'direct'",
     )
     parser.add_argument(
         "--num-iters",
         type=int,
         default=101,
-        help="Number of iterations for performance testing"
+        help="Number of iterations for performance testing",
     )
     parser.add_argument(
-        "--num-warmup",
-        type=int,
-        default=2,
-        help="Number of warmup iterations"
+        "--num-warmup", type=int, default=2, help="Number of warmup iterations"
     )
 
     args = parser.parse_args()

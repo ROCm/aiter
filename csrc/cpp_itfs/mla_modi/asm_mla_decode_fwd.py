@@ -16,7 +16,9 @@ import functools
 
 MD_NAME = "asm_mla_decode_fwd"
 warpSize = 64
-with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/mla_modi/asm_mla_decode_fwd.cpp.jinja", "r") as f:
+with open(
+    f"{AITER_CORE_DIR}/csrc/cpp_itfs/mla_modi/asm_mla_decode_fwd.cpp.jinja", "r"
+) as f:
     src_template = Template(f.read())
 
 mgcs = {16: 64, 128: 16}
@@ -90,7 +92,11 @@ def compile(
         return compile_template_op(
             src_template,
             MD_NAME,
-            [current_dir + "/../utils.h", current_dir + "/../../include", triton_header],
+            [
+                current_dir + "/../utils.h",
+                current_dir + "/../../include",
+                triton_header,
+            ],
             [triton_source],
             page_size=page_size,
             q_dtype=q_dtype,
