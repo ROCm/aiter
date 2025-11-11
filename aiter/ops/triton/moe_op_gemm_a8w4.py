@@ -81,6 +81,15 @@ def get_kernel_config(m, n, k, routing_data):
         block_n = 128
         block_k = 256
         num_warps = 4
+
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n >= 64 and grid < 256:
+            block_n = block_n // 2
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
     else:
         # for scale preshuffling
         block_n = 512
@@ -234,6 +243,11 @@ def moe_gemm_a8w4(
     # determine shapes
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
+    block_m = routing_data.block_m
+    if unpadded_N and block_m == 16:
+        N = unpadded_N
+    if unpadded_K and block_m == 16:
+        K = unpadded_K
     # compute optimization flags
     config = get_kernel_config(M, N, K, routing_data)
     if apply_swiglu and config["split_k"] > 1:
@@ -267,20 +281,12 @@ def moe_gemm_a8w4(
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
     expt_data = routing_data.expt_data
-    block_m = config["block_m"]
     expt_hist = None if expt_data is None else expt_data.hist
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
     # spmd grid
-    if unpadded_N and block_m == 16:
-        N = unpadded_N
-    if unpadded_K and block_m == 16:
-        K = unpadded_K
-    if expt_block_pid_map is not None:
-        grid_m = routing_data.n_blocks(M, config["block_m"])
-    else:
-        grid_m = triton.cdiv(M, config["block_m"])
+    grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
