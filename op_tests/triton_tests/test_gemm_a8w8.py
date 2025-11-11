@@ -4,11 +4,19 @@
 import torch
 import pytest
 import torch.nn.functional as F
-from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
+from aiter.ops.triton.gemm_a8w8 import (
+    gemm_a8w8 as triton_gemm_a8w8,
+)
+from aiter.ops.triton.gluon.gemm_a8w8 import (
+    gemm_a8w8 as gluon_gemm_a8w8,
+)
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from typing import Union
 
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+DEVICE_ARCH = arch_info.get_device()
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     x = F.linear(x.to(torch.float32), weight.to(torch.float32))
@@ -19,8 +27,8 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
-def run_triton(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=None):
-    return gemm_a8w8(x, weight, x_scale, w_scale, bias, dtype, y)
+def run_triton(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=None, impl=None):
+    return impl(x, weight, x_scale, w_scale, bias, dtype, y)
 
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
@@ -122,15 +130,32 @@ def generate_gemm_a8w8_inputs(
     [
         (in_dtype, out_dtype, *shape, layout, output)
         for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
-        for out_dtype in ["bf16"]
+        for out_dtype in ["bf16", "fp16", "fp32", "int8", "int32"]
         for shape in get_x_vals()
         for layout in ["TN", "TT", "NN", "NT"]
         for output in [True, False]
     ],
 )
-def test_gemm(in_dtype, out_dtype, m, n, k, layout, output):
+@pytest.mark.parametrize(
+    "impl",
+    [
+        "gluon",
+        "triton",
+    ],
+)
+def test_gemm(in_dtype, out_dtype, m, n, k, layout, output, impl: str):
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
+    if impl == "gluon" and int(DEVICE_ARCH.split("MI")[1].replace("X", "")) < 350:
+        pytest.skip(
+            "Gluon implementation is not supported on this device (requires CDNA4)."
+        )
+
+    if in_dtype in ["fp8e4m3", "fp8e5m2"] and out_dtype in ["int8", "int32"]:
+        pytest.skip(
+            "This kernel is not supported for in_dtype of float and out_dtype of int."
+        )
 
     in_dtype = str_to_torch_dtype[in_dtype]
     out_dtype = str_to_torch_dtype[out_dtype]
@@ -145,6 +170,12 @@ def test_gemm(in_dtype, out_dtype, m, n, k, layout, output):
     )
 
     a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
-    b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y)
+    if impl == "gluon":
+        impl = gluon_gemm_a8w8
+    elif impl == "triton":
+        impl = triton_gemm_a8w8
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
+    b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
