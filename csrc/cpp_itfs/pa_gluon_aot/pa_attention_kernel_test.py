@@ -29,11 +29,11 @@ from csrc.cpp_itfs.utils import (
     not_built,
     run_lib,
 )
-from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8 import (
+from aiter.ops.triton.gluon.pa_decode_gluon import (
     paged_attention_decode_v2_gluon_fp8,
     paged_attention_decode_v2_gluon_large_block_fp8,
 )
-from csrc.cpp_itfs.pa_gluon.pa_decode_gluon_test import (
+from op_tests.triton_tests.test_pa_decode_gluon import (
     torch_attention_compute,
     create_kv_cache,
     quantize_kv_cache_symmetric,
@@ -240,7 +240,7 @@ def compile_attention_kernel(
             gluon_kernel_name = "paged_attention_decode_v2_gluon_large_block_fp8"
 
         compile_args = CompileGluonArgs(
-            path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_triton_gluon_fp8.py",
+            path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
             kernel_name=gluon_kernel_name,
             signature=signature,
             grid="num_seqs,num_kv_heads,max_context_partition_num",
@@ -258,7 +258,7 @@ def compile_attention_kernel(
                 triton_source = output_file
 
         with open(
-            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_attention_kernel.cpp.jinja",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon_aot/pa_decode_attention_kernel.cpp.jinja",
             "r",
         ) as f:
             src_template = Template(f.read())
@@ -399,7 +399,7 @@ def run_direct_attention_kernel(
     is_causal: int,
 ):
     """
-    Directly call the attention kernel from pa_decode_triton_gluon_fp8.py with perftest timing
+    Directly call the attention kernel from pa_decode_gluon.py with perftest timing
     """
     num_seqs = exp_sums.shape[0]
     num_kv_heads = exp_sums.shape[1]
@@ -838,7 +838,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
         )
         print(f"Compiled kernel execution time: {compiled_time:.2f} us/iter")
     elif kernel_type == "direct":
-        # Directly call the kernel from pa_decode_triton_gluon_fp8.py
+        # Directly call the kernel from pa_decode_gluon.py
         print("\n=== Running Direct Kernel ===")
         _, direct_time = run_direct_attention_kernel(
             exp_sums,

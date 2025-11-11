@@ -20,10 +20,10 @@ from aiter import dtypes
 from aiter import pertoken_quant, per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 
-from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8 import (
+from aiter.ops.triton.gluon.pa_decode_gluon import (
     pa_decode_gluon,
 )
-from csrc.cpp_itfs.pa_gluon.pa_decode_gluon_fp8 import (
+from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
 )
 

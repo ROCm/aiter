@@ -11,7 +11,7 @@ import argparse
 from triton.tools.compile import compile_kernel, CompileArgs
 from jinja2 import Template
 from aiter.test_common import perftest, run_perftest
-from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8 import (
+from aiter.ops.triton.gluon.pa_decode_gluon import (
     paged_attention_decode_v2_reduce_kernel,
 )
 from csrc.cpp_itfs.torch_utils import torch_to_c_types
@@ -111,7 +111,7 @@ def compile_reduce_kernel(
         signature = ",".join(signature_parts)
 
         compile_args = CompileArgs(
-            path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_triton_gluon_fp8.py",
+            path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
             kernel_name="paged_attention_decode_v2_reduce_kernel",
             signature=signature,
             grid="num_seqs,num_kv_heads,1",
@@ -129,7 +129,7 @@ def compile_reduce_kernel(
                 triton_source = output_file
 
         with open(
-            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_reduce_kernel.cpp.jinja",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon_aot/pa_decode_reduce_kernel.cpp.jinja",
             "r",
         ) as f:
             src_template = Template(f.read())
@@ -240,7 +240,7 @@ def run_direct_kernel(
         num_kv_heads,
         QUERY_GROUP_SIZE=query_group_size,
         HEAD_SIZE=head_size,
-        MAX_NUM_SEQ_PARTITIONS=max_context_partition_num,
+        MAX_CONTEXT_PARTITION_NUM=max_context_partition_num,
         CONTEXT_PARTITION_SIZE=context_partition_size,
     )
 
@@ -424,7 +424,7 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
         )
         print(f"Compiled kernel execution time: {compiled_time:.2f} us/iter")
     elif kernel_type == "direct":
-        # Directly call the kernel from pa_decode_triton_gluon_fp8.py
+        # Directly call the kernel from pa_decode_gluon.py
         print("\n=== Running Direct Kernel ===")
         _, direct_time = run_direct_kernel(
             output,
