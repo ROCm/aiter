@@ -38,6 +38,7 @@
 #include "rope.h"
 #include "sample.h"
 #include "smoothquant.h"
+#include "topk_plain.h"
 #include <torch/extension.h>
 
 // #include "torch/mha_batch_prefill.h"

@@ -41,6 +41,7 @@
 
 #include "ck_tile/core.hpp"
 #include "dispatch_utils.h"
+#include "opus/opus.hpp"
 #include "py_itfs_common.h"
 #include "quick_all_reduce_base.h"
 
@@ -51,8 +52,6 @@
 
 namespace topk {
 namespace utils {
-
-constexpr int WAVE_SIZE = 64;
 
 // Supported types
 template <typename T>
@@ -193,7 +192,7 @@ __inline__ __host__ __device__ constexpr int integer_log2(T n, int p = 0)
 __inline__ __host__ __device__ constexpr int calc_capacity(int k)
 {
     int capacity = utils::ceil_to_power_of_2(k);
-    return (capacity < WAVE_SIZE) ? WAVE_SIZE : capacity;
+    return (capacity < opus::get_warp_size()) ? opus::get_warp_size() : capacity;
 }
 
 } // namespace utils
@@ -319,8 +318,8 @@ struct BitonicMerge
     __device__ static void merge(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
     {
         static_assert(utils::is_power_of_2(size));
-        static_assert(size >= 2 * utils::WAVE_SIZE);
-        constexpr int arr_len = size / utils::WAVE_SIZE;
+        static_assert(size >= 2 * opus::get_warp_size());
+        constexpr int arr_len = size / opus::get_warp_size();
 
         constexpr int stride = arr_len / 2;
         for(int i = 0; i < stride; ++i)
@@ -352,38 +351,14 @@ struct BitonicSort
     __device__ static void sort(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
     {
         static_assert(utils::is_power_of_2(size));
-        static_assert(size >= 2 * utils::WAVE_SIZE);
-        constexpr int arr_len = size / utils::WAVE_SIZE;
+        static_assert(size >= 2 * opus::get_warp_size());
+        constexpr int arr_len = size / opus::get_warp_size();
 
         BitonicSort<size / 2, true, T, idxT>::sort(val_arr, idx_arr);
         BitonicSort<size / 2, false, T, idxT>::sort(val_arr + arr_len / 2, idx_arr + arr_len / 2);
         BitonicMerge<size, ascending, T, idxT>::merge(val_arr, idx_arr);
     }
 };
-
-template <typename T>
-__device__ __forceinline__ T dev_max(const T& a, const T& b)
-{
-    return a > b ? a : b;
-}
-
-template <>
-__device__ __forceinline__ float dev_max<float>(const float& a, const float& b)
-{
-    return __builtin_fmaxf(a, b);
-}
-
-template <typename T>
-__device__ __forceinline__ T dev_min(const T& a, const T& b)
-{
-    return a > b ? b : a;
-}
-
-template <>
-__device__ __forceinline__ float dev_min<float>(const float& a, const float& b)
-{
-    return __builtin_fminf(a, b);
-}
 
 template <typename T>
 __device__ __forceinline__ T dev_med3(const T& a, const T& b, const T& c)
@@ -402,9 +377,9 @@ __device__ __forceinline__ T dev_med3(const T& a, const T& b, const T& c)
     }
     else
     {
-        auto max_0 = dev_max(a, b);
-        auto min_0 = dev_min(a, b);
-        return dev_min(max_0, dev_max(min_0, c));
+        auto max_0 = opus::max(a, b);
+        auto min_0 = opus::min(a, b);
+        return opus::min(max_0, opus::max(min_0, c));
     }
 }
 
@@ -453,6 +428,9 @@ struct StrideToDPP<8>
 template <typename T, int stride>
 __forceinline__ __device__ T mov_dpp(T x)
 {
+    static_assert(sizeof(T) == 4 || sizeof(T) == 2,
+                  "mov_dpp only supports 32-bit and 16-bit types.");
+
     constexpr int dpp_i       = StrideToDPP<stride>::dpp_i;
     constexpr int row_mask    = 0xf;
     constexpr int bank_mask   = 0xf;
@@ -460,10 +438,11 @@ __forceinline__ __device__ T mov_dpp(T x)
 
     if constexpr(sizeof(T) == 4)
     {
-        return __builtin_bit_cast(
-            T,
-            __builtin_amdgcn_mov_dpp(
-                __builtin_bit_cast(int, x), dpp_i, row_mask, bank_mask, bound_ctrl));
+        return opus::mov_dpp(x,
+                             opus::number<dpp_i>(),
+                             opus::number<row_mask>(),
+                             opus::number<bank_mask>(),
+                             opus::bool_constant<bound_ctrl>());
     }
     else if constexpr(sizeof(T) == 2)
     {
@@ -474,17 +453,14 @@ __forceinline__ __device__ T mov_dpp(T x)
         unsigned short result_u16 = static_cast<unsigned short>(result_u32);
         return __builtin_bit_cast(T, result_u16);
     }
-    else
-    {
-        static_assert(sizeof(T) == 4 || sizeof(T) == 2,
-                      "mov_dpp only supports 32-bit and 16-bit types.");
-        return x;
-    }
 }
 
 template <typename T, int stride, bool shl>
 __forceinline__ __device__ T upd_dpp(const T& old, T x)
 {
+    static_assert(sizeof(T) == 4 || sizeof(T) == 2,
+                  "upd_dpp only supports 32-bit and 16-bit types.");
+
     constexpr int dpp_i    = shl ? StrideToDPP<stride>::dpp_i_shl : StrideToDPP<stride>::dpp_i_shr;
     constexpr int row_mask = 0xf;
     constexpr int bank_mask =
@@ -493,13 +469,12 @@ __forceinline__ __device__ T upd_dpp(const T& old, T x)
 
     if constexpr(sizeof(T) == 4)
     {
-        return __builtin_bit_cast(T,
-                                  __builtin_amdgcn_update_dpp(__builtin_bit_cast(int, old),
-                                                              __builtin_bit_cast(int, x),
-                                                              dpp_i,
-                                                              row_mask,
-                                                              bank_mask,
-                                                              bound_ctrl));
+        return opus::upd_dpp(old,
+                             x,
+                             opus::number<dpp_i>(),
+                             opus::number<row_mask>(),
+                             opus::number<bank_mask>(),
+                             opus::bool_constant<bound_ctrl>());
     }
     else if constexpr(sizeof(T) == 2)
     {
@@ -510,12 +485,6 @@ __forceinline__ __device__ T upd_dpp(const T& old, T x)
             __builtin_amdgcn_update_dpp(old_u32, x_u32, dpp_i, row_mask, bank_mask, bound_ctrl);
         unsigned short result_u16 = static_cast<unsigned short>(result_u32);
         return __builtin_bit_cast(T, result_u16);
-    }
-    else
-    {
-        static_assert(sizeof(T) == 4 || sizeof(T) == 2,
-                      "upd_dpp only supports 32-bit and 16-bit types.");
-        __builtin_unreachable();
     }
 }
 
@@ -575,7 +544,7 @@ template <typename T, typename idxT, int stage, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride <= 2), void>::type
 sort_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (utils::WAVE_SIZE - 1);
+    const int lane = threadIdx.x & (opus::get_warp_size() - 1);
     bool reverse   = (lane >> stage) & 2;
     bool is_second = lane & stride;
 
@@ -597,7 +566,7 @@ template <typename T, typename idxT, int stage, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride > 2 && stride <= 8), void>::type
 sort_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (utils::WAVE_SIZE - 1);
+    const int lane = threadIdx.x & (opus::get_warp_size() - 1);
     bool reverse   = (lane >> stage) & 2;
     bool is_second = lane & stride;
 
@@ -626,7 +595,7 @@ template <typename T, typename idxT, int stage, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride > 8), void>::type
 sort_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (utils::WAVE_SIZE - 1);
+    const int lane = threadIdx.x & (opus::get_warp_size() - 1);
     bool reverse   = (lane >> stage) & 2;
     bool is_second = lane & stride;
 
@@ -682,7 +651,7 @@ template <bool ascending, typename T, typename idxT, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride <= 2), void>::type
 merge_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (utils::WAVE_SIZE - 1);
+    const int lane = threadIdx.x & (opus::get_warp_size() - 1);
     bool is_second = lane & stride;
     T& val         = *val_arr;
     idxT& idx      = *idx_arr;
@@ -703,7 +672,7 @@ template <bool ascending, typename T, typename idxT, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride > 2 && stride <= 8), void>::type
 merge_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (utils::WAVE_SIZE - 1);
+    const int lane = threadIdx.x & (opus::get_warp_size() - 1);
     bool is_second = lane & stride;
     T& val         = *val_arr;
     idxT& idx      = *idx_arr;
@@ -731,7 +700,7 @@ template <bool ascending, typename T, typename idxT, int stride>
 __forceinline__ __device__ typename std::enable_if<(stride > 8), void>::type
 merge_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 {
-    const int lane = threadIdx.x & (topk::utils::WAVE_SIZE - 1);
+    const int lane = threadIdx.x & (opus::get_warp_size() - 1);
     bool is_second = lane & stride;
     T& val         = *val_arr;
     idxT& idx      = *idx_arr;
@@ -825,8 +794,8 @@ struct BlockTopkMerge;
 template <int capacity, typename T, typename IdxT>
 struct WaveBuffer
 {
-    static constexpr int slots_per_lane = capacity / utils::WAVE_SIZE;
-    static_assert(capacity >= utils::WAVE_SIZE && utils::is_power_of_2(capacity),
+    static constexpr int slots_per_lane = capacity / opus::get_warp_size();
+    static_assert(capacity >= opus::get_warp_size() && utils::is_power_of_2(capacity),
                   "Capacity must be power-of-2 and >= wave size");
 
     T priorities[slots_per_lane];
@@ -836,7 +805,9 @@ struct WaveBuffer
     T sentinel;
 
     __device__ WaveBuffer(IdxT k, T sentinel_value)
-        : lane_id(threadIdx.x & (utils::WAVE_SIZE - 1)), target_count(k), sentinel(sentinel_value)
+        : lane_id(threadIdx.x & (opus::get_warp_size() - 1)),
+          target_count(k),
+          sentinel(sentinel_value)
     {
 #pragma unroll
         for(int i = 0; i < slots_per_lane; ++i)
@@ -857,7 +828,7 @@ struct WaveBuffer
 #pragma unroll
         for(int i = 0; i < slots_per_lane; ++i)
         {
-            const IdxT global_slot = i * utils::WAVE_SIZE + lane_id;
+            const IdxT global_slot = i * opus::get_warp_size() + lane_id;
             if(global_slot < target_count)
             {
                 out_vals[global_slot]    = priorities[i];
@@ -910,9 +881,9 @@ struct WaveMergeHelper
                                               const IdxT* __restrict__ in_idx,
                                               IdxT start)
     {
-        IdxT idx = start + utils::WAVE_SIZE - 1 - buffer.lane_id;
+        IdxT idx = start + opus::get_warp_size() - 1 - buffer.lane_id;
 #pragma unroll
-        for(int i = buffer.slots_per_lane - 1; i >= 0; --i, idx += utils::WAVE_SIZE)
+        for(int i = buffer.slots_per_lane - 1; i >= 0; --i, idx += opus::get_warp_size())
         {
             if(idx < start + buffer.target_count)
             {
@@ -1022,7 +993,7 @@ int calc_lds_size_for_block_wide(int num_wave, IdxT k)
 {
     // TODO: "num_wave / 2 * k" should be enough
     // Base size for reduction buffers
-    int n         = std::max<int>(num_wave / 2 * k, num_wave * utils::WAVE_SIZE);
+    int n         = std::max<int>(num_wave / 2 * k, num_wave * opus::get_warp_size());
     int base_size = utils::round_up_to_multiple_of<16>(n * sizeof(T)) + n * sizeof(IdxT);
     return base_size;
 }
@@ -1033,7 +1004,7 @@ void calc_launch_parameter_by_occupancy(IdxT k, int* block_size, int* min_grid_s
     const int capacity = utils::calc_capacity(k);
     auto func          = get_kernel_function_pointer<true, StrategyClass, T, IdxT>(capacity);
     auto calc_lds      = [k](int bs) {
-        return calc_lds_size_for_block_wide<T, IdxT>(bs / utils::WAVE_SIZE, k);
+        return calc_lds_size_for_block_wide<T, IdxT>(bs / opus::get_warp_size(), k);
     };
     HIP_CHECK(
         hipOccupancyMaxPotentialBlockSizeVariableSMem(min_grid_size, block_size, func, calc_lds));
@@ -1071,11 +1042,11 @@ void calc_launch_parameter(int batch_size, IdxT len, IdxT k, int* p_num_of_block
     int block_per_batch;
     if(batch_size < min_grid_size)
     {
-        num_wave                 = block_size / utils::WAVE_SIZE;
+        num_wave                 = block_size / opus::get_warp_size();
         block_per_batch          = min_grid_size / batch_size;
         IdxT len_per_block       = (len - 1) / block_per_batch + 1;
         IdxT len_per_wave        = (len_per_block - 1) / num_wave + 1;
-        len_per_wave             = utils::round_up_to_multiple_of<utils::WAVE_SIZE>(len_per_wave);
+        len_per_wave = utils::round_up_to_multiple_of<opus::get_warp_size()>(len_per_wave);
         len_per_block            = len_per_wave * num_wave;
         block_per_batch          = (len - 1) / len_per_block + 1;
         constexpr int len_factor = LaunchThreshold<StrategyClass>::multi_block_factor;
@@ -1106,11 +1077,11 @@ void calc_launch_parameter(int batch_size, IdxT len, IdxT k, int* p_num_of_block
             {
                 block_size = 1;
             }
-            block_size = utils::round_up_to_multiple_of<utils::WAVE_SIZE>(block_size);
+            block_size = utils::round_up_to_multiple_of<opus::get_warp_size()>(block_size);
         }
-        num_wave                 = block_size / utils::WAVE_SIZE;
+        num_wave                 = block_size / opus::get_warp_size();
         IdxT len_per_wave        = (len - 1) / num_wave + 1;
-        len_per_wave             = utils::round_up_to_multiple_of<utils::WAVE_SIZE>(len_per_wave);
+        len_per_wave = utils::round_up_to_multiple_of<opus::get_warp_size()>(len_per_wave);
         num_wave                 = (len - 1) / len_per_wave + 1;
         constexpr int len_factor = LaunchThreshold<StrategyClass>::single_block_factor;
         if(len_per_wave < static_cast<IdxT>(capacity * len_factor))
@@ -1130,7 +1101,7 @@ void calc_launch_parameter_for_merge(IdxT len, IdxT k, int* block_per_batch, int
     int block_size    = 0;
     int min_grid_size = 0;
     calc_launch_parameter_by_occupancy<BlockTopkMerge, T, IdxT>(k, &block_size, &min_grid_size);
-    *num_wave         = block_size / utils::WAVE_SIZE;
+    *num_wave         = block_size / opus::get_warp_size();
     IdxT len_per_wave = (len - 1) / (*num_wave) + 1;
     len_per_wave      = ((len_per_wave - 1) / k + 1) * k;
     *num_wave         = (len - 1) / len_per_wave + 1;
@@ -1198,7 +1169,7 @@ struct WaveTopkSort
     {
         IdxT pos = start + buffer_.lane_id;
 #pragma unroll
-        for(int i = 0; i < buffer_.slots_per_lane; ++i, pos += utils::WAVE_SIZE)
+        for(int i = 0; i < buffer_.slots_per_lane; ++i, pos += opus::get_warp_size())
         {
             if(pos < end)
             {
@@ -1214,7 +1185,7 @@ struct WaveTopkSort
     {
         IdxT pos = start + buffer_.lane_id;
 #pragma unroll
-        for(int i = 0; i < buffer_.slots_per_lane; ++i, pos += utils::WAVE_SIZE)
+        for(int i = 0; i < buffer_.slots_per_lane; ++i, pos += opus::get_warp_size())
         {
             temp_priorities_[i] = (pos < end) ? in[pos] : buffer_.sentinel;
             temp_positions_[i]  = pos;
@@ -1246,7 +1217,7 @@ struct WaveTopkSort
     }
 
     WaveBuffer<capacity, T, IdxT> buffer_;
-    static constexpr int slots_per_lane_ = capacity / utils::WAVE_SIZE;
+    static constexpr int slots_per_lane_ = capacity / opus::get_warp_size();
     T temp_priorities_[slots_per_lane_];
     IdxT temp_positions_[slots_per_lane_];
 };
@@ -1257,7 +1228,7 @@ struct BlockTopkSort
     __device__ BlockTopkSort(IdxT k, T sentinel, void* lds_buf)
         : wave_topk_(k, sentinel), k_(k), sentinel_(sentinel)
     {
-        const int num_waves = blockDim.x / utils::WAVE_SIZE;
+        const int num_waves = blockDim.x / opus::get_warp_size();
         val                 = reinterpret_cast<T*>(lds_buf);
         pos                 = reinterpret_cast<IdxT*>(
             reinterpret_cast<char*>(lds_buf) +
@@ -1278,10 +1249,10 @@ struct BlockTopkSort
     // Sort the results within each wave
     __device__ void sort(const T* __restrict__ in, IdxT start, IdxT end)
     {
-        int num_waves     = blockDim.x / utils::WAVE_SIZE;
-        const int wave_id = threadIdx.x / utils::WAVE_SIZE;
+        int num_waves     = blockDim.x / opus::get_warp_size();
+        const int wave_id = threadIdx.x / opus::get_warp_size();
         IdxT len_per_wave = (end - start - 1) / num_waves + 1;
-        len_per_wave      = utils::round_up_to_multiple_of<utils::WAVE_SIZE>(len_per_wave);
+        len_per_wave      = utils::round_up_to_multiple_of<opus::get_warp_size()>(len_per_wave);
         IdxT wave_start   = start + wave_id * len_per_wave;
         IdxT wave_end     = std::min(wave_start + len_per_wave, end);
         wave_topk_.sort(in, wave_start, wave_end);
@@ -1290,8 +1261,8 @@ struct BlockTopkSort
     // Reduce the results via LDS
     __device__ void reduce()
     {
-        int num_waves     = blockDim.x / utils::WAVE_SIZE;
-        const int wave_id = threadIdx.x / utils::WAVE_SIZE;
+        int num_waves     = blockDim.x / opus::get_warp_size();
+        const int wave_id = threadIdx.x / opus::get_warp_size();
         while(num_waves > 1)
         {
             int half_num_waves = (num_waves + 1) / 2;
@@ -1313,7 +1284,7 @@ struct BlockTopkSort
     // Store the results to the global memory
     __device__ void store(T* __restrict__ out, IdxT* __restrict__ out_idx)
     {
-        if(threadIdx.x < utils::WAVE_SIZE)
+        if(threadIdx.x < opus::get_warp_size())
         {
             wave_topk_.store(out, out_idx);
         }
@@ -1379,17 +1350,17 @@ struct WaveTopkFilter
     __device__ WaveTopkFilter(IdxT k, T sentinel)
         : buffer_(k, sentinel),
           threshold_(sentinel),
-          threshold_lane_((k - 1) & (utils::WAVE_SIZE - 1)),
+          threshold_lane_((k - 1) & (opus::get_warp_size() - 1)),
           staging_count_(0)
     {
         extern __shared__ char lds_buf[];
-        const int num_waves = blockDim.x / utils::WAVE_SIZE;
-        const int wave_id   = threadIdx.x / utils::WAVE_SIZE;
-        staging_vals_       = reinterpret_cast<T*>(lds_buf) + wave_id * utils::WAVE_SIZE;
+        const int num_waves = blockDim.x / opus::get_warp_size();
+        const int wave_id   = threadIdx.x / opus::get_warp_size();
+        staging_vals_       = reinterpret_cast<T*>(lds_buf) + wave_id * opus::get_warp_size();
         const size_t vals_size =
-            utils::round_up_to_multiple_of<16>(num_waves * sizeof(T) * utils::WAVE_SIZE);
+            utils::round_up_to_multiple_of<16>(num_waves * sizeof(T) * opus::get_warp_size());
         staging_indices_ =
-            reinterpret_cast<IdxT*>(lds_buf + vals_size) + wave_id * utils::WAVE_SIZE;
+            reinterpret_cast<IdxT*>(lds_buf + vals_size) + wave_id * opus::get_warp_size();
     }
 
     __device__ void
@@ -1512,7 +1483,7 @@ struct WaveTopkFilter
         const int lane_offset  = __popcll(ballot & ((1ull << buffer_.lane_id) - 1));
         const int staging_base = staging_count_;
         const int slot         = staging_base + lane_offset;
-        const bool fits        = passes && (slot < utils::WAVE_SIZE);
+        const bool fits        = passes && (slot < opus::get_warp_size());
 
         if(fits)
         {
@@ -1523,18 +1494,18 @@ struct WaveTopkFilter
         const int ballot_count = __popcll(ballot);
         staging_count_         = staging_base + ballot_count;
 
-        if(staging_count_ >= utils::WAVE_SIZE)
+        if(staging_count_ >= opus::get_warp_size())
         {
             __builtin_amdgcn_wave_barrier();
             integrate_staging(staging_vals_[buffer_.lane_id], staging_indices_[buffer_.lane_id]);
-            staging_count_ -= utils::WAVE_SIZE;
+            staging_count_ -= opus::get_warp_size();
         }
 
         const bool overflow = passes && !fits;
         if(overflow)
         {
-            staging_vals_[slot - utils::WAVE_SIZE]    = candidate;
-            staging_indices_[slot - utils::WAVE_SIZE] = position;
+            staging_vals_[slot - opus::get_warp_size()]    = candidate;
+            staging_indices_[slot - opus::get_warp_size()] = position;
         }
         __builtin_amdgcn_wave_barrier();
     }
@@ -1565,7 +1536,7 @@ struct WaveTopkFilter
 
     __device__ void integrate_staging(T val, IdxT pos)
     {
-        sorting::BitonicSort<utils::WAVE_SIZE, descending, T, IdxT>::sort(&val, &pos);
+        sorting::BitonicSort<opus::get_warp_size(), descending, T, IdxT>::sort(&val, &pos);
         T& weakest = buffer_.priorities[buffer_.slots_per_lane - 1];
         if(numeric::is_preferred<descending>(val, weakest))
         {
@@ -1611,7 +1582,7 @@ struct BlockTopkFilter
     __device__ BlockTopkFilter(IdxT k, T sentinel, void* lds_buf)
         : wave_topk_(k, sentinel), k_(k), sentinel_(sentinel)
     {
-        const int num_waves = blockDim.x / utils::WAVE_SIZE;
+        const int num_waves = blockDim.x / opus::get_warp_size();
         val                 = reinterpret_cast<T*>(lds_buf);
         pos                 = reinterpret_cast<IdxT*>(
             reinterpret_cast<char*>(lds_buf) +
@@ -1641,8 +1612,8 @@ struct BlockTopkFilter
     // Reduce the results via LDS
     __device__ void reduce()
     {
-        int num_waves     = blockDim.x / utils::WAVE_SIZE;
-        const int wave_id = threadIdx.x / utils::WAVE_SIZE;
+        int num_waves     = blockDim.x / opus::get_warp_size();
+        const int wave_id = threadIdx.x / opus::get_warp_size();
         while(num_waves > 1)
         {
             int half_num_waves = (num_waves + 1) / 2;
@@ -1664,7 +1635,7 @@ struct BlockTopkFilter
     // Store the results to the global memory
     __device__ void store(T* __restrict__ out, IdxT* __restrict__ out_idx)
     {
-        if(threadIdx.x < utils::WAVE_SIZE)
+        if(threadIdx.x < opus::get_warp_size())
         {
             wave_topk_.store(out, out_idx);
         }
@@ -1750,7 +1721,7 @@ struct WaveTopkMerge
         IdxT chunk_end =
             (start + buffer_.target_count < end) ? (start + buffer_.target_count) : end;
 #pragma unroll
-        for(int i = 0; i < buffer_.slots_per_lane; ++i, pos += utils::WAVE_SIZE)
+        for(int i = 0; i < buffer_.slots_per_lane; ++i, pos += opus::get_warp_size())
         {
             if(pos < chunk_end)
             {
@@ -1786,7 +1757,7 @@ struct BlockTopkMerge
     __device__ BlockTopkMerge(IdxT k, T sentinel, void* lds_buf)
         : wave_topk_(k, sentinel), k_(k), sentinel_(sentinel)
     {
-        const int num_waves = blockDim.x / utils::WAVE_SIZE;
+        const int num_waves = blockDim.x / opus::get_warp_size();
         val                 = reinterpret_cast<T*>(lds_buf);
         pos                 = reinterpret_cast<IdxT*>(
             reinterpret_cast<char*>(lds_buf) +
@@ -1808,8 +1779,8 @@ struct BlockTopkMerge
     __device__ void
     merge(const T* __restrict__ in, const IdxT* __restrict__ in_idx, IdxT start, IdxT end)
     {
-        int num_waves     = blockDim.x / utils::WAVE_SIZE;
-        const int wave_id = threadIdx.x / utils::WAVE_SIZE;
+        int num_waves     = blockDim.x / opus::get_warp_size();
+        const int wave_id = threadIdx.x / opus::get_warp_size();
         IdxT len_per_wave = (end - start - 1) / num_waves + 1;
         len_per_wave      = ((len_per_wave - 1) / k_ + 1) * k_;
         IdxT wave_start   = start + wave_id * len_per_wave;
@@ -1819,8 +1790,8 @@ struct BlockTopkMerge
 
     __device__ void reduce()
     {
-        int num_waves     = blockDim.x / utils::WAVE_SIZE;
-        const int wave_id = threadIdx.x / utils::WAVE_SIZE;
+        int num_waves     = blockDim.x / opus::get_warp_size();
+        const int wave_id = threadIdx.x / opus::get_warp_size();
         while(num_waves > 1)
         {
             int half_num_waves = (num_waves + 1) / 2;
@@ -1841,7 +1812,7 @@ struct BlockTopkMerge
 
     __device__ void store(T* __restrict__ out, IdxT* __restrict__ out_idx)
     {
-        if(threadIdx.x < utils::WAVE_SIZE)
+        if(threadIdx.x < opus::get_warp_size())
         {
             wave_topk_.store(out, out_idx);
         }
@@ -1912,7 +1883,7 @@ void topk_kernel_launcher(int block_per_batch,
     T sentinel       = numeric::get_sentinel_value<greater, T>();
     T* result_val    = (block_per_batch == 1) ? out : tmp_val;
     IdxT* result_idx = (block_per_batch == 1) ? out_idx : tmp_idx;
-    int block_dim    = wave_per_block * utils::WAVE_SIZE;
+    int block_dim    = wave_per_block * opus::get_warp_size();
 
     int lds_size = calc_lds_size_for_block_wide<T, IdxT>(wave_per_block, k);
 
@@ -1928,7 +1899,7 @@ void topk_kernel_launcher(int block_per_batch,
 
         // Launch single block in merge phase
         calc_launch_parameter_for_merge<T, IdxT>(len, k, &block_per_batch, &wave_per_block);
-        block_dim = wave_per_block * utils::WAVE_SIZE;
+        block_dim = wave_per_block * opus::get_warp_size();
         lds_size  = calc_lds_size_for_block_wide<T, IdxT>(wave_per_block, k);
 
         auto topk_merge_kernel =

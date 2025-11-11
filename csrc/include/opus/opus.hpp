@@ -804,7 +804,7 @@ OPUS_H_D constexpr auto set_slice(C&& dst_c, V&& src_c, S&&...ss) {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // BELOW IS AMDGPU SPECIFIC TYPES/ARCH/INTRINSICS
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// dtype, sufix is "_t", and register corresponding ext_vector_type, and a specialization of is_dtype
+// dtype, suffix is "_t", and register corresponding ext_vector_type, and a specialization of is_dtype
 #define REGISTER_DTYPE(dtype_base_, dtype_impl_)        \
     using dtype_base_ ## _t    = dtype_impl_;           \
     using dtype_base_ ## x1_t  = dtype_base_ ## _t __attribute__((ext_vector_type(1 )));    \
