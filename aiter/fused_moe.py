@@ -26,7 +26,6 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-#from aiter.fused_moe_bf16_asm import fused_moe_stage1_tkw1
 
 BLOCK_SIZE_M = 32
 
@@ -246,9 +245,6 @@ def fused_moe_(
     )
 
     if metadata.run_1stage and not doweight_stage1:
-        assert (
-            doweight_stage1 == False
-        ), "doweight_stage1 not support in fused_moe_1stage"
         return metadata.stage1(
             hidden_states,
             w1,
@@ -465,10 +461,9 @@ fused_moe_1stage_dict = {
     {
         (ActivationType.Silu,    QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True) : aiter.fmoe_g1u1,
         (ActivationType.Silu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_fp8_blockscale_g1u1,
-        (ActivationType.Silu,          QuantType.No,   dtypes.bf16,    dtypes.bf16,   dtypes.bf16,   False) : aiter.fmoe,
-        #(ActivationType.Silu,          QuantType.No,   dtypes.bf16,    dtypes.fp8,     dtypes.fp8,    True) : aiter.fmoe_fp8_g1u1_a16,
-        (ActivationType.Silu,          QuantType.No,   dtypes.bf16,     dtypes.i8,     dtypes.i8,    False) : aiter.fmoe_int8_g1u0_a16,
-        (ActivationType.Silu,          QuantType.No,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_g1u1_tkw1,
+        (ActivationType.Silu,          QuantType.per_Token,   dtypes.bf16,    dtypes.bf16,   dtypes.bf16,   False) : aiter.fmoe,
+        (ActivationType.Silu,          QuantType.per_Token,   dtypes.bf16,     dtypes.i8,     dtypes.i8,    False) : aiter.fmoe_int8_g1u0_a16,
+        (ActivationType.Silu,          QuantType.per_Token,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_g1u1_tkw1,
     }
 }
 # fmt: on
