@@ -579,13 +579,13 @@ rmsnorm2d_hip(torch::Tensor& input,
     {
 		const int max_block_size = 256;
 		dim3 block(std::min(hidden_size, max_block_size));
-        no_fused_rms_norm_kernel<ck_tile::bf16_t, 8192, 8, 2, 256, float, ck_tile::bf16_t><<<grid, block, 0, stream>>>(params);
+        no_fused_rms_norm_kernel<ck_tile::bf16_t, 8192, 4, 2, 256, float, ck_tile::bf16_t><<<grid, block, 0, stream>>>(params);
     }
     else if (hidden_size == 7168)
     {
         const int32_t max_block_size = 128;
         dim3 block(std::min(hidden_size, max_block_size));
-        no_fused_rms_norm_kernel<ck_tile::bf16_t, 7168, 8, 2, 128, float, ck_tile::bf16_t><<<grid, block, 0, stream>>>(params);
+        no_fused_rms_norm_kernel<ck_tile::bf16_t, 7168, 4, 2, 128, float, ck_tile::bf16_t><<<grid, block, 0, stream>>>(params);
     }
 
     return out;
