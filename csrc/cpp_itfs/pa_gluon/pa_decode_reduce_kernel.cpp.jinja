@@ -2,10 +2,10 @@
 
 
 extern "C" {
-void {{func_name}}(void* output_ptr,             // [num_seqs, num_kv_heads, query_group_size, head_size]
-                    void* exp_sums_ptr,           // [num_seqs, num_kv_heads, max_parts, query_group_size]
-                    void* max_logits_ptr,         // [num_seqs, num_kv_heads, max_parts, query_group_size]
-                    void* logits_ptr,             // [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
+void {{func_name}}(void* output_ptr,             // [num_seqs, num_kv_heads, q_group_size, head_size]
+                    void* exp_sums_ptr,           // [num_seqs, num_kv_heads, max_parts, q_group_size]
+                    void* max_logits_ptr,         // [num_seqs, num_kv_heads, max_parts, q_group_size]
+                    void* logits_ptr,             // [num_seqs, num_kv_heads, max_parts, q_group_size, head_size]
                     void* sequence_lengths_ptr,   // [num_seqs]
                     int stride_output_seq,
                     int stride_output_head,
@@ -23,10 +23,10 @@ void {{func_name}}(void* output_ptr,             // [num_seqs, num_kv_heads, que
 }
 
 
-void {{func_name}}(void* output_ptr,             // [num_seqs, num_kv_heads, query_group_size, head_size]
-                    void* exp_sums_ptr,           // [num_seqs, num_kv_heads, max_parts, query_group_size]
-                    void* max_logits_ptr,         // [num_seqs, num_kv_heads, max_parts, query_group_size]
-                    void* logits_ptr,             // [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
+void {{func_name}}(void* output_ptr,             // [num_seqs, num_kv_heads, q_group_size, head_size]
+                    void* exp_sums_ptr,           // [num_seqs, num_kv_heads, max_parts, q_group_size]
+                    void* max_logits_ptr,         // [num_seqs, num_kv_heads, max_parts, q_group_size]
+                    void* logits_ptr,             // [num_seqs, num_kv_heads, max_parts, q_group_size, head_size]
                     void* sequence_lengths_ptr,   // [num_seqs]
                     int stride_output_seq,
                     int stride_output_head,
