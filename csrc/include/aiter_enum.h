@@ -6,8 +6,7 @@ enum class ActivationType : int
 {
     No = -1,
     Silu = 0,
-    Gelu = 1,
-    Swiglu = 2,
+    Gelu
 };
 enum class QuantType : int
 {
