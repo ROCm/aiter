@@ -31,7 +31,6 @@ torch.set_default_device("cuda")
 # torch.manual_seed(100)
 
 
-
 def ck_moe_stage1(
     hidden_states,
     w1,  # [E, inter_dim*2, model_dim]
@@ -313,17 +312,17 @@ def test_fmoe(
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
         if need_pad:
-            w1[:,:,-kpad0:] = 0
-            w1[:,-npad0:,:] = 0
-            w1[:,inter_dim-npad0:inter_dim,:] = 0
+            w1[:, :, -kpad0:] = 0
+            w1[:, -npad0:, :] = 0
+            w1[:, inter_dim - npad0 : inter_dim, :] = 0
         exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
     if need_pad:
-        w2[:,:,-kpad0:] = 0
-        w2[:,-npad0:,:] = 0
+        w2[:, :, -kpad0:] = 0
+        w2[:, -npad0:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
@@ -395,7 +394,9 @@ def test_fmoe(
         )
         a1_qt = a1_qt.view(token, model_dim)
         a1_scale = a1_scale.squeeze(-1)
-    elif qType == aiter.QuantType.per_1x32 and (AQDType in [dtypes.bf16, dtypes.fp16]): #a16w4
+    elif qType == aiter.QuantType.per_1x32 and (
+        AQDType in [dtypes.bf16, dtypes.fp16]
+    ):  # a16w4
         a1_qt = input.to(AQDType)
         a1_scale = None
     else:
@@ -427,12 +428,20 @@ def test_fmoe(
                 shuffle_weight(w2_qt_aiter, (16, 16), use_int4=True)
             )
         )
-    elif qType == aiter.QuantType.per_1x32 and (AQDType in [dtypes.bf16, dtypes.fp16]) and (WQDType == dtypes.fp4x2): #a16w4
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and (AQDType in [dtypes.bf16, dtypes.fp16])
+        and (WQDType == dtypes.fp4x2)
+    ):  # a16w4
         w1_qt_aiter = shuffle_mxfp4_weight(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_mxfp4_scale(w1_scale, E, True)
         w2_qt_aiter = shuffle_mxfp4_weight(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_mxfp4_scale(w2_scale, E, False)
-    elif WQDType != dtypes.fp4x2 and (get_gfx() in ["gfx950"]) and (qType != aiter.QuantType.per_128x128):
+    elif (
+        WQDType != dtypes.fp4x2
+        and (get_gfx() in ["gfx950"])
+        and (qType != aiter.QuantType.per_128x128)
+    ):
         inst_K = 128 // w1_qt_aiter.element_size()
         w1_qt_aiter = shuffle_weight_NK(w1_qt_aiter, 16, inst_K)
         w2_qt_aiter = shuffle_weight_NK(w2_qt_aiter, 16, inst_K)
@@ -656,7 +665,7 @@ def test_fmoe(
     # ######################## stage 2 end ###########
 
     # # ######################## fused 2 stage #########
-    us1=0
+    us1 = 0
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
