@@ -93,7 +93,7 @@ def test_ragged_layout_trans(bs, max_seq_len, nheads, hdim, dtype):
     )
     seq_lens_sum = seq_lens_ptr.sum()
 
-    stride = triton.next_power_of_2(max_seq_len)
+    stride = triton.next_power_of_2(max_seq_len) + random.randint(0, max_seq_len)
 
     print(
         f"bs = {bs}, max seqlen = {max_seq_len}, nheads = {nheads}, hdim = {hdim}, stride = {stride}"
@@ -192,9 +192,9 @@ def test_ragged_layout_trans(bs, max_seq_len, nheads, hdim, dtype):
 if __name__ == "__main__":
     # parameters for problem
     min_batch_size = 1
-    max_batch_size = 8
+    max_batch_size = 64
     min_head_dim = 0
-    max_head_dim = 8
+    max_head_dim = 7
     min_seq_len = 6
     max_seq_len = 18
     nheads = 1  # support only nheads = 1, for now
@@ -219,6 +219,7 @@ if __name__ == "__main__":
     test_ragged_layout_trans(1, 32768, 1, 128, torch.bfloat16)
     test_ragged_layout_trans(1, 65536, 1, 128, torch.bfloat16)
     test_ragged_layout_trans(1, 131072, 1, 128, torch.bfloat16)
+    #test_ragged_layout_trans(62, 262144, 1, 256, torch.bfloat16)
     # test_ragged_layout_trans(1, 16, 1, 128, torch.bfloat16)
 
     print(f"Fixed tests done!\n")
