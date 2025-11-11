@@ -1,4 +1,3 @@
-import os
 from jinja2 import Template
 from csrc.cpp_itfs.utils import (
     compile_template_op,
@@ -12,7 +11,6 @@ from csrc.cpp_itfs.utils import (
 from triton.tools.compile import compile_kernel, CompileArgs
 import triton
 import functools
-
 
 MD_NAME = "asm_mla_decode_fwd"
 warpSize = 64
@@ -43,17 +41,13 @@ def compile(
     v_head_dim: int,
     func_name: str = None,
 ):
-    # import pdb
-    # pdb.set_trace()
-
     if func_name is None:
         func_name = get_default_func_name(
             MD_NAME,
             (gqa_ratio, page_size, q_dtype, kv_dtype, num_kv_splits, v_head_dim),
         )
 
-    # if not_built(func_name):
-    if True:
+    if not_built(func_name):
         if gqa_ratio == 128:
             hsaco_path = f"{AITER_CORE_DIR}/hsa/{GPU_ARCH}/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co"
             kernel_name = "_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E"
@@ -80,19 +74,10 @@ def compile(
             elif output_file.suffix == ".cpp":
                 triton_source = output_file
 
-        # import pdb
-        # pdb.set_trace()
-
-        current_dir = os.path.dirname(__file__)
-        # print(f"current_dir={current_dir}")
         return compile_template_op(
             src_template,
             MD_NAME,
-            [
-                current_dir + "/../utils.h",
-                current_dir + "/../../include",
-                triton_header,
-            ],
+            ["../utils.h", "../../include", triton_header],
             [triton_source],
             bin_size=bin_size,
             bin_data=bin_data,

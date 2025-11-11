@@ -15,9 +15,6 @@ import torch
 import aiter
 
 
-TRITON_VERSION = triton.__version__
-
-
 def parse_version(version_str):
     """Parse version string into comparable tuple format, handling possible development version suffixes"""
     # Remove potential suffixes like .dev, +git etc.
@@ -32,6 +29,7 @@ def parse_version(version_str):
             break
 
     return tuple(parts)
+TRITON_VERSION = parse_version(triton.__version__)
 
 
 @gluon.jit
@@ -2020,8 +2018,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
         )
     else:
         kernel = paged_attention_decode_v2_reduce_kernel_triton34
-        triton_version = parse_version(TRITON_VERSION)
-        if triton_version > (3, 4, 0):
+        if TRITON_VERSION > (3, 4, 0):
             kernel = paged_attention_decode_v2_reduce_kernel
 
         # Launch standard Triton reduction kernel
