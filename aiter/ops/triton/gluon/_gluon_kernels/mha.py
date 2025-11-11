@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 import triton.experimental.gluon as gluon
 import triton.experimental.gluon.language as gl
+import triton.experimental.gluon.language.amd.cdna4.async_copy as acp
 
 from ...utils._triton import arch_info
 from ...utils.core import AITER_TRITON_CONFIGS_PATH
@@ -30,11 +31,12 @@ def _load_fn(ptrs, offset_first, offset_second, boundary_first, boundary_second)
     elif offset_second is not None:
         mask = offset_second[None, :] < boundary_second
 
-    tensor = gl.amd.cdna4.buffer_load(ptr=ptrs, offset=0, mask=mask, other=0.0)
+    tensor = gl.amd.cdna4.buffer_load(
+        ptr=ptrs, offset=gl.full_like(ptrs, 0), mask=mask, other=0.0
+    )
     return tensor
 
 
-# TODO: Clean up the arguments here; some are not needed
 @gluon.jit
 def _attn_fwd_inner(
     acc,
@@ -48,24 +50,16 @@ def _attn_fwd_inner(
     stride_kn,
     stride_vk,
     stride_sn,
-    start_m,
     seqlen_k,
     seqlen_q,
-    dropout_p,
     sd_mask_ptrs,
-    dropout_mask_ptrs,
-    philox_seed,
-    philox_ptrs,
     block_min,
     block_max,
     offs_n_causal,
     n_extra_tokens,
-    alibi_slope,
-    descale_q,
-    descale_k,
-    descale_v,
     OFFS_M: gl.constexpr,
     OFFS_N: gl.constexpr,
+    OFFS_D: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
@@ -73,13 +67,8 @@ def _attn_fwd_inner(
     BLOCK_DMODEL_PE: gl.constexpr,  # it's zero or a power of 2
     SM_SCALE: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
-    MASK_STEPS: gl.constexpr,  # whether to apply masking for steps (for causal or padding)
-    ENABLE_DROPOUT: gl.constexpr,
+    MASK_STEPS: gl.constexpr,  # whether to apply masking at some point while stepping (for causal or padding)
     RETURN_SCORES: gl.constexpr,
-    # TODO: Do we even need this?
-    PADDED_HEAD: gl.constexpr,  # whether BLOCK_DMODEL != BLOCK_DMODEL_POW2
-    IS_FP8: gl.constexpr,
-    FP8_MAX: gl.constexpr,
     ENABLE_PIPELINING: gl.constexpr,
 ):
     """
@@ -98,20 +87,12 @@ def _attn_fwd_inner(
 
         # Compute k offsets across sequence length
         if MASK_STEPS:
-            k_offs_n = start_n + gl.arange(
-                0, BLOCK_N, layout=...
-            )  # FIXME: This can be passed in with the layout (OFFS_N?)
+            k_offs_n = start_n + OFFS_N
         else:
             k_offs_n = None
 
         # Compute k offsets across head dimension, only needed if padded head
-        k_offs_k = (
-            None
-            if not PADDED_HEAD
-            else gl.arange(
-                0, BLOCK_DMODEL_POW2, layout=...
-            )  # FIXME: This can be passed in with the layout (OFFS_D?)
-        )
+        k_offs_k = None if BLOCK_DMODEL == BLOCK_DMODEL_POW2 else OFFS_D
         k = _load_fn(k_ptrs, k_offs_k, k_offs_n, BLOCK_DMODEL, seqlen_k)
         if HAS_PE:
             k_pe = _load_fn(
@@ -122,7 +103,7 @@ def _attn_fwd_inner(
                 seqlen_k,
             )
 
-        # TODO: Probably need to be passing in the MFMA layout for qk and mask
+        # TODO: Probably need to be passing in the MFMA and DotOperand layouts for qk and mask
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=...)
         mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=...)
         if MASK_STEPS:
@@ -145,7 +126,7 @@ def _attn_fwd_inner(
 
         # Compute masks across q and k sequence lengths
         q_mask = OFFS_M[:, None] < seqlen_q
-        k_mask = (start_n + gl.arange(0, BLOCK_N, layout=...))[None, :] < seqlen_k
+        k_mask = (start_n + OFFS_N)[None, :] < seqlen_k
         p_mask = q_mask & k_mask
 
         # Compute qk^T
@@ -176,7 +157,10 @@ def _attn_fwd_inner(
         if RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
             gl.amd.cdna4.buffer_store(
-                stored_value=p, ptr=sd_mask_ptrs, offset=0, mask=p_mask
+                stored_value=p,
+                ptr=sd_mask_ptrs,
+                offset=gl.full_like(sd_mask_ptrs, 0),
+                mask=p_mask,
             )
 
         # Update the output accumulator
@@ -278,29 +262,88 @@ def _attn_fwd(
             "Grouped query and multi-query attention not supported yet in Gluon MHA."
         )
 
-    """
-    TODO: Take a look at these layouts, and assign them as appropriate to the aranges
-    #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
-    #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
-    #blocked2 = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [16, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
-    #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 8]], warp = [[32, 0], [64, 0]], block = []}>
-    """
-
     NUM_BLOCKS = gl.cdiv(SEQLEN_Q, BLOCK_M)
-    # calculate offsets
     wid = gl.program_id(
         0
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
-    # num blocks along seqlen
 
     off_q_head = wid % NUM_Q_HEADS  # across num q heads
     off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
     start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
     off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH  # across batch size
 
-    # TODO: create layouts (blocked, linear, mfma) for offsets
+    """
+    NOTE:
+    The following layouts come from the compiler-generated IR for the basic Triton kernel.
+        
+    This one is for loading/storing 1D tensors of 32-bit dtype (like lse and associated offsets/masks):
+    #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+    
+    This one is for loading from Q tensor:
+    #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+    
+    This one is for loading from K and V tensors:
+    #blocked2 = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [16, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
+    
+    This one is for storing the output tensor:
+    #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 8]], warp = [[32, 0], [64, 0]], block = []}>
+    
+    This one is for matmul operations:
+    #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [32, 32, 16], isTransposed = true}>
+    
+    This is shared memory for the Q block:
+    #shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 16, order = [1, 0]}>
+    
+    This is shared memory for the K block:
+    #shared1 = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 16, order = [0, 1]}>
+    
+    This is shared memory for the V block:
+    #shared2 = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 16, order = [1, 0]}>
+    """
 
-    # offsets
+    # TODO: These layouts need to be generalized across input data sizes (right now, these
+    # are hardcoded for dtype=float16)
+    blocked_lse: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1],
+        threads_per_warp=[64],
+        warps_per_cta=[gl.num_warps()],
+        order=[0],
+    )
+    blocked_md: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 8],
+        threads_per_warp=[8, 8],
+        warps_per_cta=[gl.num_warps(), 1],
+        order=[1, 0],
+    )
+    blocked_dn: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[8, 1],
+        threads_per_warp=[8, 8],
+        warps_per_cta=[1, gl.num_warps()],
+        order=[0, 1],
+    )
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[32, 32, 16],
+        transposed=True,
+        warps_per_cta=[gl.num_warps(), 1],
+    )
+    shared_q: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=8, per_phase=2, max_phase=8, order=[1, 0]
+    )
+    shared_k: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=8, per_phase=2, max_phase=8, order=[0, 1]
+    )
+    shared_v: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=4, per_phase=2, max_phase=8, order=[1, 0]
+    )
+    dot_q_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=8
+    )
+    dot_k_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=8
+    )
+
+    # Create offsets
     offs_m = start_m * BLOCK_M + gl.arange(
         0, BLOCK_M, layout=...
     )  # across sequence length of q
@@ -385,8 +428,6 @@ def _attn_fwd(
     gl.assume(stride_vn_in >= 0)
     gl.assume(stride_vk_in >= 0)
 
-    # NOTE: philox offset is need in dropout pointer calculations
-    gl.assume(philox_offset_base_in >= 0)
     gl.assume(stride_sd_z_in >= 0)
     gl.assume(stride_sd_h_in >= 0)
     gl.assume(stride_sd_m_in >= 0)
@@ -395,7 +436,7 @@ def _attn_fwd(
     gl.assume(stride_lse_h_in >= 0)
     gl.assume(stride_lse_m_in >= 0)
 
-    # get sequence lengths
+    # Get sequence lengths
     if VARLEN:
         cu_seqlens_q_start = gl.amd.cdna4.buffer_load(cu_seqlens_q + off_z)
         cu_seqlens_q_end = gl.amd.cdna4.buffer_load(cu_seqlens_q + off_z + 1)
@@ -414,12 +455,12 @@ def _attn_fwd(
         seqlen_q = SEQLEN_Q
         seqlen_k = SEQLEN_K
 
-    # creating sequence length and dimension masks
+    # Creating sequence length and dimension masks
     q_mask = offs_m[:, None] < seqlen_q
     k_mask = offs_n[None, :] < seqlen_k
     d_mask = offs_d[None, :] < BLOCK_DMODEL
 
-    # create offsets to return softmax scores
+    # Create offsets to return softmax scores
     if s_dmask_ptr is not None:
         s_dmask_offs = (
             off_z * stride_sd_z
@@ -431,7 +472,7 @@ def _attn_fwd(
     else:
         s_dmask_ptrs = None
 
-    # create offsets to return log-sum-exp
+    # Create offsets to return log-sum-exp
     if softmax_lse_ptr is not None:
         offs_lse = (
             off_z * stride_lse_z
@@ -444,7 +485,7 @@ def _attn_fwd(
         offs_lse = None
         lse_mask = None
 
-    # compute number of blocks along seqlen_k
+    # Compute number of blocks along seqlen_k
     n_blocks = gl.cdiv(seqlen_k, BLOCK_N)
 
     # Now we compute whether we need to exit early due to causal masking.
@@ -478,7 +519,9 @@ def _attn_fwd(
                 + offs_m[:, None] * stride_om
                 + offs_d[None, :] * stride_on
             )
-            acc = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=out_ptr.type.element_ty)
+            acc = gl.zeros(
+                [BLOCK_M, BLOCK_DMODEL_POW2], dtype=out_ptr.type.element_ty, layout=...
+            )
             out_mask = q_mask & d_mask
             gl.amd.cdna4.buffer_store(
                 stored_value=acc, ptr=out_ptr, offset=offs_out, mask=out_mask
@@ -508,7 +551,7 @@ def _attn_fwd(
 
     off_k_head = off_q_head  # for now, no grouped q/k attention
 
-    # create q offsets
+    # Create q offsets
     q_offs = (
         off_z * stride_qz
         + off_q_head * stride_qh
@@ -527,7 +570,7 @@ def _attn_fwd(
     else:
         q_pe_offs = None
 
-    # create k offsets
+    # Create k offsets
     k_offs = (
         off_z * stride_kz
         + off_k_head * stride_kh
@@ -548,7 +591,7 @@ def _attn_fwd(
     else:
         k_pe_ptrs = None
 
-    # create v offsets
+    # Create v offsets
     v_offs = (
         off_z * stride_vz
         + off_k_head * stride_vh
@@ -558,7 +601,7 @@ def _attn_fwd(
     )
     v_ptrs = v_ptr + v_offs
 
-    # load q block
+    # Load q block
     m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=...)
     l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=...)
     acc = gl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=...)
@@ -579,7 +622,7 @@ def _attn_fwd(
     elif seqlen_k % BLOCK_N:
         n_extra_tokens = seqlen_k % BLOCK_N
 
-    # if CAUSAL, then determine masked_blocks and full blocks
+    # If CAUSAL, then determine masked_blocks and full blocks
     # Here we compute how many full and masked blocks we have.
     padded_block_k = n_extra_tokens != 0
     is_modulo_mn = not padded_block_k and (seqlen_q % BLOCK_M == 0)
@@ -591,7 +634,7 @@ def _attn_fwd(
         # Padding on Q does not need to be masked in the FA loop.
         masked_blocks = padded_block_k
 
-    # if IS_CAUSAL, not is_modulo_mn does not always result in an additional block.
+    # If IS_CAUSAL, not is_modulo_mn does not always result in an additional block.
     # In this case we might exceed n_blocks so pick the min.
     masked_blocks = min(masked_blocks, n_blocks)
     n_full_blocks = n_blocks - masked_blocks
@@ -614,24 +657,16 @@ def _attn_fwd(
             stride_kn,
             stride_vn,
             stride_sd_n,
-            start_m,
             seqlen_k,
             seqlen_q,
-            dropout_p,
             s_dmask_ptrs,
-            None,
-            philox_seed,
-            None,
             block_min,
             block_max,
             0,
             0,
-            None,
-            None,
-            None,
-            None,
             offs_m,
             offs_n,
+            offs_d,
             BLOCK_M,
             BLOCK_N,
             BLOCK_DMODEL,
@@ -640,11 +675,7 @@ def _attn_fwd(
             sm_scale,
             False,
             MASK_STEPS=False,
-            ENABLE_DROPOUT=ENABLE_DROPOUT,
             RETURN_SCORES=RETURN_SCORES,
-            PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
             ENABLE_PIPELINING=True,
         )
         block_min = block_max
@@ -678,24 +709,16 @@ def _attn_fwd(
             stride_kn,
             stride_vn,
             stride_sd_n,
-            start_m,
             seqlen_k,
             seqlen_q,
-            dropout_p,
             s_dmask_ptrs,
-            None,
-            philox_seed,
-            None,
             block_min,
             block_max,
             offs_n_causal,
             n_extra_tokens,
-            None,
-            None,
-            None,
-            None,
             offs_m,
             offs_n,
+            offs_d,
             BLOCK_M,
             BLOCK_N,
             BLOCK_DMODEL,
@@ -704,11 +727,7 @@ def _attn_fwd(
             sm_scale,
             IS_CAUSAL,
             MASK_STEPS=True,
-            ENABLE_DROPOUT=ENABLE_DROPOUT,
             RETURN_SCORES=RETURN_SCORES,
-            PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
             ENABLE_PIPELINING=False,
         )
 
@@ -725,6 +744,8 @@ def _attn_fwd(
     causal_start_idx = seqlen_q - seqlen_k
     if IS_CAUSAL:
         if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
+            # TODO: Understand this better; is the gl.full needed, instead of using scalar,
+            # because we need the broadcasting for out_ptrs_mask to work properly?
             out_mask_boundary = gl.full(
                 (BLOCK_DMODEL_POW2,), causal_start_idx, dtype=gl.int32, layout=...
             )
@@ -738,15 +759,14 @@ def _attn_fwd(
     if softmax_lse_ptr is not None:
         RCP_LN2: gl.constexpr = 1.4426950408889634
         LN2: gl.constexpr = 0.6931471824645996
-        # compute log-sum-exp in base 2 units
-        # mi_base2 = m_i * RCP_LN2
+        # Compute log-sum-exp in base-2 units
         mi_base2 = m_i * RCP_LN2 * sm_scale
         softmax_lse = mi_base2 + gl.log2(l_i)
-        # convert back to natural units
+        # Convert back to natural units
         softmax_lse *= LN2
 
         if IS_CAUSAL:
-            # zero out nans caused by -infs when doing causal
+            # Zero out nans caused by -infs when doing causal
             lse_causal_mask = (
                 start_m_idx + gl.arange(0, BLOCK_M, layout=...)
             ) < causal_start_idx
@@ -774,7 +794,7 @@ def _attn_fwd(
                 stored_value=softmax_lse, ptr=softmax_lse_ptr, offset=offs_lse
             )
 
-    # write back O
+    # Write back O
     offs_out = (
         off_z * stride_oz
         + off_q_head * stride_oh
