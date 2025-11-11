@@ -63,8 +63,8 @@ def tensor_to_hash(tensor: torch.Tensor, algorithm: str = "md5") -> str:
 def compile_reduce_kernel(
     query_group_size: int,
     head_size: int,
-    max_num_seq_partitions: int,
-    sequence_partition_size: int,
+    max_context_partition_num: int,
+    context_partition_size: int,
     md_name: str,
     func_name: str = None,
 ):
@@ -75,8 +75,8 @@ def compile_reduce_kernel(
             (
                 query_group_size,
                 head_size,
-                max_num_seq_partitions,
-                sequence_partition_size,
+                max_context_partition_num,
+                context_partition_size,
             ),
         )
 
@@ -105,8 +105,8 @@ def compile_reduce_kernel(
             "i32",  # num_kv_heads
             f"{query_group_size}",
             f"{head_size}",
-            f"{max_num_seq_partitions}",
-            f"{sequence_partition_size}",
+            f"{max_context_partition_num}",
+            f"{context_partition_size}",
         ]
         signature = ",".join(signature_parts)
 
@@ -160,8 +160,8 @@ def run_compiled_kernel(
     num_kv_heads: int,
     query_group_size: int,
     head_size: int,
-    max_num_seq_partitions: int,
-    sequence_partition_size: int,
+    max_context_partition_num: int,
+    context_partition_size: int,
     md_name: str,
     func_name: str = None,
 ):
@@ -171,8 +171,8 @@ def run_compiled_kernel(
     reduce_func = compile_reduce_kernel(
         query_group_size=query_group_size,
         head_size=head_size,
-        max_num_seq_partitions=max_num_seq_partitions,
-        sequence_partition_size=sequence_partition_size,
+        max_context_partition_num=max_context_partition_num,
+        context_partition_size=context_partition_size,
         md_name=md_name,
     )
 
@@ -208,8 +208,8 @@ def run_direct_kernel(
     context_lengths: torch.Tensor,
     query_group_size: int,
     head_size: int,
-    max_num_seq_partitions: int,
-    sequence_partition_size: int,
+    max_context_partition_num: int,
+    context_partition_size: int,
 ):
     """
     Directly call the paged_attention_decode_v2_reduce_kernel with perftest timing
@@ -240,18 +240,18 @@ def run_direct_kernel(
         num_kv_heads,
         QUERY_GROUP_SIZE=query_group_size,
         HEAD_SIZE=head_size,
-        MAX_NUM_SEQ_PARTITIONS=max_num_seq_partitions,
-        SEQUENCE_PARTITION_SIZE=sequence_partition_size,
+        MAX_NUM_SEQ_PARTITIONS=max_context_partition_num,
+        CONTEXT_PARTITION_SIZE=context_partition_size,
     )
 
 
 def torch_reduce_reference(
     output: torch.Tensor,  # [num_seqs, num_q_heads_total, head_size]
-    exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
-    max_logits: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
-    temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size, head_size]
+    exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+    max_logits: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+    temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
     context_lengths: torch.Tensor,  # [num_seqs]
-    sequence_partition_size: int = 256,
+    context_partition_size: int = 256,
 ) -> torch.Tensor:
     """
     Reference implementation of the reduce kernel.
@@ -265,7 +265,7 @@ def torch_reduce_reference(
 
     for seq_idx in range(num_seqs):
         seq_len = context_lengths[seq_idx].item()
-        num_parts = (seq_len + sequence_partition_size - 1) // sequence_partition_size
+        num_parts = (seq_len + context_partition_size - 1) // context_partition_size
 
         # Global max across partitions
         global_max = (
@@ -317,8 +317,8 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
     query_sequence_length = 1
     query_group_size = 8
     head_size = 128
-    max_num_seq_partitions = 16
-    sequence_partition_size = 256
+    max_context_partition_num = 16
+    context_partition_size = 256
     num_sequences = 128
     num_kv_heads = 2
     # num_kv_heads = 1
@@ -328,8 +328,8 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
     # print("\n=== Reduce Kernel Compile Parameters ===")
     # print(f"  head_size: {head_size}")
     # print(f"  query_group_size: {query_group_size}")
-    # print(f"  sequence_partition_size: {sequence_partition_size}")
-    # print(f"  max_num_seq_partitions: {max_num_seq_partitions}")
+    # print(f"  context_partition_size: {context_partition_size}")
+    # print(f"  max_context_partition_num: {max_context_partition_num}")
 
     # Create test tensors with the provided shapes
     # output = torch.zeros((num_sequences, num_kv_heads * query_group_size, head_size),
@@ -339,12 +339,12 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
         device="cuda",
     )
     exp_sums = torch.zeros(
-        (num_sequences, num_kv_heads, max_num_seq_partitions, query_group_size),
+        (num_sequences, num_kv_heads, max_context_partition_num, query_group_size),
         dtype=torch.float32,
         device="cuda",
     )
     max_logits = torch.zeros(
-        (num_sequences, num_kv_heads, max_num_seq_partitions, query_group_size),
+        (num_sequences, num_kv_heads, max_context_partition_num, query_group_size),
         dtype=torch.float32,
         device="cuda",
     )
@@ -352,7 +352,7 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
         (
             num_sequences,
             num_kv_heads,
-            max_num_seq_partitions,
+            max_context_partition_num,
             query_group_size,
             head_size,
         ),
@@ -361,7 +361,7 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
     )
     context_lengths = torch.randint(
         1,
-        sequence_partition_size * max_num_seq_partitions,
+        context_partition_size * max_context_partition_num,
         (num_sequences,),
         dtype=torch.int32,
         device="cuda",
@@ -401,7 +401,7 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
         max_logits,
         temporary_output,
         context_lengths,
-        sequence_partition_size,
+        context_partition_size,
     )
 
     # Execute kernel based on selected type
@@ -418,8 +418,8 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
             num_kv_heads,
             query_group_size=equivalent_query_group_size,
             head_size=head_size,
-            max_num_seq_partitions=max_num_seq_partitions,
-            sequence_partition_size=sequence_partition_size,
+            max_context_partition_num=max_context_partition_num,
+            context_partition_size=context_partition_size,
             md_name="pa_decode_reduce_kernel",
         )
         print(f"Compiled kernel execution time: {compiled_time:.2f} us/iter")
@@ -434,8 +434,8 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
             context_lengths,
             query_group_size,
             head_size,
-            max_num_seq_partitions,
-            sequence_partition_size,
+            max_context_partition_num,
+            context_partition_size,
         )
         print(f"Direct kernel execution time: {direct_time:.2f} us/iter")
     else:

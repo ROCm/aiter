@@ -20,11 +20,8 @@ from aiter import dtypes
 from aiter import pertoken_quant, per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 
-from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8_triton34 import (
-    paged_attention_decode as paged_attention_decode_gluon_fp8_triton34,
-)
 from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8 import (
-    pa_decode_gluon as paged_attention_decode_gluon_fp8,
+    pa_decode_gluon,
 )
 from csrc.cpp_itfs.pa_gluon.pa_decode_gluon_fp8 import (
     pa_decode_gluon_aot,
@@ -58,7 +55,7 @@ USE_TORCH_FLASH_REF_OPTIONS = [True]
 USE_AOT_IMPL_OPTIONS = [True, False]
 KV_VARLEN_OPTIONS = [False, True]
 TRANS_V_OPTIONS = [False, True]
-SEQUENCE_PARTITION_SIZE_OPTIONS = [256]
+CONTEXT_PARTITION_SIZE_OPTIONS = [256]
 DATA_TYPE_OPTIONS = ["bf16"]
 QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
 
@@ -81,23 +78,6 @@ def setup_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-
-
-# Convert version string to comparable tuple format
-def parse_version(version_str):
-    """Parse version string into tuple format, handling possible development version suffixes"""
-    # Remove potential suffixes like .dev, +git etc.
-    version_str = version_str.split("+")[0].split("-")[0]
-
-    # Split version number and convert to integers
-    parts = []
-    for part in version_str.split("."):
-        try:
-            parts.append(int(part))
-        except ValueError:
-            break
-
-    return tuple(parts)
 
 
 def compare_arrays(
@@ -423,7 +403,7 @@ def torch_attention_compute(
     alibi_slopes: Optional[torch.Tensor] = None,  # [num_kv_heads, query_group_size]
     output_dtype: torch.dtype = torch.bfloat16,
     kv_block_size: int = 16,
-    sequence_partition_size: int = 256,
+    context_partition_size: int = 256,
     is_causal: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -444,17 +424,22 @@ def torch_attention_compute(
     value_transposed = len(value_cache.shape) == 5
 
     compute_block_size = 256
-    if kv_block_size > sequence_partition_size and value_transposed:
+    if kv_block_size > context_partition_size and value_transposed:
         compute_block_size = 128
 
     # Reconstruct full key/value per sequence
     max_seq_len = context_lengths.max().item()
-    max_num_partitions = (
-        max_seq_len + sequence_partition_size - 1
-    ) // sequence_partition_size
+    max_context_partition_num = (
+        max_seq_len + context_partition_size - 1
+    ) // context_partition_size
 
     # Output buffers (same as Triton)
-    intermediate_shape = (num_seqs, num_kv_heads, max_num_partitions, query_group_size)
+    intermediate_shape = (
+        num_seqs,
+        num_kv_heads,
+        max_context_partition_num,
+        query_group_size,
+    )
     max_logits = torch.full(
         intermediate_shape, -float("inf"), dtype=torch.float32, device=query.device
     )
@@ -525,9 +510,9 @@ def torch_attention_compute(
         q_fp32 = q.to(torch.float32)
 
         # Process each partition
-        for part_idx in range(max_num_partitions):
-            part_start = part_idx * sequence_partition_size
-            part_end = min(part_start + sequence_partition_size, seq_len)
+        for part_idx in range(max_context_partition_num):
+            part_start = part_idx * context_partition_size
+            part_end = min(part_start + context_partition_size, seq_len)
             if part_start >= seq_len:
                 continue
 
@@ -706,11 +691,11 @@ def torch_attention_compute(
 
 def torch_reduce_compute(
     output: torch.Tensor,  # [num_seqs, num_q_heads_total, head_size]
-    exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
-    max_logits: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
-    temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size, head_size]
+    exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+    max_logits: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+    temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
     context_lengths: torch.Tensor,  # [num_seqs]
-    sequence_partition_size: int = 256,
+    context_partition_size: int = 256,
 ) -> torch.Tensor:
     """
     Reference implementation of the reduce kernel.
@@ -723,7 +708,7 @@ def torch_reduce_compute(
 
     for seq_idx in range(num_seqs):
         seq_len = context_lengths[seq_idx].item()
-        num_parts = (seq_len + sequence_partition_size - 1) // sequence_partition_size
+        num_parts = (seq_len + context_partition_size - 1) // context_partition_size
 
         # Global max across partitions
         global_max = (
@@ -781,7 +766,7 @@ def torch_mha_extend_flashattn_style(
     alibi_slopes: Optional[torch.Tensor] = None,  # [num_kv_heads, query_group_size]
     output_dtype: torch.dtype = torch.bfloat16,
     kv_block_size: int = 16,
-    sequence_partition_size: int = 256,
+    context_partition_size: int = 256,
     is_causal: bool = True,
 ) -> torch.Tensor:
     """
@@ -803,7 +788,7 @@ def torch_mha_extend_flashattn_style(
         alibi_slopes=alibi_slopes,
         output_dtype=output_dtype,
         kv_block_size=kv_block_size,
-        sequence_partition_size=sequence_partition_size,
+        context_partition_size=context_partition_size,
         is_causal=is_causal,
     )
 
@@ -819,7 +804,7 @@ def torch_mha_extend_flashattn_style(
         max_logits,
         partial_output,
         context_lengths,
-        sequence_partition_size,
+        context_partition_size,
     )
 
     return final_output
@@ -1060,7 +1045,6 @@ def prepare_gluon_query_and_scale(
 
 @perftest()
 def run_gluon_fp8_kernel(
-    pa_gluon_fp8_op,
     output: torch.Tensor,
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -1069,8 +1053,8 @@ def run_gluon_fp8_kernel(
     block_tables: torch.Tensor,
     attention_scale: float,
     query_sequence_length: int,
-    max_sequence_length: int,
-    sequence_partition_size: int,
+    max_context_length: int,
+    context_partition_size: int,
     compute_type: tl.dtype,
     query_scale: torch.Tensor,
     key_scale: torch.Tensor,
@@ -1097,8 +1081,8 @@ def run_gluon_fp8_kernel(
             block_tables,
             attention_scale,
             query_sequence_length,
-            max_sequence_length,
-            sequence_partition_size,
+            max_context_length,
+            context_partition_size,
             compute_type,
             query_scale,
             key_scale,
@@ -1109,7 +1093,7 @@ def run_gluon_fp8_kernel(
             alibi_slopes=alibi_slopes,
         )
     else:
-        pa_gluon_fp8_op(
+        pa_decode_gluon(
             output,
             query,
             key_cache,
@@ -1118,8 +1102,8 @@ def run_gluon_fp8_kernel(
             block_tables,
             attention_scale,
             query_sequence_length,
-            max_sequence_length,
-            sequence_partition_size,
+            max_context_length,
+            context_partition_size,
             compute_type,
             query_scale,
             key_scale,
@@ -1141,7 +1125,7 @@ def run_pa_gluon_test(
     data_type: torch.dtype,
     query_length: int,
     quant_mode: str,
-    sequence_partition_size: int,
+    context_partition_size: int,
     trans_v: bool,
     kv_varlen: bool,
     use_aot_impl: bool,
@@ -1158,8 +1142,8 @@ def run_pa_gluon_test(
         num_query_heads % num_kv_heads == 0
     ), "Query heads must be divisible by KV heads"
 
-    max_sequence_length = 16384
-    max_blocks_per_sequence = (max_sequence_length + block_size - 1) // block_size
+    max_context_length = 16384
+    max_blocks_per_sequence = (max_context_length + block_size - 1) // block_size
     total_blocks = max_blocks_per_sequence * batch_size
     blocks_per_sequence = (context_length + block_size - 1) // block_size
 
@@ -1305,7 +1289,7 @@ def run_pa_gluon_test(
             key_scale=key_scale_original,
             value_scale=value_scale_original,
             kv_block_size=block_size,
-            sequence_partition_size=sequence_partition_size,
+            context_partition_size=context_partition_size,
         )
         if query_length > 1:
             query_group_size = num_query_heads // num_kv_heads
@@ -1337,25 +1321,17 @@ def run_pa_gluon_test(
         print(f"out_flashattn_ref_md5={out_flashattn_ref_md5}")
 
     # Test Gluon
-    pa_gluon_fp8_op = paged_attention_decode_gluon_fp8_triton34
-    triton_version = parse_version(TRITON_VERSION)
-    if triton_version > (3, 4, 0):
-        print(f"pa_gluon_fp8_op==paged_attention_decode_gluon_fp8")
-        pa_gluon_fp8_op = paged_attention_decode_gluon_fp8
-    else:
-        print(f"pa_gluon_fp8_op==paged_attention_decode_gluon_fp8_triton34")
-
     # Create intermediate tensors for attention computation
     num_seqs = batch_size
     num_kv_heads = num_kv_heads
-    max_num_partitions = (
-        context_lengths.max().item() + sequence_partition_size - 1
-    ) // sequence_partition_size
+    max_context_partition_num = (
+        context_lengths.max().item() + context_partition_size - 1
+    ) // context_partition_size
     equivalent_query_group_size = query_length * (num_query_heads // num_kv_heads)
     intermediate_shape = (
         num_seqs,
         num_kv_heads,
-        max_num_partitions,
+        max_context_partition_num,
         equivalent_query_group_size,
     )
     exp_sums = torch.empty(
@@ -1371,7 +1347,6 @@ def run_pa_gluon_test(
         device=output_gluon.device,
     )
     _, gluon_time = run_gluon_fp8_kernel(
-        pa_gluon_fp8_op,
         output_gluon,
         quantized_query_gluon,
         quantized_keys,
@@ -1381,7 +1356,7 @@ def run_pa_gluon_test(
         softmax_scale,
         query_length,
         context_lengths.max().item(),
-        sequence_partition_size,
+        context_partition_size,
         TORCH_TO_TL_DTYPE[data_type],
         query_scale=query_scale_gluon,
         key_scale=key_scale_original,
@@ -1599,7 +1574,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="Use gluon AOT implementation (True/False)",
     )
     parser.add_argument(
-        "--sequence_partition_size",
+        "--context_partition_size",
         type=int,
         default=None,
         help="Sequence partition size",
@@ -1621,7 +1596,7 @@ def process_arguments(args: argparse.Namespace) -> tuple:
     kv_varlen = KV_VARLEN_OPTIONS
     use_torch_flash_ref_options = USE_TORCH_FLASH_REF_OPTIONS
     use_aot_impl_options = USE_AOT_IMPL_OPTIONS
-    sequence_partition_size_options = SEQUENCE_PARTITION_SIZE_OPTIONS
+    context_partition_size_options = CONTEXT_PARTITION_SIZE_OPTIONS
 
     if args.dtype is not None:
         data_types = [dtypes.d_dtypes[args.dtype]]
@@ -1652,8 +1627,8 @@ def process_arguments(args: argparse.Namespace) -> tuple:
         use_torch_flash_ref_options = [args.use_torch_flash_ref]
     if args.use_aot_impl is not None:
         use_aot_impl_options = [args.use_aot_impl]
-    if args.sequence_partition_size is not None:
-        sequence_partition_size_options = [args.sequence_partition_size]
+    if args.context_partition_size is not None:
+        context_partition_size_options = [args.context_partition_size]
 
     return (
         data_types,
@@ -1667,7 +1642,7 @@ def process_arguments(args: argparse.Namespace) -> tuple:
         kv_varlen,
         use_torch_flash_ref_options,
         use_aot_impl_options,
-        sequence_partition_size_options,
+        context_partition_size_options,
     )
 
 
@@ -1683,7 +1658,7 @@ def run_multi_pa_gluon_test(
     kv_varlen,
     use_torch_flash_ref_options,
     use_aot_impl_options,
-    sequence_partition_size_options,
+    context_partition_size_options,
 ) -> pd.DataFrame:
     """Run all tests."""
     results = []
@@ -1696,7 +1671,7 @@ def run_multi_pa_gluon_test(
         * len(query_lengths)
         * len(use_torch_flash_ref_options)
         * len(use_aot_impl_options)
-        * len(sequence_partition_size_options)
+        * len(context_partition_size_options)
     )
     current = 0
 
@@ -1709,7 +1684,7 @@ def run_multi_pa_gluon_test(
             USE_TORCH_FLASH_REF = use_torch_flash_ref
             for trans_v_mode in trans_v:
                 for kv_varlen_mode in kv_varlen:
-                    for sequence_partition_size in sequence_partition_size_options:
+                    for context_partition_size in context_partition_size_options:
                         for qm in quant_mode:
                             for dt in data_types:
                                 for bs in block_sizes:
@@ -1722,7 +1697,7 @@ def run_multi_pa_gluon_test(
                                                     ) in HEAD_DIMENSION_OPTIONS:
                                                         current += 1
                                                         print(
-                                                            f"\n[{current}/{total * len(quant_mode)}] Testing: use_torch_flash_ref={use_torch_flash_ref}, use_aot_impl={use_aot_impl}, trans_v={trans_v_mode}, kv_varlen={kv_varlen_mode}, sequence_partition_size={sequence_partition_size}, quant_mode={qm}, data_type={dt}, block_size={bs}, num_heads={hc}, context_lengths={cl}, batch_size={bsz}, query_length={ql}, head_size={head_size}"
+                                                            f"\n[{current}/{total * len(quant_mode)}] Testing: use_torch_flash_ref={use_torch_flash_ref}, use_aot_impl={use_aot_impl}, trans_v={trans_v_mode}, kv_varlen={kv_varlen_mode}, context_partition_size={context_partition_size}, quant_mode={qm}, data_type={dt}, block_size={bs}, num_heads={hc}, context_lengths={cl}, batch_size={bsz}, query_length={ql}, head_size={head_size}"
                                                         )
                                                         result = run_pa_gluon_test(
                                                             context_length=cl,
@@ -1733,7 +1708,7 @@ def run_multi_pa_gluon_test(
                                                             data_type=dt,
                                                             query_length=ql,
                                                             quant_mode=qm,
-                                                            sequence_partition_size=sequence_partition_size,
+                                                            context_partition_size=context_partition_size,
                                                             trans_v=trans_v_mode,
                                                             kv_varlen=kv_varlen_mode,
                                                             use_aot_impl=use_aot_impl,
@@ -1761,7 +1736,7 @@ def main():
         kv_varlen,
         use_torch_flash_ref_options,
         use_aot_impl_options,
-        sequence_partition_size_options,
+        context_partition_size_options,
     ) = process_arguments(args)
 
     results_df = run_multi_pa_gluon_test(
@@ -1776,7 +1751,7 @@ def main():
         kv_varlen,
         use_torch_flash_ref_options,
         use_aot_impl_options,
-        sequence_partition_size_options,
+        context_partition_size_options,
     )
 
     output_file = f"run_pa_gluon_test.triton.{TRITON_VERSION}.csv"

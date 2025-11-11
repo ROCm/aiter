@@ -24,6 +24,25 @@ from csrc.cpp_itfs.utils import (
 )
 
 
+TRITON_VERSION = triton.__version__
+
+
+def parse_version(version_str):
+    """Parse version string into comparable tuple format, handling possible development version suffixes"""
+    # Remove potential suffixes like .dev, +git etc.
+    version_str = version_str.split("+")[0].split("-")[0]
+
+    # Split version number and convert to integers
+    parts = []
+    for part in version_str.split("."):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            break
+
+    return tuple(parts)
+
+
 def compile_attention_reduce_kernel(
     compute_type: tl.dtype,
     query_seq_len: int,
@@ -31,8 +50,8 @@ def compile_attention_reduce_kernel(
     head_size: int,
     kv_block_size: int,
     kv_16b_element_count: int,
-    max_num_partitions: int,
-    sequence_partition_size: int,
+    max_context_partition_num: int,
+    context_partition_size: int,
     query_quant_mode: int,
     kv_quant_mode: int,
     fp8_max_value: float,
@@ -52,8 +71,8 @@ def compile_attention_reduce_kernel(
                 head_size,
                 kv_block_size,
                 kv_16b_element_count,
-                max_num_partitions,
-                sequence_partition_size,
+                max_context_partition_num,
+                context_partition_size,
                 query_quant_mode,
                 kv_quant_mode,
                 fp8_max_value,
@@ -68,7 +87,7 @@ def compile_attention_reduce_kernel(
         kv_compute_block_size = 256
         waves_per_eu = 1
         # Select kernel implementation based on block size
-        if kv_block_size > sequence_partition_size:
+        if kv_block_size > context_partition_size:
             # Use big block kernel for large block sizes
             if value_transposed:
                 # Use smaller compute block size for better performance with transposed values
@@ -117,14 +136,14 @@ def compile_attention_reduce_kernel(
             "i32",  # kv_scale_stride_1
             "i32",  # num_seqs
             "i32",  # num_kv_heads
-            "i32",  # max_num_partitions
+            "i32",  # max_context_partition_num
             f"{str(compute_type)}",
             f"{query_seq_len}",
             f"{query_group_size}",
             f"{head_size}",
             f"{kv_block_size}",
             f"{kv_16b_element_count}",
-            f"{sequence_partition_size}",
+            f"{context_partition_size}",
             f"{kv_compute_block_size}",
             f"{query_quant_mode}",
             f"{kv_quant_mode}",
@@ -134,14 +153,14 @@ def compile_attention_reduce_kernel(
         ]
         signature = ",".join(signature_parts)
         gluon_kernel_name = "paged_attention_decode_v2_gluon_fp8"
-        if kv_block_size > sequence_partition_size:
+        if kv_block_size > context_partition_size:
             gluon_kernel_name = "paged_attention_decode_v2_gluon_large_block_fp8"
 
         compile_args = CompileGluonArgs(
             path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_triton_gluon_fp8.py",
             kernel_name=gluon_kernel_name,
             signature=signature,
-            grid="num_seqs,num_kv_heads,max_num_partitions",
+            grid="num_seqs,num_kv_heads,max_context_partition_num",
             num_warps=4,
             num_ctas=1,
             out_name=f"{md_name}_stage1",
@@ -168,14 +187,19 @@ def compile_attention_reduce_kernel(
             "i32",  # num_kv_heads
             f"{equivalent_query_group_size}",
             f"{head_size}",
-            f"{max_num_partitions}",
-            f"{sequence_partition_size}",
+            f"{max_context_partition_num}",
+            f"{context_partition_size}",
         ]
         reduce_signature = ",".join(reduce_signature_parts)
 
+        reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel_triton34"
+        triton_version = parse_version(TRITON_VERSION)
+        if triton_version > (3, 4, 0):
+            reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel"
+
         reduce_compile_args = CompileArgs(
             path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_triton_gluon_fp8.py",
-            kernel_name="paged_attention_decode_v2_reduce_kernel",
+            kernel_name=reduce_kernel_name,
             signature=reduce_signature,
             grid="num_seqs,num_kv_heads,1",
             num_warps=4,
@@ -232,15 +256,15 @@ def pa_decode_gluon_aot(
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
     query_sequence_length: int,
-    max_sequence_length: int,
-    sequence_partition_size: int,
+    max_context_length: int,
+    context_partition_size: int,
     compute_type: tl.dtype,
     query_scale: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
-    max_logits: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
-    temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size, head_size]
+    exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+    max_logits: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+    temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
     alibi_slopes: torch.Tensor = None,
 ) -> dict:
     # Extract tensor dimensions
@@ -248,8 +272,8 @@ def pa_decode_gluon_aot(
     num_query_heads_total = query.shape[1]
     num_query_heads_total = num_query_heads_total // query_sequence_length
     num_kv_heads = key_cache.shape[1]
-    max_num_partitions = int(
-        (max_sequence_length + sequence_partition_size - 1) // sequence_partition_size
+    max_context_partition_num = int(
+        (max_context_length + context_partition_size - 1) // context_partition_size
     )
     head_size = query.shape[-1]
     kv_block_size = key_cache.shape[-2]
@@ -375,8 +399,8 @@ def pa_decode_gluon_aot(
         head_size=head_size,
         kv_block_size=kv_block_size,
         kv_16b_element_count=kv_elements_per_16b,
-        max_num_partitions=max_num_partitions,
-        sequence_partition_size=sequence_partition_size,
+        max_context_partition_num=max_context_partition_num,
+        context_partition_size=context_partition_size,
         query_quant_mode=query_quant_mode,
         kv_quant_mode=kv_quant_mode,
         fp8_max_value=fp8_max_value,
@@ -425,7 +449,7 @@ def pa_decode_gluon_aot(
             key_scale_stride_1,
             num_sequences,
             num_kv_heads,
-            max_num_partitions,
+            max_context_partition_num,
             torch.cuda.current_stream(output.device),
         )
     )
