@@ -157,7 +157,7 @@ def compile_attention_reduce_kernel(
             gluon_kernel_name = "paged_attention_decode_v2_gluon_large_block_fp8"
 
         compile_args = CompileGluonArgs(
-            path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_triton_gluon_fp8.py",
+            path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
             kernel_name=gluon_kernel_name,
             signature=signature,
             grid="num_seqs,num_kv_heads,max_context_partition_num",
@@ -198,7 +198,7 @@ def compile_attention_reduce_kernel(
             reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel"
 
         reduce_compile_args = CompileArgs(
-            path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_triton_gluon_fp8.py",
+            path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
             kernel_name=reduce_kernel_name,
             signature=reduce_signature,
             grid="num_seqs,num_kv_heads,1",
@@ -225,7 +225,7 @@ def compile_attention_reduce_kernel(
                 triton_source2 = output_file
 
         with open(
-            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_attention_reduce_kernel.cpp.jinja",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon_aot/pa_decode_attention_reduce_kernel.cpp.jinja",
             "r",
         ) as f:
             src_template = Template(f.read())
