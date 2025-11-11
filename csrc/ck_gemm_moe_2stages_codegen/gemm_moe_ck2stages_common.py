@@ -317,7 +317,7 @@ gemm2_kernels_dict = {
 
 bit8_list = ["F8", "I8", "f8", "i8"]
 bit16_list = ["B16", "F16", "b16", "f16"]
-bit4_list = ["I4", "i4", "FP4X2", "fp4x2", "fp4x2_bns"]
+bit4_list = ["I4", "i4", "FP4X2", "fp4x2"]
 QuantType_list = [3, 4]
 
 
@@ -329,6 +329,7 @@ def get_gemm1_kernels_list(
     QuantType: str,
     ActOP: str,
     MulRoutedWeight: bool,
+    preshuffle: str,
 ) -> list:
     arch = get_gfx()
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
@@ -355,7 +356,7 @@ def get_gemm1_kernels_list(
     ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
-        if "bns" in Adtype:
+        if preshuffle == "off":
             tag = "a4w4_bns"
         else:
             tag = "a4w4"
@@ -375,7 +376,7 @@ def get_gemm1_kernels_list(
             kernel.CDEElementOp = "MulABScaleWint4"
         elif tag == "a8w8blkscale":
             kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4":
+        elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScale"
         elif tag == "a16w16":
             if MulRoutedWeight:
@@ -392,8 +393,8 @@ def get_gemm2_kernels_list(
     Nswizzle: bool,
     QuantType: str,
     MulRoutedWeight: bool,
+    preshuffle: str,
 ) -> list:
-    global bns_or_preslf
     arch = get_gfx()
 
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
@@ -420,7 +421,7 @@ def get_gemm2_kernels_list(
     ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
-        if "bns" in Adtype:
+        if preshuffle == "off":
             tag = "a4w4_bns"
         else:
             tag = "a4w4"
@@ -439,7 +440,7 @@ def get_gemm2_kernels_list(
             kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
         elif tag == "a8w8blkscale":
             kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4":
+        elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScaleExpertWeight"
         elif tag == "a16w16":
             if MulRoutedWeight:

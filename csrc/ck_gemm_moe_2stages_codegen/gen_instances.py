@@ -591,6 +591,7 @@ class ck_moe_2stage_gemm_codegen:
         quant_type,
         activation,
         mul_routed_weight_stage,
+        preshuffle,
     ):
         self.working_path = working_path
         self.a_dtype = a_dtype.upper()
@@ -600,6 +601,7 @@ class ck_moe_2stage_gemm_codegen:
         self.activation = activation
         self.mul_routed_weight_stage = mul_routed_weight_stage
         self.nswizzle = False
+        self.preshuffle = preshuffle
 
     def generate_instance_and_lookUpTable(self):
         _, gemm1_kernel_list = get_gemm1_kernels_list(
@@ -610,6 +612,7 @@ class ck_moe_2stage_gemm_codegen:
             self.quant_type,
             self.activation,
             self.mul_routed_weight_stage == 1,
+            self.preshuffle,
         )
         tag, gemm2_kernel_list = get_gemm2_kernels_list(
             self.a_dtype,
@@ -618,6 +621,7 @@ class ck_moe_2stage_gemm_codegen:
             self.nswizzle,
             self.quant_type,
             self.mul_routed_weight_stage == 2,
+            self.preshuffle,
         )
         kernel_list = list(gemm1_kernel_list.values()) + list(
             gemm2_kernel_list.values()
@@ -637,7 +641,7 @@ class ck_moe_2stage_gemm_codegen:
                 if self.quant_type in [4, 5]:
                     quanttype = "_blockscale"
                 elif "FP4" in self.a_dtype:
-                    if "bns" in self.a_dtype:
+                    if "bns" in tag:
                         quanttype = "_mxfp4_bns"
                     else:
                         quanttype = "_mxfp4"
@@ -815,6 +819,16 @@ if __name__ == "__main__":
         help="the path where all the blobs are going to be generated",
     )
 
+    parser.add_argument(
+        "-p",
+        "--preshuffle",
+        default="off",
+        required=False,
+        type=str,
+        choices=["off", "on"],
+        help="Choose the weight mode: bns or pre-shuffle.",
+    )
+
     args = parser.parse_args()
     args.quant_type = (
         "per_1x128" if args.quant_type == "per_128x128" else args.quant_type
@@ -837,8 +851,21 @@ if __name__ == "__main__":
         acts = ["silu", "gelu"]
         routed_weight_l = [1, 2]
         general_quant_l = ["per_tensor", "per_token"]
-        for b_dtype, c_dtype, act, routed_weight, quant in itertools.product(
-            b_quant_dtypes, c_dtypes, acts, routed_weight_l, general_quant_l
+        preshuffle_mode_l = ["off"]
+        for (
+            b_dtype,
+            c_dtype,
+            act,
+            routed_weight,
+            quant,
+            preshuffle_mode,
+        ) in itertools.product(
+            b_quant_dtypes,
+            c_dtypes,
+            acts,
+            routed_weight_l,
+            general_quant_l,
+            preshuffle_mode_l,
         ):
             a_dtype = b_dtype if b_dtype != "i4" else "f8"
             quant = quant if b_dtype != "fp4x2" else "per_1x32"
@@ -850,6 +877,7 @@ if __name__ == "__main__":
                 quant_dict[quant],
                 act,
                 routed_weight,
+                preshuffle_mode,
             )
             codegen.generate_instance_and_lookUpTable()
 
@@ -866,6 +894,7 @@ if __name__ == "__main__":
                 quant_dict[quant],
                 act,
                 routed_weight,
+                preshuffle_mode,
             )
             codegen.generate_instance_and_lookUpTable()
 
@@ -889,6 +918,7 @@ if __name__ == "__main__":
                 quant_dict["no"],
                 act,
                 routed_weight,
+                preshuffle_mode,
             )
             codegen.generate_instance_and_lookUpTable()
     else:
@@ -902,6 +932,7 @@ if __name__ == "__main__":
                 quant_dict[args.quant_type],
                 args.activation,
                 args.mul_routed_weight_stage,
+                args.preshuffle,
             )
             codegen.generate_instance_and_lookUpTable()
 
