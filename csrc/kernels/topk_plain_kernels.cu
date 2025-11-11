@@ -360,29 +360,6 @@ struct BitonicSort
     }
 };
 
-template <typename T>
-__device__ __forceinline__ T dev_med3(const T& a, const T& b, const T& c)
-{
-    if constexpr(std::is_same_v<T, float>)
-    {
-        return __builtin_amdgcn_fmed3f(a, b, c);
-    }
-    else if constexpr(std::is_same_v<T, _Float16>)
-    {
-        __fp16 a_fp16 = *reinterpret_cast<const __fp16*>(&a);
-        __fp16 b_fp16 = *reinterpret_cast<const __fp16*>(&b);
-        __fp16 c_fp16 = *reinterpret_cast<const __fp16*>(&c);
-        __fp16 result = __builtin_amdgcn_fmed3h(a_fp16, b_fp16, c_fp16);
-        return *reinterpret_cast<const _Float16*>(&result);
-    }
-    else
-    {
-        auto max_0 = opus::max(a, b);
-        auto min_0 = opus::min(a, b);
-        return opus::min(max_0, opus::max(min_0, c));
-    }
-}
-
 template <typename idxT, typename T>
 __device__ __forceinline__ idxT select_idx(
     const idxT& idx_a, const idxT& idx_b, const T& val_a, const T& val_b, const T& selected_val)
@@ -554,7 +531,7 @@ sort_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
     idxT other_idx = mov_dpp<idxT, stride>(idx);
 
     // Use median-of-3 to select the appropriate value
-    T selected_val    = dev_med3(val, other, get_guard<T>(reverse != is_second));
+    T selected_val    = opus::med3(val, other, get_guard<T>(reverse != is_second));
     idxT selected_idx = select_idx(idx, other_idx, val, other, selected_val);
 
     *val_arr = selected_val;
@@ -583,7 +560,7 @@ sort_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 #pragma clang diagnostic pop
 
     // Use median-of-3 to select the appropriate value
-    T selected_val    = dev_med3(val, other, get_guard<T>(reverse != is_second));
+    T selected_val    = opus::med3(val, other, get_guard<T>(reverse != is_second));
     idxT selected_idx = select_idx(idx, other_idx, val, other, selected_val);
 
     *val_arr = selected_val;
@@ -605,7 +582,7 @@ sort_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
     idxT other_idx = shfl_xor(idx, stride);
 
     // Use median-of-3 to select the appropriate value
-    T selected_val    = dev_med3(val, other, get_guard<T>(reverse != is_second));
+    T selected_val    = opus::med3(val, other, get_guard<T>(reverse != is_second));
     idxT selected_idx = select_idx(idx, other_idx, val, other, selected_val);
 
     *val_arr = selected_val;
@@ -660,7 +637,7 @@ merge_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
     idxT other_idx = mov_dpp<idxT, stride>(idx);
 
     // Use median-of-3 to select the appropriate value
-    T selected_val    = dev_med3(val, other, get_guard<T>(ascending != is_second));
+    T selected_val    = opus::med3(val, other, get_guard<T>(ascending != is_second));
     idxT selected_idx = select_idx(idx, other_idx, val, other, selected_val);
 
     val = selected_val;
@@ -688,7 +665,7 @@ merge_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
 #pragma clang diagnostic pop
 
     // Use median-of-3 to select the appropriate value
-    T selected_val    = dev_med3(val, other, get_guard<T>(ascending != is_second));
+    T selected_val    = opus::med3(val, other, get_guard<T>(ascending != is_second));
     idxT selected_idx = select_idx(idx, other_idx, val, other, selected_val);
 
     val = selected_val;
@@ -709,7 +686,7 @@ merge_step(T* __restrict__ val_arr, idxT* __restrict__ idx_arr)
     idxT other_idx = shfl_xor(idx, stride);
 
     // Use median-of-3 to select the appropriate value
-    T selected_val    = dev_med3(val, other, get_guard<T>(ascending != is_second));
+    T selected_val    = opus::med3(val, other, get_guard<T>(ascending != is_second));
     idxT selected_idx = select_idx(idx, other_idx, val, other, selected_val);
 
     val = selected_val;
@@ -1377,8 +1354,7 @@ struct WaveTopkFilter
 
         if constexpr(std::is_same_v<T, _Float16>)
         {
-            constexpr IdxT repetition = 2;
-            constexpr IdxT tile       = elements * repetition;
+            constexpr IdxT tile       = elements;
             const IdxT block_tile     = blockDim.x * tile;
             const IdxT end_aligned    = start + utils::round_up_to_multiple_of(n, block_tile);
             const IdxT tail           = end_aligned - block_tile;
@@ -1387,27 +1363,28 @@ struct WaveTopkFilter
                                                buffer_load_helpers::bf16x8_t,
                                                buffer_load_helpers::halfx8_t>;
 
-            aiter::BufferResource src_buffer(const_cast<T*>(in), batch_start * sizeof(T));
+            const auto buffer_size = total_len * sizeof(T);
+            aiter::BufferResource src_buffer(const_cast<T*>(in), buffer_size);
             uint32_t src_offset = (batch_start + start) * sizeof(T) + tid * sizeof(VecType);
 
-            VecType arr[repetition];
+            VecType arr[2];
+            arr[0] = aiter::buffer_load_dwordx4(
+                src_buffer.descriptor, src_offset, 0, static_cast<IdxT>(cache_policy));
             for(IdxT i = start + tid * tile; i < tail; i += stride * tile)
             {
-#pragma unroll
-                for(IdxT idx = 0; idx < repetition; ++idx)
-                {
-                    arr[idx] = aiter::buffer_load_dwordx4(
-                        src_buffer.descriptor, src_offset, 0, static_cast<IdxT>(cache_policy));
-                    src_offset += stride * sizeof(VecType);
-                }
+                src_offset += stride * sizeof(VecType);
+                arr[1] = aiter::buffer_load_dwordx4(
+                    src_buffer.descriptor, src_offset, 0, static_cast<IdxT>(cache_policy));
 #pragma unroll
                 for(IdxT idx = 0; idx < tile; ++idx)
                 {
-                    filter_and_stage(arr[idx / elements][idx % elements], i + idx);
+                    filter_and_stage(arr[0][idx], i + idx);
                 }
+                arr[0] = arr[1];
             }
 
             // tail - element-by-element to avoid out-of-bounds loads
+            in += batch_start;
             for(IdxT i = tail + tid; i < end_aligned; i += stride)
             {
                 const auto val = (i < end) ? in[i] : buffer_.sentinel;
