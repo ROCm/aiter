@@ -15,26 +15,26 @@ from ...utils._triton.pid_preprocessing import remap_xcd
 from ...utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 
 
-# FIXME: Need to replace with amd.cdna4.buffer_load instructions, probably
-# passing in offset arguments (maybe generalize for pipelining?)
+# FIXME: Need to generalize for pipelining support (using async_copy functions)
 @gluon.jit
 def _load_fn(ptrs, offset_first, offset_second, boundary_first, boundary_second):
+    """
+    Loads from the given pointers using mask determined by given offsets and offset boundaries.
+    """
     if offset_first is not None and offset_second is not None:
         mask = (offset_first[:, None] < boundary_first) & (
             offset_second[None, :] < boundary_second
         )
-        tensor = gl.load(ptrs, mask=mask, other=0.0)
     elif offset_first is not None:
         mask = offset_first[:, None] < boundary_first
-        tensor = gl.load(ptrs, mask=mask, other=0.0)
     elif offset_second is not None:
         mask = offset_second[None, :] < boundary_second
-        tensor = gl.load(ptrs, mask=mask, other=0.0)
-    else:
-        tensor = gl.load(ptrs)
+
+    tensor = gl.amd.cdna4.buffer_load(ptr=ptrs, offset=0, mask=mask, other=0.0)
     return tensor
 
 
+# TODO: Clean up the arguments here; some are not needed
 @gluon.jit
 def _attn_fwd_inner(
     acc,
@@ -59,7 +59,6 @@ def _attn_fwd_inner(
     block_min,
     block_max,
     offs_n_causal,
-    masked_blocks,
     n_extra_tokens,
     alibi_slope,
     descale_q,
@@ -74,10 +73,11 @@ def _attn_fwd_inner(
     BLOCK_DMODEL_PE: gl.constexpr,  # it's zero or a power of 2
     SM_SCALE: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
-    MASK_STEPS: gl.constexpr,
+    MASK_STEPS: gl.constexpr,  # whether to apply masking for steps (for causal or padding)
     ENABLE_DROPOUT: gl.constexpr,
     RETURN_SCORES: gl.constexpr,
-    PADDED_HEAD: gl.constexpr,
+    # TODO: Do we even need this?
+    PADDED_HEAD: gl.constexpr,  # whether BLOCK_DMODEL != BLOCK_DMODEL_POW2
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
     ENABLE_PIPELINING: gl.constexpr,
@@ -95,12 +95,22 @@ def _attn_fwd_inner(
     for start_n in tl.range(block_min, block_max, BLOCK_N):
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
+
+        # Compute k offsets across sequence length
         if MASK_STEPS:
-            k_offs_n = start_n + gl.arange(0, BLOCK_N, layout=...)
+            k_offs_n = start_n + gl.arange(
+                0, BLOCK_N, layout=...
+            )  # FIXME: This can be passed in with the layout (OFFS_N?)
         else:
             k_offs_n = None
+
+        # Compute k offsets across head dimension, only needed if padded head
         k_offs_k = (
-            None if not PADDED_HEAD else gl.arange(0, BLOCK_DMODEL_POW2, layout=...)
+            None
+            if not PADDED_HEAD
+            else gl.arange(
+                0, BLOCK_DMODEL_POW2, layout=...
+            )  # FIXME: This can be passed in with the layout (OFFS_D?)
         )
         k = _load_fn(k_ptrs, k_offs_k, k_offs_n, BLOCK_DMODEL, seqlen_k)
         if HAS_PE:
@@ -112,10 +122,8 @@ def _attn_fwd_inner(
                 seqlen_k,
             )
 
+        # TODO: Probably need to be passing in the MFMA layout for qk and mask
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=...)
-        # We start from end of seqlen_k so only the first iteration would need
-        # to be checked for padding if it is not a multiple of block_n
-        # TODO: This can be optimized to only be true for the padded block.
         mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=...)
         if MASK_STEPS:
             # If this is the last block / iteration, we want to
@@ -144,7 +152,7 @@ def _attn_fwd_inner(
         zeros = ...
         qk += gl.amd.cdna4.mfma(q, k, zeros)
         if HAS_PE:
-            qk += gl.amd.cdna4.mfma(q, k, zeros)
+            qk += gl.amd.cdna4.mfma(q_pe, k_pe, zeros)
 
         if IS_CAUSAL:
             causal_boundary = start_n + offs_n_causal
@@ -269,6 +277,14 @@ def _attn_fwd(
         raise NotImplementedError(
             "Grouped query and multi-query attention not supported yet in Gluon MHA."
         )
+
+    """
+    TODO: Take a look at these layouts, and assign them as appropriate to the aranges
+    #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+    #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+    #blocked2 = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [16, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
+    #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 8]], warp = [[32, 0], [64, 0]], block = []}>
+    """
 
     NUM_BLOCKS = gl.cdiv(SEQLEN_Q, BLOCK_M)
     # calculate offsets
@@ -610,7 +626,6 @@ def _attn_fwd(
             block_max,
             0,
             0,
-            0,
             None,
             None,
             None,
@@ -674,7 +689,6 @@ def _attn_fwd(
             block_min,
             block_max,
             offs_n_causal,
-            masked_blocks,
             n_extra_tokens,
             None,
             None,
