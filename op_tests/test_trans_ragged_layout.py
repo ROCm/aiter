@@ -47,9 +47,8 @@ def create_flashinfer_kv_indices_triton(
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
 
 
-# slow
 @triton.jit
-def read_sequential_cache_v1(
+def read_sequential_cache(
     k_cache,
     v_cache,
     addrs,
@@ -74,33 +73,6 @@ def read_sequential_cache_v1(
             data = tl.load(v_cache + offset + j, mask=mask)
             tl.store(v_buf + offset + j, data, mask=mask)
 
-
-# TODO...
-@triton.jit
-def read_sequential_cache_v2(
-    k_cache,
-    v_cache,
-    addrs,
-    seqlens,
-    n_elements,
-    k_buf,
-    v_buf,
-    BLOCK_SIZE: tl.constexpr = GLOBAL_BLOCK_SIZE,
-):
-    pid = tl.program_id(axis=0)
-
-    addr = tl.load(addrs + pid)
-    seqlen = tl.load(seqlens + pid)
-    num_loop = tl.cdiv(seqlen, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE).to(tl.int32) + i * BLOCK_SIZE
-        mask = offset < seqlen
-        data = tl.load(k_cache + addr + offset, mask=mask)
-        tl.store(k_buf + addr + offset, data, mask=mask)
-        data = tl.load(v_cache + addr + offset, mask=mask)
-        tl.store(v_buf + addr + offset, data, mask=mask)
-
-
 # sequential cache functions
 def create_sequential_cache(seqlen, nheads, hdim, dtype):
     return torch.rand((seqlen, nheads, hdim), dtype=dtype, device="cuda")
@@ -113,14 +85,6 @@ def get_sequential_addrs(cu_lens, idx):
         device="cuda",
     )
 
-
-def next_power_of_2(n):
-    assert n > 0
-    return int(
-        torch.pow(2, torch.ceil(torch.log2(torch.tensor(n, dtype=torch.float32))))
-    )
-
-
 def test_ragged_layout_trans(bs, max_seq_len, nheads, hdim, dtype):
     seq_lens_ptr = torch.tensor(
         [random.randint(1, max_seq_len) for i in range(bs)],
@@ -129,7 +93,7 @@ def test_ragged_layout_trans(bs, max_seq_len, nheads, hdim, dtype):
     )
     seq_lens_sum = seq_lens_ptr.sum()
 
-    stride = next_power_of_2(max_seq_len)
+    stride = triton.next_power_of_2(max_seq_len)
 
     print(
         f"bs = {bs}, max seqlen = {max_seq_len}, nheads = {nheads}, hdim = {hdim}, stride = {stride}"
@@ -179,7 +143,7 @@ def test_ragged_layout_trans(bs, max_seq_len, nheads, hdim, dtype):
     v_ref = torch.empty(seq_lens_sum * nheads * hdim, dtype=dtype, device="cuda")
 
     n_elements = nheads * hdim
-    read_sequential_cache_v1[(bs,)](
+    read_sequential_cache[(bs,)](
         k_cache,
         v_cache,
         kv_indptr[:-1] * n_elements,
