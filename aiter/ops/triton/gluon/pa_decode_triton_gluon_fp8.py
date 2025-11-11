@@ -1763,7 +1763,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     configuration parameters and launches the appropriate kernel.
 
     Args:
-        All parameters from the paged_attention_decode function, plus kernel configuration
+        All parameters from the pa_decode_gluon function, plus kernel configuration
         parameters for Triton compilation and execution.
     """
     # Debug compilation path - kept for development and debugging purposes
@@ -1978,7 +1978,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
         )
 
 
-def paged_attention_decode(
+def pa_decode_gluon(
     output: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
     query: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]

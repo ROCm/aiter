@@ -24,10 +24,10 @@ from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8_triton34 import (
     paged_attention_decode as paged_attention_decode_gluon_fp8_triton34,
 )
 from aiter.ops.triton.gluon.pa_decode_triton_gluon_fp8 import (
-    paged_attention_decode as paged_attention_decode_gluon_fp8,
+    pa_decode_gluon as paged_attention_decode_gluon_fp8,
 )
 from csrc.cpp_itfs.pa_gluon.pa_decode_gluon_fp8 import (
-    pa_decode_gluon_fp8 as pa_decode_gluon_fp8_aot,
+    pa_decode_gluon_aot,
 )
 
 
@@ -1084,11 +1084,11 @@ def run_gluon_fp8_kernel(
     """Run Gluon FP8 kernel for paged attention.
 
     This function can run both implementations based on use_aot_impl flag:
-    - True: Use csrc implementation (pa_decode_gluon_fp8_aot)
+    - True: Use csrc implementation (pa_decode_gluon_aot)
     - False: Use original ops implementation (pa_gluon_fp8_op)
     """
     if use_aot_impl:
-        pa_decode_gluon_fp8_aot(
+        pa_decode_gluon_aot(
             output,
             query,
             key_cache,
@@ -1842,8 +1842,8 @@ if __name__ == "__main__":
     HEAD_CONFIGURATIONS = [(16, 2)]
     main()
 
-    # BLOCK_SIZE_OPTIONS = [1024]
-    # HEAD_CONFIGURATIONS = [(10, 1)]
-    # main()
+    BLOCK_SIZE_OPTIONS = [1024]
+    HEAD_CONFIGURATIONS = [(10, 1)]
+    main()
 
     pass

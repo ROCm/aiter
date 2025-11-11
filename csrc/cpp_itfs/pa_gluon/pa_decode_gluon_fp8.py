@@ -24,13 +24,14 @@ from csrc.cpp_itfs.utils import (
 )
 
 
-def compile_attention_kernel(
+def compile_attention_reduce_kernel(
     compute_type: tl.dtype,
     query_seq_len: int,
     query_group_size: int,
     head_size: int,
     kv_block_size: int,
     kv_16b_element_count: int,
+    max_num_partitions: int,
     sequence_partition_size: int,
     query_quant_mode: int,
     kv_quant_mode: int,
@@ -40,7 +41,7 @@ def compile_attention_kernel(
     md_name: str,
     func_name: str = None,
 ):
-    """Compile the attention kernel for paged attention decode."""
+    """Compile the combined attention and reduce kernel for paged attention decode."""
     if func_name is None:
         func_name = get_default_func_name(
             md_name,
@@ -51,6 +52,7 @@ def compile_attention_kernel(
                 head_size,
                 kv_block_size,
                 kv_16b_element_count,
+                max_num_partitions,
                 sequence_partition_size,
                 query_quant_mode,
                 kv_quant_mode,
@@ -79,11 +81,11 @@ def compile_attention_kernel(
             else:
                 waves_per_eu = 4
 
-        # Build signature based on kernel parameters
+        # Build signature based on kernel parameters (combined from both kernels)
         signature_parts = [
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
-            "*bf16:16",  # output_ptr
+            "*bf16:16",  # logits_ptr
             "*fp8e4b8:16",  # query_ptr
             "*fp8e4b8:16",  # key_cache_ptr
             "*fp8e4b8:16",  # value_cache_ptr
@@ -142,60 +144,12 @@ def compile_attention_kernel(
             grid="num_seqs,num_kv_heads,max_num_partitions",
             num_warps=4,
             num_ctas=1,
-            out_name=md_name,
+            out_name=f"{md_name}_stage1",
         )
-        triton_kernel, output_files = compile_gluon_kernel(compile_args)
-        triton_header = None
-        triton_source = None
-        for output_file in output_files:
-            if output_file.suffix == ".h":
-                triton_header = output_file
-            elif output_file.suffix == ".cpp":
-                triton_source = output_file
+        triton_kernel1, output_files1 = compile_gluon_kernel(compile_args)
 
-        with open(
-            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_attention_kernel.cpp.jinja",
-            "r",
-        ) as f:
-            src_template = Template(f.read())
-
-        return compile_template_op(
-            src_template,
-            md_name,
-            [triton_header],
-            [triton_source],
-            triton_header=triton_header,
-            kernel_name=md_name,
-            triton_kernel=triton_kernel,
-            func_name=func_name,
-        )
-    else:
-        return run_lib(func_name)
-
-
-def compile_reduce_kernel(
-    query_group_size: int,
-    head_size: int,
-    max_num_seq_partitions: int,
-    sequence_partition_size: int,
-    md_name: str,
-    func_name: str = None,
-):
-    """Compile the reduce kernel for paged attention decode."""
-    if func_name is None:
-        func_name = get_default_func_name(
-            md_name,
-            (
-                query_group_size,
-                head_size,
-                max_num_seq_partitions,
-                sequence_partition_size,
-            ),
-        )
-
-    if not_built(func_name):
-        # Build signature based on kernel parameters
-        signature_parts = [
+        # Compile reduce kernel separately
+        reduce_signature_parts = [
             "*bf16:16",  # output_ptr
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
@@ -212,53 +166,63 @@ def compile_reduce_kernel(
             "i32",  # stride_logits_group
             "i32",  # num_seqs
             "i32",  # num_kv_heads
-            f"{query_group_size}",
+            f"{equivalent_query_group_size}",
             f"{head_size}",
-            f"{max_num_seq_partitions}",
+            f"{max_num_partitions}",
             f"{sequence_partition_size}",
         ]
-        signature = ",".join(signature_parts)
+        reduce_signature = ",".join(reduce_signature_parts)
 
-        compile_args = CompileArgs(
+        reduce_compile_args = CompileArgs(
             path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_triton_gluon_fp8.py",
             kernel_name="paged_attention_decode_v2_reduce_kernel",
-            signature=signature,
+            signature=reduce_signature,
             grid="num_seqs,num_kv_heads,1",
             num_warps=4,
             num_stages=2,
-            out_name=md_name,
+            out_name=f"{md_name}_stage2",
         )
-        triton_kernel, output_files = compile_kernel(compile_args)
-        triton_header = None
-        triton_source = None
-        for output_file in output_files:
+        triton_kernel2, output_files2 = compile_kernel(reduce_compile_args)
+
+        # Combine output files
+        triton_header1 = None
+        triton_source1 = None
+        triton_header2 = None
+        triton_source2 = None
+        for output_file in output_files1:
             if output_file.suffix == ".h":
-                triton_header = output_file
+                triton_header1 = output_file
             elif output_file.suffix == ".cpp":
-                triton_source = output_file
+                triton_source1 = output_file
+        for output_file in output_files2:
+            if output_file.suffix == ".h":
+                triton_header2 = output_file
+            elif output_file.suffix == ".cpp":
+                triton_source2 = output_file
 
         with open(
-            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_reduce_kernel.cpp.jinja",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_attention_reduce_kernel.cpp.jinja",
             "r",
         ) as f:
             src_template = Template(f.read())
 
-        kernel_name = "paged_attention_decode_v2_reduce_kernel"
         return compile_template_op(
             src_template,
             md_name,
-            [triton_header],
-            [triton_source],
-            triton_header=triton_header,
-            kernel_name=kernel_name,
-            triton_kernel=triton_kernel,
+            [triton_header1, triton_header2],
+            [triton_source1, triton_source2],
+            triton_header1=triton_header1,
+            triton_header2=triton_header2,
+            kernel_name=md_name,
+            triton_kernel1=triton_kernel1,
+            triton_kernel2=triton_kernel2,
             func_name=func_name,
         )
     else:
         return run_lib(func_name)
 
 
-def pa_decode_gluon_fp8(
+def pa_decode_gluon_aot(
     output: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
     query: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
@@ -403,26 +367,28 @@ def pa_decode_gluon_fp8(
     if value_cache.dtype == aiter.dtypes.fp8:
         fp8_max_value = torch.finfo(aiter.dtypes.fp8).max
 
-    # Compile the kernel
-    func = compile_attention_kernel(
+    # Compile the combined attention and reduce kernel
+    combined_func = compile_attention_reduce_kernel(
         compute_type=compute_type,
         query_seq_len=query_sequence_length,
         query_group_size=query_group_size,
         head_size=head_size,
         kv_block_size=kv_block_size,
         kv_16b_element_count=kv_elements_per_16b,
+        max_num_partitions=max_num_partitions,
         sequence_partition_size=sequence_partition_size,
         query_quant_mode=query_quant_mode,
         kv_quant_mode=kv_quant_mode,
         fp8_max_value=fp8_max_value,
         value_transposed=int(value_transposed),
         is_causal=int(is_causal),
-        md_name="pa_decode_attention_kernel",
+        md_name="pa_decode_attention_reduce_kernel",
     )
 
-    # Execute the kernel
-    func(
+    # Execute the combined kernel
+    combined_func(
         *torch_to_c_types(
+            output,
             exp_sums,
             max_logits,
             temporary_output,
@@ -435,6 +401,8 @@ def pa_decode_gluon_fp8(
             query_scale,
             key_scale,
             value_scale,
+            output.stride(0),
+            output.stride(1),
             exp_sums.stride(0),
             exp_sums.stride(1),
             exp_sums.stride(2),
@@ -461,57 +429,3 @@ def pa_decode_gluon_fp8(
             torch.cuda.current_stream(output.device),
         )
     )
-
-    # Compile and execute the reduction kernel
-    reduce_func = compile_reduce_kernel(
-        query_group_size=equivalent_query_group_size,
-        head_size=head_size,
-        max_num_seq_partitions=max_num_partitions,
-        sequence_partition_size=sequence_partition_size,
-        md_name="pa_decode_reduce_kernel",
-    )
-
-    # Execute the reduction kernel
-    reduce_func(
-        *torch_to_c_types(
-            output,
-            exp_sums,
-            max_logits,
-            temporary_output,
-            context_lengths,
-            output.stride(0),
-            output.stride(1),
-            exp_sums.stride(0),
-            exp_sums.stride(1),
-            exp_sums.stride(2),
-            temporary_output.stride(0),
-            temporary_output.stride(1),
-            temporary_output.stride(2),
-            temporary_output.stride(3),
-            num_sequences,
-            num_kv_heads,
-            torch.cuda.current_stream(output.device),
-        )
-    )
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--query_seq_len", type=int, required=True)
-    parser.add_argument("--head_size", type=int, required=True)
-    parser.add_argument("--query_group_size", type=int, required=True)
-    parser.add_argument("--kv_block_size", type=int, required=True)
-    parser.add_argument("--sequence_partition_size", type=int, required=True)
-    parser.add_argument("--kv_16b_element_count", type=int, required=True)
-    parser.add_argument("--query_quant_mode", type=int, required=True)
-    parser.add_argument("--kv_quant_mode", type=int, required=True)
-    parser.add_argument("--kv_compute_block_size", type=int, required=True)
-    parser.add_argument("--fp8_max_value", type=float, required=True)
-    parser.add_argument("--value_transposed", type=int, required=True)
-    parser.add_argument("--is_causal", type=int, required=True)
-    parser.add_argument("--compute_type", type=str, required=True)
-    parser.add_argument("--func_name", type=str, default=None)
-    args = parser.parse_args()
-    compile_attention_kernel(**vars(args))
