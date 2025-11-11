@@ -1425,7 +1425,8 @@ struct WaveTopkFilter
 #pragma unroll
                 for(IdxT idx = 0; idx < repetition; ++idx)
                 {
-                    arr[idx] = aiter::buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
+                    arr[idx] = aiter::buffer_load_dwordx4(
+                        src_buffer.descriptor, src_offset, 0, static_cast<IdxT>(cache_policy));
                     src_offset += stride * sizeof(VecType);
                 }
 #pragma unroll
@@ -1456,11 +1457,13 @@ struct WaveTopkFilter
             uint32_t src_offset = (batch_start + start) * sizeof(T) + tid * sizeof(VecType);
 
             VecType arr[2];
-            arr[0] = aiter::buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
+            arr[0] = aiter::buffer_load_dwordx4(
+                src_buffer.descriptor, src_offset, 0, static_cast<IdxT>(cache_policy));
             for(IdxT i = start + tid * tile; i < end_aligned; i += stride * tile)
             {
                 src_offset += stride * sizeof(VecType);
-                arr[1] = aiter::buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
+                arr[1] = aiter::buffer_load_dwordx4(
+                    src_buffer.descriptor, src_offset, 0, static_cast<IdxT>(cache_policy));
 #pragma unroll
                 for(IdxT idx = 0; idx < tile; ++idx)
                 {
