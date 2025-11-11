@@ -1024,6 +1024,169 @@ struct OpCachedFwd
                                 stride_oy_d);
         }
     }
+
+    template <int32_t RotateStyle,
+              bool ReuseFreqsFrontPart,
+              bool NopeFirst,
+              bool Inplace,
+              bool StrideDOutXEq1,
+              bool StrideDOutYEq1,
+              bool StrideDInXEq1,
+              bool StrideDInYEq1,
+              typename scalar_t,
+              typename scalar_f_t>
+    __device__ __forceinline__ static void apply_2c_and_cache(scalar_t* __restrict__ p_output_x,
+                                                             scalar_t* __restrict__ p_output_y,
+                                                             const scalar_t* __restrict__ p_input_x,
+                                                             const scalar_t* __restrict__ p_input_y,
+                                                             const scalar_t* __restrict__ p_input_v,
+                                                             scalar_t* __restrict__ p_cache_y,
+                                                             scalar_t* __restrict__ p_cache_v,
+                                                             const int64_t slot,
+                                                             const int32_t token_elem_num,
+                                                             const int32_t block_size,
+                                                             const int32_t x,
+                                                             const scalar_f_t* __restrict__ p_cos,
+                                                             const scalar_f_t* __restrict__ p_sin,
+                                                             const int32_t size_h_x,
+                                                             const int32_t size_h_y,
+                                                             const int32_t size_d,
+                                                             const int32_t size_f,
+                                                             const int32_t stride_ix_h,
+                                                             const int32_t stride_ix_d,
+                                                             const int32_t stride_iy_h,
+                                                             const int32_t stride_iy_d,
+                                                             const int32_t stride_ox_h,
+                                                             const int32_t stride_ox_d,
+                                                             const int32_t stride_oy_h,
+                                                             const int32_t stride_oy_d)
+    {
+        // rotate count
+        const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r = size_r >> 1;
+        const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
+        const int32_t size_min_h  = min(size_h_x, size_h_y);
+
+        for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        {
+            float cos_0, sin_0, cos_1, sin_1;
+            load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
+
+            for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
+            {
+                float input_x_0, input_x_1, input_y_0, input_y_1;
+                load_payload<RotateStyle, StrideDInXEq1>(&input_x_0,
+                                                         &input_x_1,
+                                                         p_input_x,
+                                                         did,
+                                                         hid,
+                                                         stride_ix_d,
+                                                         stride_ix_h,
+                                                         size_half_r);
+                load_payload<RotateStyle, StrideDInYEq1>(&input_y_0,
+                                                         &input_y_1,
+                                                         p_input_y,
+                                                         did,
+                                                         hid,
+                                                         stride_iy_d,
+                                                         stride_iy_h,
+                                                         size_half_r);
+
+                const float output_x_0 = input_x_0 * cos_0 - input_x_1 * sin_0;
+                const float output_x_1 = input_x_1 * cos_1 + input_x_0 * sin_1;
+                const float output_y_0 = input_y_0 * cos_0 - input_y_1 * sin_0;
+                const float output_y_1 = input_y_1 * cos_1 + input_y_0 * sin_1;
+                store_payload<RotateStyle, StrideDOutXEq1>(p_output_x,
+                                                           output_x_0,
+                                                           output_x_1,
+                                                           did,
+                                                           hid,
+                                                           stride_ox_d,
+                                                           stride_ox_h,
+                                                           size_half_r);
+                store_payload<RotateStyle, StrideDOutYEq1>(p_output_y,
+                                                           output_y_0,
+                                                           output_y_1,
+                                                           did,
+                                                           hid,
+                                                           stride_oy_d,
+                                                           stride_oy_h,
+                                                           size_half_r);
+            }
+
+            for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
+            {
+                float input_x_0, input_x_1;
+                load_payload<RotateStyle, StrideDInXEq1>(&input_x_0,
+                                                         &input_x_1,
+                                                         p_input_x,
+                                                         did,
+                                                         hid,
+                                                         stride_ix_d,
+                                                         stride_ix_h,
+                                                         size_half_r);
+
+                const float output_x_0 = input_x_0 * cos_0 - input_x_1 * sin_0;
+                const float output_x_1 = input_x_1 * cos_1 + input_x_0 * sin_1;
+                store_payload<RotateStyle, StrideDOutXEq1>(p_output_x,
+                                                           output_x_0,
+                                                           output_x_1,
+                                                           did,
+                                                           hid,
+                                                           stride_ox_d,
+                                                           stride_ox_h,
+                                                           size_half_r);
+            }
+
+            for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
+            {
+                float input_y_0, input_y_1;
+                load_payload<RotateStyle, StrideDInYEq1>(&input_y_0,
+                                                         &input_y_1,
+                                                         p_input_y,
+                                                         did,
+                                                         hid,
+                                                         stride_iy_d,
+                                                         stride_iy_h,
+                                                         size_half_r);
+
+                const float output_y_0 = input_y_0 * cos_0 - input_y_1 * sin_0;
+                const float output_y_1 = input_y_1 * cos_1 + input_y_0 * sin_1;
+                store_payload<RotateStyle, StrideDOutYEq1>(p_output_y,
+                                                           output_y_0,
+                                                           output_y_1,
+                                                           did,
+                                                           hid,
+                                                           stride_oy_d,
+                                                           stride_oy_h,
+                                                           size_half_r);
+            }
+        }
+
+        // the rest are just forwarded
+        if constexpr(!Inplace)
+        {
+            const int32_t did_start = NopeFirst ? 0 : size_r;
+            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            elementwise_copy_2c(p_output_x,
+                                p_output_y,
+                                p_input_x,
+                                p_input_y,
+                                size_h_x,
+                                size_h_y,
+                                did_start,
+                                did_end,
+                                stride_ix_h,
+                                stride_ix_d,
+                                stride_iy_h,
+                                stride_iy_d,
+                                stride_ox_h,
+                                stride_ox_d,
+                                stride_oy_h,
+                                stride_oy_d);
+        }
+    }
 };
 
 struct OpCachedBwd
@@ -2234,7 +2397,6 @@ kn_entry_2c_value_sbhd_cached_indirect2_inplace(scalar_t* __restrict__ p_inout_x
                                                 const int32_t x,
                                                 const int32_t size_h_x,
                                                 const int32_t size_h_y,
-                                                const int32_t size_h_v,
                                                 const int32_t size_d,
                                                 const int32_t size_f, // size of last dimension of freqs.
                                                 const int32_t stride_x_s,
@@ -2249,7 +2411,9 @@ kn_entry_2c_value_sbhd_cached_indirect2_inplace(scalar_t* __restrict__ p_inout_x
     const uint64_t sid    = blockIdx.x;
     const uint64_t bid    = blockIdx.y;
     const uint64_t ib_idx = sid * gridDim.y + bid;
-    const int64_t pos     = p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx];
+    const int64_t  pos     = p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx];
+    const int64_t  slot    = p_slot_mapping[ib_idx];
+    const int      token_elem_num = size_h_y * size_d;
 
     if((pos >= 0) && (pos < max_position))
     {
@@ -2257,31 +2421,38 @@ kn_entry_2c_value_sbhd_cached_indirect2_inplace(scalar_t* __restrict__ p_inout_x
         const uint64_t offset_y = sid * stride_y_s + bid * stride_y_b;
         const int64_t offset_f  = pos * size_f;
 
-        Op::template apply_2c<RotateStyle,
-                              ReuseFreqsFrontPart,
-                              NopeFirst,
-                              true,
-                              StrideDXEq1,
-                              StrideDYEq1,
-                              StrideDXEq1,
-                              StrideDYEq1>(p_inout_x + offset_x,
-                                           p_inout_y + offset_y,
-                                           p_inout_x + offset_x,
-                                           p_inout_y + offset_y,
-                                           p_cos + offset_f,
-                                           p_sin + offset_f,
-                                           size_h_x,
-                                           size_h_y,
-                                           size_d,
-                                           size_f,
-                                           stride_x_h,
-                                           stride_x_d,
-                                           stride_y_h,
-                                           stride_y_d,
-                                           stride_x_h,
-                                           stride_x_d,
-                                           stride_y_h,
-                                           stride_y_d);
+        Op::template apply_2c_and_cache<RotateStyle,
+                                        ReuseFreqsFrontPart,
+                                        NopeFirst,
+                                        true,
+                                        StrideDXEq1,
+                                        StrideDYEq1,
+                                        StrideDXEq1,
+                                        StrideDYEq1>(p_inout_x + offset_x,
+                                                    p_inout_y + offset_y,
+                                                    p_inout_x + offset_x,
+                                                    p_inout_y + offset_y,
+                                                    p_value + offset_y,
+                                                    p_cache_y,
+                                                    p_cache_value,
+                                                    slot,
+                                                    token_elem_num,
+                                                    block_size,
+                                                    x,
+                                                    p_cos + offset_f,
+                                                    p_sin + offset_f,
+                                                    size_h_x,
+                                                    size_h_y,
+                                                    size_d,
+                                                    size_f,
+                                                    stride_x_h,
+                                                    stride_x_d,
+                                                    stride_y_h,
+                                                    stride_y_d,
+                                                    stride_x_h,
+                                                    stride_x_d,
+                                                    stride_y_h,
+                                                    stride_y_d);
     }
 }
 
@@ -3629,6 +3800,7 @@ void dispatch_2c_value_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
         assert(stride_iy_b == stride_oy_b);
         assert(stride_iy_h == stride_oy_h);
         assert(stride_iy_d == stride_oy_d);
+        assert(size_h_y    == size_h_v);
 
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
             RotateStyle,
@@ -3655,7 +3827,6 @@ void dispatch_2c_value_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                          x,
                                          size_h_x,
                                          size_h_y,
-                                         size_h_v,
                                          size_d,
                                          size_f,
                                          stride_ix_s,
