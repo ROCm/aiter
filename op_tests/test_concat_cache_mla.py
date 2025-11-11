@@ -1,6 +1,6 @@
 import torch
 import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark
+from aiter.test_common import checkAllclose, perftest, benchmark, run_perftest
 from aiter import dtypes
 from typing import Tuple
 import argparse
@@ -119,7 +119,7 @@ def run_torch_fused(
         k_nope, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale
     )
 
-    if kv_cache_dtype == "fp8":
+    if out_dtype == dtypes.fp8:
         q_nope_scale = (q_nope.to(torch.float32) / q_scale.item()).to(out_dtype)
         q_pe_scale = (q_pe.to(torch.float32) / q_scale.item()).to(out_dtype)
         q_out = torch.cat((q_nope_scale, q_pe_scale), dim=-1)
@@ -261,6 +261,7 @@ def test_fused_rope_concat_and_cache_mla(
     dtype: torch.dtype,
     device: str,
     kv_cache_dtype: str,
+    q_dtype: str,
 ):
     ret = {}
     torch.set_default_device(device)
@@ -279,17 +280,18 @@ def test_fused_rope_concat_and_cache_mla(
     )
     entry_size = kv_lora_rank + qk_rope_head_dim
     cos_cache, sin_cache = compute_cache(num_tokens, qk_rope_head_dim // 2, dtype)
-    max_positions = 131072
+
     pos = torch.randint(0, num_tokens, (num_tokens,), device=device)
     scale = torch.tensor(0.1, dtype=torch.float32, device=device)
-    q_scale = torch.tensor(0.3, dtype=torch.float32, device=device)
+    q_scale = torch.tensor(1, dtype=torch.float32, device=device)
     cache_dtype = dtypes.fp8 if kv_cache_dtype == "fp8" else dtype
+    q_out_dtype = dtypes.fp8 if q_dtype == "fp8" else dtype
     kv_cache = torch.zeros(
         num_blocks, block_size, entry_size, dtype=cache_dtype, device=device
     )
     q_out = torch.empty(
         (num_tokens, num_heads, qk_rope_head_dim + kv_lora_rank),
-        dtype=cache_dtype,
+        dtype=q_out_dtype,  # cache_dtype,
         device=q_nope.device,
     )
     is_nope_first = True
@@ -310,11 +312,12 @@ def test_fused_rope_concat_and_cache_mla(
         sin_cache,
         is_neox,
         is_nope_first,
+        q_out_dtype,
     )
 
     ref_q_out = torch.empty(
         (num_tokens, num_heads, qk_rope_head_dim + kv_lora_rank),
-        dtype=cache_dtype,
+        dtype=q_out_dtype,
         device=q_nope.device,
     )
     ref_temp = torch.zeros(*kv_cache.shape, dtype=cache_dtype, device=device)
@@ -334,19 +337,62 @@ def test_fused_rope_concat_and_cache_mla(
         sin_cache,
         is_neox,
         is_nope_first,
-        cache_dtype,
+        q_out_dtype,
+    )
+    from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
+
+    reshaped_kv_c = kv_c.unsqueeze(1)
+    reshaped_k_pe = k_pe.unsqueeze(1)
+    triton_q_out = torch.empty(
+        (num_tokens, num_heads, qk_rope_head_dim + kv_lora_rank),
+        dtype=q_out_dtype,
+        device=q_nope.device,
+    )
+    triton_temp = torch.zeros(*kv_cache.shape, dtype=cache_dtype, device=device)
+    (triton_q_out, decode_q_pe_out, k_pe_out, triton_temp), triton_us = run_perftest(
+        fused_qk_rope_cat_and_cache_mla,
+        q_nope,
+        q_pe,
+        reshaped_kv_c,
+        reshaped_k_pe,
+        triton_temp,
+        slot_mapping,
+        pos,
+        cos_cache,
+        sin_cache,
+        scale,
+        is_neox,
+        0,
+        True if kv_cache_dtype == "fp8" else False,
+        triton_q_out,
     )
 
-    if kv_cache_dtype == "fp8":
+    if kv_cache_dtype == "fp8" and q_dtype == "fp8":
         kv_result_temp = kv_cache.to(torch.float32) * scale
         kv_expected_temp = ref_kv_cache.to(torch.float32) * scale
         q_result_tmp = q_out.to(torch.float32) * q_scale
         q_expected_tmp = ref_q_out.to(torch.float32) * q_scale
+
         checkAllclose(kv_result_temp, kv_expected_temp, atol=0.01, rtol=0.01)
         checkAllclose(q_result_tmp, q_expected_tmp, atol=0.01, rtol=0.01)
+
+    elif kv_cache_dtype == "fp8" and q_dtype == "auto":
+        print("1!!!!!!")
+        kv_result_temp = kv_cache.to(torch.float32) * scale
+        kv_expected_temp = ref_kv_cache.to(torch.float32) * scale
+        checkAllclose(kv_result_temp, kv_expected_temp, atol=0.01, rtol=0.01)
+        checkAllclose(q_out, ref_q_out)
+
+        checkAllclose(triton_q_out, ref_q_out)
+        checkAllclose(triton_temp.to(torch.float32) * scale, kv_expected_temp)
     else:
+        # torch.set_printoptions(threshold=float("inf"))  # print all elements
         checkAllclose(kv_cache, ref_kv_cache)
         checkAllclose(q_out, ref_q_out)
+        checkAllclose(triton_q_out, ref_q_out)
+        checkAllclose(triton_temp, ref_kv_cache)
+
+    ret["triton_us"] = triton_us
     ret["fused_qk_us"] = avg_us
     ret["unfused_us"] = ref_us
     ret["aiter_bw(TB/s)"] = (
@@ -366,13 +412,14 @@ def test_fused_rope_concat_and_cache_mla(
 
 kv_lora_rank = 128
 qk_rope_head_dim = 64
-l_num_tokens = [128, 256, 512, 1024, 2048, 4096]  # , 8192, 16384
+l_num_tokens = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]  #
 block_size = 64
 dtype = torch.float16
+l_qk_dtypes = ["auto", "fp8"]
 device = "cuda"
 l_kv_cache_dtypes = ["auto", "fp8"]
 ltests = ["normal", "fused_qk"]
-lheads = [1, 2, 4, 8]
+l_num_heads = [1, 2, 4, 8]
 num_heads = 4
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -434,9 +481,20 @@ parser.add_argument(
     "-hd",
     "--head",
     type=int,
-    default=4,
+    nargs="*",
+    default=l_num_heads,
     help="""num heads.
     e.g.: -hd 1""",
+)
+parser.add_argument(
+    "-qd",
+    "--q_dtype",
+    type=str,
+    choices=["auto", "fp8"],
+    nargs="*",
+    default=["auto", "fp8"],
+    help="""Data type of Q out.
+    e.g.: -qd auto""",
 )
 parser.add_argument(
     "-c",
@@ -452,10 +510,13 @@ parser.add_argument(
 args = parser.parse_args()
 if args.dtype is not None:
     dtype = dtypes.d_dtypes[args.dtype]
+
 if args.token is not None:
     l_num_tokens = args.token
 if args.kv_dtype is not None:
     l_kv_cache_dtypes = args.kv_dtype
+if args.q_dtype is not None:
+    l_qk_dtypes = args.q_dtype
 if args.block_size is not None:
     block_size = args.block_size
 if args.qk_rope_head_dim is not None:
@@ -467,7 +528,7 @@ if args.case is not None:
     ltests = args.case
 
 if args.head is not None:
-    num_heads = args.head
+    l_num_heads = args.head
 
 
 if "normal" in ltests:
@@ -494,18 +555,23 @@ if "fused_qk" in ltests:
     df = []
     for num_token in l_num_tokens:
         num_blocks = num_token // block_size
-        for kv_cache_dtype in l_kv_cache_dtypes:
-            ret = test_fused_rope_concat_and_cache_mla(
-                kv_lora_rank,
-                qk_rope_head_dim,
-                num_token,
-                block_size,
-                num_blocks,
-                num_heads,
-                dtype,
-                device,
-                kv_cache_dtype,
-            )
-            df.append(ret)
+        for num_heads in l_num_heads:
+            for kv_cache_dtype in l_kv_cache_dtypes:
+                for q_dtype in l_qk_dtypes:
+                    if q_dtype == "fp8" and kv_cache_dtype != "fp8":
+                        continue
+                    ret = test_fused_rope_concat_and_cache_mla(
+                        kv_lora_rank,
+                        qk_rope_head_dim,
+                        num_token,
+                        block_size,
+                        num_blocks,
+                        num_heads,
+                        dtype,
+                        device,
+                        kv_cache_dtype,
+                        q_dtype,
+                    )
+                    df.append(ret)
     df = pd.DataFrame(df)
     aiter.logger.info(f"fused_rope_concat_and_cache_mla summary:\n{df}")
