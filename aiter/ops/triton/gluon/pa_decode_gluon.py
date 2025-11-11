@@ -29,6 +29,8 @@ def parse_version(version_str):
             break
 
     return tuple(parts)
+
+
 TRITON_VERSION = parse_version(triton.__version__)
 
 

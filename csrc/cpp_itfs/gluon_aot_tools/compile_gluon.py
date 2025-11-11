@@ -172,8 +172,6 @@ def compile_gluon_kernel(args: CompileGluonArgs):
     hints = {k: v for k, v in hints.items() if v is not None}
     constants = {kernel.arg_names[i]: constexpr(s) for i, s in enumerate(signature)}
     constants = {k: v for k, v in constants.items() if v is not None}
-    # print(f"signature={signature}")
-
     for key, value in hints.items():
         if value == 1:
             constants[kernel.arg_names[key[0]]] = value
@@ -194,17 +192,6 @@ def compile_gluon_kernel(args: CompileGluonArgs):
     src = GluonASTSource(
         fn=kernel, constexprs=constants, signature=signature, attrs=attrs
     )
-    # print(f"\n**********************************************")
-    # print(f"triton.compiler.ASTSource={triton.compiler.ASTSource}")
-    # print(f"kernel={kernel}")
-    # print(f"signature={signature}")
-    # print(f"constexprs={constants}")
-    # print(f"attrs={attrs}")
-    # print(f"src={src}")
-    # print(f"const_sig={const_sig}")
-    # print(f"doc_string={doc_string}")
-    # print(f"**********************************************\n")
-
     target = (
         triton.backends.compiler.GPUTarget(*args.target.split(":"))
         if args.target
