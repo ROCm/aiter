@@ -19,8 +19,21 @@ env:
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
 jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
   build_vllm_image:
     if: ${{ !github.event.pull_request.head.repo.fork }}
+    needs: [check-signal]
     runs-on: aiter-1gpu-runner
 
     steps:

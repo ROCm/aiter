@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
 namespace aiter {
@@ -28,6 +28,9 @@ mha_varlen_bwd(const at::Tensor& dout,         // [total_q, hq, d]
                std::optional<at::Tensor> dv,                 // [total_k, hk, d]
                std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
                std::optional<const at::Tensor> rng_state,
-               std::optional<at::Generator> gen);
+               std::optional<at::Generator> gen,
+               std::optional<const at::Tensor> cu_seqlens_q_padded, // [b+1]
+               std::optional<const at::Tensor> cu_seqlens_k_padded  // [b+1]
+);
 } // namespace torch_itfs
 } // namespace aiter

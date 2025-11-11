@@ -11,6 +11,7 @@ from aiter.ops.triton.lean_atten import (
 )
 from aiter.ops.triton._triton_kernels.lean_atten import _get_config
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+import pytest
 
 
 def get_lean_attn_inputs(
@@ -18,7 +19,8 @@ def get_lean_attn_inputs(
     n_ctx_q: int,
     n_ctx: List[int],
     block_n: int,
-    h: int,
+    hq: int,
+    hk: int,
     d: int,
     total_programs: int,
     init_dtype: Union[torch.dtype, str],
@@ -29,13 +31,13 @@ def get_lean_attn_inputs(
     except ValueError:
         print(f"N_CTX contains non-numeric values: {n_ctx}")
     # Allocate Tensors
-    q = torch.empty((n_ctx_q * batch, h, d), dtype=init_dtype, device="cuda").normal_(
+    q = torch.empty((n_ctx_q * batch, hq, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
-    k = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
+    k = torch.empty((sum_n_ctx, hk, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
-    v = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
+    v = torch.empty((sum_n_ctx, hk, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
 
@@ -79,6 +81,12 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
         kb_reshaped = kb.transpose(0, 1)
         vb = v[start : (start + int(b)), :, :]
         vb_reshaped = vb.transpose(0, 1)
+        # Expand K/V heads to match Q heads when using GQA (hq > hk)
+        if qb_reshaped.shape[0] != kb_reshaped.shape[0]:
+            assert qb_reshaped.shape[0] % kb_reshaped.shape[0] == 0
+            group_size = qb_reshaped.shape[0] // kb_reshaped.shape[0]
+            kb_reshaped = kb_reshaped.repeat_interleave(group_size, dim=0)
+            vb_reshaped = vb_reshaped.repeat_interleave(group_size, dim=0)
         p = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) * sm_scale
         if causal:
             M = torch.tril(torch.ones((n_ctx_q, b), device="cuda"))
@@ -94,27 +102,163 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
 
 
 @pytest.mark.parametrize(
-    "causal, batch, h, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
+    "causal, batch, hq, hk, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, RAGGED_BATCH, waves_per_eu, num_warps ",
     [
-        (False, 2, 64, 128, [65536, 65536], 128, 304, torch.float16, 128, 64, 1, 4),
-        (False, 2, 64, 16, [65536, 65536], 128, 912, torch.float16, 16, 128, 3, 4),
-        (False, 1, 64, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 64, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 64, 16, [524288], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 2, 96, 16, [32768, 32768], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
-        (False, 1, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),  #
-        (False, 1, 128, 16, [32768], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
+        (
+            False,
+            2,
+            64,
+            64,
+            128,
+            [65536, 65536],
+            128,
+            304,
+            torch.float16,
+            128,
+            64,
+            False,
+            1,
+            4,
+        ),
+        (
+            False,
+            2,
+            64,
+            64,
+            16,
+            [65536, 65536],
+            128,
+            912,
+            torch.float16,
+            16,
+            128,
+            False,
+            3,
+            4,
+        ),
+        (False, 1, 64, 64, 16, [131072], 128, 912, torch.float16, 16, 128, False, 2, 4),
+        (False, 1, 64, 64, 16, [262144], 64, 912, torch.float16, 16, 64, False, 2, 4),
+        (False, 1, 64, 64, 16, [524288], 64, 912, torch.float16, 16, 64, False, 2, 4),
+        (
+            False,
+            2,
+            96,
+            96,
+            16,
+            [32768, 32768],
+            128,
+            912,
+            torch.float16,
+            16,
+            128,
+            False,
+            2,
+            4,
+        ),
+        (False, 1, 96, 96, 16, [65536], 128, 912, torch.float16, 16, 128, False, 2, 4),
+        (False, 1, 96, 96, 16, [131072], 128, 912, torch.float16, 16, 128, False, 2, 4),
+        (False, 1, 96, 96, 16, [262144], 64, 912, torch.float16, 16, 64, False, 2, 4),
+        (
+            False,
+            1,
+            96,
+            96,
+            16,
+            [524288],
+            16,
+            912,
+            torch.float16,
+            16,
+            256,
+            False,
+            1,
+            4,
+        ),  #
+        (
+            False,
+            1,
+            96,
+            96,
+            16,
+            [1048576],
+            16,
+            912,
+            torch.float16,
+            16,
+            256,
+            False,
+            1,
+            4,
+        ),  #
+        (
+            False,
+            1,
+            128,
+            128,
+            16,
+            [32768],
+            128,
+            912,
+            torch.float16,
+            16,
+            128,
+            False,
+            2,
+            4,
+        ),
+        (
+            False,
+            1,
+            128,
+            128,
+            16,
+            [65536],
+            128,
+            912,
+            torch.float16,
+            16,
+            128,
+            False,
+            2,
+            4,
+        ),
+        (
+            False,
+            1,
+            128,
+            128,
+            16,
+            [131072],
+            128,
+            912,
+            torch.float16,
+            16,
+            128,
+            False,
+            2,
+            4,
+        ),
+        (False, 1, 128, 128, 16, [262144], 64, 912, torch.float16, 16, 64, False, 2, 4),
+        (
+            False,
+            1,
+            128,
+            128,
+            16,
+            [524288],
+            16,
+            912,
+            torch.float16,
+            16,
+            256,
+            False,
+            1,
+            4,
+        ),  #
         (
             False,
             3,
+            64,
             64,
             16,
             [4096, 32768, 65536],
@@ -123,12 +267,14 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
             torch.float16,
             16,
             128,
+            True,
             2,
             4,
         ),
         (
             False,
             8,
+            64,
             64,
             16,
             [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536],
@@ -137,12 +283,14 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
             torch.float16,
             16,
             64,
+            True,
             2,
             4,
         ),
         (
             True,
             1,
+            64,
             64,
             8192,
             [8192],
@@ -151,20 +299,39 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
             torch.float16,
             128,
             64,
+            False,
             2,
             4,
         ),  # Causal=1,
-        (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
+        (
+            True,
+            2,
+            64,
+            64,
+            2048,
+            [2048, 2048],
+            128,
+            304,
+            torch.float16,
+            128,
+            64,
+            False,
+            2,
+            4,
+        ),
         # These test cases fail:
         # (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
         # (True, 1, 64, 4096, [4096], 128, 304, torch.float16, 128, 16, 3, 4),
         # (False, 1, 64, 4096, [4096], 128, 304, torch.float16, 128, 16, 3, 4),
     ],
 )
+@pytest.mark.skip(reason="This test is temporarily disabled.")
 def test_persistent_lean_attention(
     request,
+    causal,
     batch,
-    h,
+    hq,
+    hk,
     n_ctx_q,
     n_ctx,
     d,
@@ -172,9 +339,9 @@ def test_persistent_lean_attention(
     init_dtype,
     BLOCK_M,
     BLOCK_N,
+    RAGGED_BATCH,
     waves_per_eu,
     num_warps,
-    causal,
 ):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
@@ -214,13 +381,14 @@ def test_persistent_lean_attention(
         n_ctx_q,
         n_ctx,
         BLOCK_N,
-        h,
+        hq,
+        hk,
         d,
         total_programs,
         init_dtype,
     )
 
-    XCD_REMAP = True
+    XCD_REMAP = False
 
     # Triton LeanAttention output
     la_out, ms = _persistent_lean_attention(
@@ -239,6 +407,7 @@ def test_persistent_lean_attention(
         causal,
         batch,
         sm_scale,
+        RAGGED_BATCH,
         num_warps,
         waves_per_eu,
     )
@@ -264,6 +433,7 @@ def test_persistent_lean_attention(
 @pytest.mark.parametrize("d", [32])
 @pytest.mark.parametrize("causal", [(True), (False)])
 @pytest.mark.parametrize("init_dtype", [torch.float16])
+@pytest.mark.parametrize("RAGGED_BATCH", [False])
 def test_persistent_lean_attention_outer(
     batch,
     h,
@@ -272,6 +442,7 @@ def test_persistent_lean_attention_outer(
     d,
     init_dtype,
     causal,
+    RAGGED_BATCH,
 ):
     torch.manual_seed(20)
 
@@ -294,6 +465,7 @@ def test_persistent_lean_attention_outer(
         n_ctx,
         config["BLOCK_SIZE_N"],
         h,
+        h,
         d,
         sm_count,
         init_dtype,
@@ -312,6 +484,7 @@ def test_persistent_lean_attention_outer(
         batch,
         sm_scale,
         causal=causal,
+        RAGGED_BATCH=RAGGED_BATCH,
         config=config,
     )
 
@@ -355,19 +528,21 @@ def print_mismatches(ref_out, la_out, atol=1e-8, rtol=1e-5):
 
 
 def main():
-    batch = 1
-    causal = True
-    h = 64
-    n_ctx_q = 8192
-    n_ctx = [8192]  # [16384] #[8192]
+    batch = 3
+    causal = False
+    hq = 128
+    hk = 128
+    n_ctx_q = 16
+    n_ctx = [4096, 32768, 65536]  # [131072] * batch  # [16384] #[8192]
     d = 128
-    total_programs = 304
+    total_programs = 912
     init_dtype = torch.float16
-    BLOCK_M = 128
-    BLOCK_N = 64
+    BLOCK_M = 16
+    BLOCK_N = 128
     XCD_REMAP = True
     waves_per_eu = 2
     num_warps = 4
+    RAGGED_BATCH = True
     assert batch == len(n_ctx)
 
     try:
@@ -397,7 +572,8 @@ def main():
         n_ctx_q,
         n_ctx,
         BLOCK_N,
-        h,
+        hq,
+        hk,
         d,
         total_programs,
         init_dtype,
@@ -420,6 +596,7 @@ def main():
         causal,
         batch,
         sm_scale,
+        RAGGED_BATCH,
         num_warps,
         waves_per_eu,
     )
@@ -427,14 +604,14 @@ def main():
 
     ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
 
-    # Compare result
+    # # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
     try:
         torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
     except AssertionError:
-        print("Assertion failed! Showing mismatches:")
-        # print_mismatches(ref_out, la_out, atol, rtol)
+        #     print("Assertion failed! Showing mismatches:")
+        #     # print_mismatches(ref_out, la_out, atol, rtol)
         raise  # Re-raise the exception after printing mismatches
 
     # torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)

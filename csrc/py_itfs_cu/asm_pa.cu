@@ -120,8 +120,8 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
 
     int dim            = head_size;
     int stride_Q       = Q.stride(0) * Q.itemsize();
-    int stride_KV_head = block_size * dim * K.itemsize();
-    int stride_KV_blk  = stride_KV_head * num_kv_heads;
+    int stride_KV_head = K.stride(1) * K.itemsize();
+    int stride_KV_blk  = K.stride(0) * K.itemsize();
     float k_log2e      = f_log2E;
     float k_scalar     = sqrt(dim);
     k_scalar           = (float)((double)k_log2e / (double)k_scalar);

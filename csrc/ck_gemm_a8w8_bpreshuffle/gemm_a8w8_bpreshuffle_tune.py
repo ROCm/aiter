@@ -203,6 +203,9 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
     ):
         (cu_num, M, N, K, q_dtype_w) = info_keys
         if eval(q_dtype_w) != dtypes.fp8:
+            print(
+                f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
+            )
             return []
         kernels_num = len(kernels_list)
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
