@@ -130,6 +130,14 @@ def gemm_a8w8_blockscale_ck(
     Out: torch.Tensor,
 ) -> torch.Tensor: ...
 
+@compile_ops("module_ck_tile_gemm_a8w8_blockscale", fc_name="ck_tile_gemm_a8w8_blockscale")
+def ck_tile_gemm_a8w8_blockscale(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+) -> torch.Tensor: ...
 
 @compile_ops(
     "module_gemm_a8w8_blockscale_bpreshuffle",
@@ -466,6 +474,17 @@ def gemm_a8w8_blockscale(
         get_CKGEMM_config(m, n, k, AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE)
         return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
 
+def gemm_a8w8_blockscale_ck_tile(
+    XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, dtype=dtypes.bf16
+):
+    assert dtype in [
+        dtypes.bf16,
+        dtypes.fp16,
+    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    return ck_tile_gemm_a8w8_blockscale(XQ, WQ, x_scale, w_scale, Y)
 
 def flatmm_a8w8_blockscale_ASM(
     XQ: Tensor,
