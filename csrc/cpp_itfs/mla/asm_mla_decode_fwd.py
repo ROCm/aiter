@@ -88,7 +88,11 @@ def compile(
         return compile_template_op(
             src_template,
             MD_NAME,
-            [current_dir + "/../utils.h", current_dir + "/../../include", triton_header],
+            [
+                current_dir + "/../utils.h",
+                current_dir + "/../../include",
+                triton_header,
+            ],
             [triton_source],
             bin_size=bin_size,
             bin_data=bin_data,

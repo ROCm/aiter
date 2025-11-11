@@ -14,13 +14,14 @@ from triton.experimental import gluon
 
 @dataclass
 class CompileGluonArgs:
-    '''
+    """
     A class to contain arguments from command-line parser for Gluon kernels.
-    '''
-    path: str = ''
-    kernel_name: str = ''
-    signature: str = ''
-    grid: str = ''
+    """
+
+    path: str = ""
+    kernel_name: str = ""
+    signature: str = ""
+    grid: str = ""
     target: str | None = None
     num_warps: int = 1
     num_ctas: int = 1
@@ -58,22 +59,60 @@ used to run this `compile_gluon.py` script
 def main():
     # command-line arguments
     parser = ArgumentParser(description=desc)
-    parser.add_argument("path",
-                        help="Path to Python source containing desired Gluon kernel in its scope. File will be executed.")
-    parser.add_argument("--kernel-name", "-n", type=str, default="", help="Name of the Gluon kernel to compile",
-                        required=True)
     parser.add_argument(
-        "--target", "-t", type=str, default=None,
+        "path",
+        help="Path to Python source containing desired Gluon kernel in its scope. File will be executed.",
+    )
+    parser.add_argument(
+        "--kernel-name",
+        "-n",
+        type=str,
+        default="",
+        help="Name of the Gluon kernel to compile",
+        required=True,
+    )
+    parser.add_argument(
+        "--target",
+        "-t",
+        type=str,
+        default=None,
         help="The target to compile towards, in format of '<backend>:<arch>:<warp-size>'; "
-        "e.g., 'cuda:80:32', 'hip:gfx942:64'. Default to None, which means using current machine's GPU target")
-    parser.add_argument("--num-warps", "-w", type=int, default=1, help="Number of warps to launch the kernel")
-    parser.add_argument("--num-ctas", "-c", type=int, default=1, help="Number of CTAs (cooperative thread arrays) for the kernel")
-    parser.add_argument("--out-name", "-on", type=str, default=None, help="Out name for the compiled kernel")
-    parser.add_argument("--out-path", "-o", type=Path, default=None, help="Out filename")
-    parser.add_argument("--signature", "-s", type=str, help="Signature of the kernel", required=True)
-    parser.add_argument("--grid", "-g", type=str, help="Launch grid of the kernel", required=True)
+        "e.g., 'cuda:80:32', 'hip:gfx942:64'. Default to None, which means using current machine's GPU target",
+    )
+    parser.add_argument(
+        "--num-warps",
+        "-w",
+        type=int,
+        default=1,
+        help="Number of warps to launch the kernel",
+    )
+    parser.add_argument(
+        "--num-ctas",
+        "-c",
+        type=int,
+        default=1,
+        help="Number of CTAs (cooperative thread arrays) for the kernel",
+    )
+    parser.add_argument(
+        "--out-name",
+        "-on",
+        type=str,
+        default=None,
+        help="Out name for the compiled kernel",
+    )
+    parser.add_argument(
+        "--out-path", "-o", type=Path, default=None, help="Out filename"
+    )
+    parser.add_argument(
+        "--signature", "-s", type=str, help="Signature of the kernel", required=True
+    )
+    parser.add_argument(
+        "--grid", "-g", type=str, help="Launch grid of the kernel", required=True
+    )
     cli_args = parser.parse_args()
-    args = CompileGluonArgs(**vars(cli_args))  # A sanity check to ensure class CompileGluonArgs is updated as well.
+    args = CompileGluonArgs(
+        **vars(cli_args)
+    )  # A sanity check to ensure class CompileGluonArgs is updated as well.
     compile_gluon_kernel(args)
 
 
@@ -90,8 +129,10 @@ def compile_gluon_kernel(args: CompileGluonArgs):
     kernel = getattr(mod, args.kernel_name)
 
     # Verify this is a Gluon kernel
-    if not hasattr(kernel, 'is_gluon') or not kernel.is_gluon():
-        raise RuntimeError(f"Kernel '{args.kernel_name}' is not a Gluon kernel. Use @gluon.jit decorator.")
+    if not hasattr(kernel, "is_gluon") or not kernel.is_gluon():
+        raise RuntimeError(
+            f"Kernel '{args.kernel_name}' is not a Gluon kernel. Use @gluon.jit decorator."
+        )
 
     grid = args.grid.split(",")
     assert len(grid) == 3
@@ -118,20 +159,28 @@ def compile_gluon_kernel(args: CompileGluonArgs):
             return ret
         except ValueError:
             pass
+        try:
+            ret = triton.language.core.dtype(s)
+            return ret
+        except AssertionError:
+            pass
         return None
 
-    hints = {(i, ): constexpr(s.split(":")[1]) for i, s in enumerate(signature) if ":" in s}
+    hints = {
+        (i,): constexpr(s.split(":")[1]) for i, s in enumerate(signature) if ":" in s
+    }
     hints = {k: v for k, v in hints.items() if v is not None}
     constants = {kernel.arg_names[i]: constexpr(s) for i, s in enumerate(signature)}
     constants = {k: v for k, v in constants.items() if v is not None}
+    # print(f"signature={signature}")
 
     for key, value in hints.items():
         if value == 1:
             constants[kernel.arg_names[key[0]]] = value
     signature = {kernel.arg_names[i]: s.split(":")[0] for i, s in enumerate(signature)}
     for key in constants:
-        signature[key] = 'constexpr'
-    const_sig = 'x'.join([str(v) for v in constants.values()])
+        signature[key] = "constexpr"
+    const_sig = "x".join([str(v) for v in constants.values()])
     doc_string = [f"{k}={v}" for k, v in constants.items()]
     doc_string += [f"num_warps={args.num_warps}", f"num_ctas={args.num_ctas}"]
     # compile ast into cubin
@@ -141,19 +190,39 @@ def compile_gluon_kernel(args: CompileGluonArgs):
 
     # Use GluonASTSource for compilation
     from triton.experimental.gluon._runtime import GluonASTSource
-    src = GluonASTSource(fn=kernel, constexprs=constants, signature=signature, attrs=attrs)
 
-    target = triton.backends.compiler.GPUTarget(*args.target.split(":")) \
-        if args.target else triton.runtime.driver.active.get_current_target()
+    src = GluonASTSource(
+        fn=kernel, constexprs=constants, signature=signature, attrs=attrs
+    )
+    # print(f"\n**********************************************")
+    # print(f"triton.compiler.ASTSource={triton.compiler.ASTSource}")
+    # print(f"kernel={kernel}")
+    # print(f"signature={signature}")
+    # print(f"constexprs={constants}")
+    # print(f"attrs={attrs}")
+    # print(f"src={src}")
+    # print(f"const_sig={const_sig}")
+    # print(f"doc_string={doc_string}")
+    # print(f"**********************************************\n")
+
+    target = (
+        triton.backends.compiler.GPUTarget(*args.target.split(":"))
+        if args.target
+        else triton.runtime.driver.active.get_current_target()
+    )
     backend = triton.compiler.make_backend(target)
     kwargs = {"num_warps": args.num_warps, "num_ctas": args.num_ctas}
     options = backend.parse_options(kwargs)
     ccinfo = triton.compile(src, target=target, options=options.__dict__)
 
     if getattr(ccinfo.metadata, "global_scratch_size", 0) > 0:
-        raise RuntimeError("AOT compiling Gluon kernels with global scratch requirements is not yet implemented")
+        raise RuntimeError(
+            "AOT compiling Gluon kernels with global scratch requirements is not yet implemented"
+        )
     if ccinfo.metadata.profile_scratch_size > 0:
-        raise RuntimeError("AOT compiling Gluon kernels with profile scratch requirements is not yet implemented")
+        raise RuntimeError(
+            "AOT compiling Gluon kernels with profile scratch requirements is not yet implemented"
+        )
 
     arg_names = []
     arg_types = []
@@ -165,19 +234,19 @@ def compile_gluon_kernel(args: CompileGluonArgs):
             arg_types.append(signature[arg_name])
             arg_names_not_1.append(arg_name)
             arg_types_not_1.append(signature[arg_name])
-        elif hints.get((i, ), None) == 1:
+        elif hints.get((i,), None) == 1:
             arg_names.append(arg_name)
             arg_types.append("i32")
 
     # dump C stub code
-    suffix = ''
+    suffix = ""
     for i, ty in enumerate(signature.values()):
         suffix += str(i)
-        if hints.get((i, ), None) == 1:
-            suffix += 'c'
-        if hints.get((i, ), None) == 16:
-            suffix += 'd'
-    func_name = '_'.join([out_name, sig_hash, suffix])
+        if hints.get((i,), None) == 1:
+            suffix += "c"
+        if hints.get((i,), None) == 16:
+            suffix += "d"
+    func_name = "_".join([out_name, sig_hash, suffix])
     asm = ccinfo.asm[backend.binary_ext]  # store binary data once
 
     hex_ = str(binascii.hexlify(asm))[2:-1]
@@ -189,9 +258,20 @@ def compile_gluon_kernel(args: CompileGluonArgs):
         "triton_kernel_name": args.kernel_name,
         "bin_size": len(asm),
         "bin_data": ", ".join([f"0x{x}{y}" for x, y in zip(hex_[::2], hex_[1::2])]),
-        "signature": ", ".join([f"{ty_to_cpp(ty)} {name}" for name, ty in zip(arg_names_not_1, arg_types_not_1)]),
-        "full_signature": ", ".join([f"{ty_to_cpp(ty)} {name}" for name, ty in zip(arg_names, arg_types)]),
-        "arg_pointers": ", ".join([f"&{arg}" for arg in arg_names_not_1] + ["&global_scratch"] + ["&profile_scratch"]),
+        "signature": ", ".join(
+            [
+                f"{ty_to_cpp(ty)} {name}"
+                for name, ty in zip(arg_names_not_1, arg_types_not_1)
+            ]
+        ),
+        "full_signature": ", ".join(
+            [f"{ty_to_cpp(ty)} {name}" for name, ty in zip(arg_names, arg_types)]
+        ),
+        "arg_pointers": ", ".join(
+            [f"&{arg}" for arg in arg_names_not_1]
+            + ["&global_scratch"]
+            + ["&profile_scratch"]
+        ),
         "num_args": len(arg_names_not_1) + 2,  # +2 for global and profile scratch
         "kernel_docstring": doc_string,
         "shared": ccinfo.metadata.shared,
@@ -206,7 +286,7 @@ def compile_gluon_kernel(args: CompileGluonArgs):
     output_files = []
     backend_name = target.backend
     template_dir = Path(__file__).parent / "extra" / backend_name
-    for template_path in template_dir.glob('compile.*'):
+    for template_path in template_dir.glob("compile.*"):
         ext = template_path.suffix
         output_file = out_path.with_suffix(f".{sig_hash}_{suffix}{ext}")
         with output_file.open("w") as fp:

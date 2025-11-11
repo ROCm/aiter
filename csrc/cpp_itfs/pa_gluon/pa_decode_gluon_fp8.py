@@ -11,7 +11,10 @@ import triton.language as tl
 
 from triton.tools.compile import compile_kernel, CompileArgs
 from csrc.cpp_itfs.torch_utils import torch_to_c_types
-from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import compile_gluon_kernel, CompileGluonArgs
+from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
+    compile_gluon_kernel,
+    CompileGluonArgs,
+)
 from csrc.cpp_itfs.utils import (
     compile_template_op,
     AITER_CORE_DIR,
@@ -22,81 +25,107 @@ from csrc.cpp_itfs.utils import (
 
 
 def compile_attention_kernel(
+    compute_type: tl.dtype,
     query_seq_len: int,
-    head_size: int,
     query_group_size: int,
+    head_size: int,
     kv_block_size: int,
-    sequence_partition_size: int,
     kv_16b_element_count: int,
+    sequence_partition_size: int,
     query_quant_mode: int,
     kv_quant_mode: int,
-    kv_compute_block_size: int,
     fp8_max_value: float,
     value_transposed: int,
     is_causal: int,
-    compute_type: tl.dtype,
     md_name: str,
     func_name: str = None,
 ):
+    """Compile the attention kernel for paged attention decode."""
     if func_name is None:
         func_name = get_default_func_name(
             md_name,
-            (query_seq_len, head_size, query_group_size, kv_block_size, sequence_partition_size,
-             kv_16b_element_count, query_quant_mode, kv_quant_mode, kv_compute_block_size,
-             fp8_max_value, value_transposed, is_causal, compute_type),
+            (
+                compute_type,
+                query_seq_len,
+                query_group_size,
+                head_size,
+                kv_block_size,
+                kv_16b_element_count,
+                sequence_partition_size,
+                query_quant_mode,
+                kv_quant_mode,
+                fp8_max_value,
+                value_transposed,
+                is_causal,
+            ),
         )
 
     if not_built(func_name):
-        query_group_size_original = query_group_size
+        equivalent_query_group_size = query_seq_len * query_group_size
+        equi_query_group_size_pow2 = triton.next_power_of_2(equivalent_query_group_size)
+        kv_compute_block_size = 256
+        waves_per_eu = 1
+        # Select kernel implementation based on block size
+        if kv_block_size > sequence_partition_size:
+            # Use big block kernel for large block sizes
+            if value_transposed:
+                # Use smaller compute block size for better performance with transposed values
+                kv_compute_block_size = 128
+        else:
+            # Use standard kernel for normal block sizes
+            # Configure waves per EU based on query group size
+            if equi_query_group_size_pow2 == 64:
+                waves_per_eu = 3
+            else:
+                waves_per_eu = 4
 
         # Build signature based on kernel parameters
         signature_parts = [
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
             "*bf16:16",  # output_ptr
-            "*fp8e4b8:16",   # query_ptr
-            "*fp8e4b8:16",   # key_cache_ptr
-            "*fp8e4b8:16",   # value_cache_ptr
-            "*i32:16",   # block_tables_ptr
-            "*i32:16",   # sequence_lengths_ptr
-            "fp32",      # softmax_scale
+            "*fp8e4b8:16",  # query_ptr
+            "*fp8e4b8:16",  # key_cache_ptr
+            "*fp8e4b8:16",  # value_cache_ptr
+            "*i32:16",  # block_tables_ptr
+            "*i32:16",  # context_lengths_ptr
+            "fp32:16",  # softmax_scale
             "*fp32:16",  # query_scale
             "*fp32:16",  # key_scale
             "*fp32:16",  # value_scale
-            "i32",       # stride_max_logits_seq
-            "i32",       # stride_max_logits_head
-            "i32",       # stride_max_logits_part
-            "i32",       # stride_output_seq
-            "i32",       # stride_output_head
-            "i32",       # stride_output_part
-            "i32",       # stride_output_group
-            "i32",       # stride_query_seq
-            "i32",       # stride_query_head
-            "i32",       # stride_key_block
-            "i32",       # stride_key_head
-            "i32",       # stride_key_head_split
-            "i32",       # stride_key_block_elem
-            "i32",       # stride_value_block
-            "i32",       # stride_value_head
-            "i32",       # stride_value_head_size
-            "i32",       # stride_block_table_seq
-            "i32",       # query_scale_stride_0
-            "i32",       # kv_scale_stride_0
-            "i32",       # kv_scale_stride_1
-            "i32",       # num_seqs
-            "i32",       # num_kv_heads
-            "i32",       # max_num_partitions
+            "i32",  # stride_max_logits_seq
+            "i32",  # stride_max_logits_head
+            "i32",  # stride_max_logits_part
+            "i32",  # stride_output_seq
+            "i32",  # stride_output_head
+            "i32",  # stride_output_part
+            "i32",  # stride_output_group
+            "i32",  # stride_query_seq
+            "i32",  # stride_query_head
+            "i32",  # stride_key_block
+            "i32",  # stride_key_head
+            "i32",  # stride_key_head_split
+            "i32",  # stride_key_block_elem
+            "i32",  # stride_value_block
+            "i32",  # stride_value_head
+            "i32",  # stride_value_head_size
+            "i32",  # stride_block_table_seq
+            "i32",  # query_scale_stride_0
+            "i32",  # kv_scale_stride_0
+            "i32",  # kv_scale_stride_1
+            "i32",  # num_seqs
+            "i32",  # num_kv_heads
+            "i32",  # max_num_partitions
+            f"{str(compute_type)}",
             f"{query_seq_len}",
-            # f"{compute_type}",
-            f"{head_size}",
-            f"{query_group_size_original}",
             f"{query_group_size}",
+            f"{head_size}",
             f"{kv_block_size}",
-            f"{sequence_partition_size}",
             f"{kv_16b_element_count}",
+            f"{sequence_partition_size}",
+            f"{kv_compute_block_size}",
             f"{query_quant_mode}",
             f"{kv_quant_mode}",
-            f"{kv_compute_block_size}",
             f"{fp8_max_value}",
             f"{value_transposed}",
             f"{is_causal}",
@@ -124,7 +153,10 @@ def compile_attention_kernel(
             elif output_file.suffix == ".cpp":
                 triton_source = output_file
 
-        with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_attention_kernel.cpp.jinja", "r") as f:
+        with open(
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_attention_kernel.cpp.jinja",
+            "r",
+        ) as f:
             src_template = Template(f.read())
 
         return compile_template_op(
@@ -142,17 +174,23 @@ def compile_attention_kernel(
 
 
 def compile_reduce_kernel(
-    head_size: int,
     query_group_size: int,
-    sequence_partition_size: int,
+    head_size: int,
     max_num_seq_partitions: int,
+    sequence_partition_size: int,
     md_name: str,
     func_name: str = None,
 ):
+    """Compile the reduce kernel for paged attention decode."""
     if func_name is None:
         func_name = get_default_func_name(
             md_name,
-            (head_size, query_group_size, sequence_partition_size, max_num_seq_partitions),
+            (
+                query_group_size,
+                head_size,
+                max_num_seq_partitions,
+                sequence_partition_size,
+            ),
         )
 
     if not_built(func_name):
@@ -162,22 +200,22 @@ def compile_reduce_kernel(
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
             "*bf16:16",  # logits_ptr
-            "*i32:16",   # sequence_lengths_ptr
-            "i32",       # stride_output_seq
-            "i32",       # stride_output_head
-            "i32",       # stride_exp_sums_seq
-            "i32",       # stride_exp_sums_head
-            "i32",       # stride_exp_sums_part
-            "i32",       # stride_logits_seq
-            "i32",       # stride_logits_head
-            "i32",       # stride_logits_part
-            "i32",       # stride_logits_group
-            "i32",       # num_seqs
-            "i32",       # num_kv_heads
-            f"{head_size}",
+            "*i32:16",  # context_lengths_ptr
+            "i32",  # stride_output_seq
+            "i32",  # stride_output_head
+            "i32",  # stride_exp_sums_seq
+            "i32",  # stride_exp_sums_head
+            "i32",  # stride_exp_sums_part
+            "i32",  # stride_logits_seq
+            "i32",  # stride_logits_head
+            "i32",  # stride_logits_part
+            "i32",  # stride_logits_group
+            "i32",  # num_seqs
+            "i32",  # num_kv_heads
             f"{query_group_size}",
-            f"{sequence_partition_size}",
+            f"{head_size}",
             f"{max_num_seq_partitions}",
+            f"{sequence_partition_size}",
         ]
         signature = ",".join(signature_parts)
 
@@ -199,16 +237,20 @@ def compile_reduce_kernel(
             elif output_file.suffix == ".cpp":
                 triton_source = output_file
 
-        with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_reduce_kernel.cpp.jinja", "r") as f:
+        with open(
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon/pa_decode_reduce_kernel.cpp.jinja",
+            "r",
+        ) as f:
             src_template = Template(f.read())
 
+        kernel_name = "paged_attention_decode_v2_reduce_kernel"
         return compile_template_op(
             src_template,
             md_name,
             [triton_header],
             [triton_source],
             triton_header=triton_header,
-            kernel_name=md_name,
+            kernel_name=kernel_name,
             triton_kernel=triton_kernel,
             func_name=func_name,
         )
@@ -222,12 +264,13 @@ def pa_decode_gluon_fp8(
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or
     # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
-    sequence_lengths: torch.Tensor,  # [num_seqs]
+    context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
     query_sequence_length: int,
     max_sequence_length: int,
-    compute_type,
+    sequence_partition_size: int,
+    compute_type: tl.dtype,
     query_scale: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -236,32 +279,13 @@ def pa_decode_gluon_fp8(
     temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size, head_size]
     alibi_slopes: torch.Tensor = None,
 ) -> dict:
-    # # Debug: Print function call parameters
-    # print("\n=== DEBUG: pa_decode_gluon_fp8 Function Call ===")
-    # print("Input tensor parameters:")
-    # print(f"  output: shape={output.shape}, dtype={output.dtype}")
-    # print(f"  query: shape={query.shape}, dtype={query.dtype}")
-    # print(f"  key_cache: shape={key_cache.shape}, dtype={key_cache.dtype}")
-    # print(f"  value_cache: shape={value_cache.shape}, dtype={value_cache.dtype}")
-    # print(f"  sequence_lengths: shape={sequence_lengths.shape}, dtype={sequence_lengths.dtype}")
-    # print(f"  block_tables: shape={block_tables.shape}, dtype={block_tables.dtype}")
-    # print(f"  query_scale: shape={query_scale.shape if query_scale is not None else 'None'}, dtype={query_scale.dtype if query_scale is not None else 'None'}")
-    # print(f"  key_scale: shape={key_scale.shape if key_scale is not None else 'None'}, dtype={key_scale.dtype if key_scale is not None else 'None'}")
-    # print(f"  value_scale: shape={value_scale.shape if value_scale is not None else 'None'}, dtype={value_scale.dtype if value_scale is not None else 'None'}")
-    # print("\nScalar parameters:")
-    # print(f"  softmax_scale: {softmax_scale}")
-    # print(f"  query_sequence_length: {query_sequence_length}")
-    # print(f"  max_sequence_length: {max_sequence_length}")
-    # print(f"  compute_type: {compute_type}")
-    # sys.stdout.flush()
-
     # Extract tensor dimensions
     num_sequences = query.shape[0]
     num_query_heads_total = query.shape[1]
     num_query_heads_total = num_query_heads_total // query_sequence_length
     num_kv_heads = key_cache.shape[1]
     max_num_partitions = int(
-        (max_sequence_length + 256 - 1) // 256
+        (max_sequence_length + sequence_partition_size - 1) // sequence_partition_size
     )
     head_size = query.shape[-1]
     kv_block_size = key_cache.shape[-2]
@@ -379,90 +403,22 @@ def pa_decode_gluon_fp8(
     if value_cache.dtype == aiter.dtypes.fp8:
         fp8_max_value = torch.finfo(aiter.dtypes.fp8).max
 
-    # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
-    # Determine compute block size
-    kv_compute_block_size = 256
-    if value_transposed and kv_block_size > 256:
-        kv_compute_block_size = 128
-
-    # print("\n=== DEBUG: attention_kernel Compile Parameters ===")
-    # compile_params = {
-    #     "query_seq_len": query_sequence_length,
-    #     "head_size": head_size,
-    #     "query_group_size": equivalent_query_group_size,
-    #     "kv_block_size": kv_block_size,
-    #     "sequence_partition_size": 256,
-    #     "kv_16b_element_count": kv_elements_per_16b,
-    #     "query_quant_mode": query_quant_mode,
-    #     "kv_quant_mode": kv_quant_mode,
-    #     "kv_compute_block_size": kv_compute_block_size,
-    #     "fp8_max_value": fp8_max_value,
-    #     "value_transposed": int(value_transposed),
-    #     "is_causal": int(is_causal),
-    #     "compute_type": compute_type,
-    # }
-    # for key, value in compile_params.items():
-    #     print(f"  {key}: {value}")
-    # sys.stdout.flush()
-
     # Compile the kernel
     func = compile_attention_kernel(
+        compute_type=compute_type,
         query_seq_len=query_sequence_length,
+        query_group_size=query_group_size,
         head_size=head_size,
-        query_group_size=equivalent_query_group_size,
         kv_block_size=kv_block_size,
-        sequence_partition_size=256,
         kv_16b_element_count=kv_elements_per_16b,
+        sequence_partition_size=sequence_partition_size,
         query_quant_mode=query_quant_mode,
         kv_quant_mode=kv_quant_mode,
-        kv_compute_block_size=kv_compute_block_size,
         fp8_max_value=fp8_max_value,
         value_transposed=int(value_transposed),
         is_causal=int(is_causal),
-        compute_type=compute_type,
         md_name="pa_decode_attention_kernel",
     )
-
-    # # Debug: Print main kernel execution parameters
-    # print("\n=== DEBUG: Main Kernel Execution Parameters ===")
-    # print("Tensor parameters:")
-    # print(f"  exp_sums: shape={exp_sums.shape}, dtype={exp_sums.dtype}")
-    # print(f"  max_logits: shape={max_logits.shape}, dtype={max_logits.dtype}")
-    # print(f"  temporary_output: shape={temporary_output.shape}, dtype={temporary_output.dtype}")
-    # print(f"  query: shape={query.shape}, dtype={query.dtype}")
-    # print(f"  key_cache: shape={key_cache.shape}, dtype={key_cache.dtype}")
-    # print(f"  value_cache: shape={value_cache.shape}, dtype={value_cache.dtype}")
-    # print(f"  block_tables: shape={block_tables.shape}, dtype={block_tables.dtype}")
-    # print(f"  sequence_lengths: shape={sequence_lengths.shape}, dtype={sequence_lengths.dtype}")
-    # print(f"  query_scale: shape={query_scale.shape if query_scale is not None else 'None'}, dtype={query_scale.dtype if query_scale is not None else 'None'}")
-    # print(f"  key_scale: shape={key_scale.shape if key_scale is not None else 'None'}, dtype={key_scale.dtype if key_scale is not None else 'None'}")
-    # print(f"  value_scale: shape={value_scale.shape if value_scale is not None else 'None'}, dtype={value_scale.dtype if value_scale is not None else 'None'}")
-    # print("\nScalar parameters:")
-    # print(f"  softmax_scale: {softmax_scale}")
-    # print(f"  exp_sums.stride(0): {exp_sums.stride(0)}")
-    # print(f"  exp_sums.stride(1): {exp_sums.stride(1)}")
-    # print(f"  exp_sums.stride(2): {exp_sums.stride(2)}")
-    # print(f"  temporary_output.stride(0): {temporary_output.stride(0)}")
-    # print(f"  temporary_output.stride(1): {temporary_output.stride(1)}")
-    # print(f"  temporary_output.stride(2): {temporary_output.stride(2)}")
-    # print(f"  temporary_output.stride(3): {temporary_output.stride(3)}")
-    # print(f"  query.stride(0): {query.stride(0)}")
-    # print(f"  query.stride(1): {query.stride(1)}")
-    # print(f"  key_cache.stride(0): {key_cache.stride(0)}")
-    # print(f"  key_cache.stride(1): {key_cache.stride(1)}")
-    # print(f"  key_cache.stride(2): {key_cache.stride(2)}")
-    # print(f"  key_cache.stride(3): {key_cache.stride(3)}")
-    # print(f"  value_cache.stride(0): {value_cache.stride(0)}")
-    # print(f"  value_cache.stride(1): {value_cache.stride(1)}")
-    # print(f"  value_cache.stride(2): {value_cache.stride(2)}")
-    # print(f"  block_tables.stride(0): {block_tables.stride(0)}")
-    # print(f"  query_scale_stride_0: {query_scale_stride_0}")
-    # print(f"  key_scale_stride_0: {key_scale_stride_0}")
-    # print(f"  key_scale_stride_1: {key_scale_stride_1}")
-    # print(f"  num_sequences: {num_sequences}")
-    # print(f"  num_kv_heads: {num_kv_heads}")
-    # print(f"  max_num_partitions: {max_num_partitions}")
-    # sys.stdout.flush()
 
     # Execute the kernel
     func(
@@ -474,7 +430,7 @@ def pa_decode_gluon_fp8(
             key_cache,
             value_cache,
             block_tables,
-            sequence_lengths,
+            context_lengths,
             softmax_scale,
             query_scale,
             key_scale,
@@ -506,48 +462,14 @@ def pa_decode_gluon_fp8(
         )
     )
 
-    # print("\n=== DEBUG: reduce_kernel Compile Parameters ===")
-    # reduce_compile_params = {
-    #     "head_size": head_size,
-    #     "query_group_size": equivalent_query_group_size,
-    #     "sequence_partition_size": 256,
-    #     "max_num_seq_partitions": max_num_partitions,
-    # }
-    # for key, value in reduce_compile_params.items():
-    #     print(f"  {key}: {value}")
-    # sys.stdout.flush()
-
     # Compile and execute the reduction kernel
     reduce_func = compile_reduce_kernel(
-        head_size=head_size,
         query_group_size=equivalent_query_group_size,
-        sequence_partition_size=256,
+        head_size=head_size,
         max_num_seq_partitions=max_num_partitions,
+        sequence_partition_size=sequence_partition_size,
         md_name="pa_decode_reduce_kernel",
     )
-
-    # # Debug: Print reduce kernel execution parameters
-    # print("\n=== DEBUG: Reduce Kernel Execution Parameters ===")
-    # print("Tensor parameters:")
-    # print(f"  output: shape={output.shape}, dtype={output.dtype}")
-    # print(f"  exp_sums: shape={exp_sums.shape}, dtype={exp_sums.dtype}")
-    # print(f"  max_logits: shape={max_logits.shape}, dtype={max_logits.dtype}")
-    # print(f"  temporary_output: shape={temporary_output.shape}, dtype={temporary_output.dtype}")
-    # print(f"  sequence_lengths: shape={sequence_lengths.shape}, dtype={sequence_lengths.dtype}")
-
-    # print("\nScalar parameters:")
-    # print(f"  output.stride(0): {output.stride(0)}")
-    # print(f"  output.stride(1): {output.stride(1)}")
-    # print(f"  exp_sums.stride(0): {exp_sums.stride(0)}")
-    # print(f"  exp_sums.stride(1): {exp_sums.stride(1)}")
-    # print(f"  exp_sums.stride(2): {exp_sums.stride(2)}")
-    # print(f"  temporary_output.stride(0): {temporary_output.stride(0)}")
-    # print(f"  temporary_output.stride(1): {temporary_output.stride(1)}")
-    # print(f"  temporary_output.stride(2): {temporary_output.stride(2)}")
-    # print(f"  temporary_output.stride(3): {temporary_output.stride(3)}")
-    # print(f"  num_sequences: {num_sequences}")
-    # print(f"  num_kv_heads: {num_kv_heads}")
-    # sys.stdout.flush()
 
     # Execute the reduction kernel
     reduce_func(
@@ -556,7 +478,7 @@ def pa_decode_gluon_fp8(
             exp_sums,
             max_logits,
             temporary_output,
-            sequence_lengths,
+            context_lengths,
             output.stride(0),
             output.stride(1),
             exp_sums.stride(0),
