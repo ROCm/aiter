@@ -208,12 +208,13 @@ def _gemm_a8w8_kernel(
     smem_a.store(a)
 
     #accumulator
-    acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
+    acc_dtype = gl.float32 if (c_ptr.type.element_ty != gl.int8 and c_ptr.type.element_ty != gl.int32) else gl.int32
+    zeros_dtype = gl.float32 if a_ptr.type.element_ty != gl.int8 else gl.int32
     acc = gl.zeros(
         (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout
     )
     zeros = gl.zeros(
-        (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout
+        (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=zeros_dtype, layout=mfma_layout
     )
 
     
@@ -383,6 +384,7 @@ def gemm_a8w8(
 
     # Check constraints.
     assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
+    assert x.dtype == w.dtype, "Input types must be the same"
 
     M, K = x.shape
     N, K = w.shape
