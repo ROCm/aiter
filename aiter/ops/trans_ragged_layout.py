@@ -2,24 +2,6 @@ import torch
 import triton
 import triton.language as tl
 
-
-@triton.jit
-def binary_search(value, arr_ptr, arr_length):
-    left = 0
-    right = arr_length - 1
-
-    while left <= right:
-        mid = (left + right) // 2
-        mid_value = tl.load(arr_ptr + mid)
-
-        if mid_value <= value:
-            left = mid + 1
-        else:
-            right = mid - 1
-
-    return left - 1
-
-
 @triton.jit
 def _ragged_trans_kernel(
     k_buffer_ptr,
@@ -41,19 +23,9 @@ def _ragged_trans_kernel(
 
     for local_idx in range(p_token_num):
         cur_token_idx = p_token_offset + local_idx
-        if cur_token_idx >= total_tokens:
-            batch_idx = -1
-        else:
-            batch_idx = binary_search(cur_token_idx, kv_indptr_ptr, B + 1)
-        if batch_idx >= 0 and batch_idx < B:
-            batch_token_start = tl.load(kv_indptr_ptr + batch_idx)
-            kv_start = tl.load(kv_indptr_ptr + batch_idx)
-            # kv_end = tl.load(kv_indptr_ptr + batch_idx + 1)
-
-            local_p_token_offset = cur_token_idx - batch_token_start
+        if cur_token_idx < total_tokens:
             E_DIM_mask = tl.arange(0, BLOCK_E_DIM) < E_DIM
-
-            kv_idx = tl.load(kv_indices_ptr + kv_start + local_p_token_offset)
+            kv_idx = tl.load(kv_indices_ptr + cur_token_idx)
             kv_buffer_off = kv_idx * E_DIM + tl.arange(0, BLOCK_E_DIM)
             k_vals = tl.load(k_buffer_ptr + kv_buffer_off, mask=E_DIM_mask)
             v_vals = tl.load(v_buffer_ptr + kv_buffer_off, mask=E_DIM_mask)
