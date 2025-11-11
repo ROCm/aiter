@@ -89,12 +89,12 @@ __global__ void fused_add_smooth_quant_rms_norm_kernel(RMSNormParameter params)
     // const int thread_row         = warp_base_row + thread_row_in_warp;
     // const int row_offset = thread_row * HIDDEN_SIZE;
 
-    const int row_offset = warp_base_row * HIDDEN_SIZE;
+    const int64_t row_offset = warp_base_row * HIDDEN_SIZE;
 
     const DTYPE* warp_in_ptr = reinterpret_cast<DTYPE*>(params.p_input) + row_offset;
     const DTYPE* warp_residual_in_ptr = reinterpret_cast<DTYPE*>(params.p_residual_in) + row_offset;
 
-    const int first_elt_read_by_thread = threadIdx.x * WIDTH;
+    const int64_t first_elt_read_by_thread = threadIdx.x * WIDTH;
 
     // Input init
     const DTYPE* thread_in_ptr = warp_in_ptr + first_elt_read_by_thread;
@@ -263,11 +263,10 @@ template <typename DTYPE,
           typename QUANT_DTYPE>
 __global__ void no_fused_rms_norm_kernel(NoFusedRMSNormParameter params)
 {
-  // Sanity checks on our vector struct and type-punned pointer arithmetic
-    static constexpr int LANE_HIDDEN_SIZE = HIDDEN_SIZE / blockDim;                   // 5120 / 128 = 80 
-    static constexpr int VEC_HIDDEN_SIZE_LOC = LANE_HIDDEN_SIZE / WIDTH;        // 80 / 8 = 10
+    static constexpr int32_t LANE_HIDDEN_SIZE = HIDDEN_SIZE / blockDim;                   // 5120 / 128 = 80 
+    static constexpr int32_t VEC_HIDDEN_SIZE_LOC = LANE_HIDDEN_SIZE / WIDTH;        // 80 / 8 = 10
 
-    static constexpr int WARP_GROUP = blockDim / 64;        // 80 / 8 = 10
+    static constexpr int32_t WARP_GROUP = blockDim / 64;        // 80 / 8 = 10
 
     auto arg_sum = [](const float& a, const float& b) {
         return a + b;
@@ -284,28 +283,29 @@ __global__ void no_fused_rms_norm_kernel(NoFusedRMSNormParameter params)
     using QuantVecType = ck_tile::vec_t<QUANT_DTYPE, WIDTH>;
 
     __shared__ float s_variance[WARP_GROUP];
-    __shared__ float s_max_local[WARP_GROUP];
 
-    // const int cta_base_row = blockIdx.x * HIDDEN_SIZE * BlockDim.y;
-    // const int warp_base_row = cta_base_row + threadIdx.y * ROWS_PER_WARP;
-    const int warp_base_row = blockIdx.x * ROW_WIDTH;
+    // const int32_t cta_base_row = blockIdx.x * HIDDEN_SIZE * BlockDim.y;
+    // const int32_t warp_base_row = cta_base_row + threadIdx.y * ROWS_PER_WARP;
+    // const int32_t warp_base_row = blockIdx.x * ROW_WIDTH;
+    const int64_t warp_base_row = blockIdx.x * ROW_WIDTH;
 
-    constexpr int THREADS_PER_ROW = 256;
-    // constexpr int THREADS_PER_ROW = 64;
-    // const int thread_row_in_warp = threadIdx.x / THREADS_PER_ROW;
-    // const int thread_row         = warp_base_row + thread_row_in_warp;
-    // const int row_offset = thread_row * HIDDEN_SIZE;
+    constexpr int32_t THREADS_PER_ROW = blockDim;
+    // constexpr int32_t THREADS_PER_ROW = 64;
+    // const int32_t thread_row_in_warp = threadIdx.x / THREADS_PER_ROW;
+    // const int32_t thread_row         = warp_base_row + thread_row_in_warp;
+    // const int32_t row_offset = thread_row * HIDDEN_SIZE;
 
     const DTYPE* warp_in_ptr = reinterpret_cast<DTYPE*>(params.p_input) + warp_base_row * params.stride;
 
-    const int first_elt_read_by_thread = threadIdx.x * WIDTH;
+    const int64_t first_elt_read_by_thread = threadIdx.x * WIDTH;
 
     // Input init
     const DTYPE* thread_in_ptr = warp_in_ptr + first_elt_read_by_thread;
 
-    float in_local[LANE_HIDDEN_SIZE * ROW_WIDTH];
+    constexpr int32_t NUM_STAGES = 2;
+    float in_local[LANE_HIDDEN_SIZE * NUM_STAGES];
     DTYPE gamma_local[LANE_HIDDEN_SIZE];
-    DTYPE in_local_b16[LANE_HIDDEN_SIZE];
+    DTYPE in_local_b16[LANE_HIDDEN_SIZE * NUM_STAGES];
 
     // float residual_in_local[LANE_HIDDEN_SIZE];
     AccVecType* row_in_ptr            = reinterpret_cast<AccVecType*>(&in_local);
@@ -319,13 +319,14 @@ __global__ void no_fused_rms_norm_kernel(NoFusedRMSNormParameter params)
     AccessType* row_in_b16_ptr = reinterpret_cast<AccessType*>(&in_local_b16);
 
     QUANT_DTYPE* thread_out_ptr = reinterpret_cast<QUANT_DTYPE*>(params.p_out) + warp_base_row * HIDDEN_SIZE + first_elt_read_by_thread;
+    StoreQuantType* vec_out_st_ptr = reinterpret_cast<StoreQuantType*>(thread_out_ptr);
 
     float r_dim_scale = __builtin_amdgcn_rcpf(HIDDEN_SIZE);
 #pragma unroll  // Unroll loop for better instruction pipelining
-    for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+    for (int32_t ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
     {
 #pragma unroll
-        for (int j = 0; j < WIDTH; ++j)
+        for (int32_t j = 0; j < WIDTH; ++j)
         {
             in_local_b16[ii * WIDTH + j] = __builtin_nontemporal_load(thread_in_ptr + ii * blockDim * WIDTH + j);
         }
@@ -333,40 +334,42 @@ __global__ void no_fused_rms_norm_kernel(NoFusedRMSNormParameter params)
 
     // Issue gamma with add.
 #pragma unroll
-    for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+    for(int32_t ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
     {
         gamma_in_ptr[ii] = vec_gamma_read_ptr[ii * THREADS_PER_ROW];
     }
 
 #pragma unroll
-    for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+    for (int32_t ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
     {
         row_in_ptr[ii] = ck_tile::vec_convert<ACC_DTYPE, DTYPE, WIDTH>(row_in_b16_ptr[ii]);
     }
 
-#pragma unroll  // Unroll loop for better instruction pipelining
-    for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+    for (int32_t r = 0; r < ROW_WIDTH - 1; ++r)
     {
-#pragma unroll
-        for (int j = 0; j < WIDTH; ++j)
-        {
-            in_local_b16[ii * WIDTH + j] = __builtin_nontemporal_load(thread_in_ptr + ii * blockDim * WIDTH + j + params.stride);
-        }
-    }
+        int32_t ld_stage = r & 1;
+        int32_t st_stage = ld_stage ^ 1;
 
+#pragma unroll  // Unroll loop for better instruction pipelining
+        for (int32_t ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+        {
 #pragma unroll
-    for (int r = 0; r < ROW_WIDTH; ++r)
-    {
+            for (int32_t j = 0; j < WIDTH; ++j)
+            {
+                in_local_b16[ii * WIDTH + j + st_stage * LANE_HIDDEN_SIZE] = __builtin_nontemporal_load(thread_in_ptr + ii * blockDim * WIDTH + j + params.stride * (r + 1));
+            }
+        }
+
         float variance = 0.0f;
 
 #pragma unroll
-        for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+        for(int32_t ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
         {
 #pragma unroll
-            for (int j = 0; j < WIDTH; ++j)
+            for (int32_t j = 0; j < WIDTH; ++j)
             {
                 auto idx = ii * WIDTH + j;
-                variance += in_local[idx + r * LANE_HIDDEN_SIZE] * in_local[idx + r * LANE_HIDDEN_SIZE];
+                variance += in_local[idx + ld_stage * LANE_HIDDEN_SIZE] * in_local[idx + ld_stage * LANE_HIDDEN_SIZE];
             }
         }
 
@@ -381,12 +384,12 @@ __global__ void no_fused_rms_norm_kernel(NoFusedRMSNormParameter params)
         {
             auto variance_local = s_variance[0];
 #pragma unroll
-            for (int i = 1; i < WARP_GROUP; ++i)
+            for (int32_t i = 1; i < WARP_GROUP; ++i)
             {
                 variance_local += s_variance[i];
             }
 #pragma unroll
-            for (int i = 0; i < WARP_GROUP; ++i)
+            for (int32_t i = 0; i < WARP_GROUP; ++i)
             {
                 s_variance[i] = variance_local;
             }
@@ -398,38 +401,102 @@ __global__ void no_fused_rms_norm_kernel(NoFusedRMSNormParameter params)
 
         float scale_rms = rsqrtf(variance * r_dim_scale + params.epsilon);
 
-        if (r == 0)
-        {
 #pragma unroll
-            for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
-            {
-                row_in_ptr[ii + VEC_HIDDEN_SIZE_LOC] = ck_tile::vec_convert<ACC_DTYPE, DTYPE, WIDTH>(row_in_b16_ptr[ii]);
-            }
+        for (int32_t ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+        {
+            row_in_ptr[ii + st_stage * VEC_HIDDEN_SIZE_LOC] = ck_tile::vec_convert<ACC_DTYPE, DTYPE, WIDTH>(row_in_b16_ptr[ii + st_stage * VEC_HIDDEN_SIZE_LOC]);
         }
 
 #pragma unroll
-        for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+        for(int32_t ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
         {
 #pragma unroll
-            for (int j = 0; j < WIDTH; ++j)
+            for (int32_t j = 0; j < WIDTH; ++j)
             {
                 auto idx = ii * WIDTH + j;
-                in_local[idx + r * LANE_HIDDEN_SIZE] = in_local[idx + r * LANE_HIDDEN_SIZE] * scale_rms * ck_tile::type_convert<ACC_DTYPE>(gamma_local[idx]);
+                in_local[idx + ld_stage * LANE_HIDDEN_SIZE] = in_local[idx + ld_stage * LANE_HIDDEN_SIZE] * scale_rms * ck_tile::type_convert<ACC_DTYPE>(gamma_local[idx]);
             }
-            row_in_b16_ptr[ii] = ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(row_in_ptr[ii + r * VEC_HIDDEN_SIZE_LOC]);
+            row_in_b16_ptr[ii] = ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(row_in_ptr[ii + ld_stage * VEC_HIDDEN_SIZE_LOC]);
         }
 
 #pragma unroll  // Unroll loop for better instruction pipelining
-        for (int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+        for (int32_t ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
         {
 #pragma unroll
-            for (int j = 0; j < WIDTH; ++j)
+            for (int32_t j = 0; j < WIDTH; ++j)
             {
                 // __builtin_nontemporal_store(in_local_b16[ii * WIDTH + j], thread_out_ptr);
                 __builtin_nontemporal_store(in_local_b16[ii * WIDTH + j], thread_out_ptr + ii * blockDim * WIDTH + j + r * HIDDEN_SIZE);
             }
         }
-     }
+    }
+
+    int32_t ld_stage = (ROW_WIDTH - 1) & 1;
+    int32_t st_stage = ld_stage ^ 1;
+
+    float variance = 0.0f;
+
+#pragma unroll
+    for(int32_t ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+    {
+#pragma unroll
+        for (int32_t j = 0; j < WIDTH; ++j)
+        {
+            auto idx = ii * WIDTH + j;
+            variance += in_local[idx + ld_stage * LANE_HIDDEN_SIZE] * in_local[idx + ld_stage * LANE_HIDDEN_SIZE];
+        }
+    }
+
+    variance = multithread_reduce(variance, arg_sum, 64);
+
+    auto warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
+
+    s_variance[warp_id] = variance;
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        auto variance_local = s_variance[0];
+#pragma unroll
+        for (int32_t i = 1; i < WARP_GROUP; ++i)
+        {
+            variance_local += s_variance[i];
+        }
+#pragma unroll
+        for (int32_t i = 0; i < WARP_GROUP; ++i)
+        {
+            s_variance[i] = variance_local;
+        }
+    }
+
+    __syncthreads();
+
+    variance = s_variance[warp_id];
+
+    float scale_rms = rsqrtf(variance * r_dim_scale + params.epsilon);
+
+#pragma unroll
+    for(int32_t ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+    {
+#pragma unroll
+        for (int32_t j = 0; j < WIDTH; ++j)
+        {
+            auto idx = ii * WIDTH + j;
+            in_local[idx + ld_stage * LANE_HIDDEN_SIZE] = in_local[idx + ld_stage * LANE_HIDDEN_SIZE] * scale_rms * ck_tile::type_convert<ACC_DTYPE>(gamma_local[idx]);
+        }
+        row_in_b16_ptr[ii] = ck_tile::vec_convert<QUANT_DTYPE, ACC_DTYPE, WIDTH>(row_in_ptr[ii + ld_stage * VEC_HIDDEN_SIZE_LOC]);
+    }
+
+#pragma unroll  // Unroll loop for better instruction pipelining
+    for (int32_t ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
+    {
+#pragma unroll
+        for (int32_t j = 0; j < WIDTH; ++j)
+        {
+            // __builtin_nontemporal_store(in_local_b16[ii * WIDTH + j], thread_out_ptr);
+            __builtin_nontemporal_store(in_local_b16[ii * WIDTH + j], thread_out_ptr + ii * blockDim * WIDTH + j + (ROW_WIDTH - 1) * HIDDEN_SIZE);
+        }
+    }
 }
 
 void rmsnorm2d_with_add_smoothquant_hip(
@@ -498,8 +565,6 @@ rmsnorm2d_hip(torch::Tensor& input,
        When num_tokens is large, a smaller block size allows
        for increased block occupancy on CUs and better latency
        hiding on global mem ops. */
-    const int max_block_size = 256;
-    dim3 block(std::min(hidden_size, max_block_size));
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
@@ -510,7 +575,18 @@ rmsnorm2d_hip(torch::Tensor& input,
     params.epsilon = epsilon;
     params.stride = input.stride(0);
 
-    no_fused_rms_norm_kernel<ck_tile::bf16_t, 8192, 8, row_block, 256, float, ck_tile::bf16_t><<<grid, block, 0, stream>>>(params);
+    if (hidden_size == 8192)
+    {
+		const int max_block_size = 256;
+		dim3 block(std::min(hidden_size, max_block_size));
+        no_fused_rms_norm_kernel<ck_tile::bf16_t, 8192, 8, 2, 256, float, ck_tile::bf16_t><<<grid, block, 0, stream>>>(params);
+    }
+    else if (hidden_size == 7168)
+    {
+        const int32_t max_block_size = 128;
+        dim3 block(std::min(hidden_size, max_block_size));
+        no_fused_rms_norm_kernel<ck_tile::bf16_t, 7168, 8, 2, 128, float, ck_tile::bf16_t><<<grid, block, 0, stream>>>(params);
+    }
 
     return out;
 }
