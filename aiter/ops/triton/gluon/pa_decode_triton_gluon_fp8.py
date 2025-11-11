@@ -1,23 +1,37 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# This code is derived from sglang and FLASHNN projects
+# https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
 import os
 import sys
 import math
 from typing import Optional, Dict, Tuple
-import tempfile
-import subprocess
 
 import triton
 import triton.language as tl
-from triton.compiler.compiler import compile
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 import torch
 import aiter
 
 
-# This code is derived from sglang and FLASHNN projects
-# https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
+TRITON_VERSION = triton.__version__
+
+
+def parse_version(version_str):
+    """Parse version string into comparable tuple format, handling possible development version suffixes"""
+    # Remove potential suffixes like .dev, +git etc.
+    version_str = version_str.split("+")[0].split("-")[0]
+
+    # Split version number and convert to integers
+    parts = []
+    for part in version_str.split("."):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            break
+
+    return tuple(parts)
 
 
 @gluon.jit
@@ -56,14 +70,14 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     kv_scale_stride_1,
     num_seqs,
     num_kv_heads,
-    max_num_partitions,
+    max_context_partition_num,
     COMPUTE_TYPE: gl.constexpr,
     QUERY_SEQ_LEN: gl.constexpr,
     QUERY_GROUP_SIZE_ORIGINAL: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     KV_BLOCK_SIZE: gl.constexpr,
     KV_16B_ELEMENT_COUNT: gl.constexpr,
-    SEQUENCE_PARTITION_SIZE: gl.constexpr,
+    CONTEXT_PARTITION_SIZE: gl.constexpr,
     KV_COMPUTE_BLOCK_SIZE: gl.constexpr,
     QUERY_QUANT_MODE: gl.constexpr,
     KV_QUANT_MODE: gl.constexpr,
@@ -95,8 +109,8 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         f"QUERY_SEQ_LEN={QUERY_SEQ_LEN}, Do not support QUERY_SEQ_LEN > 4",
     )
     gl.static_assert(
-        SEQUENCE_PARTITION_SIZE == 256,
-        f"SEQUENCE_PARTITION_SIZE={SEQUENCE_PARTITION_SIZE}, Only support SEQUENCE_PARTITION_SIZE == 256",
+        CONTEXT_PARTITION_SIZE == 256,
+        f"CONTEXT_PARTITION_SIZE={CONTEXT_PARTITION_SIZE}, Only support CONTEXT_PARTITION_SIZE == 256",
     )
     gl.static_assert(
         KV_BLOCK_SIZE == 1024,
@@ -290,11 +304,11 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     # Calculate page offset based on partition index
     page_offset = 0
     if sequence_partition_idx % 4 == 1:
-        page_offset = 1 * SEQUENCE_PARTITION_SIZE
+        page_offset = 1 * CONTEXT_PARTITION_SIZE
     elif sequence_partition_idx % 4 == 2:
-        page_offset = 2 * SEQUENCE_PARTITION_SIZE
+        page_offset = 2 * CONTEXT_PARTITION_SIZE
     elif sequence_partition_idx % 4 == 3:
-        page_offset = 3 * SEQUENCE_PARTITION_SIZE
+        page_offset = 3 * CONTEXT_PARTITION_SIZE
 
     # ==================== Query Loading ====================
     # Calculate query tensor offsets
@@ -372,15 +386,15 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     )
 
     # ==================== Sequence Length Handling ====================
-    kv_sequence_length = gl.load(context_lengths_ptr + sequence_idx)
-    kv_sequence_start_index = sequence_partition_idx * SEQUENCE_PARTITION_SIZE
+    context_length = gl.load(context_lengths_ptr + sequence_idx)
+    kv_sequence_start_index = sequence_partition_idx * CONTEXT_PARTITION_SIZE
 
     # Early return if this partition is beyond sequence length
-    if kv_sequence_start_index >= kv_sequence_length:
+    if kv_sequence_start_index >= context_length:
         return
 
     KV_COMPUTE_BLOCK_COUNT: gl.constexpr = (
-        SEQUENCE_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
+        CONTEXT_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
     )
 
     # ==================== Main Attention Computation Loop ====================
@@ -529,15 +543,15 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
             )
             causal_mask = (
                 sequence_extension[:, None] + qk_column_offsets[None, :]
-                < kv_sequence_length
+                < context_length
             )
         else:
-            causal_mask = qk_column_offsets[None, :] < kv_sequence_length
+            causal_mask = qk_column_offsets[None, :] < context_length
 
         # Combine masks
         combined_mask = boundary_mask & causal_mask
 
-        # Apply masking to QK scores (if [0, SEQUENCE_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
+        # Apply masking to QK scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         qk_matrix = tl.where(combined_mask, qk_matrix, float(-3.4e38))
 
         # ==================== Softmax Computation ====================
@@ -557,7 +571,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
             if KV_QUANT_MODE == 1:
                 # Per-token quantization scaling
                 # Create mask for valid tokens (exclude padding/invalid tokens)
-                valid_token_mask = qk_column_offsets < kv_sequence_length
+                valid_token_mask = qk_column_offsets < context_length
                 # Mask out value_scale of invalid tokens
                 masked_value_scale = tl.where(
                     valid_token_mask, value_scale_value, float(-3.4e38)
@@ -685,14 +699,14 @@ def paged_attention_decode_v2_gluon_fp8(
     kv_scale_stride_1,
     num_seqs,
     num_kv_heads,
-    max_num_partitions,
+    max_context_partition_num,
     COMPUTE_TYPE: gl.constexpr,
     QUERY_SEQ_LEN: gl.constexpr,
     QUERY_GROUP_SIZE_ORIGINAL: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     KV_BLOCK_SIZE: gl.constexpr,
     KV_16B_ELEMENT_COUNT: gl.constexpr,
-    SEQUENCE_PARTITION_SIZE: gl.constexpr,
+    CONTEXT_PARTITION_SIZE: gl.constexpr,
     KV_COMPUTE_BLOCK_SIZE: gl.constexpr,
     QUERY_QUANT_MODE: gl.constexpr,
     KV_QUANT_MODE: gl.constexpr,
@@ -1001,17 +1015,15 @@ def paged_attention_decode_v2_gluon_fp8(
     )
 
     # ==================== SEQUENCE PROCESSING ====================
-    kv_sequence_length = gl.load(context_lengths_ptr + sequence_idx)
-    kv_sequence_start_idx = sequence_partition_idx * SEQUENCE_PARTITION_SIZE
-    if kv_sequence_start_idx >= kv_sequence_length:
+    context_length = gl.load(context_lengths_ptr + sequence_idx)
+    kv_sequence_start_idx = sequence_partition_idx * CONTEXT_PARTITION_SIZE
+    if kv_sequence_start_idx >= context_length:
         return  # No computation needed for this partition
 
     KV_COMPUTE_BLOCK_COUNT: gl.constexpr = (
-        SEQUENCE_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
+        CONTEXT_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
     )
-    SEQUENCE_PARTITION_KV_BLOCKS: gl.constexpr = (
-        SEQUENCE_PARTITION_SIZE // KV_BLOCK_SIZE
-    )
+    SEQUENCE_PARTITION_KV_BLOCKS: gl.constexpr = CONTEXT_PARTITION_SIZE // KV_BLOCK_SIZE
 
     # Process KV sequence in compute blocks
     for kv_compute_idx in range(KV_COMPUTE_BLOCK_COUNT):
@@ -1019,7 +1031,7 @@ def paged_attention_decode_v2_gluon_fp8(
             kv_sequence_start_idx + kv_compute_idx * KV_COMPUTE_BLOCK_SIZE
         )
         kv_subsequence_end_idx = gl.minimum(
-            kv_subsequence_start_idx + KV_COMPUTE_BLOCK_SIZE, kv_sequence_length
+            kv_subsequence_start_idx + KV_COMPUTE_BLOCK_SIZE, context_length
         )
 
         num_kv_blocks = gl.cdiv(
@@ -1197,14 +1209,14 @@ def paged_attention_decode_v2_gluon_fp8(
             )
             causal_mask = (
                 sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                < kv_sequence_length
+                < context_length
             )
         else:
-            causal_mask = qk_column_offsets[None, :] < kv_sequence_length
+            causal_mask = qk_column_offsets[None, :] < context_length
 
         boundary_mask = boundary_mask & causal_mask
 
-        # Apply masking to attention scores (if [0, SEQUENCE_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
+        # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         attention_scores = tl.where(boundary_mask, attention_scores, float(-3.4e38))
 
         # ==================== SOFTMAX COMPUTATION ====================
@@ -1227,7 +1239,7 @@ def paged_attention_decode_v2_gluon_fp8(
             if KV_QUANT_MODE == 1:
                 # Per-token quantization scaling
                 # Create mask for valid tokens
-                valid_token_mask = qk_column_offsets < kv_sequence_length
+                valid_token_mask = qk_column_offsets < context_length
                 # Mask out value_scale of invalid tokens
                 masked_value_scale = tl.where(
                     valid_token_mask, value_scale_value, float(-3.4e38)
@@ -1325,8 +1337,8 @@ def paged_attention_decode_v2_reduce_gluon(
     stride_logits_group,
     QUERY_GROUP_SIZE: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
-    MAX_NUM_SEQ_PARTITIONS: gl.constexpr,
-    SEQUENCE_PARTITION_SIZE: gl.constexpr,
+    MAX_CONTEXT_PARTITION_NUM: gl.constexpr,
+    CONTEXT_PARTITION_SIZE: gl.constexpr,
     USE_SINK_TOKENS: gl.constexpr,
 ):
     """
@@ -1351,7 +1363,7 @@ def paged_attention_decode_v2_reduce_gluon(
     # Calculate power-of-2 values internally
     HEAD_SIZE_POW2: gl.constexpr = triton.next_power_of_2(HEAD_SIZE)
     MAX_NUM_SEQ_PARTITIONS_POW2: gl.constexpr = triton.next_power_of_2(
-        MAX_NUM_SEQ_PARTITIONS
+        MAX_CONTEXT_PARTITION_NUM
     )
     if QUERY_GROUP_SIZE < 16:
         QUERY_GROUP_SIZE_POW2: gl.constexpr = 16
@@ -1362,8 +1374,8 @@ def paged_attention_decode_v2_reduce_gluon(
     sequence_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
     num_query_heads_total = gl.num_programs(1) * QUERY_GROUP_SIZE
-    sequence_length = gl.load(context_lengths_ptr + sequence_idx)
-    num_partitions = gl.cdiv(sequence_length, SEQUENCE_PARTITION_SIZE)
+    context_length = gl.load(context_lengths_ptr + sequence_idx)
+    context_partition_num = gl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
 
     # Select optimal memory layout based on maximum partition count
     if MAX_NUM_SEQ_PARTITIONS_POW2 >= 256:
@@ -1411,7 +1423,7 @@ def paged_attention_decode_v2_reduce_gluon(
     )
 
     # Create mask for valid partitions and query groups
-    exp_sums_mask = (partition_offsets[:, None] < num_partitions) & (
+    exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (
         query_group_offsets[None, :] < QUERY_GROUP_SIZE
     )
 
@@ -1464,7 +1476,7 @@ def paged_attention_decode_v2_reduce_gluon(
     )
 
     # Create mask for valid logits access
-    logits_mask = (partition_offsets[:, None] < num_partitions) & (
+    logits_mask = (partition_offsets[:, None] < context_partition_num) & (
         query_group_offsets[None, :] < QUERY_GROUP_SIZE
     )
 
@@ -1505,7 +1517,7 @@ def paged_attention_decode_v2_reduce_gluon(
 
 
 @triton.jit
-def paged_attention_decode_v2_reduce_kernel(
+def paged_attention_decode_v2_reduce_kernel_triton34(
     output_ptr,  # [num_seqs, num_kv_heads, query_group_size, head_size]
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
@@ -1524,8 +1536,8 @@ def paged_attention_decode_v2_reduce_kernel(
     num_kv_heads,
     QUERY_GROUP_SIZE: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
-    MAX_NUM_SEQ_PARTITIONS: tl.constexpr,
-    SEQUENCE_PARTITION_SIZE: tl.constexpr,
+    MAX_CONTEXT_PARTITION_NUM: tl.constexpr,
+    CONTEXT_PARTITION_SIZE: tl.constexpr,
 ):
     """
     Triton reduction kernel for paged attention decode that combines partial results.
@@ -1551,7 +1563,7 @@ def paged_attention_decode_v2_reduce_kernel(
     # Calculate power-of-2 values internally
     HEAD_SIZE_POW2: tl.constexpr = triton.next_power_of_2(HEAD_SIZE)
     MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr = triton.next_power_of_2(
-        MAX_NUM_SEQ_PARTITIONS
+        MAX_CONTEXT_PARTITION_NUM
     )
     if QUERY_GROUP_SIZE < 16:
         QUERY_GROUP_SIZE_POW2: gl.constexpr = 16
@@ -1562,8 +1574,8 @@ def paged_attention_decode_v2_reduce_kernel(
     sequence_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
-    kv_sequence_length = tl.load(context_lengths_ptr + sequence_idx)
-    num_partitions = tl.cdiv(kv_sequence_length, SEQUENCE_PARTITION_SIZE)
+    context_length = tl.load(context_lengths_ptr + sequence_idx)
+    context_partition_num = tl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
 
     # Generate coordinate ranges
     partition_offsets = tl.arange(0, MAX_NUM_SEQ_PARTITIONS_POW2)
@@ -1580,7 +1592,159 @@ def paged_attention_decode_v2_reduce_kernel(
     )
 
     # Create mask for valid partitions and query groups
-    exp_sums_mask = (partition_offsets[:, None] < num_partitions) & (
+    exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (
+        query_group_offsets[None, :] < QUERY_GROUP_SIZE
+    )
+
+    # Load maximum logits from all partitions [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2]
+    max_logits = tl.load(
+        max_logits_ptr + exp_sums_offsets, mask=exp_sums_mask, other=float("-inf")
+    )
+
+    # Compute global maximum logit across all partitions [QUERY_GROUP_SIZE_POW2]
+    global_max_logits = tl.max(max_logits, axis=0)
+
+    # ==================== EXPONENTIAL SUMS RESCALING ====================
+    # Load exponential sums from all partitions
+    exp_sums = tl.load(exp_sums_ptr + exp_sums_offsets, mask=exp_sums_mask)
+
+    # Rescale exponential sums using global maximum for numerical stability
+    exp_sums *= tl.exp(max_logits - global_max_logits[None, :])
+
+    # Compute global exponential sum across all partitions [QUERY_GROUP_SIZE_POW2]
+    global_exp_sum = tl.sum(exp_sums, axis=0)
+
+    # ==================== ATTENTION PROBABILITY COMPUTATION ====================
+    # Compute normalized attention probabilities [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2]
+    attention_probs = exp_sums / global_exp_sum[None, :]
+
+    # Reshape probabilities for broadcasting with logits
+    attention_probs = tl.reshape(
+        attention_probs, (MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2, 1)
+    )
+
+    # ==================== LOGITS LOADING AND WEIGHTED SUMMATION ====================
+    # Calculate offsets for loading partial logits
+    logits_offsets = (
+        sequence_idx * stride_logits_seq
+        + kv_head_idx * stride_logits_head
+        + partition_offsets[:, None, None] * stride_logits_part
+        + query_group_offsets[None, :, None] * stride_logits_group
+        + head_size_offsets[None, None, :]
+    )
+
+    # Create mask for valid logits access
+    logits_mask = (partition_offsets[:, None] < context_partition_num) & (
+        query_group_offsets[None, :] < QUERY_GROUP_SIZE
+    )
+
+    # Load partial logits from all partitions
+    partial_logits = tl.load(logits_ptr + logits_offsets, mask=logits_mask[:, :, None])
+
+    # Compute weighted sum of logits to produce final output [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
+    final_output = tl.sum((partial_logits * attention_probs).to(tl.float32), axis=0).to(
+        output_ptr.dtype.element_ty
+    )
+
+    # ==================== FINAL OUTPUT STORING ====================
+    # Calculate output tensor offsets
+    output_offsets = (
+        sequence_idx * stride_output_seq
+        + (kv_head_idx * QUERY_GROUP_SIZE + query_group_offsets[:, None])
+        * stride_output_head
+        + head_size_offsets[None, :]
+    )
+
+    # Create mask for valid output storage
+    output_mask = (query_group_offsets[:, None] < QUERY_GROUP_SIZE) & (
+        head_size_offsets[None, :] < HEAD_SIZE
+    )
+
+    # Store final output to global memory
+    tl.store(
+        output_ptr + output_offsets,
+        final_output,
+        mask=output_mask,
+    )
+
+
+@triton.jit
+def paged_attention_decode_v2_reduce_kernel(
+    output_ptr,  # [num_seqs, num_kv_heads, query_group_size, head_size]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
+    context_lengths_ptr,  # [num_seqs]
+    stride_output_seq,
+    stride_output_head,
+    stride_exp_sums_seq,
+    stride_exp_sums_head,
+    stride_exp_sums_part,
+    stride_logits_seq,
+    stride_logits_head,
+    stride_logits_part,
+    stride_logits_group,
+    num_seqs,
+    num_kv_heads,
+    QUERY_GROUP_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    MAX_CONTEXT_PARTITION_NUM: tl.constexpr,
+    CONTEXT_PARTITION_SIZE: tl.constexpr,
+):
+    """
+    Triton reduction kernel for paged attention decode that combines partial results.
+
+    This kernel performs the final reduction by:
+    1. Finding global maximum logits across partitions
+    2. Rescaling exponential sums for numerical stability
+    3. Computing normalized attention probabilities
+    4. Weighted summation of partial logits
+
+    Args:
+        output_ptr: Output tensor for final attention results
+        exp_sums_ptr: Exponential sums from partial computations
+        max_logits_ptr: Maximum logits from partial computations
+        logits_ptr: Partial logit tensors from each sequence partition
+        context_lengths_ptr: Sequence lengths for each sequence
+        Various stride parameters for tensor access
+        Compile-time constants for kernel configuration
+    """
+    # Mathematical constant for exponential calculations
+    LOG2_E: tl.constexpr = 1.4426950408889634
+
+    # Calculate power-of-2 values internally
+    HEAD_SIZE_POW2: tl.constexpr = triton.next_power_of_2(HEAD_SIZE)
+    MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr = triton.next_power_of_2(
+        MAX_CONTEXT_PARTITION_NUM
+    )
+    if QUERY_GROUP_SIZE < 16:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = 16
+    else:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(QUERY_GROUP_SIZE)
+
+    # ==================== INITIALIZATION ====================
+    sequence_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+
+    context_length = tl.load(context_lengths_ptr + sequence_idx)
+    context_partition_num = tl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
+
+    # Generate coordinate ranges
+    partition_offsets = tl.arange(0, MAX_NUM_SEQ_PARTITIONS_POW2)
+    query_group_offsets = tl.arange(0, QUERY_GROUP_SIZE_POW2)
+    head_size_offsets = tl.arange(0, HEAD_SIZE_POW2)
+
+    # ==================== GLOBAL MAXIMUM LOGIT COMPUTATION ====================
+    # Calculate offsets for exponential sums and max logits
+    exp_sums_offsets = (
+        sequence_idx * stride_exp_sums_seq
+        + kv_head_idx * stride_exp_sums_head
+        + partition_offsets[:, None] * stride_exp_sums_part
+        + query_group_offsets[None, :]
+    )
+
+    # Create mask for valid partitions and query groups
+    exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (
         query_group_offsets[None, :] < QUERY_GROUP_SIZE
     )
 
@@ -1623,13 +1787,13 @@ def paged_attention_decode_v2_reduce_kernel(
     )
 
     # Create mask for valid logits access
-    logits_mask = (partition_offsets[None, :] < num_partitions) & (
+    logits_mask = (partition_offsets[None, :] < context_partition_num) & (
         query_group_offsets[:, None] < QUERY_GROUP_SIZE
     )
 
     # Load partial logits from all partitions
     # BUGFIX: Add other=0.0 to prevent loading undefined values for invalid partitions
-    # This is critical when num_partitions is small (e.g., context_lengths < 256)
+    # This is critical when context_partition_num is small (e.g., context_lengths < 256)
     partial_logits = tl.load(
         logits_ptr + logits_offsets, mask=logits_mask[:, :, None], other=0.0
     )
@@ -1661,52 +1825,6 @@ def paged_attention_decode_v2_reduce_kernel(
         final_output,
         mask=output_mask,
     )
-
-
-def compile_ttgir_with_triton(ttgir_content: str):
-    """
-    Compile TTGIR (Triton Tensor IR) content to executable artifact.
-
-    This function takes TTGIR string content, writes it to a temporary file,
-    and compiles it using the Triton compiler. The temporary file is cleaned up
-    after compilation regardless of success or failure.
-
-    Args:
-        ttgir_content (str): The TTGIR (Triton Tensor IR) code as a string
-                             to be compiled.
-
-    Returns:
-        object: The compiled artifact from the Triton compiler.
-
-    Raises:
-        Exception: Any exception raised during the compilation process
-                  will be propagated to the caller.
-
-    Note:
-        This function uses a temporary file to work with the Triton compiler
-        which expects file input. The file is automatically deleted after
-        compilation to avoid leaving temporary files on disk.
-    """
-    # Create a temporary file to store the TTGIR content
-    # Using NamedTemporaryFile with delete=False to control deletion manually
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".ttgir", delete=False
-    ) as temp_file:
-        # Write TTGIR content to temporary file
-        temp_file.write(ttgir_content)
-        ttgir_file_path = temp_file.name
-
-    try:
-        # Compile the TTGIR file using Triton compiler
-        # This converts the intermediate representation to executable code
-        compiled_artifact = compile(ttgir_file_path)
-        return compiled_artifact
-
-    finally:
-        # Ensure temporary file is cleaned up even if compilation fails
-        # This prevents leaving temporary files on the filesystem
-        if os.path.exists(ttgir_file_path):
-            os.unlink(ttgir_file_path)
 
 
 def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
@@ -1749,7 +1867,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     HEAD_SIZE,
     KV_BLOCK_SIZE,
     KV_16B_ELEMENT_COUNT,
-    SEQUENCE_PARTITION_SIZE,
+    CONTEXT_PARTITION_SIZE,
     QUERY_QUANT_MODE,
     KV_QUANT_MODE,
     FP8_MAX_VALUE,
@@ -1766,133 +1884,81 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         All parameters from the pa_decode_gluon function, plus kernel configuration
         parameters for Triton compilation and execution.
     """
-    # Debug compilation path - kept for development and debugging purposes
-    # if 0:
-    if 1:
-        # ttgir_file_path = os.path.join(
-        #     os.path.dirname(__file__),
-        #     "/mnt/raid0/heyanguang/code/fa_triton/aiter/paged_attention_decode_v2_gluon_fp8.ttgir",
-        # )
-        ttgir_file_path = "/mnt/raid0/heyanguang/code/fa_triton/aiter/paged_attention_decode_v2_gluon_fp8.ttgir"
-        with open(ttgir_file_path, "r") as f:
-            ttgir_content = f.read()
-        try:
-            compiled_kernel = compile_ttgir_with_triton(ttgir_content)
-            compiled_kernel[grid](
-                exp_sums_ptr,
-                max_logits_ptr,
-                output_ptr,
-                query_ptr,
-                key_cache_ptr,
-                value_cache_ptr,
-                block_tables_ptr,
-                context_lengths_ptr,
-                softmax_scale,
-                query_scale,
-                key_scale,
-                value_scale,
-                stride_max_logits_seq,
-                stride_max_logits_head,
-                stride_max_logits_part,
-                stride_output_seq,
-                stride_output_head,
-                stride_output_part,
-                stride_output_group,
-                stride_query_seq,
-                stride_query_head,
-                stride_key_block,
-                stride_key_head,
-                stride_key_head_split,
-                stride_key_block_elem,
-                stride_value_block,
-                stride_value_head_size,
-                stride_value_block_elem,
-                stride_block_table_seq,
-                query_scale_stride_0,
-                kv_scale_stride_0,
-                kv_scale_stride_1,
-                grid[0],
-                grid[1],
-                grid[2],
-            )
-        except Exception as e:
-            print(f"Compilation failed: {e}")
+    # Production path - select and launch appropriate kernel
+    QUERY_GROUP_SIZE: gl.constexpr = QUERY_SEQ_LEN * QUERY_GROUP_SIZE_ORIGINAL
+    QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(QUERY_GROUP_SIZE)
+    KV_COMPUTE_BLOCK_SIZE = 256
+    waves_per_eu = 1
+
+    # Select kernel implementation based on block size
+    if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE:
+        # Use big block kernel for large block sizes
+        paged_attention_kernel = paged_attention_decode_v2_gluon_large_block_fp8
+        if VALUE_TRANSPOSED:
+            # Use smaller compute block size for better performance with transposed values
+            KV_COMPUTE_BLOCK_SIZE = 128
     else:
-        # Production path - select and launch appropriate kernel
-        QUERY_GROUP_SIZE: gl.constexpr = QUERY_SEQ_LEN * QUERY_GROUP_SIZE_ORIGINAL
-        QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(QUERY_GROUP_SIZE)
-        KV_COMPUTE_BLOCK_SIZE = 256
-        waves_per_eu = 1
-
-        # Select kernel implementation based on block size
-        if KV_BLOCK_SIZE > SEQUENCE_PARTITION_SIZE:
-            # Use big block kernel for large block sizes
-            paged_attention_kernel = paged_attention_decode_v2_gluon_large_block_fp8
-            if VALUE_TRANSPOSED:
-                # Use smaller compute block size for better performance with transposed values
-                KV_COMPUTE_BLOCK_SIZE = 128
+        # Use standard kernel for normal block sizes
+        paged_attention_kernel = paged_attention_decode_v2_gluon_fp8
+        # Configure waves per EU based on query group size
+        if QUERY_GROUP_SIZE_POW2 == 64:
+            waves_per_eu = 3
         else:
-            # Use standard kernel for normal block sizes
-            paged_attention_kernel = paged_attention_decode_v2_gluon_fp8
-            # Configure waves per EU based on query group size
-            if QUERY_GROUP_SIZE_POW2 == 64:
-                waves_per_eu = 3
-            else:
-                waves_per_eu = 4
+            waves_per_eu = 4
 
-        # Launch the selected kernel
-        paged_attention_kernel[grid](
-            exp_sums_ptr,
-            max_logits_ptr,
-            output_ptr,
-            query_ptr,
-            key_cache_ptr,
-            value_cache_ptr,
-            block_tables_ptr,
-            context_lengths_ptr,
-            softmax_scale,
-            query_scale,
-            key_scale,
-            value_scale,
-            stride_max_logits_seq,
-            stride_max_logits_head,
-            stride_max_logits_part,
-            stride_output_seq,
-            stride_output_head,
-            stride_output_part,
-            stride_output_group,
-            stride_query_seq,
-            stride_query_head,
-            stride_key_block,
-            stride_key_head,
-            stride_key_head_split,
-            stride_key_block_elem,
-            stride_value_block,
-            stride_value_head_size,
-            stride_value_block_elem,
-            stride_block_table_seq,
-            query_scale_stride_0,
-            kv_scale_stride_0,
-            kv_scale_stride_1,
-            num_seqs=grid[0],
-            num_kv_heads=grid[1],
-            max_num_partitions=grid[2],
-            COMPUTE_TYPE=COMPUTE_TYPE,
-            QUERY_SEQ_LEN=QUERY_SEQ_LEN,
-            QUERY_GROUP_SIZE_ORIGINAL=QUERY_GROUP_SIZE_ORIGINAL,
-            HEAD_SIZE=HEAD_SIZE,
-            KV_BLOCK_SIZE=KV_BLOCK_SIZE,
-            KV_16B_ELEMENT_COUNT=KV_16B_ELEMENT_COUNT,
-            SEQUENCE_PARTITION_SIZE=SEQUENCE_PARTITION_SIZE,
-            KV_COMPUTE_BLOCK_SIZE=KV_COMPUTE_BLOCK_SIZE,
-            QUERY_QUANT_MODE=QUERY_QUANT_MODE,
-            KV_QUANT_MODE=KV_QUANT_MODE,
-            FP8_MAX_VALUE=FP8_MAX_VALUE,
-            VALUE_TRANSPOSED=VALUE_TRANSPOSED,
-            IS_CAUSAL=IS_CAUSAL,
-            waves_per_eu=waves_per_eu,
-            num_stages=1,
-        )
+    # Launch the selected kernel
+    paged_attention_kernel[grid](
+        exp_sums_ptr,
+        max_logits_ptr,
+        output_ptr,
+        query_ptr,
+        key_cache_ptr,
+        value_cache_ptr,
+        block_tables_ptr,
+        context_lengths_ptr,
+        softmax_scale,
+        query_scale,
+        key_scale,
+        value_scale,
+        stride_max_logits_seq,
+        stride_max_logits_head,
+        stride_max_logits_part,
+        stride_output_seq,
+        stride_output_head,
+        stride_output_part,
+        stride_output_group,
+        stride_query_seq,
+        stride_query_head,
+        stride_key_block,
+        stride_key_head,
+        stride_key_head_split,
+        stride_key_block_elem,
+        stride_value_block,
+        stride_value_head_size,
+        stride_value_block_elem,
+        stride_block_table_seq,
+        query_scale_stride_0,
+        kv_scale_stride_0,
+        kv_scale_stride_1,
+        num_seqs=grid[0],
+        num_kv_heads=grid[1],
+        max_context_partition_num=grid[2],
+        COMPUTE_TYPE=COMPUTE_TYPE,
+        QUERY_SEQ_LEN=QUERY_SEQ_LEN,
+        QUERY_GROUP_SIZE_ORIGINAL=QUERY_GROUP_SIZE_ORIGINAL,
+        HEAD_SIZE=HEAD_SIZE,
+        KV_BLOCK_SIZE=KV_BLOCK_SIZE,
+        KV_16B_ELEMENT_COUNT=KV_16B_ELEMENT_COUNT,
+        CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
+        KV_COMPUTE_BLOCK_SIZE=KV_COMPUTE_BLOCK_SIZE,
+        QUERY_QUANT_MODE=QUERY_QUANT_MODE,
+        KV_QUANT_MODE=KV_QUANT_MODE,
+        FP8_MAX_VALUE=FP8_MAX_VALUE,
+        VALUE_TRANSPOSED=VALUE_TRANSPOSED,
+        IS_CAUSAL=IS_CAUSAL,
+        waves_per_eu=waves_per_eu,
+        num_stages=1,
+    )
 
 
 def _paged_attention_decode_v2_reduce_kernel_wrapper(
@@ -1913,8 +1979,8 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
     stride_logits_group,
     QUERY_GROUP_SIZE,
     HEAD_SIZE,
-    MAX_NUM_SEQ_PARTITIONS,
-    SEQUENCE_PARTITION_SIZE,
+    MAX_CONTEXT_PARTITION_NUM,
+    CONTEXT_PARTITION_SIZE,
 ):
     """
     Wrapper function for paged attention reduction kernel with kernel selection.
@@ -1948,13 +2014,18 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             stride_logits_group,
             QUERY_GROUP_SIZE=QUERY_GROUP_SIZE,
             HEAD_SIZE=HEAD_SIZE,
-            MAX_NUM_SEQ_PARTITIONS=MAX_NUM_SEQ_PARTITIONS,
-            SEQUENCE_PARTITION_SIZE=SEQUENCE_PARTITION_SIZE,
+            MAX_CONTEXT_PARTITION_NUM=MAX_CONTEXT_PARTITION_NUM,
+            CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
             USE_SINK_TOKENS=False,
         )
     else:
+        kernel = paged_attention_decode_v2_reduce_kernel_triton34
+        triton_version = parse_version(TRITON_VERSION)
+        if triton_version > (3, 4, 0):
+            kernel = paged_attention_decode_v2_reduce_kernel
+
         # Launch standard Triton reduction kernel
-        paged_attention_decode_v2_reduce_kernel[grid](
+        kernel[grid](
             output_ptr,
             exp_sums_ptr,
             max_logits_ptr,
@@ -1973,8 +2044,8 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             num_kv_heads=grid[1],
             QUERY_GROUP_SIZE=QUERY_GROUP_SIZE,
             HEAD_SIZE=HEAD_SIZE,
-            MAX_NUM_SEQ_PARTITIONS=MAX_NUM_SEQ_PARTITIONS,
-            SEQUENCE_PARTITION_SIZE=SEQUENCE_PARTITION_SIZE,
+            MAX_CONTEXT_PARTITION_NUM=MAX_CONTEXT_PARTITION_NUM,
+            CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
         )
 
 
@@ -1988,15 +2059,15 @@ def pa_decode_gluon(
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
     query_sequence_length: int,
-    max_sequence_length: int,
-    sequence_partition_size: int,
+    max_context_length: int,
+    context_partition_size: int,
     compute_type: tl.dtype,
     query_scale: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
-    max_logits: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size]
-    temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_num_partitions, query_group_size, head_size]
+    exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+    max_logits: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+    temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
     alibi_slopes: torch.Tensor = None,
 ) -> None:
     """
@@ -2038,7 +2109,7 @@ def pa_decode_gluon(
     query_sequence_length : int
         Length of query sequences
 
-    max_sequence_length : int
+    max_context_length : int
         Maximum sequence length supported
 
     compute_type
@@ -2066,8 +2137,8 @@ def pa_decode_gluon(
     num_query_heads_total = query.shape[1]
     num_query_heads_total = num_query_heads_total // query_sequence_length
     num_kv_heads = key_cache.shape[1]
-    max_num_partitions = int(
-        (max_sequence_length + sequence_partition_size - 1) // sequence_partition_size
+    max_context_partition_num = int(
+        (max_context_length + context_partition_size - 1) // context_partition_size
     )
     head_size = query.shape[-1]
     kv_block_size = key_cache.shape[-2]
@@ -2083,7 +2154,7 @@ def pa_decode_gluon(
     kv_elements_per_16b = 16 // key_cache.dtype.itemsize
 
     # Configure execution grid
-    grid = (num_sequences, num_kv_heads, max_num_partitions)
+    grid = (num_sequences, num_kv_heads, max_context_partition_num)
 
     # Validate input params constraint
     assert (
@@ -2229,7 +2300,7 @@ def pa_decode_gluon(
         QUERY_GROUP_SIZE_ORIGINAL=query_group_size,
         KV_BLOCK_SIZE=kv_block_size,
         KV_16B_ELEMENT_COUNT=kv_elements_per_16b,
-        SEQUENCE_PARTITION_SIZE=sequence_partition_size,
+        CONTEXT_PARTITION_SIZE=context_partition_size,
         QUERY_QUANT_MODE=query_quant_mode,
         KV_QUANT_MODE=kv_quant_mode,
         FP8_MAX_VALUE=fp8_max_value,
@@ -2257,6 +2328,6 @@ def pa_decode_gluon(
         temporary_output.stride(3),
         QUERY_GROUP_SIZE=equivalent_query_group_size,
         HEAD_SIZE=head_size,
-        MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
-        SEQUENCE_PARTITION_SIZE=sequence_partition_size,
+        MAX_CONTEXT_PARTITION_NUM=int(max_context_partition_num),
+        CONTEXT_PARTITION_SIZE=context_partition_size,
     )

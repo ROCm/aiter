@@ -131,7 +131,7 @@ def compile_attention_kernel(
     head_size: int,
     kv_block_size: int,
     kv_16b_element_count: int,
-    sequence_partition_size: int,
+    context_partition_size: int,
     query_quant_mode: int,
     kv_quant_mode: int,
     fp8_max_value: float,
@@ -151,7 +151,7 @@ def compile_attention_kernel(
                 head_size,
                 kv_block_size,
                 kv_16b_element_count,
-                sequence_partition_size,
+                context_partition_size,
                 query_quant_mode,
                 kv_quant_mode,
                 fp8_max_value,
@@ -170,7 +170,7 @@ def compile_attention_kernel(
         kv_compute_block_size = 256
         waves_per_eu = 1
         # Select kernel implementation based on block size
-        if kv_block_size > sequence_partition_size:
+        if kv_block_size > context_partition_size:
             # Use big block kernel for large block sizes
             if value_transposed:
                 # Use smaller compute block size for better performance with transposed values
@@ -219,14 +219,14 @@ def compile_attention_kernel(
             "i32",  # kv_scale_stride_1
             "i32",  # num_seqs
             "i32",  # num_kv_heads
-            "i32",  # max_num_partitions
+            "i32",  # max_context_partition_num
             f"{str(compute_type)}",
             f"{query_seq_len}",
             f"{query_group_size}",
             f"{head_size}",
             f"{kv_block_size}",
             f"{kv_16b_element_count}",
-            f"{sequence_partition_size}",
+            f"{context_partition_size}",
             f"{kv_compute_block_size}",
             f"{query_quant_mode}",
             f"{kv_quant_mode}",
@@ -236,14 +236,14 @@ def compile_attention_kernel(
         ]
         signature = ",".join(signature_parts)
         gluon_kernel_name = "paged_attention_decode_v2_gluon_fp8"
-        if kv_block_size > sequence_partition_size:
+        if kv_block_size > context_partition_size:
             gluon_kernel_name = "paged_attention_decode_v2_gluon_large_block_fp8"
 
         compile_args = CompileGluonArgs(
             path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_triton_gluon_fp8.py",
             kernel_name=gluon_kernel_name,
             signature=signature,
-            grid="num_seqs,num_kv_heads,max_num_partitions",
+            grid="num_seqs,num_kv_heads,max_context_partition_num",
             num_warps=4,
             num_ctas=1,
             out_name=md_name,
@@ -293,13 +293,13 @@ def run_compiled_attention_kernel(
     value_scale: torch.Tensor,
     num_sequences: int,
     num_kv_heads: int,
-    max_num_partitions: int,
+    max_context_partition_num: int,
     query_seq_len: int,
     query_group_size: int,
     head_size: int,
     kv_block_size: int,
     kv_16b_element_count: int,
-    sequence_partition_size: int,
+    context_partition_size: int,
     query_quant_mode: int,
     kv_quant_mode: int,
     fp8_max_value: float,
@@ -319,7 +319,7 @@ def run_compiled_attention_kernel(
         head_size=head_size,
         kv_block_size=kv_block_size,
         kv_16b_element_count=kv_16b_element_count,
-        sequence_partition_size=sequence_partition_size,
+        context_partition_size=context_partition_size,
         query_quant_mode=query_quant_mode,
         kv_quant_mode=kv_quant_mode,
         fp8_max_value=fp8_max_value,
@@ -365,7 +365,7 @@ def run_compiled_attention_kernel(
             key_scale.stride(1) if key_scale is not None else 0,
             num_sequences,
             num_kv_heads,
-            max_num_partitions,
+            max_context_partition_num,
             torch.cuda.current_stream(exp_sums.device),
         )
     )
@@ -391,7 +391,7 @@ def run_direct_attention_kernel(
     head_size: int,
     kv_block_size: int,
     kv_16b_element_count: int,
-    sequence_partition_size: int,
+    context_partition_size: int,
     query_quant_mode: int,
     kv_quant_mode: int,
     fp8_max_value: float,
@@ -403,9 +403,9 @@ def run_direct_attention_kernel(
     """
     num_seqs = exp_sums.shape[0]
     num_kv_heads = exp_sums.shape[1]
-    max_num_partitions = exp_sums.shape[2]
+    max_context_partition_num = exp_sums.shape[2]
     # Configure grid
-    grid = (num_seqs, num_kv_heads, max_num_partitions)
+    grid = (num_seqs, num_kv_heads, max_context_partition_num)
 
     query_scale_stride_0 = 0
     key_scale_stride_0 = 0
@@ -515,7 +515,7 @@ def run_direct_attention_kernel(
         # Use standard kernel
         kernel = paged_attention_decode_v2_gluon_fp8
         # Select kernel implementation based on block size
-        if kv_block_size > sequence_partition_size:
+        if kv_block_size > context_partition_size:
             # Use large block kernel
             kernel = paged_attention_decode_v2_gluon_large_block_fp8
             if value_transposed:
@@ -565,14 +565,14 @@ def run_direct_attention_kernel(
             key_scale_stride_1,
             num_seqs,
             num_kv_heads,
-            max_num_partitions,
+            max_context_partition_num,
             COMPUTE_TYPE=compute_type,
             QUERY_SEQ_LEN=query_seq_len,
             QUERY_GROUP_SIZE_ORIGINAL=query_group_size,
             HEAD_SIZE=head_size,
             KV_BLOCK_SIZE=kv_block_size,
             KV_16B_ELEMENT_COUNT=kv_16b_element_count,
-            SEQUENCE_PARTITION_SIZE=sequence_partition_size,
+            CONTEXT_PARTITION_SIZE=context_partition_size,
             KV_COMPUTE_BLOCK_SIZE=kv_compute_block_size,
             QUERY_QUANT_MODE=query_quant_mode,
             KV_QUANT_MODE=kv_quant_mode,
@@ -591,7 +591,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     print(f"\n=== Testing Attention Kernel (Type: {kernel_type}) ===")
     setup_seed(123)
     device = "cuda:0"
-    max_sequence_length = 16384
+    max_context_length = 16384
 
     context_length = 4096
     batch_size = 128
@@ -601,7 +601,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     data_type = torch.bfloat16
     query_length = 1
     quant_mode = "per_token"
-    sequence_partition_size = 256
+    context_partition_size = 256
     trans_v = True
     kv_varlen = False
     compute_type = TORCH_TO_TL_DTYPE[data_type]
@@ -631,13 +631,13 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     # Determine if causal masking is needed
     is_causal = query_length > 1
     num_sequences = batch_size
-    max_num_partitions = (
-        context_length + sequence_partition_size - 1
-    ) // sequence_partition_size
+    max_context_partition_num = (
+        context_length + context_partition_size - 1
+    ) // context_partition_size
     softmax_scale = 1.0 / (head_size**0.5)
 
     # Calculate block table dimensions
-    max_blocks_per_sequence = (max_sequence_length + block_size - 1) // block_size
+    max_blocks_per_sequence = (max_context_length + block_size - 1) // block_size
     total_blocks = max_blocks_per_sequence * batch_size
     blocks_per_sequence = (context_length + block_size - 1) // block_size
 
@@ -646,7 +646,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     intermediate_shape = (
         num_sequences,
         num_kv_heads,
-        max_num_partitions,
+        max_context_partition_num,
         equivalent_query_group_size,
     )
 
@@ -775,7 +775,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
     #     "head_size": head_size,
     #     "query_group_size": query_group_size,
     #     "kv_block_size": kv_block_size,
-    #     "sequence_partition_size": sequence_partition_size,
+    #     "context_partition_size": context_partition_size,
     #     "kv_16b_element_count": kv_16b_element_count,
     #     "query_quant_mode": query_quant_mode,
     #     "kv_quant_mode": kv_quant_mode,
@@ -821,13 +821,13 @@ def test_attention_kernel(kernel_type: str = "compiled"):
             value_scale,
             num_sequences,
             num_kv_heads,
-            max_num_partitions,
+            max_context_partition_num,
             query_seq_len=query_seq_len,
             query_group_size=query_group_size,
             head_size=head_size,
             kv_block_size=kv_block_size,
             kv_16b_element_count=kv_16b_element_count,
-            sequence_partition_size=sequence_partition_size,
+            context_partition_size=context_partition_size,
             query_quant_mode=query_quant_mode,
             kv_quant_mode=kv_quant_mode,
             fp8_max_value=fp8_max_value,
@@ -859,7 +859,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
             head_size,
             kv_block_size,
             kv_16b_element_count,
-            sequence_partition_size,
+            context_partition_size,
             query_quant_mode,
             kv_quant_mode,
             fp8_max_value,
@@ -897,7 +897,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
         value_scale=value_scale,
         output_dtype=torch.bfloat16,
         kv_block_size=kv_block_size,
-        sequence_partition_size=sequence_partition_size,
+        context_partition_size=context_partition_size,
         is_causal=bool(is_causal),
     )
 
