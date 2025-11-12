@@ -26,10 +26,10 @@ def calculate_tflops(start_inds, end_inds, num_heads_q, head_dim, time_ms):
     return tflops
 def main():
     parser = argparse.ArgumentParser(description="FP8 MQA Logits Benchmark")
-    parser.add_argument('--num_heads_q', type=int, default=64, help='')
-    parser.add_argument('--head_dim', type=int, default=128, help='')
-    parser.add_argument('--seq_q_l', type=int, default=1024, help='')
-    parser.add_argument('--seq_kv_l', type=int, default=1024, help='')
+    parser.add_argument('--num_heads_q', type=int, default=64, help='num. q heads')
+    parser.add_argument('--head_dim', type=int, default=128, help='head dim size')
+    parser.add_argument('--seq_q_l', type=int, default=1024, help='Input sequence length')
+    parser.add_argument('--seq_kv_l', type=int, default=1024, help='Output sequence length')
     args = parser.parse_args()
 
     cache_size = eval(args.cache_size)
