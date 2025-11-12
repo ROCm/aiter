@@ -29,7 +29,9 @@ def _fp8_mqa_logits_kernel(
     BLOCK_KV: tl.constexpr,
 ):
     row_id = tl.program_id(0)
-
+    # go from larger to smaller in terms of work
+    # to reduce the tail effect
+    row_id = tl.num_programs(0) - row_id - 1
     tl.assume(row_id >= 0)
     tl.assume(stride_q_s > 0)
     tl.assume(stride_q_h > 0)
@@ -89,22 +91,21 @@ def _fp8_mqa_logits_kernel(
         kv_scales_ptrs += BLOCK_KV
         logits_ptrs += BLOCK_KV * stride_logits_k
 
-    if unmasked_end_ind != end_ind:
-        # masked load
-        kv_col_offsets = tl.arange(0, BLOCK_KV) + unmasked_end_ind
-        kv_col_mask = kv_col_offsets < seq_len_kv
-        kv_block = tl.load(kv_ptrs, mask=kv_col_mask[None, :], other=0.0)
-        kv_scales = tl.load(kv_scales_ptrs, mask=kv_col_mask, other=0.0)
+    # masked load
+    kv_col_offsets = tl.arange(0, BLOCK_KV) + unmasked_end_ind
+    kv_col_mask = kv_col_offsets < end_ind
+    kv_block = tl.load(kv_ptrs, mask=kv_col_mask[None, :], other=0.0)
+    kv_scales = tl.load(kv_scales_ptrs, mask=kv_col_mask, other=0.0)
 
-        # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
-        scores = tl.dot(q_block, kv_block)
-        # Multiply by kv_scales (broadcast along rows)
-        scores = scores * kv_scales[None, :]
-        # ReLU
-        scores = tl.maximum(scores, 0.0)
-        scores = scores * w_block
-        # [NUM_HEADS, BLOCK_KV] -> [BLOCK_KV, ]
-        scores = tl.sum(scores, axis=0)
-        # masked store
-        in_window = (kv_col_offsets >= start_ind) & (kv_col_offsets < end_ind)
-        tl.store(logits_ptrs, scores, mask=in_window)
+    # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
+    scores = tl.dot(q_block, kv_block)
+    # Multiply by kv_scales (broadcast along rows)
+    scores = scores * kv_scales[None, :]
+    # ReLU
+    scores = tl.maximum(scores, 0.0)
+    scores = scores * w_block
+    # [NUM_HEADS, BLOCK_KV] -> [BLOCK_KV, ]
+    scores = tl.sum(scores, axis=0)
+    # masked store
+    in_window = (kv_col_offsets >= start_ind) & (kv_col_offsets < end_ind)
+    tl.store(logits_ptrs, scores, mask=in_window)
