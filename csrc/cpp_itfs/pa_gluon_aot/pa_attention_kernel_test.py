@@ -46,7 +46,7 @@ from op_tests.triton_tests.test_pa_decode_gluon import (
 UNIFORM_RANGE = (-1, 1)
 TORCH_TO_TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
 # os.environ['TRITON_CACHE_DIR'] = '/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache'
-# compile_reduce_kernel_count = 0
+compile_reduce_kernel_count = 0
 
 
 def setup_seed(seed: int) -> None:
@@ -160,11 +160,11 @@ def compile_attention_kernel(
             ),
         )
 
-    # global compile_reduce_kernel_count
-    # compile_reduce_kernel_count += 1
+    global compile_reduce_kernel_count
+    compile_reduce_kernel_count += 1
 
-    if not_built(func_name):
-        # if compile_reduce_kernel_count == 1:
+    # if not_built(func_name):
+    if compile_reduce_kernel_count == 1:
         equivalent_query_group_size = query_seq_len * query_group_size
         equi_query_group_size_pow2 = triton.next_power_of_2(equivalent_query_group_size)
         kv_compute_block_size = 256
@@ -187,39 +187,39 @@ def compile_attention_kernel(
         signature_parts = [
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
-            "*bf16:16",  # output_ptr
+            "*bf16:16",  # logits_ptr
             "*fp8e4b8:16",  # query_ptr
             "*fp8e4b8:16",  # key_cache_ptr
             "*fp8e4b8:16",  # value_cache_ptr
             "*i32:16",  # block_tables_ptr
-            "*i32:16",  # sequence_lengths_ptr
+            "*i32:16",  # context_lengths_ptr
             "fp32:16",  # softmax_scale
             "*fp32:16",  # query_scale
             "*fp32:16",  # key_scale
             "*fp32:16",  # value_scale
-            "i32",  # stride_max_logits_seq
-            "i32",  # stride_max_logits_head
-            "i32",  # stride_max_logits_part
-            "i32",  # stride_output_seq
-            "i32",  # stride_output_head
-            "i32",  # stride_output_part
-            "i32",  # stride_output_group
-            "i32",  # stride_query_seq
-            "i32",  # stride_query_head
-            "i32",  # stride_key_block
-            "i32",  # stride_key_head
-            "i32",  # stride_key_head_split
-            "i32",  # stride_key_block_elem
-            "i32",  # stride_value_block
-            "i32",  # stride_value_head
-            "i32",  # stride_value_head_size
-            "i32",  # stride_block_table_seq
-            "i32",  # query_scale_stride_0
-            "i32",  # kv_scale_stride_0
-            "i32",  # kv_scale_stride_1
-            "i32",  # num_seqs
-            "i32",  # num_kv_heads
-            "i32",  # max_context_partition_num
+            "i32:16",  # stride_max_logits_seq
+            "i32:16",  # stride_max_logits_head
+            "i32:16",  # stride_max_logits_part
+            "i32:16",  # stride_output_seq
+            "i32:16",  # stride_output_head
+            "i32:16",  # stride_output_part
+            "i32:16",  # stride_output_group
+            "i32:16",  # stride_query_seq
+            "i32:16",  # stride_query_head
+            "i32:16",  # stride_key_block
+            "i32:16",  # stride_key_head
+            "i32:16",  # stride_key_head_split
+            "i32:16",  # stride_key_block_elem
+            "i32:16",  # stride_value_block
+            "i32:16",  # stride_value_head
+            "i32:16",  # stride_value_head_size
+            "i32:16",  # stride_block_table_seq
+            "i32:16",  # query_scale_stride_0
+            "i32:16",  # kv_scale_stride_0
+            "i32:16",  # kv_scale_stride_1
+            "i32:16",  # num_seqs
+            "i32:16",  # num_kv_heads
+            "i32:16",  # max_context_partition_num
             f"{str(compute_type)}",
             f"{query_seq_len}",
             f"{query_group_size}",
@@ -245,7 +245,10 @@ def compile_attention_kernel(
             signature=signature,
             grid="num_seqs,num_kv_heads,max_context_partition_num",
             num_warps=4,
+            waves_per_eu=waves_per_eu,
+            num_stages=1,
             num_ctas=1,
+            kpack=1,
             out_name=md_name,
         )
         triton_kernel, output_files = compile_gluon_kernel(compile_args)
@@ -579,6 +582,8 @@ def run_direct_attention_kernel(
             FP8_MAX_VALUE=fp8_max_value,
             VALUE_TRANSPOSED=value_transposed,
             IS_CAUSAL=is_causal,
+            waves_per_eu=waves_per_eu,
+            num_stages=1,
         )
 
 

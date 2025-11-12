@@ -25,6 +25,16 @@ class CompileGluonArgs:
     target: str | None = None
     num_warps: int = 1
     num_ctas: int = 1
+    waves_per_eu: int = 1
+    num_stages: int = 3
+    matrix_instr_nonkdim: int = 0
+    kpack: int = 1
+    warp_size: int = 64
+    enable_fp_fusion: bool = True
+    allow_flush_denorm: bool = False
+    launch_cooperative_grid: bool = False
+    sanitize_overflow: bool = True
+    debug: bool = False
     out_name: str | None = None
     out_path: Path | None = None
 
@@ -92,6 +102,78 @@ def main():
         type=int,
         default=1,
         help="Number of CTAs (cooperative thread arrays) for the kernel",
+    )
+    parser.add_argument(
+        "--waves-per-eu",
+        type=int,
+        default=1,
+        help="Number of waves per EU",
+    )
+    parser.add_argument(
+        "--num-stages",
+        type=int,
+        default=2,
+        help="Number of stages for the kernel",
+    )
+    parser.add_argument(
+        "--matrix-instr-nonkdim",
+        type=int,
+        default=0,
+        help="Matrix instruction non-K dimension",
+    )
+    parser.add_argument(
+        "--kpack",
+        type=int,
+        default=1,
+        help="K packing factor",
+    )
+    parser.add_argument(
+        "--warp-size",
+        type=int,
+        default=64,
+        help="Warp size",
+    )
+    parser.add_argument(
+        "--enable-fp-fusion",
+        action="store_true",
+        default=True,
+        help="Enable FP fusion",
+    )
+    parser.add_argument(
+        "--disable-fp-fusion",
+        action="store_false",
+        dest="enable_fp_fusion",
+        help="Disable FP fusion",
+    )
+    parser.add_argument(
+        "--allow-flush-denorm",
+        action="store_true",
+        default=False,
+        help="Allow flush denorm",
+    )
+    parser.add_argument(
+        "--launch-cooperative-grid",
+        action="store_true",
+        default=False,
+        help="Launch cooperative grid",
+    )
+    parser.add_argument(
+        "--sanitize-overflow",
+        action="store_true",
+        default=True,
+        help="Sanitize overflow",
+    )
+    parser.add_argument(
+        "--no-sanitize-overflow",
+        action="store_false",
+        dest="sanitize_overflow",
+        help="Disable overflow sanitization",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable debug mode",
     )
     parser.add_argument(
         "--out-name",
@@ -198,7 +280,20 @@ def compile_gluon_kernel(args: CompileGluonArgs):
         else triton.runtime.driver.active.get_current_target()
     )
     backend = triton.compiler.make_backend(target)
-    kwargs = {"num_warps": args.num_warps, "num_ctas": args.num_ctas}
+    kwargs = {
+        "num_warps": args.num_warps,
+        "num_ctas": args.num_ctas,
+        "waves_per_eu": args.waves_per_eu,
+        "num_stages": args.num_stages,
+        "matrix_instr_nonkdim": args.matrix_instr_nonkdim,
+        "kpack": args.kpack,
+        "warp_size": args.warp_size,
+        "enable_fp_fusion": args.enable_fp_fusion,
+        "allow_flush_denorm": args.allow_flush_denorm,
+        "launch_cooperative_grid": args.launch_cooperative_grid,
+        "sanitize_overflow": args.sanitize_overflow,
+        "debug": args.debug,
+    }
     options = backend.parse_options(kwargs)
     ccinfo = triton.compile(src, target=target, options=options.__dict__)
 

@@ -114,29 +114,29 @@ def compile_attention_reduce_kernel(
             "*fp32:16",  # query_scale
             "*fp32:16",  # key_scale
             "*fp32:16",  # value_scale
-            "i32",  # stride_max_logits_seq
-            "i32",  # stride_max_logits_head
-            "i32",  # stride_max_logits_part
-            "i32",  # stride_output_seq
-            "i32",  # stride_output_head
-            "i32",  # stride_output_part
-            "i32",  # stride_output_group
-            "i32",  # stride_query_seq
-            "i32",  # stride_query_head
-            "i32",  # stride_key_block
-            "i32",  # stride_key_head
-            "i32",  # stride_key_head_split
-            "i32",  # stride_key_block_elem
-            "i32",  # stride_value_block
-            "i32",  # stride_value_head
-            "i32",  # stride_value_head_size
-            "i32",  # stride_block_table_seq
-            "i32",  # query_scale_stride_0
-            "i32",  # kv_scale_stride_0
-            "i32",  # kv_scale_stride_1
-            "i32",  # num_seqs
-            "i32",  # num_kv_heads
-            "i32",  # max_context_partition_num
+            "i32:16",  # stride_max_logits_seq
+            "i32:16",  # stride_max_logits_head
+            "i32:16",  # stride_max_logits_part
+            "i32:16",  # stride_output_seq
+            "i32:16",  # stride_output_head
+            "i32:16",  # stride_output_part
+            "i32:16",  # stride_output_group
+            "i32:16",  # stride_query_seq
+            "i32:16",  # stride_query_head
+            "i32:16",  # stride_key_block
+            "i32:16",  # stride_key_head
+            "i32:16",  # stride_key_head_split
+            "i32:16",  # stride_key_block_elem
+            "i32:16",  # stride_value_block
+            "i32:16",  # stride_value_head
+            "i32:16",  # stride_value_head_size
+            "i32:16",  # stride_block_table_seq
+            "i32:16",  # query_scale_stride_0
+            "i32:16",  # kv_scale_stride_0
+            "i32:16",  # kv_scale_stride_1
+            "i32:16",  # num_seqs
+            "i32:16",  # num_kv_heads
+            "i32:16",  # max_context_partition_num
             f"{str(compute_type)}",
             f"{query_seq_len}",
             f"{query_group_size}",
@@ -162,7 +162,10 @@ def compile_attention_reduce_kernel(
             signature=signature,
             grid="num_seqs,num_kv_heads,max_context_partition_num",
             num_warps=4,
+            waves_per_eu=waves_per_eu,
+            num_stages=1,
             num_ctas=1,
+            kpack=1,
             out_name=f"{md_name}_stage1",
         )
         triton_kernel1, output_files1 = compile_gluon_kernel(compile_args)
@@ -174,17 +177,17 @@ def compile_attention_reduce_kernel(
             "*fp32:16",  # max_logits_ptr
             "*bf16:16",  # logits_ptr
             "*i32:16",  # context_lengths_ptr
-            "i32",  # stride_output_seq
-            "i32",  # stride_output_head
-            "i32",  # stride_exp_sums_seq
-            "i32",  # stride_exp_sums_head
-            "i32",  # stride_exp_sums_part
-            "i32",  # stride_logits_seq
-            "i32",  # stride_logits_head
-            "i32",  # stride_logits_part
-            "i32",  # stride_logits_group
-            "i32",  # num_seqs
-            "i32",  # num_kv_heads
+            "i32:16",  # stride_output_seq
+            "i32:16",  # stride_output_head
+            "i32:16",  # stride_exp_sums_seq
+            "i32:16",  # stride_exp_sums_head
+            "i32:16",  # stride_exp_sums_part
+            "i32:16",  # stride_logits_seq
+            "i32:16",  # stride_logits_head
+            "i32:16",  # stride_logits_part
+            "i32:16",  # stride_logits_group
+            "i32:16",  # num_seqs
+            "i32:16",  # num_kv_heads
             f"{equivalent_query_group_size}",
             f"{head_size}",
             f"{max_context_partition_num}",
@@ -249,8 +252,7 @@ def pa_decode_gluon_aot(
     output: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
     query: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or
-    # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
