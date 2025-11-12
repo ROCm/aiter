@@ -3,12 +3,14 @@
 
 # user interface
 
+import functools
+
 import torch
-import aiter
-from aiter import dtypes
 import triton
 import triton.language as tl
-import functools
+
+import aiter
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
@@ -21,11 +23,11 @@ def _fwd_kernel_stage2_asm(
     qo_indptr,
     kv_indptr,
     num_kv_splits_indptr,
-    stride_mid_ob,
-    stride_mid_oh,
-    stride_mid_os,
-    stride_obs,
-    stride_oh,
+    stride_mid_ob: tl.int64,
+    stride_mid_oh: tl.int64,
+    stride_mid_os: tl.int64,
+    stride_obs: tl.int64,
+    stride_oh: tl.int64,
     MAYBE_FINAL_OUT: tl.constexpr,
     BATCH_NUM: tl.constexpr,
     BLOCK_DV: tl.constexpr,
