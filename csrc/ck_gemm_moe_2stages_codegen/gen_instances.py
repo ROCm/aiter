@@ -846,7 +846,7 @@ if __name__ == "__main__":
         acts = ["silu", "gelu"]
         routed_weight_l = [1, 2]
         general_quant_l = ["per_tensor", "per_token"]
-        preshuffle_mode_l = ["off"]
+        preshuffle_mode_l = [False]
         for (
             b_dtype,
             c_dtype,
