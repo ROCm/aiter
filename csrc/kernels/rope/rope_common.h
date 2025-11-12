@@ -228,6 +228,43 @@ __device__ __forceinline__ void get_offset(int32_t* p_offset_0,
     }
 }
 
+// get kvcache store index
+template <int32_t RotateStyle, bool StrideDEq1>
+__device__ __forceinline__ void get_cache_offset(int32_t* p_offset_k_0,
+                                                 int32_t* p_offset_k_1,
+                                                 int32_t* p_offset_v_0,
+                                                 int32_t* p_offset_v_1,
+                                                 const int64_t offset_y,
+                                                 const int64_t offset_v,
+                                                 const int32_t x,
+                                                 const int32_t did,
+                                                 const int32_t hid,
+                                                 const int32_t size_h,
+                                                 const int32_t size_d,
+                                                 const int32_t size_half_r)
+{
+    const int32_t offset_h = hid * stride_h;
+
+    if constexpr(RotateStyle == ROTATE_STYLE_NEOX)
+    {
+        *p_offset_0 = offset_h + did * stride_d;
+        *p_offset_1 = *p_offset_0 + size_half_r * stride_d;
+    }
+    else if constexpr(RotateStyle == ROTATE_STYLE_GPTJ)
+    {
+        *p_offset_0 = offset_h + 2 * did * stride_d;
+        if constexpr(StrideDEq1)
+        {
+            // Asking compiler to merge memory ops when accessing adjacent elements.
+            *p_offset_1 = *p_offset_0 + 1;
+        }
+        else
+        {
+            *p_offset_1 = *p_offset_0 + stride_d;
+        }
+    }
+}
+
 template <int32_t RotateStyle, bool StrideDEq1, typename o_scalar_t, typename i_scalar_t>
 __device__ __forceinline__ void load_payload(o_scalar_t* p_data_0,
                                              o_scalar_t* p_data_1,
@@ -1042,6 +1079,8 @@ struct OpCachedFwd
                                                              const scalar_t* __restrict__ p_input_v,
                                                              scalar_t* __restrict__ p_cache_y,
                                                              scalar_t* __restrict__ p_cache_v,
+                                                             const int64_t offset_y,
+                                                             const int64_t offset_v,
                                                              const int64_t slot,
                                                              const int32_t token_elem_num,
                                                              const int32_t block_size,
@@ -2380,7 +2419,8 @@ template <typename Op,
           bool StrideDXEq1,
           bool StrideDYEq1,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          bool asmLayout = false>
 __global__ void
 kn_entry_2c_value_sbhd_cached_indirect2_inplace(scalar_t* __restrict__ p_inout_x,
                                                 scalar_t* __restrict__ p_inout_y,
@@ -2414,6 +2454,35 @@ kn_entry_2c_value_sbhd_cached_indirect2_inplace(scalar_t* __restrict__ p_inout_x
     const int64_t  pos     = p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx];
     const int64_t  slot    = p_slot_mapping[ib_idx];
     const int      token_elem_num = size_h_y * size_d;
+    const int64_t  block_idx = slot / block_size;
+    const int64_t  block_offset = slot % block_size;
+    const int64_t  offt_kcache, offt_vcache;
+    if(slot < 0) 
+    {
+        // ignore padding token
+        offt_kcache = -1;
+        offt_vcache = -1;
+    }
+    else // get common kvcache offt
+    {
+        // [num_blocks, size_h_y, size_d/x, block_size, x]
+        offt_kcache = block_idx * size_h_y * (size_d / x) * block_size * x +
+                      block_offset * x;
+        if constexpr(asmLayout) 
+        { 
+            //[num_blocks, size_h_y, block_size/x, size_d, x]
+            const int x_idx_v = block_offset / x;
+            const int x_offset_v = block_offset % x;
+            offt_vcache = block_idx * size_h_y * size_d * block_size +
+                          x_idx_v * size_d * x + x_offset_v;
+        }
+        else
+        {
+            //[num_blocks, size_h_y, size_d, block_size]
+            offt_vcache = block_idx * size_h_y * size_d * block_size +
+                          block_offset;
+        }
+    }
 
     if((pos >= 0) && (pos < max_position))
     {
@@ -2435,6 +2504,8 @@ kn_entry_2c_value_sbhd_cached_indirect2_inplace(scalar_t* __restrict__ p_inout_x
                                                     p_value + offset_y,
                                                     p_cache_y,
                                                     p_cache_value,
+                                                    offt_kcache,
+                                                    offt_vcache,
                                                     slot,
                                                     token_elem_num,
                                                     block_size,

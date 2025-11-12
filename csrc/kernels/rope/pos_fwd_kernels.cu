@@ -328,7 +328,8 @@ void rope_cached_positions_offsets_2c_fwd_impl(
 /**
  * @brief Compute Rotational Positional Encoding on 2 channels: @param input_x and @param input_y. Results are written
  *        in @param output_x and @param output_y respectively. Then, cache rotated @param output_y to @param key_cache
- *        and @param value to @param value_cache.
+ *        and @param value to @param value_cache. Shape of @param key_cache and @param value_cache is aligned with
+ *        reshape_and_cache_kernel in cache_kernels.cu.
  *        Cosine and sine of frequency should have been calculated and specified in @param cos and @param sin.
  *        @param positions and @param offsets are indirect buffers storing the index of value in @param cos and
  *        @param sin used to calculate with current input element. The corresponding values in @param positions and
@@ -341,7 +342,7 @@ void rope_cached_positions_offsets_2c_fwd_impl(
  * @param input_y      [s, b, h, d]
  * @param value        [s, b, h, d]
  * @param key_cache    [num_blocks, h, d/x, block_size, x]
- * @param value_cache  [num_blocks, h, d, block_size]
+ * @param value_cache  [num_blocks, h, d, block_size] or [num_blocks, h, block_size/x, d, x] for asm layout
  * @param cos          [max_pos, 1, 1, d // 2] if @param reuse_freqs_front_part else [max_pos, 1, 1, d]
  * @param sin          [max_pos, 1, 1, d // 2] if @param reuse_freqs_front_part else [max_pos, 1, 1, d]
  * @param positions    [s, b]
@@ -357,7 +358,7 @@ void rope_cached_positions_offsets_2c_fwd_cachekv_impl(
     const torch::Tensor& input_y,                   // [s, b, h, d]
     const torch::Tensor& value,                     // [s, b, h, d]
     torch::Tensor&       key_cache,                 // [num_blocks, h, d/x, block_size, x]
-    torch::Tensor&       value_cache,               // [num_blocks, h, d, block_size]
+    torch::Tensor&       value_cache,               // [num_blocks, h, d, block_size] or [num_blocks, h, block_size/x, d, x]
     const torch::Tensor& cos,                       // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
     const torch::Tensor& sin,                       // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
     const torch::Tensor& positions,                 // [s, b]
