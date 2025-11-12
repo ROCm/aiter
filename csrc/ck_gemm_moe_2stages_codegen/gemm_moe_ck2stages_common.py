@@ -170,6 +170,8 @@ a8w8_gemm1_blockscale_kernels_list= {
      1: kernelInstanceGEMM1(       256,       16,        128,       256,     1,       4,        1,),
      0: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
      #2: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
+     3: kernelInstanceGEMM1(       256,       32,        128,       256,     1,       4,        1,),
+     4: kernelInstanceGEMM1(       256,       32,        128,       128,     1,       4,        1,),
 }
 
 # gemm1 out:bf16/fp16 A:fp8 B:win4
@@ -266,6 +268,8 @@ a8w8_gemm2_blockscale_kernels_list= {
      0: kernelInstanceGEMM2(       256,       16,        128,       256,     1,       4,        1,),
      1: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
      #2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
+     3: kernelInstanceGEMM2(       256,       32,        128,       256,     1,       4,        1,),
+     4: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
 }
 
 # gemm2 out:bf16/fp16 A:fp8 B:in4

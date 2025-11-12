@@ -229,7 +229,7 @@ def run_2stage_moe(
         (num_tokens, hidden_dim), dtype=dtype, device="cuda"
     )
     output_ck = metadata.stage2(
-        inter_ref,
+        inter_ref.to(dtypes.fp8) if use_fp8_blockscale else inter_ref,
         w1_shuffle,
         w2_shuffle,
         sorted_token_ids,
@@ -247,7 +247,7 @@ def run_2stage_moe(
     output_out_perf = torch.zeros((num_tokens, hidden_dim), dtype=dtype, device="cuda")
     _, us_stage2 = run_perftest(
         metadata.stage2,
-        inter_ref,
+        inter_ref.to(dtypes.fp8) if use_fp8_blockscale else inter_ref,
         w1_shuffle,
         w2_shuffle,
         sorted_token_ids,
