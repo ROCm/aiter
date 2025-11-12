@@ -131,7 +131,7 @@ def _attention_inner(
         k = tl.load(k_ptrs, mask=mask_k_cols_local[:, None], other=0.0)
         qk_scale = SM_SCALE * RCP_LN2
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k) 
+        qk += tl.dot(q, k)
         qk = qk * qk_scale
 
         if causal:

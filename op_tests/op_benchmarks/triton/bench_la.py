@@ -340,7 +340,6 @@ def bench_lean_attention(
         list_sum_block_n.append(len_sum)
     batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
 
-
     # Allocate Tensors
     q = torch.empty((n_ctx_q * batch, hq, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5

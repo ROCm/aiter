@@ -327,7 +327,6 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, causal):
         # (False, 1, 64, 4096, [4096], 128, 304, torch.float16, 128, 16, 3, 4),
     ],
 )
-
 def test_persistent_lean_attention(
     request,
     causal,
@@ -416,10 +415,10 @@ def test_persistent_lean_attention(
     # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
-    #torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+    # torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
     # # Compare result
-    #atol = 1e-2 
-    #rtol = 1e-2 
+    # atol = 1e-2
+    # rtol = 1e-2
     try:
         torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
     except AssertionError:
@@ -539,7 +538,16 @@ def main():
     hq = 64
     hk = 64
     n_ctx_q = 16
-    n_ctx = [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536] #[4096, 32768, 65536]  # [131072] * batch  # [16384] #[8192]
+    n_ctx = [
+        1024,
+        1024,
+        2048,
+        2048,
+        4096,
+        4096,
+        32768,
+        65536,
+    ]  # [4096, 32768, 65536]  # [131072] * batch  # [16384] #[8192]
     d = 128
     total_programs = 912
     init_dtype = torch.float16
@@ -570,7 +578,6 @@ def main():
         len_sum += list_num_block_n[i]
         list_sum_block_n.append(len_sum)
     batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
-
 
     q, k, v, Mp, Lp, Op, locks, batch_num_block_n = get_lean_attn_inputs(
         batch,
