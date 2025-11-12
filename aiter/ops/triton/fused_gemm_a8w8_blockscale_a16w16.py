@@ -47,12 +47,13 @@ def fused_gemm_a8w8_blockscale_a16w16(
     - x_fp8_scale: Scale tensor for X with shape (M, *scale_k).
     - w_fp8_scale: Scale tensor for W with shape (**scale_n, *scale_k).
     - x_bf16: Matrix X with shape (M, K).
-    - w_bf16: Matrix W with shape (N_fp8, K).
+    - w_bf16: Matrix W with shape (N_bf16, K).
 
     Note: M, N, K must be identical for x_fp8 and x_bf16, but the N-dim fow w_fp8 and w_bf16 can be different
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+    - y_fp8: The output matrix with shape (M, N_fp8).
+    - y_bf16: The output matrix with shape (M, N_bf16).
 
     *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k
     **scale_n = (N_fp8 + scale_block_size_n - 1) // scale_block_size_n
@@ -74,7 +75,7 @@ def fused_gemm_a8w8_blockscale_a16w16(
         x_fp8.shape[1] == x_bf16.shape[1]
     ), "K-dim should be identical for x_fp8 and x_bf16"
     assert x_fp8.shape[1] == w_fp8.shape[1], "Incompatible dimensions!!!"
-    assert w_bf16.shape[1] == w_bf16.shape[1], "Incompatible dimensions!!!"
+    assert x_bf16.shape[1] == w_bf16.shape[1], "Incompatible dimensions!!!"
 
     # Transpose w and w_scale
     w_fp8 = w_fp8.T
