@@ -300,7 +300,7 @@ class CustomAllreduce:
             else:
                 # if warm up, mimic the allocation pattern
                 # since custom allreduce is out-of-place
-                return torch.empty_like(input)
+                return torch.zeros_like(input)
         else:
             # note: outside of cuda graph context,
             # custom allreduce incurs a cost of cudaMemcpy, which should
@@ -332,7 +332,7 @@ class CustomAllreduce:
                 return self.all_gather_reg(inp)
             else:
                 print("allgather capture hipgraph error")
-                return torch.empty_like(inp)
+                return torch.zeros_like(inp)
         else:
             return self.all_gather_unreg(inp)
 
@@ -371,7 +371,7 @@ class CustomAllreduce:
             if torch.cuda.is_current_stream_capturing():
                 return self.fused_ar_rms(input, w=weight, eps=eps, registered=True)
             else:
-                return torch.empty_like(input), torch.empty_like(input)
+                return torch.zeros_like(input), torch.zeros_like(input)
         else:
             return self.fused_ar_rms(input, w=weight, eps=eps, registered=False)
 
