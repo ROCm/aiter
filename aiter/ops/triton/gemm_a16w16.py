@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
+import os
 import torch
 import triton
 import triton.language as tl
@@ -57,47 +58,62 @@ def gemm_a16w16(
 
     if config is None:
         config, _ = _get_config(M, N, K)
+        config = config.copy()
 
-    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
+    # ======= parse env vars =======
+    env_vars = config.pop("env_vars", {})
+    old_env_vars = {}
+    for key, value in env_vars.items():
+        old_env_vars[key] = os.environ.get(key)
+        os.environ[key] = str(value)
 
-    if config["NUM_KSPLIT"] > 1:
-        y_pp = torch.empty(
-            (config["NUM_KSPLIT"], M, N),
-            dtype=torch.float32,
-            device=y.device if y is not None else x.device,
+    try:
+        if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
+            y = torch.empty((M, N), dtype=dtype, device=x.device)
+
+        if config["NUM_KSPLIT"] > 1:
+            y_pp = torch.empty(
+                (config["NUM_KSPLIT"], M, N),
+                dtype=torch.float32,
+                device=y.device if y is not None else x.device,
+            )
+        else:
+            y_pp = None
+
+        grid = lambda META: (  # noqa: E731
+            (
+                META["NUM_KSPLIT"]
+                * triton.cdiv(M, META["BLOCK_SIZE_M"])
+                * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            ),
         )
-    else:
-        y_pp = None
-
-    grid = lambda META: (  # noqa: E731
-        (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        ),
-    )
-    _gemm_a16_w16_kernel[grid](
-        x,
-        w,
-        bias,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        activation=_get_activation_from_str(activation) if activation else "",
-        use_activation=activation is not None,
-        ADD_BIAS=(bias is not None),
-        SKIP_REDUCE=skip_reduce,
-        **config,
-    )
+        _gemm_a16_w16_kernel[grid](
+            x,
+            w,
+            bias,
+            y if config["NUM_KSPLIT"] == 1 else y_pp,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+            activation=_get_activation_from_str(activation) if activation else "",
+            use_activation=activation is not None,
+            ADD_BIAS=(bias is not None),
+            SKIP_REDUCE=skip_reduce,
+            **config,
+        )
+    finally:
+        for key, old_value in old_env_vars.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
 
     if config["NUM_KSPLIT"] > 1:
         if skip_reduce:
