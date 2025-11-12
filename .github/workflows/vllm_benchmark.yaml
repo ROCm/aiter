@@ -70,7 +70,17 @@ jobs:
               python3 setup.py develop
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
-          RUN echo "=== vLLM version ===" && pip show vllm || true
+
+          RUN echo "=== vLLM version BEFORE uninstall ===" && pip show vllm || true
+          RUN pip uninstall -y vllm
+
+          RUN git clone ${{ env.VLLM_REPOSITORY_URL }} /vllm && \
+              cd /vllm && \
+              git checkout ${{ env.VLLM_BRANCH }} && \
+              pip install -U -r requirements/rocm.txt && \
+              python3 setup.py develop
+
+          RUN echo "=== vLLM version AFTER installation ===" && pip show vllm || true
           EOF
 
       - name: Show Dockerfile
