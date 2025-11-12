@@ -1937,7 +1937,7 @@ def _rope_fwd_2d_kernel_neox(
 
 
 @triton.jit
-def _rope_fwd_3d_kernel(
+def _rope_fwd_3d(
     x_ptr,
     freqs_real_ptr,
     freqs_imag_ptr,
