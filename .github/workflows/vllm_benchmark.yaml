@@ -70,6 +70,7 @@ jobs:
               python3 setup.py develop
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
+          RUN echo "=== vLLM version ===" && pip show vllm || true
           EOF
 
       - name: Show Dockerfile
