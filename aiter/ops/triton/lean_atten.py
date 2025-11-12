@@ -30,7 +30,6 @@ from aiter.ops.triton.utils._triton import arch_info
 
 _LOGGER = AiterTritonLogger()
 
-LOG_TWO_E = 1.44269504  # log_2(e) value for softmax scaling
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
 
 
@@ -80,7 +79,6 @@ def persistent_lean_attention(
         XCD_REMAP=config["XCD_REMAP"],
         causal=causal,
         batch_size=batch_size,
-        sm_scale=sm_scale,
         RAGGED_BATCH=RAGGED_BATCH,
         num_warps=config["num_warps"],
         waves_per_eu=config["waves_per_eu"],
@@ -104,7 +102,6 @@ def _persistent_lean_attention(
     XCD_REMAP: bool,  # xcd_remap for spatial
     causal: bool,  # causal masking
     batch_size: int,
-    sm_scale: torch.float16,  # typically 1 / sqrt(d)
     RAGGED_BATCH: bool,
     num_warps: int,
     waves_per_eu: int,
@@ -144,7 +141,7 @@ def _persistent_lean_attention(
     GQA_GROUP_SIZE = H // H_K
     HEADS_PER_XCD = H // NUM_XCDS
 
-    qk_scale = sm_scale * LOG_TWO_E
+    sm_scale = q.shape[-1] ** (-0.5)
 
     (
         num_m_blocks,
@@ -271,7 +268,6 @@ def _persistent_lean_attention(
         q,
         k,
         v,
-        qk_scale,
         Mp,
         Lp,
         Op,
@@ -294,6 +290,7 @@ def _persistent_lean_attention(
         Op.stride(0),  # total_programs
         Op.stride(1),  # n_ctx_q
         Op.stride(2),  # head_dim
+        sm_scale,
         HEADS_PER_XCD=HEADS_PER_XCD,
         HEAD_DIM_ORIG=HEAD_DIM_K,
         HEAD_DIM=HEAD_DIM_K,
