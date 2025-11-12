@@ -440,7 +440,7 @@ def get_moe_stage_module(
     activation,
     quant_type,
     mul_routed_weight_stage,
-    preslf_mode=False,
+    preshuffle_mode=False,
 ):
     if isinstance(activation, int):
         activation = ActivationType(activation)
@@ -451,9 +451,9 @@ def get_moe_stage_module(
     Bdtype = dtype2str_dict[weight_dtype]
     Cdtype = dtype2str_dict[output_dtype]
 
-    preslf_str = "off"
-    if preslf_mode and weight_dtype == dtypes.fp4x2:
-        preslf_str = "on"
+    preshuffle_str = ""
+    if preshuffle_mode and weight_dtype == dtypes.fp4x2:
+        preshuffle_str = "--preshuffle"
 
     quant_type = (
         QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
@@ -466,7 +466,7 @@ def get_moe_stage_module(
             "module_moe_ck2stages",
             Adtype,
             Bdtype,
-            "slf" + preslf_str,
+            "preshuffle_on" if preshuffle_mode else "preshuffle_off",
             Cdtype,
             act,
             quant_type,
@@ -474,7 +474,7 @@ def get_moe_stage_module(
         ]
     )
     blob_gen_cmd = [
-        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} -p {preslf_str} -w {{}}"
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} -w {{}}"
     ]
 
     return md_name, blob_gen_cmd

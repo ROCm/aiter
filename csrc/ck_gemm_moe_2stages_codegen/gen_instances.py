@@ -820,11 +820,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "-p",
         "--preshuffle",
-        default="off",
-        required=False,
-        type=str,
-        choices=["off", "on"],
-        help="Choose the weight mode: bns or pre-shuffle.",
+        action="store_true",
+        help="enable pre-shuffle weight mode",
     )
 
     args = parser.parse_args()
