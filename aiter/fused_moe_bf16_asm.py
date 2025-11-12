@@ -282,15 +282,21 @@ def asm_moe_tkw1(
     activation=ActivationType.Silu,
 ):
     return fused_moe(
-        hidden_states, w1, w2, topk_weight, topk_ids,
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
         expert_mask=expert_mask,
         activation=activation,
         quant_type=QuantType.per_Token,
         doweight_stage1=True,
-        w1_scale=fc1_scale, w2_scale=fc2_scale,
-        a1_scale=fc1_smooth_scale, a2_scale=fc2_smooth_scale,
+        w1_scale=fc1_scale,
+        w2_scale=fc2_scale,
+        a1_scale=fc1_smooth_scale,
+        a2_scale=fc2_smooth_scale,
         a16=a16,
-        per_tensor_quant_scale=per_tensor_quant_scale
+        per_tensor_quant_scale=per_tensor_quant_scale,
     )
 
 

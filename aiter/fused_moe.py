@@ -162,7 +162,7 @@ def fused_moe_fake(
     moe_sorting_dispatch_policy: bool = 0,
     dtype: Optional[torch.dtype] = None,
     a16: bool = False,
-    per_tensor_quant_scale: torch.Tensor = None
+    per_tensor_quant_scale: torch.Tensor = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -287,19 +287,22 @@ def fused_moe_(
     elif metadata.run_1stage and doweight_stage1:
         return metadata.stage1(
             hidden_states,
-            w1, w2,
+            w1,
+            w2,
             topk_ids,
             sorted_ids,
             sorted_weights,
             sorted_expert_ids,
             num_valid_ids,
             moe_buf,
-            w1_scale, w2_scale,
-            a1_scale, a2_scale,
+            w1_scale,
+            w2_scale,
+            a1_scale,
+            a2_scale,
             a16,
             per_tensor_quant_scale,
             expert_mask,
-            activation
+            activation,
         )
     else:
         return fused_moe_2stages(
@@ -470,7 +473,7 @@ def fused_moe_stage1_tkw1(
     per_tensor_quant_scale=None,
     expert_mask=None,
     activation=ActivationType.Silu,
-    kernelName: str = ""
+    kernelName: str = "",
 ):
     E, model_dim, inter_dim = w2.shape
     M, topk = topk_ids.shape
@@ -828,9 +831,7 @@ def get_2stage_cfgs(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
     if run_1stage and not doweight_stage1:
-        logger.info(
-            f"[get_2stage_cfgs] run_1stage"
-        )
+        logger.info(f"[get_2stage_cfgs] run_1stage")
         return MOEMetadata(
             functools.partial(
                 fused_moe_1stage,
@@ -844,14 +845,9 @@ def get_2stage_cfgs(
             run_1stage,
         )
     elif run_1stage and doweight_stage1:
-        logger.info(
-            f"[get_2stage_cfgs] run_1stage and doweight_stage1"
-        )
+        logger.info(f"[get_2stage_cfgs] run_1stage and doweight_stage1")
         return MOEMetadata(
-            functools.partial(
-                fused_moe_stage1_tkw1,
-                kernelName=kernelName1
-            ),
+            functools.partial(fused_moe_stage1_tkw1, kernelName=kernelName1),
             None,
             block_m,
             ksplit,
