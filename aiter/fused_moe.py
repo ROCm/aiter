@@ -105,7 +105,7 @@ def fused_moe(
     moe_sorting_dispatch_policy=0,
     dtype=None,
     a16=False,
-    per_tensor_quant_scale=None
+    per_tensor_quant_scale=None,
     # following for cktile support
     hidden_pad=0,
     intermediate_pad=0,
@@ -133,7 +133,7 @@ def fused_moe(
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
         dtype=dtype,
         a16=a16,
-        per_tensor_quant_scale=per_tensor_quant_scale
+        per_tensor_quant_scale=per_tensor_quant_scale,
         hidden_pad=hidden_pad,
         intermediate_pad=intermediate_pad,
         bias1=bias1,
@@ -194,7 +194,7 @@ def fused_moe_(
     moe_sorting_dispatch_policy: bool = 0,
     dtype: Optional[torch.dtype] = None,
     a16: bool = False,
-    per_tensor_quant_scale: torch.Tensor = None
+    per_tensor_quant_scale: torch.Tensor = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
@@ -640,9 +640,9 @@ fused_moe_1stage_dict = {
     {
         (ActivationType.Silu,    QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True) : aiter.fmoe_g1u1,
         (ActivationType.Silu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_fp8_blockscale_g1u1,
-        (ActivationType.Silu,          QuantType.per_Token,   dtypes.bf16,    dtypes.bf16,   dtypes.bf16,   False) : aiter.fmoe,
-        (ActivationType.Silu,          QuantType.per_Token,   dtypes.bf16,     dtypes.i8,     dtypes.i8,    False) : aiter.fmoe_int8_g1u0_a16,
-        (ActivationType.Silu,          QuantType.per_Token,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_g1u1_tkw1,
+        (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,    dtypes.bf16,   dtypes.bf16,   False) : aiter.fmoe,
+        (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,     dtypes.i8,     dtypes.i8,    False) : aiter.fmoe_int8_g1u0_a16,
+        (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_g1u1_tkw1,
     }
 }
 # fmt: on
