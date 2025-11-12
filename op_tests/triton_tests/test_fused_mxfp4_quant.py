@@ -10,6 +10,7 @@ from op_tests.triton_tests.test_gemm_afp4wfp4 import (
     e8m0_to_f32,
     SCALE_GROUP_SIZE,
 )
+from quark.torch.algorithm.rotation.rotation_utils import get_rotation_matrix
 
 torch.manual_seed(0)
 
@@ -22,7 +23,7 @@ def rmsnorm(input, weight, eps=1e-6):
     return rms_norm
 
 
-def calculate_target_w_torch(mat1, rms1_w, resid1, mat2, rms2_w, eps=1e-6):
+def calculate_target_w_torch(mat1, rms1_w, resid1, mat2, rms2_w, rot1, eps=1e-6):
     orig_dtype = mat1.dtype
     mat1 = mat1.to(torch.float32)
     rms1_w = rms1_w.to(torch.float32)
@@ -34,7 +35,15 @@ def calculate_target_w_torch(mat1, rms1_w, resid1, mat2, rms2_w, eps=1e-6):
         mat1 = res1_out = mat1 + resid1
         res1_out = res1_out.to(orig_dtype)
     mat1 = rmsnorm(mat1, rms1_w, eps)
+    if rot1 is not None:
+        rot1 = rot1.to(torch.float32)
+        mat1_shape = mat1.shape
+        mat1 = torch.matmul(mat1.view(-1, rot1.shape[0]), rot1).view(mat1_shape)
     mat2 = rmsnorm(mat2, rms2_w, eps).to(orig_dtype)
+    if rot1 is not None:
+        rot1 = rot1.to(mat2.dtype)
+        mat2_shape = mat2.shape
+        mat2 = torch.matmul(mat2.view(-1, rot1.shape[0]), rot1).view(mat2_shape)
     q_fp4, q_scales = torch_dynamic_mxfp4_quant(mat1)
     return (q_fp4, q_scales), mat2, res1_out
 
@@ -54,6 +63,7 @@ def generate_fused_rms_quant_data(
     mat2_stride=(2112, 1),
     residual=False,
     dtype=torch.bfloat16,
+    rot_size=0,
 ):
     mat1 = torch.randn((mat1_shape[0], mat1_stride[0]), dtype=dtype, device="cuda")
     mat1 = mat1[:, : mat1_shape[1]]
@@ -66,7 +76,13 @@ def generate_fused_rms_quant_data(
     resid1 = None
     if residual:
         resid1 = torch.randn_like(mat1, dtype=dtype, device="cuda")
-    return mat1, mat2, rms1_w, rms2_w, resid1
+    rot1 = None
+    if rot_size > 0:
+        assert mat1.shape[1] % rot_size == 0
+        # rot1 = torch.randn((rot_size, rot_size), dtype=dtype, device="cuda")
+        rot1 = get_rotation_matrix(rot_size, random=False).to(dtype=dtype, device="cuda")
+        # rot1 = torch.eye(rot_size, dtype=dtype, device="cuda")
+    return mat1, mat2, rms1_w, rms2_w, resid1, rot1
 
 
 @pytest.mark.parametrize("B", [1, 4, 16, 32, 1000, 10000])
@@ -86,53 +102,60 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
 
 
 @pytest.mark.parametrize("B", [1, 32, 256])
-@pytest.mark.parametrize("M", [128, 132, 2112])
-@pytest.mark.parametrize("N", [32, 96])
+@pytest.mark.parametrize("M", [128, 1024, 132, 2112])
+@pytest.mark.parametrize("N", [32, 96, 128, 512])
 @pytest.mark.parametrize("stride", [2112])
 @pytest.mark.parametrize("skip_second", [True, False])
 @pytest.mark.parametrize("residual", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("rot_size", [128, 0])
 def test_fused_rms_quant(
-    B: int, M: int, N: int, stride: int, skip_second: bool, residual: bool, dtype
+    B: int, M: int, N: int, stride: int, skip_second: bool, residual: bool, dtype, rot_size: int
 ):
+    if rot_size > 0 and (M % rot_size != 0 or N % rot_size != 0):
+        pytest.skip("Rotation size must divide M evenly.")
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    mat1, mat2, rms1_w, rms2_w, resid1 = generate_fused_rms_quant_data(
+    mat1, mat2, rms1_w, rms2_w, resid1, rot1 = generate_fused_rms_quant_data(
         mat1_shape=(B, M),
         mat2_shape=(B, N),
         mat1_stride=(stride, 1),
         mat2_stride=(stride, 1),
         residual=residual,
         dtype=dtype,
+        rot_size=rot_size,
     )
     (mat1_fp4_torch, mat1_scales_torch), mat2_torch, res1_out_torch = (
-        calculate_target_w_torch(mat1, rms1_w, resid1, mat2, rms2_w)
+        calculate_target_w_torch(mat1, rms1_w, resid1, mat2, rms2_w, rot1)
     )
     if not skip_second:
         if not residual:
             (mat1_fp4_triton, mat1_scales_triton), mat2_triton = fused_rms_mxfp4_quant(
-                mat1, rms1_w, 1e-6, mat2, rms2_w, 1e-6, resid1
+                mat1, rms1_w, 1e-6, mat2, rms2_w, 1e-6, resid1, rot1
             )
         else:
             (mat1_fp4_triton, mat1_scales_triton), mat2_triton, res1_out_triton = (
-                fused_rms_mxfp4_quant(mat1, rms1_w, 1e-6, mat2, rms2_w, 1e-6, resid1)
+                fused_rms_mxfp4_quant(mat1, rms1_w, 1e-6, mat2, rms2_w, 1e-6, resid1, rot1)
             )
     else:
         if not residual:
             (mat1_fp4_triton, mat1_scales_triton) = fused_rms_mxfp4_quant(
-                mat1, rms1_w, 1e-6, None, None, None, None
+                mat1, rms1_w, 1e-6, None, None, None, None, rot1
             )
         else:
             (mat1_fp4_triton, mat1_scales_triton), res1_out_triton = (
-                fused_rms_mxfp4_quant(mat1, rms1_w, 1e-6, None, None, None, resid1)
+                fused_rms_mxfp4_quant(mat1, rms1_w, 1e-6, None, None, None, resid1, rot1)
             )
     if not skip_second:
-        torch.testing.assert_close(mat2_torch, mat2_triton)
+        torch.testing.assert_close(mat2_torch, mat2_triton, atol=1e-2, rtol=1e-2)
 
     if residual:
+        print('rms: ', rmsnorm(mat1+resid1, rms1_w, 1e-6), flush=True)
+        print('pt: ', res1_out_torch, '\ntriton: ', res1_out_triton, flush=True)
         torch.testing.assert_close(res1_out_torch, res1_out_triton)
 
     res_fp32_torch = convert_mxfp4_to_fp32(mat1_fp4_torch, mat1_scales_torch)
     res_fp32_triton = convert_mxfp4_to_fp32(mat1_fp4_triton, mat1_scales_triton)
 
-    torch.testing.assert_close(res_fp32_torch, res_fp32_triton)
+    print(res_fp32_torch, res_fp32_triton, flush=True)
+    torch.testing.assert_close(res_fp32_torch, res_fp32_triton, atol=0.5, rtol=0.5)

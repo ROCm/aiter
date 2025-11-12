@@ -5,7 +5,7 @@ from .quant import _mxfp4_quant_op
 
 
 @triton.jit
-def _rmsmorm_op(row, weight, n_cols, epsilon):
+def _rmsnorm_op(row, weight, n_cols, epsilon):
     row_norm = row * row
     row_norm = tl.sum(row_norm, axis=-1)
     norm_factor = tl.math.rsqrt((row_norm / n_cols) + epsilon)
@@ -13,6 +13,9 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
     rms_norm = row * norm_factor * weight
     return rms_norm
 
+@triton.jit
+def _rotate_op(row, rot_matrix, BLOCK_SIZE: tl.constexpr, ROT_SIZE: tl.constexpr):
+    return tl.dot(tl.reshape(row.to(rot_matrix.dtype), (BLOCK_SIZE // ROT_SIZE, ROT_SIZE)), rot_matrix).reshape(BLOCK_SIZE)
 
 @triton.jit
 def _fused_rms_mxfp4_quant_kernel(
@@ -20,6 +23,7 @@ def _fused_rms_mxfp4_quant_kernel(
     weight1_ptr,
     inp2_ptr,
     weight2_ptr,
+    rot1_ptr,
     res1_ptr,
     out1_fp4_ptr,
     out1_bs_ptr,
@@ -40,12 +44,17 @@ def _fused_rms_mxfp4_quant_kernel(
     out_res1_row_stride,
     BLOCK_SIZE: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    ROT_SIZE: tl.constexpr,
     SKIP_SECOND_INPUT: tl.constexpr,
     FIRST_INPUT_RES: tl.constexpr,
 ):
     pid = tl.program_id(0)
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE // MXFP4_QUANT_BLOCK_SIZE
     block_inds = tl.arange(0, BLOCK_SIZE)
+
+    if ROT_SIZE > 0:
+        rot_indices = tl.arange(0, ROT_SIZE)
+        rot1 = tl.load(rot1_ptr + rot_indices[:, None] * ROT_SIZE + rot_indices[None, :], cache_modifier=".cg")
 
     mask1 = block_inds < inp1_n_cols
     inp1 = tl.load(
@@ -65,7 +74,10 @@ def _fused_rms_mxfp4_quant_kernel(
 
     w1 = tl.load(weight1_ptr + block_inds, mask=mask1, other=0.0).to(tl.float32)
 
-    norm1 = _rmsmorm_op(inp1, w1, inp1_n_cols, eps1)
+    norm1 = _rmsnorm_op(inp1, w1, inp1_n_cols, eps1)
+    if ROT_SIZE > 0:
+        norm1 = _rotate_op(norm1, rot1, BLOCK_SIZE, ROT_SIZE).to(tl.float32)  # cast to fp32 for mxfp4 quant
+
     out1_fp4, out1_block_scales = _mxfp4_quant_op(
         norm1, BLOCK_SIZE, 1, MXFP4_QUANT_BLOCK_SIZE
     )
@@ -95,7 +107,9 @@ def _fused_rms_mxfp4_quant_kernel(
             cache_modifier=".cg",
         ).to(tl.float32)
         w2 = tl.load(weight2_ptr + block_inds, mask=mask2, other=0.0).to(tl.float32)
-        norm2 = _rmsmorm_op(inp2, w2, inp2_n_cols, eps2)
+        norm2 = _rmsnorm_op(inp2, w2, inp2_n_cols, eps2)
+        if ROT_SIZE > 0:
+            norm2 = _rotate_op(norm2, rot1, BLOCK_SIZE, ROT_SIZE)
         tl.store(out2_ptr + pid * out2_row_stride + block_inds, norm2, mask=mask2)
     if FIRST_INPUT_RES:
         inp1 = inp1.to(out_res1_ptr.dtype.element_ty)

@@ -3,7 +3,6 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.fused_mxfp4_quant import (
-    _rmsmorm_op,
     _fused_rms_mxfp4_quant_kernel,
     _fused_flatten_mxfp4_quant,
 )
@@ -20,16 +19,20 @@ def fused_rms_mxfp4_quant(
     inp2_weight=None,
     inp2_epsilon=0.0,
     res1=None,
+    rot1=None,
 ):
     """
     This op contains several steps:
         1. if res1 is not None, inp1 = inp1 + res1, and store inp1 to out_res1
         2. perform RMS norm along the last dimenion for inp1
-        3. if inp2 is not None, perform RMS norm along the last dimenion for inp2
-        4. perform mxfp4 quantization for inp1 only
+        3. if rot1 is not None, perform rotation along the last dimension for inp1
+        4. if inp2 is not None, perform RMS norm along the last dimenion for inp2
+        5. if rot1 is not None, perform rotation along the last dimension for inp2
+        6. perform mxfp4 quantization for inp1 only
 
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
+    - rot1: Orthogonal rotation matrix with shape (R, R), where N1 % R == 0.
 
     Returns:
     - out1_fp4: The output matrix with shape (M, N1 // 2).
@@ -46,11 +49,13 @@ def fused_rms_mxfp4_quant(
     MXFP4_QUANT_BLOCK_SIZE = 32
     M, N1 = inp1.shape
     BLOCK_SIZE = max(triton.next_power_of_2(N1), MXFP4_QUANT_BLOCK_SIZE)
+    ROT_SIZE = rot1.shape[0] if rot1 is not None else 0
     if inp2 is not None:
         N2 = inp2.shape[1]
         BLOCK_SIZE = max(triton.next_power_of_2(N2), BLOCK_SIZE)
     else:
         N2 = 0
+    BLOCK_SIZE = max(BLOCK_SIZE, ROT_SIZE)
     # as we merge 2 fp4s to 1 uint8
     assert N1 % 2 == 0
 
@@ -83,6 +88,7 @@ def fused_rms_mxfp4_quant(
         inp1_weight,
         inp2,
         inp2_weight,
+        rot1,
         res1,
         out1_fp4,
         out1_bs,
@@ -102,6 +108,7 @@ def fused_rms_mxfp4_quant(
         out_res1_row_stride,
         BLOCK_SIZE=BLOCK_SIZE,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+        ROT_SIZE=ROT_SIZE,
         SKIP_SECOND_INPUT=(inp2 is None),
         FIRST_INPUT_RES=(res1 is not None),
     )

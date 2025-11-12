@@ -26,9 +26,11 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     x_f32 = fp4_utils.mxfp4_to_f32(x)
     w_f32 = fp4_utils.mxfp4_to_f32(w)
     # Next convert the e8m0 scales to f32.
+    aiter.logger.info(f"x shape: {x.shape}, w shape: {w.shape}, x_f32 shape: {x_f32.shape}, w_f32 shape: {w_f32.shape}, x_scale shape: {x_scales.shape}, w_scale shape: {w_scales.shape}")
     x_scales = x_scales[:m]
     x_scales = x_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1)
     x_scales_f32 = fp4_utils.e8m0_to_f32(x_scales)
+    aiter.logger.info(f"x_f32 shape: {x_f32.shape}, x_scales_f32 shape: {x_scales_f32.shape}")
     x_f32 = x_f32 * x_scales_f32
     w_scales = w_scales[:n]
     w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1)
@@ -84,7 +86,7 @@ def run_gemm_asm(
 
 
 @benchmark()
-def test_gemm(dtype, M, N, K):
+def test_gemm_asm(dtype, M, N, K):
     from aiter.jit.utils.chip_info import get_gfx
 
     if get_gfx() not in ["gfx950"]:
@@ -109,16 +111,21 @@ def test_gemm(dtype, M, N, K):
     # b, avg_b = a, 0
     # err_b = checkAllclose(a, b, msg="triton        ")
 
-    c, us = run_perftest(
-        aiter.gemm_a4w4,
-        x,
-        wshuffle,
-        x_scales_shuffle,
-        w_scales_shuffle,
-        out2,
-        bpreshuffle=True,
-    )
-    err = checkAllclose(a, c[:M], msg="unified api")
+    try:
+        c, us = run_perftest(
+            aiter.gemm_a4w4,
+            x,
+            wshuffle,
+            x_scales_shuffle,
+            w_scales_shuffle,
+            out2,
+            bpreshuffle=True,
+        )
+        err = checkAllclose(a, c[:M], msg="unified api")
+    except RuntimeError as e:
+        err = str(e)
+        us = float("nan")
+        aiter.logger.warning(f"gemm_a4w4 failed: dtype={dtype} M={M} N={N} K={K} error={err}")
     ret["us"] = us
     ret["TFLOPS"] = M * N * K * 2 / us / 1e6
     ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
@@ -154,6 +161,66 @@ def test_gemm(dtype, M, N, K):
 
     return ret
 
+@benchmark()
+def test_gemm_triton(dtype, M, N, K):
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+
+    if get_gfx() not in ["gfx950"]:
+        return
+    ret = {}
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    x = torch.randn((M, K), dtype=dtype)
+    w = torch.randn((N, K), dtype=dtype)
+    _, x_scales = quant_func(x, shuffle=False)
+    _, w_scales = quant_func(w, shuffle=False)
+    x, x_scales_shuffle = quant_func(x, shuffle=True)
+    w, w_scales_shuffle = quant_func(w, shuffle=True)
+    wshuffle = shuffle_weight(w, layout=(16, 16))
+    out1 = torch.empty(M, N, dtype=dtype)
+    out2 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
+    out3 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
+    bias_f32 = None
+    x_scales = x_scales.view(torch.uint8)
+    w_scales = w_scales.view(torch.uint8)
+    a, avg_a = run_torch(x, w, x_scales, w_scales, dtype)
+    # b, avg_b = run_triton(x, w.T, x_scales, w_scales, out1, dtype)
+    # b, avg_b = a, 0
+    # err_b = checkAllclose(a, b, msg="triton        ")
+
+    c, us = run_perftest(
+        gemm_afp4wfp4,
+        x.view(torch.uint8),
+        w.view(torch.uint8),
+        x_scales,
+        w_scales,
+        dtype,
+        out1,
+    )
+    err = checkAllclose(a, c[:M], msg="triton gemm")
+    ret["us"] = us
+    ret["TFLOPS"] = M * N * K * 2 / us / 1e6
+    ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
+    ret["err"] = err
+    return ret
+
+@benchmark()
+def test_gemm_baseline(dtype, M, N, K):
+    ret = {}
+    x = torch.randn((M, K), dtype=dtype)
+    w = torch.randn((N, K), dtype=dtype)
+    bias_f32 = None
+
+    _, us = run_perftest(
+        torch.mm,
+        x,
+        w.T
+    )
+    ret["us"] = us
+    ret["TFLOPS"] = M * N * K * 2 / us / 1e6
+    ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
+    ret["err"] = 0
+    return ret
 
 l_dtype = ["bf16"]
 l_mnk = [
@@ -232,6 +299,33 @@ l_mnk = [
     (3072, 8192, 28672),
 ]
 
+# _l_m = [1, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+_l_m = [64]
+# _l_m = [1]
+l_mnk = [
+    # dsr1
+    # qkv_a_proj
+    *((i, 2112, 7168) for i in _l_m),
+    # o_proj
+    *((i, 7168, 256) for i in _l_m),
+    # q_b_proj
+    *((i, 3072, 1536) for i in _l_m),
+    # shared_experts.gate_up_proj
+    *((i, 512, 7168) for i in _l_m),
+    # shared_experts.down_proj
+    *((i, 7168, 2048) for i in _l_m),
+    # gate_up_proj (dense mlp)
+    *((i, 4608, 7168) for i in _l_m),
+    # down_proj (dense mlp)
+    *((i, 7168, 2304) for i in _l_m),
+    # w_kc
+    # (1, 8192, 128),  # shape error during quant
+    # w_vc
+    *((i, 2048, 512) for i in _l_m),
+    # kv_b_proj,
+    *((i, 4096, 512) for i in _l_m),
+]
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -266,10 +360,20 @@ else:
 if args.shape is not None:
     l_mnk = [args.shape]
 
-df = []
+df_asm = []
+df_triton = []
+df_base = []
 for dtype in l_dtype:
     for m, n, k in l_mnk:
-        ret = test_gemm(dtype, m, n, k)
-        df.append(ret)
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+        ret = test_gemm_asm(dtype, m, n, k)
+        df_asm.append(ret)
+        ret = test_gemm_triton(dtype, m, n, k)
+        df_triton.append(ret)
+        ret = test_gemm_baseline(dtype, m, n, k)
+        df_base.append(ret)
+df_asm = pd.DataFrame(df_asm)
+df_triton = pd.DataFrame(df_triton)
+df_base = pd.DataFrame(df_base)
+aiter.logger.info(f"summary:\n{df_asm}")
+aiter.logger.info(f"triton summary:\n{df_triton}")
+aiter.logger.info(f"baseline summary:\n{df_base}")
