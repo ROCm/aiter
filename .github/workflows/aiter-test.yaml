@@ -13,6 +13,8 @@ concurrency:
 
 env:
   DOCKER_IMAGE: "rocm/pytorch:latest"
+  PR_TITLE: ${{ github.event.pull_request.title }}
+  GITHUB_REF: ${{ github.ref }}
 
 jobs:
   check-signal:
@@ -39,8 +41,8 @@ jobs:
         id: machines
         run: |
           set -euo pipefail
-          pr_title="${{ github.event.pull_request.title }}"
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          pr_title="$PR_TITLE"
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
             echo "It's main branch, running tests on MI300 and MI35X..."
             echo 'standard_runners=["aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
             echo 'multigpu_runners=["aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
@@ -75,7 +77,7 @@ jobs:
       - name: Sync submodules
         run: |
           set -euo pipefail
-          if [[ ${{ github.ref }} == "refs/heads/main" ]]; then
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
             echo "It's main branch, syncing latest CK..."
             git submodule sync
             git submodule update --init --recursive --remote --depth 1 --jobs 4
@@ -155,7 +157,7 @@ jobs:
       - name: Sync submodules
         run: |
           set -euo pipefail
-          if [[ ${{ github.ref }} == "refs/heads/main" ]]; then
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
             echo "It's main branch, syncing latest CK..."
             git submodule sync
             git submodule update --init --recursive --remote --depth 1 --jobs 4
