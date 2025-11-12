@@ -105,7 +105,7 @@ def get_tuned_gemm_list(tuned_gemm_file):
         tunedf = pd.read_csv(tuned_gemm_file)
     else:
         tunedf = pd.DataFrame(
-            columns=["cu_num", "M", "N", "K", "blockM", "kernelId_gemm1", "us_gemm1", "kernelName_gemm1" , "kernelId_gemm2", "us_gemm2", "kernelName_gemm2"]
+            columns=["cu_num", "M", "N", "K", "expert", "topk", "blockM", "kernelId_gemm1", "us_gemm1", "kernelName_gemm1" , "kernelId_gemm2", "us_gemm2", "kernelName_gemm2"]
         )
     return tunedf
 
@@ -484,8 +484,8 @@ def transform_txt_idx(txt_list):
 def tune_gemm_list(
     untunedf,
     tunedf,
-    expert, 
-    topk, 
+    # expert, 
+    # topk, 
     a_type,
     b_type,
     c_type,
@@ -516,13 +516,17 @@ def tune_gemm_list(
         M = untunedf.loc[i, "M"]
         N = untunedf.loc[i, "N"]
         K = untunedf.loc[i, "K"]
+        expert = untunedf.loc[i, "expert"]
+        topk  = untunedf.loc[i, "topk"]
         blockM = int(untunedf.loc[i, "blockM"])
         if (
             tunedf[
                 (tunedf["M"] == M)
                 & (tunedf["N"] == N)
                 & (tunedf["K"] == K)
-                & (tunedf["blockM"]  == blockM)
+                & (tunedf["K"] == K)
+                & (tunedf["expert"] == expert)
+                & (tunedf["topk"]  == topk)
                 & (tunedf["cu_num"] == cu_num)
             ].empty
             or forced
@@ -533,7 +537,7 @@ def tune_gemm_list(
             total_kernel_nums = 0
             #gemm1
             for id, _ in gemm1_blockM_dict.items():
-                info = ((cu_num, M, N, K, blockM), id)
+                info = ((cu_num, M, N, K, expert, topk, blockM), id)
                 task_gemm1.append(
                     (
                         info,
@@ -572,7 +576,7 @@ def tune_gemm_list(
             total_kernel_nums = 0
             #gemm2
             for id, _ in gemm2_blockM_dict.items():
-                info = ((cu_num, M, N, K, blockM), id)
+                info = ((cu_num, M, N, K, expert, topk, blockM), id)
                 task_gemm2.append(
                     (
                         info,
@@ -621,12 +625,12 @@ def tune_gemm_list(
                 el_gemm2 = ret_gemm2[i]
                 info_gemm1, time_gemm1, err_ratio_gemm1 = el_gemm1
                 info_gemm2, time_gemm2, err_ratio_gemm2 = el_gemm2
-                (cu_num, M, N, K, blockM), kernelId_gemm1 = info_gemm1
+                (cu_num, M, N, K, expert, topk, blockM), kernelId_gemm1 = info_gemm1
                 kernelId_gemm2 = info_gemm2[-1]
                 kernelName_gemm1 = "None" if kernelId_gemm1 == -1 else gemm1_kernel_list[kernelId_gemm1].name
                 kernelName_gemm2 = "None" if kernelId_gemm2 == -1 else gemm2_kernel_list[kernelId_gemm2].name
                 print(
-                    f"Tuning result for M:{M}, N:{N}, K:{K}, BlockM:{blockM}, cu_num:{cu_num} is "
+                    f"Tuning result for M:{M}, N:{N}, K:{K}, expert{expert}, topk{topk}, BlockM:{blockM}, cu_num:{cu_num} is "
                     f"Gemm1: {kernelId_gemm1} {kernelName_gemm1}, {time_gemm1}us. "
                     f"Gemm2: {kernelId_gemm2} {kernelName_gemm2}, {time_gemm2}us."
                 )
@@ -635,6 +639,8 @@ def tune_gemm_list(
                         "M": [M],
                         "N": [N],
                         "K": [K],
+                        "expert": [expert],
+                        "topk": [topk],
                         "blockM": [blockM],
                         "cu_num": [cu_num],
                         "kernelId_gemm1": [kernelId_gemm1],
@@ -646,15 +652,15 @@ def tune_gemm_list(
                     }
                 )
                 tunedf = pd.concat([tunedf, temp], ignore_index=True).drop_duplicates(
-                    subset=["M", "N", "K", "blockM", "cu_num"], keep="last"
+                    subset=["M", "N", "K", "expert", "topk", "blockM", "cu_num"], keep="last"
                 )
         else:
-            print(f"M:{M}, N:{N}, K{K}, BlockM{blockM} is in tuned gemm, skip!!!")
+            print(f"M:{M}, N:{N}, K{K}, expert{expert}, topk{topk}, BlockM{blockM} is in tuned gemm, skip!!!")
         print()
         print()
     issorted = True
     if issorted:
-        tunedf = tunedf.sort_values(by=["cu_num","blockM", "M", "N", "K"])
+        tunedf = tunedf.sort_values(by=["cu_num","blockM", "expert", "topk","M", "N", "K"])
     print("Totall tuning result:")
     print(tunedf)
     return tunedf
@@ -679,7 +685,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-i",
         "--untune_file",
-        # default="aiter/configs/cktile_moe_2stage_a16w4_e128topk4_untuned.csv",
+        # default="aiter/configs/cktile_moe_2stage_a16w4_untuned.csv",
         default="aiter/configs/test_untuned.csv",
         required=False,
         help="input",
@@ -695,7 +701,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-o",
         "--tune_file",
-        # default="aiter/configs/cktile_moe_2stage_a16w4_e128topk4_tuned.csv",
+        # default="aiter/configs/cktile_moe_2stage_a16w4_tuned.csv",
         default="aiter/configs/test_tuned.csv",
         required=False,
         help="output: tuning result store this file",
@@ -717,25 +723,6 @@ if __name__ == "__main__":
         required=False,
         help="force to tune all kernels, even if they are already tuned",
     )
-    
-    parser.add_argument(
-        "-e",
-        "--expert",
-        type=int,
-        default=128,
-        help="""Number of experts.
-        e.g.: -e 8""",
-    )
-
-    parser.add_argument(
-        "-k",
-        "--topk",
-        type=int,
-        default=4,
-        help="""Number of top experts.
-        e.g.: -k 2""",
-    )
-
     
     # parser.add_argument(
     #     "-a",
@@ -829,8 +816,6 @@ if __name__ == "__main__":
     tunedf = get_tuned_gemm_list(args.tune_file)
     tunedf = tune_gemm_list(
         untunedf, tunedf, 
-        args.expert, 
-        args.topk, 
         aq_type,
         bq_type,
         c_type,

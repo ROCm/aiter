@@ -194,80 +194,80 @@ gemm2_kernels_dict = {
 
 
 a8w8_gfx950_heuristic_dispatch= ("""
-    // Apply shape heuristics to find a suitable kernel implementation.
-    if (block_m == 32)
-    {{
-        return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 64)
-    {{
-        return {(1, 2)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 128)
-    {{
-        return {(1, 4)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    //else if (block_m == 256)
-    //{{
-    //    return {(1, 6)}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
+        // Apply shape heuristics to find a suitable kernel implementation.
+        if (block_m == 32)
+        {{
+            return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 64)
+        {{
+            return {(1, 2)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 128)
+        {{
+            return {(1, 4)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        //else if (block_m == 256)
+        //{{
+        //    return {(1, 6)}<ADataType, BDataType, AccDataType, CDataType>;
+        //}}
 """, """
-    // Apply shape heuristics to find a suitable kernel implementation.
-    if (block_m == 32)
-    {{
-        return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 64)
-    {{
-        return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 128)
-    {{
-        return {(2, 2)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    //else if (block_m == 256)
-    //{{
-    //    return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
+        // Apply shape heuristics to find a suitable kernel implementation.
+        if (block_m == 32)
+        {{
+            return {(2, 0)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 64)
+        {{
+            return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 128)
+        {{
+            return {(2, 2)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        //else if (block_m == 256)
+        //{{
+        //    return {(2, 3)}<ADataType, BDataType, AccDataType, CDataType>;
+        //}}
 
 """)
 
 a16w4_gfx950_heuristic_dispatch= ("""
-    // Apply shape heuristics to find a suitable kernel implementation.
-    if (block_m == 16)
-    {{
-        return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 32)
-    {{
-        return {(1, 13)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 64)
-    {{
-        return {(1, 22)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 128)
-    {{
-        return {(1, 32)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
+        // Apply shape heuristics to find a suitable kernel implementation.
+        if (block_m == 16)
+        {{
+            return {(1, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 32)
+        {{
+            return {(1, 13)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 64)
+        {{
+            return {(1, 22)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 128)
+        {{
+            return {(1, 32)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
     """, """
-    // Apply shape heuristics to find a suitable kernel implementation.
-    if (block_m == 16)
-    {{
-        return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 32)
-    {{
-        return {(2, 13)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 64)
-    {{
-        return {(2, 22)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
-    else if (block_m == 128)
-    {{
-        return {(2, 32)}<ADataType, BDataType, AccDataType, CDataType>;
-    }}
+        // Apply shape heuristics to find a suitable kernel implementation.
+        if (block_m == 16)
+        {{
+            return {(2, 1)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 32)
+        {{
+            return {(2, 13)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 64)
+        {{
+            return {(2, 22)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
+        else if (block_m == 128)
+        {{
+            return {(2, 32)}<ADataType, BDataType, AccDataType, CDataType>;
+        }}
 """)
 
 heuristic_dispatch_dict = {

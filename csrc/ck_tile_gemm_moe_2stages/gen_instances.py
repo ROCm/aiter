@@ -8,22 +8,80 @@ import re
 from moe_cktile2stages_common import kernelInstance, get_gemm1_kernels_list, get_gemm2_kernels_list, get_heuristic_dispatch_template
 from aiter.jit.utils.chip_info import get_gfx
 
-class cktile_moe_2stage_gemm_codegen:
+HERUSTIC_DISPATCH_TEMPLATE = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#include "moe_cktile2stages.h"
+
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
+{{
+    {gemm1_dispatch_str}
+    TORCH_CHECK(
+    false,
+    "Unsupported block_m value for moe_gemm1 heuristic dispatch: ",
+    block_m);
+}}
+
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
+{{
+    {gemm2_dispatch_str}
+    TORCH_CHECK(
+    false,
+    "Unsupported block_m value for moe_gemm2 heuristic dispatch: ",
+    block_m);
+}}"""
+
+LOOKUP_TEMPLATE = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#include "moe_cktile2stages.h"
+
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+inline const std::unordered_map<int, MoeKernel> kernalIdMapGemm1 = [] {{
+    {idMap_gemm1_str}
+
+    TORCH_CHECK(
+    false,
+    "Unsupported Datatype for moe_gemm1 kernalIdMap");
+}}();
+
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+inline const std::unordered_map<int, MoeKernel> kernalIdMapGemm2 = [] {{
+    {idMap_gemm2_str}
+    
+    TORCH_CHECK(
+    false,
+    "Unsupported Datatype for moe_gemm2 kernalIdMap");
+}}();
+"""
+
+MAINFEST_TEMPLATE = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+// #ifdef USE_ROCM
+
+#include <cstdlib>
+
+#include <torch/extension.h>
+
+{gemms_str}
+
+// endif // USE_ROCM
+"""
+
+class instances_config:
     def __init__(
         self, 
-        working_path, 
         a_dtype,
         b_dtype,
         acc_dtype,
         c_dtype,
         quant_type,
         activation,
-        mul_routed_weight_stage,
-        istune=False):
-        self.working_path   = working_path
-        self.impl_path      = os.path.join(working_path, "impl")
-        self.instances_path = os.path.join(working_path, "instances")
-        self.istune         = istune
+        mul_routed_weight_stage):
         self.a_dtype        = a_dtype.lower()
         self.b_dtype        = b_dtype.lower()
         self.acc_dtype      = acc_dtype.lower()
@@ -31,17 +89,51 @@ class cktile_moe_2stage_gemm_codegen:
         self.quant_type     = quant_type
         self.activation     = activation
         self.mul_routed_weight_stage = mul_routed_weight_stage
-        
-    def get_suffix(self, stage: int) -> str:
-        return ("_").join(element for element in 
-            [
-                self.quant_type,
-                "MulRoutedWeight" if self.mul_routed_weight_stage == stage else "",
-                "" if (stage == 2) else self.activation,
-            ] if element != ""
-        )
+    
+    def get_ctype_ab_type_check(self):
+        if (self.quant_type == "1x32") and (self.a_dtype in ["bf16", "fp16"]): #a16w4
+            return "(std::is_same_v<ADataType, fp16> || std::is_same_v<ADataType, bf16>) && std::is_same_v<BDataType, pk_fp4>"
+        elif (self.a_dtype == "fp8") and (self.a_dtype == "fp8"):
+            return "std::is_same_v<ADataType, fp8> && std::is_same_v<BDataType, fp8>"
+        else:
+            print(f"Not supported datatype combination: a({a_dtype}), b({b_dtype})")
 
-    def gen_instance(self, k: kernelInstance):
+
+class cktile_moe_2stage_gemm_codegen:
+    def __init__(
+        self, 
+        working_path, 
+        istune=False):
+        self.working_path   = working_path
+        self.impl_path      = os.path.join(working_path, "impl")
+        self.instances_path = os.path.join(working_path, "instances")
+        self.istune         = istune
+        self.config_list    = list()
+        self.heuristic_dispatc_IMPL = ["" , ""]
+        self.lookup_IMPL = ["", ""]
+        self.manifest_IMPL = ""
+
+    
+    def add_config(
+        self,
+        a_dtype,
+        b_dtype,
+        acc_dtype,
+        c_dtype,
+        quant_type,
+        activation,
+        mul_routed_weight_stage):
+        self.config_list.append(
+            instances_config(   a_dtype,
+                                b_dtype,
+                                acc_dtype,
+                                c_dtype,
+                                quant_type,
+                                activation,
+                                mul_routed_weight_stage))
+
+
+    def gen_instance(self, k: kernelInstance, config: instances_config):
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages_common.cuh"
@@ -211,9 +303,9 @@ template torch::Tensor
                     f"{name}_a{a_type}_b{b_type}_acc{acc_type}_C{c_type}.cpp",
                 )
             ).write_text(intsance)
-        if (k.QuantType == "1x32") and (self.a_dtype in ["bf16", "fp16"]):
+        if (k.QuantType == "1x32") and (config.a_dtype in ["bf16", "fp16"]): #a16w4
             for CDtype in ["bf16", "fp16"]:
-                fill_template(k.name, CDtype, "pk_fp4", self.acc_dtype, CDtype)
+                fill_template(k.name, CDtype, "pk_fp4", "float", CDtype)
         else:
             for CDtype in ["bf16", "fp16"]:
                 for ABDtype in ["fp8"]: #"bf16", "fp16", 
@@ -230,38 +322,14 @@ template torch::Tensor
                         # ).write_text(intsance)
 
     '''genarete heuristic dispatch'''
-    def gen_heuristic_dispatch(self, tag, kernels_dict):
-        heuristic_dispatc_Template = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "moe_cktile2stages.h"
-
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
-{{{{
-    {gemm1_dispatch_str}
-    TORCH_CHECK(
-    false,
-    "Unsupported block_m value for moe_gemm1 heuristic dispatch: ",
-    block_m);
-}}}}
-
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
-{{{{
-    {gemm2_dispatch_str}
-    TORCH_CHECK(
-    false,
-    "Unsupported block_m value for moe_gemm2 heuristic dispatch: ",
-    block_m);
-}}}}"""
+    def gen_heuristic_dispatch(self, tag, kernels_dict, config):
         gemm1_str, gemm2_str =  get_heuristic_dispatch_template(tag)
-        HEURISTIC_template = heuristic_dispatc_Template.format(
-            gemm1_dispatch_str = gemm1_str,
-            gemm2_dispatch_str = gemm2_str,
-        )
+        # HEURISTIC_template = HERUSTIC_DISPATCH_TEMPLATE.format(
+        #     gemm1_dispatch_str = gemm1_str,
+        #     gemm2_dispatch_str = gemm2_str,
+        # )
         # print(HEURISTIC_template)
-       
+
         def validate_and_format(template: str, mapping: dict) -> str:
             #check all format element in dict.
             str_mapping = {str(key): value.name for key, value in mapping.items()}
@@ -279,90 +347,34 @@ MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
             return template.format(**{k: v for k, v in str_mapping.items()})
 
         #create heuristic heirarchy
-        with open(os.path.join(self.working_path, "moe_cktile2stages_heuristic_dispatch.h"), "w") as f:
-            f.write(validate_and_format(HEURISTIC_template, kernels_dict))
-            # arch = get_gfx()
-            # inst_k = "32" if self.quant_type == "1x32" else ("128" if arch == "gfx950" else "64")
-            # f.write(
-            #     HEURISTIC_template.format(
-            #         inst_k=inst_k,
-            #         suffix1 = self.get_suffix(1),
-            #         suffix2 = self.get_suffix(2)
-            #     )
-            # )
+        Template_str_head = """    if constexpr (%s) {\n"""%(config.get_ctype_ab_type_check())
+        Template_str_tail = "}\n\n"
+        self.heuristic_dispatc_IMPL[0] += (Template_str_head + validate_and_format(gemm1_str, kernels_dict) + Template_str_tail)
+        self.heuristic_dispatc_IMPL[1] += (Template_str_head + validate_and_format(gemm2_str, kernels_dict) + Template_str_tail)
+
 
 
     '''generate lookup.h linking MNK/datatype to specific instance'''
-    def gen_lookup_dict(self, kernels_dict):
-        LOOKUP_main = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "moe_cktile2stages.h"
+    def gen_lookup_dict(self, kernels_dict, config: instances_config):
+        
+        Template_id_str = """            {{{id_str}, {k_name_str}<ADataType, BDataType, AccDataType, CDataType>}}"""
+        Template_str_head = """    if constexpr (%s) {
+        return std::unordered_map<int, MoeKernel>{\n"""%(config.get_ctype_ab_type_check())
+        Template_str_tail = "\n    };\n}\n"
+        gemm_str = [list(), list()]
+        for id, k in kernels_dict.items():
+            add_str = Template_id_str.format(
+                    id_str = id[1],
+                    k_name_str = k.name,)
+            gemm_str[0 if id[0] == 1 else 1].append(add_str)
+        self.lookup_IMPL[0] += (Template_str_head + ",\n".join(gemm_str[0]) + Template_str_tail)
+        self.lookup_IMPL[1] += (Template_str_head + ",\n".join(gemm_str[1]) + Template_str_tail)
 
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-std::unordered_map<int, MoeKernel> kernalIdMapGemm1 = {{
-    {idMap_gemm1_str}
-}};
-
-template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
-std::unordered_map<int, MoeKernel> kernalIdMapGemm2 = {{
-    {idMap_gemm2_str}
-}};
-"""
-        Template_id_str = """{{{id_str}, {k_name_str}<ADataType, BDataType, AccDataType, CDataType>}}"""
-        with open(os.path.join(self.working_path, "moe_cktile2stages_lookup.h"), "w") as f:
-            idMap_gemm1 = ""
-            idMap_gemm2 = ""
-            for id, k in kernels_dict.items():
-                if (id[0] == 1):
-                    if (idMap_gemm1 != ""):
-                        idMap_gemm1 += ",\n"
-                    idMap_gemm1 += Template_id_str.format(
-                        id_str = id[1],
-                        k_name_str = k.name,
-                    )
-                if (id[0] == 2):
-                    if (idMap_gemm2 != ""):
-                        idMap_gemm2 += ",\n"
-                    idMap_gemm2 += Template_id_str.format(
-                        id_str = id[1],
-                        k_name_str = k.name,
-                    )
-            f.write(
-                LOOKUP_main.format(
-                    idMap_gemm1_str = idMap_gemm1,
-                    idMap_gemm2_str = idMap_gemm2,
-                )
-            )
-                # print( ":", k.name)
-                # if not tunning, tuned mnk = {stage, m, n, k}
-                # if not self.istune and (isinstance(mnk, tuple) and (len(mnk) == 4) and mnk[1] > 0):
-                #     f.write(
-                #         LOOKUP_template.format(
-                #             MNK="{"
-                #             + (", ").join(map(lambda x: str(x), list(mnk)))
-                #             + "}",
-                #             kernel_name=k.name,
-                #         )
-                #     )
-                # # if tunning, mnk = -1,-2.....
-                # elif self.istune and isinstance(mnk, int):
-                #     f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
-            # f.write(LOOKUP_end)
 
     '''generate manifest.h for instance header'''
     def gen_manifest_head(self, kernels_dict):
-        MAINFEST_head = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-// #ifdef USE_ROCM
-
-#include <cstdlib>
-
-#include <torch/extension.h>
-"""
-        MAINFEST_template = """
+        MAINFEST_template_gemm = """
 template <typename ADataType, typename BDataType, typename DDataType, typename EDataType>
 torch::Tensor
 {kernel_name}(
@@ -380,39 +392,12 @@ torch::Tensor
     std::optional<torch::Tensor> w_scale,
     std::optional<torch::Tensor> exp_bias);
 """
-        MAINFEST_end = """
-
-// endif // USE_ROCM
-"""
-
-        with open(os.path.join(self.working_path, "moe_cktile2stages_manifest.h"), "w") as f:
-            f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
-            f.write(MAINFEST_end)
+        for mnk, k in kernels_dict.items():
+            self.manifest_IMPL += MAINFEST_template_gemm.format(kernel_name=k.name)
 
     '''generate all instances and headers'''
-    def gen_instances(self):
-        #gen all instances for gemm1 and gemm2
-        _, gemm1_kernel_list = get_gemm1_kernels_list(
-            self.a_dtype,
-            self.b_dtype,
-            self.quant_type,
-            self.activation,
-            self.mul_routed_weight_stage == 1,
-            self.istune,
-        )
-        tag, gemm2_kernel_list = get_gemm2_kernels_list(
-            self.a_dtype,
-            self.b_dtype,
-            self.quant_type,
-            "",
-            self.mul_routed_weight_stage == 2,
-            self.istune,
-        )
-        #merge gemm1/gemm2 dict with key = {stage, key}
-        kernels_dict = {**{(1, key): value for key, value in gemm1_kernel_list.items()},
-                        **{(2, key): value for key, value in gemm2_kernel_list.items()}}
+    def gen_all_instances(self):
+        #path re-create
         if os.path.exists(self.impl_path):
             shutil.rmtree(self.impl_path)
         os.mkdir(self.impl_path)
@@ -420,12 +405,58 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for id, k in kernels_dict.items():
-            self.gen_instance(k)
+        for config_inst in self.config_list:
+            self.gen_instances(config_inst)
+        
+        with open(os.path.join(self.working_path, "moe_cktile2stages_heuristic_dispatch.h"), "w") as f:
+            f.write(
+                HERUSTIC_DISPATCH_TEMPLATE.format(
+                    gemm1_dispatch_str = self.heuristic_dispatc_IMPL[0],
+                    gemm2_dispatch_str = self.heuristic_dispatc_IMPL[1],
+                )
+            )
+        with open(os.path.join(self.working_path, "moe_cktile2stages_lookup.h"), "w") as f:
+            f.write(
+                LOOKUP_TEMPLATE.format(
+                    idMap_gemm1_str = self.lookup_IMPL[0],
+                    idMap_gemm2_str = self.lookup_IMPL[1],
+                )
+            )
+        with open(os.path.join(self.working_path, "moe_cktile2stages_manifest.h"), "w") as f:
+            f.write(
+                MAINFEST_TEMPLATE.format(
+                    gemms_str = self.manifest_IMPL
+                )
+            )
 
-        self.gen_lookup_dict(kernels_dict)
+    def gen_instances(self, config : instances_config):
+        #gen all instances for gemm1 and gemm2
+        _, gemm1_kernel_list = get_gemm1_kernels_list(
+            config.a_dtype,
+            config.b_dtype,
+            config.quant_type,
+            config.activation,
+            config.mul_routed_weight_stage == 1,
+            self.istune,
+        )
+        tag, gemm2_kernel_list = get_gemm2_kernels_list(
+            config.a_dtype,
+            config.b_dtype,
+            config.quant_type,
+            "",
+            config.mul_routed_weight_stage == 2,
+            self.istune,
+        )
+        #merge gemm1/gemm2 dict with key = {stage, key}
+        kernels_dict = {**{(1, key): value for key, value in gemm1_kernel_list.items()},
+                        **{(2, key): value for key, value in gemm2_kernel_list.items()}}
+
+        for id, k in kernels_dict.items():
+            self.gen_instance(k, config)
+
+        self.gen_lookup_dict(kernels_dict, config)
         self.gen_manifest_head(kernels_dict)
-        self.gen_heuristic_dispatch(tag, kernels_dict)
+        self.gen_heuristic_dispatch(tag, kernels_dict, config)
 
 
 # def get_tune_dict(tune_dict_csv):
@@ -546,25 +577,28 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
 
-    #single UT
-    # args.a_type = "fp8"
-    # args.b_type = "fp8"
-    # args.quant_type = "per_token"
-    
-    args.a_dtype = "bf16"
-    args.b_dtype = "fp4"
-    args.quant_type = "1x32"
-
+    #codegen initialization
     codegen = cktile_moe_2stage_gemm_codegen(
         args.working_path,
-        args.a_dtype,
-        args.b_dtype,
-        "float",
-        args.c_dtype,
-        args.quant_type,
-        args.activation,
-        args.mul_routed_weight_stage,
         args.tune
     )
+    #a16w4
+    codegen.add_config(
+        "bf16",
+        "fp4",
+        "float",
+        args.c_dtype,
+        "1x32",
+        args.activation,
+        args.mul_routed_weight_stage,)
+    #a8w8
+    codegen.add_config(
+        "fp8",
+        "fp8",
+        "float",
+        args.c_dtype,
+        "per_token",
+        args.activation,
+        args.mul_routed_weight_stage,)
 
-    codegen.gen_instances()
+    codegen.gen_all_instances()

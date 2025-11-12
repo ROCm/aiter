@@ -118,14 +118,14 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
 
     if (XQ.dtype() == torch_fp8)
     {
-    //     if (Y.dtype() == at::ScalarType::Half)
-    //     {
-    //        moe_dispatch<fp8, fp8, float, fp16, 1>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
-    //     }
-        // if (Y.dtype() == at::ScalarType::BFloat16)
-        // {
-        //     moe_dispatch<fp8, fp8, float, bf16, 1>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
-        // }
+        if (Y.dtype() == at::ScalarType::Half)
+        {
+           moe_dispatch<fp8, fp8, float, fp16, 1>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
+        }
+        if (Y.dtype() == at::ScalarType::BFloat16)
+        {
+            moe_dispatch<fp8, fp8, float, bf16, 1>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
+        }
     }
     else if ((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) && (WQ.dtype() == at::ScalarType::Byte)) //a16w4
     {
@@ -177,14 +177,14 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
 
     if (XQ.dtype() == torch_fp8)
     {
-    //     if (Y.dtype() == at::ScalarType::Half)
-    //     {
-    //        moe_dispatch<fp8, fp8, float, fp16, 2>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
-    //     }
-        // if (Y.dtype() == at::ScalarType::BFloat16)
-        // {
-        //     moe_dispatch<fp8, fp8, float, bf16, 2>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias); 
-        // }
+        if (Y.dtype() == at::ScalarType::Half)
+        {
+           moe_dispatch<fp8, fp8, float, fp16, 2>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
+        }
+        if (Y.dtype() == at::ScalarType::BFloat16)
+        {
+            moe_dispatch<fp8, fp8, float, bf16, 2>(M, N, K, MPerBlock, KernelId)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, n_padded_zeros, k_padded_zeros, topk_weight, x_scale, w_scale, exp_bias); 
+        }
     }
     else if ((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) && (WQ.dtype() == at::ScalarType::Byte)) //a16w4
     {
