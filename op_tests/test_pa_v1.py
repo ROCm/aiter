@@ -436,7 +436,6 @@ DUMP_OUTPUT = False  # whether to dump output
 @pytest.mark.parametrize("quant_cache_dtype", [None, dtypes.fp8, dtypes.i8])
 @pytest.mark.parametrize("seed", [0])
 @pytest.mark.parametrize("device", ["cuda:0"])
-@pytest.mark.parametrize("sliding_window", [0, 10])
 def test_paged_attention(
     ctx_lens: int,
     num_seqs: int,
@@ -452,7 +451,7 @@ def test_paged_attention(
     quant_cache_dtype: torch.dtype,
     seed: int,
     device: str,
-    sliding_window: int,
+    sliding_window: int = 0,
 ) -> None:
     if pa_variant == PAVariant.Shomy:
         if quant_cache_dtype is not None:
@@ -592,6 +591,37 @@ def test_paged_attention(
     # assert checkAllclose(out_native, out_aiter, atol=atol, rtol=rtol, msg=msg)
     # print(
     #     f"[test] dim: {str((ctx_lens, num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, finished)\n")
+
+
+@pytest.mark.parametrize("ctx_lens", [1, 26, 128, 4097])
+@pytest.mark.parametrize("num_seqs", [1, 3, 31, 128])
+@pytest.mark.parametrize("num_heads", [(8, 1), (32, 4)])
+@pytest.mark.parametrize("use_alibi", [False, True])
+@pytest.mark.parametrize("sliding_window", [0, 10])
+def test_paged_attention_sliding_window(
+    ctx_lens: int,
+    num_seqs: int,
+    num_heads: Tuple[int, int],
+    use_alibi: bool,
+    sliding_window: int,
+) -> None:
+    test_paged_attention(
+        ctx_lens,
+        num_seqs,
+        num_heads,
+        128,
+        use_alibi,
+        block_size=16,
+        dtype=dtypes.fp16,
+        kv_cache_dtype="auto",
+        kv_cache_layout="NHD",
+        logits_soft_cap=0.0,
+        pa_variant=PAVariant.Shomy,
+        quant_cache_dtype=None,
+        seed=0,
+        device="cuda:0",
+        sliding_window=sliding_window,
+    )
 
 
 if __name__ == "__main__":
