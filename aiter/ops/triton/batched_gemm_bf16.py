@@ -4,7 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
 from aiter.ops.triton._triton_kernels.batched_gemm_bf16 import (
     _batched_gemm_bf16_kernel,
     _get_config,
@@ -24,16 +23,20 @@ def batched_gemm_bf16(
     config: Optional[dict] = None,
 ):
     """
-    Computes the matmul YQ[i] = XQ[i] x WQ[i]T for every i in a given batch and optionally adds a bias to each result.
+    Computes batched 16 bit matrix multiplication Y[i] = X[i] @ W[i]^T with optional bias.
 
-    Key parameters:
-    - XQ: Batch tensor XQ with shape (B, M, K).
-    - WQ: Batch tensor WQ with shape (B, N, K).
-    - Bias: Bias batch tensor with shape (B, 1, N).
-    - YQ: Output Matrix Y with shape (B, M, N). If this is none, then it's created by this API and returned as output
+    Args:
+        XQ (torch.Tensor): Input batch with shape (B, M, K) (BF16 or FP16).
+        WQ (torch.Tensor): Weight batch with shape (B, N, K), internally transposed.
+        bias (Optional[torch.Tensor]): Bias batch with shape (B, 1, N).
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        splitK (Optional[int]): Not supported. Must be None.
+        YQ (Optional[torch.Tensor]): Pre-allocated output tensor with shape (B, M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M).
 
     Returns:
-    - YQ: The output batch tensor with shape (B, M, N).
+        torch.Tensor: Output batch with shape (B, M, N).
     """
     _LOGGER.info(f"BATCHED_GEMM_BF16: x={tuple(XQ.shape)} w={tuple(WQ.shape)}")
 
