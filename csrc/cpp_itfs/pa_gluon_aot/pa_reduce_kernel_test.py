@@ -30,7 +30,7 @@ from csrc.cpp_itfs.utils import (
 
 
 # os.environ['TRITON_CACHE_DIR'] = '/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache'
-# compile_reduce_kernel_count = 0
+compile_reduce_kernel_count = 0
 
 
 def parse_version(version_str):
@@ -100,11 +100,11 @@ def compile_reduce_kernel(
             ),
         )
 
-    # global compile_reduce_kernel_count
-    # compile_reduce_kernel_count += 1
+    global compile_reduce_kernel_count
+    compile_reduce_kernel_count += 1
 
-    if not_built(func_name):
-        # if compile_reduce_kernel_count == 1:
+    # if not_built(func_name):
+    if compile_reduce_kernel_count == 1:
         # Build signature based on kernel parameters
         signature_parts = [
             "*bf16:16",  # output_ptr
@@ -112,17 +112,17 @@ def compile_reduce_kernel(
             "*fp32:16",  # max_logits_ptr
             "*bf16:16",  # logits_ptr
             "*i32:16",  # context_lengths_ptr
-            "i32",  # stride_output_seq
-            "i32",  # stride_output_head
-            "i32",  # stride_exp_sums_seq
-            "i32",  # stride_exp_sums_head
-            "i32",  # stride_exp_sums_part
-            "i32",  # stride_logits_seq
-            "i32",  # stride_logits_head
-            "i32",  # stride_logits_part
-            "i32",  # stride_logits_group
-            "i32",  # num_seqs
-            "i32",  # num_kv_heads
+            "i32:16",  # stride_output_seq
+            "i32:16",  # stride_output_head
+            "i32:16",  # stride_exp_sums_seq
+            "i32:16",  # stride_exp_sums_head
+            "i32:16",  # stride_exp_sums_part
+            "i32:16",  # stride_logits_seq
+            "i32:16",  # stride_logits_head
+            "i32:16",  # stride_logits_part
+            "i32:16",  # stride_logits_group
+            "i32:16",  # num_seqs
+            "i32:16",  # num_kv_heads
             f"{query_group_size}",
             f"{head_size}",
             f"{max_context_partition_num}",

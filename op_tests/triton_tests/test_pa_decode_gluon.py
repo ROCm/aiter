@@ -1679,25 +1679,38 @@ def run_multi_pa_gluon_test(
     global USE_TORCH_FLASH_REF
 
     for use_torch_flash_ref in use_torch_flash_ref_options:
-        for use_aot_impl in use_aot_impl_options:
-            # Set global configuration for this test run
-            USE_TORCH_FLASH_REF = use_torch_flash_ref
-            for trans_v_mode in trans_v:
-                for kv_varlen_mode in kv_varlen:
-                    for context_partition_size in context_partition_size_options:
-                        for qm in quant_mode:
-                            for dt in data_types:
-                                for bs in block_sizes:
-                                    for hc in head_configs:
-                                        for cl in context_length:
-                                            for bsz in batch_sizes:
-                                                for ql in query_lengths:
+        # Set global configuration for this test run
+        USE_TORCH_FLASH_REF = use_torch_flash_ref
+        for trans_v_mode in trans_v:
+            for kv_varlen_mode in kv_varlen:
+                for context_partition_size in context_partition_size_options:
+                    for qm in quant_mode:
+                        for dt in data_types:
+                            for bs in block_sizes:
+                                for hc in head_configs:
+                                    for cl in context_length:
+                                        for bsz in batch_sizes:
+                                            for ql in query_lengths:
+                                                for head_size in HEAD_DIMENSION_OPTIONS:
                                                     for (
-                                                        head_size
-                                                    ) in HEAD_DIMENSION_OPTIONS:
+                                                        use_aot_impl
+                                                    ) in use_aot_impl_options:
                                                         current += 1
                                                         print(
-                                                            f"\n[{current}/{total * len(quant_mode)}] Testing: use_torch_flash_ref={use_torch_flash_ref}, use_aot_impl={use_aot_impl}, trans_v={trans_v_mode}, kv_varlen={kv_varlen_mode}, context_partition_size={context_partition_size}, quant_mode={qm}, data_type={dt}, block_size={bs}, num_heads={hc}, context_lengths={cl}, batch_size={bsz}, query_length={ql}, head_size={head_size}"
+                                                            f"\n[{current}/{total * len(quant_mode)}] Testing: "
+                                                            f"use_torch_flash_ref={use_torch_flash_ref}, "
+                                                            f"use_aot_impl={use_aot_impl}, "
+                                                            f"trans_v={trans_v_mode}, "
+                                                            f"kv_varlen={kv_varlen_mode}, "
+                                                            f"context_partition_size={context_partition_size}, "
+                                                            f"quant_mode={qm}, "
+                                                            f"data_type={dt}, "
+                                                            f"block_size={bs}, "
+                                                            f"num_heads={hc}, "
+                                                            f"context_lengths={cl}, "
+                                                            f"batch_size={bsz}, "
+                                                            f"query_length={ql}, "
+                                                            f"head_size={head_size}"
                                                         )
                                                         result = run_pa_gluon_test(
                                                             context_length=cl,
@@ -1813,8 +1826,8 @@ def main():
 
 if __name__ == "__main__":
     BLOCK_SIZE_OPTIONS = [16]
-    # HEAD_CONFIGURATIONS = [(16, 1), (16, 2)]
-    HEAD_CONFIGURATIONS = [(16, 2)]
+    HEAD_CONFIGURATIONS = [(16, 1), (16, 2)]
+    # HEAD_CONFIGURATIONS = [(16, 2)]
     main()
 
     BLOCK_SIZE_OPTIONS = [1024]
