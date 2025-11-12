@@ -186,27 +186,41 @@ def gemm_a16w16(
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if config is None:
-        config = _get_config(M, N, K)
+        config = _get_config(M, N, K).copy()
 
-    grid = lambda META: (  # noqa: E731
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
-    _gemm_a16_w16_kernel[grid](
-        x,
-        w,
-        y,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        y.stride(0),
-        y.stride(1),
-        activation=_get_activation_from_str(activation) if activation else "",
-        use_activation=activation is not None,
-        **config,
-    )
+    # ======= parse env vars =======
+    env_vars = config.pop("env_vars", {})
+    old_env_vars = {}
+    for key, value in env_vars.items():
+        old_env_vars[key] = os.environ.get(key)
+        os.environ[key] = str(value)
+
+    try:
+        grid = lambda META: (  # noqa: E731
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+        _gemm_a16_w16_kernel[grid](
+            x,
+            w,
+            y,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            y.stride(0),
+            y.stride(1),
+            activation=_get_activation_from_str(activation) if activation else "",
+            use_activation=activation is not None,
+            **config,
+        )
+    finally:
+        for key, old_value in old_env_vars.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
 
     return y
