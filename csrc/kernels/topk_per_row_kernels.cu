@@ -25,6 +25,7 @@ static inline __device__ uint16_t extractBinIdx(float x)
 using fp32x1 = __attribute__((__ext_vector_type__(1))) float;
 using fp32x2 = __attribute__((__ext_vector_type__(2))) float;
 using fp32x4 = __attribute__((__ext_vector_type__(4))) float;
+using fp32x8 = __attribute__((__ext_vector_type__(8))) float;
 
 template <int vec>
 struct to_vector;
@@ -46,7 +47,11 @@ struct to_vector<4>
 {
     using type = fp32x4;
 };
-
+template <>
+struct to_vector<8>
+{
+    using type = fp32x8;
+};
 static inline __device__ uint32_t floatAsSortableUint(float x)
 {
     uint32_t bits = __float_as_uint(x);
@@ -131,7 +136,7 @@ __device__ bool processHistogramStep(const float* logits,
     for(int vecIdx = (rowStart / Vector) + threadIdx.x; vecIdx < (rowEnd + Vector - 1) / Vector;
         vecIdx += kNumThreadsPerBlock)
     {
-        auto v         = reinterpret_cast<const VectorType*>(logits)[vecIdx];
+        auto v = reinterpret_cast<const VectorType*>(logits)[vecIdx];
 #pragma unroll
         for(int j = 0; j < Vector; j++)
         {
@@ -271,11 +276,8 @@ template <int kNumThreadsPerBlock        = 512,
           bool useRadixSort              = true,
           int Vector                     = 4,
           bool sortResultLogitDescending = false>
-__device__ void topk_per_row_kernel(const float* logits,
-                                    const int rowStart,
-                                    const int rowEnd,
-                                    int* outIndices,
-                                    int stride1)
+__device__ void topk_per_row_kernel(
+    const float* logits, const int rowStart, const int rowEnd, int* outIndices, int stride1)
 {
     // The number of slots for the final pass.
     static constexpr int kNumFinalItems = 2048;
@@ -580,23 +582,23 @@ static __global__ void topk_per_row_decode(
     auto logitsLocal     = logits + rowIdx * stride0;
 
     topk_per_row_kernel<kNumThreadsPerBlock, kNumBins, kTopK, useRadixSort, Vector>(
-      logitsLocal, rowStart, rowEnd, outIndicesLocal, stride1);
+        logitsLocal, rowStart, rowEnd, outIndicesLocal, stride1);
 }
 
 } // namespace aiter
 
 void top_k_per_row_prefill(const torch::Tensor& logits,
-                  const torch::Tensor& rowStarts,
-                  const torch::Tensor& rowEnds,
-                  torch::Tensor& indices,
-                  int64_t numRows,
-                  int64_t stride0,
-                  int64_t stride1)
+                           const torch::Tensor& rowStarts,
+                           const torch::Tensor& rowEnds,
+                           torch::Tensor& indices,
+                           int64_t numRows,
+                           int64_t stride0,
+                           int64_t stride1)
 {
     constexpr int kSortingAlgorithmThreshold = 12288;
 
     // Compute the results on the device.
-    constexpr int kNumThreadsPerBlock = 512;
+    constexpr int kNumThreadsPerBlock = 1024;
 
     // The top-k width.
     static constexpr int kTopK = 2048;
@@ -657,18 +659,18 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
 }
 
 void top_k_per_row_decode(const torch::Tensor& logits,
-                         int64_t next_n,
-                         const torch::Tensor& seqLens,
-                         torch::Tensor& indices,
-                         int64_t numRows,
-                         int64_t stride0,
-                         int64_t stride1)
+                          int64_t next_n,
+                          const torch::Tensor& seqLens,
+                          torch::Tensor& indices,
+                          int64_t numRows,
+                          int64_t stride0,
+                          int64_t stride1)
 {
     constexpr int kSortingAlgorithmThreshold = 12288;
     // Compute the results on the device.
     constexpr int kNumThreadsPerBlock = 1024;
     const hipStream_t stream          = at::hip::getCurrentHIPStream();
-    const auto numColumns = logits.size(1);
+    const auto numColumns             = logits.size(1);
 
     if(numColumns < kSortingAlgorithmThreshold)
     {
@@ -695,23 +697,25 @@ void top_k_per_row_decode(const torch::Tensor& logits,
     }
     else
     {
-        if (stride0 % 4 == 0)
+        if(stride0 % 4 == 0)
         {
             aiter::topk_per_row_decode<kNumThreadsPerBlock, true, 4>
                 <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
                                                               seqLens.data_ptr<int>(),
                                                               indices.data_ptr<int>(),
                                                               static_cast<int>(stride0),
-                                                          static_cast<int>(stride1),
-                                                          static_cast<int>(next_n));
-    } else {
-        aiter::topk_per_row_decode<kNumThreadsPerBlock, true, 1>
-            <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
-                                                          seqLens.data_ptr<int>(),
-                                                          indices.data_ptr<int>(),
-                                                          static_cast<int>(stride0),
-                                                          static_cast<int>(stride1),
-                                                          static_cast<int>(next_n));
+                                                              static_cast<int>(stride1),
+                                                              static_cast<int>(next_n));
+        }
+        else
+        {
+            aiter::topk_per_row_decode<kNumThreadsPerBlock, true, 1>
+                <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
+                                                              seqLens.data_ptr<int>(),
+                                                              indices.data_ptr<int>(),
+                                                              static_cast<int>(stride0),
+                                                              static_cast<int>(stride1),
+                                                              static_cast<int>(next_n));
+        }
     }
-}
 }
