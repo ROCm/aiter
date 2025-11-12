@@ -329,8 +329,7 @@
         "flags_extra_hip": [
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'",
-            "'-mllvm --slp-threshold=-32'",
-            "'-mllvm --misched-bottomup=1'"
+            "'-mllvm --slp-threshold=-32'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],

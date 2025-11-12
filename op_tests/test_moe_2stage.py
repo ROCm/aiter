@@ -31,7 +31,6 @@ torch.set_default_device("cuda")
 # torch.manual_seed(100)
 
 
-
 def ck_moe_stage1(
     hidden_states,
     w1,  # [E, inter_dim*2, model_dim]
@@ -123,6 +122,7 @@ def ck_moe_stage2(
     )
     return out
 
+
 def cktile_moe_stage1(
     hidden_states,
     w1,  # [E, inter_dim*2, model_dim]
@@ -135,8 +135,8 @@ def cktile_moe_stage1(
     exp_bias1,
     dtype,
     topk,
-    n_pad_zeros = 0,
-    k_pad_zeros = 0,
+    n_pad_zeros=0,
+    k_pad_zeros=0,
     block_size=32,
     Activation=ActivationType.Silu,
     quant_type=aiter.QuantType.No,
@@ -145,7 +145,7 @@ def cktile_moe_stage1(
     token_num = hidden_states.shape[0]
     _, n1, k1 = w1.shape
     _, k2, n2 = w2.shape
-    D = n2 if k2 == k1 else n2*2 #bit4 format
+    D = n2 if k2 == k1 else n2 * 2  # bit4 format
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
     if w1.dtype is torch.uint32:
@@ -170,6 +170,7 @@ def cktile_moe_stage1(
     )
     return out
 
+
 def cktile_moe_stage2(
     hidden_states,
     w1,  # [E, inter_dim*2, model_dim]
@@ -182,13 +183,13 @@ def cktile_moe_stage2(
     exp_bias2,
     dtype,
     topk,
-    n_pad_zeros = 0,
-    k_pad_zeros = 0,
+    n_pad_zeros=0,
+    k_pad_zeros=0,
     block_size=32,
     Activation=ActivationType.Silu,
     quant_type=aiter.QuantType.No,
     sorted_weights=None,  # [max_num_tokens_padded]
-    zeros_out = False
+    zeros_out=False,
 ):
     token_num = hidden_states.shape[0]
     D = w2.shape[1]
@@ -231,22 +232,31 @@ def shuffle_mxfp4_weight(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
     if gate_up:
         N = N // 2
     KPack = 16
-    KLane = 64 // NLane #4
+    KLane = 64 // NLane  # 4
     N0 = N // NLane
     K0 = K_pk // (KLane * KPack)
     assert KLane * KPack * K0 == K_pk, f"K({K_pk}) is not a divisble of 64."
     assert NLane * N0 == N, f"N({K_pk}) is not a divisble of 16."
-    if (gate_up):
-        src_reshaped = src.view(experts_cnt, 2, N0, NLane, K0, KLane, KPack)  # [E,2, N0, NLane ,K0, KLane, KPack]
-        src_reshaped = src_reshaped.permute(0, 2, 1, 4, 5, 3, 6).contiguous()  # [E, N0, 2, K0, KLane, NLane, KPack]
+    if gate_up:
+        src_reshaped = src.view(
+            experts_cnt, 2, N0, NLane, K0, KLane, KPack
+        )  # [E,2, N0, NLane ,K0, KLane, KPack]
+        src_reshaped = src_reshaped.permute(
+            0, 2, 1, 4, 5, 3, 6
+        ).contiguous()  # [E, N0, 2, K0, KLane, NLane, KPack]
         interleaved = src_reshaped.view(*src.shape)
     else:
         src_reshaped = src.view(experts_cnt, N0, NLane, K0, KLane, KPack)
-        interleaved = src_reshaped.permute(0, 1, 3, 4, 2, 5).contiguous().view(*src.shape)
+        interleaved = (
+            src_reshaped.permute(0, 1, 3, 4, 2, 5).contiguous().view(*src.shape)
+        )
     # print("interleaved shape:", interleaved.shape)
     return interleaved.contiguous()
 
-def shuffle_mxfp4_scale(src: torch.Tensor, experts_cnt: int, gate_up: bool) -> torch.Tensor:
+
+def shuffle_mxfp4_scale(
+    src: torch.Tensor, experts_cnt: int, gate_up: bool
+) -> torch.Tensor:
     n_experts, k_ = src.shape
     n_ = n_experts // experts_cnt
     # MXFP4 constants
@@ -257,8 +267,8 @@ def shuffle_mxfp4_scale(src: torch.Tensor, experts_cnt: int, gate_up: bool) -> t
 
     # Basic dimensions
     K1 = k_ // K_Pack // K_Lane  # k_ // 8
-    N1 = n_ // N_Lane // N_Pack        # n_ // 32
-    real_k =32 * k_ * K_Pack * K_Lane # 1x32 quant
+    N1 = n_ // N_Lane // N_Pack  # n_ // 32
+    real_k = 32 * k_ * K_Pack * K_Lane  # 1x32 quant
     assert K1 * K_Pack * K_Lane == k_, f"K {k_*32} must be divisible of 256"
     # print("src shape", src.shape)
     # Reshape based on moe_kind
@@ -274,6 +284,7 @@ def shuffle_mxfp4_scale(src: torch.Tensor, experts_cnt: int, gate_up: bool) -> t
         shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
     # print("shf_scale shape:", shfl_scale.shape)
     return shfl_scale.view(*src.shape).contiguous()
+
 
 @benchmark()
 def test_fmoe(
@@ -301,17 +312,17 @@ def test_fmoe(
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
         if need_pad:
-            w1[:,:,-kpad0:] = 0
-            w1[:,-npad0:,:] = 0
-            w1[:,inter_dim-npad0:inter_dim,:] = 0
+            w1[:, :, -kpad0:] = 0
+            w1[:, -npad0:, :] = 0
+            w1[:, inter_dim - npad0 : inter_dim, :] = 0
         exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
     if need_pad:
-        w2[:,:,-kpad0:] = 0
-        w2[:,-npad0:,:] = 0
+        w2[:, :, -kpad0:] = 0
+        w2[:, -npad0:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
@@ -325,7 +336,7 @@ def test_fmoe(
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids, topk_weights, E, model_dim, dtype, BLOCK_SIZE_M
     )
-    #Quant-ing w
+    # Quant-ing w
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
         w2_qt, w2_scale = aiter.pertoken_quant(w2.view(E, -1), quant_dtype=WQDType)
@@ -368,7 +379,7 @@ def test_fmoe(
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
-    #Re-shape and pack-k
+    # Re-shape and pack-k
     if qType != aiter.QuantType.per_1x32:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
@@ -376,28 +387,34 @@ def test_fmoe(
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
 
-    #Quant-ing a
+    # Quant-ing a
     if qType == aiter.QuantType.per_128x128:
         a1_qt, a1_scale = aiter.pertoken_quant(
             input.view(token, -1, 128), quant_dtype=AQDType
         )
         a1_qt = a1_qt.view(token, model_dim)
         a1_scale = a1_scale.squeeze(-1)
-    elif qType == aiter.QuantType.per_1x32 and (AQDType in [dtypes.bf16, dtypes.fp16]): #a16w4
+    elif qType == aiter.QuantType.per_1x32 and (
+        AQDType in [dtypes.bf16, dtypes.fp16]
+    ):  # a16w4
         a1_qt = input.to(AQDType)
         a1_scale = None
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
 
-    #bias dtype convert
-    if qType == aiter.QuantType.per_1x32 and (AQDType in [dtypes.bf16, dtypes.fp16]) and (WQDType == dtypes.fp4x2): #a16w4
+    # bias dtype convert
+    if (
+        qType == aiter.QuantType.per_1x32
+        and (AQDType in [dtypes.bf16, dtypes.fp16])
+        and (WQDType == dtypes.fp4x2)
+    ):  # a16w4
         exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
         exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
     else:
         exp_bias1_aiter = exp_bias1 = None
         exp_bias2_aiter = exp_bias2 = None
 
-    #pre-shuffle
+    # pre-shuffle
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
     if WQDType == torch.int4:  # int4 w quant
@@ -411,12 +428,20 @@ def test_fmoe(
                 shuffle_weight(w2_qt_aiter, (16, 16), use_int4=True)
             )
         )
-    elif qType == aiter.QuantType.per_1x32 and (AQDType in [dtypes.bf16, dtypes.fp16]) and (WQDType == dtypes.fp4x2): #a16w4
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and (AQDType in [dtypes.bf16, dtypes.fp16])
+        and (WQDType == dtypes.fp4x2)
+    ):  # a16w4
         w1_qt_aiter = shuffle_mxfp4_weight(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_mxfp4_scale(w1_scale, E, True)
         w2_qt_aiter = shuffle_mxfp4_weight(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_mxfp4_scale(w2_scale, E, False)
-    elif WQDType != dtypes.fp4x2 and (get_gfx() in ["gfx950"]) and (qType != aiter.QuantType.per_128x128):
+    elif (
+        WQDType != dtypes.fp4x2
+        and (get_gfx() in ["gfx950"])
+        and (qType != aiter.QuantType.per_128x128)
+    ):
         inst_K = 128 // w1_qt_aiter.element_size()
         w1_qt_aiter = shuffle_weight_NK(w1_qt_aiter, 16, inst_K)
         w2_qt_aiter = shuffle_weight_NK(w2_qt_aiter, 16, inst_K)
@@ -640,7 +665,7 @@ def test_fmoe(
     # ######################## stage 2 end ###########
 
     # # ######################## fused 2 stage #########
-    us1=0
+    us1 = 0
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
@@ -663,6 +688,8 @@ def test_fmoe(
     )
 
     return {"gemm1(us)": us1, "gemm2(us)": us2}
+
+
 seed = 1
 torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
