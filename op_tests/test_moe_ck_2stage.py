@@ -151,10 +151,6 @@ def run_2stage_moe(
         isG1U1,
         activation,
         False,  # doweight_stage1
-        0,  # hidden_pad
-        0,  # intermediate_pad
-        None,  # bias1
-        None,  # bias2
     )
 
     block_size = metadata.block_m
