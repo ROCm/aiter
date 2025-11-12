@@ -2,9 +2,6 @@ import sys
 import torch
 import triton
 import math
-
-print("sys_path = ", sys.path)
-
 from op_tests.triton_tests.test_batched_gemm_a8w8 import (
     generate_batched_gemm_a8w8_inputs,
 )
