@@ -736,7 +736,6 @@ def compile_ops(
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
-
             loadName = fc_name
             md_name = _md_name
             if fc_name is None:
@@ -800,6 +799,31 @@ def compile_ops(
                         os.environ.pop("HIP_CLANG_PATH", None)
 
                 if is_python_module:
+                    try:
+                        import importlib.util as _util
+                        from importlib.machinery import EXTENSION_SUFFIXES as _SUFFIXES
+
+                        jit_dir = os.path.abspath(get_user_jit_dir())
+                        candidates = [
+                            os.path.join(jit_dir, f"{md_name}{sfx}")
+                            for sfx in _SUFFIXES
+                        ]
+                        max_wait_ms = int(os.getenv("AITER_JIT_IMPORT_DELAY_MS", "400"))
+                        interval_ms = int(os.getenv("AITER_JIT_IMPORT_POLL_MS", "50"))
+                        deadline = time.time() + (max_wait_ms / 1000.0)
+
+                        while time.time() < deadline:
+                            has_artifact = any(os.path.exists(p) for p in candidates)
+                            spec_pkg = _util.find_spec(f"{__package__}.{md_name}")
+                            spec_bare = _util.find_spec(md_name)
+                            if has_artifact and (
+                                spec_pkg is not None or spec_bare is not None
+                            ):
+                                break
+                            time.sleep(interval_ms / 1000.0)
+                    except Exception:
+                        pass
+
                     module = get_module(md_name)
                 if md_name not in __mds:
                     __mds[md_name] = module
