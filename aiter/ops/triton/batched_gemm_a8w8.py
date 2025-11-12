@@ -4,9 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton._triton_kernels.batched_gemm_a8w8 import (
     _batched_gemm_a8w8_kernel,
     _get_config,
@@ -28,22 +25,23 @@ def batched_gemm_a8w8(
     config: Optional[dict] = None,
 ):
     """
-    Computes the matmul YQ[i] = XQ[i] x WQ[i]T and applies a conversion scale for every i in a given batch.
-    Optionally, adds a bias to each result.
+    Computes batched 8 bit matrix multiplication Y[i] = X[i] @ W[i]^T with per-batch scaling.
+    Each batch element is independently scaled back to higher precision.
 
-    The conversion scale for each matmul is received in the form of two 1D tensors that are multiplied to form a
-    2D one before being applied.
-
-    Key parameters:
-    - XQ: Batch tensor XQ with shape (B, M, K).
-    - WQ: Batch tensor WQ with shape (B, N, K).
-    - X_scale: First scale batch tensor with shape (B, M, 1).
-    - W_scale: Second scale batch tensor with shape (B, 1, N).
-    - Bias: Bias batch tensor with shape (B, 1, N).
-    - YQ: Output Matrix Y with shape (B, M, N). If this is none, then it's created by this API and returned as output
+    Args:
+        XQ (torch.Tensor): INT8 input batch with shape (B, M, K).
+        WQ (torch.Tensor): INT8 weight batch with shape (B, N, K), internally transposed.
+        x_scale (torch.Tensor): Scale for XQ with shape (B, M, 1).
+        w_scale (torch.Tensor): Scale for WQ with shape (B, 1, N).
+        bias (Optional[torch.Tensor]): Bias batch with shape (B, 1, N).
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        splitK (Optional[int]): Not supported. Must be None.
+        YQ (Optional[torch.Tensor]): Pre-allocated output tensor with shape (B, M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M).
 
     Returns:
-    - YQ: The output batch tensor with shape (B, M, N).
+        torch.Tensor: Output batch with shape (B, M, N).
     """
     _LOGGER.info(
         f"BATCHED_GEMM_A8W8: x={tuple(XQ.shape)} w={tuple(WQ.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
