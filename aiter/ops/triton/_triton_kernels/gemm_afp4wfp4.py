@@ -13,18 +13,57 @@ from ..utils._triton.kernel_repr import make_kernel_repr
 
 
 _gemm_afp4wfp4_repr = make_kernel_repr(
-    "_gemm_afp4wfp4_kernel",
+    "_gemm_afp4_wfp4_kernel",
     [
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "cache_modifier",
         "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "cache_modifier",
+    ],
+)
+
+
+_gemm_afp4wfp4_preshuffled_repr = make_kernel_repr(
+    "_gemm_afp4_wfp4_kernel_preshuffled_scales",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "cache_modifier",
+    ],
+)
+
+
+_gemm_afp4wfp4_preshuffled_weight_scales_repr = make_kernel_repr(
+    "_gemm_afp4_wfp4_kernel_preshuffled_weight_scales",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "cache_modifier",
+    ],
+)
+
+
+_gemm_afp4wfp4_reduce_repr = make_kernel_repr(
+    "_gemm_afp4_wfp4_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
     ],
 )
 
@@ -37,7 +76,7 @@ _gemm_afp4wfp4_repr = make_kernel_repr(
     }
 )
 @triton.jit(repr=_gemm_afp4wfp4_repr)
-def _gemm_afp4wfp4_kernel(
+def _gemm_afp4_wfp4_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -65,10 +104,6 @@ def _gemm_afp4wfp4_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    num_warps: tl.constexpr,
-    num_stages: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-    matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -189,23 +224,6 @@ def _gemm_afp4wfp4_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-_gemm_afp4wfp4_preshuffle_scales_repr = make_kernel_repr(
-    "_gemm_afp4wfp4_preshuffle_kernel",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "BLOCK_SIZE_K",
-        "GROUP_SIZE_M",
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "cache_modifier",
-        "NUM_KSPLIT",
-    ],
-)
-
-
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -213,8 +231,8 @@ _gemm_afp4wfp4_preshuffle_scales_repr = make_kernel_repr(
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
     }
 )
-@triton.jit(repr=_gemm_afp4wfp4_preshuffle_scales_repr)
-def _gemm_afp4wfp4_kernel_preshuffle_scales(
+@triton.jit(repr=_gemm_afp4wfp4_preshuffled_repr)
+def _gemm_afp4_wfp4_kernel_preshuffled_scales(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -242,10 +260,6 @@ def _gemm_afp4wfp4_kernel_preshuffle_scales(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    num_warps: tl.constexpr,
-    num_stages: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-    matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -415,23 +429,6 @@ def _gemm_afp4wfp4_kernel_preshuffle_scales(
         tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
 
 
-_gemm_afp4wfp4_preshuffle_repr = make_kernel_repr(
-    "_gemm_afp4wfp4_preshuffle_kernel",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "BLOCK_SIZE_K",
-        "GROUP_SIZE_M",
-        "num_warps",
-        "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "cache_modifier",
-        "NUM_KSPLIT",
-    ],
-)
-
-
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -439,8 +436,8 @@ _gemm_afp4wfp4_preshuffle_repr = make_kernel_repr(
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
     }
 )
-@triton.jit(repr=_gemm_afp4wfp4_preshuffle_repr)
-def _gemm_afp4wfp4_preshuffle_kernel(
+@triton.jit(repr=_gemm_afp4wfp4_preshuffled_weight_scales_repr)
+def _gemm_afp4_wfp4_kernel_preshuffled_weight_scales(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -468,10 +465,6 @@ def _gemm_afp4wfp4_preshuffle_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    num_warps: tl.constexpr,
-    num_stages: tl.constexpr,
-    waves_per_eu: tl.constexpr,
-    matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -532,10 +525,12 @@ def _gemm_afp4wfp4_preshuffle_kernel(
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
         b_ptrs = b_ptr + (
-            offs_bn[:, None] * stride_bn + offs_k_shuffle[None, :] * stride_bk
+            # offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+            offs_bn[:, None] * stride_bn
+            + offs_k_shuffle[None, :] * stride_bk
         )
-
         # Create pointers for the first block of A and B scales
+
         offs_asn = (
             pid_n * (BLOCK_SIZE_N // 32) + tl.arange(0, (BLOCK_SIZE_N // 32))
         ) % N
@@ -650,20 +645,8 @@ def _gemm_afp4wfp4_preshuffle_kernel(
         tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
 
 
-_gemm_afp4wfp4_reduce_repr = make_kernel_repr(
-    "_gemm_afp4wfp4_reduce_kernel",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "ACTUAL_KSPLIT",
-        "MAX_KSPLIT",
-    ],
-)
-
-
-@triton.heuristics({})  # dummy heuristics to invoke kernel re-naming
 @triton.jit(repr=_gemm_afp4wfp4_reduce_repr)
-def _gemm_afp4wfp4_reduce_kernel(
+def _gemm_afp4_wfp4_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
     M,
