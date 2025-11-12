@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 import torch
 from typing import Tuple, Optional
 from ..jit.core import (
@@ -12,6 +13,8 @@ from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
 )
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+from aiter import dtypes
+
 
 MD_NAME = "module_attention"
 
@@ -295,6 +298,59 @@ def get_mla_metadata_v0(
         max_num_splits: (1), dtype torch.int32.
     """
     ...
+
+
+def get_mla_metadata_info_v1(
+    batch_size: int,
+    max_seqlen_qo: int,
+    num_head_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    is_sparse: int,
+    fast_mode: bool = True,
+):
+    """
+    Returns:
+        1. Shape of work_metadata_ptrs followed by its scalar type.
+        2. Shape of work_indptr followed by its scalar type.
+        3. Shape of work_info_set followed by its scalar type.
+        4. Shape of reduce_indptr followed by its scalar type.
+        5. Shape of reduce_final_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type.
+    """
+
+    assert num_head_qo % 16 == 0
+
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+
+    max_qo_tiles_per_batch = (
+        int(math.ceil(max_seqlen_qo * num_head_qo / 128))
+        if num_head_qo == 16 or (num_head_qo == 128 and kv_dtype == dtypes.fp8)
+        else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
+    )
+    batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
+    tile_cnt = batch_size * max_qo_tiles_per_batch
+
+    if fast_mode:
+        max_work = tile_cnt + cu_num - 1
+        max_split_tiles = (
+            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
+        )
+    else:
+        max_work = tile_cnt * cu_num
+        max_split_tiles = tile_cnt * cu_num
+
+    return (
+        ((2), torch.uint64),  # work_metadata_ptrs
+        ((cu_num + 1), torch.int32),  # work_indptr
+        ((max_work, 8), torch.int32),  # work_info_set
+        ((tile_cnt + 1), torch.int32),  # reduce_indptr
+        ((tile_cnt, 2), torch.int32),  # reduce_final_map
+        (max_split_tiles, torch.int32),  # reduce_partial_map
+    )
+
 
 @compile_ops("module_mla_metadata")
 def get_mla_metadata_v1(

@@ -189,15 +189,15 @@ def get_meta_param_balanced(kv_indptr,
     total_kv_pad = 0
 
     for i in range(bs):
-        total_kv_pad += (kv_seq_les[i] + 16 - 1) // 16 * 16 
+        total_kv_pad += (kv_seq_les[i] + 16 - 1) // 16 * 16
     # print(total_kv_pad 37424 / bs * 2000)
     cu_num = int(get_cu_num()) * int((bs / 16) + 0.5)
 
-    split_size_pad = (total_kv_pad + cu_num - 1) // cu_num + 80 
+    split_size_pad = (total_kv_pad + cu_num - 1) // cu_num + 80
 
     num_kv_splits_indptr[0] = 0
     for i in range(bs):
-        num_kv_splits = (kv_seq_les[i] + split_size_pad - 1) // split_size_pad 
+        num_kv_splits = (kv_seq_les[i] + split_size_pad - 1) // split_size_pad
         num_kv_splits_indptr[i + 1] = num_kv_splits_indptr[i] + num_kv_splits
 
     b_idx = 0
@@ -225,12 +225,12 @@ def get_meta_param_balanced(kv_indptr,
 
     fixed_gap = fix_size - fixed_size
 
-    end_dim = bs 
+    end_dim = bs
     loops = 0
     while fixed_gap > 0:
         num_kv_splits_indptr[end_dim] -= fixed_gap
         if (kv_seq_les[end_dim - 1] > total_kv_pad and fixed_gap > 0) or fixed_gap < 0:
-            fixed_gap -= sign 
+            fixed_gap -= sign
         end_dim -= 1
         if end_dim == 0:
             return
@@ -241,7 +241,7 @@ def get_meta_param_balanced(kv_indptr,
             batch_split_table[i] = b_idx
             split_table[i] = split_idx
         else:
-            split_idx = 0 
+            split_idx = 0
             b_idx = b_idx + 1
             batch_split_table[i] = b_idx
             split_table[i] = split_idx
@@ -319,31 +319,50 @@ def mla_decode_fwd(
     num_kv_splits = 80
     if nhead == 16 and max_seqlen_q == 1:
         # special case for 16 heads and max_seqlen_q == 1
-        logits = torch.empty(
-            (total_s, num_kv_splits, nhead, v_head_dim),
-            dtype=dtypes.fp32,
-            device=device,
-        )
+        if num_kv_splits_indptr is None:
+            logits = torch.empty(
+                (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
+                dtype=dtypes.fp32,
+                device=device,
+            )
+        else:
+            logits = torch.empty(
+                (total_s, num_kv_splits, nhead, v_head_dim),
+                dtype=dtypes.fp32,
+                device=device,
+            )
         MAYBE_FINAL_OUT = False
     elif nhead in [16, 128]:
         MAYBE_FINAL_OUT = True
-        logits = torch.empty(
-            (total_s, num_kv_splits, nhead, v_head_dim),
-            dtype=dtypes.fp32,
-            device=device,
-        )
+        if num_kv_splits_indptr is None:
+            logits = torch.empty(
+                (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
+                dtype=dtypes.fp32,
+                device=device,
+            )
+        else:
+            logits = torch.empty(
+                (total_s, num_kv_splits, nhead, v_head_dim),
+                dtype=dtypes.fp32,
+                device=device,
+            )
     else:
         assert False, f"{nhead=} not supported"
 
-    attn_lse = torch.empty(
-        (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
-    )
+    if num_kv_splits_indptr is None:
+        attn_lse = torch.empty(
+            (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1), dtype=dtypes.fp32, device=device
+        )
+    else:
+        attn_lse = torch.empty(
+            (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
+        )
 
     if return_lse:
         final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
     else:
         final_lse = None
-    
+
     if num_kv_splits_indptr is not None:
         if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):
             return logits.view(total_s, nhead, v_head_dim), attn_lse
@@ -442,8 +461,8 @@ def mla_decode_fwd_balenced(
     batch_split_table=None,  # for experts only!!!
     split_table=None,
     q_rope=None,
-    k_rope=None, 
-    cu_num=None, 
+    k_rope=None,
+    cu_num=None,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -564,9 +583,9 @@ def mla_decode_fwd_dispatch(
     num_kv_splits_indptr=None,
     batch_split_table=None,
     split_table=None,
-    cu_num=None, 
+    cu_num=None,
     q_rope=None,
-    k_rope=None, 
+    k_rope=None,
     work_meta_data=None,
     work_indptr=None,
     work_info_set=None,
@@ -615,7 +634,7 @@ def mla_decode_fwd_dispatch(
             batch_split_table,
             split_table,
             q_rope,
-            k_rope, 
+            k_rope,
             cu_num,
         )
 

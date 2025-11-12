@@ -391,21 +391,40 @@ def test_mla(
 
     # aiter implementation
     # the tensor's meaning please refer aiter/ops/attention.py
-    work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
-    work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_mla_metadata_info_v1(
+        batch_size,
+        max_seqlen_qo,
+        nhead,
+        q.dtype,
+        kv_buffer.dtype,
+        is_sparse=False,
+        fast_mode=True,
+    )
+
+    work_meta_data = torch.empty(
+        work_meta_data_size, dtype=work_meta_data_type, device="cuda"
+    )
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device="cuda")
     work_info_set = torch.empty(
-        [batch_size * max_qo_tiles_per_batch * cu_num, 8],
-        dtype=torch.int32,
+        work_info_set_size,
+        dtype=work_info_set_type,
         device="cuda",
-    ).fill_(-1)
+    )
     reduce_indptr = torch.empty(
-        [batch_size * max_qo_tiles_per_batch + 1], dtype=torch.int32, device="cuda"
+        reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
     )
     reduce_final_map = torch.empty(
-        [batch_size * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
+        reduce_final_map_size, dtype=reduce_final_map_type, device="cuda"
     )
     reduce_partial_map = torch.empty(
-        [batch_size * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device="cuda"
+        reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
     split_params = {
