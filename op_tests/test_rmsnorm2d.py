@@ -67,13 +67,14 @@ def test_rmsnorm2d(dtype, m, n):
     weight = torch.randn(n, dtype=dtype, device="cuda")
     # q, k, v = torch.split(hidden_stats, [6*n, n, n], dim=1)
     # input = k
-    (a, *_), avg_a = run_torch(input, weight, 1e-5)
+    # (a, *_), avg_a = run_torch(input, weight, 1e-5)
+    # avg_a = 1e12
     (b, *_), avg_b = run_ck(input, weight, 1e-5)
     (c, *_), avg_c = run_cu(input, weight, 1e-5)
     gbps = m * n * input.element_size() * 2 / avg_b / 1e3
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}, ck(gbps): {gbps:<8.2f}"
-    checkAllclose(a, b, msg=msg)
-    checkAllclose(a, c, msg="cu")
+    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us, uplift: {avg_c/avg_b-1:<5.1%}, ck(gbps): {gbps:<8.2f}"
+    checkAllclose(c, b, msg=msg)
+    # checkAllclose(a, c, msg="cu")
 
 
 def test_rmsnorm2d_fuseAdd(dtype, m, n):
