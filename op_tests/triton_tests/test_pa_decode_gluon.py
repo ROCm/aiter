@@ -654,7 +654,7 @@ def torch_attention_compute(
                     # Avoid division by zero
                     # v_scale_max = torch.clamp(v_scale_max, min=1e-12)
                     v_scale_vals = (
-                        v_scale_vals * FP8_MAX / v_scale_max
+                        v_scale_vals * FP8_MAX / (v_scale_max + 1e-8)
                     )  # [num_kv_heads, 1, cb_len]
                     probs_scaled = (
                         v_scale_vals * probs
@@ -1164,6 +1164,7 @@ def run_pa_gluon_test(
     query.uniform_(*UNIFORM_RANGE)
 
     if kv_varlen:
+        random.seed(123)
         # kv_len_list = [random.randint(1, context_length) for _ in range(batch_size)]
         kv_len_list = [
             random.randint(query_length, context_length) for _ in range(batch_size)
@@ -1173,6 +1174,7 @@ def run_pa_gluon_test(
     context_lengths = torch.tensor(kv_len_list, dtype=torch.int32, device=device)
     # print(f"context_lengths={context_lengths}")
 
+    random.seed(123)
     block_tables_list = []
     for _ in range(batch_size):
         block_table = [
@@ -1367,7 +1369,6 @@ def run_pa_gluon_test(
         alibi_slopes=None,
         use_aot_impl=use_aot_impl,
     )
-
     final_output_gluon = output_gluon
     if query_length > 1:
         final_output_gluon = output_gluon.reshape(

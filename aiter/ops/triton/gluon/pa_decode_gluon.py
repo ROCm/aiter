@@ -570,15 +570,16 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         if value_block.dtype.is_fp8():
             if KV_QUANT_MODE == 1:
                 # Per-token quantization scaling
-                # Create mask for valid tokens (exclude padding/invalid tokens)
+                # Create mask for valid tokens
                 valid_token_mask = qk_column_offsets < context_length
                 # Mask out value_scale of invalid tokens
-                masked_value_scale = tl.where(
-                    valid_token_mask, value_scale_value, float(-3.4e38)
+                value_scale_value = tl.where(
+                    valid_token_mask, value_scale_value, float(0.0)
                 )
-                value_scale_max = gl.max(masked_value_scale, axis=0)
+                value_scale_max = gl.max(value_scale_value, axis=0)
+                # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
                 value_scale_value = (
-                    value_scale_value * float(FP8_MAX_VALUE) / value_scale_max
+                    value_scale_value * float(FP8_MAX_VALUE) / (value_scale_max + 1e-8)
                 )
                 attention_probs = value_scale_value[None, :] * attention_probs
                 probability_scale = value_scale_max / float(FP8_MAX_VALUE)
@@ -1241,13 +1242,13 @@ def paged_attention_decode_v2_gluon_fp8(
                 # Create mask for valid tokens
                 valid_token_mask = qk_column_offsets < context_length
                 # Mask out value_scale of invalid tokens
-                masked_value_scale = tl.where(
-                    valid_token_mask, value_scale_value, float(-3.4e38)
+                value_scale_value = tl.where(
+                    valid_token_mask, value_scale_value, float(0.0)
                 )
-                value_scale_max = gl.max(masked_value_scale, axis=0)
-
+                value_scale_max = gl.max(value_scale_value, axis=0)
+                # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
                 value_scale_value = (
-                    value_scale_value * float(FP8_MAX_VALUE) / value_scale_max
+                    value_scale_value * float(FP8_MAX_VALUE) / (value_scale_max + 1e-8)
                 )
                 attention_probs = value_scale_value[None, :] * attention_probs
                 probability_scale = value_scale_max / float(FP8_MAX_VALUE)
