@@ -116,7 +116,6 @@ def update_config_files(file_path: str, merge_name: str):
     return new_file_path
 
 
-# @functools.lru_cache(maxsize=1)
 def get_config_file(env_name, default_file, tuned_file_name):
     config_env_file = os.getenv(env_name)
     # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
@@ -135,7 +134,7 @@ def get_config_file(env_name, default_file, tuned_file_name):
         else:
             tuned_files = ":".join(str(p) for p in op_tuned_file_list)
             tuned_files = default_file + ":" + tuned_files
-            print(f"merge tuned file under model_configs/ and configs/ ", tuned_files)
+            #print(f"merge tuned file under model_configs/ and configs/ ", tuned_files)
             config_file = update_config_files(tuned_files, tuned_file_name)
     else:
         config_file = update_config_files(config_env_file, tuned_file_name)

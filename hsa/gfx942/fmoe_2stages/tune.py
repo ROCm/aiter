@@ -26,7 +26,6 @@ from aiter.int4_utils import (
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.utility import fp4_utils
 import torch.nn.functional as F
 from einops import rearrange
 from aiter.utility.base_tuner import TunerCommon
@@ -134,15 +133,6 @@ class FmoeTuner(TunerCommon):
     ):
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
-
-        a1_scale = moe_mxfp4_sort(
-            a1_scale,
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
-            token_num=token_num,
-            block_size=blockM,
-        )
-
         out = torch.empty(
             (token_num, topk, inter_dim),
             dtype=dtype,
@@ -194,14 +184,6 @@ class FmoeTuner(TunerCommon):
     ):
         model_dim = w2_qt_shffle_ck.shape[1]
         token_num = a2_qt.shape[0]
-
-        a2_scale = moe_mxfp4_sort(
-            a2_scale[: token_num * topk, :].view(token_num, topk, -1),
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
-            token_num=token_num,
-            block_size=blockM,
-        )
 
         out = torch.zeros(
             (token_num, model_dim),
@@ -415,14 +397,13 @@ class FmoeTuner(TunerCommon):
             quant_type == QuantType.No
             and activation == ActivationType.Silu
             and not isG1U1
-            or doweight_stage1
             or quant_type == QuantType.per_1x32
         ):
-            print("not support No Quant Silu G1U0 1 stage tuning!")
+            print("not support No Quant Silu G1U0 1 stage or per_1x32 quant tuning!")
         else:
             if quant_type == QuantType.per_1x128:
                 fmoe_func = FmoeTuner.run_1stage_fmoe_fp8_blockscale_g1u1
-            elif (q_dtype_a == dtypes.fp8) & doweight_stage1:
+            elif (q_dtype_a == dtypes.fp8) and doweight_stage1:
                 fmoe_func = FmoeTuner.run_1stage_fmoe_g1u1_tkw1
             elif isG1U1:
                 fmoe_func = FmoeTuner.run_1stage_fmoe_g1u1
@@ -642,21 +623,33 @@ class FmoeTuner(TunerCommon):
         if stage == 1:
             if not doweight_stage1:
                 sorted_weights = None
+            if q_type == QuantType.per_1x32:
+                a1_scale_fp4_sort = moe_mxfp4_sort(
+                    a1_scale[: token * topk, :].view(token, topk, -1),
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token,
+                    block_size=blockM,
+                )
+            else:
+                a1_scale_fp4_sort = a1_scale
+
             return (
-                a1_qt,
-                w1_qt_shffle_ck,
-                w2_qt_shffle_ck,
-                a1_scale,
-                w1_scale,
-                sorted_ids,
-                sorted_expert_ids,
-                sorted_weights,
-                num_valid_ids,
-                moe_buf,
-                w1_qt,
-                w2_qt,
-                topk_weights,
-                topk_ids,
+                a1_qt, #0
+                w1_qt_shffle_ck, #1
+                w2_qt_shffle_ck, #2
+                a1_scale, #3
+                w1_scale, #4
+                sorted_ids, #5
+                sorted_expert_ids, #6
+                sorted_weights, #7
+                num_valid_ids, #8
+                moe_buf, #9
+                w1_qt, #10
+                w2_qt, #11
+                topk_weights, #12
+                topk_ids, #13
+                a1_scale_fp4_sort, #14
             )
         elif stage == 2:
             ref1 = FmoeTuner.run_torch_moe_stage1(
@@ -687,22 +680,33 @@ class FmoeTuner(TunerCommon):
             a2_qt = a2_qt.view(token, topk, -1)
             if doweight_stage1:
                 sorted_weights = None
+            if q_type == QuantType.per_1x32:
+                a2_scale_mxfp4_sort = moe_mxfp4_sort(
+                    a2_scale[: token * topk, :].view(token, topk, -1),
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token,
+                    block_size=blockM,
+                )
+            else:
+                a2_scale_mxfp4_sort = a2_scale
             return (
-                a2_qt,
-                w1_qt_shffle_ck,
-                w2_qt_shffle_ck,
-                a2_scale,
-                w2_scale,
-                sorted_ids,
-                sorted_expert_ids,
-                sorted_weights,
-                num_valid_ids,
-                moe_buf,
-                w1_qt,
-                w2_qt,
-                topk_weights,
-                topk_ids,
-            )
+                    a2_qt, #0
+                    w1_qt_shffle_ck, #1
+                    w2_qt_shffle_ck,  #2
+                    a2_scale,  #3
+                    w2_scale,  #4
+                    sorted_ids, #5
+                    sorted_expert_ids, #6
+                    sorted_weights, #7
+                    num_valid_ids, #8
+                    moe_buf, #9
+                    w1_qt, #10
+                    w2_qt,  #11
+                    topk_weights,  #12
+                    topk_ids,  #13
+                    a2_scale_mxfp4_sort,  #14
+                  )
 
     @staticmethod
     def generate_data_1stage(
@@ -766,7 +770,7 @@ class FmoeTuner(TunerCommon):
         fc1_smooth_scale = None
         fc2_smooth_scale = None
         if q_type == QuantType.per_1x32:
-            a1_scale = fp4_utils.moe_mxfp4_sort(
+            a1_scale = moe_mxfp4_sort(
                 a1_scale,
                 sorted_ids,
                 num_valid_ids,
@@ -1268,8 +1272,6 @@ class FmoeTuner(TunerCommon):
             quantDtype = ""
         if doweight_stage1:
             extraInfo_1stage = "_tkw1"
-            if q_dtype_a == dtypes.fp8:
-                quantDtype = "Int8"  ## tmp solution, need to be updated
         if q_type == QuantType.No:
             quantDtype_1stage = "noquant"
         elif q_type == QuantType.per_1x128:
@@ -1559,7 +1561,7 @@ class FmoeTuner(TunerCommon):
                             ),
                             FmoeTuner.ck_moe_stage1_fwd_out,  # func
                             (
-                                [0, 1, 2, 5, 6, 7, 8, 4, 3],
+                                [0, 1, 2, 5, 6, 7, 8, 4, 14],
                                 dtype,
                                 topk,
                                 kernel.name,
@@ -1570,7 +1572,7 @@ class FmoeTuner(TunerCommon):
                             {},
                             FmoeTuner.run_torch_moe_stage1,
                             (
-                                [0, 10, 11, 12, 13, 3, 4],
+                                [0, 10, 11, 12, 13, 3, 4], #【a1_qt, w1_qt, w2_qt, topk_weights, topk_ids, a1_scale, w1_scale】
                                 dtype,
                                 act_type,
                                 q_type,
@@ -1610,7 +1612,7 @@ class FmoeTuner(TunerCommon):
                             ),
                             FmoeTuner.ck_moe_stage2_fwd_out,  # func
                             (
-                                [0, 1, 2, 5, 6, 7, 8, 4, 3],
+                                [0, 1, 2, 5, 6, 7, 8, 4, 14],
                                 dtype,
                                 topk,
                                 kernel.name,
@@ -1720,6 +1722,7 @@ class FmoeTuner(TunerCommon):
         old_tunedf = self.get_tuned_gemm_list(file)
         resultdf = self.update_tunedf(old_tunedf, results)
         self.success = pd.concat([self.success, results], ignore_index=True)
+        print("self success is ", self.success)
         resultdf["run_1stage"] = resultdf["run_1stage"].astype(int)
         if results is not None:
             resultdf = resultdf.astype(str).drop_duplicates(
