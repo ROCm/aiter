@@ -229,40 +229,79 @@ __device__ __forceinline__ void get_offset(int32_t* p_offset_0,
 }
 
 // get kvcache store index
-template <int32_t RotateStyle, bool StrideDEq1>
-__device__ __forceinline__ void get_cache_offset(int32_t* p_offset_k_0,
-                                                 int32_t* p_offset_k_1,
-                                                 int32_t* p_offset_v_0,
-                                                 int32_t* p_offset_v_1,
-                                                 const int64_t offset_y,
-                                                 const int64_t offset_v,
-                                                 const int32_t x,
-                                                 const int32_t did,
-                                                 const int32_t hid,
-                                                 const int32_t size_h,
-                                                 const int32_t size_d,
-                                                 const int32_t size_half_r)
+template <int32_t RotateStyle, bool ASMLayout, typename o_scalar_t, typename i_scalar_t>
+__device__ __forceinline__ void save_kvcache(const i_scalar_t k_data_0,
+                                             const i_scalar_t k_data_1,
+                                             const i_scalar_t v_data_0,
+                                             const i_scalar_t v_data_1,
+                                             o_scalar_t*   p_kcache,
+                                             o_scalar_t*   p_vcache,
+                                             const int64_t offset_k,
+                                             const int64_t offset_v,
+                                             const int32_t block_size,
+                                             const int32_t x,
+                                             const int32_t did,
+                                             const int32_t hid,
+                                             const int32_t size_h,
+                                             const int32_t size_d,
+                                             const int32_t size_half_r)
 {
-    const int32_t offset_h = hid * stride_h;
-
+    if ((offset_k < 0) || (offset_v < 0))
+    {
+        return;
+    }
+    const int32_t did_0, did_1;
     if constexpr(RotateStyle == ROTATE_STYLE_NEOX)
     {
-        *p_offset_0 = offset_h + did * stride_d;
-        *p_offset_1 = *p_offset_0 + size_half_r * stride_d;
+        did_0 = did;
+        did_1 = did_0 + size_half_r;
     }
     else if constexpr(RotateStyle == ROTATE_STYLE_GPTJ)
     {
-        *p_offset_0 = offset_h + 2 * did * stride_d;
-        if constexpr(StrideDEq1)
-        {
-            // Asking compiler to merge memory ops when accessing adjacent elements.
-            *p_offset_1 = *p_offset_0 + 1;
-        }
-        else
-        {
-            *p_offset_1 = *p_offset_0 + stride_d;
-        }
+        did_0 = did * 2;
+        did_1 = did_0 + 1;
     }
+    // offt_kcache = block_idx * size_h_y * (size_d / x) * block_size * x +
+    //                  block_offset * x;
+    // if constexpr(asmLayout) 
+    //     { 
+    //         //[num_blocks, size_h_y, block_size/x, size_d, x]
+    //         const int x_idx_v = block_offset / x;
+    //         const int x_offset_v = block_offset % x;
+    //         offt_vcache = block_idx * size_h_y * size_d * block_size +
+    //                       x_idx_v * size_d * x + x_offset_v;
+    //     }
+    // else
+    // {
+    //     //[num_blocks, size_h_y, size_d, block_size]
+    //     offt_vcache = block_idx * size_h_y * size_d * block_size +
+    //                     block_offset;
+    // }
+    const int32_t x_idx_0 = did_0 / x;
+    const int32_t x_offset_0 = did_0 % x;
+    const int32_t x_idx_1 = did_1 / x;
+    const int32_t x_offset_1 = did_1 % x;
+    // kcache: [num_blocks, h, d/x, block_size, x]
+    const int64_t tgt_key_idx_0 = offset_k + hid * (size_d / x) * block_size * x +
+                                  x_idx_0 * block_size * x + x_offset_0;
+    const int64_t tgt_key_idx_1 = offset_k + hid * (size_d / x) * block_size * x +
+                                  x_idx_1 * block_size * x + x_offset_1;
+    int64_t tgt_value_idx_0, tgt_value_idx_1;
+    if constexpr(ASMLayout)
+    {
+        // vcache: [num_blocks, h, block_size/x, d, x]
+        tgt_value_idx_0 = offset_v + hid * size_d * block_size + did_0 * x;
+        tgt_value_idx_1 = offset_v + hid * size_d * block_size + did_1 * x;
+    }
+    else {
+        // vcache: [num_blocks, h, d, block_size]
+        tgt_value_idx_0 = offset_v + hid * size_d * block_size + did_0 * block_size;
+        tgt_value_idx_1 = offset_v + hid * size_d * block_size + did_1 * block_size;
+    }
+    p_kcache[tgt_key_idx_0] = k_data_0;
+    p_kcache[tgt_key_idx_1] = k_data_1;
+    p_vcache[tgt_value_idx_0] = v_data_0;
+    p_vcache[tgt_value_idx_1] = v_data_1;
 }
 
 template <int32_t RotateStyle, bool StrideDEq1, typename o_scalar_t, typename i_scalar_t>
@@ -1066,6 +1105,7 @@ struct OpCachedFwd
               bool ReuseFreqsFrontPart,
               bool NopeFirst,
               bool Inplace,
+              bool ASMLayout,
               bool StrideDOutXEq1,
               bool StrideDOutYEq1,
               bool StrideDInXEq1,
@@ -1098,7 +1138,9 @@ struct OpCachedFwd
                                                              const int32_t stride_ox_h,
                                                              const int32_t stride_ox_d,
                                                              const int32_t stride_oy_h,
-                                                             const int32_t stride_oy_d)
+                                                             const int32_t stride_oy_d,
+                                                             const int32_t stride_iv_h,
+                                                             const int32_t stride_iv_d,)
     {
         // rotate count
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
@@ -1152,6 +1194,30 @@ struct OpCachedFwd
                                                            stride_oy_d,
                                                            stride_oy_h,
                                                            size_half_r);
+                float v_data_0, v_data_1;
+                load_payload<RotateStyle, StrideDOutYEq1>(&v_data_0,
+                                                          &v_data_1,
+                                                          p_input_v,
+                                                          did,
+                                                          hid,
+                                                          stride_iv_d,
+                                                          stride_iv_h,
+                                                          size_half_r);
+                save_kvcache<RotateStyle, ASMLayout>(k_data_0,
+                                                     k_data_1,
+                                                     v_data_0,
+                                                     v_data_1,
+                                                     p_cache_y,
+                                                     p_cache_v,
+                                                     offset_y,
+                                                     offset_v,
+                                                     block_size,
+                                                     x,
+                                                     did,
+                                                     hid,
+                                                     size_h,
+                                                     size_d,
+                                                     size_half_r);
             }
 
             for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
@@ -1200,6 +1266,30 @@ struct OpCachedFwd
                                                            stride_oy_d,
                                                            stride_oy_h,
                                                            size_half_r);
+                float v_data_0, v_data_1;
+                load_payload<RotateStyle, StrideDOutYEq1>(&v_data_0,
+                                                          &v_data_1,
+                                                          p_input_v,
+                                                          did,
+                                                          hid,
+                                                          stride_iv_d,
+                                                          stride_iv_h,
+                                                          size_half_r);
+                save_kvcache<RotateStyle, ASMLayout>(k_data_0,
+                                                     k_data_1,
+                                                     v_data_0,
+                                                     v_data_1,
+                                                     p_cache_y,
+                                                     p_cache_v,
+                                                     offset_y,
+                                                     offset_v,
+                                                     block_size,
+                                                     x,
+                                                     did,
+                                                     hid,
+                                                     size_h,
+                                                     size_d,
+                                                     size_half_r);
             }
         }
 
@@ -2446,7 +2536,11 @@ kn_entry_2c_value_sbhd_cached_indirect2_inplace(scalar_t* __restrict__ p_inout_x
                                                 const int32_t stride_y_s,
                                                 const int32_t stride_y_b,
                                                 const int32_t stride_y_h,
-                                                const int32_t stride_y_d)
+                                                const int32_t stride_y_d,
+                                                const int32_t stride_v_s,
+                                                const int32_t stride_v_b,
+                                                const int32_t stride_v_h,
+                                                const int32_t stride_v_d,)
 {
     const uint64_t sid    = blockIdx.x;
     const uint64_t bid    = blockIdx.y;
@@ -2494,6 +2588,7 @@ kn_entry_2c_value_sbhd_cached_indirect2_inplace(scalar_t* __restrict__ p_inout_x
                                         ReuseFreqsFrontPart,
                                         NopeFirst,
                                         true,
+                                        asmLayout,
                                         StrideDXEq1,
                                         StrideDYEq1,
                                         StrideDXEq1,
@@ -2523,7 +2618,9 @@ kn_entry_2c_value_sbhd_cached_indirect2_inplace(scalar_t* __restrict__ p_inout_x
                                                     stride_x_h,
                                                     stride_x_d,
                                                     stride_y_h,
-                                                    stride_y_d);
+                                                    stride_y_d,
+                                                    stride_v_h,
+                                                    stride_v_d);
     }
 }
 
@@ -3847,6 +3944,10 @@ void dispatch_2c_value_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                             const int32_t stride_iy_b,
                                             const int32_t stride_iy_h,
                                             const int32_t stride_iy_d,
+                                            const int32_t stride_iv_s,
+                                            const int32_t stride_iv_b,
+                                            const int32_t stride_iv_h,
+                                            const int32_t stride_iv_d,
                                             const int32_t stride_ox_s,
                                             const int32_t stride_ox_b,
                                             const int32_t stride_ox_h,
@@ -3907,7 +4008,11 @@ void dispatch_2c_value_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                          stride_iy_s,
                                          stride_iy_b,
                                          stride_iy_h,
-                                         stride_iy_d););
+                                         stride_iy_d,
+                                         stride_iv_s,
+                                         stride_iv_b,
+                                         stride_iv_h,
+                                         stride_iv_d););
     }
     else
     {

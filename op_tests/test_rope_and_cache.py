@@ -449,12 +449,12 @@ def test_rope_cached_positions_offsets_2c_fwd_inplace_cachekv(
     x = 16 // DType_KVCache.itemsize
     asm_layout = True
     if asm_layout:
-        k_cache_shape = (b * num_blocks, kvhead, head_size // x, block_size, x)
-        v_cache_shape = (b * num_blocks, kvhead, block_size // x, head_size, x)
+        k_cache_shape = (b * num_blocks, kvhead, d // x, block_size, x)
+        v_cache_shape = (b * num_blocks, kvhead, block_size // x, d, x)
         kv_scale_shape = (b * num_blocks, kvhead, block_size)
     else:
-        k_cache_shape = (b * num_blocks, kvhead, head_size // x, block_size, x)
-        v_cache_shape = (b * num_blocks, kvhead, head_size, block_size)
+        k_cache_shape = (b * num_blocks, kvhead, d // x, block_size, x)
+        v_cache_shape = (b * num_blocks, kvhead, d, block_size)
         kv_scale_shape = (kvhead, b * max_token_num_support)
     k_cache = torch.empty(k_cache_shape, dtype=DType_KVCache, device="cuda")
     v_cache = torch.empty(v_cache_shape, dtype=DType_KVCache, device="cuda")
@@ -491,6 +491,7 @@ def test_rope_cached_positions_offsets_2c_fwd_inplace_cachekv(
         slot_mapping,
         asm_layout,
     )
+    print(hip_fuse_avg)
 
 if __name__ == "__main__":
     l_dtype = ("fp16", "bf16")
@@ -710,32 +711,41 @@ if __name__ == "__main__":
                 if has_offsets
                 else None
             )
-            input_x = torch.randn((s, b, h_x, d), dtype=dtype, device="cuda")
-            input_y = torch.randn((s, b, h_y, d), dtype=dtype, device="cuda")
-            compare_rope_sbhd_2c_positions_with_legacy(
-                input_x, # q
-                input_y, # k
-                freqs,
-                positions,
-                offsets,
-                rotate_style,
-                nope_first,
-                args.compare_check,
-            )
-            print(input_x.shape, input_y.shape)
+            # input_x = torch.randn((s, b, h_x, d), dtype=dtype, device="cuda")
+            # input_y = torch.randn((s, b, h_y, d), dtype=dtype, device="cuda")
+            # compare_rope_sbhd_2c_positions_with_legacy(
+            #     input_x, # q
+            #     input_y, # k
+            #     freqs,
+            #     positions,
+            #     offsets,
+            #     rotate_style,
+            #     nope_first,
+            #     args.compare_check,
+            # )
+            # print(input_x.shape, input_y.shape)
 
-            key = input_y.permute(1,0,2,3).reshape(b*s,h_y,d)
-            print(key.shape)
-            test_reshape_and_cache(
-                key,
+            # key = input_y.permute(1,0,2,3).reshape(b*s,h_y,d)
+            # print(key.shape)
+            # test_reshape_and_cache(
+            #     key,
+            #     s,
+            #     b,
+            #     h_y,
+            #     d,
+            #     16,
+            #     dtype,
+            #     dtype,
+            # )
+            ## TODO: impl standalone kernel combinations
+            test_rope_cached_positions_offsets_2c_fwd_inplace_cachekv(
                 s,
                 b,
-                h_y,
+                [h_x, h_y],
                 d,
                 16,
                 dtype,
                 dtype,
             )
-            ## TODO: impl standalone kernel combinations
             print("test over!")
             break
