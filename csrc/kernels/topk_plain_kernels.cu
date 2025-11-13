@@ -815,15 +815,6 @@ struct WaveBuffer
     }
 };
 
-// AlgorithmTraits: Define behavior for each strategy
-template <typename StrategyType>
-struct AlgorithmTraits
-{
-    static constexpr bool uses_lds                 = false;
-    static constexpr bool requires_synchronization = false;
-    static constexpr const char* name              = "Unknown";
-};
-
 // Helper for merging sorted sequences (used by multiple strategies)
 template <int capacity, bool greater, typename T, typename IdxT>
 struct WaveMergeHelper
