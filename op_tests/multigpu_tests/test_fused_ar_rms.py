@@ -442,10 +442,7 @@ def acc_test_cudagraph_on(tp_size, pp_size, shape, dtype, loop_time=1):
 
 l_dtype = ["bf16"]
 l_shape = [
-    # (4096, 2048)
-    (128, 1024)
-    # (64, 512 * 99)
-    # (16, 512)
+    (64, 7168)
 ]
 l_tp = [8]
 l_pp = [1]
