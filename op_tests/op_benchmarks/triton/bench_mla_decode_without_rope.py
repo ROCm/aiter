@@ -7,6 +7,7 @@ import torch
 import sys
 import argparse
 import itertools
+import random
 
 import aiter
 
@@ -46,6 +47,28 @@ def cal_diff(
         assert cos_diff < 1e-5
 
 
+def kv_cache_cast_to_fp8(x: torch.Tensor, padding=True) -> torch.Tensor:
+    num_blocks, block_size, num_heads, head_dim = x.shape
+    assert num_heads == 1
+    x_amax = x.abs().float().amax(dim=3, keepdim=True).clamp(1e-4)
+    sf = x_amax / 240.0
+    x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fnuz)
+
+    padding_size = 0 if not padding else (16 - (block_size * 4) % 16) % 16
+    x_fp8 = torch.empty(
+        (num_blocks, block_size * (head_dim + 4 + padding_size)),
+        device=x.device,
+        dtype=torch.float8_e4m3fnuz,
+    )
+    x_fp8[:, : block_size * head_dim] = x_scaled.view(
+        num_blocks, block_size * head_dim
+    ).view(dtype=torch.float8_e4m3fnuz)
+    x_fp8[:, block_size * head_dim : block_size * head_dim + 4 * block_size] = sf.view(
+        num_blocks, block_size
+    ).view(dtype=torch.float8_e4m3fnuz)
+    return x_fp8.view(num_blocks, block_size, num_heads, head_dim + 4 + padding_size)
+
+
 def input_helper(
     B,
     H,
@@ -53,6 +76,7 @@ def input_helper(
     kv_lora_rank,
     qk_rope_head_dim,
     num_kv_splits,
+    page_block_size,
     dtype,
     device,
     rope_base=10,
@@ -73,6 +97,9 @@ def input_helper(
         ]
     )
 
+    max_model_len = seqlens.max().item()
+    num_blocks = max_model_len
+
     total_seqlen = cu_seqlens[-1]
 
     HK = 1
@@ -80,7 +107,7 @@ def input_helper(
 
     q = torch.randn(B, SQ, H, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
     kv_cache = torch.randn(
-        total_seqlen, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
+        num_blocks * B, page_block_size, 1, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
     )
     # q = torch.randn(B, H, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
     # kv_cache = torch.randn(
@@ -89,7 +116,30 @@ def input_helper(
 
     # interlancing [batch_start_off, batch_seq_len, batch_start_off, batch_seq_len, ...,]
     kv_indptr = cu_seqlens
-    kv_indices = torch.arange(total_seqlen, device=device).to(torch.int32)
+
+    if page_block_size == 1:
+        kv_indices = torch.arange(total_seqlen, device=device).to(torch.int32)
+        block_tables = kv_indices
+    else:
+        max_block_len = (
+            (max_model_len + page_block_size - 1) // page_block_size * page_block_size
+        )
+        block_tables = torch.zeros(
+            (B, max_block_len), device="cuda", dtype=torch.int32
+        )
+        counter = 0
+        block_idx_pool = list(range(num_blocks))
+        random.shuffle(block_idx_pool)
+        indices_list = []
+        for i in range(B):
+            ctx_len = seqlens[i].item()
+            indices = []
+            for j in range((ctx_len + page_block_size - 1) // page_block_size):
+                block_tables[i][j] = block_idx_pool[counter % num_blocks]
+                counter += 1
+                indices.append(torch.range(block_tables[i][j] * page_block_size, (block_tables[i][j] + 1) * page_block_size - 1, dtype=torch.int32))
+            indices_list.append(torch.cat(indices))
+        kv_indices = torch.cat(indices_list).cuda()
 
     attn_logits = torch.zeros(
         B, H * SQ, num_kv_splits, kv_lora_rank, dtype=torch.float, device=device
@@ -100,7 +150,7 @@ def input_helper(
 
     o = torch.zeros(B * SQ, H, kv_lora_rank, dtype=torch.bfloat16, device=device)
 
-    return kv_indptr, kv_indices, q, kv_cache, attn_logits, attn_lse, o
+    return kv_indptr, block_tables, kv_indices, q, kv_cache, attn_logits, attn_lse, o
 
 
 def ref_masked_attention(
@@ -335,7 +385,9 @@ def run_benchmark(args: argparse.Namespace):
 
         # mtp = 1
         #
-        kv_indptr, kv_indices, q, kv_cache, attn_logits, attn_lse, out_tri = (
+        page_block_size = 64
+        # page_block_size = 1
+        kv_indptr, block_tables, kv_indices, q, kv_cache, attn_logits, attn_lse, out_tri = (
             input_helper(
                 BATCH,
                 H,
@@ -343,6 +395,7 @@ def run_benchmark(args: argparse.Namespace):
                 kv_lora_rank,
                 qk_rope_head_dim,
                 num_kv_splits,
+                page_block_size,
                 dtype,
                 device,
                 varlen=False,
@@ -352,7 +405,7 @@ def run_benchmark(args: argparse.Namespace):
   
         # kv_cache = torch.ones_like(kv_cache)
 
-        q = torch.ones_like(q)
+        # q = torch.ones_like(q)
         k_input, v_input = ref_preprocess(kv_cache, kv_lora_rank)
 
         qo_indptr = torch.zeros(BATCH + 1, dtype=torch.int, device=device)
@@ -367,10 +420,12 @@ def run_benchmark(args: argparse.Namespace):
 
         q_fp8 = q.to(torch.float8_e4m3fnuz)
         kv_cache_fp8 = kv_cache.to(torch.float8_e4m3fnuz)
+        # kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
 
+        # import pdb;pdb.set_trace()
         out_ref, lse_ref = torch_mla_extend(
             q_fp8.reshape(-1, H, 576),
-            kv_cache_fp8.reshape(-1, 1, 576),
+            kv_cache_fp8[:,:,:, :576].reshape(-1, 1, 576),
             qo_indptr,
             kv_indptr,
             kv_indices,
@@ -457,11 +512,12 @@ def run_benchmark(args: argparse.Namespace):
         #     v_input_fp8,
             decode_attention_fwd_grouped_fp8,
             q_fp8.reshape(-1, H * (mtp + 1), 576),
-            kv_cache_fp8.reshape(-1, 1, 576),
+            kv_cache_fp8,
             v_input,
             out_tri,
             kv_indptr,
             kv_indices,
+            block_tables,
             kv_lora_rank,
             attn_logits,
             attn_lse,
