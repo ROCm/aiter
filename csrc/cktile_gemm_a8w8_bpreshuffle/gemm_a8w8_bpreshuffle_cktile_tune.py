@@ -162,7 +162,7 @@ if __name__ == "__main__":
     tuner = GemmA8W8BpreShuffleCktileTuner(
         "GemmA8W8BpreShuffleCktileTuner",
         key=key,
-        description="gen API for gemm a8w8 bpreshuffle kernel",
+        description="gen API for gemm a8w8 bpreshuffle cktile kernel",
     )
 
     args = tuner.parse_args()

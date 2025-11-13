@@ -15,10 +15,7 @@
 #include <ATen/ATen.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
-
-
 #include <torch/extension.h>
-
 #include "flatmm_basic.hpp"
 
 using F16         = ck_tile::half_t;

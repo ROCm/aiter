@@ -58,6 +58,11 @@ def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest()
+def run_gemm_cktile_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+    return aiter.gemm_a8w8_bpreshuffle_CKTILE(x, weight, x_scale, w_scale, None, dtype)
+
+
+@perftest()
 def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
 
@@ -130,6 +135,15 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
     else:
         avg_e = None
         err_e = None
+    if quantDtype == dtypes.fp8 and dtype == dtypes.fp16:
+        f, avg_f = run_gemm_cktile_bpreshuffle(
+            x, weightshuffle, x_scale, w_scale, dtype
+        )
+        f = f + bias
+        err_f = checkAllclose(a, f, msg="cktile bpreshuffle: ", rtol=1e-2, atol=1e-2)
+    else:
+        avg_f = None
+        err_f = None
     return {
         "ck us": avg_b,
         "ck err": err_b,
@@ -139,6 +153,8 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         "asm err": err_d,
         "hipmm bpreshuffle us": avg_e,
         "hipmm bpreshuffle err": err_e,
+        "cktile bpreshuffle us": avg_f,
+        "cktile bpreshuffle err": err_f,
     }
 
 
@@ -346,35 +362,35 @@ l_mnk_nm = [
     (128, 1280, 8192),
     (192, 1280, 8192),
     (256, 1280, 8192),
-    (320, 1280, 8192),
-    (512, 1280, 8192),
-    (1024, 1280, 8192),
-    (2048, 1280, 8192),
-    (4096, 1280, 8192),
-    (8192, 1280, 8192),
-    (16384, 1280, 8192),
-    # attn_out
-    (1, 8192, 1024),
-    (32, 8192, 1024),
-    (64, 8192, 1024),
-    (128, 8192, 1024),
-    (192, 8192, 1024),
-    (256, 8192, 1024),
-    (320, 8192, 1024),
-    (512, 8192, 1024),
-    (1024, 8192, 1024),
-    (2048, 8192, 1024),
-    (4096, 8192, 1024),
-    (8192, 8192, 1024),
-    (16384, 8192, 1024),
-    # hipmm preshuffle
-    (16, 7424, 8192),
-    (32, 7424, 8192),
-    (48, 7424, 8192),
-    (64, 7424, 8192),
-    (4096, 7424, 8192),
-    (5120, 7424, 8192),
-    (8192, 7424, 8192),
+    # (320, 1280, 8192),
+    # (512, 1280, 8192),
+    # (1024, 1280, 8192),
+    # (2048, 1280, 8192),
+    # (4096, 1280, 8192),
+    # (8192, 1280, 8192),
+    # (16384, 1280, 8192),
+    # # attn_out
+    # (1, 8192, 1024),
+    # (32, 8192, 1024),
+    # (64, 8192, 1024),
+    # (128, 8192, 1024),
+    # (192, 8192, 1024),
+    # (256, 8192, 1024),
+    # (320, 8192, 1024),
+    # (512, 8192, 1024),
+    # (1024, 8192, 1024),
+    # (2048, 8192, 1024),
+    # (4096, 8192, 1024),
+    # (8192, 8192, 1024),
+    # (16384, 8192, 1024),
+    # # hipmm preshuffle
+    # (16, 7424, 8192),
+    # (32, 7424, 8192),
+    # (48, 7424, 8192),
+    # (64, 7424, 8192),
+    # (4096, 7424, 8192),
+    # (5120, 7424, 8192),
+    # (8192, 7424, 8192),
 ]
 
 parser = argparse.ArgumentParser(

@@ -27,77 +27,9 @@ using RowwiseKernelMap = std::unordered_map<std::tuple<int, int, int>, RowwiseKe
 template <typename DDataType, typename EDataType = DDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
-
+    // Use default kernel for all architectures
     return a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_128x128x128_1x4x1_16x16x64_default<
-        DDataType,
-        EDataType>;
-    // if(K >= 1536)
-    // {
-    //     if(M < 256 && K % 512 == 0)
-    //     {
-    //       return
-    //       a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_16x64x512_1x4x1_16x16x64_default<DDataType,
-    //       EDataType>;
-    //     }
-    //     else
-    //     {
-    //         if(N < 1536)
-    //         {
-    //             return
-    //             a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_128x64x128_1x4x1_16x16x64_default<DDataType,
-    //             EDataType>;
-    //         }
-    //         else
-    //         {
-    //             return
-    //             a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_128x128x128_1x4x1_16x16x64_default<DDataType,
-    //             EDataType>;
-    //         }
-    //     }
-    // }
-    // else if(K >= 512)
-    // {
-    //     if(M < 64)
-    //     {
-    //         return
-    //         a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_16x64x512_1x4x1_16x16x64_default<DDataType,
-    //         EDataType>;
-    //     }
-    //     else if(M <= 256)
-    //     {
-    //         return
-    //         a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_128x64x128_1x4x1_16x16x64_default<DDataType,
-    //         EDataType>;
-    //     }
-    //     else
-    //     {
-    //         return
-    //         a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_128x128x64_1x4x1_16x16x64_default<DDataType,
-    //         EDataType>;
-    //     }
-    // }
-    // else if(K >= 192 && K % 64 == 0)
-    // {
-    //     if(M <= 256)
-    //     {
-    //         return
-    //         a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_64x256x64_1x4x1_16x16x64_default<DDataType,
-    //         EDataType>;
-    //     }
-    //     else
-    //     {
-    //         return
-    //         a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_128x128x64_1x4x1_16x16x64_default<DDataType,
-    //         EDataType>;
-    //     }
-    // }
-    // else
-    {
-        TORCH_CHECK(false,
-                    "Unsupported K for heuristic dispatch: ",
-                    K,
-                    ". Supported K greater than 192 and K % 64 == 0.");
-    }
+        DDataType, EDataType>;
 }
 
 // Helper function to return the next largest power of 2
