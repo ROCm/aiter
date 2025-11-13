@@ -441,9 +441,7 @@ def acc_test_cudagraph_on(tp_size, pp_size, shape, dtype, loop_time=1):
 #         checkAllclose(cpu_rslt[i], ar_rslt[i].to(ref))
 
 l_dtype = ["bf16"]
-l_shape = [
-    (64, 7168)
-]
+l_shape = [(64, 7168)]
 l_tp = [8]
 l_pp = [1]
 l_graph = [True, False]
