@@ -389,7 +389,7 @@ def test_mla(
     err = None
     us_asm_decode = 1e12
     if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
-        nhead == 16 or (nhead in range(32, 128, 16) and mtp == 1)
+        nhead == 16 or (nhead in range(32, 128, 16) and decode_qlen == 1)
     ):
         err, us_asm_decode = test_absorb_decode_bf16()
     elif kvtype == dtypes.fp8 and nhead in [16, 128]:
@@ -518,7 +518,7 @@ parser.add_argument(
     "--max_split_per_batch",
     type=int,
     nargs="*",
-    default=32,
+    default=[16, 32],
     help="""kv seqlens max split num for per batch.
     e.g.: -ms 32""",
 )
