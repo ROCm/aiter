@@ -4,7 +4,6 @@
 import functools
 import json
 import torch
-import triton
 import triton.language as tl
 import triton.experimental.gluon as gluon
 import triton.experimental.gluon.language as gl
@@ -13,44 +12,74 @@ import triton.experimental.gluon.language.amd.cdna4.async_copy as acp
 from ...utils._triton import arch_info
 from ...utils.core import AITER_TRITON_CONFIGS_PATH
 from ...utils._triton.pid_preprocessing import remap_xcd
-from ...utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+
+
+@gluon.jit
+def _full_like(tensor, value, shape=None, layout=None, dtype=None):
+    """
+    Creates a full tensor like the given tensor, with specified shape, layout, and dtype.
+
+    NOTE: gluon.language has full_like, but it currently throws a "Not implemented" error.
+    """
+
+    return gl.full(
+        tensor.shape if shape is None else shape,
+        value,
+        tensor.dtype if dtype is None else dtype,
+        tensor.type.layout if layout is None else layout,
+    )
 
 
 @gluon.jit
 def _create_mask(offset_first, offset_second, boundary_first, boundary_second):
     """
     Creates a boolean mask based on the given offsets and boundaries.
+    If there's no boundary, we do not need explicit masking for that axis.
     """
-    if offset_first is not None and offset_second is not None:
-        mask = (offset_first[:, None] < boundary_first) & (
+
+    if boundary_first is not None and boundary_second is not None:
+        return (offset_first[:, None] < boundary_first) & (
             offset_second[None, :] < boundary_second
         )
-    elif offset_first is not None:
-        mask = offset_first[:, None] < boundary_first
-    elif offset_second is not None:
-        mask = offset_second[None, :] < boundary_second
-    return mask
+    elif boundary_first is not None:
+        return offset_first[:, None] < boundary_first
+    elif boundary_second is not None:
+        return offset_second[None, :] < boundary_second
+    else:
+        return _full_like(
+            offset_first[:, None] + offset_second[None, :], True, dtype=gl.int1
+        )
 
 
 @gluon.jit
-def _load_fn(ptrs, offset_first, offset_second, boundary_first, boundary_second):
+def _create_offsets(offset_first, offset_second):
     """
-    Loads from the given pointers using mask determined by given offsets and offset boundaries.
+    Creates offsets based on the given first and second offsets, must be int32.
+    """
+
+    offsets = offset_first[:, None] + offset_second[None, :]
+    return tl.cast(offsets, gl.int32)
+
+
+@gluon.jit
+def _load_fn(base_ptr, offset_first, offset_second, boundary_first, boundary_second):
+    """
+    Loads from the given pointer using mask determined by given offsets and offset boundaries,
+    across axis 0 and axis 1 of a two-dimensional tensor.
+
+    NOTE: Assumes the given axis offsets are already strided appropriately.
     """
 
     mask = _create_mask(offset_first, offset_second, boundary_first, boundary_second)
-    tensor = gl.amd.cdna4.buffer_load(
-        ptr=ptrs, offset=gl.full_like(ptrs, 0), mask=mask, other=0.0
-    )
-
-    return tensor
+    offsets = _create_offsets(offset_first, offset_second)
+    return gl.amd.cdna4.buffer_load(ptr=base_ptr, offsets=offsets, mask=mask, other=0.0)
 
 
 @gluon.jit
 def _load_fn_with_smem(
     load_idx,
     smem,
-    ptrs,
+    base_ptr,
     offset_first,
     offset_second,
     boundary_first,
@@ -62,10 +91,11 @@ def _load_fn_with_smem(
     """
 
     mask = _create_mask(offset_first, offset_second, boundary_first, boundary_second)
+    offsets = _create_offsets(offset_first, offset_second)
     acp.buffer_load_to_shared(
         dest=smem.index(load_idx % NUM_STAGES),
-        ptr=ptrs,
-        offsets=gl.full_like(ptrs, 0),
+        ptr=base_ptr,
+        offsets=offsets,
         mask=mask,
         other=0.0,
     )
@@ -80,10 +110,12 @@ def _attn_fwd_inner(
     m_i,
     q,
     q_pe,
-    k_ptrs,
-    k_pe_ptrs,
-    v_ptrs,
+    k_base_ptr,
+    k_pe_base_ptr,
+    v_base_ptr,
+    stride_kk,
     stride_kn,
+    stride_vn,
     stride_vk,
     seqlen_k,
     block_min,
@@ -93,7 +125,10 @@ def _attn_fwd_inner(
     OFFS_QK_M: gl.constexpr,
     OFFS_QK_N: gl.constexpr,
     OFFS_QK_N_CAUSAL: gl.constexpr,
+    OFFS_V_N: gl.constexpr,
     OFFS_K_D: gl.constexpr,
+    OFFS_KPE_D: gl.constexpr,
+    OFFS_V_D: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
@@ -112,9 +147,6 @@ def _attn_fwd_inner(
     This function computes the inner loop of Flash Attention 2 over blocks of k/v,
     between given block_min and block_max.
     """
-
-    if ENABLE_PIPELINING:
-        raise NotImplementedError("Pipelining is not supported in Gluon MHA yet.")
 
     RCP_LN2: gl.constexpr = 1.4426950408889634
     HAS_PE: gl.constexpr = BLOCK_DMODEL_PE > 0
@@ -138,19 +170,19 @@ def _attn_fwd_inner(
 
         # Compute k offsets across head dimension, only needed if padded head
         k = _load_fn(
-            k_ptrs,
-            None if BLOCK_DMODEL == BLOCK_DMODEL_POW2 else OFFS_K_D,
-            None if not MASK_STEPS else start_n + OFFS_K_N,
-            BLOCK_DMODEL,
-            seqlen_k,
+            k_base_ptr,
+            OFFS_K_D * stride_kk,
+            start_n + OFFS_K_N * stride_kn,
+            None if BLOCK_DMODEL == BLOCK_DMODEL_POW2 else BLOCK_DMODEL,
+            None if not MASK_STEPS else seqlen_k,
         )
         if HAS_PE:
             k_pe = _load_fn(
-                k_pe_ptrs,
+                k_pe_base_ptr,
+                OFFS_KPE_D * stride_kk,
+                start_n + OFFS_K_N * stride_kn,
                 None,
-                None if not MASK_STEPS else start_n + OFFS_K_N,
-                BLOCK_DMODEL + BLOCK_DMODEL_PE,
-                seqlen_k,
+                None if not MASK_STEPS else seqlen_k,
             )
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
@@ -179,13 +211,13 @@ def _attn_fwd_inner(
             qk_mask = gl.where(bound_cond, qk_mask_partial, qk_mask)
 
         # Compute qk^T
-        q = gl.convert_layout(q, dot_left_layout)
-        k = gl.convert_layout(k, dot_right_layout)
-        qk += gl.amd.cdna4.mfma(q, k, qk_zeros)
+        dot_q = gl.convert_layout(q, dot_left_layout)
+        dot_k = gl.convert_layout(k, dot_right_layout)
+        qk += gl.amd.cdna4.mfma(dot_q, dot_k, qk_zeros)
         if HAS_PE:
-            q_pe = gl.convert_layout(q_pe, dot_left_layout)
-            k_pe = gl.convert_layout(k_pe, dot_right_layout)
-            qk += gl.amd.cdna4.mfma(q_pe, k_pe, qk_zeros)
+            dot_q_pe = gl.convert_layout(q_pe, dot_left_layout)
+            dot_k_pe = gl.convert_layout(k_pe, dot_right_layout)
+            qk += gl.amd.cdna4.mfma(dot_q_pe, dot_k_pe, qk_zeros)
 
         if IS_CAUSAL:
             causal_boundary = start_n + OFFS_QK_N_CAUSAL
@@ -213,25 +245,25 @@ def _attn_fwd_inner(
         alpha = gl.exp2(m_diff_scaled)
         acc = acc * alpha[:, None]
         v = _load_fn(
-            v_ptrs,
-            None if not MASK_STEPS else start_n + OFFS_V_N,
-            None if BLOCK_DMODEL == BLOCK_DMODEL_POW2 else OFFS_V_D,
-            seqlen_k,
-            BLOCK_DMODEL,
+            v_base_ptr,
+            start_n + OFFS_V_N * stride_vn,
+            OFFS_V_D * stride_vk,
+            None if not MASK_STEPS else seqlen_k,
+            None if BLOCK_DMODEL == BLOCK_DMODEL_POW2 else BLOCK_DMODEL,
         )
-        p = gl.convert_layout(p, dot_left_layout)
-        v = gl.convert_layout(v, dot_right_layout)
-        acc += gl.amd.cdna4.mfma(p.to(v.type.element_ty), v, pv_zeros)
+        dot_p = gl.convert_layout(p, dot_left_layout).to(v.type.element_ty)
+        dot_v = gl.convert_layout(v, dot_right_layout)
+        acc += gl.amd.cdna4.mfma(dot_p, dot_v, pv_zeros)
 
         # Update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
         # Update pointers for k, v, (and sd_mask if needed)
-        k_ptrs += BLOCK_N * stride_kn
+        k_base_ptr += BLOCK_N * stride_kn
         if HAS_PE:
-            k_pe_ptrs += BLOCK_N * stride_kn
-        v_ptrs += BLOCK_N * stride_vk
+            k_pe_base_ptr += BLOCK_N * stride_kn
+        v_base_ptr += BLOCK_N * stride_vk
 
     return acc, l_i, m_i
 
@@ -357,8 +389,8 @@ def _attn_fwd(
     #shared2 = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 16, order = [1, 0]}>
     """
 
-    # TODO: These layouts need to be generalized across input data sizes (right now, these
-    # are hardcoded for dtype=float16)
+    # TODO: These layouts need to eventually be generalized across input data sizes
+    # Right now, ththeyese are hardcoded for dtype=float16
     blocked_lse: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1],
         threads_per_warp=[64],
@@ -436,6 +468,9 @@ def _attn_fwd(
         offs_kpe_d = BLOCK_DMODEL + gl.arange(
             0, BLOCK_DMODEL_PE, layout=gl.SliceLayout(dim=1, parent=blocked_dn)
         )  # across dimension size of q for positional encoding
+    else:
+        offs_qpe_d = None
+        offs_kpe_d = None
 
     # NOTE:
     # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
@@ -447,27 +482,27 @@ def _attn_fwd(
     # The permanent solution is to enable upcasting of gl.constexpr
     # In the meantime, the following workaround provides correctness and does not drop perf
     if USE_INT64_STRIDES:
-        stride_qz = gl.cast(stride_qz_in, gl.int64)
-        stride_qh = gl.cast(stride_qh_in, gl.int64)
-        stride_qm = gl.cast(stride_qm_in, gl.int64)
-        stride_qk = gl.cast(stride_qk_in, gl.int64)
-        stride_kz = gl.cast(stride_kz_in, gl.int64)
-        stride_kh = gl.cast(stride_kh_in, gl.int64)
-        stride_kn = gl.cast(stride_kn_in, gl.int64)
-        stride_kk = gl.cast(stride_kk_in, gl.int64)
-        stride_vz = gl.cast(stride_vz_in, gl.int64)
-        stride_vh = gl.cast(stride_vh_in, gl.int64)
-        stride_vn = gl.cast(stride_vn_in, gl.int64)
-        stride_vk = gl.cast(stride_vk_in, gl.int64)
+        stride_qz = tl.cast(stride_qz_in, gl.int64)
+        stride_qh = tl.cast(stride_qh_in, gl.int64)
+        stride_qm = tl.cast(stride_qm_in, gl.int64)
+        stride_qk = tl.cast(stride_qk_in, gl.int64)
+        stride_kz = tl.cast(stride_kz_in, gl.int64)
+        stride_kh = tl.cast(stride_kh_in, gl.int64)
+        stride_kn = tl.cast(stride_kn_in, gl.int64)
+        stride_kk = tl.cast(stride_kk_in, gl.int64)
+        stride_vz = tl.cast(stride_vz_in, gl.int64)
+        stride_vh = tl.cast(stride_vh_in, gl.int64)
+        stride_vn = tl.cast(stride_vn_in, gl.int64)
+        stride_vk = tl.cast(stride_vk_in, gl.int64)
 
-        stride_oz = gl.cast(stride_oz_in, gl.int64)
-        stride_oh = gl.cast(stride_oh_in, gl.int64)
-        stride_om = gl.cast(stride_om_in, gl.int64)
-        stride_on = gl.cast(stride_on_in, gl.int64)
+        stride_oz = tl.cast(stride_oz_in, gl.int64)
+        stride_oh = tl.cast(stride_oh_in, gl.int64)
+        stride_om = tl.cast(stride_om_in, gl.int64)
+        stride_on = tl.cast(stride_on_in, gl.int64)
 
-        stride_lse_z = gl.cast(stride_lse_z_in, gl.int64)
-        stride_lse_h = gl.cast(stride_lse_h_in, gl.int64)
-        stride_lse_m = gl.cast(stride_lse_m_in, gl.int64)
+        stride_lse_z = tl.cast(stride_lse_z_in, gl.int64)
+        stride_lse_h = tl.cast(stride_lse_h_in, gl.int64)
+        stride_lse_m = tl.cast(stride_lse_m_in, gl.int64)
     else:
         stride_qz = stride_qz_in
         stride_qm = stride_qm_in
@@ -508,16 +543,16 @@ def _attn_fwd(
 
     # Get sequence lengths
     if VARLEN:
-        cu_seqlens_q_start = gl.amd.cdna4.buffer_load(cu_seqlens_q + off_z)
-        cu_seqlens_q_end = gl.amd.cdna4.buffer_load(cu_seqlens_q + off_z + 1)
+        cu_seqlens_q_start = gl.load(cu_seqlens_q + off_z)
+        cu_seqlens_q_end = gl.load(cu_seqlens_q + off_z + 1)
 
         seqlen_q = cu_seqlens_q_end - cu_seqlens_q_start
         # We have a one-size-fits-all grid in id(0). Some seqlens might be too
         # small for all start_m so for those we return early.
         if start_m * BLOCK_M > seqlen_q:
             return
-        cu_seqlens_k_start = gl.amd.cdna4.buffer_load(cu_seqlens_k + off_z)
-        cu_seqlens_k_end = gl.amd.cdna4.buffer_load(cu_seqlens_k + off_z + 1)
+        cu_seqlens_k_start = gl.load(cu_seqlens_k + off_z)
+        cu_seqlens_k_end = gl.load(cu_seqlens_k + off_z + 1)
         seqlen_k = cu_seqlens_k_end - cu_seqlens_k_start
     else:
         cu_seqlens_q_start = 0
@@ -533,6 +568,7 @@ def _attn_fwd(
             + cu_seqlens_q_start * stride_lse_m
             + offs_lse_m * stride_lse_m
         )
+        lse_offs = tl.cast(lse_offs, gl.int32)
         lse_mask = offs_lse_m < seqlen_q
     else:
         lse_offs = None
@@ -547,8 +583,9 @@ def _attn_fwd(
         + offs_out_d[None, :] * stride_on
     )
     out_mask = gl.full(
-        [BLOCK_M, BLOCK_DMODEL_POW2], 1, dtype=gl.int1, layout=mfma_layout
+        [BLOCK_M, BLOCK_DMODEL_POW2], 1, dtype=gl.int1, layout=out_layout
     )
+    out_offs = tl.cast(out_offs, gl.int32)
 
     # Compute number of blocks along seqlen_k
     n_blocks = gl.cdiv(seqlen_k, BLOCK_N)
@@ -577,23 +614,16 @@ def _attn_fwd(
         # If we have no blocks after adjusting for seqlen deltas, this WG is part of
         # the blocks that are all 0. We exit early.
         if n_blocks <= 0:
-            out_offs = (
-                off_z * stride_oz
-                + off_q_head * stride_oh
-                + cu_seqlens_q_start * stride_om
-                + offs_out_m[:, None] * stride_om
-                + offs_out_d[None, :] * stride_on
-            )
             acc = gl.zeros(
                 [BLOCK_M, BLOCK_DMODEL_POW2],
                 dtype=out_ptr.type.element_ty,
-                layout=mfma_layout,
+                layout=out_layout,
             )
             out_mask = (offs_out_m[:, None] < seqlen_q) & (
                 offs_out_d[None, :] < BLOCK_DMODEL
             )
             gl.amd.cdna4.buffer_store(
-                stored_value=acc, ptr=out_ptr, offset=out_offs, mask=out_mask
+                stored_value=acc, ptr=out_ptr, offsets=out_offs, mask=out_mask
             )
 
             if softmax_lse_ptr is not None:
@@ -603,7 +633,7 @@ def _attn_fwd(
                 gl.amd.cdna4.buffer_store(
                     stored_value=lse,
                     ptr=softmax_lse_ptr,
-                    offset=lse_offs,
+                    offsets=lse_offs,
                     mask=lse_mask,
                 )
 
@@ -619,6 +649,7 @@ def _attn_fwd(
         + offs_q_m[:, None] * stride_qm
         + offs_q_d[None, :] * stride_qk
     )
+    q_offs = tl.cast(q_offs, gl.int32)
     if HAS_PE:
         q_pe_offs = (
             off_z * stride_qz
@@ -627,39 +658,24 @@ def _attn_fwd(
             + offs_q_m[:, None] * stride_qm
             + offs_qpe_d[None, :] * stride_qk
         )
+        q_pe_offs = tl.cast(q_pe_offs, gl.int32)
     else:
         q_pe_offs = None
 
-    # Create k offsets
-    k_offs = (
-        off_z * stride_kz
-        + off_k_head * stride_kh
-        + cu_seqlens_k_start * stride_kn
-        + offs_k_d[:, None] * stride_kk
-        + offs_k_n[None, :] * stride_kn
-    )
-    k_ptrs = k_ptr + k_offs
+    # Create initial k offsets
+    k_offs = off_z * stride_kz + off_k_head * stride_kh + cu_seqlens_k_start * stride_kn
+    k_base_ptr = k_ptr + k_offs
     if HAS_PE:
         k_pe_offs = (
-            off_z * stride_kz
-            + off_k_head * stride_kh
-            + cu_seqlens_k_start * stride_kn
-            + offs_kpe_d[:, None] * stride_kk
-            + offs_k_n[None, :] * stride_kn
+            off_z * stride_kz + off_k_head * stride_kh + cu_seqlens_k_start * stride_kn
         )
-        k_pe_ptrs = k_ptrs + k_pe_offs
+        k_pe_base_ptr = k_base_ptr + k_pe_offs
     else:
-        k_pe_ptrs = None
+        k_pe_base_ptr = None
 
-    # Create v offsets
-    v_offs = (
-        off_z * stride_vz
-        + off_k_head * stride_vh
-        + cu_seqlens_k_start * stride_vn
-        + offs_v_n[:, None] * stride_vn
-        + offs_v_d[None, :] * stride_vk
-    )
-    v_ptrs = v_ptr + v_offs
+    # Create new base pointer for v
+    v_offs = off_z * stride_vz + off_k_head * stride_vh + cu_seqlens_k_start * stride_vn
+    v_base_ptr = v_ptr + v_offs
 
     # Load q block
     m_i = gl.full(
@@ -722,11 +738,13 @@ def _attn_fwd(
             m_i,
             q,
             q_pe,
-            k_ptrs,
-            k_pe_ptrs,
-            v_ptrs,
+            k_base_ptr,
+            k_pe_base_ptr,
+            v_base_ptr,
+            stride_kk,
             stride_kn,
             stride_vn,
+            stride_vk,
             seqlen_k,
             block_min,
             block_max,
@@ -735,7 +753,10 @@ def _attn_fwd(
             offs_qk_m,
             offs_qk_n,
             0,
+            offs_v_n,
             offs_k_d,
+            0 if not HAS_PE else offs_kpe_d,
+            offs_v_d,
             BLOCK_M,
             BLOCK_N,
             BLOCK_DMODEL,
@@ -762,10 +783,10 @@ def _attn_fwd(
             offs_qk_n_causal = 0
 
         # Update pointers if we computed for any full blocks
-        k_ptrs += n_full_blocks * BLOCK_N * stride_kn
+        k_base_ptr += n_full_blocks * BLOCK_N * stride_kn
         if HAS_PE:
-            k_pe_ptrs += n_full_blocks * BLOCK_N * stride_kn
-        v_ptrs += n_full_blocks * BLOCK_N * stride_vn
+            k_pe_base_ptr += n_full_blocks * BLOCK_N * stride_kn
+        v_base_ptr += n_full_blocks * BLOCK_N * stride_vn
 
         acc, l_i, m_i = _attn_fwd_inner(
             acc,
@@ -773,11 +794,13 @@ def _attn_fwd(
             m_i,
             q,
             q_pe,
-            k_ptrs,
-            k_pe_ptrs,
-            v_ptrs,
+            k_base_ptr,
+            k_pe_base_ptr,
+            v_base_ptr,
+            stride_kk,
             stride_kn,
             stride_vn,
+            stride_vk,
             seqlen_k,
             block_min,
             block_max,
@@ -786,7 +809,10 @@ def _attn_fwd(
             offs_qk_m,
             offs_qk_n,
             offs_qk_n_causal,
+            offs_v_n,
             offs_k_d,
+            offs_kpe_d,
+            offs_v_d,
             BLOCK_M,
             BLOCK_N,
             BLOCK_DMODEL,
@@ -846,18 +872,19 @@ def _attn_fwd(
 
         # If seqlen_q not multiple of BLOCK_M, we need to mask out the last few rows.
         # This is only true for the last M block. For others, overflow_size will be -ve
+        softmax_lse = gl.convert_layout(softmax_lse, blocked_lse)
         if overflow_size > 0:
             boundary = BLOCK_M - overflow_size
             lse_mask = offs_lse_m < boundary
             gl.amd.cdna4.buffer_store(
                 stored_value=softmax_lse,
                 ptr=softmax_lse_ptr,
-                offset=lse_offs,
+                offsets=lse_offs,
                 mask=lse_mask,
             )
         else:
             gl.amd.cdna4.buffer_store(
-                stored_value=softmax_lse, ptr=softmax_lse_ptr, offset=lse_offs
+                stored_value=softmax_lse, ptr=softmax_lse_ptr, offsets=lse_offs
             )
 
     # Write back O
@@ -865,9 +892,9 @@ def _attn_fwd(
         out_mask = out_mask & (offs_out_m[:, None] < seqlen_q)
     if BLOCK_DMODEL != BLOCK_DMODEL_POW2:
         out_mask = out_mask & (offs_out_d[None, :] < BLOCK_DMODEL)
-    op = acc.to(out_ptr.dtype.element_ty)
+    op = gl.convert_layout(acc.to(out_ptr.dtype.element_ty), out_layout)
     gl.amd.cdna4.buffer_store(
-        stored_value=op, ptr=out_ptr, offset=out_offs, mask=out_mask
+        stored_value=op, ptr=out_ptr, offsets=out_offs, mask=out_mask
     )
 
 

@@ -466,7 +466,28 @@ def flash_attn_varlen_func(
     _LOGGER.info(
         f"FLASH_ATTN_VARLEN:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
     )
-    pass
+    return _FlashAttnVarlenFunc.apply(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        deterministic,
+        return_lse,
+        return_attn_probs,
+        block_table,
+        out,
+        torch.is_grad_enabled(),
+        config,
+    )
 
 
 class _FlashAttnVarlenFP8Func(torch.autograd.Function):
