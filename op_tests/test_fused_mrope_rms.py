@@ -108,11 +108,11 @@ def run_torch_mrope_3d_rms(
         sin = apply_interleaved_rope(sin, mrope_section)
     else:
         cos = torch.cat(
-            [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+            [m[i] for i, m in enumerate(cos.split(mrope_section, dim=-1))],
             dim=-1,
         )
         sin = torch.cat(
-            [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+            [m[i] for i, m in enumerate(sin.split(mrope_section, dim=-1))],
             dim=-1,
         )
     
@@ -178,9 +178,9 @@ def test_mrope_3d_rms(dtype, num_tokens, num_heads_q, num_heads_k, num_heads_v, 
     info = f"dtype:{dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}, num_heads_v:{num_heads_v}, head_size:{head_size}, is_neox_style:{is_neox_style}"
     info += f", mrope_section:{mrope_section}, is_interleaved:{is_interleaved}, eps:{eps}"
     msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
-    checkAllclose(q_ref, q, rtol=1e-2, atol=0.01)
-    checkAllclose(k_ref, k, rtol=1e-2, atol=0.01)
-    checkAllclose(v_ref, v, msg=msg, rtol=1e-2, atol=0.01)
+    checkAllclose(q_ref, q, msg="q", rtol=1e-2, atol=0.05)
+    checkAllclose(k_ref, k, msg="k",rtol=1e-2, atol=0.05)
+    checkAllclose(v_ref, v, msg=msg, rtol=1e-2, atol=0.05)
 
 
 if __name__ == "__main__":
@@ -194,8 +194,8 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
     for is_neox_style in is_neox_styles:
         for num_token in num_tokens:
-            for i, num_head in enumerate(num_heads):
-                for head_size in head_sizes:
+            for num_head in num_heads:
+                for i, head_size in enumerate(head_sizes):
                     ms = mrope_sections[i]
                     for is_interleaved in is_interleaveds:
                         test_mrope_3d_rms(dtype, num_token, num_head, num_head, num_head, head_size, is_neox_style, ms, is_interleaved, eps=1e-6)

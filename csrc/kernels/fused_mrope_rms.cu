@@ -56,17 +56,17 @@ struct alignas(sizeof(T) * vec_size) vec_t {
         }
     }
     __device__ __forceinline__ void nontemporal_load(const T *ptr) {
-        constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint64_t);
+        constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
 #pragma unroll
         for (int i = 0; i < ITERS; ++i) {
-            reinterpret_cast<uint64_t *>(&data)[i] = __builtin_nontemporal_load((uint64_t *)ptr + i);
+            reinterpret_cast<uint32_t *>(&data)[i] = __builtin_nontemporal_load((uint32_t *)ptr + i);
         }
     }
     __device__ __forceinline__ void nontemporal_store(T *ptr) {
-        constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint64_t);
+        constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
 #pragma unroll
         for (int i = 0; i < ITERS; ++i) {
-            __builtin_nontemporal_store(reinterpret_cast<uint64_t *>(&data)[i], (uint64_t *)ptr + i);
+            __builtin_nontemporal_store(reinterpret_cast<uint32_t *>(&data)[i], (uint32_t *)ptr + i);
         }
     }
     __device__ __forceinline__ void fill(T val) {
@@ -79,12 +79,12 @@ struct alignas(sizeof(T) * vec_size) vec_t {
 
 template <typename T, int vec_size>
 __inline__ __device__ vec_t<T, vec_size> warp_shfl_sync_vec(vec_t<T, vec_size> &val, int offset) {
-    constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint64_t);
+    constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
     vec_t<T, vec_size> out;
 #pragma unroll
     for (int i = 0; i < ITERS; ++i) {
-        uint64_t val_ = reinterpret_cast<uint64_t *>(&val)[i];
-        reinterpret_cast<uint64_t *>(&out)[i] = block_utils::warp_shfl_sync<uint64_t>(val_, offset);
+        uint32_t val_ = reinterpret_cast<uint32_t *>(&val)[i];
+        reinterpret_cast<uint32_t *>(&out)[i] = block_utils::warp_shfl_sync<uint32_t>(val_, offset);
     }
     return out;
 }
@@ -105,7 +105,7 @@ __device__ __forceinline__ void warp_rms_norm_(
     int warp_id = threadIdx.x / 32;
     int warp_t_id = threadIdx.x % 32;
     acc = block_utils::warp_reduce_sum<float>(acc);
-    acc = block_utils::warp_shfl_sync(acc, 0);
+    acc = block_utils::warp_shfl_sync<float>(acc, 0);
     __syncwarp();
     auto s_val = rsqrtf(acc / rms_dim + rms_eps);
 #pragma unroll
@@ -193,12 +193,12 @@ __global__ void fused_mrope_rms_neox_kernel(
     if (neighbor_offset > 0) {
 #pragma unroll
         for (int i = 0; i < VEC_SIZE; ++i) {
-            out_vec[i] = x_vec[i] * cos_sin_vec[i] - nb_x_vec[i] * nb_cos_sin_vec[i]; // x0 * cos - x1 * sin
+            out_vec[i] = (float)x_vec[i] * (float)cos_sin_vec[i] - (float)nb_x_vec[i] * (float)nb_cos_sin_vec[i]; // x0 * cos - x1 * sin
         }
     } else {
 #pragma unroll
         for (int i = 0; i < VEC_SIZE; ++i) {
-            out_vec[i] = x_vec[i] * nb_cos_sin_vec[i] + nb_x_vec[i] * cos_sin_vec[i]; // x1 * cos + x0 * sin
+            out_vec[i] = (float)x_vec[i] * (float)nb_cos_sin_vec[i] + (float)nb_x_vec[i] * (float)cos_sin_vec[i]; // x1 * cos + x0 * sin
         }
     }
     out_vec.store(qkv_ + access_id_in_head);
@@ -249,8 +249,8 @@ __global__ void fused_mrope_rms_noneox_kernel(
     vec_t<T, VEC_SIZE> out_vec;
 #pragma unroll
     for (int i = 0; i < VEC_SIZE / 2; ++i) {
-        out_vec[2 * i + 0] = x_vec[2 * i + 0] * cos_vec[i] - x_vec[2 * i + 1] * sin_vec[i];
-        out_vec[2 * i + 1] = x_vec[2 * i + 1] * cos_vec[i] + x_vec[2 * i + 0] * sin_vec[i];
+        out_vec[2 * i + 0] = (float)x_vec[2 * i + 0] * (float)cos_vec[i] - (float)x_vec[2 * i + 1] * (float)sin_vec[i];
+        out_vec[2 * i + 1] = (float)x_vec[2 * i + 1] * (float)cos_vec[i] + (float)x_vec[2 * i + 0] * (float)sin_vec[i];
     }
 
     out_vec.store(qkv_ + access_id_in_head);
@@ -347,6 +347,21 @@ void fused_mrope_rms(
 
 } // namespace rope_rms
 
+template <typename T>
+struct KernelElementType {
+    using type = T;
+};
+
+template <>
+struct KernelElementType<c10::Half> {
+    using type = __half;
+};
+
+template <>
+struct KernelElementType<c10::BFloat16> {
+    using type = hip_bfloat16;
+};
+
 void fused_mrope_3d_rms(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Tensor &positions,
                     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
                     bool is_neox_style, std::vector<int64_t> mrope_section_, bool is_interleaved, double eps) {
@@ -362,11 +377,12 @@ void fused_mrope_3d_rms(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Te
         kHalf,
         qkv.scalar_type(),
         "fused_mrope_3d_rms", [&] {
-            rope_rms::fused_mrope_rms<scalar_t, 3>(
-                qkv.data_ptr<scalar_t>(),
-                qw.data_ptr<scalar_t>(),
-                kw.data_ptr<scalar_t>(),
-                cos_sin.data_ptr<scalar_t>(),
+            using T = KernelElementType<scalar_t>::type;
+            rope_rms::fused_mrope_rms<T, 3>(
+                (T*)qkv.data_ptr<scalar_t>(),
+                (T*)qw.data_ptr<scalar_t>(),
+                (T*)kw.data_ptr<scalar_t>(),
+                (T*)cos_sin.data_ptr<scalar_t>(),
                 positions.data_ptr<int64_t>(),
                 num_tokens,
                 num_heads_q,
