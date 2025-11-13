@@ -47,23 +47,238 @@ struct to_vector<4>
     using type = fp32x4;
 };
 
-template <int kNumThreadsPerBlock = 512, int kNumBins = 512, int kTopK = 2048, int Vector = 4>
+static inline __device__ uint32_t floatAsSortableUint(float x)
+{
+    uint32_t bits = __float_as_uint(x);
+    bits          = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
+    return bits;
+}
+
+template <int step>
+static inline __device__ uint32_t extractBinIdx(float x)
+{
+    uint32_t bits = floatAsSortableUint(x);
+
+    if constexpr(step == 0)
+    {
+        return bits >> 21;
+    }
+    else if constexpr(step == 1)
+    {
+        return (bits >> 10) & 0x7ff;
+    }
+    else
+    {
+        return bits & 0x3ff;
+    }
+}
+
+template <int shift>
+static inline __device__ bool isPartialMatch(float x, uint32_t pattern)
+{
+    if constexpr(shift == 0)
+    {
+        return true;
+    }
+    uint32_t bits = floatAsSortableUint(x);
+    return (bits ^ pattern) >> shift == 0;
+}
+
+template <int step,
+          int kNumThreadsPerBlock,
+          int kNumBins,
+          int kTopK,
+          int kNumFinalItems,
+          int Vector,
+          typename SmemFinalType>
+__device__ bool processHistogramStep(const float* logits,
+                                     int rowEnd,
+                                     uint32_t& logitPattern,
+                                     int& thresholdBinIdx,
+                                     int* smemHistogram,
+                                     int* smemIndices,
+                                     int* smemThresholdBinIdx,
+                                     int* smemFinalDstIdx,
+                                     int* smemFinalBinSize,
+                                     int* smemFoundTopKValues,
+                                     SmemFinalType& smemFinal,
+                                     int stride1,
+                                     int rowStart)
+{
+    using VectorType = typename to_vector<Vector>::type;
+    // Clear the histogram.
+#pragma unroll
+    for(int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock)
+    {
+        smemHistogram[idx] = 0;
+    }
+
+    // Make sure the histogram is ready.
+    __syncthreads();
+
+    // Update pattern
+    constexpr auto patternShift = step == 0 ? 0 : step == 1 ? 21 : 10;
+    if constexpr(step == 1)
+    {
+        logitPattern = static_cast<uint32_t>(thresholdBinIdx & 0x7ff) << patternShift;
+    }
+    else if constexpr(step == 2)
+    {
+        logitPattern |= static_cast<uint32_t>(thresholdBinIdx & 0x7ff) << patternShift;
+    }
+
+    // Fetch elements one-by-one.
+    for(int vecIdx = (rowStart / Vector) + threadIdx.x; vecIdx < (rowEnd + Vector - 1) / Vector;
+        vecIdx += kNumThreadsPerBlock)
+    {
+        auto v         = reinterpret_cast<const VectorType*>(logits)[vecIdx];
+#pragma unroll
+        for(int j = 0; j < Vector; j++)
+        {
+            int vIdx = vecIdx * Vector + j;
+            if(vIdx >= rowEnd)
+                break;
+            float logit = v[j];
+            if(isPartialMatch<patternShift>(logit, logitPattern))
+            {
+                uint32_t binIdx = extractBinIdx<step>(logit);
+                atomicAdd(&smemHistogram[binIdx], 1);
+            }
+        }
+    }
+
+    // Make sure the histogram is ready.
+    __syncthreads();
+
+    // Reads the value of the starting position in the smemIndices array
+    int lastValue = smemFoundTopKValues[0];
+
+    for(int round = 0; round < kNumBins / kNumThreadsPerBlock; round++)
+    {
+        // Read the values from SMEM.
+        int idx = threadIdx.x + kNumThreadsPerBlock * round;
+        int binCount{0};
+        binCount = smemHistogram[idx];
+
+        // Make sure each thread has read its value.
+        __syncthreads();
+
+        // Compute the prefix sum.
+        int prefixSum{0}, totalSum{0};
+        using Scan = hipcub::BlockScan<int, kNumThreadsPerBlock>;
+        Scan(smemFinal.smemScan).ExclusiveSum(binCount, prefixSum, totalSum);
+
+        // Update the histogram with the prefix sums.
+        prefixSum += lastValue;
+        totalSum += lastValue;
+        smemHistogram[idx] = prefixSum;
+
+        // Make sure the data is in shared memory.
+        __syncthreads();
+
+        // Find the last valid bin.
+        bool foundThreshold = false;
+        if(prefixSum < kTopK)
+        {
+            int nextPrefixSum =
+                threadIdx.x == kNumThreadsPerBlock - 1 ? totalSum : smemHistogram[idx + 1];
+
+            if(nextPrefixSum >= kTopK)
+            {
+                smemThresholdBinIdx[0] = idx;
+                smemFinalBinSize[0]    = nextPrefixSum - prefixSum;
+                smemFoundTopKValues[0] = prefixSum;
+                foundThreshold         = true;
+            }
+        }
+
+        // Early exit: if any thread found the threshold, we can skip remaining
+        // rounds
+        if(__syncthreads_or(foundThreshold))
+        {
+            break;
+        }
+
+        lastValue = totalSum;
+    }
+
+    // Make sure the data is in shared memory.
+    __syncthreads();
+
+    // The threshold bin.
+    thresholdBinIdx = smemThresholdBinIdx[0];
+
+    // Fetch elements one-by-one and populate the shared memory buffers.
+    for(int vecIdx = (rowStart / Vector) + threadIdx.x; vecIdx < (rowEnd + Vector - 1) / Vector;
+        vecIdx += kNumThreadsPerBlock)
+    {
+        // Compute the vector offset for coalesced VectorType load
+        auto v = reinterpret_cast<const VectorType*>(logits)[vecIdx];
+#pragma unroll
+        for(int j = 0; j < Vector; j++)
+        {
+            int vIdx = vecIdx * Vector + j;
+            if(vIdx >= rowEnd)
+                break;
+            float logit = v[j];
+
+            // Check for pattern match
+            if(!isPartialMatch<patternShift>(logit, logitPattern))
+                continue;
+
+            uint32_t binIdx = extractBinIdx<step>(logit);
+
+            if(binIdx < thresholdBinIdx)
+            {
+                int dstIdx          = atomicAdd(&smemHistogram[binIdx], 1);
+                smemIndices[dstIdx] = vIdx;
+            }
+
+            if constexpr(step < 2)
+            {
+                // Fill final items only if threshold bin fits
+                if(binIdx == thresholdBinIdx && smemFinalBinSize[0] <= kNumFinalItems)
+                {
+                    int dstIdx                      = atomicAdd(&smemFinalDstIdx[0], 1);
+                    smemFinal.items.logits[dstIdx]  = logit;
+                    smemFinal.items.indices[dstIdx] = vIdx;
+                }
+            }
+            else
+            {
+                if(binIdx == thresholdBinIdx)
+                {
+                    int dstIdx = atomicAdd(&smemHistogram[binIdx], 1);
+                    if(dstIdx < kTopK)
+                    {
+                        smemIndices[dstIdx] = vIdx;
+                    }
+                }
+            }
+        }
+    }
+
+    // Make sure the elements are in shared memory.
+    __syncthreads();
+
+    // Check if we should continue to next step
+    return smemFinalBinSize[0] > kNumFinalItems;
+}
+
+template <int kNumThreadsPerBlock        = 512,
+          int kNumBins                   = 512,
+          int kTopK                      = 2048,
+          bool useRadixSort              = true,
+          int Vector                     = 4,
+          bool sortResultLogitDescending = false>
 __device__ void topk_per_row_kernel(const float* logits,
                                     const int rowStart,
                                     const int rowEnd,
-                                    const int rowIdx,
                                     int* outIndices,
-                                    int stride0,
                                     int stride1)
 {
-    // The number of elements per thread for the final top-k sort.
-    static constexpr int kNumTopKItemsPerThread = kTopK / kNumThreadsPerBlock;
-    // The class to sort the elements during the final top-k sort.
-    using TopKSort =
-        hipcub::BlockRadixSort<float, kNumThreadsPerBlock, kNumTopKItemsPerThread, int>;
-
     // The number of slots for the final pass.
-    static constexpr int kNumFinalItems = 3072;
+    static constexpr int kNumFinalItems = 2048;
     // The number of elements per thread for the final sort.
     static constexpr int kNumFinalItemsPerThread = kNumFinalItems / kNumThreadsPerBlock;
     // The class to sort the elements during the final pass.
@@ -72,8 +287,6 @@ __device__ void topk_per_row_kernel(const float* logits,
 
     // The class to compute the inclusive prefix-sum over the histogram.
     using Scan = hipcub::BlockScan<int, kNumThreadsPerBlock>;
-
-    using VectorType = typename to_vector<Vector>::type;
 
     // Shared memory to compute the block scan.
     __shared__ typename Scan::TempStorage smemScan;
@@ -92,7 +305,7 @@ __device__ void topk_per_row_kernel(const float* logits,
     {
         FinalItems items;
         typename FinalSort::TempStorage finalSort;
-        typename TopKSort::TempStorage topKSort;
+        typename Scan::TempStorage smemScan;
     } smemFinal;
 
     // Shared memory to store the histogram.
@@ -103,6 +316,11 @@ __device__ void topk_per_row_kernel(const float* logits,
     __shared__ int smemThresholdBinIdx[1];
     // Shared memory counter to register the candidates for the final phase.
     __shared__ int smemFinalDstIdx[1];
+    // Shared memory to determine if the threshold bin fits in the final items.
+    __shared__ int smemFinalBinSize[1];
+    // Shared memory to keep track of the top-k values found so far by the
+    // previous iterations
+    __shared__ int smemFoundTopKValues[1];
 
     // The length of the row.
     int rowLen = rowEnd - rowStart;
@@ -113,229 +331,261 @@ __device__ void topk_per_row_kernel(const float* logits,
     {
         for(int rowIt = threadIdx.x; rowIt < rowLen; rowIt += kNumThreadsPerBlock)
         {
-            int idx                            = rowStart + rowIt;
-            outIndices[rowIdx * kTopK + rowIt] = idx - rowStart;
+            outIndices[rowIt] = rowIt - rowStart;
         }
         for(int rowIt = rowLen + threadIdx.x; rowIt < kTopK; rowIt += kNumThreadsPerBlock)
         {
-            outIndices[rowIdx * kTopK + rowIt] = -1;
+            outIndices[rowIt] = -1;
         }
         return;
     }
 
-    // Clear the histogram.
-    if(threadIdx.x < kNumBins)
-    {
-        smemHistogram[threadIdx.x] = 0;
-    }
-
-    // Make sure the histogram is ready.
-    __syncthreads();
-
-    // Fetch elements one-by-one.
-    for(int rowIt = rowStart + threadIdx.x; rowIt < (rowEnd + Vector - 1) / Vector;
-        rowIt += kNumThreadsPerBlock)
-    {
-        int64_t offset = ((int64_t)rowIdx) * (stride0 / Vector) + ((int64_t)rowIt) * stride1;
-        auto v         = reinterpret_cast<const VectorType*>(logits)[offset];
-
-#pragma unroll
-        for(int j = 0; j < Vector; j++)
-        {
-            float logit  = (rowIt * Vector + j) < rowEnd ? v[j] : -INFINITY;
-            uint16_t idx = extractBinIdx(logit);
-            atomicAdd(&smemHistogram[idx], 1);
-        }
-    }
-
-    // Make sure the histogram is ready.
-    __syncthreads();
-
-    // Read the values from SMEM.
-    int binCount{0};
-    if(threadIdx.x < kNumBins)
-    {
-        binCount = smemHistogram[threadIdx.x];
-    }
-
-    // Make sure each thread has read its value.
-    __syncthreads();
-
-    // Compute the prefix sum.
-    int prefixSum{0}, totalSum{0};
-    Scan(smemScan).ExclusiveSum(binCount, prefixSum, totalSum);
-
-    // Update the histogram with the prefix sums.
-    if(threadIdx.x < kNumBins)
-    {
-        smemHistogram[threadIdx.x] = prefixSum;
-    }
-
-    // Make sure the data is in shared memory.
-    __syncthreads();
-
-    // Find the last valid bin.
-    if(threadIdx.x < kNumBins)
-    {
-        int nextPrefixSum = threadIdx.x == kNumBins - 1 ? totalSum : smemHistogram[threadIdx.x + 1];
-        if(prefixSum < kTopK && nextPrefixSum >= kTopK)
-        {
-            smemThresholdBinIdx[0] = threadIdx.x;
-        }
-    }
-
-    // Clear the counter to store the items for the final phase.
+    // Initialize values
     if(threadIdx.x == 0)
     {
-        smemFinalDstIdx[0] = 0;
+        smemFinalDstIdx[0]     = 0;
+        smemFoundTopKValues[0] = 0;
+    }
+    __syncthreads();
+    int thresholdBinIdx   = -1;
+    uint32_t logitPattern = 0;
+
+    // Step 0: Process first 11 bits
+    bool continueToNextStep =
+        processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kTopK, kNumFinalItems, Vector>(
+            logits,
+            rowEnd,
+            logitPattern,
+            thresholdBinIdx,
+            smemHistogram,
+            smemIndices,
+            smemThresholdBinIdx,
+            smemFinalDstIdx,
+            smemFinalBinSize,
+            smemFoundTopKValues,
+            smemFinal,
+            stride1,
+            rowStart);
+
+    if(continueToNextStep)
+    {
+        // Step 1: Process next 11 bits
+        continueToNextStep =
+            processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kTopK, kNumFinalItems, Vector>(
+                logits,
+                rowEnd,
+                logitPattern,
+                thresholdBinIdx,
+                smemHistogram,
+                smemIndices,
+                smemThresholdBinIdx,
+                smemFinalDstIdx,
+                smemFinalBinSize,
+                smemFoundTopKValues,
+                smemFinal,
+                stride1,
+                rowStart);
+
+        if(continueToNextStep)
+        {
+            // Step 2: Process final 10 bits
+            processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kTopK, kNumFinalItems, Vector>(
+                logits,
+                rowEnd,
+                logitPattern,
+                thresholdBinIdx,
+                smemHistogram,
+                smemIndices,
+                smemThresholdBinIdx,
+                smemFinalDstIdx,
+                smemFinalBinSize,
+                smemFoundTopKValues,
+                smemFinal,
+                stride1,
+                rowStart);
+        }
     }
 
-    // Make sure the data is in shared memory.
-    __syncthreads();
-
-    // The threshold bin.
-    int thresholdBinIdx = smemThresholdBinIdx[0];
-
-    // Fetch elements one-by-one and populate the shared memory buffers.
-    for(int rowIt = rowStart + threadIdx.x; rowIt < (rowEnd + Vector - 1) / Vector;
-        rowIt += kNumThreadsPerBlock)
+    if(!continueToNextStep)
     {
-        int64_t offset = ((int64_t)rowIdx) * stride0 / Vector + ((int64_t)rowIt) * stride1;
-        auto v         = reinterpret_cast<const VectorType*>(logits)[offset];
+        // The histogram did not proceed to the final 10 bits, therefore we need to
+        // sort the final items The logits of the elements to be sorted in the final
+        // pass.
+        if constexpr(useRadixSort)
+        {
+            // Sorting with radix sort
+            float finalLogits[kNumFinalItemsPerThread];
+            // The indices of the elements to be sorted in the final pass.
+            int finalIndices[kNumFinalItemsPerThread];
 
 #pragma unroll
-        for(auto j = 0; j < Vector; j++)
-        {
-            float logit = (rowIt * Vector + j) < rowEnd ? v[j] : -INFINITY;
-            // float logit    = v[j];
-            uint16_t idx = extractBinIdx(logit);
-            if(idx < thresholdBinIdx)
+            for(int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
             {
-                int dstIdx          = atomicAdd(&smemHistogram[idx], 1);
-                smemIndices[dstIdx] = Vector * rowIt + j;
+                finalLogits[ii] = -FLT_MAX;
             }
-            else if(idx == thresholdBinIdx)
+
+            // Read the elements from SMEM.
+#pragma unroll
+            for(int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
             {
-                int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
-                if(dstIdx < kNumFinalItems)
+                int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+                if(srcIdx < smemFinalDstIdx[0])
                 {
-                    smemFinal.items.logits[dstIdx]  = logit;
-                    smemFinal.items.indices[dstIdx] = Vector * rowIt + j;
+                    finalLogits[ii]  = smemFinal.items.logits[srcIdx];
+                    finalIndices[ii] = smemFinal.items.indices[srcIdx];
+                }
+            }
+            // Make sure the shared memory has been read.
+            __syncthreads();
+
+            // Sort the elements.
+            FinalSort(smemFinal.finalSort)
+                .SortDescendingBlockedToStriped(finalLogits, finalIndices);
+
+            // Copy the data back to the shared memory storage.
+            int baseIdx = smemFoundTopKValues[0];
+
+#pragma unroll
+            for(int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
+            {
+                int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+                int dstIdx = baseIdx + srcIdx;
+
+                if(dstIdx < kTopK)
+                {
+                    smemIndices[dstIdx] = finalIndices[ii];
                 }
             }
         }
+        else
+        {
+            // Sorting with insertion sort
+            auto baseIdx = smemFoundTopKValues[0];
+            for(int i = threadIdx.x; i < smemFinalDstIdx[0]; i += kNumThreadsPerBlock)
+            {
+                int outIndex = 0;
+                auto logit   = smemFinal.items.logits[i];
+                for(int j = 0; j < smemFinalDstIdx[0]; j++)
+                {
+                    auto otherLogit = smemFinal.items.logits[j];
+                    if(logit < otherLogit || (logit == otherLogit && i < j))
+                    {
+                        outIndex++;
+                    }
+                }
+                // Store if outIndex is in bounds
+                if(outIndex + baseIdx < kTopK)
+                {
+                    smemIndices[outIndex + baseIdx] = smemFinal.items.indices[i];
+                }
+            }
+        }
+        __syncthreads();
     }
 
-    // Make sure the elements are in shared memory.
-    // __syncthreads();
-
-    // The logits of the elements to be sorted in the final pass.
-    float finalLogits[kNumFinalItemsPerThread];
-    // The indices of the elements to be sorted in the final pass.
-    int finalIndices[kNumFinalItemsPerThread];
-
-// Init.
-#pragma unroll
-    for(int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
+    if constexpr(sortResultLogitDescending)
     {
-        finalLogits[ii] = -FLT_MAX;
-    }
-
-    __syncthreads();
+        // Sorting with radix sort
+        float finalLogits[kNumFinalItemsPerThread];
+        // The indices of the elements to be sorted in the final pass.
+        int finalIndices[kNumFinalItemsPerThread];
 
 // Read the elements from SMEM.
 #pragma unroll
-    for(int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
-    {
-        int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
-        if(srcIdx < smemFinalDstIdx[0])
+        for(int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
         {
-            finalLogits[ii]  = smemFinal.items.logits[srcIdx];
-            finalIndices[ii] = smemFinal.items.indices[srcIdx];
+            int srcIdx       = ii * kNumThreadsPerBlock + threadIdx.x;
+            const auto index = smemIndices[srcIdx];
+            const auto logit = logits[index * stride1];
+            finalLogits[ii]  = logit;
+            finalIndices[ii] = index;
+        }
+
+        // Make sure the shared memory has been read.
+        __syncthreads();
+
+        // Sort the elements.
+        FinalSort(smemFinal.finalSort).SortDescendingBlockedToStriped(finalLogits, finalIndices);
+
+        // Store to global memory
+#pragma unroll
+        for(int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
+        {
+            int srcIdx         = ii * kNumThreadsPerBlock + threadIdx.x;
+            outIndices[srcIdx] = finalIndices[ii] - rowStart;
         }
     }
 
-    // Make sure the shared memory has been read.
-    __syncthreads();
-
-    // Sort the elements.
-    FinalSort(smemFinal.finalSort).SortDescendingBlockedToStriped(finalLogits, finalIndices);
-
-    // Copy the data back to the shared memory storage.
-    int baseIdx = thresholdBinIdx > 0 ? smemHistogram[thresholdBinIdx - 1] : 0;
-#pragma unroll
-    for(int ii = 0; ii < kNumFinalItemsPerThread; ++ii)
+    if constexpr(!sortResultLogitDescending)
     {
-        int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
-        int dstIdx = baseIdx + srcIdx;
-        if(dstIdx < kTopK)
+        // Store to global memory.
+#pragma unroll
+        for(int i = threadIdx.x; i < kTopK; i += kNumThreadsPerBlock)
         {
-            smemIndices[dstIdx] = finalIndices[ii];
+            outIndices[i] = smemIndices[i] - rowStart;
         }
-    }
-
-    // Make sure the data is in shared memory.
-    __syncthreads();
-
-// Store to global memory.
-#pragma unroll
-    for(int ii = 0; ii < kNumTopKItemsPerThread; ++ii)
-    {
-        int offset         = rowIdx * kTopK + ii * kNumThreadsPerBlock + threadIdx.x;
-        outIndices[offset] = smemIndices[ii * kNumThreadsPerBlock + threadIdx.x] - rowStart;
     }
 }
 
-template <int kNumThreadsPerBlock = 512, int Vector = 4>
+template <int kNumThreadsPerBlock = 512, bool useRadixSort = true, int Vector = 4>
 static __global__ void topk_per_row(const float* logits,
                                     const int* rowStarts,
                                     const int* rowEnds,
                                     int* outIndices,
                                     int stride0,
-                                    int stride1)
+                                    int stride1,
+                                    int rowOffset)
 {
     // The number of bins in the histogram.
-    static constexpr int kNumBins = 512;
+    static constexpr int kNumBins = 2048;
 
     // The top-k width.
     static constexpr int kTopK = 2048;
 
     // The row computed by this block.
-    int rowIdx = blockIdx.x;
+    int64_t rowIdx = static_cast<int64_t>(blockIdx.x) + rowOffset;
 
     // The range of logits within the row.
     int rowStart = rowStarts[rowIdx];
     int rowEnd   = rowEnds[rowIdx];
 
-    topk_per_row_kernel<kNumThreadsPerBlock, kNumBins, kTopK, Vector>(
-        logits, rowStart, rowEnd, rowIdx, outIndices, stride0, stride1);
+    // Local pointers to this block
+    auto outIndicesLocal = outIndices + rowIdx * kTopK;
+    auto logitsLocal     = logits + rowIdx * stride0;
+
+    topk_per_row_kernel<kNumThreadsPerBlock, kNumBins, kTopK, useRadixSort, Vector>(
+        logitsLocal, rowStart, rowEnd, outIndicesLocal, stride1);
 }
 
-template <int kNumThreadsPerBlock = 512, int Vector = 4>
+template <int kNumThreadsPerBlock = 512, bool useRadixSort = true, int Vector = 4>
 static __global__ void topk_per_row_decode(
     const float* logits, const int* seqLens, int* outIndices, int stride0, int stride1, int next_n)
 {
     // The number of bins in the histogram.
-    static constexpr int kNumBins = kNumThreadsPerBlock;
+    static constexpr int kNumBins = 2048;
 
     // The top-k width.
     static constexpr int kTopK = 2048;
 
     // The row computed by this block.
-    int rowIdx = blockIdx.x;
+    int64_t rowIdx = static_cast<int64_t>(blockIdx.x);
 
     // The range of logits within the row.
     int rowStart = 0;
     int seq_len  = seqLens[rowIdx / next_n];
     int rowEnd   = seq_len - next_n + (rowIdx % next_n) + 1;
 
-    topk_per_row_kernel<kNumThreadsPerBlock, kNumBins, kTopK, Vector>(
-        logits, rowStart, rowEnd, rowIdx, outIndices, stride0, stride1);
+    // Local pointers to this block
+    auto outIndicesLocal = outIndices + rowIdx * kTopK;
+    auto logitsLocal     = logits + rowIdx * stride0;
+
+    topk_per_row_kernel<kNumThreadsPerBlock, kNumBins, kTopK, useRadixSort, Vector>(
+      logitsLocal, rowStart, rowEnd, outIndicesLocal, stride1);
 }
 
 } // namespace aiter
 
-void topk_per_row(const torch::Tensor& logits,
+void top_k_per_row_prefill(const torch::Tensor& logits,
                   const torch::Tensor& rowStarts,
                   const torch::Tensor& rowEnds,
                   torch::Tensor& indices,
@@ -343,6 +593,8 @@ void topk_per_row(const torch::Tensor& logits,
                   int64_t stride0,
                   int64_t stride1)
 {
+    constexpr int kSortingAlgorithmThreshold = 12288;
+
     // Compute the results on the device.
     constexpr int kNumThreadsPerBlock = 512;
 
@@ -351,25 +603,60 @@ void topk_per_row(const torch::Tensor& logits,
 
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
+    int numInsertionBlocks = std::min(static_cast<int>(numRows), kSortingAlgorithmThreshold);
+
     if(stride0 % 4 == 0)
-        aiter::topk_per_row<kNumThreadsPerBlock, 4>
-            <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
-                                                          rowStarts.data_ptr<int>(),
-                                                          rowEnds.data_ptr<int>(),
-                                                          indices.data_ptr<int>(),
-                                                          static_cast<int>(stride0),
-                                                          static_cast<int>(stride1));
+    {
+        aiter::topk_per_row<kNumThreadsPerBlock, false, 4>
+            <<<numInsertionBlocks, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
+                                                                     rowStarts.data_ptr<int>(),
+                                                                     rowEnds.data_ptr<int>(),
+                                                                     indices.data_ptr<int>(),
+                                                                     static_cast<int>(stride0),
+                                                                     static_cast<int>(stride1),
+                                                                     0);
+    }
     else
-        aiter::topk_per_row<kNumThreadsPerBlock, 1>
-            <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
-                                                          rowStarts.data_ptr<int>(),
-                                                          rowEnds.data_ptr<int>(),
-                                                          indices.data_ptr<int>(),
-                                                          static_cast<int>(stride0),
-                                                          static_cast<int>(stride1));
+    {
+        aiter::topk_per_row<kNumThreadsPerBlock, false, 1>
+            <<<numInsertionBlocks, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
+                                                                     rowStarts.data_ptr<int>(),
+                                                                     rowEnds.data_ptr<int>(),
+                                                                     indices.data_ptr<int>(),
+                                                                     static_cast<int>(stride0),
+                                                                     static_cast<int>(stride1),
+                                                                     0);
+    }
+
+    if(numRows > kSortingAlgorithmThreshold)
+    {
+        int numRadixBlocks = numRows - kSortingAlgorithmThreshold;
+        if(stride0 % 4 == 0)
+        {
+            aiter::topk_per_row<kNumThreadsPerBlock, true, 4>
+                <<<numRadixBlocks, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
+                                                                     rowStarts.data_ptr<int>(),
+                                                                     rowEnds.data_ptr<int>(),
+                                                                     indices.data_ptr<int>(),
+                                                                     static_cast<int>(stride0),
+                                                                     static_cast<int>(stride1),
+                                                                     kSortingAlgorithmThreshold);
+        }
+        else
+        {
+            aiter::topk_per_row<kNumThreadsPerBlock, true, 1>
+                <<<numRadixBlocks, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
+                                                                     rowStarts.data_ptr<int>(),
+                                                                     rowEnds.data_ptr<int>(),
+                                                                     indices.data_ptr<int>(),
+                                                                     static_cast<int>(stride0),
+                                                                     static_cast<int>(stride1),
+                                                                     kSortingAlgorithmThreshold);
+        }
+    }
 }
 
-void topk_per_row_decode(const torch::Tensor& logits,
+void top_k_per_row_decode(const torch::Tensor& logits,
                          int64_t next_n,
                          const torch::Tensor& seqLens,
                          torch::Tensor& indices,
@@ -377,24 +664,54 @@ void topk_per_row_decode(const torch::Tensor& logits,
                          int64_t stride0,
                          int64_t stride1)
 {
+    constexpr int kSortingAlgorithmThreshold = 12288;
     // Compute the results on the device.
     constexpr int kNumThreadsPerBlock = 1024;
     const hipStream_t stream          = at::hip::getCurrentHIPStream();
+    const auto numColumns = logits.size(1);
 
-    if(stride0 % 4 == 0)
-        aiter::topk_per_row_decode<kNumThreadsPerBlock, 4>
-            <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
-                                                          seqLens.data_ptr<int>(),
-                                                          indices.data_ptr<int>(),
-                                                          static_cast<int>(stride0),
-                                                          static_cast<int>(stride1),
-                                                          static_cast<int>(next_n));
+    if(numColumns < kSortingAlgorithmThreshold)
+    {
+        if(stride0 % 4 == 0)
+        {
+            aiter::topk_per_row_decode<kNumThreadsPerBlock, false, 4>
+                <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
+                                                              seqLens.data_ptr<int>(),
+                                                              indices.data_ptr<int>(),
+                                                              static_cast<int>(stride0),
+                                                              static_cast<int>(stride1),
+                                                              static_cast<int>(next_n));
+        }
+        else
+        {
+            aiter::topk_per_row_decode<kNumThreadsPerBlock, false, 1>
+                <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
+                                                              seqLens.data_ptr<int>(),
+                                                              indices.data_ptr<int>(),
+                                                              static_cast<int>(stride0),
+                                                              static_cast<int>(stride1),
+                                                              static_cast<int>(next_n));
+        }
+    }
     else
-        aiter::topk_per_row_decode<kNumThreadsPerBlock, 1>
+    {
+        if (stride0 % 4 == 0)
+        {
+            aiter::topk_per_row_decode<kNumThreadsPerBlock, true, 4>
+                <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
+                                                              seqLens.data_ptr<int>(),
+                                                              indices.data_ptr<int>(),
+                                                              static_cast<int>(stride0),
+                                                          static_cast<int>(stride1),
+                                                          static_cast<int>(next_n));
+    } else {
+        aiter::topk_per_row_decode<kNumThreadsPerBlock, true, 1>
             <<<numRows, kNumThreadsPerBlock, 0, stream>>>(logits.data_ptr<float>(),
                                                           seqLens.data_ptr<int>(),
                                                           indices.data_ptr<int>(),
                                                           static_cast<int>(stride0),
                                                           static_cast<int>(stride1),
                                                           static_cast<int>(next_n));
+    }
+}
 }
