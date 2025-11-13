@@ -278,6 +278,26 @@ def rope_cached_positions_offsets_2c_fwd_impl(
     """
     ...
 
+@compile_ops("module_rope_pos_fwd")
+def rope_cached_positions_offsets_2c_fwd_cachekv_impl(
+    output_x: Tensor,
+    output_y: Tensor,
+    input_x: Tensor,
+    input_y: Tensor,
+    value: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    offsets: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part: bool,
+    nope_first: bool,
+    slot_mapping: Tensor,
+    asm_layout: bool,
+) -> None:
+    ...
 
 @compile_ops("module_rope_general_fwd")
 def rope_thd_fwd_impl(
