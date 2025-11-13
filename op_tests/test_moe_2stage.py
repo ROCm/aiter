@@ -257,6 +257,15 @@ def test_fmoe(
         out2_ck,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
+    
+    def calc_diff(x: torch.Tensor, y: torch.Tensor):
+        x, y = x.double(), y.double()
+        denominator = (x * x + y * y).sum()
+        sim = 2 * (x * y).sum() / denominator
+        return 1 - sim
+ 
+    logits_diff = calc_diff(out2_ref, out2_ck)
+    assert logits_diff < 1e-3
 
     return {"us": us2, "err": err}
 
