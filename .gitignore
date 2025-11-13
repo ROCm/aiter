@@ -1,6 +1,9 @@
 # aiter version
 aiter/_version.py
 
+# aiter install mode
+aiter/install_mode
+
 # Prerequisites
 *.d
 
