@@ -120,6 +120,8 @@ def run_top_k_per_row_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     indices: torch.Tensor,
+    values: torch.Tensor,
+    workspace: torch.Tensor,
     num_rows: int,
     stride_row: int,
     stride_col: int,
@@ -132,6 +134,8 @@ def run_top_k_per_row_prefill(
         row_starts,
         row_ends,
         indices,
+        values,
+        workspace,
         num_rows,
         stride_row,
         stride_col,
@@ -177,12 +181,19 @@ def test_top_k_per_row_prefill(num_rows: int, num_prefix: int, top_k: int) -> di
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
 
+    values = torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda")
+    # TODO invokeComputeTopkLastDimWorkspaceSize to get accurate workspace size
+    workspace_size = 1024 * 1024 * 1024 
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device="cuda")
+
     # Run the kernel
     _, us = run_top_k_per_row_prefill(
         logits,
         row_starts,
         row_ends,
         indices,
+        values,
+        workspace,
         num_rows,
         logits.stride(0),
         logits.stride(1),
@@ -344,13 +355,13 @@ df = pd.DataFrame(df)
 aiter.logger.info(f"summary for top_k_per_row_prefill kernel:\n{df}")
 
 
-df = []
-for m in args.decode_batch_size:
-    for ctx in args.context_len:
-        for k in args.top_k:
-            for n in args.next_n:
-                ret = test_top_k_per_row_decode(m, ctx, k, n)
-                df.append(ret)
+# df = []
+# for m in args.decode_batch_size:
+#     for ctx in args.context_len:
+#         for k in args.top_k:
+#             for n in args.next_n:
+#                 ret = test_top_k_per_row_decode(m, ctx, k, n)
+#                 df.append(ret)
 
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary for top_k_per_row_decode kernel:\n{df}")
+# df = pd.DataFrame(df)
+# aiter.logger.info(f"summary for top_k_per_row_decode kernel:\n{df}")
