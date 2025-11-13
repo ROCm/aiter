@@ -48,6 +48,31 @@ def mp_lock(
                 FinalFunc()
             baton.release()
     else:
+        ttl_ms = int(os.environ.get("AITER_JIT_LOCK_TTL_MS", "0"))
+        if ttl_ms > 0:
+            deadline = time.time() + ttl_ms / 1000.0
+            while os.path.exists(lockPath) and time.time() < deadline:
+                time.sleep(getattr(baton, "wait_seconds", 0.2))
+            if os.path.exists(lockPath):
+                try:
+                    age_ms = (time.time() - os.path.getmtime(lockPath)) * 1000.0
+                except Exception:
+                    age_ms = ttl_ms + 1
+                if age_ms >= ttl_ms:
+                    logger.warning(f"stale lock detected and removed: {lockPath}")
+                    try:
+                        os.remove(lockPath)
+                    except Exception:
+                        pass
+                    baton2 = FileBaton(lockPath)
+                    if baton2.try_acquire():
+                        try:
+                            ret = MainFunc()
+                        finally:
+                            if FinalFunc is not None:
+                                FinalFunc()
+                            baton2.release()
+                        return ret
         baton.wait()
         if WaitFunc is not None:
             ret = WaitFunc()
@@ -407,10 +432,36 @@ def get_module_custom_op(md_name: str) -> None:
     global __mds
     if md_name not in __mds:
         if "AITER_JIT_DIR" in os.environ:
-            __mds[md_name] = importlib.import_module(md_name)
+            try:
+                __mds[md_name] = importlib.import_module(md_name)
+            except ModuleNotFoundError as e:
+                import importlib.util as _util
+                from importlib.machinery import EXTENSION_SUFFIXES as _SUFFIXES
+
+                probe_name = md_name
+                spec_probe = _util.find_spec(probe_name)
+                jit_dir = os.path.abspath(get_user_jit_dir())
+                candidates = [
+                    os.path.join(jit_dir, f"{md_name}{sfx}") for sfx in _SUFFIXES
+                ]
+                candidates.append(os.path.join(jit_dir, f"{md_name}.so"))
+                has_artifact = any(os.path.exists(p) for p in candidates)
+                raise e
         else:
-            __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
-        logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
+            try:
+                __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+            except ModuleNotFoundError as e:
+                import importlib.util as _util
+
+                probe_name = f"{__package__}.{md_name}"
+                spec_probe = _util.find_spec(probe_name)
+                raise e
+        mod = __mds.get(md_name)
+        mod_file = getattr(mod, "__file__", None)
+        if mod_file:
+            logger.info(f"import [{md_name}] under {mod_file}")
+        else:
+            logger.info(f"import [{md_name}]")
     return
 
 
@@ -605,9 +656,50 @@ def build_module(
                     src_dir = Path(opbd_dir)
                     dst_dir = Path(get_user_jit_dir())
                     for src_file in src_dir.glob("*.so"):
-                        shutil.move(str(src_file), str(dst_dir / src_file.name))
+                        final = dst_dir / src_file.name
+                        try:
+                            os.replace(str(src_file), str(final))
+                        except Exception:
+                            shutil.move(str(src_file), str(final))
+                    try:
+                        fd = os.open(str(dst_dir), os.O_RDONLY)
+                        os.fsync(fd)
+                        os.close(fd)
+                    except Exception:
+                        try:
+                            p = os.path.join(
+                                str(dst_dir), f".aiter_touch_{int(time.time()*1000)}"
+                            )
+                            open(p, "wb").close()
+                            os.remove(p)
+                        except Exception:
+                            pass
                 else:
-                    shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
+                    src_path = f"{opbd_dir}/{target_name}"
+                    dst_dir = get_user_jit_dir()
+                    final_path = os.path.join(dst_dir, target_name)
+                    tmp_path = os.path.join(
+                        dst_dir,
+                        f".tmp_{target_name}_{os.getpid()}_{int(time.time()*1000)}",
+                    )
+                    with open(src_path, "rb") as s, open(tmp_path, "wb") as t:
+                        shutil.copyfileobj(s, t)
+                        t.flush()
+                        os.fsync(t.fileno())
+                    os.replace(tmp_path, final_path)
+                    try:
+                        fd = os.open(dst_dir, os.O_RDONLY)
+                        os.fsync(fd)
+                        os.close(fd)
+                    except Exception:
+                        try:
+                            p = os.path.join(
+                                dst_dir, f".aiter_touch_{int(time.time()*1000)}"
+                            )
+                            open(p, "wb").close()
+                            os.remove(p)
+                        except Exception:
+                            pass
             else:
                 shutil.copy(
                     f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
@@ -756,10 +848,7 @@ def compile_ops(
             except ModuleNotFoundError:
                 d_args = get_args_of_build(md_name)
                 d_args.update(custom_build_args)
-
-                # update module if we have coustom build
                 md_name = custom_build_args.get("md_name", md_name)
-
                 srcs = d_args["srcs"]
                 flags_extra_cc = d_args["flags_extra_cc"]
                 flags_extra_hip = d_args["flags_extra_hip"]
@@ -799,32 +888,47 @@ def compile_ops(
                         os.environ.pop("HIP_CLANG_PATH", None)
 
                 if is_python_module:
+                    module = None
                     try:
+                        module = get_module(md_name)
+                    except ModuleNotFoundError:
                         import importlib.util as _util
                         from importlib.machinery import EXTENSION_SUFFIXES as _SUFFIXES
 
                         jit_dir = os.path.abspath(get_user_jit_dir())
-                        candidates = [
-                            os.path.join(jit_dir, f"{md_name}{sfx}")
-                            for sfx in _SUFFIXES
-                        ]
-                        max_wait_ms = int(os.getenv("AITER_JIT_IMPORT_DELAY_MS", "400"))
-                        interval_ms = int(os.getenv("AITER_JIT_IMPORT_POLL_MS", "50"))
-                        deadline = time.time() + (max_wait_ms / 1000.0)
-
-                        while time.time() < deadline:
-                            has_artifact = any(os.path.exists(p) for p in candidates)
-                            spec_pkg = _util.find_spec(f"{__package__}.{md_name}")
-                            spec_bare = _util.find_spec(md_name)
-                            if has_artifact and (
-                                spec_pkg is not None or spec_bare is not None
-                            ):
+                        delay_ms = int(os.environ.get("AITER_JIT_IMPORT_DELAY_MS", "0"))
+                        poll_ms = int(os.environ.get("AITER_JIT_IMPORT_POLL_MS", "40"))
+                        if delay_ms > 0:
+                            time.sleep(delay_ms / 1000.0)
+                        max_attempts = 5 if poll_ms > 0 else 1
+                        for _attempt in range(max_attempts):
+                            for sfx in _SUFFIXES:
+                                p = os.path.join(jit_dir, f"{md_name}{sfx}")
+                                if os.path.exists(p):
+                                    spec = _util.spec_from_file_location(md_name, p)
+                                    m = _util.module_from_spec(spec)
+                                    spec.loader.exec_module(m)
+                                    module = m
+                                    break
+                            if module is not None:
                                 break
-                            time.sleep(interval_ms / 1000.0)
-                    except Exception:
-                        pass
-
-                    module = get_module(md_name)
+                            if poll_ms > 0:
+                                time.sleep(poll_ms / 1000.0)
+                        if module is None:
+                            candidates = [
+                                os.path.join(jit_dir, f"{md_name}{sfx}")
+                                for sfx in _SUFFIXES
+                            ]
+                            candidates.append(os.path.join(jit_dir, f"{md_name}.so"))
+                            for p in candidates:
+                                if os.path.exists(p):
+                                    spec = _util.spec_from_file_location(md_name, p)
+                                    m = _util.module_from_spec(spec)
+                                    spec.loader.exec_module(m)
+                                    module = m
+                                    break
+                        if module is None:
+                            raise
                 if md_name not in __mds:
                     __mds[md_name] = module
 
