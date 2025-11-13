@@ -511,6 +511,7 @@ namespace aiter
         }
         tmp_out[idx - start] = write_reg;
       }
+      __syncthreads();
     }
     end_sync<ngpus>(sg, self_sg, rank);
 
