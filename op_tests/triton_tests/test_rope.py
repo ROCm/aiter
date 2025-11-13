@@ -1157,7 +1157,7 @@ def test_rope_fwd_3d(
     sp_size = 8
     max_seq_len = 1024
 
-    x = torch.arange(B * s * n * C, dtype=dtype, device=device).reshape(B, S, N, C)
+    x = torch.arange(B * S * N * C, dtype=dtype, device=device).reshape(B, S, N, C)
     x = x / (B * S * N * C)
 
     grid_sizes = torch.tensor([[21, 45, 80]], dtype=torch.int32, device=device)
