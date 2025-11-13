@@ -15,4 +15,5 @@ def topk_plain(
     topk_ids: torch.Tensor,
     topk: int,
     largest: bool,
-) -> None: pass
+) -> None:
+    pass
