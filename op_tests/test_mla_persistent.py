@@ -277,7 +277,7 @@ def test_mla(
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=True,
-        max_split_per_batch = max_split_per_batch,
+        max_split_per_batch=max_split_per_batch,
     )
 
     def test_absorb_decode_bf16():
