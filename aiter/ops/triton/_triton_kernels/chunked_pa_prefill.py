@@ -23,7 +23,6 @@ def cdiv_fn(x, y):
 _kernel_paged_attention_2d_repr = make_kernel_repr(
     "_kernel_paged_attention_2d",
     [
-        "num_query_heads",
         "num_queries_per_kv",
         "BLOCK_SIZE",
         "HEAD_SIZE",
@@ -47,7 +46,6 @@ def _kernel_paged_attention_2d(
     scale,  # float32
     k_scale,  # float32
     v_scale,  # float32
-    num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
     block_table_stride: tl.constexpr,  # int
     query_stride_0: tl.constexpr,  # int

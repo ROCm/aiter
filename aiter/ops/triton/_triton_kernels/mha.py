@@ -11,7 +11,6 @@ from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.pid_preprocessing import remap_xcd
 from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
-from ..utils.device_info import get_num_xcds
 from ..utils._triton.kernel_repr import make_kernel_repr
 
 
@@ -260,8 +259,6 @@ def _attn_fwd_inner(
 _attn_fwd_repr = make_kernel_repr(
     "_attn_fwd",
     [
-        "SEQLEN_Q",
-        "SEQLEN_K",
         "IS_CAUSAL",
         "NUM_Q_HEADS",
         "NUM_K_HEADS",

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import math
 import triton
 import triton.language as tl
 from ..utils._triton.kernel_repr import make_kernel_repr
@@ -18,7 +17,6 @@ _paged_attn_decode_v1_wo_dot_repr = make_kernel_repr(
         "KV_BLK_SZ",
         "HEAD_SZ",
         "QUERY_GRP_SZ",
-        "MAX_SEQ_LEN_POW2",
     ],
 )
 
@@ -39,7 +37,6 @@ def _paged_attn_decode_v1_wo_dot_kernel(
     stride_q_h,
     stride_o_s,
     stride_o_nh,
-    stride_o_hs,
     stride_k_b,
     stride_k_nh,
     stride_k_kb,
@@ -50,7 +47,6 @@ def _paged_attn_decode_v1_wo_dot_kernel(
     HEAD_SZ: tl.constexpr,
     HEAD_SZ_POW2: tl.constexpr,
     QUERY_GRP_SZ: tl.constexpr,
-    MAX_SEQ_LEN_POW2: tl.constexpr,
 ):
     """
     #TODO: Add Doc
@@ -173,7 +169,6 @@ def _paged_attn_decode_v1_w_dot_kernel(
     v_scale,
     stride_o_s,
     stride_o_nh,
-    stride_o_hs,
     stride_q_s,
     stride_q_nh,
     stride_q_hs,
@@ -182,7 +177,6 @@ def _paged_attn_decode_v1_w_dot_kernel(
     stride_k_kb,
     stride_k_hs,
     stride_bt_s,
-    stride_bt_nb,
     compute_type: tl.constexpr,
     HEAD_SZ: tl.constexpr,
     HEAD_SZ_POW2: tl.constexpr,
@@ -349,8 +343,6 @@ def _paged_attn_decode_v2_wo_dot_kernel(
     HEAD_SZ_POW2: tl.constexpr,
     QUERY_GRP_SZ: tl.constexpr,
     SEQ_PARTITION_SZ: tl.constexpr,
-    MAX_NUM_BLKS_PER_SEQ: tl.constexpr,
-    MAX_SEQ_LEN_POW2: tl.constexpr,
 ):
     """
     #TODO: Add Doc
@@ -467,7 +459,7 @@ _paged_attn_decode_v2_wo_dot_reduce_repr = make_kernel_repr(
     [
         "HEAD_SZ",
         "SEQ_PARTITION_SZ",
-        "MAX_NUM_SEQ_PARTITIONS",
+        "MAX_NUM_SEQ_PARTITIONS_POW2",
     ],
 )
 
@@ -489,7 +481,6 @@ def _paged_attn_decode_v2_wo_dot_reduce_kernel(
     HEAD_SZ: tl.constexpr,
     HEAD_SZ_POW2: tl.constexpr,
     SEQ_PARTITION_SZ: tl.constexpr,
-    MAX_NUM_SEQ_PARTITIONS: tl.constexpr,
     MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr,
 ):
     """
@@ -749,7 +740,7 @@ _paged_attn_decode_v2_w_dot_reduce_repr = make_kernel_repr(
         "HEAD_SZ",
         "QUERY_GRP_SZ",
         "SEQ_PARTITION_SZ",
-        "MAX_NUM_SEQ_PARTITIONS",
+        "MAX_NUM_SEQ_PARTITIONS_POW2",
     ],
 )
 
@@ -775,7 +766,6 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel(
     QUERY_GRP_SZ: tl.constexpr,
     QUERY_GRP_SZ_POW2: tl.constexpr,
     SEQ_PARTITION_SZ: tl.constexpr,
-    MAX_NUM_SEQ_PARTITIONS: tl.constexpr,
     MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr,
 ):
     """
@@ -863,7 +853,6 @@ _paged_attn_decode_v1_wo_dot_per_token_quant_repr = make_kernel_repr(
         "HEAD_SZ",
         "HEAD_SZ_POW2",
         "QUERY_GRP_SZ",
-        "MAX_SEQ_LEN_POW2",
     ],
 )
 
@@ -884,7 +873,6 @@ def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
     stride_q_h,
     stride_o_s,
     stride_o_nh,
-    stride_o_hs,
     stride_k_b,
     stride_k_nh,
     stride_k_kb,
@@ -898,7 +886,6 @@ def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
     HEAD_SZ: tl.constexpr,
     HEAD_SZ_POW2: tl.constexpr,
     QUERY_GRP_SZ: tl.constexpr,
-    MAX_SEQ_LEN_POW2: tl.constexpr,
 ):
     """
     #TODO: Add Doc
@@ -1002,11 +989,11 @@ _paged_attn_decode_v1_w_dot_per_token_quant_repr = make_kernel_repr(
     "_paged_attn_decode_v1_w_dot_kernel_per_token_quant",
     [
         "compute_type",
-        "KV_BLK_SZ",
-        "KV_BLK_SZ_POW2",
         "HEAD_SZ",
         "HEAD_SZ_POW2",
         "QUERY_GRP_SZ",
+        "KV_BLK_SZ",
+        "KV_BLK_SZ_POW2",
         "MAX_SEQ_LEN_POW2",
     ],
 )
@@ -1026,7 +1013,6 @@ def _paged_attn_decode_v1_w_dot_kernel_per_token_quant(
     v_scale_ptr,  # [num_blks, num_kv_heads, kv_blk_sz]
     stride_o_s,
     stride_o_nh,
-    stride_o_hs,
     stride_q_s,
     stride_q_nh,
     stride_q_hs,
@@ -1035,7 +1021,6 @@ def _paged_attn_decode_v1_w_dot_kernel_per_token_quant(
     stride_k_kb,
     stride_k_hs,
     stride_bt_s,
-    stride_bt_nb,
     stride_k_scale_b,
     stride_k_scale_nh,
     stride_k_scale_kb,
@@ -1175,7 +1160,7 @@ _paged_attn_decode_v2_wo_dot_per_token_quant_repr = make_kernel_repr(
         "HEAD_SZ",
         "HEAD_SZ_POW2",
         "QUERY_GRP_SZ",
-        "MAX_SEQ_LEN_POW2",
+        "SEQ_PARTITION_SZ",
     ],
 )
 
@@ -1216,8 +1201,6 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
     HEAD_SZ_POW2: tl.constexpr,
     QUERY_GRP_SZ: tl.constexpr,
     SEQ_PARTITION_SZ: tl.constexpr,
-    MAX_NUM_BLKS_PER_SEQ: tl.constexpr,
-    MAX_SEQ_LEN_POW2: tl.constexpr,
 ):
     """
     #TODO: Add Doc
@@ -1338,11 +1321,10 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
 _paged_attn_decode_v2_wo_dot_reduce_per_token_quant_repr = make_kernel_repr(
     "_paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant",
     [
-        "compute_type",
-        "KV_BLK_SZ",
         "HEAD_SZ",
-        "QUERY_GRP_SZ",
-        "MAX_SEQ_LEN_POW2",
+        "HEAD_SZ_POW2",
+        "SEQ_PARTITION_SZ",
+        "MAX_NUM_SEQ_PARTITIONS_POW2",
     ],
 )
 
@@ -1364,7 +1346,6 @@ def _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant(
     HEAD_SZ: tl.constexpr,
     HEAD_SZ_POW2: tl.constexpr,
     SEQ_PARTITION_SZ: tl.constexpr,
-    MAX_NUM_SEQ_PARTITIONS: tl.constexpr,
     MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr,
 ):
     """
@@ -1440,12 +1421,12 @@ _paged_attn_decode_v2_w_dot_per_token_quant_repr = make_kernel_repr(
     "_paged_attn_decode_v2_w_dot_kernel_per_token_quant",
     [
         "compute_type",
-        "KV_BLK_SZ",
-        "KV_BLK_SZ_POW2",
         "HEAD_SZ",
         "HEAD_SZ_POW2",
         "QUERY_GRP_SZ",
-        "MAX_SEQ_LEN_POW2",
+        "KV_BLK_SZ",
+        "KV_BLK_SZ_POW2",
+        "SEQ_PARTITION_SZ",
     ],
 )
 
@@ -1632,11 +1613,10 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
 _paged_attn_decode_v2_w_dot_reduce_per_token_quant_repr = make_kernel_repr(
     "_paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant",
     [
-        "compute_type",
-        "KV_BLK_SZ",
         "HEAD_SZ",
         "QUERY_GRP_SZ",
-        "MAX_SEQ_LEN_POW2",
+        "SEQ_PARTITION_SZ",
+        "MAX_NUM_SEQ_PARTITIONS_POW2",
     ],
 )
 
@@ -1662,7 +1642,6 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant(
     QUERY_GRP_SZ: tl.constexpr,
     QUERY_GRP_SZ_POW2: tl.constexpr,
     SEQ_PARTITION_SZ: tl.constexpr,
-    MAX_NUM_SEQ_PARTITIONS: tl.constexpr,
     MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr,
 ):
     """

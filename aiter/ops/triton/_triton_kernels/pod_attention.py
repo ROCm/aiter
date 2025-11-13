@@ -1,4 +1,3 @@
-import torch
 import triton
 import triton.language as tl
 from ..utils._triton.kernel_repr import make_kernel_repr

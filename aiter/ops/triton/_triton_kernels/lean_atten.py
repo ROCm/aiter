@@ -21,9 +21,7 @@ import functools
 import json
 import triton
 import triton.language as tl
-from typing import Optional
-from bisect import bisect_right
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ..utils._triton.pid_preprocessing import remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.kernel_repr import make_kernel_repr
@@ -259,7 +257,7 @@ def la_persistent(
     stride_om,  # n_ctx_q
     stride_oh,  # Head
     stride_on,  # head_dim
-    n_ctx_q_rows,
+    # n_ctx_q_rows,
     stride_oph,  # total_programs
     stride_opm,  # n_ctx_q
     stride_opn,  # head_dim

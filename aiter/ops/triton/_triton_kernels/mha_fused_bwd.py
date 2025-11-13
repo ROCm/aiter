@@ -4,7 +4,6 @@
 from typing import Optional, Dict
 import functools
 import json
-import torch
 import triton
 import triton.language as tl
 
@@ -336,7 +335,6 @@ _bwd_kernel_dkdvdq_causal_repr = make_kernel_repr(
         "ENABLE_DROPOUT",
         "IS_VARLEN",
         "IS_FP8",
-        "NUM_SMS",
         "USE_INT64_STRIDES",
         "NUM_XCD",
     ],
@@ -415,7 +413,6 @@ def _bwd_kernel_dkdvdq_causal(
     IS_VARLEN: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    NUM_SMS: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
     NUM_XCD: tl.constexpr,
 ):
@@ -752,12 +749,10 @@ _bwd_kernel_dkdvdq_noncausal_repr = make_kernel_repr(
         "NUM_K_HEADS",
         "BLOCK_M",
         "BLOCK_N",
-        "BLK_SLICE_FACTOR",
         "BLOCK_D_MODEL",
         "ENABLE_DROPOUT",
         "IS_VARLEN",
         "IS_FP8",
-        "NUM_SMS",
         "USE_INT64_STRIDES",
     ],
 )
@@ -828,14 +823,12 @@ def _bwd_kernel_dkdvdq_noncausal(
     NUM_K_PIDS,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLK_SLICE_FACTOR: tl.constexpr,
     BLOCK_D_MODEL: tl.constexpr,
     BLOCK_D_MODEL_POW2: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    NUM_SMS: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
