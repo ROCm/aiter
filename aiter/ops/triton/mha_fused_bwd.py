@@ -47,6 +47,47 @@ def flash_attn_fused_backward(
     USE_INT64_STRIDES: Optional[bool] = False,
     config: Optional[Dict[str, any]] = None,
 ):
+    """
+    Flash Attention fused backward pass computing dQ, dK, dV in a single kernel using atomics.
+    Supports variable-length sequences, GQA, FP8 quantization, and dropout.
+
+    Args:
+        do (torch.Tensor): Output gradient. Shape (batch, seqlen_q, num_q_heads, head_dim)
+            or (total_tokens, num_q_heads, head_dim) for varlen.
+        q (torch.Tensor): Query tensor from forward pass with same shape as do.
+        k (torch.Tensor): Key tensor with shape (batch, seqlen_k, num_k_heads, head_dim)
+            or (total_tokens_k, num_k_heads, head_dim) for varlen.
+        v (torch.Tensor): Value tensor with same shape as k.
+        o (torch.Tensor): Output from forward pass with same shape as q.
+        softmax_lse (torch.Tensor): Log-sum-exp from forward pass with shape
+            (batch, num_q_heads, seqlen_q) or (total_tokens, num_q_heads) for varlen.
+        dq (torch.Tensor): Pre-allocated query gradient with same shape as q.
+        dk (torch.Tensor): Pre-allocated key gradient with same shape as k.
+        dv (torch.Tensor): Pre-allocated value gradient with same shape as v.
+        dbias (torch.Tensor): Bias gradient (not supported, must be None).
+        sm_scale (float): Softmax scale, typically 1/sqrt(head_dim).
+        alibi_slopes (Optional[torch.Tensor]): ALiBi position bias slopes.
+        causal (bool): Apply causal masking.
+        cu_seqlens_q (Optional[torch.Tensor]): Cumulative sequence lengths for query with shape
+            (batch + 1,). Enables variable-length mode.
+        cu_seqlens_k (Optional[torch.Tensor]): Cumulative sequence lengths for key with shape
+            (batch + 1,).
+        max_seqlen_q (int): Maximum query sequence length in batch.
+        max_seqlen_k (int): Maximum key sequence length in batch.
+        dropout_p (float): Dropout probability. 0.0 disables dropout.
+        philox_seed (Optional[int]): Random seed for dropout.
+        philox_offset (Optional[int]): Random offset for dropout.
+        descale_q (Optional[torch.Tensor]): FP8 descaling factor for q.
+        descale_k (Optional[torch.Tensor]): FP8 descaling factor for k.
+        descale_v (Optional[torch.Tensor]): FP8 descaling factor for v.
+        descale_do (Optional[torch.Tensor]): FP8 descaling factor for do.
+        USE_INT64_STRIDES (Optional[bool]): Use 64-bit stride indexing for large tensors.
+        config (Optional[Dict[str, any]]): Kernel tuning parameters (preprocess_kernel,
+            dkdvdq_kernel_N64, dkdvdq_kernel_N128).
+
+    Returns:
+        torch.Tensor: Delta tensor (element-wise product of do and o) with shape matching softmax_lse.
+    """
     _LOGGER.info(
         f"FLASH_ATTN_FUSED_BKWD: do={tuple(do.shape)} q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} "
         + f"dq={tuple(dq.shape)}  dk={tuple(dk.shape)}  dv={tuple(dv.shape)}"
@@ -174,7 +215,7 @@ def flash_attn_fused_backward(
     num_k_pids = (max_seqlen_k + config_dkdvdq["BLOCK_N"] - 1) // config_dkdvdq[
         "BLOCK_N"
     ]
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    # NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     if causal:
         grid_dkdvdq = (batch * num_q_heads * num_k_pids,)
 
@@ -220,7 +261,6 @@ def flash_attn_fused_backward(
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            NUM_SMS=NUM_SMS,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             NUM_XCD=get_num_xcds(),
             **config_dkdvdq,
@@ -270,7 +310,6 @@ def flash_attn_fused_backward(
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            NUM_SMS=NUM_SMS,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             **config_dkdvdq,
         )

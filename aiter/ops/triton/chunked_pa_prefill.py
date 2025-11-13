@@ -11,7 +11,6 @@
 
 
 import triton
-import triton.language as tl
 
 from aiter.ops.triton.pa_prefill import context_attention_fwd
 from aiter.ops.triton._triton_kernels.chunked_pa_prefill import (
@@ -38,7 +37,28 @@ def chunked_prefill_paged_decode(
     sm_scale=None,
 ):
     """
-    #TODO: Add Doc
+    Unified attention for mixed prefill (multi-token) and decode (single-token) sequences with paged KV cache.
+
+    Args:
+        query (torch.Tensor): Query tensor with shape (total_tokens, num_q_heads, head_dim).
+        key (torch.Tensor): Key tensor for prefill portion with shape (total_tokens, num_kv_heads, head_dim).
+        value (torch.Tensor): Value tensor for prefill portion with shape (total_tokens, num_kv_heads, head_dim).
+        output (torch.Tensor): Output tensor with shape (total_tokens, num_q_heads, head_dim).
+        kv_cache_dtype (str): Data type for KV cache ("auto", "fp8", "fp8_e4m3").
+        key_cache (torch.Tensor): Paged key cache with shape (num_blocks, num_kv_heads, block_size, head_dim).
+        value_cache (torch.Tensor): Paged value cache with shape (num_blocks, num_kv_heads, block_size, head_dim).
+        block_table (torch.Tensor): Block table mapping sequences to cache blocks with shape (num_seqs, max_blocks).
+        query_start_loc (torch.Tensor): Start token index for each sequence with shape (num_seqs,).
+        seq_lens (torch.Tensor): Total sequence length for each sequence with shape (num_seqs,).
+        max_query_len (int): Maximum query length in batch. If > 1, triggers prefill path.
+        k_scale (float): Quantization scale for key cache.
+        v_scale (float): Quantization scale for value cache.
+        alibi_slopes (Optional[torch.Tensor]): ALiBi position bias slopes with shape (num_q_heads,).
+        sliding_window (Optional[int]): Sliding window size for local attention. 0 or None disables.
+        sm_scale (Optional[float]): Softmax scale, defaults to 1/sqrt(head_dim).
+
+    Returns:
+        None. Results written in-place to output.
     """
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[1] ** 0.5)
@@ -91,7 +111,6 @@ def chunked_prefill_paged_decode(
         scale=sm_scale,
         k_scale=k_scale,
         v_scale=v_scale,
-        num_query_heads=num_query_heads,
         num_queries_per_kv=num_queries_per_kv,
         block_table_stride=block_table.stride(0),
         query_stride_0=query.stride(0),

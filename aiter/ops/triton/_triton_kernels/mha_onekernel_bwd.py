@@ -513,7 +513,6 @@ _bwd_kernel_causal_repr = make_kernel_repr(
         "USE_ALIBI",
         "USE_EXP2",
         "IS_FP8",
-        "FP8_OUTPUT",
         "USE_INT64_STRIDES",
     ],
 )
@@ -601,7 +600,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    FP8_OUTPUT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
@@ -1202,14 +1200,12 @@ _bwd_kernel_noncausal_repr = make_kernel_repr(
         "BLOCK_N1",
         "BLOCK_M2",
         "BLOCK_N2",
-        "BLK_SLICE_FACTOR",
         "HEAD_DIM",
         "ENABLE_DROPOUT",
         "IS_VARLEN",
         "USE_ALIBI",
         "USE_EXP2",
         "IS_FP8",
-        "FP8_OUTPUT",
         "USE_INT64_STRIDES",
     ],
 )
@@ -1287,7 +1283,6 @@ def bwd_kernel_noncausal(
     BLOCK_N1: tl.constexpr,  # 128
     BLOCK_M2: tl.constexpr,  # 128
     BLOCK_N2: tl.constexpr,  # 32
-    BLK_SLICE_FACTOR: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     ACTUAL_HEAD_DIM: tl.constexpr,
     PE_HEAD_DIM: tl.constexpr,
@@ -1297,7 +1292,6 @@ def bwd_kernel_noncausal(
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    FP8_OUTPUT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,

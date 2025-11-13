@@ -29,7 +29,7 @@ import json
 import triton
 import triton.language as tl
 from .activation import _tanh
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ..utils._triton.pid_preprocessing import remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.kernel_repr import make_kernel_repr

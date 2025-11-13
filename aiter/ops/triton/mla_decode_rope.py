@@ -25,7 +25,6 @@ It supports page size = 1.
 
 from typing import Optional
 import triton
-import triton.language as tl
 import torch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.mla_decode_rope import (
@@ -163,30 +162,36 @@ def decode_attention_fwd_grouped_rope(
     config: Optional[dict[str, any]] = None,
 ):
     """
-    Implements deepseek decode attention with grouped query attention and rotary positional encoding
+    Multi-head Latent Attention (MLA) decode with RoPE and low-rank compression.
+    Designed for DeepSeek models with paged KV cache and GQA. Uses two-stage reduction
+    with split-K parallelization.
 
-    parameters:
-    q: Query Tensor
-    k_buffer: Key Cache Tensor
-    v_buffer: Value Cache Tensor
-    o: Output tensor containing the result of decode. Allocated by the caller
-    kv_indptr:
-    kv_indices:
-    k_pe_tokens:
-    kv_lora_rank:
-    rotary_dim
-    cos_sin_cache:
-    positions:
-    attn_logits:
-    num_kv_splits:
-    sm_scale
-    logit_cap:
-    use_rope
-    is_neox_style
+    Args:
+        q (torch.Tensor): Query tensor with shape (batch, num_q_heads, head_dim).
+        k_buffer (torch.Tensor): Paged key cache with shape (total_tokens, num_kv_heads, kv_lora_rank + qk_rope_dim).
+            Keys have low-rank latent component plus RoPE component.
+        v_buffer (torch.Tensor): Paged value cache with shape (total_tokens, num_kv_heads, v_head_dim).
+        o (torch.Tensor): Pre-allocated output tensor with shape (batch, num_q_heads, v_head_dim).
+        kv_indptr (torch.Tensor): KV cache index pointers with shape (batch + 1,).
+        kv_indices (torch.Tensor): KV cache page indices for paged attention.
+        k_pe_tokens (torch.Tensor): Output buffer for keys with RoPE applied with shape
+            (total_tokens, num_kv_heads, qk_rope_dim). Only used when use_rope=True.
+        kv_lora_rank (int): Rank of low-rank key compression (latent dimension).
+        rotary_dim (int): Dimension of rotary position encoding.
+        cos_sin_cache (torch.Tensor): Precomputed RoPE cos/sin values with shape (max_positions, rotary_dim).
+        positions (torch.Tensor): Token positions for RoPE with shape (batch,).
+        attn_logits (torch.Tensor): Intermediate logits buffer with shape
+            (batch, num_q_heads, num_kv_splits, max_seq_len).
+        num_kv_splits (int): Number of splits for split-K reduction parallelization.
+        sm_scale (float): Softmax scale, typically 1/sqrt(head_dim).
+        logit_cap (Optional[float]): Cap logits to prevent overflow. 0.0 disables.
+        use_rope (Optional[bool]): Apply rotary position encoding.
+        is_neox_style (Optional[bool]): Use NeoX-style RoPE (interleaved) vs GPT-J style (block).
+        config (Optional[dict]): Kernel tuning parameters (fwd_grouped_kernel_stage1_rope,
+            fwd_kernel_stage2).
 
     Returns:
-    o: output Tensor
-
+        torch.Tensor: Output tensor o with shape (batch, num_q_heads, v_head_dim).
     """
     _LOGGER.info(
         f"DECODE_ATTENTION_FWD_GROUPED_ROPE:  q={tuple(q.shape)}  k_buffer={tuple(k_buffer.shape)}  v_buffer={tuple(v_buffer.shape)} "

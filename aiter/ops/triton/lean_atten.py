@@ -22,8 +22,7 @@ from typing import Optional
 from bisect import bisect_right
 import math
 import triton
-import triton.language as tl
-from aiter.ops.triton._triton_kernels.lean_atten import la_persistent, _get_config
+from aiter.ops.triton._triton_kernels.lean_atten import _get_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils._triton import arch_info
@@ -37,7 +36,7 @@ LOG_TWO_E = 1.44269504  # log_2(e) value for softmax scaling
 def persistent_lean_attention(
     q: torch.Tensor,  # (B * seq_len_q, H, d)
     k: torch.Tensor,  # (total_seq_len_k, H, d) -> supports ragged batching
-    v: torch.Tensor,  # (total_seq_len_k, H, d)
+    v: torch.Tensor,  # (total_seq_k, H, d)
     Mp: torch.Tensor,  # temp buffer to store partial max during sm
     Lp: torch.Tensor,  # temp buffer to store partial se during sm
     Op: torch.Tensor,  # (total_programs, n_ctx_q, d)
@@ -51,13 +50,37 @@ def persistent_lean_attention(
     program_count: Optional[int] = None,
 ):
     """
-    Lean Attention kernel.
+    Lean Attention using stream-K tiling for efficient CU utilization.
+    Supports both prefill and decode with ragged batching and causal masking.
+
+    Args:
+        q (torch.Tensor): Query tensor with shape (batch_size * seq_len_q, num_heads, head_dim).
+        k (torch.Tensor): Key tensor with shape (total_seq_len_k, num_heads, head_dim).
+            For ragged batching, total_seq_len_k is sum of all K sequence lengths.
+        v (torch.Tensor): Value tensor with shape (total_seq_len_k, num_heads, head_dim).
+        Mp (torch.Tensor): Partial max buffer for softmax with shape (total_programs, BLOCK_M).
+        Lp (torch.Tensor): Partial sum buffer for softmax with shape (total_programs, BLOCK_M).
+        Op (torch.Tensor): Partial output buffer with shape (total_programs, seq_len_q, head_dim).
+        locks (torch.Tensor): Synchronization locks with shape (num_heads, seq_len_q).
+        batch_num_block_n (torch.Tensor): Cumulative BLOCK_N counts per batch with shape (batch_size,).
+        batch_size (int): Number of sequences in batch.
+        sm_scale (torch.float16): Softmax scale, typically 1/sqrt(head_dim).
+        causal (bool): Apply causal masking.
+        RAGGED_BATCH (bool): Enable ragged batching mode for variable-length sequences.
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N, SM_CNT_FACTOR,
+            XCD_REMAP, num_warps, waves_per_eu).
+        program_count (Optional[int]): Override number of thread blocks (CTAs). Defaults to
+            SM_count * SM_CNT_FACTOR.
+
+    Returns:
+        Tuple[torch.Tensor, float]: Output tensor with shape (batch_size * seq_len_q, num_heads, head_dim)
+            and kernel execution time in milliseconds.
     """
     _LOGGER.info(
         f"LEAN_ATTEN: q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} Mp={tuple(Mp.shape)} Lp={tuple(Lp.shape)}  Op={tuple(Op.shape)}"
     )
     if config is None:
-        config = _get_config(causal=causal, batch_size=batch_size)
+        config = _get_config()
     sm_count = arch_info.get_num_sms()
     total_programs = (
         program_count
@@ -112,6 +135,7 @@ def _persistent_lean_attention(
 ):
     """
     Inner kernel launching function.
+    batch_num_block_n, RAGGED_BATCH, num_warps, waves_per_eu, config not being used.
     """
     DEBUG = False
 
@@ -141,10 +165,10 @@ def _persistent_lean_attention(
     H = q.shape[1]
     H_K = k.shape[1]
     assert H % H_K == 0, "For GQA, the number of Q heads must be divisible by K/V heads"
-    GQA_GROUP_SIZE = H // H_K
+    # GQA_GROUP_SIZE = H // H_K
     HEADS_PER_XCD = H // NUM_XCDS
 
-    qk_scale = sm_scale * LOG_TWO_E
+    # qk_scale = sm_scale * LOG_TWO_E
 
     (
         num_m_blocks,
@@ -265,72 +289,72 @@ def _persistent_lean_attention(
     }
     kernel_timing["attn_fwd"]["start_event"].record()
     """
-    la_kernel = la_persistent[grid](
-        False,
-        0,
-        q,
-        k,
-        v,
-        qk_scale,
-        Mp,
-        Lp,
-        Op,
-        o,
-        batch_num_block_n,
-        locks,
-        q.stride(0),  # N_CTX_Q
-        q.stride(1),  # H
-        q.stride(2),  # Head_Dim
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        N_CTX_Q,
-        Op.stride(0),  # total_programs
-        Op.stride(1),  # n_ctx_q
-        Op.stride(2),  # head_dim
-        HEADS_PER_XCD=HEADS_PER_XCD,
-        HEAD_DIM_ORIG=HEAD_DIM_K,
-        HEAD_DIM=HEAD_DIM_K,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        MASKED_BLOCKS=MASKED_BLOCKS,
-        XCD_REMAP=XCD_REMAP,
-        NUM_XCDS=NUM_XCDS,
-        batch_size=batch_size,
-        causal=causal,
-        num_m_blocks=num_m_blocks,
-        num_n_blocks=num_n_blocks,
-        total_programs=total_programs,
-        # leanAttention params
-        high_load_wgs=high_load_wgs,
-        max_tiles_per_wg=max_tiles_per_wg,
-        tiles_per_head=tiles_per_head,
-        num_splits=num_splits,
-        max_output_tile_cnt=max_output_tile_cnt,
-        waves_per_eu=waves_per_eu,
-        num_warps=num_warps,
-        num_stages=1,
-        num_ctas=1,
-        num_heads_q=H,
-        num_heads_k=H_K,
-        gqa_group_size=GQA_GROUP_SIZE,
-        use_64_indexing=(
-            (k.stride(0) * N_CTX_K) >= (1 << 31)
-            or (v.stride(0) * N_CTX_K) >= (1 << 31)
-            or (Op.stride(0) * total_programs) >= (1 << 31)
-            or (Op.stride(1) * N_CTX_Q) >= (1 << 31)
-            or (o.stride(0) * N_CTX_Q) >= (1 << 31)
-            or (q.stride(0) * N_CTX_Q) >= (1 << 31)
-        ),
-        RAGGED_BATCH=RAGGED_BATCH,
-        **config,
-    )
+    # la_kernel = la_persistent[grid](
+    #     False,
+    #     0,
+    #     q,
+    #     k,
+    #     v,
+    #     qk_scale,
+    #     Mp,
+    #     Lp,
+    #     Op,
+    #     o,
+    #     batch_num_block_n,
+    #     locks,
+    #     q.stride(0),  # N_CTX_Q
+    #     q.stride(1),  # H
+    #     q.stride(2),  # Head_Dim
+    #     k.stride(0),
+    #     k.stride(1),
+    #     k.stride(2),
+    #     v.stride(0),
+    #     v.stride(1),
+    #     v.stride(2),
+    #     o.stride(0),
+    #     o.stride(1),
+    #     o.stride(2),
+    #     # N_CTX_Q,
+    #     Op.stride(0),  # total_programs
+    #     Op.stride(1),  # n_ctx_q
+    #     Op.stride(2),  # head_dim
+    #     HEADS_PER_XCD=HEADS_PER_XCD,
+    #     HEAD_DIM_ORIG=HEAD_DIM_K,
+    #     HEAD_DIM=HEAD_DIM_K,
+    #     BLOCK_M=BLOCK_M,
+    #     BLOCK_N=BLOCK_N,
+    #     MASKED_BLOCKS=MASKED_BLOCKS,
+    #     XCD_REMAP=XCD_REMAP,
+    #     NUM_XCDS=NUM_XCDS,
+    #     batch_size=batch_size,
+    #     causal=causal,
+    #     num_m_blocks=num_m_blocks,
+    #     num_n_blocks=num_n_blocks,
+    #     total_programs=total_programs,
+    #     # leanAttention params
+    #     high_load_wgs=high_load_wgs,
+    #     max_tiles_per_wg=max_tiles_per_wg,
+    #     tiles_per_head=tiles_per_head,
+    #     num_splits=num_splits,
+    #     max_output_tile_cnt=max_output_tile_cnt,
+    #     waves_per_eu=waves_per_eu,
+    #     num_warps=num_warps,
+    #     num_stages=1,
+    #     num_ctas=1,
+    #     # num_heads_q=H,
+    #     # num_heads_k=H_K,
+    #     gqa_group_size=GQA_GROUP_SIZE,
+    #     use_64_indexing=(
+    #         (k.stride(0) * N_CTX_K) >= (1 << 31)
+    #         or (v.stride(0) * N_CTX_K) >= (1 << 31)
+    #         or (Op.stride(0) * total_programs) >= (1 << 31)
+    #         or (Op.stride(1) * N_CTX_Q) >= (1 << 31)
+    #         or (o.stride(0) * N_CTX_Q) >= (1 << 31)
+    #         or (q.stride(0) * N_CTX_Q) >= (1 << 31)
+    #     ),
+    #     RAGGED_BATCH=RAGGED_BATCH,
+    #     **config,
+    # )
     """
     kernel_timing["attn_fwd"]["end_event"].record()
     torch.cuda.synchronize()
@@ -350,7 +374,7 @@ def get_num_splits_and_buffer_sizes(
     max_seqlen_q,
     max_seqlen_k,
     num_heads,
-    num_heads_k,
+    num_heads_k,  # Not used
     BLOCK_M,
     BLOCK_N,
     num_SMs,
@@ -358,7 +382,24 @@ def get_num_splits_and_buffer_sizes(
     NUM_XCDS,
 ):
     """
-    Calculates parameters for Lean Attention (num CTAs, num_m_blocks, num_n_blocks, etc.))
+    Calculates workload distribution parameters for Lean Attention stream-K scheduling.
+
+    Args:
+        causal (bool): Causal masking mode.
+        batch_size (int): Batch size.
+        max_seqlen_q (int): Maximum query sequence length.
+        max_seqlen_k (int): Maximum key sequence length.
+        num_heads (int): Number of query heads.
+        num_heads_k (int): Number of key/value heads (unused for now).
+        BLOCK_M (int): Query tile size.
+        BLOCK_N (int): Key tile size.
+        num_SMs (int): Number of streaming multiprocessors (CTAs to launch).
+        XCD_REMAP (bool): Enable XCD remapping for spatial distribution.
+        NUM_XCDS (int): Number of XCDs (compute dies).
+
+    Returns:
+        Tuple: (num_m_blocks, num_n_blocks, high_load_wgs, max_tiles_per_wg,
+            tiles_per_head, total_programs, num_splits, even_split).
     """
     ##### Lean Attention: Calculate Splits and Tile Sizes #####
     ## based on onnxruntime/contrib_ops/cuda/bert/lean_attention
@@ -453,8 +494,21 @@ def calculate_max_output_tiles_analytically(
     MODE: int,  # 0-ping-pong, 1-sequential
 ):
     """
-    Calculates the maximum number of output tiles any single workgroup will process
-    using a fast, analytical method with binary search.
+    Calculates maximum output tiles per workgroup for buffer allocation.
+    Uses binary search for efficient causal workload analysis.
+
+    Args:
+        tiles_per_head (int): Total tiles per attention head.
+        num_m_blocks (int): Number of M-dimension blocks.
+        num_wgs (int): Number of workgroups (CTAs).
+        high_load_wgs (int): Number of workgroups with extra tile.
+        max_tiles_per_wg (int): Maximum tiles assigned to any workgroup.
+        causal (bool): Causal masking mode.
+        MASKED_BLOCKS (int): BLOCK_M / BLOCK_N ratio for causal tiling.
+        MODE (int): Scheduling mode (0: ping-pong, 1: sequential).
+
+    Returns:
+        int: Maximum number of output tiles any workgroup will produce.
     """
     if num_wgs == 0:
         return 0

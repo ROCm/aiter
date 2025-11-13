@@ -20,6 +20,10 @@ _USE_FUSED_BWD_KERNEL = False
 
 
 def mha_set_use_fused_bwd_kernel(value: bool):
+    """
+    Set whether to use fused backward kernel (with atomics) or one-kernel backward (without atomics).
+    Fused backward is faster but doesn't support positional encoding.
+    """
     global _USE_FUSED_BWD_KERNEL
     _USE_FUSED_BWD_KERNEL = value
 
@@ -141,7 +145,7 @@ def _flash_attn_forward(
     window_size_right: int,
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
-    return_lse: bool,
+    return_lse: bool,  # Not used
     return_softmax: bool,
     max_seqlen_q: int,
     max_seqlen_k: int,
@@ -766,6 +770,29 @@ def flash_attn_fp8_func(
     return_attn_probs=False,
     config: Optional[dict[str, any]] = None,
 ):
+    """
+    Flash Attention with on-the-fly FP8 E4M3 quantization for Q, K, V.
+    Automatically computes per-sequence per-head quantization scales.
+
+    Args:
+        q (torch.Tensor): Query with shape (batch, seqlen, num_q_heads, head_dim).
+        k (torch.Tensor): Key with shape (batch, seqlen, num_k_heads, head_dim).
+        v (torch.Tensor): Value with shape (batch, seqlen, num_k_heads, head_dim).
+        dropout_p (float): Dropout probability. 0.0 disables dropout.
+        softmax_scale (Optional[float]): Softmax scale, defaults to 1/sqrt(head_dim).
+        causal (bool): Apply causal masking.
+        window_size (Tuple[int, int]): Sliding window (left, right). (-1, -1) disables.
+        alibi_slopes (Optional[torch.Tensor]): ALiBi position bias slopes with shape (num_q_heads,).
+        deterministic (bool): Use deterministic backward pass.
+        return_lse (bool): Return log-sum-exp values.
+        return_attn_probs (bool): Return attention probabilities for testing.
+        config (Optional[dict]): Kernel tuning parameters.
+
+    Returns:
+        torch.Tensor: Output with shape (batch, seqlen, num_q_heads, head_dim).
+        Optional[torch.Tensor]: Log-sum-exp if return_lse=True.
+        Optional[torch.Tensor]: Attention probabilities if return_attn_probs=True.
+    """
     _LOGGER.info(
         f"FLASH_ATTN_FP8:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
     )
@@ -1259,6 +1286,34 @@ def flash_attn_varlen_fp8_func(
     block_table=None,
     config: Optional[dict[str, any]] = None,
 ):
+    """
+    Variable-length Flash Attention with on-the-fly FP8 E4M3 quantization.
+    Computes per-sequence per-head quantization scales for variable-length inputs.
+
+    Args:
+        q (torch.Tensor): Query with shape (total_q, num_q_heads, head_dim).
+        k (torch.Tensor): Key with shape (total_k, num_k_heads, head_dim).
+        v (torch.Tensor): Value with shape (total_k, num_k_heads, head_dim).
+        cu_seqlens_q (torch.Tensor): Cumulative sequence lengths for query with shape (batch + 1,).
+        cu_seqlens_k (torch.Tensor): Cumulative sequence lengths for key with shape (batch + 1,).
+        max_seqlen_q (int): Maximum query sequence length in batch.
+        max_seqlen_k (int): Maximum key sequence length in batch.
+        dropout_p (float): Dropout probability. 0.0 disables dropout.
+        softmax_scale (Optional[float]): Softmax scale, defaults to 1/sqrt(head_dim).
+        causal (bool): Apply causal masking.
+        window_size (Tuple[int, int]): Sliding window (left, right). (-1, -1) disables.
+        alibi_slopes (Optional[torch.Tensor]): ALiBi position bias slopes.
+        deterministic (bool): Use deterministic backward pass.
+        return_lse (bool): Return log-sum-exp values.
+        return_attn_probs (bool): Return attention probabilities for testing.
+        block_table (Optional[torch.Tensor]): Block table for paged attention (not used).
+        config (Optional[dict]): Kernel tuning parameters.
+
+    Returns:
+        torch.Tensor: Output with shape (total_q, num_q_heads, head_dim).
+        Optional[torch.Tensor]: Log-sum-exp if return_lse=True.
+        Optional[torch.Tensor]: Attention probabilities if return_attn_probs=True.
+    """
     _LOGGER.info(
         f"FLASH_ATTN_VARLEN_FP8:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
     )
