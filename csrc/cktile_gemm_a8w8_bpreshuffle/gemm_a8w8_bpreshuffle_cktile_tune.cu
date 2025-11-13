@@ -44,21 +44,7 @@ RowwiseKernel rowwise_dispatch(int id)
             static_assert(false, "rowwise_dispatch used with unsupported dtype!");
         }
     }();
-
-    // DEBUG: Print lookup table size
-    static bool debug_printed = false;
-    if(!debug_printed)
-    {
-        std::cout << "[solinDEBUG] Lookup table size: " << lookup.size() << std::endl;
-        std::cout << "[solinDEBUG] Available kernel IDs: ";
-        for(const auto& kv : lookup)
-        {
-            std::cout << kv.first << " ";
-        }
-        std::cout << std::endl;
-        debug_printed = true;
-    }
-
+    
     TORCH_CHECK(id < lookup.size(),
                 "Kernel id " + std::to_string(id) +
                     " is out of range! (lookup.size()=" + std::to_string(lookup.size()) + ")");
