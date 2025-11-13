@@ -683,7 +683,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/fused_mrope_rms_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
-            "f'{AITER_CSRC_DIR}/kernels/rope/fused_mrope_rms.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/fused_mrope_rms.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

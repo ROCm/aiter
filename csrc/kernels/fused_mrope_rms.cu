@@ -1,4 +1,6 @@
-#include "rope_common.h"
+#include "rope/rope_common.h"
+
+using namespace at;
 
 namespace rope_rms {
 
@@ -258,7 +260,7 @@ template <typename T>
 void fused_rope_rms(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions,
     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
-    bool is_neox_style, double eps, gpuStream_t stream) {
+    bool is_neox_style, double eps, hipStream_t stream) {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int block_size = 256;
     auto total_warps = num_tokens * (num_heads_q + num_heads_k);
@@ -295,7 +297,7 @@ template <typename T, int M>
 void fused_mrope_rms(
     T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions,
     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
-    bool is_neox_style, double eps, std::array<int64_t, M> mrope_section, bool is_interleaved, gpuStream_t stream) {
+    bool is_neox_style, double eps, std::array<int64_t, M> mrope_section, bool is_interleaved, hipStream_t stream) {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
     TORCH_CHECK(dim == head_size / 2);
