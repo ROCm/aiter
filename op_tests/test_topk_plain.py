@@ -2,17 +2,15 @@
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import aiter
 from aiter.test_common import (
     checkAllclose,
     benchmark,
     run_perftest,
-    perftest,
 )
-from aiter import dtypes, get_gfx
+from aiter import dtypes, logger
 from aiter.ops.triton.topk import topk as triton_topk
+from aiter.ops.topk_plain import topk_plain
 import pandas as pd
-import argparse
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -29,9 +27,6 @@ def test_topk(
     output = torch.randn((batch_size, hiddensize), dtype=dtype)
     device = output.device
 
-    row = torch.arange(
-        hiddensize, dtype=dtypes.i32, device=device
-    )  # [0, 1, ..., length-1]
     topk_ids = torch.zeros((batch_size, topk), dtype=dtypes.i32, device=device)
 
     x = torch.arange(hiddensize, dtype=dtype).repeat(batch_size, 1)
@@ -76,7 +71,7 @@ def test_topk(
     )
 
     _, us_aiter = run_perftest(
-        aiter.topk_plain,
+        topk_plain,
         x,
         topk_ids,
         topk,
@@ -144,4 +139,4 @@ df["speedup (aiter vs triton)"] = df["time_us (triton)"] / df["time_us (aiter)"]
 print("\n" + "=" * 60)
 print("SUMMARY")
 print("=" * 60)
-aiter.logger.info(f"\n{df.to_string(index=False)}")
+logger.info(f"\n{df.to_string(index=False)}")
