@@ -234,11 +234,6 @@ void mla_decode_stage1_asm_fwd(
         args.ptr_QSCALE  = q_scale.value().data_ptr();
         args.ptr_KVSCALE = kv_scale.value().data_ptr();
 
-        if(!persistent && kv_split == 1)
-        {
-            args.ptr_R = output.data_ptr();
-        }
-
         if(gqa_ratio == 16)
         {
             if(persistent)

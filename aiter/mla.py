@@ -195,11 +195,16 @@ def mla_decode_fwd(
         if nhead == 16 and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
 
-        logits = torch.empty(
-            (total_s, num_kv_splits, nhead, v_head_dim),
-            dtype=dtypes.fp32,
-            device=device,
+        logits = (
+            o.view((total_s, num_kv_splits, nhead, v_head_dim)) if (num_kv_splits == 1
+                and (q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4))) else
+            torch.empty(
+                (total_s, num_kv_splits, nhead, v_head_dim),
+                dtype=dtypes.fp32,
+                device=device,
+            )
         )
+
         attn_lse = torch.empty(
             (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
         )
@@ -225,7 +230,7 @@ def mla_decode_fwd(
             kv_scale,
         )
 
-        if num_kv_splits == 1 and q.dtype != torch.bfloat16:
+        if (num_kv_splits == 1 and (q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4))):
             return logits.view(total_s, nhead, v_head_dim), attn_lse
 
         Lv = v_head_dim
