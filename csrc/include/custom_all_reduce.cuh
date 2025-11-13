@@ -935,7 +935,6 @@ namespace aiter
 #pragma unroll
       for (int i = 0; i < pack_size; ++i)
       {
-        // float res_x = ck_tile::type_convert<float>(input_reg.data[i]);
         float sum_x = *(reinterpret_cast<float*>(&tmp_smem[0]) + lane_id * pack_size + i);
         rslt.data[i] = ck_tile::type_convert<T>(sum_x);
       }
