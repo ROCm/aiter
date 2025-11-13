@@ -116,11 +116,9 @@ __global__ void act_and_mul_kernel(DTYPE_I* __restrict__ out,         // [..., d
 
     for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
     {
-        using vec_i = ck_tile::vec_t<DTYPE_I, VEC_SIZE_I>;
         vec_i x{};
         vec_i y{};
 
-        // 修复：在 buffer 视图对象上调用 get，而不是 ck_tile 命名空间
         x = buffer_x.template get<vec_i>(idx, 0, true);
         y = buffer_y.template get<vec_i>(idx, 0, true);
 
