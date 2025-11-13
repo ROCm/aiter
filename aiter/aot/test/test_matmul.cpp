@@ -7,7 +7,7 @@
 #include <vector>
 #include <cmath>
 #include <random>
-#include "matmul_fp16.b3a5a34c_0d1d2d34567c89c10d11c121314.h"
+#include "matmul_fp16.2a9a36fa_0d1d2d34567c89c10d11c121314.h"
 
 float random_float() {
     return static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
@@ -44,7 +44,7 @@ protected:
         // Allocate device memory
         ASSERT_EQ(hipSuccess, hipMalloc(&d_A, M * K * sizeof(__half)));
         ASSERT_EQ(hipSuccess, hipMalloc(&d_B, K * N * sizeof(__half)));
-        ASSERT_EQ(hipSuccess, hipMalloc(&d_C, M * N * sizeof(__half)));
+        ASSERT_EQ(hipSuccess, hipMalloc(&d_C, M * N * sizeof(float)));
 
         // Copy input data to device
         ASSERT_EQ(hipSuccess, hipMemcpy(d_A, h_A.data(), M * K * sizeof(__half), hipMemcpyHostToDevice));
@@ -65,7 +65,7 @@ protected:
                 for (int k = 0; k < K; k++) {
                     sum += __half2float(h_A[m * K + k]) * __half2float(h_B[k * N + n]);
                 }
-                h_expected[m * N + n] = __float2half(sum);
+                h_expected[m * N + n] = sum;
             }
         }
     }
@@ -73,7 +73,7 @@ protected:
     bool compareResults() {
         const float tolerance = 0.01f;  // Adjust based on needed precision
         for (int i = 0; i < M * N; i++) {
-            float diff = std::abs(__half2float(h_C[i]) - __half2float(h_expected[i]));
+            float diff = std::abs(h_C[i] - h_expected[i]);
             if (diff > tolerance) {
                 return false;
             }
@@ -82,7 +82,8 @@ protected:
     }
 
     int M, N, K;
-    std::vector<__half> h_A, h_B, h_C, h_expected;
+    std::vector<float> h_C, h_expected;
+    std::vector<__half> h_A, h_B;
     hipDeviceptr_t d_A, d_B, d_C;
 };
 
@@ -95,14 +96,14 @@ TEST_F(MatmulFP16Test, CorrectResult) {
                 ASSERT_EQ(hipSuccess, hipStreamCreate(&stream));
 
                 // Call the matrix multiplication function
-                ASSERT_EQ(hipSuccess, matmul_fp16_b3a5a34c_0d1d2d34567c89c10d11c121314(
+                ASSERT_EQ(hipSuccess, matmul_fp16_2a9a36fa_0d1d2d34567c89c10d11c121314(
                     stream, d_C, d_A, d_B, M, N, K, N, K, N));
 
                 // Synchronize and check for errors
                 ASSERT_EQ(hipSuccess, hipStreamSynchronize(stream));
 
                 // Copy result back to host
-                ASSERT_EQ(hipSuccess, hipMemcpy(h_C.data(), d_C, M * N * sizeof(__half), hipMemcpyDeviceToHost));
+                ASSERT_EQ(hipSuccess, hipMemcpy(h_C.data(), d_C, M * N * sizeof(float), hipMemcpyDeviceToHost));
 
                 // Verify results
                 EXPECT_TRUE(compareResults());

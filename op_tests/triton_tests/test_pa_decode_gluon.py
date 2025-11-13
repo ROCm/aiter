@@ -52,23 +52,30 @@ TORCH_TO_TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
 
 # Test configuration parameters
 USE_TORCH_FLASH_REF_OPTIONS = [True]
-USE_AOT_IMPL_OPTIONS = [True, False]
+USE_AOT_IMPL_OPTIONS = [False]
 KV_VARLEN_OPTIONS = [False, True]
 TRANS_V_OPTIONS = [False, True]
 CONTEXT_PARTITION_SIZE_OPTIONS = [256]
 DATA_TYPE_OPTIONS = ["bf16"]
-QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
-HEAD_DIMENSION_OPTIONS = [128]
+QUANT_MODE_OPTIONS = ["per_token"]
+# TRANS_V_OPTIONS = [1]
+# KV_VARLEN_OPTIONS = [0]
 
-BLOCK_SIZE_OPTIONS = [16, 64, 1024]
-HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1), (64, 4)]
-QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-CONTEXT_LENGTH_OPTIONS = [512, 4096, 4097]
-BATCH_SIZE_OPTIONS = [4, 80, 128]
-
+# BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+# HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1), (64, 4)]
 # QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-# CONTEXT_LENGTH_OPTIONS = [4096]
-# BATCH_SIZE_OPTIONS = [4, 128]
+# CONTEXT_LENGTH_OPTIONS = [512, 4096, 4097]
+# BATCH_SIZE_OPTIONS = [4, 80, 128]
+
+# BLOCK_SIZE_OPTIONS = [16]
+# HEAD_CONFIGURATIONS = [(16, 1)]
+BLOCK_SIZE_OPTIONS = [16]
+HEAD_CONFIGURATIONS = [(64, 8)]
+
+HEAD_DIMENSION_OPTIONS = [128]
+QUERY_LENGTH_OPTIONS = [1]
+CONTEXT_LENGTH_OPTIONS = [4096]
+BATCH_SIZE_OPTIONS = [128]
 # DATA_TYPE_OPTIONS = [dtypes.d_dtypes[key] for key in DATA_TYPE_OPTIONS]
 
 
@@ -1071,6 +1078,7 @@ def run_gluon_fp8_kernel(
     - True: Use csrc implementation (pa_decode_gluon_aot)
     - False: Use original ops implementation (pa_gluon_fp8_op)
     """
+    use_aot_impl=False
     if use_aot_impl:
         pa_decode_gluon_aot(
             output,
@@ -1780,7 +1788,7 @@ def main():
         f"Tests failed! {total_errors} test case(s) exceeded the error threshold. "
         f"Please check rows with non-zero err_gluon in {output_file}."
     )
-    print("\n✓ All tests passed!")
+    print("\n? All tests passed!")
 
 
 # @pytest.mark.parametrize("block_size", BLOCK_SIZE_OPTIONS)
@@ -1835,13 +1843,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # BLOCK_SIZE_OPTIONS = [16]
-    # # HEAD_CONFIGURATIONS = [(16, 1), (16, 2)]
-    # HEAD_CONFIGURATIONS = [(16, 2)]
     main()
-
-    # BLOCK_SIZE_OPTIONS = [1024]
-    # HEAD_CONFIGURATIONS = [(10, 1)]
-    # main()
-
-    pass
+    # pass

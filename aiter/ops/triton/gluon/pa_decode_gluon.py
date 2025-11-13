@@ -2,11 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
-import os
-import sys
-import math
-from typing import Optional, Dict, Tuple
-
 import triton
 import triton.language as tl
 from triton.experimental import gluon
@@ -428,7 +423,8 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
             + contiguous_kv_elements_offsets[None, None, :]
         )
 
-        # Load key cache block
+        # Optimize: Schedule key block VMEM load, overlap with scale offset calculation
+        gl.amd.cdna3.sched_group_barrier(0x020, 1, 0)  # 1 large VMEM read
         key_block = gl.amd.cdna3.buffer_load(
             ptr=key_cache_ptr, offsets=key_block_offsets
         )
@@ -447,6 +443,8 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
                     + current_page_offset
                     + kv_scale_column_offsets
                 )
+                # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
+                gl.amd.cdna3.sched_group_barrier(0x020, 2, 0)  # 2 VMEM reads
                 key_scale_value = gl.amd.cdna3.buffer_load(
                     ptr=key_scale, offsets=key_scale_offsets
                 )
@@ -454,7 +452,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
                     ptr=value_scale, offsets=key_scale_offsets
                 )
 
-        # Reshape key block to [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE]
+        # Reshape key block to [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE] (overlaps with scale loads)
         key_block = gl.permute(key_block, [0, 2, 1])
         key_block = gl.reshape(key_block, [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE])
 
@@ -698,9 +696,9 @@ def paged_attention_decode_v2_gluon_fp8(
     query_scale_stride_0,
     kv_scale_stride_0,
     kv_scale_stride_1,
-    num_seqs,
-    num_kv_heads,
-    max_context_partition_num,
+    # num_seqs,
+    # num_kv_heads,
+    # max_context_partition_num,
     COMPUTE_TYPE: gl.constexpr,
     QUERY_SEQ_LEN: gl.constexpr,
     QUERY_GROUP_SIZE_ORIGINAL: gl.constexpr,
@@ -960,6 +958,7 @@ def paged_attention_decode_v2_gluon_fp8(
     query_tensor = gl.amd.cdna3.buffer_load(
         ptr=query_ptr, offsets=query_offsets_base, mask=query_mask
     )
+    context_length = gl.load(context_lengths_ptr + sequence_idx)
 
     # Load query quantization scales if needed
     if QUERY_QUANT_MODE == 0:
@@ -1015,16 +1014,15 @@ def paged_attention_decode_v2_gluon_fp8(
         (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
     )
 
-    # ==================== SEQUENCE PROCESSING ====================
-    context_length = gl.load(context_lengths_ptr + sequence_idx)
-    kv_sequence_start_idx = sequence_partition_idx * CONTEXT_PARTITION_SIZE
-    if kv_sequence_start_idx >= context_length:
-        return  # No computation needed for this partition
 
     KV_COMPUTE_BLOCK_COUNT: gl.constexpr = (
         CONTEXT_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
     )
     SEQUENCE_PARTITION_KV_BLOCKS: gl.constexpr = CONTEXT_PARTITION_SIZE // KV_BLOCK_SIZE
+    # ==================== SEQUENCE PROCESSING ====================
+    kv_sequence_start_idx = sequence_partition_idx * CONTEXT_PARTITION_SIZE
+    if kv_sequence_start_idx >= context_length:
+        return  # No computation needed for this partition
 
     # Process KV sequence in compute blocks
     for kv_compute_idx in range(KV_COMPUTE_BLOCK_COUNT):
@@ -1058,8 +1056,8 @@ def paged_attention_decode_v2_gluon_fp8(
             ptr=block_table_start_ptr + kv_block_start_idx, offsets=masked_block_indices
         )
 
-        # ==================== KEY LOADING AND PROCESSING ====================
-        # Calculate key cache offsets and load keys
+        # ==================== KEY LOADING WITH QUERY PREPARATION ====================
+        # Calculate key cache offsets
         key_block_offsets = (
             kv_block_numbers[:, None, None, None] * stride_key_block
             + kv_head_idx * stride_key_head
@@ -1068,19 +1066,30 @@ def paged_attention_decode_v2_gluon_fp8(
             * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
             + contiguous_kv_element_offsets[None, None, None, :]
         )
+
+        # Optimize: Start key load, then prepare QK MFMA accumulators/query (overlaps with key load)
+        gl.amd.cdna3.sched_group_barrier(0x020, 1, 0)  # 1 large VMEM read
         key_tensor = gl.amd.cdna3.buffer_load(
             ptr=key_cache_ptr,
             offsets=key_block_offsets,
         )
 
-        # Load key quantization scales if needed
+        # Prepare QK MFMA while key loads (these don't depend on key data)
+        qk_accumulator = gl.zeros(
+            (QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE),
+            dtype=gl.float32,
+            layout=qk_mfma_layout,
+        )
+        query_converted = gl.convert_layout(query_tensor, layout=qk_lhs_operand_layout)
+
+        # Load key quantization scales if needed (overlaps with key tensor load)
         if KV_QUANT_MODE >= 0:
             if KV_QUANT_MODE == 0:
                 # Per-tensor quantization
                 key_scale_value = tl.load(key_scale)
                 value_scale_value = tl.load(value_scale)
             elif KV_QUANT_MODE == 1:
-                # Per-token quantization
+                # Per-token quantization - prepare offsets while key loads
                 key_scale_offsets = (
                     kv_block_numbers[:, None, None, None] * kv_scale_stride_0
                     + kv_head_idx * kv_scale_stride_1
@@ -1092,6 +1101,8 @@ def paged_attention_decode_v2_gluon_fp8(
                 key_scale_offsets = gl.convert_layout(
                     key_scale_offsets, layout=gl.SliceLayout(0, qk_linear_layout)
                 )
+                # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
+                gl.amd.cdna3.sched_group_barrier(0x020, 2, 0)  # 2 VMEM reads
                 key_scale_value = gl.amd.cdna3.buffer_load(
                     ptr=key_scale, offsets=key_scale_offsets
                 )
@@ -1099,11 +1110,14 @@ def paged_attention_decode_v2_gluon_fp8(
                     ptr=value_scale, offsets=key_scale_offsets
                 )
 
-        # Reshape key tensor for matrix multiplication
+        # Reshape key tensor for matrix multiplication (overlaps with scale loads)
         key_tensor = gl.permute(key_tensor, [1, 3, 0, 2])
         key_tensor = gl.reshape(key_tensor, [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE])
 
-        # ==================== VALUE LOADING AND PROCESSING ====================
+        # ==================== VALUE LOADING WITH QK MFMA OVERLAP ====================
+        # Convert key layout for MFMA (query_converted and qk_accumulator already prepared above)
+        key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
+
         if VALUE_TRANSPOSED:
             # Load values from transposed cache layout
             kv_block_numbers_reshaped = gl.convert_layout(
@@ -1120,10 +1134,19 @@ def paged_attention_decode_v2_gluon_fp8(
                 * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
                 + value_dim3_offsets[None, None, None, :]
             )
+            # Schedule: Start value VMEM load, then QK MFMA
+            gl.amd.cdna3.sched_group_barrier(0x020, 1, 0)  # VMEM
             value_tensor = gl.amd.cdna3.buffer_load(
                 ptr=value_cache_ptr,
                 offsets=value_block_offsets,
             )
+
+            gl.amd.cdna3.sched_group_barrier(0x008, 2, 0)  # MFMA
+            # Compute QK attention scores using MFMA (overlaps with value load)
+            attention_scores = gl.amd.cdna3.mfma(
+                query_converted, key_converted, qk_accumulator
+            )
+
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
             value_tensor = gl.reshape(
@@ -1141,10 +1164,19 @@ def paged_attention_decode_v2_gluon_fp8(
                 + value_dim1_offsets[None, :, None] * stride_value_head_size
                 + value_dim2_offsets[None, None, :]
             )
+            # Schedule: Start value VMEM load, then QK MFMA
+            gl.amd.cdna3.sched_group_barrier(0x020, 1, 0)  # VMEM
             value_tensor = gl.amd.cdna3.buffer_load(
                 ptr=value_cache_ptr,
                 offsets=value_block_offsets,
             )
+
+            gl.amd.cdna3.sched_group_barrier(0x008, 2, 0)  # MFMA
+            # Compute QK attention scores using MFMA (overlaps with value load)
+            attention_scores = gl.amd.cdna3.mfma(
+                query_converted, key_converted, qk_accumulator
+            )
+
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 2, 1])
             value_tensor = gl.reshape(
@@ -1152,31 +1184,6 @@ def paged_attention_decode_v2_gluon_fp8(
             )
 
         # ==================== ATTENTION SCORE COMPUTATION ====================
-        # Initialize QK accumulator
-        qk_accumulator = gl.zeros(
-            (QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE),
-            dtype=gl.float32,
-            layout=qk_mfma_layout,
-        )
-
-        # if sequence_idx == 0 \
-        #     and kv_head_idx == 0 \
-        #     and sequence_partition_idx == 0:
-        #     print("query_tensor=", query_tensor.to(tl.float32))
-        #     print("key_tensor=", key_tensor.to(tl.float32))
-        # if QUERY_QUANT_MODE == 0 and KV_QUANT_MODE == 0:
-        #     print("QKV_per_tensor")
-        # else:
-        #     print("QKV_per_token")
-
-        # Convert layouts for MFMA operation
-        query_converted = gl.convert_layout(query_tensor, layout=qk_lhs_operand_layout)
-        key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
-
-        # Compute QK attention scores using MFMA
-        attention_scores = gl.amd.cdna3.mfma(
-            query_converted, key_converted, qk_accumulator
-        )
         attention_scores = gl.reshape(
             attention_scores, [QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE]
         )
@@ -1281,9 +1288,11 @@ def paged_attention_decode_v2_gluon_fp8(
             dtype=gl.float32,
             layout=pv_mfma_layout,
         )
+
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
         )
+        gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)
         attention_accumulator += probability_scale * attention_output
 
         # Update running maximum for next iteration
@@ -1906,7 +1915,8 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             waves_per_eu = 3
         else:
             waves_per_eu = 4
-
+    # CONTEXT_PARTITION_SIZE  = 128
+    # KV_COMPUTE_BLOCK_SIZE = 256
     # Launch the selected kernel
     paged_attention_kernel[grid](
         exp_sums_ptr,
@@ -1941,9 +1951,9 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         query_scale_stride_0,
         kv_scale_stride_0,
         kv_scale_stride_1,
-        num_seqs=grid[0],
-        num_kv_heads=grid[1],
-        max_context_partition_num=grid[2],
+        # num_seqs=grid[0],
+        # num_kv_heads=grid[1],
+        # max_context_partition_num=grid[2],
         COMPUTE_TYPE=COMPUTE_TYPE,
         QUERY_SEQ_LEN=QUERY_SEQ_LEN,
         QUERY_GROUP_SIZE_ORIGINAL=QUERY_GROUP_SIZE_ORIGINAL,
