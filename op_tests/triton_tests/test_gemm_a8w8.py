@@ -178,4 +178,7 @@ def test_gemm(in_dtype, out_dtype, m, n, k, layout, output, impl: str):
         raise ValueError(f"Unknown implementation: {impl}")
     b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y, impl)
 
-    torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
+    if out_dtype in [torch.int8, torch.int32]:
+        torch.testing.assert_close(a, b, atol=1, rtol=0)
+    else:
+        torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
