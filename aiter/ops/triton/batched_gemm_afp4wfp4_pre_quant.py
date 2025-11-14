@@ -3,6 +3,7 @@
 
 from typing import Optional
 import torch
+from torch import Tensor
 import triton
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton._triton_kernels.batched_gemm_afp4wfp4_pre_quant import (
@@ -11,6 +12,7 @@ from aiter.ops.triton._triton_kernels.batched_gemm_afp4wfp4_pre_quant import (
     _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
@@ -23,14 +25,25 @@ def set_use_gemm_splitk_bf16(value: bool):
     _USE_GEMM_SPLITK_BF16 = value
 
 
-def batched_gemm_afp4wfp4_pre_quant(
-    x,
-    w,
-    w_scales,
-    dtype: Optional[float] = torch.bfloat16,
+def batched_gemm_afp4wfp4_pre_quant_fake_tensor(
+    x: Tensor,
+    w: Tensor,
+    x_scales: Tensor,
+    w_scales: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-):
+) -> Tensor:
+    return y
+
+@torch_compile_guard(gen_fake=batched_gemm_afp4wfp4_pre_quant_fake_tensor)
+def batched_gemm_afp4wfp4_pre_quant(
+    x: Tensor,
+    w: Tensor,
+    w_scales: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    #config: Optional[dict] = None,
+) -> Tensor:
     """
     Computes batched FP4 matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.
     X is quantized to MXFP4 during computation, W is pre-quantized FP4.
@@ -61,6 +74,8 @@ def batched_gemm_afp4wfp4_pre_quant(
     assert Bx == Bw == By
     Batch = Bx
 
+    config = {}
+    config = None
     if config is None:
         config = _get_config(M, N, K)
 

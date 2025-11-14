@@ -3,6 +3,7 @@
 
 from typing import Optional
 import torch
+from torch import Tensor
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
@@ -12,18 +13,29 @@ from aiter.ops.triton._triton_kernels.gemm_afp4wfp4_pre_quant_atomic import (
     _gemm_afp4_wfp4_pre_quant_kernel,
     _get_config,
 )
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
 
-def gemm_afp4wfp4_pre_quant(
-    x,
-    w,
-    w_scales,
-    dtype: Optional[float] = torch.bfloat16,
+def gemm_afp4wfp4_pre_quant_fake_tensor(
+    x: Tensor,
+    w: Tensor,
+    w_scales: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-):
+) -> Tensor:
+    return y
+
+@torch_compile_guard(gen_fake=gemm_afp4wfp4_pre_quant_fake_tensor)
+def gemm_afp4wfp4_pre_quant(
+    x: Tensor,
+    w: Tensor,
+    w_scales: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+#    config: Optional[dict] = None,
+) -> Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with on-the-fly FP4 quantization of activations.
     X is quantized to MXFP4 during computation, W is pre-quantized FP4. Uses atomic operations for split-K reduction.
@@ -59,6 +71,8 @@ def gemm_afp4wfp4_pre_quant(
     if y is None:
         y = torch.zeros((M, N), dtype=dtype, device=x.device)
 
+    config = {}
+    config = None
     if config is None:
         config = _get_config(M, N, K)
 

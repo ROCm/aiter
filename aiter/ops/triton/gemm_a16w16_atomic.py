@@ -3,6 +3,7 @@
 
 from typing import Optional
 import torch
+from torch import Tensor
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
@@ -11,17 +12,27 @@ from aiter.ops.triton._triton_kernels.gemm_a16w16_atomic import (
     _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
 
-def gemm_a16w16_atomic(
-    x,
-    w,
-    dtype: Optional[float] = torch.bfloat16,
+def gemm_a16w16_atomic_fake_tensor(
+    x: Tensor,
+    w: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-):
+) -> Tensor:
+    return y
+
+@torch_compile_guard(gen_fake=gemm_a16w16_atomic_fake_tensor)
+def gemm_a16w16_atomic(
+    x: Tensor,
+    w: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    #config: Optional[dict] = None,
+) -> Tensor:
     """
     Computes 16 bit matrix multiplication Y = X @ W^T using atomic operations for split-K reduction.
 
@@ -48,6 +59,8 @@ def gemm_a16w16_atomic(
     M, K = x.shape
     K, N = w.shape
 
+    config = {}
+    config = None
     if config is None:
         config = _get_config(M, N, K)
     # For compatability reasons, these keys may not exist in the config

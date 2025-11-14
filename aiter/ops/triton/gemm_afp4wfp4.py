@@ -3,9 +3,11 @@
 
 from typing import Optional
 import torch
+from torch import Tensor
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
     _gemm_afp4_wfp4_kernel,
@@ -62,16 +64,29 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
 
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
 
-
-def gemm_afp4wfp4(
-    x,
-    w,
-    x_scales,
-    w_scales,
-    dtype: Optional[float] = torch.bfloat16,
+def gemm_afp4wfp4_fake_tensor(
+    x: Tensor,
+    w: Tensor,
+    x_scales: Tensor,
+    w_scales: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-):
+) -> Tensor:
+    M, K = x.shape
+    N, K = w.shape
+    out = torch.empty((M, N), dtype=dtype, device=x.device)
+    return out
+
+@torch_compile_guard(gen_fake=gemm_afp4wfp4_fake_tensor)
+def gemm_afp4wfp4(
+    x: Tensor,
+    w: Tensor,
+    x_scales: Tensor,
+    w_scales: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    #config: Optional[dict] = None,
+) -> Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
 
@@ -106,6 +121,8 @@ def gemm_afp4wfp4(
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
+    config = {}
+    config = None
     if config is None:
         config = _get_config(M, N, K)
 
