@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+from typing import Optional
 import aiter
 import torch
 import torch.nn.functional as F
@@ -37,7 +38,16 @@ logger = logging.getLogger("aiter")
 set_start_method("spawn", force=True)
 
 
-def fused_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
+def fused_ar_rmsnorm(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    weight,
+    eps,
+    withGraph=False,
+    distributed_init_method: Optional[str] = None,
+):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     # init
@@ -46,7 +56,7 @@ def fused_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
     init_distributed_environment(
         world_size=tp_size,
         rank=rankID,
-        distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
+        distributed_init_method=distributed_init_method,
     )
     ensure_model_parallel_initialized(tp_size, pp_size)
     x = x.to(device)
@@ -63,7 +73,7 @@ def fused_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
                 res_out, out = tensor_model_parallel_fused_allreduce_rmsnorm(
-                    x, weight, eps
+                    x, x, weight, eps
                 )
         out.fill_(0)
         res_out.fill_(0)
@@ -78,7 +88,9 @@ def fused_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
 
         @perftest()
         def run_ca(x):
-            res_out, out = tensor_model_parallel_fused_allreduce_rmsnorm(x, weight, eps)
+            res_out, out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                x, x, weight, eps
+            )
             return out
 
         out = run_ca(x)
@@ -91,7 +103,16 @@ def fused_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
     return out
 
 
-def get_acc_value_with_cudagraph(tp_size, pp_size, rankID, x, weight, eps, loop_time=1):
+def get_acc_value_with_cudagraph(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    weight,
+    eps,
+    loop_time=1,
+    distributed_init_method: Optional[str] = None,
+):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     # init
@@ -100,7 +121,7 @@ def get_acc_value_with_cudagraph(tp_size, pp_size, rankID, x, weight, eps, loop_
     init_distributed_environment(
         world_size=tp_size,
         rank=rankID,
-        distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
+        distributed_init_method=distributed_init_method,
     )
     ensure_model_parallel_initialized(tp_size, pp_size)
     x = x.to(device)
@@ -117,7 +138,9 @@ def get_acc_value_with_cudagraph(tp_size, pp_size, rankID, x, weight, eps, loop_
     with graph_capture() as gc:
         with torch.cuda.graph(graph, stream=gc.stream):
             # out = torch.empty_like(x)
-            res_out, out = tensor_model_parallel_fused_allreduce_rmsnorm(x, weight, eps)
+            res_out, out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                x, x, weight, eps
+            )
     out.fill_(0)
 
     def run_ca():
@@ -137,7 +160,16 @@ def get_acc_value_with_cudagraph(tp_size, pp_size, rankID, x, weight, eps, loop_
     return out
 
 
-def get_acc_value_only(tp_size, pp_size, rankID, x, weight, eps, loop_time=1):
+def get_acc_value_only(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    weight,
+    eps,
+    loop_time=1,
+    distributed_init_method: Optional[str] = None,
+):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     # init
@@ -146,7 +178,7 @@ def get_acc_value_only(tp_size, pp_size, rankID, x, weight, eps, loop_time=1):
     init_distributed_environment(
         world_size=tp_size,
         rank=rankID,
-        distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
+        distributed_init_method=distributed_init_method,
     )
     ensure_model_parallel_initialized(tp_size, pp_size)
     x = x.to(device)
@@ -158,7 +190,7 @@ def get_acc_value_only(tp_size, pp_size, rankID, x, weight, eps, loop_time=1):
     torch.cuda.synchronize()
 
     for i in range(loop_time):
-        res, out = tensor_model_parallel_fused_allreduce_rmsnorm(x, weight, eps)
+        res, out = tensor_model_parallel_fused_allreduce_rmsnorm(x, x, weight, eps)
 
     # destroy
     if dist.is_initialized():
@@ -168,7 +200,16 @@ def get_acc_value_only(tp_size, pp_size, rankID, x, weight, eps, loop_time=1):
     return out
 
 
-def split_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
+def split_ar_rmsnorm(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    weight,
+    eps,
+    withGraph=False,
+    distributed_init_method: Optional[str] = None,
+):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     # init
@@ -177,7 +218,7 @@ def split_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
     init_distributed_environment(
         world_size=tp_size,
         rank=rankID,
-        distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
+        distributed_init_method=distributed_init_method,
     )
     ensure_model_parallel_initialized(tp_size, pp_size)
     x = x.to(device)
@@ -243,7 +284,14 @@ def split_ar_rmsnorm(tp_size, pp_size, rankID, x, weight, eps, withGraph=False):
 
 
 @benchmark()
-def test_split_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
+def test_split_ar_rmsnorm(
+    tp_size,
+    pp_size,
+    shape,
+    dtype,
+    withGraph=False,
+    distributed_init_method: Optional[str] = None,
+):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     pool = Pool(processes=tp_size)
@@ -264,7 +312,17 @@ def test_split_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
         weight_list.append(weight)
         rets.append(
             pool.apply_async(
-                split_ar_rmsnorm, args=(tp_size, pp_size, i, x, weight, eps, withGraph)
+                split_ar_rmsnorm,
+                args=(
+                    tp_size,
+                    pp_size,
+                    i,
+                    x,
+                    weight,
+                    eps,
+                    withGraph,
+                    distributed_init_method,
+                ),
             )
         )
     pool.close()
@@ -285,7 +343,14 @@ def test_split_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
 
 
 @benchmark()
-def test_fused_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
+def test_fused_ar_rmsnorm(
+    tp_size,
+    pp_size,
+    shape,
+    dtype,
+    withGraph=False,
+    distributed_init_method: Optional[str] = None,
+):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     pool = Pool(processes=tp_size)
@@ -308,7 +373,17 @@ def test_fused_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
         weight_list.append(weight)
         rets.append(
             pool.apply_async(
-                fused_ar_rmsnorm, args=(tp_size, pp_size, i, x, weight, eps, withGraph)
+                fused_ar_rmsnorm,
+                args=(
+                    tp_size,
+                    pp_size,
+                    i,
+                    x,
+                    weight,
+                    eps,
+                    withGraph,
+                    distributed_init_method,
+                ),
             )
         )
     pool.close()
@@ -333,7 +408,9 @@ def test_fused_ar_rmsnorm(tp_size, pp_size, shape, dtype, withGraph=False):
         # checkAllclose(ref, out.to(ref), msg=msg)
 
 
-def acc_test(tp_size, pp_size, shape, dtype):
+def acc_test(
+    tp_size, pp_size, shape, dtype, distributed_init_method: Optional[str] = None
+):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     pool = Pool(processes=tp_size)
@@ -352,7 +429,8 @@ def acc_test(tp_size, pp_size, shape, dtype):
         weight_list.append(weight)
         rets.append(
             pool.apply_async(
-                get_acc_value_only, args=(tp_size, pp_size, i, x, weight, eps, 1)
+                get_acc_value_only,
+                args=(tp_size, pp_size, i, x, weight, eps, 1, distributed_init_method),
             )
         )
     pool.close()
@@ -366,7 +444,14 @@ def acc_test(tp_size, pp_size, shape, dtype):
         checkAllclose(ref, i.to(ref))
 
 
-def acc_test_cudagraph_on(tp_size, pp_size, shape, dtype, loop_time=1):
+def acc_test_cudagraph_on(
+    tp_size,
+    pp_size,
+    shape,
+    dtype,
+    loop_time=1,
+    distributed_init_method: Optional[str] = None,
+):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     pool = Pool(processes=tp_size)
@@ -386,7 +471,16 @@ def acc_test_cudagraph_on(tp_size, pp_size, shape, dtype, loop_time=1):
         rets.append(
             pool.apply_async(
                 get_acc_value_with_cudagraph,
-                args=(tp_size, pp_size, i, x, weight, eps, loop_time),
+                args=(
+                    tp_size,
+                    pp_size,
+                    i,
+                    x,
+                    weight,
+                    eps,
+                    loop_time,
+                    distributed_init_method,
+                ),
             )
         )
     pool.close()
@@ -437,12 +531,7 @@ def acc_test_cudagraph_on(tp_size, pp_size, shape, dtype, loop_time=1):
 #         checkAllclose(cpu_rslt[i], ar_rslt[i].to(ref))
 
 l_dtype = ["bf16"]
-l_shape = [
-    # (4096, 2048)
-    (64, 7168)
-    # (64, 512 * 99)
-    # (16, 512)
-]
+l_shape = [(64, 7168)]
 l_tp = [8]
 l_pp = [1]
 l_graph = [True, False]
@@ -518,5 +607,23 @@ if __name__ == "__main__":
     for dtype, shape, tp, pp, graph_on in itertools.product(
         l_dtype, l_shape, l_tp, l_pp, l_graph
     ):
-        test_split_ar_rmsnorm(tp, pp, shape, dtype, withGraph=graph_on)
-        test_fused_ar_rmsnorm(tp, pp, shape, dtype, withGraph=graph_on)
+        test_split_ar_rmsnorm(
+            tp,
+            pp,
+            shape,
+            dtype,
+            withGraph=graph_on,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
+        test_fused_ar_rmsnorm(
+            tp,
+            pp,
+            shape,
+            dtype,
+            withGraph=graph_on,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
