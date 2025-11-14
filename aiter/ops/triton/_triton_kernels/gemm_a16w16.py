@@ -6,6 +6,41 @@ import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
+
+
+_gemm_a16w16_repr = make_kernel_repr(
+    "_gemm_a16_w16_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "cache_modifier",
+        "activation",
+        "use_activation",
+        "ADD_BIAS",
+        "SKIP_REDUCE",
+    ],
+)
+
+
+_gemm_a16w16_reduce_repr = make_kernel_repr(
+    "_gemm_a16w16_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+        "activation",
+        "use_activation",
+        "ADD_BIAS",
+    ],
+)
 
 
 @triton.heuristics(
@@ -16,10 +51,11 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_gemm_a16w16_repr)
 def _gemm_a16_w16_kernel(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M,
     N,
@@ -43,6 +79,8 @@ def _gemm_a16_w16_kernel(
     cache_modifier: tl.constexpr,
     activation: tl.constexpr,
     use_activation: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
+    SKIP_REDUCE: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -92,7 +130,16 @@ def _gemm_a16_w16_kernel(
         )
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+        if ADD_BIAS:
+            if NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0):
+                accumulator = tl.load(bias_ptr + offs_bn).to(dtype=acc_dtype)
+                accumulator = tl.broadcast_to(
+                    accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)
+                )
+            else:
+                accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+        else:
+            accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
         split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
         k_span = split_k_end - split_k_start
@@ -136,8 +183,9 @@ def _gemm_a16_w16_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(repr=_gemm_a16w16_reduce_repr)
 def _gemm_a16w16_reduce_kernel(
+    bias_ptr,
     c_in_ptr,
     c_out_ptr,
     M,
@@ -153,6 +201,7 @@ def _gemm_a16w16_reduce_kernel(
     MAX_KSPLIT: tl.constexpr,
     activation: tl.constexpr,
     use_activation: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
 
     tl.assume(stride_c_in_k > 0)
@@ -182,6 +231,11 @@ def _gemm_a16w16_reduce_kernel(
     else:
         c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
     c = tl.sum(c, axis=0)
+    acc_dtype = tl.float32 if c_in_ptr.type.element_ty != tl.int8 else tl.int32
+    if ADD_BIAS:
+        bias = tl.load(bias_ptr + offs_n).to(dtype=acc_dtype)
+        bias = tl.broadcast_to(bias[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N))
+        c += bias
 
     if use_activation:
         c = activation(c)
@@ -221,13 +275,13 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    bounds = [64, 128, 256, 512, 2048]
+    bounds = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
     for bound in bounds:
         if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
             temp_config = _get_config._config_dict[key][f"M_LEQ_{bound}"]
             break
     else:
-        temp_config = _get_config._config_dict[key]["M_GEQ_4096"]
+        temp_config = _get_config._config_dict[key]["any"]
 
     # Copy to avoid mutating the cached config
     chosen_config = dict(temp_config)

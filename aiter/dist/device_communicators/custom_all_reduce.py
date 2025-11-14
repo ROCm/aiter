@@ -258,7 +258,7 @@ class CustomAllreduce:
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         if self.world_size == 2 or self.fully_connected:
-            return inp_size < self.max_size
+            return inp_size <= self.max_size
         return False
 
     def all_reduce(
@@ -300,7 +300,7 @@ class CustomAllreduce:
             else:
                 # if warm up, mimic the allocation pattern
                 # since custom allreduce is out-of-place
-                return torch.empty_like(input)
+                return torch.zeros_like(input)
         else:
             # note: outside of cuda graph context,
             # custom allreduce incurs a cost of cudaMemcpy, which should
@@ -332,9 +332,58 @@ class CustomAllreduce:
                 return self.all_gather_reg(inp)
             else:
                 print("allgather capture hipgraph error")
-                return torch.empty_like(inp)
+                return torch.zeros_like(inp)
         else:
             return self.all_gather_unreg(inp)
+
+    def fused_ar_rms(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        *,
+        res_out: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
+        w: torch.Tensor,
+        eps: float,
+        registered: bool = False,
+    ):
+        if out is None:
+            out = torch.empty_like(inp)
+        if res_out is None:
+            res_out = torch.empty_like(inp)
+        ops.fused_allreduce_rmsnorm(
+            self._ptr,
+            inp,
+            res_inp,
+            res_out,
+            out,
+            w,
+            eps,
+            None if registered else self.buffer,
+        )
+        return res_out, out
+
+    def custom_fused_ar_rms(
+        self,
+        input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> Optional[torch.Tensor]:
+        # when custom allreduce is disabled, this will be None
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_ar_rms(
+                    input, residual_inp, w=weight, eps=eps, registered=True
+                )
+            else:
+                return torch.zeros_like(input), torch.zeros_like(input)
+        else:
+            return self.fused_ar_rms(
+                input, residual_inp, w=weight, eps=eps, registered=False
+            )
 
     def close(self):
         if not self.disabled and self._ptr:
