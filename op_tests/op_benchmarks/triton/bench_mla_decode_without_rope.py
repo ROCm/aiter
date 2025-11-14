@@ -409,7 +409,6 @@ def run_benchmark(args: argparse.Namespace):
   
         # kv_cache = torch.ones_like(kv_cache)
 
-        q = torch.ones_like(q)
         k_input, v_input = ref_preprocess(kv_cache, kv_lora_rank)
 
         qo_indptr = torch.zeros(BATCH + 1, dtype=torch.int, device=device)
@@ -427,8 +426,10 @@ def run_benchmark(args: argparse.Namespace):
 
         # import pdb;pdb.set_trace()
         out_ref, lse_ref = torch_mla_extend(
-            q_fp8.reshape(-1, H, 576),
-            kv_cache_fp8[:,:,:, :576].reshape(-1, 1, 576),
+            # q_fp8.reshape(-1, H, 576),
+            # kv_cache_fp8[:,:,:, :576].reshape(-1, 1, 576),
+            q.reshape(-1, H, 576),
+            kv_cache.reshape(-1, 1, 576),
             qo_indptr,
             kv_indptr,
             kv_indices,
@@ -481,41 +482,18 @@ def run_benchmark(args: argparse.Namespace):
             BATCH * (mtp + 1) * out_elems * out_tri.element_size()
         )
 
-        mem = bytes_read / 2 + bytes_written
+        mem = bytes_read + bytes_written
         # print(mem)
 
         # ms = triton.testing.do_bench(
-        # _, us = run_perftest(
-        # # lambda: decode_attention_fwd_grouped(
-        # #     q_fp8.reshape(-1, H * 2, 576),
-        # #     k_input_fp8,
-        # #     v_input_fp8,
-        #     decode_attention_fwd_grouped,
-        #     q.reshape(-1, H * (mtp + 1), 576),
-        #     k_input,
-        #     v_input,
-        #     out_tri,
-        #     kv_indptr,
-        #     kv_indices,
-        #     kv_lora_rank,
-        #     attn_logits,
-        #     attn_lse,
-        #     num_kv_splits,
-        #     sm_scale,
-        #     logit_cap,
-        #     mtp,
-        #     # ),
-        #     # warmup=25,
-        #     # rep=100,
-        # )
         _, us = run_perftest(
         # lambda: decode_attention_fwd_grouped(
         #     q_fp8.reshape(-1, H * 2, 576),
         #     k_input_fp8,
         #     v_input_fp8,
-            decode_attention_fwd_grouped_fp8,
-            q_fp8.reshape(-1, H * (mtp + 1), 576),
-            kv_cache_fp8,
+            decode_attention_fwd_grouped,
+            q.reshape(-1, H * (mtp + 1), 576),
+            kv_cache,
             v_input,
             out_tri,
             kv_indptr,
@@ -532,6 +510,30 @@ def run_benchmark(args: argparse.Namespace):
             # warmup=25,
             # rep=100,
         )
+        # _, us = run_perftest(
+        # # lambda: decode_attention_fwd_grouped(
+        # #     q_fp8.reshape(-1, H * 2, 576),
+        # #     k_input_fp8,
+        # #     v_input_fp8,
+        #     decode_attention_fwd_grouped_fp8,
+        #     q_fp8.reshape(-1, H * (mtp + 1), 576),
+        #     kv_cache_fp8,
+        #     v_input,
+        #     out_tri,
+        #     kv_indptr,
+        #     kv_indices,
+        #     block_tables,
+        #     kv_lora_rank,
+        #     attn_logits,
+        #     attn_lse,
+        #     num_kv_splits,
+        #     sm_scale,
+        #     logit_cap,
+        #     mtp,
+        #     # ),
+        #     # warmup=25,
+        #     # rep=100,
+        # )
         # print(lse_ref)
         # decode_attention_fwd_grouped_fp8(
         #     q_fp8.reshape(-1, H * (mtp + 1), 576),
@@ -557,7 +559,7 @@ def run_benchmark(args: argparse.Namespace):
             msg=f"mla_decode-absorb    [golden vs triton]: {ms * 1000} us......",
         )
 
-        import pdb;pdb.set_trace()
+        # import pdb;pdb.set_trace()
         cal_diff(out_ref, out_tri, "out", True)
 
         # Return exactly one scalar depending on which metric is active

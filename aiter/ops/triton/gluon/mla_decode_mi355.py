@@ -33,6 +33,7 @@ from aiter.ops.triton.activation import _tanh
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.pid_preprocessing import remap_xcd
+from aiter import dtypes
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -641,6 +642,7 @@ def _decode_grouped_att_m_fwd(
 
     
     if page_block_size == 1:
+        pass
     #     _fwd_grouped_kernel_stage1_n16x4_prefetch_k[grid](
     #         q,
     #         k_buffer,
@@ -878,7 +880,7 @@ def decode_attention_fwd_grouped(
         sm_scale,
         logit_cap,
         mtp,
-        config["fwd_grouped_kernel_stage1_rope_fp8"] if q.dtype == aiter.types.fp8 else config["fwd_grouped_kernel_stage1_rope"],
+        config["fwd_grouped_kernel_stage1_rope_fp8"] if q.dtype == dtypes.fp8 else config["fwd_grouped_kernel_stage1_rope"],
     )
     # import pdb ;pdb.set_trace()
     _decode_softmax_reducev_fwd(
