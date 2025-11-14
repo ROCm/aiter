@@ -426,12 +426,10 @@ class FmoeTuner(TunerCommon):
     ):
         torch.manual_seed(0)
         input = torch.randn((token, model_dim), dtype=dtype) / 10
-        score = torch.randn((token, expert), dtype=dtype)
         if use_g1u1:
             w1 = torch.randn((expert, inter_dim * 2, model_dim), dtype=dtype) / 10
         else:
             w1 = torch.randn((expert, inter_dim, model_dim), dtype=dtype) / 10
-        torch.manual_seed(0)
         w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype)
         w1_qt, w1_scale = FmoeTuner.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
         w2_qt, w2_scale = FmoeTuner.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
@@ -441,7 +439,7 @@ class FmoeTuner(TunerCommon):
         else:
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-
+        score = torch.randn((token, expert), dtype=dtype)
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
         if q_type == QuantType.per_1x128:
             a1_qt, a1_scale = aiter.pertoken_quant(
@@ -639,7 +637,7 @@ class FmoeTuner(TunerCommon):
                 sorted_weights = None
             if q_type == QuantType.per_1x32:
                 a1_scale_fp4_sort = moe_mxfp4_sort(
-                    a1_scale,#a1_scale[: token * topk, :].view(token, topk, -1),
+                    a1_scale,  # a1_scale[: token * topk, :].view(token, topk, -1),
                     sorted_ids=sorted_ids,
                     num_valid_ids=num_valid_ids,
                     token_num=token,
@@ -649,21 +647,21 @@ class FmoeTuner(TunerCommon):
                 a1_scale_fp4_sort = a1_scale
 
             return (
-                a1_qt, #0
-                w1_qt_shffle_ck, #1
-                w2_qt_shffle_ck, #2
-                a1_scale, #3
-                w1_scale, #4
-                sorted_ids, #5
-                sorted_expert_ids, #6
-                sorted_weights, #7
-                num_valid_ids, #8
-                moe_buf, #9
-                w1_qt, #10
-                w2_qt, #11
-                topk_weights, #12
-                topk_ids, #13
-                a1_scale_fp4_sort, #14
+                a1_qt,  # 0
+                w1_qt_shffle_ck,  # 1
+                w2_qt_shffle_ck,  # 2
+                a1_scale,  # 3
+                w1_scale,  # 4
+                sorted_ids,  # 5
+                sorted_expert_ids,  # 6
+                sorted_weights,  # 7
+                num_valid_ids,  # 8
+                moe_buf,  # 9
+                w1_qt,  # 10
+                w2_qt,  # 11
+                topk_weights,  # 12
+                topk_ids,  # 13
+                a1_scale_fp4_sort,  # 14
                 w1_scale_aiter,
             )
         elif stage == 2:
@@ -706,23 +704,23 @@ class FmoeTuner(TunerCommon):
             else:
                 a2_scale_mxfp4_sort = a2_scale
             return (
-                    a2_qt, #0
-                    w1_qt_shffle_ck, #1
-                    w2_qt_shffle_ck,  #2
-                    a2_scale,  #3
-                    w2_scale,  #4
-                    sorted_ids, #5
-                    sorted_expert_ids, #6
-                    sorted_weights, #7
-                    num_valid_ids, #8
-                    moe_buf, #9
-                    w1_qt, #10
-                    w2_qt,  #11
-                    topk_weights,  #12
-                    topk_ids,  #13
-                    a2_scale_mxfp4_sort,  #14
-                    w2_scale_aiter,
-                  )
+                a2_qt,  # 0
+                w1_qt_shffle_ck,  # 1
+                w2_qt_shffle_ck,  # 2
+                a2_scale,  # 3
+                w2_scale,  # 4
+                sorted_ids,  # 5
+                sorted_expert_ids,  # 6
+                sorted_weights,  # 7
+                num_valid_ids,  # 8
+                moe_buf,  # 9
+                w1_qt,  # 10
+                w2_qt,  # 11
+                topk_weights,  # 12
+                topk_ids,  # 13
+                a2_scale_mxfp4_sort,  # 14
+                w2_scale_aiter,
+            )
 
     @staticmethod
     def generate_data_1stage(
@@ -1588,7 +1586,7 @@ class FmoeTuner(TunerCommon):
                             {},
                             FmoeTuner.run_torch_moe_stage1,
                             (
-                                #[a1_qt, w1_qt, w2_qt, topk_weights, topk_ids, a1_scale, w1_scale]
+                                # [a1_qt, w1_qt, w2_qt, topk_weights, topk_ids, a1_scale, w1_scale]
                                 [0, 10, 11, 12, 13, 3, 4],
                                 dtype,
                                 act_type,

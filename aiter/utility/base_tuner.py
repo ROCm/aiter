@@ -166,6 +166,7 @@ class TunerCommon:
     def result_to_df(self, rets):
         """transfer results to dataframe"""
         pass
+
     def update_config_files(self, file_path: str, merge_name: str):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
@@ -189,10 +190,10 @@ class TunerCommon:
         merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
         ##drop_duplicates
         merge_df = (
-                merge_df.sort_values("us")
-                .drop_duplicates(subset=self.keys, keep="first")
-                .reset_index(drop=True)
-            )
+            merge_df.sort_values("us")
+            .drop_duplicates(subset=self.keys, keep="first")
+            .reset_index(drop=True)
+        )
         new_file_path = f"/tmp/{merge_name}.csv"
         merge_df.to_csv(new_file_path, index=False)
         return new_file_path
