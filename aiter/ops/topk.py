@@ -202,6 +202,8 @@ def top_k_per_row_prefill(
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
     indices: torch.Tensor,
+    values: torch.Tensor,
+    workspace: torch.Tensor,
     numRows: int,
     stride0: int,
     stride1: int,
