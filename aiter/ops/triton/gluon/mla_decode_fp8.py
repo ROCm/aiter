@@ -544,6 +544,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
 
     cur_batch_kv = cur_batch # // (max_qo_len // 2)
     cur_batch_kv_start_idx = gl.load(kv_indptr + cur_batch_kv)
+    cur_batch_kv_end_idx = gl.load(kv_indptr + cur_batch_kv + 1)
 
     blocked_q_nope_mk: gl.constexpr = gl.BlockedLayout(  # max 64 * 512 in
         size_per_thread=[1, 16],  # 64 * 512
@@ -680,7 +681,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
         layout=gl.SliceLayout(0, blocked_ld_k_rope_kn)
     )  # to get the k_pe
 
-    cur_batch_seq_len = gl.load(kv_indptr + cur_batch_kv + 1) - cur_batch_kv_start_idx
+    cur_batch_seq_len = cur_batch_kv_end_idx - cur_batch_kv_start_idx
     cur_batch_block_nums = gl.cdiv(cur_batch_seq_len, PAGE_BLOCK_SIZE)
 
     off_q_pe = (
@@ -695,6 +696,14 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
 
     blocks_per_split = gl.cdiv(cur_batch_block_nums, NUM_KV_SPLITS)
     split_kv_start = blocks_per_split * split_kv_id
+    
+    # if pid == 4:
+    #     tl.device_print("split_kv_start   ", split_kv_start)
+    #     tl.device_print("cur_batch_seq_len   ", cur_batch_seq_len)
+
+    if split_kv_start * PAGE_BLOCK_SIZE > cur_batch_seq_len:
+        return
+
     split_kv_end = gl.minimum(split_kv_start + blocks_per_split, cur_batch_block_nums)
 
     q = gl.amd.cdna3.buffer_load(
@@ -710,6 +719,9 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     kv_loc = gl.load(
         kv_indices + split_kv_start + cur_batch * stride_b_block_table,
     )
+
+    # if pid == 4:
+    #     tl.device_print("kv_loc ", kv_loc)
 
     q = gl.reshape(q, [BLOCK_H, 2, BLOCK_C // 2])
     q = gl.permute(q, (0, 2, 1))
@@ -744,20 +756,28 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     zeros = gl.zeros(
         (BLOCK_H, BLOCK_N), dtype=gl.float32, layout=mfma_layout_qk,
     )
-
-    offs_buf_kv = (kv_loc * PAGE_BLOCK_SIZE + cur_N[:, None]) * stride_buf_kh + offs_k_c[None, :]
-    # if pid == 5:
-    #     tl.device_print("offs_buf_kv ", offs_buf_kv)
+    k_id = kv_loc * PAGE_BLOCK_SIZE + cur_N
+    mask_k_id = split_kv_start * PAGE_BLOCK_SIZE + cur_N
+    mask_k = mask_k_id < cur_batch_seq_len
+    offs_buf_kv = (k_id[:, None]) * stride_buf_kh + offs_k_c[None, :]
+    # if pid == 2:
+    #     tl.device_print("k_id  ", mask_k_id)
+    #     tl.device_print("mask_k   ", mask_k)
 
     kv1 = gl.amd.cdna3.buffer_load(
         ptr=K_Buffer,
         offsets=offs_buf_kv,
+        mask=mask_k[:, None] & mask_k_c[None, :]
     )  # the shared latent tensor for keys and values
 
     kv2 = gl.amd.cdna3.buffer_load(
         ptr=K_Buffer,
         offsets=offs_buf_kv + 256,
+        mask=mask_k[:, None] & mask_k_c[None, :]
     )  # the shared latent tensor for keys and values
+
+    # if pid == 1:
+    #     tl.device_print("kv2 before ", kv2.to(gl.float32))
 
     smem_kv1 = gl.allocate_shared_memory(
         K_Buffer.type.element_ty, [kv_lora_rank // 2, BLOCK_N], layout=shared_k
@@ -771,11 +791,22 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     smem_kv1.store(kv1.T)
     smem_kv2.store(kv2.T)
 
-    offs_buf_k_pe = (kv_loc * PAGE_BLOCK_SIZE + cur_N_pe[:, None]) * stride_buf_kh + offs_k_r[None, :]
+    k_id_pe = kv_loc * PAGE_BLOCK_SIZE + cur_N_pe
+    offs_buf_k_pe = k_id_pe[:, None] * stride_buf_kh + offs_k_r[None, :]
+    mask_k_id = split_kv_start * PAGE_BLOCK_SIZE + cur_N_pe
+    mask_k_pe = mask_k_id < cur_batch_seq_len 
+
+    # if pid == 2:
+    #     tl.device_print("cur_batch_kv_end_idx before ", cur_batch_kv_end_idx)
+
     k_pe = gl.amd.cdna3.buffer_load(
         ptr=K_Buffer,
         offsets=offs_buf_k_pe,
+        mask=mask_k_pe[:, None] & mask_k_r[None, :]
     )  # positional embedding part of keys
+
+    # if pid == 2:
+    #     tl.device_print("k_pe before ", k_pe)
 
     e_sum = gl.arange(0, BLOCK_H, layout = gl.SliceLayout(1, mfma_layout_qk)).to(gl.float32) * float(0)
     e_max = e_sum - float("inf")
@@ -804,6 +835,11 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     gl.amd.cdna3.sched_barrier(0x0)
     split_kv_start += 1 
 
+    mask_qk_h = gl.arange(0, BLOCK_H, gl.SliceLayout(1, mfma_layout_qk))
+    # if pid == 1:
+    #     tl.device_print("split_kv_start  ", split_kv_start)
+    #     tl.device_print("split_kv_end  ", split_kv_end)
+
     for start_n in range(split_kv_start, split_kv_end):
         kv_loc = gl.load(
             kv_indices + start_n + cur_batch * stride_b_block_table,
@@ -812,13 +848,17 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
         cur_k_pe = smem_k_rope.load(layout=dot_k_layout)
 
         gl.amd.cdna3.sched_barrier(0x0)
-        offs_buf_kv = (kv_loc * PAGE_BLOCK_SIZE + cur_N[:, None]) * stride_buf_kh + offs_k_c[None, :]
+        k_id = kv_loc * PAGE_BLOCK_SIZE + cur_N
+        offs_buf_kv = k_id[:, None] * stride_buf_kh + offs_k_c[None, :]
+        mask_k_id = start_n * PAGE_BLOCK_SIZE + cur_N
+        mask_k = mask_k_id < cur_batch_seq_len
         gl.amd.cdna3.sched_barrier(0x0)
 
         qk = gl.amd.cdna3.mfma(q0, cur_k1, zeros)
         kv1 = gl.amd.cdna3.buffer_load(
             ptr=K_Buffer,
             offsets=offs_buf_kv,
+            mask=mask_k[:, None] & mask_k_c[None, :]
         )
 
         gl.amd.cdna3.sched_barrier(0x0)
@@ -827,6 +867,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
         kv2 = gl.amd.cdna3.buffer_load(
             ptr=K_Buffer,
             offsets=offs_buf_kv + 256,
+            mask=mask_k[:, None] & mask_k_c[None, :]
         )
 
         # smem_kv1 = smem_kv1.permute([1, 0])
@@ -838,13 +879,26 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
         qk = gl.amd.cdna3.mfma(q_pe, cur_k_pe, qk)
 
         qk *= sm_scale
+        # if pid == 0:
+        #     tl.device_print("qk before ", qk)
+        # mask_qk_n = (start_n - 1) * PAGE_BLOCK_SIZE + gl.arange(0, BLOCK_N, gl.SliceLayout(0, mfma_layout_qk))
+        # qk = tl.where(
+        #     (mask_qk_n[None, :] < cur_batch_seq_len) & (mask_qk_h[:, None] >= 0), qk, float("-inf")
+        # )
+        # if pid == 0:
+        #     tl.device_print("qk after ", qk)
+        
 
-        offs_buf_k_pe = (kv_loc * PAGE_BLOCK_SIZE + cur_N_pe[:, None]) * stride_buf_kh + offs_k_r[None, :]
+        k_id_pe = kv_loc * PAGE_BLOCK_SIZE + cur_N_pe
+        offs_buf_k_pe = k_id_pe[:, None] * stride_buf_kh + offs_k_r[None, :]
+        mask_k_id = start_n * PAGE_BLOCK_SIZE + cur_N_pe
+        mask_k_pe = mask_k_id < cur_batch_seq_len
 
         gl.amd.cdna3.sched_barrier(0x0)
         k_pe = gl.amd.cdna3.buffer_load(
             ptr=K_Buffer,
             offsets=offs_buf_k_pe,
+            mask=mask_k_pe[:, None] & mask_k_r[None, :]
         )  # positional embedding part of keys
 
 
@@ -915,9 +969,17 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     cur_k2 = smem_kv2.load(layout=dot_v_layout)
 
     qk *= sm_scale
+    # if pid == 1:
+    #     tl.device_print("qk before ", (split_kv_end - 1) * PAGE_BLOCK_SIZE)
+    mask_qk_n = (split_kv_end - 1) * PAGE_BLOCK_SIZE + gl.arange(0, BLOCK_N, gl.SliceLayout(0, mfma_layout_qk))
+
+    qk = tl.where(
+        (mask_qk_n[None, :] < cur_batch_seq_len) & (mask_qk_h[:, None] >= 0), qk, float("-inf")
+    )
+    # if pid == 1:
+    #     tl.device_print("qk after", qk)
 
     n_e_max = gl.convert_layout(gl.max(qk, 1), gl.SliceLayout(1, mfma_layout_qk))
-
 
     n_e_max = gl.maximum(n_e_max, e_max)
     re_scale = tl.math.exp2((e_max - n_e_max) * log2e)

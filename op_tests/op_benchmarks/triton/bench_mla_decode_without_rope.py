@@ -138,7 +138,8 @@ def input_helper(
                 block_tables[i][j] = block_idx_pool[counter % num_blocks]
                 counter += 1
                 indices.append(torch.range(block_tables[i][j] * page_block_size, (block_tables[i][j] + 1) * page_block_size - 1, dtype=torch.int32))
-            indices_list.append(torch.cat(indices))
+            indice = torch.cat(indices)
+            indices_list.append(indice[:max_model_len])
         kv_indices = torch.cat(indices_list).cuda()
 
     attn_logits = torch.zeros(
@@ -405,7 +406,7 @@ def run_benchmark(args: argparse.Namespace):
   
         # kv_cache = torch.ones_like(kv_cache)
 
-        # q = torch.ones_like(q)
+        q = torch.ones_like(q)
         k_input, v_input = ref_preprocess(kv_cache, kv_lora_rank)
 
         qo_indptr = torch.zeros(BATCH + 1, dtype=torch.int, device=device)
@@ -548,15 +549,14 @@ def run_benchmark(args: argparse.Namespace):
         #     # warmup=25,
         #     # rep=100,
         # )
-        # import pdb;pdb.set_trace()
         ms = us / 1000
 
         checkAllclose(out_ref, out_tri,
             msg=f"mla_decode-absorb    [golden vs triton]: {ms * 1000} us......",
         )
 
+        import pdb;pdb.set_trace()
         cal_diff(out_ref, out_tri, "out", True)
-        # import pdb;pdb.set_trace()
 
         # Return exactly one scalar depending on which metric is active
         tflops = total_flops / ms * 1e-9
