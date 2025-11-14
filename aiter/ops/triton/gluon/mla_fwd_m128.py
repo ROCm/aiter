@@ -189,8 +189,8 @@ def kn_mla_fwd_fp8_m128_ps(
     assert same_kv == True
 
     # Private configs
-    Q_LOAD_LAYOUT_DOT: gl.constexpr = True
-    TRANSFORM_Q_VIA_LDS: gl.constexpr = False and not Q_LOAD_LAYOUT_DOT
+    Q_LOAD_LAYOUT_DOT: gl.constexpr = False
+    TRANSFORM_Q_VIA_LDS: gl.constexpr = True and not Q_LOAD_LAYOUT_DOT
 
     """
     Const states
@@ -311,7 +311,7 @@ def kn_mla_fwd_fp8_m128_ps(
         """
         Each work info contains 8 DWs
         """
-        batch_idx = gl.load(p_work_info_set + work_idx * 8)
+        # batch_idx = gl.load(p_work_info_set + work_idx * 8)
         partial_qo_loc = gl.load(p_work_info_set + work_idx * 8 + 1)
         qo_start = gl.load(p_work_info_set + work_idx * 8 + 2)
         qo_end = gl.load(p_work_info_set + work_idx * 8 + 3)
