@@ -22,6 +22,7 @@ struct mha_fwd_traits : public fmha_fwd_traits
                    bool has_dropout,
                    bool use_ext_asm,
                    int how_v3_bf16_cvt,
+                   bool is_qkv_fp8,
                    bool skip_min_seqlen_q)
         : fmha_fwd_traits{head_size_q,
                           head_size_v,
@@ -33,7 +34,7 @@ struct mha_fwd_traits : public fmha_fwd_traits
                           bias_type,
                           has_lse,
                           has_dropout,
-                          false, // do_fp8_static_quant
+                          is_qkv_fp8,
                           skip_min_seqlen_q},
           use_ext_asm(use_ext_asm),
           how_v3_bf16_cvt(how_v3_bf16_cvt)
@@ -78,6 +79,7 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      mask_enum mask_type,
                                                      bias_enum bias_type,
                                                      bool has_lse,
+                                                     bool is_qkv_fp8,
                                                      bool use_ext_asm,
                                                      int how_v3_bf16_cvt                = 1,
                                                      const void* seqstart_q_padding_ptr = nullptr,

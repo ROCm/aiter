@@ -21,6 +21,9 @@ def cmdGenFunc_mha_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -45,7 +48,9 @@ def cmdGenFunc_mha_fwd(
         md_name += "_bf16"
         filter += "bf16*"
     elif q.dtype == dtypes.fp8:
-        # only support bf16 out for fp8 input
+        # fp8 input requires bf16 output
+        if out is not None and out.dtype != dtypes.bf16:
+            raise NotImplementedError("only support bf16 out for fp8 input for now")
         md_name += "_fp8bf16"
         filter += "fp8bf16*"
     if bias is not None:
@@ -103,7 +108,8 @@ def common_mha_fwd_fake_tensors(
     seqlen_k = k.size(1)
 
     if out is not None:
-        assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
+        if q.dtype != dtypes.fp8:
+            assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
         assert out.device == q.device, "Output must be on the same device as inputs"
         assert out.stride(-1) == 1, "Output tensor must have contiguous last dimension"
         assert out.shape == (
@@ -151,6 +157,9 @@ def gen_mha_fwd_fake_tensors(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -180,6 +189,9 @@ def mha_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -251,6 +263,9 @@ def cmdGenFunc_mha_varlen_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
@@ -311,6 +326,7 @@ def cmdGenFunc_mha_varlen_fwd(
         else:
             md_name += "_dropout"
             filter_fwd += "_dropout*"
+        # TODO - squant and nsquant (wait for ck rename)
         if min_seqlen_q == 0:
             md_name += "_nskip"
             filter_fwd += "_nskip*"
@@ -404,6 +420,9 @@ def gen_mha_varlen_fwd_fake_tensor(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
@@ -468,6 +487,9 @@ def mha_varlen_fwd(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
@@ -1174,6 +1196,9 @@ def _flash_attn_forward(
     causal: bool,
     window_size_left: int,
     window_size_right: int,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
     return_lse: bool,
@@ -1248,6 +1273,9 @@ def _flash_attn_forward(
             causal,
             window_size_left,
             window_size_right,
+            q_descale,
+            k_descale,
+            v_descale,
             return_lse,
             return_softmax,
             cu_seqlens_q,
@@ -1663,6 +1691,9 @@ class FlashAttnFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=int(window_size[0]),
             window_size_right=int(window_size[1]),
+            q_descale=1.0,
+            k_descale=1.0,
+            v_descale=1.0,
             bias=bias,
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
@@ -1877,6 +1908,9 @@ def _flash_attn_varlen_forward(
     logits_soft_cap: float = 0.0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    q_descale: float = 1.0,
+    k_descale: float = 1.0,
+    v_descale: float = 1.0,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     return_lse: bool = False,
@@ -1976,6 +2010,9 @@ def _flash_attn_varlen_forward(
             causal,
             window_size_left,
             window_size_right,
+            q_descale,
+            k_descale,
+            v_descale,
             return_lse,
             return_softmax,
             out=out,
@@ -2240,6 +2277,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             logits_soft_cap=logits_soft_cap,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            q_descale=1.0,
+            k_descale=1.0,
+            v_descale=1.0,
             bias=bias,
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
@@ -2696,6 +2736,9 @@ def flash_attn_fp8_pertensor_func(
     q,
     k,
     v,
+    q_descale,
+    k_descale,
+    v_descale,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softmax_scale=None,
@@ -2718,6 +2761,9 @@ def flash_attn_fp8_pertensor_func(
         causal=causal,
         window_size_left=int(window_size[0]),
         window_size_right=int(window_size[1]),
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         bias=None,
         alibi_slopes=None,
         return_lse=False,
@@ -2731,6 +2777,9 @@ def flash_attn_varlen_fp8_pertensor_func(
     q,
     k,
     v,
+    q_descale,
+    k_descale,
+    v_descale,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -2767,6 +2816,9 @@ def flash_attn_varlen_fp8_pertensor_func(
         logits_soft_cap=logits_soft_cap,
         window_size_left=int(window_size[0]),
         window_size_right=int(window_size[1]),
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         bias=None,
         alibi_slopes=None,
         return_lse=False,
