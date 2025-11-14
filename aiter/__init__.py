@@ -76,3 +76,5 @@ from .ops.gradlib import *
 from .ops.trans_ragged_layout import *
 from .ops.sample import *
 from . import mla
+from .ops.prefill_sparge_attention import *
+from .ops.jenga_sparse_attention import *

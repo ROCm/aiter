@@ -1220,3 +1220,88 @@
     pybind11::implicitly_convertible<int, ActivationType>();
 #define GEMM_COMMON_PYBIND \
     m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
+
+#define PREFILL_SPARGE_ATTENTION_PYBIND            \
+    m.def("prefill_sparge_attention",              \
+    &prefill_sparge_attention,               \
+    "prefill_sparge_attention",              \
+    py::arg("TQ"),                    \
+    py::arg("TK"),                    \
+    py::arg("TV"),               \
+    py::arg("Tlut"),               \
+    py::arg("Tvalid_block_num"),                   \
+    py::arg("out"),         \
+    py::arg("bias")   = std::nullopt, \
+    py::arg("lse")   = std::nullopt, \
+    py::arg("seqstart_q")   = std::nullopt, \
+    py::arg("seqstart_k")   = std::nullopt, \
+    py::arg("bias_type") = 0,            \
+    py::arg("batch") = 0,            \
+    py::arg("nhead") = 0,            \
+    py::arg("nhead_k") = 0,            \
+    py::arg("seqlen_q") = 0,            \
+    py::arg("seqlen_k") = 0,            \
+    py::arg("hdim_q") = 0,            \
+    py::arg("hdim_v") = 0,            \
+    py::arg("pv_threshold") = 50.0,            \
+    py::arg("mode") = 0,            \
+    py::arg("i_perm") = true,            \
+    py::arg("o_perm") = true,            \
+    py::arg("max_seqlen_q") = 0,            \
+    py::arg("max_seqlen_k") = 0,      \
+    py::arg("is_causal") = true);
+
+#define JENGA_SPARSE_ATTENTION_PYBIND            \
+    m.def("jenga_sparse_attention",              \
+    &jenga_sparse_attention,               \
+    "jenga_sparse_attention",              \
+    py::arg("TQ"),                    \
+    py::arg("TK"),                    \
+    py::arg("TV"),               \
+    py::arg("Tblock_relation_onehot"),                   \
+    py::arg("out"),         \
+    py::arg("bias")   = std::nullopt, \
+    py::arg("lse")   = std::nullopt, \
+    py::arg("seqstart_q")   = std::nullopt, \
+    py::arg("seqstart_k")   = std::nullopt, \
+    py::arg("bias_type") = 0,            \
+    py::arg("batch") = 0,            \
+    py::arg("nhead") = 0,            \
+    py::arg("nhead_k") = 0,            \
+    py::arg("seqlen_q") = 0,            \
+    py::arg("seqlen_k") = 0,            \
+    py::arg("hdim_q") = 0,            \
+    py::arg("hdim_v") = 0,            \
+    py::arg("mode") = 0,            \
+    py::arg("i_perm") = true,            \
+    py::arg("o_perm") = true,            \
+    py::arg("max_seqlen_q") = 0,            \
+    py::arg("max_seqlen_k") = 0);
+
+#define VSA_SPARSE_ATTENTION_PYBIND            \
+    m.def("vsa_sparse_attention",              \
+    &vsa_sparse_attention,               \
+    "vsa_sparse_attention",              \
+    py::arg("TQ"),                    \
+    py::arg("TK"),                    \
+    py::arg("TV"),               \
+    py::arg("Tkv_block_idx"),                   \
+    py::arg("Tkv_blocks"),                   \
+    py::arg("out"),         \
+    py::arg("bias")   = std::nullopt, \
+    py::arg("lse")   = std::nullopt, \
+    py::arg("seqstart_q")   = std::nullopt, \
+    py::arg("seqstart_k")   = std::nullopt, \
+    py::arg("bias_type") = 0,            \
+    py::arg("batch") = 0,            \
+    py::arg("nhead") = 0,            \
+    py::arg("nhead_k") = 0,            \
+    py::arg("seqlen_q") = 0,            \
+    py::arg("seqlen_k") = 0,            \
+    py::arg("hdim_q") = 0,            \
+    py::arg("hdim_v") = 0,            \
+    py::arg("mode") = 0,            \
+    py::arg("i_perm") = true,            \
+    py::arg("o_perm") = true,            \
+    py::arg("max_seqlen_q") = 0,            \
+    py::arg("max_seqlen_k") = 0);
