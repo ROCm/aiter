@@ -605,7 +605,7 @@ def _attn_fwd(
     )
     out_offs = tl.cast(out_offs, gl.int32)
     out_mask = gl.full(
-        [BLOCK_M, BLOCK_DMODEL_POW2], 1, dtype=gl.int1, layout=out_layout
+        [BLOCK_M, BLOCK_DMODEL_POW2], True, dtype=gl.int1, layout=out_layout
     )
     if overflow_size > 0:
         out_mask = out_mask & (offs_out_m[:, None] < seqlen_q)
@@ -886,6 +886,8 @@ def _attn_fwd(
         # Convert back to natural units
         softmax_lse *= LN2
 
+        softmax_lse = gl.convert_layout(softmax_lse, blocked_lse)
+
         if IS_CAUSAL:
             # Zero out nans caused by -infs when doing causal
             lse_causal_mask = (start_m_idx + offs_lse_m) < causal_start_idx
@@ -893,7 +895,6 @@ def _attn_fwd(
 
         # If seqlen_q not multiple of BLOCK_M, we need to mask out the last few rows.
         # This is only true for the last M block. For others, overflow_size will be -ve
-        softmax_lse = gl.convert_layout(softmax_lse, blocked_lse)
         if overflow_size > 0:
             boundary = BLOCK_M - overflow_size
             lse_mask = offs_lse_m < boundary
