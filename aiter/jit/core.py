@@ -90,7 +90,7 @@ def update_config_files(file_path: str, merge_name: str):
 
             df_list.append(df)
         else:
-            print(f"path {i+1}: {path} (not exist)")
+            logger.info(f"path {i+1}: {path} (not exist)")
     merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
     ## get keys from untuned file to drop_duplicates
     untuned_name = (
@@ -135,7 +135,9 @@ def get_config_file(env_name, default_file, tuned_file_name):
         else:
             tuned_files = ":".join(str(p) for p in op_tuned_file_list)
             tuned_files = default_file + ":" + tuned_files
-            print(f"merge tuned file under model_configs/ and configs/ ", tuned_files)
+            logger.info(
+                f"merge tuned file under model_configs/ and configs/ {tuned_files}"
+            )
             config_file = update_config_files(tuned_files, tuned_file_name)
     else:
         config_file = update_config_files(config_env_file, tuned_file_name)
