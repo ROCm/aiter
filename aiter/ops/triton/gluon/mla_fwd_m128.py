@@ -32,6 +32,7 @@ def mla_core(
     lds_kv_nope_0,
     lds_kv_nope_1,
     lds_k_rope,
+    lds_p,
     mfma_layout_qk,
     mfma_layout_kv,
     sm_scale,
@@ -42,6 +43,7 @@ def mla_core(
     FIRST_ITER: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    TRANSFORM_P_VIA_LDS: gl.constexpr,
     kv_lora_rank: gl.constexpr,
     lds_layout_k: gl.constexpr,
     lds_layout_v: gl.constexpr,
@@ -132,6 +134,13 @@ def mla_core(
     else:
         row_sum_e = row_sum_e * rescale + gl.sum(p, 1)
 
+    # Transform P
+    if TRANSFORM_P_VIA_LDS:
+        lds_p.store(p.cast(lds_p.type.element_ty))
+        p = lds_p.load(layout=dot_p_layout)
+    else:
+        p = gl.convert_layout(p.cast(lds_kv_nope_0.type.element_ty), dot_p_layout)
+
     # Load V from LDS
     v_0 = lds_kv_nope_0.load(layout=dot_v_layout)
     v_1 = lds_kv_nope_1.load(layout=dot_v_layout)
@@ -146,7 +155,6 @@ def mla_core(
     if not FIRST_ITER:
         acc_0 *= rescale[:, None]
         acc_1 *= rescale[:, None]
-    p = gl.convert_layout(p.cast(v_0.dtype), dot_p_layout)
     acc_0 = gl.amd.cdna3.mfma(p, v_0, acc_0)
     acc_1 = gl.amd.cdna3.mfma(p, v_1, acc_1)
 
@@ -186,11 +194,12 @@ def kn_mla_fwd_fp8_m128_ps(
     BLOCK_K: gl.constexpr,
 ):
     # Not expected to be supported
-    assert same_kv == True
+    assert same_kv
 
     # Private configs
     Q_LOAD_LAYOUT_DOT: gl.constexpr = False
     TRANSFORM_Q_VIA_LDS: gl.constexpr = True and not Q_LOAD_LAYOUT_DOT
+    TRANSFORM_P_VIA_LDS: gl.constexpr = False
 
     """
     Const states
@@ -232,6 +241,9 @@ def kn_mla_fwd_fp8_m128_ps(
     )
     lds_layout_v: gl.constexpr = gl.SwizzledSharedLayout(
         vec=8, per_phase=1, max_phase=16, order=[0, 1]
+    )
+    lds_layout_p: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=8, per_phase=1, max_phase=16, order=[1, 0]
     )
 
     mfma_layout_qk: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -317,7 +329,7 @@ def kn_mla_fwd_fp8_m128_ps(
         qo_end = gl.load(p_work_info_set + work_idx * 8 + 3)
         kv_start = gl.load(p_work_info_set + work_idx * 8 + 4)
         kv_end = gl.load(p_work_info_set + work_idx * 8 + 5)
-        kv_offset = gl.load(p_work_info_set + work_idx * 8 + 6)
+        # kv_offset = gl.load(p_work_info_set + work_idx * 8 + 6)
 
         # Allocate ACCs and softmax states
         acc_0 = gl.zeros(
@@ -405,6 +417,12 @@ def kn_mla_fwd_fp8_m128_ps(
         lds_k_rope = gl.allocate_shared_memory(
             p_k_buffer.type.element_ty, [qk_rope_head_dim, BLOCK_N], layout=lds_layout_k
         )
+        if TRANSFORM_P_VIA_LDS:
+            lds_p = gl.allocate_shared_memory(
+                p_q.type.element_ty, [BLOCK_M, BLOCK_N], layout=lds_layout_p
+            )
+        else:
+            lds_p = None
 
         # Main Loop
         acc_0, acc_1, row_max, row_sum_e = mla_core(
@@ -423,6 +441,7 @@ def kn_mla_fwd_fp8_m128_ps(
             lds_kv_nope_0,
             lds_kv_nope_1,
             lds_k_rope,
+            lds_p,
             mfma_layout_qk,
             mfma_layout_qk,
             sm_scale,
@@ -433,6 +452,7 @@ def kn_mla_fwd_fp8_m128_ps(
             True,
             BLOCK_M,
             BLOCK_N,
+            TRANSFORM_P_VIA_LDS,
             kv_lora_rank,
             lds_layout_k,
             lds_layout_v,
@@ -454,6 +474,7 @@ def kn_mla_fwd_fp8_m128_ps(
                 lds_kv_nope_0,
                 lds_kv_nope_1,
                 lds_k_rope,
+                lds_p,
                 mfma_layout_qk,
                 mfma_layout_qk,
                 sm_scale,
@@ -464,6 +485,7 @@ def kn_mla_fwd_fp8_m128_ps(
                 False,
                 BLOCK_M,
                 BLOCK_N,
+                TRANSFORM_P_VIA_LDS,
                 kv_lora_rank,
                 lds_layout_k,
                 lds_layout_v,
@@ -473,6 +495,8 @@ def kn_mla_fwd_fp8_m128_ps(
         lds_kv_nope_0._keep_alive()
         lds_kv_nope_1._keep_alive()
         lds_k_rope._keep_alive()
+        if TRANSFORM_P_VIA_LDS:
+            lds_p._keep_alive()
 
         # Output results
         acc = gl.join(acc_0, acc_1)
@@ -563,7 +587,7 @@ def mla_fwd_m128(
         config["BLOCK_N"] = 32
         config["BLOCK_K"] = 16
 
-        compiled_kn = kn_mla_fwd_fp8_m128_ps[grid](
+        kn_mla_fwd_fp8_m128_ps[grid](
             q,
             kv_buffer,
             kv_buffer,
