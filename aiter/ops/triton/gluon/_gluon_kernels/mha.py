@@ -123,7 +123,6 @@ def _attn_fwd_inner(
     q,
     q_pe,
     k_base_ptr,
-    k_pe_base_ptr,
     v_base_ptr,
     stride_kk,
     stride_kn,
@@ -192,12 +191,12 @@ def _attn_fwd_inner(
         )
         if HAS_PE:
             k_pe = _load_fn(
-                k_pe_base_ptr,
+                k_base_ptr,
                 OFFS_KPE_D,
                 OFFS_K_N,
                 stride_kk,
                 stride_kn,
-                None,
+                None,  # if HAS_PE, BLOCK_DMODEL == BLOCK_DMODEL_POW2 and BLOCK_DMODEL_PE is a power of 2
                 None if not MASK_STEPS else seqlen_k - start_n,
             )
 
@@ -279,8 +278,6 @@ def _attn_fwd_inner(
 
         # Update pointers for k and v
         k_base_ptr += BLOCK_N * stride_kn
-        if HAS_PE:
-            k_pe_base_ptr += BLOCK_N * stride_kn
         v_base_ptr += BLOCK_N * stride_vn
 
     return acc, l_i, m_i
@@ -696,13 +693,6 @@ def _attn_fwd(
     # Create initial k offsets
     k_offs = off_z * stride_kz + off_k_head * stride_kh + cu_seqlens_k_start * stride_kn
     k_base_ptr = k_ptr + k_offs
-    if HAS_PE:
-        k_pe_offs = (
-            off_z * stride_kz + off_k_head * stride_kh + cu_seqlens_k_start * stride_kn
-        )
-        k_pe_base_ptr = k_base_ptr + k_pe_offs
-    else:
-        k_pe_base_ptr = None
 
     # Create new base pointer for v
     v_offs = off_z * stride_vz + off_k_head * stride_vh + cu_seqlens_k_start * stride_vn
@@ -770,7 +760,6 @@ def _attn_fwd(
             q,
             q_pe,
             k_base_ptr,
-            k_pe_base_ptr,
             v_base_ptr,
             stride_kk,
             stride_kn,
@@ -816,8 +805,6 @@ def _attn_fwd(
 
         # Update pointers if we computed for any full blocks
         k_base_ptr += n_full_blocks * BLOCK_N * stride_kn
-        if HAS_PE:
-            k_pe_base_ptr += n_full_blocks * BLOCK_N * stride_kn
         v_base_ptr += n_full_blocks * BLOCK_N * stride_vn
 
         acc, l_i, m_i = _attn_fwd_inner(
@@ -827,7 +814,6 @@ def _attn_fwd(
             q,
             q_pe,
             k_base_ptr,
-            k_pe_base_ptr,
             v_base_ptr,
             stride_kk,
             stride_kn,
