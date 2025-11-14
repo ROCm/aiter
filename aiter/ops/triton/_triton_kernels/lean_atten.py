@@ -32,8 +32,7 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 @functools.lru_cache(maxsize=1024)
-def _get_config(
-):
+def _get_config():
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json"
