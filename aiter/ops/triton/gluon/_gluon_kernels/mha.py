@@ -281,7 +281,7 @@ def _attn_fwd_inner(
         k_base_ptr += BLOCK_N * stride_kn
         if HAS_PE:
             k_pe_base_ptr += BLOCK_N * stride_kn
-        v_base_ptr += BLOCK_N * stride_vk
+        v_base_ptr += BLOCK_N * stride_vn
 
     return acc, l_i, m_i
 
