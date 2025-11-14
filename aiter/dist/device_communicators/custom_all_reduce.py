@@ -344,6 +344,7 @@ class CustomAllreduce:
     def fused_ar_rms(
         self,
         inp: torch.Tensor,
+        res_inp: torch.Tensor,
         *,
         res_out: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
@@ -358,6 +359,7 @@ class CustomAllreduce:
         ops.fused_allreduce_rmsnorm(
             self._ptr,
             inp,
+            res_inp,
             res_out,
             out,
             w,
@@ -367,18 +369,26 @@ class CustomAllreduce:
         return res_out, out
 
     def custom_fused_ar_rms(
-        self, input: torch.Tensor, weight: torch.Tensor, eps: float
+        self,
+        input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.fused_ar_rms(input, w=weight, eps=eps, registered=True)
+                return self.fused_ar_rms(
+                    input, residual_inp, w=weight, eps=eps, registered=True
+                )
             else:
                 return torch.zeros_like(input), torch.zeros_like(input)
         else:
-            return self.fused_ar_rms(input, w=weight, eps=eps, registered=False)
+            return self.fused_ar_rms(
+                input, residual_inp, w=weight, eps=eps, registered=False
+            )
 
     def close(self):
         if not self.disabled and self._ptr:
