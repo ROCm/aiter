@@ -33,7 +33,7 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--metric",
         type=str,
-        choices=["time", "throughput", "bandwidth"],
+        choices=["all", "time", "throughput", "bandwidth", "ai"],
         default="throughput",
         help="metric to plot",
     )

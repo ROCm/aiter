@@ -50,21 +50,44 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
         ylabel = "Throughput (TFLOPS)"
     elif args.metric == "bandwidth":
         ylabel = "Bandwidth (GB/s)"
+    elif args.metric == "ai":
+        ylabel = "Arithmetic Intensity (FLOPs/Byte)"
+    elif args.metric == "all":
+        ylabel = "Performance"
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
+    line_vals_to_names = {
+        "time": "Time (ms)",
+        "throughput": "Throughput (TFLOPS)",
+        "bandwidth": "Bandwidth (GB/s)",
+        "ai": "Arithmetic Intensity (FLOPs/Byte)",
+    }
+    
+    if args.metric == "all":
+        line_vals = ["time", "throughput", "bandwidth", "ai"]
+        line_names = [line_vals_to_names[lv] for lv in line_vals]
+    else:
+        line_vals = [args.metric]
+        line_names = [line_vals_to_names[args.metric]]
+
+    
+    mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
         x_log=True,
         y_log=True,
-        line_arg="provider",
-        line_vals=["Triton"],
-        line_names=["Triton"],
-        styles=[("green", "-")],
+        line_arg="metric",
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=[
+            (mpl_colors[i], "-") for i in range(len(line_names))
+        ],
         ylabel=ylabel,
         plot_name=plot_name,
-        args={"metric": args.metric},
+        args={},
     )
     return benchmark
 
@@ -96,23 +119,42 @@ def get_model_benchmark_object(
         ylabel = "Throughput (TFLOPS)"
     elif args.metric == "bandwidth":
         ylabel = "Bandwidth (GB/s)"
+    elif args.metric == "ai":
+        ylabel = "Arithmetic Intensity (FLOPs/Byte)"
+    elif args.metric == "all":
+        assert not (args.fc1 and args.fc2), "Cannot plot all metrics for both layers simultaneously. Choose only one layer or one metric."
+        ylabel = "Performance"
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
-    line_names = []
-    if args.fc1:
-        line_names.append("fc1")
-    if args.fc2:
-        line_names.append("fc2")
-    line_vals = line_names
+    line_vals_to_names = {
+        "time": "Time (ms)",
+        "throughput": "Throughput (TFLOPS)",
+        "bandwidth": "Bandwidth (GB/s)",
+        "ai": "Arithmetic Intensity (FLOPs/Byte)",
+    }
+    
+    if args.metric == "all":
+        line_vals = ["time", "throughput", "bandwidth", "ai"]
+        line_names = [line_vals_to_names[lv] for lv in line_vals]
+    else:
+        line_vals = [args.metric]
+        line_names = [line_vals_to_names[args.metric]]
+
+    if args.fc1 and args.fc2:
+        line_names = ["fc1", "fc2"]
+        line_vals = line_names
 
     mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+   
+    benchmark_args = {"metric": args.metric} if (args.fc1 and args.fc2) else {"layer": "fc1" if args.fc1 else "fc2"}
+   
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
         x_log=True,
         y_log=True,
-        line_arg="layer",
+        line_arg="layer" if (args.fc1 and args.fc2) else "metric",
         line_vals=line_vals,
         line_names=line_names,
         styles=[
@@ -120,7 +162,7 @@ def get_model_benchmark_object(
         ],  # match line names to colors
         ylabel=ylabel,
         plot_name=plot_name,
-        args={"metric": args.metric},
+        args=benchmark_args,
     )
     return benchmark
 
