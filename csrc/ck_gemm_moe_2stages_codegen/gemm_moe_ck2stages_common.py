@@ -329,8 +329,8 @@ def get_gemm1_kernels_list(
     QuantType: str,
     ActOP: str,
     MulRoutedWeight: bool,
+    preshuffle: bool,
 ) -> list:
-    global bns_or_preslf
     arch = get_gfx()
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
         if arch == "gfx950":
@@ -356,7 +356,7 @@ def get_gemm1_kernels_list(
     ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
-        if int(os.getenv("AITER_MXFP4_MOE_SF", 0)) == 1:
+        if preshuffle:
             tag = "a4w4"
         else:
             tag = "a4w4_bns"
@@ -376,7 +376,7 @@ def get_gemm1_kernels_list(
             kernel.CDEElementOp = "MulABScaleWint4"
         elif tag == "a8w8blkscale":
             kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4":
+        elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScale"
         elif tag == "a16w16":
             if MulRoutedWeight:
@@ -393,8 +393,8 @@ def get_gemm2_kernels_list(
     Nswizzle: bool,
     QuantType: str,
     MulRoutedWeight: bool,
+    preshuffle: bool,
 ) -> list:
-    global bns_or_preslf
     arch = get_gfx()
 
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
@@ -421,7 +421,7 @@ def get_gemm2_kernels_list(
     ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
-        if int(os.getenv("AITER_MXFP4_MOE_SF", 0)) == 1:
+        if preshuffle:
             tag = "a4w4"
         else:
             tag = "a4w4_bns"
@@ -440,7 +440,7 @@ def get_gemm2_kernels_list(
             kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
         elif tag == "a8w8blkscale":
             kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4":
+        elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScaleExpertWeight"
         elif tag == "a16w16":
             if MulRoutedWeight:
