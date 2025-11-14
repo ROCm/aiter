@@ -443,13 +443,34 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
                     + current_page_offset
                     + kv_scale_column_offsets
                 )
+
+                # Use BlockedLayout for vectorized scale loading
+                # Each thread loads 4 consecutive elements (16 bytes with fp32)
+                scale_load_layout: gl.constexpr = gl.BlockedLayout(
+                    size_per_thread=[4],
+                    threads_per_warp=[64],
+                    warps_per_cta=[4],
+                    order=[0],
+                )
+                key_scale_offsets_blocked = gl.convert_layout(
+                    key_scale_offsets, layout=scale_load_layout
+                )
+
                 # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
                 gl.amd.cdna3.sched_group_barrier(0x020, 2, 0)  # 2 VMEM reads
-                key_scale_value = gl.amd.cdna3.buffer_load(
-                    ptr=key_scale, offsets=key_scale_offsets
+                key_scale_value_blocked = gl.amd.cdna3.buffer_load(
+                    ptr=key_scale, offsets=key_scale_offsets_blocked, cache=".ca"
                 )
-                value_scale_value = gl.amd.cdna3.buffer_load(
-                    ptr=value_scale, offsets=key_scale_offsets
+                value_scale_value_blocked = gl.amd.cdna3.buffer_load(
+                    ptr=value_scale, offsets=key_scale_offsets_blocked, cache=".ca"
+                )
+
+                # Convert to required distributed layout for computation
+                key_scale_value = gl.convert_layout(
+                    key_scale_value_blocked, layout=gl.SliceLayout(0, qk_linear_layout)
+                )
+                value_scale_value = gl.convert_layout(
+                    value_scale_value_blocked, layout=gl.SliceLayout(0, qk_linear_layout)
                 )
 
         # Reshape key block to [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE] (overlaps with scale loads)
@@ -1098,16 +1119,34 @@ def paged_attention_decode_v2_gluon_fp8(
                 key_scale_offsets = gl.reshape(
                     key_scale_offsets, [KV_COMPUTE_BLOCK_SIZE]
                 )
-                key_scale_offsets = gl.convert_layout(
-                    key_scale_offsets, layout=gl.SliceLayout(0, qk_linear_layout)
+
+                # Use BlockedLayout for vectorized scale loading
+                # Each thread loads 4 consecutive elements (16 bytes with fp32)
+                scale_load_layout: gl.constexpr = gl.BlockedLayout(
+                    size_per_thread=[1],
+                    threads_per_warp=[64],
+                    warps_per_cta=[4],
+                    order=[0],
                 )
+                key_scale_offsets_blocked = gl.convert_layout(
+                    key_scale_offsets, layout=scale_load_layout
+                )
+
                 # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
                 gl.amd.cdna3.sched_group_barrier(0x020, 2, 0)  # 2 VMEM reads
-                key_scale_value = gl.amd.cdna3.buffer_load(
-                    ptr=key_scale, offsets=key_scale_offsets
+                key_scale_value_blocked = gl.amd.cdna3.buffer_load(
+                    ptr=key_scale, offsets=key_scale_offsets_blocked
                 )
-                value_scale_value = gl.amd.cdna3.buffer_load(
-                    ptr=value_scale, offsets=key_scale_offsets
+                value_scale_value_blocked = gl.amd.cdna3.buffer_load(
+                    ptr=value_scale, offsets=key_scale_offsets_blocked
+                )
+
+                # Convert to required distributed layout for computation
+                key_scale_value = gl.convert_layout(
+                    key_scale_value_blocked, layout=gl.SliceLayout(0, qk_linear_layout)
+                )
+                value_scale_value = gl.convert_layout(
+                    value_scale_value_blocked, layout=gl.SliceLayout(0, qk_linear_layout)
                 )
 
         # Reshape key tensor for matrix multiplication (overlaps with scale loads)
@@ -1243,7 +1282,7 @@ def paged_attention_decode_v2_gluon_fp8(
 
         # ==================== VALUE ACCUMULATION ====================
         # Handle value quantization scaling for FP8
-        if value_tensor.dtype.is_fp8():
+        if KV_QUANT_MODE >= 0:
             if KV_QUANT_MODE == 1:
                 # Per-token quantization scaling
                 # Create mask for valid tokens
