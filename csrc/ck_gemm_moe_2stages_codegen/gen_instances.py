@@ -45,7 +45,7 @@ gemm1_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage1_heuristic_dispatch(int block_m, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool b_preshuffle=true)
+MoeKernel moe_stage1_heuristic_dispatch(int block_m, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage)
 {{
 """
 
@@ -54,7 +54,7 @@ gemm2_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool b_preshuffle=true)
+MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage)
 {{
 """
 
@@ -177,8 +177,7 @@ A4W4_gemm1_heuristic_dispatch = """
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant
-        && b_preshuffle == true)
+        && {Quant} == quant)
     {{
         if (block_m == 32)
         {{
@@ -369,8 +368,7 @@ A4W4_gemm2_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant
-        && b_preshuffle == true)
+        && {Quant} == quant)
     {{
         if (inter_dim <= 256)
         {{
@@ -591,6 +589,7 @@ class ck_moe_2stage_gemm_codegen:
         quant_type,
         activation,
         mul_routed_weight_stage,
+        preshuffle,
     ):
         self.working_path = working_path
         self.a_dtype = a_dtype.upper()
@@ -600,6 +599,7 @@ class ck_moe_2stage_gemm_codegen:
         self.activation = activation
         self.mul_routed_weight_stage = mul_routed_weight_stage
         self.nswizzle = False
+        self.preshuffle = preshuffle
 
     def generate_instance_and_lookUpTable(self):
         _, gemm1_kernel_list = get_gemm1_kernels_list(
@@ -610,6 +610,7 @@ class ck_moe_2stage_gemm_codegen:
             self.quant_type,
             self.activation,
             self.mul_routed_weight_stage == 1,
+            self.preshuffle,
         )
         tag, gemm2_kernel_list = get_gemm2_kernels_list(
             self.a_dtype,
@@ -618,6 +619,7 @@ class ck_moe_2stage_gemm_codegen:
             self.nswizzle,
             self.quant_type,
             self.mul_routed_weight_stage == 2,
+            self.preshuffle,
         )
         kernel_list = list(gemm1_kernel_list.values()) + list(
             gemm2_kernel_list.values()
@@ -625,7 +627,6 @@ class ck_moe_2stage_gemm_codegen:
 
         f_lookUpTable = os.path.join(self.working_path, "gemm_moe_ck2stages_lookup.h")
 
-        # breakpoint()
         with open(f_lookUpTable, "a") as f_lookup:
             for kernel in kernel_list:
                 ## generate instance
@@ -816,6 +817,13 @@ if __name__ == "__main__":
         help="the path where all the blobs are going to be generated",
     )
 
+    parser.add_argument(
+        "-p",
+        "--preshuffle",
+        action="store_true",
+        help="enable pre-shuffle weight mode",
+    )
+
     args = parser.parse_args()
     args.quant_type = (
         "per_1x128" if args.quant_type == "per_128x128" else args.quant_type
@@ -838,8 +846,21 @@ if __name__ == "__main__":
         acts = ["silu", "gelu"]
         routed_weight_l = [1, 2]
         general_quant_l = ["per_tensor", "per_token"]
-        for b_dtype, c_dtype, act, routed_weight, quant in itertools.product(
-            b_quant_dtypes, c_dtypes, acts, routed_weight_l, general_quant_l
+        preshuffle_mode_l = [False]
+        for (
+            b_dtype,
+            c_dtype,
+            act,
+            routed_weight,
+            quant,
+            preshuffle_mode,
+        ) in itertools.product(
+            b_quant_dtypes,
+            c_dtypes,
+            acts,
+            routed_weight_l,
+            general_quant_l,
+            preshuffle_mode_l,
         ):
             a_dtype = b_dtype if b_dtype != "i4" else "f8"
             quant = quant if b_dtype != "fp4x2" else "per_1x32"
@@ -851,6 +872,7 @@ if __name__ == "__main__":
                 quant_dict[quant],
                 act,
                 routed_weight,
+                preshuffle_mode,
             )
             codegen.generate_instance_and_lookUpTable()
 
@@ -867,6 +889,7 @@ if __name__ == "__main__":
                 quant_dict[quant],
                 act,
                 routed_weight,
+                preshuffle_mode,
             )
             codegen.generate_instance_and_lookUpTable()
 
@@ -890,6 +913,7 @@ if __name__ == "__main__":
                 quant_dict["no"],
                 act,
                 routed_weight,
+                preshuffle_mode,
             )
             codegen.generate_instance_and_lookUpTable()
     else:
@@ -903,6 +927,7 @@ if __name__ == "__main__":
                 quant_dict[args.quant_type],
                 args.activation,
                 args.mul_routed_weight_stage,
+                args.preshuffle,
             )
             codegen.generate_instance_and_lookUpTable()
 

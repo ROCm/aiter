@@ -22,7 +22,9 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
     x_ = x_.permute(0, 1, 3, 4, 2, 5)
     x_ = x_.contiguous()
     x_ = x_.view(*x.shape)
-    return x_.view(x_type)
+    x_ = x_.view(x_type)
+    x_.is_shuffled = True
+    return x_
 
 
 def shuffle_weight_NK(
