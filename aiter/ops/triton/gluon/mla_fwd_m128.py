@@ -154,81 +154,6 @@ def mla_core(
 
 
 @gluon.jit
-def kn_mla_fwd_fp8_m64_ps(
-    p_q,
-    p_k_buffer,
-    p_v_buffer,
-    p_kv_indptr,
-    p_kv_indices,
-    p_final_out,
-    p_temp_out,
-    p_temp_lse,
-    p_work_indptr,
-    p_work_info_set,
-    sm_scale,
-    max_seqlen_q,
-    stride_q_bs,
-    stride_q_h,
-    stride_k_bs,
-    stride_v_bs,
-    stride_final_out_bs,
-    stride_final_out_h,
-    stride_temp_out_bs,
-    stride_temp_out_h,
-    stride_temp_lse_bs,
-    stride_temp_lse_h,
-    kv_lora_rank: gl.constexpr,
-    qk_rope_head_dim: gl.constexpr,
-    num_head_q: gl.constexpr,
-    same_kv: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    BLOCK_K: gl.constexpr,
-):
-    # Not expected to be supported
-    assert same_kv == True
-
-    cu_idx = gl.program_id(0)
-
-    work_start_idx = gl.load(p_work_indptr + cu_idx)
-    work_end_idx = gl.load(p_work_indptr + cu_idx + 1)
-
-    layout_q: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 4],
-        threads_per_warp=[16, 4],
-        warps_per_cta=[4, 1],
-        order=[1, 0],
-    )
-
-    q_row_idx = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, layout_q))
-    q_col_idx = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, layout_q))
-    q_local_offsets = q_row_idx[:, None] * stride_q_h + q_col_idx[None, :]
-
-    for work_idx in range(work_start_idx, work_end_idx):
-        """
-        Each work info contains 8 DWs
-        """
-        batch_idx = gl.load(p_work_info_set + work_idx * 8)
-        partial_qo_loc = gl.load(p_work_info_set + work_idx * 8 + 1)
-        qo_start = gl.load(p_work_info_set + work_idx * 8 + 2)
-        qo_end = gl.load(p_work_info_set + work_idx * 8 + 3)
-        kv_start = gl.load(p_work_info_set + work_idx * 8 + 4)
-        kv_end = gl.load(p_work_info_set + work_idx * 8 + 5)
-        kv_offset = gl.load(p_work_info_set + work_idx * 8 + 6)
-
-        q_row_idx = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, layout_q))
-        q_col_idx = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, layout_q))
-        q_offsets = qo_start * stride_q_bs + q_local_offsets
-        q_mask = (qo_start * num_head_q + q_row_idx) < (qo_end * num_head_q)
-
-        q_data = gl.amd.cdna3.buffer_load(
-            ptr=p_q,
-            offsets=q_offsets,
-            mask=q_mask[:, None],
-        )
-
-
-@gluon.jit
 def kn_mla_fwd_fp8_m128_ps(
     p_q,
     p_k_buffer,
@@ -615,6 +540,8 @@ def mla_fwd_m128(
     num_head_q = q.shape[1]
     qk_rope_head_dim = q.shape[-1] - kv_lora_rank
 
+    assert (max_seqlen_q * num_head_q) % 128 == 0
+
     grid = (get_cu_num(),)
 
     config = {}
@@ -627,73 +554,37 @@ def mla_fwd_m128(
     config["qk_rope_head_dim"] = qk_rope_head_dim
 
     if q.dtype == dtypes.fp8:
-        if (max_seqlen_q * num_head_q) % 128 == 0:
-            # Gluon configs
-            config["num_stages"] = 1
-            config["num_warps"] = 8
-            # ROCM configs
-            config["waves_per_eu"] = 1
-            config["BLOCK_M"] = 128
-            config["BLOCK_N"] = 32
-            config["BLOCK_K"] = 16
+        # Gluon configs
+        config["num_stages"] = 1
+        config["num_warps"] = 8
+        # ROCM configs
+        config["waves_per_eu"] = 1
+        config["BLOCK_M"] = 128
+        config["BLOCK_N"] = 32
+        config["BLOCK_K"] = 16
 
-            compiled_kn = kn_mla_fwd_fp8_m128_ps[grid](
-                q,
-                kv_buffer,
-                kv_buffer,
-                kv_indptr,
-                kv_indices,
-                final_out,
-                tmp_out,
-                tmp_lse,
-                work_indptr,
-                work_info_set,
-                sm_scale,
-                max_seqlen_q,
-                q.stride(0),
-                q.stride(1),
-                kv_buffer.stride(0),
-                kv_buffer.stride(0),
-                final_out.stride(0),
-                final_out.stride(1),
-                tmp_out.stride(-3),
-                tmp_out.stride(-2),
-                tmp_lse.stride(-3),
-                tmp_lse.stride(-2),
-                **config,
-            )
-        elif (max_seqlen_q * num_head_q) % 64 == 0:
-            # Gluon configs
-            config["num_stages"] = 1
-            config["num_warps"] = 4
-            # ROCM configs
-            config["waves_per_eu"] = 2
-            config["BLOCK_M"] = 64
-            config["BLOCK_N"] = 16
-            config["BLOCK_K"] = 16
-
-            kn_mla_fwd_fp8_m64_ps[grid](
-                q,
-                kv_buffer,
-                kv_buffer,
-                kv_indptr,
-                kv_indices,
-                final_out,
-                tmp_out,
-                tmp_lse,
-                work_indptr,
-                work_info_set,
-                sm_scale,
-                max_seqlen_q,
-                q.stride(0),
-                q.stride(1),
-                kv_buffer.stride(0),
-                kv_buffer.stride(0),
-                final_out.stride(0),
-                final_out.stride(1),
-                tmp_out.stride(-3),
-                tmp_out.stride(-2),
-                tmp_lse.stride(-3),
-                tmp_lse.stride(-2),
-                **config,
-            )
+        compiled_kn = kn_mla_fwd_fp8_m128_ps[grid](
+            q,
+            kv_buffer,
+            kv_buffer,
+            kv_indptr,
+            kv_indices,
+            final_out,
+            tmp_out,
+            tmp_lse,
+            work_indptr,
+            work_info_set,
+            sm_scale,
+            max_seqlen_q,
+            q.stride(0),
+            q.stride(1),
+            kv_buffer.stride(0),
+            kv_buffer.stride(0),
+            final_out.stride(0),
+            final_out.stride(1),
+            tmp_out.stride(-3),
+            tmp_out.stride(-2),
+            tmp_lse.stride(-3),
+            tmp_lse.stride(-2),
+            **config,
+        )
