@@ -22,6 +22,7 @@ def compile(
     logits_soft_cap_enabled: bool,
     partition_size: int = 256,
     mtp: int = 1,
+    sliding_window_enabled: bool = False,
     folder: str = None,
 ):
     return compile_template_op(
@@ -47,6 +48,7 @@ def compile(
         logits_soft_cap_enabled=logits_soft_cap_enabled,
         partition_size=partition_size,
         mtp=mtp,
+        sliding_window_enabled=sliding_window_enabled,
         folder=folder,
     )
 
@@ -72,6 +74,7 @@ def paged_attention_v1(
     partition_size: int = 256,
     mtp: int = 1,
     q_scale=None,
+    sliding_window: int = 0,
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
@@ -124,6 +127,7 @@ def paged_attention_v1(
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
     logits_soft_cap_enabled = logits_soft_cap > 0
     alibi_enabled = alibi_slopes is not None
+    sliding_window_enabled = sliding_window > 0
     func = compile(
         gqa_ratio,
         head_size,
@@ -137,6 +141,7 @@ def paged_attention_v1(
         logits_soft_cap_enabled,
         partition_size,
         mtp,
+        sliding_window_enabled=sliding_window_enabled,
     )
 
     alibi_slopes_ptr = (
@@ -230,6 +235,7 @@ def paged_attention_v1(
         kv_block_stride,
         kv_head_stride,
         kv_seq_stride,
+        sliding_window,
         stream,
     )
     return out

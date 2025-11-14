@@ -26,6 +26,7 @@ void {{func_name}}(void* out_ptr,
         const int kv_block_stride,
         const int kv_head_stride,
         const int kv_seq_stride,
+        const int sliding_window,
         void* stream);
 }
                         
@@ -53,6 +54,7 @@ void {{func_name}}(void* out_ptr,
         const int kv_block_stride,
         const int kv_head_stride,
         const int kv_seq_stride,
+        const int sliding_window,
         void* stream)
 {
     constexpr int head_size = {{head_size}};
@@ -86,7 +88,9 @@ void {{func_name}}(void* out_ptr,
                                             NTHR,                    
                                             {{"true" if alibi_enabled else "false"}},           
                                             gqa_ratio,
-                                            {{mtp}}>               
+                                            {{mtp}},
+                                            decltype(variant),
+                                            {{"true" if sliding_window_enabled else "false"}}>               
     <<<grid, block, 0, reinterpret_cast<hipStream_t>(stream)>>>(reinterpret_cast<{{dtype}}*>(query_ptr),                      
                                     reinterpret_cast<{{kv_dtype}}*>(key_cache_ptr),                  
                                     reinterpret_cast<{{kv_dtype}}*>(value_cache_ptr),                
@@ -108,7 +112,8 @@ void {{func_name}}(void* out_ptr,
                                     q_scale_ptr,                    
                                     k_scale_ptr,                    
                                     v_scale_ptr,                    
-                                    &variant);
+                                    &variant,
+                                    sliding_window);
     
     dim3 reduce_grid(num_heads, num_seqs, {{mtp}});
     dim3 reduce_block(head_size);
