@@ -187,7 +187,7 @@ class TunerCommon:
             else:
                 print(f"path {i+1}: {path} (not exist)")
         merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
-        ##drop_duplicates   
+        ##drop_duplicates
         merge_df = (
                 merge_df.sort_values("us")
                 .drop_duplicates(subset=self.keys, keep="first")
@@ -360,16 +360,16 @@ class TunerCommon:
         )
         logger.info("Successfully tuned shapes:")
         if not self.success.empty:
-            print(self.success)
+            print(self.success, flush=True)
         logger.info("Failed shapes:")
-        print(self.failed)
+        print(self.failed, flush=True)
 
         tunedf_subset = tunedf[self.untunedf.columns].astype(self.untunedf.dtypes)
         mask = self.untunedf.apply(tuple, axis=1).isin(
             tunedf_subset.apply(tuple, axis=1)
         )
         self.remain_untuned = self.untunedf[~mask]
-        
+
         if not self.remain_untuned.empty:
             logger.info("untuned shapes:")
             print(self.remain_untuned)

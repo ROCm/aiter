@@ -29,6 +29,7 @@ from aiter.jit.utils.chip_info import get_gfx
 import torch.nn.functional as F
 from einops import rearrange
 from aiter.utility.base_tuner import TunerCommon
+from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 
@@ -148,7 +149,7 @@ class FmoeTuner(TunerCommon):
             out,
             topk,
             kernelName,
-            fp4_utils.e8m0_shuffle(w1_scale),
+            w1_scale,
             a1_scale,
             blockM,
             sorted_weights,
@@ -200,9 +201,7 @@ class FmoeTuner(TunerCommon):
             out,
             topk,
             kernelName,
-            fp4_utils.e8m0_shuffle(
-                w2_scale
-            ),  # e8m0_shuffle will do nothing if it's a fp32
+            w2_scale,
             a2_scale,
             blockM,
             sorted_weights,
@@ -427,10 +426,12 @@ class FmoeTuner(TunerCommon):
     ):
         torch.manual_seed(0)
         input = torch.randn((token, model_dim), dtype=dtype) / 10
+        score = torch.randn((token, expert), dtype=dtype)
         if use_g1u1:
             w1 = torch.randn((expert, inter_dim * 2, model_dim), dtype=dtype) / 10
         else:
             w1 = torch.randn((expert, inter_dim, model_dim), dtype=dtype) / 10
+        torch.manual_seed(0)
         w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype)
         w1_qt, w1_scale = FmoeTuner.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
         w2_qt, w2_scale = FmoeTuner.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
@@ -440,7 +441,7 @@ class FmoeTuner(TunerCommon):
         else:
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-        score = torch.randn((token, expert), dtype=dtype)
+
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
         if q_type == QuantType.per_1x128:
             a1_qt, a1_scale = aiter.pertoken_quant(
@@ -448,13 +449,24 @@ class FmoeTuner(TunerCommon):
             )
             a1_qt = a1_qt.view(token, model_dim)
             a1_scale = a1_scale.squeeze(-1)
+        elif (
+            q_type == aiter.QuantType.per_1x32
+            and (q_dtype_a in [dtypes.bf16, dtypes.fp16])
+            and q_dtype_w == dtypes.fp4x2
+        ):  # a16w4
+            a1_qt = input.to(dtype)
+            a1_scale = None
         else:
             torch_quant = aiter.get_torch_quant(q_type)
             a1_qt, a1_scale = torch_quant(input, quant_dtype=q_dtype_a)
         del w1, w2, score
+        if q_dtype_w is not dtypes.fp4x2:
+            w1_qt_shffle = shuffle_weight(w1_qt, (16, 16))
+            w2_qt_shffle = shuffle_weight(w2_qt, (16, 16))
+        else:
+            w1_qt_shffle = w1_qt
+            w2_qt_shffle = w2_qt
 
-        w1_qt_shffle = shuffle_weight(w1_qt, (16, 16))
-        w2_qt_shffle = shuffle_weight(w2_qt, (16, 16))
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
             moe_sorting(topk_ids, topk_weights, expert, model_dim, dtype, blockM)
         )
@@ -620,12 +632,14 @@ class FmoeTuner(TunerCommon):
         else:
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
+        w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
+        w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
         if stage == 1:
             if not doweight_stage1:
                 sorted_weights = None
             if q_type == QuantType.per_1x32:
                 a1_scale_fp4_sort = moe_mxfp4_sort(
-                    a1_scale[: token * topk, :].view(token, topk, -1),
+                    a1_scale,#a1_scale[: token * topk, :].view(token, topk, -1),
                     sorted_ids=sorted_ids,
                     num_valid_ids=num_valid_ids,
                     token_num=token,
@@ -650,6 +664,7 @@ class FmoeTuner(TunerCommon):
                 topk_weights, #12
                 topk_ids, #13
                 a1_scale_fp4_sort, #14
+                w1_scale_aiter,
             )
         elif stage == 2:
             ref1 = FmoeTuner.run_torch_moe_stage1(
@@ -706,6 +721,7 @@ class FmoeTuner(TunerCommon):
                     topk_weights,  #12
                     topk_ids,  #13
                     a2_scale_mxfp4_sort,  #14
+                    w2_scale_aiter,
                   )
 
     @staticmethod
@@ -1561,7 +1577,7 @@ class FmoeTuner(TunerCommon):
                             ),
                             FmoeTuner.ck_moe_stage1_fwd_out,  # func
                             (
-                                [0, 1, 2, 5, 6, 7, 8, 4, 14],
+                                [0, 1, 2, 5, 6, 7, 8, 15, 14],
                                 dtype,
                                 topk,
                                 kernel.name,
@@ -1572,7 +1588,8 @@ class FmoeTuner(TunerCommon):
                             {},
                             FmoeTuner.run_torch_moe_stage1,
                             (
-                                [0, 10, 11, 12, 13, 3, 4], #【a1_qt, w1_qt, w2_qt, topk_weights, topk_ids, a1_scale, w1_scale】
+                                #[a1_qt, w1_qt, w2_qt, topk_weights, topk_ids, a1_scale, w1_scale]
+                                [0, 10, 11, 12, 13, 3, 4],
                                 dtype,
                                 act_type,
                                 q_type,
@@ -1612,7 +1629,7 @@ class FmoeTuner(TunerCommon):
                             ),
                             FmoeTuner.ck_moe_stage2_fwd_out,  # func
                             (
-                                [0, 1, 2, 5, 6, 7, 8, 4, 14],
+                                [0, 1, 2, 5, 6, 7, 8, 15, 14],
                                 dtype,
                                 topk,
                                 kernel.name,
@@ -1722,7 +1739,6 @@ class FmoeTuner(TunerCommon):
         old_tunedf = self.get_tuned_gemm_list(file)
         resultdf = self.update_tunedf(old_tunedf, results)
         self.success = pd.concat([self.success, results], ignore_index=True)
-        print("self success is ", self.success)
         resultdf["run_1stage"] = resultdf["run_1stage"].astype(int)
         if results is not None:
             resultdf = resultdf.astype(str).drop_duplicates(
