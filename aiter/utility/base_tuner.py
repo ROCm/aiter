@@ -12,7 +12,6 @@ import traceback
 from operator import itemgetter
 import time
 from aiter import dtypes
-from aiter import core
 
 INVALID_TIME = -1
 
@@ -168,6 +167,37 @@ class TunerCommon:
         """transfer results to dataframe"""
         pass
 
+    def update_config_files(self, file_path: str, merge_name: str):
+        path_list = file_path.split(os.pathsep) if file_path else []
+        if len(path_list) <= 1:
+            return file_path
+        df_list = []
+        ## merge config files
+        ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
+
+        df_list.append(pd.read_csv(path_list[0]))
+        for i, path in enumerate(path_list[1:]):
+            if os.path.exists(path):
+                df = pd.read_csv(path)
+                ## check columns
+                assert (
+                    df.columns.tolist() == df_list[0].columns.tolist()
+                ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
+
+                df_list.append(df)
+            else:
+                print(f"path {i+1}: {path} (not exist)")
+        merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+        ##drop_duplicates
+        merge_df = (
+            merge_df.sort_values("us")
+            .drop_duplicates(subset=self.keys, keep="first")
+            .reset_index(drop=True)
+        )
+        new_file_path = f"/tmp/{merge_name}.csv"
+        merge_df.to_csv(new_file_path, index=False)
+        return new_file_path
+
     def get_untuned_gemm_list(self, untuned_gemm_file):
         assert os.path.exists(
             untuned_gemm_file
@@ -183,7 +213,7 @@ class TunerCommon:
         return path_list[0]
 
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
-        all_tuned_file = core.update_config_files(tuned_gemm_file, self.name)
+        all_tuned_file = self.update_config_files(tuned_gemm_file, self.name)
         if os.path.exists(all_tuned_file):
             column_order = pd.read_csv(all_tuned_file, nrows=0).columns.tolist()
             tunedf = pd.read_csv(all_tuned_file)
@@ -331,17 +361,19 @@ class TunerCommon:
         )
         logger.info("Successfully tuned shapes:")
         if not self.success.empty:
-            print(self.success)
+            print(self.success, flush=True)
         logger.info("Failed shapes:")
-        print(self.failed)
+        print(self.failed, flush=True)
 
         tunedf_subset = tunedf[self.untunedf.columns].astype(self.untunedf.dtypes)
         mask = self.untunedf.apply(tuple, axis=1).isin(
             tunedf_subset.apply(tuple, axis=1)
         )
         self.remain_untuned = self.untunedf[~mask]
-        logger.info("untuned shapes:")
-        print(self.remain_untuned)
+
+        if not self.remain_untuned.empty:
+            logger.info("untuned shapes:")
+            print(self.remain_untuned)
 
     @abstractmethod
     def result_to_csv(self, results, file, concat=False):
