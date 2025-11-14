@@ -190,6 +190,7 @@ def paged_attention_v1(
     fp8_out_scale: Optional[torch.Tensor] = None,
     partition_size: int = 256,
     mtp: int = 1,
+    sliding_window: int = 0,
 ) -> torch.Tensor:
     paged_attention_v1_core(
         out,
@@ -211,6 +212,7 @@ def paged_attention_v1(
         fp8_out_scale,
         partition_size,
         mtp,
+        sliding_window=sliding_window,
     )
     return out
 
