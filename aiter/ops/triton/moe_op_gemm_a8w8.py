@@ -8,8 +8,11 @@ import torch
 import triton
 from enum import Enum, auto
 import math
-from aiter.ops.triton.moe_routing.routing import GatherIndx, RoutingData, ScatterIndx
-from aiter.ops.triton._triton_kernels._moe_op_gemm_a8w8 import _moe_gemm_a8w8, _reduce_grouped, _downcast_to_static_fp8
+from aiter.ops.triton.moe_routing.routing import RoutingData
+from aiter.ops.triton._triton_kernels.moe_op_gemm_a8w8 import (
+    _moe_gemm_a8w8,
+    _reduce_grouped,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -29,35 +32,43 @@ def should_upcast_indices(*args):
     return any(tensor is not None and can_overflow_int32(tensor) for tensor in args)
 
 
-def allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, routing_data, gather_indx, scatter_indx, block_m, split_k):
+def allocate_output(
+    x,
+    w,
+    out_dtype,
+    reduction_n_matmul,
+    reduction_n_reduction,
+    routing_data,
+    gather_indx,
+    scatter_indx,
+    block_m,
+    split_k,
+):
     # ---- output ------
     N = w.shape[-1]
     # by default - M is number of rows in the activations
     M = x.shape[-2]
     # if the activations are gathered, then M is number of gather indices
     if gather_indx is not None:
-        M = gather_indx.src_indx.shape[0]
+        M = gather_indx.shape[0]
     # final output
     if routing_data.n_expts_act == 1 or scatter_indx is None:
         y_rows = M
     else:
-        y_rows = scatter_indx.src_indx.shape[0] // routing_data.n_expts_act # compressed number of rows
+        y_rows = (
+            scatter_indx.shape[0] // routing_data.n_expts_act
+        )  # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
     matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
-    if scatter_indx or split_k > 1:
+    if scatter_indx is not None or split_k > 1:
         final_output = torch.empty(final_shape, device=x.device, dtype=out_dtype)
     else:
         final_output = None
     return matmul_output, final_output
 
 
-def get_kernel_config(
-    m,
-    n,
-    k,
-    routing_data
-):
+def get_kernel_config(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -70,6 +81,15 @@ def get_kernel_config(
         block_n = 64
         block_k = 256
         num_warps = 4
+
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n >= 64 and grid < 256:
+            block_n = block_n // 2
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
     else:
         # for scale preshuffling
         block_n = 256
@@ -88,7 +108,7 @@ def get_kernel_config(
         "split_k": split_k,
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1
+        "kpack": 1,
     }
     return ret
 
@@ -106,30 +126,16 @@ def swizzle_scales(data):
     return data.transpose(-1, -2)
 
 
-def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
-    M, N = x.shape
-    y = torch.empty((M, N), dtype=torch.float8_e4m3fn, device="cuda")
-
-    BLOCK_M = min(triton.next_power_of_2(M), 128)
-    if M <= 4096:
-        BLOCK_N = 32
-    else:
-        BLOCK_N = 64
-    grid_m = triton.cdiv(x.shape[0], BLOCK_M)
-    grid_n = triton.cdiv(x.shape[1], BLOCK_N)
-
-    _downcast_to_static_fp8[(grid_m, grid_n)](x, x.stride(0), x.stride(1),
-                                            y, y.stride(0), y.stride(1),
-                                            scale,
-                                            M, N, BLOCK_M, BLOCK_N,
-                                            num_warps=8)
-
-    return y
-
-
-def reduce_grouped(x: torch.Tensor, indx: torch.Tensor, out: torch.Tensor,
-                   apply_swiglu = False, alpha = 1.0, limit = 1.0, reduction_n = 1,
-                   out_dtype: bool = None):
+def reduce_grouped(
+    x: torch.Tensor,
+    indx: torch.Tensor,
+    out: torch.Tensor,
+    apply_swiglu=False,
+    alpha=1.0,
+    limit=1.0,
+    reduction_n=1,
+    out_dtype: bool = None,
+):
     """
     In-place grouped row reduction.
 
@@ -169,44 +175,77 @@ def reduce_grouped(x: torch.Tensor, indx: torch.Tensor, out: torch.Tensor,
     out_dtype = x.dtype if out_dtype is None else out_dtype
     assert x.shape[-1] % reduction_n == 0
     BLOCK_N = 512
-    _reduce_grouped[(num_groups, )](
-        x, x.stride(0), x.stride(1), x.stride(2),  #
-        out, out.stride(0), out.stride(1),  #
+    num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
+
+    _reduce_grouped[(num_blocks, num_groups)](
+        x,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),  #
+        out,
+        out.stride(0),
+        out.stride(1),  #
         indx,  #
-        x.shape[0], x.shape[-1],  #
-        apply_swiglu, alpha, limit, reduction_n,
-        BLOCK_N=BLOCK_N, K=K,  #
-        num_warps=1,  #
+        x.shape[0],
+        x.shape[-1],  #
+        apply_swiglu,
+        alpha,
+        limit,
+        reduction_n,
+        BLOCK_N=BLOCK_N,
+        EVEN_N=(x.shape[-1] % BLOCK_N == 0),
+        K=K,  #
+        num_warps=2,  #
     )
     return out
+
 
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
 
-def moe_gemm_a8w8(x, w, x_scales, w_scales, 
-               x_static_scale = None, quant_static_scale = None,
-               bias = None,
-               routing_data: RoutingData | None = None,
-               gather_indx: GatherIndx | None = None,
-               scatter_indx: ScatterIndx | None = None,
-               gammas = None,
-               swizzle_mx_scale = None,
-               out_dtype = torch.bfloat16,
-               apply_swiglu = False,
-               alpha = 1.0,
-               limit = 1.0,
-               unpadded_N = None,
-               unpadded_K = None
-               ):
+
+def moe_gemm_a8w8(
+    x,
+    w,
+    x_scales,
+    w_scales,
+    x_static_scale=None,
+    w_static_scale=None,
+    quant_static_scale=None,
+    bias=None,
+    routing_data: RoutingData | None = None,
+    gather_indx=None,
+    scatter_indx=None,
+    gammas=None,
+    swizzle_mx_scale=None,
+    out_dtype=torch.bfloat16,
+    apply_swiglu=False,
+    alpha=1.0,
+    limit=1.0,
+    unpadded_N=None,
+    unpadded_K=None,
+):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
-    assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
+    w_has_mx = w_scales is not None
+    if w_has_mx:
+        assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
+    if w_has_mx:
+        stride_w_mx_e = w_scales.stride(0)
+        stride_w_mx_k = w_scales.stride(1)
+        stride_w_mx_n = w_scales.stride(2)
+    else:
+        stride_w_mx_e = 0
+        stride_w_mx_k = 0
+        stride_w_mx_n = 0
+    
     x_has_mx = x_scales is not None
-    if x_has_mx: assert x.stride(-1) == 1, "'x' must be row-major when it has data-type mxfp"
+    if x_has_mx:
+        assert x.stride(-1) == 1, "'x' must be row-major when it has data-type mxfp"
     if x_has_mx:
         stride_x_mx_m = x_scales.stride(0)
         stride_x_mx_k = x_scales.stride(1)
@@ -214,8 +253,13 @@ def moe_gemm_a8w8(x, w, x_scales, w_scales,
         stride_x_mx_m = 0
         stride_x_mx_k = 0
     # determine shapes
-    M = x.shape[-2] if gather_indx is None else gather_indx.src_indx.shape[0]
+    M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
+    block_m = routing_data.block_m
+    if unpadded_N and block_m == 16:
+        N = unpadded_N
+    if unpadded_K and block_m == 16:
+        K = unpadded_K
     # compute optimization flags
     config = get_kernel_config(M, N, K, routing_data)
     if apply_swiglu and config["split_k"] > 1:
@@ -234,41 +278,68 @@ def moe_gemm_a8w8(x, w, x_scales, w_scales,
         apply_swiglu_reduction = False
         reduction_n_reduction = 1
     # allocate output memory
-    y, y_final = allocate_output(x, w, out_dtype, reduction_n_matmul, reduction_n_reduction, routing_data, gather_indx, scatter_indx, config["block_m"], config["split_k"])
+    y, y_final = allocate_output(
+        x,
+        w,
+        out_dtype,
+        reduction_n_matmul,
+        reduction_n_reduction,
+        routing_data,
+        gather_indx,
+        scatter_indx,
+        config["block_m"],
+        config["split_k"],
+    )
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
     expt_data = routing_data.expt_data
-    block_m = config["block_m"]
     expt_hist = None if expt_data is None else expt_data.hist
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
     # spmd grid
-    if unpadded_N and block_m == 16:
-        N = unpadded_N
-    if unpadded_K and block_m == 16:
-        K = unpadded_K
-    if expt_block_pid_map is not None:
-        grid_m = routing_data.n_blocks(M, config["block_m"])
-    else:
-        grid_m = triton.cdiv(M, config["block_m"])
+    grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
     _moe_gemm_a8w8[(grid,)](
-        y, y.stride(0), y.stride(1), y.stride(2),
-        x, x.stride(0), x.stride(1),
-        x_scales, stride_x_mx_m, stride_x_mx_k,
-        w, w.stride(0), w.stride(1), w.stride(2),
-        w_scales, w_scales.stride(0), w_scales.stride(1), w_scales.stride(2),
-        x_static_scale, quant_static_scale,
-        bias, stride_bias,
+        y,
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        x,
+        x.stride(0),
+        x.stride(1),
+        x_scales,
+        stride_x_mx_m,
+        stride_x_mx_k,
+        w,
+        w.stride(0),
+        w.stride(1),
+        w.stride(2),
+        w_scales,
+        stride_w_mx_e,
+        stride_w_mx_k,
+        stride_w_mx_n,
+        x_static_scale,
+        w_static_scale,
+        quant_static_scale,
+        bias,
+        stride_bias,
         gammas,
-        N, K,
-        None if gather_indx is None else gather_indx.src_indx,
-        expt_hist, expt_token_offs_raw, expt_hist_sum, expt_block_pid_map,
-        grid_m, grid_n,
-        apply_swiglu_matmul, alpha, limit, reduction_n_matmul,
+        N,
+        K,
+        gather_indx,
+        expt_hist,
+        expt_token_offs_raw,
+        expt_hist_sum,
+        expt_block_pid_map,
+        grid_m,
+        grid_n,
+        apply_swiglu_matmul,
+        alpha,
+        limit,
+        reduction_n_matmul,
         routing_data.n_expts_act,
         config["block_m"],
         config["block_n"],
@@ -285,21 +356,31 @@ def moe_gemm_a8w8(x, w, x_scales, w_scales,
         UPCAST_INDICES=should_upcast_indices(x, w, y),
         waves_per_eu=config["waves_per_eu"],
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        kpack=config["kpack"])
+        kpack=config["kpack"],
+    )
     # Build grouped reduction inputs in a uniform way
-    group_indx = None if scatter_indx is None else scatter_indx.src_indx.view(-1, routing_data.n_expts_act)
+    group_indx = (
+        None
+        if scatter_indx is None
+        else scatter_indx.view(-1, routing_data.n_expts_act)
+    )
     y_final = reduce_grouped(
         y,
         group_indx,
         y_final,
-        apply_swiglu_reduction, alpha, limit, reduction_n_reduction,
+        apply_swiglu_reduction,
+        alpha,
+        limit,
+        reduction_n_reduction,
         out_dtype=out_dtype,
     )
     return y_final
 
+
 # -----------------------------------------------------------------------------
 # Reference Implementation
 # -----------------------------------------------------------------------------
+
 
 def swiglu_torch(a, alpha, limit):
     a_gelu = a[..., ::2]
@@ -314,67 +395,57 @@ def swiglu_torch(a, alpha, limit):
     return out
 
 
-def moe_gemm_torch(x, w, bias,
-                 routing_data: RoutingData = None,
-                 gather_indx: GatherIndx = None,
-                 scatter_indx: ScatterIndx = None,
-                 gammas = None,
-                 apply_swiglu = False,
-                 alpha = 1.0,
-                 limit = 1.0
-                 ):
-    is_input_batched = x.ndim == 3
+def moe_gemm_torch(
+    x,
+    w,
+    bias,
+    routing_data: RoutingData = None,
+    gather_indx=None,
+    scatter_indx=None,
+    gammas=None,
+    apply_swiglu=False,
+    alpha=1.0,
+    limit=1.0,
+):
     assert x.dtype.itemsize > 1
     assert w.dtype.itemsize > 1
-    if is_input_batched:
-        assert gather_indx is None, "gather not supported in batched mode"
-        assert scatter_indx is None, "scatter not supported in batched mode"
-        assert routing_data is None, "routing not supported in batched mode"
-        assert w.ndim == 3 and w.shape[0] == x.shape[0]
     if bias is not None and bias.ndim == 1:
         bias = bias.view(1, *bias.shape)
     if w.ndim == 2:
         w = w.view(1, *w.shape)
-    if x.ndim == 2:
-        x = x.view(1, *x.shape)
-    if routing_data is None:
-        routing_data = RoutingData(None, None, w.shape[0], 1)
     n_expts_act = routing_data.n_expts_act
     # memory offsets
-    if routing_data.n_expts_tot > 1 and not is_input_batched:
+    if routing_data.n_expts_tot > 1:
         sizes = routing_data.expt_hist
         off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32)
         off[1:] = torch.cumsum(sizes, 0)
         offs = list(itertools.pairwise(off))
     else:
-        offs = [[0, x.shape[1]] for _ in range(w.shape[0])]
+        offs = [[0, x.shape[0]] for _ in range(w.shape[0])]
     # compute
-    n_rows = x.shape[1] if gather_indx is None else gather_indx.dst_indx.shape[0]
+    n_rows = x.shape[0] if gather_indx is None else gather_indx.shape[0]
     n_cols = w.shape[-1] // 2 if apply_swiglu else w.shape[-1]
-    y = torch.zeros((x.shape[0], n_rows, n_cols), device=x.device, dtype=x.dtype)
+    y = torch.zeros((n_rows, n_cols), device=x.device, dtype=x.dtype)
     for i, (lo, hi) in enumerate(offs):
         if gather_indx is None:
             idx = torch.arange(lo, hi, device=x.device)
         else:
-            idx = gather_indx.src_indx[lo:hi] // n_expts_act
-        batch = i if is_input_batched else 0
-        out = torch.matmul(x[batch, idx, :].float(), w[i].float())
+            idx = gather_indx[lo:hi] // n_expts_act
+        out = torch.matmul(x[idx, :].float(), w[i].float())
         if bias is not None:
             out += bias[i, :]
         if apply_swiglu:
             out = swiglu_torch(out, alpha, limit)
         if gammas is not None:
             out *= gammas[lo:hi, None]
-        y[batch, lo:hi, :] = out
-    if not is_input_batched:
-        y = y.view(y.shape[1], y.shape[2])
+        y[lo:hi, :] = out
     if scatter_indx is None:
         return y
     # accumulate output from all experts
     n_rows = y.shape[0] // n_expts_act
     out = torch.zeros((n_rows, y.shape[-1]), dtype=torch.float32, device=x.device)
-    for i, (lo, hi) in enumerate(offs):
-        dst_idx = scatter_indx.dst_indx[lo:hi] // n_expts_act
-        msk = dst_idx != -1
-        out[dst_idx[msk], :] += y[lo:hi, :][msk, :].float()
+    src_idx = scatter_indx.view(-1, n_expts_act)
+    for i in range(n_rows):
+        out[i, :] = y[src_idx[i], :].float().sum(0)
+
     return out
