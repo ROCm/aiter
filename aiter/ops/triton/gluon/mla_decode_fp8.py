@@ -1839,7 +1839,7 @@ def decode_attention_fwd_grouped(
         sm_scale,
         logit_cap,
         mtp,
-        config["fwd_grouped_kernel_stage1_rope_fp8"],
+        config["fwd_grouped_kernel_stage1_rope_fp8"] if q.dtype == aiter.types.fp8 else config["fwd_grouped_kernel_stage1_rope"],
     )
     # import pdb ;pdb.set_trace()
     _decode_softmax_reducev_fwd(

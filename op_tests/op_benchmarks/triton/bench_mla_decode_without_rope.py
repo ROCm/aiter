@@ -14,7 +14,10 @@ import aiter
 # from aiter.ops.triton.mla_decode import (
 #     decode_attention_fwd_grouped,
 # )
-from aiter.ops.triton.gluon.mla_decode import (
+# from aiter.ops.triton.gluon.mla_decode import (
+#     decode_attention_fwd_grouped,
+# )
+from aiter.ops.triton.gluon.mla_decode_mi355 import (
     decode_attention_fwd_grouped,
 )
 from aiter.ops.triton.gluon.mla_decode_fp8 import (
