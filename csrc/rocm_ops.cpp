@@ -18,6 +18,7 @@
 #include "communication_asm.h"
 #include "custom.h"
 #include "custom_all_reduce.h"
+#include "deepgemm.h"
 #include "gemm_a4w4_blockscale.h"
 #include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
@@ -25,6 +26,7 @@
 #include "gemm_a8w8_bpreshuffle_cktile.h"
 #include "gemm_common.h"
 #include "hipbsolgemm.cuh"
+#include "mla.h"
 #include "moe_ck.h"
 #include "moe_op.h"
 #include "moe_sorting.h"
@@ -88,6 +90,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     ATTENTION_RAGGED_PYBIND;
     ATTENTION_V1_PYBIND;
     MOE_OP_PYBIND;
+    MOE_TOPK_PYBIND;
     ROPE_GENERAL_FWD_PYBIND;
     ROPE_GENERAL_BWD_PYBIND;
     ROPE_POS_FWD_PYBIND;
@@ -102,5 +105,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     SAMPLE_PYBIND;
     HIPBSOLGEMM_PYBIND;
     ROCSOLGEMM_PYBIND;
+    MLA_METADATA_PYBIND;
+    MLA_REDUCE_PYBIND;
+    DEEPGEMM_PYBIND;
 }
 #endif

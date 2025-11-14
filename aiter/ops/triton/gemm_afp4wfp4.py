@@ -73,20 +73,22 @@ def gemm_afp4wfp4(
     config: Optional[dict] = None,
 ):
     """
-    Computes the matmul Y = X x W
-    X and W are e2m1 fp4 tensors.
-    x_scales and w_scales are e8m0 tensors.
-    Every 32 elements in the K dimension share one e8m0 scale.
+    Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
 
-
-    Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
-    - X_scales: Matrix with shape (M, K // 32)
-    - W_scales: Matrix with shape (N, K // 32)
+    Args:
+        x (torch.Tensor): FP4 E2M1 input matrix with shape (M, K).
+        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N, K), internally transposed.
+        x_scales (torch.Tensor): E8M0 per-group scale for x with shape (M, K//32).
+            One scale per 32 elements in K dimension.
+        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (N, K//32).
+            One scale per 32 elements in K dimension.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+        torch.Tensor: Output with shape (M, N).
     """
 
     _LOGGER.info(
@@ -200,20 +202,23 @@ def gemm_afp4wfp4_preshuffled_scales(
     config: Optional[dict] = None,
 ):
     """
-    Computes the matmul Y = X x W
-    X and W are e2m1 fp4 tensors.
-    x_scales and w_scales are e8m0 tensors.
-    Every 32 elements in the K dimension share one e8m0 scale.
+    Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights using preshuffled scales.
+    Scales are arranged with M/N dimension grouped by 32 instead of K dimension.
 
-
-    Key parameters:
-    - X: Matrix X with shape (M, K). M >= 32 is required
-    - W: Matrix W with shape (N, K).
-    - X_scales: Matrix with shape (M // 32, K)
-    - W_scales: Matrix with shape (N // 32, K)
+    Args:
+        x (torch.Tensor): FP4 E2M1 input matrix with shape (M, K). M >= 32 required.
+        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N, K), internally transposed.
+        x_scales (torch.Tensor): E8M0 per-group scale for x with shape (M//32, K).
+            Groups of 32 rows in M dimension share K scales.
+        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (N//32, K).
+            Groups of 32 rows in N dimension share K scales.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+        torch.Tensor: Output with shape (M, N).
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
@@ -329,22 +334,28 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
+    use_aot: Optional[bool] = True,
 ):
     """
-    Computes the matmul Y = X x W
-    X and W are e2m1 fp4 tensors.
-    x_scales and w_scales are e8m0 tensors.
-    Every 32 elements in the K dimension share one e8m0 scale.
+    Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights using preshuffled weight scales.
+    Weight matrix and scales are stored in optimized layout for improved performance.
 
-
-    Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
-    - X_scales: Matrix with shape (M // 32, K)
-    - W_scales: Matrix with shape (N // 32, K)
+    Args:
+        x (torch.Tensor): FP4 E2M1 input matrix with shape (M, K).
+        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N//16, K*16), internally transposed.
+            Preshuffled layout: logical shape after unpacking is (N, K).
+        x_scales (torch.Tensor): E8M0 per-group scale for x with shape (M//32, K) if M >= 32,
+            or (M, K//32) if M < 32.
+        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (N//32, K).
+            Groups of 32 rows in N dimension share K scales.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
+        use_aot (Optional[bool]): Enable ahead-of-time compilation metadata.
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+        torch.Tensor: Output with shape (M, N).
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
@@ -407,7 +418,7 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
     if M < 32 and M_POW2 > 16:
         M_POW2 = 16
     metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_gemm_afp4_wfp4_kernel_preshuffled_weight_scales.fn.__name__}_M={M_POW2}-N={N}-K={K*2}"
-    if os.path.exists(metadata_pth):
+    if use_aot and os.path.exists(metadata_pth):
         with AOTMetadataContext(
             _gemm_afp4_wfp4_kernel_preshuffled_weight_scales.fn.__name__,
             f"{metadata_pth}",
