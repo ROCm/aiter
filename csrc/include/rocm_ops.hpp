@@ -327,6 +327,7 @@ namespace py = pybind11;
           &aiter::fused_allreduce_rmsnorm,                                                     \
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
+          py::arg("res_inp"),                                                                  \
           py::arg("res_out"),                                                                  \
           py::arg("out"),                                                                      \
           py::arg("w"),                                                                        \

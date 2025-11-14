@@ -45,6 +45,7 @@ def all_gather_unreg(
 def fused_allreduce_rmsnorm(
     _fa: int,
     inp: torch.Tensor,
+    res_inp: torch.Tensor,
     res_out: torch.Tensor,
     out: torch.Tensor,
     w: torch.Tensor,

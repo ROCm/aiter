@@ -511,6 +511,7 @@ namespace aiter
         }
         tmp_out[idx - start] = write_reg;
       }
+      __syncthreads();
     }
     end_sync<ngpus>(sg, self_sg, rank);
 
@@ -935,9 +936,8 @@ namespace aiter
 #pragma unroll
       for (int i = 0; i < pack_size; ++i)
       {
-        float res_x = ck_tile::type_convert<float>(input_reg.data[i]);
         float sum_x = *(reinterpret_cast<float*>(&tmp_smem[0]) + lane_id * pack_size + i);
-        rslt.data[i] = ck_tile::type_convert<T>(res_x + sum_x);
+        rslt.data[i] = ck_tile::type_convert<T>(sum_x);
       }
       tmps[warp_id][(rank * part + bid) * tnum_gpu + lane_id] = rslt;
     }
@@ -976,6 +976,7 @@ namespace aiter
   template <typename T, int tnum, int n_loop>
   __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm_naive(
       RankSignals sg,
+      T* __restrict__ residual_inp,
       T* __restrict__ residual_out,
       T* __restrict__ results,
       T* __restrict__ weight,
@@ -1000,14 +1001,18 @@ namespace aiter
       for (int n_iter = 0; n_iter < n_loop; ++n_iter)
       {
         int read_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
-        rmsnorm_inp[n_iter] = tmps[read_idx];
+        P reduce_out_pack = tmps[read_idx];
+        P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
         w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * blockDim.x + threadIdx.x);
         A reduce_pack;
 #pragma unroll
         for (int i = 0; i < pack_size; ++i)
         {
-          float ar_elem = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
-          reduce_pack.data[i] = ar_elem * ar_elem;
+          float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+          float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+          float rms_inp = res_inp + ar_out;
+          rmsnorm_inp[n_iter].data[i] = ck_tile::type_convert<T>(rms_inp);
+          reduce_pack.data[i] = rms_inp * rms_inp;
         }
         square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
       }
@@ -1041,6 +1046,7 @@ namespace aiter
   template <typename T, int tnum, int n_loop>
   __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(
       RankSignals sg,
+      T* __restrict__ residual_inp,
       T* __restrict__ residual_out,
       T* __restrict__ results,
       T* __restrict__ weight,
@@ -1067,14 +1073,18 @@ namespace aiter
         if (n_iter * tnum + threadIdx.x < (n / pack_size))
         {
           int read_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
-          rmsnorm_inp[n_iter] = tmps[read_idx];
+          P reduce_out_pack = tmps[read_idx];
+          P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
           w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
           A reduce_pack;
 #pragma unroll
           for (int i = 0; i < pack_size; ++i)
           {
-            float ar_elem = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
-            reduce_pack.data[i] = ar_elem * ar_elem;
+            float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+            float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+            float rms_inp = ar_out + res_inp;
+            rmsnorm_inp[n_iter].data[i] = ck_tile::type_convert<T>(rms_inp);
+            reduce_pack.data[i] = rms_inp * rms_inp;
           }
           square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
         }
@@ -1108,6 +1118,7 @@ namespace aiter
   template <typename T, int n_loop>
   __global__ void __launch_bounds__(256, 1) local_device_load_rmsnorm_512n(
       RankSignals sg,
+      T* __restrict__ residual_inp,
       T* __restrict__ residual_out,
       T* __restrict__ results,
       T* __restrict__ weight,
@@ -1134,14 +1145,18 @@ namespace aiter
       for (int n_iter = 0; n_iter < n_loop; ++n_iter)
       {
         int read_idx = bid * 64 * n_loop + n_iter * 64 + lane_id;
-        rmsnorm_inp[n_iter] = tmps[read_idx];
+        P reduce_out_pack = tmps[read_idx];
+        P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
         w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * 64 + lane_id);
         A reduce_pack;
 #pragma unroll
         for (int i = 0; i < pack_size; ++i)
         {
-          float ar_elem = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
-          reduce_pack.data[i] = ar_elem * ar_elem;
+          float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+          float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+          float rms_inp = ar_out + res_inp;
+          rmsnorm_inp[n_iter].data[i] = ck_tile::type_convert<T>(rms_inp);
+          reduce_pack.data[i] = rms_inp * rms_inp;
         }
         float tmp_sum = packReduce<AddFunctor, float, pack_size>(reduce_pack);
         square_sum += tmp_sum;
@@ -1587,7 +1602,7 @@ namespace aiter
   }
 
   template <typename T>
-  void dispatchFusedAllReduceRMSNorm(hipStream_t stream, T* input, T* residual_out, T* output, T* weight, float eps, int m, int n)
+  void dispatchFusedAllReduceRMSNorm(hipStream_t stream, T* input, T* residual_inp, T* residual_out, T* output, T* weight, float eps, int m, int n)
   {
     auto d = packed_t<T>::P::size;
     int size = m * n;
@@ -1633,12 +1648,12 @@ namespace aiter
       grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
     };
 
-#define launch_fused_allreduce_rmsnorm(template_kernel)                                                 \
-    do                                                                                                  \
-    {                                                                                                   \
-      auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);                                 \
-      setGrid(naive_grid_size, kernel_ptr);                                                             \
-      template_kernel<<<grid, block, 0, stream>>>(sg_, residual_out, output, weight, eps, rank_, m, n); \
+#define launch_fused_allreduce_rmsnorm(template_kernel)                                                               \
+    do                                                                                                                \
+    {                                                                                                                 \
+      auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);                                               \
+      setGrid(naive_grid_size, kernel_ptr);                                                                           \
+      template_kernel<<<grid, block, 0, stream>>>(sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
     } while (0)
 
     if (n_bytes % 1024 == 0)

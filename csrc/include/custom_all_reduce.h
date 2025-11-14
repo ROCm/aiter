@@ -40,6 +40,7 @@ void all_gather_unreg(fptr_t _fa,
                       torch::Tensor& out);
 void fused_allreduce_rmsnorm(fptr_t _fa,
                 torch::Tensor& inp,
+                torch::Tensor& res_inp,
                 torch::Tensor& res_out,
                 torch::Tensor& out,
                 torch::Tensor& w,
