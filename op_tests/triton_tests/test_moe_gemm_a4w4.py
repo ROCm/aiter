@@ -174,7 +174,6 @@ class Case:
     m: int
     n: int
     k: int
-    act_dtype_str: str
     n_expts_tot: int = 1
     n_expts_act: int = 1
     hbm_swizzling: bool = False
@@ -185,17 +184,17 @@ class Case:
     [
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
-            Case(32, 6144, 3072, "mxfloat4_e2m1", 128, 4, hbm_swizzling=True),
-            Case(8192, 3072, 3072, "mxfloat4_e2m1", 128, 4, hbm_swizzling=True),
-            Case(4, 1024, 3072, "mxfloat4_e2m1", 128, 4, hbm_swizzling=True),
-            Case(1024, 3072, 512, "mxfloat4_e2m1", 128, 4, hbm_swizzling=True),
-            Case(4096, 3072, 3072, "mxfloat4_e2m1", 128, 4),
-            Case(16, 1024, 1024, "mxfloat4_e2m1", 128, 4, hbm_swizzling=True),
-            Case(4096, 1024, 1024, "mxfloat4_e2m1", 128, 4),
-            Case(16, 256, 256, "mxfloat4_e2m1", 128, 4, hbm_swizzling=True),
-            Case(4096, 256, 256, "mxfloat4_e2m1", 128, 4),
-            Case(1000, 704, 800, "mxfloat4_e2m1", 8, 2),
-            Case(300, 400, 800, "mxfloat4_e2m1", 8, 4),
+            Case(4096, 7168, 4096, 128, 4, hbm_swizzling=True),
+            Case(4096, 7168, 4096, 128, 4),
+            Case(4096, 7168, 4096, 8, 4, hbm_swizzling=True),
+            Case(4096, 7168, 4096, 8, 4),
+            Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
+            Case(8192, 3072, 3072, 128, 4, hbm_swizzling=True),
+            Case(4, 1024, 3072, 128, 4, hbm_swizzling=True),
+            Case(1024, 3072, 512, 128, 4, hbm_swizzling=True),
+            Case(4096, 3072, 3072, 128, 4),
+            Case(1000, 704, 800, 8, 2),
+            Case(300, 400, 800, 8, 4),
         ]
     ],
 )
@@ -222,13 +221,9 @@ def test_op(
     fused_quant,
     n_expts_tot,
     n_expts_act,
-    act_dtype_str,
     hbm_swizzling,
     device="cuda",
 ):
-
-    if get_arch() != "gfx950":
-        pytest.skip("float8 x mx only supported on CDNA4")
 
     if hbm_swizzling:
         if get_arch() != "gfx950":
@@ -242,13 +237,11 @@ def test_op(
 
     torch.manual_seed(0)
 
-    weight_dtype_str = "mxfloat4_e2m1"
-    weight_mxfp = weight_dtype_str.startswith("mx")
-    if weight_mxfp:
-        weight_dtype_str = weight_dtype_str[2:]
-    act_mxfp8 = "mxfloat4_e2m1"
-    if act_mxfp8:
-        act_dtype_str = act_dtype_str[2:]
+    weight_mxfp4 = "mxfloat4_e2m1"
+    weight_dtype_str = weight_mxfp4[2:]
+
+    act_mxfp4 = "mxfloat4_e2m1"
+    act_dtype_str = act_mxfp4[2:]
 
     weight_dtype = dtype_str_to_torch(weight_dtype_str)
     act_dtype = dtype_str_to_torch(act_dtype_str)
@@ -270,7 +263,7 @@ def test_op(
     )
     x_ref, w_ref, bias_ref = x_tri.clone(), w_tri.clone(), bias_tri.clone()
 
-    # downcast to mxfp
+    # downcast to mxfp4
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
@@ -289,7 +282,7 @@ def test_op(
     ref_y = moe_gemm_torch(
         x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
     )
-    if not act_mxfp8 and fused_quant:
+    if not act_mxfp4 and fused_quant:
         quant_static_scale = ref_y.abs().max().float() / 448.0
     else:
         quant_static_scale = None
@@ -309,6 +302,6 @@ def test_op(
         out_dtype,
         apply_swiglu,
     )
-    if not act_mxfp8 and fused_quant:
+    if not act_mxfp4 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
