@@ -22,6 +22,20 @@ from aiter.ops.triton.mha import (
 _LOGGER = AiterTritonLogger()
 
 
+def _get_mfma_instr_shape(dtype: torch.dtype) -> Tuple[int, int, int]:
+    # V_MFMA_F32_32x32x16_F16
+    if dtype == torch.float16:
+        return (32, 32, 16)
+    # V_MFMA_F32_16x16x32_BF16
+    elif dtype == torch.bfloat16:
+        return (16, 16, 32)
+    # V_MFMA_F32_16x16x4_F32
+    elif dtype == torch.float32:
+        return (16, 16, 4)
+    else:
+        raise ValueError(f"Unsupported data type for MFMA: {dtype}")
+
+
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -153,6 +167,21 @@ def _flash_attn_forward(
         batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
     )
 
+    buffer_size = 16  # we want to load contiguous 128 bits at a time
+    size_per_thread_d = buffer_size // q.element_size()
+    size_per_thread_m = triton.cdiv(
+        config["BLOCK_M"] // (config["num_warps"] * 64), size_per_thread_d
+    )
+    size_per_thread_m = max(1, size_per_thread_m)
+    size_per_thread_n = triton.cdiv(
+        config["BLOCK_N"] // (config["num_warps"] * 64), size_per_thread_d
+    )
+    size_per_thread_n = max(1, size_per_thread_n)
+
+    mfma_instr_shape_m, mfma_instr_shape_n, mfma_instr_shape_k = _get_mfma_instr_shape(
+        q.dtype
+    )
+
     _attn_fwd[grid](
         q,
         k,
@@ -203,6 +232,12 @@ def _flash_attn_forward(
         BATCH=batch,
         NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
+        MFMA_INSTR_SHAPE_M=mfma_instr_shape_m,
+        MFMA_INSTR_SHAPE_N=mfma_instr_shape_n,
+        MFMA_INSTR_SHAPE_K=mfma_instr_shape_k,
+        SIZE_PER_THREAD_M=size_per_thread_m,
+        SIZE_PER_THREAD_N=size_per_thread_n,
+        SIZE_PER_THREAD_D=size_per_thread_d,
         **config,
     )
 

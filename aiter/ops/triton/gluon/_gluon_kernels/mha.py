@@ -351,6 +351,12 @@ def _attn_fwd(
     BATCH,
     NUM_XCD: gl.constexpr,
     USE_INT64_STRIDES: gl.constexpr,
+    MFMA_INSTR_SHAPE_M: gl.constexpr,
+    MFMA_INSTR_SHAPE_N: gl.constexpr,
+    MFMA_INSTR_SHAPE_K: gl.constexpr,
+    SIZE_PER_THREAD_M: gl.constexpr,
+    SIZE_PER_THREAD_N: gl.constexpr,
+    SIZE_PER_THREAD_D: gl.constexpr,
 ):
     if IS_FP8:
         raise NotImplementedError("FP8 is not supported in Gluon MHA yet.")
@@ -407,8 +413,6 @@ def _attn_fwd(
     #shared2 = #ttg.swizzled_shared<{vec = 4, perPhase = 1, maxPhase = 16, order = [1, 0]}>
     """
 
-    # TODO: These layouts need to eventually be generalized across input data sizes
-    # Right now, ththeyese are hardcoded for dtype=float16
     blocked_lse: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1],
         threads_per_warp=[64],
@@ -416,30 +420,35 @@ def _attn_fwd(
         order=[0],
     )  # analogous to #blocked in the comment above
     blocked_md: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
+        size_per_thread=[SIZE_PER_THREAD_M, SIZE_PER_THREAD_D],
         threads_per_warp=[8, 8],
         warps_per_cta=[gl.num_warps(), 1],
         order=[1, 0],
     )  # analogous to #blocked1 in the comment above
     blocked_dn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[8, 1],
+        size_per_thread=[SIZE_PER_THREAD_D, SIZE_PER_THREAD_N],
         threads_per_warp=[8, 8],
         warps_per_cta=[1, gl.num_warps()],
         order=[0, 1],
     )  # analogous to #blocked2 in the comment above
+
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[32, 32, 16],
+        instr_shape=[MFMA_INSTR_SHAPE_M, MFMA_INSTR_SHAPE_N, MFMA_INSTR_SHAPE_K],
         transposed=True,
         warps_per_cta=[gl.num_warps(), 1],
     )  # analogous to #mma in the comment above
-    out_layout: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 16], [0, 32], [0, 64]],
-        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 8]],
-        warp_bases=[[32, 0], [64, 0]],
-        block_bases=[],
-        shape=[BLOCK_M, BLOCK_DMODEL_POW2],
-    )  # analogous to #linear in the comment above
+
+    # FIXME: Figure out how to generalize this layout across different data sizes
+    # out_layout: gl.constexpr = gl.DistributedLinearLayout(
+    #     reg_bases=[[0, 1], [0, 2], [0, 4], [0, 16], [0, 32], [0, 64]],
+    #     lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 8]],
+    #     warp_bases=[[32, 0], [64, 0]],
+    #     block_bases=[],
+    #     shape=[BLOCK_M, BLOCK_DMODEL_POW2],
+    # )  # analogous to #linear in the comment above
+    out_layout: gl.constexpr = mfma_layout
+
     shared_q: gl.constexpr = gl.SwizzledSharedLayout(
         vec=8, per_phase=2, max_phase=8, order=[1, 0]
     )  # analogous to #shared in the comment above
@@ -489,6 +498,23 @@ def _attn_fwd(
     else:
         offs_qpe_d = None
         offs_kpe_d = None
+
+    gl.assume(stride_qz_in >= 0)
+    gl.assume(stride_qh_in >= 0)
+    gl.assume(stride_qm_in >= 0)
+    gl.assume(stride_qk_in >= 0)
+    gl.assume(stride_kz_in >= 0)
+    gl.assume(stride_kh_in >= 0)
+    gl.assume(stride_kn_in >= 0)
+    gl.assume(stride_kk_in >= 0)
+    gl.assume(stride_vz_in >= 0)
+    gl.assume(stride_vh_in >= 0)
+    gl.assume(stride_vn_in >= 0)
+    gl.assume(stride_vk_in >= 0)
+
+    gl.assume(stride_lse_z_in >= 0)
+    gl.assume(stride_lse_h_in >= 0)
+    gl.assume(stride_lse_m_in >= 0)
 
     # NOTE:
     # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
@@ -541,23 +567,6 @@ def _attn_fwd(
         stride_lse_z = stride_lse_z_in
         stride_lse_h = stride_lse_h_in
         stride_lse_m = stride_lse_m_in
-
-    gl.assume(stride_qz_in >= 0)
-    gl.assume(stride_qh_in >= 0)
-    gl.assume(stride_qm_in >= 0)
-    gl.assume(stride_qk_in >= 0)
-    gl.assume(stride_kz_in >= 0)
-    gl.assume(stride_kh_in >= 0)
-    gl.assume(stride_kn_in >= 0)
-    gl.assume(stride_kk_in >= 0)
-    gl.assume(stride_vz_in >= 0)
-    gl.assume(stride_vh_in >= 0)
-    gl.assume(stride_vn_in >= 0)
-    gl.assume(stride_vk_in >= 0)
-
-    gl.assume(stride_lse_z_in >= 0)
-    gl.assume(stride_lse_h_in >= 0)
-    gl.assume(stride_lse_m_in >= 0)
 
     # Get sequence lengths
     if VARLEN:
