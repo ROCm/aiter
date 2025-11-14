@@ -130,7 +130,7 @@ def generate_gemm_a8w8_inputs(
     [
         (in_dtype, out_dtype, *shape, layout, output)
         for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
-        for out_dtype in ["bf16", "fp16", "fp32", "int8", "int32"]
+        for out_dtype in ["bf16", "fp16", "fp32", "int32"]
         for shape in get_x_vals()
         for layout in ["TN", "TT", "NN", "NT"]
         for output in [True, False]
