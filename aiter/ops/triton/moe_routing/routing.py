@@ -2,7 +2,10 @@ import math
 import torch
 import triton
 from dataclasses import dataclass, field
-from aiter.ops.triton._triton_kernels.moe_routing.routing import _combined_routing
+from aiter.ops.triton._triton_kernels.moe_routing.routing import (
+    _combined_routing,
+    _combined_routing_fused,
+)
 
 
 @dataclass
@@ -125,6 +128,72 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
     )
 
 
+def sort_tokens_fused(
+    expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M
+):
+    cdiv = triton.cdiv
+
+    device = expt_scal.device
+    dtype = expt_scal.dtype
+    n_tokens, n_expts_act = expt_scal.shape
+    n_gates = n_tokens * n_expts_act
+
+    hist = bitmatrix.scratchpad
+    hist = hist[:n_expts_tot]
+    assert hist.dtype == torch.int32
+    num_blocks_bitmatrix = cdiv(bitmatrix.shape[1], 32)
+    # scratchpad
+    combined_indx = torch.empty(n_gates * 2, dtype=torch.int32, device=device)
+    # output
+    topk_indx = combined_indx[:n_gates]
+    gate_indx = combined_indx[n_gates:]
+    gate_scal = torch.empty(n_gates, dtype=dtype, device=device)
+
+    token_offs_raw, token_offs_pad, block_pid_map, blocks1a, BLOCK_A, block_m_log2 = (
+        _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device)
+    )
+
+    blocks1b = cdiv(n_tokens, HIST_BLOCK_M)
+
+    _combined_routing_fused[(blocks1a + blocks1b,)](
+        topk_indx,
+        gate_indx,
+        gate_scal,  # outputs
+        expt_scal,
+        expt_indx,
+        bitmatrix.data,
+        bitmatrix.shape[0],
+        bitmatrix.data.stride(0),
+        bitmatrix.data.stride(1),
+        num_blocks_bitmatrix,
+        n_gates,  # input shape
+        HIST_BLOCK_M,
+        n_tokens % HIST_BLOCK_M == 0,
+        n_expts_act,  # constants
+        n_expts_tot,
+        hist,
+        token_offs_raw,
+        token_offs_pad,  #
+        blocks1a,
+        block_pid_map,
+        block_pid_map.shape[0],  #
+        block_m_log2,
+        BLOCK_A=BLOCK_A,
+        EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
+        num_warps=1,
+    )
+
+    return (
+        hist,
+        topk_indx,
+        gate_indx,
+        gate_scal,
+        token_offs_raw,
+        token_offs_pad,
+        block_pid_map,
+    )
+
+
 # --------------------------
 # expt_data
 # --------------------------
@@ -186,15 +255,31 @@ def routing(logits, n_expts_act, sm_first=False, expt_indx=None):
     m = num_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
-    (
-        hist,
-        topk_indx,
-        gate_indx,
-        gate_scal,
-        token_offs_raw,
-        token_offs_pad,
-        block_pid_map,
-    ) = sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
+    if num_tokens <= 16:
+        HIST_BLOCK_M = triton.next_power_of_2(num_tokens)
+        (
+            hist,
+            topk_indx,
+            gate_indx,
+            gate_scal,
+            token_offs_raw,
+            token_offs_pad,
+            block_pid_map,
+        ) = sort_tokens_fused(
+            expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M
+        )
+    else:
+        (
+            hist,
+            topk_indx,
+            gate_indx,
+            gate_scal,
+            token_offs_raw,
+            token_offs_pad,
+            block_pid_map,
+        ) = sort_tokens(
+            expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M
+        )
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
 
     # pack the matmul data structure

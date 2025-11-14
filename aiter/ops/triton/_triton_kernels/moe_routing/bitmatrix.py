@@ -102,3 +102,33 @@ def _sum_bitmatrix_rows(
         )
 
     # tl.store(Partials + offs_t[:, None] * stride_pm + offs_n[None, :] * stride_pn, ret)
+
+
+@triton.jit
+def _sum_bitmatrix_rows_fused(
+    B,
+    shape_bm,
+    stride_bm,
+    stride_bn,
+    Ret,
+    N_BLKS_BITMATRIX: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    EVEN_M: tl.constexpr,
+):
+    if isinstance(shape_bm, tl.tensor) and shape_bm.dtype.is_ptr():
+        shape_bm = tl.load(shape_bm)
+    for i in tl.static_range(N_BLKS_BITMATRIX):
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_n = i * 32 + tl.arange(0, 32)
+        n_rows = shape_bm
+        if EVEN_M:
+            bits = tl.load(B + i * stride_bn + offs_m * stride_bm)
+        else:
+            bits = tl.load(
+                B + i * stride_bn + offs_m * stride_bm, mask=offs_m < n_rows, other=0
+            )
+        bits = tl.reshape(bits, [1, BLOCK_M])
+        ret = vpopc(bits)  # [1, 32]
+        ret = tl.reshape(ret, [32])
+
+        tl.store(Ret + offs_n, ret)
