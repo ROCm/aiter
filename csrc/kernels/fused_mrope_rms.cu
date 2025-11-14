@@ -171,9 +171,9 @@ __global__ void fused_mrope_rms_neox_kernel(
     vec_t<T, VEC_SIZE> w_vec;
 
     if (is_q) {
-        w_vec.nontemporal_load(q_w + access_id_in_head);
+        w_vec.load(q_w + access_id_in_head);
     } else {
-        w_vec.nontemporal_load(k_w + access_id_in_head);
+        w_vec.load(k_w + access_id_in_head);
     }
 
     vec_t<T, VEC_SIZE> x_vec, cos_sin_vec;
@@ -226,9 +226,9 @@ __global__ void fused_mrope_rms_noneox_kernel(
     vec_t<T, VEC_SIZE> w_vec;
 
     if (is_q) {
-        w_vec.nontemporal_load(q_w + access_id_in_head);
+        w_vec.load(q_w + access_id_in_head);
     } else {
-        w_vec.nontemporal_load(k_w + access_id_in_head);
+        w_vec.load(k_w + access_id_in_head);
     }
 
     vec_t<T, VEC_SIZE> x_vec, cos_vec, sin_vec;
