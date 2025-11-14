@@ -316,7 +316,7 @@ def run_benchmark(args: argparse.Namespace):
         qk_rope_head_dim: int,
         mtp: int,
         dtype: torch.dtype,
-        num_kv_splits: int = 5,
+        num_kv_splits: int = 8,
         sm_scale: float = 1.0,
         logit_cap: float = 0.0,
         device="cuda",
@@ -365,8 +365,8 @@ def run_benchmark(args: argparse.Namespace):
         max_seqlen_qo = seq_lens_qo.max().item()
         qo_indptr[1 : BATCH + 1] = torch.cumsum(seq_lens_qo, dim=0)
 
-        q_fp8 = q.to(torch.float8_e4m3fnuz)
-        kv_cache_fp8 = kv_cache.to(torch.float8_e4m3fnuz)
+        q_fp8 = q.to(torch.float8_e4m3fn)
+        kv_cache_fp8 = kv_cache.to(torch.float8_e4m3fn)
 
         out_ref, lse_ref = torch_mla_extend(
             q_fp8.reshape(-1, H, 576),
