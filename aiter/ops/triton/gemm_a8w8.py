@@ -27,21 +27,22 @@ def gemm_a8w8(
     config: Optional[dict] = None,
 ):
     """
-    Computes the 8 bit matmul Y = X x WT, applies a conversion scale and optionally adds a bias
-    to the result.
-    The conversion scale is received in the form of two 1D tensors that are multiplied to form a
-    2D one before being applied.
+    Computes 8 bit matrix multiplication Y = (X @ W^T) * (x_scale * w_scale) with optional bias.
+    INT8 inputs are scaled back to higher precision using per-tensor scale factors.
 
-    Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
-    - X_scale: First scale tensor with shape (M, 1).
-    - W_scale: Second scale tensor with shape (1, N).
-    - Bias: Bias tensor with shape (1, N).
-    - Y: Output Matrix Y with shape (M, K). If this is none, then it's created by this API and returned as output
+    Args:
+        x (torch.Tensor): INT8 input matrix with shape (M, K).
+        w (torch.Tensor): INT8 weight matrix with shape (N, K), internally transposed.
+        x_scale (torch.Tensor): Scale factor for x with shape (M, 1) or (M,).
+        w_scale (torch.Tensor): Scale factor for w with shape (1, N) or (N,).
+        bias (Optional[torch.Tensor]): Bias vector with shape (N,).
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+        torch.Tensor: Output with shape (M, N) in higher precision format.
     """
 
     _LOGGER.info(

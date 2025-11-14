@@ -13,12 +13,34 @@ def create_random_logits(
     row_ends: torch.Tensor,
     dtype: torch.dtype,
     seed: int,
+    data_generation: str = "random",
 ) -> torch.Tensor:
     """Create random logits tensor for testing."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     # Generate logits with some structure to make testing more meaningful
-    logits = torch.randn(row_starts.shape[0], max(row_ends), dtype=dtype, device="cuda")
+    if data_generation == "random":
+        logits = torch.randn(
+            row_starts.shape[0], max(row_ends), dtype=dtype, device="cuda"
+        )
+    elif data_generation == "10LSBits":
+        top_22_bits_mask = 0xFFFFFC00
+        last_10_bits_mask = 0x000003FF
+        fixed_top_22_bits = 0x3F900000
+        # Generate random bits for the last 10 bits
+        random_bottom_bits = torch.randint(
+            0,
+            2**10,
+            (row_starts.shape[0], max(row_ends)),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        # Combine: fixed top 22 bits with random last 10 bits
+        logits_bits = (fixed_top_22_bits & top_22_bits_mask) | (
+            random_bottom_bits & last_10_bits_mask
+        )
+        logits = logits_bits.view(dtype)
+
     for i, end in enumerate(row_ends):
         logits[i, end:] = float("-inf")
     return logits
@@ -91,7 +113,7 @@ def compare_topk_results(
 
 
 @perftest()
-def run_topk_per_row(
+def run_top_k_per_row_prefill(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
@@ -103,7 +125,7 @@ def run_topk_per_row(
     """
     Run the top_k_per_row kernel.
     """
-    return aiter.topk_per_row(
+    return aiter.top_k_per_row_prefill(
         logits,
         row_starts,
         row_ends,
@@ -115,7 +137,7 @@ def run_topk_per_row(
 
 
 @perftest()
-def run_topk_per_row_decode(
+def run_top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
     seqLens: torch.Tensor,
@@ -127,7 +149,7 @@ def run_topk_per_row_decode(
     """
     Run the top_k_per_row kernel.
     """
-    return aiter.topk_per_row_decode(
+    return aiter.top_k_per_row_decode(
         logits,
         next_n,
         seqLens,
@@ -139,9 +161,9 @@ def run_topk_per_row_decode(
 
 
 @benchmark()
-def test_topk_per_row(num_rows: int, top_k: int) -> dict:
+def test_top_k_per_row_prefill(num_rows: int, top_k: int) -> dict:
     """
-    Test topk_per_row.
+    Test topk_per_row_prefill.
     """
     ret = {}
     torch.set_default_device("cuda:0")
@@ -154,7 +176,7 @@ def test_topk_per_row(num_rows: int, top_k: int) -> dict:
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
 
     # Run the kernel
-    _, us = run_topk_per_row(
+    _, us = run_top_k_per_row_prefill(
         logits,
         row_starts,
         row_ends,
@@ -184,14 +206,15 @@ def test_topk_per_row(num_rows: int, top_k: int) -> dict:
 
 
 @benchmark()
-def test_topk_per_row_decode(
+def test_top_k_per_row_decode(
     batch_size: int,
     context_len: int,
     top_k: int,
     next_n: int,
+    data_generation: str = "random",
 ) -> None:
     """
-    Test topk_per_row with seq_lens tensor.
+    Test top_k_per_row_decode with seq_lens tensor.
     """
     torch.set_default_device("cuda:0")
     ret = {}
@@ -210,7 +233,7 @@ def test_topk_per_row_decode(
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
 
     # Run the kernel
-    _, us = run_topk_per_row_decode(
+    _, us = run_top_k_per_row_decode(
         logits,
         next_n,
         seq_lens,
@@ -285,17 +308,28 @@ parser.add_argument(
     e.g.: -n 4""",
 )
 
+parser.add_argument(
+    "-d",
+    "--data_generation",
+    type=str,
+    default=["random"],
+    choices=["random", "10LSBits"],
+    nargs="+",
+    help="""Specify method for generating logits.
+    e.g.: -d random""",
+)
+
 args = parser.parse_args()
 
 
 df = []
 for m in args.context_len:
     for k in args.top_k:
-        ret = test_topk_per_row(m, k)
+        ret = test_top_k_per_row_prefill(m, k)
         df.append(ret)
 
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary for topk_per_row kernel:\n{df}")
+aiter.logger.info(f"summary for top_k_per_row_prefill kernel:\n{df}")
 
 
 df = []
@@ -303,8 +337,8 @@ for m in args.decode_batch_size:
     for ctx in args.context_len:
         for k in args.top_k:
             for n in args.next_n:
-                ret = test_topk_per_row_decode(m, ctx, k, n)
+                ret = test_top_k_per_row_decode(m, ctx, k, n)
                 df.append(ret)
 
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary for topk_per_row_decode kernel:\n{df}")
+aiter.logger.info(f"summary for top_k_per_row_decode kernel:\n{df}")

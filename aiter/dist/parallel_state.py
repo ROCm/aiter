@@ -128,7 +128,7 @@ def fused_allreduce_rmsnorm_fake(
 @torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
 def fused_allreduce_rmsnorm_(
     inp: torch.Tensor, w: torch.Tensor, eps: float, group_name: str
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -348,14 +348,14 @@ class GroupCoordinator:
 
     def fused_allreduce_rmsnorm(
         self, input_: torch.Tensor, weight_: torch.Tensor, eps: float
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         return fused_allreduce_rmsnorm_(
             input_, weight_, eps, group_name=self.unique_name
         )
 
     def _fused_allreduce_rmsnorm_out_place(
         self, input_: torch.Tensor, weight_: torch.Tensor, eps: float
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_allreduce_rmsnorm(input_, weight_, eps)
@@ -861,6 +861,7 @@ def get_pp_group() -> GroupCoordinator:
 
 
 from typing import Optional
+
 _DP: Optional[GroupCoordinator] = None
 
 
@@ -916,6 +917,8 @@ def init_distributed_environment(
     distributed_init_method: str = "env://",
     local_rank: int = -1,
     backend: str = "nccl",
+    data_parallel_size: int = 1,
+    data_parallel_rank: int = 0,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -925,6 +928,10 @@ def init_distributed_environment(
         distributed_init_method,
         backend,
     )
+    if data_parallel_size > 1:
+        # Adjust the rank and world size for data parallel
+        rank = data_parallel_rank * world_size + rank
+        world_size = data_parallel_size * world_size
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
@@ -936,10 +943,10 @@ def init_distributed_environment(
             update_environment_variables(
                 {"HIP_VISIBLE_DEVICES": (",".join(map(str, range(world_size))))}
             )
-        # this backend is used for WORLD
+
         torch.distributed.init_process_group(
             backend=backend,
-            # init_method=distributed_init_method,
+            init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
         )
@@ -951,7 +958,7 @@ def init_distributed_environment(
         # setting, where we can use rank as local rank
         if distributed_init_method == "env://":
             # local_rank = envs.LOCAL_RANK
-            local_rank = os.environ.get("LOCAL_RANK", "0")
+            local_rank = os.environ.get("LOCAL_RANK", rank)
         else:
             local_rank = rank
     global _WORLD
@@ -967,8 +974,9 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
-    decode_context_model_parallel_size: Optional[int] = 1,
+    # decode_context_model_parallel_size: Optional[int] = 1,
     backend: Optional[str] = None,
+    data_parallel_size: int = 1,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -999,7 +1007,7 @@ def initialize_model_parallel(
     rank = torch.distributed.get_rank()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    data_parallel_size = 1
+    # data_parallel_size = 1
     # from vllm.config import get_current_vllm_config
 
     # config = get_current_vllm_config()
@@ -1098,6 +1106,7 @@ def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
     backend: Optional[str] = None,
+    data_parallel_size: int = 1,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -1106,7 +1115,10 @@ def ensure_model_parallel_initialized(
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(
-            tensor_model_parallel_size, pipeline_model_parallel_size, backend
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            backend,
+            data_parallel_size,
         )
         return
 
