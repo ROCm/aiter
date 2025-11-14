@@ -33,8 +33,6 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
 
 @functools.lru_cache(maxsize=1024)
 def _get_config(
-    causal: bool,
-    batch_size: int,
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
@@ -261,8 +259,6 @@ def la_persistent(
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
     max_output_tile_cnt: tl.constexpr,
-    num_heads_q: tl.constexpr,
-    num_heads_k: tl.constexpr,
     gqa_group_size: tl.constexpr,
     use_64_indexing: tl.constexpr,
     RAGGED_BATCH: tl.constexpr,
@@ -348,8 +344,6 @@ def la_persistent(
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 MASKED_BLOCKS=MASKED_BLOCKS,
-                XCD_REMAP=XCD_REMAP,
-                NUM_XCDS=NUM_XCDS,
                 batch_size=batch_size,
                 causal=causal,
                 num_m_blocks=num_m_blocks,
@@ -403,8 +397,6 @@ def la_persistent_inner(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MASKED_BLOCKS: tl.constexpr,
-    XCD_REMAP: tl.constexpr,
-    NUM_XCDS: tl.constexpr,
     batch_size: tl.constexpr,
     causal: tl.constexpr,
     num_m_blocks: tl.constexpr,

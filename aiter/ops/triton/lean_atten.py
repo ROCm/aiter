@@ -158,7 +158,6 @@ def _persistent_lean_attention(
         N_CTX_Q,
         N_CTX_K,
         H,
-        H_K,
         BLOCK_M,
         BLOCK_N,
         total_programs,
@@ -216,7 +215,6 @@ def _persistent_lean_attention(
         N_CTX_Q,
         N_CTX_K,
         H,
-        H_K,
         BLOCK_M,
         BLOCK_N,
         total_programs,
@@ -314,8 +312,6 @@ def _persistent_lean_attention(
         num_warps=num_warps,
         num_stages=1,
         num_ctas=1,
-        num_heads_q=H,
-        num_heads_k=H_K,
         gqa_group_size=GQA_GROUP_SIZE,
         use_64_indexing=(
             (k.stride(0) * N_CTX_K) >= (1 << 31)
@@ -347,7 +343,6 @@ def get_num_splits_and_buffer_sizes(
     max_seqlen_q,
     max_seqlen_k,
     num_heads,
-    num_heads_k,
     BLOCK_M,
     BLOCK_N,
     num_SMs,
@@ -367,7 +362,6 @@ def get_num_splits_and_buffer_sizes(
     # print(f"block_m: {BLOCK_M}, block_n: {BLOCK_N} ")
     # print(f"num_m_block: {num_m_blocks}, num_n_block: {num_n_blocks} ")
     # print(f"max_seqlen_q: {max_seqlen_q}, max_seqlen_k: {max_seqlen_k}")
-    # print(f"num_heads: {num_heads}, num_heads_k: {num_heads_k} ")
 
     if max_seqlen_q == 1:
         causal = False
