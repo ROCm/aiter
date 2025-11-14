@@ -9,6 +9,7 @@ from aiter.ops.triton._triton_kernels.pa_mqa_logits import (
     _deepgemm_fp8_paged_mqa_logits,
     _deepgemm_fp8_paged_mqa_logits_ragged_k,
 )
+from aiter import dtypes
 
 
 def deepgemm_fp8_paged_mqa_logits_ragged_k(
@@ -29,7 +30,7 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
     )
     # Since triton doesn't have have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
-    kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
+    kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
 
     config = {
         "ChunkQ": heads,
@@ -78,7 +79,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
     )
     # Since triton doesn't have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
-    kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
+    kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
 
     config = {
         "ChunkQ": 32,
@@ -130,7 +131,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     )
     # Since triton doesn't have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
-    kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
+    kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
 
     config = {
         "ChunkQ": 32,
@@ -185,7 +186,7 @@ def deepgemm_fp8_paged_mqa_logits(
     )
     # Since triton doesn't have the reinterpret_cast, we slice the scale out and view it as float
     kv_cache_scale = kv_cache_scale.view(torch.float32)
-    kv_cache_fp8 = kv_cache_fp8.view(torch.float8_e4m3fnuz)
+    kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
 
     config = {
         "ChunkQ": heads,
