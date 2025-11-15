@@ -3,13 +3,13 @@
 
 # user interface
 
-from typing import Tuple
+from typing import Optional, Tuple
+
 import torch
-from ..jit.core import (
-    compile_ops,
-)
-from ..utility import dtypes
+
+from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num
+from ..utility import dtypes
 
 
 @compile_ops("module_moe_asm", fc_name="biased_grouped_topk")
@@ -202,6 +202,7 @@ def top_k_per_row_prefill(
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
     indices: torch.Tensor,
+    values: Optional[torch.Tensor],
     numRows: int,
     stride0: int,
     stride1: int,

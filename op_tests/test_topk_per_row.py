@@ -47,11 +47,13 @@ def create_random_logits(
 
 
 def create_row_boundaries(
-    num_rows: int, top_k: int = 2048
+    num_rows: int, num_prefix: int = 0, top_k: int = 2048
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Create row start and end indices for testing."""
     row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
-    row_ends = torch.arange(1, num_rows + 1, device="cuda", dtype=torch.int32)
+    row_ends = torch.arange(
+        num_prefix + 1, num_prefix + num_rows + 1, device="cuda", dtype=torch.int32
+    )
     return row_starts, row_ends
 
 
@@ -118,6 +120,7 @@ def run_top_k_per_row_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     indices: torch.Tensor,
+    values: torch.Tensor,
     num_rows: int,
     stride_row: int,
     stride_col: int,
@@ -130,6 +133,7 @@ def run_top_k_per_row_prefill(
         row_starts,
         row_ends,
         indices,
+        values,
         num_rows,
         stride_row,
         stride_col,
@@ -161,7 +165,7 @@ def run_top_k_per_row_decode(
 
 
 @benchmark()
-def test_top_k_per_row_prefill(num_rows: int, top_k: int) -> dict:
+def test_top_k_per_row_prefill(num_rows: int, num_prefix: int, top_k: int) -> dict:
     """
     Test topk_per_row_prefill.
     """
@@ -169,11 +173,13 @@ def test_top_k_per_row_prefill(num_rows: int, top_k: int) -> dict:
     torch.set_default_device("cuda:0")
 
     # Create test data
-    row_starts, row_ends = create_row_boundaries(num_rows)
+    row_starts, row_ends = create_row_boundaries(num_rows, num_prefix)
     logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+
+    values = torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda").fill_(0)
 
     # Run the kernel
     _, us = run_top_k_per_row_prefill(
@@ -181,6 +187,8 @@ def test_top_k_per_row_prefill(num_rows: int, top_k: int) -> dict:
         row_starts,
         row_ends,
         indices,
+        None,  # values
+        # values,
         num_rows,
         logits.stride(0),
         logits.stride(1),
@@ -272,7 +280,7 @@ parser.add_argument(
     "-c",
     "--context_len",
     type=int,
-    default=[8, 16, 32, 64, 128, 1024, 16384, 65536, 90000, 128000],
+    default=[8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
     nargs="+",
     help="""number of kv.
     e.g.: -c 64""",
@@ -286,6 +294,15 @@ parser.add_argument(
     nargs="+",
     help="""top-k elements per row.
     e.g.: -k 2048""",
+)
+
+parser.add_argument(
+    "--num_prefix",
+    type=int,
+    default=[0],
+    nargs="+",
+    help="""top-k elements per row.
+    e.g.: --num_prefix 8000 16000 24000 32000 40000 48000 56000""",
 )
 
 parser.add_argument(
@@ -325,20 +342,21 @@ args = parser.parse_args()
 df = []
 for m in args.context_len:
     for k in args.top_k:
-        ret = test_top_k_per_row_prefill(m, k)
-        df.append(ret)
+        for num_prefix in args.num_prefix:
+            ret = test_top_k_per_row_prefill(m, num_prefix, k)
+            df.append(ret)
 
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary for top_k_per_row_prefill kernel:\n{df}")
 
 
-df = []
-for m in args.decode_batch_size:
-    for ctx in args.context_len:
-        for k in args.top_k:
-            for n in args.next_n:
-                ret = test_top_k_per_row_decode(m, ctx, k, n)
-                df.append(ret)
+# df = []
+# for m in args.decode_batch_size:
+#     for ctx in args.context_len:
+#         for k in args.top_k:
+#             for n in args.next_n:
+#                 ret = test_top_k_per_row_decode(m, ctx, k, n)
+#                 df.append(ret)
 
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary for top_k_per_row_decode kernel:\n{df}")
+# df = pd.DataFrame(df)
+# aiter.logger.info(f"summary for top_k_per_row_decode kernel:\n{df}")

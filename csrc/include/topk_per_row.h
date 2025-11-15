@@ -6,6 +6,7 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
                            const torch::Tensor& rowStarts,
                            const torch::Tensor& rowEnds,
                            torch::Tensor& indices,
+                           std::optional<torch::Tensor> values,
                            int64_t numRows,
                            int64_t stride0,
                            int64_t stride1);
