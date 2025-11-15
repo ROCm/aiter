@@ -12,7 +12,6 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 
 @triton.jit
@@ -98,7 +97,7 @@ def _fwd_kernel_stage2_asm(
             )
 
 
-@functools.lru_cache()
+@functools.lru_cache(maxsize=1)
 def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     if num_kv_splits is None:
         cu_num = get_cu_num()
@@ -130,7 +129,7 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         512: 32,
     }
 
-    if dtype == get_fp8_e4m3_dtype():
+    if dtype == dtypes.fp8:
         min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
         num_kv_splits = min(
             num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n
@@ -270,7 +269,7 @@ def mla_decode_fwd(
     else:
         if num_kv_splits is None:
             num_kv_splits = get_cu_num()
-        if nhead == 16 or (nhead == 128 and kv_buffer.dtype == get_fp8_e4m3_dtype()):
+        if nhead == 16 or (nhead == 128 and kv_buffer.dtype == dtypes.fp8):
             # Natively support cases
             pass
         elif nhead in range(32, 512 + 1, 16) and persistent_mode and max_seqlen_q == 1:
