@@ -111,11 +111,8 @@ template <typename T, int BitsPerPass>
 __device__ constexpr int calc_start_bit(int pass)
 {
     int start_bit = static_cast<int>(sizeof(T) * 8) - (pass + 1) * BitsPerPass;
-    if(start_bit < 0)
-    {
-        start_bit = 0;
-    }
-    return start_bit;
+    int r = start_bit < 0 ? 0 : start_bit;
+    return r;
 }
 
 template <typename T, int BitsPerPass>
@@ -130,12 +127,19 @@ template <typename T>
 __device__ typename hipcub::Traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
 {
     auto bits = reinterpret_cast<typename hipcub::Traits<T>::UnsignedBits&>(key);
-    bits      = hipcub::Traits<T>::TwiddleIn(bits);
-    if(!select_min)
-    {
-        bits = ~bits;
+    if constexpr (std::is_same_v<T, float>){
+        // TODO: hardcoded for select_min is false!
+        uint32_t mask = (key < 0) ? 0 : 0x7fffffff;
+        return bits ^ mask;
     }
-    return bits;
+    else {
+        bits      = hipcub::Traits<T>::TwiddleIn(bits);
+        if(!select_min)
+        {
+            bits = ~bits;
+        }
+        return bits;
+    }
 }
 
 template <typename T>
@@ -505,10 +509,11 @@ __device__ void filter_and_histogram(T const* in_buf,
     // merge histograms produced by individual blocks
     for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
     {
-        if(histogram_smem[i] != 0)
-        {
-            atomicAdd(histogram + i, histogram_smem[i]);
-        }
+        // if(histogram_smem[i] != 0)
+        // {
+        //     atomicAdd(histogram + i, histogram_smem[i]);
+        // }
+        *(histogram + i) = histogram_smem[i];
     }
 }
 
@@ -907,19 +912,19 @@ __global__ void radix_kernel(T const* in,
         }
 
         scan<IdxT, BitsPerPass, BlockSize>(histogram);
-        __syncthreads();
+        //__syncthreads();
         choose_bucket<T, IdxT, BitsPerPass>(counter, histogram, current_k, pass);
-        __syncthreads();
+        //__syncthreads();
 
         constexpr int num_passes = calc_num_passes<T, BitsPerPass>();
         // reset for next pass
-        if(pass != num_passes - 1)
-        {
-            for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
-            {
-                histogram[i] = 0;
-            }
-        }
+        // if(pass != num_passes - 1)
+        // {
+        //     for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+        //     {
+        //         histogram[i] = 0;
+        //     }
+        // }
         if(threadIdx.x == 0)
         {
             // `last_filter_kernel()` requires setting previous_len even in the last
