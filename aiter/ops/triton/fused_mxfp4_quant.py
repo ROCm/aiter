@@ -59,6 +59,22 @@ def fused_rms_mxfp4_quant(
     # as we merge 2 fp4s to 1 uint8
     assert N1 % 2 == 0
 
+    kwargs = {}
+    # TODO: proper tune for better perf
+    if ROT_SIZE >= 128:
+        # Not tuned yet.
+        kwargs["waves_per_eu"] = 0
+        kwargs["num_warps"] = 2
+    elif ROT_SIZE > 0:
+        kwargs["waves_per_eu"] = 0
+        if N1 >= 4096:
+            if M >= 16384:
+                kwargs["num_warps"] = 8
+            else:
+                kwargs["num_warps"] = 4
+        else:
+            kwargs["num_warps"] = 2
+
     BLOCK_SIZE = max(BLOCK_SIZE, MXFP4_QUANT_BLOCK_SIZE)
     out1_fp4 = torch.empty((M, N1 // 2), dtype=torch.uint8, device=inp1.device)
     out1_bs = torch.empty(
@@ -111,6 +127,7 @@ def fused_rms_mxfp4_quant(
         ROT_SIZE=ROT_SIZE,
         SKIP_SECOND_INPUT=(inp2 is None),
         FIRST_INPUT_RES=(res1 is not None),
+        **kwargs,
     )
     if res1 is not None:
         if inp2 is None:

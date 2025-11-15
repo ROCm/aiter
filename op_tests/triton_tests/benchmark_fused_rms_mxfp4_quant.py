@@ -124,14 +124,12 @@ def bench_fused_rms_quant_single(dtype, M, N, rotation_size=0, with_residual=Fal
     ret["M"] = M
     ret["N"] = N
     ret["dtype"] = str(dtype)
-    ret["rotation"] = rotation_size
-    ret["residual"] = with_residual
-    
+
     # Generate inputs
     mat1 = torch.randn((M, N), dtype=dtype, device="cuda")
     rms1_w = torch.randn(N, dtype=dtype, device="cuda")
     eps = 1e-6
-    
+
     rot1 = None
     if rotation_size > 0:
         if N % rotation_size != 0:
@@ -141,7 +139,7 @@ def bench_fused_rms_quant_single(dtype, M, N, rotation_size=0, with_residual=Fal
     resid1 = None
     if with_residual:
         resid1 = torch.randn((M, N), dtype=dtype, device="cuda")
-    
+
     # Run unfused version
     # if with_residual:
     #     unfused_out, us_unfused = run_unfused_single_with_residual(
@@ -152,7 +150,7 @@ def bench_fused_rms_quant_single(dtype, M, N, rotation_size=0, with_residual=Fal
     #     q_fp4_unfused, q_scales_unfused, us_unfused = run_unfused_single(
     #         mat1.clone(), rms1_w, eps, rot1
     #     )
-    
+
     # Run fused version
     if with_residual:
         fused_out, us_fused = run_fused_single_with_residual(
@@ -164,14 +162,14 @@ def bench_fused_rms_quant_single(dtype, M, N, rotation_size=0, with_residual=Fal
             mat1.clone(), rms1_w, eps, rot1
         )
         q_fp4_fused, q_scales_fused = fused_out
-    
+
     # Convert back to fp32 for comparison
     # unfused_fp32 = convert_mxfp4_to_fp32(q_fp4_unfused, q_scales_unfused)
     # fused_fp32 = convert_mxfp4_to_fp32(q_fp4_fused, q_scales_fused)
-    
+
     # Check correctness
     # err = checkAllclose(unfused_fp32, fused_fp32, msg="fused vs unfused")
-    
+
     # Calculate performance metrics
     # Approximate memory access: read mat1, rms1_w, write quantized output
     mem_bytes = mat1.nbytes + rms1_w.nbytes + q_fp4_fused.nbytes + q_scales_fused.nbytes
@@ -184,7 +182,7 @@ def bench_fused_rms_quant_single(dtype, M, N, rotation_size=0, with_residual=Fal
     # ret["GB/s_unfused"] = mem_bytes / us_unfused / 1e3
     ret["GB/s_fused"] = mem_bytes / us_fused / 1e3
     # ret["err"] = err
-    
+
     return ret
 
 
@@ -193,7 +191,7 @@ def bench_fused_rms_quant_single(dtype, M, N, rotation_size=0, with_residual=Fal
 # ============================================================================
 
 l_dtype = ["bf16"]  # "fp16"
-_l_m = [1, 64, 16384*4]
+_l_m = [1, 64, 16384, 16384 * 4]
 # Single matrix shapes (typical attention dimension scenarios)
 l_single_shapes = [
     # (M, N)
@@ -206,6 +204,7 @@ l_single_shapes = [
     *((i, 512) for i in _l_m),
 ]
 
+# l_single_shapes = [l_single_shapes[-1]]  # For dump triton codegen kernel
 # Dual matrix shapes (typical DeepSeek scenarios)
 l_dual_shapes = [
     # (M, N1, N2) - mat1 gets quantized, mat2 gets RMSNorm
@@ -230,7 +229,11 @@ l_dual_shapes = [
 
 
 # l_rotation_sizes = [0, 32, 64, 128]
+# l_single_shapes = [
+#     (16384 * 4, 512),
+# ]
 l_rotation_sizes = [0, 32]
+# l_rotation_sizes = [32]
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(
@@ -300,14 +303,16 @@ for dtype in l_dtype:
             aiter.logger.info(f"Running single: dtype={dtype}, M={M}, N={N}, rotation_size={rotation_size}")
 
             # With rotation: RMS + Rotate + Quant
-            ret = bench_fused_rms_quant_single(dtype, M, N, rotation_size=rotation_size, with_residual=False)
-            if ret:
-                df_single_rotation.append(ret)
-            
+            if N != 7168:
+                ret = bench_fused_rms_quant_single(dtype, M, N, rotation_size=rotation_size, with_residual=False)
+                if ret:
+                    df_single_rotation.append(ret)
+
             # With both: Add + RMS + Rotate + Quant
-            ret = bench_fused_rms_quant_single(dtype, M, N, rotation_size=rotation_size, with_residual=True)
-            if ret:
-                df_single_residual_rotation.append(ret)
+            if N == 7168:
+                ret = bench_fused_rms_quant_single(dtype, M, N, rotation_size=rotation_size, with_residual=True)
+                if ret:
+                    df_single_residual_rotation.append(ret)
 
 # Print results
 if df_single_rotation:

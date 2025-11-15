@@ -15,8 +15,19 @@ def _rmsnorm_op(row, weight, n_cols, epsilon):
 
 @triton.jit
 def _rotate_op(row, rot_matrix, BLOCK_SIZE: tl.constexpr, ROT_SIZE: tl.constexpr):
-    return tl.dot(tl.reshape(row.to(rot_matrix.dtype), (BLOCK_SIZE // ROT_SIZE, ROT_SIZE)), rot_matrix).reshape(BLOCK_SIZE)
+    row_2d = tl.reshape(row.to(rot_matrix.dtype), (BLOCK_SIZE // ROT_SIZE, ROT_SIZE))
+    rotated_2d = tl.dot(row_2d, rot_matrix)
+    return tl.reshape(rotated_2d, (BLOCK_SIZE,))
 
+
+# @triton.autotune(
+#     configs=[
+#         triton.Config(kwargs={}, num_warps=2),
+#         triton.Config(kwargs={}, num_warps=4),
+#         triton.Config(kwargs={}, num_warps=8),
+#     ],
+#     key=["n_rows", "inp1_n_cols", "ROT_SIZE"],
+# )
 @triton.jit
 def _fused_rms_mxfp4_quant_kernel(
     inp1_ptr,
@@ -76,7 +87,7 @@ def _fused_rms_mxfp4_quant_kernel(
 
     norm1 = _rmsnorm_op(inp1, w1, inp1_n_cols, eps1)
     if ROT_SIZE > 0:
-        norm1 = _rotate_op(norm1, rot1, BLOCK_SIZE, ROT_SIZE).to(tl.float32)  # cast to fp32 for mxfp4 quant
+        norm1 = _rotate_op(norm1, rot1, BLOCK_SIZE, ROT_SIZE)
 
     out1_fp4, out1_block_scales = _mxfp4_quant_op(
         norm1, BLOCK_SIZE, 1, MXFP4_QUANT_BLOCK_SIZE
