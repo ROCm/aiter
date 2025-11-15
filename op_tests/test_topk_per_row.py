@@ -121,7 +121,6 @@ def run_top_k_per_row_prefill(
     row_ends: torch.Tensor,
     indices: torch.Tensor,
     values: torch.Tensor,
-    workspace: torch.Tensor,
     num_rows: int,
     stride_row: int,
     stride_col: int,
@@ -135,7 +134,6 @@ def run_top_k_per_row_prefill(
         row_ends,
         indices,
         values,
-        workspace,
         num_rows,
         stride_row,
         stride_col,
@@ -181,10 +179,7 @@ def test_top_k_per_row_prefill(num_rows: int, num_prefix: int, top_k: int) -> di
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
 
-    values = torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda")
-    # TODO invokeComputeTopkLastDimWorkspaceSize to get accurate workspace size
-    workspace_size = 1024 * 1024 * 1024 
-    workspace = torch.empty(workspace_size, dtype=torch.uint8, device="cuda")
+    values = torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda").fill_(0)
 
     # Run the kernel
     _, us = run_top_k_per_row_prefill(
@@ -192,8 +187,8 @@ def test_top_k_per_row_prefill(num_rows: int, num_prefix: int, top_k: int) -> di
         row_starts,
         row_ends,
         indices,
-        values,
-        workspace,
+        None,  # values
+        # values,
         num_rows,
         logits.stride(0),
         logits.stride(1),
@@ -285,7 +280,7 @@ parser.add_argument(
     "-c",
     "--context_len",
     type=int,
-    default=[8, 16, 32, 64, 128, 1024, 16384, 65536, 90000, 128000],
+    default=[8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
     nargs="+",
     help="""number of kv.
     e.g.: -c 64""",
