@@ -884,7 +884,6 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
-from typing import Optional
 
 _DP: Optional[GroupCoordinator] = None
 
