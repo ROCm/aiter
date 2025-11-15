@@ -278,7 +278,7 @@ def _get_config(
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
-
+    # TODO: add N_K key
     if M < 32:
         config = _get_config._config_dict["M_LT_32"]
     elif M == 32:

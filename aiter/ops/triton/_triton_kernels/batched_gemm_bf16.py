@@ -189,7 +189,7 @@ def _get_config(
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
-
+    # TODO: add N_K key
     if M + N >= 4096:
         return _get_config._config_dict["large"]
     else:
