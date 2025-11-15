@@ -31,6 +31,7 @@ fptr_t init_custom_ar(torch::Tensor& meta,
 void all_reduce(fptr_t _fa,
                 torch::Tensor& inp,
                 torch::Tensor& out,
+                bool use_new,
                 bool open_fp8_quant,
                 std::optional<torch::Tensor> reg_buffer);
 void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
