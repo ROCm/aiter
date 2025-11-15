@@ -65,6 +65,7 @@ struct MlaMetadataV1KernelParameter
     int32_t        ori_seqlen_qo;
     int32_t        topk;
     int32_t        qk_batch_ratio;
+    int32_t        num_splits;
     bool           is_causal;
 };
 

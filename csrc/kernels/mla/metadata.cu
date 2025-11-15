@@ -50,7 +50,8 @@ void get_mla_metadata_v1(
     const int32_t        max_seqlen_qo,
     const int32_t        uni_seqlen_qo,
     const bool           fast_mode,
-    const int32_t        topk)
+    const int32_t        topk,
+    const int32_t        max_split_per_batch)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
 
@@ -77,6 +78,7 @@ void get_mla_metadata_v1(
             max_seqlen_qo,
             uni_seqlen_qo,
             topk,
+            max_split_per_batch,
             work_metadata_ptrs,
             work_info_set,
             work_indptr,
