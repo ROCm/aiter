@@ -912,9 +912,9 @@ __global__ void radix_kernel(T const* in,
         }
 
         scan<IdxT, BitsPerPass, BlockSize>(histogram);
-        //__syncthreads();
+        __syncthreads();
         choose_bucket<T, IdxT, BitsPerPass>(counter, histogram, current_k, pass);
-        //__syncthreads();
+        __syncthreads();
 
         constexpr int num_passes = calc_num_passes<T, BitsPerPass>();
         // reset for next pass
