@@ -89,6 +89,9 @@ def test_gemm(dtype, M, N, K):
 
     if get_gfx() not in ["gfx950"]:
         return
+
+    torch.cuda.empty_cache()
+
     ret = {}
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
     x = torch.randn((M, K), dtype=dtype)
