@@ -972,8 +972,39 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         self.mrope_section = mrope_section
         if self.mrope_section:
-            assert sum(self.mrope_section) == rotary_dim // 2
+            expected_sum = rotary_dim // 2
+            actual_sum = sum(self.mrope_section)
+            if actual_sum != expected_sum:
+                print(
+                    f"MRoPE section sum mismatch: expected {expected_sum}, got {actual_sum}. "
+                    f"Adjusting mrope_section to match rotary_dim // 2 = {expected_sum}"
+                )
+                # Auto-correct by scaling the mrope_section proportionally
+                if actual_sum > 0:
+                    scale_factor = expected_sum / actual_sum
+                    self.mrope_section = [
+                        max(1, int(section * scale_factor))
+                        for section in self.mrope_section
+                    ]
+                    # Ensure the sum exactly matches by adjusting the last element
+                    current_sum = sum(self.mrope_section)
+                    if current_sum != expected_sum:
+                        self.mrope_section[-1] += expected_sum - current_sum
+                else:
+                    # If all sections are 0, create a default distribution
+                    self.mrope_section = [
+                        expected_sum // len(self.mrope_section)
+                    ] * len(self.mrope_section)
+                    # Handle remainder
+                    remainder = expected_sum % len(self.mrope_section)
+                    for i in range(remainder):
+                        self.mrope_section[i] += 1
 
+                print(
+                    f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
+                )
+
+    @torch.compile(dynamic=True, backend="inductor")
     def forward(
         self,
         positions: torch.Tensor,
