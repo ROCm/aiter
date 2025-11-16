@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from aiter import dtypes
+from aiter import dtypes, fused_mrope_3d_rms
 
 # from custom_op import CustomOp
 
@@ -1174,6 +1174,53 @@ class MRotaryEmbedding(RotaryEmbedding):
             for _ in range(3)
         ]
 
+class MRotaryEmbeddingQKNormFused(MRotaryEmbedding):
+    """Rotary Embedding with Multimodal Sections fused with QKNorm"""
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        mrope_section: Optional[List[int]] = None,
+
+    ) -> None:
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, mrope_section
+        )
+        return None
+    
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        positions: torch.Tensor,
+        num_heads: int,
+        num_kv_heads: int,
+        eps: float
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert positions.ndim == 1 or positions.ndim == 2
+        num_tokens = positions.shape[-1]
+        cos_sin = self.cos_sin_cache[positions] 
+        num_heads_q = num_heads
+        num_heads_k = num_kv_heads
+        num_heads_v = num_kv_heads
+        is_interleaved = True if positions.ndim == 2 and self.mrope_section is not None else False
+        fused_mrope_3d_rms(qkv, q_weight, k_weight, cos_sin, positions, num_tokens, 
+                           num_heads_q, num_heads_k, num_heads_v, self.head_size, self.is_neox_style, self.mrope_section,
+                           is_interleaved, eps)
+        qkv = qkv.view(num_tokens, )
+        q_size = num_heads_q * self.head_size
+        k_size = num_heads_k * self.head_size
+        v_size = num_heads_v * self.head_size
+
+        qkv = qkv.view(num_tokens, q_size + k_size + v_size)
+        q, k, _ = qkv.split([q_size, k_size, v_size], dim=-1)
+        return q, k 
 
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
@@ -1330,15 +1377,26 @@ def get_rope(
                 **extra_kwargs,
             )
         elif scaling_type == "mrope":
-            rotary_emb = MRotaryEmbedding(
-                head_size,
-                rotary_dim,
-                max_position,
-                base,
-                is_neox_style,
-                dtype,
-                mrope_section=rope_scaling["mrope_section"],
-            )
+            if "try_aiter_rope_fused_qknorm" in rope_scaling and rope_scaling["try_aiter_rope_fused_qknorm"]:
+                rotary_emb = MRotaryEmbeddingQKNormFused(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                )
+            else:
+                rotary_emb = MRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
