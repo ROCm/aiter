@@ -7,7 +7,7 @@ from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 
 @triton.jit
-def _fused_indices_and_gather(
+def _fused_indices_and_gather_kernel(
     x2d,
     gather_out,
     idx2d,

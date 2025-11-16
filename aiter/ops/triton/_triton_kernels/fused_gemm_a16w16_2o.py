@@ -223,19 +223,8 @@ def _get_config(
     K: int,
 ):
 
-    print(f"\n[DEBUG] Function called with M={M}, N={N}, K={K}")
-    print(f"[DEBUG] hasattr(_get_config, '_config_dict'): {hasattr(_get_config, '_config_dict')}")
-    
-    if hasattr(_get_config, "_config_dict"):
-        print(f"[DEBUG] Existing keys in _config_dict: {list(_get_config._config_dict.keys())}")
-
-
-
-
     if not hasattr(_get_config, "_config_dict"):
-        print("[DEBUG] Initializing _config_dict")
         dev = arch_info.get_device()
-        print(f"[DEBUG] Device: {dev}")
         _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-FUSED-GEMM-A16W16-2O.json"
         with open(fpath, "r") as file:
@@ -243,26 +232,20 @@ def _get_config(
         _get_config._config_dict["default"] = config
 
     key = f"{N}_{K}"
-    print(f"[DEBUG] Looking for key: {key}")
-    print(f"[DEBUG] Key exists: {key in _get_config._config_dict}")
 
     if key not in _get_config._config_dict.keys():
         dev = arch_info.get_device()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-FUSED-GEMM-A16W16-2O-N={N}-K={K}.json"
-        print(f"[DEBUG] Checking path: {fpath}")
-        print(f"[DEBUG] File exists: {os.path.exists(fpath)}")
         if os.path.exists(fpath):
             with open(fpath, "r") as file:
                 config = json.load(file)
                 _get_config._config_dict[key] = config
         else:
             key = "default"  # fall back to default config
-    print("=============values of M, N, K==============", M, N, K)
     bounds = [2, 4, 8, 16, 32, 64, 128, 256, 512, 2048]
     for bound in bounds:
         print("value of M is:", M)
         if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
-            print("=========condition met========= M bound", M, bound)
             temp_config = _get_config._config_dict[key][f"M_LEQ_{bound}"]
             break
     else:
@@ -284,5 +267,4 @@ def _get_config(
             chosen_config["BLOCK_SIZE_K"] = chosen_config["BLOCK_SIZE_K"] // 4
     chosen_config["BLOCK_SIZE_K"] = max(chosen_config["BLOCK_SIZE_K"], 16)
 
-    print("======chosen config for gemm=======", chosen_config)
     return chosen_config

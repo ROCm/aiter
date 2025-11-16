@@ -8,7 +8,7 @@ from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 
 @triton.jit
-def _scatter_with_zero_kernel(
+def _fused_zeros_scatter_kernel(
     a, indices, values, n_indices, n_a, num_cols,
     BLOCK_SIZE: tl.constexpr = 1024
 ):
