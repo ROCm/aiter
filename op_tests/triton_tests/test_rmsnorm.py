@@ -12,7 +12,10 @@ from aiter.ops.triton.rmsnorm import (
     rmsnorm2d_fwd_with_dynamicquant,
     rmsnorm2d_fwd_with_add_smoothquant,
     rmsnorm2d_fwd_with_add_dynamicquant,
+    rmsnorm_large_m_small_n,
 )
+
+import time
 
 
 def generate_rmsnorm_inputs(M, N, dtype):
@@ -378,3 +381,66 @@ def test_rms_norm_dynamic_per_token_fp8_quant(
 
     torch.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
     torch.testing.assert_close(x_normed, ref_x_normed, atol=atol, rtol=rtol)
+
+
+def wan_rms_norm_torch(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
+    """
+    Reference RMSNorm in pure PyTorch.
+    x: [M, N]
+    weight: [N]
+    """
+    variance = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    return x.float().type_as(x) * weight
+
+
+def benchmark(fn, args, warmup=20, rep=100, desc=""):
+    for _ in range(warmup):
+        _ = fn(*args)
+    torch.cuda.synchronize()
+
+    start = time.time()
+    for _ in range(rep):
+        _ = fn(*args)
+    torch.cuda.synchronize()
+    elapsed = time.time() - start
+
+    avg_us = elapsed / rep * 1e6
+    print(f"{desc:40s} | average latency: {avg_us:8.2f} μs")
+    return avg_us
+
+
+@torch.no_grad()
+def test_performance():
+    torch.manual_seed(0)
+    device = "cuda"
+    eps = 1e-5
+
+    test_cases = [
+        (364800, 128),
+        (16380, 1536),
+    ]
+
+    print(f"=== RMSNorm latency test (float16)===\n")
+    for M, N in test_cases:
+        print(f"test shape [{M}, {N}]")
+        x = torch.randn(M, N, device=device, dtype=torch.float16)
+        weight = torch.randn(N, device=device, dtype=torch.float16)
+
+        y_torch = wan_rms_norm_torch(x, weight, eps)
+        y_orig = rms_norm(x, weight, eps)
+        y_opt = rmsnorm_large_m_small_n(x, weight, eps)
+        print("Max diff (new vs torch):", (y_opt - y_torch).abs().max().item())
+        print("Max diff (orig vs torch):", (y_orig - y_torch).abs().max().item())
+        print("Max diff (new vs orig):", (y_opt - y_orig).abs().max().item())
+        assert torch.allclose(y_opt, y_torch, atol=1e-2, rtol=1e-2), "failed"
+        assert torch.allclose(y_orig, y_torch, atol=1e-2, rtol=1e-2), "failed"
+        assert torch.allclose(y_opt, y_orig, atol=1e-2, rtol=1e-2), "failed"
+
+        print("latency compare:")
+        benchmark(wan_rms_norm_torch, (x, weight, eps), desc="PyTorch version", rep=200)
+        benchmark(rms_norm, (x, weight, eps), desc="original Triton version", rep=200)
+        benchmark(
+            rmsnorm_large_m_small_n, (x, weight, eps), desc="opt version", rep=200
+        )
+        print("-" * 80 + "\n")
