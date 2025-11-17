@@ -419,6 +419,7 @@ def ck_moe_stage2_fwd(
         mul_routed_weight_stage,
     )
 
+    print(kernelName)
     ck_moe_stage2(
         inter_states,
         w1,
