@@ -37,7 +37,7 @@ def fused_gemm_a16w16_2o(
     - Y: Output Matrix Y with shape (M, N).
     If this is none, then it's created by this API and returned as output.
     - activation: Optional activation function to apply to the output.
-    One of ("gelu", "gelu_tanh", "silu", "silu_exp2", "relu"). Default is None.
+    One of ("gelu", "gelu_tanh", "silu", "silu_exp2", "relu", "sigmoid"). Default is None.
 
     Returns:
     - Y: The output matrix with shape (M, N).
