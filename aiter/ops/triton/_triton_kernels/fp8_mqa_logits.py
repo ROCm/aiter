@@ -3,7 +3,7 @@ import triton.language as tl
 
 
 @triton.jit
-def fp8_mqa_logits_kernel(
+def _fp8_mqa_logits_kernel(
     Q_ptr,  # fp8e4m3 [seq_len, H, D]
     KV_ptr,  # fp8e4m3 [seq_len_kv, D]
     kv_scales_ptr,  # fp32 [seq_len_kv]
