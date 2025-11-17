@@ -27,6 +27,7 @@
 #include "hipbsolgemm.cuh"
 #include "mla.h"
 #include "moe_ck.h"
+#include "moe_cktile2stages.h"
 #include "moe_op.h"
 #include "moe_sorting.h"
 #include "norm.h"
