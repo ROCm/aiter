@@ -48,7 +48,7 @@ def context_attention_fwd(
         v (torch.Tensor): Value tensor for prefill tokens with shape (total_tokens, num_kv_heads, head_dim).
         o (torch.Tensor): Pre-allocated output tensor with shape (total_tokens, num_q_heads, head_dim).
         kv_cache_dtype (str): KV cache data type ("auto", "fp8", "fp8_e4m3").
-        k_cache (torch.Tensor): Paged key cache with shape 
+        k_cache (torch.Tensor): Paged key cache with shape
             (num_blocks, num_kv_heads, head_dim//x, block_size, x) for vectorized layout.
         v_cache (torch.Tensor): Paged value cache with shape
             (num_blocks, num_kv_heads, head_dim, block_size).
