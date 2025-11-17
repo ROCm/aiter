@@ -59,7 +59,7 @@ def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 @perftest()
 def run_gemm_cktile_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_bpreshuffle_CKTILE(x, weight, x_scale, w_scale, None, dtype)
+    return aiter.gemm_a8w8_cktile_bpreshuffle(x, weight, x_scale, w_scale, None, dtype)
 
 
 @perftest()

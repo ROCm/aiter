@@ -639,7 +639,7 @@ def gemm_a8w8_blockscale_bpreshuffle_tune(
 ) -> torch.Tensor: ...
 
 
-def gemm_a8w8_bpreshuffle_CKTILE(
+def gemm_a8w8_cktile_bpreshuffle(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -651,7 +651,7 @@ def gemm_a8w8_bpreshuffle_CKTILE(
     assert dtype in [
         torch.bfloat16,
         torch.float16,
-    ], f"Output {dtype=} is currently not supported in gemm_a8w8_bpreshuffle_CKTILE"
+    ], f"Output {dtype=} is currently not supported in gemm_a8w8_cktile_bpreshuffle"
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
@@ -660,8 +660,8 @@ def gemm_a8w8_bpreshuffle_CKTILE(
     #     m, n, k, dtypes.fp8, AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
     # )
     get_CKGEMM_config(m, n, k, AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE)
-    assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle_CKTILE only support fp8 now"
-    assert bias is None, "gemm_a8w8_bpreshuffle_CKTILE does not support bias now"
+    assert WQ.dtype == dtypes.fp8, "gemm_a8w8_cktile_bpreshuffle only support fp8 now"
+    assert bias is None, "gemm_a8w8_cktile_bpreshuffle does not support bias now"
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
 
