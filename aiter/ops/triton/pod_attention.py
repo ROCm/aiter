@@ -318,7 +318,7 @@ def get_num_splits_and_buffer_sizes(
         Tuple: (num_m_blocks, num_n_blocks, high_load_tbs, max_tiles_per_tb,
             tiles_per_head, num_splits, even_split).
     """
-    ##### Lean Atteion: Calculate Splits and Tile Sizes #####
+    ##### Lean Attention: Calculate Splits and Tile Sizes #####
     ## based on onnxruntime/contrib_ops/cuda/bert/lean_attention
     num_m_blocks = (max_seqlen_q + BLOCK_M - 1) // BLOCK_M
     num_n_blocks = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
