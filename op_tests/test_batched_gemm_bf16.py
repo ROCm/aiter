@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -70,7 +70,10 @@ l_mnk = [
     (8192, 8192, 1024),
 ]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -79,7 +82,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-b",
@@ -89,16 +93,19 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="batch size",
+    help="""Batch size.
+    e.g.: -b 16""",
 )
 parser.add_argument(
-    "-mnk",
+    "-s",
+    "--mnk",
     type=dtypes.str2tuple,
-    choices=l_mnk,
     nargs="?",
     const=None,
     default=None,
-    help="shape of mnk",
+    help="""Shape of mnk.
+    e.g.    -s 1024,8192,1024
+            --mnk 1024,8192,1024""",
 )
 args = parser.parse_args()
 if args.dtype is None:
@@ -106,9 +113,9 @@ if args.dtype is None:
 else:
     l_dtype = [dtypes.d_dtypes[args.dtype]]
 if args.batch is not None:
-    l_b = [args.bitch]
+    l_b = [args.batch]
 if args.mnk is not None:
-    l_mnk = [args.m]
+    l_mnk = [args.mnk]
 
 
 for dtype in l_dtype:

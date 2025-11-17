@@ -1,35 +1,40 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import re
-import os
-import sys
-import shutil
-import time
-import types
-import importlib
 import functools
-import traceback
-from typing import List, Optional
-import logging
+import importlib
 import json
+import logging
 import multiprocessing
-from packaging.version import parse, Version
+import os
+import re
+import shutil
+import sys
+import time
+import traceback
+import types
+import typing
+from typing import Any, Callable, List, Optional
+
+from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
+from chip_info import get_gfx
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
-from chip_info import get_gfx
+from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
+
+aiter_lib = None
 
 
 def mp_lock(
     lockPath: str,
-    MainFunc: callable,
-    FinalFunc: callable = None,
-    WaitFunc: callable = None,
+    MainFunc: Callable,
+    FinalFunc: Optional[Callable] = None,
+    WaitFunc: Optional[Callable] = None,
 ):
     """
     Using FileBaton for multiprocessing.
@@ -61,6 +66,169 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
+AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
+
+
+# config_env start here
+def update_config_files(file_path: str, merge_name: str):
+    path_list = file_path.split(os.pathsep) if file_path else []
+    if len(path_list) <= 1:
+        return file_path
+    df_list = []
+    ## merge config files
+    ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
+    import pandas as pd
+
+    df_list.append(pd.read_csv(path_list[0]))
+    for i, path in enumerate(path_list[1:]):
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            ## check columns
+            assert (
+                df.columns.tolist() == df_list[0].columns.tolist()
+            ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
+
+            df_list.append(df)
+        else:
+            logger.info(f"path {i+1}: {path} (not exist)")
+    merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+    ## get keys from untuned file to drop_duplicates
+    untuned_name = (
+        re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
+        if re.search(r"(?:_)?tuned$", merge_name)
+        else merge_name.replace("tuned", "untuned")
+    )
+    untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
+    if os.path.exists(untuned_path):
+        untunedf = pd.read_csv(untuned_path)
+        keys = untunedf.columns
+        merge_df = (
+            merge_df.sort_values("us")
+            .drop_duplicates(subset=keys, keep="first")
+            .reset_index(drop=True)
+        )
+    else:
+        logger.warning(
+            f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
+        )
+    new_file_path = f"/tmp/{merge_name}.csv"
+    merge_df.to_csv(new_file_path, index=False)
+    return new_file_path
+
+
+# @functools.lru_cache(maxsize=1)
+def get_config_file(env_name, default_file, tuned_file_name):
+    config_env_file = os.getenv(env_name)
+    # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
+    from pathlib import Path
+
+    if not config_env_file:
+        model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
+        op_tuned_file_list = [
+            p
+            for p in model_config_dir.glob(f"*{tuned_file_name}*")
+            if (p.is_file() and "untuned" not in str(p))
+        ]
+
+        if not op_tuned_file_list:
+            config_file = default_file
+        else:
+            tuned_files = ":".join(str(p) for p in op_tuned_file_list)
+            tuned_files = default_file + ":" + tuned_files
+            logger.info(
+                f"merge tuned file under model_configs/ and configs/ {tuned_files}"
+            )
+            config_file = update_config_files(tuned_files, tuned_file_name)
+    else:
+        config_file = update_config_files(config_env_file, tuned_file_name)
+        # print(f"get config file from environment ", config_file)
+    return config_file
+
+
+AITER_CONFIG_GEMM_A4W4 = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
+)
+AITER_CONFIG_FMOE = os.getenv(
+    "AITER_CONFIG_FMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
+    "AITER_CONFIG_A8W8_BATCHED_GEMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv",
+)
+
+AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
+    "AITER_CONFIG_BF16_BATCHED_GEMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_BF16 = os.getenv(
+    "AITER_CONFIG_GEMM_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_gemm.csv",
+)
+AITER_CONFIG_GEMM_A4W4_FILE = get_config_file(
+    "AITER_CONFIG_GEMM_A4W4", AITER_CONFIG_GEMM_A4W4, "a4w4_blockscale_tuned_gemm"
+)
+
+AITER_CONFIG_GEMM_A8W8_FILE = get_config_file(
+    "AITER_CONFIG_GEMM_A8W8", AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
+)
+AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE = get_config_file(
+    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
+    AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE,
+    "a8w8_bpreshuffle_tuned_gemm",
+)
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE = get_config_file(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
+    "a8w8_blockscale_tuned_gemm",
+)
+AITER_CONFIG_FMOE_FILE = get_config_file(
+    "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+)
+
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE = get_config_file(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
+    "a8w8_blockscale_bpreshuffle_tuned_gemm",
+)
+
+AITER_CONFIG_A8W8_BATCHED_GEMM_FILE = get_config_file(
+    "AITER_CONFIG_A8W8_BATCHED_GEMM",
+    AITER_CONFIG_A8W8_BATCHED_GEMM,
+    "a8w8_tuned_batched_gemm",
+)
+
+AITER_CONFIG_BF16_BATCHED_GEMM_FILE = get_config_file(
+    "AITER_CONFIG_BF16_BATCHED_GEMM",
+    AITER_CONFIG_BF16_BATCHED_GEMM,
+    "bf16_tuned_batched_gemm",
+)
+
+AITER_CONFIG_GEMM_BF16_FILE = get_config_file(
+    "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+)
+
+# config_env end here
 
 find_aiter = importlib.util.find_spec("aiter")
 if find_aiter is not None:
@@ -69,11 +237,17 @@ if find_aiter is not None:
     elif find_aiter.origin:
         package_path = find_aiter.origin
     package_path = os.path.dirname(package_path)
-    import site
+    package_parent_path = os.path.dirname(package_path)
 
-    site_packages_dirs = site.getsitepackages()
-    # develop mode
-    if package_path not in site_packages_dirs:
+    try:
+        with open(f"{this_dir}/../install_mode", "r") as f:
+            # develop mode
+            isDevelopMode = f.read().strip() == "develop"
+    except FileNotFoundError:
+        # pip install -e
+        isDevelopMode = True
+
+    if isDevelopMode:
         AITER_META_DIR = AITER_ROOT_DIR
     # install mode
     else:
@@ -81,30 +255,30 @@ if find_aiter is not None:
 else:
     AITER_META_DIR = AITER_ROOT_DIR
     logger.warning("aiter is not installed.")
-
+sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
-AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/"
+gfx = get_gfx()
+AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
 )
+CK_HELPER_DIR = f"{AITER_META_DIR}/3rdparty/ck_helper"
+CK_DIR = CK_3RDPARTY_DIR
 
 
 @functools.lru_cache(maxsize=1)
 def get_asm_dir():
-    gfx = get_gfx()
-    global AITER_ASM_DIR
-    AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/"
-    os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
     return AITER_ASM_DIR
 
 
 @functools.lru_cache(maxsize=1)
-def get_user_jit_dir():
-    if "JIT_WORKSPACE_DIR" in os.environ:
-        path = os.getenv("JIT_WORKSPACE_DIR")
+def get_user_jit_dir() -> str:
+    if "AITER_JIT_DIR" in os.environ:
+        path = os.getenv("AITER_JIT_DIR", "")
         os.makedirs(path, exist_ok=True)
+        sys.path.insert(0, path)
         return path
     else:
         if os.access(this_dir, os.W_OK):
@@ -121,11 +295,12 @@ if multiprocessing.current_process().name == "MainProcess":
     os.makedirs(bd_dir, exist_ok=True)
     # if os.path.exists(f"{bd_dir}/ck/library"):
     #     shutil.rmtree(f"{bd_dir}/ck/library")
-CK_DIR = f"{bd_dir}/ck"
+# CK_DIR = f"{bd_dir}/ck"
 
 
 def validate_and_update_archs():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
+    archs = [arch.strip() for arch in archs]
     # List of allowed architectures
     allowed_archs = [
         "native",
@@ -145,40 +320,51 @@ def validate_and_update_archs():
 
 
 @functools.lru_cache()
-def hip_flag_checker(flag_hip: str):
-    ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
+def hip_flag_checker(flag_hip: str) -> bool:
+    ret = os.system(f"hipcc {flag_hip} -x hip -E -P /dev/null -o /dev/null")
     if ret == 0:
-        return [flag_hip]
+        return True
     else:
         logger.warning(f"{flag_hip} is not supported by hipcc.")
-        return []
+        return False
 
 
 def check_and_set_ninja_worker():
-    max_num_jobs_cores = int(max(1, os.cpu_count() * 0.8))
-    if int(os.environ.get("MAX_JOBS", "1")) < max_num_jobs_cores:
-        import psutil
+    max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
+    import psutil
 
-        # calculate the maximum allowed NUM_JOBS based on free memory
-        free_memory_gb = psutil.virtual_memory().available / (
-            1024**3
-        )  # free memory in GB
-        # each JOB peak memory cost is ~8-9GB when threads = 4
-        max_num_jobs_memory = int(free_memory_gb / 9)
+    # calculate the maximum allowed NUM_JOBS based on free memory
+    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
+    max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
-        # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-        max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
-        max_jobs = str(max_jobs)
-        os.environ["MAX_JOBS"] = max_jobs
+    # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
+    max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
+    max_jobs_env = os.environ.get("MAX_JOBS")
+    if max_jobs_env is not None:
+        try:
+            max_processes = int(max_jobs_env)
+            # too large value
+            if max_processes > max_jobs:
+                os.environ["MAX_JOBS"] = str(max_jobs)
+        # error value
+        except ValueError:
+            os.environ["MAX_JOBS"] = str(max_jobs)
+    # none value
+    else:
+        os.environ["MAX_JOBS"] = str(max_jobs)
 
 
-def rename_cpp_to_cu(els, dst, recurisve=False):
+def rename_cpp_to_cu(els, dst, hipify, recursive=False):
     def do_rename_and_mv(name, src, dst, ret):
         newName = name
-        if name.endswith(".cpp") or name.endswith(".cu"):
-            newName = name.replace(".cpp", ".cu")
-            ret.append(f"{dst}/{newName}")
-        shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
+        if hipify:
+            if name.endswith(".cpp") or name.endswith(".cu"):
+                newName = name.replace(".cpp", ".cu")
+                ret.append(f"{dst}/{newName}")
+            shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
+        else:
+            if name.endswith(".cpp") or name.endswith(".cu"):
+                ret.append(f"{src}/{newName}")
 
     ret = []
     for el in els:
@@ -188,8 +374,10 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
         if os.path.isdir(el):
             for entry in os.listdir(el):
                 if os.path.isdir(f"{el}/{entry}"):
-                    if recurisve:
-                        ret += rename_cpp_to_cu([f"{el}/{entry}"], dst, recurisve)
+                    if recursive:
+                        ret += rename_cpp_to_cu(
+                            [f"{el}/{entry}"], dst, hipify, recursive
+                        )
                     continue
                 do_rename_and_mv(entry, el, dst, ret)
         else:
@@ -197,8 +385,8 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
     return ret
 
 
-@functools.lru_cache()
-def check_numa():
+@torch_compile_guard()
+def check_numa_custom_op() -> None:
     numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
     if numa_balance_set == "1":
         logger.warning(
@@ -208,14 +396,30 @@ def check_numa():
         )
 
 
+@functools.lru_cache()
+def check_numa():
+    check_numa_custom_op()
+
+
 __mds = {}
+
+
+@torch_compile_guard()
+def get_module_custom_op(md_name: str) -> None:
+    global __mds
+    if md_name not in __mds:
+        if "AITER_JIT_DIR" in os.environ:
+            __mds[md_name] = importlib.import_module(md_name)
+        else:
+            __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+        logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
+    return
 
 
 @functools.lru_cache(maxsize=1024)
 def get_module(md_name):
     check_numa()
-    if md_name not in __mds:
-        __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+    get_module_custom_op(md_name)
     return __mds[md_name]
 
 
@@ -224,13 +428,6 @@ rebuilded_list = ["module_aiter_enum"]
 
 def rm_module(md_name):
     os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
-
-
-@functools.lru_cache()
-def recopy_ck():
-    if os.path.exists(CK_DIR):
-        os.system(f"rm -rf {CK_DIR}")
-    shutil.copytree(CK_3RDPARTY_DIR, CK_DIR, dirs_exist_ok=True)
 
 
 def clear_build(md_name):
@@ -249,14 +446,14 @@ def build_module(
     is_python_module,
     is_standalone,
     torch_exclude,
-    hipify=True,
+    hipify=False,
+    prebuild=0,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}.so" if not is_standalone else md_name
 
     def MainFunc():
-        recopy_ck()
         if AITER_REBUILD == 1:
             rm_module(md_name)
             clear_build(md_name)
@@ -271,9 +468,16 @@ def build_module(
         if os.path.exists(f"{get_user_jit_dir()}/{target_name}"):
             os.remove(f"{get_user_jit_dir()}/{target_name}")
 
-        sources = rename_cpp_to_cu(srcs, src_dir)
+        if prebuild != 2:
+            sources = rename_cpp_to_cu(srcs, src_dir, hipify)
+        else:
+            sources = rename_cpp_to_cu(
+                [get_user_jit_dir() + "/../../csrc/rocm_ops.cpp"],
+                src_dir,
+                hipify,
+            )
 
-        flags_cc = ["-O3", "-std=c++17"]
+        flags_cc = ["-O3", "-std=c++20"]
         flags_hip = [
             "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
@@ -288,11 +492,14 @@ def build_module(
             "-Wno-vla-cxx-extension",
             "-Wno-undefined-func-template",
             "-Wno-macro-redefined",
+            "-Wno-missing-template-arg-list-after-template-kw",
             "-fgpu-flush-denormals-to-zero",
         ]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
+        if hip_version <= Version("6.3.42132"):
+            flags_hip += ["-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1"]
         if hip_version > Version("5.5.00000"):
             flags_hip += ["-mllvm --lsr-drop-solution=1"]
         if hip_version > Version("5.7.23302"):
@@ -308,11 +515,18 @@ def build_module(
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
+
+        if not torch_exclude:
+            import torch
+
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
+
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
-        flags_hip = list(set(flags_hip))  # remove same flags
+        flags_hip = sorted(set(flags_hip))  # remove same flags
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
 
@@ -323,39 +537,51 @@ def build_module(
                 if AITER_LOG_MORE:
                     logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
                 os.system(f"{PY} {blob_gen_cmd.format(blob_dir)}")
-                sources += rename_cpp_to_cu([blob_dir], src_dir, recurisve=True)
+                sources += rename_cpp_to_cu([blob_dir], src_dir, hipify, recursive=True)
             return sources
 
-        if isinstance(blob_gen_cmd, list):
-            for s_blob_gen_cmd in blob_gen_cmd:
-                sources = exec_blob(s_blob_gen_cmd, op_dir, src_dir, sources)
-        else:
-            sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
-
-        # TODO: Move all torch api into torch folder
-        old_bd_include_dir = f"{op_dir}/build/include"
-        os.makedirs(old_bd_include_dir, exist_ok=True)
-        rename_cpp_to_cu(
-            [f"{AITER_CSRC_DIR}/include"] + extra_include, old_bd_include_dir
-        )
-
-        if not is_standalone:
-            bd_include_dir = f"{op_dir}/build/include/torch"
-            os.makedirs(bd_include_dir, exist_ok=True)
-            rename_cpp_to_cu(
-                [f"{AITER_CSRC_DIR}/include/torch"] + extra_include, bd_include_dir
-            )
+        if prebuild != 2:
+            if isinstance(blob_gen_cmd, list):
+                for s_blob_gen_cmd in blob_gen_cmd:
+                    sources = exec_blob(s_blob_gen_cmd, op_dir, src_dir, sources)
+            else:
+                sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
         extra_include_paths = [
-            f"{CK_DIR}/include",
-            f"{CK_DIR}/library/include",
-            f"{old_bd_include_dir}",
+            f"{CK_HELPER_DIR}",
+            f"{CK_3RDPARTY_DIR}/include",
+            f"{CK_3RDPARTY_DIR}/library/include",
         ]
+        if not hipify:
+            extra_include_paths += [
+                f"{AITER_CSRC_DIR}/include",
+                f"{op_dir}/blob",
+            ] + extra_include
+            if not is_standalone:
+                extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
+        else:
+            old_bd_include_dir = f"{op_dir}/build/include"
+            extra_include_paths.append(old_bd_include_dir)
+            os.makedirs(old_bd_include_dir, exist_ok=True)
+            rename_cpp_to_cu(
+                [f"{AITER_CSRC_DIR}/include"] + extra_include,
+                old_bd_include_dir,
+                hipify,
+            )
+
+            if not is_standalone:
+                bd_include_dir = f"{op_dir}/build/include/torch"
+                os.makedirs(bd_include_dir, exist_ok=True)
+                rename_cpp_to_cu(
+                    [f"{AITER_CSRC_DIR}/include/torch"],
+                    bd_include_dir,
+                    hipify,
+                )
 
         try:
             _jit_compile(
                 md_name,
-                sources,
+                sorted(set(sources)),
                 extra_cflags=flags_cc,
                 extra_cuda_cflags=flags_hip,
                 extra_ldflags=extra_ldflags,
@@ -367,15 +593,29 @@ def build_module(
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
                 hipify=hipify,
+                prebuild=prebuild,
             )
             if is_python_module and not is_standalone:
-                shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
+                if prebuild == 1:
+                    shutil.copy(
+                        f"{opbd_dir}/{target_name}",
+                        f"{get_user_jit_dir()}/build/aiter_/build",
+                    )
+                elif prebuild == 2:
+                    from pathlib import Path
+
+                    src_dir = Path(opbd_dir)
+                    dst_dir = Path(get_user_jit_dir())
+                    for src_file in src_dir.glob("*.so"):
+                        shutil.move(str(src_file), str(dst_dir / src_file.name))
+                else:
+                    shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
             else:
                 shutil.copy(
                     f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
                 )
-        except:
-            tag = f"\033[31mfailed build jit [{md_name}]\033[0m"
+        except Exception as e:
+            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
             logger.error(
                 f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
                     re.sub(
@@ -386,11 +626,13 @@ def build_module(
                     ),
                 )
             )
-            raise
+            raise SystemExit(
+                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
+            ) from e
 
     def FinalFunc():
         logger.info(
-            f"finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s"
+            f"\033[32mfinish build [{md_name}], cost {time.perf_counter()-startTS:.1f}s \033[0m"
         )
 
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
@@ -408,6 +650,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
         "is_python_module": True,
         "is_standalone": False,
         "torch_exclude": False,
+        "hip_clang_path": None,
         "blob_gen_cmd": "",
     }
 
@@ -432,10 +675,10 @@ def get_args_of_build(ops_name: str, exclude=[]):
     with open(this_dir + "/optCompilerConfig.json", "r") as file:
         data = json.load(file)
         if isinstance(data, dict):
-            # parse all ops
+            # parse all ops, return list
             if ops_name == "all":
+                all_ops_list = []
                 d_all_ops = {
-                    "srcs": [],
                     "flags_extra_cc": [],
                     "flags_extra_hip": [],
                     "extra_include": [],
@@ -450,15 +693,24 @@ def get_args_of_build(ops_name: str, exclude=[]):
                     if ops_name in exclude:
                         continue
                     single_ops = convert(d_ops)
+                    d_single_ops = {
+                        "md_name": ops_name,
+                        "srcs": single_ops["srcs"],
+                        "flags_extra_cc": single_ops["flags_extra_cc"],
+                        "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "extra_include": single_ops["extra_include"],
+                        "blob_gen_cmd": single_ops["blob_gen_cmd"],
+                    }
                     for k in d_all_ops.keys():
                         if isinstance(single_ops[k], list):
                             d_all_ops[k] += single_ops[k]
                         elif isinstance(single_ops[k], str) and single_ops[k] != "":
                             d_all_ops[k].append(single_ops[k])
+                    all_ops_list.append(d_single_ops)
 
-                return d_all_ops
+                return all_ops_list, d_all_ops
             # no find opt_name in json.
-            elif data.get(ops_name) == None:
+            elif data.get(ops_name) is None:
                 logger.warning(
                     "Not found this operator ("
                     + ops_name
@@ -475,24 +727,32 @@ def get_args_of_build(ops_name: str, exclude=[]):
             )
 
 
-def compile_ops(_md_name: str, fc_name: Optional[str] = None):
+def compile_ops(
+    _md_name: str,
+    fc_name: Optional[str] = None,
+    gen_func: Optional[Callable[..., dict[str, Any]]] = None,
+    gen_fake: Optional[Callable[..., Any]] = None,
+):
     def decorator(func):
         func.arg_checked = False
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
+
             loadName = fc_name
             md_name = _md_name
             if fc_name is None:
                 loadName = func.__name__
             try:
                 module = None
+                if gen_func is not None:
+                    custom_build_args.update(gen_func(*args, **kwargs))
                 if PREBUILD_KERNELS:
                     if hasattr(aiter_, loadName):
                         module = aiter_
                 elif AITER_REBUILD and md_name not in rebuilded_list:
                     rebuilded_list.append(md_name)
-                    raise ModuleNotFoundError("")
+                    raise ModuleNotFoundError("start rebuild")
                 if module is None:
                     md = custom_build_args.get("md_name", md_name)
                     module = get_module(md)
@@ -513,7 +773,13 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
                 torch_exclude = d_args["torch_exclude"]
-                hipify = d_args.get("hipify", True)
+                hipify = d_args.get("hipify", False)
+                hip_clang_path = d_args.get("hip_clang_path", None)
+                prev_hip_clang_path = None
+                if hip_clang_path is not None and os.path.exists(hip_clang_path):
+                    prev_hip_clang_path = os.environ.get("HIP_CLANG_PATH", None)
+                    os.environ["HIP_CLANG_PATH"] = hip_clang_path
+
                 build_module(
                     md_name,
                     srcs,
@@ -528,6 +794,13 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     torch_exclude,
                     hipify,
                 )
+
+                if hip_clang_path is not None:
+                    if prev_hip_clang_path is not None:
+                        os.environ["HIP_CLANG_PATH"] = prev_hip_clang_path
+                    else:
+                        os.environ.pop("HIP_CLANG_PATH", None)
+
                 if is_python_module:
                     module = get_module(md_name)
                 if md_name not in __mds:
@@ -541,35 +814,56 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
             def check_args():
                 get_asm_dir()
                 import inspect
-                import typing
                 import re
+
                 import torch
+
+                enum_types = ["ActivationType", "QuantType"]
 
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
+                    doc_str = doc_str.replace("list[", "List[")
+                    doc_str = doc_str.replace("tuple[", "Tuple[")
+                    doc_str = doc_str.replace("collections.abc.Sequence[", "List[")
+                    doc_str = doc_str.replace("typing.SupportsInt", "int")
+                    doc_str = doc_str.replace("typing.SupportsFloat", "float")
+                    # A|None  -->  Optional[A]
+                    pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
+                    doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
+                    for el in enum_types:
+                        doc_str = re.sub(f" aiter.*{el} ", f" {el} ", doc_str)
                     namespace = {
                         "List": List,
                         "Optional": Optional,
                         "torch": torch,
+                        "typing": typing,
                     }
-                    exec(f"from aiter import*\ndef {doc_str}: pass", namespace)
+
+                    exec(
+                        f"from aiter import*\ndef {doc_str}: pass",
+                        namespace,
+                    )
                     foo = namespace[doc_str.split("(")[0]]
                     sig = inspect.signature(foo)
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
-
                     callargs = inspect.getcallargs(func, *args, **kwargs)
                     for el, arg in callargs.items():
                         expected_type = ann[el]
+                        got_type = type(arg)
                         origin = typing.get_origin(expected_type)
                         sub_t = typing.get_args(expected_type)
 
                         if origin is None:
-                            if not isinstance(arg, expected_type):
+                            if not isinstance(arg, expected_type) and not (
+                                # aiter_enum can be int
+                                any(el in str(expected_type) for el in enum_types)
+                                and isinstance(arg, int)
+                            ):
                                 raise TypeError(
-                                    f"{el} needs to be {expected_type} but got {type(arg)}"
+                                    f"{loadName}: {el} needs to be {expected_type} but got {got_type}"
                                 )
                         elif origin is list:
                             if (
@@ -577,12 +871,12 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                                 # or not all(isinstance(i, sub_t) for i in arg)
                             ):
                                 raise TypeError(
-                                    f"{el} needs to be List[{sub_t}] but got {arg}"
+                                    f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                 )
-                        elif origin is typing.Union:
+                        elif origin is typing.Union or origin is types.UnionType:
                             if arg is not None and not isinstance(arg, sub_t):
                                 raise TypeError(
-                                    f"{el} needs to be Optional[{sub_t}] but got {arg}"
+                                    f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
                                 )
                         else:
                             raise TypeError(f"Unsupported type: {expected_type}")
@@ -606,6 +900,10 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
 
             return op(*args, **kwargs)
 
-        return wrapper
+        @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
+        def custom_wrapper(*args, **kwargs):
+            return wrapper(*args, **kwargs)
+
+        return custom_wrapper
 
     return decorator

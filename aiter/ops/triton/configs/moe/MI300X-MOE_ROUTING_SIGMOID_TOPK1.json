@@ -1,0 +1,70 @@
+{
+  "N16": {
+    "small" :{
+      "BLOCK_M": 16,
+      "BLOCK_K": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "waves_per_eu": 3,
+      "kpack": 1
+    },
+    "medium" :{
+      "BLOCK_M": 16,
+      "BLOCK_K": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "waves_per_eu": 3,
+      "kpack": 1
+    },
+    "large" :{
+      "BLOCK_M": 16,
+      "BLOCK_K": 256,
+      "num_warps": 4,
+      "num_stages": 2,
+      "waves_per_eu": 3,
+      "kpack": 2
+    },
+    "xlarge" :{
+      "BLOCK_M": 32,
+      "BLOCK_K": 128,
+      "num_warps": 8,
+      "num_stages": 2,
+      "waves_per_eu": 2,
+      "kpack": 2
+    }
+  },
+  "N128": {
+    "small" :{
+      "BLOCK_M": 16,
+      "BLOCK_K": 256,
+      "num_warps": 8,
+      "num_stages": 1,
+      "waves_per_eu": 0,
+      "kpack": 1
+    },
+    "medium" :{
+      "BLOCK_M": 16,
+      "BLOCK_K": 256,
+      "num_warps": 8,
+      "num_stages": 1,
+      "waves_per_eu": 0,
+      "kpack": 2
+    },
+    "large" :{
+      "BLOCK_M": 16,
+      "BLOCK_K": 256,
+      "num_warps": 8,
+      "num_stages": 1,
+      "waves_per_eu": 2,
+      "kpack": 2
+    },
+    "xlarge" :{
+      "BLOCK_M": 32,
+      "BLOCK_K": 128,
+      "num_warps": 8,
+      "num_stages": 2,
+      "waves_per_eu": 2,
+      "kpack": 2
+    }
+  }
+}

@@ -46,13 +46,27 @@ CK_TILE_DEVICE fp32x2_v amd_assembly_pk_mul_f32(fp32x2_v a, fp32x2_t b)
 CK_TILE_DEVICE fp8x2_v amd_assembly_cvt_pk_fp8_f32(fp32_t a, fp32_t b)
 {
     int16x2_t c;
-    asm volatile("v_cvt_pk_fp8_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
+    static constexpr bool is_e4m3_fnuz =
+        (numeric_traits<fp8_t>::f8_interpret == fp8_interpretation::E4M3_FNUZ);
+    static constexpr float d = is_e4m3_fnuz ? 240.0f : 448.0f;
+    static constexpr float e = is_e4m3_fnuz ? -240.0f : -448.0f;
+    asm volatile("v_med3_f32 %1, %1, %3, %4\n"
+                 "v_med3_f32 %2, %2, %3, %4\n"
+                 "v_cvt_pk_fp8_f32 %0, %1, %2"
+                 : "=v"(c)
+                 : "v"(a), "v"(b), "v"(d), "v"(e));
     return bit_cast<fp8x2_v>(c[0]);
 }
 CK_TILE_DEVICE fp8x2_v amd_assembly_cvt_pk_bf8_f32(fp32_t a, fp32_t b)
 {
     int16x2_t c;
-    asm volatile("v_cvt_pk_bf8_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
+    static constexpr float d = 57344.0f;
+    static constexpr float e = -57344.0f;
+    asm volatile("v_med3_f32 %1, %1, %3, %4\n"
+                 "v_med3_f32 %2, %2, %3, %4\n"
+                 "v_cvt_pk_bf8_f32 %0, %1, %2"
+                 : "=v"(c)
+                 : "v"(a), "v"(b), "v"(d), "v"(e));
     return bit_cast<fp8x2_v>(c[0]);
 }
 CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_f32(fp32_t a, fp32_t b, fp32_t scale)
@@ -62,6 +76,8 @@ CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_f32(fp32_t a, fp32_t b, 
     // permute high bits and low bits to match the order of the original vector
     asm volatile("v_cvt_scalef32_pk_fp4_f32 %0, %1, %2, %3" : "=v"(c) : "v"(b), "v"(a), "v"(scale));
     return bit_cast<fp4x2_t>(bit_cast<int8x2_t>(c[0])[0]);
+#else
+    return fp4x2_t{};
 #endif
 }
 CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_f16(fp16x2_v a, fp32_t scale)
@@ -71,6 +87,8 @@ CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_f16(fp16x2_v a, fp32_t s
     // permute high bits and low bits to match the order of the original vector
     asm volatile("v_cvt_scalef32_pk_fp4_f16 %0, %1, %2" : "=v"(c) : "v"(a), "v"(scale));
     return bit_cast<fp4x2_t>(bit_cast<int8x2_t>(c[0])[0]);
+#else
+    return fp4x2_t{};
 #endif
 }
 CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_bf16(bf16x2_v a, fp32_t scale)
@@ -80,6 +98,8 @@ CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_bf16(bf16x2_v a, fp32_t 
     // permute high bits and low bits to match the order of the original vector
     asm volatile("v_cvt_scalef32_pk_fp4_bf16 %0, %1, %2" : "=v"(c) : "v"(a), "v"(scale));
     return bit_cast<fp4x2_t>(bit_cast<int8x2_t>(c[0])[0]);
+#else
+    return fp4x2_t{};
 #endif
 }
 

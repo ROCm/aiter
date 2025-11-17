@@ -1,26 +1,215 @@
 import os
 import json
+import inspect
+from pathlib import Path
 import torch
 import triton.language as tl
+import triton
+import warnings
 import sys
 import time
-import os
 import tempfile
 import re
-
+import matplotlib.pyplot as plt
 
 # Base directory where configs are located
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
 
-torch_to_tl_dtype = {
-    torch.float16: tl.float16,
-    torch.bfloat16: tl.bfloat16,
-    torch.float32: tl.float32,
-}
+
+def get_shape_benchmark_object(plot_name, args, x_names=None):
+    """
+    Utility function for returning a triton.testing.Benchmark object to populate.
+
+    Note: This is for benchmarking GEMM kernels without the --model flag. The distinction
+    comes in the x_names and x_vals: For models, we use hidden_dim and intermediate_dim
+    as args, but if we're just given a shape, we use M, N, K.
+    """
+    if x_names is None:
+        x_names = ["M", "N", "K"]
+
+    if args.shape:
+        if len(x_names) == len(args.shape):
+            x_vals_list = [args.shape]
+        elif len(x_names) == 4 and len(args.shape) == 3:  # for batched GEMM kernels
+            if hasattr(args, "B") and args.B is not None:
+                x_vals_list = [[args.B] + args.shape]
+            else:
+                batch_size = 16
+                warnings.warn(
+                    f"Batch size not specified in --shape or with -B, using default: {batch_size}."
+                )
+                x_vals_list = [[batch_size] + args.shape]
+        else:
+            raise ValueError(
+                f"Incompatible --shape provided: {args.shape}. Expected a shape that matches {x_names}."
+            )
+    else:
+        x_vals_list = get_x_vals(dims=len(x_names), args=args)
+
+    if args.metric == "time":
+        ylabel = "Time (ms)"
+    elif args.metric == "throughput":
+        ylabel = "Throughput (TFLOPS)"
+    elif args.metric == "bandwidth":
+        ylabel = "Bandwidth (GB/s)"
+    else:
+        raise NotImplementedError(f"{args.metric} is not supported")
+
+    evaluation_metric_to_unit = {
+        "throughput": "TFLOPS",
+        "time": "Time_(ms)",
+        "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
+    }
+    benchmark = triton.testing.Benchmark(
+        x_names=x_names,
+        x_vals=x_vals_list,
+        x_log=True,
+        y_log=True,
+        line_arg="unit",
+        line_vals=[evaluation_metric_to_unit[args.metric]],
+        line_names=[evaluation_metric_to_unit[args.metric]],
+        styles=[("green", "-")],
+        ylabel=ylabel,
+        plot_name=plot_name,
+        args={"metric": args.metric},
+    )
+    return benchmark
+
+
+def get_model_benchmark_object(
+    plot_name, args, x_names=None, model_benchmark_shapes_fn=None
+):
+    """
+    Utility function for returning a triton.testing.Benchmark object to populate.
+
+    Note: This is for benchmarking models (e.g with the --model arg).
+    """
+    if x_names is None:
+        x_names = ["M", "hidden_dim", "intermediate_dim", "model_name"]
+    if model_benchmark_shapes_fn is None:
+        model_benchmark_shapes_fn = model_benchmark_shapes
+    if not args.fc1 and not args.fc2:
+        # by default, benchmark both
+        warnings.warn(
+            "No specific layer selected for benchmarking, defaulting to both. To specify a layer, use -fc1 or -fc2."
+        )
+        args.fc1 = True
+        args.fc2 = True
+    x_vals_list = model_benchmark_shapes_fn(args)
+
+    if args.metric == "time":
+        ylabel = "Time (ms)"
+    elif args.metric == "throughput":
+        ylabel = "Throughput (TFLOPS)"
+    elif args.metric == "bandwidth":
+        ylabel = "Bandwidth (GB/s)"
+    else:
+        raise NotImplementedError(f"{args.metric} is not supported")
+
+    line_names = []
+    if args.fc1:
+        line_names.append("fc1")
+    if args.fc2:
+        line_names.append("fc2")
+    line_vals = line_names
+
+    mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    benchmark = triton.testing.Benchmark(
+        x_names=x_names,
+        x_vals=x_vals_list,
+        x_log=True,
+        y_log=True,
+        line_arg="layer",
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=[
+            (mpl_colors[i], "-") for i in range(len(line_names))
+        ],  # match line names to colors
+        ylabel=ylabel,
+        plot_name=plot_name,
+        args={"metric": args.metric},
+    )
+    return benchmark
+
+
+def model_benchmark_shapes(args):
+    config_file = args.model_configs
+    configs = get_model_configs(config_path=config_file, models=args.model)
+    if args.model == "all":
+        M_list = [args.M if args.M is not None else 4096]
+    else:
+        M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
+    shapes = []
+    for M in M_list:
+        for model_name, config in configs.items():
+            shapes.append(
+                (M, config["hidden_size"], config["intermediate_size"], model_name)
+            )
+
+    return shapes
+
+
+def batched_model_benchmark_shapes(args):
+    """
+    Generate benchmark shapes when profiling a batched GEMM with the --model arg.
+    """
+    config_file = args.model_configs
+    configs = get_model_configs(config_path=config_file, models=args.model)
+    if args.model == "all":
+        M_list = [args.M if args.M is not None else 4096]
+    else:
+        M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
+    batch_size = args.B if args.B is not None else 16
+    shapes = []
+    for M in M_list:
+        for model_name, config in configs.items():
+            N = config["intermediate_size"]
+            K = config["hidden_size"]
+
+            shapes.append(
+                (M, N, K, batch_size, model_name)
+            )  # rearrange batch to last dim so M is graph x-axis
+
+    return shapes
+
+
+def get_x_vals(dims: int, args=None):
+    """
+    Get a default set of benchmarking values (M, N, K).
+    """
+    assert dims in [3, 4], "Invalid number of dimensions"
+    if args.M is not None:
+        x_vals = [(args.M, 1280, 8192)]
+    else:
+        x_vals = [
+            (1, 1280, 8192),
+            (32, 1280, 8192),
+            (64, 1280, 8192),
+            (128, 1280, 8192),
+            (192, 1280, 8192),
+            (256, 1280, 8192),
+            (320, 1280, 8192),
+            (512, 1280, 8192),
+            (1024, 1280, 8192),
+            (2048, 1280, 8192),
+            (4096, 1280, 8192),
+            (8192, 1280, 8192),
+            (16384, 1280, 8192),
+        ]
+    if dims == 4:
+        if hasattr(args, "B") and args.B is not None:
+            batch_size = args.B
+        else:
+            batch_size = 16  # by default
+            warnings.warn(
+                f"Batch size not specified in --shape or with -B, using default: {batch_size}"
+            )
+        x_vals = [tuple([batch_size] + list(i)) for i in x_vals]  # (B, M, N, K)
+    return x_vals
 
 
 def get_model_configs(
-    config_path="./utils/model_configs.json", models="llama3,mistral_7B"
+    config_path="./utils/model_configs.json", models="llama3,mixtral_7B"
 ):
     """
     Load model names from the configuration file.
@@ -127,9 +316,8 @@ def parse_vgpr_usage(file_path, table_start="result-table-name"):
 
     # Print extracted information
     print("\n".join(vgpr_info))
-
     table = PrettyTable()
-    table.field_names = table_lines[0].split()
+    table.field_names = re.split(r" {1,}", table_lines[0].strip())
     [table.add_row(line.split()[1:]) for line in table_lines[1:]]
 
     print(table)
@@ -185,3 +373,8 @@ def get_dtype_bytes(dtype):
         return 1
     else:
         raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def get_caller_name_no_ext():
+    caller_file = inspect.stack()[1].filename  # full path of caller
+    return Path(caller_file).stem  # filename without extension

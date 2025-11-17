@@ -13,13 +13,15 @@ from ..utility import dtypes, fp4_utils
 
 
 @compile_ops("module_smoothquant")
-def smoothquant_fwd(input: Tensor, out: Tensor, x_scale: Tensor, y_scale: Tensor): ...
+def smoothquant_fwd(
+    out: Tensor, input: Tensor, x_scale: Tensor, y_scale: Tensor
+) -> None: ...
 
 
 @compile_ops("module_smoothquant")
 def moe_smoothquant_fwd(
-    input: Tensor, out: Tensor, x_scale: Tensor, topk_ids: Tensor, y_scale: Tensor
-): ...
+    out: Tensor, input: Tensor, x_scale: Tensor, topk_ids: Tensor, y_scale: Tensor
+) -> None: ...
 
 
 # following are pure torch implement
@@ -65,7 +67,7 @@ def pertoken_quant(
     return y, y_scale
 
 
-def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
+def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
     assert quant_dtype == dtypes.fp4x2
     block_size = 32
     F8E8M0_EXP_BIAS = 127
@@ -73,6 +75,9 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
     MAX_POW2 = int(torch.log2(torch.tensor(F4E2M1_MAX, dtype=torch.float32)).item())
     # dtypeMax = F4E2M1_MAX
     dtypeMax = 2.0**MAX_POW2
+
+    shape_original = x.shape
+    x = x.view(-1, shape_original[-1])
 
     m, n = x.shape
     x = x.view(-1, block_size)
@@ -88,27 +93,10 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
 
     y = x.float() / scale_f32.view(-1, 1)
     y = fp4_utils.f32_to_mxfp4(y)
-    y = y.view(m, -1)
+    y = y.view(*shape_original[:-1], -1)
     scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
     if shuffle:
-        scale_padded = torch.empty(
-            (m + 255) // 256 * 256, (n // block_size + 7) // 8 * 8, dtype=torch.uint8
-        ).fill_(0x7F)
-
-        scale_padded[:m, : n // block_size] = scale
-        scale = scale_padded
-        sm, sn = scale.shape
-
-    if shuffle == 2:
-        scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
-        scale = scale.permute(0, 3, 4, 1, 5, 2).contiguous()
-        scale = scale.view(-1, 4, 64)
-        scale = scale.permute(0, 2, 1).contiguous()
-        scale = scale.view(sm, sn)
-    elif shuffle:
-        scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
-        scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
-        scale = scale.view(sm, sn)
+        scale = fp4_utils.e8m0_shuffle(scale)
     return y, scale.view(dtypes.fp8_e8m0)
 
 
@@ -136,7 +124,7 @@ def per_block_quant_wrapper(block_shape=(1, 128)):
             m, n = x.shape
             x = x.view(-1, blk_n)
             y, scale = per_token_quant_func(x, scale=scale, quant_dtype=quant_dtype)
-            return y.view(m, -1), scale.view(m, -1)
+            return y.view(m, n), scale.view(m, n // blk_n)
 
         return wrapper
 
@@ -162,17 +150,19 @@ def get_torch_quant(qType):
 @functools.lru_cache()
 def get_hip_quant(qType):
     tmp = {
-        QuantType.No: lambda *a, **k: (a[0], None),
-        QuantType.per_Tensor: per_tensor_quant_hip,
-        QuantType.per_Token: per_token_quant_hip,
-        QuantType.per_1x32: per_1x32_f4_quant_hip,
-        QuantType.per_1x128: per_block_quant_wrapper((1, 128))(per_token_quant_hip),
+        QuantType.No.value: lambda *a, **k: (a[0], None),
+        QuantType.per_Tensor.value: per_tensor_quant_hip,
+        QuantType.per_Token.value: per_token_quant_hip,
+        QuantType.per_1x32.value: per_1x32_f4_quant_hip,
+        QuantType.per_1x128.value: functools.partial(
+            per_group_quant_hip, group_size=128
+        ),
     }
 
     def raise_NotImplementedError(*a, **k):
         raise NotImplementedError(f"unsupported quant type {qType=}")
 
-    return tmp.get(qType, raise_NotImplementedError)
+    return tmp.get(qType.value, raise_NotImplementedError)
 
 
 @functools.lru_cache()
@@ -191,7 +181,13 @@ def get_triton_quant(qType):
     return tmp.get(qType, raise_NotImplementedError)
 
 
-def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
+def per_token_quant_hip(
+    x,
+    scale=None,
+    quant_dtype=dtypes.i8,
+    num_rows: Optional[torch.tensor] = None,
+    num_rows_factor=1,
+):
     shape = x.shape
     device = x.device
     if scale is None:
@@ -201,7 +197,9 @@ def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
 
     if 1:
         y = torch.empty(shape, dtype=quant_dtype, device=device)
-        dynamic_per_token_scaled_quant(y, x, scale)
+        dynamic_per_token_scaled_quant(
+            y, x, scale, num_rows=num_rows, num_rows_factor=num_rows_factor
+        )
     elif quant_dtype == dtypes.i8:
         M, N = x.view(-1, shape[-1]).shape
         y = torch.empty((M, N), dtype=dtypes.i8, device=device)
@@ -211,10 +209,52 @@ def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
         y = y.view(shape)
     else:
         raise ValueError(f"unsupported: {quant_dtype=}")
+    # print("finished per token quant hip")
     return y, scale
 
 
-def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
+def per_group_quant_hip(
+    x,
+    scale=None,
+    quant_dtype=dtypes.i8,
+    group_size=128,
+    transpose_scale=False,
+    num_rows: Optional[torch.tensor] = None,
+    num_rows_factor=1,
+):
+    shape = x.shape
+    device = x.device
+    if scale is None:
+        scale = torch.empty(
+            (*shape[:-1], shape[-1] // group_size), dtype=dtypes.fp32, device=device
+        )
+    else:
+        raise ValueError("unsupported: static per token quant")
+    assert group_size in [
+        32,
+        64,
+        128,
+    ], f"unsupported group size {group_size=}, only support [32, 64, 128]"
+    y = torch.empty(shape, dtype=quant_dtype, device=device)
+    dynamic_per_token_scaled_quant(
+        y,
+        x.view(-1, group_size),
+        scale,
+        shuffle_scale=transpose_scale,
+        num_rows=num_rows,
+        num_rows_factor=num_rows_factor,
+    )
+    return y, scale
+
+
+def per_1x32_f4_quant_hip(
+    x,
+    scale=None,
+    quant_dtype=dtypes.fp4x2,
+    shuffle=False,
+    num_rows: Optional[torch.tensor] = None,
+    num_rows_factor=1,
+):
     m, n = x.shape
     assert quant_dtype == dtypes.fp4x2
     assert n % 2 == 0
@@ -246,13 +286,28 @@ def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True)
     else:
         raise ValueError("unsupported: static per token quant")
     y = torch.empty(m, n // 2, dtype=quant_dtype, device=device)
-    dynamic_per_group_scaled_quant_fp4(y, x, scale, 32, shuffle_scale=shuffle)
-    return y.view(torch.uint8), scale
+    dynamic_per_group_scaled_quant_fp4(
+        y,
+        x,
+        scale,
+        32,
+        shuffle_scale=shuffle,
+        num_rows=num_rows,
+        num_rows_factor=num_rows_factor,
+    )
+    return y, scale
 
 
-def per_tensor_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
+def per_tensor_quant_hip(
+    x,
+    scale=None,
+    quant_dtype=dtypes.i8,
+    num_rows: Optional[torch.tensor] = None,
+    num_rows_factor=1,
+):
+    assert num_rows is None, "num_rows is not supported for per_tensor_quant_hip"
     y = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
-    if quant_dtype == dtypes.fp8:
+    if quant_dtype in [dtypes.fp8, dtypes.i8]:
         if scale is None:
             scale = torch.empty(1, dtype=dtypes.fp32, device=x.device)
             dynamic_per_tensor_quant(y, x, scale)
@@ -266,13 +321,10 @@ def per_tensor_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
 def per_token_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     shape = x.shape
     device = x.device
-    dtypeMax = get_dtype_max(quant_dtype)
     y = torch.empty(shape, dtype=quant_dtype, device=device)
     if scale is None:
         scale = torch.empty((*shape[:-1], 1), dtype=dtypes.fp32, device=device)
-        triton.quant.dynamic_per_token_fp8_quant(
-            y, x, scale, quant_dtype=quant_dtype, dtypeMax=dtypeMax
-        )
+        triton.quant.dynamic_per_token_quant_fp8_i8(y, x.view(-1, x.shape[-1]), scale)
     else:
         raise ValueError("unsupported: static per token quant")
 
@@ -283,7 +335,7 @@ def per_1x32_f4_quant_triton(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=Fa
     assert quant_dtype == dtypes.fp4x2
     # y, scale = triton.quant.dynamic_mxfp4_quant(x)
     y, scale = fp4_utils.dynamic_mxfp4_quant(x, shuffle=shuffle)
-    return y, scale
+    return y.view(quant_dtype), scale
 
 
 def per_tensor_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
@@ -291,9 +343,9 @@ def per_tensor_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     x = x.view(-1, x.shape[-1])
     if scale is None:
         scale = torch.zeros(1, dtype=dtypes.fp32, device=x.device)
-        triton.quant.dynamic_per_tensor_fp8_quant(y, x, scale)
+        triton.quant.dynamic_per_tensor_quant_fp8_i8(y, x, scale)
     else:
-        triton.quant.static_per_tensor_fp8_quant(y, x, scale)
+        triton.quant.static_per_tensor_quant_fp8_i8(y, x, scale)
     return y, scale
 
 
@@ -308,21 +360,23 @@ def get_torch_act(aType):
 
 
 @compile_ops("module_quant")
-def static_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor): ...
+def static_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 
 @compile_ops("module_quant")
-def dynamic_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor): ...
+def dynamic_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 
 @compile_ops("module_quant")
 def dynamic_per_token_scaled_quant(
-    out: Tensor,
-    input: Tensor,
-    scales: Tensor,
-    scale_ub: Optional[Tensor] = None,
-    shuffle_scale=True,
-): ...
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    scale_ub: Optional[torch.Tensor] = None,
+    shuffle_scale: bool = False,
+    num_rows: Optional[torch.Tensor] = None,
+    num_rows_factor: int = 1,
+) -> None: ...
 
 
 @compile_ops("module_quant")
@@ -331,9 +385,32 @@ def dynamic_per_group_scaled_quant_fp4(
     input: Tensor,
     scales: Tensor,
     group_size: Optional[int] = 32,
-    shuffle_scale=True,
-):
+    shuffle_scale: bool = True,
+    num_rows: Optional[Tensor] = None,
+    num_rows_factor: int = 1,
+) -> None:
     """
     Only support group_size in [32, 64, 128]
     """
     ...
+
+
+@compile_ops("module_quant")
+def smooth_per_token_scaled_quant(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    smooth_scale: torch.Tensor,
+    smooth_scale_map: Optional[torch.Tensor] = None,
+    shuffle_scale: bool = False,
+    num_rows: Optional[torch.Tensor] = None,
+    num_rows_factor: int = 1,
+) -> None: ...
+
+
+@compile_ops("module_quant")
+def partial_transpose(
+    out: Tensor,
+    input: Tensor,
+    num_rows: Tensor,
+) -> None: ...

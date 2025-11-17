@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "mha_bwd.h"
 #include "ck_tile/host.hpp"
+#include "mha_bwd.h"
 #include "utils.hpp"
 
 #include <array>
@@ -14,21 +14,76 @@
 #include <utility>
 #include <vector>
 
-template <typename T>
-std::ostream& operator<<(std::ostream& os, const std::vector<T>& v)
+// This function is copied from ck commit 4d041837ade7ae01900a0442d939f80b723b1631
+std::vector<int32_t> to_seqstarts_(ck_tile::span<const int32_t> seqlens)
 {
-    using size_type = typename std::vector<T>::size_type;
-
-    os << "[";
-    for(size_type idx = 0; idx < v.size(); ++idx)
+    std::vector<int32_t> seqstarts = {0};
+    for(int32_t seqlen : seqlens)
     {
-        if(0 < idx)
-        {
-            os << ", ";
-        }
-        os << v[idx];
+        seqstarts.push_back(seqstarts.back() + seqlen);
     }
-    return os << "]";
+    assert(seqstarts.size() == seqlens.size() + 1);
+    return seqstarts;
+}
+
+std::vector<int32_t> generate_seqlens(mode_enum mode,
+                                      unsigned count,
+                                      int32_t seqlen_avg,
+                                      int32_t seqlen_min = -1, // if not negative, clamp min
+                                      int32_t seqlen_max = -1, // if not negative, clamp max
+                                      std::optional<unsigned> seed = std::nullopt)
+{
+    assert(0 < count);
+
+    seqlen_min = (0 < seqlen_min ? seqlen_min : 1);
+    seqlen_max = (0 < seqlen_max ? seqlen_max : std::numeric_limits<int32_t>::max());
+    assert(seqlen_min <= seqlen_max);
+
+    std::vector<int32_t> seqlens(count, std::clamp(seqlen_avg, seqlen_min, seqlen_max));
+
+    if(mode == mode_enum::group && 1 < count)
+    {
+        using size_type = std::vector<int32_t>::size_type;
+
+        std::mt19937 random_engine(seed.has_value() ? *seed : std::random_device{}());
+        std::uniform_int_distribution<size_type> idx_dist(0, count - 1);
+        auto next_idx = std::bind(idx_dist, std::ref(random_engine));
+
+        std::uniform_int_distribution<size_type> step_dist(1, count - 1);
+        auto next_step = std::bind(step_dist, std::ref(random_engine));
+
+        for(unsigned repeat = seqlen_avg * (count / 2); 0 < repeat; --repeat)
+        {
+            const size_type to_decrease = next_idx();
+            // make sure each elements of seqlens is in range [seqlen_min, seqlen_max]
+            if(seqlens[to_decrease] == seqlen_min)
+            {
+                continue;
+            }
+
+            const size_type to_increase = (to_decrease + next_step()) % count;
+
+            if(seqlens[to_increase] >= seqlen_max)
+            {
+                continue;
+            }
+
+            --seqlens[to_decrease];
+            ++seqlens[to_increase];
+        }
+    }
+
+    return seqlens;
+}
+
+std::vector<int32_t> generate_seqstarts(mode_enum mode,
+                                        unsigned count,
+                                        int32_t seqlen_avg,
+                                        int32_t seqlen_min           = -1,
+                                        int32_t seqlen_max           = -1,
+                                        std::optional<unsigned> seed = std::nullopt)
+{
+    return to_seqstarts_(generate_seqlens(mode, count, seqlen_avg, seqlen_min, seqlen_max, seed));
 }
 
 auto create_args(int argc, char* argv[])
@@ -87,8 +142,8 @@ auto create_args(int argc, char* argv[])
                 "0",
                 "seed and offset values are present on GPU; 0 - host, 1 - device/GPU")
         .insert("timer", "gpu", "gpu:gpu timer, cpu:cpu timer")
-        .insert("warmup", "5", "number of iterations before benchmark the kernel")
-        .insert("repeat", "20", "number of iterations to benchmark the kernel")
+        .insert("warmup", "10", "number of iterations before benchmark the kernel")
+        .insert("repeat", "10", "number of iterations to benchmark the kernel")
         .insert("deterministic",
                 "0",
                 "if set to 1 will use multi-buffer reduction strategy for dq, atomic opeartion "
@@ -100,7 +155,8 @@ auto create_args(int argc, char* argv[])
             "if set to 0 will use atomic fp16/bf16(w/o convert_dq kernel) when bwd_v3 is set to 1")
         .insert("v3_bf16_cvt",
                 "1",
-                "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ");
+                "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
+        .insert("is_v3_check", "0", "if set to 1, check whether the input scenarios is supported by the asm kernel.");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -207,6 +263,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     bool bwd_v3         = arg_parser.get_bool("bwd_v3");
     bool v3_atomic_fp32 = arg_parser.get_bool("v3_atomic_fp32");
     int v3_bf16_cvt     = arg_parser.get_int("v3_bf16_cvt");
+    bool is_v3_check    = arg_parser.get_bool("is_v3_check");
 
     ck_tile::stream_config stream_config{nullptr,
                                          true,
@@ -295,6 +352,10 @@ bool run(const ck_tile::ArgParser& arg_parser)
     const ck_tile::index_t kN0 = (hdim_q <= 128) ? 128 : 64;
     const ck_tile::index_t nsplits =
         deterministic ? ck_tile::integer_divide_ceil(max_seqlen_k, kN0) : 1;
+    const ck_tile::index_t a16_dq_acc_seq =
+        v3_atomic_fp32 ? shape_seqlen_q : (mode == mode_enum::batch ? (seqlen_q + 15) / 16 * 16 : (max_seqlen_q + 15) / 16 * 16);
+    // hdim_q = 192 pipline currently don't support hdim padding
+    const ck_tile::index_t a16_dq_acc_hdim = v3_atomic_fp32 ? hdim_q : hdim_q == 192? 192: 128;
 
     ck_tile::HostTensor<QDataType> q_host(
         get_lengths(i_perm, shape_batch, nhead, shape_seqlen_q, hdim_q));
@@ -334,6 +395,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
             : std::array<ck_tile::index_t, 4>{1, 1, 1, 1} /* dummy shape for simplifying code */);
     ck_tile::HostTensor<AccDataType> dq_acc_host(
         std::array<ck_tile::index_t, 5>{nsplits, shape_batch, nhead, shape_seqlen_q, hdim_q});
+    ck_tile::HostTensor<QGradDataType> dq_acc_host_a16(
+        std::array<ck_tile::index_t, 5>{nsplits, batch, nhead, a16_dq_acc_seq, a16_dq_acc_hdim});
 
     if(init_method == 0)
     {
@@ -345,11 +408,11 @@ bool run(const ck_tile::ArgParser& arg_parser)
     }
     else if(init_method == 1)
     {
-        ck_tile::FillUniformDistribution<QDataType>{0.f, 1.f, seed}(q_host);
-        ck_tile::FillUniformDistribution<KDataType>{0.f, 1.f, seed}(k_host);
-        ck_tile::FillUniformDistribution<VDataType>{0.f, 1.f, seed}(v_host);
-        ck_tile::FillUniformDistribution<BiasDataType>{0.f, 1.f, seed}(bias_host);
-        ck_tile::FillUniformDistribution<OGradDataType>{0.f, 1.f, seed}(do_host);
+        ck_tile::FillUniformDistribution<QDataType>{-1.f, 1.f, seed}(q_host);
+        ck_tile::FillUniformDistribution<KDataType>{-1.f, 1.f, seed}(k_host);
+        ck_tile::FillUniformDistribution<VDataType>{-1.f, 1.f, seed}(v_host);
+        ck_tile::FillUniformDistribution<BiasDataType>{-1.f, 1.f, seed}(bias_host);
+        ck_tile::FillUniformDistribution<OGradDataType>{-1.f, 1.f, seed}(do_host);
         // ck_tile::FillConstant<QDataType>{1}(q_host);
         // ck_tile::FillConstant<KDataType>{1}(k_host);
         // ck_tile::FillConstant<OGradDataType>{2}(do_host);
@@ -399,7 +462,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
     ck_tile::DeviceMem drop_seed_buf(drop_prefs ? sizeof(uint64_t) : 0);
     ck_tile::DeviceMem drop_offset_buf(drop_prefs ? sizeof(uint64_t) : 0);
     ck_tile::DeviceMem alibi_slope_buf(alibi_slope_host.get_element_space_size_in_bytes());
-    ck_tile::DeviceMem dq_acc_buf(dq_acc_host.get_element_space_size_in_bytes());
+    ck_tile::DeviceMem dq_acc_buf(v3_atomic_fp32
+                                      ? dq_acc_host.get_element_space_size_in_bytes()
+                                      : dq_acc_host_a16.get_element_space_size_in_bytes());
 
     q_buf.ToDevice(q_host.data());
     k_buf.ToDevice(k_host.data());
@@ -439,7 +504,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                   << " MByte memory workspace allocated" << std::endl;
     }
 
-    auto fmha_args   = [&]() {
+    auto fmha_args = [&]() {
         assert(nhead % nhead_k == 0);
         /// NOTE: we broadcast bias from [1, 1, seqlen_q, seqlen_k] to [batch, nhead, seqlen_q,
         ///       seqlen_k] in this example, hence both the 'batch_stride_bias' &
@@ -452,7 +517,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t stride_o       = (o_perm ? hdim_v : nhead * hdim_v);
         const ck_tile::index_t stride_randval = (max_seqlen_k);
         const ck_tile::index_t stride_do      = (o_perm ? hdim_v : nhead * hdim_v);
-        const ck_tile::index_t stride_dq_acc  = hdim_q;
+        const ck_tile::index_t stride_dq_acc  = a16_dq_acc_hdim;
         const ck_tile::index_t stride_dk      = (i_perm ? hdim_q : nhead * hdim_q);
         const ck_tile::index_t stride_dv      = (i_perm ? hdim_v : nhead * hdim_v);
         const ck_tile::index_t stride_dbias   = (i_perm ? max_seqlen_k : nhead * max_seqlen_k);
@@ -465,7 +530,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t nhead_stride_randval = (shape_seqlen_q * max_seqlen_k);
         const ck_tile::index_t nhead_stride_do      = (o_perm ? shape_seqlen_q * hdim_v : hdim_v);
         const ck_tile::index_t nhead_stride_lsed    = shape_seqlen_q;
-        const ck_tile::index_t nhead_stride_dq_acc  = shape_seqlen_q * hdim_q;
+        const ck_tile::index_t nhead_stride_dq_acc  = a16_dq_acc_seq * a16_dq_acc_hdim;
         const ck_tile::index_t nhead_stride_dbias =
             (i_perm ? shape_seqlen_q * max_seqlen_k : max_seqlen_k);
         // setup batch_stride_* arguments
@@ -480,6 +545,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t batch_stride_dk      = (nhead * shape_seqlen_k * hdim_q);
         const ck_tile::index_t batch_stride_dv      = (nhead * shape_seqlen_k * hdim_v);
         const ck_tile::index_t batch_stride_dbias   = (nhead * shape_seqlen_q * max_seqlen_k);
+        const ck_tile::index_t batch_stride_dq_acc  = (nhead * a16_dq_acc_seq * a16_dq_acc_hdim);
         const ck_tile::index_t split_stride_dq_acc =
             (shape_batch * nhead * shape_seqlen_q * hdim_q);
 
@@ -499,7 +565,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              k_buf.GetDeviceBuffer(),
                              v_buf.GetDeviceBuffer(),
                              bias.type == bias_enum::alibi ? alibi_slope_buf.GetDeviceBuffer()
-                                                             : bias_buf.GetDeviceBuffer(),
+                                                           : bias_buf.GetDeviceBuffer(),
                              o_buf.GetDeviceBuffer(),
                              lse_buf.GetDeviceBuffer(),
                              do_buf.GetDeviceBuffer(),
@@ -512,6 +578,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              dq_acc_buf.GetDeviceBuffer(),
                              seqstart_q.GetDeviceBuffer(),
                              seqstart_k.GetDeviceBuffer(),
+                             nullptr,
+                             nullptr,
+                             nullptr,
                              nullptr,
                              shape_seqlen_q,
                              shape_seqlen_k,
@@ -527,7 +596,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              stride_k,
                              stride_v,
                              bias.type == bias_enum::alibi ? (bias.rank_info == 0 ? 0 : nhead)
-                                                             : stride_bias,
+                                                           : stride_bias,
                              stride_o,
                              stride_randval,
                              stride_do,
@@ -557,8 +626,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              batch_stride_randval,
                              batch_stride_do,
                              batch_stride_lsed,
-                             batch_stride_q, // batch_stride_dq_acc
-                             batch_stride_q, // batch_stride_dq
+                             batch_stride_dq_acc, // batch_stride_dq_acc
+                             batch_stride_q,      // batch_stride_dq
                              batch_stride_dk,
                              batch_stride_dv,
                              batch_stride_dbias,
@@ -582,7 +651,10 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                     deterministic,
                                     bwd_v3,
                                     v3_atomic_fp32,
-                                    v3_bf16_cvt);
+                                    v3_bf16_cvt,
+                                    nullptr,
+                                    nullptr,
+                                    is_v3_check);
     if(ave_time < 0)
     {
         std::cout << ", not supported yet" << std::flush << std::endl;

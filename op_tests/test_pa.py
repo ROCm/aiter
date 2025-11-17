@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import random
 from typing import List, Optional, Tuple, Union
@@ -15,6 +15,8 @@ from aiter.test_common import (
     benchmark,
 )
 from aiter import pertoken_quant
+import argparse
+import pandas as pd
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
@@ -81,7 +83,6 @@ def kv_cache_factory(
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
 
-    scale = head_size**-0.5
     x = 16 // torch_dtype.itemsize
     k_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
     k_caches: List[torch.Tensor] = []
@@ -384,7 +385,7 @@ def run_aiter_asm(
     num_kv_heads,
     scale,
     alibi_slopes,
-    max_num_blocks,
+    block_tables_stride0,
     k_scale=None,
     v_scale=None,
     high_precision=0,
@@ -395,11 +396,11 @@ def run_aiter_asm(
         v_cache,
         block_tables,
         seq_lens,
-        max_num_blocks,
-        k_scale,
-        v_scale,
-        None,
-        high_precision,
+        block_tables_stride0,
+        K_QScale=k_scale,
+        V_QScale=v_scale,
+        out_=None,
+        high_precision=high_precision,
     )
 
 
@@ -491,7 +492,7 @@ def test_paged_attention(
 ) -> None:
     torch.set_default_device(device)
     # Using default kv_scale
-    k_scale = v_scale = 1.0
+    k_scale = v_scale = torch.tensor(1.0, device=device, dtype=dtypes.fp32)
     scale = float(1.0 / (head_size**0.5))
     num_query_heads, num_kv_heads = num_heads
     alibi_slopes = None
@@ -563,7 +564,8 @@ def test_paged_attention(
     )
     # tensor_dump(out_aiter, 'out_aiter')
 
-    if num_kv_heads == 1:
+    time_aiter_asm = None
+    if dtype == dtypes.bf16:
         out_aiter_asm, time_aiter_asm = run_aiter_asm(
             query.contiguous(),  # this kernel need contiguous buffer
             k_cache,
@@ -575,7 +577,7 @@ def test_paged_attention(
             num_kv_heads,
             scale,
             alibi_slopes,
-            max_num_blocks_per_seq,
+            block_tables.stride(0),
         )
 
         checkAllclose(
@@ -632,6 +634,14 @@ def test_paged_attention(
             )
             k_scale_asm.fill_(k_scale_.item())
             v_scale_asm.fill_(v_scale_.item())
+            k_scale_hip_ = torch.empty(
+                num_blocks * block_size, num_kv_heads, dtype=dtypes.fp32, device=device
+            )
+            v_scale_hip_ = torch.empty(
+                num_blocks * block_size, num_kv_heads, dtype=dtypes.fp32, device=device
+            )
+            k_scale_hip_.fill_(k_scale_.item())
+            v_scale_hip_.fill_(v_scale_.item())
 
             out_aiter, time_aiter = run_aiter(
                 query,
@@ -644,8 +654,8 @@ def test_paged_attention(
                 num_kv_heads,
                 scale,
                 alibi_slopes,
-                k_scale_.item(),
-                v_scale_.item(),
+                k_scale_hip_,
+                v_scale_hip_,
             )
             checkAllclose(
                 out_golden,
@@ -673,7 +683,6 @@ def test_paged_attention(
         # )
         # checkAllclose(out_aiter_asm, out_aiter_naive,
         #             msg=f'golden vs ck_naive(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_}):{time_aiter_naive:>8.2f} us......')
-
         if quant_algo_ != 0:
             out_aiter_asm, time_aiter_asm = run_aiter_asm(
                 query,
@@ -686,7 +695,7 @@ def test_paged_attention(
                 num_kv_heads,
                 scale,
                 alibi_slopes,
-                max_num_blocks_per_seq,
+                block_tables.stride(0),
                 k_scale_asm,
                 v_scale_asm,
             )
@@ -717,7 +726,7 @@ def test_paged_attention(
                         num_kv_heads,
                         scale,
                         alibi_slopes,
-                        max_num_blocks_per_seq,
+                        block_tables.stride(0),
                         k_scale_asm,
                         v_scale_asm,
                         high_precision,
@@ -800,11 +809,71 @@ def test_paged_attention(
     print(
         f"finish~ {ctx_lens=}, {num_seqs=}, {num_heads=}, {head_size=}, {use_alibi=}, {block_size=}, {dtype=}, {kv_cache_dtype=}\n"
     )
+    return {"aiter_shomy": time_aiter, "aiter_asm": time_aiter_asm}
 
 
-for num_heads in [(4, 1), (8, 1), (32, 8)]:
-    for ctx_len in [7, 26, 57, 66, 109, 128, 257, 282, 4097]:
-        for dtype in [dtypes.fp16, dtypes.bf16]:
-            test_paged_attention(
+df = []
+l_num_heads = [(4, 1), (8, 1), (32, 8)]
+l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097]
+l_dtype = ["fp16", "bf16"]
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+
+parser.add_argument(
+    "-n",
+    "--num_heads",
+    type=dtypes.str2tuple,
+    choices=l_num_heads,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Number of heads (num_query_heads, num_kv_heads)
+    e.g.: -n 4,1""",
+)
+
+parser.add_argument(
+    "-c",
+    "--ctx_len",
+    type=int,
+    choices=l_ctx_len,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Context length.
+    e.g. -c 128""",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.num_heads is not None:
+    l_num_heads = [args.num_heads]
+if args.ctx_len is not None:
+    l_ctx_len = [args.ctx_len]
+
+
+for num_heads in l_num_heads:
+    for ctx_len in l_ctx_len:
+        for dtype in l_dtype:
+            ret = test_paged_attention(
                 ctx_len, 128, num_heads, 128, False, 16, dtype, "auto", 0, "cuda:0"
             )
+            df.append(ret)
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")

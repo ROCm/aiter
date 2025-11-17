@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
 #include "moe_op.h"
 #include "asm_moe_2stage_configs.hpp"
@@ -76,27 +76,30 @@ static CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, Q
     else if ((inp.scalar_type() == torch_fp8) &&
              (w1.scalar_type() == torch_fp8) &&
              out.scalar_type() == at::ScalarType::BFloat16 &&
-             quant_type == QuantType::per_Token)
+             quant_type == QuantType::per_Token && 
+             !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenFp8_g1u1;
     }
     else if (inp.scalar_type() == at::ScalarType::Char &&
              w1.scalar_type() == at::ScalarType::Char &&
              out.scalar_type() == at::ScalarType::BFloat16 &&
-             quant_type == QuantType::per_Token)
+             quant_type == QuantType::per_Token && 
+             !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenInt8_g1u1;
     }
     else if ((inp.scalar_type() == torch_fp8) &&
              (w1.scalar_type() == torch_fp8) &&
              (out.scalar_type() == torch_fp8) &&
-             quant_type == QuantType::per_128x128)
+             quant_type == QuantType::per_1x128 && 
+             !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1;
     }
     else
     {
-        TORCH_CHECK(false, __func__, "Unsupported input_type:", inp.scalar_type(), ", weight_type:", w1.scalar_type(),
+        TORCH_CHECK(false, __func__, " Unsupported input_type:", inp.scalar_type(), ", weight_type:", w1.scalar_type(),
                     ", out_type:", out.scalar_type(), ", quant_type:", static_cast<int>(quant_type), ", do_weight:", do_weight);
     }
 };
@@ -160,8 +163,8 @@ void moe_stage1_g1u1(
     std::optional<torch::Tensor> sorted_weights = std::nullopt // [max_num_tokens_padded], do_weight==true need
 )
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     CFG *config_map = get_cfg(input, out, w1, quant_type, sorted_weights.has_value());
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;

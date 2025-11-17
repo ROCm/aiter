@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-#include <torch/all.h>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <stdexcept>
-#include <algorithm>
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "hip_compat.h"
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <algorithm>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#include <stdexcept>
+#include <torch/all.h>
 
 #define AT_DISPATCH_FP8_CASE(enum_type, ...) \
     AT_PRIVATE_CASE_TYPE_USING_HINT(enum_type, fp8_t, __VA_ARGS__)
@@ -28,6 +28,10 @@
 #define __HIP__MI300__
 #endif
 
+#if defined(__HIPCC__) && (defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__))
+#define __HIP__MI350_MI300_MI250__
+#endif
+
 #if defined(NDEBUG)
 #undef NDEBUG
 #include <assert.h>
@@ -36,6 +40,8 @@
 #else
 #define UNREACHABLE_CODE assert(false);
 #endif
+
+namespace aiter {
 
 template <typename T>
 struct scalar
@@ -377,7 +383,7 @@ void LLGemm1(void* in_a,
              void* out_c,
              const int M,
              const int K,
-             cudaStream_t stream,
+             hipStream_t stream,
              const int rows_per_block,
              const c10::ScalarType scalar_type)
 {
@@ -423,7 +429,7 @@ void LLGemm1(void* in_a,
     });
 }
 
-#if defined(__HIP__MI300_MI250__) // TODO: Add NAVI support
+#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
 
 // This version targets cases where A[] fits LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
@@ -660,7 +666,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     }
 }
 
-#else // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#else // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void wv_splitk_small_fp16_bf16_kernel(const int K,
@@ -674,9 +680,9 @@ __global__ void wv_splitk_small_fp16_bf16_kernel(const int K,
     UNREACHABLE_CODE
 }
 
-#endif // defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
-#if defined(__HIP__MI300_MI250__) // TODO: Add NAVI support
+#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
 // This version targets cases where A[] fits LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_sml_(const int K,
@@ -925,7 +931,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_sml_(const int K,
         m += CuCount * _WvPrGrp * YTILE;
     }
 }
-#else  // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#else  // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void wvSplitK_hf_sml_(const int K,
                                  const int M,
@@ -937,9 +943,9 @@ __global__ void wvSplitK_hf_sml_(const int K,
 {
     UNREACHABLE_CODE
 }
-#endif // defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
-#if defined(__HIP__MI300_MI250__) // TODO: Add NAVI support
+#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
 // This version targets cases where A[] marginally exceeds LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_(const int K,
@@ -1232,7 +1238,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_(const int K,
     }
 }
 
-#else  // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#else  // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void wvSplitK_hf_(const int K,
                              const int M,
@@ -1244,9 +1250,9 @@ __global__ void wvSplitK_hf_(const int K,
 {
     UNREACHABLE_CODE
 }
-#endif // defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
-#if defined(__HIP__MI300_MI250__) // TODO: Add NAVI support
+#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
 // This version targets big A[] cases, where it is much larger than LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
@@ -1598,7 +1604,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
         }
     }
 }
-#else  // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#else  // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void wvSplitK_hf_big_(const int K,
                                  const int M,
@@ -1610,7 +1616,7 @@ __global__ void wvSplitK_hf_big_(const int K,
 {
     UNREACHABLE_CODE
 }
-#endif // defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
 int mindiv(int N, int div1, int div2)
 {
@@ -1652,7 +1658,7 @@ int mindiv(int N, int div1, int div2)
 constexpr int MAX_N = 16;
 template <typename fptype, int N>
 void launch_wv_splitk_small_fp16_bf16_kernel(
-    cudaStream_t stream, int K_in, int M_in, fptype* af4, const fptype* bf4, fptype* c, int CuCount)
+    hipStream_t stream, int K_in, int M_in, fptype* af4, const fptype* bf4, fptype* c, int CuCount)
 {
     dim3 grid(CuCount);
     dim3 block(64, 1);
@@ -1673,7 +1679,7 @@ void launch_wv_splitk_small_fp16_bf16_kernel(
 }
 
 template <typename fptype>
-using KernelFuncPtr = void (*)(cudaStream_t, int, int, fptype*, const fptype*, fptype*, int);
+using KernelFuncPtr = void (*)(hipStream_t, int, int, fptype*, const fptype*, fptype*, int);
 
 // generate jump table during compilation (1~MAX_N)
 template <typename fptype, int... Is>
@@ -1689,7 +1695,7 @@ void wv_splitk_small_fp16_bf16(void* in_a,
                                const int M_in,
                                const int K_in,
                                const int N_in,
-                               cudaStream_t stream,
+                               hipStream_t stream,
                                const int CuCount,
                                const c10::ScalarType scalar_type)
 {
@@ -1718,7 +1724,7 @@ void wvSplitK_(void* in_a,
                const int M_in,
                const int K_in,
                const int N_in,
-               cudaStream_t stream,
+               hipStream_t stream,
                const int CuCount,
                const c10::ScalarType scalar_type)
 {
@@ -1765,7 +1771,7 @@ void wvSplitK_(void* in_a,
     });
 }
 
-#if defined(__HIP__MI300__) // TODO: Add NAVI support
+#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
 template <typename scalar_t,
           typename fp8_t,
           int THRDS,
@@ -1963,7 +1969,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_sml_(const int K,
         m += CuCount * _WvPrGrp * YTILE;
     }
 }
-#else  // !defined(__HIP__MI300__) TODO: Add NAVI support
+#else  // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 template <typename scalar_t,
           typename fp8_t,
           int THRDS,
@@ -1985,9 +1991,9 @@ __global__ void wvSplitKQ_hf_sml_(const int K,
 {
     UNREACHABLE_CODE
 }
-#endif // defined(__HIP__MI300__) TODO: Add NAVI support
+#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
-#if defined(__HIP__MI300__) // TODO: Add NAVI support
+#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
 template <typename scalar_t,
           typename fp8_t,
           int THRDS,
@@ -2181,7 +2187,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_(const int K,
         m += CuCount * _WvPrGrp * YTILE;
     }
 }
-#else  // !defined(__HIP__MI300__) TODO: Add NAVI support
+#else  // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 template <typename scalar_t,
           typename fp8_t,
           int THRDS,
@@ -2203,7 +2209,7 @@ __global__ void wvSplitKQ_hf_(const int K,
 {
     UNREACHABLE_CODE
 }
-#endif // defined(__HIP__MI300__) TODO: Add NAVI support
+#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
 void wvSplitKQ_(void* in_a,
                 void* in_b,
@@ -2214,7 +2220,7 @@ void wvSplitKQ_(void* in_a,
                 const int K_in,
                 const int Kp_in,
                 const int N_in,
-                cudaStream_t stream,
+                hipStream_t stream,
                 const int CuCount,
                 const c10::ScalarType a_scalar_type,
                 const c10::ScalarType c_scalar_type)
@@ -2346,7 +2352,7 @@ void LLGemmZZ(void* in_a,
               void* out_c,
               const int M,
               const int K,
-              cudaStream_t stream,
+              hipStream_t stream,
               const int solidx = 0)
 {
     // m -> M, n-> K
@@ -2392,14 +2398,14 @@ void LLGemmZZ(void* in_a,
                                          reinterpret_cast<const _Float16*>(in_b),
                                          reinterpret_cast<_Float16*>(out_c));
     }
-    cudaError_t err = cudaGetLastError();
-    if(cudaSuccess != err)
+    hipError_t err = hipGetLastError();
+    if(hipSuccess != err)
         throw std::runtime_error("CUDA kernel failed : " + std::to_string(err));
 }
 
 // instantiate the kernel template for T=float:
 // template void AddGPUKernel<float>(float *in_a, float *in_b, float *out_c,
-// const int M, const int K, cudaStream_t stream);
+// const int M, const int K, hipStream_t stream);
 const unsigned int TILE_WIDTH = 32;
 // Compute C = A * B
 __global__ void matrixMultiplyShared(float* A,
@@ -2460,7 +2466,7 @@ void MMGPUKernel(float* in_a,
                  int numBColumns,
                  int numCRows,
                  int numCColumns,
-                 cudaStream_t stream)
+                 hipStream_t stream)
 {
     // Initialize the grid and block dimensions
     dim3 dimBlock(TILE_WIDTH, TILE_WIDTH, 1);
@@ -2469,7 +2475,8 @@ void MMGPUKernel(float* in_a,
     matrixMultiplyShared<<<dimGrid, dimBlock>>>(
         in_a, in_b, out_c, numARows, numAColumns, numBRows, numBColumns, numCRows, numCColumns);
 
-    cudaError_t err = cudaGetLastError();
-    if(cudaSuccess != err)
+    hipError_t err = hipGetLastError();
+    if(hipSuccess != err)
         throw std::runtime_error("CUDA kernel failed : " + std::to_string(err));
 }
+} // namespace aiter

@@ -33,7 +33,7 @@ def moe_sorting_ck(
     sorted_expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=dtypes.i32, device=device
     )
-    num_valid_ids = torch.empty((1), dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty((2), dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     aiter.moe_sorting_fwd(
@@ -81,7 +81,6 @@ def asm_moe(
             topk_ids, topk_weight, global_E, model_dim, dtype, BLOCK_SIZE_M, expert_mask
         )
     )
-
     if fc1_scale is None:
         # pure bf16
         aiter.fmoe(
@@ -112,6 +111,7 @@ def asm_moe(
                 fc2_scale,
                 fc1_smooth_scale,
                 fc2_smooth_scale,
+                activation,
             )
         elif w1.dtype == dtypes.i8 and inter_dim == w1.shape[1]:
             aiter.fmoe_int8_g1u0_a16(
@@ -169,6 +169,7 @@ def asm_moe(
             a1_scale,
             fc1_scale,
             fc2_scale,
+            "",
             scale_blk_n,
             scale_blk_k,
             None,
@@ -219,30 +220,46 @@ def asm_moe(
                 logger.warning("FMOE fall into pure torch quant...")
                 a8, a8_scale = aiter.pertoken_quant(hidden_states, quant_dtype=w1.dtype)
         if w2.shape[2] * lastdim_mul == w1.shape[1]:
-            fmoe_func = aiter.fmoe_int8_g1u0
+            fmoe_func = aiter.fmoe_int8_g1u0(
+                moe_buf,
+                a8,
+                w1,
+                w2,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                topk,
+                a8_scale,
+                fc1_scale,
+                fc2_scale,
+                fc2_smooth_scale,
+                activation,
+            )
         elif w2.shape[2] * 2 * lastdim_mul == w1.shape[1]:
-            fmoe_func = aiter.fmoe_g1u1
+            aiter.fmoe_g1u1(
+                moe_buf,
+                a8,
+                w1,
+                w2,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                topk,
+                a8_scale,
+                fc1_scale,
+                fc2_scale,
+                "",
+                fc2_smooth_scale,
+                activation,
+            )
+
         else:
             raise ValueError(
                 f"Invalid MoE weight: {w1.shape=} {w2.shape=} {lastdim_mul}"
             )
 
-        fmoe_func(
-            moe_buf,
-            a8,
-            w1,
-            w2,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            topk,
-            a8_scale,
-            fc1_scale,
-            fc2_scale,
-            fc2_smooth_scale,
-            activation,
-        )
         #   fc2_smooth_scale)
     return moe_buf
 
@@ -393,6 +410,7 @@ def asm_moe_tkw1(
             a8_scale,
             fc1_scale,
             fc2_scale,
+            "",
             fc2_smooth_scale,
             activation,
         )

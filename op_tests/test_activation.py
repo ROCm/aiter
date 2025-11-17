@@ -23,62 +23,58 @@ def torch_silu_and_mul(input: torch.Tensor) -> torch.Tensor:
 
 @benchmark()
 def test_scaled_silu_and_mul(m, n, dtype):
+    ret = {}
     input = torch.randn(m, n, dtype=dtype, device="cuda")
     scale = torch.max(input).to(torch.float32)
     out = torch.empty((m, n // 2), dtype=dtypes.fp8, device="cuda")
 
-    ref, us = run_perftest(
-        torch_scaled_silu_and_mul,
-        input,
-        scale,
-        num_warmup=2,
-        num_iters=3,
-    )
+    ref = torch_scaled_silu_and_mul(input, scale)
 
     _, us_aiter = run_perftest(
         aiter.scaled_silu_and_mul,
         out,
         input,
         scale,
-        num_warmup=10,
-        num_iters=100,
     )
 
     # Check if the results are close
-    checkAllclose(ref.to(torch.float), out.to(torch.float))
-    return {"us_aiter": us_aiter}
+    err = checkAllclose(ref.to(torch.float), out.to(torch.float))
+    ret["us"] = us_aiter
+    ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
+    ret["err"] = err
+    return ret
 
 
 @benchmark()
 def test_silu_and_mul(m, n, dtype):
+    ret = {}
     input = torch.randn(m, n, dtype=dtype, device="cuda")
     out = torch.empty((m, n // 2), dtype=dtype, device="cuda")
 
-    ref, us = run_perftest(
-        torch_silu_and_mul,
-        input,
-        num_warmup=2,
-        num_iters=3,
-    )
+    ref = torch_silu_and_mul(input)
 
     _, us_aiter = run_perftest(
         aiter.silu_and_mul,
         out,
         input,
-        num_warmup=10,
-        num_iters=100,
     )
 
     # Check if the results are close
-    checkAllclose(ref, out)
-    return {"us_aiter": us_aiter}
+    err = checkAllclose(ref, out)
+    ret["us"] = us_aiter
+    ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
+    ret["err"] = err
+    return ret
 
 
 l_dtype = ["fp16", "bf16"]
-l_m = [1, 32, 64, 128, 256, 512, 1024, 4096, 8192]
-l_n = [1024, 4096, 8192]
+l_m = [1, 32, 64, 128, 256, 512, 1024, 4096, 8192, 163840]
+l_n = [1024, 4096, 6400, 8192]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -87,25 +83,26 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
     type=int,
-    choices=l_m,
     nargs="?",
     const=None,
     default=None,
-    help="m: matrix row count",
+    help="""M of mnk.
+    e.g.: -m 32""",
 )
 parser.add_argument(
     "-n",
     type=int,
-    choices=l_n,
     nargs="?",
     const=None,
     default=None,
-    help="n: matrix column count",
+    help="""N of mnk.
+    e.g.: -n 1024""",
 )
 
 args = parser.parse_args()

@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import os
-from pathlib import Path
-import pandas as pd
 import argparse
+import os
+import sys
 import shutil
+from pathlib import Path
+
+import pandas as pd
+import torch
+
 from gemm_a8w8_bpreshuffle_common import (
+    default_kernels_dict,
     kernelInstance,
     kernels_list,
-    default_kernels_dict,
 )
-
 
 """
 
@@ -110,7 +113,7 @@ torch::Tensor
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "{name}.cuh"
+#include "impl/{name}.cuh"
 
 template torch::Tensor
 {name}<{dtypes}>(
@@ -128,8 +131,8 @@ template torch::Tensor
 
         if self.istune:
             Path(
-                os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
-            ).write_text(INSTANCE_dFP32_eFP16)
+                os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
+            ).write_text(INSTANCE_dFP32_eBF16)
         else:
             Path(
                 os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
@@ -229,11 +232,18 @@ def get_tune_dict(tune_dict_csv):
     tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
         tune_df = pd.read_csv(tune_dict_csv)
+        if torch.cuda.is_available():
+            gpu = torch.cuda.current_device()
+            device_properties = torch.cuda.get_device_properties(gpu)
+            cu_num = device_properties.multi_processor_count
+            tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
         for i in range(len(tune_df)):
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]
             K = tune_df.loc[i, "K"]
             kid = tune_df.loc[i, "kernelId"]
+            if kid < 0 or kid > len(kernels_list):
+                continue
             tune_dict[(M, N, K)] = kernels_list[kid]
     return tune_dict
 

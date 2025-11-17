@@ -4,6 +4,7 @@
 #include "gemm_a8w8_bpreshuffle_common.cuh"
 #include "gemm_a8w8_bpreshuffle_lookup.h"
 #include "gemm_a8w8_bpreshuffle_manifest.h"
+#include "gemm_common.h"
 #include <cmath>
 
 using RowwiseKernel = std::function<torch::Tensor(
@@ -26,9 +27,88 @@ using RowwiseKernelMap = std::unordered_map<std::tuple<int, int, int>, RowwiseKe
 template <typename DDataType, typename EDataType = DDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
-    return a8w8_bpreshuffle_256x128x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8x8x1_2x1_intrawave_v3<
-        DDataType,
-        EDataType>;
+    if(K >= 1536)
+    {
+        if(M < 256 && K % 512 == 0)
+        {
+            if(N < 1536)
+            {
+                return a8w8_bpreshuffle_128x16x32x512_16x16_16x16_32x4x1_32x4x1_1x16x1x8_4x4x1_1x1_intrawave_v1<
+                    DDataType,
+                    EDataType>;
+            }
+            else
+            {
+                return a8w8_bpreshuffle_256x16x64x512_16x16_16x16_32x8x1_32x8x1_1x16x1x16_4x4x1_1x1_intrawave_v1<
+                    DDataType,
+                    EDataType>;
+            }
+        }
+        else
+        {
+            if(N < 1536 || N % 128 != 0)
+            {
+                return a8w8_bpreshuffle_256x128x64x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8x8x1_2x1_intrawave_v3<
+                    DDataType,
+                    EDataType>;
+            }
+            else
+            {
+                return a8w8_bpreshuffle_256x128x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8x8x1_2x1_intrawave_v3<
+                    DDataType,
+                    EDataType>;
+            }
+        }
+    }
+    else if(K >= 512)
+    {
+        if(M < 64)
+        {
+            return a8w8_bpreshuffle_128x16x32x128_16x16_16x16_8x16x1_8x16x1_1x16x1x8_4x4x1_1x1_intrawave_v1<
+                DDataType,
+                EDataType>;
+        }
+        else if(M <= 256)
+        {
+            return a8w8_bpreshuffle_256x128x64x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8x8x1_2x1_intrawave_v3<
+                DDataType,
+                EDataType>;
+        }
+        else
+        {
+            return a8w8_bpreshuffle_256x128x128x64_16x16_16x16_4x64x1_4x64x1_1x32x1x8_8x8x1_2x1_intrawave_v3<
+                DDataType,
+                EDataType>;
+        }
+    }
+    else if(K >= 192 && K % 64 == 0)
+    {
+        if(M < 128)
+        {
+            return a8w8_bpreshuffle_128x16x256x64_16x16_16x16_4x16x1_4x32x1_1x16x1x8_8x8x1_1x2_intrawave_v1<
+                DDataType,
+                EDataType>;
+        }
+        else if(M <= 256)
+        {
+            return a8w8_bpreshuffle_256x32x256x64_16x16_16x16_4x32x1_4x64x1_1x32x1x8_8x8x1_2x1_intrawave_v1<
+                DDataType,
+                EDataType>;
+        }
+        else
+        {
+            return a8w8_bpreshuffle_256x128x128x64_16x16_16x16_4x64x1_4x64x1_1x32x1x8_8x8x1_2x1_intrawave_v3<
+                DDataType,
+                EDataType>;
+        }
+    }
+    else
+    {
+        TORCH_CHECK(false,
+                    "Unsupported K for heuristic dispatch: ",
+                    K,
+                    ". Supported K greater than 192 and K % 64 == 0.");
+    }
 }
 
 // Helper function to return the next largest power of 2
@@ -70,18 +150,9 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     }
 
     int padded_m = M;
-    if(M > 1 && M <= 16)
-    {
-        padded_m = 16;
-    }
-    else if(M <= 16384)
-    {
-        padded_m = nextPow2(M);
-    }
-    else if(M <= 20480)
-    {
-        padded_m = 20480;
-    }
+  
+    // Fine-grained search
+    padded_m = getPaddedM(M, N, K, 0);
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
     it = lookup.find({padded_m, N, K});
     // If we found an optimal kernel, use it.
@@ -89,6 +160,17 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     {
         return it->second;
     }
+  
+    // Coarse-grained search
+    padded_m = getPaddedM(M, N, K, 1);
+    // Third check if this shape(padded_m,N,K) is available in the direct lookup.
+    it = lookup.find({padded_m, N, K});
+    // If we found an optimal kernel, use it.
+    if(it != lookup.end())
+    {
+        return it->second;
+    }
+
     // Otherwise, use heuristics.
     return rowwise_heuristic_dispatch<DDataType, EDataType>(M, N, K);
 }

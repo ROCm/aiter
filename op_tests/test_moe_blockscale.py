@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +10,7 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter import pertoken_quant
 from aiter import dtypes
 from einops import rearrange
+import argparse
 
 BLOCK_SIZE_M = 32
 
@@ -154,6 +155,7 @@ def asm_moe_test(
         a1_scale,
         fc1_scale,
         fc2_scale,
+        "",
         scale_blk_n,
         scale_blk_k,
         None,
@@ -286,11 +288,89 @@ def test_fmoe(
     checkAllclose(out_ref, out_asm, rtol=0.05, atol=0.05, msg=msg)
 
 
-for dtype in [dtypes.bf16]:
-    for m in [1, 2, 5, 16, 32, 163840]:
-        for dim in [7168]:
-            for idim in [256]:
+l_dtype = ["bf16"]
+l_m = [1, 2, 5, 16, 32, 163840]
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+
+parser.add_argument(
+    "-m",
+    type=int,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""M of mnk.
+    e.g.: -m 32""",
+)
+
+parser.add_argument(
+    "-dim",
+    type=int,
+    default=7168,
+    help="""Hidden dimension. Default is 7168.
+    e.g.: -dim 7168""",
+)
+
+parser.add_argument(
+    "-idim",
+    type=int,
+    default=256,
+    help="""Intermediate dimension. Default is 256.
+    e.g.: -idim 256""",
+)
+parser.add_argument(
+    "-e",
+    "--expert",
+    type=int,
+    default=256,
+    help="""Number of experts. Default is 256.
+    e.g.: -e 256""",
+)
+parser.add_argument(
+    "-k",
+    "--topk",
+    type=int,
+    default=8,
+    help="""Top-k value. Default is 8.
+    e.g.: -k 8""",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+
+if args.m is not None:
+    l_m = [args.m]
+
+for dtype in l_dtype:
+    for m in l_m:
+        for dim in [args.dim]:
+            for idim in [args.idim]:
                 scale_blks = (128, 128)
                 test_fmoe(
-                    dtype, m, dim, idim, scale_blks, 256, 8, quant="No", use_g1u1=True
+                    dtype,
+                    m,
+                    dim,
+                    idim,
+                    scale_blks,
+                    args.expert,
+                    args.topk,
+                    quant="No",
+                    use_g1u1=True,
                 )

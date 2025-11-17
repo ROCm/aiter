@@ -11,16 +11,19 @@ def f32_to_mxfp4(x):
     FP4_EBITS, FP4_MBITS = 2, 1
     x = _f32_to_floatx_unpacked(x.float(), FP4_EBITS, FP4_MBITS)
     x = pack_uint4(x)
-    # x = x.view(dtypes.fp4x2) # to(fp32) for this datatype gives all 0 for torch...
-    x = x.view(torch.uint8)
+    x = x.view(dtypes.fp4x2)  # to(fp32) for this datatype gives all 0 for torch...
+    # x = x.view(torch.uint8)
     return x
 
 
 def mxfp4_to_f32(x):
+    if x.dtype == torch.float4_e2m1fn_x2:
+        x = x.view(torch.uint8)
+
     # 2 because we pack fp4 in uint8.
-    x = x.repeat_interleave(2, dim=1)
-    x[:, ::2] = x[:, ::2] & 0xF
-    x[:, 1::2] = x[:, 1::2] >> 4
+    x = x.repeat_interleave(2, dim=-1)
+    x[..., ::2] = x[..., ::2] & 0xF
+    x[..., 1::2] = x[..., 1::2] >> 4
     mxfp4_list = [
         0.0,
         0.5,
@@ -39,7 +42,7 @@ def mxfp4_to_f32(x):
         -4.0,
         -6.0,
     ]
-    mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device="cuda")
+    mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device=x.device)
     return mxfp4_in_f32[x.long()]
 
 
@@ -58,12 +61,35 @@ def f32_to_e8m0(x):
 def e8m0_to_f32(scale_e8m0_biased):
     scale_e8m0_biased = scale_e8m0_biased.view(torch.uint8)
     zero_case = scale_e8m0_biased == 0
-    nan_case = scale_e8m0_biased == 0b11111111
+    nan_case = scale_e8m0_biased == 0xFF
     scale_f32 = scale_e8m0_biased.to(torch.int32) << 23
     scale_f32[zero_case] = 0x00400000
     scale_f32[nan_case] = 0x7F800001
     scale_f32 = scale_f32.view(dtypes.fp32)
     return scale_f32
+
+
+def e8m0_shuffle(scale):
+    if scale is None:
+        return scale
+    if scale.dtype == torch.float32:
+        return scale
+    assert scale.ndim == 2, "scale must be a 2D tensor"
+    m, n = scale.shape
+    scale_padded = torch.empty(
+        (m + 255) // 256 * 256,
+        (n + 7) // 8 * 8,
+        dtype=scale.dtype,
+        device=scale.device,
+    )
+
+    scale_padded[:m, :n] = scale
+    scale = scale_padded
+    sm, sn = scale.shape
+    scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
+    scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
+    scale = scale.view(sm, sn)
+    return scale
 
 
 def down_size(size):
@@ -396,7 +422,7 @@ def dynamic_mxfp4_quant(
         SHUFFLE=shuffle,
     )
 
-    return (x_fp4, blockscale_e8m0.view(dtypes.fp8_e8m0))
+    return (x_fp4.view(dtypes.fp4x2), blockscale_e8m0.view(dtypes.fp8_e8m0))
 
 
 @triton.jit

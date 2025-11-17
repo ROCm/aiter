@@ -1,6 +1,6 @@
 """
-* Copyright © Advanced Micro Devices, Inc. All rights reserved.
-* Copyright (c) 2024, The vLLM team.
+* Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+* Copyright (C) 2024-2025, The vLLM team.
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,11 +15,13 @@
 * limitations under the License.
 """
 
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
+
 import torch
+
 import aiter as ops
 from aiter import dtypes
-from dataclasses import dataclass
 
 
 # from vllm.utils import is_hip
@@ -162,12 +164,7 @@ def _use_rocm_custom_paged_attention(
 ) -> bool:
     # rocm custom page attention not support on navi (gfx1*)
     return (
-        not _ON_NAVI
-        and (qtype == torch.half or qtype == dtypes.bf16)
-        and (head_size == 64 or head_size == 128)
-        and (block_size == 16 or block_size == 32)
-        and (gqa_ratio >= 1 and gqa_ratio <= 16)
-        and max_seq_len <= 65536
+        not _ON_NAVI and (gqa_ratio >= 1 and gqa_ratio <= 32) and max_seq_len <= 65536
     )
 
 
@@ -208,8 +205,8 @@ class PagedAttention:
         value_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         kv_cache_dtype: str,
-        k_scale: float,
-        v_scale: float,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
         asm_layout=False,
     ) -> None:
         ops.reshape_and_cache(
@@ -236,151 +233,68 @@ class PagedAttention:
         num_kv_heads: int,
         scale: float,
         alibi_slopes: Optional[torch.Tensor],
-        k_scale: float,
-        v_scale: float,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        q_scale: Optional[torch.Tensor] = None,
         tp_rank: int = 0,
         blocksparse_local_blocks: int = 0,
         blocksparse_vert_stride: int = 0,
         blocksparse_block_size: int = 64,
         blocksparse_head_sliding_step: int = 0,
         fp8_out_scale=None,
+        mtp: int = 1,
+        output_dtype: torch.dtype = None,
     ) -> torch.Tensor:
         # Whether to use rocm custom paged attention or not
         num_seqs, num_heads, head_size = query.shape
-        block_size = value_cache.shape[3]
-        gqa_ratio = num_heads // num_kv_heads
-        use_custom = _use_rocm_custom_paged_attention(
-            query.dtype, head_size, block_size, gqa_ratio, max_seq_len
+        block_size = key_cache.size(3)
+        output = torch.empty_like(query, dtype=output_dtype)
+
+        max_num_partitions = (
+            max_seq_len + _PARTITION_SIZE_ROCM - 1
+        ) // _PARTITION_SIZE_ROCM
+        tmp_output = torch.empty(
+            size=(num_seqs, num_heads, max_num_partitions, head_size),
+            dtype=output.dtype,
+            device=output.device,
         )
-        output = torch.empty_like(query)
-        if use_custom:
-            max_num_partitions = (
-                max_seq_len + _PARTITION_SIZE_ROCM - 1
-            ) // _PARTITION_SIZE_ROCM
-            assert _PARTITION_SIZE_ROCM % block_size == 0
-            tmp_output = torch.empty(
-                size=(num_seqs, num_heads, max_num_partitions, head_size),
-                dtype=output.dtype,
-                device=output.device,
-            )
-            exp_sums = torch.empty(
-                size=(num_seqs, num_heads, max_num_partitions),
-                dtype=dtypes.fp32,
-                device=output.device,
-            )
-            max_logits = torch.empty_like(exp_sums)
-            cpa_fp8_out = False
-            if fp8_out_scale is not None:
-                output = torch.empty_like(output, dtype=dtypes.fp8)
-                cpa_fp8_out = True
-            ops.paged_attention_rocm(
-                output,
-                exp_sums,
-                max_logits,
-                tmp_output,
-                query,
-                key_cache,
-                value_cache,
-                num_kv_heads,
-                scale,
-                block_tables,
-                seq_lens,
-                block_size,
-                max_seq_len,
-                alibi_slopes,
-                kv_cache_dtype,
-                k_scale,
-                v_scale,
-                fp8_out_scale if cpa_fp8_out else None,
-                _PARTITION_SIZE_ROCM,
-            )
-            if cpa_fp8_out:
-                return output.view(num_seqs, num_heads * head_size)
-        else:
-            max_num_partitions = (max_seq_len + _PARTITION_SIZE - 1) // _PARTITION_SIZE
-            if blocksparse_vert_stride is not None and blocksparse_vert_stride > 1:
-                # use blocksparse paged attention
-                block_size = value_cache.size(-1)
-                assert (
-                    blocksparse_block_size > 0
-                    and blocksparse_block_size % block_size == 0
-                ), (
-                    f"{blocksparse_block_size=} needs to be a multiple of"
-                    f"{block_size=} used in block_tables."
-                )
-
-            # NOTE(woosuk): We use a simple heuristic to decide whether to use
-            # PagedAttention V1 or V2. If the number of partitions is 1, we use
-            # V1 to avoid the overhead of reduction. Also, if the number of
-            # sequences or heads is large, we use V1 since there is enough work
-            # to parallelize.
-            # TODO(woosuk): Tune this heuristic.
-            # For context len > 8192, use V2 kernel to avoid shared memory shortage.
-            use_v1 = max_seq_len <= 8192 and (
-                max_num_partitions == 1 or num_seqs * num_heads > 512
-            )
-
-            if use_v1:
-                # Run PagedAttention V1.
-                ops.paged_attention_v1(
-                    output,
-                    query,
-                    key_cache,
-                    value_cache,
-                    num_kv_heads,
-                    scale,
-                    block_tables,
-                    seq_lens,
-                    block_size,
-                    max_seq_len,
-                    alibi_slopes,
-                    kv_cache_dtype,
-                    k_scale,
-                    v_scale,
-                    tp_rank,
-                    blocksparse_local_blocks,
-                    blocksparse_vert_stride,
-                    blocksparse_block_size,
-                    blocksparse_head_sliding_step,
-                )
-            else:
-                # Run PagedAttention V2.
-                assert _PARTITION_SIZE % block_size == 0
-                tmp_output = torch.empty(
-                    size=(num_seqs, num_heads, max_num_partitions, head_size),
-                    dtype=output.dtype,
-                    device=output.device,
-                )
-                exp_sums = torch.empty(
-                    size=(num_seqs, num_heads, max_num_partitions),
-                    dtype=dtypes.fp32,
-                    device=output.device,
-                )
-                max_logits = torch.empty_like(exp_sums)
-                ops.paged_attention_v2(
-                    output,
-                    exp_sums,
-                    max_logits,
-                    tmp_output,
-                    query,
-                    key_cache,
-                    value_cache,
-                    num_kv_heads,
-                    scale,
-                    block_tables,
-                    seq_lens,
-                    block_size,
-                    max_seq_len,
-                    alibi_slopes,
-                    kv_cache_dtype,
-                    k_scale,
-                    v_scale,
-                    tp_rank,
-                    blocksparse_local_blocks,
-                    blocksparse_vert_stride,
-                    blocksparse_block_size,
-                    blocksparse_head_sliding_step,
-                )
+        exp_sums = torch.empty(
+            size=(num_seqs, num_heads, max_num_partitions),
+            dtype=dtypes.fp32,
+            device=output.device,
+        )
+        max_logits = torch.empty_like(exp_sums)
+        cpa_fp8_out = False
+        if fp8_out_scale is not None:
+            output = torch.empty_like(output, dtype=dtypes.fp8)
+            cpa_fp8_out = True
+        if scale is None:
+            scale = float(1.0 / (head_size**0.5))
+        torch.ops.aiter.paged_attention_rocm(
+            output,
+            exp_sums,
+            max_logits,
+            tmp_output,
+            query,
+            key_cache,
+            value_cache,
+            num_kv_heads,
+            scale,
+            block_tables,
+            seq_lens,
+            block_size,
+            max_seq_len,
+            alibi_slopes,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            fp8_out_scale if cpa_fp8_out else None,
+            _PARTITION_SIZE_ROCM,
+            q_scale=q_scale,
+            mtp=mtp,
+        )
+        if cpa_fp8_out:
+            return output.view(num_seqs, num_heads * head_size)
         return output
 
     # @staticmethod

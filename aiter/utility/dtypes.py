@@ -9,15 +9,17 @@ defaultDtypes = {
     "gfx950": {"fp8": torch.float8_e4m3fn},
 }
 
+_8bit_fallback = torch.uint8
+
 
 def get_dtype_fp8():
-    return defaultDtypes[get_gfx()]["fp8"]
+    return defaultDtypes.get(get_gfx(), {"fp8": _8bit_fallback})["fp8"]
 
 
-i4x2 = getattr(torch, "int4", torch.uint8)
-fp4x2 = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+i4x2 = getattr(torch, "int4", _8bit_fallback)
+fp4x2 = getattr(torch, "float4_e2m1fn_x2", _8bit_fallback)
 fp8 = get_dtype_fp8()
-fp8_e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
+fp8_e8m0 = getattr(torch, "float8_e8m0fnu", _8bit_fallback)
 fp16 = torch.float16
 bf16 = torch.bfloat16
 fp32 = torch.float32
@@ -59,3 +61,11 @@ def str2tuple(v):
         return tuple(int(p.strip()) for p in parts)
     except Exception as e:
         raise argparse.ArgumentTypeError(f"invalid format of input: {v}") from e
+
+
+def str2Dtype(v):
+    try:
+        parts = v.strip("()").split(",")
+        return list(d_dtypes[p.strip()] for p in parts)
+    except Exception as e:
+        raise argparse.ArgumentTypeError(f"invalid format of data type: {v}") from e

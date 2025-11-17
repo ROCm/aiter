@@ -1,5 +1,8 @@
 pandas
 pytest
 psutil
+matplotlib
+pyyaml
 einops
-pybind11>=2.13,<3
+pybind11>=3.0.1
+ninja

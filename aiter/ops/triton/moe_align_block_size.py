@@ -1,95 +1,20 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import triton
-import triton.language as tl
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton._triton_kernels.moe_align_block_size import (
+    _moe_align_block_size_stage1_kernel,
+    _moe_align_block_size_stage2_kernel,
+    _moe_align_block_size_stage3_kernel,
+    _moe_align_block_size_stage4_kernel,
+)
+
+_LOGGER = AiterTritonLogger()
 
 
 def ceil_div(a, b):
     return (a + b - 1) // b
-
-
-@triton.jit
-def moe_align_block_size_stage1(
-    topk_ids_ptr,
-    tokens_cnts_ptr,
-    num_experts: tl.constexpr,
-    numel: tl.constexpr,
-    tokens_per_thread: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    start_idx = pid * tokens_per_thread
-
-    off_c = (pid + 1) * num_experts
-
-    for i in range(tokens_per_thread):
-        if start_idx + i < numel:
-            idx = tl.load(topk_ids_ptr + start_idx + i)
-            token_cnt = tl.load(tokens_cnts_ptr + off_c + idx)
-            tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
-
-
-@triton.jit
-def moe_align_block_size_stage2(
-    tokens_cnts_ptr,
-    num_experts: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    last_cnt = 0
-    for i in range(1, num_experts + 1):
-        token_cnt = tl.load(tokens_cnts_ptr + i * num_experts + pid)
-        last_cnt = last_cnt + token_cnt
-        tl.store(tokens_cnts_ptr + i * num_experts + pid, last_cnt)
-
-
-@triton.jit
-def moe_align_block_size_stage3(
-    total_tokens_post_pad_ptr,
-    tokens_cnts_ptr,
-    cumsum_ptr,
-    num_experts: tl.constexpr,
-    block_size: tl.constexpr,
-):
-    last_cumsum = 0
-    off_cnt = num_experts * num_experts
-    for i in range(1, num_experts + 1):
-        token_cnt = tl.load(tokens_cnts_ptr + off_cnt + i - 1)
-        last_cumsum = last_cumsum + tl.cdiv(token_cnt, block_size) * block_size
-        tl.store(cumsum_ptr + i, last_cumsum)
-    tl.store(total_tokens_post_pad_ptr, last_cumsum)
-
-
-@triton.jit
-def moe_align_block_size_stage4(
-    topk_ids_ptr,
-    sorted_token_ids_ptr,
-    expert_ids_ptr,
-    tokens_cnts_ptr,
-    cumsum_ptr,
-    num_experts: tl.constexpr,
-    block_size: tl.constexpr,
-    numel: tl.constexpr,
-    tokens_per_thread: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    start_idx = tl.load(cumsum_ptr + pid)
-    end_idx = tl.load(cumsum_ptr + pid + 1)
-
-    for i in range(start_idx, end_idx, block_size):
-        tl.store(expert_ids_ptr + i // block_size, pid)
-
-    start_idx = pid * tokens_per_thread
-    off_t = pid * num_experts
-
-    for i in range(start_idx, tl.minimum(start_idx + tokens_per_thread, numel)):
-        expert_id = tl.load(topk_ids_ptr + i)
-        token_cnt = tl.load(tokens_cnts_ptr + off_t + expert_id)
-        rank_post_pad = token_cnt + tl.load(cumsum_ptr + expert_id)
-        tl.store(sorted_token_ids_ptr + rank_post_pad, i)
-        tl.store(tokens_cnts_ptr + off_t + expert_id, token_cnt + 1)
 
 
 def moe_align_block_size_triton(
@@ -100,6 +25,24 @@ def moe_align_block_size_triton(
     expert_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor,
 ) -> None:
+    """
+    Aligns and sorts MoE tokens by expert assignment with block-size padding for efficient computation.
+
+    Args:
+        topk_ids (torch.Tensor): Top-k expert assignments per token with shape (num_tokens, topk).
+        num_experts (int): Total number of experts.
+        block_size (int): Block size for alignment and padding.
+        sorted_token_ids (torch.Tensor): Output tensor for sorted token indices.
+        expert_ids (torch.Tensor): Output tensor for expert ID per sorted token.
+        num_tokens_post_pad (torch.Tensor): Output tensor for total tokens after padding with shape (1,).
+
+    Returns:
+        None. Results written in-place to sorted_token_ids, expert_ids, and num_tokens_post_pad.
+    """
+    _LOGGER.info(
+        f"MOE_ALIGN_BLOCK_SIZE_TRITON:  topk_ids={tuple(topk_ids.shape)} num_experts={num_experts}  sorted_token_ids={tuple(sorted_token_ids.shape)} "
+        + "block_size={block_size} expert_ids={tuple(expert_ids.shape)} num_tokens_post_pad={tuple(num_tokens_post_pad.shape)}"
+    )
     numel = topk_ids.numel()
     grid = (num_experts,)
     tokens_cnts = torch.zeros(
@@ -108,32 +51,28 @@ def moe_align_block_size_triton(
     cumsum = torch.zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device)
     tokens_per_thread = ceil_div(numel, num_experts)
 
-    moe_align_block_size_stage1[grid](
+    _moe_align_block_size_stage1_kernel[grid](
         topk_ids,
         tokens_cnts,
         num_experts,
         numel,
         tokens_per_thread,
     )
-    # print(f"Post Stage1: topk_ids={topk_ids}")
-    # print(f"token_cnts={tokens_cnts}")
-    # print(f"num_experts={num_experts}, numel={numel}, tokens_per_thread={tokens_per_thread}")
 
-    moe_align_block_size_stage2[grid](
+    _moe_align_block_size_stage2_kernel[grid](
         tokens_cnts,
         num_experts,
     )
-    # print(f"Post Stage2: token_cnts={tokens_cnts}")
-    moe_align_block_size_stage3[(1,)](
+
+    _moe_align_block_size_stage3_kernel[(1,)](
         num_tokens_post_pad,
         tokens_cnts,
         cumsum,
         num_experts,
         block_size,
     )
-    # print(f"Post Stage3: token_cnts={tokens_cnts}")
-    # print(f"Post Stage3: cumsum={cumsum}")
-    moe_align_block_size_stage4[grid](
+
+    _moe_align_block_size_stage4_kernel[grid](
         topk_ids,
         sorted_token_ids,
         expert_ids,
@@ -144,5 +83,3 @@ def moe_align_block_size_triton(
         numel,
         tokens_per_thread,
     )
-    # print(f"Post Stage4: token_cnts={tokens_cnts}")
-    # print(f"Post Stage4: cumsum={cumsum}")

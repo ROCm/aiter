@@ -12,6 +12,7 @@ from aiter import pertoken_quant
 from aiter import dtypes
 from enum import Enum
 from einops import rearrange
+import argparse
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
@@ -68,7 +69,6 @@ def kv_cache_factory(
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
 
-    scale = head_size**-0.5
     x = 16 // torch_dtype.itemsize
     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
     key_caches: List[torch.Tensor] = []
@@ -348,7 +348,6 @@ def run_aiter(
 
     num_seqs, num_heads, head_size = query.shape
     block_size = key_cache.shape[2 if kv_cache_layout == "HND" else 1]
-    gqa_ratio = num_heads // num_kv_heads
 
     output = torch.empty_like(query)
     max_num_partitions = (
@@ -372,7 +371,7 @@ def run_aiter(
     if fp8_out_scale is not None:
         output = torch.empty_like(output, dtype=dtypes.fp8)
         cpa_fp8_out = True
-    aiter.paged_attention_ragged(
+    torch.ops.aiter.paged_attention_ragged(
         output,
         workspace_buffer,
         query,
@@ -459,6 +458,7 @@ def run_aiter_asm(
         block_tables,
         seq_lens,
         max_num_blocks,
+        max_seq_len,
         k_scale,
         v_scale,
     )
@@ -638,14 +638,15 @@ def test_paged_attention(
         # prepare flashinfer format-compatible parameters
         # TODO: pass list of context_length instead
         def convert_to_kv_indptr_last_page_lens(fixed_context_length):
-            get_num_blocks = lambda context_length: (
-                context_length + block_size - 1
-            ) // (block_size)
-            get_last_page_len = lambda context_length: (
-                context_length % block_size
-                if context_length % block_size > 0
-                else block_size
-            )
+            def get_num_blocks(context_length):
+                return (context_length + block_size - 1) // (block_size)
+
+            def get_last_page_len(context_length):
+                return (
+                    context_length % block_size
+                    if context_length % block_size > 0
+                    else block_size
+                )
 
             context_lengths = [fixed_context_length] * num_seqs
             num_blocks_list = [
@@ -890,12 +891,50 @@ def test_paged_attention(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Test Paged Attention ragged.",
+    )
+    parser.add_argument(
+        "-c",
+        "--ctx_len",
+        type=int,
+        default=[1, 26, 128, 4097],
+        nargs="*",
+        help="""Context length.
+    e.g. -c 128""",
+    )
+    parser.add_argument(
+        "-p",
+        "--pa_variant",
+        type=str,
+        choices=[member.name for member in PAVariant],
+        default=[PAVariant.Shomy, PAVariant.Asm],
+        nargs="*",
+        help="Paged Attention variant to test.\n" + "    e.g. -p Shomy\n",
+    )
+    parser.add_argument(
+        "-q",
+        "--quant_cache_dtype",
+        type=str,
+        choices=["none", "fp8", "i8"],
+        default=["none", "fp8", "i8"],
+        nargs="*",
+        help="""Quantization cache dtype.
+        e.g. -q fp8""",
+    )
     torch.set_printoptions(sci_mode=False)
+    args = parser.parse_args()
+    if not args.pa_variant == [PAVariant.Shomy, PAVariant.Asm]:
+        args.pa_variant = [PAVariant[variant] for variant in args.pa_variant]
+    args.quant_cache_dtype = [
+        None if i == "none" else dtypes.d_dtypes[i] for i in args.quant_cache_dtype
+    ]
 
     for ctx_len, pa_variant, quant_cache_dtype in itertools.product(
-        [1, 26, 128, 4097],
-        [PAVariant.Shomy, PAVariant.Asm],
-        [None, dtypes.fp8, dtypes.i8],
+        args.ctx_len,
+        args.pa_variant,
+        args.quant_cache_dtype,
     ):
 
         if pa_variant == PAVariant.Shomy:

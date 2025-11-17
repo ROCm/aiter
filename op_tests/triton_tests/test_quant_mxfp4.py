@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import pytest
@@ -145,6 +145,7 @@ def torch_dynamic_mxfp4_quant(
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_dynamic_mxfp4_quant(M: int, N: int, dtype):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(20)
     x = torch.randn((M, N), dtype=dtype, device="cuda")
 

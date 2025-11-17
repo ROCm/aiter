@@ -1,0 +1,122 @@
+name: Sglang Downstream Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]  # Triggers on PRs targeting `main`
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
+  sglang:
+    name: sglang integration
+    needs: [check-signal]
+    runs-on: aiter-1gpu-runner
+    env:
+      SGL_BRANCH: v0.5.3
+      GPU_ARCH: gfx942
+      SGL_IMAGE: rocm/sgl-dev:v0.5.3.post3-rocm700-mi30x-20251019
+      GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
+      GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+
+    steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+
+      - name: Clone sglang repo
+        run: |
+          git clone -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git
+
+      - name: Pull SGlang base image
+        run: |
+          docker pull ${{ env.SGL_IMAGE }}
+
+      - name: Generate Dockerfile
+        run: |
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.SGL_IMAGE }}
+
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
+          RUN pip uninstall -y aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+
+          RUN rm -rf aiter \
+           && git clone ${{ env.GITHUB_REPO_URL }} \
+           && cd aiter \
+           && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
+           && git submodule update --init --recursive \
+           && PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop; \
+
+          RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
+          EOF
+
+      - name: Show Dockerfile
+        run: cat Dockerfile.mod
+
+      - name: Build Docker image
+        run: |
+          docker build -t sglang_aiter_test:ci -f Dockerfile.mod .
+
+      - name: Start CI container
+        run: |
+          echo "Clean up containers..."
+          docker ps -aq -f name=sglang_aiter_test | xargs -r docker stop | xargs -r docker rm
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          echo "Starting container: sglang_aiter_test:ci"
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+          -v "${GITHUB_WORKSPACE:-$PWD}/sglang:/sglang-checkout" \
+          --ipc=host --group-add video \
+          --shm-size 32g \
+          --cap-add=SYS_PTRACE \
+          -e HF_TOKEN="${HF_TOKEN:-}" \
+          --security-opt seccomp=unconfined \
+          -w /sglang-checkout \
+          --name sglang_aiter_test \
+          sglang_aiter_test:ci
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          cd sglang
+          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_install_dependency.sh
+          bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Evaluate Accuracy
+        timeout-minutes: 120
+        run: |
+          cd sglang
+          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_exec.sh
+          bash scripts/ci/amd_ci_exec.sh pip show aiter || true
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
+          bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
+
+      # TODO: Clean up because some dependencies are installed under root user which can't be removed by runner, these dependencies should be installed as a non-root user
+      - name: Clean Up
+        if: always()
+        run:
+          docker exec -u root sglang_aiter_test bash -c "rm -rf /sglang-checkout/sgl-kernel; rm -rf /sglang-checkout/python"

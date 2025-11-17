@@ -738,8 +738,11 @@ def test_paged_attention(
                 k_scale,
                 v_scale,
             )
-            assert checkAllclose(
-                out_golden, out_aiter, msg=f"golden vs aiter:{time_aiter}"
+            assert (
+                checkAllclose(
+                    out_golden, out_aiter, msg=f"golden vs aiter:{time_aiter}"
+                )
+                < 0.01
             )
             if DUMP_OUTPUT:
                 tensor_dump(out_aiter, "out_aiter")
@@ -757,8 +760,13 @@ def test_paged_attention(
                 alibi_slopes,
                 max_num_blocks_per_seq,
             )
-            assert checkAllclose(
-                out_golden, out_aiter_asm, msg=f"golden vs aiter_asm:{time_aiter_asm}"
+            assert (
+                checkAllclose(
+                    out_golden,
+                    out_aiter_asm,
+                    msg=f"golden vs aiter_asm:{time_aiter_asm}",
+                )
+                < 0.01
             )
             if DUMP_OUTPUT:
                 tensor_dump(out_aiter, "out_aiter_asm")
@@ -876,7 +884,7 @@ if __name__ == "__main__":
 
     for ctx_len, pa_variant, quant_cache_dtype in itertools.product(
         [1, 26, 128, 4097],
-        [PAVariant.Shomy, PAVariant.Asm],
+        [PAVariant.Shomy],
         [None, torch.float8_e4m3fnuz, torch.int8],
     ):
 

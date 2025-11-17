@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from typing import Any, Dict, Optional
 import os
 import json
 import functools
+from ._triton import arch_info
+from .core import AITER_TRITON_CONFIGS_PATH
+import warnings
 
 M_THRESHOLD_SMALL = 256
 M_THRESHOLD_MEDIUM = 1024
@@ -17,26 +20,23 @@ def get_config_dtype_str(
     use_int8_w8a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
+    use_mxfp4: Optional[bool] = False,
 ):
     if use_fp8_w8a8:
-        return "fp8_w8a8"
+        return "FP8_W8A8"
     elif use_int8_w8a16:
-        return "int8_w8a16"
+        return "INT8_W8A16"
     elif use_int8_w8a8:
-        return "int8_w8a8"
+        return "INT8_W8A8"
     elif use_int4_w4a16:
-        return "int4_w4a16"
+        return "INT4_W4A16"
+    elif use_mxfp4:
+        return "MX_FP4"
     elif dtype == torch.float:
         # avoiding cases where kernel fails when float32 MoE
         # use fp16/bfloat16 configs
         return "float32"
     return None
-
-
-def get_config_file_name(dtype: Optional[str]) -> str:
-    device_name = torch.cuda.get_device_name(0).replace(" ", "_")
-    dtype_selector = "" if not dtype else f",dtype={dtype}"
-    return f"device_name={device_name}{dtype_selector}.json"
 
 
 @functools.lru_cache
@@ -51,11 +51,10 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
     """
     # First look up if an optimized configuration is available in the configs
     # directory
-    json_file_name = get_config_file_name(dtype)
+    dtype_str = "DEFAULT" if dtype is None else dtype
+    dev = arch_info.get_device()
+    config_file_path = f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{dtype_str}.json"
 
-    config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "../moe_configs", json_file_name
-    )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
             # If a configuration has been found, return it
@@ -63,6 +62,9 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
 
     # If no optimized configuration is available, we will use the default
     # configuration
+    warnings.warn(
+        f"No MoE configuration found for device '{dev}' with dtype '{dtype_str}'. Using default configuration."
+    )
     return None
 
 
@@ -72,13 +74,14 @@ def get_optimal_moe_config(
     use_int8_w8a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
+    use_mxfp4: Optional[bool] = False,
     M: int = 1,
 ):
     dtype_str = get_config_dtype_str(
-        dtype, use_int8_w8a16, use_int8_w8a8, use_fp8_w8a8, use_int4_w4a16
+        dtype, use_int8_w8a16, use_int8_w8a8, use_fp8_w8a8, use_int4_w4a16, use_mxfp4
     )
+    # print(f"dtype_str={dtype_str}")
     configs = get_moe_configs(dtype_str)
-    configs = None
     if configs is not None:
         if configs:
             if M < M_THRESHOLD_SMALL:
@@ -101,6 +104,7 @@ def get_optimal_moe_config(
             "kpack": 1,
         }
 
+    # print(f"config={config}")
     return config
 
 
@@ -110,6 +114,7 @@ def get_optimal_moe_config_func(
     use_int8_w8a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
+    use_mxfp4: Optional[bool] = False,
 ):
     return functools.partial(
         get_optimal_moe_config,
@@ -118,4 +123,5 @@ def get_optimal_moe_config_func(
         use_int8_w8a8,
         use_fp8_w8a8,
         use_int4_w4a16,
+        use_mxfp4,
     )

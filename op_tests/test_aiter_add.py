@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
 from torch.profiler import profile, ProfilerActivity
+from aiter.test_common import checkAllclose
 from aiter import dtypes
 
 input_shapes = [
@@ -160,8 +161,9 @@ for tensor0, tensor1 in zip(tensors0, tensors1):
             # cache_flush1 = torch.randn(10000, 10000, requires_grad=True, device="cuda", dtype=dtypes.fp32).to(dtypes.i32)
             # output = torch.empty_like(tensor1)
             output = aiter.add(tensor0, tensor1)
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    checkAllclose(result, output, msg="add")
     print(torch.equal(result, output))
 # print("result:", result)
 # print("output:", output)

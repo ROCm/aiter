@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -8,9 +8,15 @@ import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, perftest, benchmark
+from aiter import hipb_mm, hipb_create_extension
+from aiter.jit.utils.chip_info import get_gfx
 import pandas as pd
 import argparse
+from functools import lru_cache
 
+# pd.set_option('display.max_rows', 200)
+# pd.set_option('display.max_columns', 100)
+# pd.set_option('display.width', 1000)
 TEST_NUM_ITERS = 100
 
 
@@ -25,13 +31,30 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
+def run_aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
+    if scaleB is not None:
+        scaleB = scaleB.t()
+    return hipb_mm(
+        inp,
+        weights.t(),
+        solution_index=-1,
+        bias=None,
+        out_dtype=dtype,
+        scaleA=scaleA,
+        scaleB=scaleB,
+        scaleOut=None,
+        bpreshuffle=True,
+    )
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
 def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_CK(x, weight, x_scale, w_scale, bias, dtype)
 
 
 @perftest()
 def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_bpreshuffle_CK(x, weight, x_scale, w_scale, dtype)
+    return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, None, dtype)
 
 
 @perftest()
@@ -48,6 +71,11 @@ def run_gemm_skinny(
     if bias is not None:
         out = out.to(bias) + bias
     return out.to(dtype)
+
+
+@lru_cache(maxsize=1)
+def init_hipblas():
+    hipb_create_extension()
 
 
 @benchmark()
@@ -76,7 +104,15 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
 
     avg_d = None
     err_d = None
-    if dtype == dtypes.bf16 and quantDtype == dtypes.i8 and bias is not None:
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+    if (
+        dtype == dtypes.bf16
+        and quantDtype == dtypes.i8
+        and bias is not None
+        and cu_num == 80
+    ):
         weightshuffle_asm = shuffle_weight(weight, layout=(32, 16))
         bias_f32 = bias.to(dtypes.fp32)
         d, avg_d = run_gemm_asm(x, weightshuffle_asm, x_scale, w_scale, bias_f32, dtype)
@@ -85,6 +121,15 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         else:
             avg_d = None
 
+    if quantDtype == dtypes.fp8 and get_gfx() == "gfx942" and dtype == dtypes.bf16:
+        # hipb_mm bpreshuffle only supports bfloat16 as output type
+        init_hipblas()
+        e, avg_e = run_aiter_hip_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
+        e = e + bias
+        err_e = checkAllclose(a, e, msg="hipmm bpreshuffle: ", rtol=1e-2, atol=1e-2)
+    else:
+        avg_e = None
+        err_e = None
     return {
         "ck us": avg_b,
         "ck err": err_b,
@@ -92,6 +137,8 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         "ck bpreshuffle err": err_c,
         "asm us": avg_d,
         "asm err": err_d,
+        "hipmm bpreshuffle us": avg_e,
+        "hipmm bpreshuffle err": err_e,
     }
 
 
@@ -103,12 +150,11 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     weight, w_scale = aiter.per_tensor_quant(weight, quant_dtype=quantDtype)
     bias = None
 
+    a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     if m <= 2:
-        a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+        b, avg_b = run_gemm_skinny(x, weight, x_scale, w_scale, None, dtype, cu_count)
     else:
-        a, avg_a = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
-
-    b, avg_b = run_gemm_skinny(x, weight, x_scale, w_scale, None, dtype, cu_count)
+        b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
@@ -321,9 +367,20 @@ l_mnk_nm = [
     (4096, 8192, 1024),
     (8192, 8192, 1024),
     (16384, 8192, 1024),
+    # hipmm preshuffle
+    (16, 7424, 8192),
+    (32, 7424, 8192),
+    (48, 7424, 8192),
+    (64, 7424, 8192),
+    (4096, 7424, 8192),
+    (5120, 7424, 8192),
+    (8192, 7424, 8192),
 ]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -332,7 +389,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-q",
@@ -342,16 +400,17 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="shape",
+    help="""Date type of quantization.
+    e.g.: -q fp8""",
 )
 parser.add_argument(
     "-mnk",
     type=dtypes.str2tuple,
-    choices=l_mnk_nm,
     nargs="?",
     const=None,
     default=None,
-    help="shape",
+    help="""Shape of mnk.
+    e.g. -mnk 1280,8192,1024""",
 )
 
 args = parser.parse_args()
