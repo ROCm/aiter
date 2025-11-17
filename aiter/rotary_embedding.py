@@ -1186,12 +1186,12 @@ class MRotaryEmbeddingQKNormFused(MRotaryEmbedding):
         is_neox_style: bool,
         dtype: torch.dtype,
         mrope_section: Optional[List[int]] = None,
-
+        mrope_interleaved: bool = False,
     ) -> None:
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, mrope_section
         )
-        return None
+        self.mrope_interleaved = mrope_interleaved
     
     def forward(
         self,
@@ -1210,6 +1210,7 @@ class MRotaryEmbeddingQKNormFused(MRotaryEmbedding):
         num_heads_k = num_kv_heads
         num_heads_v = num_kv_heads
         is_interleaved = True if positions.ndim == 2 and self.mrope_section is not None else False
+        assert is_interleaved == self.mrope_interleaved
         fused_mrope_3d_rms(qkv, q_weight, k_weight, cos_sin, positions, num_tokens, 
                            num_heads_q, num_heads_k, num_heads_v, self.head_size, self.is_neox_style, self.mrope_section,
                            is_interleaved, eps)
@@ -1512,6 +1513,37 @@ def get_rope(
                 high_freq_factor,
                 original_max_position,
             )
+        elif scaling_type == "default":
+            if "mrope_section" in rope_scaling:
+                if "try_aiter_rope_fused_qknorm" in rope_scaling and rope_scaling["try_aiter_rope_fused_qknorm"]:
+                    rotary_emb = MRotaryEmbeddingQKNormFused(
+                        head_size,
+                        rotary_dim,
+                        max_position,
+                        base,
+                        is_neox_style,
+                        dtype,
+                        mrope_section=rope_scaling["mrope_section"],
+                    )
+                else:
+                    rotary_emb = MRotaryEmbedding(
+                        head_size,
+                        rotary_dim,
+                        max_position,
+                        base,
+                        is_neox_style,
+                        dtype,
+                        mrope_section=rope_scaling["mrope_section"],
+                    )
+            else:
+                rotary_emb = RotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                )
         elif scaling_type == "linear":
             rotary_emb = LinearScalingRotaryEmbedding(
                 head_size,
@@ -1609,6 +1641,7 @@ def get_rope(
                     is_neox_style,
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
+                    mrope_interleaved=rope_scaling["mrope_interleaved"] if "mrope_interleaved" in rope_scaling else False
                 )
             else:
                 rotary_emb = MRotaryEmbedding(
