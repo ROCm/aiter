@@ -43,7 +43,6 @@ _gemm_a8w8_blockscale_reduce_repr = make_kernel_repr(
 )
 
 
-
 @triton.jit
 def group_broadcast(
     x,
@@ -192,7 +191,7 @@ def _gemm_a8w8_blockscale_kernel(
         offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         pid_bn = pid_n * BLOCK_SIZE_N
-        offs_bn = (pid_bn + tl.arange(0, BLOCK_SIZE_N))
+        offs_bn = pid_bn + tl.arange(0, BLOCK_SIZE_N)
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
@@ -205,13 +204,17 @@ def _gemm_a8w8_blockscale_kernel(
         a_scale_ptrs = (
             a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
         )
-        num_unique_scales_along_bn: tl.constexpr = (BLOCK_SIZE_N + GROUP_N - 1) // GROUP_N
+        num_unique_scales_along_bn: tl.constexpr = (
+            BLOCK_SIZE_N + GROUP_N - 1
+        ) // GROUP_N
         num_unique_scales_along_n: tl.constexpr = (N + GROUP_N - 1) // GROUP_N
         offs_b_scale_n = (
             pid_n * BLOCK_SIZE_N // GROUP_N + tl.arange(0, num_unique_scales_along_bn)
         ) % num_unique_scales_along_n
         b_scale_ptrs = (
-            b_scale_ptr + offs_k_scale * stride_bscale_k + offs_b_scale_n * stride_bscale_n
+            b_scale_ptr
+            + offs_k_scale * stride_bscale_k
+            + offs_b_scale_n * stride_bscale_n
         )
 
         offs_ks_step = BLOCK_SIZE_K // GROUP_K
@@ -224,13 +227,24 @@ def _gemm_a8w8_blockscale_kernel(
             # If it is out of bounds, set it to 0.
             if EVEN_K:
                 a = tl.load(a_ptrs, mask=offs_am[:, None] < M, other=0.0)
-                b = tl.load(b_ptrs, cache_modifier=cache_modifier, mask=offs_bn[None, :] < N, other=0.0)
+                b = tl.load(
+                    b_ptrs,
+                    cache_modifier=cache_modifier,
+                    mask=offs_bn[None, :] < N,
+                    other=0.0,
+                )
             else:
                 a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K and offs_am[:, None] < M, other=0.0
+                    a_ptrs,
+                    mask=offs_k[None, :] < K - k * BLOCK_SIZE_K
+                    and offs_am[:, None] < M,
+                    other=0.0,
                 )
                 b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K and offs_bn[None, :] < N, other=0.0
+                    b_ptrs,
+                    mask=offs_k[:, None] < K - k * BLOCK_SIZE_K
+                    and offs_bn[None, :] < N,
+                    other=0.0,
                 )
             a_scale = tl.load(a_scale_ptrs, mask=offs_am < M)
             b_scale = tl.load(b_scale_ptrs)
@@ -243,9 +257,7 @@ def _gemm_a8w8_blockscale_kernel(
             )
 
             accumulator += (
-                tl.dot(a, b, input_precision="ieee")
-                * a_scale[:, None]
-                * b_scale
+                tl.dot(a, b, input_precision="ieee") * a_scale[:, None] * b_scale
             )
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -364,7 +376,9 @@ def _get_config(
         elif BLK_M == 128 and "medium_M128" in _get_config._config_dict[key]:
             return _get_config._config_dict[key]["medium_M128"]
         else:
-            return _get_config._config_dict[key if key in _get_config._config_dict else "default"]["any"]
+            return _get_config._config_dict[
+                key if key in _get_config._config_dict else "default"
+            ]["any"]
     elif M <= 256 and "large" in _get_config._config_dict[key]:
         return _get_config._config_dict[key]["large"]
     elif M <= 2000:
@@ -378,4 +392,6 @@ def _get_config(
         elif "xlarge" in _get_config._config_dict[key]:
             return _get_config._config_dict[key]["xlarge"]
         else:
-            return _get_config._config_dict[key if key in _get_config._config_dict else "default"]["any"]
+            return _get_config._config_dict[
+                key if key in _get_config._config_dict else "default"
+            ]["any"]
