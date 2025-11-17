@@ -196,8 +196,8 @@ def grouped_topk_torch(
     return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
 
 
-@compile_ops("module_topk_per_row")
-def topk_per_row(
+@compile_ops("module_top_k_per_row")
+def top_k_per_row_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
@@ -208,8 +208,8 @@ def topk_per_row(
 ) -> None: ...
 
 
-@compile_ops("module_topk_per_row")
-def topk_per_row_decode(
+@compile_ops("module_top_k_per_row")
+def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
     seqLens: torch.Tensor,
