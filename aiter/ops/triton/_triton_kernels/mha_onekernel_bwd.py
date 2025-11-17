@@ -1200,6 +1200,7 @@ _bwd_kernel_noncausal_repr = make_kernel_repr(
         "BLOCK_N1",
         "BLOCK_M2",
         "BLOCK_N2",
+        "BLK_SLICE_FACTOR",
         "HEAD_DIM",
         "ENABLE_DROPOUT",
         "IS_VARLEN",
@@ -1283,6 +1284,7 @@ def bwd_kernel_noncausal(
     BLOCK_N1: tl.constexpr,  # 128
     BLOCK_M2: tl.constexpr,  # 128
     BLOCK_N2: tl.constexpr,  # 32
+    BLK_SLICE_FACTOR: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     ACTUAL_HEAD_DIM: tl.constexpr,
     PE_HEAD_DIM: tl.constexpr,

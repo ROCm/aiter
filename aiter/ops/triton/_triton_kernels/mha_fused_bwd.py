@@ -822,6 +822,7 @@ def _bwd_kernel_dkdvdq_noncausal(
     NUM_K_PIDS,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLK_SLICE_FACTOR: tl.constexpr,
     BLOCK_D_MODEL: tl.constexpr,
     BLOCK_D_MODEL_POW2: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
