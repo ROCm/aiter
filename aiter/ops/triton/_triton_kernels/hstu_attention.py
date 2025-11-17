@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Tuple
 import json
 
 # @manual=//triton:triton
@@ -711,7 +710,6 @@ _hstu_attn_bwd_repr = make_kernel_repr(
     [
         "CAUSAL",
         "HAS_MULTIPLE_TARGETS",
-        "IS_DELTA_Q",
         "ALLOW_TF32",
         "BLOCK_D_Q",
         "BLOCK_D_V",
@@ -720,7 +718,6 @@ _hstu_attn_bwd_repr = make_kernel_repr(
         "HAS_CONTEXTUAL_SEQ_LEN",
         "HAS_MAX_ATTN_LEN",
         "HAS_SORT_BY_LENGTH_INDICES",
-        "ATOMIC_ADD",
     ],
 )
 

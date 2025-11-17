@@ -311,7 +311,6 @@ _fwd_kernel_alibi_repr = make_kernel_repr(
         "BLOCK_M",
         "BLOCK_DMODEL",
         "BLOCK_N",
-        "SLIDING_WINDOW",
         "SKIP_DECODE",
     ],
 )

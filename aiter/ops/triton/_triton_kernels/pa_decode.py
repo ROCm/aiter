@@ -994,7 +994,6 @@ _paged_attn_decode_v1_w_dot_per_token_quant_repr = make_kernel_repr(
         "QUERY_GRP_SZ",
         "KV_BLK_SZ",
         "KV_BLK_SZ_POW2",
-        "MAX_SEQ_LEN_POW2",
     ],
 )
 
