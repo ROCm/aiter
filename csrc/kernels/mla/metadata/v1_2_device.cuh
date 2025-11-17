@@ -84,7 +84,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 
     // expected payload handled by each cu part.
     const int32_t payload =
-        ck_tile::integer_divide_ceil(sum_blocks, params.num_cu) + Traits::kFixedOverheadNumBlocks;
+        ck_tile::integer_divide_ceil(sum_blocks, params.num_splits) + Traits::kFixedOverheadNumBlocks;
 
     int32_t curr_batch        = 0; // batch ID of the batch which is under review
     int32_t curr_kv_block     = 0; // #blocks handled by previous cu part(s)
@@ -358,6 +358,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   const int32_t max_seqlen_qo,
                                   const int32_t ori_uni_seqlen_qo,
                                   const int32_t topk,
+                                  const int32_t max_split_per_batch,
                                   torch::Tensor& work_metadata_ptrs,
                                   torch::Tensor& work_info_set,
                                   torch::Tensor& work_indptr,
@@ -404,6 +405,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
                 "N is in [2, 8).")
 
+    int32_t num_splits = max_split_per_batch < 0 ? num_clusters : min(num_clusters, max_split_per_batch * num_batches);
+
     MlaMetadataV1KernelParameter params = {};
     params.p_work_metadata_ptrs         = work_metadata_ptrs.data_ptr<uint64_t>();
     params.p_work_indptr                = work_indptr.data_ptr<int32_t>();
@@ -416,6 +419,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.num_batches                  = num_batches;
     params.num_heads                    = num_heads_k * num_heads_per_head_k;
     params.num_cu                       = num_clusters;
+    params.num_splits                   = num_splits;
     params.reduce_indptr_size           = reduce_indptr.size(0);
     params.kv_granularity               = kv_granularity;
     params.kv_granularity_log2          = __builtin_ctz(kv_granularity);
