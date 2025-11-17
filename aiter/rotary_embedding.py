@@ -1192,7 +1192,7 @@ class MRotaryEmbeddingQKNormFused(MRotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, mrope_section
         )
         self.mrope_interleaved = mrope_interleaved
-        cache = torch.cat((self.cos, self.sin), dim=-1)
+        cache = torch.cat((self.cos_cache, self.sin_cache), dim=-1)
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
     
