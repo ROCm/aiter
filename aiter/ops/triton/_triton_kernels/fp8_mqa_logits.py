@@ -31,7 +31,7 @@ def _fp8_mqa_logits_kernel(
     row_id = tl.program_id(0)
     # go from larger to smaller in terms of work
     # to reduce the tail effect
-    row_id = tl.num_programs(0) - row_id  - 1
+    row_id = tl.num_programs(0) - row_id - 1
     tl.assume(row_id >= 0)
     tl.assume(stride_q_s > 0)
     tl.assume(stride_q_h > 0)
@@ -42,7 +42,6 @@ def _fp8_mqa_logits_kernel(
     tl.assume(stride_w_h > 0)
 
     logits_row_ptrs = logits_ptr + row_id * stride_logits_s
-  
 
     h_inds = tl.arange(0, NUM_HEADS)[:, None]
     d_inds = tl.arange(0, HEAD_SIZE)
@@ -64,7 +63,7 @@ def _fp8_mqa_logits_kernel(
     end_ind = tl.minimum(end_ind, seq_len_kv)
     shifted_end = end_ind - start_ind
     shifted_unmasked_end = shifted_end // BLOCK_KV * BLOCK_KV
-    
+
     kv_col_offsets = tl.arange(0, BLOCK_KV) + start_ind
     kv_ptrs = (
         KV_ptr + kv_col_offsets[None, :] * stride_kv_s + d_inds[:, None] * stride_kv_d
@@ -73,7 +72,6 @@ def _fp8_mqa_logits_kernel(
     kv_scales_ptrs = kv_scales_ptr + kv_col_offsets
 
     logits_ptrs = logits_row_ptrs + kv_col_offsets * stride_logits_k
-
 
     # Loop over KV tiles
     for _ in tl.range(0, shifted_unmasked_end, BLOCK_KV):
