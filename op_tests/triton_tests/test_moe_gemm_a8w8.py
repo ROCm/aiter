@@ -289,6 +289,7 @@ def test_op(
         swizzle_mx_scale = None
         w_static_scale = w_tri.abs().max().float() / 448.0
         w_tri = downcast_to_static_fp8_3d(w_tri, w_static_scale)
+        w_ref = (w_tri.float() * w_static_scale).to(torch.bfloat16)
 
     if act_mxfp8:
         x_tri, x_mx_scales_tri = downcast_to_mxfp(x_tri, act_dtype, axis=-1)
@@ -301,6 +302,7 @@ def test_op(
         x_mx_scales_tri = None
         x_static_scale = x_tri.abs().max().float() / 448.0 
         x_tri = downcast_to_static_fp8(x_tri, x_static_scale)
+        x_ref = (x_tri.float() * x_static_scale).to(torch.bfloat16)
         out_dtype = torch.float8_e4m3fn
         maxtol = 4e-1
         rmstol = 4e-2
@@ -310,8 +312,14 @@ def test_op(
     )
     if not act_mxfp8 and fused_quant:
         quant_static_scale = ref_y.abs().max().float() / 448.0
+        out_dtype = torch.float8_e4m3fn
+        maxtol = 4e-1
+        rmstol = 4e-2
     else:
         quant_static_scale = None
+        out_dtype = torch.bfloat16
+        maxtol = None
+        rmstol = None
     tri_y = moe_gemm_a8w8(
         x_tri,
         w_tri,
