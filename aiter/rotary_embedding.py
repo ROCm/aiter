@@ -1192,6 +1192,9 @@ class MRotaryEmbeddingQKNormFused(MRotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, mrope_section
         )
         self.mrope_interleaved = mrope_interleaved
+        cache = torch.cat((self.cos, self.sin), dim=-1)
+        self.cos_sin_cache: torch.Tensor
+        self.register_buffer("cos_sin_cache", cache, persistent=False)
     
     def forward(
         self,
@@ -1205,16 +1208,14 @@ class MRotaryEmbeddingQKNormFused(MRotaryEmbedding):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
         num_tokens = positions.shape[-1]
-        cos_sin = self.cos_sin_cache[positions] 
         num_heads_q = num_heads
         num_heads_k = num_kv_heads
         num_heads_v = num_kv_heads
         is_interleaved = True if positions.ndim == 2 and self.mrope_section is not None else False
         assert is_interleaved == self.mrope_interleaved
-        fused_mrope_3d_rms(qkv, q_weight, k_weight, cos_sin, positions, num_tokens, 
+        fused_mrope_3d_rms(qkv, q_weight, k_weight, self.cos_sin_cache, positions, num_tokens, 
                            num_heads_q, num_heads_k, num_heads_v, self.head_size, self.is_neox_style, self.mrope_section,
                            is_interleaved, eps)
-        qkv = qkv.view(num_tokens, )
         q_size = num_heads_q * self.head_size
         k_size = num_heads_k * self.head_size
         v_size = num_heads_v * self.head_size
@@ -1524,6 +1525,7 @@ def get_rope(
                         is_neox_style,
                         dtype,
                         mrope_section=rope_scaling["mrope_section"],
+                        mrope_interleaved=rope_scaling["mrope_interleaved"] if "mrope_interleaved" in rope_scaling else False
                     )
                 else:
                     rotary_emb = MRotaryEmbedding(
@@ -1631,28 +1633,6 @@ def get_rope(
                 long_factor,
                 **extra_kwargs,
             )
-        elif scaling_type == "mrope":
-            if "try_aiter_rope_fused_qknorm" in rope_scaling and rope_scaling["try_aiter_rope_fused_qknorm"]:
-                rotary_emb = MRotaryEmbeddingQKNormFused(
-                    head_size,
-                    rotary_dim,
-                    max_position,
-                    base,
-                    is_neox_style,
-                    dtype,
-                    mrope_section=rope_scaling["mrope_section"],
-                    mrope_interleaved=rope_scaling["mrope_interleaved"] if "mrope_interleaved" in rope_scaling else False
-                )
-            else:
-                rotary_emb = MRotaryEmbedding(
-                    head_size,
-                    rotary_dim,
-                    max_position,
-                    base,
-                    is_neox_style,
-                    dtype,
-                    mrope_section=rope_scaling["mrope_section"],
-                )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
