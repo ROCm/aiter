@@ -363,6 +363,8 @@ def _get_config(
             return _get_config._config_dict[key]["medium_M64"]
         elif BLK_M == 128 and "medium_M128" in _get_config._config_dict[key]:
             return _get_config._config_dict[key]["medium_M128"]
+        else:
+            return _get_config._config_dict[key if key in _get_config._config_dict else "default"]["any"]
     elif M <= 256 and "large" in _get_config._config_dict[key]:
         return _get_config._config_dict[key]["large"]
     elif M <= 2000:
@@ -375,5 +377,5 @@ def _get_config(
             return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
         elif "xlarge" in _get_config._config_dict[key]:
             return _get_config._config_dict[key]["xlarge"]
-
-    return _get_config._config_dict[key]["any"]
+        else:
+            return _get_config._config_dict[key if key in _get_config._config_dict else "default"]["any"]
