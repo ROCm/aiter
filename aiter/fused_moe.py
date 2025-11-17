@@ -497,7 +497,7 @@ def get_2stage_cfgs(
         or (q_dtype_w == dtypes.fp8 and q_type == QuantType.per_1x128)
         or (q_type == QuantType.per_1x128 and block_m == 16)
     ):
-        if inter_dim % 320 != 0:
+        if run_1stage and inter_dim % 320 != 0:
           return MOEMetadata(
             functools.partial(
                 aiter.ck_moe_stage1_fwd,
