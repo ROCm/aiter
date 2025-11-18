@@ -17,6 +17,7 @@ torch.set_printoptions(sci_mode=False)
 # qdtype bf16, kdtype bf16: nhead16
 # qdtype fp8, kdtype fp8: nhead16, nhead128
 # qdtype fp8, kdtype bf16: nhead16
+import functools
 
 
 def cal_diff(
@@ -238,6 +239,7 @@ def test_mla(
         kv_buffer.dtype,
         is_sparse=False,
         fast_mode=True,
+        intra_batch_mode=True,
     )
 
     # aiter implementation
@@ -261,6 +263,51 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
+    @functools.lru_cache(maxsize=1)
+    def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
+        gpu = torch.cuda.current_device()
+        device_properties = torch.cuda.get_device_properties(gpu)
+        cu_num = device_properties.multi_processor_count
+        avg_kv = total_kv / bs
+        overhead = 84.1
+        tmp = [
+            (
+                bs
+                * i
+                / ((bs * i + cu_num - 1) // cu_num * cu_num)
+                * avg_kv
+                / (avg_kv + overhead * i),
+                i,
+            )
+            for i in range(1, 17)
+        ]
+        num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
+
+        get_block_n_fp8 = {
+            16: 128,
+            32: 128,
+            48: 64,
+            64: 64,
+            128: 32,
+            256: 32,
+            384: 32,
+            512: 32,
+        }
+        if dtype == dtypes.fp8:
+            min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
+            num_kv_splits = min(
+                num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n
+            )
+
+        num_kv_splits_indptr = torch.arange(
+            0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
+        )
+        return num_kv_splits, num_kv_splits_indptr
+
+    num_kv_splits, num_kv_splits_indptr = get_meta_param(
+        None, batch_size, kv_indices.shape[0], nhead, decode_qlen, q.dtype
+    )
+
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
@@ -276,8 +323,9 @@ def test_mla(
         kv_granularity=max(page_size, 16),
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
-        fast_mode=True,
-        max_split_per_batch=max_split_per_batch,
+        fast_mode=False,
+        max_split_per_batch=num_kv_splits,
+        intera_batch_mode=True,
     )
 
     def test_absorb_decode_bf16():
@@ -295,13 +343,15 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
-            num_kv_splits=max_split_per_batch,
+            num_kv_splits=num_kv_splits,
+            num_kv_splits_indptr=num_kv_splits_indptr,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
             work_info_set=work_info_set,
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
+            intra_batch_mode=True,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -356,7 +406,8 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
-            num_kv_splits=max_split_per_batch,
+            num_kv_splits=num_kv_splits,
+            num_kv_splits_indptr=num_kv_splits_indptr,
             q_scale=q_scale,
             kv_scale=kv_scale,
             work_meta_data=work_meta_data,
@@ -365,6 +416,7 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
+            intra_batch_mode=True,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")

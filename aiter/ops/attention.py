@@ -344,6 +344,7 @@ def get_mla_metadata_info_v1(
     kv_dtype: torch.dtype,
     is_sparse: int,
     fast_mode: bool = True,
+    intra_batch_mode: bool = False,
 ):
     """
     Returns:
@@ -357,35 +358,45 @@ def get_mla_metadata_info_v1(
 
     assert num_head_qo % 16 == 0
 
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
+    if not intra_batch_mode:
+        gpu = torch.cuda.current_device()
+        device_properties = torch.cuda.get_device_properties(gpu)
+        cu_num = device_properties.multi_processor_count
 
-    max_qo_tiles_per_batch = (
-        int(math.ceil(max_seqlen_qo * num_head_qo / 128))
-        if num_head_qo == 16 or (num_head_qo == 128 and kv_dtype == dtypes.fp8)
-        else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
-    )
-    batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
-    tile_cnt = batch_size * max_qo_tiles_per_batch
+        max_qo_tiles_per_batch = (
+            int(math.ceil(max_seqlen_qo * num_head_qo / 128))
+            if num_head_qo == 16 or (num_head_qo == 128 and kv_dtype == dtypes.fp8)
+            else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
+        )
+        batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
+        tile_cnt = batch_size * max_qo_tiles_per_batch
 
-    if fast_mode:
-        max_work = tile_cnt + cu_num - 1
-        max_split_tiles = (
-            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
+        if fast_mode:
+            max_work = tile_cnt + cu_num - 1
+            max_split_tiles = (
+                min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
+            )
+        else:
+            max_work = tile_cnt * cu_num
+            max_split_tiles = tile_cnt * cu_num
+
+        return (
+            ((2), torch.uint64),  # work_metadata_ptrs
+            ((cu_num + 1), torch.int32),  # work_indptr
+            ((max_work, 8), torch.int32),  # work_info_set
+            ((tile_cnt + 1), torch.int32),  # reduce_indptr
+            ((tile_cnt, 2), torch.int32),  # reduce_final_map
+            (max_split_tiles, torch.int32),  # reduce_partial_map
         )
     else:
-        max_work = tile_cnt * cu_num
-        max_split_tiles = tile_cnt * cu_num
-
-    return (
-        ((2), torch.uint64),  # work_metadata_ptrs
-        ((cu_num + 1), torch.int32),  # work_indptr
-        ((max_work, 8), torch.int32),  # work_info_set
-        ((tile_cnt + 1), torch.int32),  # reduce_indptr
-        ((tile_cnt, 2), torch.int32),  # reduce_final_map
-        (max_split_tiles, torch.int32),  # reduce_partial_map
-    )
+        return (
+            ((2), torch.uint64),  # work_metadata_ptrs
+            (batch_size * 16 + 1, torch.int32),  # work_indptr
+            ((batch_size * 16, 8), torch.int32),  # work_info_set
+            ((batch_size + 1), torch.int32),  # reduce_indptr
+            ((batch_size, 2), torch.int32),  # reduce_final_map
+            (batch_size * 16 + 1, torch.int32),  # reduce_partial_map
+        )
 
 
 @compile_ops("module_mla_metadata")
@@ -407,6 +418,7 @@ def get_mla_metadata_v1(
     fast_mode: bool = True,
     topk: int = -1,
     max_split_per_batch: int = -1,
+    intera_batch_mode: bool = False,
 ) -> None:
     """
     Inputs:

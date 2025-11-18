@@ -168,6 +168,7 @@ def mla_decode_fwd(
     reduce_partial_map=None,
     q_scale=None,
     kv_scale=None,
+    intra_batch_mode=False,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -262,6 +263,82 @@ def mla_decode_fwd(
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
             mgc=mgc,
+            num_warps=4,
+            num_stages=2,
+            **extra_kargs,
+        )
+    elif intra_batch_mode:
+        MAYBE_FINAL_OUT = True
+
+        if nhead == 16 and max_seqlen_q == 1:
+            MAYBE_FINAL_OUT = False
+
+        logits = (
+            o.view((total_s, num_kv_splits, nhead, v_head_dim))
+            if (
+                num_kv_splits == 1
+                and (
+                    q.dtype == dtypes.fp8
+                    or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+                )
+            )
+            else torch.empty(
+                (total_s, num_kv_splits, nhead, v_head_dim),
+                dtype=dtypes.fp32,
+                device=device,
+            )
+        )
+
+        attn_lse = torch.empty(
+            (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
+        )
+        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+        aiter.mla_decode_stage1_asm_fwd(
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            num_kv_splits_indptr,
+            work_meta_data,
+            work_indptr,
+            work_info_set,
+            max_seqlen_q,
+            sm_scale,
+            logits,
+            attn_lse,
+            o,
+            q_scale,
+            kv_scale,
+        )
+        if num_kv_splits == 1 and (
+            q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+        ):
+            return logits.view(total_s, nhead, v_head_dim), attn_lse
+
+        Lv = v_head_dim
+        BLOCK_DV = triton.next_power_of_2(Lv)
+        grid = (bs, nhead)
+        extra_kargs = {"waves_per_eu": 4}
+
+        _fwd_kernel_stage2_asm[grid](
+            logits,
+            attn_lse,
+            o,
+            qo_indptr,
+            kv_indptr,
+            num_kv_splits_indptr,
+            attn_lse.stride(0),
+            attn_lse.stride(2),
+            attn_lse.stride(1),
+            o.stride(0),
+            o.stride(1),
+            MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
+            BATCH_NUM=bs,
+            BLOCK_DV=BLOCK_DV,
+            Lv=Lv,
+            mgc=16,
             num_warps=4,
             num_stages=2,
             **extra_kargs,
