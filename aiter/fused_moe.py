@@ -630,14 +630,14 @@ def get_2stage_cfgs(
         kernelName2 = ""
         run_1stage = False
         if (
-            not doweight_stage1
-            and (
+            (
                 activation,
                 q_type,
                 dtype,
                 q_dtype_a,
                 q_dtype_w,
                 use_g1u1,
+                doweight_stage1,
             )
             in fused_moe_1stage_dict[get_gfx()]
         ):
