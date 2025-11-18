@@ -283,6 +283,7 @@ def test_mla(
                 for i in range(1, 17)
             ]
             num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
+        num_kv_splits = min((total_kv + 15) // 16, num_kv_splits) 
 
         get_block_n_fp8 = {
             16: 128,
@@ -355,6 +356,8 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=True,
         )
+
+        # import pdb;pdb.set_trace()
 
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")

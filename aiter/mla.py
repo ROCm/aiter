@@ -246,6 +246,8 @@ def mla_decode_fwd(
         grid = (bs, nhead)
         extra_kargs = {"waves_per_eu": 4}
 
+        # import pdb;pdb.set_trace()
+
         _fwd_kernel_stage2_asm[grid](
             logits,
             attn_lse,
@@ -322,31 +324,41 @@ def mla_decode_fwd(
         BLOCK_DV = triton.next_power_of_2(Lv)
         grid = (bs, nhead)
         # grid = (1, 1)
+
         extra_kargs = {"waves_per_eu": 4}
         # import pdb;pdb.set_trace()
 
-        _fwd_kernel_stage2_asm[grid](
+        # _fwd_kernel_stage2_asm[grid](
+        #     logits,
+        #     attn_lse,
+        #     o,
+        #     qo_indptr,
+        #     kv_indptr,
+        #     num_kv_splits_indptr,
+        #     attn_lse.stride(0),
+        #     attn_lse.stride(2),
+        #     attn_lse.stride(1),
+        #     o.stride(0),
+        #     o.stride(1),
+        #     MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
+        #     BATCH_NUM=bs,
+        #     BLOCK_DV=BLOCK_DV,
+        #     Lv=Lv,
+        #     mgc=16,
+        #     num_warps=4,
+        #     num_stages=2,
+        #     **extra_kargs,
+        # )
+
+        aiter.mla_reduce_v1(
             logits,
             attn_lse,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
             o,
-            qo_indptr,
-            kv_indptr,
-            num_kv_splits_indptr,
-            attn_lse.stride(0),
-            attn_lse.stride(2),
-            attn_lse.stride(1),
-            o.stride(0),
-            o.stride(1),
-            MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
-            BATCH_NUM=bs,
-            BLOCK_DV=BLOCK_DV,
-            Lv=Lv,
-            mgc=16,
-            num_warps=4,
-            num_stages=2,
-            **extra_kargs,
+            final_lse,
         )
-
         
     else:
         if num_kv_splits is None:
