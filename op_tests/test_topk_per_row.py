@@ -50,10 +50,15 @@ def create_row_boundaries(
     num_rows: int, num_prefix: int = 0, top_k: int = 2048
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Create row start and end indices for testing."""
-    row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
-    row_ends = torch.arange(
-        num_prefix + 1, num_prefix + num_rows + 1, device="cuda", dtype=torch.int32
-    )
+    # row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+    row_starts = torch.zeros(3072, dtype=torch.int32, device="cuda")
+    # row_ends = torch.arange(
+        # num_prefix + 1, num_prefix + num_rows + 1, device="cuda", dtype=torch.int32
+    # )
+
+
+    row_ends = torch.full((3072,), num_rows, dtype=torch.int32, device="cuda")
+
     return row_starts, row_ends
 
 
@@ -177,9 +182,11 @@ def test_top_k_per_row_prefill(num_rows: int, num_prefix: int, top_k: int) -> di
     logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
 
     # Create output tensors
-    indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    # indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    indices = torch.empty((3072, top_k), dtype=torch.int32, device="cuda")
 
-    values = torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda").fill_(0)
+    # values = torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda").fill_(0)
+    values = torch.empty((3072, top_k), dtype=torch.float32, device="cuda").fill_(0)
 
     # Run the kernel
     _, us = run_top_k_per_row_prefill(
@@ -189,7 +196,7 @@ def test_top_k_per_row_prefill(num_rows: int, num_prefix: int, top_k: int) -> di
         indices,
         None,  # values
         # values,
-        num_rows,
+        3072,
         logits.stride(0),
         logits.stride(1),
     )

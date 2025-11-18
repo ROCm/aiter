@@ -118,35 +118,36 @@ def test_topk(
 # BATCH_SIZES = [3072, 3072, 3072]
 # HIDDENSIZES = [3072, 4096, 8192]
 BATCH_SIZES = [3072]
-HIDDENSIZES = [3072]
+HIDDENSIZES = [3072, 4096, 8192, 16384, 32768, 65536, 131072]
 # HIDDENSIZES = [32768]
-topk = 2048
+TOPKS = [2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
 largest = True
 
 df = []
 for batch_size in BATCH_SIZES:
     for hiddensize in HIDDENSIZES:
-        print(f"\n{'='*60}")
-        print(f"Testing: batch_size={batch_size}, hiddensize={hiddensize}, topk={topk}")
-        print(f"{'='*60}")
-        ret = test_topk(
-            batch_size,
-            hiddensize,
-            topk,
-            largest,
-            dtypes.fp32,
-        )
-        df.append(
-            {
-                "batch_size": batch_size,
-                "hiddensize": hiddensize,
-                "topk": topk,
-                "error": ret["err"],
-                "time_us (aiter)": ret["us_aiter"],
-                "time_us (torch)": ret["us_torch"],
-                "time_us (triton)": ret["us_triton"],
-            }
-        )
+        for topk in TOPKS:
+            print(f"\n{'='*60}")
+            print(f"Testing: batch_size={batch_size}, hiddensize={hiddensize}, topk={topk}")
+            print(f"{'='*60}")
+            ret = test_topk(
+                batch_size,
+                hiddensize,
+                topk,
+                largest,
+                dtypes.fp32,
+            )
+            df.append(
+                {
+                    "batch_size": batch_size,
+                    "hiddensize": hiddensize,
+                    "topk": topk,
+                    "error": ret["err"],
+                    "time_us (aiter)": ret["us_aiter"],
+                    "time_us (torch)": ret["us_torch"],
+                    "time_us (triton)": ret["us_triton"],
+                }
+            )
 
 df = pd.DataFrame(df)
 

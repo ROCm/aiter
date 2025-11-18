@@ -855,7 +855,17 @@ __global__ void radix_kernel(T const* in,
                              int const pass)
 {
     const int64_t batch_id = blockIdx.y;
-    const IdxT row_len     = rowEnds[batch_id] - rowStarts[batch_id];
+
+    IdxT rowStart    = 0;
+    IdxT rowEnd      = len;
+
+    if (!rowStart && !rowEnds)
+    {
+        rowStart = rowStarts[batch_id];
+        rowEnd   = rowEnds[batch_id];
+    }
+
+    const IdxT row_len = rowEnd - rowStart;
 
     auto counter = counters + batch_id;
     IdxT current_k;
@@ -1270,9 +1280,17 @@ __global__ void radix_topk_one_block_kernel(T const* in,
     __shared__ IdxT histogram[num_buckets];
 
     const int64_t batch_id = blockIdx.x;
-    const IdxT rowStart    = rowStarts[batch_id];
-    const IdxT rowEnd      = rowEnds[batch_id];
-    const IdxT row_len     = rowEnd - rowStart;
+    IdxT rowStart    = 0;
+    IdxT rowEnd      = len;
+
+    if (!rowStart && !rowEnds)
+    {
+        rowStart = rowStarts[batch_id];
+        rowEnd   = rowEnds[batch_id];
+    }
+
+    const IdxT row_len = rowEnd - rowStart;
+
     if(threadIdx.x == 0)
     {
         counter.k              = k;
@@ -2459,3 +2477,41 @@ void top_k_per_row_decode(const torch::Tensor& logits,
         }
     }
 }
+
+// Explicit template instantiations for use in topk_plain_kernels.cu
+namespace aiter {
+
+// Instantiate standalone_stable_radix_11bits
+template void standalone_stable_radix_11bits<float, int, true, true>(
+    void* buf,
+    size_t& buf_size,
+    float const* in,
+    int batch_size,
+    int64_t len,
+    int* rowStarts,
+    int* rowEnds,
+    int k,
+    float* out,
+    int* out_idx,
+    bool greater,
+    hipStream_t stream);
+
+template void standalone_stable_radix_11bits<float, int, false, true>(
+    void* buf,
+    size_t& buf_size,
+    float const* in,
+    int batch_size,
+    int64_t len,
+    int* rowStarts,
+    int* rowEnds,
+    int k,
+    float* out,
+    int* out_idx,
+    bool greater,
+    hipStream_t stream);
+
+
+} // namespace aiter
+
+// Instantiate workspace size calculation function (at global scope)
+template int64_t invokeComputeTopkLastDimWorkspaceSize<float>(int32_t numRows, int32_t stride0);

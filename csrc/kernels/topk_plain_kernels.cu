@@ -60,7 +60,27 @@ __global__ void topk_per_row(const float* logits,
                               int stride0,
                               int stride1,
                               int rowOffset);
+
+// Forward declaration of standalone_stable_radix_11bits from topk_per_row_kernels.cu
+template <typename T, typename IdxT, bool WRITE_TOPK_VALUES, bool sorted = false>
+void standalone_stable_radix_11bits(void* buf,
+                                    size_t& buf_size,
+                                    T const* in,
+                                    int batch_size,
+                                    int64_t len,
+                                    IdxT* rowStarts,
+                                    IdxT* rowEnds,
+                                    IdxT k,
+                                    T* out,
+                                    IdxT* out_idx,
+                                    bool greater,
+                                    hipStream_t stream);
+
 } // namespace aiter
+
+// Forward declaration of workspace size calculation function (at global scope)
+template <typename T>
+int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0);
 
 // Forward declaration of helper function to call topk_per_row kernel
 template <typename IdxT>
@@ -68,9 +88,11 @@ void topk_per_row_kernel_launcher(const float* in,
                                const IdxT* rowStarts,
                                const IdxT* rowEnds,
                                IdxT* out_idx,
+                               const float* out,
                                int batch_size,
                                int stride0,
                                int stride1,
+                               int k,
                                hipStream_t stream);
 
 // Gather kernel to extract values based on indices (uniform length)
@@ -2074,7 +2096,7 @@ void AdaptiveTopK(int batch_size,
         if (k >= 128 && greater) {
             topk_per_row_kernel_launcher<IdxT>(
                 in, nullptr, nullptr, out_idx,
-                batch_size, static_cast<int>(len), 1, stream);
+                out, batch_size, static_cast<int>(len), 1, k, stream);
 
             // topk_per_row only outputs indices, we need to gather values manually
             // const int threads = 256;
@@ -2134,15 +2156,15 @@ void AdaptiveTopK(int batch_size,
         {
             // Use topk_per_row implementation (optimized for k >= 128)
             topk_per_row_kernel_launcher<IdxT>(
-                in, rowStarts, rowEnds, out_idx,
-                batch_size, static_cast<int>(stride0), static_cast<int>(stride1), stream);
+                in, rowStarts, rowEnds, out_idx, out,
+                batch_size, static_cast<int>(stride0), static_cast<int>(stride1), k, stream);
 
             // topk_per_row only outputs indices, we need to gather values manually
-            const int threads = 256;
-            const int blocks = batch_size;
-            gather_topk_values_strided_kernel<T, IdxT><<<blocks, threads, 0, stream>>>(
-                in, out_idx, out, rowStarts, batch_size,
-                static_cast<int>(stride0), static_cast<int>(stride1), k);
+            // const int threads = 256;
+            // const int blocks = batch_size;
+            // gather_topk_values_strided_kernel<T, IdxT><<<blocks, threads, 0, stream>>>(
+            //     in, out_idx, out, rowStarts, batch_size,
+            //     static_cast<int>(stride0), static_cast<int>(stride1), k);
 
             return;
         }
@@ -2178,71 +2200,56 @@ void topk_per_row_kernel_launcher(const float* in,
                                const IdxT* rowStarts,
                                const IdxT* rowEnds,
                                IdxT* out_idx,
+                               const float* out,
                                int batch_size,
                                int stride0,
                                int stride1,
+                               int k,
                                hipStream_t stream)
 {
-    constexpr int kNumThreadsPerBlock = 512;
-    // constexpr int kSortingAlgorithmThreshold = 12288;
-    constexpr int kSortingAlgorithmThreshold = 1;
 
-    int numInsertionBlocks = std::min(static_cast<int>(batch_size), kSortingAlgorithmThreshold);
+    size_t buf_size = 0; // will be overwritten by the kernel
 
-    // Use Vector=4 if stride0 is aligned to 4, otherwise Vector=1
-    if(stride0 % 4 == 0)
+    static constexpr bool is_largest = true;
+
+    int64_t workspace_size = invokeComputeTopkLastDimWorkspaceSize<float>(batch_size, stride0);
+
+
+    auto options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+    torch::Tensor workspace = torch::empty({workspace_size}, options);
+
+
+    if(out)
     {
-        aiter::topk_per_row<kNumThreadsPerBlock, false, 4>
-            <<<numInsertionBlocks, kNumThreadsPerBlock, 0, stream>>>(
-                in,
-                rowStarts,
-                rowEnds,
-                out_idx,
-                stride0,
-                stride1,
-                0);
+        aiter::standalone_stable_radix_11bits<float, int, true, true>(
+            static_cast<void*>(workspace.data_ptr<uint8_t>()),
+            buf_size,
+            in,
+            batch_size,
+            stride0,
+            const_cast<IdxT*>(rowStarts),
+            const_cast<IdxT*>(rowEnds),
+            k,
+            const_cast<float*>(out),
+            out_idx,
+            is_largest,
+            stream);
     }
     else
     {
-        aiter::topk_per_row<kNumThreadsPerBlock, false, 1>
-            <<<numInsertionBlocks, kNumThreadsPerBlock, 0, stream>>>(
-                in,
-                rowStarts,
-                rowEnds,
-                out_idx,
-                stride0,
-                stride1,
-                0);
-    }
-
-    // Use radix sort for large batch sizes
-    if(batch_size > kSortingAlgorithmThreshold)
-    {
-        int numRadixBlocks = batch_size - kSortingAlgorithmThreshold;
-        if(stride0 % 4 == 0)
-        {
-            aiter::topk_per_row<kNumThreadsPerBlock, true, 4>
-                <<<numRadixBlocks, kNumThreadsPerBlock, 0, stream>>>(
-                    in,
-                    rowStarts,
-                    rowEnds,
-                    out_idx,
-                    stride0,
-                    stride1,
-                    kSortingAlgorithmThreshold);
-        }
-        else
-        {
-            aiter::topk_per_row<kNumThreadsPerBlock, true, 1>
-                <<<numRadixBlocks, kNumThreadsPerBlock, 0, stream>>>(
-                    in,
-                    rowStarts,
-                    rowEnds,
-                    out_idx,
-                    stride0,
-                    stride1,
-                    kSortingAlgorithmThreshold);
-        }
+        aiter::standalone_stable_radix_11bits<float, int, false, true>(
+            static_cast<void*>(workspace.data_ptr<uint8_t>()),
+            buf_size,
+            in,
+            batch_size,
+            stride0,
+            const_cast<IdxT*>(rowStarts),
+            const_cast<IdxT*>(rowEnds),
+            k,
+            nullptr,
+            out_idx,
+            is_largest,
+            stream);
     }
 }
 
