@@ -646,7 +646,7 @@ def get_2stage_cfgs(
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
-                run_1stage = True
+                run_1stage = token > 16
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
 
