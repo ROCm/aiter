@@ -45,6 +45,7 @@ def fp8_mqa_logits(
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
 
+    # heuristic for MFMA instruction shape
     matrix_instr_nonkdim = 32
     if seq_len <= 1024:
         matrix_instr_nonkdim = 16

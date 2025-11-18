@@ -21,9 +21,7 @@ def calculate_tflops(start_inds, end_inds, num_heads_q, head_dim, time_ms):
     for i in range(len(start_inds)):
         start = start_inds[i]
         end = end_inds[i]
-
         total_flops += 2.0 * num_heads_q * head_dim * (end - start)
-    total_flops = 2.0 * num_heads_q * head_dim * 1024 * 1024 // 2
     # TFLOPs = total FLOPs / (time in seconds * 1e12)
     tflops = total_flops / (time_s * 1e12)
 
@@ -89,7 +87,10 @@ def run_benchmark(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FP8 MQA Logits Benchmark")
+    parser = argparse.ArgumentParser(
+        description="FP8 MQA Logits Benchmark",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--num_heads_q", type=int, default=64, help="num. q heads")
     parser.add_argument("--head_dim", type=int, default=128, help="head dim size")
     parser.add_argument(
