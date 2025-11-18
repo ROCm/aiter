@@ -8,10 +8,53 @@ import triton.language as tl
 from .activation import _gelu_tanh
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton.moe_common import _write_zeros_to_output
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
 # Source:
 # MoE Kernel adapted from VLLM
+
+
+_fused_moe_kernel_gelu_repr = make_kernel_repr(
+    "_fused_moe_kernel",
+    [
+        "BLOCK_SCALE",
+        "group_n",
+        "group_k",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "EVEN_K",
+        "MUL_ROUTED_WEIGHT",
+        "top_k",
+        "compute_type",
+        "use_fp8_w8a8",
+        "use_int8_w8a16",
+        "NUM_XCDS",
+    ],
+)
+
+_fused_moe_persistent_kernel_gelu_repr = make_kernel_repr(
+    "_fused_moe_persistent_kernel",
+    [
+        "BLOCK_SCALE",
+        "group_n",
+        "group_k",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "EVEN_K",
+        "NUM_SMS",
+        "MUL_ROUTED_WEIGHT",
+        "top_k",
+        "compute_type",
+        "use_fp8_w8a8",
+        "use_int8_w8a16",
+        "NUM_XCDS",
+    ],
+)
 
 
 @triton.heuristics(
@@ -19,7 +62,7 @@ from ..utils._triton.moe_common import _write_zeros_to_output
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_moe_kernel_gelu_repr)
 def _fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
@@ -34,7 +77,6 @@ def _fused_moe_kernel(
     # Matrix dimensions
     N,
     K,
-    EM,
     num_valid_tokens,
     # The stride variables represent how much to increase the ptr by when
     # moving by 1 element in a particular dimension. E.g. `stride_am` is
@@ -238,7 +280,7 @@ def _fused_moe_kernel(
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_moe_persistent_kernel_gelu_repr)
 def _fused_moe_persistent_kernel(
     # Pointers to matrices
     a_ptr,
@@ -253,7 +295,6 @@ def _fused_moe_persistent_kernel(
     # Matrix dimensions
     N,
     K,
-    EM,
     num_valid_tokens,
     # The stride variables represent how much to increase the ptr by when
     # moving by 1 element in a particular dimension. E.g. `stride_am` is
