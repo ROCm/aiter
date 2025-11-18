@@ -630,17 +630,14 @@ def get_2stage_cfgs(
         kernelName2 = ""
         run_1stage = False
         if (
-            (
-                activation,
-                q_type,
-                dtype,
-                q_dtype_a,
-                q_dtype_w,
-                use_g1u1,
-                doweight_stage1,
-            )
-            in fused_moe_1stage_dict[get_gfx()]
-        ):
+            activation,
+            q_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            use_g1u1,
+            doweight_stage1,
+        ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
                 run_1stage = True and (inter_dim % 256 == 0)
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
