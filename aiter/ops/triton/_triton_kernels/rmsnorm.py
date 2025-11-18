@@ -971,8 +971,8 @@ def _rmsnorm_kernel_large_m_small_n(
     ).to(tl.float32)
     w = tl.load(W + n_off, mask=mask_n, other=0.0).to(tl.float32)
 
-    x_sq_masked = tl.where(mask_n[None, :], x * x, 0.0)
-    sum_sq = tl.sum(x_sq_masked, axis=1)
+    x = tl.where(mask, x, 0.0)
+    sum_sq = tl.sum(x * x, axis=1)
     var = sum_sq / N
     rsigma = tl.math.rsqrt(var + eps)
 
