@@ -3,12 +3,8 @@
 
 import torch
 from torch import Tensor
-import torch.nn.functional as F
-import random
 import aiter
-from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest, benchmark
-import argparse
 from typing import List
 
 
@@ -68,11 +64,11 @@ def apply_rotary_emb_dispatch(
 
 @perftest()
 def run_torch_mrope_3d_rms(
-    qkv: Tensor, # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
-    qw: Tensor, #  contiguous (head_size)
-    kw: Tensor, #  contiguous (head_size)
-    cos_sin: Tensor, # contiguous (max_positions * head_size)
-    positions: Tensor, # contiguous (3 * num_tokens)
+    qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
+    qw: Tensor,  #  contiguous (head_size)
+    kw: Tensor,  #  contiguous (head_size)
+    cos_sin: Tensor,  # contiguous (max_positions * head_size)
+    positions: Tensor,  # contiguous (3 * num_tokens)
     num_tokens: int,
     num_heads_q: int,
     num_heads_k: int,
@@ -97,7 +93,7 @@ def run_torch_mrope_3d_rms(
     k_by_head = k.view(num_tokens, num_heads_k, head_size)
     k_by_head = rms_norm_forward(k_by_head, kw, eps)
     k = k_by_head.view(k.shape)
-    
+
     cos_sin = cos_sin.view(max_positions, head_size)
     positions = positions.view(3, num_tokens)
     cos_sin = cos_sin[positions]
@@ -115,7 +111,7 @@ def run_torch_mrope_3d_rms(
             [m[i] for i, m in enumerate(sin.split(mrope_section, dim=-1))],
             dim=-1,
         )
-    
+
     q_shape = q.shape
     q = q.view(num_tokens, -1, head_size)
     q = apply_rotary_emb_dispatch(q, cos, sin, is_neox_style)
@@ -131,11 +127,11 @@ def run_torch_mrope_3d_rms(
 
 @perftest()
 def run_aiter_mrope_3d_rms(
-    qkv: Tensor, # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
-    qw: Tensor, #  contiguous (head_size)
-    kw: Tensor, #  contiguous (head_size)
-    cos_sin: Tensor, # contiguous (max_positions * head_size)
-    positions: Tensor, # contiguous (3 * num_tokens)
+    qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
+    qw: Tensor,  #  contiguous (head_size)
+    kw: Tensor,  #  contiguous (head_size)
+    cos_sin: Tensor,  # contiguous (max_positions * head_size)
+    positions: Tensor,  # contiguous (3 * num_tokens)
     num_tokens: int,
     num_heads_q: int,
     num_heads_k: int,
@@ -146,11 +142,24 @@ def run_aiter_mrope_3d_rms(
     is_interleaved: bool,
     eps: float,
 ):
-    qkv = qkv.clone() # inplace op
-    aiter.fused_mrope_3d_rms(qkv, qw, kw, cos_sin, positions, num_tokens, 
-        num_heads_q, num_heads_k, num_heads_v, head_size, is_neox_style, mrope_section,
-        is_interleaved, eps)
-    
+    qkv = qkv.clone()  # inplace op
+    aiter.fused_mrope_3d_rms(
+        qkv,
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_size,
+        is_neox_style,
+        mrope_section,
+        is_interleaved,
+        eps,
+    )
+
     q_size = num_heads_q * head_size
     k_size = num_heads_k * head_size
     v_size = num_heads_v * head_size
@@ -161,25 +170,70 @@ def run_aiter_mrope_3d_rms(
 
 
 @benchmark()
-def test_mrope_3d_rms(dtype, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_size, is_neox_style, mrope_section, is_interleaved, eps=1e-6):
-    qkv = torch.randn((num_tokens, num_heads_q + num_heads_k + num_heads_v, head_size), dtype=dtype, device="cuda")
+def test_mrope_3d_rms(
+    dtype,
+    num_tokens,
+    num_heads_q,
+    num_heads_k,
+    num_heads_v,
+    head_size,
+    is_neox_style,
+    mrope_section,
+    is_interleaved,
+    eps=1e-6,
+):
+    qkv = torch.randn(
+        (num_tokens, num_heads_q + num_heads_k + num_heads_v, head_size),
+        dtype=dtype,
+        device="cuda",
+    )
     qw = torch.randn(head_size, dtype=dtype, device="cuda")
     kw = torch.randn(head_size, dtype=dtype, device="cuda")
     cos_sin = torch.randn((max_positions, head_size), dtype=dtype, device="cuda")
-    positions = torch.randint(0, max_positions, (3, num_tokens), dtype=torch.int64, device="cuda")
+    positions = torch.randint(
+        0, max_positions, (3, num_tokens), dtype=torch.int64, device="cuda"
+    )
 
-    (q_ref, k_ref, v_ref), avg_torch = run_torch_mrope_3d_rms(qkv, qw, kw, cos_sin, positions, num_tokens, 
-        num_heads_q, num_heads_k, num_heads_v, head_size, 
-        is_neox_style, mrope_section, is_interleaved, eps)
-    (q, k, v), avg_cu = run_aiter_mrope_3d_rms(qkv, qw, kw, cos_sin, positions, num_tokens, 
-        num_heads_q, num_heads_k, num_heads_v, head_size, 
-        is_neox_style, mrope_section, is_interleaved, eps)
-    
+    (q_ref, k_ref, v_ref), avg_torch = run_torch_mrope_3d_rms(
+        qkv,
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_size,
+        is_neox_style,
+        mrope_section,
+        is_interleaved,
+        eps,
+    )
+    (q, k, v), avg_cu = run_aiter_mrope_3d_rms(
+        qkv,
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_size,
+        is_neox_style,
+        mrope_section,
+        is_interleaved,
+        eps,
+    )
+
     info = f"dtype:{dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}, num_heads_v:{num_heads_v}, head_size:{head_size}, is_neox_style:{is_neox_style}"
-    info += f", mrope_section:{mrope_section}, is_interleaved:{is_interleaved}, eps:{eps}"
+    info += (
+        f", mrope_section:{mrope_section}, is_interleaved:{is_interleaved}, eps:{eps}"
+    )
     msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
     checkAllclose(q_ref, q, msg="q", rtol=1e-2, atol=0.05)
-    checkAllclose(k_ref, k, msg="k",rtol=1e-2, atol=0.05)
+    checkAllclose(k_ref, k, msg="k", rtol=1e-2, atol=0.05)
     checkAllclose(v_ref, v, msg=msg, rtol=1e-2, atol=0.05)
 
 
@@ -198,5 +252,16 @@ if __name__ == "__main__":
                 for i, head_size in enumerate(head_sizes):
                     ms = mrope_sections[i]
                     for is_interleaved in is_interleaveds:
-                        test_mrope_3d_rms(dtype, num_token, num_head, num_head, num_head, head_size, is_neox_style, ms, is_interleaved, eps=1e-6)
-    print('done')
+                        test_mrope_3d_rms(
+                            dtype,
+                            num_token,
+                            num_head,
+                            num_head,
+                            num_head,
+                            head_size,
+                            is_neox_style,
+                            ms,
+                            is_interleaved,
+                            eps=1e-6,
+                        )
+    print("done")

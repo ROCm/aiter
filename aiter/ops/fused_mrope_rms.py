@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-from torch import Tensor, Generator
+from torch import Tensor
 from ..jit.core import compile_ops
-from typing import Optional, List
+from typing import List
+
 
 @compile_ops("module_fused_mrope_rms")
 def fused_mrope_3d_rms(

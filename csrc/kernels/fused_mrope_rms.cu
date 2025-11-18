@@ -396,3 +396,4 @@ void fused_mrope_3d_rms(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Te
                 stream);
         });
 }
+
