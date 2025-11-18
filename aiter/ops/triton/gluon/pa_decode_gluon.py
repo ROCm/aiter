@@ -39,13 +39,13 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     output_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size, head_size]
-    query_ptr,  # [num_seqs, num_kv_heads * query_group_size, head_size]
+    query_ptr,  # [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
     key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache_ptr,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     context_lengths_ptr,  # [num_seqs]
     softmax_scale,
-    query_scale,  # [num_seqs, num_kv_heads * query_group_size, 1]
+    query_scale,  # [num_seqs, num_kv_heads * query_length * query_group_size, 1]
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     stride_max_logits_seq,
@@ -121,10 +121,10 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         f"QUERY_GROUP_SIZE={QUERY_GROUP_SIZE}, Do not support QUERY_GROUP_SIZE > 64",
     )
 
-    # Data type validation
-    gl.static_assert(query_ptr.dtype.element_ty == gl.float8e4b8)
-    gl.static_assert(key_cache_ptr.dtype.element_ty == gl.float8e4b8)
-    gl.static_assert(value_cache_ptr.dtype.element_ty == gl.float8e4b8)
+    # # Data type validation
+    # gl.static_assert(query_ptr.dtype.element_ty == gl.float8e4b8)
+    # gl.static_assert(key_cache_ptr.dtype.element_ty == gl.float8e4b8)
+    # gl.static_assert(value_cache_ptr.dtype.element_ty == gl.float8e4b8)
 
     if QUERY_QUANT_MODE >= 0:
         gl.static_assert(query_scale.dtype.element_ty == gl.float32)
@@ -133,6 +133,10 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
     # ==================== Constants and Configuration ====================
+    if COMPUTE_TYPE == gl.float8e4b8:
+        OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
+    else:
+        OUTPUT_DTYPE: gl.constexpr = COMPUTE_TYPE
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential calculations
     CONTIGUOUS_KV_ELEMENTS_16B_LOAD: gl.constexpr = KV_16B_ELEMENT_COUNT
 
@@ -155,13 +159,25 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         warps_per_cta=[4, 1],
         order=[1, 0],
     )
+    shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
 
     # Key cache layout - optimized for CDNA3 architecture
-    blocked_key_layout: gl.constexpr = gl.BlockedLayout(
+    blocked_key_layout_fp8: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1, 16],
         threads_per_warp=[4, 16, 1],
         warps_per_cta=[1, 4, 1],
         order=[2, 1, 0],
+    )
+    blocked_key_layout_f16: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 1, 8],
+        threads_per_warp=[4, 16, 1],
+        warps_per_cta=[1, 4, 1],
+        order=[2, 1, 0],
+    )
+    blocked_key_layout: gl.constexpr = (
+        blocked_key_layout_fp8
+        if COMPUTE_TYPE == gl.float8e4b8
+        else blocked_key_layout_f16
     )
 
     # QK matrix multiplication layout using AMD MFMA instructions
@@ -318,15 +334,16 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         * stride_query_head
         + head_size_offsets[None, :]
     )
-
     # Create mask for valid query elements
     query_mask = (query_group_offsets[:, None] < QUERY_GROUP_SIZE) & (
         head_size_offsets[None, :] < HEAD_SIZE
     )
-
     # Load query tensor [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     query_tensor = gl.amd.cdna3.buffer_load(
         ptr=query_ptr, offsets=query_offsets_base, mask=query_mask
+    )
+    query_shared = gl.allocate_shared_memory(
+        query_tensor.dtype, query_tensor.shape, shared_query_layout, query_tensor
     )
 
     # ==================== Query Quantization Scale Handling ====================
@@ -388,7 +405,6 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     # ==================== Sequence Length Handling ====================
     context_length = gl.load(context_lengths_ptr + sequence_idx)
     kv_sequence_start_index = sequence_partition_idx * CONTEXT_PARTITION_SIZE
-
     # Early return if this partition is beyond sequence length
     if kv_sequence_start_index >= context_length:
         return
@@ -506,7 +522,10 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
         # Convert layouts for MFMA operation
         query_converted = gl.convert_layout(query_tensor, layout=qk_lhs_layout)
+        # query_converted = query_shared.load(qk_lhs_layout)
         key_converted = gl.convert_layout(key_block, layout=qk_rhs_layout)
+        query_converted = query_converted.to(COMPUTE_TYPE)
+        key_converted = key_converted.to(COMPUTE_TYPE)
 
         # Perform matrix multiplication
         qk_matrix = gl.amd.cdna3.mfma(query_converted, key_converted, qk_accumulator)
@@ -587,20 +606,16 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
                 attention_probs *= float(FP8_MAX_VALUE)
                 probability_scale = value_scale_value / float(FP8_MAX_VALUE)
 
-        # Convert attention probabilities to appropriate data type
-        if CONTIGUOUS_KV_ELEMENTS_16B_LOAD == 16:
-            # FP8 quantization
-            attention_probs = attention_probs.to(value_cache_ptr.dtype.element_ty)
-        else:
-            # FP16/BF16 computation
-            attention_probs = attention_probs.to(COMPUTE_TYPE)
+        # Convert attention probabilities to compute type for MFMA operation
+        attention_probs = attention_probs.to(COMPUTE_TYPE)
 
         # ==================== PV Matrix Multiplication ====================
         # Convert layouts for MFMA operation
         attention_probs_converted = gl.convert_layout(
             attention_probs, layout=pv_lhs_layout
         )
-        value_block_converted = gl.convert_layout(value_block, layout=pv_rhs_layout)
+        values_converted = gl.convert_layout(value_block, layout=pv_rhs_layout)
+        values_converted = values_converted.to(COMPUTE_TYPE)
 
         # Scale previous accumulator
         accumulator_scale_expanded = gl.convert_layout(
@@ -615,9 +630,12 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
             layout=pv_mfma_layout,
         )
         attention_output = gl.amd.cdna3.mfma(
-            attention_probs_converted, value_block_converted, pv_accumulator
+            attention_probs_converted, values_converted, pv_accumulator
         )
-        attention_accumulator += probability_scale * attention_output
+        if KV_QUANT_MODE >= 0:
+            attention_accumulator += probability_scale * attention_output
+        else:
+            attention_accumulator += attention_output
 
         # Update maximum logits for next iteration
         max_logits = new_max_logits
@@ -631,7 +649,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
     # Apply final scaling to attention accumulator
     attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
-    attention_accumulator = attention_accumulator.to(COMPUTE_TYPE)
+    attention_accumulator = attention_accumulator.to(OUTPUT_DTYPE)
 
     # Store results to output buffers
     gl.amd.cdna3.buffer_store(
@@ -669,13 +687,13 @@ def paged_attention_decode_v2_gluon_fp8(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     output_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size, head_size]
-    query_ptr,  # [num_seqs, num_kv_heads * query_group_size, head_size]
+    query_ptr,  # [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
     key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache_ptr,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     context_lengths_ptr,  # [num_seqs]
     softmax_scale,
-    query_scale,  # [num_seqs, num_kv_heads * query_group_size, 1]
+    query_scale,  # [num_seqs, num_kv_heads * query_length * query_group_size, 1]
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     stride_max_logits_seq,
@@ -745,23 +763,23 @@ def paged_attention_decode_v2_gluon_fp8(
 
     QUERY_GROUP_SIZE: gl.constexpr = QUERY_SEQ_LEN * QUERY_GROUP_SIZE_ORIGINAL
     # ==================== VALIDATION CHECKS ====================
-    gl.static_assert(
-        QUERY_SEQ_LEN <= 4,
-        f"QUERY_SEQ_LEN={QUERY_SEQ_LEN}, Only support QUERY_SEQ_LEN <= 4",
-    )
-    gl.static_assert(
-        QUERY_GROUP_SIZE <= 64,
-        f"QUERY_GROUP_SIZE={QUERY_GROUP_SIZE}, Only support QUERY_GROUP_SIZE <= 64",
-    )
-    gl.static_assert(
-        KV_BLOCK_SIZE == 16 or KV_BLOCK_SIZE == 64,
-        f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE in [16, 64]",
-    )
+    # gl.static_assert(
+    #     QUERY_SEQ_LEN <= 4,
+    #     f"QUERY_SEQ_LEN={QUERY_SEQ_LEN}, Only support QUERY_SEQ_LEN <= 4",
+    # )
+    # gl.static_assert(
+    #     QUERY_GROUP_SIZE <= 64,
+    #     f"QUERY_GROUP_SIZE={QUERY_GROUP_SIZE}, Only support QUERY_GROUP_SIZE <= 64",
+    # )
+    # gl.static_assert(
+    #     KV_BLOCK_SIZE == 16 or KV_BLOCK_SIZE == 64,
+    #     f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE in [16, 64]",
+    # )
 
-    # Data type validation
-    gl.static_assert(query_ptr.dtype.element_ty == gl.float8e4b8)
-    gl.static_assert(key_cache_ptr.dtype.element_ty == gl.float8e4b8)
-    gl.static_assert(value_cache_ptr.dtype.element_ty == gl.float8e4b8)
+    # # Data type validation
+    # gl.static_assert(query_ptr.dtype.element_ty == gl.float8e4b8)
+    # gl.static_assert(key_cache_ptr.dtype.element_ty == gl.float8e4b8)
+    # gl.static_assert(value_cache_ptr.dtype.element_ty == gl.float8e4b8)
 
     if QUERY_QUANT_MODE >= 0:
         gl.static_assert(query_scale.dtype.element_ty == gl.float32)
@@ -770,6 +788,10 @@ def paged_attention_decode_v2_gluon_fp8(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
     # ==================== CONSTANTS AND CONFIGURATION ====================
+    if COMPUTE_TYPE == gl.float8e4b8:
+        OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
+    else:
+        OUTPUT_DTYPE: gl.constexpr = COMPUTE_TYPE
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential conversion
     CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD: gl.constexpr = KV_16B_ELEMENT_COUNT
 
@@ -793,13 +815,25 @@ def paged_attention_decode_v2_gluon_fp8(
         warps_per_cta=[4, 1],
         order=[1, 0],
     )
+    shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
 
     # Key cache layout - optimized for block-wise access patterns
-    blocked_key_layout: gl.constexpr = gl.BlockedLayout(
+    blocked_key_layout_fp8: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 1, 1, 16],
         threads_per_warp=[1, 4, 16, 1],
         warps_per_cta=[4, 1, 1, 1],
         order=[3, 2, 1, 0],
+    )
+    blocked_key_layout_f16: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 1, 1, 8],
+        threads_per_warp=[1, 4, 16, 1],
+        warps_per_cta=[4, 1, 1, 1],
+        order=[3, 2, 1, 0],
+    )
+    blocked_key_layout: gl.constexpr = (
+        blocked_key_layout_fp8
+        if COMPUTE_TYPE == gl.float8e4b8
+        else blocked_key_layout_f16
     )
 
     # QK Matrix multiplication layout using AMD MFMA instructions
@@ -884,6 +918,13 @@ def paged_attention_decode_v2_gluon_fp8(
             warps_per_cta=[1, 4, 1],
             order=[2, 1, 0],
         )
+        # blocked_value_layout: gl.constexpr = gl.DistributedLinearLayout(
+        #     reg_bases=((0,0,1), (0,0,2), (0,0,4), (0,0,8), (4,0,0), (8,0,0), (0,64,0)),
+        #     lane_bases=((0,1,0), (0,2,0), (0,4,0), (0,8,0), (1,0,0), (2,0,0)),
+        #     warp_bases=((0,16,0), (0,32,0)),
+        #     block_bases=[],
+        #     shape=[16, 128, 16],
+        # )
         value_dim1_offsets = gl.arange(
             0,
             HEAD_SIZE_POW2,
@@ -959,6 +1000,9 @@ def paged_attention_decode_v2_gluon_fp8(
     )
     query_tensor = gl.amd.cdna3.buffer_load(
         ptr=query_ptr, offsets=query_offsets_base, mask=query_mask
+    )
+    query_shared = gl.allocate_shared_memory(
+        query_tensor.dtype, query_tensor.shape, shared_query_layout, query_tensor
     )
 
     # Load query quantization scales if needed
@@ -1170,8 +1214,11 @@ def paged_attention_decode_v2_gluon_fp8(
         #     print("QKV_per_token")
 
         # Convert layouts for MFMA operation
-        query_converted = gl.convert_layout(query_tensor, layout=qk_lhs_operand_layout)
+        # query_converted = gl.convert_layout(query_tensor, layout=qk_lhs_operand_layout)
+        query_converted = query_shared.load(qk_lhs_operand_layout)
         key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
+        query_converted = query_converted.to(COMPUTE_TYPE)
+        key_converted = key_converted.to(COMPUTE_TYPE)
 
         # Compute QK attention scores using MFMA
         attention_scores = gl.amd.cdna3.mfma(
@@ -1252,23 +1299,22 @@ def paged_attention_decode_v2_gluon_fp8(
                 )
                 attention_probs = value_scale_value[None, :] * attention_probs
                 probability_scale = value_scale_max / float(FP8_MAX_VALUE)
-            else:
+            elif KV_QUANT_MODE == 0:
+                # Per-tensor quantization scaling
                 attention_probs *= float(FP8_MAX_VALUE)
                 probability_scale = value_scale_value / float(FP8_MAX_VALUE)
+            else:
+                raise ValueError(f"Invalid KV_QUANT_MODE: {KV_QUANT_MODE}")
 
-        # Convert attention probabilities to appropriate data type
-        if CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD == 16:
-            # FP8 data type
-            attention_probs = attention_probs.to(value_cache_ptr.dtype.element_ty)
-        else:
-            # BF16/FP16 data type
-            attention_probs = attention_probs.to(COMPUTE_TYPE)
+        # Convert attention probabilities to compute type for MFMA operation
+        attention_probs = attention_probs.to(COMPUTE_TYPE)
 
         # Convert layouts for PV MFMA operation
         probs_converted = gl.convert_layout(
             attention_probs, layout=pv_lhs_operand_layout
         )
         values_converted = gl.convert_layout(value_tensor, layout=pv_rhs_operand_layout)
+        values_converted = values_converted.to(COMPUTE_TYPE)
 
         # Scale previous accumulator and compute new attention output
         accumulator_scale_expanded = gl.convert_layout(
@@ -1284,7 +1330,10 @@ def paged_attention_decode_v2_gluon_fp8(
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
         )
-        attention_accumulator += probability_scale * attention_output
+        if KV_QUANT_MODE >= 0:
+            attention_accumulator += probability_scale * attention_output
+        else:
+            attention_accumulator += attention_output
 
         # Update running maximum for next iteration
         max_logits = new_max_logits
@@ -1296,7 +1345,7 @@ def paged_attention_decode_v2_gluon_fp8(
         exp_sums_reciprocal[:, None], layout=pv_mfma_layout
     )
     attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
-    attention_accumulator = attention_accumulator.to(COMPUTE_TYPE)
+    attention_accumulator = attention_accumulator.to(OUTPUT_DTYPE)
 
     # Store results to global memory
     gl.amd.cdna3.buffer_store(
@@ -1833,13 +1882,13 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     output_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size, head_size]
-    query_ptr,  # [num_seqs, num_kv_heads * query_group_size, head_size]
+    query_ptr,  # [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
     key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache_ptr,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     context_lengths_ptr,  # [num_seqs]
     softmax_scale,
-    query_scale,  # [num_seqs, num_kv_heads * query_group_size, 1]
+    query_scale,  # [num_seqs, num_kv_heads * query_length * query_group_size, 1]
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     stride_max_logits_seq,
@@ -2050,18 +2099,18 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
 
 
 def pa_decode_gluon(
-    output: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
-    query: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
+    output: torch.Tensor,  # [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
+    query: torch.Tensor,  # [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
-    query_sequence_length: int,
+    query_length: int,
     max_context_length: int,
     context_partition_size: int,
     compute_type: tl.dtype,
-    query_scale: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, 1]
+    query_scale: torch.Tensor,  # [num_seqs, num_kv_heads * query_length * query_group_size, 1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
@@ -2070,7 +2119,7 @@ def pa_decode_gluon(
     alibi_slopes: torch.Tensor = None,
 ) -> None:
     """
-    Paged Attention Decode with FP8/BF16 Support.
+    Paged Attention Decode with FP8/BF16/FP16 Support.
 
     Implements the attention mechanism for transformer decoding with paged KV caches,
     supporting various quantization schemes and data types.
@@ -2079,11 +2128,11 @@ def pa_decode_gluon(
     ----------
     output : torch.Tensor
         Output tensor for attention results
-        Shape: [num_seqs, num_kv_heads * query_group_size, head_size]
+        Shape: [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
 
     query : torch.Tensor
         Input query tensor
-        Shape: [num_seqs, num_kv_heads * query_group_size, head_size]
+        Shape: [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
 
     key_cache : torch.Tensor
         Paged key cache in block layout
@@ -2105,18 +2154,18 @@ def pa_decode_gluon(
     softmax_scale : float
         Scaling factor for attention scores
 
-    query_sequence_length : int
+    query_length : int
         Length of query sequences
 
     max_context_length : int
         Maximum sequence length supported
 
     compute_type
-        Data type for computation (FP8, BF16, etc.)
+        Data type for computation (tl.float8e4b8, tl.bfloat16, tl.float16)
 
     query_scale : torch.Tensor
         Quantization scales for queries
-        Shape: [1] (per-tensor) or [num_seqs, num_kv_heads * query_group_size, 1] (per-token)
+        Shape: [1] (per-tensor) or [num_seqs, num_kv_heads * query_length * query_group_size, 1] (per-token)
 
     key_scale : torch.Tensor
         Quantization scales for keys
@@ -2134,7 +2183,7 @@ def pa_decode_gluon(
     # Extract tensor dimensions
     num_sequences = query.shape[0]
     num_query_heads_total = query.shape[1]
-    num_query_heads_total = num_query_heads_total // query_sequence_length
+    num_query_heads_total = num_query_heads_total // query_length
     num_kv_heads = key_cache.shape[1]
     max_context_partition_num = int(
         (max_context_length + context_partition_size - 1) // context_partition_size
@@ -2144,10 +2193,10 @@ def pa_decode_gluon(
     query_group_size = num_query_heads_total // num_kv_heads
 
     # Calculate equivalent group sizes for kernel configuration
-    equivalent_query_group_size = query_sequence_length * query_group_size
+    equivalent_query_group_size = query_length * query_group_size
 
     # Determine if causal masking is needed
-    is_causal = query_sequence_length > 1
+    is_causal = query_length > 1
 
     # Calculate elements per 16B load based on data type
     kv_elements_per_16b = 16 // key_cache.dtype.itemsize
@@ -2156,18 +2205,25 @@ def pa_decode_gluon(
     grid = (num_sequences, num_kv_heads, max_context_partition_num)
 
     # Validate input params constraint
-    assert (
-        query.dtype == aiter.dtypes.fp8
-    ), f"query tensor only support dtype == {aiter.dtypes.fp8}, but got query.dtype == {query.dtype}"
-    assert (
-        key_cache.dtype == aiter.dtypes.fp8
-    ), f"key_cache tensor only support dtype == {aiter.dtypes.fp8}, but got key_cache.dtype == {key_cache.dtype}"
-    assert (
-        value_cache.dtype == aiter.dtypes.fp8
-    ), f"value_cache tensor only support dtype == {aiter.dtypes.fp8}, but got value_cache.dtype == {value_cache.dtype}"
-    assert (
-        output.dtype == aiter.dtypes.bf16
-    ), f"output tensor only support dtype == {aiter.dtypes.bf16}, but got output.dtype == {output.dtype}"
+    assert query.dtype in [
+        aiter.dtypes.fp8,
+        aiter.dtypes.bf16,
+        aiter.dtypes.fp16,
+    ], f"query tensor only support dtype in [{aiter.dtypes.fp8, aiter.dtypes.bf16, aiter.dtypes.fp16}], but got query.dtype == {query.dtype}"
+    assert key_cache.dtype in [
+        aiter.dtypes.fp8,
+        aiter.dtypes.bf16,
+        aiter.dtypes.fp16,
+    ], f"key_cache tensor only support dtype in [{aiter.dtypes.fp8, aiter.dtypes.bf16, aiter.dtypes.fp16}], but got key_cache.dtype == {key_cache.dtype}"
+    assert value_cache.dtype in [
+        aiter.dtypes.fp8,
+        aiter.dtypes.bf16,
+        aiter.dtypes.fp16,
+    ], f"value_cache tensor only support dtype in [{aiter.dtypes.fp8, aiter.dtypes.bf16, aiter.dtypes.fp16}], but got value_cache.dtype == {value_cache.dtype}"
+    assert output.dtype in [
+        aiter.dtypes.bf16,
+        aiter.dtypes.fp16,
+    ], f"output tensor only support dtype in [{aiter.dtypes.bf16, aiter.dtypes.fp16}], but got output.dtype == {output.dtype}"
     assert (
         equivalent_query_group_size <= 64
     ), f"equivalent_query_group_size={equivalent_query_group_size} exceeds maximum of 64"
@@ -2294,7 +2350,7 @@ def pa_decode_gluon(
         key_scale_stride_0,
         key_scale_stride_1,
         COMPUTE_TYPE=compute_type,
-        QUERY_SEQ_LEN=query_sequence_length,
+        QUERY_SEQ_LEN=query_length,
         HEAD_SIZE=head_size,
         QUERY_GROUP_SIZE_ORIGINAL=query_group_size,
         KV_BLOCK_SIZE=kv_block_size,
