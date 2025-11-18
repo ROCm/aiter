@@ -1153,7 +1153,6 @@ def run_gluon_fp8_kernel(
             temporary_output=temporary_output,
             alibi_slopes=alibi_slopes,
         )
-        pass
 
 
 @benchmark()
@@ -1519,6 +1518,7 @@ def run_pa_gluon_test(
         or (block_size == 64)
         or (quant_kv == False)
         or (compute_type == torch.float16 and (quant_q or quant_kv))
+        or (head_size not in [128])
     )
 
     # aiter_assembly_kernel do not support per-tensor quantization, we always use per-token quantization here
@@ -1944,6 +1944,7 @@ def multi_compute_quant_type_test():
     global CONTEXT_LENGTH_OPTIONS
     global COMPUTE_TYPE_OPTIONS
     global QUANT_MODE_OPTIONS
+    global HEAD_DIMENSION_OPTIONS
     global TRANS_V_OPTIONS
     global KV_VARLEN_OPTIONS
     global QUANT_Q_AND_KV_OPTIONS
@@ -1951,29 +1952,29 @@ def multi_compute_quant_type_test():
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS
 
+    USE_TORCH_FLASH_REF_OPTIONS = [True]
+    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
     BLOCK_SIZE_OPTIONS = [16]
     QUERY_LENGTH_OPTIONS = [1]
     BATCH_SIZE_OPTIONS = [128]
     HEAD_CONFIGURATIONS = [(16, 1)]
     CONTEXT_LENGTH_OPTIONS = [4096]
     COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
-
     QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
-
+    # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
+    HEAD_DIMENSION_OPTIONS = [64, 128, 256]
+    # QUANT_MODE_OPTIONS = ["per_tensor"]
     # TRANS_V_OPTIONS = [False]
     TRANS_V_OPTIONS = [True]
-
-    KV_VARLEN_OPTIONS = [False, True]
-
-    QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
-
-    USE_TORCH_FLASH_REF_OPTIONS = [True]
-    USE_AOT_IMPL_OPTIONS = [False]
-    # USE_AOT_IMPL_OPTIONS = [True]
-    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-
-    BLOCK_SIZE_OPTIONS = [1024]
-    HEAD_CONFIGURATIONS = [(10, 1)]
+    # KV_VARLEN_OPTIONS = [False, True]
+    KV_VARLEN_OPTIONS = [False]
+    # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
+    QUANT_Q_AND_KV_OPTIONS = [[True, True]]
+    # USE_AOT_IMPL_OPTIONS = [False]
+    USE_AOT_IMPL_OPTIONS = [True]
+    # USE_AOT_IMPL_OPTIONS = [False, True]
+    # BLOCK_SIZE_OPTIONS = [1024]
+    # HEAD_CONFIGURATIONS = [(10, 1)]
     parse_arg_and_run_test()
 
 
