@@ -8,60 +8,6 @@ from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 import aiter
 
 
-class TRTLLMAllreduceFusion:
-    _SUPPORTED_WORLD_SIZES = [2, 4, 8]
-
-    # max_size: max supported allreduce size
-    def __init__(
-        self,
-        group: ProcessGroup = None,
-        max_size_in_bytes = 8192 * 16384,
-    ) -> None:
-        """
-        Args:
-            group: the process group to work on. If None, it will use the
-                default process group.
-        It is the caller's responsibility to make sure each communicator
-        is bind to a unique device, and all communicators in this group
-        are in the same node.
-        """
-        self.group = group
-        rank = dist.get_rank(group=self.group)
-        torch.cuda.set_device(rank)
-        self.rank = rank
-        self.fptr = None
-        world_size = dist.get_world_size(group=self.group)
-        if world_size == 1:
-            return
-
-        if world_size not in TRTLLMAllreduceFusion._SUPPORTED_WORLD_SIZES:
-            logger.warning(
-                "Custom allreduce fusion is disabled due to an unsupported world"
-                " size: %d. Supported world sizes: %s. To silence this "
-                "warning, specify disable_custom_all_reduce=True explicitly.",
-                world_size,
-                str(TRTLLMAllreduceFusion._SUPPORTED_WORLD_SIZES),
-            )
-            return
-
-        torch.cuda.set_device(rank)
-        self.fptr = aiter.init_trtllm_ar_fusion(rank, world_size, max_size_in_bytes)
-        handle = aiter.get_trtllm_ar_fusion_handle(self.fptr)
-        handle_list = [None] * world_size
-        dist.all_gather_object(handle_list, handle, group=group)
-        aiter.open_trtllm_ar_fusion_handles(self.fptr, handle_list)
-        torch.cuda.synchronize(rank)
-        dist.barrier(group=group)
-        # print(f"init TRTLLMAllreduceFusion at rank:{rank}", flush=True)
-
-    def get_workspace(self, ref: torch.Tensor):
-        return aiter.get_trtllm_ar_fusion_workspace(self.fptr, ref)
-    
-    def __del__(self):
-        if self.fptr:
-            aiter.destroy_trtllm_ar_fusion(self.fptr)
-
-
 envs = {  
     "HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
 }
@@ -94,7 +40,7 @@ def setup(rank, world_size):
 
 def worker(rank, world_size, allreduce_in, residual_in, rms, ref_residual_out, ref_norm_out, eps, use_fused=True):
     setup(rank, world_size)
-    trtllm_instance = TRTLLMAllreduceFusion()
+    trtllm_instance = aiter.TRTLLMAllreduceFusion()
     num_tokens, hidden_dim = residual_in.shape
     local_allreduce_in = allreduce_in[rank].cuda(rank)
     local_residual_in = residual_in.cuda(rank)
@@ -109,8 +55,8 @@ def worker(rank, world_size, allreduce_in, residual_in, rms, ref_residual_out, r
             dist.all_reduce(local_allreduce_in)    
             local_norm_out = local_rms(local_allreduce_in + local_residual_in)
         else:
-            local_residual_out = torch.empty_like(residual_in)
-            local_norm_out = torch.empty_like(allreduce_in)
+            local_residual_out = torch.empty_like(local_residual_in)
+            local_norm_out = torch.empty_like(local_allreduce_in)
             aiter.trtllm_allreduce_rms(rank, world_size, local_allreduce_in, local_residual_in, 
                 local_rms.weight.data, local_residual_out, local_norm_out, eps, trtllm_instance.get_workspace(local_allreduce_in))
     maxdiff = (local_norm_out.cpu() - ref_norm_out).abs().max()
@@ -129,11 +75,11 @@ def main():
         ref_residual_out = allreduce_in.sum(dim=0) + residual_in
         ref_norm_out = rms(ref_residual_out)
         mp.spawn(worker, args=(world_size, allreduce_in, residual_in, rms, ref_residual_out, ref_norm_out, eps), nprocs=world_size, join=True)
-    # num_tokens = 129
-    # testcase(num_tokens=num_tokens, dtype=torch.float)
-    # testcase(num_tokens=num_tokens, dtype=torch.float)
-    # testcase(num_tokens=num_tokens, dtype=torch.bfloat16)
-    # testcase(num_tokens=num_tokens, dtype=torch.half)
+    num_tokens = 129
+    testcase(num_tokens=num_tokens, dtype=torch.float)
+    testcase(num_tokens=num_tokens, dtype=torch.float)
+    testcase(num_tokens=num_tokens, dtype=torch.bfloat16)
+    testcase(num_tokens=num_tokens, dtype=torch.half)
     num_tokens = 128
     testcase(num_tokens=num_tokens, dtype=torch.float)
     testcase(num_tokens=num_tokens, dtype=torch.float)

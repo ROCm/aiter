@@ -30,7 +30,7 @@ using __bfloat16 = __hip_bfloat16;
 
 #define NBLOCKS_PER_GPU 256
 
-namespace trtllm_allreduce_fusion {
+namespace trtllm {
 
 namespace details {
 
@@ -599,9 +599,9 @@ void allreduce_rms_fusion_impl(
     }
 }
 
-} // namespace trtllm_allreduce_fusion
+} // namespace trtllm
 
-using namespace trtllm_allreduce_fusion;
+using namespace trtllm;
 
 template <typename T>
 struct KernelElementType {
@@ -629,7 +629,7 @@ void trtllm_allreduce_rms(int64_t rank, int64_t nranks, Tensor &allreduce_in, Te
         allreduce_in.scalar_type(),
         "trtllm_allreduce_rms", [&] {
             using k_scalar_t = KernelElementType<scalar_t>::type;
-            trtllm_allreduce_fusion::allreduce_rms_fusion_impl<k_scalar_t>(
+            trtllm::allreduce_rms_fusion_impl<k_scalar_t>(
                 (void **)workspace.data_ptr(),
                 rank,
                 nranks,
