@@ -944,7 +944,7 @@ struct WaveMergeHelper
 };
 
 // Forward declarations for kernel wrapper functions
-template <int capacity, bool greater, typename T, typename IdxT>
+template <int capacity, bool greater, typename T, typename IdxT, bool UseBufferAddressing = true>
 __global__ void __launch_bounds__(512, 2) topk_filter_kernel(const T* __restrict__ in,
                                                              const IdxT* __restrict__ in_idx,
                                                              int batch_size,
@@ -979,7 +979,10 @@ template <typename T, typename IdxT>
 using KernelFuncPtr = void (*)(const T*, const IdxT*, int, IdxT, IdxT, T*, IdxT*, T);
 
 // Helper: Map block-level strategy class to its corresponding kernel function template
-template <template <int, bool, typename, typename> class StrategyClass>
+// UseBufferAddressing: Controls whether BlockTopkFilter uses buffer addressing (limited to
+// UINT_MAX)
+template <template <int, bool, typename, typename> class StrategyClass,
+          bool UseBufferAddressing = true>
 struct StrategyKernelSelector
 {
     template <int capacity, bool greater, typename T, typename IdxT>
@@ -988,7 +991,7 @@ struct StrategyKernelSelector
         if constexpr(std::is_same_v<StrategyClass<64, greater, T, IdxT>,
                                     BlockTopkFilter<64, greater, T, IdxT>>)
         {
-            return topk_filter_kernel<capacity, greater, T, IdxT>;
+            return topk_filter_kernel<capacity, greater, T, IdxT, UseBufferAddressing>;
         }
         else if constexpr(std::is_same_v<StrategyClass<64, greater, T, IdxT>,
                                          BlockTopkSort<64, greater, T, IdxT>>)
@@ -1003,7 +1006,7 @@ struct StrategyKernelSelector
         else
         {
             static_assert(sizeof(T) == 0, "Unsupported strategy class");
-            return topk_filter_kernel<capacity, greater, T, IdxT>;
+            return topk_filter_kernel<capacity, greater, T, IdxT, UseBufferAddressing>;
         }
     }
 };
@@ -1012,26 +1015,34 @@ template <bool greater,
           template <int, bool, typename, typename>
           class StrategyClass,
           typename T,
-          typename IdxT>
+          typename IdxT,
+          bool UseBufferAddressing = true>
 __forceinline__ KernelFuncPtr<T, IdxT> get_kernel_function_pointer(int capacity)
 {
     switch(capacity)
     {
     case 64:
-        return StrategyKernelSelector<StrategyClass>::template get_kernel<64, greater, T, IdxT>();
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<64, greater, T, IdxT>();
     case 128:
-        return StrategyKernelSelector<StrategyClass>::template get_kernel<128, greater, T, IdxT>();
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<128, greater, T, IdxT>();
     case 256:
-        return StrategyKernelSelector<StrategyClass>::template get_kernel<256, greater, T, IdxT>();
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<256, greater, T, IdxT>();
     case 512:
-        return StrategyKernelSelector<StrategyClass>::template get_kernel<512, greater, T, IdxT>();
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<512, greater, T, IdxT>();
     case 1024:
-        return StrategyKernelSelector<StrategyClass>::template get_kernel<1024, greater, T, IdxT>();
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<1024, greater, T, IdxT>();
     case 2048:
-        return StrategyKernelSelector<StrategyClass>::template get_kernel<2048, greater, T, IdxT>();
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<2048, greater, T, IdxT>();
     default:
         assert(false && "Unsupported capacity");
-        return StrategyKernelSelector<StrategyClass>::template get_kernel<64, greater, T, IdxT>();
+        return StrategyKernelSelector<StrategyClass, UseBufferAddressing>::
+            template get_kernel<64, greater, T, IdxT>();
     }
 }
 
@@ -1410,8 +1421,55 @@ struct WaveTopkFilter
             reinterpret_cast<IdxT*>(lds_buf + vals_size) + wave_id * opus::get_warp_size();
     }
 
-    __device__ void
-    sort(const T* __restrict__ in, IdxT batch_start, IdxT start, IdxT end, IdxT total_len)
+    __device__ void sort(const T* __restrict__ in, uint64_t batch_start, IdxT start, IdxT end)
+    {
+        static_assert(utils::is_supported_type_v<T>,
+                      "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
+
+        constexpr auto cache_policy = ck_tile::amd_buffer_coherence_enum::slc;
+        const IdxT n                = end - start;
+        const IdxT tid              = threadIdx.x;
+        const IdxT stride           = blockDim.x;
+        constexpr IdxT elements     = 16 / sizeof(T);
+
+        if constexpr(std::is_same_v<T, _Float16>)
+        {
+            const IdxT block_tile  = blockDim.x;
+            const IdxT end_aligned = start + utils::round_up_to_multiple_of(n, block_tile);
+
+            in += batch_start;
+
+            T val[2];
+            val[0] = (start + tid < end) ? in[start + tid] : buffer_.sentinel;
+            for(IdxT i = start + tid; i < end_aligned; i += stride)
+            {
+                val[1] = (i + stride < end) ? in[i + stride] : buffer_.sentinel;
+                filter_and_stage(val[0], i);
+                val[0] = val[1];
+            }
+        }
+        else if constexpr(std::is_same_v<T, float> || std::is_same_v<T, int>)
+        {
+            const IdxT block_tile  = blockDim.x;
+            const IdxT end_aligned = start + utils::round_up_to_multiple_of(n, block_tile);
+
+            in += batch_start;
+
+            T val[2];
+            val[0] = (start + tid < end) ? in[start + tid] : buffer_.sentinel;
+            for(IdxT i = start + tid; i < end_aligned; i += stride)
+            {
+                val[1] = (i + stride < end) ? in[i + stride] : buffer_.sentinel;
+                filter_and_stage(val[0], i);
+                val[0] = val[1];
+            }
+        }
+
+        finalize();
+    }
+
+    __device__ void sort_buffer_addressing(
+        const T* __restrict__ in, uint64_t batch_start, IdxT start, IdxT end, IdxT total_len)
     {
         static_assert(utils::is_supported_type_v<T>,
                       "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
@@ -1461,11 +1519,11 @@ struct WaveTopkFilter
                 filter_and_stage(val, i);
             }
         }
-        else if(std::is_same_v<T, float> || std::is_same_v<T, int>)
+        else if constexpr(std::is_same_v<T, float> || std::is_same_v<T, int>)
         {
-            constexpr IdxT tile       = elements;
-            const IdxT block_tile     = blockDim.x * tile;
-            const IdxT end_aligned    = start + utils::round_up_to_multiple_of(n, block_tile);
+            constexpr IdxT tile    = elements;
+            const IdxT block_tile  = blockDim.x * tile;
+            const IdxT end_aligned = start + utils::round_up_to_multiple_of(n, block_tile);
 
             using VecType = std::conditional_t<std::is_same_v<T, float>,
                                                buffer_load_helpers::floatx4_t,
@@ -1636,24 +1694,37 @@ struct BlockTopkFilter
             utils::round_up_to_multiple_of<16>(num_waves / 2 * sizeof(T) * k_));
     }
 
+    template <bool UseBufferAddressing = true>
     __device__ void operator()(const T* __restrict__ in,
-                               IdxT batch_start,
+                               uint64_t batch_start,
                                T* __restrict__ out,
                                IdxT* __restrict__ out_idx,
                                IdxT start,
                                IdxT end,
                                IdxT total_len)
     {
-        sort(in, batch_start, start, end, total_len);
+        if constexpr(UseBufferAddressing)
+        {
+            sort_buffer_addressing(in, batch_start, start, end, total_len);
+        }
+        else
+        {
+            sort(in, batch_start, start, end);
+        }
         reduce();
         store(out, out_idx);
     }
 
     // Sort the results within each wave
-    __device__ void
-    sort(const T* __restrict__ in, IdxT batch_start, IdxT start, IdxT end, IdxT total_len)
+    __device__ void sort(const T* __restrict__ in, uint64_t batch_start, IdxT start, IdxT end)
     {
-        wave_topk_.sort(in, batch_start, start, end, total_len);
+        wave_topk_.sort(in, batch_start, start, end);
+    }
+
+    __device__ void sort_buffer_addressing(
+        const T* __restrict__ in, uint64_t batch_start, IdxT start, IdxT end, IdxT total_len)
+    {
+        wave_topk_.sort_buffer_addressing(in, batch_start, start, end, total_len);
     }
 
     // Reduce the results via LDS
@@ -1696,7 +1767,7 @@ struct BlockTopkFilter
     IdxT* pos;
 };
 
-template <int capacity, bool greater, typename T, typename IdxT>
+template <int capacity, bool greater, typename T, typename IdxT, bool UseBufferAddressing>
 __global__ void __launch_bounds__(512, 2) topk_filter_kernel(const T* __restrict__ in,
                                                              const IdxT* __restrict__ in_idx,
                                                              int batch_size,
@@ -1707,23 +1778,23 @@ __global__ void __launch_bounds__(512, 2) topk_filter_kernel(const T* __restrict
                                                              T sentinel)
 {
     extern __shared__ char lds_buf[];
-    const int block_per_batch     = gridDim.x / batch_size;
-    const int batch_id            = blockIdx.x / block_per_batch;
-    const int block_id_in_a_batch = blockIdx.x % block_per_batch;
+    const IdxT block_per_batch     = gridDim.x / batch_size;
+    const IdxT batch_id            = blockIdx.x / block_per_batch;
+    const IdxT block_id_in_a_batch = blockIdx.x % block_per_batch;
     // TODO: Consider multiple blocks
     const IdxT len_per_block = len;
-    const IdxT batch_start   = batch_id * len;
+    const uint64_t batch_start = static_cast<uint64_t>(batch_id) * len;
     IdxT start               = block_id_in_a_batch * len_per_block;
     IdxT end                 = std::min(start + len_per_block, len);
 
     BlockTopkFilter<capacity, greater, T, IdxT> topk(k, sentinel, lds_buf);
-    topk(in,
-         batch_start,
-         out + static_cast<size_t>(blockIdx.x) * k,
-         out_idx + static_cast<size_t>(blockIdx.x) * k,
-         start,
-         end,
-         batch_size * len);
+    topk.template operator()<UseBufferAddressing>(in,
+                                                  batch_start,
+                                                  out + static_cast<size_t>(blockIdx.x) * k,
+                                                  out_idx + static_cast<size_t>(blockIdx.x) * k,
+                                                  start,
+                                                  end,
+                                                  batch_size * len);
 }
 
 // WaveTopkMerge: Iteratively merges pre-sorted k-sized chunks
@@ -1935,7 +2006,34 @@ void topk_kernel_launcher(int block_per_batch,
     int lds_size = calc_lds_size_for_block_wide<T, IdxT>(wave_per_block, k);
 
     const int capacity = utils::calc_capacity(k);
-    auto topk_kernel   = get_kernel_function_pointer<greater, StrategyClass, T, IdxT>(capacity);
+
+    // For BlockTopkFilter: check if buffer addressing can be used (limited to UINT_MAX)
+    // For other strategies: always use default behavior (they don't use buffer addressing)
+    constexpr bool is_filter =
+        std::is_same_v<StrategyClass<64, greater, T, IdxT>, BlockTopkFilter<64, greater, T, IdxT>>;
+
+    KernelFuncPtr<T, IdxT> topk_kernel;
+    if constexpr(is_filter)
+    {
+        // BlockTopkFilter: dispatch based on total size
+        const uint64_t total_size = static_cast<uint64_t>(batch_size) * len * sizeof(T);
+        if(total_size < static_cast<uint64_t>(UINT32_MAX))
+        {
+            topk_kernel =
+                get_kernel_function_pointer<greater, StrategyClass, T, IdxT, true>(capacity);
+        }
+        else
+        {
+            topk_kernel =
+                get_kernel_function_pointer<greater, StrategyClass, T, IdxT, false>(capacity);
+        }
+    }
+    else
+    {
+        // BlockTopkSort / BlockTopkMerge: always use default
+        topk_kernel = get_kernel_function_pointer<greater, StrategyClass, T, IdxT>(capacity);
+    }
+
     topk_kernel<<<batch_size * block_per_batch, block_dim, lds_size, stream>>>(
         in, static_cast<IdxT*>(nullptr), batch_size, len, k, result_val, result_idx, sentinel);
 
