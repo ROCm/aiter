@@ -121,10 +121,22 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         f"QUERY_GROUP_SIZE={QUERY_GROUP_SIZE}, Do not support QUERY_GROUP_SIZE > 64",
     )
 
-    # # Data type validation
-    # gl.static_assert(query_ptr.dtype.element_ty == gl.float8e4b8)
-    # gl.static_assert(key_cache_ptr.dtype.element_ty == gl.float8e4b8)
-    # gl.static_assert(value_cache_ptr.dtype.element_ty == gl.float8e4b8)
+    # Data type validation
+    gl.static_assert(
+        query_ptr.dtype.element_ty == gl.float8e4b8
+        or query_ptr.dtype.element_ty == gl.bfloat16
+        or query_ptr.dtype.element_ty == gl.float16
+    )
+    gl.static_assert(
+        key_cache_ptr.dtype.element_ty == gl.float8e4b8
+        or key_cache_ptr.dtype.element_ty == gl.bfloat16
+        or key_cache_ptr.dtype.element_ty == gl.float16
+    )
+    gl.static_assert(
+        value_cache_ptr.dtype.element_ty == gl.float8e4b8
+        or value_cache_ptr.dtype.element_ty == gl.bfloat16
+        or value_cache_ptr.dtype.element_ty == gl.float16
+    )
 
     if QUERY_QUANT_MODE >= 0:
         gl.static_assert(query_scale.dtype.element_ty == gl.float32)
@@ -602,9 +614,11 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
                 )
                 attention_probs = value_scale_value[None, :] * attention_probs
                 probability_scale = value_scale_max / float(FP8_MAX_VALUE)
-            else:
+            elif KV_QUANT_MODE == 0:
                 attention_probs *= float(FP8_MAX_VALUE)
                 probability_scale = value_scale_value / float(FP8_MAX_VALUE)
+            else:
+                raise ValueError(f"Invalid KV_QUANT_MODE: {KV_QUANT_MODE}")
 
         # Convert attention probabilities to compute type for MFMA operation
         attention_probs = attention_probs.to(COMPUTE_TYPE)
@@ -763,23 +777,35 @@ def paged_attention_decode_v2_gluon_fp8(
 
     QUERY_GROUP_SIZE: gl.constexpr = QUERY_SEQ_LEN * QUERY_GROUP_SIZE_ORIGINAL
     # ==================== VALIDATION CHECKS ====================
-    # gl.static_assert(
-    #     QUERY_SEQ_LEN <= 4,
-    #     f"QUERY_SEQ_LEN={QUERY_SEQ_LEN}, Only support QUERY_SEQ_LEN <= 4",
-    # )
-    # gl.static_assert(
-    #     QUERY_GROUP_SIZE <= 64,
-    #     f"QUERY_GROUP_SIZE={QUERY_GROUP_SIZE}, Only support QUERY_GROUP_SIZE <= 64",
-    # )
-    # gl.static_assert(
-    #     KV_BLOCK_SIZE == 16 or KV_BLOCK_SIZE == 64,
-    #     f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE in [16, 64]",
-    # )
+    gl.static_assert(
+        QUERY_SEQ_LEN <= 4,
+        f"QUERY_SEQ_LEN={QUERY_SEQ_LEN}, Only support QUERY_SEQ_LEN <= 4",
+    )
+    gl.static_assert(
+        QUERY_GROUP_SIZE <= 64,
+        f"QUERY_GROUP_SIZE={QUERY_GROUP_SIZE}, Only support QUERY_GROUP_SIZE <= 64",
+    )
+    gl.static_assert(
+        KV_BLOCK_SIZE == 16 or KV_BLOCK_SIZE == 64,
+        f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE in [16, 64]",
+    )
 
-    # # Data type validation
-    # gl.static_assert(query_ptr.dtype.element_ty == gl.float8e4b8)
-    # gl.static_assert(key_cache_ptr.dtype.element_ty == gl.float8e4b8)
-    # gl.static_assert(value_cache_ptr.dtype.element_ty == gl.float8e4b8)
+    # Data type validation
+    gl.static_assert(
+        query_ptr.dtype.element_ty == gl.float8e4b8
+        or query_ptr.dtype.element_ty == gl.bfloat16
+        or query_ptr.dtype.element_ty == gl.float16
+    )
+    gl.static_assert(
+        key_cache_ptr.dtype.element_ty == gl.float8e4b8
+        or key_cache_ptr.dtype.element_ty == gl.bfloat16
+        or key_cache_ptr.dtype.element_ty == gl.float16
+    )
+    gl.static_assert(
+        value_cache_ptr.dtype.element_ty == gl.float8e4b8
+        or value_cache_ptr.dtype.element_ty == gl.bfloat16
+        or value_cache_ptr.dtype.element_ty == gl.float16
+    )
 
     if QUERY_QUANT_MODE >= 0:
         gl.static_assert(query_scale.dtype.element_ty == gl.float32)
