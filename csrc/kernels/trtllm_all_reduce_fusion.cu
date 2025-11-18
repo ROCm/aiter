@@ -1,9 +1,8 @@
 #include <iostream>
-#include <random>
+#include <limits>
 #include <vector>
 #include <array>
 #include <tuple>
-#include <chrono>
 
 #include "hip_float8.h"
 
@@ -12,11 +11,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 #include <hip/hip_cooperative_groups.h>
-#include <iostream>
-#include <limits>
-#include <map>
-#include <unordered_map>
-#include <vector>
 
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
@@ -230,20 +224,8 @@ struct alignas(sizeof(T) * vec_size) vec_t {
     __device__ __forceinline__ void load(const T *ptr) {
         *this = *reinterpret_cast<vec_t<T, vec_size> *>(const_cast<T *>(ptr));
     }
-    __device__ __forceinline__ void loop_load(const T *ptr) {
-#pragma unroll
-        for (int i = 0; i < vec_size; ++i) {
-            data[i] = ptr[i];
-        }
-    }
     __device__ __forceinline__ void store(T *ptr) {
         *reinterpret_cast<vec_t<T, vec_size> *>(ptr) = *this;
-    }
-    __device__ __forceinline__ void loop_store(T *ptr) {
-#pragma unroll
-        for (int i = 0; i < vec_size; ++i) {
-            ptr[i] = data[i];
-        }
     }
     __device__ __forceinline__ void nontemporal_load(const T *ptr) {
         constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
@@ -295,6 +277,16 @@ __device__ __forceinline__ void vec_add_(vec_t<T, VEC_SIZE> &self,
     }
 }
 
+template<typename T, int vec_size>
+__device__ __forceinline__ vec_t<hip_fp8, vec_size> convert_to_fp8(vec_t<T, vec_size> &in_vec) {
+    vec_t<hip_fp8, vec_size> out_vec;
+#pragma unroll
+    for (int i = 0; i < vec_size; ++i) {
+        out_vec[i] = static_cast<hip_fp8>((float)in_vec[i]);
+    }
+    return out_vec;
+}
+
 template <typename T>
 struct AllReduceFusionParams {
     int nranks;
@@ -309,6 +301,7 @@ struct AllReduceFusionParams {
     void *rms_gamma;
     float rms_eps;
     float scale_factor;
+    bool fp8_out;
 };
 
 template <typename T, int VEC_SIZE>
@@ -389,12 +382,12 @@ __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> 
             vec_add_<T, VEC_SIZE>(data[0], data[1]);
             data[0].store(reinterpret_cast<T *>(params.residual_out) + idx);
             auto val = rms_norm<T, VEC_SIZE>(params, data[0], gamma);
-            // #pragma unroll
-            //             for (int i = 0; i < VEC_SIZE; ++i) {
-            //                 reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(
-            //                     static_cast<float>(val[i]) * m_scale_factor);
-            //             }
-            val.store(reinterpret_cast<T *>(params.norm_out) + idx);
+            if (params.fp8_out) {
+                auto val_fp8 = convert_to_fp8<T, VEC_SIZE>(val);
+                val_fp8.store(reinterpret_cast<hip_fp8 *>(params.norm_out) + idx);
+            } else {
+                val.store(reinterpret_cast<T *>(params.norm_out) + idx);
+            }
         }
     }
 
@@ -575,6 +568,7 @@ void allreduce_rms_fusion_impl(
     void *norm_out,
     void *rms_gamma,
     float eps,
+    bool fp8_out,
     hipStream_t stream = 0) {
     AllReduceFusionParams<T> params;
     params.nranks = nranks;
@@ -588,6 +582,7 @@ void allreduce_rms_fusion_impl(
     params.norm_out = norm_out;
     params.rms_gamma = rms_gamma;
     params.rms_eps = eps;
+    params.fp8_out = fp8_out;
     if (nranks == 8) {
         allreduce_fusion_kernel_launcher<T, 8>(params, stream);
     } else if (nranks == 4) {
@@ -618,7 +613,8 @@ struct KernelElementType<c10::BFloat16> {
     using type = __bfloat16;
 };
 
-void trtllm_allreduce_rms(int64_t rank, int64_t nranks, Tensor &allreduce_in, Tensor &residual_in, Tensor &rms_gamma, Tensor &residual_out, Tensor &norm_out, double eps, Tensor &workspace) {
+void trtllm_allreduce_rms(int64_t rank, int64_t nranks, Tensor &allreduce_in, Tensor &residual_in, Tensor &rms_gamma, Tensor &residual_out, 
+    Tensor &norm_out, double eps, bool fp8_out, Tensor &workspace) {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(allreduce_in));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     int size = allreduce_in.numel();
@@ -641,6 +637,7 @@ void trtllm_allreduce_rms(int64_t rank, int64_t nranks, Tensor &allreduce_in, Te
                 (void *)norm_out.data_ptr<scalar_t>(),
                 (void *)rms_gamma.data_ptr<scalar_t>(),
                 eps,
+                fp8_out,
                 stream);
         });
 }

@@ -2,11 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from torch import Tensor, Generator
+from torch import Tensor
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from ..jit.core import compile_ops
-from typing import Optional, List
 
 
 @compile_ops("module_trtllm_all_reduce_fusion")
@@ -53,7 +52,8 @@ def trtllm_allreduce_rms(
     residual_out: Tensor,
     norm_out: Tensor,
     eps: float,
-    workspace: Tensor
+    fp8_out: bool,
+    workspace: Tensor,
 ) -> None: ...
 
 
@@ -64,7 +64,7 @@ class TRTLLMAllreduceFusion:
     def __init__(
         self,
         group: ProcessGroup = None,
-        max_size_in_bytes = 8192 * 16384,
+        max_size_in_bytes=8192 * 16384,
     ) -> None:
         """
         Args:
@@ -104,7 +104,7 @@ class TRTLLMAllreduceFusion:
 
     def get_workspace(self, ref: torch.Tensor):
         return get_trtllm_ar_fusion_workspace(self.fptr, ref)
-    
+
     def __del__(self):
         if self.fptr:
             destroy_trtllm_ar_fusion(self.fptr)
