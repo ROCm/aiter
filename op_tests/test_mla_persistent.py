@@ -210,10 +210,6 @@ def test_mla(
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
 
-    kv_indptr_bak = torch.zeros_like(kv_indptr)
-    kv_indptr_bak[-1] = kv_indptr[-1] // 2
-    kv_indices_bak = torch.zeros_like(kv_indices)
-    kv_indices_bak[:kv_indptr[-1] // 2] = kv_indices[kv_indptr[-1] // 2:]
     # troch implementation
     out_ref, lse_ref = torch_mla_extend(
         q,
@@ -221,8 +217,6 @@ def test_mla(
         qo_indptr,
         kv_indptr,
         kv_indices,
-        # kv_indptr_bak,
-        # kv_indices_bak,
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
@@ -312,7 +306,7 @@ def test_mla(
         return num_kv_splits, num_kv_splits_indptr
 
     num_kv_splits, num_kv_splits_indptr = get_meta_param(
-        2, batch_size, kv_indices.shape[0], nhead, decode_qlen, q.dtype
+        None, batch_size, kv_indices.shape[0], nhead, decode_qlen, q.dtype
     )
 
     meta = aiter.get_mla_metadata_v1(
