@@ -423,6 +423,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 1,
 ):
+    # for AOT load use, only need kernel have the same signature as implementation side
     pass
 
 
@@ -454,4 +455,5 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 16,
 ):
+    # for AOT load use, only need kernel have the same signature as implementation side
     pass

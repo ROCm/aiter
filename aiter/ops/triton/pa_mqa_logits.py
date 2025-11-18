@@ -368,7 +368,7 @@ def deepgemm_fp8_paged_mqa_logits(
     Preshuffle: bool = False,
     KVBlockSize: int = 1,
     ChunkK: int = 256,
-    TotalCuCount: int = 80,
+    TotalCuCount: int = 80 if get_gfx() == "gfx942" else 256,
     WavePerEU: int = 2,
 ):
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
@@ -383,7 +383,7 @@ def deepgemm_fp8_paged_mqa_logits(
     if Preshuffle:
         assert (
             KVBlockSize % 16 == 0
-        ), "Preshuffle mode only support KVBlockSize aligned to 16."
+        ), f"Preshuffle mode only supports KVBlockSize aligned to 16. Got KVBlockSize={KVBlockSize}"
 
     kv_cache = kv_cache.view(-1, KVBlockSize * index_dim)
     kv_cache_fp8, kv_cache_scale = (
@@ -455,7 +455,8 @@ def deepgemm_fp8_paged_mqa_logits(
                 max_model_len,
                 max_block_len,
                 SplitKV,
-                out_logits,  # dummyPointerArg for triton version < 3.4.0
+                out_logits,  # dummyPointerArg for triton version < 3.4.0,
+                # the kernel signature has an extra pointer argument on triton>=3.5.0
                 # constexpr
                 heads,
                 ChunkK,
