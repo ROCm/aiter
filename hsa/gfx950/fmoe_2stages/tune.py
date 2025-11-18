@@ -57,8 +57,6 @@ class FmoeTuner950(FmoeTuner):
             quantDtype = ""
         if doweight_stage1:
             extraInfo_1stage = "_tkw1"
-            if q_dtype_a == dtypes.fp8:
-                quantDtype = "Int8"  ## tmp solution, need to be updated
         if q_type == QuantType.No:
             quantDtype_1stage = "noquant"
         elif q_type == QuantType.per_1x128:
