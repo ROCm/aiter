@@ -1520,7 +1520,7 @@ def get_rope(
             )
         elif scaling_type == "default":
             if "mrope_section" in rope_scaling:
-                if "try_aiter_rope_fused_qknorm" in rope_scaling and rope_scaling["try_aiter_rope_fused_qknorm"]:
+                if "aiter_rope_fused_qknorm" in rope_scaling:
                     rotary_emb = MRotaryEmbeddingQKNormFused(
                         head_size,
                         rotary_dim,
