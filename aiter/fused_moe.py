@@ -333,9 +333,9 @@ def fused_moe_1stage(
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
-    M:int = None,
+    M: int = None,
     device=None,
-    doweight_stage1:bool=None,
+    doweight_stage1: bool = None,
 ):
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
@@ -498,7 +498,6 @@ fused_moe_1stage_dict = {
         (ActivationType.Silu,    QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True) : aiter.fmoe_g1u1,
         (ActivationType.Silu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_fp8_blockscale_g1u1,
         (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,    dtypes.bf16,   dtypes.bf16,   False) : aiter.fmoe,
-        (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,     dtypes.i8,     dtypes.i8,    False) : aiter.fmoe_int8_g1u0_a16,
         (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_g1u1_tkw1,
     }
 }
