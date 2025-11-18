@@ -4,7 +4,7 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.def("mi300_a8w8_blockscale_asm", &mi300_a8w8_blockscale_asm, "mi300_a8w8_blockscale_asm", 
+    m.def("a8w8_blockscale_bpreshuffle_asm", &a8w8_blockscale_bpreshuffle_asm, "a8w8_blockscale_bpreshuffle_asm", 
         py::arg("A"),
         py::arg("B"),
         py::arg("a_scale"),

@@ -169,27 +169,29 @@ def flatmm_a8w8_blockscale_asm(
     out: Tensor,
 ) -> Tensor: ...
 
-def gen_mi300_a8w8_blockscale_asm_fake_tensors(
+def gen_a8w8_blockscale_bpreshuffle_asm_fake_tensors(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
+    bias: Tensor,
 ) -> Tensor:
     return out
 
 
 @compile_ops(
-    "module_gemm_mi300_a8w8_blockscale_asm",
-    fc_name="mi300_a8w8_blockscale_asm",
-    gen_fake=gen_mi300_a8w8_blockscale_asm_fake_tensors,
+    "module_gemm_mi308_a8w8_blockscale_asm",
+    fc_name="a8w8_blockscale_bpreshuffle_asm",
+    gen_fake=gen_a8w8_blockscale_bpreshuffle_asm_fake_tensors,
 )
-def mi300_a8w8_blockscale_asm(
+def a8w8_blockscale_bpreshuffle_asm(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
+    bias: Tensor,
 ) -> Tensor: ...
 
 
@@ -441,7 +443,7 @@ def gemm_a8w8_blockscale(
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             return mi350_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
         elif get_gfx() in ["gfx942"] and dtype == dtypes.bf16:
-            return mi300_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
+            return a8w8_blockscale_bpreshuffle_asm(XQ, WQ, x_scale, w_scale, Y)
         else:
             assert 0, f"asm kernel only support B preshuffle and m >= 16"
     else:
@@ -496,12 +498,11 @@ def mi350_a8w8_blockscale_ASM(
     n = WQ.shape[0]
     return mi350_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
-def mi300_a8w8_blockscale_ASM(
+def a8w8_blockscale_bpreshuffle_ASM(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    Y: Tensor,
     dtype=dtypes.bf16,
 ):
     assert dtype in [
@@ -509,7 +510,10 @@ def mi300_a8w8_blockscale_ASM(
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     m = XQ.shape[0]
     n = WQ.shape[0]
-    return mi300_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    # Create a zero bias tensor as required by the C++ implementation
+    bias = torch.zeros(1, n, dtype=torch.float32, device=XQ.device)
+    return a8w8_blockscale_bpreshuffle_asm(XQ, WQ, x_scale, w_scale, Y, bias)
 
 
 def gen_gemm_a8w8_tune_fake_tensors(
