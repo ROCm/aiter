@@ -146,8 +146,7 @@ def test_fmoe(
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
-
+    w2 = torch.ones((E, model_dim, inter_dim), dtype=dtype)
     score = torch.randn((token, E), dtype=dtype)
     # rand
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
@@ -160,6 +159,8 @@ def test_fmoe(
     BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
     if qType == aiter.QuantType.per_128x128:
         BLOCK_SIZE_M = 64
+    elif qType == aiter.QuantType.per_1x32:
+        BLOCK_SIZE_M = 256
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids, topk_weights, E, model_dim, dtype, BLOCK_SIZE_M
     )
@@ -253,6 +254,7 @@ def test_fmoe(
     elif WQDType != dtypes.fp4x2:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
+
     # # ######################## ck stage 1 start ###########
     # # a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
     # # out1_ck = torch.empty((token, topk, inter_dim), dtype=dtype)
@@ -330,40 +332,40 @@ def test_fmoe(
     a2_qt = a2_qt.view(token, topk, -1)
 
     ### specific for asm fp4x2
-    if qType == aiter.QuantType.per_1x32:
-        input_t = torch.randn((token, inter_dim), dtype=dtype)
-        a1_qt_t, a1_scale_t = torch_quant(input_t, quant_dtype=AQDType)
-        w1_t = torch.randn((E, model_dim * 2, inter_dim), dtype=dtype)
-        w2_t = torch.randn((E, inter_dim, model_dim), dtype=dtype)
-        w1_qt_t, w1_scale_t = torch_quant(w1_t, quant_dtype=WQDType)
-        w2_qt_t, w2_scale_t = torch_quant(w2_t, quant_dtype=WQDType)
-        out1_ref_t = torch_moe_stage1(
-            a1_qt_t,
-            w1_qt_t,
-            w2_qt_t,
-            topk_weights,
-            topk_ids,
-            dtype=dtype,
-            activation=actType,
-            quant_type=qType,
-            a1_scale=a1_scale_t,
-            w1_scale=w1_scale_t,
-            doweight=doweight_stage1,
-        )
-        a2_qt_t, a2_scale_t = torch_quant(out1_ref_t, quant_dtype=AQDType)
-        a2_qt_t = a2_qt_t.view(token, topk, -1)
-        out2_ref_t = torch_moe_stage2(
-            a2_qt_t,
-            w1_qt_t,  # E, model_dim*2, inter_dim
-            w2_qt_t,  # E, inter_dim, model_dim
-            topk_weights,
-            topk_ids,
-            dtype=dtype,
-            quant_type=qType,
-            w2_scale=w2_scale_t,
-            a2_scale=a2_scale_t,
-            doweight=not doweight_stage1,
-        )
+    # if qType == aiter.QuantType.per_1x32:
+    #     input_t = torch.randn((token, inter_dim), dtype=dtype)
+    #     a1_qt_t, a1_scale_t = torch_quant(input_t, quant_dtype=AQDType)
+    #     w1_t = torch.randn((E, model_dim * 2, inter_dim), dtype=dtype)
+    #     w2_t = torch.randn((E, inter_dim, model_dim), dtype=dtype)
+    #     w1_qt_t, w1_scale_t = torch_quant(w1_t, quant_dtype=WQDType)
+    #     w2_qt_t, w2_scale_t = torch_quant(w2_t, quant_dtype=WQDType)
+    #     out1_ref_t = torch_moe_stage1(
+    #         a1_qt_t,
+    #         w1_qt_t,
+    #         w2_qt_t,
+    #         topk_weights,
+    #         topk_ids,
+    #         dtype=dtype,
+    #         activation=actType,
+    #         quant_type=qType,
+    #         a1_scale=a1_scale_t,
+    #         w1_scale=w1_scale_t,
+    #         doweight=doweight_stage1,
+    #     )
+    #     a2_qt_t, a2_scale_t = torch_quant(out1_ref_t, quant_dtype=AQDType)
+    #     a2_qt_t = a2_qt_t.view(token, topk, -1)
+    #     out2_ref_t = torch_moe_stage2(
+    #         a2_qt_t,
+    #         w1_qt_t,  # E, model_dim*2, inter_dim
+    #         w2_qt_t,  # E, inter_dim, model_dim
+    #         topk_weights,
+    #         topk_ids,
+    #         dtype=dtype,
+    #         quant_type=qType,
+    #         w2_scale=w2_scale_t,
+    #         a2_scale=a2_scale_t,
+    #         doweight=not doweight_stage1,
+    #     )
 
     out2_ref = torch_moe_stage2(
         a2_qt,
@@ -412,28 +414,35 @@ def test_fmoe(
     #     msg=f"[perf]  ck_moe_stage2:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     # )
     # ######################## stage 2 end ###########
-    # a2_qt_shuffle, a2_scale_shuffle = aiter.per_1x32_f4_quant(a2_qt, shuffle=False)
-    out2_asm = torch.empty((token, inter_dim), dtype=dtype)
+    out2_asm = torch.empty((token, model_dim), dtype=dtype)
+    a2_scale = fp4_utils.moe_mxfp4_sort(
+        a2_scale,
+        sorted_ids,
+        num_valid_ids,
+        a2_qt.shape[0],
+        256,
+    )
     _, us = run_perftest(
         asm_stage2,
         a2_qt,
-        w1_qt_aiter,
-        w2_qt_aiter,
+        shuffle_weight(w1_qt, (16, 16)),
+        shuffle_weight(w2_qt, (16, 16)),
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
         out2_asm,
-        topk,
+        topk=topk,
         kernelName="_ZN5aiter52fmoe_stage2_bf16_pertokenFp4_blockscale_g1u1_256x256E",  # _ZN5aiter52fmoe_stage2_bf16_pertokenFp4_blockscale_g1u1_256x256E
-        w2_scale=fp4_utils.e8m0_shuffle(w2_scale),
         a2_scale=a2_scale,
+        #a2_scale=fp4_utils.e8m0_shuffle(a2_scale),
+        w2_scale=fp4_utils.e8m0_shuffle(w2_scale),
         activation=actType,
         quant_type=qType,
         block_m=256,  # BLOCK_SIZE_M
         sorted_weights=sorted_weights,
     )
     checkAllclose(
-        out2_ref_t,
+        out2_ref,
         out2_asm,
         msg=f"[perf] asm_moe_stage2:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )

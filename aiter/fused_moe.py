@@ -915,7 +915,7 @@ def asm_stage2(
     sorted_ids,
     sorted_expert_ids,
     num_valid_ids,
-    out,  # [token_num, inter_dim]M N
+    out,  # [token_num, model_dim] M N
     topk,
     block_m: int,
     kernelName: str = "",
@@ -939,7 +939,7 @@ def asm_stage2(
         w1_scale = w1_scale.view(E, 1).repeat(1, w1.shape[1])
         quant_type = QuantType.per_Token
 
-    tmp_out = out
+    out.fill_(0)
     aiter.moe_stage2_g1u1(
         input,
         w1,
@@ -947,7 +947,7 @@ def asm_stage2(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        tmp_out,
+        out,
         inter_dim,
         kernelName,
         block_m,

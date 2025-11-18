@@ -80,9 +80,9 @@ struct __attribute__((packed)) KernelStage2Args
     p2 _p7;
     void* expt_buf;
     p2 _p8;
-    int model_dim;
-    p3 _p9;
     int inter_dim;
+    p3 _p9;
+    int model_dim;
     p3 _p10;
     int tokens;
     p3 _p11;
@@ -100,14 +100,18 @@ struct __attribute__((packed)) KernelStage2Args
     p3 _p17;
     int topks;
     p3 _p18;
-    void* dbg_i32;
-    p2 _p19;
-    void* dbg_f32;
+    int split_k;
+    p3 _p19;
+    void* o_flat_buf;
     p2 _p20;
-    void* dbg_f16;
+    void* dbg_i32;
     p2 _p21;
-    void* dbg_lds;
+    void* dbg_f32;
     p2 _p22;
+    void* dbg_f16;
+    p2 _p23;
+    void* dbg_lds;
+    p2 _p24;
 };
 
 static CFG* get_cfg(torch::Tensor& inp,
@@ -406,9 +410,9 @@ void moe_stage1_g1u1(
 }
 
 void moe_stage2_g1u1(
-    torch::Tensor& input,             // [token, topK, inter_dim] M,M N
-    torch::Tensor& w1,                // [expert, inter_dim*2, model_dim] E,N,K
-    torch::Tensor& w2,                // [expert, model_dim, inter_dim] E,K,N
+    torch::Tensor& input,             // [token, topK, inter_dim] M,toK K
+    torch::Tensor& w1,                // [expert, inter_dim*2, model_dim/2] E,K,N/2
+    torch::Tensor& w2,                // [expert, model_dim, inter_dim/2] E,N,K/2
     torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
     torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
     torch::Tensor& num_valid_ids,     // [1]
@@ -430,20 +434,20 @@ void moe_stage2_g1u1(
 
     CFG* config_map = get_stage2_cfg(input, out, w2, quant_type, sorted_weights.has_value());
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    int K          = w2.size(1);
-    int N          = w2.size(2);
-    int model_dim  = N; // K N exchanged in asm kernel
-    int hidden_dim = K;
+    int N          = w2.size(1);
+    int K          = inter_dim;
+    int model_dim  = N;
+    int hidden_dim = inter_dim;
     int sub_X_cnt  = sorted_expert_ids.size(0);
     int token_cnt  = input.size(0);
     int topk       = input.size(1);
     int eprt       = w1.size(0);
     // prepare kernel args
-    int stride_o             = K * out.element_size();   // ROW
-    int stride_a             = N * input.element_size(); // ROW
-    int stride_b             = N * w2.element_size();    // COL
-    int stride_exprt_b       = K * N;                    // COL
-    int stride_exprt_b_scale = N * (K / 32);             // COL
+    int stride_o             = model_dim * out.element_size();    // ROW
+    int stride_a             = hidden_dim * input.element_size(); // ROW
+    int stride_b             = hidden_dim * w2.element_size();    // COL
+    int stride_exprt_b       = K * N;                             // COL
+    int stride_exprt_b_scale = N * (K / 32);                      // COL
 
     stride_a /= 2;
     stride_b /= 2;
@@ -477,7 +481,6 @@ void moe_stage2_g1u1(
         TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
 
     const auto& cfg = it->second;
-    uint32_t sub_D  = cfg.tile_N;
     TORCH_CHECK(
         block_m == cfg.tile_M, __func__, " kernel: ", cfg.name, " need block_m == ", cfg.tile_M);
 
@@ -491,8 +494,8 @@ void moe_stage2_g1u1(
     kargs.tk_buf         = sorted_token_ids.data_ptr();
     kargs.w_buf          = sorted_weights.value().data_ptr();
     kargs.expt_buf       = sorted_expert_ids.data_ptr();
-    kargs.model_dim      = model_dim;
     kargs.inter_dim      = hidden_dim;
+    kargs.model_dim      = model_dim;
     kargs.tokens         = token_cnt;
     kargs.experts        = eprt;
     kargs.stride_a       = stride_a;
@@ -501,15 +504,17 @@ void moe_stage2_g1u1(
     kargs.stride_expt_b  = stride_exprt_b;
     kargs.stride_expt_bs = stride_exprt_b_scale;
     kargs.topks          = topk;
+    kargs.split_k        = ksplit == 0 ? 1 : ksplit;
+    kargs.o_flat_buf     = nullptr;
     kargs.dbg_i32        = nullptr;
     kargs.dbg_f32        = nullptr;
     kargs.dbg_f16        = nullptr;
     kargs.dbg_lds        = nullptr;
 
     int bdx         = 256;
-    int gdx         = ((hidden_dim + sub_D - 1) / sub_D);
+    int gdx         = ((model_dim + cfg.tile_N - 1) / cfg.tile_N);
     int gdy         = sub_X_cnt;
-    int gdz         = 1;
+    int gdz         = kargs.split_k;
     size_t arg_size = sizeof(kargs);
 
     std::cout << "out:" << kargs.o_buf << std::endl;
@@ -521,8 +526,8 @@ void moe_stage2_g1u1(
     std::cout << "tk_buf:" << kargs.tk_buf << std::endl;
     std::cout << "w_buf:" << kargs.w_buf << std::endl;
     std::cout << "expt_buf:" << kargs.expt_buf << std::endl;
-    std::cout << "model_dim:" << kargs.model_dim << std::endl;
     std::cout << "inter_dim:" << kargs.inter_dim << std::endl;
+    std::cout << "model_dim:" << kargs.model_dim << std::endl;
     std::cout << "tokens:" << kargs.tokens << std::endl;
     std::cout << "experts:" << kargs.experts << std::endl;
     std::cout << "stride_a:" << kargs.stride_a << std::endl;
