@@ -282,17 +282,18 @@ def mla_decode_fwd(
                     or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
                 )
             )
-            else torch.empty(
+            else torch.zeros(
                 (total_s, num_kv_splits, nhead, v_head_dim),
                 dtype=dtypes.fp32,
                 device=device,
             )
         )
 
-        attn_lse = torch.empty(
+        attn_lse = torch.zeros(
             (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
         )
         final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+        # import pdb;pdb.set_trace()
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
@@ -320,7 +321,9 @@ def mla_decode_fwd(
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
         grid = (bs, nhead)
+        # grid = (1, 1)
         extra_kargs = {"waves_per_eu": 4}
+        # import pdb;pdb.set_trace()
 
         _fwd_kernel_stage2_asm[grid](
             logits,
@@ -343,6 +346,8 @@ def mla_decode_fwd(
             num_stages=2,
             **extra_kargs,
         )
+
+        
     else:
         if num_kv_splits is None:
             num_kv_splits = get_cu_num()

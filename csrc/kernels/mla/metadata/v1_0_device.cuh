@@ -26,10 +26,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         const int32_t kv_begin  = params.p_seqlens_kv_indptr[bid];
         const int32_t seqlen_kv = kv_end - kv_begin;
 
-        const int32_t num_blocks = integer_divide_ceil_power2(
-            seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
-
-        const int32_t payload = ck_tile::integer_divide_ceil(num_blocks, params.num_splits);
+        const int32_t payload = ck_tile::integer_divide_ceil(seqlen_kv, params.num_splits);
 
         MlaWorkInfo work_info{};
         for(int32_t sid = 0; sid < params.num_splits; sid++)
@@ -37,22 +34,20 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             const int32_t work_index = bid * params.num_splits + sid;
 
             work_info.batch_idx = bid;
-            work_info.partial_qo_loc = work_index;
+            work_info.partial_qo_loc = params.num_splits == 1 ? -1 : work_index * params.uni_seqlen_qo;
             work_info.qo_start  = bid * params.uni_seqlen_qo;
             work_info.qo_end    = work_info.qo_start + params.uni_seqlen_qo;
-            work_info.kv_start  = kv_begin + (sid * params.kv_granularity * payload);
-            work_info.kv_end    = ck_tile::min(work_info.kv_start +
-                                                (payload * params.kv_granularity),
-                                            kv_end);
+            work_info.kv_start  = kv_begin + (sid * payload);
+            work_info.kv_end    = ck_tile::min(work_info.kv_start + payload, kv_end);
             work_info.kv_offset = kv_end - work_info.kv_end;
             p_work_info_set[work_index] = work_info;
             params.p_work_indptr[work_index + 1] = work_index + 1;
-            // params.p_reduce_partial_map[work_index + 1] = work_index + 1;
+            params.p_reduce_partial_map[work_index + 1] = work_index + 1;
         }
 
-        // params.p_reduce_indptr[bid + 1] = (bid + 1) * params.num_splits;
-        // params.p_reduce_final_map[bid * 2]     = work_info.qo_start;
-        // params.p_reduce_final_map[bid * 2 + 1] = work_info.qo_end;
+        params.p_reduce_indptr[bid + 1] = (bid + 1) * params.num_splits;
+        params.p_reduce_final_map[bid * 2]     = work_info.qo_start;
+        params.p_reduce_final_map[bid * 2 + 1] = work_info.qo_end;
     }
 }
 

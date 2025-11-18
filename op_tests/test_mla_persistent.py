@@ -210,6 +210,10 @@ def test_mla(
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
 
+    kv_indptr_bak = torch.zeros_like(kv_indptr)
+    kv_indptr_bak[-1] = kv_indptr[-1] // 2
+    kv_indices_bak = torch.zeros_like(kv_indices)
+    kv_indices_bak[:kv_indptr[-1] // 2] = kv_indices[kv_indptr[-1] // 2:]
     # troch implementation
     out_ref, lse_ref = torch_mla_extend(
         q,
@@ -217,6 +221,8 @@ def test_mla(
         qo_indptr,
         kv_indptr,
         kv_indices,
+        # kv_indptr_bak,
+        # kv_indices_bak,
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
@@ -265,23 +271,24 @@ def test_mla(
 
     @functools.lru_cache(maxsize=1)
     def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
-        gpu = torch.cuda.current_device()
-        device_properties = torch.cuda.get_device_properties(gpu)
-        cu_num = device_properties.multi_processor_count
-        avg_kv = total_kv / bs
-        overhead = 84.1
-        tmp = [
-            (
-                bs
-                * i
-                / ((bs * i + cu_num - 1) // cu_num * cu_num)
-                * avg_kv
-                / (avg_kv + overhead * i),
-                i,
-            )
-            for i in range(1, 17)
-        ]
-        num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
+        if num_kv_splits is None:
+            gpu = torch.cuda.current_device()
+            device_properties = torch.cuda.get_device_properties(gpu)
+            cu_num = device_properties.multi_processor_count
+            avg_kv = total_kv / bs
+            overhead = 84.1
+            tmp = [
+                (
+                    bs
+                    * i
+                    / ((bs * i + cu_num - 1) // cu_num * cu_num)
+                    * avg_kv
+                    / (avg_kv + overhead * i),
+                    i,
+                )
+                for i in range(1, 17)
+            ]
+            num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
         get_block_n_fp8 = {
             16: 128,
@@ -305,7 +312,7 @@ def test_mla(
         return num_kv_splits, num_kv_splits_indptr
 
     num_kv_splits, num_kv_splits_indptr = get_meta_param(
-        None, batch_size, kv_indices.shape[0], nhead, decode_qlen, q.dtype
+        2, batch_size, kv_indices.shape[0], nhead, decode_qlen, q.dtype
     )
 
     meta = aiter.get_mla_metadata_v1(
@@ -327,6 +334,7 @@ def test_mla(
         max_split_per_batch=num_kv_splits,
         intera_batch_mode=True,
     )
+    # import pdb;pdb.set_trace()
 
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -424,6 +432,7 @@ def test_mla(
         # checkAllclose(logits_ref, attn_logits,
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
+        # import pdb;pdb.set_trace()
         err = checkAllclose(
             out_ref,
             out_asm,

@@ -342,7 +342,7 @@ void mla_decode_stage1_asm_fwd(
         gdy = 1;
         gdz = 1;
     }
-    // printf("gdz: %d \n", gdz);
+    // printf("gdx: %d \n", gdx);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
