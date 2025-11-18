@@ -79,7 +79,6 @@ def run_torch_mrope_3d_rms(
     is_interleaved: bool,
     eps: float,
 ):
-    dtype = qkv.dtype
     q_size = num_heads_q * head_size
     k_size = num_heads_k * head_size
     v_size = num_heads_v * head_size
