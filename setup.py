@@ -126,23 +126,6 @@ if IS_ROCM:
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
 
-        ck_batched_gemm_folders = [
-            f"{this_dir}/csrc/{name}/include"
-            for name in os.listdir(f"{this_dir}/csrc")
-            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name))
-            and name.startswith("ck_batched_gemm")
-        ]
-        ck_gemm_folders = [
-            f"{this_dir}/csrc/{name}/include"
-            for name in os.listdir(f"{this_dir}/csrc")
-            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name))
-            and name.startswith("ck_gemm_a")
-        ]
-        ck_gemm_inc = ck_batched_gemm_folders + ck_gemm_folders
-        for src in ck_gemm_inc:
-            dst = f"{prebuild_dir}/include"
-            shutil.copytree(src, dst, dirs_exist_ok=True)
-
         shutil.copytree(
             f"{this_dir}/csrc/include", f"{prebuild_dir}/include", dirs_exist_ok=True
         )
