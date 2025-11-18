@@ -358,9 +358,7 @@ def fused_moe_1stage(
         a8_scale = torch.empty(M, dtype=dtypes.fp32, device=device)
         aiter.dynamic_per_token_scaled_quant(a8, hidden_states, a8_scale)
 
-        fmoe_func = aiter.fmoe_g1u1_tkw1
-
-        fmoe_func(
+        aiter.fmoe_g1u1_tkw1(
             moe_buf,
             a8,
             w1,
