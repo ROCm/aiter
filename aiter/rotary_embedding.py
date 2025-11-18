@@ -1154,7 +1154,7 @@ class MRotaryEmbeddingQKNormFused(nn.Module):
         inv_freq = 1.0 / (
             base
             ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+                torch.arange(0, self.rotary_dim, 2, dtype=dtypes.fp32) / self.rotary_dim
             )
         )
         return inv_freq
@@ -1162,13 +1162,12 @@ class MRotaryEmbeddingQKNormFused(nn.Module):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = torch.arange(self.max_position_embeddings, dtype=dtypes.fp32)
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1)
-        return cache
+        return cos, sin
 
     def __init__(
         self,
@@ -1190,7 +1189,10 @@ class MRotaryEmbeddingQKNormFused(nn.Module):
         self.dtype = dtype
         self.mrope_interleaved = mrope_interleaved
 
-        cache = self._compute_cos_sin_cache()
+        cos, sin = self._compute_cos_sin_cache()
+        cos = cos.to(dtype)
+        sin = sin.to(dtype)
+        cache = torch.cat((cos, sin), dim=-1)
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
         self.mrope_section = mrope_section
