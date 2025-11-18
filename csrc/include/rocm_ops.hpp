@@ -1337,6 +1337,7 @@ namespace py = pybind11;
           py::arg("rowStarts"),    \
           py::arg("rowEnds"),      \
           py::arg("indices"),      \
+          py::arg("values"),       \
           py::arg("numRows"),      \
           py::arg("stride0"),      \
           py::arg("stride1"));     \
