@@ -126,8 +126,8 @@ template torch::Tensor
 
         if self.istune:
             Path(
-                os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
-            ).write_text(INSTANCE_dFP32_eFP16)
+                os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
+            ).write_text(INSTANCE_dFP32_eBF16)
         else:
             Path(
                 os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")

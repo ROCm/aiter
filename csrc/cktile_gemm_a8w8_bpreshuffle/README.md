@@ -15,4 +15,4 @@ You can find the results of the tuning in `aiter/configs/a8w8_bpreshuffle_cktile
 
 ## More
 If you want to re-install gemm_a8w8_bpreshuffle_cktile, you should remove `aiter/jit/module_gemm_a8w8_bpreshuffle_cktile.so` and `aiter/jit/build/module_gemm_a8w8_bpreshuffle_cktile` first.
-If you use flag `PREBUILD_KERNELS=1 USE_CK_A8W8=1` when you install aiter, it will build gemm a8w8 kernels in `aiter/configs/a8w8_bpreshuffle_cktile_tuned_gemm.csv` by default. If you want to use the new result of gemm_a8w8_bpreshuffle_cktile_tune, please remove `build` and `*.so` first, then re-intall aiter after finishing tune.
+If you use flag `PREBUILD_KERNELS=1` when you install aiter, it will build gemm a8w8 kernels in `aiter/configs/a8w8_bpreshuffle_cktile_tuned_gemm.csv` by default. If you want to use the new result of gemm_a8w8_bpreshuffle_cktile_tune, please remove `build` and `*.so` first, then re-intall aiter after finishing tune.

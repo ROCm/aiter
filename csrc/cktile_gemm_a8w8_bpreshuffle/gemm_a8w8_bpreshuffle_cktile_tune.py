@@ -14,7 +14,7 @@ import argparse
 from aiter.utility.mp_tuner import mp_tuner
 
 
-def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.float16):
+def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     x = x.to(dtypes.fp32) * x_scale
     weight = weight.to(dtypes.fp32) * w_scale
     out = F.linear(x, weight)
@@ -32,12 +32,14 @@ def run_gemm_a8w8_bpreshuffle_cktile(
     return out
 
 
-def generate_data(m, n, k, seed, dtype=dtypes.fp16, device="cuda"):
+def generate_data(
+    m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8, device="cuda"
+):
     torch.manual_seed(seed)
     x = torch.randn((m, k), dtype=dtype, device=device)
     weight = torch.randn((n, k), dtype=dtype, device=device)
-    x, x_scale = aiter.pertoken_quant(x, quant_dtype=dtypes.fp8)
-    weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=dtypes.fp8)
+    x, x_scale = aiter.pertoken_quant(x, quant_dtype=q_dtype_w)
+    weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=q_dtype_w)
     bias_f32 = None
     weight_shuffle = shuffle_weight(weight, layout=(16, 16))
     out = torch.empty(m, n, dtype=dtype, device=device)
@@ -69,7 +71,12 @@ class GemmA8W8BpreShuffleCktileTuner(GemmCommonTuner):
         useSplitK,
         seed,
     ):
-        (cu_num, M, N, K) = info_keys
+        (cu_num, M, N, K, q_dtype_w) = info_keys
+        if eval(q_dtype_w) != dtypes.fp8:
+            print(
+                f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
+            )
+            return []
         kernels_num = len(kernels_list)
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
         ref_data_idx = [0, 5, 2, 3, 6]
@@ -94,7 +101,7 @@ class GemmA8W8BpreShuffleCktileTuner(GemmCommonTuner):
                     (
                         info,
                         generate_data,
-                        (M, N, K, seed, dtypes.fp16),
+                        (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
                         run_gemm_a8w8_bpreshuffle_cktile,
                         (
                             gemm_a8w8_idx,
@@ -105,7 +112,7 @@ class GemmA8W8BpreShuffleCktileTuner(GemmCommonTuner):
                         run_torch,
                         (
                             ref_data_idx,
-                            dtypes.fp16,
+                            dtypes.bf16,
                         ),
                         {},
                         None,
@@ -134,10 +141,11 @@ class GemmA8W8BpreShuffleCktileTuner(GemmCommonTuner):
             M = untunedf.loc[i, "M"]
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
+            q_dtype_w = untunedf.loc[i, "q_dtype_w"]
             seed = seed + 1
             total_kernel_nums = 0
             kernels_num = len(kernels_list)
-            info_keys = (cu_num, M, N, K)
+            info_keys = (cu_num, M, N, K, q_dtype_w)
             task.extend(
                 self.get_cktile_gemm_a8w8_bpreshuffle_tune_task(
                     info_keys,
@@ -158,7 +166,7 @@ class GemmA8W8BpreShuffleCktileTuner(GemmCommonTuner):
 
 if __name__ == "__main__":
     ## use default key and resultList
-    key = ["cu_num", "M", "N", "K"]
+    key = ["cu_num", "M", "N", "K", "q_dtype_w"]
     tuner = GemmA8W8BpreShuffleCktileTuner(
         "GemmA8W8BpreShuffleCktileTuner",
         key=key,

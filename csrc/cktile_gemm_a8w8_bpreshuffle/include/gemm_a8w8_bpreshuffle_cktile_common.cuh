@@ -25,7 +25,7 @@ using F32         = float;
 using B16         = ck_tile::bf16_t;
 using ADataType   = typename GemmBasicTypeConfig<ck_tile::fp8_t>::ADataType;
 using BDataType   = typename GemmBasicTypeConfig<ck_tile::fp8_t>::BDataType;
-using CDataType   = typename GemmBasicTypeConfig<ck_tile::fp8_t>::CDataType;
+using CDataType   = ck_tile::bf16_t;
 using AccDataType = typename GemmBasicTypeConfig<ck_tile::fp8_t>::AccDataType;
 using ALayout     = ck_tile::tensor_layout::gemm::RowMajor;
 using BLayout     = ck_tile::tensor_layout::gemm::ColumnMajor;
@@ -330,7 +330,7 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
     using ADataType      = typename GemmBasicTypeConfig<ck_tile::fp8_t>::ADataType;
     using BDataType      = typename GemmBasicTypeConfig<ck_tile::fp8_t>::BDataType;
-    using CDataType      = typename GemmBasicTypeConfig<ck_tile::fp8_t>::CDataType;
+    using CDataType      = ck_tile::bf16_t;;
     using AccDataType    = typename GemmBasicTypeConfig<ck_tile::fp8_t>::AccDataType;
     using DsDataType     = ck_tile::tuple<>;
     using ALayout        = ck_tile::tensor_layout::gemm::RowMajor;
