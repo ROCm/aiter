@@ -436,15 +436,12 @@ def _attn_fwd(
         warps_per_cta=[gl.num_warps(), 1],
     )  # analogous to #mma in the comment above
 
-    # FIXME: Figure out how to generalize this layout across different data sizes
-    # out_layout: gl.constexpr = gl.DistributedLinearLayout(
-    #     reg_bases=[[0, 1], [0, 2], [0, 4], [0, 16], [0, 32], [0, 64]],
-    #     lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 8]],
-    #     warp_bases=[[32, 0], [64, 0]],
-    #     block_bases=[],
-    #     shape=[BLOCK_M, BLOCK_DMODEL_POW2],
-    # )  # analogous to #linear in the comment above
-    out_layout: gl.constexpr = mfma_layout
+    out_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 64],
+        threads_per_warp=[32, 2],
+        warps_per_cta=[gl.num_warps(), 1],
+        order=[1, 0],
+    )  # analogous to #linear in the comment above
 
     shared_q: gl.constexpr = gl.SwizzledSharedLayout(
         vec=8, per_phase=2, max_phase=8, order=[1, 0]
