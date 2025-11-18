@@ -23,6 +23,7 @@ from csrc.cpp_itfs.utils import (
     run_lib,
 )
 
+MD_NAME = "pa_decode_attention_reduce_kernel"
 
 def parse_version(version_str):
     """Parse version string into comparable tuple format, handling possible development version suffixes"""
@@ -43,13 +44,11 @@ def parse_version(version_str):
 TRITON_VERSION = parse_version(triton.__version__)
 
 
-def compile_attention_reduce_kernel(
+def compile(
     compute_type: tl.dtype,
-    query_seq_len: int,
-    query_group_size: int,
+    equivalent_query_group_size: int,
     head_size: int,
     kv_block_size: int,
-    kv_16b_element_count: int,
     max_context_partition_num: int,
     context_partition_size: int,
     query_quant_mode: int,
@@ -57,21 +56,26 @@ def compile_attention_reduce_kernel(
     fp8_max_value: float,
     value_transposed: int,
     is_causal: int,
-    md_name: str,
     func_name: str = None,
 ):
     """Compile the combined attention and reduce kernel for paged attention decode."""
+    max_context_partition_num_pow2 = triton.next_power_of_2(max_context_partition_num)
+    head_size_pow2 = triton.next_power_of_2(head_size)
+
+    if equivalent_query_group_size < 16:
+        equi_query_group_size_pow2 = 16
+    else:
+        equi_query_group_size_pow2 = triton.next_power_of_2(equivalent_query_group_size)
+
     if func_name is None:
         func_name = get_default_func_name(
-            md_name,
+            MD_NAME,
             (
                 compute_type,
-                query_seq_len,
-                query_group_size,
-                head_size,
+                equi_query_group_size_pow2,
+                head_size_pow2,
                 kv_block_size,
-                kv_16b_element_count,
-                max_context_partition_num,
+                max_context_partition_num_pow2,
                 context_partition_size,
                 query_quant_mode,
                 kv_quant_mode,
@@ -82,8 +86,6 @@ def compile_attention_reduce_kernel(
         )
 
     if not_built(func_name):
-        equivalent_query_group_size = query_seq_len * query_group_size
-        equi_query_group_size_pow2 = triton.next_power_of_2(equivalent_query_group_size)
         kv_compute_block_size = 256
         waves_per_eu = 1
         # Select kernel implementation based on block size
@@ -134,15 +136,16 @@ def compile_attention_reduce_kernel(
             "i32:16",  # query_scale_stride_0
             "i32:16",  # kv_scale_stride_0
             "i32:16",  # kv_scale_stride_1
+            "i32:16",  # query_sequence_length
+            "i32:16",  # query_group_size
+            "i32:16",  # head_size
             "i32:16",  # num_seqs
             "i32:16",  # num_kv_heads
             "i32:16",  # max_context_partition_num
             f"{str(compute_type)}",
-            f"{query_seq_len}",
-            f"{query_group_size}",
-            f"{head_size}",
+            f"{equi_query_group_size_pow2}",
+            f"{head_size_pow2}",
             f"{kv_block_size}",
-            f"{kv_16b_element_count}",
             f"{context_partition_size}",
             f"{kv_compute_block_size}",
             f"{query_quant_mode}",
@@ -166,7 +169,7 @@ def compile_attention_reduce_kernel(
             num_stages=1,
             num_ctas=1,
             kpack=1,
-            out_name=f"{md_name}_stage1",
+            out_name=f"{MD_NAME}_stage1",
         )
         triton_kernel1, output_files1 = compile_gluon_kernel(compile_args)
 
@@ -186,11 +189,13 @@ def compile_attention_reduce_kernel(
             "i32:16",  # stride_logits_head
             "i32:16",  # stride_logits_part
             "i32:16",  # stride_logits_group
+            "i32:16",  # query_group_size
+            "i32:16",  # head_size
             "i32:16",  # num_seqs
             "i32:16",  # num_kv_heads
-            f"{equivalent_query_group_size}",
-            f"{head_size}",
-            f"{max_context_partition_num}",
+            f"{equi_query_group_size_pow2}",
+            f"{head_size_pow2}",
+            f"{max_context_partition_num_pow2}",
             f"{context_partition_size}",
         ]
         reduce_signature = ",".join(reduce_signature_parts)
@@ -206,7 +211,7 @@ def compile_attention_reduce_kernel(
             grid="num_seqs,num_kv_heads,1",
             num_warps=4,
             num_stages=2,
-            out_name=f"{md_name}_stage2",
+            out_name=f"{MD_NAME}_stage2",
         )
         triton_kernel2, output_files2 = compile_kernel(reduce_compile_args)
 
@@ -234,12 +239,12 @@ def compile_attention_reduce_kernel(
 
         return compile_template_op(
             src_template,
-            md_name,
+            MD_NAME,
             [triton_header1, triton_header2],
             [triton_source1, triton_source2],
             triton_header1=triton_header1,
             triton_header2=triton_header2,
-            kernel_name=md_name,
+            kernel_name=MD_NAME,
             triton_kernel1=triton_kernel1,
             triton_kernel2=triton_kernel2,
             func_name=func_name,
@@ -393,13 +398,11 @@ def pa_decode_gluon_aot(
         fp8_max_value = torch.finfo(aiter.dtypes.fp8).max
 
     # Compile the combined attention and reduce kernel
-    combined_func = compile_attention_reduce_kernel(
+    combined_func = compile(
         compute_type=compute_type,
-        query_seq_len=query_sequence_length,
-        query_group_size=query_group_size,
+        equivalent_query_group_size=query_sequence_length * query_group_size,
         head_size=head_size,
         kv_block_size=kv_block_size,
-        kv_16b_element_count=kv_elements_per_16b,
         max_context_partition_num=max_context_partition_num,
         context_partition_size=context_partition_size,
         query_quant_mode=query_quant_mode,
@@ -407,7 +410,6 @@ def pa_decode_gluon_aot(
         fp8_max_value=fp8_max_value,
         value_transposed=int(value_transposed),
         is_causal=int(is_causal),
-        md_name="pa_decode_attention_reduce_kernel",
     )
 
     # Execute the combined kernel
@@ -451,6 +453,9 @@ def pa_decode_gluon_aot(
             num_sequences,
             num_kv_heads,
             max_context_partition_num,
+            query_sequence_length,
+            query_group_size,
+            head_size,
             torch.cuda.current_stream(output.device),
         )
     )

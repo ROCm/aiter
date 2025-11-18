@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 /* clang-format off */
 #include <stdio.h>
@@ -58,9 +58,10 @@ hipError_t {kernel_name}(hipStream_t stream, {signature}) {{
     hipDeviceptr_t global_scratch = 0;
     hipDeviceptr_t profile_scratch = 0;
     void *args[{num_args}] = {{ {arg_pointers} }};
+    int warpSizeHost = 64;
     // TODO: shared memory
     if(gX * gY * gZ > 0)
-      return hipModuleLaunchKernel({kernel_name}_func, gX, gY, gZ, {num_warps} * warpSize, 1, 1, {shared}, stream, args, nullptr);
+      return hipModuleLaunchKernel({kernel_name}_func, gX, gY, gZ, {num_warps} * warpSizeHost, 1, 1, {shared}, stream, args, nullptr);
     else
       return hipErrorInvalidValue;
 }}
