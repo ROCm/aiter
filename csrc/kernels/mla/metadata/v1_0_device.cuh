@@ -37,6 +37,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             const int32_t work_index = bid * params.num_splits + sid;
 
             work_info.batch_idx = bid;
+            work_info.partial_qo_loc = work_index;
             work_info.qo_start  = bid * params.uni_seqlen_qo;
             work_info.qo_end    = work_info.qo_start + params.uni_seqlen_qo;
             work_info.kv_start  = kv_begin + (sid * params.kv_granularity * payload);
@@ -46,12 +47,12 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             work_info.kv_offset = kv_end - work_info.kv_end;
             p_work_info_set[work_index] = work_info;
             params.p_work_indptr[work_index + 1] = work_index + 1;
-            params.p_reduce_partial_map[work_index + 1] = work_index + 1;
+            // params.p_reduce_partial_map[work_index + 1] = work_index + 1;
         }
 
-        params.p_reduce_indptr[bid + 1] = (bid + 1) * params.num_splits;
-        params.p_reduce_final_map[bid * 2]     = work_info.qo_start;
-        params.p_reduce_final_map[bid * 2 + 1] = work_info.qo_end;
+        // params.p_reduce_indptr[bid + 1] = (bid + 1) * params.num_splits;
+        // params.p_reduce_final_map[bid * 2]     = work_info.qo_start;
+        // params.p_reduce_final_map[bid * 2 + 1] = work_info.qo_end;
     }
 }
 
