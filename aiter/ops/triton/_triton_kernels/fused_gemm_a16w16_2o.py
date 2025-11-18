@@ -226,7 +226,7 @@ def _get_config(
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
         _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-FUSED-GEMM-A16W16-2O-N={N}-K={K}.json"
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-FUSED-GEMM-A16W16-2O.json"
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict["default"] = config
