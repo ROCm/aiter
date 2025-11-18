@@ -249,7 +249,7 @@ def _get_config(
             temp_config = _get_config._config_dict[key][f"M_LEQ_{bound}"]
             break
     else:
-        temp_config = _get_config._config_dict[key]["M_GEQ_4096"]
+        temp_config = _get_config._config_dict[key]["any"]
 
     # Copy to avoid mutating the cached config
     chosen_config = dict(temp_config)
