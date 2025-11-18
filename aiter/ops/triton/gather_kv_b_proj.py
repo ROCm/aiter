@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-
-import triton
-import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
     _triton_gather_kv_b_proj,
