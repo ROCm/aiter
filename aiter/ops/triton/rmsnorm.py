@@ -159,6 +159,29 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     return dx, dgamma
 
 
+def _should_use_large_m_small_n(M: int, N: int) -> bool:
+
+    if M > 8192 and N <= 2048:
+        return True
+
+    return False
+
+
+def rmsnorm_forward_inference(x: torch.Tensor, weight: torch.Tensor, eps: float):
+    assert x.ndim == 2 and weight.ndim == 1 and x.shape[1] == weight.shape[0]
+    x = x.contiguous()
+    weight = weight.contiguous()
+    M, N = x.shape
+
+    if _should_use_large_m_small_n(M, N):
+        return _rmsnorm_forward_large_m_small_n(x, weight, eps, return_rsigma=False)
+    else:
+        y, _ = _rmsnorm_forward(
+            x, weight, eps
+        )  # always returns rsigma, but we discard it
+        return y
+
+
 class _RMSNorm(torch.autograd.Function):
 
     @staticmethod
@@ -167,8 +190,18 @@ class _RMSNorm(torch.autograd.Function):
         is_grad = is_grad_enabled and any(
             tensor.requires_grad for tensor in [x, weight]
         )
-
-        y, rsigma = _rmsnorm_forward(x, weight, epsilon)
+        M, N = x.shape
+        if _should_use_large_m_small_n(M, N):
+            out = _rmsnorm_forward_large_m_small_n(
+                x, weight, epsilon, return_rsigma=is_grad
+            )
+            if is_grad:
+                y, rsigma = out
+            else:
+                y = out
+                rsigma = None
+        else:
+            y, rsigma = _rmsnorm_forward(x, weight, epsilon)
 
         if is_grad:
             ctx.save_for_backward(x, weight, rsigma)
@@ -531,10 +564,10 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     )
 
 
-def rmsnorm_large_m_small_n(
+def _rmsnorm_forward_large_m_small_n(
     x: torch.Tensor,
     weight: torch.Tensor,
-    eps: float = 1e-5,
+    eps: float,
     return_rsigma: bool = False,
 ):
     assert x.ndim == 2 and weight.ndim == 1 and x.shape[1] == weight.shape[0]
