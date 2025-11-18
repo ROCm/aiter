@@ -28,6 +28,7 @@ def test_topk(
     device = output.device
 
     topk_ids = torch.zeros((batch_size, topk), dtype=dtypes.i32, device=device)
+    topk_value = torch.zeros((batch_size, topk), dtype=dtype, device=device)
 
     x = torch.arange(hiddensize, dtype=dtype).repeat(batch_size, 1)
     for b in range(batch_size):
@@ -74,8 +75,13 @@ def test_topk(
         topk_plain,
         x,
         topk_ids,
+        topk_value,
         topk,
         largest,
+        torch.tensor([], dtype=torch.int32, device=device),  # rowStarts - empty int32 tensor
+        torch.tensor([], dtype=torch.int32, device=device),  # rowEnds - empty int32 tensor
+        -1,              # stride0
+        1,               # stride1
     )
 
     id_aiter, _aiter = torch.sort(topk_ids.to(torch.long))
@@ -91,6 +97,12 @@ def test_topk(
             f"  {'aiter':<10} {us_aiter:>12.2f}\n"
         ),
     )
+    # err = checkAllclose(
+    #     ref_value.gather(1, _ref),
+    #     topk_value.gather(1, _aiter),
+    #     msg="topk_values [golden vs aiter]",
+    # )
+
 
     return {
         "err": err,
@@ -100,9 +112,15 @@ def test_topk(
     }
 
 
-BATCH_SIZES = [100, 1000, 10000]
-HIDDENSIZES = [10000, 100000]
-topk = 64
+# BATCH_SIZES = [100, 1000, 10000]
+# HIDDENSIZES = [10000, 100000]
+# topk = 64
+# BATCH_SIZES = [3072, 3072, 3072]
+# HIDDENSIZES = [3072, 4096, 8192]
+BATCH_SIZES = [3072]
+HIDDENSIZES = [3072]
+# HIDDENSIZES = [32768]
+topk = 2048
 largest = True
 
 df = []

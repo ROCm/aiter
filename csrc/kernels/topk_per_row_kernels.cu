@@ -528,13 +528,13 @@ __device__ void topk_per_row_kernel(const float* logits,
 }
 
 template <int kNumThreadsPerBlock = 512, bool useRadixSort = true, int Vector = 4>
-static __global__ void topk_per_row(const float* logits,
-                                    const int* rowStarts,
-                                    const int* rowEnds,
-                                    int* outIndices,
-                                    int stride0,
-                                    int stride1,
-                                    int rowOffset)
+__global__ void topk_per_row(const float* logits,
+                              const int* rowStarts,
+                              const int* rowEnds,
+                              int* outIndices,
+                              int stride0,
+                              int stride1,
+                              int rowOffset)
 {
     // The number of bins in the histogram.
     static constexpr int kNumBins = 2048;
@@ -546,8 +546,14 @@ static __global__ void topk_per_row(const float* logits,
     int64_t rowIdx = static_cast<int64_t>(blockIdx.x) + rowOffset;
 
     // The range of logits within the row.
-    int rowStart = rowStarts[rowIdx];
-    int rowEnd   = rowEnds[rowIdx];
+    int rowStart = 0;
+    int rowEnd   = stride0;
+
+    if (rowStarts && rowEnds)
+    {
+        rowStart = rowStarts[rowIdx];
+        rowEnd   = rowEnds[rowIdx];
+    }
 
     // Local pointers to this block
     auto outIndicesLocal = outIndices + rowIdx * kTopK;
