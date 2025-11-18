@@ -476,13 +476,12 @@ def get_2stage_cfgs(
         ksplit = cfg["ksplit"]
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
-        run_1stage = cfg["run_1stage"]
+        run_1stage = False if "run_1stage" not in cfg else cfg["run_1stage"]
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
-
     if (
         "ck" in kernelName1
         or q_dtype_w
@@ -521,7 +520,7 @@ def get_2stage_cfgs(
 
     return MOEMetadata(
         functools.partial(
-            asm_stage1,
+            aiter.ck_moe_stage1_fwd,
             kernelName=kernelName1,
             activation=activation,
             quant_type=q_type,
@@ -830,7 +829,8 @@ def torch_moe(
 
     return (out * topk_weight.view(B, -1, 1)).sum(dim=1).to(dtype)
 
-#temp workaround for swiglu
+
+# temp workaround for swiglu
 def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0):
     # Clamp the input values
     x_glu = x_glu.clamp(min=None, max=limit)
@@ -862,12 +862,13 @@ def torch_moe_stage1(
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     if quant_type == QuantType.per_1x32:
         from aiter.utility import fp4_utils
+
         w1 = fp4_utils.mxfp4_to_f32(w1)
         w1_scale = fp4_utils.e8m0_to_f32(w1_scale)
-        if a1_scale is not None: #skip a16w4
+        if a1_scale is not None:  # skip a16w4
             hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
             a1_scale = fp4_utils.e8m0_to_f32(a1_scale)
-        else: #a16w4
+        else:  # a16w4
             hidden_states = hidden_states.to(ctype)
 
     else:
@@ -905,7 +906,9 @@ def torch_moe_stage1(
         hidden_states = hidden_states.view(a1_shape[0], a1_shape[1] // 32, 32)
         if a1_scale is not None:
             a1_scale = a1_scale[: a1_shape[0]]
-            hidden_states = hidden_states * a1_scale.view(a1_shape[0], a1_shape[1] // 32, 1)
+            hidden_states = hidden_states * a1_scale.view(
+                a1_shape[0], a1_shape[1] // 32, 1
+            )
         hidden_states = hidden_states.view(a1_shape)
     else:
         assert False, f"Unsupported quant_type: {quant_type}"
@@ -951,7 +954,7 @@ def torch_moe_stage2(
     quant_type=QuantType.No,
     w2_scale=None,  # [1]
     a2_scale=None,  # [expert]]'
-    w2_bias=None, 
+    w2_bias=None,
     doweight=True,
 ):
     ctype = dtypes.fp32  # compute type
@@ -964,7 +967,7 @@ def torch_moe_stage2(
         if a2_scale is not None:
             hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
             a2_scale = fp4_utils.e8m0_to_f32(a2_scale)
-        else: #a16w4
+        else:  # a16w4
             hidden_states = hidden_states.to(ctype)
     else:
         hidden_states = hidden_states.to(ctype)
