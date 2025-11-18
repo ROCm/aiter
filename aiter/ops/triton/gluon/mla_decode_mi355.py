@@ -38,6 +38,25 @@ from aiter import dtypes
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+enable_aot_gluon_mla = os.environ.get(
+    "AITER_ENABLE_AOT_MLA", "0"
+)
+enable_aot_gluon_mla = enable_aot_gluon_mla == "1"
+
+if triton.__version__ >= "3.5.0":
+    from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
+    enable_gluon_mla = True
+    enable_jit_gluon_mla = True
+else:
+    from triton.compiler import ASTSource
+    assert triton.__version__ < "3.4.0"
+    enable_gluon_mla = enable_aot_gluon_mla
+    enable_jit_gluon_mla = False
+
+from aiter.utility.triton.triton_metadata_redirect import (
+    AOTMetadataContext,
+)
+
 
 @gluon.jit
 def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
@@ -600,6 +619,135 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     )
 
 
+@lru_cache(maxsize=None)
+def _compile_mla(
+    kv_lora_rank,
+    qk_rope_head_dim,
+    kv_group_num,
+    q_head_num,
+    batch,
+    logit_cap,
+    max_qo_len,
+    PAGE_BLOCK_SIZE,
+    BLOCK_C,
+    BLOCK_R,
+    BLOCK_N,
+    BLOCK_H,
+    NUM_KV_SPLITS,
+    WavePerEU: int = 2,
+):
+    target = GPUTarget("hip", "gfx950", 64)
+
+    fn_signature = {
+        "Q": "*bf16",
+        "K_Buffer": "*bf16",
+        "V_Buffer": "*bf16",
+        "batch_size": "i32",
+        "sm_scale": "fp32",
+        "kv_indptr": "*i32",
+        "kv_indices": "*i32",
+        "Att_Out": "*fp32",
+        "Att_Lse": "*fp32",
+        "stride_qb": "i32",
+        "stride_qh": "i32",
+        "stride_buf_kbs": "i32",
+        "stride_buf_kh":  "i32",
+        "stride_mid_ob": "i32",
+        "stride_mid_oh": "i32",
+        "stride_mid_os": "i32",
+        "stride_mid_lse_b": "i32",
+        "stride_mid_lse_h": "i32",
+        "stride_mid_lse_s": "i32",
+        "stride_b_block_table": "i32",
+    }
+    if not enable_jit_gluon_mla:
+        fn_signature["dummyPointerArg"] = "*i32"
+    fn_signature["kv_lora_rank"] = "constexpr"
+    fn_signature["qk_rope_head_dim"] = "constexpr"
+    fn_signature["kv_group_num"] = "constexpr"
+    fn_signature["q_head_num"] = "constexpr"
+    fn_signature["batch"] = "constexpr"
+    fn_signature["logit_cap"] = "constexpr"
+    fn_signature["max_qo_len"] = "constexpr"
+    fn_signature["BLOCK_C"] = "constexpr"
+    fn_signature["BLOCK_R"] = "constexpr"
+    fn_signature["BLOCK_N"] = "constexpr"
+    fn_signature["BLOCK_H"] = "constexpr"
+    fn_signature["NUM_KV_SPLITS"] = "constexpr"
+    fn_signature["PAGE_BLOCK_SIZE"] = "constexpr"
+
+    options = {
+        "num_warps": 4,
+        "waves_per_eu": WavePerEU,
+        "num_stages": 2,
+        "num_ctas": 1,
+        "cluster_dims": [1, 1, 1],
+        "arch": "gfx950",
+        "backend_name": "hip",
+        "warp_size": 64,
+        "name": "_fd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64",
+    }
+
+    kernel_fn = (
+    )
+    src = ASTSource(
+        fn=kernel_fn,
+        signature=fn_signature,
+        constexprs={
+            "kv_lora_rank": kv_lora_rank,
+            "qk_rope_head_dim": qk_rope_head_dim,
+            "kv_group_num": kv_group_num,
+            "q_head_num": q_head_num,
+            "batch": batch,
+            "logit_cap": logit_cap,
+            "max_qo_len": max_qo_len,
+            "BLOCK_C": BLOCK_C,
+            "BLOCK_R": BLOCK_R,
+            "BLOCK_N": BLOCK_N,
+            "BLOCK_H": BLOCK_H,
+            "NUM_KV_SPLITS": NUM_KV_SPLITS,
+            "PAGE_BLOCK_SIZE": PAGE_BLOCK_SIZE,
+        },
+        attrs={
+            (0,): [["tt.divisibility", 16], ["tt.pointer_range", 32]],  # Q
+            (1,): [["tt.divisibility", 16]],  # k_buffer 
+            (2,): [["tt.divisibility", 16]],  # v_buffer
+            (3,): [["tt.divisibility", 16]],  # sm_scale
+            (4,): [["tt.divisibility", 16]],  # stride_qb
+            (5,): [["tt.divisibility", 16]],  # stride_qh
+            (6,): [["tt.divisibility", 16]],  # stride_buf_kbs
+            (7,): [["tt.divisibility", 16]],  # stride_buf_kh
+            (8,): [["tt.divisibility", 16]],  # stride_mid_ob
+            (9,): [["tt.divisibility", 16]],  # stride_mid_oh
+            (10,): [["tt.divisibility", 16]],  # stride_mid_os
+            (11,): [["tt.divisibility", 16]],  # stride_mid_lse_b
+            (12,): [["tt.divisibility", 16]],  # stride_mid_lse_h
+            (13,): [["tt.divisibility", 16]],  # stride_mid_lse_s
+            (14,): [["tt.divisibility", 16]],  # stride_b_block_table
+        },
+    )
+
+    if enable_jit_gluon_mla:
+        kernel = triton.compile(
+            src,
+            target=target,
+            options=options,
+        )
+    else:
+        kernel_str = f"mla_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}W{WavePerEU}"
+        metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/mla/aot/{kernel_str}"
+        with AOTMetadataContext(
+            kernel_fn.fn.__name__,
+            metadata_pth,
+        ):
+            kernel = triton.compile(
+                src,
+                target=target,
+                options=options,
+            )
+    return kernel
+
+
 def _decode_grouped_att_m_fwd(
     q,               # [b, sq, hq, 576]
     k_buffer,        # [pages, hk, 576]
@@ -640,41 +788,54 @@ def _decode_grouped_att_m_fwd(
     )
     # print(q.shape, grid)
 
-    
-    if page_block_size == 1:
-        pass
-    #     _fwd_grouped_kernel_stage1_n16x4_prefetch_k[grid](
-    #         q,
-    #         k_buffer,
-    #         v_buffer,
-    #         sm_scale,
-    #         kv_indptr,
-    #         kv_indices,
-    #         att_out,
-    #         att_lse,
-    #         q.stride(0),
-    #         q.stride(1),
-    #         k_buffer.stride(0),
-    #         v_buffer.stride(0),
-    #         att_out.stride(0),
-    #         att_out.stride(1),
-    #         att_out.stride(2),
-    #         att_lse.stride(0),
-    #         att_lse.stride(1),
-    #         att_lse.stride(2),
-    #         kv_lora_rank,
-    #         qk_rope_head_dim,
-    #         kv_group_num=kv_group_num,
-    #         q_head_num=head_num,
-    #         batch=batch,
-    #         logit_cap=logit_cap,
-    #         max_qo_len=mtp + 1,
-    #         **config,
-    #     )
-    elif page_block_size == 64:
+    kernel = _compile_mla(
+        kv_lora_rank,
+        qk_rope_head_dim,
+        kv_group_num,
+        q_head_num,
+        batch,
+        logit_cap,
+        max_qo_len,
+        PAGE_BLOCK_SIZE,
+        **config,
+    )
+    if enable_gluon_mla:
+        if enable_jit_gluon_mla:
+            kernel[grid](
+                q,
+                k_buffer,
+                v_buffer,
+                sm_scale,
+                kv_indptr,
+                block_tables,
+                att_out,
+                att_lse,
+                q.stride(0),
+                q.stride(1),
+                k_buffer.stride(-3),
+                k_buffer.stride(-2),
+                att_out.stride(0),
+                att_out.stride(1),
+                att_out.stride(2),
+                att_lse.stride(0),
+                att_lse.stride(1),
+                att_lse.stride(2),
+                block_tables.stride(0),
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                kv_group_num=kv_group_num,
+                q_head_num=head_num,
+                batch=batch,
+                logit_cap=logit_cap,
+                max_qo_len=mtp + 1,
+                **config,
+            )
+        else:
+
+    if page_block_size == 64:
         # import pdb; pdb.set_trace()
         config["PAGE_BLOCK_SIZE"] = page_block_size
-        _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64[grid](
+        kernel = _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64[grid](
             q,
             k_buffer,
             v_buffer,
@@ -703,6 +864,7 @@ def _decode_grouped_att_m_fwd(
             max_qo_len=mtp + 1,
             **config,
         )
+    return triton.runtime.cache.get_cache_manager(kernel.hash).key
 
 
 @triton.jit
@@ -866,7 +1028,7 @@ def decode_attention_fwd_grouped(
     if config is None:
         config = _get_config()
 
-    _decode_grouped_att_m_fwd(
+    cache_key = _decode_grouped_att_m_fwd(
         q,
         k_buffer,
         v_buffer,
@@ -895,5 +1057,4 @@ def decode_attention_fwd_grouped(
         config["fwd_kernel_stage2"],
     )
 
-
-
+    return cache_key

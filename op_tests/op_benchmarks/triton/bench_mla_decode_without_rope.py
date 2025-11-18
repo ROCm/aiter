@@ -375,6 +375,7 @@ def run_benchmark(args: argparse.Namespace):
         logit_cap: float = 0.0,
         device="cuda",
         metric: str = "bandwidth",
+        args,
         **kwargs,
     ):
         """
@@ -553,6 +554,24 @@ def run_benchmark(args: argparse.Namespace):
         #     # warmup=25,
         #     # rep=100,
         # )
+        cache_key = decode_attention_fwd_grouped(
+            q.reshape(-1, H * (mtp + 1), 576),
+            kv_cache,
+            v_input,
+            out_tri,
+            kv_indptr,
+            kv_indices,
+            block_tables,
+            kv_lora_rank,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            sm_scale,
+            logit_cap,
+            mtp,
+        )
+
+        print(">>> ", cache_key)
         ms = us / 1000
 
         checkAllclose(out_ref, out_tri,
@@ -567,6 +586,23 @@ def run_benchmark(args: argparse.Namespace):
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         print(f"{tflops=}")
         print(f"{bandwidth=}")
+
+        if args.aot:
+            triton_cache_dir = str(triton.knobs.cache.dir)
+            aot_kernel_dir = f"./mla/aot"
+
+            padded_str = "T" if args.padding else "F"
+            os.makedirs(aot_kernel_dir, exist_ok=True)
+            aot_name = f"mla_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
+
+            src = os.path.join(triton_cache_dir, cache_key)
+            dst = os.path.join(aot_kernel_dir, aot_name)
+            if os.path.exists(dst):
+                os.system(f"rm -rf {dst}")
+            os.system(f"mv {src} {dst}")
+            print(f"Moved cache from {src} to {dst}")
+
+            os.system(f"zip -r mla_aot_kernel mla")
         return bandwidth
 
     bench_mla.run(save_path=".", print_data=True, show_plots=False)
