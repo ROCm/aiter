@@ -14,6 +14,7 @@ from aiter import dtypes
 def hip_rope_fwd(
     input, freqs, rotate_style, reuse_freqs_front_part, nope_first, transpose_output
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_fwd(
         input, freqs, rotate_style, reuse_freqs_front_part, nope_first, transpose_output
     )
@@ -28,6 +29,7 @@ def hip_rope_bwd(
     nope_first,
     transpose_output,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_bwd(
         output_grads,
         freqs,
@@ -48,6 +50,7 @@ def hip_rope_2c_fwd(
     nope_first,
     transpose_output,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_2c_fwd(
         input_x,
         input_y,
@@ -69,6 +72,7 @@ def hip_rope_2c_bwd(
     nope_first,
     transpose_output,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_2c_bwd(
         output_grads_x,
         output_grads_y,
@@ -84,6 +88,7 @@ def hip_rope_2c_bwd(
 def hip_rope_cached_fwd(
     input, cos, sin, rotate_style, reuse_freqs_front_part, nope_first, transpose_output
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_cached_fwd(
         input,
         cos,
@@ -105,6 +110,7 @@ def hip_rope_cached_bwd(
     nope_first,
     transpose_output,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_cached_bwd(
         output_grads,
         cos,
@@ -127,6 +133,7 @@ def hip_rope_cached_2c_fwd(
     nope_first,
     transpose_output,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_cached_2c_fwd(
         input_x,
         input_y,
@@ -150,6 +157,7 @@ def hip_rope_cached_2c_bwd(
     nope_first,
     transpose_output,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_cached_2c_bwd(
         output_grads_x,
         output_grads_y,
@@ -173,6 +181,7 @@ def hip_rope_cached_positions_fwd(
     nope_first,
     transpose_output,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_cached_positions_fwd(
         input,
         cos,
@@ -197,6 +206,7 @@ def hip_rope_cached_positions_offsets_fwd(
     nope_first,
     transpose_output,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_cached_positions_offsets_fwd(
         input,
         cos,
@@ -214,6 +224,7 @@ def hip_rope_cached_positions_offsets_fwd(
 def hip_rope_cached_positions_fwd_inplace(
     input, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_cached_positions_fwd_inplace(
         input, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first
     )
@@ -230,6 +241,7 @@ def hip_rope_cached_positions_offsets_fwd_inplace(
     reuse_freqs_front_part,
     nope_first,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_cached_positions_offsets_fwd_inplace(
         input,
         cos,
@@ -254,6 +266,7 @@ def hip_rope_cached_positions_2d_fwd(
     nope_first,
     transpose_output,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_cached_positions_2c_fwd(
         input_x,
         input_y,
@@ -280,6 +293,7 @@ def hip_rope_cached_positions_offsets_2d_fwd(
     nope_first,
     transpose_output,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_cached_positions_offsets_2c_fwd(
         input_x,
         input_y,
@@ -305,6 +319,7 @@ def hip_rope_cached_positions_2d_fwd_inplace(
     reuse_freqs_front_part,
     nope_first,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_cached_positions_2c_fwd_inplace(
         input_x,
         input_y,
@@ -329,6 +344,7 @@ def hip_rope_cached_positions_offsets_2d_fwd_inplace(
     reuse_freqs_front_part,
     nope_first,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_cached_positions_offsets_2c_fwd_inplace(
         input_x,
         input_y,
@@ -346,6 +362,7 @@ def hip_rope_cached_positions_offsets_2d_fwd_inplace(
 def hip_rope_thd_fwd(
     input, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part, nope_first
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_thd_fwd(
         input, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part, nope_first
     )
@@ -355,6 +372,7 @@ def hip_rope_thd_fwd(
 def hip_rope_thd_bwd(
     output_grads, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part, nope_first
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_thd_bwd(
         output_grads,
         cu_seqlens,
@@ -378,6 +396,7 @@ def hip_rope_2d_fwd(
     reuse_freqs_front_part,
     nope_first,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_2d_fwd(
         input,
         height,
@@ -405,6 +424,7 @@ def hip_rope_2d_bwd(
     reuse_freqs_front_part,
     nope_first,
 ):
+    torch.cuda.empty_cache()
     return aiter.rope_2d_bwd(
         output_grads,
         height,
@@ -423,6 +443,7 @@ def hip_rope_2d_bwd(
 def legacy_rope_cached_positions_2d_fwd(
     input_x, input_y, cos, sin, positions, rotate_style, nope_first
 ):
+    torch.cuda.empty_cache()
     aiter.rotary_embedding_fwd(
         positions,
         input_x,
@@ -440,6 +461,7 @@ def legacy_rope_cached_positions_2d_fwd(
 def legacy_rope_cached_positions_offsets_2d_fwd(
     input_x, input_y, cos, sin, positions, offsets, rotate_style, nope_first
 ):
+    torch.cuda.empty_cache()
     rotate_dim = sin.size(-1) * 2
     aiter.batched_rotary_embedding(
         positions,
