@@ -100,14 +100,42 @@ def compile_attention_reduce_kernel(
             else:
                 waves_per_eu = 4
 
+        if compute_type == tl.float8e4b8 or compute_type == tl.bfloat16:
+            if query_quant_mode >= 0:
+                query_sig = "*fp8e4b8:16"
+            else:
+                query_sig = "*bf16:16"
+            if kv_quant_mode >= 0:
+                key_cache_sig = "*fp8e4b8:16"
+                value_cache_sig = "*fp8e4b8:16"
+            else:
+                key_cache_sig = "*bf16:16"
+                value_cache_sig = "*bf16:16"
+            logits_sig = "*bf16:16"
+            output_sig = "*bf16:16"
+        elif compute_type == tl.float16:
+            if query_quant_mode >= 0:
+                query_sig = "*fp8e4b8:16"
+            else:
+                query_sig = "*fp16:16"
+            if kv_quant_mode >= 0:
+                key_cache_sig = "*fp8e4b8:16"
+                value_cache_sig = "*fp8e4b8:16"
+            else:
+                key_cache_sig = "*fp16:16"
+                value_cache_sig = "*fp16:16"
+            logits_sig = "*fp16:16"
+            output_sig = "*fp16:16"
+        else:
+            raise ValueError(f"Unsupported compute type: {compute_type}")
         # Build signature based on kernel parameters (combined from both kernels)
         signature_parts = [
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
-            "*bf16:16",  # logits_ptr
-            "*fp8e4b8:16",  # query_ptr
-            "*fp8e4b8:16",  # key_cache_ptr
-            "*fp8e4b8:16",  # value_cache_ptr
+            logits_sig,  # logits_ptr
+            query_sig,  # query_ptr
+            key_cache_sig,  # key_cache_ptr
+            value_cache_sig,  # value_cache_ptr
             "*i32:16",  # block_tables_ptr
             "*i32:16",  # context_lengths_ptr
             "fp32:16",  # softmax_scale
@@ -172,10 +200,10 @@ def compile_attention_reduce_kernel(
 
         # Compile reduce kernel separately
         reduce_signature_parts = [
-            "*bf16:16",  # output_ptr
+            output_sig,  # output_ptr
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
-            "*bf16:16",  # logits_ptr
+            logits_sig,  # logits_ptr
             "*i32:16",  # context_lengths_ptr
             "i32:16",  # stride_output_seq
             "i32:16",  # stride_output_head
@@ -290,18 +318,25 @@ def pa_decode_gluon_aot(
     kv_elements_per_16b = 16 // key_cache.dtype.itemsize
 
     # Validate input params constraint
-    assert (
-        query.dtype == aiter.dtypes.fp8
-    ), f"query tensor only support dtype == {aiter.dtypes.fp8}, but got query.dtype == {query.dtype}"
-    assert (
-        key_cache.dtype == aiter.dtypes.fp8
-    ), f"key_cache tensor only support dtype == {aiter.dtypes.fp8}, but got key_cache.dtype == {key_cache.dtype}"
-    assert (
-        value_cache.dtype == aiter.dtypes.fp8
-    ), f"value_cache tensor only support dtype == {aiter.dtypes.fp8}, but got value_cache.dtype == {value_cache.dtype}"
-    assert (
-        output.dtype == aiter.dtypes.bf16
-    ), f"output tensor only support dtype == {aiter.dtypes.bf16}, but got output.dtype == {output.dtype}"
+    assert query.dtype in [
+        aiter.dtypes.fp8,
+        aiter.dtypes.bf16,
+        aiter.dtypes.fp16,
+    ], f"query tensor only support dtype in [{aiter.dtypes.fp8, aiter.dtypes.bf16, aiter.dtypes.fp16}], but got query.dtype == {query.dtype}"
+    assert key_cache.dtype in [
+        aiter.dtypes.fp8,
+        aiter.dtypes.bf16,
+        aiter.dtypes.fp16,
+    ], f"key_cache tensor only support dtype in [{aiter.dtypes.fp8, aiter.dtypes.bf16, aiter.dtypes.fp16}], but got key_cache.dtype == {key_cache.dtype}"
+    assert value_cache.dtype in [
+        aiter.dtypes.fp8,
+        aiter.dtypes.bf16,
+        aiter.dtypes.fp16,
+    ], f"value_cache tensor only support dtype in [{aiter.dtypes.fp8, aiter.dtypes.bf16, aiter.dtypes.fp16}], but got value_cache.dtype == {value_cache.dtype}"
+    assert output.dtype in [
+        aiter.dtypes.bf16,
+        aiter.dtypes.fp16,
+    ], f"output tensor only support dtype in [{aiter.dtypes.bf16, aiter.dtypes.fp16}], but got output.dtype == {output.dtype}"
     assert (
         equivalent_query_group_size <= 64
     ), f"equivalent_query_group_size={equivalent_query_group_size} exceeds maximum of 64"

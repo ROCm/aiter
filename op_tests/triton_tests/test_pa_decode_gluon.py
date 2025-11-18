@@ -1123,8 +1123,7 @@ def run_gluon_fp8_kernel(
             query_sequence_length,
             max_context_length,
             context_partition_size,
-            # compute_type,
-            tl.bfloat16,
+            compute_type,
             query_scale,
             key_scale,
             value_scale,
@@ -1970,6 +1969,7 @@ def multi_compute_quant_type_test():
 
     USE_TORCH_FLASH_REF_OPTIONS = [True]
     USE_AOT_IMPL_OPTIONS = [False]
+    # USE_AOT_IMPL_OPTIONS = [True]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
 
     BLOCK_SIZE_OPTIONS = [1024]
@@ -1996,7 +1996,7 @@ if __name__ == "__main__":
     # # QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
     # QUANT_MODE_OPTIONS = ["per_tensor"]
 
-    # TRANS_V_OPTIONS = [False]
+    # TRANS_V_OPTIONS = [True]
 
     # KV_VARLEN_OPTIONS = [False]
     # # KV_VARLEN_OPTIONS = [True]
@@ -2007,7 +2007,8 @@ if __name__ == "__main__":
     # # QUANT_Q_AND_KV_OPTIONS = [[False, False]]
 
     # USE_TORCH_FLASH_REF_OPTIONS = [True]
-    # USE_AOT_IMPL_OPTIONS = [False]
+    # # USE_AOT_IMPL_OPTIONS = [False]
+    # USE_AOT_IMPL_OPTIONS = [True]
     # CONTEXT_PARTITION_SIZE_OPTIONS = [256]
     # parse_arg_and_run_test()
 
