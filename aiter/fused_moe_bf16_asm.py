@@ -295,8 +295,6 @@ def asm_moe_tkw1(
         w2_scale=fc2_scale,
         a1_scale=fc1_smooth_scale,
         a2_scale=fc2_smooth_scale,
-        a16=a16,
-        per_tensor_quant_scale=per_tensor_quant_scale,
     )
 
 

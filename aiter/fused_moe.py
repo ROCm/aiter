@@ -104,8 +104,6 @@ def fused_moe(
     num_local_tokens: Optional[torch.tensor] = None,
     moe_sorting_dispatch_policy=0,
     dtype=None,
-    a16=False,
-    per_tensor_quant_scale=None,
     # following for cktile support
     hidden_pad=0,
     intermediate_pad=0,
@@ -132,8 +130,6 @@ def fused_moe(
         num_local_tokens=num_local_tokens,
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
         dtype=dtype,
-        a16=a16,
-        per_tensor_quant_scale=per_tensor_quant_scale,
         hidden_pad=hidden_pad,
         intermediate_pad=intermediate_pad,
         bias1=bias1,
@@ -161,8 +157,6 @@ def fused_moe_fake(
     num_local_tokens: Optional[torch.Tensor] = None,
     moe_sorting_dispatch_policy: bool = 0,
     dtype: Optional[torch.dtype] = None,
-    a16: bool = False,
-    per_tensor_quant_scale: torch.Tensor = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -193,8 +187,6 @@ def fused_moe_(
     num_local_tokens: Optional[torch.Tensor] = None,
     moe_sorting_dispatch_policy: bool = 0,
     dtype: Optional[torch.dtype] = None,
-    a16: bool = False,
-    per_tensor_quant_scale: torch.Tensor = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
