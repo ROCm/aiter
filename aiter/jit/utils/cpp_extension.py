@@ -12,19 +12,19 @@ import os
 import re
 import shlex
 import shutil
-import setuptools
 import subprocess
 import sys
 import sysconfig
 import warnings
-from packaging.version import Version
-from setuptools.command.build_ext import build_ext
+from typing import Dict, List, Optional, Tuple, Union
 
-from file_baton import FileBaton
+import setuptools
 from _cpp_extension_versioner import ExtensionVersioner
+from file_baton import FileBaton
 from hipify import hipify_python
 from hipify.hipify_python import GeneratedFileCleaner
-from typing import Dict, List, Optional, Union, Tuple
+from packaging.version import Version
+from setuptools.command.build_ext import build_ext
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
@@ -111,9 +111,10 @@ def _find_rocm_home() -> Optional[str]:
             fallback_path = "/opt/rocm"
             if os.path.exists(fallback_path):
                 rocm_home = fallback_path
-    # if rocm_home and torch.version.hip is None:
-    #     print(f"No ROCm runtime is found, using ROCM_HOME='{rocm_home}'",
-    #           file=sys.stderr)
+    if rocm_home is None:
+        print(
+            f"No ROCm runtime is found, using ROCM_HOME='{rocm_home}'", file=sys.stderr
+        )
     return rocm_home
 
 
@@ -229,9 +230,10 @@ COMMON_HIPCC_FLAGS = [
     "-fno-unique-section-names",
     "-ffunction-sections",
     "-fdata-sections",
-    "-fvisibility=hidden",
-    "-fvisibility-inlines-hidden",
 ]
+
+if not int(os.environ.get("AITER_SYMBOL_VISIBLE", "0")):
+    COMMON_HIPCC_FLAGS.extend(["-fvisibility=hidden", "-fvisibility-inlines-hidden"])
 
 JIT_EXTENSION_VERSIONER = ExtensionVersioner()
 
@@ -284,9 +286,10 @@ def check_compiler_ok_for_platform(compiler: str) -> bool:
         True if the compiler is gcc/g++ on Linux or clang/clang++ on macOS,
         and always True for Windows.
     """
-    which = subprocess.check_output(["which", compiler], stderr=subprocess.STDOUT)
-    # Use os.path.realpath to resolve any symlinks, in particular from 'c++' to e.g. 'g++'.
-    compiler_path = os.path.realpath(which.decode(*SUBPROCESS_DECODE_ARGS).strip())
+    compiler_path = os.path.realpath(shutil.which(compiler))
+    if not compiler_path:
+        return False
+
     # Check the compiler name
     if any(name in compiler_path for name in _accepted_compilers_for_platform()):
         return True
@@ -379,7 +382,7 @@ class BuildExtension(build_ext):
     A custom :mod:`setuptools` build extension .
 
     This :class:`setuptools.build_ext` subclass takes care of passing the
-    minimum required compiler flags (e.g. ``-std=c++17``) as well as mixed
+    minimum required compiler flags (e.g. ``-std=c++20``) as well as mixed
     C++/CUDA compilation (and support for CUDA files in general).
 
     When using :class:`BuildExtension`, it is allowed to supply a dictionary
@@ -491,7 +494,7 @@ class BuildExtension(build_ext):
                 "/{}:" if self.compiler.compiler_type == "msvc" else "-{}="
             )
             cpp_flag_prefix = cpp_format_prefix.format("std")
-            cpp_flag = cpp_flag_prefix + "c++17"
+            cpp_flag = cpp_flag_prefix + "c++20"
             if not any(flag.startswith(cpp_flag_prefix) for flag in cflags):
                 cflags.append(cpp_flag)
 
@@ -1083,7 +1086,7 @@ def _get_pybind11_abi_build_flags():
 
     abi_cflags = []
     for pname in ["COMPILER_TYPE", "STDLIB", "BUILD_ABI"]:
-        pval = getattr(torch._C, f"_PYBIND11_{pname}")
+        pval = getattr(torch._C, f"_PYBIND11_{pname}", None)
         if pval is not None:
             abi_cflags.append(f'-DPYBIND11_{pname}=\\"{pval}\\"')
     return abi_cflags
@@ -1142,6 +1145,7 @@ def _jit_compile(
     keep_intermediates=True,
     torch_exclude=False,
     hipify=True,
+    prebuild=0,
 ) -> None:
     if is_python_module and is_standalone:
         raise ValueError(
@@ -1233,6 +1237,7 @@ def _jit_compile(
                         is_python_module=is_python_module,
                         is_standalone=is_standalone,
                         torch_exclude=torch_exclude,
+                        prebuild=prebuild,
                     )
             elif verbose:
                 print(
@@ -1315,6 +1320,7 @@ def _write_ninja_file_and_build_library(
     is_python_module: bool,
     is_standalone: bool = False,
     torch_exclude: bool = False,
+    prebuild: int = 0,
 ) -> None:
     verify_ninja_availability()
 
@@ -1323,7 +1329,7 @@ def _write_ninja_file_and_build_library(
     if with_cuda is None:
         with_cuda = any(map(_is_cuda_file, sources))
     extra_ldflags = _prepare_ldflags(
-        extra_ldflags or [], with_cuda, verbose, is_standalone, torch_exclude
+        extra_ldflags or [], with_cuda, verbose, is_standalone, torch_exclude, prebuild
     )
     build_file_path = os.path.join(build_directory, "build.ninja")
     if verbose:
@@ -1333,7 +1339,7 @@ def _write_ninja_file_and_build_library(
     _write_ninja_file_to_build_library(
         path=build_file_path,
         name=name,
-        sources=list(set(sources)),
+        sources=sorted(set(sources)),
         extra_cflags=extra_cflags or [],
         extra_cuda_cflags=extra_cuda_cflags or [],
         extra_ldflags=extra_ldflags or [],
@@ -1342,6 +1348,7 @@ def _write_ninja_file_and_build_library(
         is_python_module=is_python_module,
         is_standalone=is_standalone,
         torch_exclude=torch_exclude,
+        prebuild=prebuild,
     )
 
     if verbose:
@@ -1367,7 +1374,9 @@ def verify_ninja_availability():
         raise RuntimeError("Ninja is required to load C++ extensions")
 
 
-def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude):
+def _prepare_ldflags(
+    extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude, prebuild
+):
     extra_ldflags.append("-mcmodel=large")
     extra_ldflags.append("-ffunction-sections")
     extra_ldflags.append("-fdata-sections ")
@@ -1379,15 +1388,18 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
         _TORCH_PATH = os.path.join(os.path.dirname(torch.__file__))
         TORCH_LIB_PATH = os.path.join(_TORCH_PATH, "lib")
         extra_ldflags.append(f"-L{TORCH_LIB_PATH}")
-        extra_ldflags.append("-lc10")
-        if with_cuda:
-            extra_ldflags.append("-lc10_hip" if IS_HIP_EXTENSION else "-lc10_cuda")
-        extra_ldflags.append("-ltorch_cpu")
-        if with_cuda:
-            extra_ldflags.append("-ltorch_hip" if IS_HIP_EXTENSION else "-ltorch_cuda")
-        extra_ldflags.append("-ltorch")
-        if not is_standalone:
-            extra_ldflags.append("-ltorch_python")
+        if prebuild != 1:
+            extra_ldflags.append("-lc10")
+            if with_cuda:
+                extra_ldflags.append("-lc10_hip" if IS_HIP_EXTENSION else "-lc10_cuda")
+            extra_ldflags.append("-ltorch_cpu")
+            if with_cuda:
+                extra_ldflags.append(
+                    "-ltorch_hip" if IS_HIP_EXTENSION else "-ltorch_cuda"
+                )
+            extra_ldflags.append("-ltorch")
+            if not is_standalone:
+                extra_ldflags.append("-ltorch_python")
 
         if is_standalone:
             extra_ldflags.append(f"-Wl,-rpath,{TORCH_LIB_PATH}")
@@ -1397,7 +1409,8 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
             print("Detected CUDA files, patching ldflags", file=sys.stderr)
 
         extra_ldflags.append(f'-L{_join_rocm_home("lib")}')
-        extra_ldflags.append("-lamdhip64")
+        if prebuild != 1:
+            extra_ldflags.append("-lamdhip64")
     return extra_ldflags
 
 
@@ -1429,26 +1442,23 @@ def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
 def _get_num_workers(verbose: bool) -> Optional[int]:
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs is not None and max_jobs.isdigit():
+        if int(max_jobs) > int(max(1, os.cpu_count() * 0.8)):
+            max_jobs = int(max(1, os.cpu_count() * 0.8))
         if verbose:
             print(
                 f"Using envvar MAX_JOBS ({max_jobs}) as the number of workers...",
                 file=sys.stderr,
             )
-        return int(max_jobs)
     else:
         max_jobs = int(max(1, os.cpu_count() * 0.8))
         print(
             f"Using 0.8*cpu_cnt MAX_JOBS ({max_jobs}) as the number of workers...",
             file=sys.stderr,
         )
-        return max_jobs
-    if verbose:
-        print(
-            "Allowing ninja to set a default number of workers... "
-            "(overridable by setting the environment variable MAX_JOBS=N)",
-            file=sys.stderr,
-        )
-    return None
+    prebuild_thread_num = os.environ.get("PREBUILD_THREAD_NUM")
+    if prebuild_thread_num is not None:
+        max_jobs = int(max_jobs) / int(prebuild_thread_num)
+    return int(max_jobs)
 
 
 def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> None:
@@ -1528,6 +1538,7 @@ def _write_ninja_file_to_build_library(
     is_python_module,
     is_standalone,
     torch_exclude,
+    prebuild=0,
 ) -> None:
     extra_cflags = [flag.strip() for flag in extra_cflags]
     extra_cuda_cflags = [flag.strip() for flag in extra_cuda_cflags]
@@ -1540,7 +1551,7 @@ def _write_ninja_file_to_build_library(
     # But we can't use this now because all aiter op based on torch
     # which means pybind11 related build flags must from torch now
     common_cflags = []
-    if torch_exclude and is_python_module:
+    if is_python_module:
         import pybind11
 
         extra_include_paths.append(pybind11.get_include())
@@ -1560,21 +1571,26 @@ def _write_ninja_file_to_build_library(
     user_includes = [os.path.abspath(file) for file in extra_include_paths]
 
     if not torch_exclude:
-        common_cflags.append(f"-DTORCH_EXTENSION_NAME={name}")
-        common_cflags.append("-DTORCH_API_INCLUDE_EXTENSION_H")
-        common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
-        common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
+        if prebuild == 0:
+            common_cflags.append(f"-DTORCH_EXTENSION_NAME={name}")
+        else:
+            common_cflags.append(f"-DTORCH_EXTENSION_NAME=aiter_")
+        # common_cflags.append("-DTORCH_API_INCLUDE_EXTENSION_H")
+        # common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
+        # common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
 
     # Windows does not understand `-isystem` and quotes flags later.
     common_cflags += [f"-I{shlex.quote(include)}" for include in user_includes]
     common_cflags += [f"-isystem {shlex.quote(include)}" for include in system_includes]
 
-    cflags = common_cflags + ["-fPIC", "-std=c++17"] + extra_cflags
+    cflags = common_cflags + ["-fPIC", "-std=c++20"] + extra_cflags
 
     if with_cuda and IS_HIP_EXTENSION:
         cuda_flags = ["-DWITH_HIP"] + cflags + COMMON_HIP_FLAGS + COMMON_HIPCC_FLAGS
         cuda_flags += extra_cuda_cflags
         cuda_flags += _get_rocm_arch_flags(cuda_flags)
+        if prebuild == 1:
+            cuda_flags += ["-fvisibility=default -DEXPORT_SYMBOLS"]
 
     def object_file_path(source_file: str) -> str:
         # '/path/to/file.cpp' -> 'file'
@@ -1592,6 +1608,8 @@ def _write_ninja_file_to_build_library(
 
     ext = EXEC_EXT if is_standalone else LIB_EXT
     library_target = f"{name}{ext}"
+    if prebuild == 2:
+        library_target = "aiter_.so"
 
     _write_ninja_file(
         path=path,
@@ -1605,6 +1623,7 @@ def _write_ninja_file_to_build_library(
         ldflags=ldflags,
         library_target=library_target,
         with_cuda=with_cuda,
+        prebuild=prebuild,
     )
 
 
@@ -1620,6 +1639,7 @@ def _write_ninja_file(
     ldflags,
     library_target,
     with_cuda,
+    prebuild=0,
 ) -> None:
     r"""Write a ninja file that does the desired compiling and linking.
 
@@ -1670,7 +1690,6 @@ def _write_ninja_file(
         flags.append(f'cuda_cflags = {" ".join(cuda_cflags)}')
         flags.append(f'cuda_post_cflags = {" ".join(cuda_post_cflags)}')
     flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
-    flags.append(f'ldflags = {" ".join(ldflags)}')
 
     # Turn into absolute paths so we can emit them into the ninja build
     # file wherever it is.
@@ -1700,7 +1719,17 @@ def _write_ninja_file(
         source_file = source_file.replace(" ", "$ ")
         object_file = object_file.replace(" ", "$ ")
         build.append(f"build {object_file}: {rule} {source_file}")
+    if prebuild == 2:
+        o_path = path.split("build/aiter_")[0]
+        ldflags.append(f"-Wl,-rpath={o_path}")
 
+        for root, dirs, files in os.walk(o_path):
+            for file in files:
+                mid_file_dir = o_path + file
+                if file.endswith(".so") and file not in objects:
+                    objects.append(file)
+
+    flags.append(f'ldflags = {" ".join(ldflags)}')
     if cuda_dlink_post_cflags:
         devlink_out = os.path.join(os.path.dirname(objects[0]), "dlink.o")
         devlink_rule = ["rule cuda_devlink"]
@@ -1713,9 +1742,14 @@ def _write_ninja_file(
     if library_target is not None:
         link_rule = ["rule link"]
 
-        link_rule.append(
-            "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
-        )
+        if prebuild == 2:
+            link_rule.append(
+                f"  command = $cxx @$out.rsp $ldflags -Wl,-rpath,'$$ORIGIN' -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
+            )
+        else:
+            link_rule.append(
+                "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
+            )
 
         link = [f'build {library_target}: link {" ".join(objects)}']
 
@@ -1748,6 +1782,7 @@ def _write_ninja_file(
 
 
 def _is_cuda_file(path: str) -> bool:
+    return True
     valid_ext = [".cu", ".cuh"]
     if IS_HIP_EXTENSION:
         valid_ext.append(".hip")

@@ -76,11 +76,11 @@ torch::Tensor gemm_a4w4_blockscale_tune(
 
   if (Y.dtype() == at::ScalarType::Half)
   {
-    blockwise_dispatch<F16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+    blockwise_dispatch<F16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, splitK);
   }
   else if (Y.dtype() == at::ScalarType::BFloat16)
   {
-    blockwise_dispatch<B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+    blockwise_dispatch<B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, splitK);
   }
   else
   {

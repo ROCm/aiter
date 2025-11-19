@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
@@ -10,7 +10,7 @@
 
 namespace aiter {
 namespace torch_itfs {
-fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
+mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           bool has_dropout_randval,
                                           const mask_info &mask,
                                           // sizes
@@ -36,7 +36,10 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           float softmax_scale,
                                           float logits_soft_cap,
                                           float p_dropout,
-                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                          // optional padded physical seqstarts (including PAD)
+                                          std::optional<const at::Tensor> &cu_seqlens_q_padded_,
+                                          std::optional<const at::Tensor> &cu_seqlens_k_padded_)
 {
     // q: (total_q, nheads, d)
     // k: (total_k, nheads_k, d)
@@ -93,24 +96,46 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
         bias_ptr = alibi_slopes.data_ptr();
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
-    
-    return fmha_fwd_args{q.data_ptr(),
+        
+    const void* seqstart_k_ptr = nullptr;
+    const void* seqstart_q_ptr = nullptr;
+    const void* cu_seqlen_k_ptr = nullptr;
+    const void* cu_seqlen_q_ptr = nullptr;
+
+    if (cu_seqlens_k_padded_.has_value()) {
+        seqstart_k_ptr = cu_seqlens_k_padded_.value().data_ptr();
+        cu_seqlen_k_ptr = cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr;
+    } else {
+        seqstart_k_ptr = cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr;
+    }
+
+    if (cu_seqlens_q_padded_.has_value()) {
+        seqstart_q_ptr = cu_seqlens_q_padded_.value().data_ptr();
+        cu_seqlen_q_ptr = cu_seqlens_q.data_ptr();
+    } else {
+        seqstart_q_ptr = cu_seqlens_q.data_ptr();
+    }
+
+    return mha_fwd_args{q.data_ptr(),
                          k.data_ptr(),
                          v.data_ptr(),
                          bias_ptr,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
-                         cu_seqlens_q.data_ptr(), // seqstart_q
-                         cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k
-                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_kpads
+                         seqstart_q_ptr, // seqstart_q_ptr (cumulative physical with padding)
+                         seqstart_k_ptr, // seqstart_k_ptr (cumulative physical with padding)
+                         nullptr, // seqlen_q_ptr (per-sequence logical, alternative to cu_seqlen_q_ptr)
+                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr (per-sequence logical K lengths)
+                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
+                         cu_seqlen_k_ptr, // cu_seqlen_k_ptr
                          total_q,
                          total_k,
                          b,
                          max_seqlen_q,
                          d,             // hdim_q
                          d_v,           // hdim_v
-                         h,             // nhead
+                         h,             // nhead_q
                          h_k,           // nhead_k
                          softmax_scale, // scale_s
                          1,             // scale_p
@@ -294,43 +319,56 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     return args;
 }
 
-
-std::vector<at::Tensor>
-mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
-               const at::Tensor &k,            // [total_k, hk, d]
-               const at::Tensor &v,            // [total_k, hk, d]
-               const at::Tensor &cu_seqlens_q, // [b+1]
-               std::optional<const at::Tensor> &cu_seqlens_k, // [b+1]
-               int max_seqlen_q,
-               int max_seqlen_k,
-               int min_seqlen_q,
-               float p_dropout,
-               float softmax_scale,
-               float logits_soft_cap,
-               bool zero_tensors,
-               bool is_causal,
-               int window_size_left,
-               int window_size_right,
-               bool return_softmax_lse,
-               bool return_dropout_randval,
-               std::optional<at::Tensor> out_,                // [total_q, hq, d]
-               std::optional<const at::Tensor> block_table_,  // [hq] or [b, hq]
-               std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
-               std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-               std::optional<at::Generator> gen_)
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> 
+mha_varlen_fwd(
+    at::Tensor& q,                                 // [total_q, hq, d]
+    const at::Tensor& k,                           // [total_k, hk, d]
+    const at::Tensor& v,                           // [total_k, hk, d]
+    const at::Tensor& cu_seqlens_q,                // [b+1]
+    std::optional<const at::Tensor>& cu_seqlens_k, // [b+1]
+    int max_seqlen_q,
+    int max_seqlen_k,
+    int min_seqlen_q,
+    float p_dropout,
+    float softmax_scale,
+    float logits_soft_cap,
+    bool zero_tensors,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    bool return_softmax_lse,
+    bool return_dropout_randval,
+    std::optional<at::Tensor> out_,                // [total_q, hq, d]
+    std::optional<const at::Tensor> block_table_,  // [hq] or [b, hq]
+    std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
+    std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
+    std::optional<at::Generator> gen_,
+    std::optional<const at::Tensor> cu_seqlens_q_padded_, // [b+1] physical starts with PAD
+    std::optional<const at::Tensor> cu_seqlens_k_padded_) // [b+1]
 {
-    auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    auto q_dtype = q.scalar_type();
+    bool isQKVFp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
+
+    TORCH_CHECK(q_dtype == at::ScalarType::Half || q_dtype == at::ScalarType::BFloat16 || isQKVFp8,
+                "FlashAttention only support fp16, bf16 and fp8_e4m3 data type");
 
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+
+    std::string q_dtype_str;
+    if (q_dtype == at::ScalarType::Half)
+        q_dtype_str = "fp16";
+    else if (q_dtype == at::ScalarType::BFloat16)
+        q_dtype_str = "bf16";
+    else if (isQKVFp8)
+        q_dtype_str = "fp8bf16"; // only support bf16 out for fp8
+
+    // TODO - support descale
+
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     if (cu_seqlens_k.has_value()) {
         TORCH_CHECK(cu_seqlens_k.value().dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
     }
-
-    std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(cu_seqlens_q);
@@ -341,6 +379,9 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     at::Tensor block_table;
     const bool paged_KV = block_table_.has_value();
     if (paged_KV) {
+        if (cu_seqlens_q_padded_.has_value() || cu_seqlens_k_padded_.has_value()) {
+            TORCH_CHECK(false, "Paged KV (splitkv, pagekv) does not support sequence padding.");
+        }
         block_table = block_table_.value();
         CHECK_DEVICE(block_table);
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
@@ -423,21 +464,21 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         CHECK_SHAPE(cu_seqlens_k.value(), batch_size + 1);
     }
     auto opts = q.options();
-
+    auto out_type = isQKVFp8 ? at::ScalarType::BFloat16 : q_dtype;
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        TORCH_CHECK(out.dtype() == out_type, "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, total_q, num_heads, head_size_v);
     }
     else {
-        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
+        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(out_type));
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    at::cuda::CUDAGuard device_guard{q.device()};
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
     bool has_lse = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
@@ -482,9 +523,9 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
             aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
     }
     std::optional<const at::Tensor> seqlens_k = std::nullopt;
-    
+
     if (max_seqlen_k > 0) {
-        auto stream = at::cuda::getCurrentHIPStream().stream();
+        auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
         if (paged_KV)
@@ -493,7 +534,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
             num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size_v, 0, num_splits);
             TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
             TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
-        
+
             auto softmax_lse_accum = torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
             auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size_v}, opts.dtype(at::kFloat));
 
@@ -564,7 +605,9 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     softmax_scale,
                     logits_soft_cap,
                     p_dropout,
-                    drop_seed_offset);
+                    drop_seed_offset,
+                    const_cast<std::optional<const at::Tensor>&>(cu_seqlens_q_padded_),
+                    const_cast<std::optional<const at::Tensor>&>(cu_seqlens_k_padded_));
 
             float t = aiter::mha_fwd(args,
                                      stream_config,
@@ -573,7 +616,8 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                                      mask.type,
                                      bias_type,
                                      has_lse,
-                                     false);
+                                     false, // use_ext_asm
+                                     1);     // how_v3_bf16_cvt
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
         }
     }
@@ -582,7 +626,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
-    
+
     return {out, softmax_lse, p, rng_state};
 }
 

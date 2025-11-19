@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
@@ -10,7 +10,7 @@
 
 namespace aiter {
 namespace torch_itfs {
-fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
+mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    bool has_dropout_randval,
                                    const mask_info &mask,
                                    // sizes
@@ -32,7 +32,9 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    at::Tensor dropout_randval,
                                    float softmax_scale,
                                    float p_dropout,
-                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                   const std::optional<at::Tensor> &cu_seqlens_q_,
+                                   const std::optional<at::Tensor> &cu_seqlens_kv_)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -85,23 +87,29 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
-    return fmha_fwd_args{q.data_ptr(),
+    const ck_tile::index_t *cu_seqlen_q_ptr = cu_seqlens_q_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_q_.value().data_ptr<int32_t>()) : nullptr;
+    const ck_tile::index_t *cu_seqlen_kv_ptr = cu_seqlens_kv_.has_value() ? reinterpret_cast<const ck_tile::index_t*>(cu_seqlens_kv_.value().data_ptr<int32_t>()) : nullptr;
+
+    return mha_fwd_args{q.data_ptr(),
                          k.data_ptr(),
                          v.data_ptr(),
                          bias_ptr,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
-                         nullptr, // seqstart_q
-                         nullptr, // seqstart_k
-                         nullptr,
+                         nullptr, // seqstart_q_ptr
+                         nullptr, // seqstart_k_ptr
+                         nullptr, // seqlen_q_ptr
+                         nullptr, // seqlen_k_ptr
+                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
+                         cu_seqlen_kv_ptr, // cu_seqlen_k_ptr
                          seqlen_q,
                          seqlen_k,
                          b,
                          seqlen_q,      // max_seqlen_q
                          d,             // hdim_q
                          d_v,           // hdim_v
-                         h,             // nhead
+                         h,             // nhead_q
                          h_k,           // nhead_k
                          softmax_scale, // scale_s
                          1,             // scale_p
@@ -130,7 +138,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          mask.left,
                          mask.right,
                          static_cast<ck_tile::index_t>(mask.type),
-                         0,
+                         0, // min_seqlen_q
                          p_dropout,
                          has_dropout_randval,
                          drop_seed_offset};
@@ -147,19 +155,32 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         int window_size_right,
         bool return_softmax_lse,
         bool return_dropout_randval,
+        std::optional<at::Tensor> cu_seqlens_q_,
+        std::optional<at::Tensor> cu_seqlens_kv_,
         std::optional<at::Tensor> out_,          // [b, sq, hq, d_v]
         std::optional<const at::Tensor> bias_,   // [sq, sk]
         std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
         std::optional<at::Generator> gen_)
 {
-    auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    auto q_dtype = q.scalar_type();
+    bool isQKVFp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
+
+    TORCH_CHECK(q_dtype == at::ScalarType::Half || q_dtype == at::ScalarType::BFloat16 || isQKVFp8,
+                "FlashAttention only support fp16, bf16 and fp8_e4m3 data type");
 
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
-    std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
+    std::string q_dtype_str;
+    if (q_dtype == at::ScalarType::Half)
+        q_dtype_str = "fp16";
+    else if (q_dtype == at::ScalarType::BFloat16)
+        q_dtype_str = "bf16";
+    else if (isQKVFp8)
+        q_dtype_str = "fp8bf16"; // only support bf16 out for fp8
+
+    // TODO - support descale
+    // TODO - set do_fp8_static_quant to true in fmha_fwd_traits
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
 
@@ -226,10 +247,11 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
 
     auto opts = q.options();
+    auto out_type = isQKVFp8 ? at::ScalarType::BFloat16 : q_dtype;
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        TORCH_CHECK(out.dtype() == out_type, "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size_v);
@@ -238,11 +260,11 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         }
     }
     else {
-        out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(q_dtype));
+        out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(out_type));
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
-    at::cuda::CUDAGuard device_guard{q.device()};
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
     bool has_lse = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
@@ -280,7 +302,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
 
     if (seqlen_k > 0) {
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
-        auto stream = at::cuda::getCurrentHIPStream().stream();
+        auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
         auto args =
@@ -305,7 +327,9 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                 p,
                 softmax_scale,
                 p_dropout,
-                drop_seed_offset);
+                drop_seed_offset,
+                cu_seqlens_q_,
+                cu_seqlens_kv_);
 
         float t = aiter::mha_fwd(args,
                                  stream_config,

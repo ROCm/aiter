@@ -8,16 +8,16 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
-def setup_seed(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-setup_seed(1)
+# current supported case in ps decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
+# qdtype bf16, kdtype bf16: nhead16
+# qdtype fp8, kdtype fp8: nhead16, nhead128
+# qdtype fp8, kdtype bf16: nhead16
+
 
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
@@ -26,11 +26,11 @@ def cal_diff(
     RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
     amax_diff = (x - y).abs().max().item()
-    print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
-    # if use_fp8:
-    #     assert cos_diff < 3e-2
-    # else:
-    #     assert cos_diff < 1e-5
+    # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
+    if use_fp8:
+        assert cos_diff < 3e-2
+    else:
+        assert cos_diff < 1e-5
 
 
 def ref_masked_attention(
@@ -40,13 +40,16 @@ def ref_masked_attention(
     scale: float,
     dtype,
     is_causal=True,
-    is_fp8=False,
+    is_fp8_q=False,
+    is_fp8_kvc=False,
     q_scale=None,
     kv_scale=None,
-) -> torch.Tensor:
+):
 
-    if is_fp8:
-        scale *= q_scale * kv_scale
+    if is_fp8_q and q_scale is not None:
+        scale *= q_scale
+    if is_fp8_kvc and kv_scale is not None:
+        scale *= kv_scale
 
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     if is_causal:
@@ -66,16 +69,15 @@ def ref_masked_attention(
 
     l = attn_weights_exp.sum(-1)
 
-    if is_fp8:
-        attn_weights_fp8 = attn_weights_exp.to(torch.float8_e4m3fnuz)
+    if is_fp8_q:
+        attn_weights_fp8 = attn_weights_exp.to(dtype)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
 
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
 
-    # import pdb; pdb.set_trace()
     out = out / l.transpose(0, 1).unsqueeze(-1)
 
-    if is_fp8:
+    if is_fp8_kvc and kv_scale is not None:
         out *= kv_scale
     return out.to(dtype), lse
 
@@ -94,10 +96,13 @@ def torch_mla_extend(
     q_scale=None,
     kv_scale=None,
 ):
-    is_fp8 = q.dtype == torch.float8_e4m3fnuz
+    is_fp8_q = q.dtype == dtypes.fp8
+    is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
 
-    if is_fp8:
+    if is_fp8_q:
         q = q.to(torch.float)
+
+    if is_fp8_kvc:
         kvc_cache = kvc_cache.to(torch.float)
 
     qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
@@ -119,7 +124,8 @@ def torch_mla_extend(
             sm_scale,
             dtype,
             is_causal=is_causal,
-            is_fp8=is_fp8,
+            is_fp8_q=is_fp8_q,
+            is_fp8_kvc=is_fp8_kvc,
             q_scale=q_scale,
             kv_scale=kv_scale,
         )
@@ -143,8 +149,12 @@ def test_mla(
     kvtype,
     page_size,
     varlen,
-    mtp,
+    decode_qlen,
+    max_split_per_batch,
 ):
+    ret = {}
+
+    out_dtype = torch.bfloat16
     kv_max_sz = (
         65536 * 32
     )  # calculated by rest of mem after weight loaded in frameworks
@@ -166,10 +176,6 @@ def test_mla(
         seq_lens_kv.fill_(ctx_lens)
         seq_lens_qo.fill_(ctx_lens)
 
-    # seq_lens_kv = torch.tensor([3819,9978,784,530,8062,1390,287,1008,5090,5304,7396,2288,2104,4063,3644,5091,6470,4732,7237,430,2777,956,1357,5478,1292,521,6802,1347,2388,5062,443,8560,5049,7235,927,9580,623,4913,2511,8120,1638,4859,600,7289,8278,6693,136,1021,1465,5859,1278,7123,7839,2459,1090,6333,812,9358,6345,8616,2313,6115,6059,4963,
-    #     12343, 213, 143, 12312, 12345, 3215, 4444, 5325, 2132, 123, 456, 2135, 135, 2564, 5465, 4362], device="cuda")
-    # seq_lens_kv = seq_lens_kv[:batch_size]
-
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
     kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -179,11 +185,11 @@ def test_mla(
     total_kv = kv_indptr[-1].item()
     kv_buffer = torch.randn(
         (num_page * page_size, 1, kv_lora_rank + qk_rope_head_dim),
-        dtype=kvtype,
+        dtype=torch.bfloat16,
     )
 
     # for none absorb (mha)
-    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
     us_asm = None
@@ -194,31 +200,65 @@ def test_mla(
 
     # ############################## absorb: decode
     # seq_lens_qo = torch.randint(1, 5, (batch_size,), dtype=torch.int)
-    # if nhead == 16 and mtp != 1:
+    # if nhead == 16 and decode_qlen != 1:
     #     return
-    seq_lens_qo.fill_(mtp)
+    seq_lens_qo.fill_(decode_qlen)
 
     max_seqlen_qo = seq_lens_qo.max().item()
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_q = qo_indptr[-1].item()
-    q = torch.randn((total_q, nhead, qk_head_dim), dtype=dtype)
+    q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
 
     # troch implementation
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
+    out_ref, lse_ref = torch_mla_extend(
+        q,
+        kv_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        is_causal=True,
+        dtype=out_dtype,
+    )
+
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_mla_metadata_info_v1(
+        batch_size,
+        max_seqlen_qo,
+        nhead,
+        q.dtype,
+        kv_buffer.dtype,
+        is_sparse=False,
+        fast_mode=True,
+    )
 
     # aiter implementation
     # the tensor's meaning please refer aiter/ops/attention.py
-    work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
-    work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
-    work_info_set = torch.empty(
-        [batch_size * cu_num, 8], dtype=torch.int32, device="cuda"
+    work_meta_data = torch.empty(
+        work_meta_data_size, dtype=work_meta_data_type, device="cuda"
     )
-    reduce_indptr = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
-    reduce_final_map = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device="cuda")
+    work_info_set = torch.empty(
+        work_info_set_size,
+        dtype=work_info_set_type,
+        device="cuda",
+    )
+    reduce_indptr = torch.empty(
+        reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
+    )
+    reduce_final_map = torch.empty(
+        reduce_final_map_size, dtype=reduce_final_map_type, device="cuda"
+    )
     reduce_partial_map = torch.empty(
-        [batch_size * cu_num], dtype=torch.int32, device="cuda"
+        reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
     meta = aiter.get_mla_metadata_v1(
@@ -233,29 +273,16 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+        kv_granularity=max(page_size, 16),
+        max_seqlen_qo=int(max_seqlen_qo),
+        uni_seqlen_qo=decode_qlen,
+        fast_mode=True,
+        max_split_per_batch=max_split_per_batch,
     )
 
-    def test_absorb_decode():
+    def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
-        out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
-
-        kv_indptr_ex = torch.zeros_like(kv_indptr)
-        kv_indptr_ex[-1] = 16
-        # out_ref, lse_ref = torch_mla_extend(
-        #     q,
-        #     kv_buffer,
-        #     qo_indptr,
-        #     kv_indptr_ex,
-        #     kv_indices[:16],
-        #     # kv_indptr,
-        #     # kv_indices,
-        #     sm_scale,
-        #     kv_lora_rank,
-        #     qk_rope_head_dim,
-        #     is_causal=False,
-        #     dtype=dtype,
-        # )
-        #
+        out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
@@ -268,6 +295,7 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
+            num_kv_splits=max_split_per_batch,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
             work_info_set=work_info_set,
@@ -276,36 +304,11 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
         )
 
-        # import pdb;pdb.set_trace()
-
-        out_ref, lse_ref = torch_mla_extend(
-            q,
-            kv_buffer,
-            qo_indptr,
-            # kv_indptr_ex,
-            # kv_indices[16:],
-            kv_indptr,
-            kv_indices,
-            sm_scale,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            is_causal=False,
-            dtype=dtype,
-        )
-        import pdb;pdb.set_trace()
-
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
         # checkAllclose(logits_ref, attn_logits,
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
-        flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
-
-
-        bytes = (
-            total_kv * nhead_kv * qk_head_dim
-            + total_q * nhead * (qk_head_dim + v_head_dim)
-        ) * (torch.finfo(dtype).bits // 8)
         err = checkAllclose(
             out_ref,
             out_asm,
@@ -313,24 +316,22 @@ def test_mla(
         )
         return err, us_asm_decode
 
-    err = None
-    us_asm_decode = 10000000000
-    err, us_asm_decode = test_absorb_decode()
-
     def test_absorb_decode_fp8():
+        if dtype != dtypes.fp8 and nhead == 128:
+            aiter.logger.info("don't support this case:\n")
+            return None, 1e12
+
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
-        out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
+        out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
-        # q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
-        # q_scale = q_scale.to(torch.float)
-
-        q_fp8 = q.to(torch.float8_e4m3fnuz)
+        q_fp8 = q.to(dtypes.fp8)
         q_scale = torch.ones([1], dtype=torch.float, device="cuda")
-        kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
+
+        kv_buffer_fp8 = kv_buffer.to(kvtype)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
-            q_fp8,
+            q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8,
             qo_indptr,
             kv_indptr,
@@ -338,15 +339,15 @@ def test_mla(
             sm_scale,
             kv_lora_rank,
             qk_rope_head_dim,
-            dtype=dtype,
+            dtype=out_dtype,
             is_causal=True,
-            q_scale=q_scale,
+            q_scale=None,
             kv_scale=kv_scale,
         )
 
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
-            q_fp8,
+            q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
             out_asm,
             qo_indptr,
@@ -355,6 +356,7 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
+            num_kv_splits=max_split_per_batch,
             q_scale=q_scale,
             kv_scale=kv_scale,
             work_meta_data=work_meta_data,
@@ -365,18 +367,11 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
         )
 
-        cal_diff(out_ref, out_asm, "out", True)
-
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
         # checkAllclose(logits_ref, attn_logits,
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
-        flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
-        bytes = (
-            total_kv * nhead_kv * qk_head_dim
-            + total_q * nhead * (qk_head_dim + v_head_dim)
-        ) * (torch.finfo(dtype).bits // 8)
         err = checkAllclose(
             out_ref,
             out_asm,
@@ -387,33 +382,34 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        return err, err_fp8, us_asm_decode
 
-    err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8 = test_absorb_decode_fp8()
+        cal_diff(out_ref, out_asm, "out", True)
+        return err, us_asm_decode
 
-    # print(f"{out_ref.view(total_q, -1)=}")
-    # print(f"{out_asm.view(total_q, -1)=}")
-    # checkAllclose(logits_ref, attn_logits,
-    #               msg=f'attn_logits [golden vs aiter_asm]')
-    # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
-    flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+    err = None
+    us_asm_decode = 1e12
+    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
+        nhead == 16 or (nhead in range(32, 128, 16) and decode_qlen == 1)
+    ):
+        err, us_asm_decode = test_absorb_decode_bf16()
+    elif kvtype == dtypes.fp8 and nhead in [16, 128]:
+        err, us_asm_decode = test_absorb_decode_fp8()
+    ret["decode:err"] = err
+    ret["decode:asm_576"] = us_asm_decode
+
+    flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
     bytes = (
-        total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
-    ) * (torch.finfo(dtype).bits // 8)
+        total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
+        + total_q * nhead * qk_head_dim * (torch.finfo(dtype).bits // 8)
+        + total_q * nhead * v_head_dim * (torch.finfo(out_dtype).bits // 8)
+    )
 
-    return {
-        "decode:flops": flops,
-        "decode:bytes": bytes,
-        "decode:err": err,
-        "decode:asm_576": us_asm_decode,
-        "decode:TFLOPS": flops / us_asm_decode / 1e6,
-        "decode:TB/s": bytes / us_asm_decode / 1e6,
-        "decode_fp8:err vs fp32": err_fp8_fp32,
-        "decode_fp8:err vs fp8": err_fp8_fp8,
-        "decode_fp8:asm_576": us_asm_decode_fp8,
-        "decode_fp8:TFLOPS": flops / us_asm_decode_fp8 / 1e6,
-        "decode_fp8:TB/s": bytes / us_asm_decode_fp8 / 1e6,
-    }
+    ret["decode:flops"] = flops
+    ret["decode:bytes"] = bytes
+    ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
+    ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
+
+    return ret
 
 
 kv_lora_rank = 512
@@ -421,9 +417,9 @@ qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
-list_dtype = ["bf16"]
-l_kv_dtype = ["bf16"]
-list_nhead = [(16, 1)]
+list_dtype = ["bf16", "fp8"]
+l_kv_dtype = ["bf16", "fp8"]
+list_nhead = [(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -441,7 +437,7 @@ parser.add_argument(
     "-qn",
     "--qk_nope_head_dim",
     type=int,
-    default=512,
+    default=128,
     help="""qk nope head dim.
     e.g.: -qn 512""",
 )
@@ -473,7 +469,7 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=str,
-    choices=["bf16"],
+    choices=["bf16", "fp8"],
     nargs="*",
     default=["bf16"],
     help="""Data type of Q.
@@ -483,7 +479,7 @@ parser.add_argument(
     "-kvd",
     "--kv_dtype",
     type=str,
-    choices=["bf16"],
+    choices=["bf16", "fp8"],
     nargs="*",
     default=["bf16"],
     help="""Data type of KV.
@@ -494,7 +490,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[3500],  #
+    default=[21, 64, 256, 512, 1200, 3200, 5200, 8192],
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -503,8 +499,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    # default=[i for i in range(1, 80)],  # [41],
-    default=[64],  # [41],
+    default=[1, 3, 5, 16, 32, 64, 128, 256],
     help="""Batch size.
     e.g.: -b 16""",
 )
@@ -518,6 +513,21 @@ parser.add_argument(
     help="""Number of heads.
     e.g.: -n 16,1""",
 )
+parser.add_argument(
+    "-ms",
+    "--max_split_per_batch",
+    type=int,
+    nargs="*",
+    default=[16, 32],
+    help="""kv seqlens max split num for per batch.
+    e.g.: -ms 32""",
+)
+parser.add_argument(
+    "--varlen",
+    action="store_true",
+    help="""variable kv seqlens per batch. Default: False.
+    --varlen # True""",
+)
 
 import pandas as pd
 
@@ -526,11 +536,10 @@ list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
 l_kv_dtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
 if args.nhead is not None:
     list_nhead = [args.nhead]
-
-for nhead, mtp in list_nhead:
+for nhead, decode_qlen in list_nhead:
     df = []
-    for dtype, kvtype, ctx_len, batch_size in itertools.product(
-        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize
+    for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
+        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
     ):
         ret = test_mla(
             ctx_len,
@@ -543,10 +552,11 @@ for nhead, mtp in list_nhead:
             dtype,
             kvtype,
             args.block_size,
-            varlen=False,
-            mtp=mtp,
+            varlen=args.varlen,
+            decode_qlen=decode_qlen,
+            max_split_per_batch=max_split_per_batch,
         )
         df.append(ret)
     df = pd.DataFrame(df)
-    # df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")
+    # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
     aiter.logger.info(f"summary:\n{df}")

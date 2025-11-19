@@ -27,22 +27,32 @@ def input_helper(
         max_prefix_length = prefix_length
 
         seqlens_extend = torch.randint(
-            1, max_extend_length + 1, (B,), dtype=torch.int32
+            1,
+            max_extend_length + 1,
+            (B,),
+            dtype=torch.int32,
+            device=device,
         )
         if prefix_length == 0:
-            seqlens_prefix = torch.full((B,), prefix_length)
+            seqlens_prefix = torch.full((B,), prefix_length, device=device)
         else:
             seqlens_prefix = torch.randint(
-                1, max_prefix_length + 1, (B,), dtype=torch.int32
+                1,
+                max_prefix_length + 1,
+                (B,),
+                dtype=torch.int32,
+                device=device,
             )
 
     else:
-        seqlens_extend = torch.full((B,), extend_length)
-        seqlens_prefix = torch.full((B,), prefix_length)
+        seqlens_extend = torch.full((B,), extend_length, device=device)
+        seqlens_prefix = torch.full((B,), prefix_length, device=device)
+
+    B_Seqlen = seqlens_extend + seqlens_prefix
 
     cu_seqlens_extend = torch.cat(
         [
-            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32, device=device),
             seqlens_extend.cumsum(dim=0, dtype=torch.int32),
         ]
     )
@@ -53,8 +63,7 @@ def input_helper(
         ]
     )
 
-    cu_seqlens_extend = cu_seqlens_extend.to(device="cuda")
-    cu_seqlens_prefix = cu_seqlens_prefix.to(device="cuda")
+    B_Start_Loc = cu_seqlens_extend
 
     total_extend = cu_seqlens_extend[-1].item()
     total_prefix = cu_seqlens_prefix[-1].item()
@@ -96,6 +105,14 @@ def input_helper(
     kv_indptr = cu_seqlens_prefix
     kv_indices = torch.arange(total_prefix, device=device)
 
+    max_prefix = seqlens_prefix.max().item()
+    B_Loc = torch.full((B, max_prefix), -1, dtype=torch.int32, device=device)
+    for b in range(B):
+        start = cu_seqlens_prefix[b].item()
+        end = cu_seqlens_prefix[b + 1].item()
+        B_Loc[b, : seqlens_prefix[b]] = torch.arange(start, end, device=device)
+    B_Loc = B_Loc.unsqueeze(-1)  # [B, max_prefix, 1]
+
     custom_mask = None
     mask_indptr = None
     max_len_extend = extend_length
@@ -112,6 +129,9 @@ def input_helper(
         custom_mask,
         mask_indptr,
         max_len_extend,
+        B_Start_Loc,
+        B_Loc,
+        B_Seqlen,
     )
 
 
@@ -126,7 +146,7 @@ def input_helper(
         # (8, 16, 0, 16324, 128, 0, 128), # this one fails, numeric precision is likely the issue
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("ref_attn_impl", ["normal", "absorb"])
 def test_op_fwd(
@@ -148,6 +168,8 @@ def test_op_fwd(
     torch.set_default_device(device)
     torch.set_default_dtype(dtype)
 
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     (
         q_extend,
         k_extend,
@@ -160,6 +182,9 @@ def test_op_fwd(
         custom_mask,
         mask_indptr,
         max_len_extend,
+        _,
+        _,
+        _,
     ) = input_helper(
         B,
         H,
@@ -214,10 +239,14 @@ def test_op_fwd(
         seq_len = end_q - start_q
 
         # Calculate attention scores for prefix tokens
-        scores_prefix = torch.einsum("qhc,khc->hqk", q, k_prefix)  # .float()
+        scores_prefix = torch.einsum(
+            "qhc,khc->hqk", q.float(), k_prefix.float()
+        )  # .float()
 
         # Calculate attention scores for extend tokens
-        scores_extend = torch.einsum("qhc,khc->hqk", q, k_ext)  # .float()
+        scores_extend = torch.einsum(
+            "qhc,khc->hqk", q.float(), k_ext.float()
+        )  # .float()
 
         # Apply causal mask only to the extend part if needed
         if causal:
@@ -241,8 +270,12 @@ def test_op_fwd(
         p_extend = p_combined[:, :, prefix_len:]
 
         # Calculate output separately and combine
-        out_prefix = torch.einsum("hqk,khd->qhd", p_prefix, v_prefix)
-        out_extend = torch.einsum("hqk,khd->qhd", p_extend, v_ext)
+        out_prefix = torch.einsum(
+            "hqk,khd->qhd", p_prefix.to(dtype).float(), v_prefix.float()
+        )
+        out_extend = torch.einsum(
+            "hqk,khd->qhd", p_extend.to(dtype).float(), v_ext.float()
+        )
 
         ref_out[start_q:end_q] = out_prefix.to(dtype) + out_extend.to(dtype)
 
@@ -250,5 +283,5 @@ def test_op_fwd(
 
 
 if __name__ == "__main__":
-    test_op_fwd(1, 2, 1024, 1024, 256, 0, 256, torch.float32, "normal", False)
+    test_op_fwd(1, 2, 1024, 1024, 256, 0, 256, torch.bfloat16, "normal", False)
     test_op_fwd(3, 5, 110, 333, 18, 0, 17, torch.float32, "normal", True)

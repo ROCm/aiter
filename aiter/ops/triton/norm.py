@@ -1,581 +1,250 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
 import torch
 import triton
 import triton.language as tl
 from typing import Optional
+from aiter.ops.triton._triton_kernels.norm import (
+    _per_token_quant,
+    _layernorm_kernel,
+    _fused_add_layernorm_kernel,
+    _quant_layernorm_kernel,
+    _quant_fused_add_layernorm_kernel,
+    _layernorm_bwd_dx_fused_triton,
+    _layernorm_bwd_dwdb_triton,
+    _layernorm_bwd_dwdb_triton_v2,
+)
+from aiter.ops.triton.utils.types import get_dtype_max
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
-@triton.jit
-def _per_token_quant(
-    x,
-    row_max,
-    DTYPE_MAX: tl.constexpr,
+def _layernorm_forward(
+    y: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    eps: float = 1e-5,
 ):
-    """
-    #TODO: Add Doc
-    """
 
-    scale_out = row_max / DTYPE_MAX
-    scale_out = tl.where(scale_out == 0, 1.0, scale_out)
+    M, N = x.shape
 
-    scale_recip = 1 / scale_out
+    # Less than 64KB per feature: enqueue fused kernel
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
 
-    qx = x * scale_recip
-
-    return qx, scale_out
-
-
-@triton.jit
-def _layernorm_kernel(
-    # Pointers to matrices
-    x_ptr,
-    y_ptr,
-    w_ptr,
-    b_ptr,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `x_row_stride` is
-    # how much to increase `x_ptr` by to get the element one row down.
-    x_row_stride,
-    y_row_stride,
-    # Matrix dimensions
-    n_rows,
-    n_cols,
-    # Epsilon to avoid division by zero
-    eps,
-    # Meta-parameters
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Note: this is Triton jited function and not meant to be called directly. Call layer_norm function
-    below
-
-    Applies Layer Normalization over a mini-batch of inputs.
-
-    Key parameters:
-    - X: The input tensor to be normalized with shape (M, N).
-    - Y: The output tensor with the same shape as the input one.
-    - W: The learnable weights tensor with shape (N, ).
-    - B: The learnable bias tensor with shape (N, ).
-    """
-    # Map the program id to the row of X and Y it should compute.
-    row = tl.program_id(0)
-    x_ptr_start = x_ptr + (row * x_row_stride)
-    y_ptr_start = y_ptr + (row * y_row_stride)
-
-    loop_num = tl.cdiv(n_cols, BLOCK_SIZE) - 1
-
-    # Calculate mean
-    mean = 0
-    _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
-        _mean += x_block
-
-    # For last iteration, do masked load
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x_block = tl.load(
-        x_ptr_start + col_offsets, mask=col_offsets < n_cols, other=0.0
-    ).to(tl.float32)
-    _mean += x_block
-    mean = tl.sum(_mean, axis=0) / n_cols
-
-    # Calculate variance
-    _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
-        x_block = x_block - mean
-        _var += x_block * x_block
-
-    # For last iteration, do masked load
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x_block = tl.load(
-        x_ptr_start + col_offsets, mask=col_offsets < n_cols, other=0.0
-    ).to(tl.float32)
-    x_block = tl.where(col_offsets < n_cols, x_block - mean, 0.0)
-    _var += x_block * x_block
-
-    var = tl.sum(_var, axis=0) / n_cols
-    rstd = tl.rsqrt(var + eps)
-
-    # Normalize and store
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        w_block = tl.load(w_ptr + col_offsets)
-        b_block = tl.load(b_ptr + col_offsets)
-        x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)
-        y_block = (x_block - mean) * rstd
-        y_block = y_block * w_block + b_block
-        tl.store(y_ptr_start + col_offsets, y_block)
-
-    # For last iteration, do masked load and store
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-    w_block = tl.load(w_ptr + col_offsets, mask=mask, other=0.0)
-    b_block = tl.load(b_ptr + col_offsets, mask=mask, other=0.0)
-    x_block = tl.load(x_ptr_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
-    y_block = (x_block - mean) * rstd
-    y_block = y_block * w_block + b_block
-    tl.store(y_ptr_start + col_offsets, y_block, mask=mask)
-
-
-@triton.jit
-def _fused_add_layernorm_kernel(
-    # Pointers to matrices
-    x_ptr,
-    y_ptr,
-    res_in_ptr,
-    res_out_ptr,
-    w_ptr,
-    b_ptr,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `x_row_stride` is
-    # how much to increase `x_ptr` by to get the element one row down.
-    x_row_stride,
-    y_row_stride,
-    # Matrix dimensions
-    n_rows,
-    n_cols,
-    # Epsilon to avoid division by zero
-    eps,
-    # Meta-parameters
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Note: this is Triton jited function and not meant to be called directly. Call layernorm2d_fwd_with_add function
-    below
-
-    Performs an addition between two inputs and then applies Layer Normalization over
-    the addition result.
-
-    Key parameters:
-    - X: The input tensor to be normalized with shape (M, N).
-    - Y: The output tensor with the same shape as the input one.
-    - Res_in: The tensor to be added to the X tensor with shape (M, N).
-    - Res_out: The tensor in which the addition result will be stored with shape (M, N).
-    - W: The learnable weights tensor with shape (N, ).
-    - B: The learnable bias tensor with shape (N, ).
-    """
-    # Map the program id to the row of X and Y it should compute.
-    row = tl.program_id(0)
-    x_ptr_start = x_ptr + (row * x_row_stride)
-    y_ptr_start = y_ptr + (row * y_row_stride)
-    res_in_ptr_start = res_in_ptr + (row * x_row_stride)
-    res_out_ptr_start = res_out_ptr + (row * x_row_stride)
-
-    loop_num = tl.cdiv(n_cols, BLOCK_SIZE) - 1
-
-    # Calculate mean
-    mean = 0
-    _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        _x_block = tl.load(x_ptr_start + col_offsets)  # Unmasked loads
-        res_in_block = tl.load(res_in_ptr_start + col_offsets)
-        _x_block += res_in_block
-        tl.store(res_out_ptr_start + col_offsets, _x_block)  # Stores residual_out
-        _mean += _x_block.to(tl.float32)
-
-    # For last iteration, do masked load
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    _x_block = tl.load(x_ptr_start + col_offsets, mask=col_offsets < n_cols, other=0.0)
-    res_in_block = tl.load(
-        res_in_ptr_start + col_offsets, mask=col_offsets < n_cols, other=0.0
+    _layernorm_kernel[(M,)](
+        x, y, weight, bias, mean, rstd, x.stride(0), y.stride(0), M, N, eps, BLOCK_SIZE
     )
-    _x_block += res_in_block
-    tl.store(
-        res_out_ptr_start + col_offsets, _x_block, mask=col_offsets < n_cols
-    )  # Stores residual_out
-    _mean += _x_block.to(tl.float32)
-    mean = tl.sum(_mean, axis=0) / n_cols
 
-    # Calculate variance
-    _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        x_block = tl.load(res_out_ptr_start + col_offsets).to(
-            tl.float32
-        )  # Unmasked loads
-        x_block = x_block - mean
-        _var += x_block * x_block
-
-    # For last iteration, do masked load
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x_block = tl.load(
-        res_out_ptr_start + col_offsets, mask=col_offsets < n_cols, other=0.0
-    ).to(tl.float32)
-    x_block = tl.where(col_offsets < n_cols, x_block - mean, 0.0)
-    _var += x_block * x_block
-
-    var = tl.sum(_var, axis=0) / n_cols
-    rstd = tl.rsqrt(var + eps)
-
-    # Normalize and store
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        w_block = tl.load(w_ptr + col_offsets)
-        b_block = tl.load(b_ptr + col_offsets)
-        x_block = tl.load(res_out_ptr_start + col_offsets).to(tl.float32)
-        y_block = (x_block - mean) * rstd
-        y_block = y_block * w_block + b_block
-        tl.store(y_ptr_start + col_offsets, y_block)
-
-    # For last iteration, do masked load and store
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-    w_block = tl.load(w_ptr + col_offsets, mask=mask, other=0.0)
-    b_block = tl.load(b_ptr + col_offsets, mask=mask, other=0.0)
-    x_block = tl.load(res_out_ptr_start + col_offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    y_block = (x_block - mean) * rstd
-    y_block = y_block * w_block + b_block
-    tl.store(y_ptr_start + col_offsets, y_block, mask=mask)
+    return
 
 
-@triton.jit
-def _quant_layernorm_kernel(
-    # Pointers to matrices
-    x_ptr,
-    y_ptr,
-    w_ptr,
-    b_ptr,
-    x_scale_ptr,
-    y_scale_ptr,
-    # Auxiliary tensor to store intermediate data
-    aux_ptr,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `x_row_stride` is
-    # how much to increase `x_ptr` by to get the element one row down.
-    x_row_stride,
-    y_row_stride,
-    aux_row_stride,
-    # Matrix dimensions
-    n_rows,
-    n_cols,
-    # Epsilon to avoid division by zero
-    eps,
-    # Dtype max for quantization
-    DTYPE_MAX: tl.constexpr,
-    # Meta-parameters
-    IS_SMOOTH: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+def _layernorm_forward_with_add(
+    y: torch.Tensor,
+    x: torch.Tensor,
+    res_in: torch.Tensor,
+    res_out: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    epsilon: float,
 ):
-    """
-    Note: this is Triton jited function and not meant to be called directly. Call layer_norm function
-    below
 
-    Applies Layer Normalization over a mini-batch of inputs and quantizes the result.
+    M, N = x.shape
 
-    Key parameters:
-    - X: The input tensor to be normalized with shape (M, N).
-    - Y: The output tensor with the same shape as the input one.
-    - W: The learnable weights tensor with shape (N, ).
-    - B: The learnable bias tensor with shape (N, ).
-    - X_scale: The tensor to be multiplied by the LayerNorm output if IS_SMOOTH is true, with shape (n_cols, ).
-    - Y_scale: The tensor where the scale for each row will be stored with shape (n_rows, ).
-    """
-    # Map the program id to the row of X and Y it should compute.
-    row = tl.program_id(0)
-    x_ptr_start = x_ptr + (row * x_row_stride)
-    y_ptr_start = y_ptr + (row * y_row_stride)
-    aux_ptr_start = aux_ptr + (row * aux_row_stride)
+    # Less than 64KB per feature: enqueue fused kernel
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
 
-    loop_num = tl.cdiv(n_cols, BLOCK_SIZE) - 1
+    _fused_add_layernorm_kernel[(M,)](
+        x,
+        y,
+        res_in,
+        res_out,
+        weight,
+        bias,
+        mean,
+        rstd,
+        x.stride(0),
+        y.stride(0),
+        M,
+        N,
+        epsilon,
+        BLOCK_SIZE,
+    )
 
-    # Calculate mean
-    mean = 0
-    _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
-        _mean += x_block
-
-    # For last iteration, do masked load
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x_block = tl.load(
-        x_ptr_start + col_offsets, mask=col_offsets < n_cols, other=0.0
-    ).to(tl.float32)
-    _mean += x_block
-    mean = tl.sum(_mean, axis=0) / n_cols
-
-    # Calculate variance
-    _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)  # Unmasked loads
-        x_block = x_block - mean
-        _var += x_block * x_block
-
-    # For last iteration, do masked load
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x_block = tl.load(
-        x_ptr_start + col_offsets, mask=col_offsets < n_cols, other=0.0
-    ).to(tl.float32)
-    x_block = tl.where(col_offsets < n_cols, x_block - mean, 0.0)
-    _var += x_block * x_block
-
-    var = tl.sum(_var, axis=0) / n_cols
-    rstd = tl.rsqrt(var + eps)
-
-    row_max: tl.float32 = 0.0
-
-    # Normalize and write output temporarily as fp32
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        w_block = tl.load(w_ptr + col_offsets)
-        b_block = tl.load(b_ptr + col_offsets)
-        x_block = tl.load(x_ptr_start + col_offsets).to(tl.float32)
-        y_block = (x_block - mean) * rstd
-        y_block = y_block * w_block + b_block
-
-        if IS_SMOOTH:
-            x_scale_ptrs = x_scale_ptr + col_offsets
-            x_scale = tl.load(x_scale_ptrs)
-            y_block *= x_scale
-
-        # Computes the max value for each row
-        blk_max = tl.max(tl.abs(y_block), axis=-1)
-        row_max = max(row_max, blk_max)
-
-        aux_ptrs = aux_ptr_start + col_offsets
-        tl.store(aux_ptrs, y_block)
-
-    # For last iteration, do masked load
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-    w_block = tl.load(w_ptr + col_offsets, mask=mask, other=0.0)
-    b_block = tl.load(b_ptr + col_offsets, mask=mask, other=0.0)
-    x_block = tl.load(x_ptr_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
-    y_block = tl.where(mask, (x_block - mean) * rstd, 0.0)
-    y_block = y_block * w_block + b_block
-
-    if IS_SMOOTH:
-        x_scale_ptrs = x_scale_ptr + col_offsets
-        x_scale = tl.load(x_scale_ptrs, mask=mask, other=0.0)
-        y_block *= x_scale
-
-    # Computes the max value for each row
-    blk_max = tl.max(tl.abs(y_block), axis=-1)
-    row_max = max(row_max, blk_max)
-
-    tl.store(aux_ptr_start + col_offsets, y_block, mask=mask)
-
-    # Apply quantization and write output
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        aux_block = tl.load(aux_ptr_start + col_offsets)  # Unmasked loads
-
-        y_block, _ = _per_token_quant(aux_block, row_max, DTYPE_MAX)
-
-        tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty))
-
-    # For last iteration, do masked load and store
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-    aux_block = tl.load(aux_ptr_start + col_offsets, mask=mask, other=0.0)
-
-    y_block, y_scale = _per_token_quant(aux_block, row_max, DTYPE_MAX)
-
-    # Store scale
-    tl.store(y_scale_ptr + row, y_scale.to(y_scale_ptr.type.element_ty))
-
-    tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty), mask=mask)
+    return
 
 
-@triton.jit
-def _quant_fused_add_layernorm_kernel(
-    # Pointers to matrices
-    x_ptr,
-    y_ptr,
-    res_in_ptr,
-    res_out_ptr,
-    w_ptr,
-    b_ptr,
-    x_scale_ptr,
-    y_scale_ptr,
-    # Auxiliary tensor to store intermediate data
-    aux_ptr,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `x_row_stride` is
-    # how much to increase `x_ptr` by to get the element one row down.
-    x_row_stride,
-    y_row_stride,
-    aux_row_stride,
-    # Matrix dimensions
-    n_rows,
-    n_cols,
-    # Epsilon to avoid division by zero
-    eps,
-    # Dtype max for quantization
-    DTYPE_MAX: tl.constexpr,
-    # Meta-parameters
-    IS_SMOOTH: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+def _layernorm_backward(
+    dy: torch.Tensor,
+    dx: torch.Tensor,
+    dw: torch.Tensor,
+    db: torch.Tensor,
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    mu: torch.Tensor,
+    rsigma: torch.Tensor,
 ):
-    """
-    Note: this is Triton jited function and not meant to be called directly. Call layernorm2d_fwd_with_add function
-    below
 
-    Performs an addition between two inputs, applies Layer Normalization over the result and then quantizes it.
+    M, N = x.shape
+    # calculate dw and db separately when M is small
+    IGNORE_DW_DB_IN_FUSED = M <= 512
+    tile_num = max(min(256, M // 4), 1)
+    if M <= 512 and M * N < 64 * 1024 * 1024:
+        tile_num = M
+    elif M >= 8192:
+        tile_num = 2048
+    max_fused_size = 32768 // x.element_size()
+    next_power = triton.next_power_of_2(N)
+    BLOCK_SIZE = min(max_fused_size, next_power)
+    # For cases with small M and large N, decrease block size to help with occupancy and register spill
+    if tile_num == M:
+        if tile_num > 256:
+            BLOCK_SIZE = min(BLOCK_SIZE, 2048)
+        else:
+            BLOCK_SIZE = min(BLOCK_SIZE, 4096)
+    USE_BLOCKED = N > BLOCK_SIZE
+    num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
 
-    Key parameters:
-    - X: The input tensor to be normalized with shape (M, N).
-    - Y: The output tensor with the same shape as the input one.
-    - Res_in: The tensor to be added to the X tensor with shape (M, N).
-    - Res_out: The tensor in which the addition result will be stored with shape (M, N).
-    - W: The learnable weights tensor with shape (N, ).
-    - B: The learnable bias tensor with shape (N, ).
-    - X_scale: The tensor to be multiplied by the LayerNorm output if IS_SMOOTH is true, with shape (n_cols, ).
-    - Y_scale: The tensor where the scale for each row will be stored with shape (n_rows, ).
-    """
-    # Map the program id to the row of X and Y it should compute.
-    row = tl.program_id(0)
-    x_ptr_start = x_ptr + (row * x_row_stride)
-    y_ptr_start = y_ptr + (row * y_row_stride)
-    res_in_ptr_start = res_in_ptr + (row * x_row_stride)
-    res_out_ptr_start = res_out_ptr + (row * x_row_stride)
-    aux_ptr_start = aux_ptr + (row * aux_row_stride)
-
-    loop_num = tl.cdiv(n_cols, BLOCK_SIZE) - 1
-
-    # Calculate mean
-    mean = 0
-    _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        _x_block = tl.load(x_ptr_start + col_offsets)  # Unmasked loads
-        res_in_block = tl.load(res_in_ptr_start + col_offsets)
-        _x_block += res_in_block
-        tl.store(res_out_ptr_start + col_offsets, _x_block)  # Stores residual_out
-        _mean += _x_block.to(tl.float32)
-
-    # For last iteration, do masked load
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    _x_block = tl.load(x_ptr_start + col_offsets, mask=col_offsets < n_cols, other=0.0)
-    res_in_block = tl.load(
-        res_in_ptr_start + col_offsets, mask=col_offsets < n_cols, other=0.0
-    )
-    _x_block += res_in_block
-    tl.store(
-        res_out_ptr_start + col_offsets, _x_block, mask=col_offsets < n_cols
-    )  # Stores residual_out
-    _mean += _x_block.to(tl.float32)
-    mean = tl.sum(_mean, axis=0) / n_cols
-
-    # Calculate variance
-    _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        x_block = tl.load(res_out_ptr_start + col_offsets).to(
-            tl.float32
-        )  # Unmasked loads
-        x_block = x_block - mean
-        _var += x_block * x_block
-
-    # For last iteration, do masked load
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x_block = tl.load(
-        res_out_ptr_start + col_offsets, mask=col_offsets < n_cols, other=0.0
-    ).to(tl.float32)
-    x_block = tl.where(col_offsets < n_cols, x_block - mean, 0.0)
-    _var += x_block * x_block
-
-    var = tl.sum(_var, axis=0) / n_cols
-    rstd = tl.rsqrt(var + eps)
-
-    row_max: tl.float32 = 0.0
-
-    # Normalize and write output temporarily as fp32
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        w_block = tl.load(w_ptr + col_offsets)
-        b_block = tl.load(b_ptr + col_offsets)
-        x_block = tl.load(res_out_ptr_start + col_offsets).to(tl.float32)
-        y_block = (x_block - mean) * rstd
-        y_block = y_block * w_block + b_block
-
-        if IS_SMOOTH:
-            x_scale_ptrs = x_scale_ptr + col_offsets
-            x_scale = tl.load(x_scale_ptrs)
-            y_block *= x_scale
-
-        # Computes the max value for each row
-        blk_max = tl.max(tl.abs(y_block), axis=-1)
-        row_max = max(row_max, blk_max)
-
-        aux_ptrs = aux_ptr_start + col_offsets
-        tl.store(aux_ptrs, y_block)
-
-    # For last iteration, do masked load and store
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-    w_block = tl.load(w_ptr + col_offsets, mask=mask, other=0.0)
-    b_block = tl.load(b_ptr + col_offsets, mask=mask, other=0.0)
-    x_block = tl.load(res_out_ptr_start + col_offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    y_block = tl.where(mask, (x_block - mean) * rstd, 0.0)
-    y_block = y_block * w_block + b_block
-
-    if IS_SMOOTH:
-        x_scale_ptrs = x_scale_ptr + col_offsets
-        x_scale = tl.load(x_scale_ptrs, mask=mask, other=0.0)
-        y_block *= x_scale
-
-    # Computes the max value for each row
-    blk_max = tl.max(tl.abs(y_block), axis=-1)
-    row_max = max(row_max, blk_max)
-
-    tl.store(aux_ptr_start + col_offsets, y_block, mask=mask)
-
-    # Apply quantization and write output
-    loop_num_l = loop_num
-    for b in range(0, loop_num_l):
-        col_offsets = b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        aux_block = tl.load(aux_ptr_start + col_offsets)  # Unmasked loads
-
-        y_block, _ = _per_token_quant(aux_block, row_max, DTYPE_MAX)
-
-        tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty))
-
-    # For last iteration, do masked load and store
-    col_offsets = loop_num_l * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < n_cols
-    aux_block = tl.load(aux_ptr_start + col_offsets, mask=mask, other=0.0)
-
-    y_block, y_scale = _per_token_quant(aux_block, row_max, DTYPE_MAX)
-
-    # Store scale
-    tl.store(y_scale_ptr + row, y_scale.to(y_scale_ptr.type.element_ty))
-
-    tl.store(y_ptr_start + col_offsets, y_block.to(y_ptr.type.element_ty), mask=mask)
-
-
-def get_dtype_max(dtype):
-    if torch.is_floating_point(torch.tensor([], dtype=dtype)):
-        return torch.finfo(dtype).max
+    if not IGNORE_DW_DB_IN_FUSED:
+        _dw = torch.zeros((tile_num, N), dtype=torch.float32, device=gamma.device)
+        _db = torch.zeros((tile_num, N), dtype=torch.float32, device=gamma.device)
     else:
-        return torch.iinfo(dtype).max
+        _dw = None
+        _db = None
+
+    grid_bwd = (tile_num,)
+    _layernorm_bwd_dx_fused_triton[grid_bwd](
+        dx,
+        dy,
+        _dw,
+        _db,
+        x,
+        gamma,
+        mu,
+        rsigma,
+        x.stride(0),
+        N,
+        NUM_ROWS=M,
+        BLOCK_SIZE_N=BLOCK_SIZE,
+        USE_BLOCKED=USE_BLOCKED,
+        num_warps=num_warps,
+        IGNORE_DW_DB=IGNORE_DW_DB_IN_FUSED,
+    )
+    grid_reduce = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)  # noqa: E731
+    if not IGNORE_DW_DB_IN_FUSED:
+        dwdb_block_n = max(16, N // 256)
+        dwdb_block_n = triton.next_power_of_2(dwdb_block_n)
+        dwdb_block_m = (64 * 128) // dwdb_block_n
+        dwdb_block_m = min(triton.next_power_of_2(tile_num), dwdb_block_m)
+        _layernorm_bwd_dwdb_triton[grid_reduce](
+            _dw,
+            _db,
+            dw,
+            db,
+            min(tile_num, M),
+            N,
+            BLOCK_SIZE_M=dwdb_block_m,
+            BLOCK_SIZE_N=dwdb_block_n,
+        )
+    else:
+        dwdb_block_n = max(16, N // 256)
+        dwdb_block_n = triton.next_power_of_2(dwdb_block_n)
+        dwdb_block_m = (64 * 128) // dwdb_block_n
+        dwdb_block_m = min(triton.next_power_of_2(M), dwdb_block_m)
+        _layernorm_bwd_dwdb_triton_v2[grid_reduce](
+            x,
+            dy,
+            mu,
+            rsigma,
+            x.stride(0),
+            dw,
+            db,
+            M,
+            N,
+            BLOCK_SIZE_M=dwdb_block_m,
+            BLOCK_SIZE_N=dwdb_block_n,
+        )
+
+    return dx, dw, db
+
+
+class _LayerNorm(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, eps, is_grad_enabled):
+
+        is_grad = is_grad_enabled and any(
+            tensor.requires_grad for tensor in [x, weight, bias]
+        )
+
+        y = torch.empty_like(x)
+        M = x.shape[0]
+        mean = torch.empty((M,), dtype=torch.float32, device=x.device)
+        rstd = torch.empty((M,), dtype=torch.float32, device=x.device)
+
+        _layernorm_forward(y, x, weight, bias, mean, rstd, eps)
+
+        if is_grad:
+            ctx.save_for_backward(x, weight, mean, rstd)
+
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, w, m, v = ctx.saved_tensors
+        N = w.shape[0]
+
+        dw = torch.empty((N,), dtype=w.dtype, device=w.device)
+        db = torch.empty((N,), dtype=w.dtype, device=w.device)
+        dx = torch.empty_like(dy)
+
+        _layernorm_backward(dy, dx, dw, db, x, w, m, v)
+
+        return dx, dw, db, None, None
+
+
+class _Layernorm2dFwdWithAdd(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, y, x, res_in, res_out, weight, bias, eps, is_grad_enabled):
+
+        is_grad = is_grad_enabled and any(
+            tensor.requires_grad for tensor in [x, weight, bias]
+        )
+
+        M = x.shape[0]
+        mean = torch.empty((M,), dtype=torch.float32, device=x.device)
+        rstd = torch.empty((M,), dtype=torch.float32, device=x.device)
+
+        _layernorm_forward_with_add(
+            y, x, res_in, res_out, weight, bias, mean, rstd, eps
+        )
+
+        if is_grad:
+            ctx.save_for_backward(res_out, weight, mean, rstd)
+
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, w, m, v = ctx.saved_tensors
+        N = w.shape[0]
+
+        dw = torch.empty((N,), dtype=w.dtype, device=w.device)
+        db = torch.empty((N,), dtype=w.dtype, device=w.device)
+        dx = torch.empty_like(dy)
+
+        _layernorm_backward(dy, dx, dw, db, x, w, m, v)
+
+        return None, dx, None, None, dw, db, None, None
 
 
 def layer_norm(
@@ -597,18 +266,8 @@ def layer_norm(
     Returns:
     - Output: The output tensor with shape (M, N).
     """
-    out = torch.empty_like(input)
-    M, N = input.shape
-
-    # Less than 64KB per feature: enqueue fused kernel
-    MAX_FUSED_SIZE = 65536 // input.element_size()
-    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-
-    _layernorm_kernel[(M,)](
-        input, out, weight, bias, input.stride(0), out.stride(0), M, N, eps, BLOCK_SIZE
-    )
-
-    return out
+    _LOGGER.info(f"LAYERNORM: input={tuple(input.shape)} weight={tuple(weight.shape)} ")
+    return _LayerNorm.apply(input, weight, bias, eps, torch.is_grad_enabled())
 
 
 def layernorm2d_fwd_with_add(
@@ -631,34 +290,25 @@ def layernorm2d_fwd_with_add(
     - residual_out: Output tensor that is input + residual_in with shape (M, N). Must be allocated by the caller
     - weight: The learnable weights tensor with shape (N, ).
     - bias: Bias added to the result of layer norm with shape (N,)
-    - eps: A value added to the denominator for numerical stability.
+    - epsilon: A value added to the denominator for numerical stability.
 
     Returns:
     - out: The output tensor with shape (M, N).
     - residual_out: Output tensor that is input + residual_in with shape (M, N).
     """
-    M, N = input.shape
-
-    # Less than 64KB per feature: enqueue fused kernel
-    MAX_FUSED_SIZE = 65536 // input.element_size()
-    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-
-    _fused_add_layernorm_kernel[(M,)](
-        input,
+    _LOGGER.info(
+        f"LAYERNORM_2D_FWD_ADD: input={tuple(input.shape)} weight={tuple(weight.shape)} residual_in={tuple(residual_in.shape)}  "
+    )
+    return _Layernorm2dFwdWithAdd.apply(
         out,
+        input,
         residual_in,
         residual_out,
         weight,
         bias,
-        input.stride(0),
-        out.stride(0),
-        M,
-        N,
         epsilon,
-        BLOCK_SIZE,
+        torch.is_grad_enabled(),
     )
-
-    return
 
 
 def layernorm2d_fwd_with_dynamicquant(
@@ -685,6 +335,9 @@ def layernorm2d_fwd_with_dynamicquant(
     - out: The output tensor with shape (M, N).
     - yscale: Output scale tensor with shape (M,). Allocated by the caller
     """
+    _LOGGER.info(
+        f"LAYERNORM_2D_FWD_DYNAMICQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} yscale={tuple(yscale.shape)}  "
+    )
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -717,7 +370,7 @@ def layernorm2d_fwd_with_dynamicquant(
         BLOCK_SIZE,
     )
 
-    return out
+    return
 
 
 def layernorm2d_fwd_with_smoothquant(
@@ -744,6 +397,9 @@ def layernorm2d_fwd_with_smoothquant(
     Returns:
     - Output: The output tensor with shape (M, N).
     """
+    _LOGGER.info(
+        f"RMSNORM_2D_FWD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+    )
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -775,7 +431,7 @@ def layernorm2d_fwd_with_smoothquant(
         BLOCK_SIZE,
     )
 
-    return out
+    return
 
 
 def layernorm2d_fwd_with_add_dynamicquant(
@@ -806,6 +462,9 @@ def layernorm2d_fwd_with_add_dynamicquant(
     - out: The output tensor with shape (M, N).
     - yscale: Output scale tensor with shape (M,). Allocated by the caller
     """
+    _LOGGER.info(
+        f"LAYERNORM_2D_FWD_ADD_DYNAMICQUANT: input={input.shape} weight={weight.shape} residual_in={residual_in.shape} yscale={yscale.shape}  "
+    )
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -840,7 +499,7 @@ def layernorm2d_fwd_with_add_dynamicquant(
         BLOCK_SIZE,
     )
 
-    return out
+    return
 
 
 def layernorm2d_fwd_with_add_smoothquant(
@@ -873,6 +532,10 @@ def layernorm2d_fwd_with_add_smoothquant(
     - yscale: Output scale tensor with shape (M,). Allocated by the caller
     """
 
+    _LOGGER.info(
+        f"LAYERNORM_2D_FWD_ADD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} "
+        + f"residual_in={tuple(residual_in.shape)} xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+    )
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -906,4 +569,4 @@ def layernorm2d_fwd_with_add_smoothquant(
         BLOCK_SIZE,
     )
 
-    return out
+    return

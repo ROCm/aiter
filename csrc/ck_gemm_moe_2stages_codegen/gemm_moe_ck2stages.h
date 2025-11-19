@@ -2,19 +2,21 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "ck/ck.hpp"
-#include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
-#include "ck/tensor_operation/gpu/device/tensor_layout.hpp"
-#include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
-#include "ck/tensor_operation/gpu/element/unary_element_wise_operation.hpp"
-
 #include "ck/library/utility/check_err.hpp"
 #include "ck/library/utility/device_memory.hpp"
 #include "ck/library/utility/host_tensor.hpp"
 #include "ck/library/utility/host_tensor_generator.hpp"
 #include "ck/library/utility/literals.hpp"
-
+#include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
+#include "ck/tensor_operation/gpu/device/tensor_layout.hpp"
+#include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
+#include "ck/tensor_operation/gpu/element/unary_element_wise_operation.hpp"
 #include "ck/utility/blkgemmpipe_scheduler.hpp"
+
+#include "aiter_enum.h"
+#include "py_itfs_common.h"
 #include <hip/hip_runtime.h>
+#include <torch/extension.h>
 #include <torch/torch.h>
 
 template <ck::index_t... Is>
@@ -36,6 +38,34 @@ using PipelineVersion = ck::BlockGemmPipelineVersion;
 
 const auto V1 = ck::BlockGemmPipelineVersion::v1;
 const auto V3 = ck::BlockGemmPipelineVersion::v3;
+
+using CK_Dtype = std::variant<I4, I8, I32, F16, B16, F8, F32, FP4X2>;
+
+struct CK_DTypeVisitor
+{
+    // i4 packed
+    at::ScalarType operator()(I4) { return torch::kUInt32; }
+    at::ScalarType operator()(I8) { return torch::kInt8; }
+    at::ScalarType operator()(I32) { return torch::kInt32; }
+    at::ScalarType operator()(F16) { return torch::kHalf; }
+    at::ScalarType operator()(B16) { return torch::kBFloat16; }
+    at::ScalarType operator()(F8) { return torch_fp8; }
+    at::ScalarType operator()(F32) { return torch::kFloat; }
+    // f4 packed
+    at::ScalarType operator()(FP4X2) { return torch_fp4x2; }
+};
+
+template <typename T>
+at::ScalarType getTypeValue()
+{
+    return std::visit(CK_DTypeVisitor{}, CK_Dtype{T{}});
+};
+
+template <typename CK_Dtype>
+struct dtype_checker
+{
+    bool operator()(at::ScalarType t) { return t == getTypeValue<CK_Dtype>(); }
+};
 
 struct TypeCast
 {
@@ -282,6 +312,26 @@ struct MulABScaleExpertWeightWin4
         B16& e, const int& c, const float& d0, const float& d1, const float& d2) const
     {
         e = ck::type_convert<B16>(ck::type_convert<F32>(c) * 16.f);
+    }
+};
+
+struct MulABScaleExpertWeightA8W8blkscale
+{
+    template <typename E, typename C, typename D2>
+    __host__ __device__ constexpr void operator()(E& e, const C& c, const D2& d2) const;
+    template <>
+    __host__ __device__ constexpr void
+    operator()<F16, float, float>(F16& e, const float& c, const float& d2) const
+    {
+        (void)d2;
+        e = ck::type_convert<F16>(c);
+    }
+    template <>
+    __host__ __device__ constexpr void
+    operator()<B16, float, float>(B16& e, const float& c, const float& d2) const
+    {
+        (void)d2;
+        e = ck::type_convert<B16>(c);
     }
 };
 

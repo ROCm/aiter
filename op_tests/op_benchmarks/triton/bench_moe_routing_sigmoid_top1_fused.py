@@ -3,15 +3,20 @@ from functools import partial
 import torch
 import triton
 
-from aiter.ops.triton.routing import (
+from aiter.ops.triton.moe_routing_sigmoid_top1_fused import (
     _routing_sigmoid_top1_kernel,
     routing_sigmoid_top1,
-    torch_routing_sigmoid_top1,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_model_configs
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_model_configs,
+    get_caller_name_no_ext,
+)
+from op_tests.triton_tests.test_moe_routing_sigmoid_top1_fused import (
+    torch_routing_sigmoid_top1,
+)
 
 
 def _get_compiled(fn):
@@ -35,7 +40,12 @@ def run_benchmark(args, x_vals_list):
         ylabel = "Bandwidth (GB/s)"
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
-    line_names = ["Triton"]
+    evaluation_metric_to_unit = {
+        "throughput": "TFLOPS",
+        "time": "Time_(ms)",
+        "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
+    }
+    line_names = [evaluation_metric_to_unit[args.metric]]
     line_vals = line_names
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
@@ -45,7 +55,7 @@ def run_benchmark(args, x_vals_list):
         line_names=line_names,
         styles=[("green", "-")],  # match line names to colors
         ylabel=ylabel,
-        plot_name="Benchmark Routing Layer",
+        plot_name=get_caller_name_no_ext(),
         args={"metric": args.metric},
     )
 
@@ -76,7 +86,7 @@ def run_benchmark(args, x_vals_list):
         else:
             raise ValueError("Unknown metric: " + args.metric)
 
-    bench_routing_layer.run(save_path=".", print_data=True)
+    bench_routing_layer.run(save_path="." if args.o else None, print_data=True)
 
 
 def benchmark(M, N, K):
@@ -165,6 +175,9 @@ def parse_args():
         nargs=3,
         metavar=("M", "N", "K"),
         help="user-defined shape to benchmark.",
+    )
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     return parser.parse_args()
 

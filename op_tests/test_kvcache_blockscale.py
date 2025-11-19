@@ -668,7 +668,7 @@ parser.add_argument(
         "bf16tofp8_asm_pa128",
         "bf16tofp8_asm_pa256",
     ],
-    help="""select which test to run, default is all
+    help="""Select which test to run, default is all
     e.g.: -t fp16tofp8""",
 )
 args = parser.parse_args()

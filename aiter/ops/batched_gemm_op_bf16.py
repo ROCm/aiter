@@ -9,15 +9,28 @@ import pandas as pd
 from ..jit.core import (
     compile_ops,
     AITER_ROOT_DIR,
+    AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
+    AITER_LOG_TUNED_CONFIG,
 )
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
+from aiter import logger
 
 
-@compile_ops("module_batched_gemm_bf16", fc_name="batched_gemm_bf16")
+def gen_batched_gemm_bf16_tune_fake_tensor(
+    XQ: Tensor, WQ: Tensor, out: Tensor, kernelId: int, splitK: int = 0
+) -> Tensor:
+    return out
+
+
+@compile_ops(
+    "module_batched_gemm_bf16",
+    fc_name="batched_gemm_bf16",
+    gen_fake=gen_batched_gemm_bf16_tune_fake_tensor,
+)
 def batched_gemm_bf16(
-    XQ: Tensor, WQ: Tensor, out: Tensor, bias: Optional[Tensor] = None, splitK=0
-): ...
+    XQ: Tensor, WQ: Tensor, out: Tensor, bias: Optional[Tensor] = None, splitK: int = 0
+) -> Tensor: ...
 
 
 @functools.lru_cache(maxsize=1024)
@@ -43,17 +56,28 @@ def get_CKBatchedGEMM_config(
 ):
     if not hasattr(get_CKBatchedGEMM_config, "ck_batched_gemm_dict"):
         ck_batched_gemm_dict = pd.read_csv(
-            f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv"
+            AITER_CONFIG_BF16_BATCHED_GEMM_FILE
         ).drop_duplicates()
         get_CKBatchedGEMM_config.ck_batched_gemm_dict = ck_batched_gemm_dict.set_index(
-            ["B", "M", "N", "K"]
+            ["cu_num", "B", "M", "N", "K"]
         ).to_dict("index")
-    config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get((B, M, N, K), None)
-    if config != None:
+    cu_num = get_cu_num()
+    config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get(
+        (cu_num, B, M, N, K), None
+    )
+    if config is not None:
+        if AITER_LOG_TUNED_CONFIG:
+            logger.info(
+                f"shape is B:{B}, M:{M}, N:{N}, K:{K} dtype is bf16, is tuned on cu_num = {cu_num} in {AITER_CONFIG_BF16_BATCHED_GEMM_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
+            )
         mnk = config["kernelName"].split("_")[2].split("x")[1:]
         config["tile_m"] = int(mnk[0])
         config["tile_n"] = int(mnk[1])
         config["tile_k"] = int(mnk[2])
+    else:
+        logger.info(
+            f"shape is B:{B}, M:{M}, N:{N}, K:{K} dtype is bf16, not found tuned config in CKGEMM, will use default config!"
+        )
     return config
 
 
@@ -74,8 +98,8 @@ def batched_gemm_bf16_CK(
     n = WQ.shape[1]
     k = XQ.shape[2]
     ck_config = get_CKBatchedGEMM_config(b, m, n, k)
-    if splitK == None:
-        if ck_config != None:
+    if splitK is None:
+        if ck_config is not None:
             splitK = ck_config["splitK"]
         else:
             splitK = 0
@@ -83,7 +107,11 @@ def batched_gemm_bf16_CK(
     return batched_gemm_bf16(XQ, WQ, Y, bias, splitK)
 
 
-@compile_ops("module_batched_gemm_bf16_tune", fc_name="batched_gemm_bf16_tune")
+@compile_ops(
+    "module_batched_gemm_bf16_tune",
+    fc_name="batched_gemm_bf16_tune",
+    gen_fake=gen_batched_gemm_bf16_tune_fake_tensor,
+)
 def batched_gemm_bf16_tune(
-    XQ: Tensor, WQ: Tensor, out: Tensor, kernelId: int, splitK=0
-): ...
+    XQ: Tensor, WQ: Tensor, out: Tensor, kernelId: int, splitK: int = 0
+) -> Tensor: ...

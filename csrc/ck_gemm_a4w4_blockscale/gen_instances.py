@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import os
-from pathlib import Path
-import pandas as pd
 import argparse
+import os
 import shutil
+from pathlib import Path
+
+import pandas as pd
 import torch
 from gemm_a4w4_blockscale_common import (
+    default_kernels_dict,
     kernelInstance,
     kernels_list,
-    default_kernels_dict,
 )
-
 
 """
 
@@ -102,7 +102,7 @@ torch::Tensor
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "{name}.cuh"
+#include "impl/{name}.cuh"
 
 template torch::Tensor
 {name}<{dtypes}>(
@@ -236,7 +236,7 @@ def get_tune_dict(tune_dict_csv):
             N = tune_df.loc[i, "N"]
             K = tune_df.loc[i, "K"]
             kid = tune_df.loc[i, "kernelId"]
-            if kid < 0:
+            if kid < 0 or kid > len(kernels_list):
                 continue
             tune_dict[(M, N, K)] = kernels_list[kid]
     return tune_dict

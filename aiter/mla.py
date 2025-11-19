@@ -3,12 +3,15 @@
 
 # user interface
 
+import functools
+
 import torch
-import aiter
-from aiter import dtypes
 import triton
 import triton.language as tl
-import functools
+
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_cu_num
 
 
 @triton.jit
@@ -19,11 +22,11 @@ def _fwd_kernel_stage2_asm(
     qo_indptr,
     kv_indptr,
     num_kv_splits_indptr,
-    stride_mid_ob,
-    stride_mid_oh,
-    stride_mid_os,
-    stride_obs,
-    stride_oh,
+    stride_mid_ob: tl.int64,
+    stride_mid_oh: tl.int64,
+    stride_mid_os: tl.int64,
+    stride_obs: tl.int64,
+    stride_oh: tl.int64,
     MAYBE_FINAL_OUT: tl.constexpr,
     BATCH_NUM: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -94,21 +97,54 @@ def _fwd_kernel_stage2_asm(
             )
 
 
-@functools.lru_cache()
-def get_meta_param(num_kv_splits, kv_indptr, nhead, nhead_kv, max_seqlen_q):
+@functools.lru_cache(maxsize=1)
+def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     if num_kv_splits is None:
-        (kv_splits_indptr, max_splits) = aiter.get_mla_metadata_v0(
-            kv_indptr, nhead // nhead_kv, nhead_kv
-        )
-        num_kv_splits = max_splits.item()
+        cu_num = get_cu_num()
+        avg_kv = total_kv / bs
+        overhead = 84.1
+        tmp = [
+            (
+                bs
+                * i
+                / ((bs * i + cu_num - 1) // cu_num * cu_num)
+                * avg_kv
+                / (avg_kv + overhead * i),
+                i,
+            )
+            for i in range(1, 17)
+        ]
+        num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
     get_mgc = {16: 16, 128: 16}
+
+    get_block_n_fp8 = {
+        16: 128,
+        32: 128,
+        48: 64,
+        64: 64,
+        128: 32,
+        256: 32,
+        384: 32,
+        512: 32,
+    }
+
+    if dtype == dtypes.fp8:
+        min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
+        num_kv_splits = min(
+            num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n
+        )
 
     assert nhead in get_mgc, f"{nhead=} not supported"
     mgc = get_mgc[nhead]
     if max_seqlen_q == 1 and nhead == 16:
         mgc = 64
-    return num_kv_splits, kv_splits_indptr, mgc
+
+    num_kv_splits_indptr = torch.arange(
+        0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
+    )
+
+    return num_kv_splits, mgc, num_kv_splits_indptr
 
 
 def mla_decode_fwd(
@@ -139,46 +175,45 @@ def mla_decode_fwd(
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
 
+    ori_total_s, ori_nhead, ori_v_head_dim = o.shape
     total_s, nhead, v_head_dim = o.shape
     bs = qo_indptr.shape[0] - 1
     total_kv = kv_indices.shape[0]
 
-    if num_kv_splits_indptr is None and work_meta_data is None:
-        num_kv_splits, num_kv_splits_indptr, mgc = get_meta_param(
-            None, kv_indptr, nhead, nhead_kv, max_seqlen_q
+    persistent_mode = work_meta_data is not None
+
+    io_transformed = False
+
+    if not persistent_mode:
+        num_kv_splits, mgc, num_kv_splits_indptr = get_meta_param(
+            num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
         )
 
-    num_kv_splits = 80
-    if nhead == 16 and max_seqlen_q == 1:
-        # special case for 16 heads and max_seqlen_q == 1
-        logits = torch.zeros(
-            (total_s, num_kv_splits, nhead, v_head_dim),
-            dtype=dtypes.fp32,
-            device=device,
-        )
-        MAYBE_FINAL_OUT = False
-    elif nhead in [8, 16, 128]:
         MAYBE_FINAL_OUT = True
-        logits = torch.zeros(
-            (total_s, num_kv_splits, nhead, v_head_dim),
-            dtype=dtypes.fp32,
-            device=device,
-        )
-    else:
-        assert False, f"{nhead=} not supported"
 
-    attn_lse = torch.zeros(
-        (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
-    )
-    final_lse = torch.zeros((total_s, nhead), dtype=dtypes.fp32, device=device)
-    
-    if num_kv_splits_indptr is not None:
-        if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):
-            return logits.view(total_s, nhead, v_head_dim), attn_lse
-        Lv = v_head_dim
-        BLOCK_DV = triton.next_power_of_2(Lv)
-        grid = (bs, nhead)
-        extra_kargs = {"waves_per_eu": 4}
+        if nhead == 16 and max_seqlen_q == 1:
+            MAYBE_FINAL_OUT = False
+
+        logits = (
+            o.view((total_s, num_kv_splits, nhead, v_head_dim))
+            if (
+                num_kv_splits == 1
+                and (
+                    q.dtype == dtypes.fp8
+                    or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+                )
+            )
+            else torch.empty(
+                (total_s, num_kv_splits, nhead, v_head_dim),
+                dtype=dtypes.fp32,
+                device=device,
+            )
+        )
+
+        attn_lse = torch.empty(
+            (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
+        )
+        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
 
         aiter.mla_decode_stage1_asm_fwd(
             q,
@@ -196,7 +231,19 @@ def mla_decode_fwd(
             logits,
             attn_lse,
             o,
+            q_scale,
+            kv_scale,
         )
+
+        if num_kv_splits == 1 and (
+            q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+        ):
+            return logits.view(total_s, nhead, v_head_dim), attn_lse
+
+        Lv = v_head_dim
+        BLOCK_DV = triton.next_power_of_2(Lv)
+        grid = (bs, nhead)
+        extra_kargs = {"waves_per_eu": 4}
 
         _fwd_kernel_stage2_asm[grid](
             logits,
@@ -219,85 +266,72 @@ def mla_decode_fwd(
             num_stages=2,
             **extra_kargs,
         )
-        return logits, final_lse
+    else:
+        if num_kv_splits is None:
+            num_kv_splits = get_cu_num()
+        if nhead == 16 or (nhead == 128 and kv_buffer.dtype == dtypes.fp8):
+            # Natively support cases
+            pass
+        elif nhead in range(32, 512 + 1, 16) and persistent_mode and max_seqlen_q == 1:
+            # we use nhead=16 to simulate such cases by customized metadata
+            # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
+            total_s = ori_total_s * (ori_nhead // 16)
+            nhead = 16
+            q = q.view(total_s, nhead, -1)
+            o = o.view(total_s, nhead, -1)
+            io_transformed = True
+        else:
+            assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
-    # from aiter.ops.triton.mla_decode_ps import (
-    from aiter.ops.triton.gluon.mla_decode_ps import (
-        decode_grouped_att_m_fwd_ps,
-    )
-    import aiter.ops.triton.utils.arch_info as arch_info
-    import json
+        logits = torch.empty(
+            (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
+            dtype=dtypes.fp32,
+            device=device,
+        )
+        attn_lse = torch.empty(
+            (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
+            dtype=dtypes.fp32,
+            device=device,
+        )
+        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
 
-    @functools.lru_cache(maxsize=1024)
-    def _get_config():
-        if not hasattr(_get_config, "_config_dict"):
-            dev = arch_info.get_device()
-            _get_config._config_dict = {}
-            fpath = f"aiter/ops/triton/configs/{dev}-MLA_DECODE_ROPE-DEFAULT.json"
-            with open(fpath, "r") as file:
-                config = json.load(file)
-            _get_config._config_dict = config
+        aiter.mla_decode_stage1_asm_fwd(
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            num_kv_splits_indptr,
+            work_meta_data,
+            work_indptr,
+            work_info_set,
+            max_seqlen_q,
+            sm_scale,
+            logits,
+            attn_lse,
+            o,
+            q_scale,
+            kv_scale,
+        )
 
-        return _get_config._config_dict
+        aiter.mla_reduce_v1(
+            logits,
+            attn_lse,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            o,
+            final_lse,
+        )
 
-    config = _get_config()["fwd_grouped_kernel_stage1_rope_ps"]
-
-
-    qo_len = 1
-
-    decode_grouped_att_m_fwd_ps(
-        q.reshape(-1, nhead * qo_len, 576),               # [B, Sq, hq, 576]
-        kv_buffer,        # [Pages, hk, 576]
-        kv_buffer,
-        logits.reshape(-1, nhead * qo_len, 512),
-        attn_lse.reshape(-1, nhead * qo_len, 1),
-        o.reshape(-1, nhead * qo_len, 512),
-        work_indptr,
-        work_info_set,
-        512,  # c
-        kv_indptr,
-        kv_indices,
-        sm_scale,
-        logit_cap,
-        qo_len - 1,
-        config,
-    )
-
-    logits_copy = torch.zeros_like(logits)
-    attn_lse_copy = torch.zeros_like(attn_lse)
-
-    # aiter.mla_decode_stage1_asm_fwd(
-    #     q,
-    #     kv_buffer,
-    #     qo_indptr,
-    #     kv_indptr,
-    #     kv_indices,
-    #     kv_last_page_lens,
-    #     num_kv_splits_indptr,
-    #     work_meta_data,
-    #     work_indptr,
-    #     work_info_set,
-    #     max_seqlen_q,
-    #     sm_scale,
-    #     logits_copy,
-    #     attn_lse_copy,
-    #     o,
-    #     q_scale,
-    #     kv_scale,
-    # )
-    #
-    # import pdb;pdb.set_trace()
-
-
-    aiter.mla_reduce_v1(
-        logits,
-        attn_lse,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-        o,
-        final_lse,
-    )
+    if io_transformed:
+        if persistent_mode:
+            logits = logits.view(-1, 1, ori_nhead, v_head_dim)
+        else:
+            logits = logits.view(ori_total_s, num_kv_splits, ori_nhead, v_head_dim)
+        q = q.view(ori_total_s, ori_nhead, -1)
+        o = o.view(ori_total_s, ori_nhead, -1)
 
     return logits, final_lse
 

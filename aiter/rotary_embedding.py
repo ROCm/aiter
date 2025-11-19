@@ -34,6 +34,7 @@ from aiter import dtypes
 import os
 
 AITER_ROPE_TRITON_BACKEND = int(os.environ.get("AITER_ROPE_TRITON_BACKEND", 0)) == 1
+AITER_ROPE_NATIVE_BACKEND = int(os.environ.get("AITER_ROPE_NATIVE_BACKEND", 0)) == 1
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -134,7 +135,7 @@ class RotaryEmbedding(nn.Module):
     def forward(self, *args, **kwargs):
         if AITER_ROPE_TRITON_BACKEND:
             return self.forward_triton(*args, **kwargs)
-        elif torch.compiler.is_compiling():
+        elif AITER_ROPE_NATIVE_BACKEND:
             return self.forward_native(*args, **kwargs)
         else:
             return self.forward_hip(*args, **kwargs)
@@ -259,8 +260,9 @@ class RotaryEmbedding(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         import aiter as ops
 
-        self.cos_cache = self.cos_cache.to(query.device, dtype=query.dtype)
-        self.sin_cache = self.sin_cache.to(query.device, dtype=query.dtype)
+        assert (
+            self.cos_cache.dtype == query.dtype
+        ), f"cos_cache dtype ({self.cos_cache.dtype}) does not match query dtype ({query.dtype})"
         cos, sin = self.cos_cache, self.sin_cache
 
         rotate_style = 0 if self.is_neox_style else 1
