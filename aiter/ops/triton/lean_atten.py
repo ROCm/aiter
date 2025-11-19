@@ -18,20 +18,18 @@ TO be added features:
 """
 
 import torch
-from typing import Optional, Sequence, Union
+from typing import Optional
 from bisect import bisect_right
+import math
 import triton
 import triton.language as tl
-from aiter.ops.triton._triton_kernels.lean_atten import la_persistent, _get_config
 from aiter.ops.triton._triton_kernels.lean_atten import la_persistent, _get_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils._triton import arch_info
 
 _LOGGER = AiterTritonLogger()
 
-LOG_TWO_E = 1.44269504  # log_2(e) value for softmax scaling
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
 
 
@@ -47,6 +45,7 @@ def persistent_lean_attention(
     batch_size: int,
     sm_scale: torch.float16,
     causal: bool = True,  # causal masking
+    RAGGED_BATCH: bool = False,
     config: Optional[dict] = None,
     program_count: Optional[int] = None,
 ):
@@ -59,11 +58,6 @@ def persistent_lean_attention(
     if config is None:
         config = _get_config(causal=causal, batch_size=batch_size)
     sm_count = arch_info.get_num_sms()
-    total_programs = (
-        program_count
-        if program_count is not None
-        else sm_count * config["SM_CNT_FACTOR"]
-    )
     total_programs = (
         program_count
         if program_count is not None
@@ -85,7 +79,7 @@ def persistent_lean_attention(
         XCD_REMAP=config["XCD_REMAP"],
         causal=causal,
         batch_size=batch_size,
-        sm_scale=sm_scale,
+        RAGGED_BATCH=RAGGED_BATCH,
         num_warps=config["num_warps"],
         waves_per_eu=config["waves_per_eu"],
         config=config,
@@ -108,7 +102,7 @@ def _persistent_lean_attention(
     XCD_REMAP: bool,  # xcd_remap for spatial
     causal: bool,  # causal masking
     batch_size: int,
-    sm_scale: torch.float16,  # typically 1 / sqrt(d)
+    RAGGED_BATCH: bool,
     num_warps: int,
     waves_per_eu: int,
     config: dict = {},
@@ -129,10 +123,6 @@ def _persistent_lean_attention(
     HEAD_DIM_PADDED = triton.next_power_of_2(HEAD_DIM_K)
     if HEAD_DIM_PADDED < 16:
         HEAD_DIM_PADDED = 16
-    # Allow irregular head dims by padding compute width and masking I/O
-    HEAD_DIM_PADDED = triton.next_power_of_2(HEAD_DIM_K)
-    if HEAD_DIM_PADDED < 16:
-        HEAD_DIM_PADDED = 16
 
     # MASKED_BLOCKS is used for prefill/causal for BLOCK_M > BLOCK_N
     # For MI300, BLOCK_M=128, BLOCK_N=64 is better for performance
@@ -149,12 +139,9 @@ def _persistent_lean_attention(
     H_K = k.shape[1]
     assert H % H_K == 0, "For GQA, the number of Q heads must be divisible by K/V heads"
     GQA_GROUP_SIZE = H // H_K
-    H_K = k.shape[1]
-    assert H % H_K == 0, "For GQA, the number of Q heads must be divisible by K/V heads"
-    GQA_GROUP_SIZE = H // H_K
     HEADS_PER_XCD = H // NUM_XCDS
 
-    qk_scale = sm_scale * LOG_TWO_E
+    sm_scale = q.shape[-1] ** (-0.5)
 
     (
         num_m_blocks,
@@ -171,7 +158,6 @@ def _persistent_lean_attention(
         N_CTX_Q,
         N_CTX_K,
         H,
-        H_K,
         BLOCK_M,
         BLOCK_N,
         total_programs,
@@ -200,9 +186,10 @@ def _persistent_lean_attention(
         causal=causal,
         MASKED_BLOCKS=MASKED_BLOCKS,
         MODE=CAUSAL_MODE,
-        batch_size=batch_size,
-        batch_num_block_n=batch_num_block_n,
     )
+    if not causal:
+        max_output_tile_cnt = math.ceil((H * batch_size) / total_programs) + 10
+
     if DEBUG:
         print(f"max_output_tile_cnt={max_output_tile_cnt}")
 
@@ -228,7 +215,6 @@ def _persistent_lean_attention(
         N_CTX_Q,
         N_CTX_K,
         H,
-        H_K,
         BLOCK_M,
         BLOCK_N,
         total_programs,
@@ -259,7 +245,6 @@ def _persistent_lean_attention(
             f"locks must have length >= total_programs ({total_programs}), got {locks.numel()}"
         )
 
-
     grid = (total_programs, 1, 1)
 
     o = torch.empty_like(q, dtype=v.dtype)
@@ -281,7 +266,6 @@ def _persistent_lean_attention(
         q,
         k,
         v,
-        qk_scale,
         Mp,
         Lp,
         Op,
@@ -301,10 +285,10 @@ def _persistent_lean_attention(
         o.stride(1),
         o.stride(2),
         N_CTX_Q,
-        N_CTX_Q,
         Op.stride(0),  # total_programs
         Op.stride(1),  # n_ctx_q
         Op.stride(2),  # head_dim
+        sm_scale,
         HEADS_PER_XCD=HEADS_PER_XCD,
         HEAD_DIM_ORIG=HEAD_DIM_K,
         HEAD_DIM=HEAD_DIM_K,
@@ -328,8 +312,6 @@ def _persistent_lean_attention(
         num_warps=num_warps,
         num_stages=1,
         num_ctas=1,
-        num_heads_q=H,
-        num_heads_k=H_K,
         gqa_group_size=GQA_GROUP_SIZE,
         use_64_indexing=(
             (k.stride(0) * N_CTX_K) >= (1 << 31)
@@ -337,7 +319,9 @@ def _persistent_lean_attention(
             or (Op.stride(0) * total_programs) >= (1 << 31)
             or (Op.stride(1) * N_CTX_Q) >= (1 << 31)
             or (o.stride(0) * N_CTX_Q) >= (1 << 31)
+            or (q.stride(0) * N_CTX_Q) >= (1 << 31)
         ),
+        RAGGED_BATCH=RAGGED_BATCH,
         **config,
     )
     """
@@ -351,7 +335,6 @@ def _persistent_lean_attention(
     # print(f"la kernel {la_kernel.n_regs} registers used, {la_kernel.n_spills} spills")
     ms = 0
     return (o, ms)
-    return (o, ms)
 
 
 def get_num_splits_and_buffer_sizes(
@@ -360,7 +343,6 @@ def get_num_splits_and_buffer_sizes(
     max_seqlen_q,
     max_seqlen_k,
     num_heads,
-    num_heads_k,
     BLOCK_M,
     BLOCK_N,
     num_SMs,
@@ -376,12 +358,10 @@ def get_num_splits_and_buffer_sizes(
     num_n_blocks = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
 
     # Schedule over Q heads; K/V heads are mapped inside the kernel via gqa_group_size
-    # Schedule over Q heads; K/V heads are mapped inside the kernel via gqa_group_size
 
     # print(f"block_m: {BLOCK_M}, block_n: {BLOCK_N} ")
     # print(f"num_m_block: {num_m_blocks}, num_n_block: {num_n_blocks} ")
     # print(f"max_seqlen_q: {max_seqlen_q}, max_seqlen_k: {max_seqlen_k}")
-    # print(f"num_heads: {num_heads}, num_heads_k: {num_heads_k} ")
 
     if max_seqlen_q == 1:
         causal = False
@@ -394,16 +374,13 @@ def get_num_splits_and_buffer_sizes(
         # Does not support ragged batch for causal.
         tiles_per_head = tiles_per_head * batch_size
     else:
-        # Decode or Not Causal: tiles_per_head equals total # of N-blocks across the batch
-        tiles_per_head = num_n_blocks
+        # Decode or Not Causal
+        tiles_per_head = num_m_blocks * num_n_blocks
 
-    # Total tiles across all Q heads
     # Total tiles across all Q heads
     if XCD_REMAP:
         total_tiles = tiles_per_head * (num_heads // NUM_XCDS)
-        total_tiles = tiles_per_head * (num_heads // NUM_XCDS)
     else:
-        total_tiles = tiles_per_head * num_heads
         total_tiles = tiles_per_head * num_heads
 
     # StreamK Lean has as many threadblocks as SMs
@@ -442,8 +419,7 @@ def get_num_splits_and_buffer_sizes(
     high_load_tbs = total_tiles - ((max_tiles_per_tb - 1) * xcd_programs)
 
     # Needed for causal. This is (per batch n_ctx) // BLOCK_N
-    if causal:
-        num_n_blocks = num_n_blocks // batch_size
+    num_n_blocks = num_n_blocks // batch_size
 
     return (
         num_m_blocks,
@@ -466,8 +442,6 @@ def calculate_max_output_tiles_analytically(
     causal: bool,
     MASKED_BLOCKS: int,
     MODE: int,  # 0-ping-pong, 1-sequential
-    batch_size: int,
-    batch_num_block_n: Optional[Union[torch.Tensor, Sequence[int]]] = None,
 ):
     """
     Calculates the maximum number of output tiles any single workgroup will process
@@ -490,17 +464,6 @@ def calculate_max_output_tiles_analytically(
             task_size = (q_block_idx + 1) * MASKED_BLOCKS
             total_blocks += task_size
             m_block_boundaries.append(total_blocks)
-    else:
-        # For non-causal ragged: build per-batch cumulative boundaries within a head
-        if batch_num_block_n is not None:
-            if isinstance(batch_num_block_n, torch.Tensor):
-                batch_boundaries = [int(x) for x in batch_num_block_n.tolist()]
-            else:
-                batch_boundaries = [int(x) for x in batch_num_block_n]
-        else:
-            # Fallback to uniform split
-            per_batch = tiles_per_head // max(batch_size, 1)
-            batch_boundaries = [per_batch * (i + 1) for i in range(max(batch_size, 0))]
 
     max_total_output_tiles = 0
     # Loop through each workgroup to find the one that spans the most output tiles.
@@ -529,13 +492,8 @@ def calculate_max_output_tiles_analytically(
             wg_end_in_head = min(end_iter, head_start_iter + tiles_per_head)
 
             if not causal:
-                # Count how many batch tiles (ragged) are spanned in this head
-                relative_start = wg_start_in_head - head_start_iter
-                relative_end = wg_end_in_head - head_start_iter
-                start_b_idx = bisect_right(batch_boundaries, relative_start)
-                end_b_idx = bisect_right(batch_boundaries, relative_end - 1)
-                tiles_in_this_head = (end_b_idx - start_b_idx) + 1
-                total_output_tiles_for_wg += tiles_in_this_head
+                # For non-causal, each head is one output tile.
+                total_output_tiles_for_wg += 1
                 continue
 
             # --- Causal Logic using Binary Search ---
