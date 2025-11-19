@@ -1615,6 +1615,9 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "-c", "--context_length", type=int, default=None, help="Context length"
     )
     parser.add_argument("-b", "--batch_size", type=int, default=None, help="Batch size")
+    parser.add_argument(
+        "-d", "--head_dim", type=int, default=None, help="Head dimension"
+    )
     parser.add_argument("--block_size", type=int, default=None, help="Block size")
     parser.add_argument(
         "--quant_mode",
@@ -1677,8 +1680,9 @@ def process_arguments(args: argparse.Namespace) -> tuple:
     compute_types = COMPUTE_TYPE_OPTIONS
     block_sizes = BLOCK_SIZE_OPTIONS
     head_configs = HEAD_CONFIGURATIONS
-    context_length = CONTEXT_LENGTH_OPTIONS
+    context_lengths = CONTEXT_LENGTH_OPTIONS
     batch_sizes = BATCH_SIZE_OPTIONS
+    head_sizes = HEAD_DIMENSION_OPTIONS
     query_lengths = QUERY_LENGTH_OPTIONS
     quant_mode = QUANT_MODE_OPTIONS
     trans_v = TRANS_V_OPTIONS
@@ -1698,11 +1702,11 @@ def process_arguments(args: argparse.Namespace) -> tuple:
     if args.query_length is not None:
         query_lengths = [args.query_length]
     if args.context_length is not None:
-        context_length = [args.context_length]
+        context_lengths = [args.context_length]
     if args.batch_size is not None:
         batch_sizes = [args.batch_size]
-    if args.block_size is not None:
-        block_sizes = [args.block_size]
+    if args.head_dim is not None:
+        head_sizes = [args.head_dim]
     if args.block_size is not None:
         block_sizes = [args.block_size]
     if args.quant_mode is not None:
@@ -1729,8 +1733,9 @@ def process_arguments(args: argparse.Namespace) -> tuple:
         compute_types,
         block_sizes,
         head_configs,
-        context_length,
+        context_lengths,
         batch_sizes,
+        head_sizes,
         query_lengths,
         quant_mode,
         trans_v,
@@ -1801,8 +1806,9 @@ def run_multi_pa_gluon_test(
     compute_types,
     block_sizes,
     head_configs,
-    context_length,
+    context_lengths,
     batch_sizes,
+    head_sizes,
     query_lengths,
     quant_mode,
     trans_v,
@@ -1814,24 +1820,6 @@ def run_multi_pa_gluon_test(
     sample_rate=1.0,
 ) -> pd.DataFrame:
     """Run all tests."""
-    # results = []
-    # total = (
-    #     len(compute_types)
-    #     * len(block_sizes)
-    #     * len(head_configs)
-    #     * len(context_length)
-    #     * len(batch_sizes)
-    #     * len(query_lengths)
-    #     * len(quant_mode)
-    #     * len(trans_v)
-    #     * len(kv_varlen)
-    #     * len(quant_q_and_kv)
-    #     * len(use_torch_flash_ref_options)
-    #     * len(use_aot_impl_options)
-    #     * len(context_partition_size_options)
-    # )
-    # current = 0
-
     # Generate all test configurations
     test_configs = []
 
@@ -1845,20 +1833,14 @@ def run_multi_pa_gluon_test(
                             qm_cnt = 0
                             for qm in quant_mode:
                                 qm_cnt += 1
-                                if (
-                                    quant_q is False
-                                    and quant_kv is False
-                                    and qm_cnt > 1
-                                ):
+                                if not quant_q and not quant_kv and qm_cnt > 1:
                                     continue
                                 for bs in block_sizes:
                                     for hc in head_configs:
-                                        for cl in context_length:
+                                        for cl in context_lengths:
                                             for bsz in batch_sizes:
                                                 for ql in query_lengths:
-                                                    for (
-                                                        head_size
-                                                    ) in HEAD_DIMENSION_OPTIONS:
+                                                    for head_size in head_sizes:
                                                         for (
                                                             use_aot_impl
                                                         ) in use_aot_impl_options:
@@ -1915,8 +1897,9 @@ def parse_arg_and_run_test(sample_rate0: float = None):
         compute_types,
         block_sizes,
         head_configs,
-        context_length,
+        context_lengths,
         batch_sizes,
+        head_sizes,
         query_lengths,
         quant_mode,
         trans_v,
@@ -1936,8 +1919,9 @@ def parse_arg_and_run_test(sample_rate0: float = None):
         compute_types,
         block_sizes,
         head_configs,
-        context_length,
+        context_lengths,
         batch_sizes,
+        head_sizes,
         query_lengths,
         quant_mode,
         trans_v,
@@ -2067,14 +2051,18 @@ def multi_compute_quant_type_test():
     USE_TORCH_FLASH_REF_OPTIONS = [True]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
     USE_AOT_IMPL_OPTIONS = [True, False]
+    # USE_AOT_IMPL_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
     TRANS_V_OPTIONS = [False, True]
     QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
+    # QUANT_Q_AND_KV_OPTIONS = [[False, False]]
     COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
     QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
     # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
     HEAD_DIMENSION_OPTIONS = [64, 128, 256]
+    # HEAD_DIMENSION_OPTIONS = [128]
     BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+    # BLOCK_SIZE_OPTIONS = [1024]
     HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
     CONTEXT_LENGTH_OPTIONS = [
@@ -2084,13 +2072,14 @@ def multi_compute_quant_type_test():
         2048,
         4096,
         8192,
-        16 * 1024,
-        32 * 1024,
+        # 16 * 1024,
+        # 32 * 1024,
     ]
     # CONTEXT_LENGTH_OPTIONS = [4096]
     BATCH_SIZE_OPTIONS = [3, 128]
 
-    parse_arg_and_run_test(sample_rate0=0.04)
+    # parse_arg_and_run_test(sample_rate0=0.04)
+    parse_arg_and_run_test()
 
 
 if __name__ == "__main__":

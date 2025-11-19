@@ -2003,7 +2003,7 @@ def paged_attention_decode_v2_reduce_kernel(
 
     # Create mask for valid logits access
     logits_mask = (partition_offsets[None, :] < context_partition_num) & (
-        query_group_offsets[:, None] < QUERY_GROUP_SIZE
+        query_group_offsets[:, None] < query_group_size
     )
 
     # Load partial logits from all partitions
