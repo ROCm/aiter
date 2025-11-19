@@ -187,17 +187,25 @@ class Case:
     [
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
-            Case(4096, 7168, 4096, "float8_e4m3fn", "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            # TP1
+            Case(16,  7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(1024, 2048, 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4096, 4096, 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(8192, 7168, 2048, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            # TP8 
+            Case(16, 512, 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(1024, 7168, 256, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4096, 512  , 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(8192, 7168, 256, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            # Precision combinations
             Case(4096, 7168, 4096, "float8_e4m3fn", "float8_e4m3fn", 128, 4),
-            Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "float8_e4m3fn", 128, 4, hbm_swizzling=True),
             Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "float8_e4m3fn", 128, 4),
-            Case(4096, 7168, 4096, "float8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
             Case(4096, 7168, 4096, "float8_e4m3fn", "mxfloat8_e4m3fn", 128, 4),
-            Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
             Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4),
-            Case(2048, 4096, 2048, "float8_e4m3fn", "float8_e4m3fn", 8, 2),
-            Case(2048, 4096, 2048, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
+            # edges
             Case(300, 400, 400, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
+            Case(1000, 704, 2048, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
+            Case(8192, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
         ]
     ],
 )
