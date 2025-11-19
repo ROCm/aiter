@@ -84,12 +84,6 @@ class TRTLLMAllreduceFusion:
             return
 
         if world_size not in TRTLLMAllreduceFusion._SUPPORTED_WORLD_SIZES:
-            logger.warning(
-                "TRTLLMAllreduceFusion is disabled due to an unsupported world"
-                " size: %d. Supported world sizes: %s.",
-                world_size,
-                str(TRTLLMAllreduceFusion._SUPPORTED_WORLD_SIZES),
-            )
             return
 
         torch.cuda.set_device(rank)
