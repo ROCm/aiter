@@ -17,11 +17,14 @@ import aiter
 # from aiter.ops.triton.gluon.mla_decode import (
 #     decode_attention_fwd_grouped,
 # )
-from aiter.ops.triton.gluon.mla_decode_mi355 import (
-    decode_attention_fwd_grouped,
-)
-from aiter.ops.triton.gluon.mla_decode_fp8 import (
-    decode_attention_fwd_grouped as decode_attention_fwd_grouped_fp8,
+# from aiter.ops.triton.gluon.mla_decode_mi355 import (
+#     decode_attention_fwd_grouped,
+# )
+# from aiter.ops.triton.gluon.mla_decode_fp8 import (
+#     decode_attention_fwd_grouped as decode_attention_fwd_grouped_fp8,
+# )
+from aiter.ops.triton.mla_decode_dispatch import (
+    decode_attention_fwd_grouped
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_mla_decode import ref_preprocess
@@ -375,7 +378,6 @@ def run_benchmark(args: argparse.Namespace):
         logit_cap: float = 0.0,
         device="cuda",
         metric: str = "bandwidth",
-        args,
         **kwargs,
     ):
         """
@@ -486,39 +488,15 @@ def run_benchmark(args: argparse.Namespace):
         mem = bytes_read + bytes_written
         # print(mem)
 
-        # ms = triton.testing.do_bench(
-        _, us = run_perftest(
-        # lambda: decode_attention_fwd_grouped(
-        #     q_fp8.reshape(-1, H * 2, 576),
-        #     k_input_fp8,
-        #     v_input_fp8,
-            decode_attention_fwd_grouped,
-            q.reshape(-1, H * (mtp + 1), 576),
-            kv_cache,
-            v_input,
-            out_tri,
-            kv_indptr,
-            kv_indices,
-            block_tables,
-            kv_lora_rank,
-            attn_logits,
-            attn_lse,
-            num_kv_splits,
-            sm_scale,
-            logit_cap,
-            mtp,
-            # ),
-            # warmup=25,
-            # rep=100,
-        )
+        # # ms = triton.testing.do_bench(
         # _, us = run_perftest(
         # # lambda: decode_attention_fwd_grouped(
         # #     q_fp8.reshape(-1, H * 2, 576),
         # #     k_input_fp8,
         # #     v_input_fp8,
-        #     decode_attention_fwd_grouped_fp8,
-        #     q_fp8.reshape(-1, H * (mtp + 1), 576),
-        #     kv_cache_fp8,
+        #     decode_attention_fwd_grouped,
+        #     q.reshape(-1, H * (mtp + 1), 576),
+        #     kv_cache,
         #     v_input,
         #     out_tri,
         #     kv_indptr,
@@ -535,6 +513,30 @@ def run_benchmark(args: argparse.Namespace):
         #     # warmup=25,
         #     # rep=100,
         # )
+        _, us = run_perftest(
+        # lambda: decode_attention_fwd_grouped(
+        #     q_fp8.reshape(-1, H * 2, 576),
+        #     k_input_fp8,
+        #     v_input_fp8,
+            decode_attention_fwd_grouped,
+            q_fp8.reshape(-1, H * (mtp + 1), 576),
+            kv_cache_fp8,
+            v_input,
+            out_tri,
+            kv_indptr,
+            kv_indices,
+            block_tables,
+            kv_lora_rank,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            sm_scale,
+            logit_cap,
+            mtp,
+            # ),
+            # warmup=25,
+            # rep=100,
+        )
         # print(lse_ref)
         # decode_attention_fwd_grouped_fp8(
         #     q_fp8.reshape(-1, H * (mtp + 1), 576),
@@ -554,22 +556,24 @@ def run_benchmark(args: argparse.Namespace):
         #     # warmup=25,
         #     # rep=100,
         # )
-        cache_key = decode_attention_fwd_grouped(
-            q.reshape(-1, H * (mtp + 1), 576),
-            kv_cache,
-            v_input,
-            out_tri,
-            kv_indptr,
-            kv_indices,
-            block_tables,
-            kv_lora_rank,
-            attn_logits,
-            attn_lse,
-            num_kv_splits,
-            sm_scale,
-            logit_cap,
-            mtp,
-        )
+        # cache_key = decode_attention_fwd_grouped(
+        #     # q.reshape(-1, H * (mtp + 1), 576),
+        #     # kv_cache,
+        #     q_fp8.reshape(-1, H * (mtp + 1), 576),
+        #     kv_cache_fp8,
+        #     v_input,
+        #     out_tri,
+        #     kv_indptr,
+        #     kv_indices,
+        #     block_tables,
+        #     kv_lora_rank,
+        #     attn_logits,
+        #     attn_lse,
+        #     num_kv_splits,
+        #     sm_scale,
+        #     logit_cap,
+        #     mtp,
+        # )
 
         print(">>> ", cache_key)
         ms = us / 1000
@@ -587,13 +591,14 @@ def run_benchmark(args: argparse.Namespace):
         print(f"{tflops=}")
         print(f"{bandwidth=}")
 
-        if args.aot:
+        if True:
             triton_cache_dir = str(triton.knobs.cache.dir)
             aot_kernel_dir = f"./mla/aot"
 
             padded_str = "T" if args.padding else "F"
             os.makedirs(aot_kernel_dir, exist_ok=True)
-            aot_name = f"mla_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
+            # aot_name = f"mla_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
+            aot_name = f"mla_n16x4_prefetch_k_paged_64"
 
             src = os.path.join(triton_cache_dir, cache_key)
             dst = os.path.join(aot_kernel_dir, aot_name)
