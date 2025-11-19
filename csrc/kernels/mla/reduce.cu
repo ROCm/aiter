@@ -8,13 +8,16 @@
 #include "aiter_hip_common.h"
 #include "mla.h"
 
-template <int32_t kSizeDV_,
+template <int32_t kSizeDV0_,
+          int32_t kSizeDV1_,
           int32_t kNumHeadQ_,
           bool    kOutputLse_,
           bool    kOmitReduceFinalMap_>
 struct MlaReduceKernelV1Traits
 {
-    static constexpr int32_t kSizeDV             = kSizeDV_;       // hidden dimension size of value/output
+    static constexpr int32_t kSizeDV0            = kSizeDV0_;      // hidden dimension size of value/output
+    static constexpr int32_t kSizeDV1            = kSizeDV1_;      // for case like 384, tile is splited to 256+128.
+    static constexpr int32_t kSizeDV             = kSizeDV0 + kSizeDV1;
     static constexpr int32_t kNumHeadQ           = kNumHeadQ_;     // head count of q
     static constexpr int32_t kNumHeadQMask       = kNumHeadQ - 1;
     static constexpr int32_t kNumHeadQLog2       = __builtin_ctz(kNumHeadQ);
@@ -80,12 +83,12 @@ CK_TILE_HOST_DEVICE static constexpr auto GetVectorSizeForTile()
 }
 
 template <typename Traits, typename scalar_t>
-CK_TILE_DEVICE static constexpr auto MakeOutputTileDistribution()
+CK_TILE_DEVICE static constexpr auto MakeOutputTileDistribution0()
 {
-    constexpr int32_t kVectorN     = GetVectorSizeForTile<Traits::kNumWarps, 1, Traits::kSizeDV, scalar_t>();
+    constexpr int32_t kVectorN     = GetVectorSizeForTile<Traits::kNumWarps, 1, Traits::kSizeDV0, scalar_t>();
     constexpr int32_t kThrPerWarpN = ck_tile::get_warp_size();
     constexpr int32_t kNumWarpN    = Traits::kNumWarps;
-    constexpr int32_t kNumRepeat   = ck_tile::max(1, Traits::kSizeDV / kThrPerWarpN / kNumWarpN / kVectorN);
+    constexpr int32_t kNumRepeat   = ck_tile::max(1, Traits::kSizeDV0 / kThrPerWarpN / kNumWarpN / kVectorN);
 
     return ck_tile::make_static_tile_distribution(
         ck_tile::tile_distribution_encoding<
@@ -99,13 +102,32 @@ CK_TILE_DEVICE static constexpr auto MakeOutputTileDistribution()
 }
 
 template <typename Traits, typename scalar_t>
-CK_TILE_DEVICE static auto MakeTileWindow(
+CK_TILE_DEVICE static constexpr auto MakeOutputTileDistribution1()
+{
+    constexpr int32_t kVectorN     = GetVectorSizeForTile<Traits::kNumWarps, 1, Traits::kSizeDV1, scalar_t>();
+    constexpr int32_t kThrPerWarpN = ck_tile::get_warp_size();
+    constexpr int32_t kNumWarpN    = Traits::kNumWarps;
+    constexpr int32_t kNumRepeat   = ck_tile::max(1, Traits::kSizeDV1 / kThrPerWarpN / kNumWarpN / kVectorN);
+
+    return ck_tile::make_static_tile_distribution(
+        ck_tile::tile_distribution_encoding<
+            ck_tile::sequence<>,    // no replicate
+            ck_tile::tuple<ck_tile::sequence<1>,
+                           ck_tile::sequence<kNumRepeat, kNumWarpN, kThrPerWarpN, kVectorN>>,
+            ck_tile::tuple<ck_tile::sequence<2>, ck_tile::sequence<2>>,
+            ck_tile::tuple<ck_tile::sequence<1>, ck_tile::sequence<2>>,
+            ck_tile::sequence<2, 1, 2>,
+            ck_tile::sequence<0, 0, 3>>{});
+}
+
+template <typename Traits, typename scalar_t>
+CK_TILE_DEVICE static auto MakeTileWindow0(
     scalar_t* p_tile)
 {
     const auto naive_view =
         ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
             p_tile,
-            ck_tile::make_tuple(1, Traits::kSizeDV),    // lengths
+            ck_tile::make_tuple(1, Traits::kSizeDV0),   // lengths
             ck_tile::make_tuple(Traits::kSizeDV, 1),    // strides
             ck_tile::number<Traits::kSizeDV>{},         // last dim alignment
             ck_tile::number<1>{});                      // last dim stride
@@ -113,7 +135,28 @@ CK_TILE_DEVICE static auto MakeTileWindow(
     const auto tile_window = ck_tile::make_tile_window(
         naive_view,
         ck_tile::make_tuple(ck_tile::number<1>{},               // window size
-                            ck_tile::number<Traits::kSizeDV>{}),
+                            ck_tile::number<Traits::kSizeDV0>{}),
+        {0, 0});                                                // origin
+
+    return tile_window;
+}
+
+template <typename Traits, typename scalar_t>
+CK_TILE_DEVICE static auto MakeTileWindow1(
+    scalar_t* p_tile)
+{
+    const auto naive_view =
+        ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
+            p_tile,
+            ck_tile::make_tuple(1, Traits::kSizeDV1),   // lengths
+            ck_tile::make_tuple(Traits::kSizeDV, 1),    // strides
+            ck_tile::number<Traits::kSizeDV>{},         // last dim alignment
+            ck_tile::number<1>{});                      // last dim stride
+
+    const auto tile_window = ck_tile::make_tile_window(
+        naive_view,
+        ck_tile::make_tuple(ck_tile::number<1>{},               // window size
+                            ck_tile::number<Traits::kSizeDV1>{}),
         {0, 0});                                                // origin
 
     return tile_window;
@@ -267,23 +310,62 @@ CK_TILE_DEVICE void reduce_output(
     const float*                   p_partial_output_seq_base,
     out_t*                         p_final_out_base)
 {
-    auto oaccu_window = ck_tile::make_tile_window(MakeTileWindow<Traits, const float>(nullptr),
-                                                  MakeOutputTileDistribution<Traits, const float>());
-    auto reg_out = ck_tile::make_static_distributed_tensor<float>(
-        decltype(ck_tile::load_tile(oaccu_window))::get_tile_distribution());
-    ck_tile::set_tile(reg_out, 0.f);
+    auto oaccu_window_0 = ck_tile::make_tile_window(MakeTileWindow0<Traits, const float>(nullptr),
+                                                    MakeOutputTileDistribution0<Traits, const float>());
+    auto oaccu_window_1 = [&]() {
+        if constexpr (Traits::kSizeDV1 != 0)
+        {
+            return ck_tile::make_tile_window(MakeTileWindow1<Traits, const float>(nullptr),
+                                             MakeOutputTileDistribution1<Traits, const float>());
+        }
+        else
+        {
+            return ck_tile::make_null_tile_window(ck_tile::make_tuple(ck_tile::number<Traits::kSizeDV1>()));
+        }
+    }();
+
+
+    auto reg_out_0 = ck_tile::make_static_distributed_tensor<float>(
+        decltype(ck_tile::load_tile(oaccu_window_0))::get_tile_distribution());
+    auto reg_out_1 = [&]() {
+        if constexpr (Traits::kSizeDV1 != 0)
+        {
+            return ck_tile::make_static_distributed_tensor<float>(
+                decltype(ck_tile::load_tile(oaccu_window_1))::get_tile_distribution());
+        }
+        else
+        {
+            return ck_tile::null_tensor();
+        }
+    }();
+
+    ck_tile::set_tile(reg_out_0, 0.f);
+    if constexpr (Traits::kSizeDV1 != 0)
+    {
+        ck_tile::set_tile(reg_out_1, 0.f);
+    }
 
     auto cal_out = [&](const int32_t reduce_partial_map, const int32_t split_idx)
     {
+        const float lse_scale = p_lds_lse_scale[split_idx];
+
         const int64_t reduce_tile_pos = reduce_partial_map * int64_t(Traits::kNumHeadQ * Traits::kSizeDV);
         const float* p_partial_output = p_partial_output_seq_base + reduce_tile_pos;
-        oaccu_window.set_bottom_tensor_view_data_ptr(p_partial_output);
+        oaccu_window_0.set_bottom_tensor_view_data_ptr(p_partial_output);
 
-        const float lse_scale = p_lds_lse_scale[split_idx];
-        auto oaccu = ck_tile::load_tile(oaccu_window);
-        ck_tile::sweep_tile(oaccu, [&](auto idx) {
-            reg_out(idx) += lse_scale * oaccu(idx);
+        auto oaccu_0 = ck_tile::load_tile(oaccu_window_0);
+        ck_tile::sweep_tile(oaccu_0, [&](auto idx) {
+            reg_out_0(idx) += lse_scale * oaccu_0(idx);
         });
+
+        if constexpr (Traits::kSizeDV1 != 0)
+        {
+            oaccu_window_1.set_bottom_tensor_view_data_ptr(p_partial_output + Traits::kSizeDV0);
+            auto oaccu_1 = ck_tile::load_tile(oaccu_window_1);
+            ck_tile::sweep_tile(oaccu_1, [&](auto idx) {
+                reg_out_1(idx) += lse_scale * oaccu_1(idx);
+            });
+        }
     };
 
     cal_out(reduce_partial_map_0, 0);
@@ -295,8 +377,14 @@ CK_TILE_DEVICE void reduce_output(
     }
 
     out_t* p_final_out = p_final_out_base + seq_idx * params.stride_s_o;
-    auto dram_out = MakeTileWindow<Traits, out_t>(p_final_out);
-    ck_tile::store_tile(dram_out, ck_tile::cast_tile<out_t>(reg_out));
+    auto dram_out_0 = MakeTileWindow0<Traits, out_t>(p_final_out);
+    ck_tile::store_tile(dram_out_0, ck_tile::cast_tile<out_t>(reg_out_0));
+
+    if constexpr (Traits::kSizeDV1 != 0)
+    {
+        auto dram_out_1 = MakeTileWindow0<Traits, out_t>(p_final_out + Traits::kSizeDV0);
+        ck_tile::store_tile(dram_out_1, ck_tile::cast_tile<out_t>(reg_out_1));
+    }
 }
 
 template <typename Traits, typename lse_t, typename out_t>
@@ -431,11 +519,21 @@ __global__ void kn_mla_reduce_v1(
 // NRFM: No Reduce Final Map
 #define MLA_MERGE_CASE(NUM_HEAD_C, HEAD_DIM_C, OUTPUT_LSE_C, NRFM_C, NAME, ...)                             \
     constexpr int32_t NumHeads  = (NUM_HEAD_C);                                                             \
-    constexpr int32_t HeadDim   = (HEAD_DIM_C);                                                             \
     constexpr bool    OutputLse = (OUTPUT_LSE_C);                                                           \
     constexpr bool    NoReduceFinalMap = (NRFM_C);                                                          \
-    using Traits = MlaReduceKernelV1Traits<HeadDim, NumHeads, OutputLse, NoReduceFinalMap>;                 \
-    __VA_ARGS__;
+    if constexpr (((HEAD_DIM_C) == 384))                                                                    \
+    {                                                                                                       \
+        constexpr int32_t HeadDim  = 256;                                                                   \
+        constexpr int32_t HeadDim1 = (HEAD_DIM_C) - HeadDim;                                                \
+        using Traits = MlaReduceKernelV1Traits<HeadDim, HeadDim1, NumHeads, OutputLse, NoReduceFinalMap>;   \
+        __VA_ARGS__;                                                                                        \
+    }                                                                                                       \
+    else                                                                                                    \
+    {                                                                                                       \
+        constexpr int32_t HeadDim = (HEAD_DIM_C);                                                           \
+        using Traits = MlaReduceKernelV1Traits<HeadDim, 0, NumHeads, OutputLse, NoReduceFinalMap>;          \
+        __VA_ARGS__;                                                                                        \
+    }
 
 #define MLA_MERGE_CASE_IF(NUM_HEAD, NUM_HEAD_C,                                                             \
                           HEAD_DIM, HEAD_DIM_C,                                                             \
@@ -490,6 +588,14 @@ __global__ void kn_mla_reduce_v1(
         NUM_HEAD,  16, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NAME, __VA_ARGS__)                    \
     MLA_MERGE_CASE_EF(                                                                                      \
         NUM_HEAD,  16, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,  16, HEAD_DIM, 384, OUTPUT_LSE, true,  NRFM, true,  NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,  16, HEAD_DIM, 384, OUTPUT_LSE, true,  NRFM, false, NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,  16, HEAD_DIM, 384, OUTPUT_LSE, false, NRFM, true,  NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,  16, HEAD_DIM, 384, OUTPUT_LSE, false, NRFM, false, NAME, __VA_ARGS__)                    \
     MLA_MERGE_CASE_EF(                                                                                      \
         NUM_HEAD,  16, HEAD_DIM, 512, OUTPUT_LSE, true,  NRFM, true,  NAME, __VA_ARGS__)                    \
     MLA_MERGE_CASE_EF(                                                                                      \
