@@ -10,12 +10,11 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
 def _fused_indices_and_gather_kernel(
     x2d,
     gather_out,
-    idx2d,
+    idx1d,
     E: tl.constexpr,
     a: tl.constexpr,
     D: tl.constexpr,
-    stridex0: tl.int32,
-    stridex1: tl.int32,
+    stridex: tl.int32,
     strideop0: tl.int32,
     strideop1: tl.int32,
     strideidx0: tl.int32,
@@ -48,7 +47,6 @@ def _fused_indices_and_gather_kernel(
     tile = tl.load(x2d + src_x, mask=mask_m[:, None] & mask_n[None, :])
     # Store to out
     tl.store(gather_out + dst_gather_out, tile, mask=mask_m[:, None] & mask_n[None, :])
-    idx2d_vals = tl.broadcast_to(row_vals[:, None], (BLOCK_M, BLOCK_N)).to(tl.int64)
-    tl.store(
-        idx2d + dst_indices_out, idx2d_vals, mask=mask_m[:, None] & mask_n[None, :]
-    )
+    if pid_n == 0:
+        dst_idx = offs_m * strideidx
+        tl.store(idx1d + dst_idx, row_vals.to(tl.int32), mask=mask_m)
