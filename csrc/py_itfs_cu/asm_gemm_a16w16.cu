@@ -55,6 +55,7 @@ get_heuristic_kernel(int M,
                      int N,
                      int K,
                      CFG* cfgs,
+                     std::string arch_id,
                      std::optional<int> splitk             = std::nullopt,
                      std::optional<std::string> kernelName = std::nullopt)
 {
@@ -62,8 +63,6 @@ get_heuristic_kernel(int M,
     hipDeviceProp_t dev_prop;
     HIP_CALL(hipGetDevice(&dev));
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-    std::string arch_id = get_gpu_arch();
-    printf("Arch ID: %s\n", arch_id.c_str());
     uint32_t num_cu = dev_prop.multiProcessorCount;
     // printf("num_cu: %d\n", num_cu);
     uint32_t empty_cu      = num_cu;
@@ -129,7 +128,7 @@ get_heuristic_kernel(int M,
                 compute2mem_effi   = local_compute2mem_effi;
                 oob                = (M % cfg.tileM == 0) ? 0 : cfg.tileM - (M % cfg.tileM);
                 selectedKernelName = el.first;
-                printf("Selected Kernel: %s\n", selectedKernelName.c_str());
+                // printf("Selected Kernel: %s\n", selectedKernelName.c_str());
                 selectedsplitK     = split_K;
             }
         }
@@ -208,7 +207,8 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     CFG* config_map          = &cfg_bf16gemm_outf32;
 
     // 2.1 static dict
-    std::string selectedKernelName = kernelName.value_or("");
+    std::string arch_id = get_gpu_arch();
+    std::string selectedKernelName = kernelName.has_value() ? arch_id + kernelName.value() : "";
     int selectedksplit             = splitK.value_or(0) ?: 1;
     if(!kernelName.has_value() || kernelName == "")
     {
@@ -217,6 +217,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
                                            Ndim,
                                            Kdim,
                                            config_map,
+                                           arch_id,
                                            splitK.has_value() ? splitK : std::nullopt,
                                            kernelName.has_value() ? kernelName : std::nullopt);
         selectedKernelName = std::get<0>(it_sel);

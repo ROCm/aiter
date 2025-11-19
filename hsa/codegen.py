@@ -10,10 +10,13 @@ from collections import defaultdict
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 base_dir = os.path.basename(this_dir)
-archs = [os.path.basename(os.path.normpath(path)) for path in os.environ.get("AITER_ASM_DIR").split(":")]
+archs = [
+    os.path.basename(os.path.normpath(path))
+    for path in os.environ.get("AITER_ASM_DIR").split(":")
+]
 
 
-content =  """// SPDX-License-Identifier: MIT
+content = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include <unordered_map>
@@ -49,11 +52,8 @@ if __name__ == "__main__":
         for el in glob.glob(f"{this_dir}/{arch}/{args.module}/*.csv", recursive=True):
             df = pd.read_csv(el)
             cfgname = os.path.basename(el).split(".")[0]
-            csv_groups[cfgname].append({
-                'file_path': el,
-                'arch': arch
-            })
-    
+            csv_groups[cfgname].append({"file_path": el, "arch": arch})
+
     ## deal with same name csv
     cfgs = []
     have_get_header = False
@@ -61,25 +61,31 @@ if __name__ == "__main__":
         dfs = []
         for file_info in file_info_list:
             single_file = file_info["file_path"]
-            arch = file_info['arch']
+            arch = file_info["arch"]
             df = pd.read_csv(single_file)
             # check headers
             headers_list = df.columns.tolist()
-            required_columns = {'knl_name', 'co_name'}
+            required_columns = {"knl_name", "co_name"}
             if not required_columns.issubset(headers_list):
                 missing = required_columns - set(headers_list)
-                print(f"ERROR: Invalid assembly CSV format -- {single_file}. Missing required columns: {', '.join(missing)}")
-            df['arch'] = arch    # add arch into df
+                print(
+                    f"ERROR: Invalid assembly CSV format -- {single_file}. Missing required columns: {', '.join(missing)}"
+                )
+            df["arch"] = arch  # add arch into df
             dfs.append(df)
         if dfs:
             combine_df = pd.concat(dfs, ignore_index=True).fillna(0)
             if have_get_header == False:
                 headers_list = combine_df.columns.tolist()
-                required_columns = {'knl_name', 'co_name', 'arch'}
-                other_columns = [col for col in headers_list if col not in required_columns]
-                other_columns_comma = ', '.join(other_columns)
-                other_columns_cpp_def =  "\n".join([f"    int {col};" for col in other_columns])
-                content += f'''
+                required_columns = {"knl_name", "co_name", "arch"}
+                other_columns = [
+                    col for col in headers_list if col not in required_columns
+                ]
+                other_columns_comma = ", ".join(other_columns)
+                other_columns_cpp_def = "\n".join(
+                    [f"    int {col};" for col in other_columns]
+                )
+                content += f"""
 #define ADD_CFG({other_columns_comma}, path, knl_name, co_name, arch)         \\
     {{                                         \\
         arch knl_name, {{ knl_name, path co_name, arch, {other_columns_comma} }}         \\
@@ -95,7 +101,7 @@ struct {args.module}Config
 
 using CFG = std::unordered_map<std::string, {args.module}Config>;
 
-'''
+"""
                 have_get_header = True
             cfg = [
                 f'ADD_CFG({", ".join(str(getattr(row, col)) for col in other_columns)}, "{os.path.relpath(os.path.dirname(el), f"{this_dir}/{arch}")}/", "{row.knl_name}", "{row.co_name}", "{row.arch}"),'
