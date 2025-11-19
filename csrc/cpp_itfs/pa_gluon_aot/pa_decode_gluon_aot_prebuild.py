@@ -24,7 +24,9 @@ import aiter
 from aiter import dtypes
 from aiter import pertoken_quant, per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
-
+from csrc.cpp_itfs.utils import (
+    BUILD_DIR,
+)
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     pa_decode_gluon,
 )
@@ -875,22 +877,30 @@ def prebuild_pa_decode_gluon_aot_so():
 
     # USE_TORCH_FLASH_REF_OPTIONS = [True]
     # CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-    # BLOCK_SIZE_OPTIONS = [16]
-    # QUERY_LENGTH_OPTIONS = [1]
-    # BATCH_SIZE_OPTIONS = [128]
-    # HEAD_CONFIGURATIONS = [(16, 1)]
-    # CONTEXT_LENGTH_OPTIONS = [4096]
-    # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+    # BLOCK_SIZE_OPTIONS = [16, 1024]
+    # # BLOCK_SIZE_OPTIONS = [16]
+    # QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+    # # QUERY_LENGTH_OPTIONS = [1]
+    # BATCH_SIZE_OPTIONS = [3]
+    # HEAD_CONFIGURATIONS = [(16, 1), (10, 1)]
+    # # HEAD_CONFIGURATIONS = [(16, 1)]
+    # # CONTEXT_LENGTH_OPTIONS = [4096]
+    # # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024, 64 * 1024, 128 * 1024]
+    # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024]
+    # # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+    # COMPUTE_TYPE_OPTIONS = ["fp8"]
     # QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
+    # # QUANT_MODE_OPTIONS = ["per_tensor"]
     # # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
     # HEAD_DIMENSION_OPTIONS = [128]
     # # QUANT_MODE_OPTIONS = ["per_tensor"]
+    # TRANS_V_OPTIONS = [False, True]
     # # TRANS_V_OPTIONS = [False]
-    # TRANS_V_OPTIONS = [True]
+    # # TRANS_V_OPTIONS = [True]
     # KV_VARLEN_OPTIONS = [False, True]
     # # KV_VARLEN_OPTIONS = [False]
-    # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
-    # # QUANT_Q_AND_KV_OPTIONS = [[True, True]]
+    # # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
+    # QUANT_Q_AND_KV_OPTIONS = [[True, True]]
     # # USE_AOT_IMPL_OPTIONS = [False]
     # USE_AOT_IMPL_OPTIONS = [True]
     # # USE_AOT_IMPL_OPTIONS = [False, True]
@@ -909,13 +919,20 @@ def prebuild_pa_decode_gluon_aot_so():
     BLOCK_SIZE_OPTIONS = [16, 64, 1024]
     HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    # CONTEXT_LENGTH_OPTIONS = list(range(256, 32 * 1024, 256))
-    CONTEXT_LENGTH_OPTIONS = [4096]
-    BATCH_SIZE_OPTIONS = [4]
+    CONTEXT_LENGTH_OPTIONS = [
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16 * 1024,
+        32 * 1024,
+    ]
+    BATCH_SIZE_OPTIONS = [3]
 
     parse_arg_and_run_test()
-    target_directory = "/root/.aiter/build"
-    clean_directory_except_so(target_directory)
+    clean_directory_except_so(BUILD_DIR)
     print("Cleanup completed, only .so files are left.")
 
 
