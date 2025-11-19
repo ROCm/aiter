@@ -222,8 +222,8 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
 
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 
-    std::string arch_id            = get_gpu_arch();
-    std::string selectedKernelName = kernelName.has_value() ? arch_id + kernelName.value() : "";
+    std::string arch_id = get_gpu_arch();
+    kernelName          = kernelName.empty() ? "" : arch_id + kernelName;
 
     int selectedksplit = log2_k_split.has_value() ? log2_k_split.value() : 0;
     if(kernelName.empty())
@@ -256,7 +256,7 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
     if(it != config_map->end())
     {
         const auto& cfg     = it->second;
-        const char* name    = cfg.name.c_str();
+        const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         SUBM                = cfg.tile_M;
         SUBN                = cfg.tile_N;
