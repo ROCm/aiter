@@ -693,32 +693,32 @@ def paged_attention_decode_v2_gluon_fp8(
     value_cache_ptr,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     context_lengths_ptr,  # [num_seqs]
-    softmax_scale,
+    softmax_scale: float,
     query_scale,  # [num_seqs, num_kv_heads * query_group_size, 1]
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    stride_max_logits_seq,
-    stride_max_logits_head,
-    stride_max_logits_part,
-    stride_output_seq,
-    stride_output_head,
-    stride_output_part,
-    stride_output_group,
-    stride_query_seq,
-    stride_query_head,
-    stride_key_block,
-    stride_key_head,
-    stride_key_head_split,
-    stride_key_block_elem,
-    stride_value_block,
-    stride_value_head,
-    stride_value_head_size,
-    stride_block_table_seq,
-    query_scale_stride_0,
-    kv_scale_stride_0,
-    kv_scale_stride_1,
+    stride_max_logits_seq: int,
+    stride_max_logits_head: int,
+    stride_max_logits_part: int,
+    stride_output_seq: int,
+    stride_output_head: int,
+    stride_output_part: int,
+    stride_output_group: int,
+    stride_query_seq: int,
+    stride_query_head: int,
+    stride_key_block: int,
+    stride_key_head: int,
+    stride_key_head_split: int,
+    stride_key_block_elem: int,
+    stride_value_block: int,
+    stride_value_head: int,
+    stride_value_head_size: int,
+    stride_block_table_seq: int,
+    query_scale_stride_0: int,
+    kv_scale_stride_0: int,
+    kv_scale_stride_1: int,
     query_seq_len: int,
-    query_group_size_original,
+    query_group_size_original: int,
     head_size: int,
     num_seqs: int,
     num_kv_heads: int,
@@ -1925,6 +1925,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     # CONTEXT_PARTITION_SIZE  = 128
     # KV_COMPUTE_BLOCK_SIZE = 256
     # Launch the selected kernel
+
     paged_attention_kernel[grid](
         exp_sums_ptr,
         max_logits_ptr,

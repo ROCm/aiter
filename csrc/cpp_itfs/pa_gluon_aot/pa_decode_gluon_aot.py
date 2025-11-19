@@ -106,7 +106,7 @@ def compile(
         signature_parts = [
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
-            "*bf16:16",  # logits_ptr
+            f"{str(compute_type)}:16",  # logits_ptr
             "*fp8e4b8:16",  # query_ptr
             "*fp8e4b8:16",  # key_cache_ptr
             "*fp8e4b8:16",  # value_cache_ptr
