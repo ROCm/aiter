@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
@@ -6,7 +7,7 @@ import aiter
 
 
 envs = {
-    "HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+    "HIP_VISIBLE_DEVICES": "1,2,3,4,5,6,7",
 }
 for k, v in envs.items():
     os.environ[k] = v
@@ -25,7 +26,7 @@ class DistributedEnv:
         torch.cuda.set_device(rank)
         dist.init_process_group(
             backend="nccl",
-            init_method="tcp://127.0.0.1:23459",
+            init_method="tcp://127.0.0.1:22129",
             rank=rank,
             world_size=world_size,
         )
@@ -83,12 +84,22 @@ def worker(
             ]
         )
         with prof:
+            dist_env.barrier()
+            start_native = time.time()
             ref_residual_out, ref_norm_out = dist_env.allreduce_add_rms_native(
                 local_allreduce_in.clone(), local_residual_in, local_rms_weight, eps
             )
+            dist_env.barrier()
+            start_fused = time.time()
             residual_out, norm_out = dist_env.allreduce_add_rms_fused(
                 local_allreduce_in.clone(), local_residual_in, local_rms_weight, eps
             )
+            dist_env.barrier()
+            end = time.time()
+        dur_native = start_fused - start_native
+        dur_fused = end - start_fused
+        speedup = dur_native / dur_fused
+        print(f"dur_native:{dur_native}, dur_fused:{dur_fused}, speedup:{speedup}")
         if rank == 0 and show_profile:
             print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10000))
         maxdiff = (norm_out.cpu().float() - ref_norm_out.cpu().float()).abs().max()
@@ -103,6 +114,9 @@ def testcase(
     dtype=torch.float,
     nsamples=5,
 ):
+    print(
+        f"\n============ world_size:{world_size}, num_tokens:{num_tokens}, hidden_dim:{hidden_dim}, eps:{eps}, dtype:{dtype}, nsamples:{nsamples} ============\n"
+    )
     allreduce_in_ = []
     residual_in_ = []
     rms_weight_ = []
@@ -128,13 +142,16 @@ def testcase(
 
 def main():
     num_tokens = 129
-    testcase(num_tokens=num_tokens, dtype=torch.float)
-    testcase(num_tokens=num_tokens, dtype=torch.bfloat16)
-    testcase(num_tokens=num_tokens, dtype=torch.half)
+    testcase(world_size=4, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.float)
+    testcase(world_size=4, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.bfloat16)
+    testcase(world_size=4, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.half)
+
     num_tokens = 128
-    testcase(num_tokens=num_tokens, dtype=torch.float)
-    testcase(num_tokens=num_tokens, dtype=torch.bfloat16)
-    testcase(num_tokens=num_tokens, dtype=torch.half)
+    testcase(world_size=4, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.float)
+    testcase(world_size=4, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.half)
+    testcase(world_size=4, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.bfloat16)
+
+    testcase(world_size=4, num_tokens=32768, hidden_dim=4096, dtype=torch.bfloat16)
 
 
 if __name__ == "__main__":

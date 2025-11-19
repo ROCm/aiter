@@ -64,7 +64,7 @@ class TRTLLMAllreduceFusion:
     def __init__(
         self,
         group: ProcessGroup = None,
-        max_size_in_bytes=8192 * 16384,
+        max_size_in_bytes=16384 * 16384,
     ) -> None:
         """
         Args:

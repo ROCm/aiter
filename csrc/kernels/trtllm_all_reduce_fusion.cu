@@ -266,6 +266,13 @@ struct alignas(sizeof(T) * vec_size) vec_t {
             data[i] = val;
         }
     }
+    template <typename VT>
+    __device__ __forceinline__ void cast_fill(VT val) {
+#pragma unroll
+        for (int i = 0; i < vec_size; ++i) {
+            *reinterpret_cast<VT*>(&data[i]) = val;
+        }
+    }
 };
 
 template <typename T, uint32_t VEC_SIZE>
@@ -420,6 +427,13 @@ struct neg_zero<float> {
     using bits_type = unsigned int;
 };
 
+template <>
+struct neg_zero<double> {
+    static constexpr uint64_t neg_zero_bits = 0x8000000000000000ULL;
+    static constexpr double value = -0.0f;
+    using bits_type = uint64_t;
+};
+
 template <typename T>
 __device__ static constexpr T neg_zero_v = neg_zero<T>::value;
 
@@ -480,7 +494,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     int access_stride = gridDim.x * params.hidden_dim;
 
     vec_t<T, VEC_SIZE> clear_vec;
-    clear_vec.fill(neg_zero_v<T>);
+    clear_vec.cast_fill(neg_zero<T>::neg_zero_bits);
 
     vec_t<T, VEC_SIZE> gamma;
     gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
@@ -544,7 +558,11 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params, hi
     int threads_per_token = params.hidden_dim / VEC_SIZE;
     int threads_per_block = threads_per_token;
     dim3 threadsPerBlock(threads_per_block);
-    dim3 numBlocks(NBLOCKS_PER_GPU);
+    int nblocks = NBLOCKS_PER_GPU;
+    if (params.size * sizeof(T) > 1024*1024*128) {
+        nblocks /= 2;
+    }
+    dim3 numBlocks(nblocks);
     void *args[] = {(void *)&params};
     if (token_num <= details::kOneShotMaxToken) {
         hipLaunchCooperativeKernel(allreduce_fusion_kernel_oneshot_lamport<T, NRanks>, numBlocks, threadsPerBlock, args, 0, stream);
