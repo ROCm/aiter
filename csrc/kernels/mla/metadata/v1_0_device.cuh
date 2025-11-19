@@ -85,10 +85,16 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
     }
 
     int32_t work_end = p_lds_shift[params.num_batches - 1] + p_lds_split[params.num_batches - 1];
+    int32_t reduce_end = params.p_reduce_indptr[params.num_batches];
 
     for (int32_t work_id = work_end + lane_idx; work_id < params.num_batches * params.num_splits; work_id += ck_tile::get_warp_size())
     {
         params.p_work_indptr[work_id + 1] = work_end;
+    }
+
+    for (int32_t reduce_id = params.num_batches + lane_idx; reduce_id < params.fixed_num_batches; reduce_id += ck_tile::get_warp_size())
+    {
+        params.p_reduce_indptr[reduce_id] = reduce_end;
     }
 }
 
@@ -124,6 +130,7 @@ void get_mla_metadata_v1_0_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     int32_t qk_batch_ratio = 1;
     int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
 
+    int32_t fixed_num_batches = reduce_indptr.size(0) - 1;
     // In the following cases, we use #head=16 to simulate cases which is not natively supported by
     // mla main kernel.
     if((num_heads != 16) &&
@@ -154,6 +161,7 @@ void get_mla_metadata_v1_0_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     // params.num_cu                       = num_clusters;
     params.num_cu                       = num_splits * num_batches;
     params.num_splits                   = num_splits;
+    params.fixed_num_batches            = fixed_num_batches;
     params.reduce_indptr_size           = reduce_indptr.size(0);
     params.kv_granularity               = kv_granularity;
     params.kv_granularity_log2          = __builtin_ctz(kv_granularity);
