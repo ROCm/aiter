@@ -613,8 +613,8 @@ struct KernelElementType<c10::BFloat16> {
     using type = __bfloat16;
 };
 
-void trtllm_allreduce_rms(int64_t rank, int64_t nranks, Tensor &allreduce_in, Tensor &residual_in, Tensor &rms_gamma, Tensor &residual_out, 
-    Tensor &norm_out, double eps, bool fp8_out, Tensor &workspace) {
+void trtllm_allreduce_rms(int64_t rank, int64_t nranks, Tensor &allreduce_in, Tensor &residual_in, 
+    Tensor &rms_gamma, Tensor &residual_out, Tensor &norm_out, double eps, bool fp8_out, Tensor &workspace) {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(allreduce_in));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     int size = allreduce_in.numel();

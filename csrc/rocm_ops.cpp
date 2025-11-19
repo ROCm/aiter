@@ -38,6 +38,7 @@
 #include "rope.h"
 #include "sample.h"
 #include "smoothquant.h"
+#include "trtllm_all_reduce_fusion.h"
 #include <torch/extension.h>
 
 // #include "torch/mha_batch_prefill.h"
