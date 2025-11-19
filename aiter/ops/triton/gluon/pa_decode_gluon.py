@@ -1438,7 +1438,7 @@ def paged_attention_decode_v2_reduce_gluon(
     """
     # Calculate power-of-2 values internally
     HEAD_SIZE_POW2: gl.constexpr = triton.next_power_of_2(HEAD_SIZE)
-    MAX_NUM_SEQ_PARTITIONS_POW2: gl.constexpr = triton.next_power_of_2(
+    MAX_CONTEXT_PARTITION_NUM_POW2: gl.constexpr = triton.next_power_of_2(
         MAX_CONTEXT_PARTITION_NUM
     )
     if QUERY_GROUP_SIZE < 16:
@@ -1454,7 +1454,7 @@ def paged_attention_decode_v2_reduce_gluon(
     context_partition_num = gl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
 
     # Select optimal memory layout based on maximum partition count
-    if MAX_NUM_SEQ_PARTITIONS_POW2 >= 256:
+    if MAX_CONTEXT_PARTITION_NUM_POW2 >= 256:
         blocked_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 2, 4],
             threads_per_warp=[4, 4, 4],
@@ -1482,7 +1482,7 @@ def paged_attention_decode_v2_reduce_gluon(
 
     # Generate coordinate offsets for tensor access
     partition_offsets = gl.arange(
-        0, MAX_NUM_SEQ_PARTITIONS_POW2, layout=sequence_partition_layout
+        0, MAX_CONTEXT_PARTITION_NUM_POW2, layout=sequence_partition_layout
     )
     query_group_offsets = gl.arange(
         0, QUERY_GROUP_SIZE_POW2, layout=query_group_size_layout
@@ -1503,7 +1503,7 @@ def paged_attention_decode_v2_reduce_gluon(
         query_group_offsets[None, :] < QUERY_GROUP_SIZE
     )
 
-    # Load maximum logits from all partitions [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2]
+    # Load maximum logits from all partitions [MAX_CONTEXT_PARTITION_NUM_POW2, QUERY_GROUP_SIZE_POW2]
     max_logits = gl.amd.cdna3.buffer_load(
         ptr=max_logits_ptr, offsets=exp_sums_offsets, mask=exp_sums_mask
     )
@@ -1512,7 +1512,7 @@ def paged_attention_decode_v2_reduce_gluon(
     global_max_logits = gl.max(max_logits, axis=0)
 
     # ==================== EXPONENTIAL SUMS RESCALING ====================
-    # Load exponential sums from all partitions [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2]
+    # Load exponential sums from all partitions [MAX_CONTEXT_PARTITION_NUM_POW2, QUERY_GROUP_SIZE_POW2]
     exp_sums = gl.amd.cdna3.buffer_load(
         ptr=exp_sums_ptr, offsets=exp_sums_offsets, mask=exp_sums_mask
     )
@@ -1533,12 +1533,12 @@ def paged_attention_decode_v2_reduce_gluon(
         global_exp_sum += gl.math.exp(sink_token_values - global_max_logits)
 
     # ==================== ATTENTION PROBABILITY COMPUTATION ====================
-    # Compute normalized attention probabilities [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2]
+    # Compute normalized attention probabilities [MAX_CONTEXT_PARTITION_NUM_POW2, QUERY_GROUP_SIZE_POW2]
     attention_probs = exp_sums / global_exp_sum[None, :]
 
     # Reshape probabilities for broadcasting with logits
     attention_probs = gl.reshape(
-        attention_probs, (MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2, 1)
+        attention_probs, (MAX_CONTEXT_PARTITION_NUM_POW2, QUERY_GROUP_SIZE_POW2, 1)
     )
 
     # ==================== LOGITS LOADING AND WEIGHTED SUMMATION ====================
@@ -1638,7 +1638,7 @@ def paged_attention_decode_v2_reduce_kernel_triton34(
 
     # Calculate power-of-2 values internally
     HEAD_SIZE_POW2: tl.constexpr = triton.next_power_of_2(HEAD_SIZE)
-    MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr = triton.next_power_of_2(
+    MAX_CONTEXT_PARTITION_NUM_POW2: tl.constexpr = triton.next_power_of_2(
         MAX_CONTEXT_PARTITION_NUM
     )
     if QUERY_GROUP_SIZE < 16:
@@ -1654,7 +1654,7 @@ def paged_attention_decode_v2_reduce_kernel_triton34(
     context_partition_num = tl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
 
     # Generate coordinate ranges
-    partition_offsets = tl.arange(0, MAX_NUM_SEQ_PARTITIONS_POW2)
+    partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM_POW2)
     query_group_offsets = tl.arange(0, QUERY_GROUP_SIZE_POW2)
     head_size_offsets = tl.arange(0, HEAD_SIZE_POW2)
 
@@ -1672,7 +1672,7 @@ def paged_attention_decode_v2_reduce_kernel_triton34(
         query_group_offsets[None, :] < QUERY_GROUP_SIZE
     )
 
-    # Load maximum logits from all partitions [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2]
+    # Load maximum logits from all partitions [MAX_CONTEXT_PARTITION_NUM_POW2, QUERY_GROUP_SIZE_POW2]
     max_logits = tl.load(
         max_logits_ptr + exp_sums_offsets, mask=exp_sums_mask, other=float("-inf")
     )
@@ -1691,12 +1691,12 @@ def paged_attention_decode_v2_reduce_kernel_triton34(
     global_exp_sum = tl.sum(exp_sums, axis=0)
 
     # ==================== ATTENTION PROBABILITY COMPUTATION ====================
-    # Compute normalized attention probabilities [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2]
+    # Compute normalized attention probabilities [MAX_CONTEXT_PARTITION_NUM_POW2, QUERY_GROUP_SIZE_POW2]
     attention_probs = exp_sums / global_exp_sum[None, :]
 
     # Reshape probabilities for broadcasting with logits
     attention_probs = tl.reshape(
-        attention_probs, (MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2, 1)
+        attention_probs, (MAX_CONTEXT_PARTITION_NUM_POW2, QUERY_GROUP_SIZE_POW2, 1)
     )
 
     # ==================== LOGITS LOADING AND WEIGHTED SUMMATION ====================
@@ -1740,6 +1740,193 @@ def paged_attention_decode_v2_reduce_kernel_triton34(
     tl.store(
         output_ptr + output_offsets,
         final_output,
+        mask=output_mask,
+    )
+
+
+@triton.jit
+def paged_attention_decode_v2_reduce_kernel_triton34_loop(
+    output_ptr,  # [num_seqs, num_kv_heads, query_group_size, head_size]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
+    context_lengths_ptr,  # [num_seqs]
+    stride_output_seq,
+    stride_output_head,
+    stride_exp_sums_seq,
+    stride_exp_sums_head,
+    stride_exp_sums_part,
+    stride_logits_seq,
+    stride_logits_head,
+    stride_logits_part,
+    stride_logits_group,
+    num_seqs,
+    num_kv_heads,
+    QUERY_GROUP_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    CONTEXT_PARTITION_SIZE: tl.constexpr,
+):
+    """
+    Triton reduction kernel for paged attention decode that combines partial results.
+
+    This version uses a fixed MAX_CONTEXT_PARTITION_NUM=16 and loops through partitions
+    in chunks to handle arbitrary numbers of context partitions.
+
+    This kernel performs the final reduction by:
+    1. Finding global maximum logits across partitions (first pass)
+    2. Rescaling exponential sums for numerical stability (second pass)
+    3. Computing normalized attention probabilities (second pass)
+    4. Weighted summation of partial logits (second pass)
+
+    Args:
+        output_ptr: Output tensor for final attention results
+        exp_sums_ptr: Exponential sums from partial computations
+        max_logits_ptr: Maximum logits from partial computations
+        logits_ptr: Partial logit tensors from each sequence partition
+        context_lengths_ptr: Sequence lengths for each sequence
+        Various stride parameters for tensor access
+        Compile-time constants for kernel configuration (no MAX_CONTEXT_PARTITION_NUM needed)
+    """
+    # Mathematical constant for exponential calculations
+    LOG2_E: tl.constexpr = 1.4426950408889634
+
+    # Calculate power-of-2 values internally
+    HEAD_SIZE_POW2: tl.constexpr = triton.next_power_of_2(HEAD_SIZE)
+    MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 16
+    if QUERY_GROUP_SIZE < 16:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = 16
+    else:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(QUERY_GROUP_SIZE)
+
+    # ==================== INITIALIZATION ====================
+    sequence_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+
+    context_length = tl.load(context_lengths_ptr + sequence_idx)
+    context_partition_num = tl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
+
+    # Generate coordinate ranges
+    query_group_offsets = tl.arange(0, QUERY_GROUP_SIZE_POW2)
+    head_size_offsets = tl.arange(0, HEAD_SIZE_POW2)
+
+    # Initialize global accumulation variables
+    global_max_logits = tl.full(
+        (QUERY_GROUP_SIZE_POW2,), float("-inf"), dtype=tl.float32
+    )
+    global_exp_sum = tl.zeros((QUERY_GROUP_SIZE_POW2,), dtype=tl.float32)
+    final_output = tl.zeros((QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=tl.float32)
+
+    # Calculate number of iterations needed
+    num_iterations = tl.cdiv(context_partition_num, MAX_CONTEXT_PARTITION_NUM)
+
+    # ==================== FIRST PASS: FIND GLOBAL MAX ====================
+    # Loop through partitions in chunks of MAX_CONTEXT_PARTITION_NUM
+    for iter_idx in range(num_iterations):
+        partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
+        partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM) + partition_base
+
+        # Calculate offsets for exponential sums and max logits
+        exp_sums_offsets = (
+            sequence_idx * stride_exp_sums_seq
+            + kv_head_idx * stride_exp_sums_head
+            + partition_offsets[:, None] * stride_exp_sums_part
+            + query_group_offsets[None, :]
+        )
+
+        # Create mask for valid partitions and query groups
+        exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (
+            query_group_offsets[None, :] < QUERY_GROUP_SIZE
+        )
+
+        # Load maximum logits from current chunk of partitions
+        max_logits = tl.load(
+            max_logits_ptr + exp_sums_offsets, mask=exp_sums_mask, other=float("-inf")
+        )
+
+        # Update global maximum logit
+        chunk_max_logits = tl.max(max_logits, axis=0)
+        global_max_logits = tl.maximum(global_max_logits, chunk_max_logits)
+
+    # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
+    for iter_idx in range(num_iterations):
+        partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
+        partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM) + partition_base
+
+        # Calculate offsets for exponential sums and max logits
+        exp_sums_offsets = (
+            sequence_idx * stride_exp_sums_seq
+            + kv_head_idx * stride_exp_sums_head
+            + partition_offsets[:, None] * stride_exp_sums_part
+            + query_group_offsets[None, :]
+        )
+
+        # Create mask for valid partitions and query groups
+        exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (
+            query_group_offsets[None, :] < QUERY_GROUP_SIZE
+        )
+
+        # Load maximum logits and exponential sums from current chunk
+        max_logits = tl.load(
+            max_logits_ptr + exp_sums_offsets, mask=exp_sums_mask, other=float("-inf")
+        )
+        exp_sums = tl.load(exp_sums_ptr + exp_sums_offsets, mask=exp_sums_mask)
+
+        # Rescale exponential sums using global maximum for numerical stability
+        exp_sums *= tl.exp(max_logits - global_max_logits[None, :])
+
+        # Accumulate global exponential sum
+        chunk_exp_sum = tl.sum(exp_sums, axis=0)
+        global_exp_sum += chunk_exp_sum
+
+        # ==================== ATTENTION PROBABILITY AND WEIGHTED SUMMATION ====================
+        # Compute normalized attention probabilities for this chunk
+        attention_probs = exp_sums / global_exp_sum[None, :]
+
+        # Reshape probabilities for broadcasting with logits
+        attention_probs = tl.reshape(
+            attention_probs, (MAX_CONTEXT_PARTITION_NUM, QUERY_GROUP_SIZE_POW2, 1)
+        )
+
+        # Calculate offsets for loading partial logits
+        logits_offsets = (
+            sequence_idx * stride_logits_seq
+            + kv_head_idx * stride_logits_head
+            + partition_offsets[:, None, None] * stride_logits_part
+            + query_group_offsets[None, :, None] * stride_logits_group
+            + head_size_offsets[None, None, :]
+        )
+
+        # Create mask for valid logits access
+        logits_mask = (partition_offsets[:, None] < context_partition_num) & (
+            query_group_offsets[None, :] < QUERY_GROUP_SIZE
+        )
+
+        # Load partial logits from current chunk of partitions
+        partial_logits = tl.load(
+            logits_ptr + logits_offsets, mask=logits_mask[:, :, None]
+        )
+
+        # Accumulate weighted sum of logits
+        final_output += tl.sum(partial_logits * attention_probs, axis=0)
+
+    # ==================== FINAL OUTPUT STORING ====================
+    # Calculate output tensor offsets
+    output_offsets = (
+        sequence_idx * stride_output_seq
+        + (kv_head_idx * QUERY_GROUP_SIZE + query_group_offsets[:, None])
+        * stride_output_head
+        + head_size_offsets[None, :]
+    )
+
+    # Create mask for valid output storage
+    output_mask = (query_group_offsets[:, None] < QUERY_GROUP_SIZE) & (
+        head_size_offsets[None, :] < HEAD_SIZE
+    )
+
+    # Store final output to global memory
+    tl.store(
+        output_ptr + output_offsets,
+        final_output.to(output_ptr.dtype.element_ty),
         mask=output_mask,
     )
 
@@ -1790,7 +1977,7 @@ def paged_attention_decode_v2_reduce_kernel(
 
     # Calculate power-of-2 values internally
     HEAD_SIZE_POW2: tl.constexpr = triton.next_power_of_2(HEAD_SIZE)
-    MAX_NUM_SEQ_PARTITIONS_POW2: tl.constexpr = triton.next_power_of_2(
+    MAX_CONTEXT_PARTITION_NUM_POW2: tl.constexpr = triton.next_power_of_2(
         MAX_CONTEXT_PARTITION_NUM
     )
     if QUERY_GROUP_SIZE < 16:
@@ -1806,7 +1993,7 @@ def paged_attention_decode_v2_reduce_kernel(
     context_partition_num = tl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
 
     # Generate coordinate ranges
-    partition_offsets = tl.arange(0, MAX_NUM_SEQ_PARTITIONS_POW2)
+    partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM_POW2)
     query_group_offsets = tl.arange(0, QUERY_GROUP_SIZE_POW2)
     head_size_offsets = tl.arange(0, HEAD_SIZE_POW2)
 
@@ -1824,7 +2011,7 @@ def paged_attention_decode_v2_reduce_kernel(
         query_group_offsets[None, :] < QUERY_GROUP_SIZE
     )
 
-    # Load maximum logits from all partitions [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2]
+    # Load maximum logits from all partitions [MAX_CONTEXT_PARTITION_NUM_POW2, QUERY_GROUP_SIZE_POW2]
     max_logits = tl.load(
         max_logits_ptr + exp_sums_offsets, mask=exp_sums_mask, other=float("-inf")
     )
@@ -1844,12 +2031,12 @@ def paged_attention_decode_v2_reduce_kernel(
     global_exp_sum = tl.sum(exp_sums, axis=0)
 
     # ==================== ATTENTION PROBABILITY COMPUTATION ====================
-    # Compute normalized attention probabilities [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2]
+    # Compute normalized attention probabilities [MAX_CONTEXT_PARTITION_NUM_POW2, QUERY_GROUP_SIZE_POW2]
     attention_probs = exp_sums / global_exp_sum[None, :]
 
     # Reshape probabilities for broadcasting with logits
     attention_probs = tl.reshape(
-        attention_probs, (MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GROUP_SIZE_POW2, 1)
+        attention_probs, (MAX_CONTEXT_PARTITION_NUM_POW2, QUERY_GROUP_SIZE_POW2, 1)
     )
 
     # ==================== LOGITS LOADING AND WEIGHTED SUMMATION ====================
@@ -1899,6 +2086,200 @@ def paged_attention_decode_v2_reduce_kernel(
     tl.store(
         output_ptr + output_offsets,
         final_output,
+        mask=output_mask,
+    )
+
+
+@triton.jit
+def paged_attention_decode_v2_reduce_kernel_loop(
+    output_ptr,  # [num_seqs, num_kv_heads, query_group_size, head_size]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
+    context_lengths_ptr,  # [num_seqs]
+    stride_output_seq,
+    stride_output_head,
+    stride_exp_sums_seq,
+    stride_exp_sums_head,
+    stride_exp_sums_part,
+    stride_logits_seq,
+    stride_logits_head,
+    stride_logits_part,
+    stride_logits_group,
+    num_seqs,
+    num_kv_heads,
+    QUERY_GROUP_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    CONTEXT_PARTITION_SIZE: tl.constexpr,
+):
+    """
+    Triton reduction kernel for paged attention decode that combines partial results.
+
+    This version uses a fixed MAX_CONTEXT_PARTITION_NUM=16 and loops through partitions
+    in chunks to handle arbitrary numbers of context partitions.
+
+    This kernel performs the final reduction by:
+    1. Finding global maximum logits across partitions (first pass)
+    2. Rescaling exponential sums for numerical stability (second pass)
+    3. Computing normalized attention probabilities (second pass)
+    4. Weighted summation of partial logits (second pass)
+
+    Args:
+        output_ptr: Output tensor for final attention results
+        exp_sums_ptr: Exponential sums from partial computations
+        max_logits_ptr: Maximum logits from partial computations
+        logits_ptr: Partial logit tensors from each sequence partition
+        context_lengths_ptr: Sequence lengths for each sequence
+        Various stride parameters for tensor access
+        Compile-time constants for kernel configuration (no MAX_CONTEXT_PARTITION_NUM needed)
+    """
+    # Mathematical constant for exponential calculations
+    LOG2_E: tl.constexpr = 1.4426950408889634
+
+    # Calculate power-of-2 values internally
+    HEAD_SIZE_POW2: tl.constexpr = triton.next_power_of_2(HEAD_SIZE)
+    MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 16
+    if QUERY_GROUP_SIZE < 16:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = 16
+    else:
+        QUERY_GROUP_SIZE_POW2: gl.constexpr = triton.next_power_of_2(QUERY_GROUP_SIZE)
+
+    # ==================== INITIALIZATION ====================
+    sequence_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+
+    context_length = tl.load(context_lengths_ptr + sequence_idx)
+    context_partition_num = tl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
+
+    # Generate coordinate ranges
+    query_group_offsets = tl.arange(0, QUERY_GROUP_SIZE_POW2)
+    head_size_offsets = tl.arange(0, HEAD_SIZE_POW2)
+
+    # Initialize global accumulation variables
+    global_max_logits = tl.full(
+        (QUERY_GROUP_SIZE_POW2,), float("-inf"), dtype=tl.float32
+    )
+    global_exp_sum = tl.zeros((QUERY_GROUP_SIZE_POW2,), dtype=tl.float32)
+    final_output = tl.zeros((QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=tl.float32)
+
+    # Calculate number of iterations needed
+    num_iterations = tl.cdiv(context_partition_num, MAX_CONTEXT_PARTITION_NUM)
+
+    # ==================== FIRST PASS: FIND GLOBAL MAX ====================
+    # Loop through partitions in chunks of MAX_CONTEXT_PARTITION_NUM
+    for iter_idx in range(num_iterations):
+        partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
+        partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM) + partition_base
+
+        # Calculate offsets for exponential sums and max logits
+        exp_sums_offsets = (
+            sequence_idx * stride_exp_sums_seq
+            + kv_head_idx * stride_exp_sums_head
+            + partition_offsets[:, None] * stride_exp_sums_part
+            + query_group_offsets[None, :]
+        )
+
+        # Create mask for valid partitions and query groups
+        exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (
+            query_group_offsets[None, :] < QUERY_GROUP_SIZE
+        )
+
+        # Load maximum logits from current chunk of partitions
+        max_logits = tl.load(
+            max_logits_ptr + exp_sums_offsets, mask=exp_sums_mask, other=float("-inf")
+        )
+
+        # Update global maximum logit
+        chunk_max_logits = tl.max(max_logits, axis=0)
+        global_max_logits = tl.maximum(global_max_logits, chunk_max_logits)
+
+    # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
+    for iter_idx in range(num_iterations):
+        partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
+        partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM) + partition_base
+
+        # Calculate offsets for exponential sums and max logits
+        exp_sums_offsets = (
+            sequence_idx * stride_exp_sums_seq
+            + kv_head_idx * stride_exp_sums_head
+            + partition_offsets[:, None] * stride_exp_sums_part
+            + query_group_offsets[None, :]
+        )
+
+        # Create mask for valid partitions and query groups
+        exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (
+            query_group_offsets[None, :] < QUERY_GROUP_SIZE
+        )
+
+        # Load maximum logits and exponential sums from current chunk
+        max_logits = tl.load(
+            max_logits_ptr + exp_sums_offsets, mask=exp_sums_mask, other=float("-inf")
+        )
+        # BUGFIX: Add other=0.0 to prevent loading undefined values for invalid partitions
+        exp_sums = tl.load(
+            exp_sums_ptr + exp_sums_offsets, mask=exp_sums_mask, other=0.0
+        )
+
+        # Rescale exponential sums using global maximum for numerical stability
+        exp_sums *= tl.exp(max_logits - global_max_logits[None, :])
+
+        # Accumulate global exponential sum
+        chunk_exp_sum = tl.sum(exp_sums, axis=0)
+        global_exp_sum += chunk_exp_sum
+
+        # ==================== ATTENTION PROBABILITY AND WEIGHTED SUMMATION ====================
+        # Compute normalized attention probabilities for this chunk
+        attention_probs = exp_sums / global_exp_sum[None, :]
+
+        # Reshape probabilities for broadcasting with logits
+        attention_probs = tl.reshape(
+            attention_probs, (MAX_CONTEXT_PARTITION_NUM, QUERY_GROUP_SIZE_POW2, 1)
+        )
+
+        # Calculate offsets for loading partial logits
+        logits_offsets = (
+            sequence_idx * stride_logits_seq
+            + kv_head_idx * stride_logits_head
+            + partition_offsets[None, :, None] * stride_logits_part
+            + query_group_offsets[:, None, None] * stride_logits_group
+            + head_size_offsets[None, None, :]
+        )
+
+        # Create mask for valid logits access
+        logits_mask = (partition_offsets[None, :] < context_partition_num) & (
+            query_group_offsets[:, None] < QUERY_GROUP_SIZE
+        )
+
+        # Load partial logits from current chunk of partitions
+        # BUGFIX: Add other=0.0 to prevent loading undefined values for invalid partitions
+        partial_logits = tl.load(
+            logits_ptr + logits_offsets, mask=logits_mask[:, :, None], other=0.0
+        )
+
+        # Permute to match the expected dimension order
+        partial_logits = tl.permute(partial_logits, (1, 0, 2))
+
+        # Accumulate weighted sum of logits
+        final_output += tl.sum(partial_logits * attention_probs, axis=0)
+
+    # ==================== FINAL OUTPUT STORING ====================
+    # Calculate output tensor offsets
+    output_offsets = (
+        sequence_idx * stride_output_seq
+        + (kv_head_idx * QUERY_GROUP_SIZE + query_group_offsets[:, None])
+        * stride_output_head
+        + head_size_offsets[None, :]
+    )
+
+    # Create mask for valid output storage
+    output_mask = (query_group_offsets[:, None] < QUERY_GROUP_SIZE) & (
+        head_size_offsets[None, :] < HEAD_SIZE
+    )
+
+    # Store final output to global memory
+    tl.store(
+        output_ptr + output_offsets,
+        final_output.to(output_ptr.dtype.element_ty),
         mask=output_mask,
     )
 
@@ -2096,8 +2477,10 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
         )
     else:
         kernel = paged_attention_decode_v2_reduce_kernel_triton34
+        loop_kernel = paged_attention_decode_v2_reduce_kernel_triton34_loop
         if TRITON_VERSION > (3, 4, 0):
             kernel = paged_attention_decode_v2_reduce_kernel
+            loop_kernel = paged_attention_decode_v2_reduce_kernel_triton34_loop
 
         # Launch standard Triton reduction kernel
         kernel[grid](
@@ -2122,6 +2505,27 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             MAX_CONTEXT_PARTITION_NUM=MAX_CONTEXT_PARTITION_NUM,
             CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
         )
+        # loop_kernel[grid](
+        #     output_ptr,
+        #     exp_sums_ptr,
+        #     max_logits_ptr,
+        #     logits_ptr,
+        #     context_lengths_ptr,
+        #     stride_output_seq,
+        #     stride_output_head,
+        #     stride_exp_sums_seq,
+        #     stride_exp_sums_head,
+        #     stride_exp_sums_part,
+        #     stride_logits_seq,
+        #     stride_logits_head,
+        #     stride_logits_part,
+        #     stride_logits_group,
+        #     num_seqs=grid[0],
+        #     num_kv_heads=grid[1],
+        #     QUERY_GROUP_SIZE=QUERY_GROUP_SIZE,
+        #     HEAD_SIZE=HEAD_SIZE,
+        #     CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
+        # )
 
 
 def pa_decode_gluon(
