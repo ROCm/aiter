@@ -60,9 +60,10 @@ def fused_qk_rope_cat_and_cache_mla(
     b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
+    # allow bk >= b to support prefill + decode mixed scenario
     assert (
-        b_slot <= b and b == b2 == bk == bk2
-    ), "batch dimension should be identical for q_nope, q_pe, k_nope, and k_pe, and the batch dimeion of slot_mapping should be no more than that of q_nope, q_pe, k_nope, and k_pe"
+        b == b2 and bk == bk2 and b_slot <= bk and b <= bk
+    ), "Q batch dimensions should be identical (b == b2), K batch dimensions should be identical (bk == bk2), slot_mapping should not exceed K batch size (b_slot <= bk), and Q batch should not exceed K batch (b <= bk)"
     assert qh == qh2, "Q head should be identical"
     assert kh == kh2 == h_cache, "K head should be identical"
     assert d_pe == dk2, "D dimension of q_pe and k_pe should be identical"
@@ -105,12 +106,12 @@ def fused_qk_rope_cat_and_cache_mla(
         ), "decode_q_pe_out shape mismatch"
 
     if k_pe_out is None:
-        k_pe_out = torch.empty((b, kh, d_pe), dtype=k_pe.dtype, device=k_pe.device)
+        k_pe_out = torch.empty((bk, kh, d_pe), dtype=k_pe.dtype, device=k_pe.device)
     else:
         b_k_pe_out, hk_k_pe_out, d_k_pe_out = k_pe_out.shape
         assert (
-            b == b_k_pe_out and kh == hk_k_pe_out and d_pe == d_k_pe_out
-        ), "k_pe_out shape mismatch"
+            bk == b_k_pe_out and kh == hk_k_pe_out and d_pe == d_k_pe_out
+        ), "k_pe_out shape mismatch, expected (bk, kh, d_pe)"
 
     q_nope_zeros_out = None
     if num_decode_toks_for_zeros > 0:

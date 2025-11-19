@@ -25,6 +25,7 @@ from aiter.ops.triton._triton_kernels.rope import (
     _rope_kernel_cached_thd_2c_gqa_bwd,
     _rope_kernel_cached_thd_2c_gqa_onehead_bwd,
     _rope_fwd_2d_kernel_neox,
+    _rope_fwd_3d,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -1499,6 +1500,66 @@ def rope_fwd_2d_inplace(
         reuse_freqs_front_part,
         nope_first,
         transpose_output,
+    )
+
+    return out
+
+
+def rope_fwd_3d(
+    x,
+    grid_sizes: tl.constexpr,
+    freqs: tl.constexpr,
+    sp_size: tl.constexpr,
+    sp_rank: tl.constexpr,
+):
+    B, s, n_heads, C = x.shape
+    c_total = C // 2  # 64
+    c1 = c_total - 2 * (c_total // 3)  # 22
+    c2 = c_total // 3  # 21
+    c3 = c_total // 3  # 21
+    device = x.device
+
+    grid_sizes = grid_sizes.to(device=device, dtype=torch.int32).contiguous()
+
+    freqs_real = freqs.real.to(dtype=torch.float32, device=device).contiguous()
+    freqs_imag = freqs.imag.to(dtype=torch.float32, device=device).contiguous()
+    out = torch.empty_like(x, dtype=torch.float32, device=device)
+
+    BLOCK_L, BLOCK_N, BLOCK_C = 32, 4, 64
+
+    grid = (B, n_heads, triton.cdiv(s, BLOCK_L))
+
+    num_warps = 4
+    waves_per_eu = 1
+
+    _rope_fwd_3d[grid](
+        x,
+        freqs_real,
+        freqs_imag,
+        grid_sizes,
+        out,
+        *x.stride(),
+        freqs_real.stride(0),
+        freqs_real.stride(1),
+        *grid_sizes.stride(),
+        *out.stride(),
+        s,
+        n_heads,
+        C,
+        c_total,
+        sp_size,
+        sp_rank,
+        freqs.shape[0],
+        s,
+        1.0,
+        0.0,
+        BLOCK_L=BLOCK_L,
+        BLOCK_N=BLOCK_N,
+        BLOCK_C=BLOCK_C,
+        C1=c1,
+        C2=c2,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
     )
 
     return out

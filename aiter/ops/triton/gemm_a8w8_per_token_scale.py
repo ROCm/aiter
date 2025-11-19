@@ -24,17 +24,21 @@ def gemm_a8w8_per_token_scale(
     config=None,
 ):
     """
-    Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
+    Computes 8 bit matrix multiplication Y = X @ W^T using per-token quantization scales.
+    Each token (row) in x and each output column in w has independent scale factors.
 
-    Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
-    - X_scale: Scale tensor for X with shape (M, 1).
-    - W_scale: Scale tensor for W with shape (N, 1).
-    - Y: Output Matrix Y with shape (M, K). If this is none, then it's created by this API and returned as output
+    Args:
+        x (torch.Tensor): INT8 input matrix with shape (M, K).
+        w (torch.Tensor): INT8 weight matrix with shape (N, K), internally transposed.
+        x_scale (torch.Tensor): Per-token scale for x with shape (M, 1) or (M,).
+        w_scale (torch.Tensor): Per-output-channel scale for w with shape (N, 1) or (N,).
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+        torch.Tensor: Output with shape (M, N).
     """
     M, K = x.shape
     N, K = w.shape

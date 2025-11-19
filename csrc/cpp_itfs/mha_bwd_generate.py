@@ -101,24 +101,31 @@ float mha_bwd(mha_bwd_args args,
 
 V2_API = "t = fmha_bwd(traits, args, stream_config);"
 
-V3_MULTI_TARGET_API = """
-    if (get_gpu_arch() == "gfx942") {
-        t = gfx942::fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded, is_v3_api_check);
-    } else if (get_gpu_arch() == "gfx950") {
-        t = gfx950::fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded, is_v3_api_check);
-    } else {
-        std::cout << "No supported GPU arch found!" << std::endl;
-        return -1;
-    }
-"""
-
 
 def get_v3_api():
+    v3_call = "fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded, is_v3_api_check)"
     gfx_list = get_gfx_list()
+    v3_arch_list = [arch for arch in ["gfx942", "gfx950"] if arch in gfx_list]
+
+    if len(v3_arch_list) == 0:
+        return ""  # no v3 support
     if len(gfx_list) == 1:
-        return f"t = {gfx_list[0]}::fmha_bwd_v3(traits, args, stream_config, seqlen_q_padded, seqlen_k_padded, is_v3_api_check);"
-    else:
-        return V3_MULTI_TARGET_API
+        return f"t = {gfx_list[0]}::{v3_call};"
+
+    api = """{
+        const std::string gpu_arch = get_gpu_arch();"""
+    for arch in v3_arch_list:
+        api = (
+            api
+            + f"""
+        if (gpu_arch == "{arch}") {{ t = {arch}::{v3_call}; }}"""
+        )
+    api = (
+        api
+        + """
+    }"""
+    )
+    return api
 
 
 V3_API = get_v3_api()

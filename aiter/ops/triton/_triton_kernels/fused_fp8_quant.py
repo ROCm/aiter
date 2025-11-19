@@ -32,6 +32,112 @@ def _fp8_quant_op(
 
 
 @triton.jit
+def _fused_rms_fp8_per_tensor_static_quant_kernel(
+    inp1_ptr,
+    weight1_ptr,
+    inp2_ptr,
+    weight2_ptr,
+    res1_ptr,
+    out1_fp8_ptr,
+    out2_ptr,
+    out_res1_ptr,
+    out1_ptr,
+    scale_ptr,
+    eps1,
+    eps2,
+    n_rows,
+    inp1_n_cols,
+    inp2_n_cols,
+    inp1_row_stride,
+    inp2_row_stride,
+    inp1_col_stride,
+    inp2_col_stride,
+    res1_row_stride,
+    res1_col_stride,
+    out1_fp8_row_stride,
+    out1_fp8_col_stride,
+    out2_row_stride,
+    out2_col_stride,
+    out_res1_row_stride,
+    out_res1_col_stride,
+    out1_row_stride,
+    out1_col_stride,
+    BLOCK_SIZE_N: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+    DTYPE_MIN: tl.constexpr,
+    HAVE_SECOND_INPUT: tl.constexpr,
+    FIRST_INPUT_RES: tl.constexpr,
+    FIRST_INPUT_OUT: tl.constexpr,
+):
+    m_pid = tl.program_id(0)
+    n_offs = tl.arange(0, BLOCK_SIZE_N)
+
+    mask1 = n_offs < inp1_n_cols
+    inp1 = tl.load(
+        inp1_ptr + m_pid * inp1_row_stride + n_offs * inp1_col_stride,
+        mask=mask1,
+        other=0.0,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+
+    if FIRST_INPUT_RES:
+        res1 = tl.load(
+            res1_ptr + m_pid * res1_row_stride + n_offs * res1_col_stride,
+            mask=mask1,
+            other=0.0,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        inp1 = inp1 + res1
+
+    w1 = tl.load(weight1_ptr + n_offs, mask=mask1, other=0.0).to(tl.float32)
+    norm1 = _rmsmorm_op(inp1, w1, inp1_n_cols, eps1)
+
+    if FIRST_INPUT_OUT:
+        mask1 = n_offs < inp1_n_cols
+        tl.store(
+            out1_ptr + m_pid * out1_row_stride + n_offs * out1_col_stride,
+            norm1,
+            mask=mask1,
+        )
+
+    # apply quantization
+    scale = tl.load(scale_ptr).to(tl.float32)
+    scale_recip = 1.0 / scale
+    out1_fp8 = tl.clamp(norm1 * scale_recip, DTYPE_MIN, DTYPE_MAX)
+
+    # store the results
+    tl.store(
+        out1_fp8_ptr + m_pid * out1_fp8_row_stride + n_offs * out1_fp8_col_stride,
+        out1_fp8.to(out1_fp8_ptr.dtype.element_ty),
+        mask=mask1,
+    )
+
+    if HAVE_SECOND_INPUT:
+        mask2 = n_offs < inp2_n_cols
+        inp2 = tl.load(
+            inp2_ptr + m_pid * inp2_row_stride + n_offs * inp2_col_stride,
+            mask=mask2,
+            other=0.0,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        w2 = tl.load(weight2_ptr + n_offs, mask=mask2, other=0.0).to(tl.float32)
+        norm2 = _rmsmorm_op(inp2, w2, inp2_n_cols, eps2)
+        tl.store(
+            out2_ptr + m_pid * out2_row_stride + n_offs * out2_col_stride,
+            norm2,
+            mask=mask2,
+        )
+
+    if FIRST_INPUT_RES:
+        inp1 = inp1.to(out_res1_ptr.dtype.element_ty)
+        tl.store(
+            out_res1_ptr + m_pid * out_res1_row_stride + n_offs * out_res1_col_stride,
+            inp1,
+            mask=mask1,
+        )
+
+
+@triton.jit
 def _fused_rms_fp8_group_quant_kernel(
     inp1_ptr,
     weight1_ptr,

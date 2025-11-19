@@ -27,19 +27,24 @@ def gemm_a16w16(
     skip_reduce: Optional[bool] = False,
 ):
     """
-    Computes the 16 bit matmul Y = X x W
+    Computes 16 bit matrix multiplication Y = X @ W^T
 
-    Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
-    - dtype: Optional parameter to specifcy bf16 or fp16 datatype. Default is bf16
-    - Y: Output Matrix Y with shape (M, N).
-    If this is none, then it's created by this API and returned as output.
-    - activation: Optional activation function to apply to the output.
-    One of ("gelu", "gelu_tanh", "silu", "silu_exp2", "relu"). Default is None.
+    Args:
+        x (torch.Tensor): Input matrix with shape (M, K).
+        w (torch.Tensor): Weight matrix with shape (N, K), internally transposed.
+        bias (Optional[torch.Tensor]): Bias vector with shape (N,).
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
+        activation (Optional[str]): Activation function ("gelu", "gelu_tanh", "silu",
+            "silu_exp2", "relu").
+        skip_reduce (Optional[bool]): Skip reduction of split-K partial results.
+            Enables kernel fusion with downstream operations (FP8/FP4 quantization,
+            RMSNorm). Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+        torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
     """
 
     _LOGGER.info(f"GEMM_A16W16: x={tuple(x.shape)} w={tuple(w.shape)}")

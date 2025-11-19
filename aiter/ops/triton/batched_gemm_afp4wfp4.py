@@ -4,7 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton._triton_kernels.batched_gemm_afp4wfp4 import (
     _batched_gemm_afp4_wfp4_kernel,
@@ -34,20 +33,22 @@ def batched_gemm_afp4wfp4(
     config: Optional[dict] = None,
 ):
     """
-    Computes the matmul Y = X x W
-    X and W are e2m1 fp4 tensors.
-    x_scales and w_scales are e8m0 tensors.
-    Every 32 elements in the K dimension share one e8m0 scale.
+    Computes batched FP4 matrix multiplication Y[i] = X[i] @ W[i]^T with FP4 activations and weights.
 
-
-    Key parameters:
-    - X: Matrix X with shape (B, M, K).
-    - W: Matrix W with shape (B, N, K).
-    - X_scales: Matrix with shape (B, M, K // 32)
-    - W_scales: Matrix with shape (B, N, K // 32)
+    Args:
+        x (torch.Tensor): FP4 E2M1 input batch with shape (B, M, K).
+        w (torch.Tensor): FP4 E2M1 weight batch with shape (B, N, K), internally transposed.
+        x_scales (torch.Tensor): E8M0 per-group scale for x with shape (B, M, K//32).
+            One scale per 32 elements in K dimension.
+        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (B, N, K//32).
+            One scale per 32 elements in K dimension.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (B, M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
 
     Returns:
-    - Y: The output matrix with shape (B, M, N).
+        torch.Tensor: Output batch with shape (B, M, N).
     """
     _LOGGER.info(
         f"BATCHED_GEMM_AFP4WFP4: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x.shape)} w_scale={tuple(w.shape)}"
