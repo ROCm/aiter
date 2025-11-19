@@ -286,15 +286,20 @@ def get_bpreshuffle_GEMM_config(
         ).to_dict("index")
 
     cu_num = get_cu_num()
-    config = get_bpreshuffle_GEMM_config.file_cache[tuned_file].get(
-        (cu_num, M, N, K, str(q_dtype_w)), None
-    )
-    if config is not None:
-        if AITER_LOG_TUNED_CONFIG:
-            logger.info(
-                f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w} is tuned, in {tuned_file}!"
-            )
-    else:
+    padded_M = M
+    config = None
+    for gl in [None, 0, 1]:
+        padded_M = M if gl is None else get_padded_m(M, N, K, gl)
+        config = get_bpreshuffle_GEMM_config.file_cache[tuned_file].get(
+            (cu_num, padded_M, N, K, str(q_dtype_w)), None
+        )
+        if config is not None:
+            if AITER_LOG_TUNED_CONFIG:
+                logger.info(
+                    f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}!"
+                )
+            break
+    if config is None:
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
         )
