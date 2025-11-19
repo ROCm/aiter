@@ -1255,8 +1255,8 @@ class MRotaryEmbeddingQKNormFused(nn.Module):
         v_size = num_heads_v * self.head_size
 
         qkv = qkv.view(num_tokens, q_size + k_size + v_size)
-        q, k, _ = qkv.split([q_size, k_size, v_size], dim=-1)
-        return q, k 
+        q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
+        return q, k, v
 
 class DualChunkRotaryEmbedding(nn.Module):
     """Rotary positional embedding for Dual Chunk Attention."""
