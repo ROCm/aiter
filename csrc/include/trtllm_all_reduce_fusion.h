@@ -22,6 +22,7 @@ void trtllm_allreduce_rms(int64_t rank,
                           at::Tensor& rms_gamma,
                           at::Tensor& residual_out,
                           at::Tensor& norm_out,
+                          at::Tensor& scale_out,
                           double eps,
                           bool fp8_out,
                           Tensor& workspace);

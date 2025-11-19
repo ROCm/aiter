@@ -51,6 +51,7 @@ def trtllm_allreduce_rms(
     rms_gamma: Tensor,
     residual_out: Tensor,
     norm_out: Tensor,
+    scale_out: Tensor,
     eps: float,
     fp8_out: bool,
     workspace: Tensor,

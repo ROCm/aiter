@@ -1,4 +1,5 @@
 #include <iostream>
+#include <functional>
 #include <limits>
 #include <vector>
 #include <array>
@@ -32,26 +33,28 @@ static constexpr int kBytesPerAccess = 16;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kOneShotMaxSize = kOneShotMaxToken * 1024 * kBytesPerAccess;
 
+static constexpr float FP8_E4M3_MAX = 240;
+
 } // namespace details
 
 namespace block_utils {
 
-template <typename T>
-__device__ __forceinline__ T warp_reduce_sum(T val) {
+template <typename T, typename func_t>
+__device__ __forceinline__ T warp_reduce(T val, func_t fn) {
 #pragma unroll
     for (int offset = (32 >> 1); offset > 0; offset >>= 1) {
-        val += __shfl_xor(val, offset, 32);
+        val = fn(val, __shfl_xor(val, offset, 32));
     }
     return val;
 }
 
-template <typename T>
-__inline__ __device__ T block_reduce_sum(T val) {
+template <typename T, typename func_t>
+__inline__ __device__ T block_reduce(T val, func_t fn) {
     static __shared__ T shared[32];
     const int tid = threadIdx.x;
     const int w_tid = tid % 32;
     const int wid = tid / 32;
-    val = warp_reduce_sum(val);
+    val = warp_reduce<T, func_t>(val, fn);
     if (w_tid == 0) {
         shared[wid] = val;
     }
@@ -59,7 +62,7 @@ __inline__ __device__ T block_reduce_sum(T val) {
     bool is_mask = threadIdx.x < (blockDim.x / 32.f);
     val = is_mask ? shared[w_tid] : (T)(0.0f);
     __syncthreads();
-    val = warp_reduce_sum(val);
+    val = warp_reduce<T, func_t>(val, fn);
     return val;
 }
 
@@ -275,7 +278,7 @@ struct alignas(sizeof(T) * vec_size) vec_t {
     }
 };
 
-template <typename T, uint32_t VEC_SIZE>
+template <typename T, int VEC_SIZE>
 __device__ __forceinline__ void vec_add_(vec_t<T, VEC_SIZE> &self,
                                          const vec_t<T, VEC_SIZE> &other) {
 #pragma unroll
@@ -284,12 +287,32 @@ __device__ __forceinline__ void vec_add_(vec_t<T, VEC_SIZE> &self,
     }
 }
 
+template <typename T, int VEC_SIZE, int NRanks>
+__device__ __forceinline__ void vec_add_r_(vec_t<T, VEC_SIZE> (&self)[NRanks]) {
+    vec_t<float, VEC_SIZE> acc;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+        acc[i] = (float)self[0][i];
+    }
+#pragma unroll
+    for (int r = 1; r < NRanks; ++r) {
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+            acc[i] += (float)self[r][i];
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+        self[0][i] = (T)acc[i];
+    }
+}
+
 template<typename T, int vec_size>
-__device__ __forceinline__ vec_t<hip_fp8, vec_size> convert_to_fp8(vec_t<T, vec_size> &in_vec) {
+__device__ __forceinline__ vec_t<hip_fp8, vec_size> convert_to_fp8(vec_t<T, vec_size> &in_vec, float scale) {
     vec_t<hip_fp8, vec_size> out_vec;
 #pragma unroll
     for (int i = 0; i < vec_size; ++i) {
-        out_vec[i] = static_cast<hip_fp8>((float)in_vec[i]);
+        out_vec[i] = static_cast<hip_fp8>((float)in_vec[i] / scale);
     }
     return out_vec;
 }
@@ -307,8 +330,8 @@ struct AllReduceFusionParams {
     void *norm_out;
     void *rms_gamma;
     float rms_eps;
-    float scale_factor;
-    bool fp8_out;
+    bool fp8_out; // per token fp8 quant
+    void *fp8_scale_out;
 };
 
 template <typename T, int VEC_SIZE>
@@ -324,7 +347,7 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(
         float v = static_cast<float>(reinterpret_cast<T const *>(&residual)[i]);
         acc += v * v;
     }
-    acc = block_utils::block_reduce_sum<float>(acc);
+    acc = block_utils::block_reduce<float>(acc, std::plus<float>());
     if (threadIdx.x == 0) {
         s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
     }
@@ -335,6 +358,25 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(
             static_cast<T>(static_cast<float>(reinterpret_cast<T const *>(&residual)[i]) * s_val * static_cast<float>(reinterpret_cast<T const *>(&gamma)[i]));
     }
     return norm_out;
+}
+
+template <typename T, int VEC_SIZE>
+__device__ __forceinline__ float reduce_abs_max(vec_t<T, VEC_SIZE> const &data) {
+    __shared__ float s_val;
+    auto fn = [](float a, float b) { return a > b ? a : b; };
+    float acc = -1.f;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+        float v = static_cast<float>(reinterpret_cast<T const *>(&data)[i]);
+        acc = fn(acc, std::abs(v));
+    }
+    acc = block_utils::block_reduce<float>(acc, fn);
+    if (threadIdx.x == 0) {
+        s_val = acc;
+    }
+    __syncthreads();
+    acc = s_val;
+    return acc;
 }
 
 template <typename T, int NRanks>
@@ -367,10 +409,7 @@ __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> 
         for (int r = 0; r < NRanks; ++r) {
             vals[r].load(reinterpret_cast<T *>(comm.comm_bufs[r]) + idx);
         }
-#pragma unroll
-        for (int r = 1; r < NRanks; ++r) {
-            vec_add_<T, VEC_SIZE>(vals[0], vals[r]);
-        }
+        vec_add_r_<T, VEC_SIZE, NRanks>(vals);
 #pragma unroll
         for (int r = 0; r < NRanks; ++r) {
             vals[0].store(reinterpret_cast<T *>(comm.comm_bufs[r]) + params.size + idx);
@@ -390,8 +429,12 @@ __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> 
             data[0].store(reinterpret_cast<T *>(params.residual_out) + idx);
             auto val = rms_norm<T, VEC_SIZE>(params, data[0], gamma);
             if (params.fp8_out) {
-                auto val_fp8 = convert_to_fp8<T, VEC_SIZE>(val);
+                float scale = reduce_abs_max<T, VEC_SIZE>(val);
+                scale = scale == 0.f ? 1.f : scale / details::FP8_E4M3_MAX;
+                auto val_fp8 = convert_to_fp8<T, VEC_SIZE>(val, scale);
                 val_fp8.store(reinterpret_cast<hip_fp8 *>(params.norm_out) + idx);
+                if (threadIdx.x == 0)
+                    reinterpret_cast<float *>(params.fp8_scale_out)[token_id] = scale;
             } else {
                 val.store(reinterpret_cast<T *>(params.norm_out) + idx);
             }
@@ -534,16 +577,20 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
                 done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
             }
         }
-
-#pragma unroll
-        for (int r = 1; r < NRanks; ++r) {
-            vec_add_<T, VEC_SIZE>(vals[0], vals[r]);
-        }
-
+        vec_add_r_<T, VEC_SIZE, NRanks>(vals);
         vec_add_<T, VEC_SIZE>(vals[0], residual);
         vals[0].store(reinterpret_cast<T *>(params.residual_out) + idx);
         auto val = rms_norm<T, VEC_SIZE>(params, vals[0], gamma);
-        val.store(reinterpret_cast<T *>(params.norm_out) + idx);
+        if (params.fp8_out) {
+            float scale = reduce_abs_max<T, VEC_SIZE>(val);
+            scale = scale == 0.f ? 1.f : scale / details::FP8_E4M3_MAX;
+            auto val_fp8 = convert_to_fp8<T, VEC_SIZE>(val, scale);
+            val_fp8.store(reinterpret_cast<hip_fp8 *>(params.norm_out) + idx);
+            if (threadIdx.x == 0)
+                reinterpret_cast<float *>(params.fp8_scale_out)[token_id] = scale;
+        } else {
+            val.store(reinterpret_cast<T *>(params.norm_out) + idx);
+        }
     }
 
     comm.update(params.size * NRanks);
@@ -559,7 +606,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params, hi
     int threads_per_block = threads_per_token;
     dim3 threadsPerBlock(threads_per_block);
     int nblocks = NBLOCKS_PER_GPU;
-    if (params.size * sizeof(T) > 1024*1024*128) {
+    if (params.size * sizeof(T) >= 1024*1024*128) {
         nblocks /= 2;
     }
     dim3 numBlocks(nblocks);
@@ -587,6 +634,7 @@ void allreduce_rms_fusion_impl(
     void *rms_gamma,
     float eps,
     bool fp8_out,
+    void *fp8_scale_out,
     hipStream_t stream = 0) {
     AllReduceFusionParams<T> params;
     params.nranks = nranks;
@@ -601,6 +649,7 @@ void allreduce_rms_fusion_impl(
     params.rms_gamma = rms_gamma;
     params.rms_eps = eps;
     params.fp8_out = fp8_out;
+    params.fp8_scale_out = fp8_scale_out;
     if (nranks == 8) {
         allreduce_fusion_kernel_launcher<T, 8>(params, stream);
     } else if (nranks == 4) {
@@ -632,7 +681,7 @@ struct KernelElementType<c10::BFloat16> {
 };
 
 void trtllm_allreduce_rms(int64_t rank, int64_t nranks, Tensor &allreduce_in, Tensor &residual_in, 
-    Tensor &rms_gamma, Tensor &residual_out, Tensor &norm_out, double eps, bool fp8_out, Tensor &workspace) {
+    Tensor &rms_gamma, Tensor &residual_out, Tensor &norm_out, Tensor &scale_out, double eps, bool fp8_out, Tensor &workspace) {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(allreduce_in));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     int size = allreduce_in.numel();
@@ -652,10 +701,11 @@ void trtllm_allreduce_rms(int64_t rank, int64_t nranks, Tensor &allreduce_in, Te
                 (void *)allreduce_in.data_ptr<scalar_t>(),
                 (void *)residual_in.data_ptr<scalar_t>(),
                 (void *)residual_out.data_ptr<scalar_t>(),
-                (void *)norm_out.data_ptr<scalar_t>(),
+                (void *)norm_out.data_ptr(),
                 (void *)rms_gamma.data_ptr<scalar_t>(),
                 eps,
                 fp8_out,
+                (void *)scale_out.data_ptr<float>(),
                 stream);
         });
 }
