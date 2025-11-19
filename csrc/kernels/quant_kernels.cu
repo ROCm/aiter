@@ -460,15 +460,15 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
             : (1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max()));
 
     const int32_t smscale_map_idx = smooth_scale_map == nullptr ? 0 : smooth_scale_map[blockIdx.x];
-    const int64_t row_offset     = token_idx * cols;
-    auto const* ptr_i            = reinterpret_cast<DTYPE_I const*>(input + row_offset);
-    auto const* input_vecs       = reinterpret_cast<vec_i const*>(ptr_i);
+    const int64_t row_offset      = token_idx * cols;
+    auto const* ptr_i             = reinterpret_cast<DTYPE_I const*>(input + row_offset);
+    auto const* input_vecs        = reinterpret_cast<vec_i const*>(ptr_i);
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     const int32_t oob_i             = (cols + ooba_i - 1) / ooba_i * ooba_i;
     auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_i, oob_i);
     buffer_i.init_raw();
 
-    auto const* ptr_smscale  = reinterpret_cast<float const*>(smooth_scale + smscale_map_idx * cols);
+    auto const* ptr_smscale = reinterpret_cast<float const*>(smooth_scale + smscale_map_idx * cols);
     auto const* smscale_vecs = reinterpret_cast<vec_s const*>(ptr_smscale);
     auto buffer_s =
         ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_smscale, cols);
@@ -673,10 +673,10 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
 void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                                     torch::Tensor const& input, // [..., d]
                                     torch::Tensor& scales,
-                                    std::optional<at::Tensor> const& scale_ub,
-                                    bool shuffle_scale                        = false,
-                                    std::optional<at::Tensor> const& num_rows = std::nullopt,
-                                    int num_rows_factor                       = 1)
+                                    std::optional<torch::Tensor> scale_ub = std::nullopt,
+                                    bool shuffle_scale                    = false,
+                                    std::optional<torch::Tensor> num_rows = std::nullopt,
+                                    int num_rows_factor                   = 1)
 {
     TORCH_CHECK(input.is_contiguous());
     TORCH_CHECK(out.is_contiguous());

@@ -6,7 +6,7 @@ import argparse
 import torch
 import pandas as pd
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from aiter import logger
 import traceback
 from operator import itemgetter
@@ -37,6 +37,7 @@ class TunerCommon:
         dtypes.fp4x2: 1,
         torch.uint8: 1,
         torch.uint32: 4,
+        dtypes.fp32: 4,
         torch.int4: 1 / 2,
         torch.float8_e4m3fnuz: 1,
         torch.float8_e4m3fn: 1,
@@ -76,6 +77,7 @@ class TunerCommon:
             "-i",
             "--untune_file",
             default=defaults["untune_file"],
+            dest="untune_file",
             required=False,
             help="input",
         )
@@ -83,6 +85,7 @@ class TunerCommon:
             "-o",
             "--tune_file",
             default=defaults["tune_file"],
+            dest="tune_file",
             required=False,
             help="output: tuning result store this file",
         )
@@ -151,7 +154,7 @@ class TunerCommon:
 
     @abstractmethod
     def getKernelName(self, kernel_id):
-        """??kernel name"""
+        """obtain name of the kernel from its id"""
         pass
 
     @abstractmethod
@@ -164,6 +167,37 @@ class TunerCommon:
         """transfer results to dataframe"""
         pass
 
+    def update_config_files(self, file_path: str, merge_name: str):
+        path_list = file_path.split(os.pathsep) if file_path else []
+        if len(path_list) <= 1:
+            return file_path
+        df_list = []
+        ## merge config files
+        ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
+
+        df_list.append(pd.read_csv(path_list[0]))
+        for i, path in enumerate(path_list[1:]):
+            if os.path.exists(path):
+                df = pd.read_csv(path)
+                ## check columns
+                assert (
+                    df.columns.tolist() == df_list[0].columns.tolist()
+                ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
+
+                df_list.append(df)
+            else:
+                print(f"path {i+1}: {path} (not exist)")
+        merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
+        ##drop_duplicates
+        merge_df = (
+            merge_df.sort_values("us")
+            .drop_duplicates(subset=self.keys, keep="first")
+            .reset_index(drop=True)
+        )
+        new_file_path = f"/tmp/{merge_name}.csv"
+        merge_df.to_csv(new_file_path, index=False)
+        return new_file_path
+
     def get_untuned_gemm_list(self, untuned_gemm_file):
         assert os.path.exists(
             untuned_gemm_file
@@ -172,15 +206,20 @@ class TunerCommon:
         filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
         return filtered_df
 
+    def get_out_file(self, tuned_file):
+        """if there are multiple tuned file, then write tuning result to the first file"""
+        path_list = tuned_file.split(os.pathsep) if tuned_file else []
+        assert path_list, f"output tuned file is empty"
+        return path_list[0]
+
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
-        path_list = tuned_gemm_file.split(os.pathsep) if tuned_gemm_file else []
-        assert len(path_list) <= 1, f"tuning to multiple files is not supported"
-        if os.path.exists(tuned_gemm_file):
-            column_order = pd.read_csv(tuned_gemm_file, nrows=0).columns.tolist()
-            tunedf = pd.read_csv(tuned_gemm_file)
+        all_tuned_file = self.update_config_files(tuned_gemm_file, self.name)
+        if os.path.exists(all_tuned_file):
+            column_order = pd.read_csv(all_tuned_file, nrows=0).columns.tolist()
+            tunedf = pd.read_csv(all_tuned_file)
             tunedf = tunedf[column_order]
         else:
-            print(f"Not exist tuned file: {tuned_gemm_file}")
+            print(f"Not exist tuned file: {all_tuned_file}")
             columns = self.columns if not columns else columns
             tunedf = pd.DataFrame(columns=columns)
         return tunedf
@@ -189,7 +228,7 @@ class TunerCommon:
         """get retune gemm list from tune_file and untune_file"""
         if args.untune_file is None:
             raise ValueError("untune_file must be specified for retuning")
-        if args.tune_file == args.untune_file:
+        if self.get_out_file(args.tune_file) == args.untune_file:
             # retune all shapes in tune_file
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
             self.tunedf = self.untunedf[self.untunedf["cu_num"] != self.get_cu_num()]
@@ -322,15 +361,19 @@ class TunerCommon:
         )
         logger.info("Successfully tuned shapes:")
         if not self.success.empty:
-            print(self.success)
+            print(self.success, flush=True)
         logger.info("Failed shapes:")
-        print(self.failed)
+        print(self.failed, flush=True)
+
+        tunedf_subset = tunedf[self.untunedf.columns].astype(self.untunedf.dtypes)
         mask = self.untunedf.apply(tuple, axis=1).isin(
-            tunedf[self.untunedf.columns].apply(tuple, axis=1)
+            tunedf_subset.apply(tuple, axis=1)
         )
         self.remain_untuned = self.untunedf[~mask]
-        logger.info("untuned shapes:")
-        print(self.remain_untuned)
+
+        if not self.remain_untuned.empty:
+            logger.info("untuned shapes:")
+            print(self.remain_untuned)
 
     @abstractmethod
     def result_to_csv(self, results, file, concat=False):
@@ -345,12 +388,16 @@ class TunerCommon:
     def run(self, args, fast_mode=False):
         """tuner run function"""
         self.pre_process(args)
+        print(self.untunedf)
+        output_file = self.get_out_file(args.tune_file)
         if args.verbose:
             logger.info(f"args: {args}")
         if len(self.untunedf) == 0:
             # self.update_tflops_bw(args.tune_file)
-            self.sortResults(args.tune_file, args.sort, self.keys)
-            logger.info(f"no shapes to be tuned, skip tuning")
+            self.sortResults(output_file, args.sort, self.keys)
+            logger.info(
+                f"no shapes to be tuned, skip tuning, tuned file is {args.tune_file}"
+            )
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
         batch_size = min(args.batch, len(self.untunedf))
         total_batches = (len(self.untunedf) + batch_size - 1) // batch_size
@@ -358,6 +405,7 @@ class TunerCommon:
             logger.info(
                 f"total shapes to be tuned: {len(self.untunedf) }, total_batches: {total_batches}, batch_size: {batch_size}"
             )
+            logger.info(f"results will be written to {output_file}")
         processed_batches = 0
         results = []
         topk = -1 if fast_mode else 1
@@ -370,13 +418,15 @@ class TunerCommon:
                 all_results = self.tune(batch, self.tunedf, args)
                 if all_results:
                     results = self.post_process(all_results, args, topk)
-                    self.result_to_csv(results, args.tune_file, not args.all)
+                    self.result_to_csv(results, output_file, not args.all)
                     logger.info(
                         f"processed {processed_batches} batches of {total_batches}, Processing Status ====> {round(processed_batches / total_batches,2)*100:.1f}% tuned in {self.name}"
                     )
                 else:
-                    logger.info("tune result is none or all shape is tuned!")
-            self.sortResults(args.tune_file, args.sort, self.keys)
+                    logger.info(
+                        f"tune result is none or all shape is tuned in {args.tune_file}!"
+                    )
+            self.sortResults(output_file, args.sort, self.keys)
         except KeyboardInterrupt:
             tuning_status = "Interrupted"
             logger.error(
@@ -435,7 +485,7 @@ class GemmCommonTuner(TunerCommon):
         info, time, err_ratio = results
         if time == -1:
             return -1, -1
-        cu_num, m, n, k = info[0]
+        cu_num, m, n, k, *rest = info[0]
         flop = m * n * k * 2
         tflops = round(flop / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes
@@ -474,7 +524,10 @@ class GemmCommonTuner(TunerCommon):
                 }
             )
             temp = pd.DataFrame(key_dict)
-            resultdf = pd.concat([resultdf, temp], ignore_index=True)
+            if resultdf.empty:
+                resultdf = temp
+            else:
+                resultdf = pd.concat([resultdf, temp], ignore_index=True)
         return resultdf
 
     def result_to_csv(self, resultdf, file, concat=False):
@@ -488,7 +541,7 @@ class GemmCommonTuner(TunerCommon):
             [self.success, resultdf[resultdf["us"] != self.INVALID_TIME]],
             ignore_index=True,
         )
-        update_tunedf = self.success
+        update_tunedf = resultdf[resultdf["us"] != self.INVALID_TIME]  # self.success
         if not concat:
             resultdf = self.update_tunedf(old_df, update_tunedf)
         else:

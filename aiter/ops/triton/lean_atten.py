@@ -23,8 +23,10 @@ from bisect import bisect_right
 import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.lean_atten import la_persistent, _get_config
+from aiter.ops.triton._triton_kernels.lean_atten import la_persistent, _get_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton import arch_info
 
 _LOGGER = AiterTritonLogger()
@@ -47,6 +49,7 @@ def persistent_lean_attention(
     causal: bool = True,  # causal masking
     config: Optional[dict] = None,
     program_count: Optional[int] = None,
+    program_count: Optional[int] = None,
 ):
     """
     Lean Attention kernel.
@@ -57,6 +60,11 @@ def persistent_lean_attention(
     if config is None:
         config = _get_config(causal=causal, batch_size=batch_size)
     sm_count = arch_info.get_num_sms()
+    total_programs = (
+        program_count
+        if program_count is not None
+        else sm_count * config["SM_CNT_FACTOR"]
+    )
     total_programs = (
         program_count
         if program_count is not None
@@ -122,6 +130,10 @@ def _persistent_lean_attention(
     HEAD_DIM_PADDED = triton.next_power_of_2(HEAD_DIM_K)
     if HEAD_DIM_PADDED < 16:
         HEAD_DIM_PADDED = 16
+    # Allow irregular head dims by padding compute width and masking I/O
+    HEAD_DIM_PADDED = triton.next_power_of_2(HEAD_DIM_K)
+    if HEAD_DIM_PADDED < 16:
+        HEAD_DIM_PADDED = 16
 
     # MASKED_BLOCKS is used for prefill/causal for BLOCK_M > BLOCK_N
     # For MI300, BLOCK_M=128, BLOCK_N=64 is better for performance
@@ -135,6 +147,9 @@ def _persistent_lean_attention(
     N_CTX_Q = q.shape[0] // batch_size
     N_CTX_K = k.shape[0]  # This is the sum of all ctx_n in a batch
     H = q.shape[1]
+    H_K = k.shape[1]
+    assert H % H_K == 0, "For GQA, the number of Q heads must be divisible by K/V heads"
+    GQA_GROUP_SIZE = H // H_K
     H_K = k.shape[1]
     assert H % H_K == 0, "For GQA, the number of Q heads must be divisible by K/V heads"
     GQA_GROUP_SIZE = H // H_K
@@ -157,6 +172,7 @@ def _persistent_lean_attention(
         N_CTX_Q,
         N_CTX_K,
         H,
+        H_K,
         H_K,
         BLOCK_M,
         BLOCK_N,
@@ -245,7 +261,7 @@ def _persistent_lean_attention(
             f"locks must have length >= total_programs ({total_programs}), got {locks.numel()}"
         )
 
-    # Use analytically computed bound without extra padding
+    max_output_tile_cnt = max_output_tile_cnt + 4
 
     grid = (total_programs, 1, 1)
 
@@ -288,10 +304,12 @@ def _persistent_lean_attention(
         o.stride(1),
         o.stride(2),
         N_CTX_Q,
+        N_CTX_Q,
         Op.stride(0),  # total_programs
         Op.stride(1),  # n_ctx_q
         Op.stride(2),  # head_dim
         HEADS_PER_XCD=HEADS_PER_XCD,
+        HEAD_DIM_ORIG=HEAD_DIM_K,
         HEAD_DIM_ORIG=HEAD_DIM_K,
         HEAD_DIM=HEAD_DIM_K,
         BLOCK_M=BLOCK_M,
@@ -324,6 +342,16 @@ def _persistent_lean_attention(
             or (Op.stride(1) * N_CTX_Q) >= (1 << 31)
             or (o.stride(0) * N_CTX_Q) >= (1 << 31)
         ),
+        num_heads_q=H,
+        num_heads_k=H_K,
+        gqa_group_size=GQA_GROUP_SIZE,
+        use_64_indexing=(
+            (k.stride(0) * N_CTX_K) >= (1 << 31)
+            or (v.stride(0) * N_CTX_K) >= (1 << 31)
+            or (Op.stride(0) * total_programs) >= (1 << 31)
+            or (Op.stride(1) * N_CTX_Q) >= (1 << 31)
+            or (o.stride(0) * N_CTX_Q) >= (1 << 31)
+        ),
         **config,
     )
     """
@@ -336,6 +364,7 @@ def _persistent_lean_attention(
     """
     # print(f"la kernel {la_kernel.n_regs} registers used, {la_kernel.n_spills} spills")
     ms = 0
+    return (o, ms)
     return (o, ms)
 
 
@@ -361,6 +390,7 @@ def get_num_splits_and_buffer_sizes(
     num_n_blocks = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
 
     # Schedule over Q heads; K/V heads are mapped inside the kernel via gqa_group_size
+    # Schedule over Q heads; K/V heads are mapped inside the kernel via gqa_group_size
 
     # print(f"block_m: {BLOCK_M}, block_n: {BLOCK_N} ")
     # print(f"num_m_block: {num_m_blocks}, num_n_block: {num_n_blocks} ")
@@ -382,9 +412,12 @@ def get_num_splits_and_buffer_sizes(
         tiles_per_head = num_n_blocks
 
     # Total tiles across all Q heads
+    # Total tiles across all Q heads
     if XCD_REMAP:
         total_tiles = tiles_per_head * (num_heads // NUM_XCDS)
+        total_tiles = tiles_per_head * (num_heads // NUM_XCDS)
     else:
+        total_tiles = tiles_per_head * num_heads
         total_tiles = tiles_per_head * num_heads
 
     # StreamK Lean has as many threadblocks as SMs
