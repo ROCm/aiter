@@ -97,7 +97,7 @@ def _fwd_kernel_stage2_asm(
             )
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache()
 def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     if num_kv_splits is None:
         cu_num = get_cu_num()
