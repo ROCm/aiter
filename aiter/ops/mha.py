@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from torch import Tensor, Generator
-from typing import Optional, Tuple, Any
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
+from typing import Any, Optional, Tuple
+
+import torch
+from torch import Generator, Tensor
+
+from ..jit.core import AITER_CSRC_DIR, CK_DIR, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
-import torch
 
 
 def cmdGenFunc_mha_fwd(
@@ -200,6 +202,7 @@ def gen_fmha_v3_fwd_fake_tensors(
     window_size_right: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
+    how_v3_bf16_cvt: int,
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
@@ -224,6 +227,7 @@ def fmha_v3_fwd(
     window_size_right: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
+    how_v3_bf16_cvt: int,
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
@@ -846,6 +850,8 @@ def cmdGenFunc_mha_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    cu_seqlens_q_padded: Optional[Tensor] = None,
+    cu_seqlens_k_padded: Optional[Tensor] = None,
 ) -> dict[str, Any]:
     md_name = "mha_varlen_bwd"
     filter1 = "*"  # get_bwd_dot_do_o_blobs()
@@ -1079,6 +1085,8 @@ def mha_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    cu_seqlens_q_padded: Optional[Tensor] = None,
+    cu_seqlens_k_padded: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -1108,6 +1116,8 @@ def gen_fmha_v3_varlen_bwd_fake_tensor(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    cu_seqlens_q_padded: Optional[Tensor] = None,
+    cu_seqlens_k_padded: Optional[Tensor] = None,
 ):
     return gen_mha_varlen_bwd_fake_tensors_common(
         q, k, v, cu_seqlens_q, max_seqlen_q, zero_tensors, dq, dk, dv
@@ -1129,8 +1139,6 @@ def fmha_v3_varlen_bwd(
     softmax_lse: Tensor,
     cu_seqlens_q: Tensor,
     cu_seqlens_k: Tensor,
-    # cu_seqlens_q_padded: Tensor,
-    # cu_seqlens_k_padded: Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
@@ -1148,6 +1156,8 @@ def fmha_v3_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    cu_seqlens_q_padded: Optional[Tensor] = None,
+    cu_seqlens_k_padded: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -1168,6 +1178,7 @@ def _flash_attn_forward(
     alibi_slopes: Optional[torch.Tensor],
     return_lse: bool,
     return_softmax: bool,
+    how_v3_bf16_cvt: Optional[int] = 1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1221,6 +1232,7 @@ def _flash_attn_forward(
             window_size_right,
             return_lse,
             return_softmax,
+            how_v3_bf16_cvt,
             None,
             bias,
             alibi_slopes,
@@ -1249,7 +1261,7 @@ def _flash_attn_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-@torch_compile_guard()
+# @torch_compile_guard(mutates_args=[])
 def can_impl_fmha_v3_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -1416,7 +1428,8 @@ def can_impl_fmha_v3_bwd(
         return ret
 
     # basic
-    ret = alibi_slopes is None
+    ret = get_gfx() == "gfx942"
+    ret &= alibi_slopes is None
     ret &= bias is None
     ret &= dbias is None
     ret &= dropout_p == 0.0
@@ -1428,6 +1441,42 @@ def can_impl_fmha_v3_bwd(
     return ret
 
 
+def _flash_attn_backward_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: Optional[torch.Tensor],
+    dk: Optional[torch.Tensor],
+    dv: Optional[torch.Tensor],
+    dbias: Optional[torch.Tensor],
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    deterministic: bool,
+    rng_state: Optional[torch.Tensor] = None,
+    is_v3_atomic_fp32: Optional[bool] = True,
+    how_v3_bf16_cvt: Optional[int] = 1,
+) -> torch.Tensor:
+    batch_size = q.size(0)
+    seqlen_q = q.size(1)
+    num_heads = q.size(2)
+
+    softmax_d = torch.empty(
+        (batch_size, num_heads, seqlen_q),  # {batch_size, num_heads, seqlen_q}
+        dtype=torch.float32,
+        device=q.device,
+    )
+    return softmax_d
+
+
+@torch_compile_guard(gen_fake=_flash_attn_backward_fake)
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -1500,10 +1549,11 @@ def _flash_attn_backward(
         ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= not deterministic or is_950_1block
-        ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
-
+        ret &= (
+            (hdim_q > 64 and hdim_q <= 128)
+            or (hdim_q == 192 and hdim_v == 128 and nmask)
+        ) and hdim_q % 8 == 0
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
@@ -1617,6 +1667,7 @@ class FlashAttnFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
+            how_v3_bf16_cvt=how_v3_bf16_cvt,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
         )
@@ -1733,6 +1784,7 @@ def flash_attn_func(
     deterministic=True,
     return_lse=False,
     return_attn_probs=False,
+    how_v3_bf16_cvt=1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
 ):
@@ -1802,7 +1854,7 @@ def flash_attn_func(
         return_attn_probs,
         torch.is_grad_enabled(),
         True,  # is_v3_atomic_fp32
-        1,  # how_v3_bf16_cvt
+        how_v3_bf16_cvt,
         cu_seqlens_q,
         cu_seqlens_kv,
     )
@@ -1949,10 +2001,6 @@ def _flash_attn_varlen_backward(
     dv: Optional[torch.Tensor],
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    #  FIXME: this two args currently not support on ck side
-    # and has no host code on aiter side
-    # cu_seqlens_q_padded: Tensor,
-    # cu_seqlens_k_padded: Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
@@ -1966,6 +2014,8 @@ def _flash_attn_varlen_backward(
     is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
     zero_tensors: bool = False,
+    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
+    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 
     (_, nhead_q, hdim_q) = q.shape
@@ -2028,7 +2078,8 @@ def _flash_attn_varlen_backward(
 
     def can_impl_fmha_v3_bwd():
         # basic
-        ret = alibi_slopes is None
+        ret = get_gfx() == "gfx942"
+        ret &= alibi_slopes is None
         # ret &= bias is None
         # ret &= dbias is None
         ret &= dropout_p == 0.0
@@ -2074,8 +2125,6 @@ def _flash_attn_varlen_backward(
             softmax_lse,
             cu_seqlens_q,
             cu_seqlens_k,
-            # cu_seqlens_q_padded,
-            # cu_seqlens_k_padded,
             max_seqlen_q,
             max_seqlen_k,
             dropout_p,
@@ -2093,6 +2142,8 @@ def _flash_attn_varlen_backward(
             alibi_slopes,
             rng_state,
             None,
+            cu_seqlens_q_padded,
+            cu_seqlens_k_padded,
         )
     else:
         (
@@ -2124,6 +2175,8 @@ def _flash_attn_varlen_backward(
             alibi_slopes,
             rng_state,
             None,
+            cu_seqlens_q_padded,
+            cu_seqlens_k_padded,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
@@ -2213,6 +2266,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.head_size_q_og = head_size_q_og
             ctx.is_v3_atomic_fp32 = is_v3_atomic_fp32
             ctx.how_v3_bf16_cvt = how_v3_bf16_cvt
+            ctx.cu_seqlens_q_padded = cu_seqlens_q_padded
+            ctx.cu_seqlens_k_padded = cu_seqlens_k_padded
 
         out = out_padded[..., :head_size_v_og]
 
@@ -2269,6 +2324,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             rng_state=rng_state,
             is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
             how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
+            cu_seqlens_q_padded=ctx.cu_seqlens_q_padded,
+            cu_seqlens_k_padded=ctx.cu_seqlens_k_padded,
         )
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
@@ -2339,6 +2396,7 @@ def flash_attn_varlen_func(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
+    how_v3_bf16_cvt=1,
     block_table=None,
     out=None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
@@ -2432,7 +2490,7 @@ def flash_attn_varlen_func(
         cu_seqlens_q_padded,
         cu_seqlens_k_padded,
         True,
-        1,
+        how_v3_bf16_cvt,
     )
 
 

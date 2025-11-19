@@ -1,6 +1,9 @@
 # aiter version
 aiter/_version.py
 
+# aiter install mode
+aiter/install_mode
+
 # Prerequisites
 *.d
 
@@ -49,3 +52,7 @@ __pycache__
 debug
 aiter_logs
 *.log
+
+# artifacts
+aiter_meta
+aiter/install_mode
