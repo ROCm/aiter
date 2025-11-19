@@ -1934,3 +1934,107 @@ def _rope_fwd_2d_kernel_neox(
 
     # store output
     tl.store(out_ptr + offs_x, out)
+
+
+@triton.jit
+def _rope_fwd_3d(
+    x_ptr,
+    freqs_real_ptr,
+    freqs_imag_ptr,
+    grid_sizes_ptr,
+    out_ptr,
+    stride_x_b,
+    stride_x_l,
+    stride_x_n,
+    stride_x_c,
+    stride_freqs_s,
+    stride_freqs_c,
+    stride_grid_b,
+    stride_grid_d,
+    stride_out_b,
+    stride_out_l,
+    stride_out_n,
+    stride_out_c,
+    L: tl.constexpr,
+    N_HEADS: tl.constexpr,
+    C: tl.constexpr,
+    c_total: tl.constexpr,
+    sp_size: tl.constexpr,
+    sp_rank: tl.constexpr,
+    max_freq_seq_len: tl.constexpr,
+    s_per_rank: tl.constexpr,
+    pad_freq_val_r: tl.constexpr,
+    pad_freq_val_i: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    C1: tl.constexpr,
+    C2: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_l = tl.program_id(2)
+
+    l_start = pid_l * BLOCK_L
+    l_off = l_start + tl.arange(0, BLOCK_L)
+    s_mask = l_off < L
+
+    c_off = tl.arange(0, BLOCK_C)
+    c_mask = c_off < c_total
+
+    # head mask
+    n_mask = pid_n < N_HEADS
+
+    # broadcast to  (BLOCK_L, 1, BLOCK_C)
+    l_b = tl.broadcast_to(l_off[:, None], (BLOCK_L, BLOCK_C))
+    c_b = tl.broadcast_to(c_off[None, :], (BLOCK_L, BLOCK_C))
+
+    # read grid_sizes
+    f_grid = tl.load(
+        grid_sizes_ptr + pid_b * stride_grid_b + 0 * stride_grid_d, mask=n_mask, other=0
+    )
+    h_grid = tl.load(
+        grid_sizes_ptr + pid_b * stride_grid_b + 1 * stride_grid_d, mask=n_mask, other=0
+    )
+    w_grid = tl.load(
+        grid_sizes_ptr + pid_b * stride_grid_b + 2 * stride_grid_d, mask=n_mask, other=0
+    )
+    h_w = h_grid * w_grid
+
+    global_tid = sp_rank * s_per_rank + l_b
+    valid_global_tid = global_tid < f_grid * h_w
+
+    # caculate f h w
+    f_idx = tl.where(valid_global_tid, global_tid // h_w, 0)
+    rem = tl.where(valid_global_tid, global_tid % h_w, 0)
+    h_idx = tl.where(valid_global_tid, rem // w_grid, 0)
+    w_idx = tl.where(valid_global_tid, rem % w_grid, 0)
+
+    freq_row = tl.where(c_b < C1, f_idx, tl.where(c_b < C1 + C2, h_idx, w_idx))
+    freq_row = tl.where(freq_row >= max_freq_seq_len, max_freq_seq_len - 1, freq_row)
+
+    mask_rope = s_mask[:, None] & c_mask[None, :] & n_mask & valid_global_tid[:, :]
+
+    # load freqs_real and freqs_imag
+    off_freq = freq_row * stride_freqs_s + c_b * stride_freqs_c
+    freq_r = tl.load(freqs_real_ptr + off_freq, mask=mask_rope, other=pad_freq_val_r)
+    freq_i = tl.load(freqs_imag_ptr + off_freq, mask=mask_rope, other=pad_freq_val_i)
+
+    off_x_base = pid_b * stride_x_b + pid_n * stride_x_n
+    off_x_r = off_x_base + l_b * stride_x_l + (2 * c_b) * stride_x_c
+    off_x_i = off_x_base + l_b * stride_x_l + (2 * c_b + 1) * stride_x_c
+
+    x_r = tl.load(x_ptr + off_x_r, mask=mask_rope, other=0.0)
+    x_i = tl.load(x_ptr + off_x_i, mask=mask_rope, other=0.0)
+
+    # complex number multiplication
+    out_r = x_r * freq_r - x_i * freq_i
+    out_i = x_r * freq_i + x_i * freq_r
+
+    # write result
+    off_out_base = pid_b * stride_out_b + pid_n * stride_out_n
+    off_out_r = off_out_base + l_b * stride_out_l + (2 * c_b) * stride_out_c
+    off_out_i = off_out_base + l_b * stride_out_l + (2 * c_b + 1) * stride_out_c
+
+    tl.store(out_ptr + off_out_r, out_r, mask=mask_rope)
+    tl.store(out_ptr + off_out_i, out_i, mask=mask_rope)

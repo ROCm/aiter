@@ -30,6 +30,12 @@ def tensor_model_parallel_all_reduce(
     return get_tp_group().all_reduce(input_, open_fp8_quant)
 
 
+def tensor_model_parallel_fused_allreduce_rmsnorm(
+    input_: torch.Tensor, residual_inp_: torch.Tensor, weight_: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
+
+
 def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().custom_all_gather(input_)
 
