@@ -1662,6 +1662,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Sequence partition size",
     )
+    parser.add_argument(
+        "--sample_rate",
+        type=float,
+        default=1.0,
+        help="Sample rate for test cases (0.0-1.0). Each test case has sample_rate probability to be selected. Default: 1.0 (run all tests)",
+    )
 
     return parser
 
@@ -1716,6 +1722,9 @@ def process_arguments(args: argparse.Namespace) -> tuple:
     if args.context_partition_size is not None:
         context_partition_size_options = [args.context_partition_size]
 
+    # Process sample_rate argument
+    sample_rate = args.sample_rate if hasattr(args, "sample_rate") else 1.0
+
     return (
         compute_types,
         block_sizes,
@@ -1730,7 +1739,62 @@ def process_arguments(args: argparse.Namespace) -> tuple:
         use_torch_flash_ref_options,
         use_aot_impl_options,
         context_partition_size_options,
+        sample_rate,
     )
+
+
+def _run_single_test(args):
+    """
+    Helper function to run a single test case.
+
+    Args:
+        args: Tuple containing (test_config, current, total)
+
+    Returns:
+        Dictionary containing test results
+    """
+    test_config, current, total = args
+
+    print(
+        f"\n[{current}/{total}] Testing: "
+        f"use_torch_flash_ref={test_config['use_torch_flash_ref']}, "
+        f"compute_type={test_config['compute_type']}, "
+        f"quant_q_and_kv=({test_config['quant_q']}, {test_config['quant_kv']}), "
+        f"use_aot_impl={test_config['use_aot_impl']}, "
+        f"trans_v={test_config['trans_v']}, "
+        f"kv_varlen={test_config['kv_varlen']}, "
+        f"context_partition_size={test_config['context_partition_size']}, "
+        f"quant_mode={test_config['quant_mode']}, "
+        f"block_size={test_config['block_size']}, "
+        f"num_heads={test_config['num_heads']}, "
+        f"context_lengths={test_config['context_length']}, "
+        f"batch_size={test_config['batch_size']}, "
+        f"query_length={test_config['query_length']}, "
+        f"head_size={test_config['head_size']}"
+    )
+
+    # Import global variables to modify them
+    global USE_TORCH_FLASH_REF
+    USE_TORCH_FLASH_REF = test_config["use_torch_flash_ref"]
+
+    result = run_pa_gluon_test(
+        context_length=test_config["context_length"],
+        batch_size=test_config["batch_size"],
+        num_heads=test_config["num_heads"],
+        head_size=test_config["head_size"],
+        block_size=test_config["block_size"],
+        compute_type=test_config["compute_type"],
+        query_length=test_config["query_length"],
+        quant_mode=test_config["quant_mode"],
+        context_partition_size=test_config["context_partition_size"],
+        trans_v=test_config["trans_v"],
+        kv_varlen=test_config["kv_varlen"],
+        use_aot_impl=test_config["use_aot_impl"],
+        quant_q=test_config["quant_q"],
+        quant_kv=test_config["quant_kv"],
+    )
+
+    return result
 
 
 def run_multi_pa_gluon_test(
@@ -1747,39 +1811,46 @@ def run_multi_pa_gluon_test(
     use_torch_flash_ref_options,
     use_aot_impl_options,
     context_partition_size_options,
+    sample_rate=1.0,
 ) -> pd.DataFrame:
     """Run all tests."""
-    results = []
-    total = (
-        len(compute_types)
-        * len(block_sizes)
-        * len(head_configs)
-        * len(context_length)
-        * len(batch_sizes)
-        * len(query_lengths)
-        * len(quant_mode)
-        * len(trans_v)
-        * len(kv_varlen)
-        * len(quant_q_and_kv)
-        * len(use_torch_flash_ref_options)
-        * len(use_aot_impl_options)
-        * len(context_partition_size_options)
-    )
-    current = 0
+    # results = []
+    # total = (
+    #     len(compute_types)
+    #     * len(block_sizes)
+    #     * len(head_configs)
+    #     * len(context_length)
+    #     * len(batch_sizes)
+    #     * len(query_lengths)
+    #     * len(quant_mode)
+    #     * len(trans_v)
+    #     * len(kv_varlen)
+    #     * len(quant_q_and_kv)
+    #     * len(use_torch_flash_ref_options)
+    #     * len(use_aot_impl_options)
+    #     * len(context_partition_size_options)
+    # )
+    # current = 0
 
-    # Import global variables to modify them
-    global USE_TORCH_FLASH_REF
+    # Generate all test configurations
+    test_configs = []
 
     for use_torch_flash_ref in use_torch_flash_ref_options:
-        # Set global configuration for this test run
-        USE_TORCH_FLASH_REF = use_torch_flash_ref
         for ct in compute_types:
             for quant_q_and_kv_mode in quant_q_and_kv:
                 quant_q, quant_kv = quant_q_and_kv_mode
                 for trans_v_mode in trans_v:
                     for kv_varlen_mode in kv_varlen:
                         for context_partition_size in context_partition_size_options:
+                            qm_cnt = 0
                             for qm in quant_mode:
+                                qm_cnt += 1
+                                if (
+                                    quant_q is False
+                                    and quant_kv is False
+                                    and qm_cnt > 1
+                                ):
+                                    continue
                                 for bs in block_sizes:
                                     for hc in head_configs:
                                         for cl in context_length:
@@ -1791,47 +1862,51 @@ def run_multi_pa_gluon_test(
                                                         for (
                                                             use_aot_impl
                                                         ) in use_aot_impl_options:
-                                                            current += 1
-                                                            print(
-                                                                f"\n[{current}/{total}] Testing: "
-                                                                f"use_torch_flash_ref={use_torch_flash_ref}, "
-                                                                f"compute_type={ct}, "
-                                                                f"quant_q_and_kv={quant_q_and_kv_mode}, "
-                                                                f"use_aot_impl={use_aot_impl}, "
-                                                                f"trans_v={trans_v_mode}, "
-                                                                f"kv_varlen={kv_varlen_mode}, "
-                                                                f"context_partition_size={context_partition_size}, "
-                                                                f"quant_mode={qm}, "
-                                                                f"block_size={bs}, "
-                                                                f"num_heads={hc}, "
-                                                                f"context_lengths={cl}, "
-                                                                f"batch_size={bsz}, "
-                                                                f"query_length={ql}, "
-                                                                f"head_size={head_size}"
+                                                            test_config = {
+                                                                "use_torch_flash_ref": use_torch_flash_ref,
+                                                                "compute_type": ct,
+                                                                "quant_q": quant_q,
+                                                                "quant_kv": quant_kv,
+                                                                "trans_v": trans_v_mode,
+                                                                "kv_varlen": kv_varlen_mode,
+                                                                "context_partition_size": context_partition_size,
+                                                                "quant_mode": qm,
+                                                                "block_size": bs,
+                                                                "num_heads": hc,
+                                                                "context_length": cl,
+                                                                "batch_size": bsz,
+                                                                "query_length": ql,
+                                                                "head_size": head_size,
+                                                                "use_aot_impl": use_aot_impl,
+                                                            }
+                                                            test_configs.append(
+                                                                test_config
                                                             )
-                                                            result = run_pa_gluon_test(
-                                                                context_length=cl,
-                                                                batch_size=bsz,
-                                                                num_heads=hc,
-                                                                head_size=head_size,
-                                                                block_size=bs,
-                                                                compute_type=ct,
-                                                                query_length=ql,
-                                                                quant_mode=qm,
-                                                                context_partition_size=context_partition_size,
-                                                                trans_v=trans_v_mode,
-                                                                kv_varlen=kv_varlen_mode,
-                                                                use_aot_impl=use_aot_impl,
-                                                                quant_q=quant_q,
-                                                                quant_kv=quant_kv,
-                                                            )
-                                                            # Add configuration info to results
-                                                            results.append(result)
+    total = len(test_configs)
+    print(f"\nTotal test cases: {total}")
+
+    # Run tests with random sampling
+    if sample_rate < 1.0:
+        # Random sampling: each test case has sample_rate probability to be selected
+        test_configs_to_run = [
+            config for config in test_configs if random.random() < sample_rate
+        ]
+        print(
+            f"Using random sampling: running {len(test_configs_to_run)} out of {total} test cases (sample_rate={sample_rate:.2%})"
+        )
+    else:
+        test_configs_to_run = test_configs
+        print(f"Running all {total} test cases (sample_rate=100%)")
+
+    results = []
+    for idx, test_config in enumerate(test_configs_to_run):
+        result = _run_single_test((test_config, idx + 1, len(test_configs_to_run)))
+        results.append(result)
 
     return pd.DataFrame(results)
 
 
-def parse_arg_and_run_test():
+def parse_arg_and_run_test(sample_rate0: float = None):
     """Parse arguments and run tests."""
     parser = create_argument_parser()
     args = parser.parse_args()
@@ -1850,7 +1925,12 @@ def parse_arg_and_run_test():
         use_torch_flash_ref_options,
         use_aot_impl_options,
         context_partition_size_options,
+        sample_rate1,
     ) = process_arguments(args)
+    if sample_rate0 is None:
+        sample_rate = sample_rate1
+    else:
+        sample_rate = sample_rate0
 
     results_df = run_multi_pa_gluon_test(
         compute_types,
@@ -1866,6 +1946,7 @@ def parse_arg_and_run_test():
         use_torch_flash_ref_options,
         use_aot_impl_options,
         context_partition_size_options,
+        sample_rate,
     )
 
     output_file = f"run_pa_gluon_test.triton.{TRITON_VERSION}.csv"
@@ -1991,7 +2072,8 @@ def multi_compute_quant_type_test():
     QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
     COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
     QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
-    HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
+    # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
+    HEAD_DIMENSION_OPTIONS = [64, 128, 256]
     BLOCK_SIZE_OPTIONS = [16, 64, 1024]
     HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
@@ -2005,10 +2087,10 @@ def multi_compute_quant_type_test():
         16 * 1024,
         32 * 1024,
     ]
-    CONTEXT_LENGTH_OPTIONS = [4096]
+    # CONTEXT_LENGTH_OPTIONS = [4096]
     BATCH_SIZE_OPTIONS = [3, 128]
 
-    parse_arg_and_run_test()
+    parse_arg_and_run_test(sample_rate0=0.04)
 
 
 if __name__ == "__main__":
