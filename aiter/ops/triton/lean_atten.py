@@ -18,7 +18,7 @@ TO be added features:
 """
 
 import torch
-from typing import Optional
+from typing import Optional, Sequence, Union
 from bisect import bisect_right
 import math
 import triton
@@ -186,10 +186,9 @@ def _persistent_lean_attention(
         causal=causal,
         MASKED_BLOCKS=MASKED_BLOCKS,
         MODE=CAUSAL_MODE,
+        batch_size=batch_size,
+        batch_num_block_n=batch_num_block_n,
     )
-    if not causal:
-        max_output_tile_cnt = math.ceil((H * batch_size) / total_programs) + 10
-
     if DEBUG:
         print(f"max_output_tile_cnt={max_output_tile_cnt}")
 
@@ -442,6 +441,8 @@ def calculate_max_output_tiles_analytically(
     causal: bool,
     MASKED_BLOCKS: int,
     MODE: int,  # 0-ping-pong, 1-sequential
+    batch_size: int,
+    batch_num_block_n: Optional[torch.Tensor] = None,
 ):
     """
     Calculates the maximum number of output tiles any single workgroup will process
@@ -464,6 +465,17 @@ def calculate_max_output_tiles_analytically(
             task_size = (q_block_idx + 1) * MASKED_BLOCKS
             total_blocks += task_size
             m_block_boundaries.append(total_blocks)
+    else:
+        # For non-causal ragged: build per-batch cumulative boundaries within a head
+        if batch_num_block_n is not None:
+            if isinstance(batch_num_block_n, torch.Tensor):
+                batch_boundaries = [int(x) for x in batch_num_block_n.tolist()]
+            else:
+                batch_boundaries = [int(x) for x in batch_num_block_n]
+        else:
+            # Fallback to uniform split
+            per_batch = tiles_per_head // max(batch_size, 1)
+            batch_boundaries = [per_batch * (i + 1) for i in range(max(batch_size, 0))]
 
     max_total_output_tiles = 0
     # Loop through each workgroup to find the one that spans the most output tiles.
@@ -492,8 +504,13 @@ def calculate_max_output_tiles_analytically(
             wg_end_in_head = min(end_iter, head_start_iter + tiles_per_head)
 
             if not causal:
-                # For non-causal, each head is one output tile.
-                total_output_tiles_for_wg += 1
+                # Count how many batch tiles (ragged) are spanned in this head
+                relative_start = wg_start_in_head - head_start_iter
+                relative_end = wg_end_in_head - head_start_iter
+                start_b_idx = bisect_right(batch_boundaries, relative_start)
+                end_b_idx = bisect_right(batch_boundaries, relative_end - 1)
+                tiles_in_this_head = (end_b_idx - start_b_idx) + 1
+                total_output_tiles_for_wg += tiles_in_this_head
                 continue
 
             # --- Causal Logic using Binary Search ---
