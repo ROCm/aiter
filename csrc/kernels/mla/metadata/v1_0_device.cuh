@@ -92,7 +92,7 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
         params.p_work_indptr[work_id + 1] = work_end;
     }
 
-    for (int32_t reduce_id = params.num_batches + lane_idx; reduce_id < params.fixed_num_batches; reduce_id += ck_tile::get_warp_size())
+    for (int32_t reduce_id = params.num_batches + lane_idx; reduce_id <= params.fixed_num_batches; reduce_id += ck_tile::get_warp_size())
     {
         params.p_reduce_indptr[reduce_id] = reduce_end;
     }
