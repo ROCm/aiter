@@ -19,6 +19,7 @@
 #include "custom.h"
 #include "custom_all_reduce.h"
 #include "deepgemm.h"
+#include "fused_mrope_rms.h"
 #include "gemm_a4w4_blockscale.h"
 #include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
