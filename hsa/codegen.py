@@ -32,7 +32,7 @@ if __name__ == "__main__":
         "-m",
         "--module",
         required=True,
-        help="""module of ASM kernle
+        help="""module of ASM kernel,
     e.g.: -m bf16gemm
 """,
     )
@@ -71,11 +71,15 @@ if __name__ == "__main__":
                 print(
                     f"ERROR: Invalid assembly CSV format -- {single_file}. Missing required columns: {', '.join(missing)}"
                 )
+                sys.exit(1)
             df["arch"] = arch  # add arch into df
             dfs.append(df)
         if dfs:
+            relpath = os.path.relpath(
+                os.path.dirname(single_file), f"{this_dir}/{arch}"
+            )
             combine_df = pd.concat(dfs, ignore_index=True).fillna(0)
-            if have_get_header == False:
+            if not have_get_header:
                 headers_list = combine_df.columns.tolist()
                 required_columns = {"knl_name", "co_name", "arch"}
                 other_columns = [
@@ -104,7 +108,7 @@ using CFG = std::unordered_map<std::string, {args.module}Config>;
 """
                 have_get_header = True
             cfg = [
-                f'ADD_CFG({", ".join(str(getattr(row, col)) for col in other_columns)}, "{os.path.relpath(os.path.dirname(el), f"{this_dir}/{arch}")}/", "{row.knl_name}", "{row.co_name}", "{row.arch}"),'
+                f'ADD_CFG({", ".join(str(getattr(row, col)) for col in other_columns)}, "{relpath}/", "{row.knl_name}", "{row.co_name}", "{row.arch}"),'
                 for row in combine_df.itertuples(index=False)
             ]
             cfg_txt = "\n            ".join(cfg) + "\n"
