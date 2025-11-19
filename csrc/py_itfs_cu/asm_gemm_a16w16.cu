@@ -62,6 +62,8 @@ get_heuristic_kernel(int M,
     hipDeviceProp_t dev_prop;
     HIP_CALL(hipGetDevice(&dev));
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+    std::string arch_id = get_gpu_arch();
+    printf("Arch ID: %s\n", arch_id.c_str());
     uint32_t num_cu = dev_prop.multiProcessorCount;
     // printf("num_cu: %d\n", num_cu);
     uint32_t empty_cu      = num_cu;
@@ -75,6 +77,8 @@ get_heuristic_kernel(int M,
 
     for(const auto& el : *cfgs)
     {
+        if (el.first.find(arch_id) != 0)
+            continue;
         const auto& cfg = el.second;
         if(kernelName.has_value() && kernelName.value() != el.first)
             continue;
@@ -125,6 +129,7 @@ get_heuristic_kernel(int M,
                 compute2mem_effi   = local_compute2mem_effi;
                 oob                = (M % cfg.tileM == 0) ? 0 : cfg.tileM - (M % cfg.tileM);
                 selectedKernelName = el.first;
+                printf("Selected Kernel: %s\n", selectedKernelName.c_str());
                 selectedsplitK     = split_K;
             }
         }
@@ -243,7 +248,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     if(it_kl != config_map->end())
     {
         const auto& cfg     = it_kl->second;
-        const char* name    = cfg.name.c_str();
+        const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         SUBM                = cfg.tileM;
         SUBN                = cfg.tileN;
