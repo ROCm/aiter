@@ -61,9 +61,6 @@ else:
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
     )
 
-    assert triton_version < Version(
-        "3.4.0"
-    ), f"Unsupported triton version {triton.__version__}"
     enable_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits
     enable_jit_gluon_pa_mqa_logits_kernel = False
 
@@ -438,6 +435,13 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
             )
         else:  #  load AOT compiled gluon kernel
+            assert triton_version < Version(
+                "3.4.0"
+            ), "https://github.com/triton-lang/triton/pull/7258 involves a ABI-breaking change on triton3.4, "
+            "which adding an extra pointer argument at the end of kernel arguments. To ensure compatibility"
+            "with AOT compiled gluon kernel on triton3.5, a feasible solution is to add a pointer parameter "
+            "at the end of the parameters and ensure that the Triton version used is before the ABI "
+            "modification, i.e., verison<3.4.0"
             kernel[grid](
                 batch_size,
                 next_n,
@@ -468,6 +472,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
             )
     else:
+        assert KVBlockSize == 1
         assert not Preshuffle, "Preshuffle mode is only supported on gluon kernel."
         kernel = _deepgemm_fp8_paged_mqa_logits[grid](
             batch_size,
