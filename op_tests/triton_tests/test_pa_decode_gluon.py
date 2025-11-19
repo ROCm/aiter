@@ -1182,13 +1182,11 @@ def run_pa_gluon_test(
     device = "cuda:0"
     torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
-
     assert (
         num_query_heads % num_kv_heads == 0
     ), "Query heads must be divisible by KV heads"
 
-    max_context_length = 16384
-    # max_context_length = 128 * 1024
+    max_context_length = max(16384, context_length)
     max_blocks_per_sequence = (max_context_length + block_size - 1) // block_size
     total_blocks = max_blocks_per_sequence * batch_size
     blocks_per_sequence = (context_length + block_size - 1) // block_size
@@ -2015,41 +2013,3 @@ def multi_compute_quant_type_test():
 
 if __name__ == "__main__":
     multi_compute_quant_type_test()
-
-    # BLOCK_SIZE_OPTIONS = [16]
-
-    # QUERY_LENGTH_OPTIONS = [1]
-    # BATCH_SIZE_OPTIONS = [128]
-
-    # HEAD_CONFIGURATIONS = [(16, 1)]
-
-    # CONTEXT_LENGTH_OPTIONS = [4096]
-    # COMPUTE_TYPE_OPTIONS = ["fp8"]
-    # # COMPUTE_TYPE_OPTIONS = ["bf16"]
-    # # COMPUTE_TYPE_OPTIONS = ["fp16"]
-    # # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
-
-    # # QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
-    # QUANT_MODE_OPTIONS = ["per_tensor"]
-
-    # TRANS_V_OPTIONS = [True]
-
-    # KV_VARLEN_OPTIONS = [False]
-    # # KV_VARLEN_OPTIONS = [True]
-    # # KV_VARLEN_OPTIONS = [False, True]
-
-    # QUANT_Q_AND_KV_OPTIONS = [[True, True]]
-    # # QUANT_Q_AND_KV_OPTIONS = [[False, True]]
-    # # QUANT_Q_AND_KV_OPTIONS = [[False, False]]
-
-    # USE_TORCH_FLASH_REF_OPTIONS = [True]
-    # # USE_AOT_IMPL_OPTIONS = [False]
-    # USE_AOT_IMPL_OPTIONS = [True]
-    # CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-    # parse_arg_and_run_test()
-
-    # BLOCK_SIZE_OPTIONS = [1024]
-    # HEAD_CONFIGURATIONS = [(10, 1)]
-    # parse_arg_and_run_test()
-
-    pass

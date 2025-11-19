@@ -179,12 +179,11 @@ def run_pa_gluon_test(
     device = "cuda:0"
     torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
-
     assert (
         num_query_heads % num_kv_heads == 0
     ), "Query heads must be divisible by KV heads"
 
-    max_context_length = 16384
+    max_context_length = max(16384, context_length)
     max_blocks_per_sequence = (max_context_length + block_size - 1) // block_size
     total_blocks = max_blocks_per_sequence * batch_size
     blocks_per_sequence = (context_length + block_size - 1) // block_size
@@ -751,6 +750,7 @@ def run_multi_pa_gluon_test(
     # Determine number of processes
     if num_processes is None:
         num_processes = min(cpu_count(), total)
+        num_processes = min(num_processes, 128)
 
     print(f"Using {num_processes} parallel processes\n")
 
@@ -916,7 +916,8 @@ def prebuild_pa_decode_gluon_aot_so():
     COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
     QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
     HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
-    BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+    # BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+    BLOCK_SIZE_OPTIONS = [16, 64]
     HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
     CONTEXT_LENGTH_OPTIONS = [
