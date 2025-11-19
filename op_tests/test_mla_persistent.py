@@ -284,9 +284,7 @@ def test_mla(
             ]
             num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
-        block_num = (total_kv + 15) // 16 
-        block_size = (block_num + num_kv_splits - 1) // num_kv_splits
-        num_kv_splits = min(num_kv_splits, (block_num + block_size - 1) // block_size)
+        num_kv_splits = min(num_kv_splits, (total_kv + 15) // 16)
 
         get_block_n_fp8 = {
             16: 128,
@@ -332,6 +330,7 @@ def test_mla(
         max_split_per_batch=num_kv_splits,
         intera_batch_mode=True,
     )
+    # import pdb;pdb.set_trace()
 
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -550,7 +549,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[21, 64, 256, 512, 1200, 3200, 5200, 8192],
+    default=[i for i in range(500, 1000)],
     help="""Context length.
     e.g.: -c 21""",
 )
