@@ -517,27 +517,27 @@ void moe_stage2_g1u1(
     int gdz         = kargs.split_k;
     size_t arg_size = sizeof(kargs);
 
-    std::cout << "out:" << kargs.o_buf << std::endl;
-    std::cout << "a:" << kargs.a_buf << std::endl;
-    std::cout << "b:" << kargs.b_buf << std::endl;
-    std::cout << "tk_num_buf:" << kargs.tk_num_buf << std::endl;
-    std::cout << "as_buf:" << kargs.as_buf << std::endl;
-    std::cout << "bs_buf:" << kargs.bs_buf << std::endl;
-    std::cout << "tk_buf:" << kargs.tk_buf << std::endl;
-    std::cout << "w_buf:" << kargs.w_buf << std::endl;
-    std::cout << "expt_buf:" << kargs.expt_buf << std::endl;
-    std::cout << "inter_dim:" << kargs.inter_dim << std::endl;
-    std::cout << "model_dim:" << kargs.model_dim << std::endl;
-    std::cout << "tokens:" << kargs.tokens << std::endl;
-    std::cout << "experts:" << kargs.experts << std::endl;
-    std::cout << "stride_a:" << kargs.stride_a << std::endl;
-    std::cout << "stride_b:" << kargs.stride_b << std::endl;
-    std::cout << "stride_o:" << kargs.stride_o << std::endl;
-    std::cout << "stride_expt_b:" << kargs.stride_expt_b << std::endl;
-    std::cout << "stride_expt_bs:" << kargs.stride_expt_bs << std::endl;
-    std::cout << "topks:" << kargs.topks << std::endl;
-    std::cout << "arg_size:" << arg_size << std::endl;
-    printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
+    // std::cout << "out:" << kargs.o_buf << std::endl;
+    // std::cout << "a:" << kargs.a_buf << std::endl;
+    // std::cout << "b:" << kargs.b_buf << std::endl;
+    // std::cout << "tk_num_buf:" << kargs.tk_num_buf << std::endl;
+    // std::cout << "as_buf:" << kargs.as_buf << std::endl;
+    // std::cout << "bs_buf:" << kargs.bs_buf << std::endl;
+    // std::cout << "tk_buf:" << kargs.tk_buf << std::endl;
+    // std::cout << "w_buf:" << kargs.w_buf << std::endl;
+    // std::cout << "expt_buf:" << kargs.expt_buf << std::endl;
+    // std::cout << "inter_dim:" << kargs.inter_dim << std::endl;
+    // std::cout << "model_dim:" << kargs.model_dim << std::endl;
+    // std::cout << "tokens:" << kargs.tokens << std::endl;
+    // std::cout << "experts:" << kargs.experts << std::endl;
+    // std::cout << "stride_a:" << kargs.stride_a << std::endl;
+    // std::cout << "stride_b:" << kargs.stride_b << std::endl;
+    // std::cout << "stride_o:" << kargs.stride_o << std::endl;
+    // std::cout << "stride_expt_b:" << kargs.stride_expt_b << std::endl;
+    // std::cout << "stride_expt_bs:" << kargs.stride_expt_bs << std::endl;
+    // std::cout << "topks:" << kargs.topks << std::endl;
+    // std::cout << "arg_size:" << arg_size << std::endl;
+    // printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
 
     impl_ptr->launch_kernel({&kargs,
                              &arg_size,
