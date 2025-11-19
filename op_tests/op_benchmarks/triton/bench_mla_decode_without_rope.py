@@ -5,6 +5,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 import torch
 import sys
+import os
 import argparse
 import itertools
 import random
@@ -29,6 +30,7 @@ from aiter.ops.triton.mla_decode_dispatch import (
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_mla_decode import ref_preprocess
 from aiter.test_common import checkAllclose, run_perftest
+from aiter import dtypes
 
 arg_to_torch_dtype = {
     "fp8": torch.float8_e4m3fnuz,
@@ -424,8 +426,8 @@ def run_benchmark(args: argparse.Namespace):
         max_seqlen_qo = seq_lens_qo.max().item()
         qo_indptr[1 : BATCH + 1] = torch.cumsum(seq_lens_qo, dim=0)
 
-        q_fp8 = q.to(torch.float8_e4m3fn)
-        kv_cache_fp8 = kv_cache.to(torch.float8_e4m3fn)
+        q_fp8 = q.to(dtypes.fp8)
+        kv_cache_fp8 = kv_cache.to(dtypes.fp8)
 
         # import pdb;pdb.set_trace()
         out_ref, lse_ref = torch_mla_extend(
@@ -574,8 +576,8 @@ def run_benchmark(args: argparse.Namespace):
         #     logit_cap,
         #     mtp,
         # )
-
-        print(">>> ", cache_key)
+        #
+        # print(">>> ", cache_key)
         ms = us / 1000
 
         checkAllclose(out_ref, out_tri,
@@ -591,23 +593,22 @@ def run_benchmark(args: argparse.Namespace):
         print(f"{tflops=}")
         print(f"{bandwidth=}")
 
-        if True:
-            triton_cache_dir = str(triton.knobs.cache.dir)
-            aot_kernel_dir = f"./mla/aot"
-
-            padded_str = "T" if args.padding else "F"
-            os.makedirs(aot_kernel_dir, exist_ok=True)
-            # aot_name = f"mla_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
-            aot_name = f"mla_n16x4_prefetch_k_paged_64"
-
-            src = os.path.join(triton_cache_dir, cache_key)
-            dst = os.path.join(aot_kernel_dir, aot_name)
-            if os.path.exists(dst):
-                os.system(f"rm -rf {dst}")
-            os.system(f"mv {src} {dst}")
-            print(f"Moved cache from {src} to {dst}")
-
-            os.system(f"zip -r mla_aot_kernel mla")
+        # from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+        # if True:
+        #     triton_cache_dir = str(triton.knobs.cache.dir)
+        #     aot_kernel_dir = f"{AITER_TRITON_CONFIGS_PATH}/mla/aot/"
+        #
+        #     os.makedirs(aot_kernel_dir, exist_ok=True)
+        #     aot_name = f"mla_n16x4_prefetch_k_paged_64"
+        #
+        #     src = os.path.join(triton_cache_dir, cache_key)
+        #     dst = os.path.join(aot_kernel_dir, aot_name)
+        #     if os.path.exists(dst):
+        #         os.system(f"rm -rf {dst}")
+        #     os.system(f"mv {src} {dst}")
+        #     print(f"Moved cache from {src} to {dst}")
+        #
+        #     os.system(f"zip -r mla_aot_kernel mla")
         return bandwidth
 
     bench_mla.run(save_path=".", print_data=True, show_plots=False)

@@ -85,7 +85,8 @@ def _compile_mla(
     q_dtype,
     WavePerEU: int = 2,
 ):
-    target = GPUTarget("hip", "gfx950", 64)
+    dev = arch_info.get_arch()
+    target = GPUTarget("hip", dev, 64)
     if q_dtype == dtypes.fp8:
         dtype_str = "*fp8e4b8"
     else:
@@ -112,8 +113,8 @@ def _compile_mla(
         "stride_mid_lse_s": "i32",
         "stride_b_block_table": "i32",
     }
-    if not enable_jit_gluon_mla:
-        fn_signature["dummyPointerArg"] = "*i32"
+    # if not enable_jit_gluon_mla:
+    #     fn_signature["dummyPointerArg"] = "*i32"
     fn_signature["kv_lora_rank"] = "constexpr"
     fn_signature["qk_rope_head_dim"] = "constexpr"
     fn_signature["kv_group_num"] = "constexpr"
@@ -134,15 +135,16 @@ def _compile_mla(
         "num_stages": 2,
         "num_ctas": 1,
         "cluster_dims": [1, 1, 1],
-        "arch": "gfx950",
+        "arch": dev,
         "backend_name": "hip",
         "warp_size": 64,
-        "name": "_fd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64",
+        "name": "mla_n16x4_prefetch_k_paged_64",
     }
 
     kernel_fn = (
         _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
     )
+    # import pdb; pdb.set_trace()
     src = ASTSource(
         fn=kernel_fn,
         signature=fn_signature,
@@ -162,8 +164,8 @@ def _compile_mla(
             "PAGE_BLOCK_SIZE": PAGE_BLOCK_SIZE,
         },
         attrs={
-            (0,): [["tt.divisibility", 16], ["tt.pointer_range", 32]],  # Q
-            (1,): [["tt.divisibility", 16]],  # k_buffer 
+            # (0,): [["tt.divisibility", 16], ["tt.pointer_range", 32]],  # Q
+            # (1,): [["tt.divisibility", 16]],  # k_buffer 
             (2,): [["tt.divisibility", 16]],  # v_buffer
             (3,): [["tt.divisibility", 16]],  # sm_scale
             (1,): [["tt.divisibility", 16]],  # kv_indptr 
@@ -193,6 +195,7 @@ def _compile_mla(
     else:
         kernel_str = f"mla_n16x4_prefetch_k_paged_64"
         metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/mla/aot/{kernel_str}"
+        # metadata_pth = f"./mla/aot/{kernel_str}"
         with AOTMetadataContext(
             kernel_fn.fn.__name__,
             metadata_pth,
@@ -242,6 +245,8 @@ def _decode_grouped_att_m_fwd(
         triton.cdiv(head_num, min(config["BLOCK_H"], kv_group_num))
         * batch
         * config["NUM_KV_SPLITS"],
+        # 1,
+        # 1,
     )
     # print(q.shape, grid)
 
@@ -263,38 +268,77 @@ def _decode_grouped_att_m_fwd(
     #     WavePerEU=config["waves_per_eu"],
     # )
     # if enable_gluon_mla:
-    #     if enable_jit_gluon_mla:
-    #         kernel[grid](
-    #             q,
-    #             k_buffer,
-    #             v_buffer,
-    #             sm_scale,
-    #             kv_indptr,
-    #             block_tables,
-    #             att_out,
-    #             att_lse,
-    #             q.stride(0),
-    #             q.stride(1),
-    #             k_buffer.stride(-3),
-    #             k_buffer.stride(-2),
-    #             att_out.stride(0),
-    #             att_out.stride(1),
-    #             att_out.stride(2),
-    #             att_lse.stride(0),
-    #             att_lse.stride(1),
-    #             att_lse.stride(2),
-    #             block_tables.stride(0),
-    #             kv_lora_rank=kv_lora_rank,
-    #             qk_rope_head_dim=qk_rope_head_dim,
-    #             kv_group_num=kv_group_num,
-    #             q_head_num=head_num,
-    #             batch=batch,
-    #             logit_cap=logit_cap,
-    #             max_qo_len=mtp + 1,
-    #             **config,
-    #         )
-    #     else:
-    #         pass
+        # if enable_jit_gluon_mla:
+        #     kernel[grid](
+        #         q,
+        #         k_buffer,
+        #         v_buffer,
+        #         sm_scale,
+        #         kv_indptr,
+        #         block_tables,
+        #         att_out,
+        #         att_lse,
+        #         q.stride(0),
+        #         q.stride(1),
+        #         k_buffer.stride(-3),
+        #         k_buffer.stride(-2),
+        #         att_out.stride(0),
+        #         att_out.stride(1),
+        #         att_out.stride(2),
+        #         att_lse.stride(0),
+        #         att_lse.stride(1),
+        #         att_lse.stride(2),
+        #         block_tables.stride(0),
+        #         kv_lora_rank,
+        #         qk_rope_head_dim,
+        #         kv_group_num,
+        #         head_num,
+        #         batch,
+        #         logit_cap,
+        #         mtp + 1,
+        #         config["BLOCK_C"],
+        #         config["BLOCK_R"],
+        #         config["BLOCK_N"],
+        #         config["BLOCK_H"],
+        #         config["NUM_KV_SPLITS"],
+        #         page_block_size,
+        #     )
+        # else:
+        #     kernel[grid](
+        #         q,
+        #         k_buffer,
+        #         v_buffer,
+        #         sm_scale,
+        #         kv_indptr,
+        #         block_tables,
+        #         att_out,
+        #         att_lse,
+        #         q.stride(0),
+        #         q.stride(1),
+        #         k_buffer.stride(-3),
+        #         k_buffer.stride(-2),
+        #         att_out.stride(0),
+        #         att_out.stride(1),
+        #         att_out.stride(2),
+        #         att_lse.stride(0),
+        #         att_lse.stride(1),
+        #         att_lse.stride(2),
+        #         block_tables.stride(0),
+        #         kv_lora_rank,
+        #         qk_rope_head_dim,
+        #         kv_group_num,
+        #         head_num,
+        #         batch,
+        #         logit_cap,
+        #         mtp + 1,
+        #         config["BLOCK_C"],
+        #         config["BLOCK_R"],
+        #         config["BLOCK_N"],
+        #         config["BLOCK_H"],
+        #         config["NUM_KV_SPLITS"],
+        #         page_block_size,
+        #     )
+        #     # pass
 
     if page_block_size == 64:
         # import pdb; pdb.set_trace()
