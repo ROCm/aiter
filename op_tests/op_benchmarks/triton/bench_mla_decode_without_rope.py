@@ -431,10 +431,10 @@ def run_benchmark(args: argparse.Namespace):
 
         # import pdb;pdb.set_trace()
         out_ref, lse_ref = torch_mla_extend(
-            # q_fp8.reshape(-1, H, 576),
-            # kv_cache_fp8[:,:,:, :576].reshape(-1, 1, 576),
-            q.reshape(-1, H, 576),
-            kv_cache.reshape(-1, 1, 576),
+            q_fp8.reshape(-1, H, 576),
+            kv_cache_fp8[:,:,:, :576].reshape(-1, 1, 576),
+            # q.reshape(-1, H, 576),
+            # kv_cache.reshape(-1, 1, 576),
             qo_indptr,
             kv_indptr,
             kv_indices,
@@ -487,7 +487,7 @@ def run_benchmark(args: argparse.Namespace):
             BATCH * (mtp + 1) * out_elems * out_tri.element_size()
         )
 
-        mem = bytes_read + bytes_written
+        mem = bytes_read // 2 + bytes_written
         # print(mem)
 
         # # ms = triton.testing.do_bench(
@@ -558,26 +558,26 @@ def run_benchmark(args: argparse.Namespace):
         #     # warmup=25,
         #     # rep=100,
         # )
-        # cache_key = decode_attention_fwd_grouped(
-        #     # q.reshape(-1, H * (mtp + 1), 576),
-        #     # kv_cache,
-        #     q_fp8.reshape(-1, H * (mtp + 1), 576),
-        #     kv_cache_fp8,
-        #     v_input,
-        #     out_tri,
-        #     kv_indptr,
-        #     kv_indices,
-        #     block_tables,
-        #     kv_lora_rank,
-        #     attn_logits,
-        #     attn_lse,
-        #     num_kv_splits,
-        #     sm_scale,
-        #     logit_cap,
-        #     mtp,
-        # )
-        #
-        # print(">>> ", cache_key)
+        cache_key = decode_attention_fwd_grouped(
+            # q.reshape(-1, H * (mtp + 1), 576),
+            # kv_cache,
+            q_fp8.reshape(-1, H * (mtp + 1), 576),
+            kv_cache_fp8,
+            v_input,
+            out_tri,
+            kv_indptr,
+            kv_indices,
+            block_tables,
+            kv_lora_rank,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            sm_scale,
+            logit_cap,
+            mtp,
+        )
+
+        print(">>> ", cache_key)
         ms = us / 1000
 
         checkAllclose(out_ref, out_tri,
@@ -593,22 +593,22 @@ def run_benchmark(args: argparse.Namespace):
         print(f"{tflops=}")
         print(f"{bandwidth=}")
 
-        # from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-        # if True:
-        #     triton_cache_dir = str(triton.knobs.cache.dir)
-        #     aot_kernel_dir = f"{AITER_TRITON_CONFIGS_PATH}/mla/aot/"
-        #
-        #     os.makedirs(aot_kernel_dir, exist_ok=True)
-        #     aot_name = f"mla_n16x4_prefetch_k_paged_64"
-        #
-        #     src = os.path.join(triton_cache_dir, cache_key)
-        #     dst = os.path.join(aot_kernel_dir, aot_name)
-        #     if os.path.exists(dst):
-        #         os.system(f"rm -rf {dst}")
-        #     os.system(f"mv {src} {dst}")
-        #     print(f"Moved cache from {src} to {dst}")
-        #
-        #     os.system(f"zip -r mla_aot_kernel mla")
+        from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+        if True:
+            triton_cache_dir = str(triton.knobs.cache.dir)
+            aot_kernel_dir = f"{AITER_TRITON_CONFIGS_PATH}/mla/aot/"
+
+            os.makedirs(aot_kernel_dir, exist_ok=True)
+            aot_name = f"mla_n16x4_prefetch_k_paged_64"
+
+            src = os.path.join(triton_cache_dir, cache_key)
+            dst = os.path.join(aot_kernel_dir, aot_name)
+            if os.path.exists(dst):
+                os.system(f"rm -rf {dst}")
+            os.system(f"mv {src} {dst}")
+            print(f"Moved cache from {src} to {dst}")
+
+            os.system(f"zip -r mla_aot_kernel mla")
         return bandwidth
 
     bench_mla.run(save_path=".", print_data=True, show_plots=False)
