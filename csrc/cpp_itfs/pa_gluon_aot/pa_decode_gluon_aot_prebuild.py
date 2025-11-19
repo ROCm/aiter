@@ -707,11 +707,7 @@ def run_multi_pa_gluon_test(
                             qm_cnt = 0
                             for qm in quant_mode:
                                 qm_cnt += 1
-                                if (
-                                    quant_q is False
-                                    and quant_kv is False
-                                    and qm_cnt > 1
-                                ):
+                                if not quant_q and not quant_kv and qm_cnt > 1:
                                     continue
                                 for bs in block_sizes:
                                     for hc in head_configs:
@@ -922,6 +918,7 @@ def prebuild_pa_decode_gluon_aot_so():
     HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
     # BLOCK_SIZE_OPTIONS = [16, 64, 1024]
     BLOCK_SIZE_OPTIONS = [16, 64]
+    # BLOCK_SIZE_OPTIONS = [1024]
     HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
     CONTEXT_LENGTH_OPTIONS = [
@@ -931,8 +928,8 @@ def prebuild_pa_decode_gluon_aot_so():
         2048,
         4096,
         8192,
-        # 16 * 1024,
-        # 32 * 1024,
+        16 * 1024,
+        32 * 1024,
     ]
     BATCH_SIZE_OPTIONS = [3]
 

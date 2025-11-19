@@ -197,6 +197,7 @@ def compile(
         current_dir = os.getcwd()
         aot_file_dir = f"{current_dir}/{func_name}"
         os.makedirs(aot_file_dir, exist_ok=True)
+        # print(f"current_dir: {current_dir}")
 
         compile_args = CompileGluonArgs(
             path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
@@ -263,22 +264,7 @@ def compile(
             logger.info(f"start build {func_name}")
             triton_kernel1, output_files1 = compile_gluon_kernel(compile_args)
             triton_kernel2, output_files2 = compile_kernel(reduce_compile_args)
-            return triton_kernel1, output_files1, triton_kernel2, output_files2
-
-        def final_func():
-            """Final function called after compilation completes."""
-            logger.info(
-                f"finish build {func_name}, cost {time.perf_counter()-start_ts:.8f}s"
-            )
-
-        # Use multiprocessing lock to protect the compilation process
-        main_func_result = mp_lock(
-            lock_path=lock_path, main_func=main_func, final_func=final_func
-        )
-        if main_func_result is not None:
-            triton_kernel1, output_files1, triton_kernel2, output_files2 = (
-                main_func_result
-            )
+            # return triton_kernel1, output_files1, triton_kernel2, output_files2
             # Combine output files
             triton_header1 = None
             triton_source1 = None
@@ -313,8 +299,23 @@ def compile(
                 triton_kernel2=triton_kernel2,
                 func_name=func_name,
             )
+
+        def final_func():
+            """Final function called after compilation completes."""
+            logger.info(
+                f"finish build {func_name}, cost {time.perf_counter()-start_ts:.8f}s"
+            )
+
+        # Use multiprocessing lock to protect the compilation process
+        main_func_result = mp_lock(
+            lock_path=lock_path, main_func=main_func, final_func=final_func
+        )
+        if main_func_result is not None:
+            return main_func_result
         else:
-            return None
+            logger.info(f"{func_name} already built by another process")
+            assert not not_built(func_name)
+            return run_lib(func_name)
     else:
         return run_lib(func_name)
 
