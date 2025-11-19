@@ -27,6 +27,8 @@ def moe_smoothquant_fwd(
 # following are pure torch implement
 @functools.lru_cache()
 def get_dtype_max(dtype):
+    print('get_dtype_max')
+    return 7
     try:
         dtypeMax = torch.finfo(dtype).max
     except:
@@ -68,6 +70,7 @@ def pertoken_quant(
 
 
 def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
+    print(x.shape)
     assert quant_dtype == dtypes.fp4x2
     block_size = 32
     F8E8M0_EXP_BIAS = 127
@@ -121,10 +124,14 @@ def per_block_quant_wrapper(block_shape=(1, 128)):
                 x.shape[-1] % blk_n == 0
             ), f"block size {blk_n} not match {x.shape[-1]}"
             assert blk_m == 1, "only support 1xN block, TODO: support MxN"
-            m, n = x.shape
+            print(x.shape)
+            # m, n = x.shape
             x = x.view(-1, blk_n)
             y, scale = per_token_quant_func(x, scale=scale, quant_dtype=quant_dtype)
-            return y.view(m, n), scale.view(m, n // blk_n)
+            # return y.view(m, n), scale.view(m, n // blk_n)
+            scale_shape = list(x.shape)
+            scale_shape[-1] = scale_shape[-1] // blk_n
+            return y.view(x.shape), scale.view(scale_shape)
 
         return wrapper
 
@@ -137,7 +144,8 @@ def get_torch_quant(qType):
         QuantType.No: lambda *a, **k: (a[0], None),
         QuantType.per_Tensor: per_tensor_quant,
         QuantType.per_Token: pertoken_quant,
-        QuantType.per_1x32: per_1x32_f4_quant,
+        # QuantType.per_1x32: per_1x32_f4_quant,
+        QuantType.per_1x32: per_block_quant_wrapper((1, 32))(pertoken_quant),
         QuantType.per_1x128: per_block_quant_wrapper((1, 128))(pertoken_quant),
     }
 

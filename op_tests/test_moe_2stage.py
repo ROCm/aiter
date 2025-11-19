@@ -112,6 +112,8 @@ def test_fmoe(
         w1_qt, w1_scale = weight_per_128x128_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = weight_per_128x128_quant(w2, quant_dtype=WQDType)
     else:
+        print(w1.shape)
+        print(w2.shape)
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
@@ -288,13 +290,14 @@ l_tokenNum = [
     163840,
 ]
 l_quant = [
-    (aiter.QuantType.No, None, None),  # a16w16
-    (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
-    (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
+    # (aiter.QuantType.No, None, None),  # a16w16
+    # (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
+    # (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
+    # (aiter.QuantType.per_127x128, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
+    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16w4
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]

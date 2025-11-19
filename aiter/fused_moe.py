@@ -239,6 +239,8 @@ def fused_moe_(
         bias2,
     )
 
+    print(metadata)
+
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
