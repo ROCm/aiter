@@ -49,7 +49,6 @@ def persistent_lean_attention(
     causal: bool = True,  # causal masking
     config: Optional[dict] = None,
     program_count: Optional[int] = None,
-    program_count: Optional[int] = None,
 ):
     """
     Lean Attention kernel.
@@ -173,7 +172,6 @@ def _persistent_lean_attention(
         N_CTX_K,
         H,
         H_K,
-        H_K,
         BLOCK_M,
         BLOCK_N,
         total_programs,
@@ -261,7 +259,6 @@ def _persistent_lean_attention(
             f"locks must have length >= total_programs ({total_programs}), got {locks.numel()}"
         )
 
-    max_output_tile_cnt = max_output_tile_cnt + 4
 
     grid = (total_programs, 1, 1)
 
@@ -310,7 +307,6 @@ def _persistent_lean_attention(
         Op.stride(2),  # head_dim
         HEADS_PER_XCD=HEADS_PER_XCD,
         HEAD_DIM_ORIG=HEAD_DIM_K,
-        HEAD_DIM_ORIG=HEAD_DIM_K,
         HEAD_DIM=HEAD_DIM_K,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
@@ -332,16 +328,6 @@ def _persistent_lean_attention(
         num_warps=num_warps,
         num_stages=1,
         num_ctas=1,
-        num_heads_q=H,
-        num_heads_k=H_K,
-        gqa_group_size=GQA_GROUP_SIZE,
-        use_64_indexing=(
-            (k.stride(0) * N_CTX_K) >= (1 << 31)
-            or (v.stride(0) * N_CTX_K) >= (1 << 31)
-            or (Op.stride(0) * total_programs) >= (1 << 31)
-            or (Op.stride(1) * N_CTX_Q) >= (1 << 31)
-            or (o.stride(0) * N_CTX_Q) >= (1 << 31)
-        ),
         num_heads_q=H,
         num_heads_k=H_K,
         gqa_group_size=GQA_GROUP_SIZE,

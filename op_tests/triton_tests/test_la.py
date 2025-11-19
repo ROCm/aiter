@@ -20,8 +20,6 @@ def get_lean_attn_inputs(
     block_n: int,
     hq: int,
     hk: int,
-    hq: int,
-    hk: int,
     d: int,
     total_programs: int,
     init_dtype: Union[torch.dtype, str],
@@ -33,14 +31,11 @@ def get_lean_attn_inputs(
         print(f"N_CTX contains non-numeric values: {n_ctx}")
     # Allocate Tensors
     q = torch.empty((n_ctx_q * batch, hq, d), dtype=init_dtype, device="cuda").normal_(
-    q = torch.empty((n_ctx_q * batch, hq, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
     k = torch.empty((sum_n_ctx, hk, d), dtype=init_dtype, device="cuda").normal_(
-    k = torch.empty((sum_n_ctx, hk, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
-    v = torch.empty((sum_n_ctx, hk, d), dtype=init_dtype, device="cuda").normal_(
     v = torch.empty((sum_n_ctx, hk, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
@@ -113,7 +108,6 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
 
 @pytest.mark.parametrize(
     "causal, batch, hq, hk, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
-    "causal, batch, hq, hk, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
     [
         (False, 2, 64, 64, 128, [65536, 65536], 128, 304, torch.float16, 128, 64, 1, 4),
         (False, 2, 64, 64, 16, [65536, 65536], 128, 912, torch.float16, 16, 128, 3, 4),
@@ -152,7 +146,6 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
             3,
             64,
             64,
-            64,
             16,
             [4096, 32768, 65536],
             128,
@@ -168,7 +161,6 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
             8,
             64,
             64,
-            64,
             16,
             [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536],
             128,
@@ -182,7 +174,6 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
         (
             True,
             1,
-            64,
             64,
             64,
             8192,
@@ -206,8 +197,6 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
 def test_persistent_lean_attention(
     request,
     batch,
-    hq,
-    hk,
     hq,
     hk,
     n_ctx_q,
@@ -259,8 +248,6 @@ def test_persistent_lean_attention(
         n_ctx_q,
         n_ctx,
         BLOCK_N,
-        hq,
-        hk,
         hq,
         hk,
         d,
