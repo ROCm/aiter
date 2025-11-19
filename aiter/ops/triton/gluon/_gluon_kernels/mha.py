@@ -112,7 +112,280 @@ def _load_fn_with_smem(
         other=0.0,
     )
 
-    return load_idx + 1
+
+@gluon.jit
+def _attn_fwd_loads(
+    load_idx,
+    smem_k,
+    smem_kpe,
+    smem_v,
+    k_base_ptr,
+    v_base_ptr,
+    OFFS_K_D: gl.constexpr,
+    OFFS_K_N: gl.constexpr,
+    OFFS_KPE_D: gl.constexpr,
+    OFFS_V_N: gl.constexpr,
+    OFFS_V_D: gl.constexpr,
+    stride_kk,
+    stride_kn,
+    stride_vn,
+    stride_vk,
+    seqlen_k,
+    block_min,
+    BLOCK_DMODEL: gl.constexpr,
+    BLOCK_DMODEL_POW2: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    MASK_STEPS: gl.constexpr,
+    HAS_PE: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+):
+    _load_fn_with_smem(
+        load_idx,
+        smem_k,
+        k_base_ptr,
+        OFFS_K_D,
+        OFFS_K_N,
+        stride_kk,
+        stride_kn,
+        None if BLOCK_DMODEL == BLOCK_DMODEL_POW2 else BLOCK_DMODEL,
+        None if not MASK_STEPS else seqlen_k - (block_min + load_idx * BLOCK_N),
+        NUM_STAGES,
+    )
+    if HAS_PE:
+        _load_fn_with_smem(
+            load_idx,
+            smem_kpe,
+            k_base_ptr,
+            OFFS_KPE_D,
+            OFFS_K_N,
+            stride_kk,
+            stride_kn,
+            None,  # if HAS_PE, BLOCK_DMODEL == BLOCK_DMODEL_POW2 and BLOCK_DMODEL_PE is a power of 2
+            None if not MASK_STEPS else seqlen_k - (block_min + load_idx * BLOCK_N),
+            NUM_STAGES,
+        )
+    _load_fn_with_smem(
+        load_idx,
+        smem_v,
+        v_base_ptr,
+        OFFS_V_N,
+        OFFS_V_D,
+        stride_vn,
+        stride_vk,
+        None if not MASK_STEPS else seqlen_k - (block_min + load_idx * BLOCK_N),
+        None if BLOCK_DMODEL == BLOCK_DMODEL_POW2 else BLOCK_DMODEL,
+        NUM_STAGES,
+    )
+    acp.commit_group()
+
+    return k_base_ptr + BLOCK_N * stride_kn, v_base_ptr + BLOCK_N * stride_vn
+
+
+@gluon.jit
+def _attn_fwd_compute(
+    i,
+    acc,
+    l_i,
+    m_i,
+    dot_q,
+    dot_q_pe,
+    k_base_ptr,
+    v_base_ptr,
+    smem_k,
+    smem_kpe,
+    smem_v,
+    stride_kk,
+    stride_kn,
+    stride_vn,
+    stride_vk,
+    seqlen_k,
+    block_min,
+    block_max,
+    n_extra_tokens,
+    OFFS_K_N: gl.constexpr,
+    OFFS_QK_M: gl.constexpr,
+    OFFS_QK_N: gl.constexpr,
+    OFFS_QK_N_CAUSAL: gl.constexpr,
+    OFFS_V_N: gl.constexpr,
+    OFFS_K_D: gl.constexpr,
+    OFFS_KPE_D: gl.constexpr,
+    OFFS_V_D: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_DMODEL: gl.constexpr,
+    BLOCK_DMODEL_POW2: gl.constexpr,
+    MFMA_LAYOUT: gl.constexpr,
+    DOT_LEFT_LAYOUT: gl.constexpr,
+    DOT_RIGHT_LAYOUT: gl.constexpr,
+    SM_SCALE: gl.constexpr,
+    IS_CAUSAL: gl.constexpr,
+    MASK_STEPS: gl.constexpr,  # whether to apply masking at some point while stepping (for causal or padding)
+    ENABLE_PIPELINING: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    HAS_PE: gl.constexpr,
+):
+    RCP_LN2: gl.constexpr = 1.4426950408889634
+
+    if ENABLE_PIPELINING:
+        # NOTE: At this point, load_idx should be equivalent to i + NUM_STAGES - 1
+        load_idx = i + NUM_STAGES - 1
+        start_n = block_min + load_idx * BLOCK_N
+        # Issue an overlapping load for the next stage
+        k_base_ptr, v_base_ptr = _attn_fwd_loads(
+            load_idx,
+            smem_k,
+            smem_kpe if HAS_PE else None,
+            smem_v,
+            k_base_ptr,
+            v_base_ptr,
+            OFFS_K_D,
+            OFFS_K_N,
+            OFFS_KPE_D,
+            OFFS_V_N,
+            OFFS_V_D,
+            stride_kk,
+            stride_kn,
+            stride_vn,
+            stride_vk,
+            seqlen_k,
+            block_min,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            BLOCK_N,
+            MASK_STEPS,
+            HAS_PE,
+            NUM_STAGES,
+        )
+
+        # Wait for the oldest load to complete before doing any computation
+        acp.wait_group(num_outstanding=(NUM_STAGES - 1))
+
+        # Load current blocks from shared memory
+        dot_k = smem_k.index((load_idx - 1) % NUM_STAGES).load(layout=DOT_RIGHT_LAYOUT)
+        if HAS_PE:
+            dot_k_pe = smem_kpe.index((load_idx - 1) % NUM_STAGES).load(
+                layout=DOT_RIGHT_LAYOUT
+            )
+        else:
+            dot_k_pe = None
+        dot_v = smem_v.index((load_idx - 1) % NUM_STAGES).load(layout=DOT_RIGHT_LAYOUT)
+    else:
+        start_n = block_min + i * BLOCK_N
+        # If pipelining is disabled, directly load from global memory
+        dot_k = gl.convert_layout(
+            _load_fn(
+                k_base_ptr,
+                OFFS_K_D,
+                OFFS_K_N,
+                stride_kk,
+                stride_kn,
+                None if BLOCK_DMODEL == BLOCK_DMODEL_POW2 else BLOCK_DMODEL,
+                None if not MASK_STEPS else seqlen_k - (start_n),
+            ),
+            DOT_RIGHT_LAYOUT,
+        )
+        if HAS_PE:
+            dot_k_pe = gl.convert_layout(
+                _load_fn(
+                    k_base_ptr,
+                    OFFS_KPE_D,
+                    OFFS_K_N,
+                    stride_kk,
+                    stride_kn,
+                    None,  # if HAS_PE, BLOCK_DMODEL == BLOCK_DMODEL_POW2 and BLOCK_DMODEL_PE is a power of 2
+                    None if not MASK_STEPS else seqlen_k - start_n,
+                ),
+                DOT_RIGHT_LAYOUT,
+            )
+        else:
+            dot_k_pe = None
+        dot_v = gl.convert_layout(
+            _load_fn(
+                v_base_ptr,
+                OFFS_V_N,
+                OFFS_V_D,
+                stride_vn,
+                stride_vk,
+                None if not MASK_STEPS else seqlen_k - start_n,
+                None if BLOCK_DMODEL == BLOCK_DMODEL_POW2 else BLOCK_DMODEL,
+            ),
+            DOT_RIGHT_LAYOUT,
+        )
+
+        # Update pointers for k and v
+        k_base_ptr += BLOCK_N * stride_kn
+        v_base_ptr += BLOCK_N * stride_vn
+
+    # Performing the computation below
+
+    qk_zeros = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
+    pv_zeros = gl.zeros(
+        [BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=MFMA_LAYOUT
+    )
+
+    qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
+    qk_mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=MFMA_LAYOUT)
+    if MASK_STEPS:
+        # If this is the last block / iteration, we want to
+        # mask if the sequence length is not a multiple of block size
+        # a solution is to always do BLOCK_M // BLOCK_N + 1 steps if not is_modulo_mn.
+        # last step might get wasted but that is okay. check if this masking works For
+        # that case.
+
+        # remove the old if condition
+        # if (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0):
+        # Though this will unconditionally compute mask_partial at runtime,
+        # the causal for loop does not have the if-else block any more, which
+        # helps instruction scheduling and register pressure.
+        bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
+        boundary_m = gl.full(
+            [BLOCK_M],
+            seqlen_k,
+            dtype=gl.int32,
+            layout=gl.SliceLayout(dim=1, parent=MFMA_LAYOUT),
+        )
+        size_n = start_n + OFFS_QK_N[None, :]
+        qk_mask_partial = size_n < boundary_m[:, None]
+        qk_mask = gl.where(bound_cond, qk_mask_partial, qk_mask)
+
+    # Compute qk^T
+    qk += gl.amd.cdna4.mfma(dot_q, dot_k, qk_zeros)
+    if HAS_PE:
+        qk += gl.amd.cdna4.mfma(dot_q_pe, dot_k_pe, qk_zeros)
+
+    if IS_CAUSAL:
+        causal_boundary = start_n + OFFS_QK_N_CAUSAL
+        causal_mask = OFFS_QK_M[:, None] >= causal_boundary[None, :]
+        qk_mask = qk_mask & causal_mask
+
+    # Perform causal and padding masking
+    qk = gl.where(qk_mask, qk, float("-inf"))
+
+    # Get max scores so far
+    m_ij = gl.maximum(m_i, gl.max(qk, 1))
+    m_ij_scaled = m_ij * SM_SCALE * RCP_LN2
+
+    # Scale and subtract max
+    q_shifted = qk * SM_SCALE * RCP_LN2 - m_ij_scaled[:, None]
+
+    # Compute scaled QK and softmax probabilities
+    p = gl.exp2(q_shifted)
+    l_ij = gl.sum(p, 1)
+
+    # Update the output accumulator
+    # alpha is an adjustment factor for acc and li as we loop and find new maxes
+    # store the diff in maxes to adjust acc and li as we discover new maxes
+    m_diff_scaled = m_i * SM_SCALE * RCP_LN2 - m_ij_scaled
+    alpha = gl.exp2(m_diff_scaled)
+    acc = acc * alpha[:, None]
+    dot_p = gl.convert_layout(p, DOT_LEFT_LAYOUT).to(dot_v.type.element_ty)
+    acc += gl.amd.cdna4.mfma(dot_p, dot_v, pv_zeros)
+
+    # Update m_i and l_i
+    l_i = l_i * alpha + l_ij
+    m_i = m_ij
+
+    return acc, l_i, m_i, k_base_ptr, v_base_ptr
 
 
 @gluon.jit
@@ -159,7 +432,6 @@ def _attn_fwd_inner(
     between given block_min and block_max.
     """
 
-    RCP_LN2: gl.constexpr = 1.4426950408889634
     HAS_PE: gl.constexpr = BLOCK_DMODEL_PE > 0
 
     dot_left_layout: gl.constexpr = gl.DotOperandLayout(
@@ -168,117 +440,156 @@ def _attn_fwd_inner(
     dot_right_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=MFMA_LAYOUT, k_width=8
     )
-    qk_zeros = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
-    pv_zeros = gl.zeros(
-        [BLOCK_M, BLOCK_DMODEL_POW2], dtype=gl.float32, layout=MFMA_LAYOUT
-    )
 
-    # TODO: Attempt to pipeline the loads of K and V with compute, using async_copy
+    dot_q = gl.convert_layout(q, dot_left_layout)
+    if HAS_PE:
+        dot_q_pe = gl.convert_layout(q_pe, dot_left_layout)
 
-    for start_n in tl.range(block_min, block_max, BLOCK_N):
-        # For padded blocks, we will overrun the tensor size if
-        # we load all BLOCK_N. For others, the blocks are all within range.
+    if ENABLE_PIPELINING:
+        load_idx = 0
+        smem_k = gl.allocate_shared_memory(
+            k_base_ptr.type.element_ty,
+            [NUM_STAGES, BLOCK_DMODEL_POW2, BLOCK_N],
+            layout=SHARED_K_LAYOUT,
+        )
+        smem_kpe = (
+            gl.allocate_shared_memory(
+                k_base_ptr.type.element_ty,
+                [NUM_STAGES, BLOCK_DMODEL_PE, BLOCK_N],
+                layout=SHARED_K_LAYOUT,
+            )
+            if HAS_PE
+            else None
+        )
+        smem_v = gl.allocate_shared_memory(
+            v_base_ptr.type.element_ty,
+            [NUM_STAGES, BLOCK_N, BLOCK_DMODEL_POW2],
+            layout=SHARED_V_LAYOUT,
+        )
+    else:
+        NUM_STAGES = 1
 
-        # Compute k offsets across head dimension, only needed if padded head
-        k = _load_fn(
+    # Prefetch initial stages; if pipelining is disabled, this is skipped
+    for _ in gl.static_range(NUM_STAGES - 1):
+        k_base_ptr, v_base_ptr = _attn_fwd_loads(
+            load_idx,
+            smem_k,
+            smem_kpe if HAS_PE else None,
+            smem_v,
             k_base_ptr,
+            v_base_ptr,
             OFFS_K_D,
             OFFS_K_N,
-            stride_kk,
-            stride_kn,
-            None if BLOCK_DMODEL == BLOCK_DMODEL_POW2 else BLOCK_DMODEL,
-            None if not MASK_STEPS else seqlen_k - start_n,
-        )
-        if HAS_PE:
-            k_pe = _load_fn(
-                k_base_ptr,
-                OFFS_KPE_D,
-                OFFS_K_N,
-                stride_kk,
-                stride_kn,
-                None,  # if HAS_PE, BLOCK_DMODEL == BLOCK_DMODEL_POW2 and BLOCK_DMODEL_PE is a power of 2
-                None if not MASK_STEPS else seqlen_k - start_n,
-            )
-
-        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
-        qk_mask = gl.full([BLOCK_M, BLOCK_N], True, dtype=gl.int1, layout=MFMA_LAYOUT)
-        if MASK_STEPS:
-            # If this is the last block / iteration, we want to
-            # mask if the sequence length is not a multiple of block size
-            # a solution is to always do BLOCK_M // BLOCK_N + 1 steps if not is_modulo_mn.
-            # last step might get wasted but that is okay. check if this masking works For
-            # that case.
-
-            # remove the old if condition
-            # if (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0):
-            # Though this will unconditionally compute mask_partial at runtime,
-            # the causal for loop does not have the if-else block any more, which
-            # helps instruction scheduling and register pressure.
-            bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
-            boundary_m = gl.full(
-                [BLOCK_M],
-                seqlen_k,
-                dtype=gl.int32,
-                layout=gl.SliceLayout(dim=1, parent=MFMA_LAYOUT),
-            )
-            size_n = start_n + OFFS_QK_N[None, :]
-            qk_mask_partial = size_n < boundary_m[:, None]
-            qk_mask = gl.where(bound_cond, qk_mask_partial, qk_mask)
-
-        # Compute qk^T
-        dot_q = gl.convert_layout(q, dot_left_layout)
-        dot_k = gl.convert_layout(k, dot_right_layout)
-        qk += gl.amd.cdna4.mfma(dot_q, dot_k, qk_zeros)
-        if HAS_PE:
-            dot_q_pe = gl.convert_layout(q_pe, dot_left_layout)
-            dot_k_pe = gl.convert_layout(k_pe, dot_right_layout)
-            qk += gl.amd.cdna4.mfma(dot_q_pe, dot_k_pe, qk_zeros)
-
-        if IS_CAUSAL:
-            causal_boundary = start_n + OFFS_QK_N_CAUSAL
-            causal_mask = OFFS_QK_M[:, None] >= causal_boundary[None, :]
-            qk_mask = qk_mask & causal_mask
-
-        # Perform causal and padding masking
-        qk = gl.where(qk_mask, qk, float("-inf"))
-
-        # Get max scores so far
-        m_ij = gl.maximum(m_i, gl.max(qk, 1))
-        m_ij_scaled = m_ij * SM_SCALE * RCP_LN2
-
-        # Scale and subtract max
-        q_shifted = qk * SM_SCALE * RCP_LN2 - m_ij_scaled[:, None]
-
-        # Compute scaled QK and softmax probabilities
-        p = gl.exp2(q_shifted)
-        l_ij = gl.sum(p, 1)
-
-        # Update the output accumulator
-        # alpha is an adjustment factor for acc and li as we loop and find new maxes
-        # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff_scaled = m_i * SM_SCALE * RCP_LN2 - m_ij_scaled
-        alpha = gl.exp2(m_diff_scaled)
-        acc = acc * alpha[:, None]
-        v = _load_fn(
-            v_base_ptr,
+            OFFS_KPE_D,
             OFFS_V_N,
             OFFS_V_D,
+            stride_kk,
+            stride_kn,
             stride_vn,
             stride_vk,
-            None if not MASK_STEPS else seqlen_k - start_n,
-            None if BLOCK_DMODEL == BLOCK_DMODEL_POW2 else BLOCK_DMODEL,
+            seqlen_k,
+            block_min,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            BLOCK_N,
+            MASK_STEPS,
+            HAS_PE,
+            NUM_STAGES,
         )
-        dot_p = gl.convert_layout(p, dot_left_layout).to(v.type.element_ty)
-        dot_v = gl.convert_layout(v, dot_right_layout)
-        acc += gl.amd.cdna4.mfma(dot_p, dot_v, pv_zeros)
+        load_idx += 1
 
-        # Update m_i and l_i
-        l_i = l_i * alpha + l_ij
-        m_i = m_ij
+    # Steady state loop; if pipelining is disabled, this iterates through all blocks
+    for i in gl.static_range(
+        gl.cdiv(block_max - block_min, BLOCK_N) - (NUM_STAGES - 1)
+    ):
+        acc, l_i, m_i = _attn_fwd_compute(
+            i,
+            acc,
+            l_i,
+            m_i,
+            dot_q,
+            dot_q_pe if HAS_PE else None,
+            k_base_ptr,
+            v_base_ptr,
+            smem_k,
+            smem_kpe if HAS_PE else None,
+            smem_v,
+            stride_kk,
+            stride_kn,
+            stride_vn,
+            stride_vk,
+            seqlen_k,
+            block_min,
+            block_max,
+            n_extra_tokens,
+            OFFS_K_N,
+            OFFS_QK_M,
+            OFFS_QK_N,
+            OFFS_QK_N_CAUSAL,
+            OFFS_V_N,
+            OFFS_K_D,
+            OFFS_KPE_D,
+            OFFS_V_D,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            MFMA_LAYOUT,
+            dot_left_layout,
+            dot_right_layout,
+            SM_SCALE,
+            IS_CAUSAL,
+            MASK_STEPS,
+            ENABLE_PIPELINING,
+            NUM_STAGES,
+            HAS_PE,
+        )
 
-        # Update pointers for k and v
-        k_base_ptr += BLOCK_N * stride_kn
-        v_base_ptr += BLOCK_N * stride_vn
+    # Finish up remaining computations; if pipelining is disabled, this is skipped
+    for i in gl.static_range(NUM_STAGES - 1):
+        acp.wait_group(num_outstanding=(NUM_STAGES - 2 - i))
+        acc, l_i, m_i = _attn_fwd_compute(
+            i + gl.cdiv(block_max - block_min, BLOCK_N) - (NUM_STAGES - 1),
+            acc,
+            l_i,
+            m_i,
+            dot_q,
+            dot_q_pe if HAS_PE else None,
+            k_base_ptr,
+            v_base_ptr,
+            smem_k,
+            smem_kpe if HAS_PE else None,
+            smem_v,
+            stride_kk,
+            stride_kn,
+            stride_vn,
+            stride_vk,
+            seqlen_k,
+            block_min,
+            block_max,
+            n_extra_tokens,
+            OFFS_K_N,
+            OFFS_QK_M,
+            OFFS_QK_N,
+            OFFS_QK_N_CAUSAL,
+            OFFS_V_N,
+            OFFS_K_D,
+            OFFS_KPE_D,
+            OFFS_V_D,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            MFMA_LAYOUT,
+            dot_left_layout,
+            dot_right_layout,
+            SM_SCALE,
+            IS_CAUSAL,
+            MASK_STEPS,
+            ENABLE_PIPELINING,
+            NUM_STAGES,
+            HAS_PE,
+        )
 
     return acc, l_i, m_i
 
