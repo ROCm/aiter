@@ -116,7 +116,6 @@ def update_config_files(file_path: str, merge_name: str):
     return new_file_path
 
 
-# @functools.lru_cache(maxsize=1)
 def get_config_file(env_name, default_file, tuned_file_name):
     config_env_file = os.getenv(env_name)
     # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
