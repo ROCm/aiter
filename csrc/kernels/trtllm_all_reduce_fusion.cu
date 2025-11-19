@@ -605,7 +605,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params, hi
     int threads_per_token = params.hidden_dim / VEC_SIZE;
     int threads_per_block = threads_per_token;
     dim3 threadsPerBlock(threads_per_block);
-    int nblocks = NBLOCKS_PER_GPU;
+    int nblocks = std::min(token_num, NBLOCKS_PER_GPU);
     if (params.size * sizeof(T) >= 1024*1024*128) {
         nblocks /= 2;
     }
