@@ -21,6 +21,10 @@ _USE_FUSED_BWD_KERNEL = False
 
 
 def mha_set_use_fused_bwd_kernel(value: bool):
+    """
+    Set whether to use fused backward kernel (with atomics) or one-kernel backward (without atomics).
+    Fused backward is faster but doesn't support positional encoding.
+    """
     global _USE_FUSED_BWD_KERNEL
     _USE_FUSED_BWD_KERNEL = value
 
@@ -45,7 +49,7 @@ def _flash_attn_forward(
     window_size_right: int,
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
-    return_lse: bool,
+    return_lse: bool,  # Not used
     return_softmax: bool,
     max_seqlen_q: int,
     max_seqlen_k: int,
