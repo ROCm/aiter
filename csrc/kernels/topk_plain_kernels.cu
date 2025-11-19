@@ -2093,7 +2093,7 @@ void AdaptiveTopK(int batch_size,
 
     constexpr bool is_float = std::is_same_v<T, float>;
     if constexpr(is_float) {
-        if (k >= 128 && greater) {
+        if (k > 128 && greater) {
             topk_per_row_kernel_launcher<IdxT>(
                 in, nullptr, nullptr, out_idx,
                 out, batch_size, static_cast<int>(len), 1, k, stream);
@@ -2152,9 +2152,8 @@ void AdaptiveTopK(int batch_size,
     constexpr bool is_float = std::is_same_v<T, float>;
     if constexpr(is_float)
     {
-        if(k >= 128 && greater)  // topk_per_row only supports descending (largest)
+        if(k > 128 && greater)  // topk_per_row only supports descending (largest)
         {
-            // Use topk_per_row implementation (optimized for k >= 128)
             topk_per_row_kernel_launcher<IdxT>(
                 in, rowStarts, rowEnds, out_idx, out,
                 batch_size, static_cast<int>(stride0), static_cast<int>(stride1), k, stream);
@@ -2171,7 +2170,6 @@ void AdaptiveTopK(int batch_size,
     }
 
     // Fall back to processing each batch separately for other cases
-    // (k < 128, or non-float types, or finding smallest)
     for(int batch_id = 0; batch_id < batch_size; ++batch_id)
     {
         IdxT start = rowStarts[batch_id];
