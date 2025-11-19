@@ -337,7 +337,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         )
     else:
         padded_str = "T" if is_padded_mode and not Preshuffle else "F"
-        kernel_str = f"paged_mqa_logits{"_preshuffle" if Preshuffle else ""}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
+        kernel_str = f"paged_mqa_logits{'_preshuffle' if Preshuffle else ''}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
         metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/paged_mqa_logits/aot/{kernel_str}"
         with AOTMetadataContext(
             kernel_fn.fn.__name__,
