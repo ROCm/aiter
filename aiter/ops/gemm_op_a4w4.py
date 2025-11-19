@@ -36,7 +36,9 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 @functools.lru_cache(maxsize=1024)
 def get_GEMM_config(M: int, N: int, K: int):
     if not hasattr(get_GEMM_config, "gemm_dict"):
-        gemm_dict = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE).drop_duplicates()
+        gemm_dict = pd.read_csv(
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
+        ).drop_duplicates()
         get_GEMM_config.gemm_dict = gemm_dict.set_index(
             ["cu_num", "M", "N", "K"]
         ).to_dict("index")

@@ -328,7 +328,11 @@ def gemm_a8w8_ASM(
         and w_scale.dtype == dtypes.fp32
         and (
             asm_config := get_bpreshuffle_GEMM_config(
-                m, n, k, dtypes.i8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+                m,
+                n,
+                k,
+                dtypes.i8,
+                AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
             )
         )
         is not None
@@ -506,7 +510,9 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    get_CKGEMM_config(m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE)
+    get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    )
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
