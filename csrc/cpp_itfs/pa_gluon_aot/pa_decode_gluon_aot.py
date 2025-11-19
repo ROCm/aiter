@@ -1,6 +1,10 @@
 import os
 import sys
 import hashlib
+import time
+import logging
+from pathlib import Path
+from unittest import result
 from jinja2 import Template
 import triton
 import functools
@@ -18,9 +22,11 @@ from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
 from csrc.cpp_itfs.utils import (
     compile_template_op,
     AITER_CORE_DIR,
+    BUILD_DIR,
     get_default_func_name,
     not_built,
     run_lib,
+    mp_lock,
 )
 
 
@@ -41,6 +47,7 @@ def parse_version(version_str):
 
 
 TRITON_VERSION = parse_version(triton.__version__)
+logger = logging.getLogger("aiter")
 
 
 def compile_attention_reduce_kernel(
@@ -184,6 +191,10 @@ def compile_attention_reduce_kernel(
         if kv_block_size > context_partition_size:
             gluon_kernel_name = "paged_attention_decode_v2_gluon_large_block_fp8"
 
+        current_dir = os.getcwd()
+        aot_file_dir = f"{current_dir}/{func_name}"
+        os.makedirs(aot_file_dir, exist_ok=True)
+
         compile_args = CompileGluonArgs(
             path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
             kernel_name=gluon_kernel_name,
@@ -194,9 +205,9 @@ def compile_attention_reduce_kernel(
             num_stages=1,
             num_ctas=1,
             kpack=1,
+            out_path=Path(aot_file_dir + f"/{md_name}_stage1"),
             out_name=f"{md_name}_stage1",
         )
-        triton_kernel1, output_files1 = compile_gluon_kernel(compile_args)
 
         # Compile reduce kernel separately
         reduce_signature_parts = [
@@ -234,44 +245,71 @@ def compile_attention_reduce_kernel(
             grid="num_seqs,num_kv_heads,1",
             num_warps=4,
             num_stages=2,
+            out_path=Path(aot_file_dir + f"/{md_name}_stage2"),
             out_name=f"{md_name}_stage2",
         )
-        triton_kernel2, output_files2 = compile_kernel(reduce_compile_args)
 
-        # Combine output files
-        triton_header1 = None
-        triton_source1 = None
-        triton_header2 = None
-        triton_source2 = None
-        for output_file in output_files1:
-            if output_file.suffix == ".h":
-                triton_header1 = output_file
-            elif output_file.suffix == ".cpp":
-                triton_source1 = output_file
-        for output_file in output_files2:
-            if output_file.suffix == ".h":
-                triton_header2 = output_file
-            elif output_file.suffix == ".cpp":
-                triton_source2 = output_file
+        # Create lock directory and lock path
+        lock_path = os.path.join(aot_file_dir, "lock_triton_aot_compile")
+        start_ts = time.perf_counter()
 
-        with open(
-            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon_aot/pa_decode_attention_reduce_kernel.cpp.jinja",
-            "r",
-        ) as f:
-            src_template = Template(f.read())
+        def main_func():
+            """Main compilation function protected by multiprocessing lock."""
+            logger.info(f"start build {func_name}")
+            triton_kernel1, output_files1 = compile_gluon_kernel(compile_args)
+            triton_kernel2, output_files2 = compile_kernel(reduce_compile_args)
+            return triton_kernel1, output_files1, triton_kernel2, output_files2
 
-        return compile_template_op(
-            src_template,
-            md_name,
-            [triton_header1, triton_header2],
-            [triton_source1, triton_source2],
-            triton_header1=triton_header1,
-            triton_header2=triton_header2,
-            kernel_name=md_name,
-            triton_kernel1=triton_kernel1,
-            triton_kernel2=triton_kernel2,
-            func_name=func_name,
+        def final_func():
+            """Final function called after compilation completes."""
+            logger.info(
+                f"finish build {func_name}, cost {time.perf_counter()-start_ts:.8f}s"
+            )
+
+        # Use multiprocessing lock to protect the compilation process
+        main_func_result = mp_lock(
+            lock_path=lock_path, main_func=main_func, final_func=final_func
         )
+        if main_func_result is not None:
+            triton_kernel1, output_files1, triton_kernel2, output_files2 = (
+                main_func_result
+            )
+            # Combine output files
+            triton_header1 = None
+            triton_source1 = None
+            triton_header2 = None
+            triton_source2 = None
+            for output_file in output_files1:
+                if output_file.suffix == ".h":
+                    triton_header1 = output_file
+                elif output_file.suffix == ".cpp":
+                    triton_source1 = output_file
+            for output_file in output_files2:
+                if output_file.suffix == ".h":
+                    triton_header2 = output_file
+                elif output_file.suffix == ".cpp":
+                    triton_source2 = output_file
+
+            with open(
+                f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa_gluon_aot/pa_decode_attention_reduce_kernel.cpp.jinja",
+                "r",
+            ) as f:
+                src_template = Template(f.read())
+
+            return compile_template_op(
+                src_template,
+                md_name,
+                [triton_header1, triton_header2],
+                [triton_source1, triton_source2],
+                triton_header1=triton_header1,
+                triton_header2=triton_header2,
+                kernel_name=md_name,
+                triton_kernel1=triton_kernel1,
+                triton_kernel2=triton_kernel2,
+                func_name=func_name,
+            )
+        else:
+            return None
     else:
         return run_lib(func_name)
 
@@ -447,7 +485,7 @@ def pa_decode_gluon_aot(
     )
 
     # Execute the combined kernel
-    if run_compiled_kernel:
+    if run_compiled_kernel and combined_func is not None:
         combined_func(
             *torch_to_c_types(
                 output,

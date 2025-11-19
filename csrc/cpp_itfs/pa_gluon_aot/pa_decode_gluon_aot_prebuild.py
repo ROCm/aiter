@@ -542,7 +542,8 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num_processes",
         type=int,
-        default=1,
+        # default=1,
+        default=None,
         help="Number of parallel processes to use (default: use 1 CPU cores)",
     )
 
@@ -881,21 +882,20 @@ def prebuild_pa_decode_gluon_aot_so():
     # CONTEXT_LENGTH_OPTIONS = [4096]
     # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
     # QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
-    # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
-    # # HEAD_DIMENSION_OPTIONS = [64, 128]
+    # # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
+    # HEAD_DIMENSION_OPTIONS = [128]
     # # QUANT_MODE_OPTIONS = ["per_tensor"]
     # # TRANS_V_OPTIONS = [False]
     # TRANS_V_OPTIONS = [True]
-    # # KV_VARLEN_OPTIONS = [False, True]
-    # KV_VARLEN_OPTIONS = [False]
-    # # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
-    # QUANT_Q_AND_KV_OPTIONS = [[True, True]]
+    # KV_VARLEN_OPTIONS = [False, True]
+    # # KV_VARLEN_OPTIONS = [False]
+    # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
+    # # QUANT_Q_AND_KV_OPTIONS = [[True, True]]
     # # USE_AOT_IMPL_OPTIONS = [False]
     # USE_AOT_IMPL_OPTIONS = [True]
     # # USE_AOT_IMPL_OPTIONS = [False, True]
     # # BLOCK_SIZE_OPTIONS = [1024]
     # # HEAD_CONFIGURATIONS = [(10, 1)]
-    # parse_arg_and_run_test()
 
     USE_TORCH_FLASH_REF_OPTIONS = [True]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
@@ -912,8 +912,8 @@ def prebuild_pa_decode_gluon_aot_so():
     # CONTEXT_LENGTH_OPTIONS = list(range(256, 32 * 1024, 256))
     CONTEXT_LENGTH_OPTIONS = [4096]
     BATCH_SIZE_OPTIONS = [4]
-    parse_arg_and_run_test()
 
+    parse_arg_and_run_test()
     target_directory = "/root/.aiter/build"
     clean_directory_except_so(target_directory)
     print("Cleanup completed, only .so files are left.")
