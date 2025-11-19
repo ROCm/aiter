@@ -49,7 +49,9 @@ if __name__ == "__main__":
     csv_groups = defaultdict(list)
     for arch in archs:
         # print(f"{this_dir}/{arch}/{args.module}")
-        for el in glob.glob(f"{this_dir}/{arch}/{args.module}/*.csv", recursive=True):
+        for el in glob.glob(
+            f"{this_dir}/{arch}/{args.module}/**/*.csv", recursive=True
+        ):
             df = pd.read_csv(el)
             cfgname = os.path.basename(el).split(".")[0]
             csv_groups[cfgname].append({"file_path": el, "arch": arch})
@@ -117,7 +119,7 @@ using CFG = std::unordered_map<std::string, {args.module}Config>;
             {cfg_txt}}};"""
             cfgs.append(txt)
 
-        content += "\n".join(cfgs) + "\n"
+    content += "\n".join(cfgs) + "\n"
 
     with open(f"{args.output_dir}/asm_{args.module}_configs.hpp", "w") as f:
         f.write(content)
