@@ -274,7 +274,8 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "max_block_len": "i32",
         "SplitKV": "i32",
     }
-    if not enable_jit_gluon_pa_mqa_logits_kernel and triton_version < Version("3.4.0"):
+    if triton_version < Version("3.4.0"):
+        assert not enable_jit_gluon_pa_mqa_logits_kernel
         fn_signature["dummyPointerArg"] = "*i32"
     fn_signature["ChunkQ"] = "constexpr"
     fn_signature["ChunkK"] = "constexpr"
@@ -406,7 +407,7 @@ def deepgemm_fp8_paged_mqa_logits(
             is_padded_mode=is_padded_mode,
             WavePerEU=WavePerEU,
         )
-        if enable_jit_gluon_pa_mqa_logits_kernel:
+        if triton_version >= Version("3.5.0"):
             kernel[grid](
                 batch_size,
                 next_n,
@@ -435,69 +436,41 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
             )
         else:  #  load AOT compiled gluon kernel
-            if triton_version >= Version("3.5.0"):
-                kernel[grid](
-                    batch_size,
-                    next_n,
-                    heads,
-                    q_fp8,
-                    q_fp8.stride(0),
-                    q_fp8.stride(1),
-                    q_fp8.stride(2),
-                    kv_cache_fp8,
-                    kv_cache_fp8.stride(0),
-                    kv_cache_scale,
-                    kv_cache_scale.stride(0),
-                    context_lens,
-                    kv_indices,
-                    weights,
-                    weights.stride(0),
-                    out_logits,
-                    out_logits.stride(0),
-                    max_model_len,
-                    max_block_len,
-                    SplitKV,
-                    heads,
-                    ChunkK,
-                    KVBlockSize,
-                    hidden_dim,
-                )
-            else:
-                assert triton_version < Version(
-                    "3.4.0"
-                ), "https://github.com/triton-lang/triton/pull/7258 involves a ABI-breaking change on triton3.4, "
-                "which adding an extra pointer argument at the end of kernel arguments. To ensure compatibility"
-                "with AOT compiled gluon kernel on triton3.5, a feasible solution is to add a pointer parameter "
-                "at the end of the parameters and ensure that the Triton version used is before the ABI "
-                "modification, i.e., verison<3.4.0"
-                kernel[grid](
-                    batch_size,
-                    next_n,
-                    heads,
-                    q_fp8,
-                    q_fp8.stride(0),
-                    q_fp8.stride(1),
-                    q_fp8.stride(2),
-                    kv_cache_fp8,
-                    kv_cache_fp8.stride(0),
-                    kv_cache_scale,
-                    kv_cache_scale.stride(0),
-                    context_lens,
-                    kv_indices,
-                    weights,
-                    weights.stride(0),
-                    out_logits,
-                    out_logits.stride(0),
-                    max_model_len,
-                    max_block_len,
-                    SplitKV,
-                    out_logits,  # dummyPointerArg for triton version < 3.4.0,
-                    # constexpr
-                    heads,
-                    ChunkK,
-                    KVBlockSize,
-                    hidden_dim,
-                )
+            assert triton_version < Version(
+                "3.4.0"
+            ), "https://github.com/triton-lang/triton/pull/7258 involves a ABI-breaking change on triton3.4, "
+            "which adding an extra pointer argument at the end of kernel arguments. To ensure compatibility"
+            "with AOT compiled gluon kernel on triton3.5, a feasible solution is to add a pointer parameter "
+            "at the end of the parameters and ensure that the Triton version used is before the ABI "
+            "modification, i.e., verison<3.4.0"
+            kernel[grid](
+                batch_size,
+                next_n,
+                heads,
+                q_fp8,
+                q_fp8.stride(0),
+                q_fp8.stride(1),
+                q_fp8.stride(2),
+                kv_cache_fp8,
+                kv_cache_fp8.stride(0),
+                kv_cache_scale,
+                kv_cache_scale.stride(0),
+                context_lens,
+                kv_indices,
+                weights,
+                weights.stride(0),
+                out_logits,
+                out_logits.stride(0),
+                max_model_len,
+                max_block_len,
+                SplitKV,
+                out_logits,  # dummyPointerArg for triton version < 3.4.0,
+                # constexpr
+                heads,
+                ChunkK,
+                KVBlockSize,
+                hidden_dim,
+            )
     else:
         assert KVBlockSize == 1
         assert not Preshuffle, "Preshuffle mode is only supported on gluon kernel."
