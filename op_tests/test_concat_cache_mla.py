@@ -25,7 +25,7 @@ def run_aiter(
     return kv_cache
 
 
-@perftest()
+# @perftest()
 def aiter_fused_rope_concat_and_cache_mla(
     q_nope,
     q_pe,
@@ -280,10 +280,12 @@ def test_fused_rope_concat_and_cache_mla(
     )
     entry_size = kv_lora_rank + qk_rope_head_dim
     cos_cache, sin_cache = compute_cache(num_tokens, qk_rope_head_dim // 2, dtype)
+    cos_cache = cos_cache.to(device)
+    sin_cache = sin_cache.to(device)
 
     pos = torch.randint(0, num_tokens, (num_tokens,), device=device)
     scale = torch.tensor(0.1, dtype=torch.float32, device=device)
-    q_scale = torch.tensor(1, dtype=torch.float32, device=device)
+    q_scale = torch.tensor(0.3, dtype=torch.float32, device=device)
     cache_dtype = dtypes.fp8 if kv_cache_dtype == "fp8" else dtype
     q_out_dtype = dtypes.fp8 if q_dtype == "fp8" else dtype
     kv_cache = torch.zeros(
@@ -296,24 +298,6 @@ def test_fused_rope_concat_and_cache_mla(
     )
     is_nope_first = True
     is_neox = True
-    (kv_cache, q_out), avg_us = aiter_fused_rope_concat_and_cache_mla(
-        q_nope,
-        q_pe,
-        kv_c,
-        k_pe,
-        kv_cache,
-        q_out,
-        slot_mapping,
-        kv_cache_dtype,
-        scale,
-        q_scale,
-        pos,
-        cos_cache,
-        sin_cache,
-        is_neox,
-        is_nope_first,
-        q_out_dtype,
-    )
 
     ref_q_out = torch.empty(
         (num_tokens, num_heads, qk_rope_head_dim + kv_lora_rank),
@@ -349,49 +333,71 @@ def test_fused_rope_concat_and_cache_mla(
         device=q_nope.device,
     )
     triton_temp = torch.zeros(*kv_cache.shape, dtype=cache_dtype, device=device)
-    (triton_q_out, decode_q_pe_out, k_pe_out, triton_temp), triton_us = run_perftest(
-        fused_qk_rope_cat_and_cache_mla,
+    if q_dtype != "fp8":
+        (triton_q_out, decode_q_pe_out, k_pe_out, triton_temp), triton_us = (
+            run_perftest(
+                fused_qk_rope_cat_and_cache_mla,
+                q_nope,
+                q_pe,
+                reshaped_kv_c,
+                reshaped_k_pe,
+                triton_temp,
+                slot_mapping,
+                pos,
+                cos_cache,
+                sin_cache,
+                scale,
+                is_neox,
+                0,
+                True if kv_cache_dtype == "fp8" else False,
+                triton_q_out,
+            )
+        )
+    else:
+        (triton_q_out, decode_q_pe_out, k_pe_out, triton_temp), triton_us = (
+            None,
+            None,
+            None,
+            None,
+        ), None
+    (kv_cache, q_out), avg_us = run_perftest(
+        aiter_fused_rope_concat_and_cache_mla,
         q_nope,
         q_pe,
-        reshaped_kv_c,
-        reshaped_k_pe,
-        triton_temp,
+        kv_c,
+        k_pe,
+        kv_cache,
+        q_out,
         slot_mapping,
+        kv_cache_dtype,
+        scale,
+        q_scale,
         pos,
         cos_cache,
         sin_cache,
-        scale,
         is_neox,
-        0,
-        True if kv_cache_dtype == "fp8" else False,
-        triton_q_out,
+        is_nope_first,
+        q_out_dtype,
     )
-
     if kv_cache_dtype == "fp8" and q_dtype == "fp8":
         kv_result_temp = kv_cache.to(torch.float32) * scale
         kv_expected_temp = ref_kv_cache.to(torch.float32) * scale
         q_result_tmp = q_out.to(torch.float32) * q_scale
         q_expected_tmp = ref_q_out.to(torch.float32) * q_scale
-
         checkAllclose(kv_result_temp, kv_expected_temp, atol=0.01, rtol=0.01)
         checkAllclose(q_result_tmp, q_expected_tmp, atol=0.01, rtol=0.01)
-
     elif kv_cache_dtype == "fp8" and q_dtype == "auto":
-        print("1!!!!!!")
         kv_result_temp = kv_cache.to(torch.float32) * scale
         kv_expected_temp = ref_kv_cache.to(torch.float32) * scale
         checkAllclose(kv_result_temp, kv_expected_temp, atol=0.01, rtol=0.01)
         checkAllclose(q_out, ref_q_out)
-
         checkAllclose(triton_q_out, ref_q_out)
         checkAllclose(triton_temp.to(torch.float32) * scale, kv_expected_temp)
     else:
-        # torch.set_printoptions(threshold=float("inf"))  # print all elements
         checkAllclose(kv_cache, ref_kv_cache)
         checkAllclose(q_out, ref_q_out)
         checkAllclose(triton_q_out, ref_q_out)
         checkAllclose(triton_temp, ref_kv_cache)
-
     ret["triton_us"] = triton_us
     ret["fused_qk_us"] = avg_us
     ret["unfused_us"] = ref_us
@@ -403,10 +409,15 @@ def test_fused_rope_concat_and_cache_mla(
             + num_heads * kv_lora_rank
             + num_heads * qk_rope_head_dim
         )
-        * 2
         * (torch.finfo(dtype).bits // 8)
-        / (avg_us * 1e6)
-    )
+        + num_tokens
+        * (kv_lora_rank + qk_rope_head_dim)
+        * (torch.finfo(cache_dtype).bits // 8)
+        + num_tokens
+        * num_heads
+        * (kv_lora_rank + qk_rope_head_dim)
+        * (torch.finfo(q_out_dtype).bits // 8)
+    ) / (avg_us * 1e6)
     return ret
 
 
@@ -503,7 +514,7 @@ parser.add_argument(
     choices=ltests,
     nargs="*",
     default=ltests,
-    help="""tests concat and cache or fused qk.
+    help="""tests concat and cache or fused_qk.
     e.g.: -kvd normal""",
 )
 

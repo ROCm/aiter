@@ -306,7 +306,7 @@ namespace py = pybind11;
           "                     Tensor sin_cache,"                                  \
           "                     bool is_neox    ,"                                  \
           "                     bool is_nope_first,"                                \
-          "                     std::optional<torch::Dtype> q_out_dtype =  = std::nullopt)->()",                      \
+          "                     std::optional<torch::Dtype> q_out_dtype = std::nullopt)->()",                      \
           py::arg("q_nope"),                                                        \
           py::arg("q_pe"),                                                          \
           py::arg("kv_c"),                                                          \
@@ -360,6 +360,7 @@ namespace py = pybind11;
           &aiter::fused_allreduce_rmsnorm,                                                     \
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
+          py::arg("res_out"),                                                                  \
           py::arg("out"),                                                                      \
           py::arg("w"),                                                                        \
           py::arg("eps"),                                                                      \
@@ -647,6 +648,7 @@ namespace py = pybind11;
           py::arg("window_size_right"),           \
           py::arg("return_softmax_lse"),          \
           py::arg("return_dropout_randval"),      \
+          py::arg("how_v3_bf16_cvt"),             \
           py::arg("out")          = std::nullopt, \
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
