@@ -42,16 +42,16 @@ jobs:
           pr_title="${{ github.event.pull_request.title }}"
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             echo "It's main branch, running tests on MI325 and MI35X..."
-            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
           elif echo "$pr_title" | grep -qi "mi35x"; then
             echo "PR title contains 'MI35X', running tests on MI325 and MI35X..."
-            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
           else
             echo "Not main branch and PR title does not contain mi35x, only running on MI325..."
-            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-1gpu-runner"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-8gpu-runner"]' >> "$GITHUB_OUTPUT"
           fi
           echo "$GITHUB_OUTPUT"
     
