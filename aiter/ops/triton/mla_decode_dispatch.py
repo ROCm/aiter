@@ -51,9 +51,9 @@ if triton.__version__ >= "3.5.0":
     enable_jit_gluon_mla = True
 else:
     from triton.compiler import ASTSource
-    assert triton.__version__ < "3.4.0"
+    # assert triton.__version__ < "3.4.0"
     enable_gluon_mla = enable_aot_gluon_mla
-    enable_jit_gluon_mla = False
+enable_jit_gluon_mla = False
 
 from aiter.utility.triton.triton_metadata_redirect import (
     AOTMetadataContext,
@@ -241,8 +241,9 @@ def _decode_grouped_att_m_fwd(
     # print(config["BLOCK_H"])
 
     config["NUM_KV_SPLITS"] = num_kv_splits
+    block_h = min(config["BLOCK_H"], kv_group_num)
     grid = (
-        triton.cdiv(head_num, min(config["BLOCK_H"], kv_group_num))
+        (head_num + block_h - 1) // block_h
         * batch
         * config["NUM_KV_SPLITS"],
         1,
