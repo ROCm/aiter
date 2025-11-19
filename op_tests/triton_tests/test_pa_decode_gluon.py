@@ -1188,6 +1188,7 @@ def run_pa_gluon_test(
     ), "Query heads must be divisible by KV heads"
 
     max_context_length = 16384
+    # max_context_length = 128 * 1024
     max_blocks_per_sequence = (max_context_length + block_size - 1) // block_size
     total_blocks = max_blocks_per_sequence * batch_size
     blocks_per_sequence = (context_length + block_size - 1) // block_size
@@ -1958,23 +1959,45 @@ def multi_compute_quant_type_test():
     QUERY_LENGTH_OPTIONS = [1]
     BATCH_SIZE_OPTIONS = [128]
     HEAD_CONFIGURATIONS = [(16, 1)]
-    CONTEXT_LENGTH_OPTIONS = [4096]
-    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+    # CONTEXT_LENGTH_OPTIONS = [4096]
+    # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024, 64 * 1024, 128 * 1024]
+    CONTEXT_LENGTH_OPTIONS = [4096, 8192]
+    # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+    COMPUTE_TYPE_OPTIONS = ["fp8"]
     QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
+    # QUANT_MODE_OPTIONS = ["per_tensor"]
     # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
     HEAD_DIMENSION_OPTIONS = [128]
     # QUANT_MODE_OPTIONS = ["per_tensor"]
     # TRANS_V_OPTIONS = [False]
-    TRANS_V_OPTIONS = [True]
+    # TRANS_V_OPTIONS = [True]
     KV_VARLEN_OPTIONS = [False, True]
     # KV_VARLEN_OPTIONS = [False]
-    QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
-    # QUANT_Q_AND_KV_OPTIONS = [[True, True]]
-    # USE_AOT_IMPL_OPTIONS = [False]
-    USE_AOT_IMPL_OPTIONS = [True]
+    # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
+    QUANT_Q_AND_KV_OPTIONS = [[True, True]]
+    USE_AOT_IMPL_OPTIONS = [False]
+    # USE_AOT_IMPL_OPTIONS = [True]
     # USE_AOT_IMPL_OPTIONS = [False, True]
     # BLOCK_SIZE_OPTIONS = [1024]
     # HEAD_CONFIGURATIONS = [(10, 1)]
+
+    # USE_TORCH_FLASH_REF_OPTIONS = [True]
+    # CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+    # USE_AOT_IMPL_OPTIONS = [True]
+    # KV_VARLEN_OPTIONS = [False]
+    # TRANS_V_OPTIONS = [False, True]
+    # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
+    # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+    # QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
+    # # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
+    # HEAD_DIMENSION_OPTIONS = [64, 128, 256]
+    # BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+    # HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
+    # QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+    # # CONTEXT_LENGTH_OPTIONS = list(range(256, 32 * 1024, 256))
+    # CONTEXT_LENGTH_OPTIONS = [4096]
+    # BATCH_SIZE_OPTIONS = [4]
+
     parse_arg_and_run_test()
 
 
