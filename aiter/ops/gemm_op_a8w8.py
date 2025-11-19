@@ -274,13 +274,19 @@ def get_bpreshuffle_GEMM_config(
     q_dtype_w: torch.dtype,
     tuned_file=f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
 ):
-    if not hasattr(get_bpreshuffle_GEMM_config, "bpreshuffle_gemm_dict"):
+    # Use dict to cache configs for different files
+    if not hasattr(get_bpreshuffle_GEMM_config, "file_cache"):
+        get_bpreshuffle_GEMM_config.file_cache = {}
+
+    # Load file if not cached
+    if tuned_file not in get_bpreshuffle_GEMM_config.file_cache:
         asmGemmDictDf = pd.read_csv(tuned_file).drop_duplicates()
-        get_bpreshuffle_GEMM_config.bpreshuffle_gemm_dict = asmGemmDictDf.set_index(
+        get_bpreshuffle_GEMM_config.file_cache[tuned_file] = asmGemmDictDf.set_index(
             ["cu_num", "M", "N", "K", "q_dtype_w"]
         ).to_dict("index")
+
     cu_num = get_cu_num()
-    config = get_bpreshuffle_GEMM_config.bpreshuffle_gemm_dict.get(
+    config = get_bpreshuffle_GEMM_config.file_cache[tuned_file].get(
         (cu_num, M, N, K, str(q_dtype_w)), None
     )
     if config is not None:
@@ -456,13 +462,13 @@ def gemm_a8w8_bpreshuffle(
         m, n, k, dtypes.fp8, AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
     )
     if cktile_config is not None and ck_config is not None:
-        cktile_time = cktile_config.get("time", float("inf"))
-        ck_time = ck_config.get("time", float("inf"))
+        cktile_time = cktile_config.get("us", float("inf"))
+        ck_time = ck_config.get("us", float("inf"))
 
         if AITER_LOG_TUNED_CONFIG:
             logger.info(
                 f"Both CKTile and CK configs found for M:{m}, N:{n}, K:{k} - "
-                f"CKTile time: {cktile_time:.6f}ms, CK time: {ck_time:.6f}ms"
+                f"CKTile time: {cktile_time:.6f}us, CK time: {ck_time:.6f}us"
             )
 
         if cktile_time <= ck_time:
