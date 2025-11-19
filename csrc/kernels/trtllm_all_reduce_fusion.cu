@@ -421,7 +421,7 @@ __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> 
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
         int token_id = blockIdx.x * NRanks + r;
-        for (int idx = token_id * params.hidden_dim + access_id_in_token; idx < params.size; idx += gridDim.x * NRanks * params.hidden_dim) {
+        for (int idx = token_id * params.hidden_dim + access_id_in_token, tidx = token_id; idx < params.size; idx += gridDim.x * NRanks * params.hidden_dim, tidx += gridDim.x * NRanks) {
             vec_t<T, VEC_SIZE> data[2];
             data[0].load(reinterpret_cast<T *>(params.residual_in) + idx);
             data[1].load(reinterpret_cast<T *>(comm.comm_bufs[params.rank]) + params.size + idx);
@@ -434,7 +434,7 @@ __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> 
                 auto val_fp8 = convert_to_fp8<T, VEC_SIZE>(val, scale);
                 val_fp8.store(reinterpret_cast<hip_fp8 *>(params.norm_out) + idx);
                 if (threadIdx.x == 0)
-                    reinterpret_cast<float *>(params.fp8_scale_out)[token_id] = scale;
+                    reinterpret_cast<float *>(params.fp8_scale_out)[tidx] = scale;
             } else {
                 val.store(reinterpret_cast<T *>(params.norm_out) + idx);
             }
@@ -587,7 +587,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
             auto val_fp8 = convert_to_fp8<T, VEC_SIZE>(val, scale);
             val_fp8.store(reinterpret_cast<hip_fp8 *>(params.norm_out) + idx);
             if (threadIdx.x == 0)
-                reinterpret_cast<float *>(params.fp8_scale_out)[token_id] = scale;
+                reinterpret_cast<float *>(params.fp8_scale_out)[tidx] = scale;
         } else {
             val.store(reinterpret_cast<T *>(params.norm_out) + idx);
         }

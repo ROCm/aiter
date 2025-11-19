@@ -149,7 +149,7 @@ def worker(
             msg="residual_out",
         )
         checkAllclose(
-            norm_out.float(), ref_norm_out.float(), rtol=1e-1, atol=1e-1, msg="norm_out"
+            norm_out.float(), ref_norm_out.float(), rtol=1e-2, atol=1e-2, msg="norm_out"
         )
         # residual_out_maxdiff = (residual_out.cpu().float() - ref_residual_out.cpu().float()).abs().max()
         # norm_out_maxdiff = (norm_out.cpu().float() - ref_norm_out.cpu().float()).abs().max()
@@ -203,7 +203,7 @@ def main():
     testcase(world_size=4, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.half)
     testcase(world_size=4, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.bfloat16)
 
-    # testcase(world_size=4, num_tokens=32768, hidden_dim=4096, dtype=torch.bfloat16)
+    testcase(world_size=4, num_tokens=32768, hidden_dim=4096, dtype=torch.bfloat16)
 
 
 if __name__ == "__main__":
