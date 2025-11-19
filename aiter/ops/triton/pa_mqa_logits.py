@@ -21,24 +21,26 @@
 # ========================================================================
 
 import os
-import torch
-import triton
 from functools import lru_cache
 
+import torch
+import triton
+from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
     "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS", "0"
 )
 enable_aot_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits == "1"
-
-if triton.__version__ >= "3.5.0":
+triton_version = Version(Version(triton.__version__).base_version)
+if triton_version >= Version("3.5.0"):
     from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
+
     from aiter.ops.triton._triton_kernels.pa_mqa_logits import (
-        _deepgemm_fp8_paged_mqa_logits_stage1,
-        _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
         _deepgemm_fp8_paged_mqa_logits,
         _deepgemm_fp8_paged_mqa_logits_ragged_k,
+        _deepgemm_fp8_paged_mqa_logits_stage1,
+        _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
     )
     from aiter.ops.triton.gluon.pa_mqa_logits import (
         _gluon_deepgemm_fp8_paged_mqa_logits,
@@ -49,25 +51,27 @@ if triton.__version__ >= "3.5.0":
     enable_jit_gluon_pa_mqa_logits_kernel = True
 else:
     from triton.compiler import ASTSource
+
     from aiter.ops.triton._triton_kernels.pa_mqa_logits import (
-        _deepgemm_fp8_paged_mqa_logits_stage1,
-        _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
         _deepgemm_fp8_paged_mqa_logits,
         _deepgemm_fp8_paged_mqa_logits_ragged_k,
+        _deepgemm_fp8_paged_mqa_logits_stage1,
+        _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
         _gluon_deepgemm_fp8_paged_mqa_logits,
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
     )
 
-    assert triton.__version__ < "3.4.0"
+    assert triton_version < Version(
+        "3.4.0"
+    ), f"Unsupported triton version {triton.__version__}"
     enable_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits
     enable_jit_gluon_pa_mqa_logits_kernel = False
 
 
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.utility.triton.triton_metadata_redirect import (
-    AOTMetadataContext,
-)
 from aiter import dtypes
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
+
 from ...jit.utils.chip_info import get_gfx
 
 
