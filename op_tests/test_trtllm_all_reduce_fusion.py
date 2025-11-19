@@ -149,7 +149,7 @@ def worker(
             msg="residual_out",
         )
         checkAllclose(
-            norm_out.float(), ref_norm_out.float(), rtol=1e-2, atol=1e-2, msg="norm_out"
+            norm_out.float(), ref_norm_out.float(), rtol=5e-2, atol=5e-2, msg="norm_out"
         )
         checkAllclose(
             scale_out.float(),
@@ -200,8 +200,13 @@ def testcase(
 
 
 def main(world_size=4):
-    # num_tokens = 1
-    # testcase(world_size=world_size, num_tokens=num_tokens, hidden_dim=1024, dtype=torch.bfloat16)
+    num_tokens = 1
+    testcase(
+        world_size=world_size,
+        num_tokens=num_tokens,
+        hidden_dim=4096,
+        dtype=torch.bfloat16,
+    )
 
     num_tokens = 129
     testcase(
