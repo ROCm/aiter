@@ -442,8 +442,10 @@ namespace aiter
         }
         ((P *)result)[idx] = write_reg;
       }
+      __syncthreads();
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    // maybe do not need device sync
+    // end_sync<ngpus, true>(sg, self_sg, rank);
   }
 
   template <typename T, int ngpus>
