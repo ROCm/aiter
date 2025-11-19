@@ -14,11 +14,11 @@ def _fused_indices_and_gather_kernel(
     E: tl.constexpr,
     a: tl.constexpr,
     D: tl.constexpr,
-    stridex: tl.int32,
+    stridex0: tl.int32,
+    stridex1: tl.int32,
     strideop0: tl.int32,
     strideop1: tl.int32,
-    strideidx0: tl.int32,
-    strideidx1: tl.int32,
+    strideidx: tl.int32,:
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -41,7 +41,6 @@ def _fused_indices_and_gather_kernel(
     # We need this for the gather output, the input tensor X, and the indices tensor idx2d
     src_x = row_vals[:, None] * stridex0 + offs_n[None, :] * stridex1
     dst_gather_out = offs_m[:, None] * strideop0 + offs_n[None, :] * strideop1
-    dst_indices_out = offs_m[:, None] * strideidx0 + offs_n[None, :] * strideidx1
 
     # Now load the input tile from x2d
     tile = tl.load(x2d + src_x, mask=mask_m[:, None] & mask_n[None, :])
