@@ -704,11 +704,15 @@ def run_multi_pa_gluon_test(
                 for trans_v_mode in trans_v:
                     for kv_varlen_mode in kv_varlen:
                         for context_partition_size in context_partition_size_options:
-                            # qm_cnt = 0
+                            qm_cnt = 0
                             for qm in quant_mode:
-                                # qm_cnt += 1
-                                # if quant_q is False and quant_kv is False and qm_cnt > 1:
-                                #     continue
+                                qm_cnt += 1
+                                if (
+                                    quant_q is False
+                                    and quant_kv is False
+                                    and qm_cnt > 1
+                                ):
+                                    continue
                                 for bs in block_sizes:
                                     for hc in head_configs:
                                         for cl in context_length:
@@ -927,8 +931,8 @@ def prebuild_pa_decode_gluon_aot_so():
         2048,
         4096,
         8192,
-        16 * 1024,
-        32 * 1024,
+        # 16 * 1024,
+        # 32 * 1024,
     ]
     BATCH_SIZE_OPTIONS = [3]
 
