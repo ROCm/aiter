@@ -1183,6 +1183,7 @@ class MRotaryEmbeddingQKNormFused(nn.Module):
         super().__init__()
         self.head_size = head_size
         self.rotary_dim = rotary_dim
+        assert self.head_size == self.rotary_dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         self.is_neox_style = is_neox_style
