@@ -260,7 +260,8 @@ FMoeKernel* get_heuristic_kernel(
     uint32_t tg_num             = 0;
     uint32_t num_persistent_tgs = 0;
     uint32_t round              = 0xffffffff;
-    std::string selectedKl      = kernel_name;
+    std::string arch_id = get_gpu_arch();
+    std::string selectedKl = kernel_name.empty() ? "" : arch_id + kernel_name;
     int vskip                   = 1;
     static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
 
@@ -271,6 +272,8 @@ FMoeKernel* get_heuristic_kernel(
     {
         for(const auto& el : *cfgs)
         {
+            if (el.first.find(arch_id) != 0)
+                        continue;
             const auto& cfg = el.second;
             if(cfg.vskip == vskip && cfg.smf == smf)
             {
@@ -312,7 +315,7 @@ FMoeKernel* get_heuristic_kernel(
     if(it != cfgs->end())
     {
         const auto& cfg     = it->second;
-        const char* name    = cfg.name.c_str();
+        const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         auto result         = impl_ptr_map.emplace(name, nullptr);
         if(cfg.ps == 1)
