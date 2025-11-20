@@ -9,7 +9,6 @@
 #include "ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async_default_policy.hpp"
 #include "ck_tile/ops/fmha/block/block_dropout.hpp"
 #include "ck_tile/ops/reduce/block/block_reduce.hpp"
-#include <cstdio>
 
 namespace ck_tile {
 
@@ -365,12 +364,10 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
         static_assert(1 <= k0_loops);
         static_assert(1 <= k1_loops);
         // main loop
-	
         do
         {
             // STAGE 1, QK gemm
             clear_tile(s_acc); // initialize C
-            
             if constexpr(k0_loops > 1)
             {
                 static_for<0, k0_loops - 1, 1>{}([&](auto i_k0) {
@@ -384,44 +381,35 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
 
                     async_load_fence(k_dram_window.get_num_of_access());
                     __builtin_amdgcn_s_barrier();
+                    __builtin_amdgcn_sched_barrier(0);
                     gemm_0(s_acc,
                            get_slice_tile(
                                q, sequence<0, i_k0 * kK0>{}, sequence<kM0, (i_k0 + 1) * kK0>{}),
                            get_slice_tile(k_lds_load,
                                           sequence<(LdsSeq.at(number<i_k0>{})) * kN0, 0>{},
                                           sequence<(LdsSeq.at(number<i_k0>{}) + 1) * kN0, kK0>{}));
-	            asm volatile("s_waitcnt lgkmcnt(1)");
-                    __builtin_amdgcn_s_waitcnt(1);
-		    block_sync_lds();
                 });
-		__shared__ int printed_flag;
-		if (blockIdx.x == 0 && threadIdx.x == 0 && i_total_loops==1000) {
-		    	    printed_flag = 100;
-		}
+                
             }
-
+            __shared__ int printed_flag;
+            if (blockIdx.x == 0 && threadIdx.x == 0 && i_total_loops==1000) {
+                printed_flag = 100;
+            }
 
             // TODO: this to fix a bug when loop smaller than 2,
             // the following fence/barrier will be scheduled inside 1st loop
-            //if constexpr(k0_loops <= 2)
-            //    __builtin_amdgcn_sched_barrier(0);
+            if constexpr(k0_loops <= 2)
+                __builtin_amdgcn_sched_barrier(0);
 
             async_load_fence();
-            //__syncthreads();
             __builtin_amdgcn_s_barrier();
-            //__builtin_amdgcn_sched_barrier(0);
-	    
-            
             
 	    int block_idx = kv_block_idx_ptr[i_total_loops+1];
-            
-
-            __builtin_amdgcn_s_waitcnt(0);
+	    //if (threadIdx.x==0 && blockIdx.x==0 && blockIdx.z == 101) printf("%d %d %d\n", i_total_loops, num_total_loop, block_idx);
 	    const auto bias_tile = load_tile(bias_dram_window); // load bias tile
             auto v_buf           = load_tile(v_dram_window, number<-1>{}, bool_constant<false>{});
-            __builtin_amdgcn_s_waitcnt(0);
             __builtin_amdgcn_sched_barrier(0);
-	    { // tail
+            { // tail
                 gemm_0(
                     s_acc,
                     get_slice_tile(
@@ -431,19 +419,6 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
                                    sequence<(LdsSeq.at(number<k0_loops - 1>{}) + 1) * kN0, kK0>{}));
             }
             __builtin_amdgcn_sched_barrier(1);
-	    
-            // Print s_acc values from the first thread in the first block
-            //if (blockIdx.x == 0 && threadIdx.x == 0 && i_total_loops == 0) {
-	    //    if(!printed_flag) {
-	    //    	printf("QK^T Result (first block, first thread):\n");
-	    //    	for (index_t i = 0; i < s_acc.get_thread_buffer().size(); ++i) {
-	    //    	    printf("%f ", static_cast<float>(s_acc.get_thread_buffer()[i]));
-	    //    	}
-            //        printf("\n");
-	    //        printed_flag = true;
-	    //    }
-            //}
-	    //__syncthreads();
 
             // STAGE 2, scale_s, add bias, mask, softmax
             if constexpr(BiasEnum == BlockAttentionBiasEnum::ELEMENTWISE_BIAS)
@@ -513,8 +488,6 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
 #endif
                 }
             }
-
-
             move_tile_window(bias_dram_window, {0, kN0});
             if constexpr(kPadSeqLenK || FmhaMask::IsMasking)
             {
@@ -783,28 +756,6 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
                         sequence<(LdsSeq.at(number<k0_loops + k1_loops - 1>{})) * kN1, 0>{},
                         sequence<(LdsSeq.at(number<k0_loops + k1_loops - 1>{}) + 1) * kN1, kK1>{}));
             }
-        
-/*
-	     __syncthreads();
-
-            // Print s_acc values from the first thread in the first block
-            if (blockIdx.x == 0 && threadIdx.x == 0 && i_total_loops == 100) {
-		if(!printed_flag) {
-			printf("PV Result (first block, first thread PV):\n");
-			for (index_t i = 0; i < o_acc.get_thread_buffer().size(); ++i) {
-			    printf("%f ", static_cast<float>(o_acc.get_thread_buffer()[i]));
-			}
-                    printf("\n");
-		    printed_flag = true;
-		}
-            }
-	    __syncthreads();
-	    */
-
-            //if (blockIdx.x == 0 && threadIdx.x == 0) {
-            //		    printf("i_total_loops:%d\n",i_total_loops);
-	    //}
-
         } while(i_total_loops < num_total_loop);
 
         // store lse
@@ -860,22 +811,6 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
         });
 
         o_acc = tile_elementwise_in(o_acc_element_func, o_acc);
-	/*__syncthreads();
-
-	if (blockIdx.x == 0 && threadIdx.x == 0)
-	{
-	    printf("===== Final O_ACC Result (first block, first thread) =====\n");
-	    const auto& buf = o_acc.get_thread_buffer();
-	    const index_t num_to_print = buf.size() < 32 ? buf.size() : 32; // 最多打印前32个元素
-
-	    for (index_t i = 0; i < num_to_print; ++i)
-	    {
-		printf("%f ", static_cast<float>(buf[i]));
-	    }
-	    printf("\n===========================================================\n");
-	}
-
-	__syncthreads();*/
 
         return o_acc;
     }
@@ -935,4 +870,3 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
 };
 
 } // namespace ck_tile
-
