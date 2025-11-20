@@ -1143,8 +1143,10 @@ class MRotaryEmbedding(RotaryEmbedding):
             for _ in range(3)
         ]
 
+
 class MRotaryEmbeddingQKNormFused(nn.Module):
     """Rotary Embedding with Multimodal Sections fused with QKNorm"""
+
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
@@ -1238,18 +1240,33 @@ class MRotaryEmbeddingQKNormFused(nn.Module):
         positions: torch.Tensor,
         num_heads: int,
         num_kv_heads: int,
-        eps: float
+        eps: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
         num_tokens = positions.shape[-1]
         num_heads_q = num_heads
         num_heads_k = num_kv_heads
         num_heads_v = num_kv_heads
-        is_interleaved = True if positions.ndim == 2 and self.mrope_section is not None else False
+        is_interleaved = (
+            True if positions.ndim == 2 and self.mrope_section is not None else False
+        )
         assert is_interleaved == self.mrope_interleaved
-        fused_mrope_3d_rms(qkv, q_weight, k_weight, self.cos_sin_cache, positions, num_tokens, 
-                           num_heads_q, num_heads_k, num_heads_v, self.head_size, self.is_neox_style, self.mrope_section,
-                           is_interleaved, eps)
+        fused_mrope_3d_rms(
+            qkv,
+            q_weight,
+            k_weight,
+            self.cos_sin_cache,
+            positions,
+            num_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            self.head_size,
+            self.is_neox_style,
+            self.mrope_section,
+            is_interleaved,
+            eps,
+        )
         q_size = num_heads_q * self.head_size
         k_size = num_heads_k * self.head_size
         v_size = num_heads_v * self.head_size
@@ -1257,6 +1274,7 @@ class MRotaryEmbeddingQKNormFused(nn.Module):
         qkv = qkv.view(num_tokens, q_size + k_size + v_size)
         q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
         return q, k, v
+
 
 class DualChunkRotaryEmbedding(nn.Module):
     """Rotary positional embedding for Dual Chunk Attention."""
@@ -1453,6 +1471,7 @@ class DualChunkRotaryEmbedding(nn.Module):
         s += f", chunk_size={self.chunk_size}, local_size={self.local_size}"
         return s
 
+
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
 
@@ -1477,7 +1496,7 @@ def get_rope(
         rope_scaling_args = tuple(rope_scaling_tuple.items())
     else:
         rope_scaling_args = None
-    
+
     if dual_chunk_attention_config is not None:
         dual_chunk_attention_tuple = {
             k: tuple(v) if isinstance(v, list) else v
@@ -1549,17 +1568,24 @@ def get_rope(
                 original_max_position,
             )
         elif scaling_type == "default":
-            if "mrope_section" in rope_scaling and "aiter_rope_fused_qknorm" in rope_scaling:
-                    rotary_emb = MRotaryEmbeddingQKNormFused(
-                        head_size,
-                        rotary_dim,
-                        max_position,
-                        base,
-                        is_neox_style,
-                        dtype,
-                        mrope_section=rope_scaling["mrope_section"],
-                        mrope_interleaved=rope_scaling["mrope_interleaved"] if "mrope_interleaved" in rope_scaling else False
-                    )
+            if (
+                "mrope_section" in rope_scaling
+                and "aiter_rope_fused_qknorm" in rope_scaling
+            ):
+                rotary_emb = MRotaryEmbeddingQKNormFused(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                    mrope_interleaved=(
+                        rope_scaling["mrope_interleaved"]
+                        if "mrope_interleaved" in rope_scaling
+                        else False
+                    ),
+                )
             else:
                 rotary_emb = RotaryEmbedding(
                     head_size,
