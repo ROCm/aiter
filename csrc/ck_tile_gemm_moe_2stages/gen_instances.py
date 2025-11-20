@@ -545,7 +545,7 @@ if __name__ == "__main__":
     # quant_type = "per_token"
 
     a_type = "bf16"
-    b_type = "fp4"
+    b_type = "i4"
     quant_type = "1x32"
 
     acc_type = "float"
@@ -562,6 +562,7 @@ if __name__ == "__main__":
         act_type,
         False,
     )
+    print(gemm1_kernel_list)
     tag, gemm2_kernel_list = get_gemm2_kernels_list(
         a_type,
         b_type,
@@ -569,6 +570,8 @@ if __name__ == "__main__":
         "",
         True,
     )
+    print(gemm2_kernel_list)
+    print(tag)
     # merge gemm1/gemm2 dict with key = {stage, key}
     kernel_dict_merge = {
         **{(1, key): value for key, value in gemm1_kernel_list.items()},
