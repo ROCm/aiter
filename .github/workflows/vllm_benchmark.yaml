@@ -34,7 +34,7 @@ jobs:
   build_vllm_image:
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: [check-signal]
-    runs-on: aiter-1gpu-runner
+    runs-on: aiter-k8s-build
 
     steps:
       - name: Checkout aiter repo
@@ -45,9 +45,6 @@ jobs:
           set -e
           git submodule sync
           git submodule update --init --recursive --depth 1 --jobs 4
-
-      - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Download the vLLM base image
         run: |
