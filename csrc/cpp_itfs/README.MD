@@ -1,4 +1,4 @@
 ```
 apt install libssl-dev libfmt-dev libgtest-dev
-pip install jinja2
+pip install jinja2 hip-python==<rocm-version>
 ```

@@ -297,7 +297,7 @@ def str_to_bool(s):
     return True if s.lower() == "true" else False
 
 
-def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1)):
+def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
     import triton
     import triton.language as tl
 
@@ -309,27 +309,32 @@ def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1)):
     for idx, param in enumerate(sig.parameters.values()):
         if param.annotation == tl.constexpr:
             constant_indices.append(idx)
-    ccinfo = kernel.warmup(*args, grid=grid)
-    constants = OrderedDict()
+    ccinfo = kernel.warmup(*args, grid=grid, **kwargs)
+    constants = {}
     keys = list(sig.parameters.keys())
     for idx, arg in enumerate(args):
         if idx in constant_indices:
             constants[keys[idx]] = arg
-    func_name = get_default_func_name(kernel.fn.__name__, tuple(constants.values()))
+    return compile_hsaco(kernel.fn.__name__, ccinfo.asm['hsaco'], ccinfo.metadata.shared, ccinfo.metadata.target.arch, constants)
+
+
+def compile_hsaco(kernel_name, hsaco, shared=0, gcnArchName=GPU_ARCH, constants={}):
+    constants = OrderedDict(constants)
+    func_name = get_default_func_name(kernel_name, tuple(constants.values()))
     metadata = {}
-    metadata["shared"] = ccinfo.metadata.shared
-    metadata["name"] = ccinfo.metadata.name
-    metadata["gcnArchName"] = ccinfo.metadata.target.arch
+    metadata["shared"] = shared
+    metadata["name"] = kernel_name
+    metadata["gcnArchName"] = gcnArchName
     for key, value in constants.items():
         metadata[key] = str(value)
     os.makedirs(f"{BUILD_DIR}/{metadata["gcnArchName"]}", exist_ok=True)
     with open(f"{BUILD_DIR}/{metadata["gcnArchName"]}/{func_name}.hsaco", "wb") as f:
-        f.write(ccinfo.asm['hsaco'])
+        f.write(hsaco)
 
     with open(f"{BUILD_DIR}/{metadata["gcnArchName"]}/{func_name}.json", "w") as f:
         json.dump(metadata, f)
-
     return func_name
+
 
 @lru_cache(maxsize=None)
 def get_hsaco_launcher(hsaco_name, kernel_name):
@@ -339,6 +344,7 @@ def get_hsaco_launcher(hsaco_name, kernel_name):
     hsaco_launcher.load_module(hsaco)
     hsaco_launcher.get_function(kernel_name)
     return hsaco_launcher
+
 
 def run_hsaco(func_name, *args, grid=(1, 1, 1), block=(256, 1, 1), stream=None, constants={}):
     constants = OrderedDict(constants)
