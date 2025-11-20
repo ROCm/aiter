@@ -310,15 +310,18 @@ def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1)):
         if param.annotation == tl.constexpr:
             constant_indices.append(idx)
     ccinfo = kernel.warmup(*args, grid=grid)
-    constants = []
+    constants = OrderedDict()
+    keys = list(sig.parameters.keys())
     for idx, arg in enumerate(args):
         if idx in constant_indices:
-            constants.append(arg)
-    func_name = get_default_func_name(kernel.fn.__name__, tuple(constants))
+            constants[keys[idx]] = arg
+    func_name = get_default_func_name(kernel.fn.__name__, tuple(constants.values()))
     metadata = {}
     metadata["shared"] = ccinfo.metadata.shared
     metadata["name"] = ccinfo.metadata.name
     metadata["gcnArchName"] = ccinfo.metadata.target.arch
+    for key, value in constants.items():
+        metadata[key] = str(value)
     os.makedirs(f"{BUILD_DIR}/{metadata["gcnArchName"]}", exist_ok=True)
     with open(f"{BUILD_DIR}/{metadata["gcnArchName"]}/{func_name}.hsaco", "wb") as f:
         f.write(ccinfo.asm['hsaco'])
@@ -337,8 +340,9 @@ def get_hsaco_launcher(hsaco_name, kernel_name):
     hsaco_launcher.get_function(kernel_name)
     return hsaco_launcher
 
-def run_hsaco(func_name, *args, grid=(1, 1, 1), block=(256, 1, 1), stream=None, constants=()):
-    hsaco_name = get_default_func_name(func_name, tuple(constants))
+def run_hsaco(func_name, *args, grid=(1, 1, 1), block=(256, 1, 1), stream=None, constants={}):
+    constants = OrderedDict(constants)
+    hsaco_name = get_default_func_name(func_name, tuple(constants.values()))
     with open(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.json", "r") as f:
         metadata = json.load(f)
     kernel_name = metadata["name"]
