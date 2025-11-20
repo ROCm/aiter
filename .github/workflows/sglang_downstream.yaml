@@ -12,12 +12,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
   sglang:
     name: sglang integration
-    runs-on: aiter-1gpu-runner
+    needs: [check-signal]
+    runs-on: aiter-mi355-1gpu
     env:
       SGL_BRANCH: v0.5.3
-      GPU_ARCH: gfx942
+      GPU_ARCH: gfx950
       SGL_IMAGE: rocm/sgl-dev:v0.5.3.post3-rocm700-mi30x-20251019
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}

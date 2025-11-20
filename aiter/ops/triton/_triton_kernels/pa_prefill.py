@@ -9,9 +9,23 @@
 
 import triton
 import triton.language as tl
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
-@triton.jit
+_fwd_kernel_repr = make_kernel_repr(
+    "_fwd_kernel",
+    [
+        "IN_PRECISION",
+        "BLOCK_M",
+        "BLOCK_DMODEL",
+        "BLOCK_N",
+        "SLIDING_WINDOW",
+        "SKIP_DECODE",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_kernel_repr)
 def _fwd_kernel(
     Q,
     K,
@@ -290,7 +304,19 @@ def _fwd_kernel(
     return
 
 
-@triton.jit
+_fwd_kernel_alibi_repr = make_kernel_repr(
+    "_fwd_kernel_alibi",
+    [
+        "IN_PRECISION",
+        "BLOCK_M",
+        "BLOCK_DMODEL",
+        "BLOCK_N",
+        "SKIP_DECODE",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_kernel_alibi_repr)
 def _fwd_kernel_alibi(
     Q,
     K,
