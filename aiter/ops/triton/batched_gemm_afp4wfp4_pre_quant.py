@@ -5,11 +5,6 @@ from typing import Optional
 import torch
 import triton
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton._triton_kernels.batched_gemm_afp4wfp4_pre_quant import (
-    _batched_gemm_afp4_wfp4_pre_quant_reduce_kernel,
-    _batched_gemm_afp4_wfp4_pre_quant_kernel,
-    _get_config,
-)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
