@@ -3,14 +3,19 @@ import json
 import os
 import triton
 import triton.language as tl
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 
 @triton.jit
 def _fused_zeros_scatter_kernel(
-    a, indices, values, n_indices, n_a, num_cols,
+    a,
+    indices,
+    values,
+    n_indices: tl.constexpr, 
+    n_a: tl.constexpr, 
+    num_cols: tl.constexpr,
     BLOCK_SIZE: tl.constexpr = 1024
+
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
