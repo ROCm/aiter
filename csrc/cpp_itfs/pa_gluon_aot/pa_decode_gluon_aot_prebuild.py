@@ -1,29 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from curses import flash
 import os
-import sys
 import argparse
 import random
 from typing import List, Optional, Tuple, Union, Dict
-import hashlib
 import shutil
+import subprocess
 from multiprocessing import Pool, cpu_count
-from functools import partial
 
 import pandas as pd
-import numpy as np
-from pandas.core.frame import com
 import torch
 import triton
 import triton.language as tl
-import pytest
 
 import aiter
 from aiter import dtypes
-from aiter import pertoken_quant, per_tensor_quant
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import benchmark
 from csrc.cpp_itfs.utils import (
     BUILD_DIR,
 )
@@ -36,6 +29,7 @@ from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
 
 
 TRITON_VERSION = triton.__version__
+MD_NAME = "pa_decode_attention_reduce_kernel"
 
 # Global variables that will be set by command line arguments
 USE_TORCH_FLASH_REF = False
@@ -84,7 +78,7 @@ BATCH_SIZE_OPTIONS = [4, 80, 128]
 # COMPUTE_TYPE_OPTIONS = [dtypes.d_dtypes[key] for key in COMPUTE_TYPE_OPTIONS]
 
 
-def run_gluon_fp8_kernel(
+def run_gluon_kernel(
     output: torch.Tensor,
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -129,7 +123,8 @@ def run_gluon_fp8_kernel(
             max_logits=max_logits,
             temporary_output=temporary_output,
             alibi_slopes=alibi_slopes,
-            run_compiled_kernel=False,
+            run_compiled_kernel=True,
+            # run_compiled_kernel=False,
         )
     else:
         pa_decode_gluon(
@@ -434,7 +429,7 @@ def run_pa_gluon_test(
         dtype=data_type,
         device=device,
     )
-    run_gluon_fp8_kernel(
+    run_gluon_kernel(
         output_gluon,
         quantized_query_gluon,
         quantized_keys,
@@ -456,7 +451,7 @@ def run_pa_gluon_test(
         use_aot_impl=use_aot_impl,
     )
 
-    results[f"us_gluon_fp8"] = 0
+    results[f"us_gluon"] = 0
 
     return results
 
@@ -875,67 +870,117 @@ def prebuild_pa_decode_gluon_aot_so():
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS
 
-    # USE_TORCH_FLASH_REF_OPTIONS = [True]
-    # CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-    # BLOCK_SIZE_OPTIONS = [16, 1024]
-    # # BLOCK_SIZE_OPTIONS = [16]
-    # QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    # # QUERY_LENGTH_OPTIONS = [1]
-    # BATCH_SIZE_OPTIONS = [3]
-    # HEAD_CONFIGURATIONS = [(16, 1), (10, 1)]
-    # # HEAD_CONFIGURATIONS = [(16, 1)]
-    # # CONTEXT_LENGTH_OPTIONS = [4096]
-    # # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024, 64 * 1024, 128 * 1024]
-    # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024]
-    # # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
-    # COMPUTE_TYPE_OPTIONS = ["fp8"]
-    # QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
-    # # QUANT_MODE_OPTIONS = ["per_tensor"]
-    # # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
-    # HEAD_DIMENSION_OPTIONS = [128]
-    # # QUANT_MODE_OPTIONS = ["per_tensor"]
-    # TRANS_V_OPTIONS = [False, True]
-    # # TRANS_V_OPTIONS = [False]
-    # # TRANS_V_OPTIONS = [True]
-    # KV_VARLEN_OPTIONS = [False, True]
-    # # KV_VARLEN_OPTIONS = [False]
-    # # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
-    # QUANT_Q_AND_KV_OPTIONS = [[True, True]]
-    # # USE_AOT_IMPL_OPTIONS = [False]
-    # USE_AOT_IMPL_OPTIONS = [True]
-    # # USE_AOT_IMPL_OPTIONS = [False, True]
-    # # BLOCK_SIZE_OPTIONS = [1024]
-    # # HEAD_CONFIGURATIONS = [(10, 1)]
-
-    USE_TORCH_FLASH_REF_OPTIONS = [True]
-    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-    USE_AOT_IMPL_OPTIONS = [True]
-    KV_VARLEN_OPTIONS = [False]
-    TRANS_V_OPTIONS = [False, True]
-    QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
-    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
-    QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
-    HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
-    # BLOCK_SIZE_OPTIONS = [16, 64, 1024]
-    BLOCK_SIZE_OPTIONS = [16, 64]
-    # BLOCK_SIZE_OPTIONS = [1024]
-    HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
-    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    CONTEXT_LENGTH_OPTIONS = [
-        256,
-        512,
-        1024,
-        2048,
-        4096,
-        8192,
-        16 * 1024,
-        32 * 1024,
-    ]
-    BATCH_SIZE_OPTIONS = [3]
+    # use_simple_config = True
+    use_simple_config = False
+    if use_simple_config:
+        USE_TORCH_FLASH_REF_OPTIONS = [True]
+        CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+        BLOCK_SIZE_OPTIONS = [16, 1024]
+        # BLOCK_SIZE_OPTIONS = [16]
+        # BLOCK_SIZE_OPTIONS = [1024]
+        QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+        # QUERY_LENGTH_OPTIONS = [1]
+        BATCH_SIZE_OPTIONS = [3]
+        HEAD_CONFIGURATIONS = [(16, 1), (10, 1)]
+        # HEAD_CONFIGURATIONS = [(16, 1)]
+        # HEAD_CONFIGURATIONS = [(10, 1)]
+        # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024, 64 * 1024, 128 * 1024]
+        # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024]
+        CONTEXT_LENGTH_OPTIONS = [4096]
+        COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+        # COMPUTE_TYPE_OPTIONS = ["fp8"]
+        QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
+        # QUANT_MODE_OPTIONS = ["per_tensor"]
+        # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
+        HEAD_DIMENSION_OPTIONS = [128]
+        # QUANT_MODE_OPTIONS = ["per_tensor"]
+        TRANS_V_OPTIONS = [False, True]
+        # TRANS_V_OPTIONS = [False]
+        # TRANS_V_OPTIONS = [True]
+        KV_VARLEN_OPTIONS = [False, True]
+        # KV_VARLEN_OPTIONS = [False]
+        # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
+        QUANT_Q_AND_KV_OPTIONS = [[True, True]]
+        # USE_AOT_IMPL_OPTIONS = [False, True]
+        # USE_AOT_IMPL_OPTIONS = [False]
+        USE_AOT_IMPL_OPTIONS = [True]
+    else:
+        USE_TORCH_FLASH_REF_OPTIONS = [True]
+        CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+        BATCH_SIZE_OPTIONS = [3]
+        KV_VARLEN_OPTIONS = [False]
+        TRANS_V_OPTIONS = [False, True]
+        QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
+        COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+        QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
+        HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
+        # HEAD_DIMENSION_OPTIONS = [256]
+        # BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+        BLOCK_SIZE_OPTIONS = [16, 64]
+        # BLOCK_SIZE_OPTIONS = [1024]
+        HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
+        QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+        CONTEXT_LENGTH_OPTIONS = [
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            8192,
+            # 16 * 1024,
+            # 32 * 1024,
+        ]
+        # USE_AOT_IMPL_OPTIONS = [False, True]
+        # USE_AOT_IMPL_OPTIONS = [False]
+        USE_AOT_IMPL_OPTIONS = [True]
 
     parse_arg_and_run_test()
+
+    # Clean current directory cache
+    current_dir = os.getcwd()
+    print(f"Cleaning current directory cache: {current_dir}/{MD_NAME}_*")
+    clean_current_dir_cache_cmd = ["sh", "-c", f"rm -rf {current_dir}/{MD_NAME}_*"]
+    result = subprocess.run(
+        clean_current_dir_cache_cmd, capture_output=True, text=True, timeout=10
+    )
+    if result.returncode != 0 and result.stderr:
+        print(f"Warning: {result.stderr}")
+    print(f"Cleaning current directory cache completed!")
+    # Clean aiter build directory cache, only *.so files are left
+    print(f"Cleaning aiter build directory cache: {BUILD_DIR}")
     clean_directory_except_so(BUILD_DIR)
-    print("Cleanup completed, only .so files are left.")
+    print("Cleaning aiter build directory cache completed, only *.so files are left!")
+    # Get the total size of so files in aiter build directory
+    try:
+        du_result = subprocess.run(
+            ["du", "-sh", BUILD_DIR], capture_output=True, text=True, timeout=10
+        )
+        if du_result.returncode == 0:
+            total_size_of_so_files = du_result.stdout.split()[0]
+            print(
+                f"The total size of so files in aiter build directory: {total_size_of_so_files}"
+            )
+    except Exception as e:
+        print(
+            f"Warning: Could not get the total size of so files in aiter build directory: {e}"
+        )
+    # Get the number of so files in aiter build directory
+    try:
+        so_count_result = subprocess.run(
+            ["sh", "-c", f"find {BUILD_DIR} -type f -name '*.so' | wc -l"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if so_count_result.returncode == 0:
+            number_of_so_files = so_count_result.stdout.strip()
+            print(
+                f"The number of so files in aiter build directory: {number_of_so_files}"
+            )
+    except Exception as e:
+        print(
+            f"Warning: Could not get the number of so files in aiter build directory: {e}"
+        )
 
 
 if __name__ == "__main__":
