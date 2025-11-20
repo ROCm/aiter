@@ -18,6 +18,21 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from aiter.ops.shuffle import shuffle_weight
 
+try:
+    from triton.experimental.gluon.language.amd.cdna3 import (
+        sched_barrier as _amd_iglp_sched_barrier,
+    )
+    from triton.experimental.gluon.language.amd.cdna3 import (
+        sched_group_barrier as _amd_iglp_sched_group_barrier,
+    )
+except ImportError:
+    @gluon.jit
+    def _amd_iglp_sched_barrier(inst_mask):
+        pass
+    @gluon.jit
+    def _amd_iglp_sched_group_barrier(inst_mask, cnt, _):
+        pass
+
 
 @triton.heuristics(
     {
@@ -84,6 +99,12 @@ def _gemm_a8w8_ptpc(
     *scale_k = (K + GROUP_K - 1) // GROUP_K
     **scale_n = (N + GROUP_N - 1) // GROUP_N
     """
+
+    DS_WRITE: gl.constexpr = 0x200
+    DS_READ: gl.constexpr = 0x100
+    BUFFER_LOAD: gl.constexpr = 0x020
+    MFMA: gl.constexpr = 0x008
+
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
@@ -277,6 +298,11 @@ def _gemm_a8w8_ptpc(
             acc = gl.amd.cdna4.mfma(cur_a, cur_b_fma, acc)
             smem_a.store(a)
             cur_b = b.permute(2, 0, 3, 1).reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
+
+            for i in range(12):
+                _amd_iglp_sched_group_barrier(BUFFER_LOAD, 3, 0)
+                _amd_iglp_sched_group_barrier(DS_READ, 3, 0)
+                _amd_iglp_sched_group_barrier(MFMA, 12, 0)
 
         # ======= Epilogue ========
         # smem_b.store(b)
