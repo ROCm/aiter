@@ -1,0 +1,52 @@
+{
+  "q": {
+    "shape": [
+      2048,
+      32,
+      128
+    ],
+    "dtype": "bfloat16",
+    "device": "cuda:0"
+  },
+  "k": {
+    "shape": [
+      2048,
+      8,
+      128
+    ],
+    "dtype": "bfloat16",
+    "device": "cuda:0"
+  },
+  "v": {
+    "shape": [
+      2048,
+      8,
+      128
+    ],
+    "dtype": "bfloat16",
+    "device": "cuda:0"
+  },
+  "cu_seqlens_q": {
+    "shape": [
+      2
+    ],
+    "dtype": "int32",
+    "device": "cuda:0"
+  },
+  "cu_seqlens_k": {
+    "shape": [
+      2
+    ],
+    "dtype": "int32",
+    "device": "cuda:0"
+  },
+  "max_seqlen_q": 2048,
+  "max_seqlen_k": 2048,
+  "softmax_scale": 0.08838834764831845,
+  "causal": true,
+  "extra": {
+    "window_size": "[4095, 0]",
+    "layer_id": null,
+    "batch_size": null
+  }
+}

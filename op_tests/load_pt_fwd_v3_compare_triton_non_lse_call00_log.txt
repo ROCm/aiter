@@ -1,0 +1,164 @@
+[aiter INFO] 2025-11-20 06:18:50.759 - MainProcess:10665 - /home/memin/code/aiter/aiter/jit/core.py:133 - get_config_file
+merge tuned file under model_configs/ and configs/ /home/memin/code/aiter/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv:/home/memin/code/aiter/aiter/configs/model_configs/a8w8_bpreshuffle_tuned_gemm_dsv3.csv
+[aiter INFO] 2025-11-20 06:18:50.878 - MainProcess:10665 - /home/memin/code/aiter/aiter/jit/core.py:133 - get_config_file
+merge tuned file under model_configs/ and configs/ /home/memin/code/aiter/aiter/configs/a8w8_blockscale_tuned_gemm.csv:/home/memin/code/aiter/aiter/configs/model_configs/a8w8_blockscale_tuned_gemm_ds_v3.csv:/home/memin/code/aiter/aiter/configs/model_configs/a8w8_blockscale_tuned_gemm_qwen3_235b.csv
+[aiter INFO] 2025-11-20 06:18:50.886 - MainProcess:10665 - /home/memin/code/aiter/aiter/jit/core.py:133 - get_config_file
+merge tuned file under model_configs/ and configs/ /home/memin/code/aiter/aiter/configs/tuned_fmoe.csv:/home/memin/code/aiter/aiter/configs/model_configs/a8w8_blockscale_tuned_fmoe_qwen3_235b.csv
+[aiter INFO] 2025-11-20 06:18:50.900 - MainProcess:10665 - /home/memin/code/aiter/aiter/jit/core.py:133 - get_config_file
+merge tuned file under model_configs/ and configs/ /home/memin/code/aiter/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv:/home/memin/code/aiter/aiter/configs/model_configs/a8w8_blockscale_bpreshuffle_tuned_gemm_dsv3.csv
+[aiter INFO] 2025-11-20 06:18:51.233 - MainProcess:10665 - /home/memin/code/aiter/aiter/jit/core.py:410 - get_module_custom_op
+import [module_aiter_enum] under /home/memin/code/aiter/aiter/jit/module_aiter_enum.so
+[aiter INFO] 2025-11-20 06:18:51.233 - MainProcess:10665 - /home/memin/code/aiter/aiter/test_common.py:214 - log_args
+
+calling _ActivationType(dummy                        = 0)
+[aiter INFO] 2025-11-20 06:18:51.233 - MainProcess:10665 - /home/memin/code/aiter/aiter/test_common.py:214 - log_args
+
+calling _QuantType(dummy                        = 0)
+[aiter INFO] 2025-11-20 06:18:51.930 - MainProcess:10665 - /home/memin/code/aiter/aiter/jit/core.py:410 - get_module_custom_op
+import [module_fmha_v3_varlen_fwd] under /home/memin/code/aiter/aiter/jit/module_fmha_v3_varlen_fwd.so
+[aiter WARNING] 2025-11-20 06:18:51.931 - MainProcess:10665 - /home/memin/code/aiter/aiter/jit/core.py:860 - check_args
+type hints mismatch, override to --> fmha_v3_varlen_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens_q: torch.Tensor, cu_seqlens_k: Optional[torch.Tensor], max_seqlen_q: int, max_seqlen_k: int, min_seqlen_q: int, dropout_p: float, softmax_scale: float, logits_soft_cap: float, zero_tensors: bool, is_causal: bool, window_size_left: int, window_size_right: int, return_softmax_lse: bool, return_dropout_randval: bool, how_v3_bf16_cvt: int, out: Optional[torch.Tensor] = None, block_table: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None) -> List[torch.Tensor]
+[aiter INFO] 2025-11-20 06:18:51.931 - MainProcess:10665 - /home/memin/code/aiter/aiter/test_common.py:214 - log_args
+
+calling fmha_v3_varlen_fwd(q                            = torch.Size([2048, 32, 128]) torch.bfloat16 cuda:0 0x7ee699800000,
+                           k                            = torch.Size([2048, 8, 128]) torch.bfloat16 cuda:0 0x7f1ea1200000,
+                           v                            = torch.Size([2048, 8, 128]) torch.bfloat16 cuda:0 0x7f1ea1600000,
+                           cu_seqlens_q                 = torch.Size([2]) torch.int32 cuda:0 0x7ee68da00000,
+                           cu_seqlens_k                 = torch.Size([2]) torch.int32 cuda:0 0x7ee68da00400,
+                           max_seqlen_q                 = 2048,
+                           max_seqlen_k                 = 2048,
+                           min_seqlen_q                 = 1,
+                           dropout_p                    = 0.0,
+                           softmax_scale                = 0.1352337788608801,
+                           logits_soft_cap              = 0.0,
+                           zero_tensors                 = False,
+                           is_causal                    = True,
+                           window_size_left             = -1,
+                           window_size_right            = -1,
+                           return_softmax_lse           = False,
+                           return_dropout_randval       = False,
+                           how_v3_bf16_cvt              = 1,
+                           out                          = torch.Size([2048, 32, 128]) torch.bfloat16 cuda:0 0x7ee68c800000,
+                           block_table                  = None,
+                           bias                         = None,
+                           alibi_slopes                 = None,
+                           gen                          = None)
+q shape is torch.Size([2048, 32, 128]), stride is (6144, 128, 1)
+k shape is torch.Size([2048, 8, 128]), stride is (1024, 128, 1)
+v shape is torch.Size([2048, 8, 128]), stride is (1024, 128, 1)
+cu_seqlens_q is tensor([   0, 2048], device='cuda:0', dtype=torch.int32)
+cu_seqlens_k is tensor([   0, 2048], device='cuda:0', dtype=torch.int32)
+tensor([[[-0.0042, -0.0053,  0.0006,  ..., -0.0067, -0.0032, -0.0159],
+         [-0.0042, -0.0053,  0.0006,  ..., -0.0067, -0.0032, -0.0159],
+         [-0.0042, -0.0053,  0.0006,  ..., -0.0067, -0.0032, -0.0159],
+         ...,
+         [-0.0151, -0.0117,  0.0021,  ..., -0.0068, -0.0026,  0.0177],
+         [-0.0151, -0.0117,  0.0021,  ..., -0.0068, -0.0026,  0.0177],
+         [-0.0151, -0.0117,  0.0021,  ..., -0.0068, -0.0026,  0.0177]],
+
+        [[-0.0040, -0.0055,  0.0009,  ..., -0.0066, -0.0030, -0.0159],
+         [-0.0041, -0.0054,  0.0007,  ..., -0.0066, -0.0031, -0.0159],
+         [-0.0040, -0.0055,  0.0009,  ..., -0.0066, -0.0030, -0.0159],
+         ...,
+         [-0.0151, -0.0117,  0.0022,  ..., -0.0069, -0.0025,  0.0177],
+         [-0.0079, -0.0105,  0.0172,  ..., -0.0264,  0.0053,  0.0057],
+         [-0.0135, -0.0115,  0.0054,  ..., -0.0110, -0.0008,  0.0151]],
+
+        [[-0.0043, -0.0067,  0.0020,  ..., -0.0060, -0.0027, -0.0154],
+         [-0.0040, -0.0058,  0.0012,  ..., -0.0065, -0.0029, -0.0157],
+         [ 0.0030, -0.0398,  0.0388,  ...,  0.0072,  0.0146, -0.0067],
+         ...,
+         [-0.0147, -0.0117,  0.0030,  ..., -0.0079, -0.0021,  0.0170],
+         [-0.0121, -0.0121,  0.0083,  ..., -0.0142,  0.0015,  0.0114],
+         [ 0.0024, -0.0105,  0.0386,  ..., -0.0527,  0.0181, -0.0138]],
+
+        ...,
+
+        [[-0.0209, -0.0002,  0.0171,  ...,  0.0420, -0.0161,  0.0072],
+         [-0.0095,  0.0014,  0.0107,  ...,  0.0086, -0.0100, -0.0008],
+         [-0.0225, -0.0247,  0.0017,  ...,  0.0952, -0.1328, -0.0576],
+         ...,
+         [-0.0198, -0.0047, -0.0204,  ...,  0.0076,  0.0269,  0.0640],
+         [-0.0430,  0.0237, -0.0157,  ..., -0.0198,  0.0265,  0.0106],
+         [-0.0147, -0.0104,  0.0017,  ..., -0.0049, -0.0022,  0.0173]],
+
+        [[-0.0050, -0.0036,  0.0010,  ..., -0.0061, -0.0052, -0.0161],
+         [-0.0031, -0.0057,  0.0020,  ..., -0.0060, -0.0068, -0.0139],
+         [-0.0334, -0.0457, -0.0294,  ...,  0.0317,  0.0635, -0.0242],
+         ...,
+         [-0.0029, -0.0146, -0.0299,  ...,  0.0156,  0.0118,  0.0825],
+         [ 0.0294,  0.0386, -0.0064,  ..., -0.0026,  0.0786, -0.0864],
+         [-0.0149, -0.0107,  0.0021,  ..., -0.0056, -0.0025,  0.0172]],
+
+        [[-0.0046, -0.0044,  0.0008,  ..., -0.0061, -0.0045, -0.0157],
+         [-0.0045, -0.0035,  0.0012,  ..., -0.0050, -0.0066, -0.0146],
+         [ 0.0171, -0.0845, -0.0503,  ...,  0.0105,  0.1504, -0.0181],
+         ...,
+         [-0.0138, -0.0010, -0.0223,  ...,  0.0109,  0.0132,  0.0640],
+         [ 0.0304,  0.0027, -0.1089,  ..., -0.1069, -0.1689, -0.0058],
+         [-0.0149, -0.0110,  0.0022,  ..., -0.0060, -0.0026,  0.0173]]],
+       device='cuda:0', dtype=torch.bfloat16,
+       grad_fn=<FlashAttnVarlenFuncBackward>)
+attn_softmax shape is torch.Size([2048, 32, 128]), stride is (4096, 128, 1)
+tensor([[[-0.0042, -0.0053,  0.0006,  ..., -0.0067, -0.0032, -0.0159],
+         [-0.0042, -0.0053,  0.0006,  ..., -0.0067, -0.0032, -0.0159],
+         [-0.0042, -0.0053,  0.0006,  ..., -0.0067, -0.0032, -0.0159],
+         ...,
+         [-0.0151, -0.0117,  0.0021,  ..., -0.0068, -0.0026,  0.0177],
+         [-0.0151, -0.0117,  0.0021,  ..., -0.0068, -0.0026,  0.0177],
+         [-0.0151, -0.0117,  0.0021,  ..., -0.0068, -0.0026,  0.0177]],
+
+        [[-0.0040, -0.0055,  0.0009,  ..., -0.0066, -0.0030, -0.0159],
+         [-0.0041, -0.0054,  0.0007,  ..., -0.0066, -0.0031, -0.0159],
+         [-0.0040, -0.0055,  0.0009,  ..., -0.0066, -0.0030, -0.0159],
+         ...,
+         [-0.0151, -0.0117,  0.0022,  ..., -0.0069, -0.0025,  0.0177],
+         [-0.0079, -0.0105,  0.0172,  ..., -0.0264,  0.0053,  0.0057],
+         [-0.0135, -0.0115,  0.0054,  ..., -0.0110, -0.0008,  0.0151]],
+
+        [[-0.0043, -0.0067,  0.0020,  ..., -0.0060, -0.0027, -0.0154],
+         [-0.0040, -0.0058,  0.0012,  ..., -0.0065, -0.0029, -0.0157],
+         [ 0.0030, -0.0398,  0.0388,  ...,  0.0072,  0.0146, -0.0067],
+         ...,
+         [-0.0147, -0.0117,  0.0030,  ..., -0.0079, -0.0021,  0.0170],
+         [-0.0121, -0.0121,  0.0083,  ..., -0.0142,  0.0015,  0.0114],
+         [ 0.0024, -0.0105,  0.0386,  ..., -0.0527,  0.0181, -0.0138]],
+
+        ...,
+
+        [[-0.0209, -0.0002,  0.0171,  ...,  0.0420, -0.0161,  0.0072],
+         [-0.0095,  0.0015,  0.0107,  ...,  0.0086, -0.0099, -0.0008],
+         [-0.0225, -0.0247,  0.0017,  ...,  0.0952, -0.1328, -0.0576],
+         ...,
+         [-0.0198, -0.0047, -0.0205,  ...,  0.0076,  0.0270,  0.0640],
+         [-0.0430,  0.0237, -0.0156,  ..., -0.0197,  0.0264,  0.0106],
+         [-0.0147, -0.0104,  0.0017,  ..., -0.0049, -0.0022,  0.0173]],
+
+        [[-0.0050, -0.0036,  0.0010,  ..., -0.0061, -0.0052, -0.0161],
+         [-0.0031, -0.0057,  0.0020,  ..., -0.0060, -0.0068, -0.0139],
+         [-0.0334, -0.0457, -0.0294,  ...,  0.0317,  0.0635, -0.0242],
+         ...,
+         [-0.0029, -0.0146, -0.0299,  ...,  0.0156,  0.0118,  0.0825],
+         [ 0.0294,  0.0386, -0.0063,  ..., -0.0026,  0.0786, -0.0864],
+         [-0.0149, -0.0107,  0.0021,  ..., -0.0056, -0.0025,  0.0172]],
+
+        [[-0.0046, -0.0044,  0.0008,  ..., -0.0061, -0.0045, -0.0157],
+         [-0.0045, -0.0035,  0.0012,  ..., -0.0050, -0.0066, -0.0146],
+         [ 0.0171, -0.0845, -0.0503,  ...,  0.0105,  0.1504, -0.0181],
+         ...,
+         [-0.0137, -0.0010, -0.0225,  ...,  0.0109,  0.0132,  0.0640],
+         [ 0.0304,  0.0027, -0.1089,  ..., -0.1069, -0.1689, -0.0058],
+         [-0.0149, -0.0110,  0.0022,  ..., -0.0060, -0.0026,  0.0173]]],
+       device='cuda:0', dtype=torch.bfloat16)
+attn_softmax_ref shape is torch.Size([2048, 32, 128]), stride is (4096, 128, 1)
+   attn_out_flash:
+     has_nan=False, has_inf=False
+   attn_out_ref:
+     has_nan=False, has_inf=False
+   torch.allclose(atol=0.1, rtol=0.1): True
+   Max absolute difference: 7.812500e-03
+   Mean absolute difference: 7.262436e-06
+   Max reference value: 2.671875e+00
+   Relative difference: 2.923977e-03
+
+PASS!!!!
