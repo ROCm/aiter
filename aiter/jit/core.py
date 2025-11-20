@@ -63,6 +63,7 @@ def mp_lock(
         if ttl_ms > 0:
             deadline = time.time() + ttl_ms / 1000.0
             while os.path.exists(lockPath) and time.time() < deadline:
+                # Spin with base interval and jitter to reduce thundering herd
                 sleep_s = getattr(baton, "wait_seconds", 0.2)
                 jitter_s = max(
                     0.0,
@@ -72,14 +73,19 @@ def mp_lock(
                 time.sleep(max(0.0, sleep_s + jitter_s))
             if os.path.exists(lockPath):
                 try:
+                    # Compute lock file age to decide staleness
                     age_ms = (time.time() - os.path.getmtime(lockPath)) * 1000.0
                 except Exception:
+                    # If stat fails, treat as stale to unblock progress
                     age_ms = ttl_ms + 1
                 if age_ms >= ttl_ms:
                     logger.warning(f"stale lock detected and removed: {lockPath}")
                     removed = False
                     try:
                         os.remove(lockPath)
+                        removed = True
+                    except FileNotFoundError:
+                        # Lock was already removed by another process; consider as success
                         removed = True
                     except Exception as rm_err:
                         # Removal failed (permission/race/etc.); log and defer to wait path

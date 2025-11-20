@@ -50,8 +50,11 @@ class FileBaton:
             time.sleep(self.wait_seconds)
 
     def release(self):
-        """Release the baton and removes its file."""
+        """Release the baton and remove its file (idempotent)."""
         if self.fd is not None:
             os.close(self.fd)
-
-        os.remove(self.lock_file_path)
+        try:
+            os.remove(self.lock_file_path)
+        except FileNotFoundError:
+            # Another process may have removed the lock already; treat as success
+            pass
