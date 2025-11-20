@@ -1086,7 +1086,7 @@ def prepare_gluon_query_and_scale(
 
 
 @perftest()
-def run_gluon_fp8_kernel(
+def run_gluon_kernel(
     output: torch.Tensor,
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -1418,7 +1418,7 @@ def run_pa_gluon_test(
         dtype=output_gluon.dtype,
         device=output_gluon.device,
     )
-    _, gluon_time = run_gluon_fp8_kernel(
+    _, gluon_time = run_gluon_kernel(
         output_gluon,
         quantized_query_gluon,
         quantized_keys,
@@ -1469,7 +1469,7 @@ def run_pa_gluon_test(
     else:
         print("gluon_vs_torch_ref FAILED")
     # Track results based on implementation type
-    results[f"us_gluon_fp8"] = gluon_time
+    results[f"us_gluon"] = gluon_time
     results[f"err_gluon"] = err_gluon
 
     if USE_TORCH_FLASH_REF:
@@ -1501,12 +1501,12 @@ def run_pa_gluon_test(
         .tobytes()
     ).hexdigest()
     print(f"out_ref_md5={out_ref_md5}")
-    print(f"gluon_fp8_output_md5={gluon_hash}")
+    print(f"gluon_output_md5={gluon_hash}")
 
     # Bandwidth
     kernel_time_us = gluon_time
     bandwidth_tb_per_sec = pa_rw_bytes / (kernel_time_us * 1e6 * 1.024**4)
-    results[f"gluon_fp8_bandwith(TB/s)"] = bandwidth_tb_per_sec
+    results[f"gluon_bandwith(TB/s)"] = bandwidth_tb_per_sec
 
     # Test Assembly
     query_group_size = num_query_heads // num_kv_heads
@@ -1564,16 +1564,16 @@ def run_pa_gluon_test(
         ).hexdigest()
         print(f"assembly_md5={assembly_md5}")
 
-        results[f"us_asm_fp8"] = assembly_time
+        results[f"us_asm"] = assembly_time
         assembly_bandwidth = pa_rw_bytes / (assembly_time * 1e6 * 1.024**4)
-        results[f"asm_fp8_bandwith(TB/s)"] = assembly_bandwidth
+        results[f"asm_bandwith(TB/s)"] = assembly_bandwidth
 
-    if f"us_asm_fp8" in results:
-        results[f"perf_fp8_gluon_vs_asm"] = (
-            f'{results[f"us_asm_fp8"] / results[f"us_gluon_fp8"]:.0%}'
+    if f"us_asm" in results:
+        results[f"perf_gluon_vs_asm"] = (
+            f'{results[f"us_asm"] / results[f"us_gluon"]:.0%}'
         )
     else:
-        results[f"perf_fp8_gluon_vs_asm"] = "NaN"
+        results[f"perf_gluon_vs_asm"] = "NaN"
 
     print(f"Triton location: {triton}")
     print(f"Triton version: {triton.__version__}")
@@ -2016,67 +2016,70 @@ def multi_compute_quant_type_test():
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS
 
-    # USE_TORCH_FLASH_REF_OPTIONS = [True]
-    # CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-    # BLOCK_SIZE_OPTIONS = [16, 1024]
-    # # BLOCK_SIZE_OPTIONS = [16]
-    # QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    # # QUERY_LENGTH_OPTIONS = [1]
-    # BATCH_SIZE_OPTIONS = [3]
-    # HEAD_CONFIGURATIONS = [(16, 1), (10, 1)]
-    # # HEAD_CONFIGURATIONS = [(16, 1)]
-    # # CONTEXT_LENGTH_OPTIONS = [4096]
-    # # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024, 64 * 1024, 128 * 1024]
-    # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024]
-    # # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
-    # COMPUTE_TYPE_OPTIONS = ["fp8"]
-    # QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
-    # # QUANT_MODE_OPTIONS = ["per_tensor"]
-    # # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
-    # HEAD_DIMENSION_OPTIONS = [128]
-    # # QUANT_MODE_OPTIONS = ["per_tensor"]
-    # TRANS_V_OPTIONS = [False, True]
-    # # TRANS_V_OPTIONS = [False]
-    # # TRANS_V_OPTIONS = [True]
-    # KV_VARLEN_OPTIONS = [False, True]
-    # # KV_VARLEN_OPTIONS = [False]
-    # # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
-    # QUANT_Q_AND_KV_OPTIONS = [[True, True]]
-    # # USE_AOT_IMPL_OPTIONS = [False]
-    # USE_AOT_IMPL_OPTIONS = [True]
-    # # USE_AOT_IMPL_OPTIONS = [False, True]
-    # # BLOCK_SIZE_OPTIONS = [1024]
-    # # HEAD_CONFIGURATIONS = [(10, 1)]
-
-    USE_TORCH_FLASH_REF_OPTIONS = [True]
-    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-    USE_AOT_IMPL_OPTIONS = [True, False]
-    # USE_AOT_IMPL_OPTIONS = [False]
-    KV_VARLEN_OPTIONS = [False]
-    TRANS_V_OPTIONS = [False, True]
-    QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
-    # QUANT_Q_AND_KV_OPTIONS = [[False, False]]
-    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
-    QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
-    # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
-    HEAD_DIMENSION_OPTIONS = [64, 128, 256]
-    # HEAD_DIMENSION_OPTIONS = [128]
-    BLOCK_SIZE_OPTIONS = [16, 64, 1024]
-    # BLOCK_SIZE_OPTIONS = [1024]
-    HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
-    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    CONTEXT_LENGTH_OPTIONS = [
-        256,
-        512,
-        1024,
-        2048,
-        4096,
-        8192,
-        # 16 * 1024,
-        # 32 * 1024,
-    ]
-    # CONTEXT_LENGTH_OPTIONS = [4096]
-    BATCH_SIZE_OPTIONS = [3, 128]
+    # use_simple_config = True
+    use_simple_config = False
+    if use_simple_config:
+        USE_TORCH_FLASH_REF_OPTIONS = [True]
+        CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+        BLOCK_SIZE_OPTIONS = [16, 1024]
+        # BLOCK_SIZE_OPTIONS = [16]
+        # BLOCK_SIZE_OPTIONS = [1024]
+        QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+        # QUERY_LENGTH_OPTIONS = [1]
+        BATCH_SIZE_OPTIONS = [3]
+        HEAD_CONFIGURATIONS = [(16, 1), (10, 1)]
+        # HEAD_CONFIGURATIONS = [(16, 1)]
+        # HEAD_CONFIGURATIONS = [(10, 1)]
+        # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024, 64 * 1024, 128 * 1024]
+        # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024]
+        CONTEXT_LENGTH_OPTIONS = [4096]
+        COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+        # COMPUTE_TYPE_OPTIONS = ["fp8"]
+        QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
+        # QUANT_MODE_OPTIONS = ["per_tensor"]
+        # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
+        HEAD_DIMENSION_OPTIONS = [128]
+        # QUANT_MODE_OPTIONS = ["per_tensor"]
+        TRANS_V_OPTIONS = [False, True]
+        # TRANS_V_OPTIONS = [False]
+        # TRANS_V_OPTIONS = [True]
+        KV_VARLEN_OPTIONS = [False, True]
+        # KV_VARLEN_OPTIONS = [False]
+        # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
+        QUANT_Q_AND_KV_OPTIONS = [[True, True]]
+        USE_AOT_IMPL_OPTIONS = [False, True]
+        # USE_AOT_IMPL_OPTIONS = [False]
+        # USE_AOT_IMPL_OPTIONS = [True]
+    else:
+        USE_TORCH_FLASH_REF_OPTIONS = [True]
+        CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+        BATCH_SIZE_OPTIONS = [3, 128]
+        KV_VARLEN_OPTIONS = [False]
+        TRANS_V_OPTIONS = [False, True]
+        QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
+        COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+        QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
+        HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
+        # HEAD_DIMENSION_OPTIONS = [256]
+        # BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+        BLOCK_SIZE_OPTIONS = [16, 64]
+        # BLOCK_SIZE_OPTIONS = [1024]
+        HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
+        QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+        CONTEXT_LENGTH_OPTIONS = [
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            8192,
+            # 16 * 1024,
+            # 32 * 1024,
+        ]
+        # CONTEXT_LENGTH_OPTIONS = [4096]
+        USE_AOT_IMPL_OPTIONS = [False, True]
+        # USE_AOT_IMPL_OPTIONS = [False]
+        # USE_AOT_IMPL_OPTIONS = [True]
 
     # parse_arg_and_run_test(sample_rate0=0.04)
     parse_arg_and_run_test()

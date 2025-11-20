@@ -490,8 +490,9 @@ def pa_decode_gluon_aot(
         is_causal=int(is_causal),
     )
 
+    assert combined_func is not None, f"Combined function is not compiled"
     # Execute the combined kernel
-    if run_compiled_kernel and combined_func is not None:
+    if run_compiled_kernel:
         combined_func(
             *torch_to_c_types(
                 output,
