@@ -20,6 +20,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor& q,       // [b, sq, hq, d]
                                 std::optional<at::Tensor> out,                // [b, sq, hq, d]
                                 std::optional<const at::Tensor> bias,         // [sq, sk]
                                 std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
+                                std::optional<const at::Tensor> q_descale,    // [1]
+                                std::optional<const at::Tensor> k_descale,    // [1]
+                                std::optional<const at::Tensor> v_descale,    // [1]
                                 std::optional<at::Generator> gen);
 } // namespace torch_itfs
 } // namespace aiter
