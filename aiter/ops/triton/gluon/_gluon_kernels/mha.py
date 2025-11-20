@@ -188,7 +188,7 @@ def _attn_fwd_compute(
     l_i,
     m_i,
     dot_q,
-    dot_q_pe,
+    dot_qpe,
     k_base_ptr,
     v_base_ptr,
     smem_k,
@@ -234,7 +234,7 @@ def _attn_fwd_compute(
         k_base_ptr, v_base_ptr = _attn_fwd_loads(
             load_idx,
             smem_k,
-            smem_kpe if HAS_PE else None,
+            smem_kpe,
             smem_v,
             k_base_ptr,
             v_base_ptr,
@@ -258,16 +258,14 @@ def _attn_fwd_compute(
         )
 
         # Wait for the oldest load to complete before doing any computation
-        acp.wait_group(num_outstanding=(NUM_STAGES - 1))
+        acp.wait_group(NUM_STAGES - 1)
 
         # Load current blocks from shared memory
         dot_k = smem_k.index((load_idx - 1) % NUM_STAGES).load(layout=DOT_RIGHT_LAYOUT)
         if HAS_PE:
-            dot_k_pe = smem_kpe.index((load_idx - 1) % NUM_STAGES).load(
+            dot_kpe = smem_kpe.index((load_idx - 1) % NUM_STAGES).load(
                 layout=DOT_RIGHT_LAYOUT
             )
-        else:
-            dot_k_pe = None
         dot_v = smem_v.index((load_idx - 1) % NUM_STAGES).load(layout=DOT_RIGHT_LAYOUT)
     else:
         start_n = block_min + i * BLOCK_N
@@ -285,7 +283,7 @@ def _attn_fwd_compute(
             DOT_RIGHT_LAYOUT,
         )
         if HAS_PE:
-            dot_k_pe = gl.convert_layout(
+            dot_kpe = gl.convert_layout(
                 _load_fn(
                     k_base_ptr,
                     OFFS_KPE_D,
@@ -297,8 +295,6 @@ def _attn_fwd_compute(
                 ),
                 DOT_RIGHT_LAYOUT,
             )
-        else:
-            dot_k_pe = None
         dot_v = gl.convert_layout(
             _load_fn(
                 v_base_ptr,
@@ -351,7 +347,7 @@ def _attn_fwd_compute(
     # Compute qk^T
     qk += gl.amd.cdna4.mfma(dot_q, dot_k, qk_zeros)
     if HAS_PE:
-        qk += gl.amd.cdna4.mfma(dot_q_pe, dot_k_pe, qk_zeros)
+        qk += gl.amd.cdna4.mfma(dot_qpe, dot_kpe, qk_zeros)
 
     if IS_CAUSAL:
         causal_boundary = start_n + OFFS_QK_N_CAUSAL
@@ -394,7 +390,7 @@ def _attn_fwd_inner(
     l_i,
     m_i,
     q,
-    q_pe,
+    qpe,
     k_base_ptr,
     v_base_ptr,
     stride_kk,
@@ -424,7 +420,6 @@ def _attn_fwd_inner(
     SM_SCALE: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
     MASK_STEPS: gl.constexpr,  # whether to apply masking at some point while stepping (for causal or padding)
-    ENABLE_PIPELINING: gl.constexpr,
     NUM_STAGES: gl.constexpr,
 ):
     """
@@ -432,6 +427,7 @@ def _attn_fwd_inner(
     between given block_min and block_max.
     """
 
+    ENABLE_PIPELINING = NUM_STAGES > 1
     HAS_PE: gl.constexpr = BLOCK_DMODEL_PE > 0
 
     dot_left_layout: gl.constexpr = gl.DotOperandLayout(
@@ -443,38 +439,37 @@ def _attn_fwd_inner(
 
     dot_q = gl.convert_layout(q, dot_left_layout)
     if HAS_PE:
-        dot_q_pe = gl.convert_layout(q_pe, dot_left_layout)
+        dot_qpe = gl.convert_layout(qpe, dot_left_layout)
+    else:
+        dot_qpe = None
 
-    if ENABLE_PIPELINING:
-        load_idx = 0
-        smem_k = gl.allocate_shared_memory(
+    load_idx = 0
+    smem_k = gl.allocate_shared_memory(
+        k_base_ptr.type.element_ty,
+        [NUM_STAGES, BLOCK_DMODEL_POW2, BLOCK_N],
+        layout=SHARED_K_LAYOUT,
+    )
+    smem_kpe = (
+        gl.allocate_shared_memory(
             k_base_ptr.type.element_ty,
-            [NUM_STAGES, BLOCK_DMODEL_POW2, BLOCK_N],
+            [NUM_STAGES, BLOCK_DMODEL_PE, BLOCK_N],
             layout=SHARED_K_LAYOUT,
         )
-        smem_kpe = (
-            gl.allocate_shared_memory(
-                k_base_ptr.type.element_ty,
-                [NUM_STAGES, BLOCK_DMODEL_PE, BLOCK_N],
-                layout=SHARED_K_LAYOUT,
-            )
-            if HAS_PE
-            else None
-        )
-        smem_v = gl.allocate_shared_memory(
-            v_base_ptr.type.element_ty,
-            [NUM_STAGES, BLOCK_N, BLOCK_DMODEL_POW2],
-            layout=SHARED_V_LAYOUT,
-        )
-    else:
-        NUM_STAGES = 1
+        if HAS_PE
+        else 0
+    )
+    smem_v = gl.allocate_shared_memory(
+        v_base_ptr.type.element_ty,
+        [NUM_STAGES, BLOCK_N, BLOCK_DMODEL_POW2],
+        layout=SHARED_V_LAYOUT,
+    )
 
     # Prefetch initial stages; if pipelining is disabled, this is skipped
     for _ in gl.static_range(NUM_STAGES - 1):
         k_base_ptr, v_base_ptr = _attn_fwd_loads(
             load_idx,
             smem_k,
-            smem_kpe if HAS_PE else None,
+            smem_kpe,
             smem_v,
             k_base_ptr,
             v_base_ptr,
@@ -499,20 +494,18 @@ def _attn_fwd_inner(
         load_idx += 1
 
     # Steady state loop; if pipelining is disabled, this iterates through all blocks
-    for i in gl.static_range(
-        gl.cdiv(block_max - block_min, BLOCK_N) - (NUM_STAGES - 1)
-    ):
+    for i in range(gl.cdiv(block_max - block_min, BLOCK_N) - (NUM_STAGES - 1)):
         acc, l_i, m_i = _attn_fwd_compute(
             i,
             acc,
             l_i,
             m_i,
             dot_q,
-            dot_q_pe if HAS_PE else None,
+            dot_qpe,
             k_base_ptr,
             v_base_ptr,
             smem_k,
-            smem_kpe if HAS_PE else None,
+            smem_kpe,
             smem_v,
             stride_kk,
             stride_kn,
@@ -547,18 +540,18 @@ def _attn_fwd_inner(
 
     # Finish up remaining computations; if pipelining is disabled, this is skipped
     for i in gl.static_range(NUM_STAGES - 1):
-        acp.wait_group(num_outstanding=(NUM_STAGES - 2 - i))
+        acp.wait_group(NUM_STAGES - 2 - i)
         acc, l_i, m_i = _attn_fwd_compute(
             i + gl.cdiv(block_max - block_min, BLOCK_N) - (NUM_STAGES - 1),
             acc,
             l_i,
             m_i,
             dot_q,
-            dot_q_pe if HAS_PE else None,
+            dot_qpe,
             k_base_ptr,
             v_base_ptr,
             smem_k,
-            smem_kpe if HAS_PE else None,
+            smem_kpe,
             smem_v,
             stride_kk,
             stride_kn,
@@ -739,6 +732,12 @@ def _attn_fwd(
         warps_per_cta=[1, gl.num_warps()],
         order=[0, 1],
     )  # analogous to #blocked2 in the comment above
+    blocked_nd: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[SIZE_PER_THREAD_N, SIZE_PER_THREAD_D],
+        threads_per_warp=[8, 8],
+        warps_per_cta=[gl.num_warps(), 1],
+        order=[1, 0],
+    )
 
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
@@ -774,10 +773,7 @@ def _attn_fwd(
         0, BLOCK_M, layout=gl.SliceLayout(dim=1, parent=mfma_layout)
     )
     offs_qk_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(dim=0, parent=mfma_layout))
-    offs_v_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(dim=1, parent=mfma_layout))
-    offs_v_d = gl.arange(
-        0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(dim=0, parent=mfma_layout)
-    )
+    offs_v_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(dim=1, parent=blocked_nd))
     offs_out_m = start_m * BLOCK_M + gl.arange(
         0, BLOCK_M, layout=gl.SliceLayout(dim=1, parent=out_layout)
     )
@@ -788,6 +784,9 @@ def _attn_fwd(
     )
     offs_k_d = gl.arange(
         0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(dim=1, parent=blocked_dn)
+    )
+    offs_v_d = gl.arange(
+        0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(dim=0, parent=blocked_nd)
     )
     offs_out_d = gl.arange(
         0, BLOCK_DMODEL_POW2, layout=gl.SliceLayout(dim=0, parent=out_layout)
@@ -987,16 +986,16 @@ def _attn_fwd(
     )
     q_offs = tl.cast(q_offs, gl.int32)
     if HAS_PE:
-        q_pe_offs = (
+        qpe_offs = (
             off_z * stride_qz
             + off_q_head * stride_qh
             + cu_seqlens_q_start * stride_qm
             + offs_q_m[:, None] * stride_qm
             + offs_qpe_d[None, :] * stride_qk
         )
-        q_pe_offs = tl.cast(q_pe_offs, gl.int32)
+        qpe_offs = tl.cast(qpe_offs, gl.int32)
     else:
-        q_pe_offs = None
+        qpe_offs = None
 
     # Create initial k offsets
     k_offs = off_z * stride_kz + off_k_head * stride_kh + cu_seqlens_k_start * stride_kn
@@ -1025,11 +1024,11 @@ def _attn_fwd(
         q_mask = q_mask & (offs_q_d[None, :] < BLOCK_DMODEL)
     q = gl.amd.cdna4.buffer_load(ptr=q_ptr, offsets=q_offs, mask=q_mask, other=0.0)
     if HAS_PE:
-        q_pe = gl.amd.cdna4.buffer_load(
-            ptr=q_ptr, offsets=q_pe_offs, mask=q_mask, other=0.0
+        qpe = gl.amd.cdna4.buffer_load(
+            ptr=q_ptr, offsets=qpe_offs, mask=q_mask, other=0.0
         )
     else:
-        q_pe = None
+        qpe = None
 
     # Any extra tokens to pad on the K side?
     n_extra_tokens = 0
@@ -1066,7 +1065,7 @@ def _attn_fwd(
             l_i,
             m_i,
             q,
-            q_pe,
+            qpe,
             k_base_ptr,
             v_base_ptr,
             stride_kk,
@@ -1096,7 +1095,6 @@ def _attn_fwd(
             sm_scale,
             False,
             MASK_STEPS=False,
-            ENABLE_PIPELINING=True,
             NUM_STAGES=2,
         )
 
@@ -1120,7 +1118,7 @@ def _attn_fwd(
             l_i,
             m_i,
             q,
-            q_pe,
+            qpe,
             k_base_ptr,
             v_base_ptr,
             stride_kk,
@@ -1150,8 +1148,7 @@ def _attn_fwd(
             sm_scale,
             IS_CAUSAL,
             MASK_STEPS=True,
-            ENABLE_PIPELINING=False,
-            NUM_STAGES=2,
+            NUM_STAGES=1,
         )
 
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
