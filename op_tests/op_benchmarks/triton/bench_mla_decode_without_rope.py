@@ -593,22 +593,22 @@ def run_benchmark(args: argparse.Namespace):
         print(f"{tflops=}")
         print(f"{bandwidth=}")
 
-        from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-        if True:
-            triton_cache_dir = str(triton.knobs.cache.dir)
-            aot_kernel_dir = f"{AITER_TRITON_CONFIGS_PATH}/mla/aot/"
-
-            os.makedirs(aot_kernel_dir, exist_ok=True)
-            aot_name = f"mla_n16x4_prefetch_k_paged_64"
-
-            src = os.path.join(triton_cache_dir, cache_key)
-            dst = os.path.join(aot_kernel_dir, aot_name)
-            if os.path.exists(dst):
-                os.system(f"rm -rf {dst}")
-            os.system(f"mv {src} {dst}")
-            print(f"Moved cache from {src} to {dst}")
-
-            os.system(f"zip -r mla_aot_kernel mla")
+        # from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+        # if True:
+        #     triton_cache_dir = str(triton.knobs.cache.dir)
+        #     aot_kernel_dir = f"{AITER_TRITON_CONFIGS_PATH}/mla/aot/"
+        #
+        #     os.makedirs(aot_kernel_dir, exist_ok=True)
+        #     aot_name = f"mla_n16x4_prefetch_k_paged_64"
+        #
+        #     src = os.path.join(triton_cache_dir, cache_key)
+        #     dst = os.path.join(aot_kernel_dir, aot_name)
+        #     if os.path.exists(dst):
+        #         os.system(f"rm -rf {dst}")
+        #     os.system(f"mv {src} {dst}")
+        #     print(f"Moved cache from {src} to {dst}")
+        #
+        #     os.system(f"zip -r mla_aot_kernel mla")
         return bandwidth
 
     bench_mla.run(save_path=".", print_data=True, show_plots=False)

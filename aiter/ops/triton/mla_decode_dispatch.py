@@ -49,22 +49,21 @@ if triton.__version__ >= "3.5.0":
     from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
     enable_gluon_mla = True
     enable_jit_gluon_mla = True
+    from aiter.ops.triton.gluon.mla_decode_mi355 import (
+        _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
+    )
 else:
     from triton.compiler import ASTSource
     # assert triton.__version__ < "3.4.0"
     enable_gluon_mla = enable_aot_gluon_mla
-enable_jit_gluon_mla = False
+    from aiter.ops.triton._triton_kernels.mla_decode_mi355 import (
+        _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
+    )
+    enable_jit_gluon_mla = False
 
 from aiter.utility.triton.triton_metadata_redirect import (
     AOTMetadataContext,
 )
-
-from aiter.ops.triton.gluon.mla_decode_mi355 import (
-    _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
-)
-# from aiter.ops.triton.gluon.mla_decode_fp8 import (
-#     _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64 as decode_attention_fwd_fp8,
-# )
 
 
 @functools.lru_cache(maxsize=None)
@@ -113,8 +112,8 @@ def _compile_mla(
         "stride_mid_lse_s": "i32",
         "stride_b_block_table": "i32",
     }
-    # if not enable_jit_gluon_mla:
-    #     fn_signature["dummyPointerArg"] = "*i32"
+    if not enable_jit_gluon_mla:
+        fn_signature["dummyPointerArg"] = "*i32"
     fn_signature["kv_lora_rank"] = "constexpr"
     fn_signature["qk_rope_head_dim"] = "constexpr"
     fn_signature["kv_group_num"] = "constexpr"
@@ -140,7 +139,6 @@ def _compile_mla(
         "warp_size": 64,
         "name": "mla_n16x4_prefetch_k_paged_64",
     }
-
     kernel_fn = (
         _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
     )
@@ -325,6 +323,7 @@ def _decode_grouped_att_m_fwd(
                 att_lse.stride(1),
                 att_lse.stride(2),
                 block_tables.stride(0),
+                att_out,
                 kv_lora_rank,
                 qk_rope_head_dim,
                 kv_group_num,
