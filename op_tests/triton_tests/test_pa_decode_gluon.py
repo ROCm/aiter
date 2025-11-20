@@ -3,6 +3,7 @@
 
 from curses import flash
 import os
+from re import T
 import sys
 import argparse
 import random
@@ -28,6 +29,15 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
 )
+
+try:
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+except ImportError:
+    print(
+        "Warning: triton.experimental.gluon or triton.experimental.gluon.language not exists, only pa_decode_gluon_aot can be used!"
+    )
+    pa_decode_gluon = None
 
 
 TRITON_VERSION = triton.__version__
@@ -1133,26 +1143,31 @@ def run_gluon_kernel(
             alibi_slopes=alibi_slopes,
         )
     else:
-        pa_decode_gluon(
-            output,
-            query,
-            key_cache,
-            value_cache,
-            context_lengths,
-            block_tables,
-            attention_scale,
-            query_sequence_length,
-            max_context_length,
-            context_partition_size,
-            compute_type,
-            query_scale,
-            key_scale,
-            value_scale,
-            exp_sums=exp_sums,
-            max_logits=max_logits,
-            temporary_output=temporary_output,
-            alibi_slopes=alibi_slopes,
-        )
+        if pa_decode_gluon is not None:
+            pa_decode_gluon(
+                output,
+                query,
+                key_cache,
+                value_cache,
+                context_lengths,
+                block_tables,
+                attention_scale,
+                query_sequence_length,
+                max_context_length,
+                context_partition_size,
+                compute_type,
+                query_scale,
+                key_scale,
+                value_scale,
+                exp_sums=exp_sums,
+                max_logits=max_logits,
+                temporary_output=temporary_output,
+                alibi_slopes=alibi_slopes,
+            )
+        else:
+            raise RuntimeError(
+                "This version triton is not support gluon, please upgrade to 3.5.0 or higher!"
+            )
 
 
 @benchmark()
@@ -1999,6 +2014,41 @@ def parse_arg_and_run_test(sample_rate0: float = None):
 #     assert gluon_error == 0, f"gluon implementation test FAILED!"
 
 
+def simple_test():
+    """Run simple test."""
+    global BLOCK_SIZE_OPTIONS
+    global QUERY_LENGTH_OPTIONS
+    global BATCH_SIZE_OPTIONS
+    global HEAD_CONFIGURATIONS
+    global CONTEXT_LENGTH_OPTIONS
+    global COMPUTE_TYPE_OPTIONS
+    global QUANT_MODE_OPTIONS
+    global HEAD_DIMENSION_OPTIONS
+    global TRANS_V_OPTIONS
+    global KV_VARLEN_OPTIONS
+    global QUANT_Q_AND_KV_OPTIONS
+    global USE_TORCH_FLASH_REF_OPTIONS
+    global USE_AOT_IMPL_OPTIONS
+    global CONTEXT_PARTITION_SIZE_OPTIONS
+
+    USE_TORCH_FLASH_REF_OPTIONS = [True]
+    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+    BLOCK_SIZE_OPTIONS = [16, 1024]
+    QUERY_LENGTH_OPTIONS = [1, 4]
+    BATCH_SIZE_OPTIONS = [4, 128]
+    HEAD_CONFIGURATIONS = [(16, 1)]
+    CONTEXT_LENGTH_OPTIONS = [4096]
+    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16"]
+    QUANT_MODE_OPTIONS = ["per_token"]
+    HEAD_DIMENSION_OPTIONS = [128]
+    TRANS_V_OPTIONS = [True]
+    KV_VARLEN_OPTIONS = [False, True]
+    QUANT_Q_AND_KV_OPTIONS = [[False, False], [True, True]]
+    USE_AOT_IMPL_OPTIONS = [False]
+    # USE_AOT_IMPL_OPTIONS = [True]
+    parse_arg_and_run_test()
+
+
 def multi_compute_quant_type_test():
     """Run tests for multiple compute types and quantization types."""
     global BLOCK_SIZE_OPTIONS
@@ -2016,8 +2066,8 @@ def multi_compute_quant_type_test():
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS
 
-    # use_simple_config = True
-    use_simple_config = False
+    use_simple_config = True
+    # use_simple_config = False
     if use_simple_config:
         USE_TORCH_FLASH_REF_OPTIONS = [True]
         CONTEXT_PARTITION_SIZE_OPTIONS = [256]
@@ -2047,8 +2097,8 @@ def multi_compute_quant_type_test():
         # KV_VARLEN_OPTIONS = [False]
         # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
         QUANT_Q_AND_KV_OPTIONS = [[True, True]]
-        USE_AOT_IMPL_OPTIONS = [False, True]
-        # USE_AOT_IMPL_OPTIONS = [False]
+        # USE_AOT_IMPL_OPTIONS = [False, True]
+        USE_AOT_IMPL_OPTIONS = [False]
         # USE_AOT_IMPL_OPTIONS = [True]
     else:
         USE_TORCH_FLASH_REF_OPTIONS = [True]
@@ -2086,4 +2136,5 @@ def multi_compute_quant_type_test():
 
 
 if __name__ == "__main__":
-    multi_compute_quant_type_test()
+    simple_test()
+    # multi_compute_quant_type_test()

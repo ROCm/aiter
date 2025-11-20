@@ -9,7 +9,11 @@ from typing import List
 
 import triton
 import triton.backends
-from triton.experimental import gluon
+
+try:
+    from triton.experimental.gluon._runtime import GluonASTSource
+except ImportError:
+    print("Warning: GluonASTSource is not in triton.experimental.gluon._runtime!")
 
 
 @dataclass
@@ -267,9 +271,6 @@ def compile_gluon_kernel(args: CompileGluonArgs):
     for h in hints.values():
         assert h in [1, 16], f"Only 1 and 16 are valid hints, got {h}"
     attrs = {k: [["tt.divisibility", 16]] for k, v in hints.items() if v == 16}
-
-    # Use GluonASTSource for compilation
-    from triton.experimental.gluon._runtime import GluonASTSource
 
     src = GluonASTSource(
         fn=kernel, constexprs=constants, signature=signature, attrs=attrs

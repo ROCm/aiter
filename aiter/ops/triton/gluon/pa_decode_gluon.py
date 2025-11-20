@@ -6,13 +6,23 @@ import os
 import sys
 import math
 from typing import Optional, Dict, Tuple
+import torch
+import aiter
 
 import triton
 import triton.language as tl
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
-import torch
-import aiter
+
+GLUON_JIT_KERNEL_ENABLED = True
+try:
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+except ImportError:
+    print(
+        "Warning: triton.experimental.gluon or triton.experimental.gluon.language not exists, gluon can only be used in triton AOT mode!"
+    )
+    gluon = triton
+    gl = tl
+    GLUON_JIT_KERNEL_ENABLED = False
 
 
 def parse_version(version_str):
@@ -2575,6 +2585,11 @@ def pa_decode_gluon(
     dict
         Dictionary containing timing information and intermediate tensors
     """
+    if not GLUON_JIT_KERNEL_ENABLED:
+        raise RuntimeError(
+            "This version triton is not support gluon jit mode, please upgrade to 3.5.0 or higher!"
+        )
+
     # Extract tensor dimensions
     num_sequences = query.shape[0]
     num_query_heads_total = query.shape[1]

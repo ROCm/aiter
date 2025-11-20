@@ -20,12 +20,22 @@ from aiter.test_common import benchmark
 from csrc.cpp_itfs.utils import (
     BUILD_DIR,
 )
+
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     pa_decode_gluon,
 )
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
 )
+
+try:
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+except ImportError:
+    print(
+        "Warning: triton.experimental.gluon or triton.experimental.gluon.language not exists, only pa_decode_gluon_aot can be used!"
+    )
+    pa_decode_gluon = None
 
 
 TRITON_VERSION = triton.__version__
@@ -127,26 +137,27 @@ def run_gluon_kernel(
             # run_compiled_kernel=False,
         )
     else:
-        pa_decode_gluon(
-            output,
-            query,
-            key_cache,
-            value_cache,
-            context_lengths,
-            block_tables,
-            attention_scale,
-            query_sequence_length,
-            max_context_length,
-            context_partition_size,
-            compute_type,
-            query_scale,
-            key_scale,
-            value_scale,
-            exp_sums=exp_sums,
-            max_logits=max_logits,
-            temporary_output=temporary_output,
-            alibi_slopes=alibi_slopes,
-        )
+        if pa_decode_gluon is not None:
+            pa_decode_gluon(
+                output,
+                query,
+                key_cache,
+                value_cache,
+                context_lengths,
+                block_tables,
+                attention_scale,
+                query_sequence_length,
+                max_context_length,
+                context_partition_size,
+                compute_type,
+                query_scale,
+                key_scale,
+                value_scale,
+                exp_sums=exp_sums,
+                max_logits=max_logits,
+                temporary_output=temporary_output,
+                alibi_slopes=alibi_slopes,
+            )
 
 
 @benchmark()
@@ -941,7 +952,7 @@ def prebuild_pa_decode_gluon_aot_so():
     print(f"Cleaning current directory cache: {current_dir}/{MD_NAME}_*")
     clean_current_dir_cache_cmd = ["sh", "-c", f"rm -rf {current_dir}/{MD_NAME}_*"]
     result = subprocess.run(
-        clean_current_dir_cache_cmd, capture_output=True, text=True, timeout=10
+        clean_current_dir_cache_cmd, capture_output=True, text=True, timeout=100
     )
     if result.returncode != 0 and result.stderr:
         print(f"Warning: {result.stderr}")
@@ -953,7 +964,7 @@ def prebuild_pa_decode_gluon_aot_so():
     # Get the total size of so files in aiter build directory
     try:
         du_result = subprocess.run(
-            ["du", "-sh", BUILD_DIR], capture_output=True, text=True, timeout=10
+            ["du", "-sh", BUILD_DIR], capture_output=True, text=True, timeout=100
         )
         if du_result.returncode == 0:
             total_size_of_so_files = du_result.stdout.split()[0]
@@ -970,7 +981,7 @@ def prebuild_pa_decode_gluon_aot_so():
             ["sh", "-c", f"find {BUILD_DIR} -type f -name '*.so' | wc -l"],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=100,
         )
         if so_count_result.returncode == 0:
             number_of_so_files = so_count_result.stdout.strip()
