@@ -9,18 +9,21 @@ to load and launch Triton-compiled kernels from HSACO binary files.
 import os
 import sys
 from typing import List, Tuple
+import logging
+
+logger = logging.getLogger("aiter")
 
 try:
     from hip import hip
 except ImportError:
-    print("Error: hip-python not found. Please install: pip install hip-python")
+    logger.info("Error: hip-python not found. Please install: pip install hip-python")
     sys.exit(1)
 
 try:
     import torch
 except ImportError:
     torch = None
-    print("Warning: PyTorch not found. Tensor support will be limited.")
+    logger.info("Warning: PyTorch not found. Tensor support will be limited.")
 
 
 def hip_check(result):
@@ -55,7 +58,7 @@ def read_hsaco(path: str) -> bytes:
     with open(path, "rb") as f:
         data = f.read()
 
-    print(f"Loaded HSACO file: {len(data)} bytes from {path}")
+    logger.info(f"Loaded HSACO file: {len(data)} bytes from {path}")
     return data
 
 
@@ -69,7 +72,7 @@ class HsacoLauncher:
         # Get device count
         err, device_count = hip.hipGetDeviceCount()
         hip_check(err)
-        print(f"Found {device_count} HIP device(s)")
+        logger.info(f"Found {device_count} HIP device(s)")
 
         # Set device 0
         err = hip.hipSetDevice(0)
@@ -79,7 +82,7 @@ class HsacoLauncher:
         props = hip.hipDeviceProp_t()
         err = hip.hipGetDeviceProperties(props, 0)
         hip_check(err)
-        print(f"Using device: {props.gcnArchName}")
+        logger.info(f"Using device: {props.gcnArchName}")
 
         self.module = None
         self.kernel_func = None
@@ -93,7 +96,7 @@ class HsacoLauncher:
         """
         err, self.module = hip.hipModuleLoadData(hsaco_data)
         hip_check(err)
-        print("Module loaded successfully")
+        logger.info("Module loaded successfully")
 
     def get_function(self, kernel_name: str):
         """
@@ -116,7 +119,7 @@ class HsacoLauncher:
                 f"Failed to get kernel function '{kernel_name}': {error_string}"
             )
 
-        print(f"Kernel function retrieved: {kernel_name}")
+        logger.info(f"Kernel function retrieved: {kernel_name}")
 
     def launch_kernel(
         self,
@@ -175,7 +178,7 @@ class HsacoLauncher:
             else:
                 raise TypeError(f"Unsupported argument type: {type(arg)}")
 
-        print(
+        logger.info(
             f"Launching kernel with grid=({grid[0]},{grid[1]},{grid[2]}) "
             f"block=({block[0]},{block[1]},{block[2]}) "
             f"shared_mem={shared_mem_bytes} bytes"
@@ -191,7 +194,7 @@ class HsacoLauncher:
             extra=tuple(args),
         )
         hip_check(err)
-        print("Kernel launched successfully")
+        logger.info("Kernel launched successfully")
 
     def unload_module(self):
         """Unload the HIP module"""
@@ -257,7 +260,7 @@ def launch_triton_kernel(
         return 0
 
     except Exception as e:
-        print(f"Error launching kernel: {e}")
+        logger.info(f"Error launching kernel: {e}")
         import traceback
 
         traceback.print_exc()
