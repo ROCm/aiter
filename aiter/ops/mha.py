@@ -276,6 +276,9 @@ def cmdGenFunc_mha_varlen_fwd(
     block_table: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
@@ -294,9 +297,11 @@ def cmdGenFunc_mha_varlen_fwd(
             md_name += "_bf16"
             filter_fwd += "bf16*"
         elif q.dtype == dtypes.fp8:
-            # only support bf16 out for fp8 input
-            md_name += "_fp8bf16"
-            filter_fwd += "fp8bf16*"
+            if out is None or out.dtype == dtypes.bf16:
+                md_name += "_fp8bf16"
+                filter_fwd += "fp8bf16*"
+            else:
+                raise NotImplementedError("Unsupported output dtype for FP8 MHA")
         if 0.0 < logits_soft_cap:
             md_name += "_logits"
             filter_fwd += "_logits*"
@@ -336,6 +341,13 @@ def cmdGenFunc_mha_varlen_fwd(
         else:
             md_name += "_skip"
             filter_fwd += "_skip*"
+        if q_descale is None or k_descale is None or v_descale is None:
+            md_name += "_nqscale"
+            filter_fwd += "_nqscale*"
+        else:
+            # only support per-tensor quantization for now
+            md_name += "_pertensor"
+            filter_fwd += "_pertensor*"
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
             "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
@@ -429,6 +441,9 @@ def gen_mha_varlen_fwd_fake_tensor(
     block_table: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
@@ -493,6 +508,9 @@ def mha_varlen_fwd(
     block_table: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
@@ -1907,6 +1925,9 @@ def _flash_attn_varlen_forward(
     window_size_right: int = -1,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     return_softmax: bool = False,
     how_v3_bf16_cvt: Optional[int] = 1,
@@ -2010,6 +2031,9 @@ def _flash_attn_varlen_forward(
             block_table=block_table,
             bias=bias,
             alibi_slopes=alibi_slopes,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             gen=None,
             cu_seqlens_q_padded=cu_seqlens_q_padded,
             cu_seqlens_k_padded=cu_seqlens_k_padded,
@@ -2270,6 +2294,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             bias=bias,
             alibi_slopes=alibi_slopes,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
             how_v3_bf16_cvt=how_v3_bf16_cvt,
@@ -2765,6 +2792,9 @@ def flash_attn_varlen_fp8_pertensor_func(
     q,
     k,
     v,
+    q_descale,
+    k_descale,
+    v_descale,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -2803,6 +2833,9 @@ def flash_attn_varlen_fp8_pertensor_func(
         window_size_right=int(window_size[1]),
         bias=None,
         alibi_slopes=None,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         return_lse=False,
         return_softmax=False,
     )

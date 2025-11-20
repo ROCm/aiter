@@ -93,59 +93,60 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
         bias_ptr = alibi_slopes.data_ptr();
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
-    
+
     return mha_fwd_args{q.data_ptr(),
-                         k.data_ptr(),
-                         v.data_ptr(),
-                         bias_ptr,
-                         has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
-                         has_lse ? softmax_lse.data_ptr() : nullptr,
-                         out.data_ptr(),
-                         cu_seqlens_q.data_ptr(), // seqstart_q_ptr (cumulative physical)
-                         cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k_ptr
-                         nullptr, // seqlen_q_ptr (per-sequence logical, not used here)
-                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr
-                         nullptr, // cu_seqlen_q_ptr (not used in this mode)
-                         nullptr, // cu_seqlen_k_ptr (not used in this mode)
-                         total_q,
-                         total_k,
-                         b,
-                         max_seqlen_q,
-                         d,             // hdim_q
-                         d_v,           // hdim_v
-                         h,             // nhead_q
-                         h_k,           // nhead_k
-                         softmax_scale, // scale_s
-                         1,             // scale_p
-                         1,             // scale_o
-                         logits_soft_cap,
-                         stride_q,
-                         stride_k,
-                         stride_v,
-                         stride_bias,
-                         stride_randval,
-                         stride_o,
-                         nhead_stride_q,
-                         nhead_stride_k,
-                         nhead_stride_v,
-                         nhead_stride_bias,
-                         nhead_stride_randval,
-                         nhead_stride_lse,
-                         nhead_stride_o,
-                         batch_stride_q,
-                         batch_stride_k,
-                         batch_stride_v,
-                         batch_stride_bias,
-                         batch_stride_randval,
-                         batch_stride_lse,
-                         batch_stride_o,
-                         mask.left,
-                         mask.right,
-                         static_cast<ck_tile::index_t>(mask.type),
-                         min_seqlen_q,
-                         p_dropout,
-                         has_dropout_randval,
-                         drop_seed_offset};
+                        k.data_ptr(),
+                        v.data_ptr(),
+                        bias_ptr,
+                        nullptr, // q_descale_ptr
+                        nullptr, // k_descale_ptr
+                        nullptr, // v_descale_ptr
+                        has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
+                        has_lse ? softmax_lse.data_ptr() : nullptr,
+                        out.data_ptr(),
+                        cu_seqlens_q.data_ptr(), // seqstart_q_ptr (cumulative physical)
+                        cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k_ptr
+                        nullptr, // seqlen_q_ptr (per-sequence logical, not used here)
+                        seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr
+                        nullptr, // cu_seqlen_q_ptr (not used in this mode)
+                        nullptr, // cu_seqlen_k_ptr (not used in this mode)
+                        total_q,
+                        total_k,
+                        b,
+                        max_seqlen_q,
+                        d,             // hdim_q
+                        d_v,           // hdim_v
+                        h,             // nhead_q
+                        h_k,           // nhead_k
+                        softmax_scale, // scale_s
+                        logits_soft_cap,
+                        stride_q,
+                        stride_k,
+                        stride_v,
+                        stride_bias,
+                        stride_randval,
+                        stride_o,
+                        nhead_stride_q,
+                        nhead_stride_k,
+                        nhead_stride_v,
+                        nhead_stride_bias,
+                        nhead_stride_randval,
+                        nhead_stride_lse,
+                        nhead_stride_o,
+                        batch_stride_q,
+                        batch_stride_k,
+                        batch_stride_v,
+                        batch_stride_bias,
+                        batch_stride_randval,
+                        batch_stride_lse,
+                        batch_stride_o,
+                        mask.left,
+                        mask.right,
+                        static_cast<ck_tile::index_t>(mask.type),
+                        min_seqlen_q,
+                        p_dropout,
+                        has_dropout_randval,
+                        drop_seed_offset};
 }
 
 
@@ -341,7 +342,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
             aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
     }
     std::optional<const at::Tensor> seqlens_k = std::nullopt;
-    
+
     if (max_seqlen_k > 0) {
         auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
@@ -383,6 +384,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                                 mask.type,
                                 bias_type,
                                 has_lse,
+                                quant_scale_enum::no_scale,
                                 true,
                                 how_v3_bf16_cvt);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd 3");
@@ -392,7 +394,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
-    
+
     return {out, softmax_lse, p, rng_state};
 }
 
