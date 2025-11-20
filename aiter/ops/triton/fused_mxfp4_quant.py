@@ -2,11 +2,12 @@ import torch
 import triton
 import triton.language as tl
 from typing import Optional
-
+from aiter.utility import dtypes
 from aiter.ops.triton._triton_kernels.fused_mxfp4_quant import (
     _rmsmorm_op,
     _fused_rms_mxfp4_quant_kernel,
     _fused_flatten_mxfp4_quant,
+    _fused_dynamic_mxfp4_quant_moe_sort_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -173,3 +174,96 @@ def fused_flatten_mxfp4_quant(
     )
 
     return out, out_block_scales
+
+
+def fused_dynamic_mxfp4_quant_moe_sort(
+    x: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+    block_size: int = 32,
+    scaling_mode: str = "even",
+):
+    """
+    Fusing dynamic_mxfp4_quant and moe_mxfp4_sort
+
+    Args:
+        x: The input tensor, typically fp16 or bf16.
+        scaling_mode: The method to calculate MX block scaling.
+            - "even" (default): `even_round` in `quark.torch.quantization.utils`.
+            - etc.
+        sorted_ids: The indices used for sorting.
+
+    shuffle is not supported here
+
+    Returns:
+        A tuple of (x_fp4, blockscale_e8m0).
+    """
+    # Assume x is 2D-Tensor for now
+    M, N = x.shape
+
+    assert (N // 2) % 2 == 0
+
+    # This is fixed by spec for MXFP4. Do not tune this.
+    # For performance, perhaps, we should look at passing multiple of 32 column blocks
+    # that a triton program can process
+    MXFP4_QUANT_BLOCK_SIZE = 32
+
+    x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+    # scaleM = triton.cdiv(M, 32) * 32
+    scaleN_valid = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
+    # scaleN = triton.cdiv(scaleN_valid, 8) * 8
+    scaleN = scaleN_valid
+
+    BLOCK_SIZE_Mx = 128
+
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 8
+    BLOCK_SIZE_M_u32, BLOCK_SIZE_N_u32 = 16, 4
+
+    M_i, N_i = M, scaleN
+    M_o, N_o = sorted_ids.shape[0], N_i
+    assert (N_i // 2) % 2 == 0
+    assert block_size % BLOCK_SIZE_M == 0
+
+    blockscale_e8m0_sorted = torch.empty(
+        (
+            triton.cdiv(M_o, BLOCK_SIZE_M),
+            triton.cdiv(N_o, BLOCK_SIZE_N),
+            BLOCK_SIZE_N_u32,
+            BLOCK_SIZE_M_u32,
+            4,
+        ),
+        dtype=torch.uint8,
+        device=x.device,
+    )  # .fill_(0)
+
+    num_pid = triton.cdiv(M, BLOCK_SIZE_Mx) * scaleN + triton.cdiv(
+        M_o, BLOCK_SIZE_M
+    ) * triton.cdiv(N_i, BLOCK_SIZE_N)
+    _fused_dynamic_mxfp4_quant_moe_sort_kernel[(num_pid,)](
+        x,
+        x_fp4,
+        sorted_ids,
+        num_valid_ids,
+        blockscale_e8m0_sorted,
+        M,
+        N,
+        scaleN,
+        *x.stride(),
+        *x_fp4.stride(),
+        *blockscale_e8m0_sorted.stride(),
+        token_num=token_num,
+        M_i=M_i,
+        N_i=N_i,
+        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+        BLOCK_SIZE_Mx=BLOCK_SIZE_Mx,
+        BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
+        BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
+        TOPK=topk,
+    )
+
+    return (
+        x_fp4.view(dtypes.fp4x2),
+        blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o),
+    )

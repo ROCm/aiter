@@ -3,6 +3,7 @@ import pytest
 from aiter.ops.triton.fused_mxfp4_quant import (
     fused_flatten_mxfp4_quant,
     fused_rms_mxfp4_quant,
+    fused_dynamic_mxfp4_quant_moe_sort,
 )
 from op_tests.triton_tests.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
 from op_tests.triton_tests.test_gemm_afp4wfp4 import (
@@ -10,7 +11,10 @@ from op_tests.triton_tests.test_gemm_afp4wfp4 import (
     e8m0_to_f32,
     SCALE_GROUP_SIZE,
 )
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 from op_tests.triton_tests.test_gemm_afp4wfp4 import shuffle_scales, un_shuffle_scales
+from aiter.ops.quant import per_1x32_f4_quant_hip
+from aiter.utility.fp4_utils import moe_mxfp4_sort, dynamic_mxfp4_quant
 
 torch.manual_seed(0)
 
@@ -96,6 +100,8 @@ def generate_fused_rms_quant_data(
 @pytest.mark.parametrize("N", [32, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_flatten_quant(B: int, M: int, N: int, dtype):
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     x = torch.randn((B, M, N), dtype=dtype, device="cuda").transpose(0, 1)
@@ -135,6 +141,8 @@ def test_fused_rms_quant(
     shuffle: bool,
     scale_shuffle_padding: bool,
 ):
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     x1, x2, rms1_w, rms2_w, resid1 = generate_fused_rms_quant_data(
         x1_shape=(M, N1),
@@ -185,3 +193,138 @@ def test_fused_rms_quant(
     res_fp32_triton = convert_mxfp4_to_fp32(x1_fp4_triton, x1_scales_triton)
 
     torch.testing.assert_close(res_fp32_torch, res_fp32_triton)
+
+
+def run_fused_dynamic_mxfp4_quant_moe_sort_ref(
+    x,
+    sorted_ids,
+    token_num,
+    topk,
+    q_dtype_a,
+    num_local_tokens,
+    num_valid_ids,
+    block_size_M,
+):
+    x_fp4, x_scales_not_sorted = per_1x32_f4_quant_hip(
+        x,
+        scale=None,
+        quant_dtype=q_dtype_a,
+        num_rows=num_local_tokens,
+        num_rows_factor=topk,
+    )
+    x_scales = moe_mxfp4_sort(
+        x_scales_not_sorted[: token_num * topk, :].view(token_num, topk, -1),
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token_num,
+        block_size=block_size_M,
+    )
+    return x_fp4, x_scales, x_scales_not_sorted
+
+
+def run_fused_dynamic_mxfp4_quant_moe_sort_triton(
+    x,
+    sorted_ids,
+    token_num,
+    topk,
+    q_dtype_a,
+    num_local_tokens,
+    num_valid_ids,
+    block_size_M,
+):
+    x_fp4, x_scales = fused_dynamic_mxfp4_quant_moe_sort(
+        x,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token_num,
+        topk=topk,
+        block_size=block_size_M,
+    )
+    return x_fp4, x_scales
+
+
+@pytest.mark.parametrize("hidden_dim", [256])
+@pytest.mark.parametrize("token_num", [1, 32, 1024])
+@pytest.mark.parametrize(
+    "token_num_sort, num_valid_ids_0", [(1, 1), (32, 32), (1024, 1024), (1024, 512)]
+)
+@pytest.mark.parametrize("topk", [1, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fused_dynamic_mxfp4_quant_moe_sort(
+    hidden_dim: int,
+    token_num: int,
+    token_num_sort: int,
+    num_valid_ids_0: int,
+    topk: int,
+    dtype,
+):
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+    q_dtype_a = torch.float4_e2m1fn_x2
+    num_local_tokens = None
+    num_valid_ids = torch.zeros(2, dtype=torch.int64, device="cuda")
+    num_valid_ids[0] = num_valid_ids_0
+    num_valid_ids[1] = token_num
+    block_size_M = 128
+
+    topk_ids = torch.randint(0, topk, (token_num_sort,), device="cuda")
+    topk_ids, _ = torch.sort(topk_ids)
+    sorted_ids = torch.randint(0, token_num, (token_num_sort,), device="cuda")
+    sorted_ids = (topk_ids << 24) | sorted_ids
+
+    x = torch.randn((token_num, topk, hidden_dim), dtype=dtype, device="cuda") / 20
+    x = x.view(-1, hidden_dim)
+
+    x_fp4_ref, x_scales_ref, x_scales_ref_not_sorted = (
+        run_fused_dynamic_mxfp4_quant_moe_sort_ref(
+            x,
+            sorted_ids,
+            token_num,
+            topk,
+            q_dtype_a,
+            num_local_tokens,
+            num_valid_ids,
+            block_size_M,
+        )
+    )
+
+    x_fp4_triton, x_scales_triton = run_fused_dynamic_mxfp4_quant_moe_sort_triton(
+        x,
+        sorted_ids,
+        token_num,
+        topk,
+        q_dtype_a,
+        num_local_tokens,
+        num_valid_ids,
+        block_size_M,
+    )
+
+    tol = 0.1
+    x_scales_ref = x_scales_ref[: num_valid_ids[0]]
+    x_scales_triton = x_scales_triton[: num_valid_ids[0]]
+    torch.testing.assert_close(
+        x_scales_ref.view(torch.uint8),
+        x_scales_triton.view(torch.uint8),
+        atol=tol,
+        rtol=tol,
+    )
+    # torch.testing.assert_close(x_fp4_ref.view(torch.uint8), x_fp4_triton.view(torch.uint8), atol=tol, rtol=tol)
+
+    _, x_scales_ref_triton_not_sorted = dynamic_mxfp4_quant(x)
+    x_scales_ref_triton_not_sorted = x_scales_ref_triton_not_sorted[
+        : x_scales_ref_not_sorted.shape[0], : x_scales_ref_not_sorted.shape[1]
+    ]
+    torch.testing.assert_close(
+        x_scales_ref_not_sorted.view(torch.uint8),
+        x_scales_ref_triton_not_sorted.view(torch.uint8),
+        atol=tol,
+        rtol=tol,
+    )
+
+    x_ref = convert_mxfp4_to_fp32(
+        x_fp4_ref.view(torch.uint8), x_scales_ref_not_sorted.view(torch.uint8)
+    )
+    x_triton = convert_mxfp4_to_fp32(
+        x_fp4_triton.view(torch.uint8), x_scales_ref_triton_not_sorted.view(torch.uint8)
+    )
+    torch.testing.assert_close(x_ref, x_triton, atol=tol, rtol=tol)
