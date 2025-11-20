@@ -327,7 +327,8 @@ l_quant = [
     # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16w4
 ]
-l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
+# l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
+l_act = [aiter.ActivationType.Swiglu]
 l_doweight_stage1 = [False, True][:1]
 l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
 l_preshuffle = [False, True]

@@ -659,6 +659,7 @@ def get_2stage_cfgs(
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
     ):
+        aiter.logger.info('use ck_tiles')
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
