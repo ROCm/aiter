@@ -353,11 +353,13 @@ def compile_hsaco(
     metadata.update(extra_metadata or {})
     for key, value in constants.items():
         metadata[key] = str(value)
-    os.makedirs(f"{BUILD_DIR}/{metadata["gcnArchName"]}", exist_ok=True)
-    with open(f"{BUILD_DIR}/{metadata["gcnArchName"]}/{func_name}.hsaco", "wb") as f:
+    build_dir = f"{BUILD_DIR}/{metadata["gcnArchName"]}"
+    if not os.path.exists(build_dir):
+        os.makedirs(build_dir, exist_ok=True)
+    with open(f"{build_dir}/{func_name}.hsaco", "wb") as f:
         f.write(hsaco)
 
-    with open(f"{BUILD_DIR}/{metadata["gcnArchName"]}/{func_name}.json", "w") as f:
+    with open(f"{build_dir}/{func_name}.json", "w") as f:
         json.dump(metadata, f)
     return func_name
 
