@@ -18,7 +18,7 @@ def _fused_indices_and_gather_kernel(
     stridex1: tl.int32,
     strideop0: tl.int32,
     strideop1: tl.int32,
-    strideidx: tl.int32,:
+    strideidx: tl.int32,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
