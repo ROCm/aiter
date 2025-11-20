@@ -13,12 +13,26 @@ import torch
 import triton
 import triton.language as tl
 
-from triton.tools.compile import compile_kernel, CompileArgs
-from csrc.cpp_itfs.torch_utils import torch_to_c_types
+GLUON_AOT_COMPILE_ENABLED = True
+try:
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+except ImportError:
+    print(
+        "Warning: triton.experimental.gluon or triton.experimental.gluon.language not exists, pa_decode_gluon_aot cannot use compile mode!"
+    )
+    GLUON_AOT_COMPILE_ENABLED = False
+
+try:
+    from triton.tools.compile import compile_kernel, CompileArgs
+except ImportError:
+    print("Warning: compile_kernel or CompileArgs is not in triton.tools.compile!")
+
 from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
     compile_gluon_kernel,
     CompileGluonArgs,
 )
+from csrc.cpp_itfs.torch_utils import torch_to_c_types
 from csrc.cpp_itfs.utils import (
     compile_template_op,
     AITER_CORE_DIR,
@@ -93,6 +107,11 @@ def compile(
         )
 
     if not_built(func_name):
+        if not GLUON_AOT_COMPILE_ENABLED:
+            raise RuntimeError(
+                "This version triton is not support gluon aot compile, please upgrade to 3.5.0 or higher!"
+            )
+
         kv_compute_block_size = 256
         waves_per_eu = 1
         # Select kernel implementation based on block size
