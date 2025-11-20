@@ -27,6 +27,7 @@ run_gfx950_fwd_v3() {
     for seqlen_k in 512 700 1023 1058; do
 
     $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=$head_dim -d_v=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=$head_dim -d_v=128 -s=$seqlen_q,$seqlen_k -s_k=$seqlen_k,0 -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
     $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=$head_dim -d_v=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
     $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=$head_dim -d_v=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
 
@@ -58,6 +59,7 @@ run_gfx942_fwd_v3() {
     for v3_bf16_cvt in 0 1 2; do
 
     $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=128 -s=$seqlen_q,$seqlen_k -s_k=$seqlen_k,0 -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
     $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
     $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=128 -s=$seqlen_q -s_k=$seqlen_k -iperm=$i_perm -operm=$o_perm -mask=$mask -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
 
