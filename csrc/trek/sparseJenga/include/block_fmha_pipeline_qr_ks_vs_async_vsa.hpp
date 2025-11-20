@@ -391,10 +391,10 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
                 });
                 
             }
-            __shared__ int printed_flag;
-            if (blockIdx.x == 0 && threadIdx.x == 0 && i_total_loops==1000) {
-                printed_flag = 100;
-            }
+            //__shared__ int printed_flag;
+            //if (blockIdx.x == 0 && threadIdx.x == 0 && i_total_loops==1000) {
+            //    printed_flag = 100;
+            //}
 
             // TODO: this to fix a bug when loop smaller than 2,
             // the following fence/barrier will be scheduled inside 1st loop
