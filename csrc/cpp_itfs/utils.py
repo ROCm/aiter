@@ -14,6 +14,8 @@ import binascii
 import hashlib
 import logging
 import time
+import inspect
+import json
 
 
 logger = logging.getLogger("aiter")
@@ -142,8 +144,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
     start_ts = time.perf_counter()
 
     def main_func(includes=None, sources=None, cxxflags=None):
-        if AITER_LOG_MORE >= 2:
-            logger.info(f"start build {sub_build_dir}")
+        logger.info(f"start build {sub_build_dir}")
         if includes is None:
             includes = []
         if sources is None:
@@ -217,17 +218,13 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         with open(f"{sub_build_dir}/Makefile", "w") as f:
             f.write(makefile_file)
         subprocess.run(
-            f"cd {sub_build_dir} && make build -j{len(sources)}",
-            shell=True,
-            capture_output=AITER_LOG_MORE < 2,
-            check=True,
+            f"cd {sub_build_dir} && make build -j{len(sources)}", shell=True, check=True
         )
 
     def final_func():
-        if AITER_LOG_MORE >= 2:
-            logger.info(
-                f"finish build {sub_build_dir}, cost {time.perf_counter()-start_ts:.8f}s"
-            )
+        logger.info(
+            f"finish build {sub_build_dir}, cost {time.perf_counter()-start_ts:.8f}s"
+        )
 
     main_func = partial(
         main_func, includes=includes, sources=sources, cxxflags=cxxflags
@@ -281,9 +278,8 @@ def compile_template_op(
             sources = []
         if cxxflags is None:
             cxxflags = []
-        if AITER_LOG_MORE >= 2:
-            logger.info(f"compile_template_op {func_name = } with {locals()}...")
         src_file = src_template.render(func_name=func_name, **kwargs)
+        logger.info(f"compile_template_op {func_name = } with {locals()}...")
         compile_lib(src_file, folder, includes, sources, cxxflags)
     return run_lib(func_name, folder)
 
@@ -299,3 +295,68 @@ def transfer_hsaco(hsaco_path):
 
 def str_to_bool(s):
     return True if s.lower() == "true" else False
+
+
+def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
+    import triton
+    import triton.language as tl
+
+    if not isinstance(kernel, triton.JITFunction):
+        raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
+    sig = inspect.signature(kernel.fn)
+
+    constant_indices = []
+    for idx, param in enumerate(sig.parameters.values()):
+        if param.annotation == tl.constexpr:
+            constant_indices.append(idx)
+    ccinfo = kernel.warmup(*args, grid=grid, **kwargs)
+    constants = {}
+    keys = list(sig.parameters.keys())
+    for idx, arg in enumerate(args):
+        if idx in constant_indices:
+            constants[keys[idx]] = arg
+    extra_metadata = {}
+    extra_metadata["waves_per_eu"] = kwargs.get("waves_per_eu", 1)
+    extra_metadata["num_stages"] = kwargs.get("num_stages", 1)
+    extra_metadata["num_warps"] = kwargs.get("num_warps", 1)
+    extra_metadata["num_ctas"] = kwargs.get("num_ctas", 1)
+    return compile_hsaco(kernel.fn.__name__, ccinfo.asm['hsaco'], ccinfo.metadata.shared, ccinfo.metadata.target.arch, constants, extra_metadata)
+
+
+def compile_hsaco(kernel_name, hsaco, shared=0, gcnArchName=GPU_ARCH, constants={}, extra_metadata={}):
+    constants = OrderedDict(constants)
+    func_name = get_default_func_name(kernel_name, tuple(constants.values()))
+    metadata = {}
+    metadata["shared"] = shared
+    metadata["name"] = kernel_name
+    metadata["gcnArchName"] = gcnArchName
+    metadata.update(extra_metadata)
+    for key, value in constants.items():
+        metadata[key] = str(value)
+    os.makedirs(f"{BUILD_DIR}/{metadata["gcnArchName"]}", exist_ok=True)
+    with open(f"{BUILD_DIR}/{metadata["gcnArchName"]}/{func_name}.hsaco", "wb") as f:
+        f.write(hsaco)
+
+    with open(f"{BUILD_DIR}/{metadata["gcnArchName"]}/{func_name}.json", "w") as f:
+        json.dump(metadata, f)
+    return func_name
+
+
+@lru_cache(maxsize=None)
+def get_hsaco_launcher(hsaco_name, kernel_name):
+    from csrc.cpp_itfs.hsaco_launcher import HsacoLauncher, read_hsaco
+    hsaco = read_hsaco(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.hsaco")
+    hsaco_launcher = HsacoLauncher()
+    hsaco_launcher.load_module(hsaco)
+    hsaco_launcher.get_function(kernel_name)
+    return hsaco_launcher
+
+
+def run_hsaco(func_name, *args, grid=(1, 1, 1), block=(256, 1, 1), stream=None, constants={}):
+    constants = OrderedDict(constants)
+    hsaco_name = get_default_func_name(func_name, tuple(constants.values()))
+    with open(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.json", "r") as f:
+        metadata = json.load(f)
+    kernel_name = metadata["name"]
+    hsaco_launcher = get_hsaco_launcher(hsaco_name, kernel_name)
+    hsaco_launcher.launch_kernel(args, grid=grid, block=block, shared_mem_bytes=metadata["shared"], stream=stream)
