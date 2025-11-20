@@ -112,8 +112,10 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
         //     sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias);
         // }
     }
+    // else if((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) &&
+    //         (WQ.dtype() == torch_fp4x2)) // a16w4
     else if((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) &&
-            (WQ.dtype() == torch_fp4x2)) // a16w4
+            true) // a16w4
     {
         // if (Y.dtype() == at::ScalarType::Half)
         // {
