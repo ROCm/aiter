@@ -52,7 +52,7 @@ def read_hsaco(path: str) -> bytes:
     if not os.path.exists(path):
         raise FileNotFoundError(f"HSACO file not found: {path}")
 
-    with open(path, 'rb') as f:
+    with open(path, "rb") as f:
         data = f.read()
 
     print(f"Loaded HSACO file: {len(data)} bytes from {path}")
@@ -105,12 +105,16 @@ class HsacoLauncher:
         if self.module is None:
             raise RuntimeError("Module not loaded. Call load_module() first.")
 
-        err, self.kernel_func = hip.hipModuleGetFunction(self.module, kernel_name.encode('utf-8'))
+        err, self.kernel_func = hip.hipModuleGetFunction(
+            self.module, kernel_name.encode("utf-8")
+        )
         if err != hip.hipError_t.hipSuccess:
             error_string = hip.hipGetErrorString(err)
             if isinstance(error_string, tuple):
                 error_string = error_string[1]
-            raise RuntimeError(f"Failed to get kernel function '{kernel_name}': {error_string}")
+            raise RuntimeError(
+                f"Failed to get kernel function '{kernel_name}': {error_string}"
+            )
 
         print(f"Kernel function retrieved: {kernel_name}")
 
@@ -120,7 +124,7 @@ class HsacoLauncher:
         grid: Tuple[int, int, int] = (1, 1, 1),
         block: Tuple[int, int, int] = (256, 1, 1),
         shared_mem_bytes: int = 0,
-        stream=None
+        stream=None,
     ):
         """
         Launch the kernel
@@ -133,7 +137,9 @@ class HsacoLauncher:
             stream: HIP stream (None for default stream)
         """
         if self.kernel_func is None:
-            raise RuntimeError("Kernel function not retrieved. Call get_function() first.")
+            raise RuntimeError(
+                "Kernel function not retrieved. Call get_function() first."
+            )
 
         # Convert stream to hipStream_t if None
         if stream is None:
@@ -169,9 +175,11 @@ class HsacoLauncher:
             else:
                 raise TypeError(f"Unsupported argument type: {type(arg)}")
 
-        print(f"Launching kernel with grid=({grid[0]},{grid[1]},{grid[2]}) "
-              f"block=({block[0]},{block[1]},{block[2]}) "
-              f"shared_mem={shared_mem_bytes} bytes")
+        print(
+            f"Launching kernel with grid=({grid[0]},{grid[1]},{grid[2]}) "
+            f"block=({block[0]},{block[1]},{block[2]}) "
+            f"shared_mem={shared_mem_bytes} bytes"
+        )
         # Launch the kernel
         err = hip.hipModuleLaunchKernel(
             self.kernel_func,
@@ -180,7 +188,7 @@ class HsacoLauncher:
             shared_mem_bytes,
             stream,
             None,
-            extra=tuple(args)
+            extra=tuple(args),
         )
         hip_check(err)
         print("Kernel launched successfully")
@@ -197,7 +205,7 @@ class HsacoLauncher:
         """Cleanup on destruction"""
         try:
             self.unload_module()
-        except:
+        except Exception:
             pass
 
 
@@ -208,7 +216,7 @@ def launch_triton_kernel(
     grid: Tuple[int, int, int] = (1, 1, 1),
     block: Tuple[int, int, int] = (256, 1, 1),
     shared_mem_bytes: int = 0,
-    stream=None
+    stream=None,
 ) -> int:
     """
     Launch a Triton kernel from HSACO binary data
@@ -240,7 +248,7 @@ def launch_triton_kernel(
             grid=grid,
             block=block,
             shared_mem_bytes=shared_mem_bytes,
-            stream=stream
+            stream=stream,
         )
 
         # Cleanup
@@ -251,6 +259,7 @@ def launch_triton_kernel(
     except Exception as e:
         print(f"Error launching kernel: {e}")
         import traceback
+
         traceback.print_exc()
         return 1
 
@@ -262,7 +271,7 @@ def launch_triton_kernel_from_file(
     grid: Tuple[int, int, int] = (1, 1, 1),
     block: Tuple[int, int, int] = (256, 1, 1),
     shared_mem_bytes: int = 0,
-    stream=None
+    stream=None,
 ) -> int:
     """
     Launch a Triton kernel from HSACO file
@@ -290,5 +299,5 @@ def launch_triton_kernel_from_file(
         grid=grid,
         block=block,
         shared_mem_bytes=shared_mem_bytes,
-        stream=stream
+        stream=stream,
     )
