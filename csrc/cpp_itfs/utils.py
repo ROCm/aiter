@@ -315,16 +315,22 @@ def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
     for idx, arg in enumerate(args):
         if idx in constant_indices:
             constants[keys[idx]] = arg
-    return compile_hsaco(kernel.fn.__name__, ccinfo.asm['hsaco'], ccinfo.metadata.shared, ccinfo.metadata.target.arch, constants)
+    extra_metadata = {}
+    extra_metadata["waves_per_eu"] = kwargs.get("waves_per_eu", 1)
+    extra_metadata["num_stages"] = kwargs.get("num_stages", 1)
+    extra_metadata["num_warps"] = kwargs.get("num_warps", 1)
+    extra_metadata["num_ctas"] = kwargs.get("num_ctas", 1)
+    return compile_hsaco(kernel.fn.__name__, ccinfo.asm['hsaco'], ccinfo.metadata.shared, ccinfo.metadata.target.arch, constants, extra_metadata)
 
 
-def compile_hsaco(kernel_name, hsaco, shared=0, gcnArchName=GPU_ARCH, constants={}):
+def compile_hsaco(kernel_name, hsaco, shared=0, gcnArchName=GPU_ARCH, constants={}, extra_metadata={}):
     constants = OrderedDict(constants)
     func_name = get_default_func_name(kernel_name, tuple(constants.values()))
     metadata = {}
     metadata["shared"] = shared
     metadata["name"] = kernel_name
     metadata["gcnArchName"] = gcnArchName
+    metadata.update(extra_metadata)
     for key, value in constants.items():
         metadata[key] = str(value)
     os.makedirs(f"{BUILD_DIR}/{metadata["gcnArchName"]}", exist_ok=True)
