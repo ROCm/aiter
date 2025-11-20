@@ -114,7 +114,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                                                true>; // Preshuffle_
 
     // constexpr bool MXFP4_Pipeline = std::is_same_v<BDataType, ck_tile::pk_fp4_t>;
-    static constexpr bool MXFP4_Pipeline = std::is_same_v<BDataType, pk_fp4_t> || std::is_same_v<BDataType, pk_int4_t>;
+    static constexpr bool MXFP4_Pipeline = std::is_same_v<BDataType, ck_tile::pk_fp4_t> || std::is_same_v<BDataType, ck_tile::pk_int4_t>;
 
     if constexpr(!MXFP4_Pipeline && moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up)
     {
