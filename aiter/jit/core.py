@@ -311,6 +311,7 @@ CK_3RDPARTY_DIR = os.environ.get(
 )
 CK_HELPER_DIR = f"{AITER_META_DIR}/3rdparty/ck_helper"
 CK_DIR = CK_3RDPARTY_DIR
+HIP_KITTENS_DIR = f"{AITER_META_DIR}/3rdparty/HipKittens"
 
 
 @functools.lru_cache(maxsize=1)
@@ -595,6 +596,7 @@ def build_module(
             f"{CK_HELPER_DIR}",
             f"{CK_3RDPARTY_DIR}/include",
             f"{CK_3RDPARTY_DIR}/library/include",
+            f"{HIP_KITTENS_DIR}/include",
         ]
         if not hipify:
             extra_include_paths += [
@@ -783,7 +785,7 @@ def compile_ops(
                 if module is None:
                     try:
                         module = get_module(md_name)
-                    except Exception as e:
+                    except Exception:
                         md = custom_build_args.get("md_name", md_name)
                         module = get_module(md)
             except ModuleNotFoundError:

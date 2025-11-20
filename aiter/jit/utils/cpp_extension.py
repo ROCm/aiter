@@ -930,6 +930,7 @@ def include_paths(cuda: bool = False) -> List[str]:
     if cuda and IS_HIP_EXTENSION:
         paths.append(os.path.join(lib_include, "THH"))
         paths.append(_join_rocm_home("include"))
+        paths.append(_join_rocm_home("include/hip"))
     return paths
 
 
