@@ -14,6 +14,7 @@ import time
 import traceback
 import types
 import typing
+import random
 from typing import Any, Callable, List, Optional
 
 from packaging.version import Version, parse
@@ -48,10 +49,25 @@ def mp_lock(
             baton.release()
     else:
         ttl_ms = int(os.environ.get("AITER_JIT_LOCK_TTL_MS", "0"))
+        lock_max_tries = int(os.environ.get("AITER_JIT_LOCK_MAX_TRIES", "10"))
+        lock_backoff_base_ms = float(
+            os.environ.get("AITER_JIT_LOCK_BACKOFF_BASE_MS", "100")
+        )
+        lock_backoff_cap_ms = float(
+            os.environ.get("AITER_JIT_LOCK_BACKOFF_CAP_MS", "8000")
+        )
+        lock_backoff_jitter_ms = float(os.environ.get("AITER_JIT_LOCK_JITTER_MS", "75"))
+
         if ttl_ms > 0:
             deadline = time.time() + ttl_ms / 1000.0
             while os.path.exists(lockPath) and time.time() < deadline:
-                time.sleep(getattr(baton, "wait_seconds", 0.2))
+                sleep_s = getattr(baton, "wait_seconds", 0.2)
+                jitter_s = max(
+                    0.0,
+                    random.uniform(-lock_backoff_jitter_ms, lock_backoff_jitter_ms)
+                    / 1000.0,
+                )
+                time.sleep(max(0.0, sleep_s + jitter_s))
             if os.path.exists(lockPath):
                 try:
                     age_ms = (time.time() - os.path.getmtime(lockPath)) * 1000.0
@@ -82,6 +98,21 @@ def mp_lock(
                         logger.info(
                             f"stale lock not removed, deferring to wait: {lockPath}"
                         )
+
+        # Exponential backoff with jitter when not using TTL or TTL window expired
+        for attempt in range(lock_max_tries):
+            if baton.try_acquire():
+                try:
+                    ret = MainFunc()
+                finally:
+                    if FinalFunc is not None:
+                        FinalFunc()
+                    baton.release()
+                return ret
+            backoff_ms = min(lock_backoff_base_ms * (2**attempt), lock_backoff_cap_ms)
+            jitter_ms = random.uniform(-lock_backoff_jitter_ms, lock_backoff_jitter_ms)
+            time.sleep(max(0.0, (backoff_ms + jitter_ms) / 1000.0))
+
         baton.wait()
         if WaitFunc is not None:
             return WaitFunc()
@@ -439,10 +470,44 @@ __mds = {}
 def get_module_custom_op(md_name: str) -> None:
     global __mds
     if md_name not in __mds:
+        import_max_tries = int(os.environ.get("AITER_IMPORT_MAX_TRIES", "8"))
+        import_backoff_base_ms = float(
+            os.environ.get("AITER_IMPORT_BACKOFF_BASE_MS", "150")
+        )
+        import_backoff_cap_ms = float(
+            os.environ.get("AITER_IMPORT_BACKOFF_CAP_MS", "6000")
+        )
+        import_backoff_jitter_ms = float(
+            os.environ.get("AITER_IMPORT_BACKOFF_JITTER_MS", "75")
+        )
+
         if "AITER_JIT_DIR" in os.environ:
-            try:
-                __mds[md_name] = importlib.import_module(md_name)
-            except ModuleNotFoundError as e:
+            last_err = None
+            for attempt in range(import_max_tries):
+                try:
+                    __mds[md_name] = importlib.import_module(md_name)
+                    break
+                except ModuleNotFoundError as e:
+                    last_err = e
+                    jit_dir = os.path.abspath(get_user_jit_dir())
+                    candidates = [
+                        os.path.join(jit_dir, f"{md_name}{sfx}") for sfx in _SUFFIXES
+                    ]
+                    candidates.append(os.path.join(jit_dir, f"{md_name}.so"))
+                    has_artifact = any(os.path.exists(p) for p in candidates)
+                    if has_artifact and AITER_LOG_MORE:
+                        logger.info(
+                            f"artifact exists but import failed, retrying: {candidates}"
+                        )
+                    _refresh_jit_fs_cache(jit_dir)
+                    backoff_ms = min(
+                        import_backoff_base_ms * (2**attempt), import_backoff_cap_ms
+                    )
+                    jitter_ms = random.uniform(
+                        -import_backoff_jitter_ms, import_backoff_jitter_ms
+                    )
+                    time.sleep(max(0.0, (backoff_ms + jitter_ms) / 1000.0))
+            else:
                 jit_dir = os.path.abspath(get_user_jit_dir())
                 candidates = [
                     os.path.join(jit_dir, f"{md_name}{sfx}") for sfx in _SUFFIXES
@@ -454,12 +519,26 @@ def get_module_custom_op(md_name: str) -> None:
                 )
                 raise ModuleNotFoundError(
                     f"Module '{md_name}' not found. Artifact present: {has_artifact}. Candidates checked: {candidates}"
-                ) from e
+                ) from last_err
         else:
-            try:
-                __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
-            except ModuleNotFoundError as e:
-                raise e
+            last_err = None
+            for attempt in range(import_max_tries):
+                try:
+                    __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+                    break
+                except ModuleNotFoundError as e:
+                    last_err = e
+                    _refresh_jit_fs_cache(os.path.abspath(get_user_jit_dir()))
+                    backoff_ms = min(
+                        import_backoff_base_ms * (2**attempt), import_backoff_cap_ms
+                    )
+                    jitter_ms = random.uniform(
+                        -import_backoff_jitter_ms, import_backoff_jitter_ms
+                    )
+                    time.sleep(max(0.0, (backoff_ms + jitter_ms) / 1000.0))
+            else:
+                raise last_err
+
         mod = __mds.get(md_name)
         mod_file = getattr(mod, "__file__", None)
         if mod_file:
@@ -487,6 +566,16 @@ def try_load_module_from_path(md_name: str, jit_dir: str, suffixes: list[str]):
             spec.loader.exec_module(m)
             return m
     return None
+
+
+def _refresh_jit_fs_cache(jit_dir: str) -> None:
+    try:
+        importlib.invalidate_caches()
+        sys.path_importer_cache.pop(jit_dir, None)
+        _ = os.listdir(jit_dir)
+    except Exception as e:
+        if AITER_LOG_MORE:
+            logger.info(f"refresh jit fs cache failed for {jit_dir}: {e}")
 
 
 rebuilded_list = ["module_aiter_enum"]
