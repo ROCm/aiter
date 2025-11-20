@@ -1,0 +1,341 @@
+# adapted from triton_kernels package
+# original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/tests/test_matmul.py
+
+from dataclasses import dataclass, fields
+import itertools
+import pytest
+import torch
+from typing import Union
+import triton
+
+# routing utilities
+from aiter.ops.triton.moe_routing.routing import routing
+
+# matmul utilities
+from aiter.ops.triton.moe_op_gemm_a8w8_blockscale import (
+    moe_gemm_a8w8_blockscale,
+    moe_gemm_torch,
+)
+
+# target-specific utilities
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+# ---------------
+# initialize data
+# ---------------
+
+# Default BLOCK_N and BLOCK_K
+block_shape = (128, 128, 128)
+
+# def alloc_rand(shape, device, dtype):
+#     if dtype.itemsize == 1:
+#         tmp = 2**-(torch.randint(1, 2, shape, device=device, dtype=torch.bfloat16))
+#         return tmp
+#     return torch.randint(1, 2, shape, device=device, dtype=dtype)
+
+
+# def alloc_rand_like(x):
+#     return alloc_rand(x.shape, x.device, x.dtype)
+
+
+def init_routing_data(
+    m, n_expts_tot, n_expts_act, do_gather, do_scatter, device="cuda"
+):
+    logits = torch.randn((m, n_expts_tot), dtype=torch.float16, device=device)
+    routing_data, gather_idx, scatter_idx = routing(logits, n_expts_act)
+    routing_data.gate_scal = None
+    gather_idx = gather_idx if do_gather else None
+    scatter_idx = scatter_idx if do_scatter else None
+    # TODO: re-enable
+    # if do_gather and do_scatter and n_expts_act == 1 and n_expt_shards == 1:
+    #     scatter_idx = mask_indx(scatter_idx, n_expts_act)
+    return m, routing_data, gather_idx, scatter_idx
+
+
+def init_compute_data(
+    m,
+    n,
+    k,
+    gindx,
+    sindx,
+    n_expts_tot,
+    n_expts_act,
+    act_dtype,
+    weight_dtype,
+    has_y_gammas,
+    device="cuda",
+    per_row_x_scale=False,
+    is_x_blockscale=False,
+    is_w_blockscale=False,
+):
+    torch.manual_seed(0)
+    in_m = m * (n_expts_act if gindx is None else 1)
+    shape_x = (in_m, k)
+    x = (torch.randn(shape_x, dtype=torch.bfloat16, device=device) / 10).to(act_dtype)
+    w = (torch.randn((n_expts_tot, k, n), dtype=torch.bfloat16, device=device) / 10).to(weight_dtype)
+    bias = torch.randn((n_expts_tot, n), dtype=torch.float32, device=device)
+    if has_y_gammas:
+        gamma = 2 ** torch.randint(
+            -5, 0, (m * n_expts_act,), device=device, dtype=torch.float32
+        )
+    else:
+        gamma = None
+
+    block_shape_m, block_shape_n, block_shape_k = block_shape
+    scale_m = (in_m + block_shape_m - 1) // block_shape_m
+    scale_k = (k + block_shape_k - 1) // block_shape_k
+    scale_n = (n + block_shape_n - 1) // block_shape_n
+    x_scale = None
+    w_scale = None
+    x_static_scale = None
+    w_static_scale = None
+    
+    if is_x_blockscale:
+        if per_row_x_scale:
+            x_scale = torch.randn((in_m, scale_k), dtype=torch.float32, device="cuda")
+        else:
+            x_scale = torch.randn((scale_m, scale_k), dtype=torch.float32, device="cuda")
+    else:
+        x_static_scale = x.abs().max().float() / 448.0
+
+    if is_w_blockscale:
+        w_scale = torch.randn((scale_k, scale_n), dtype=torch.float32, device="cuda")   # TODO: scale_k, scale_n or opposite?
+    else:
+        w_static_scale = w.abs().max().float() / 448.0
+    return x, x_scale, x_static_scale, w, w_scale, w_static_scale, bias, gamma
+
+
+# def dtype_str_to_torch(dtype_str: str) -> torch.dtype:
+#     return torch.uint8 if dtype_str == "float4_e2m1" else getattr(torch, dtype_str)
+
+
+def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=True):
+    if tri.dtype.itemsize == 1:
+        ref_as_type = ref.to(tri.dtype)
+        if ref.dtype == tri.dtype:
+            assert torch.all(ref_as_type == tri)
+            return
+        ref = ref_as_type
+
+    if ref.numel() == 0:
+        return
+
+    if maxtol is None:
+        maxtol = 2e-2
+    if rmstol is None:
+        rmstol = 4e-3
+    """
+    Compare reference values against obtained values.
+    """
+
+    # cast to float32:
+    ref = ref.to(torch.float32).detach()
+    tri = tri.to(torch.float32).detach()
+    assert (
+        ref.shape == tri.shape
+    ), f"Tensors must have same size {ref.shape=} {tri.shape=}"
+
+    # deal with infinite elements:
+    inf_mask_ref = torch.isinf(ref)
+    inf_mask_tri = torch.isinf(tri)
+    assert torch.equal(
+        inf_mask_ref, inf_mask_tri
+    ), "Tensor must have same infinite elements"
+    refn = torch.where(inf_mask_ref, 0, ref)
+    trin = torch.where(inf_mask_tri, 0, tri)
+
+    # normalise so that RMS calculation doesn't overflow:
+    eps = 1.0e-30
+    multiplier = 1.0 / (torch.max(torch.abs(refn)) + eps)
+    refn *= multiplier
+    trin *= multiplier
+
+    ref_rms = torch.sqrt(torch.square(refn).mean()) + eps
+
+    rel_err = torch.abs(refn - trin) / torch.maximum(ref_rms, torch.abs(refn))
+    max_err = torch.max(rel_err).item()
+    rms_err = torch.sqrt(torch.square(rel_err).mean()).item()
+
+    if verbose:
+        print(
+            "%s maximum relative error = %s (threshold = %s)"
+            % (description, max_err, maxtol)
+        )
+        print(
+            "%s RMS relative error = %s (threshold = %s)"
+            % (description, rms_err, rmstol)
+        )
+
+    if max_err > maxtol:
+        bad_idxs = torch.nonzero(rel_err > maxtol)
+        num_nonzero = bad_idxs.size(0)
+        bad_idxs = bad_idxs[:1000]
+        print(
+            "%d / %d mismatched elements (shape = %s) at coords %s"
+            % (num_nonzero, rel_err.numel(), tuple(rel_err.shape), bad_idxs.tolist())
+        )
+
+        bad_idxs = bad_idxs.unbind(-1)
+        print("ref values: ", ref[tuple(bad_idxs)].cpu())
+        print("tri values: ", tri[tuple(bad_idxs)].cpu())
+
+    assert max_err <= maxtol
+    assert rms_err <= rmstol
+
+
+# ---------------
+# Helpers
+# ---------------
+
+
+def dequant_x_blockscale(x, x_scales, per_row_x_scale):
+    assert x_scales is not None
+    block_shape_m, block_shape_n, block_shape_k = block_shape
+    M, K = x.shape
+
+    K_blocks = (K + block_shape_k - 1) // block_shape_k
+    if per_row_x_scale:
+        assert x_scales.shape == (M, K_blocks)
+        x = x.to(torch.float32).view(
+            M, K_blocks, block_shape_k
+        ) * x_scales.unsqueeze(-1)
+        x = x.view(M, K)
+    else:
+        M_blocks = (M + block_shape_m - 1) // block_shape_m
+        assert x_scales.shape == (M_blocks, K_blocks)
+        x = x.to(torch.float32).view(
+            M_blocks, block_shape_m, K_blocks, block_shape_k
+        )
+        scales = x_scales.to(torch.float32).view(M_blocks, 1, K_blocks, 1)
+        x = x * scales
+        x = x.view(M, K)
+    return x
+
+
+# ---------------
+# unit tests
+# ---------------
+
+
+@dataclass
+class Case:
+    m: int
+    n: int
+    k: int
+    n_expts_tot: int = 1
+    n_expts_act: int = 1
+    is_x_blockscale: bool = True
+    is_w_blockscale: bool = True
+    per_row_x_scale: bool = False
+
+
+@pytest.mark.parametrize(
+    ", ".join(f.name for f in fields(Case)),
+    [
+        tuple(getattr(case, f.name) for f in fields(Case))
+        for case in [
+            Case(4096, 7168, 4096, 128, 4, is_x_blockscale=True, is_w_blockscale=True, per_row_x_scale=False),
+            # TODO: for testing do 1 test
+            # Case(2048, 4096, 2048, 8, 2, is_x_blockscale=True, is_w_blockscale=True, per_row_x_scale=True),
+            # Case(2048, 4096, 2048, 8, 2, is_x_blockscale=True, is_w_blockscale=False, per_row_x_scale=False),
+            # Case(300, 400, 400, 8, 2, is_x_blockscale=False, is_w_blockscale=True, per_row_x_scale=True),
+        ]
+    ],
+)
+@pytest.mark.parametrize(
+    "do_gather, do_scatter",
+    [
+        (False, False),
+        # TODO: disable features for testing
+        # (True, False),
+        # (False, True),
+        # (True, True),
+    ],
+)
+# TODO: disable features for testing
+@pytest.mark.parametrize("has_y_gammas", [False])
+@pytest.mark.parametrize("apply_swiglu", [False])
+@pytest.mark.parametrize("fused_quant", [False])
+def test_op(
+    m,
+    n,
+    k,
+    do_gather,
+    do_scatter,
+    has_y_gammas,
+    apply_swiglu,
+    fused_quant,
+    n_expts_tot,
+    n_expts_act,
+    is_x_blockscale,
+    is_w_blockscale,
+    per_row_x_scale,
+    device="cuda",
+):
+
+    torch.manual_seed(0)
+
+    m, rdata, gindx, sindx = init_routing_data(
+        m, n_expts_tot, n_expts_act, do_gather, do_scatter, device=device
+    )
+    x_tri, x_scales_tri, x_static_scale, w_tri, w_scales_tri, w_static_scale, bias_tri, gammas = init_compute_data(
+        m,
+        n,
+        k,
+        gindx,
+        sindx,
+        n_expts_tot,
+        n_expts_act,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fn,
+        has_y_gammas,
+        device=device,
+        per_row_x_scale=per_row_x_scale,
+        is_x_blockscale=is_x_blockscale,
+        is_w_blockscale=is_w_blockscale
+    )
+    x_ref, w_ref, bias_ref = x_tri.clone(), w_tri.clone(), bias_tri.clone()
+
+    # Assume that x and w are quantized shapes
+    # TODO: dequant x and w before doing torch gemm.
+    if is_x_blockscale:
+        x_ref = dequant_x_blockscale(x_tri, x_scales_tri, per_row_x_scale).to(torch.bfloat16)
+    else:
+        x_ref = (x_tri.float() * x_static_scale).to(torch.bfloat16)
+
+    if is_w_blockscale:
+        w_ref = dequant_w_blockscale(w_tri, w_scales_tri).to(torch.bfloat16)
+    else:
+        w_ref = (w_tri.float() * w_static_scale).to(torch.bfloat16)
+    ref_y = moe_gemm_torch(
+        x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
+    )
+    if not is_x_blockscale and fused_quant:
+        quant_static_scale = ref_y.abs().max().float() / 448.0
+        out_dtype = torch.float8_e4m3fn
+        maxtol = 4e-1
+        rmstol = 4e-2
+    else:
+        quant_static_scale = None
+        out_dtype = torch.bfloat16
+        maxtol = None
+        rmstol = None
+    tri_y = moe_gemm_a8w8_blockscale(
+        x_tri,
+        w_tri,
+        x_scales_tri,
+        w_scales_tri,
+        x_static_scale,
+        w_static_scale,
+        quant_static_scale,
+        bias_tri,
+        rdata,
+        gindx,
+        sindx,
+        gammas,
+        out_dtype,
+        apply_swiglu,
+    )
+    if not is_x_blockscale and fused_quant:
+        tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
+    assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
