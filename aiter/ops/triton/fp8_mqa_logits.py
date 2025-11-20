@@ -44,6 +44,12 @@ def fp8_mqa_logits(
     stride_kv_s, stride_kv_d = KV.stride()
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
+
+    # heuristic for MFMA instruction shape
+    matrix_instr_nonkdim = 32
+    if seq_len <= 1024:
+        matrix_instr_nonkdim = 16
+
     _fp8_mqa_logits_kernel[(seq_len,)](
         Q_ptr=Q,
         KV_ptr=KV,
@@ -69,7 +75,7 @@ def fp8_mqa_logits(
         num_warps=4,
         num_stages=2,
         waves_per_eu=2,
-        matrix_instr_nonkdim=16,
+        matrix_instr_nonkdim=matrix_instr_nonkdim,
     )
 
     return logits

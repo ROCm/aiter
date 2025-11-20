@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Dict
 import functools
 import json
-import torch
 import triton
 import triton.language as tl
 
 
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ..utils._triton.pid_preprocessing import remap_xcd
 from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
 # This function computes delta given output Out and gradient DO
@@ -20,7 +19,18 @@ from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 # Out: (batch, nhead_q, max_seqlens_q, headDim)
 # DO: (batch, nhead_q, max_seqlens_q, headDim)
 # Delta: (batch, nheads_q, max_seqlens_q), same as softmax_lse defined at
-@triton.jit
+_bwd_preprocess_repr = make_kernel_repr(
+    "_bwd_preprocess",
+    [
+        "BLOCK_M",
+        "BLOCK_D_MODEL",
+        "IS_VARLEN",
+        "IS_FP8",
+    ],
+)
+
+
+@triton.jit(repr=_bwd_preprocess_repr)
 def _bwd_preprocess(
     o_ptr,
     do_ptr,  # noqa: E741
@@ -312,7 +322,25 @@ def _bwd_dkdvdq_inner(
     return dk, dv
 
 
-@triton.jit
+_bwd_kernel_dkdvdq_causal_repr = make_kernel_repr(
+    "_bwd_kernel_dkdvdq_causal",
+    [
+        "NUM_Q_HEADS",
+        "NUM_K_HEADS",
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLK_SLICE_FACTOR",
+        "BLOCK_D_MODEL",
+        "ENABLE_DROPOUT",
+        "IS_VARLEN",
+        "IS_FP8",
+        "USE_INT64_STRIDES",
+        "NUM_XCD",
+    ],
+)
+
+
+@triton.jit(repr=_bwd_kernel_dkdvdq_causal_repr)
 def _bwd_kernel_dkdvdq_causal(
     q_ptr,
     k_ptr,
@@ -384,7 +412,6 @@ def _bwd_kernel_dkdvdq_causal(
     IS_VARLEN: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    NUM_SMS: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
     NUM_XCD: tl.constexpr,
 ):
@@ -714,7 +741,23 @@ def _bwd_kernel_dkdvdq_causal(
     tl.atomic_add(dk_ptr + offs_dkdv, dk, mask=mask_kv, sem="relaxed")
 
 
-@triton.jit
+_bwd_kernel_dkdvdq_noncausal_repr = make_kernel_repr(
+    "_bwd_kernel_dkdvdq_noncausal",
+    [
+        "NUM_Q_HEADS",
+        "NUM_K_HEADS",
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_D_MODEL",
+        "ENABLE_DROPOUT",
+        "IS_VARLEN",
+        "IS_FP8",
+        "USE_INT64_STRIDES",
+    ],
+)
+
+
+@triton.jit(repr=_bwd_kernel_dkdvdq_noncausal_repr)
 def _bwd_kernel_dkdvdq_noncausal(
     Q,
     K,
@@ -786,7 +829,6 @@ def _bwd_kernel_dkdvdq_noncausal(
     IS_VARLEN: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    NUM_SMS: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
