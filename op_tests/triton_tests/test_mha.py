@@ -104,7 +104,7 @@ def fp8_assert_close(
 def check_gluon_compatibility(impl, **params):
     """Skip test if parameters are incompatible with Gluon kernel"""
     if impl != "GLUON":
-        return  # Triton supports everything
+        return
 
     if params.get("NUM_Q_HEADS", 1) > params.get("NUM_K_HEADS", 1):
         pytest.skip("Gluon backend doesn't support Q > KV heads")
@@ -118,7 +118,7 @@ def check_gluon_compatibility(impl, **params):
     if params.get("FP8", False):
         pytest.skip("Gluon backend doesn't support FP8")
 
-    if "test_backward" in params and params["test_backward"]:
+    if "TEST_BACKWARD" in params and params["TEST_BACKWARD"]:
         pytest.skip("Gluon backend doesn't support backward pass")
 
     if "dtype" in params and params["dtype"] != torch.float16:
@@ -234,6 +234,7 @@ def test_mha(
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("CAUSAL", [True])
 @pytest.mark.parametrize("DROPOUT", [0.0])
+@pytest.mark.parametrize("TEST_BACKWARD", [True, False])
 def test_mha_int64_strides(
     IMPL: str,
     BATCH: int,
@@ -244,9 +245,9 @@ def test_mha_int64_strides(
     HEAD_SZ: int,
     CAUSAL: bool,
     DROPOUT: float,
+    TEST_BACKWARD: bool,
     dtype=torch.float16,
     device="cuda",
-    test_backward=True,  # FIXME: Make sure this is not run with Gluon
 ):
     """
     In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
@@ -262,7 +263,7 @@ def test_mha_int64_strides(
         CAUSAL=CAUSAL,
         DROPOUT=DROPOUT,
         dtype=dtype,
-        test_backward=test_backward,
+        TEST_BACKWARD=TEST_BACKWARD,
     )
 
     torch.cuda.empty_cache()
@@ -331,14 +332,14 @@ def test_mha_int64_strides(
         causal=CAUSAL,
         return_lse=True,
     )
-    if test_backward:
+    if TEST_BACKWARD:
         triton_dq, triton_dk, triton_dv = torch.autograd.grad(
             triton_out, (q, k, v), do.clone()
         )
 
     # NOTE: use fwd output to wait not exit program before kernel finishes
     print("triton_out:", triton_out)
-    if test_backward:
+    if TEST_BACKWARD:
         print("triton_dq:", triton_dq.shape, triton_dq.stride())
         print("triton_dk:", triton_dk.shape, triton_dk.stride())
         print("triton_dv:", triton_dv.shape, triton_dv.stride())
