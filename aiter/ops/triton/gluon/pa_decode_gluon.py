@@ -1922,6 +1922,31 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             waves_per_eu = 3
         else:
             waves_per_eu = 4
+        from csrc.cpp_itfs.utils import compile_hsaco_from_triton, run_hsaco
+        compile_hsaco_from_triton(paged_attention_decode_v2_gluon_fp8, exp_sums_ptr, max_logits_ptr, output_ptr,
+    query_ptr, key_cache_ptr, value_cache_ptr, block_tables_ptr, context_lengths_ptr, softmax_scale, query_scale, key_scale, value_scale, stride_max_logits_seq, stride_max_logits_head,
+    stride_max_logits_part, stride_output_seq, stride_output_head, stride_output_part, stride_output_group, stride_query_seq,
+    stride_query_head, stride_key_block, stride_key_head, stride_key_head_split,
+    stride_key_block_elem, stride_value_block, stride_value_head_size, stride_value_block_elem,
+    stride_block_table_seq, query_scale_stride_0, kv_scale_stride_0, kv_scale_stride_1, QUERY_SEQ_LEN, QUERY_GROUP_SIZE_ORIGINAL, HEAD_SIZE,
+    grid[0], grid[1], grid[2],
+    COMPUTE_TYPE, QUERY_GROUP_SIZE_POW2, triton.next_power_of_2(HEAD_SIZE),
+    KV_BLOCK_SIZE, CONTEXT_PARTITION_SIZE, KV_COMPUTE_BLOCK_SIZE, QUERY_QUANT_MODE, KV_QUANT_MODE, FP8_MAX_VALUE,
+    VALUE_TRANSPOSED, IS_CAUSAL, grid=grid, waves_per_eu=waves_per_eu, num_stages=1)
+        run_hsaco(paged_attention_decode_v2_gluon_fp8.fn.__name__,
+        exp_sums_ptr, max_logits_ptr, output_ptr, query_ptr, key_cache_ptr, value_cache_ptr, block_tables_ptr,
+        context_lengths_ptr, softmax_scale, query_scale, key_scale, value_scale, stride_max_logits_seq, stride_max_logits_head,
+        stride_max_logits_part, stride_output_seq, stride_output_head, stride_output_part, stride_output_group, stride_query_seq,
+        stride_query_head, stride_key_block, stride_key_head, stride_key_head_split,
+        stride_key_block_elem, stride_value_block, stride_value_head_size, stride_value_block_elem,
+        stride_block_table_seq, query_scale_stride_0, kv_scale_stride_0, kv_scale_stride_1,  QUERY_SEQ_LEN, QUERY_GROUP_SIZE_ORIGINAL, HEAD_SIZE,
+        grid[0], grid[1], grid[2], grid=grid,
+        constants={"COMPUTE_TYPE": COMPUTE_TYPE, "QUERY_GROUP_SIZE_POW2": QUERY_GROUP_SIZE_POW2,
+        "HEAD_SIZE_POW2": triton.next_power_of_2(HEAD_SIZE), "KV_BLOCK_SIZE": KV_BLOCK_SIZE,
+        "CONTEXT_PARTITION_SIZE": CONTEXT_PARTITION_SIZE, "KV_COMPUTE_BLOCK_SIZE": KV_COMPUTE_BLOCK_SIZE,
+        "QUERY_QUANT_MODE": QUERY_QUANT_MODE, "KV_QUANT_MODE": KV_QUANT_MODE, "FP8_MAX_VALUE": FP8_MAX_VALUE,
+        "VALUE_TRANSPOSED": VALUE_TRANSPOSED, "IS_CAUSAL": IS_CAUSAL})
+        return
     # CONTEXT_PARTITION_SIZE  = 128
     # KV_COMPUTE_BLOCK_SIZE = 256
     # Launch the selected kernel
