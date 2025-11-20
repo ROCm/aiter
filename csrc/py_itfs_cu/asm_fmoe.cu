@@ -836,7 +836,7 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
     int sub_X_cnt            = sorted_expert_ids.size(0);
     const char* enable_vskip = std::getenv("AITER_ENABLE_VSKIP");
 
-    if(out.dtype() == at::ScalarType::BFloat16 && inter_dim % 256 == 0 && fc_scale_blkn == 128 &&
+    if(out.dtype() == at::ScalarType::BFloat16 && (inter_dim % 256 == 0 || inter_dim % 320 == 0)&& fc_scale_blkn == 128 &&
        fc_scale_blkk == 128)
     {
         if(activation == ActivationType::Silu)
