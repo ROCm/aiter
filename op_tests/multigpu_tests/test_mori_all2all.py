@@ -294,11 +294,11 @@ def test_mori_all2all(world_size, shape, dtype, E, topk, quant_type=aiter.QuantT
 
 l_dtype = ["bf16"]
 l_shape = [(128, 6144, 1024)]
+# Explicitly define the default quantization types to test
 quant_types = [
-    aiter.QuantType.No,
     aiter.QuantType.per_Token,
     aiter.QuantType.per_128x128,
-][-2:]
+]
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(
@@ -343,7 +343,7 @@ if __name__ == "__main__":
     if args.shape is not None:
         l_shape = [args.shape]
     if args.quant_type is not None:
-        quant_types = [eval(f"aiter.QuantType.{args.quant_type}")]
+        quant_types = [getattr(aiter.QuantType, args.quant_type)]
 
     for quant_type in quant_types:
         for dtype in l_dtype:
