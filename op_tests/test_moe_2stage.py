@@ -263,6 +263,10 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
+    aiter.logger.info(f'w1_qt {w1_qt.dtype}, {w1_qt.shape}')
+    aiter.logger.info(f'w2_qt {w2_qt.dtype}, {w2_qt.shape}')
+    aiter.logger.info(f'w1_qt_aiter {w1_qt_aiter.dtype}, {w1_qt_aiter.shape}')
+    aiter.logger.info(f'w2_qt_aiter {w2_qt_aiter.dtype}, {w2_qt_aiter.shape}')
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,

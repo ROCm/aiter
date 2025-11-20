@@ -638,6 +638,10 @@ def get_2stage_cfgs(
         run_1stage = cfg.get("run_1stage", False)
 
     tag = f"({kernelName1=}, {kernelName2=})"
+    aiter.logger.info(f'dtype = {dtype}'),
+    aiter.logger.info(f'q_dtype_a = {q_dtype_a}'),
+    aiter.logger.info(f'q_dtype_w = {q_dtype_w}'),
+    aiter.logger.info(f'q_type = {q_type}'),
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
@@ -836,6 +840,7 @@ def fused_moe_2stages(
             dtype=dtype,
             device=device,
         )
+    aiter.logger.info(f'a1.dtype = {a1.dtype}, w1.dtype = {w1.dtype}, w2.dtype = {w2.dtype}')
 
     a2 = metadata.stage1(
         a1,
