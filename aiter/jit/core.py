@@ -29,7 +29,6 @@ from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
-
 def mp_lock(
     lockPath: str,
     MainFunc: Callable,
@@ -48,25 +47,17 @@ def mp_lock(
                 FinalFunc()
             baton.release()
     else:
-        ttl_ms = int(os.environ.get("AITER_JIT_LOCK_TTL_MS", "0"))
-        lock_max_tries = int(os.environ.get("AITER_JIT_LOCK_MAX_TRIES", "10"))
-        lock_backoff_base_ms = float(
-            os.environ.get("AITER_JIT_LOCK_BACKOFF_BASE_MS", "100")
-        )
-        lock_backoff_cap_ms = float(
-            os.environ.get("AITER_JIT_LOCK_BACKOFF_CAP_MS", "8000")
-        )
-        lock_backoff_jitter_ms = float(os.environ.get("AITER_JIT_LOCK_JITTER_MS", "75"))
+        ttl_ms = int(os.environ.get("AITER_JIT_LOCK_TTL_MS", "40000"))
+        lock_max_tries = int(os.environ.get("AITER_JIT_LOCK_MAX_TRIES", "12"))
+        lock_backoff_base_ms = float(os.environ.get("AITER_JIT_LOCK_BACKOFF_BASE_MS", "200"))
+        lock_backoff_cap_ms = float(os.environ.get("AITER_JIT_LOCK_BACKOFF_CAP_MS", "12000"))
+        lock_backoff_jitter_ms = float(os.environ.get("AITER_JIT_LOCK_JITTER_MS", "120"))
 
         if ttl_ms > 0:
             deadline = time.time() + ttl_ms / 1000.0
             while os.path.exists(lockPath) and time.time() < deadline:
                 sleep_s = getattr(baton, "wait_seconds", 0.2)
-                jitter_s = max(
-                    0.0,
-                    random.uniform(-lock_backoff_jitter_ms, lock_backoff_jitter_ms)
-                    / 1000.0,
-                )
+                jitter_s = max(0.0, random.uniform(-lock_backoff_jitter_ms, lock_backoff_jitter_ms) / 1000.0)
                 time.sleep(max(0.0, sleep_s + jitter_s))
             if os.path.exists(lockPath):
                 try:
@@ -81,9 +72,7 @@ def mp_lock(
                         removed = True
                     except Exception as rm_err:
                         # Removal failed (permission/race/etc.); log and defer to wait path
-                        logger.warning(
-                            f"failed to remove stale lock {lockPath}: {rm_err}"
-                        )
+                        logger.warning(f"failed to remove stale lock {lockPath}: {rm_err}")
                     if removed:
                         baton2 = FileBaton(lockPath)
                         if baton2.try_acquire():
@@ -95,9 +84,7 @@ def mp_lock(
                                 baton2.release()
                             return ret
                     else:
-                        logger.info(
-                            f"stale lock not removed, deferring to wait: {lockPath}"
-                        )
+                        logger.info(f"stale lock not removed, deferring to wait: {lockPath}")
 
         # Exponential backoff with jitter when not using TTL or TTL window expired
         for attempt in range(lock_max_tries):
@@ -109,7 +96,7 @@ def mp_lock(
                         FinalFunc()
                     baton.release()
                 return ret
-            backoff_ms = min(lock_backoff_base_ms * (2**attempt), lock_backoff_cap_ms)
+            backoff_ms = min(lock_backoff_base_ms * (2 ** attempt), lock_backoff_cap_ms)
             jitter_ms = random.uniform(-lock_backoff_jitter_ms, lock_backoff_jitter_ms)
             time.sleep(max(0.0, (backoff_ms + jitter_ms) / 1000.0))
 
@@ -470,16 +457,10 @@ __mds = {}
 def get_module_custom_op(md_name: str) -> None:
     global __mds
     if md_name not in __mds:
-        import_max_tries = int(os.environ.get("AITER_IMPORT_MAX_TRIES", "8"))
-        import_backoff_base_ms = float(
-            os.environ.get("AITER_IMPORT_BACKOFF_BASE_MS", "150")
-        )
-        import_backoff_cap_ms = float(
-            os.environ.get("AITER_IMPORT_BACKOFF_CAP_MS", "6000")
-        )
-        import_backoff_jitter_ms = float(
-            os.environ.get("AITER_IMPORT_BACKOFF_JITTER_MS", "75")
-        )
+        import_max_tries = int(os.environ.get("AITER_IMPORT_MAX_TRIES", "10"))
+        import_backoff_base_ms = float(os.environ.get("AITER_IMPORT_BACKOFF_BASE_MS", "200"))
+        import_backoff_cap_ms = float(os.environ.get("AITER_IMPORT_BACKOFF_CAP_MS", "8000"))
+        import_backoff_jitter_ms = float(os.environ.get("AITER_IMPORT_BACKOFF_JITTER_MS", "120"))
 
         if "AITER_JIT_DIR" in os.environ:
             last_err = None
@@ -490,28 +471,18 @@ def get_module_custom_op(md_name: str) -> None:
                 except ModuleNotFoundError as e:
                     last_err = e
                     jit_dir = os.path.abspath(get_user_jit_dir())
-                    candidates = [
-                        os.path.join(jit_dir, f"{md_name}{sfx}") for sfx in _SUFFIXES
-                    ]
+                    candidates = [os.path.join(jit_dir, f"{md_name}{sfx}") for sfx in _SUFFIXES]
                     candidates.append(os.path.join(jit_dir, f"{md_name}.so"))
                     has_artifact = any(os.path.exists(p) for p in candidates)
                     if has_artifact and AITER_LOG_MORE:
-                        logger.info(
-                            f"artifact exists but import failed, retrying: {candidates}"
-                        )
+                        logger.info(f"artifact exists but import failed, retrying: {candidates}")
                     _refresh_jit_fs_cache(jit_dir)
-                    backoff_ms = min(
-                        import_backoff_base_ms * (2**attempt), import_backoff_cap_ms
-                    )
-                    jitter_ms = random.uniform(
-                        -import_backoff_jitter_ms, import_backoff_jitter_ms
-                    )
+                    backoff_ms = min(import_backoff_base_ms * (2 ** attempt), import_backoff_cap_ms)
+                    jitter_ms = random.uniform(-import_backoff_jitter_ms, import_backoff_jitter_ms)
                     time.sleep(max(0.0, (backoff_ms + jitter_ms) / 1000.0))
             else:
                 jit_dir = os.path.abspath(get_user_jit_dir())
-                candidates = [
-                    os.path.join(jit_dir, f"{md_name}{sfx}") for sfx in _SUFFIXES
-                ]
+                candidates = [os.path.join(jit_dir, f"{md_name}{sfx}") for sfx in _SUFFIXES]
                 candidates.append(os.path.join(jit_dir, f"{md_name}.so"))
                 has_artifact = any(os.path.exists(p) for p in candidates)
                 logger.error(
@@ -529,12 +500,8 @@ def get_module_custom_op(md_name: str) -> None:
                 except ModuleNotFoundError as e:
                     last_err = e
                     _refresh_jit_fs_cache(os.path.abspath(get_user_jit_dir()))
-                    backoff_ms = min(
-                        import_backoff_base_ms * (2**attempt), import_backoff_cap_ms
-                    )
-                    jitter_ms = random.uniform(
-                        -import_backoff_jitter_ms, import_backoff_jitter_ms
-                    )
+                    backoff_ms = min(import_backoff_base_ms * (2 ** attempt), import_backoff_cap_ms)
+                    jitter_ms = random.uniform(-import_backoff_jitter_ms, import_backoff_jitter_ms)
                     time.sleep(max(0.0, (backoff_ms + jitter_ms) / 1000.0))
             else:
                 raise last_err
@@ -567,7 +534,6 @@ def try_load_module_from_path(md_name: str, jit_dir: str, suffixes: list[str]):
             return m
     return None
 
-
 def _refresh_jit_fs_cache(jit_dir: str) -> None:
     try:
         importlib.invalidate_caches()
@@ -576,7 +542,6 @@ def _refresh_jit_fs_cache(jit_dir: str) -> None:
     except Exception as e:
         if AITER_LOG_MORE:
             logger.info(f"refresh jit fs cache failed for {jit_dir}: {e}")
-
 
 rebuilded_list = ["module_aiter_enum"]
 
@@ -785,6 +750,7 @@ def build_module(
                             logger.warning(
                                 f"directory visibility touch fallback failed at {dst_dir}: {touch_err}"
                             )
+                    _refresh_jit_fs_cache(os.path.abspath(os.fspath(dst_dir)))
                 else:
                     src_path = f"{opbd_dir}/{target_name}"
                     dst_dir = get_user_jit_dir()
@@ -825,10 +791,17 @@ def build_module(
                             logger.warning(
                                 f"directory visibility touch fallback failed at {dst_dir}: {touch_err}"
                             )
+                    _refresh_jit_fs_cache(os.path.abspath(os.fspath(dst_dir)))
             else:
                 shutil.copy(
                     f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
                 )
+            if int(os.environ.get("AITER_REFRESH_AFTER_BUILD", "1")) == 1:
+                try:
+                    _refresh_jit_fs_cache(os.path.abspath(get_user_jit_dir()))
+                except Exception as _e:
+                    if AITER_LOG_MORE:
+                        logger.info(f"post-build cache refresh failed: {_e}")
         except Exception as e:
             tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
             logger.error(
