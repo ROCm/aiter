@@ -298,7 +298,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{get_asm_dir()}/i8gemm/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m i8gemm --output_dir {{}}'"
     },
     "module_gemm_a16w16_asm": {
         "srcs": [
