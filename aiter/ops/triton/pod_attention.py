@@ -1,12 +1,8 @@
 import torch
-import triton
-import triton.language as tl
 
 import importlib.util
 from pathlib import Path
 from aiter.ops.triton._triton_kernels.quant import (
-    read_realtime,
-    get_cu_id,
     pod_persistent,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -55,6 +51,47 @@ def pod_attention(
     prefill_ratio: int,
     decode_ratio: int,
 ):
+    """
+    POD (Prefill-On-Decode) fused attention for simultaneous prefill and decode execution.
+    Launches persistent kernels that execute both operations concurrently on different CUs
+    for improved hardware utilization.
+
+    Args:
+        cu_ctr (torch.Tensor): CU (Compute Unit) counter for workload distribution.
+        q (torch.Tensor): Decode query with shape (batch_size * 1, num_heads, head_dim).
+        k (torch.Tensor): Decode key with shape (total_tokens, num_heads, head_dim).
+        v (torch.Tensor): Decode value with shape (total_tokens, num_heads, head_dim).
+        Mp (torch.Tensor): Decode partial max buffer with shape (total_programs, BLOCK_M).
+        Lp (torch.Tensor): Decode partial sum buffer with shape (total_programs, BLOCK_M).
+        Op (torch.Tensor): Decode partial output buffer with shape (total_programs, seq_len, head_dim).
+        locks (torch.Tensor): Decode synchronization locks.
+        batch_num_block_n (torch.Tensor): Decode cumulative BLOCK_N counts per batch.
+        total_programs (int): Total number of thread blocks (CTAs) to launch. Should be 2x the
+            number of CUs (one for prefill, one for decode per CU).
+        BLOCK_M (int): Decode query tile size.
+        BLOCK_N (int): Decode key tile size.
+        batch_size (int): Decode batch size.
+        sm_scale (torch.float16): Softmax scale, typically 1/sqrt(head_dim).
+        num_warps (int): Number of warps per CTA.
+        waves_per_eu (int): Number of waves per execution unit.
+        q_pf (torch.Tensor): Prefill query with shape (batch_size_pf * seq_len_pf, num_heads, head_dim).
+        k_pf (torch.Tensor): Prefill key with shape (total_tokens_pf, num_heads, head_dim).
+        v_pf (torch.Tensor): Prefill value with shape (total_tokens_pf, num_heads, head_dim).
+        Mp_pf (torch.Tensor): Prefill partial max buffer.
+        Lp_pf (torch.Tensor): Prefill partial sum buffer.
+        Op_pf (torch.Tensor): Prefill partial output buffer.
+        locks_pf (torch.Tensor): Prefill synchronization locks.
+        batch_num_block_n_pf (torch.Tensor): Prefill cumulative BLOCK_N counts per batch.
+        BLOCK_M_pf (int): Prefill query tile size.
+        BLOCK_N_pf (int): Prefill key tile size.
+        batch_size_pf (int): Prefill batch size.
+        prefill_ratio (int): Ratio of workload assigned to prefill workgroups.
+        decode_ratio (int): Ratio of workload assigned to decode workgroups.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: (decode_output, prefill_output) with shapes
+            matching respective query tensors.
+    """
     _LOGGER.info(
         f"POD_ATTENTION: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
     )
@@ -262,7 +299,26 @@ def get_num_splits_and_buffer_sizes(
     BLOCK_N,
     num_SMs,
 ):
-    ##### Lean Atteion: Calculate Splits and Tile Sizes #####
+    """
+    Calculates workload distribution parameters for POD attention stream-K scheduling.
+    Similar to Lean Attention scheduling but adapted for POD's dual prefill/decode execution.
+
+    Args:
+        causal (bool): Causal masking mode.
+        batch_size (int): Batch size.
+        max_seqlen_q (int): Maximum query sequence length.
+        max_seqlen_k (int): Maximum key sequence length.
+        num_heads (int): Number of query heads.
+        num_heads_k (int): Number of key/value heads.
+        BLOCK_M (int): Query tile size.
+        BLOCK_N (int): Key tile size.
+        num_SMs (int): Number of streaming multiprocessors (CTAs available).
+
+    Returns:
+        Tuple: (num_m_blocks, num_n_blocks, high_load_tbs, max_tiles_per_tb,
+            tiles_per_head, num_splits, even_split).
+    """
+    ##### Lean Attention: Calculate Splits and Tile Sizes #####
     ## based on onnxruntime/contrib_ops/cuda/bert/lean_attention
     num_m_blocks = (max_seqlen_q + BLOCK_M - 1) // BLOCK_M
     num_n_blocks = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
