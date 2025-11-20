@@ -16,6 +16,22 @@ from triton import language as tl
 _LOGGER = AiterTritonLogger()
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+# Import advanced scheduling functions for PTPC4 optimization (reference pattern)
+try:
+    from triton.experimental.gluon.language.amd.cdna3 import (
+        sched_barrier as _amd_iglp_sched_barrier,
+    )
+    from triton.experimental.gluon.language.amd.cdna3 import (
+        sched_group_barrier as _amd_iglp_sched_group_barrier,
+    )
+except ImportError:
+    @gluon.jit
+    def _amd_iglp_sched_barrier(inst_mask):
+        pass
+    @gluon.jit
+    def _amd_iglp_sched_group_barrier(inst_mask, cnt, _):
+        pass
+
 from aiter.ops.shuffle import shuffle_weight
 
 
@@ -61,6 +77,13 @@ def _gemm_a8w8_ptpc(
     cache_modifier: gl.constexpr,
     cdna_version: gl.constexpr,
 ):
+    # Advanced Scheduling Constants (based on reference code)
+    DS_WRITE: gl.constexpr = 0x200
+    DS_READ: gl.constexpr = 0x100
+    BUFFER_LOAD: gl.constexpr = 0x020
+    MFMA: gl.constexpr = 0x008
+    VALU: gl.constexpr = 0x002
+    VMEM: gl.constexpr = 0x040
     """
     Note: this is Triton jited function and not meant to be called direcgly. Call gemm_a8w8_blockscale function
     below
@@ -127,7 +150,7 @@ def _gemm_a8w8_ptpc(
     )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=cdna_version,
-        instr_shape=[16, 16, 32],
+        instr_shape=[16, 16],
         transposed=True,
         warps_per_cta=[1, NUM_WARPS],
     )
@@ -268,9 +291,18 @@ def _gemm_a8w8_ptpc(
             
             cur_b_fma = gl.convert_layout(cur_b, layout=dot_b_layout)
             acc = gl.amd.cdna4.mfma(cur_a, cur_b_fma, acc)
+
+            # Simple but effective optimization: minimal scheduling
             smem_a.store(a)
             cur_b = b.permute(2, 0, 3, 1).reshape(BLOCK_SIZE_K, BLOCK_SIZE_N)
 
+                        # Optimized scheduling pattern with balanced VMEM usage
+            for i in range(12):
+                # _amd_iglp_sched_group_barrier(VMEM, 2, 0)         # 24次内存提示
+                # _amd_iglp_sched_group_barrier(VMEM, 2, 0)         # 24次内存提示
+                _amd_iglp_sched_group_barrier(BUFFER_LOAD, 3, 0)  # 36次buffer_load提示
+                _amd_iglp_sched_group_barrier(DS_READ, 3, 0)      # 36次ds_read提示
+                _amd_iglp_sched_group_barrier(MFMA, 12, 0)        # 144次MFMA提示   
         # ======= Epilogue ========
         # smem_b.store(b)
         cur_a = smem_a.load(layout=dot_a_layout)
@@ -418,7 +450,7 @@ def _gemm_a8w8_ptpc2(
     )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=cdna_version,
-        instr_shape=[16, 16, 32],
+        instr_shape=[16, 16],
         transposed=True,
         warps_per_cta=[1, NUM_WARPS],
     )
@@ -868,7 +900,7 @@ def gemm_a8w8_ptpc(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),
     )
-    _gemm_a8w8_ptpc2[grid](
+    _gemm_a8w8_ptpc[grid](
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
