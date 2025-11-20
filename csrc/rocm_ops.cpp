@@ -19,6 +19,7 @@
 #include "custom.h"
 #include "custom_all_reduce.h"
 #include "deepgemm.h"
+#include "fused_mrope_rms.h"
 #include "gemm_a4w4_blockscale.h"
 #include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
@@ -38,6 +39,7 @@
 #include "rope.h"
 #include "sample.h"
 #include "smoothquant.h"
+#include "trtllm_all_reduce_fusion.h"
 #include <torch/extension.h>
 
 // #include "torch/mha_batch_prefill.h"
@@ -93,6 +95,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     ROPE_GENERAL_FWD_PYBIND;
     ROPE_GENERAL_BWD_PYBIND;
     ROPE_POS_FWD_PYBIND;
+    FUSED_MROPE_RMS_PYBIND;
     // GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND;
     GEMM_A4W4_BLOCKSCALE_PYBIND;
     GEMM_A8W8_BLOCKSCALE_PYBIND;
@@ -100,6 +103,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     AITER_UNARY_PYBIND;
     CUSTOM_ALL_REDUCE_PYBIND;
     QUICK_ALL_REDUCE_PYBIND;
+    TRTLLM_ALL_REDUCE_FUSION_PYBIND;
     CACHE_PYBIND;
     SAMPLE_PYBIND;
     HIPBSOLGEMM_PYBIND;
