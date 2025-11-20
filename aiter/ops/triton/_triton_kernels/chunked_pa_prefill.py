@@ -12,6 +12,7 @@
 
 import triton
 import triton.language as tl
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
 @triton.jit
@@ -19,7 +20,21 @@ def cdiv_fn(x, y):
     return (x + y - 1) // y
 
 
-@triton.jit
+_kernel_paged_attention_2d_repr = make_kernel_repr(
+    "_kernel_paged_attention_2d",
+    [
+        "num_queries_per_kv",
+        "BLOCK_SIZE",
+        "HEAD_SIZE",
+        "USE_ALIBI_SLOPES",
+        "SLIDING_WINDOW",
+        "x",
+        "filter_by_query_len",
+    ],
+)
+
+
+@triton.jit(repr=_kernel_paged_attention_2d_repr)
 def _kernel_paged_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -31,7 +46,6 @@ def _kernel_paged_attention_2d(
     scale,  # float32
     k_scale,  # float32
     v_scale,  # float32
-    num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
     block_table_stride: tl.constexpr,  # int
     query_stride_0: tl.constexpr,  # int
