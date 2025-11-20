@@ -52,9 +52,11 @@ def test_fmoe(
     preshuffle=False,
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
-        return
+        # return
+        pass
     torch_quant = aiter.get_torch_quant(qType)
     input = torch.randn((token, model_dim), dtype=dtype)
+    aiter.logger.info(f'input_dim {token} {model_dim}')
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
         if hidden_pad != 0 and intermediate_pad != 0:
@@ -114,17 +116,30 @@ def test_fmoe(
     else:
         print(w1.shape)
         print(w2.shape)
-        w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
-        w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
+        print(f'tag0 {WQDType}\n')
+        if False:
+            w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
+            w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
+        else:
+            w1_qt, w1_scale = torch_quant(w1, quant_dtype=dtypes.i8, dtypeMax=7)
+            w2_qt, w2_scale = torch_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
+        print('tag2\n')
+        aiter.logger.info(f'w1_shape {w1.shape}')
+        aiter.logger.info(f'w2_shape {w2.shape}')
+        aiter.logger.info(f'w1_qt_shape {w1_qt.shape}')
+        aiter.logger.info(f'w2_qt_shape {w2_qt.shape}')
 
     if qType != aiter.QuantType.per_1x32:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
     else:
-        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
-        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+        # w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+        # w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2])
+        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2])
 
     # Quant-ing a
+    aiter.logger.info(f'quantize a qType {qType} {AQDType} {WQDType}')
     if qType == aiter.QuantType.per_128x128:
         a1_qt, a1_scale = aiter.pertoken_quant(
             input.view(token, -1, 128), quant_dtype=AQDType
@@ -134,9 +149,10 @@ def test_fmoe(
     elif (
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16])
-        and WQDType == dtypes.fp4x2
+        and WQDType in [ dtypes.fp4x2, dtypes.i4x2 ] 
     ):  # a16w4
         a1_qt = input.to(AQDType)
+        aiter.logger.info(f'dump input {input.shape} a1_qt {a1_qt.shape}')
         a1_scale = None
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
@@ -188,6 +204,14 @@ def test_fmoe(
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
     # # ######################## stage 1 start ###########
+    # print(w1_qt)
+    # print(w1_qt_aiter)
+    # print(w2_qt)
+    # print(w2_qt_aiter)
+    aiter.logger.info('stage 1 start')
+    print(a1_qt.dtype, w1_qt.shape)
+    print(w1_qt.dtype, w1_qt.shape)
+    print(w1_qt_aiter.dtype, w1_qt_aiter.shape)
     out1_ref = torch_moe_stage1(
         a1_qt,
         w1_qt,
@@ -212,13 +236,17 @@ def test_fmoe(
     elif (
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16])
-        and (WQDType == dtypes.fp4x2)
+        and (WQDType in [dtypes.fp4x2, dtypes.i4x2])
     ):  # a16w4
         a2_qt = out1_ref
         a2_scale = None
     else:
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
     a2_qt = a2_qt.view(token, topk, -1)
+
+    aiter.logger.info('stage 2 start')
+    aiter.logger.info(f'w1_qt {w1_qt.dtype}, {w1_qt.shape}')
+    aiter.logger.info(f'w2_qt {w2_qt.dtype}, {w2_qt.shape}')
 
     out2_ref = torch_moe_stage2(
         a2_qt,
@@ -439,6 +467,7 @@ for (
     doweight_stage1,
     preshuffle,
 ) in itertools.product(l_dtype, l_quant, l_dim, l_doweight_stage1, l_preshuffle):
+    print(f"wq_dtype {wq_dtype}")
     if (quant_type, aq_dtype, wq_dtype) == (
         aiter.QuantType.per_1x32,
         dtypes.bf16,

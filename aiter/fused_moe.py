@@ -763,6 +763,9 @@ def fused_moe_2stages(
 
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    aiter.logger.info(f'2stages {E}, {model_dim}, {inter_dim}')
+    aiter.logger.info(w1.shape)
+    aiter.logger.info(w2.shape)
     dtype = moe_out.dtype
     device = hidden_states.device
     metadata = get_2stage_cfgs(
@@ -1071,13 +1074,16 @@ def torch_moe_stage1(
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
 ):
+    logger.info('torch_moe_stage1') 
+    logger.info(hidden_states.shape) 
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
     B, D = hidden_states.shape
     topk = topk_weight.shape[1]
     N = w1.shape[1]
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if quant_type == QuantType.per_1x32:
+    # if quant_type == QuantType.per_1x32:
+    if False:
         from aiter.utility import fp4_utils
 
         w1 = fp4_utils.mxfp4_to_f32(w1)
@@ -1176,7 +1182,10 @@ def torch_moe_stage2(
 ):
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if quant_type == QuantType.per_1x32:
+    aiter.logger.info('moe stage2')
+    aiter.logger.info(f'context {quant_type} {E} {model_dim} {inter_dim} {w1.shape} {w2.shape} {w1.dtype} {w2.dtype}')
+    aiter.logger.info(f'tag2.1 {w1.shape} {w2.shape} {w1.dtype} {w2.dtype}')
+    if quant_type == QuantType.per_1x32 and False:
         from aiter.utility import fp4_utils
 
         w2 = fp4_utils.mxfp4_to_f32(w2)
@@ -1189,6 +1198,7 @@ def torch_moe_stage2(
     else:
         hidden_states = hidden_states.to(ctype)
         w2 = w2.to(ctype)
+    aiter.logger.info(f'tag2.2 {w1.shape} {w2.shape} {w1.dtype} {w2.dtype}')
 
     token_num, topk = topk_ids.shape
     hidden_states = hidden_states.view(token_num, topk, inter_dim)
@@ -1219,6 +1229,8 @@ def torch_moe_stage2(
         hidden_states = hidden_states.view(a2_shape)
 
         w2_shape = w2.shape
+        aiter.logger.info(f'dims {E}, {model_dim}, {inter_dim}')
+        aiter.logger.info(f'w2_shape {w2_shape} {w2.dtype}')
         w2 = w2.view(E, model_dim, inter_dim // 32, 32) * w2_scale.view(
             E, model_dim, inter_dim // 32, 1
         )

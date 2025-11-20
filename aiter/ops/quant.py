@@ -27,8 +27,7 @@ def moe_smoothquant_fwd(
 # following are pure torch implement
 @functools.lru_cache()
 def get_dtype_max(dtype):
-    print('get_dtype_max')
-    return 7
+    print(dtype)
     try:
         dtypeMax = torch.finfo(dtype).max
     except:
@@ -64,6 +63,7 @@ def pertoken_quant(
         per_token_scale[per_token_scale == 0] = 1
 
     # quant hidden_states
+    print(quant_dtype)
     y = (hidden_states / per_token_scale).to(dtype=quant_dtype)
     y_scale = per_token_scale.to(scale_dtype)
     return y, y_scale
@@ -137,6 +137,29 @@ def per_block_quant_wrapper(block_shape=(1, 128)):
 
     return decorator
 
+def per_block_quant_wrapper_int4(block_shape=(1, 128)):
+    def decorator(per_token_quant_func):
+        def wrapper(x, scale=None, quant_dtype=dtypes.i8, dtypeMax=7):
+            blk_m, blk_n = block_shape
+            assert (
+                x.shape[-1] % blk_n == 0
+            ), f"block size {blk_n} not match {x.shape[-1]}"
+            assert blk_m == 1, "only support 1xN block, TODO: support MxN"
+            print(x.shape)
+            print('call here!!')
+            print(quant_dtype)
+            # m, n = x.shape
+            x = x.view(-1, blk_n)
+            y, scale = per_token_quant_func(x, scale=scale, quant_dtype=quant_dtype, dtypeMax=dtypeMax)
+            # return y.view(m, n), scale.view(m, n // blk_n)
+            scale_shape = list(x.shape)
+            scale_shape[-1] = scale_shape[-1] // blk_n
+            return y.view(x.shape), scale.view(scale_shape)
+
+        return wrapper
+
+    return decorator
+
 
 @functools.lru_cache()
 def get_torch_quant(qType):
@@ -145,7 +168,7 @@ def get_torch_quant(qType):
         QuantType.per_Tensor: per_tensor_quant,
         QuantType.per_Token: pertoken_quant,
         # QuantType.per_1x32: per_1x32_f4_quant,
-        QuantType.per_1x32: per_block_quant_wrapper((1, 32))(pertoken_quant),
+        QuantType.per_1x32: per_block_quant_wrapper_int4((1, 32))(pertoken_quant),
         QuantType.per_1x128: per_block_quant_wrapper((1, 128))(pertoken_quant),
     }
 
