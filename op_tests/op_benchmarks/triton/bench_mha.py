@@ -55,6 +55,18 @@ def varlen_benchmark_configs():
     return configs
 
 
+def seq_length_benchmark_configs(args):
+    batch_sizes = [args.b if args.b else 1]
+    N_HEADS = [(args.hq if args.hq else 1, args.hk if args.hk else 1)]
+    seq_lens = [1, 32, 64, 128, 192, 256, 320, 512, 1024, 2048, 4096, 8192, 16384]
+    configs = list(itertools.product(batch_sizes, N_HEADS, seq_lens))
+    configs = [
+        (batch_size, N_HEAD_Q, N_HEAD_K, seq_len, seq_len)
+        for batch_size, (N_HEAD_Q, N_HEAD_K), seq_len in configs
+    ]
+    return configs
+
+
 def model_benchmark_configs(args):
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=args.model)
@@ -139,7 +151,9 @@ def create_benchmark_configs(custom, args):
     if custom:
         x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
     else:
-        if varlen:
+        if args.bench_seq_length:
+            x_vals_list = seq_length_benchmark_configs(args)
+        elif varlen:
             x_vals_list = varlen_benchmark_configs()  # Assume this exists
         else:
             x_vals_list = nonvarlen_benchmark_configs()  # Assume this exists
@@ -655,6 +669,12 @@ def parse_args():
         + "-causal = True or False \n"
         + "-dtype = fp16",
     )
+    parser.add_argument(
+        "-bench_seq_length",
+        action="store_true",
+        default=False,
+        help="Benchmark over a range of sequence lengths (sq == sk).",
+    )
     return parser.parse_args()
 
 
@@ -705,7 +725,7 @@ def main():
     assert (
         args.layout == "thd" or not args.equal_seqlens or args.model
     ), "Equal sequence lengths arg must be used with the thd layout or a model config."
-    if args.hq or args.hk or args.d or args.dv:
+    if not args.bench_seq_length and (args.hq or args.hk or args.d or args.dv):
         custom_config = True
         if not args.dv:
             args.dv = args.d
