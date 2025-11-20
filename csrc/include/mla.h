@@ -49,9 +49,11 @@ void get_mla_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size 
                          const int32_t kv_granularity,
                          const int32_t max_seqlen_qo,
                          const int32_t uni_seqlen_qo,
-                         const bool    fast_mode,
+                         const bool fast_mode,
                          const int32_t topk,
-                         const int32_t max_split_per_batch);
+                         const int32_t max_split_per_batch,
+                         const std::optional<at::ScalarType> dtype_q,
+                         const std::optional<at::ScalarType> dtype_kv);
 
 std::vector<torch::Tensor>
 get_mla_metadata_v1_no_redundant(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]

@@ -272,7 +272,7 @@ def mla_decode_fwd(
         if nhead == 16 or (nhead == 128 and kv_buffer.dtype == dtypes.fp8):
             # Natively support cases
             pass
-        elif nhead in range(32, 512 + 1, 16) and persistent_mode and max_seqlen_q == 1:
+        elif nhead in range(32, 128 + 1, 16) and persistent_mode and max_seqlen_q == 1:
             # we use nhead=16 to simulate such cases by customized metadata
             # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
             total_s = ori_total_s * (ori_nhead // 16)

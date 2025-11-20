@@ -8,7 +8,6 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -278,6 +277,8 @@ def test_mla(
         uni_seqlen_qo=decode_qlen,
         fast_mode=True,
         max_split_per_batch=max_split_per_batch,
+        dtype_q=q.dtype,
+        dtype_kv=kv_buffer.dtype,
     )
 
     def test_absorb_decode_bf16():
@@ -389,7 +390,7 @@ def test_mla(
     err = None
     us_asm_decode = 1e12
     if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
-        nhead == 16 or (nhead in range(32, 128, 16) and decode_qlen == 1)
+        (nhead in [16]) or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
     ):
         err, us_asm_decode = test_absorb_decode_bf16()
     elif kvtype == dtypes.fp8 and nhead in [16, 128]:
