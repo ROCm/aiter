@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Tuple
 import json
 
 # @manual=//triton:triton
@@ -22,9 +21,9 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 import functools
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 try:
     from triton.language.extra.libdevice import (
@@ -315,7 +314,25 @@ def _hstu_attn_fwd_compute(  # noqa C901
             tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
 
 
-@triton.jit
+_hstu_attn_fwd_repr = make_kernel_repr(
+    "_hstu_attn_fwd",
+    [
+        "CAUSAL",
+        "HAS_MULTIPLE_TARGETS",
+        "IS_DELTA_Q",
+        "ALLOW_TF32",
+        "BLOCK_D_Q",
+        "BLOCK_D_V",
+        "BLOCK_M",
+        "BLOCK_N",
+        "HAS_CONTEXTUAL_SEQ_LEN",
+        "HAS_MAX_ATTN_LEN",
+        "HAS_SORT_BY_LENGTH_INDICES",
+    ],
+)
+
+
+@triton.jit(repr=_hstu_attn_fwd_repr)
 def _hstu_attn_fwd(  # noqa C901
     Q,
     K,
@@ -333,13 +350,8 @@ def _hstu_attn_fwd(  # noqa C901
     stride_om,
     stride_oh,
     alpha,
-    Z,
-    AUTOTUNE_Z,
     H,
     MAX_SEQ_LEN,
-    AUTOTUNE_MAX_SEQ_LEN,  # Quantized MAX_SEQ_LEN used as an autotuning key
-    DimQ,
-    DimV,
     DeltaSize,
     contextual_seq_len,
     max_attn_len,
@@ -693,7 +705,24 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     tl.store(dk_ptrs, dk.to(k.dtype), mask=mask_n[:, None])
 
 
-@triton.jit
+_hstu_attn_bwd_repr = make_kernel_repr(
+    "_hstu_attn_bwd",
+    [
+        "CAUSAL",
+        "HAS_MULTIPLE_TARGETS",
+        "ALLOW_TF32",
+        "BLOCK_D_Q",
+        "BLOCK_D_V",
+        "BLOCK_M",
+        "BLOCK_N",
+        "HAS_CONTEXTUAL_SEQ_LEN",
+        "HAS_MAX_ATTN_LEN",
+        "HAS_SORT_BY_LENGTH_INDICES",
+    ],
+)
+
+
+@triton.jit(repr=_hstu_attn_bwd_repr)
 def _hstu_attn_bwd(  # noqa C901
     Q,
     K,
@@ -723,13 +752,8 @@ def _hstu_attn_bwd(  # noqa C901
     alpha,
     contextual_seq_len,
     max_attn_len,
-    Z,
-    AUTOTUNE_Z,
     H,
     MAX_SEQ_LEN,
-    AUTOTUNE_MAX_SEQ_LEN,  # Quantized MAX_SEQ_LEN used as an autotuning key
-    DimQ,
-    DimV,
     CAUSAL: tl.constexpr,
     HAS_MULTIPLE_TARGETS: tl.constexpr,
     HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
@@ -845,12 +869,6 @@ def _hstu_attn_bwd(  # noqa C901
 @functools.lru_cache(maxsize=1024)
 def _get_fwd_config(
     AUTOTUNE_Z: int,
-    H: int,
-    AUTOTUNE_MAX_SEQ_LEN: int,
-    DimQ: int,
-    DimV: int,
-    DeltaSize: int,
-    IS_DELTA_Q: bool,
 ):
     if not hasattr(_get_fwd_config, "_config_dict"):
         dev = arch_info.get_device()
@@ -872,10 +890,6 @@ def _get_fwd_config(
 @functools.lru_cache(maxsize=1024)
 def _get_bwd_config(
     AUTOTUNE_Z: int,
-    H: int,
-    AUTOTUNE_MAX_SEQ_LEN: int,
-    DimQ: int,
-    DimV: int,
 ):
     if not hasattr(_get_bwd_config, "_config_dict"):
         dev = arch_info.get_device()
