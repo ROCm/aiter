@@ -203,6 +203,9 @@ class Case:
             Case(4096, 7168, 4096, "float8_e4m3fn", "mxfloat8_e4m3fn", 128, 4),
             Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4),
             # edges
+            Case(300, 400, 400, "float8_e4m3fn", "float8_e4m3fn", 8, 2),
+            Case(300, 400, 400, "float8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
+            Case(300, 400, 400, "mxfloat8_e4m3fn", "float8_e4m3fn", 8, 2),
             Case(300, 400, 400, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
             Case(1000, 704, 2048, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
             Case(8192, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
