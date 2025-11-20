@@ -3,7 +3,7 @@ from aiter.aot.test.matmul_fp16 import matmul_fp16
 import torch
 
 if __name__ == "__main__":
-    func_name = compile_hsaco_from_triton(
+    compile_hsaco_from_triton(
         matmul_fp16,
         torch.float16,
         torch.float16,
