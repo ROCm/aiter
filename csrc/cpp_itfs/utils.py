@@ -144,7 +144,8 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
     start_ts = time.perf_counter()
 
     def main_func(includes=None, sources=None, cxxflags=None):
-        logger.info(f"start build {sub_build_dir}")
+        if AITER_LOG_MORE >= 2:
+            logger.info(f"start build {sub_build_dir}")
         if includes is None:
             includes = []
         if sources is None:
@@ -218,13 +219,17 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         with open(f"{sub_build_dir}/Makefile", "w") as f:
             f.write(makefile_file)
         subprocess.run(
-            f"cd {sub_build_dir} && make build -j{len(sources)}", shell=True, check=True
+            f"cd {sub_build_dir} && make build -j{len(sources)}",
+            shell=True,
+            capture_output=AITER_LOG_MORE < 2,
+            check=True,
         )
 
     def final_func():
-        logger.info(
-            f"finish build {sub_build_dir}, cost {time.perf_counter()-start_ts:.8f}s"
-        )
+        if AITER_LOG_MORE >= 2:
+            logger.info(
+                f"finish build {sub_build_dir}, cost {time.perf_counter()-start_ts:.8f}s"
+            )
 
     main_func = partial(
         main_func, includes=includes, sources=sources, cxxflags=cxxflags
@@ -278,8 +283,9 @@ def compile_template_op(
             sources = []
         if cxxflags is None:
             cxxflags = []
+        if AITER_LOG_MORE >= 2:
+            logger.info(f"compile_template_op {func_name = } with {locals()}...")
         src_file = src_template.render(func_name=func_name, **kwargs)
-        logger.info(f"compile_template_op {func_name = } with {locals()}...")
         compile_lib(src_file, folder, includes, sources, cxxflags)
     return run_lib(func_name, folder)
 
@@ -331,15 +337,20 @@ def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
 
 
 def compile_hsaco(
-    kernel_name, hsaco, shared=0, gcnArchName=GPU_ARCH, constants={}, extra_metadata={}
+    kernel_name,
+    hsaco,
+    shared=0,
+    gcnArchName=GPU_ARCH,
+    constants=None,
+    extra_metadata=None,
 ):
-    constants = OrderedDict(constants)
+    constants = OrderedDict(constants or {})
     func_name = get_default_func_name(kernel_name, tuple(constants.values()))
     metadata = {}
     metadata["shared"] = shared
     metadata["name"] = kernel_name
     metadata["gcnArchName"] = gcnArchName
-    metadata.update(extra_metadata)
+    metadata.update(extra_metadata or {})
     for key, value in constants.items():
         metadata[key] = str(value)
     os.makedirs(f"{BUILD_DIR}/{metadata["gcnArchName"]}", exist_ok=True)
@@ -363,9 +374,9 @@ def get_hsaco_launcher(hsaco_name, kernel_name):
 
 
 def run_hsaco(
-    func_name, *args, grid=(1, 1, 1), block=(256, 1, 1), stream=None, constants={}
+    func_name, *args, grid=(1, 1, 1), block=(256, 1, 1), stream=None, constants=None
 ):
-    constants = OrderedDict(constants)
+    constants = OrderedDict(constants or {})
     hsaco_name = get_default_func_name(func_name, tuple(constants.values()))
     with open(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.json", "r") as f:
         metadata = json.load(f)
