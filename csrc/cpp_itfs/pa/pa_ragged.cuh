@@ -28,7 +28,8 @@
 ///////////////////////////////////////
 // grid (num_seqs, num_partitions, num_kv_heads)
 // block (256)
-template <typename scalar_t,
+template <int VERSION_ID,
+          typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
           int BLOCK_SIZE,
@@ -89,7 +90,17 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     }
     const int64_t query_loc = static_cast<int64_t>(seq_idx * MTP);
     const int* block_table_seq = kv_page_indices + kv_indptr[seq_idx];
-    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, false>(block_table_seq, query_loc, context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, 0);
+    
+    if constexpr (VERSION_ID == 0) // 0: GOLDEN VERSION
+    {
+        _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, false>
+        (block_table_seq, query_loc, context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, 0);
+    }
+    else // Experimental VERSION: head_dim 128
+    {
+        _paged_attention_kernel_EXPERIMENTAL<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, false>
+        (block_table_seq, query_loc, context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, 0);
+    }
 }
 
 // Grid: (num_heads, num_seqs, mtp).
@@ -135,7 +146,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
 #else // !defined(__HIP__MI3XX_MI250__) TODO: Add NAVI support
 
 
-template <typename scalar_t,
+template <int VERSION_ID,
+          typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
           int BLOCK_SIZE,

@@ -69,8 +69,10 @@ void {{func_name}}(void* out_ptr,
     constexpr int NTHR = 256;
     dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
     dim3 block(NTHR);
+    constexpr int VERSION_ID = {{"0" if version == 'GOLDEN' else "1" if version == 'EXPERIMENTAL' else "0"}};
  
-    paged_attention_ll4mi_QKV_mfma16_kernel<{{dtype}},                       
+    paged_attention_ll4mi_QKV_mfma16_kernel<VERSION_ID,
+                                            {{dtype}},                       
                                             {{kv_dtype}},                            
                                             {% if fp8_kv_dtype == 'auto' %}
                                             vllm::Fp8KVCacheDataType::kAuto,
