@@ -139,7 +139,7 @@ def all_gather_iris(
 
     Example:
         >>> with IrisCommContext() as ctx:
-        >>>     input_shard = ctx.iris_ctx.shmem.zeros((1024, 7168), dtype=torch.float32)
+        >>>     input_shard = ctx.iris_ctx.zeros((1024, 7168), dtype=torch.float32)
         >>>     # ... initialize input_shard ...
         >>>     full_tensor = all_gather_iris(input_shard, ctx)
         >>>     print(full_tensor.shape)  # [8192, 7168] for world_size=8
@@ -156,7 +156,7 @@ def all_gather_iris(
     cur_rank = ctx.cur_rank
     world_size = ctx.num_ranks
     heap_bases = ctx.get_heap_bases()
-    shmem = ctx.iris_ctx.shmem
+    iris_ctx = ctx.iris_ctx
 
     # Input shape
     M_shard, N = input_shard.shape
@@ -167,7 +167,7 @@ def all_gather_iris(
     )
 
     # Allocate output buffer in IRIS shared memory
-    full_output = shmem.zeros((M, N), dtype=input_shard.dtype)
+    full_output = iris_ctx.zeros((M, N), dtype=input_shard.dtype)
 
     # Launch kernel
     grid = (num_sms,)
@@ -195,7 +195,7 @@ def all_gather_iris(
 
     # Synchronize
     torch.cuda.synchronize()
-    shmem.barrier()
+    iris_ctx.barrier()
 
     logger.info(
         f"Rank {cur_rank}: All-gather complete, output shape: {full_output.shape}"
