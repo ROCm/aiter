@@ -7,6 +7,7 @@ from torch import Tensor
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from .utils.common_utils import serialize_dict, deserialize_string
 from aiter.ops.triton._triton_kernels.gemm_a16w16_atomic import (
     _gemm_a16_w16_atomic_kernel,
     _get_config,
@@ -22,34 +23,18 @@ def gemm_a16w16_atomic_fake_tensor(
     w: Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
 ) -> Tensor:
     return y
 
 @torch_compile_guard(gen_fake=gemm_a16w16_atomic_fake_tensor)
-def gemm_a16w16_atomic(
+def gemm_a16w16_atomic_(
     x: Tensor,
     w: Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    #config: Optional[dict] = None,
+    config: Optional[str] = None,
 ) -> Tensor:
-    """
-    Computes 16 bit matrix multiplication Y = X @ W^T using atomic operations for split-K reduction.
-
-    Args:
-        x (torch.Tensor): Input matrix with shape (M, K).
-        w (torch.Tensor): Weight matrix with shape (N, K), internally transposed.
-        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
-            Note: BF16 atomic aggregation may have slight precision loss.
-        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
-            Must be zero-initialized for split-K (NUM_KSPLIT > 1).
-        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
-            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, cache_modifier).
-
-    Returns:
-        torch.Tensor: Output with shape (M, N).
-    """
-
     _LOGGER.info(
         f"GEMM_A16W16_ATOMIC: x.shape={tuple(x.shape)}, w.shape={tuple(w.shape)} "
     )
@@ -59,10 +44,11 @@ def gemm_a16w16_atomic(
     M, K = x.shape
     K, N = w.shape
 
-    config = {}
-    config = None
     if config is None:
         config = _get_config(M, N, K)
+    else:
+        config = deserialize_string(config)
+
     # For compatability reasons, these keys may not exist in the config
     # TODO: This needs to be embedded in the configs later
     if "NUM_KSPLIT" not in config:
@@ -102,3 +88,29 @@ def gemm_a16w16_atomic(
     )
 
     return y
+
+def gemm_a16w16_atomic(
+    x: Tensor,
+    w: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+) -> Tensor:
+    """
+    Computes 16 bit matrix multiplication Y = X @ W^T using atomic operations for split-K reduction.
+
+    Args:
+        x (torch.Tensor): Input matrix with shape (M, K).
+        w (torch.Tensor): Weight matrix with shape (N, K), internally transposed.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+            Note: BF16 atomic aggregation may have slight precision loss.
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+            Must be zero-initialized for split-K (NUM_KSPLIT > 1).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, cache_modifier).
+
+    Returns:
+        torch.Tensor: Output with shape (M, N).
+    """
+    config_hashable = serialize_dict(config) if config else None
+    return gemm_a16w16_atomic_(x, w, dtype, y, config_hashable)

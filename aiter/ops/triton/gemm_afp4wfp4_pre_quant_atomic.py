@@ -7,6 +7,7 @@ from torch import Tensor
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from .utils.common_utils import serialize_dict, deserialize_string
 from aiter.ops.triton.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.gemm_afp4wfp4_pre_quant_atomic import (
@@ -24,38 +25,19 @@ def gemm_afp4wfp4_pre_quant_fake_tensor(
     w_scales: Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
 ) -> Tensor:
     return y
 
 @torch_compile_guard(gen_fake=gemm_afp4wfp4_pre_quant_fake_tensor)
-def gemm_afp4wfp4_pre_quant(
+def gemm_afp4wfp4_pre_quant_(
     x: Tensor,
     w: Tensor,
     w_scales: Tensor,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-#    config: Optional[dict] = None,
+    config: Optional[str] = None,
 ) -> Tensor:
-    """
-    Computes matrix multiplication Y = X @ W^T with on-the-fly FP4 quantization of activations.
-    X is quantized to MXFP4 during computation, W is pre-quantized FP4. Uses atomic operations for split-K reduction.
-
-    Args:
-        x (torch.Tensor): Higher precision input matrix with shape (M, K) (BF16 or FP16).
-            Quantized to FP4 E2M1 on-the-fly during GEMM.
-        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N, K), internally transposed.
-        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (N, K//32).
-            One scale per 32 elements in K dimension.
-        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
-        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
-            Must be zero-initialized for atomic operations.
-        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
-            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT).
-
-    Returns:
-        torch.Tensor: Output with shape (M, N).
-    """
-
     _LOGGER.info(
         f"GEMM_AFP4WFP4_PRE_QUANT_ATOMIC: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w_scales.shape)} "
     )
@@ -71,10 +53,10 @@ def gemm_afp4wfp4_pre_quant(
     if y is None:
         y = torch.zeros((M, N), dtype=dtype, device=x.device)
 
-    config = {}
-    config = None
     if config is None:
         config = _get_config(M, N, K)
+    else:
+        config = deserialize_string(config)
 
     grid = lambda META: (  # noqa: E731
         (
@@ -104,3 +86,33 @@ def gemm_afp4wfp4_pre_quant(
     )
 
     return y
+
+def gemm_afp4wfp4_pre_quant(
+    x: Tensor,
+    w: Tensor,
+    w_scales: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+) -> Tensor:
+    """
+    Computes matrix multiplication Y = X @ W^T with on-the-fly FP4 quantization of activations.
+    X is quantized to MXFP4 during computation, W is pre-quantized FP4. Uses atomic operations for split-K reduction.
+
+    Args:
+        x (torch.Tensor): Higher precision input matrix with shape (M, K) (BF16 or FP16).
+            Quantized to FP4 E2M1 on-the-fly during GEMM.
+        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N, K), internally transposed.
+        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (N, K//32).
+            One scale per 32 elements in K dimension.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+            Must be zero-initialized for atomic operations.
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT).
+
+    Returns:
+        torch.Tensor: Output with shape (M, N).
+    """
+    config_hashable = serialize_dict(config) if config else None
+    return gemm_afp4wfp4_pre_quant_(x, w, w_scales, dtype, y, config_hashable)

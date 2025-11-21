@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Dict, Any
+from typing import Optional
 import torch
 from torch import Tensor
 import triton
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from .utils.common_utils import serialize_dict, deserialize_string
 from aiter.ops.triton._triton_kernels.batched_gemm_afp4wfp4_pre_quant import (
     _batched_gemm_afp4_wfp4_pre_quant_reduce_kernel,
     _batched_gemm_afp4_wfp4_pre_quant_kernel,
@@ -23,14 +24,6 @@ _USE_GEMM_SPLITK_BF16 = False
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
-
-def serialize_dict(d: Dict[str, Any]) -> str:
-    items_list = list(d.items())
-    sorted_items = sorted(items_list)
-    return json.dumps(sorted_items)
-
-def deserialize_string(s: str) -> Dict[str, Any]:
-    items_list = json.loads(s)
     return dict(items_list)
 
 def batched_gemm_afp4wfp4_pre_quant_fake_tensor(
