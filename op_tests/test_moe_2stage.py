@@ -283,8 +283,8 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
-        num_iters=1,
-        num_warmup=0,
+        num_iters=2,
+        num_warmup=1,
     )
     aiter.logger.info(f'run pertest done')
     err = checkAllclose(
