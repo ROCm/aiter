@@ -83,12 +83,15 @@ def _compile_mla(
     q_dtype,
     WavePerEU: int = 2,
 ):
-    dev = arch_info.get_arch()
-    target = GPUTarget("hip", dev, 64)
+    arch = arch_info.get_arch()
+    dev = arch_info.get_device()
+    target = GPUTarget("hip", arch, 64)
     if q_dtype == dtypes.fp8:
         dtype_str = "*fp8e4b8"
+        dtype = "fp8"
     else:
         dtype_str = "*bf16"
+        dtype = "bf16"
 
     fn_signature = {
         "Q": dtype_str,
@@ -133,7 +136,7 @@ def _compile_mla(
         "num_stages": 2,
         "num_ctas": 1,
         "cluster_dims": [1, 1, 1],
-        "arch": dev,
+        "arch": arch,
         "backend_name": "hip",
         "warp_size": 64,
         "name": "mla_n16x4_prefetch_k_paged_64",
@@ -190,7 +193,7 @@ def _compile_mla(
             options=options,
         )
     else:
-        kernel_str = f"mla_n16x4_prefetch_k_paged_64"
+        kernel_str = f"mla_n16x4_prefetch_k_paged_64_{dtype}_{dev}"
         metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/mla/aot/{kernel_str}"
         # metadata_pth = f"./mla/aot/{kernel_str}"
         with AOTMetadataContext(

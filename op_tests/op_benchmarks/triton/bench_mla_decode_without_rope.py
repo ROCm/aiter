@@ -269,6 +269,7 @@ def nonvarlen_benchmark_configs(args: argparse.Namespace):
     kv_lora_rank = 512
     qk_rope_head_dim = 64
     mtp = args.mtp
+    dtype = args.dtype
 
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_k))
     configs = [
@@ -324,12 +325,12 @@ def model_benchmark_configs(args: argparse.Namespace):
 
 
 def create_benchmark_configs(args: argparse.Namespace):
-    dtype = arg_to_torch_dtype[args.dtype]
     x_names = ["BATCH", "H", "S", "kv_lora_rank", "qk_rope_head_dim", "mtp"]
 
     configs = []
     extra_args = {
-        "dtype": dtype,
+        "dtype": args.dtype,
+        "save_aot": args.aot,
     }
 
     if args.model:
@@ -374,11 +375,12 @@ def run_benchmark(args: argparse.Namespace):
         kv_lora_rank: int,
         qk_rope_head_dim: int,
         mtp: int,
-        dtype: torch.dtype,
+        dtype: str,
         num_kv_splits: int = 8,
         sm_scale: float = 1.0,
         logit_cap: float = 0.0,
         device="cuda",
+        save_aot: bool = False,
         metric: str = "bandwidth",
         **kwargs,
     ):
@@ -392,6 +394,7 @@ def run_benchmark(args: argparse.Namespace):
         Right now q_heads == kv_heads).
         """
 
+        torch_dtype = dtypes.d_dtypes[dtype]
         # mtp = 1
         #
         page_block_size = 64
@@ -405,7 +408,7 @@ def run_benchmark(args: argparse.Namespace):
                 qk_rope_head_dim,
                 num_kv_splits,
                 page_block_size,
-                dtype,
+                torch.bfloat16,
                 device,
                 varlen=False,
                 mtp=mtp,
@@ -425,16 +428,14 @@ def run_benchmark(args: argparse.Namespace):
         seq_lens_qo.fill_(mtp + 1)
         max_seqlen_qo = seq_lens_qo.max().item()
         qo_indptr[1 : BATCH + 1] = torch.cumsum(seq_lens_qo, dim=0)
+        q = q.reshape(-1, H, 576)
 
         q_fp8 = q.to(dtypes.fp8)
         kv_cache_fp8 = kv_cache.to(dtypes.fp8)
 
-        # import pdb;pdb.set_trace()
         out_ref, lse_ref = torch_mla_extend(
-            q_fp8.reshape(-1, H, 576),
-            kv_cache_fp8[:,:,:, :576].reshape(-1, 1, 576),
-            # q.reshape(-1, H, 576),
-            # kv_cache.reshape(-1, 1, 576),
+            q_fp8 if dtype == "fp8" else q,
+            kv_cache_fp8.reshape(-1, 1, 576) if dtype == "fp8" else kv_cache.reshape(-1, 1, 576),
             qo_indptr,
             kv_indptr,
             kv_indices,
@@ -442,7 +443,7 @@ def run_benchmark(args: argparse.Namespace):
             kv_lora_rank,
             qk_rope_head_dim,
             is_causal=False,
-            dtype=dtype,
+            dtype=torch.bfloat16,
         )
 
         # FLOPS calculation
@@ -471,10 +472,11 @@ def run_benchmark(args: argparse.Namespace):
         kv_indptrs_read = BATCH + 1
         kv_indices_read = BATCH * S
 
+        bytes_per_elem = torch.finfo(torch_dtype).bits // 8
         bytes_read = (
-            BATCH * q_elems_read * q.element_size()
-            + BATCH * k_rope_elems_read * k_input.element_size()
-            + BATCH * kv_nope_elems_read * k_input.element_size()
+            BATCH * q_elems_read * bytes_per_elem
+            + BATCH * k_rope_elems_read * bytes_per_elem
+            + BATCH * kv_nope_elems_read * bytes_per_elem
             + kv_indptrs_read
             + kv_indices_read
         )
@@ -487,42 +489,15 @@ def run_benchmark(args: argparse.Namespace):
             BATCH * (mtp + 1) * out_elems * out_tri.element_size()
         )
 
-        mem = bytes_read // 2 + bytes_written
-        # print(mem)
+        mem = bytes_read + bytes_written
+        q = q.reshape(-1, H * (mtp + 1), 576)
+        if dtype == "fp8":
+            q_fp8 = q_fp8.reshape(-1, H * (mtp + 1), 576)
 
-        # # ms = triton.testing.do_bench(
-        # _, us = run_perftest(
-        # # lambda: decode_attention_fwd_grouped(
-        # #     q_fp8.reshape(-1, H * 2, 576),
-        # #     k_input_fp8,
-        # #     v_input_fp8,
-        #     decode_attention_fwd_grouped,
-        #     q.reshape(-1, H * (mtp + 1), 576),
-        #     kv_cache,
-        #     v_input,
-        #     out_tri,
-        #     kv_indptr,
-        #     kv_indices,
-        #     block_tables,
-        #     kv_lora_rank,
-        #     attn_logits,
-        #     attn_lse,
-        #     num_kv_splits,
-        #     sm_scale,
-        #     logit_cap,
-        #     mtp,
-        #     # ),
-        #     # warmup=25,
-        #     # rep=100,
-        # )
         _, us = run_perftest(
-        # lambda: decode_attention_fwd_grouped(
-        #     q_fp8.reshape(-1, H * 2, 576),
-        #     k_input_fp8,
-        #     v_input_fp8,
             decode_attention_fwd_grouped,
-            q_fp8.reshape(-1, H * (mtp + 1), 576),
-            kv_cache_fp8,
+            q_fp8 if dtype == "fp8" else q,
+            kv_cache_fp8 if dtype == "fp8" else kv_cache,
             v_input,
             out_tri,
             kv_indptr,
@@ -535,34 +510,10 @@ def run_benchmark(args: argparse.Namespace):
             sm_scale,
             logit_cap,
             mtp,
-            # ),
-            # warmup=25,
-            # rep=100,
         )
-        # print(lse_ref)
-        # decode_attention_fwd_grouped_fp8(
-        #     q_fp8.reshape(-1, H * (mtp + 1), 576),
-        #     kv_cache_fp8.reshape(-1, 1, 576),
-        #     v_input,
-        #     out_tri,
-        #     kv_indptr,
-        #     kv_indices,
-        #     kv_lora_rank,
-        #     attn_logits,
-        #     attn_lse,
-        #     num_kv_splits,
-        #     sm_scale,
-        #     logit_cap,
-        #     mtp,
-        #     # ),
-        #     # warmup=25,
-        #     # rep=100,
-        # )
         cache_key = decode_attention_fwd_grouped(
-            # q.reshape(-1, H * (mtp + 1), 576),
-            # kv_cache,
-            q_fp8.reshape(-1, H * (mtp + 1), 576),
-            kv_cache_fp8,
+            q_fp8 if dtype == "fp8" else q,
+            kv_cache_fp8 if dtype == "fp8" else kv_cache,
             v_input,
             out_tri,
             kv_indptr,
@@ -584,31 +535,32 @@ def run_benchmark(args: argparse.Namespace):
             msg=f"mla_decode-absorb    [golden vs triton]: {ms * 1000} us......",
         )
 
-        # import pdb;pdb.set_trace()
         cal_diff(out_ref, out_tri, "out", True)
 
-        # Return exactly one scalar depending on which metric is active
         tflops = total_flops / ms * 1e-9
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         print(f"{tflops=}")
         print(f"{bandwidth=}")
 
-        # from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-        # if True:
-        #     triton_cache_dir = str(triton.knobs.cache.dir)
-        #     aot_kernel_dir = f"{AITER_TRITON_CONFIGS_PATH}/mla/aot/"
-        #
-        #     os.makedirs(aot_kernel_dir, exist_ok=True)
-        #     aot_name = f"mla_n16x4_prefetch_k_paged_64"
-        #
-        #     src = os.path.join(triton_cache_dir, cache_key)
-        #     dst = os.path.join(aot_kernel_dir, aot_name)
-        #     if os.path.exists(dst):
-        #         os.system(f"rm -rf {dst}")
-        #     os.system(f"mv {src} {dst}")
-        #     print(f"Moved cache from {src} to {dst}")
-        #
-        #     os.system(f"zip -r mla_aot_kernel mla")
+        if save_aot:
+            from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+            import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+            dev = arch_info.get_device()
+            triton_cache_dir = str(triton.knobs.cache.dir)
+            aot_kernel_dir = f"{AITER_TRITON_CONFIGS_PATH}/mla/aot/"
+
+            os.makedirs(aot_kernel_dir, exist_ok=True)
+            aot_name = f"mla_n16x4_prefetch_k_paged_64_{dtype}_{dev}"
+
+            src = os.path.join(triton_cache_dir, cache_key)
+            dst = os.path.join(aot_kernel_dir, aot_name)
+            if os.path.exists(dst):
+                os.system(f"rm -rf {dst}")
+            os.system(f"mv {src} {dst}")
+            print(f"Moved cache from {src} to {dst}")
+
+            os.system(f"zip -r mla_aot_kernel mla")
         return bandwidth
 
     bench_mla.run(save_path=".", print_data=True, show_plots=False)
@@ -648,18 +600,12 @@ def parse_args():
         help="Q sequence length (mtp + 1 == qo_len) in MTP mode",
     )
     parser.add_argument(
-        "--no-rope",
+        "--aot",
         action="store_true",
         default=False,
-        help="Disable rotary positional embeddings.",
+        help="Enable aot load.",
     )
-    parser.add_argument(
-        "--use-neox-style-rope",
-        action="store_true",
-        default=False,
-        help="Use Neox style rotary positional embeddings over vanilla RoPE. This is incompatible with the --no-rope flag.",
-    )
-    parser.add_argument("--dtype", default="bf16")
+    parser.add_argument("--dtype", default="fp8")
     parser.add_argument(
         "-print_vgpr",
         action="store_true",
@@ -676,9 +622,6 @@ def main():
         assert not (
             args.hq
         ), "The -hq flag is unsupported when using --model (as the model config specifies hq)"
-    assert (
-        args.dtype in arg_to_torch_dtype
-    ), "Only fp16, bf16 and f32 types currently supported."
 
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
