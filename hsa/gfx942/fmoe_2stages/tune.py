@@ -1817,9 +1817,9 @@ class FmoeTuner(TunerCommon):
             )
             prorfiles.append(profileDF)
 
-            profileDF = profileDF.sort_values("us").drop_duplicates(
-                ["stage", "block_m"], keep="first"
-            )
+            # profileDF = profileDF.sort_values("us").drop_duplicates(
+            #     ["stage", "block_m"], keep="first"
+            # )
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
                 columns=["stage"], axis=1
             )
