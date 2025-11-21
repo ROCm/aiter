@@ -18,6 +18,22 @@ import inspect
 import json
 
 
+def get_git_commit_id_short():
+    """??? commit ID (?? 7 ???)"""
+    try:
+        commit_id = (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.STDOUT
+            )
+            .decode("utf-8")
+            .strip()
+        )
+        return commit_id
+    except subprocess.CalledProcessError:
+        return None
+
+
+commit_id = get_git_commit_id_short()
 logger = logging.getLogger("aiter")
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
@@ -361,6 +377,7 @@ def compile_hsaco(
         metadata["shared"] = shared
         metadata["name"] = kernel_name
         metadata["gcnArchName"] = gcnArchName
+        metadata["commitId"] = commit_id
         metadata.update(extra_metadata or {})
         for key, value in constants.items():
             metadata[key] = str(value)

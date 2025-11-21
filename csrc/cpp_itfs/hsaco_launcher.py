@@ -24,14 +24,14 @@ logger.setLevel(LOG_LEVEL[AITER_LOG_MORE])
 try:
     from hip import hip
 except ImportError:
-    logger.info("Error: hip-python not found. Please install: pip install hip-python")
+    logger.error("hip-python not found. Please install: pip install hip-python")
     sys.exit(1)
 
 try:
     import torch
 except ImportError:
     torch = None
-    logger.info("Warning: PyTorch not found. Tensor support will be limited.")
+    logger.warning("PyTorch not found. Tensor support will be limited.")
 
 
 def hip_check(result):
@@ -269,7 +269,7 @@ def launch_triton_kernel(
         return 0
 
     except Exception as e:
-        logger.info(f"Error launching kernel: {e}")
+        logger.error(f"Error launching kernel: {e}")
         import traceback
 
         traceback.print_exc()
