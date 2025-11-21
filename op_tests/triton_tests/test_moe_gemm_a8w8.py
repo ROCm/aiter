@@ -188,27 +188,27 @@ class Case:
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
             # TP1
-            Case(16,  7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
-            Case(1024, 2048, 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
-            Case(4096, 4096, 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
-            Case(8192, 7168, 2048, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(16,  7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
+            Case(1024, 2048, 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
+            Case(4096, 4096, 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
+            Case(8192, 7168, 2048, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
             # TP8 
-            Case(16, 512, 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
-            Case(1024, 7168, 256, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
-            Case(4096, 512  , 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
-            Case(8192, 7168, 256, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(16, 512, 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
+            Case(1024, 7168, 256, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
+            Case(4096, 512  , 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
+            Case(8192, 7168, 256, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
             # Precision combinations
-            Case(4096, 7168, 4096, "float8_e4m3fn", "float8_e4m3fn", 128, 4),
-            Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "float8_e4m3fn", 128, 4),
-            Case(4096, 7168, 4096, "float8_e4m3fn", "mxfloat8_e4m3fn", 128, 4),
-            Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 128, 4),
+            Case(4096, 7168, 4096, "float8_e4m3fn", "float8_e4m3fn", 256, 8),
+            Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "float8_e4m3fn", 256, 8),
+            Case(4096, 7168, 4096, "float8_e4m3fn", "mxfloat8_e4m3fn", 256, 8),
+            Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8),
             # edges
             Case(300, 400, 400, "float8_e4m3fn", "float8_e4m3fn", 8, 2),
             Case(300, 400, 400, "float8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
             Case(300, 400, 400, "mxfloat8_e4m3fn", "float8_e4m3fn", 8, 2),
             Case(300, 400, 400, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
-            Case(1000, 704, 2048, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
-            Case(8192, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
+            Case(1000, 704, 2048, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 4),
+            Case(8192, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 4),
         ]
     ],
 )
@@ -307,30 +307,27 @@ def test_op(
         x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)
         x_static_scale = None
         out_dtype = torch.bfloat16
-        maxtol = None
-        rmstol = None
     else:
         x_mx_scales_tri = None
         x_static_scale = x_tri.abs().max().float() / 448.0 
         x_tri = downcast_to_static_fp8(x_tri, x_static_scale)
         x_ref = (x_tri.float() * x_static_scale).to(torch.bfloat16)
         out_dtype = torch.float8_e4m3fn
+
+    if act_mxfp8 or weight_mxfp8:
         maxtol = 4e-1
         rmstol = 4e-2
+    else:
+        maxtol = 4e-1
+        rmstol = 5e-2
 
     ref_y = moe_gemm_torch(
         x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
     )
     if not act_mxfp8 and fused_quant:
         quant_static_scale = ref_y.abs().max().float() / 448.0
-        out_dtype = torch.float8_e4m3fn
-        maxtol = 4e-1
-        rmstol = 4e-2
     else:
         quant_static_scale = None
-        out_dtype = torch.bfloat16
-        maxtol = None
-        rmstol = None
     tri_y = moe_gemm_a8w8(
         x_tri,
         w_tri,
