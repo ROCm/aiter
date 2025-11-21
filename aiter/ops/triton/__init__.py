@@ -14,6 +14,7 @@ try:
         all_gather_iris,
         reduce_scatter_rmsnorm_quant_all_gather,
     )
+
     _COMMS_AVAILABLE = True
 except ImportError:
     _COMMS_AVAILABLE = False
@@ -21,11 +22,13 @@ except ImportError:
 __all__ = ["quant", "comms"]
 
 if _COMMS_AVAILABLE:
-    __all__.extend([
-        "IrisCommContext",
-        "all_reduce_iris",
-        "all_reduce_iris_atomic",
-        "reduce_scatter_iris",
-        "all_gather_iris",
-        "reduce_scatter_rmsnorm_quant_all_gather",
-    ])
+    __all__.extend(
+        [
+            "IrisCommContext",
+            "all_reduce_iris",
+            "all_reduce_iris_atomic",
+            "reduce_scatter_iris",
+            "all_gather_iris",
+            "reduce_scatter_rmsnorm_quant_all_gather",
+        ]
+    )
