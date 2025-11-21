@@ -1,0 +1,68 @@
+name: Test PyPI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-pypi:
+    runs-on: aiter-mi355-1gpu
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: test_pypi"
+          docker run -dt \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name test_pypi \
+          rocm/pytorch:latest
+    
+      - name: Test network speed and latency
+        run: |
+          set -ex
+          echo "Testing network speed with speedtest-cli..."
+          docker exec \
+          -w /workspace \
+          test_pypi \
+          bash -c "pip install -q speedtest-cli && speedtest-cli --simple || true"
+
+          echo "Checking NDS latency to pypi.org and github.com..."
+          docker exec \
+          -w /workspace \
+          test_pypi \
+          bash -c "apt-get update && apt-get install -y dnsutils iputils-ping curl"
+
+          # Check DNS resolution and latency
+          docker exec \
+          test_pypi \
+          bash -c "nslookup pypi.org || true"
+          docker exec \
+          test_pypi \
+          bash -c "nslookup github.com || true"
+          docker exec \
+          test_pypi \
+          bash -c "ping -c 4 pypi.org || true"
+          docker exec \
+          test_pypi \
+          bash -c "ping -c 4 github.com || true"
+
+          echo "Testing download speed from pypi.org..."
+          docker exec \
+          test_pypi \
+          bash -c "curl -o /dev/null -L --max-time 60 https://files.pythonhosted.org/packages/source/p/pip/pip-24.0.tar.gz -w 'pypi.org download: %{speed_download} bytes/sec\n'"
+
+          echo "Testing download speed from github.com..."
+          docker exec \
+          test_pypi \
+          bash -c "curl -o /dev/null -L --max-time 60 https://github.com/git/git/archive/refs/tags/v2.42.0.tar.gz -w 'github.com download: %{speed_download} bytes/sec\n'"
