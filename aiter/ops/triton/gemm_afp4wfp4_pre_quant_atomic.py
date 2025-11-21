@@ -7,9 +7,9 @@ from torch import Tensor
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from .utils.common_utils import serialize_dict, deserialize_string
 from aiter.ops.triton.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_string
 from aiter.ops.triton._triton_kernels.gemm_afp4wfp4_pre_quant_atomic import (
     _gemm_afp4_wfp4_pre_quant_kernel,
     _get_config,

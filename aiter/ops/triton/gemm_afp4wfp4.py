@@ -7,9 +7,8 @@ from torch import Tensor
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from .utils.common_utils import serialize_dict, deserialize_string
-from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_string
 from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
     _gemm_afp4_wfp4_kernel,
     _gemm_afp4_wfp4_kernel_preshuffled_scales,
@@ -18,6 +17,7 @@ from aiter.ops.triton._triton_kernels.gemm_afp4wfp4 import (
     _get_config,
 )
 from .utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 import os
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext

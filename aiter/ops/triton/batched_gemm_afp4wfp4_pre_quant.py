@@ -6,13 +6,13 @@ import torch
 from torch import Tensor
 import triton
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from .utils.common_utils import serialize_dict, deserialize_string
 from aiter.ops.triton._triton_kernels.batched_gemm_afp4wfp4_pre_quant import (
     _batched_gemm_afp4_wfp4_pre_quant_reduce_kernel,
     _batched_gemm_afp4_wfp4_pre_quant_kernel,
     _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_string
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()

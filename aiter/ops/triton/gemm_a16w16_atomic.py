@@ -7,12 +7,12 @@ from torch import Tensor
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from .utils.common_utils import serialize_dict, deserialize_string
 from aiter.ops.triton._triton_kernels.gemm_a16w16_atomic import (
     _gemm_a16_w16_atomic_kernel,
     _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_string
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
