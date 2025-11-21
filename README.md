@@ -14,16 +14,46 @@ Some summary of the features:
 
 
 ## Installation
-```
+
+### Basic Installation
+```bash
 git clone --recursive https://github.com/ROCm/aiter.git
 cd aiter
 python3 setup.py develop
 ```
 
 If you happen to forget the `--recursive` during `clone`, you can use the following command after `cd aiter`
-```
+```bash
 git submodule sync && git submodule update --init --recursive
 ```
+
+### Optional: Triton-based Communication (Iris)
+
+AITER supports GPU-initiated communication using the [Iris library](https://github.com/ROCm/iris). This enables high-performance Triton-based communication primitives like reduce-scatter and all-gather.
+
+**Install with Triton communication support:**
+```bash
+# Option 1: Install via extras
+pip install -e ".[triton_comms]"
+
+# Option 2: Install all optional dependencies
+pip install -e ".[all]"
+```
+
+**Using Triton communication:**
+```python
+from aiter import IrisCommContext, reduce_scatter_iris, all_gather_iris
+import torch.distributed as dist
+
+# Initialize PyTorch distributed
+dist.init_process_group(backend="nccl")
+
+# Use Iris-based communication
+with IrisCommContext() as ctx:
+    output = reduce_scatter_iris(input_tensor, ctx)
+```
+
+For more details, see [docs/iris_communication.md](docs/iris_communication.md)
 
 ## Run operators supported by aiter
 
