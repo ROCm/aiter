@@ -251,15 +251,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert input_tensor.shape[0] % world_size == 0
             chunk_size = input_tensor.shape[0] // world_size
             output_shape = (chunk_size,) + input_tensor.shape[1:]
+            output_.reshape(output_shape)
 
-            output = torch.empty(
-                output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-            )
-
-            pynccl_comm.reduce_scatter(output, input_tensor)
+            pynccl_comm.reduce_scatter(output_, input_tensor)
 
             # Reshape before returning
-            output_ = output.movedim(0, dim).contiguous()
+            output_.movedim(0, dim).contiguous()
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
