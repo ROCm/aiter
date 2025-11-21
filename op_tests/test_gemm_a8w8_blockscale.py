@@ -3,6 +3,11 @@
 
 import argparse
 import itertools
+import sys
+import os
+
+# Add parent directory to path to ensure we use local aiter module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 import torch
@@ -132,6 +137,36 @@ def test_gemm_asm(dtype, m, n, k):
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, asm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}"
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
+@perftest()
+def run_asm_mi300(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+    return aiter.a8w8_blockscale_bpreshuffle_ASM(x, weight, x_scale, w_scale, dtype)
+
+
+@benchmark()
+def test_gemm_asm_mi300(dtype, m, n, k):
+    dim = (m, n, k)
+    block_shape_n, block_shape_k = block_shape
+    scale_m = m
+    scale_n = (n + block_shape_n - 1) // block_shape_n
+    scale_k = (k + block_shape_k - 1) // block_shape_k
+
+    x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+
+    x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
+    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+
+    x_scale_trans = torch.transpose(x_scale, 0, 1)
+    w_scale_trans = torch.transpose(w_scale, 0, 1)
+
+    flat_weight = shuffle_weight(weight, layout=(32, 32)) # ?
+
+    a, avg_a = run_torch2(x, weight, x_scale, w_scale, dtype)
+    b, avg_b = run_asm_mi300(x, flat_weight, x_scale, w_scale, dtype)
+    tflops = 2 * m * n * k / (avg_b) / 1e6
+    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, asm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}"
+    checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
+
 
 l_dtype = ["bf16"]
 l_m = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]
@@ -199,17 +234,51 @@ if args.nk is not None:
 l_preshuffle: List[bool] = args.preshuffle
 
 df = []
-for dtype, m, (n, k), preshuffle in itertools.product(l_dtype, l_m, l_nk, l_preshuffle):
-    # deepseek-r1
-    ret = test_gemm(dtype, m, n, k, preshuffle)
-    df.append(ret)
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+# for dtype, m, (n, k), preshuffle in itertools.product(l_dtype, l_m, l_nk, l_preshuffle):
+#     # deepseek-r1
+#     ret = test_gemm(dtype, m, n, k, preshuffle)
+#     df.append(ret)
+# df = pd.DataFrame(df)
+# aiter.logger.info(f"summary:\n{df}")
 # for dtype in [dtypes.fp16]:
 #     # deepseek-r1
 #     for m in [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]:
 #         for (n, k) in [(1536,7168), (3072,1536), (7168, 256), (7168, 2048), (4608, 7168), (7168, 2304), (512, 7168), (4096, 512)][1:2]:
 #             test_gemm_asm(dtype, m, n, k)
 #             break
-if df["failed"].any():
-    print("Failed cases:", df[df["failed"] > 0], sep="\n")
+# if df["failed"].any():
+#     print("Failed cases:", df[df["failed"] > 0], sep="\n")
+
+for dtype in [dtypes.bf16]:
+    # deepseek-r1
+    for m in [
+        16,
+        17,
+        31,
+        33,
+        127,
+        129,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        1536,
+        2048,
+        4096,
+        8192,
+        16384,
+        20480,
+    ]:
+        for n, k in [
+            (1536, 7168),
+            (3072, 1536),
+            (7168, 2048),
+            (4608, 7168),
+            (7168, 2304),
+            (512, 7168),
+            (4096, 512),
+        ][1:2]:
+            test_gemm_asm_mi300(dtype, m, n, k)
+            break
