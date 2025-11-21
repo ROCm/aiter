@@ -60,9 +60,11 @@ def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
 
 @perftest(num_iters=TEST_NUM_ITERS)
 def run_bf16gemm_asm(
-    x, weight, out_asm, otype=dtypes.fp32, bias=None, splitK=None, kernelName=None
+    x, weight, out_asm, bias=None, splitK=1, kernelName=None, bpreshuffle=0
 ):
-    return aiter.gemm_a16w16_asm(x, weight, out_asm, bias, splitK, kernelName)
+    return aiter.gemm_a16w16_asm(
+        x, weight, out_asm, bias, splitK, kernelName, bpreshuffle
+    )
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -149,10 +151,12 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         # and (k == 5120 or k == 7168)
         and bias is None
     ):
-        # wshuffle = shuffle_weight(weight, layout=(16, 16))
         # out_asm = torch.empty((m + 191) // 192 * 192, n, dtype=otype)
         out_asm = torch.empty(m, n, dtype=otype, device=x.device)
-        (d, *_), avg_d = run_bf16gemm_asm(x, weight, out_asm, otype=dtypes.fp32)
+        wshuffle = shuffle_weight(weight, layout=(16, 16))
+        (d, *_), avg_d = run_bf16gemm_asm(
+            x, wshuffle, out_asm, bpreshuffle=wshuffle.is_shuffled
+        )
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
         err_asm = checkAllclose(b, d, msg=msg)
 

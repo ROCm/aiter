@@ -6,6 +6,7 @@ import sys
 import argparse
 import glob
 import pandas as pd
+import numpy as np
 from collections import defaultdict
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -88,8 +89,12 @@ if __name__ == "__main__":
                     col for col in headers_list if col not in required_columns
                 ]
                 other_columns_comma = ", ".join(other_columns)
+                sample_row = combine_df.iloc[0]
                 other_columns_cpp_def = "\n".join(
-                    [f"    int {col};" for col in other_columns]
+                    [
+                        f"    {'int' if isinstance(sample_row[col], (int, float, np.integer)) else 'std::string'} {col};"
+                        for col in other_columns
+                    ]
                 )
                 content += f"""
 #define ADD_CFG({other_columns_comma}, arch, path, knl_name, co_name)         \\
@@ -110,7 +115,7 @@ using CFG = std::unordered_map<std::string, {args.module}Config>;
 """
                 have_get_header = True
             cfg = [
-                f'ADD_CFG({", ".join(f"{getattr(row, col):>4}" for col in other_columns)}, '
+                f'ADD_CFG({", ".join(f"\"{getattr(row, col)}\"" if not str(getattr(row, col)).isdigit() else f"{getattr(row, col):>4}" for col in other_columns)}, '
                 f'"{row.arch}", "{relpath}/", "{row.knl_name}", "{row.co_name}"),'
                 for row in combine_df.itertuples(index=False)
             ]
