@@ -81,12 +81,12 @@ from . import mla
 try:
     from .ops.triton.comms import (
         IrisCommContext,
-        all_reduce_iris,
-        all_reduce_iris_atomic,
         reduce_scatter_iris,
         all_gather_iris,
         reduce_scatter_rmsnorm_quant_all_gather,
+        IRIS_COMM_AVAILABLE,
     )
 except ImportError:
     # Iris not available, skip import
+    IRIS_COMM_AVAILABLE = False
     pass
