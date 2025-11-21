@@ -22,15 +22,15 @@ from ..dist.parallel_state import (
 
 logger = logging.getLogger("aiter")
 
-# Explicitly define what gets exported by wildcard import
-# This prevents 'dist' (torch.distributed) from leaking into aiter namespace
-__all__ = [
-    "init_dist_env",
-    "destroy_dist_env",
-    "all_reduce_asm",
-    "all_reduce_rmsnorm",
-    "all_reduce_rmsnorm_quant",
-]
+## Explicitly define what gets exported by wildcard import
+## This prevents 'dist' (torch.distributed) from leaking into aiter namespace
+# __all__ = [
+#    "init_dist_env",
+#    "destroy_dist_env",
+#    "all_reduce_asm",
+#    "all_reduce_rmsnorm",
+#    "all_reduce_rmsnorm_quant",
+# ]
 
 
 def init_dist_env(
