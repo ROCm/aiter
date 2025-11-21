@@ -3,7 +3,11 @@
 
 import triton
 import triton.language as tl
-from triton.tools.compile import compile_kernel, CompileArgs
+
+try:
+    from triton.tools.compile import compile_kernel, CompileArgs
+except ImportError:
+    print("Warning: compile_kernel or CompileArgs is not in triton.tools.compile!")
 
 
 @triton.jit
