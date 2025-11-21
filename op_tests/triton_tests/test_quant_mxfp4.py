@@ -127,8 +127,8 @@ def torch_dynamic_mxfp4_quant(
 
     # Merge results
     e2m1_value = torch.full_like(qx, 0x7, dtype=torch.uint8)
-    e2m1_value = torch.where(denormal_mask, denormal_x, e2m1_value)
     e2m1_value = torch.where(normal_mask, normal_x, e2m1_value)
+    e2m1_value = torch.where(denormal_mask, denormal_x, e2m1_value)
 
     # add sign back
     sign_lp = s >> (MBITS_F32 + EBITS_F32 - MBITS_FP4 - EBITS_FP4)
