@@ -58,7 +58,7 @@ def test_reduce_scatter(M=8192, N=7168):
     )
 
     # Create Iris communication context
-    with IrisCommContext(heap_size=2 ** 30) as ctx:
+    with IrisCommContext(heap_size=2**30) as ctx:
         shmem = ctx.iris_ctx.shmem
 
         # Create input tensor in Iris shared memory
@@ -120,7 +120,7 @@ def test_all_gather(M_shard=1024, N=7168):
     )
 
     # Create Iris communication context
-    with IrisCommContext(heap_size=2 ** 30) as ctx:
+    with IrisCommContext(heap_size=2**30) as ctx:
         shmem = ctx.iris_ctx.shmem
 
         # Create input shard in Iris shared memory
@@ -191,7 +191,7 @@ def test_reduce_scatter_all_gather_round_trip(M=8192, N=7168):
     )
 
     # Create Iris communication context
-    with IrisCommContext(heap_size=2 ** 30) as ctx:
+    with IrisCommContext(heap_size=2**30) as ctx:
         shmem = ctx.iris_ctx.shmem
 
         # Create input tensor in Iris shared memory
