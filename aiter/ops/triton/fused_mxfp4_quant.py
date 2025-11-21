@@ -9,6 +9,7 @@ from aiter.ops.triton._triton_kernels.fused_mxfp4_quant import (
     _fused_rms_mxfp4_quant_kernel,
     _fused_flatten_mxfp4_quant,
     _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
+    _fused_reduce_rms_mxfp4_quant_kernel,
     _fused_dynamic_mxfp4_quant_moe_sort_kernel,
 )
 from aiter.ops.triton._triton_kernels.activation import (
@@ -47,7 +48,7 @@ def fused_rms_mxfp4_quant(
     - out2: The output matrix with shape (M, N2).
     - out_res1: The output matrix with shape (M, N1).
 
-        always returns (out1_fp4, out1_bs), out2, out_res1
+        always returns (out1_fp4, out1_bs), out1, out2, out_res1
     """
     _LOGGER.info(f"FUSED_RMS_MXFP4_QUANT: inp1={tuple(x1.shape)}")
 
@@ -365,6 +366,197 @@ def fused_reduce_act_mul_and_mxfp4_quant(
     )
 
     return (y, y_scale), y2
+
+
+def fused_reduce_rms_mxfp4_quant(
+    x1: torch.Tensor,
+    x1_weight: torch.Tensor,
+    x1_epsilon: float,
+    x2: Optional[torch.Tensor] = None,
+    x2_weight: Optional[torch.Tensor] = None,
+    x2_epsilon: float = 0.0,
+    x3: Optional[torch.Tensor] = None,
+    res1: Optional[torch.Tensor] = None,
+    shuffle: Optional[bool] = False,
+    scale_shuffle_padding: Optional[bool] = False,
+    output_unquantized_inp1=False,
+    dtype=None,
+    out3=None,
+):
+    """
+    This op contains several steps:
+        1. if res1 is not None, x1 = x1 + res1, and store x1 to out_res1
+        2. perform RMS norm along the last dimenion for x1
+        3. if x2 is not None, perform RMS norm along the last dimenion for x2
+        4. perform mxfp4 quantization for x1 only
+        5. if inp3 is not None, perform sum reduction along the first dimension, in the meantime, the x1 and x2 has to have the identical first diemsion as x3
+
+    Key parameters:
+    - x: Matrix X with shape (M, N1, N2).
+
+    Returns:
+    - out1_fp4: The output matrix with shape (M, N1 // 2).
+    - out1_bs: The output matrix with shape (M, cdiv(N1, MXFP4_QUANT_BLOCK_SIZE)).
+    - out2: The output matrix with shape (M, N2).
+    - out_res1: The output matrix with shape (M, N1).
+    - out3: The output matrix with shape (M, N3).
+    - out1: The output matrix with shape (M, N1).
+
+        always returns (out1_fp4, out1_bs), out1, out2, out_res1, out3
+    """
+    _LOGGER.info(f"FUSED_RMS_MXFP4_QUANT: inp1={tuple(x1.shape)}")
+
+    out_dtype = dtype if dtype is not None else x1.dtype
+    MXFP4_QUANT_BLOCK_SIZE = 32
+    SPK = 1
+    HAS_SPLITK = False
+    x1_stride_spk = 0
+    x1_stride_m = 0
+    if x1.dim() == 3:
+        SPK, M, N1 = x1.shape
+        assert SPK > 1, "Split-k dimension should have more than 1 element."
+        HAS_SPLITK = True
+        x1_stride_spk = x1.stride(0)
+        x1_stride_m = x1.stride(1)
+    else:
+        M, N1 = x1.shape
+        x1_stride_m = x1.stride(0)
+    BLOCK_SIZE_N = max(triton.next_power_of_2(N1), MXFP4_QUANT_BLOCK_SIZE)
+
+    BLOCK_SIZE_N2 = 1
+    x2_stride_spk = 0
+    x2_stride_m = 0
+    if x2 is not None:
+        if SPK > 1:
+            _, _, N2 = x2.shape
+            assert (
+                x2.dim() == 3 and x1.shape[0] == SPK and x2.shape[1] == M
+            ), f"Incompatible shapes {x1.shape=}, {x2.shape=}"
+            x2_stride_spk = x2.stride(0)
+            x2_stride_m = x2.stride(1)
+        else:
+            _, N2 = x2.shape
+            x2_stride_m = x2.stride(0)
+        BLOCK_SIZE_N2 = triton.next_power_of_2(N2)
+    else:
+        N2 = 0
+
+    BLOCK_SIZE_N3 = 1
+    x3_stride_spk = 0
+    x3_stride_m = 0
+    if x3 is not None:
+        assert x3.dim() == 3 and x3.shape[0] == SPK and x3.shape[1] == M
+        _, _, N3 = x3.shape
+        BLOCK_SIZE_N3 = triton.next_power_of_2(N3)
+        x3_stride_spk = x3.stride(0)
+        x3_stride_m = x3.stride(1)
+    else:
+        N3 = 0
+
+    assert N1 % 2 == 0
+    BLOCK_SIZE_M = 1
+    # BLOCK_SIZE_M = 32
+    BLOCK_SIZE_N = max(BLOCK_SIZE_N, MXFP4_QUANT_BLOCK_SIZE)
+    out1_fp4 = torch.empty((M, N1 // 2), dtype=torch.uint8, device=x1.device)
+    SCALE_N_valid = triton.cdiv(N1, MXFP4_QUANT_BLOCK_SIZE)
+    use_scale_shuffle_padding = shuffle or scale_shuffle_padding
+    if use_scale_shuffle_padding:
+        SCALE_M = triton.cdiv(M, 256) * 256
+        SCALE_N = triton.cdiv(SCALE_N_valid, 8) * 8
+        # BLOCK_SIZE_M = triton.cdiv(BLOCK_SIZE_M, 32) * 32
+        BLOCK_SIZE_N = triton.cdiv(BLOCK_SIZE_N, 32) * 32
+    else:
+        SCALE_M = M
+        SCALE_N = SCALE_N_valid
+    out1_bs = torch.empty(
+        (SCALE_M, SCALE_N),
+        dtype=torch.uint8,
+        device=x1.device,
+    )
+
+    out1 = None
+    out1_stride_m = 0
+    if output_unquantized_inp1:
+        out1 = torch.empty((M, N1), dtype=out_dtype, device=x1.device)
+        out1_stride_m = out1.stride(0)
+
+    out_res1 = None
+    res1_stride_m = 0
+    out_res1_stride_m = 0
+    if res1 is not None:
+        out_res1 = torch.empty((M, N1), dtype=out_dtype, device=x1.device)
+        res1_stride_m = res1.stride(0)
+        out_res1_stride_m = out_res1.stride(0)
+
+    out2 = None
+    out2_stride_m = 0
+    if x2 is not None:
+        out2 = torch.empty((M, N2), dtype=out_dtype, device=x1.device)
+        out2_stride_m = out2.stride(0)
+
+    out3_stride_m = 0
+    if x3 is not None:
+        if out3 is None:
+            out3 = torch.empty((M, N3), dtype=out_dtype, device=x1.device)
+        out3_stride_m = out3.stride(0)
+
+    r = 1
+    if HAS_SPLITK:
+        r = 3
+    elif x2 is not None:
+        r = 2
+    grid = (triton.cdiv(M, BLOCK_SIZE_M) * r,)
+    _fused_reduce_rms_mxfp4_quant_kernel[grid](
+        x1,
+        x1_weight,
+        x2,
+        x2_weight,
+        x3,
+        res1,
+        out1_fp4,
+        out1_bs,
+        out1,
+        out2,
+        out3,
+        out_res1,
+        x1_epsilon,
+        x2_epsilon,
+        M,
+        N1,
+        N2,
+        N3,
+        x1_stride_spk,
+        x1_stride_m,
+        x2_stride_spk,
+        x2_stride_m,
+        x3_stride_spk,
+        x3_stride_m,
+        res1_stride_m,
+        out1_fp4.stride(0),
+        *out1_bs.stride(),
+        out1_stride_m,
+        out2_stride_m,
+        out3_stride_m,
+        out_res1_stride_m,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
+        BLOCK_SIZE_N3=BLOCK_SIZE_N3,
+        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+        HAS_SECOND_INPUT=(x2 is not None),
+        FIRST_INPUT_RES=(res1 is not None),
+        FIRST_INPUT_OUT=output_unquantized_inp1,
+        HAS_SPLITK=HAS_SPLITK,
+        NUM_SPLITK=SPK,
+        NUM_SPLITK_POW2=triton.next_power_of_2(SPK),
+        SCALE_N=SCALE_N_valid,
+        SCALE_M_PAD=(SCALE_M if use_scale_shuffle_padding else 1),
+        SCALE_N_PAD=SCALE_N,
+        SHUFFLE=shuffle,
+        SHUFFLE_PAD=use_scale_shuffle_padding,
+    )
+
+    return (out1_fp4, out1_bs), out1, out2, out_res1, out3
 
 
 def fused_dynamic_mxfp4_quant_moe_sort(

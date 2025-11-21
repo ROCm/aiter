@@ -111,6 +111,7 @@ def _gemm_afp4wfp4_kernel(
 
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
+    tl.assume(pid_k >= 0)
     # We assume 32 elements along K share the same scale.
     SCALE_GROUP_SIZE: tl.constexpr = 32
 
