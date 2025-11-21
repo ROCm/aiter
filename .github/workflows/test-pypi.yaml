@@ -32,6 +32,10 @@ jobs:
         run: |
           set -ex
           echo "Testing network speed with speedtest-cli..."
+
+          docker exec -u root test_pypi bash -c "pip config set global.default-timeout 60"
+          docker exec -u root test_pypi bash -c "pip config set global.retries 10"
+
           docker exec \
           -w /workspace \
           test_pypi \
