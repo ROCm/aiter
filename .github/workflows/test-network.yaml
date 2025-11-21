@@ -1,8 +1,6 @@
 name: Test Connection to PyPI and GitHub
 
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       runner:
