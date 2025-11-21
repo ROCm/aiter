@@ -480,6 +480,342 @@ def _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel(
             )
 
 
+@triton.heuristics(
+    {
+        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
+        and args["N1"] % (args["BLOCK_SIZE_N"]) == 0,
+        "EVEN_M_N2": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
+        and args["N2"] % (args["BLOCK_SIZE_N2"]) == 0,
+        "EVEN_M_N3": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
+        and args["N3"] % (args["BLOCK_SIZE_N3"]) == 0,
+    }
+)
+@triton.jit
+def _fused_reduce_rms_mxfp4_quant_kernel(
+    x1_ptr,
+    w1_ptr,
+    x2_ptr,
+    w2_ptr,
+    x3_ptr,
+    res1_ptr,
+    out1_fp4_ptr,
+    out1_bs_ptr,
+    out1_ptr,
+    out2_ptr,
+    out3_ptr,
+    out_res1_ptr,
+    eps1,
+    eps2,
+    M,
+    N1,
+    N2,
+    N3,
+    x1_stride_spk,
+    x1_stride_m,
+    x2_stride_spk,
+    x2_stride_m,
+    x3_stride_spk,
+    x3_stride_m,
+    res1_stride_m,
+    out1_fp4_stride_m,
+    out1_bs_stride_m,
+    out1_bs_stride_n,
+    out1_stride_m,
+    out2_stride_m,
+    out3_stride_m,
+    out_res1_stride_m,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_N2: tl.constexpr,
+    BLOCK_SIZE_N3: tl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    HAS_SECOND_INPUT: tl.constexpr,
+    FIRST_INPUT_RES: tl.constexpr,
+    FIRST_INPUT_OUT: tl.constexpr,
+    HAS_SPLITK: tl.constexpr,
+    NUM_SPLITK: tl.constexpr,
+    NUM_SPLITK_POW2: tl.constexpr,
+    SCALE_N: tl.constexpr,
+    SCALE_M_PAD: tl.constexpr,
+    SCALE_N_PAD: tl.constexpr,
+    SHUFFLE: tl.constexpr,
+    SHUFFLE_PAD: tl.constexpr,
+    EVEN_M_N: tl.constexpr,
+    EVEN_M_N2: tl.constexpr,
+    EVEN_M_N3: tl.constexpr,
+):
+    # TODO: XCD remapping where every 32-token block should share the same XCD
+    # TODO: debug for large M
+    # TODO: investigate cache_modifier='.cg' on tl.store
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+
+    if pid >= 2 * num_pid_m:
+        pid -= 2 * num_pid_m
+        if HAS_SPLITK:
+            spk_offs = tl.arange(0, NUM_SPLITK_POW2)
+            x_offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            x_offs_n3 = tl.arange(0, BLOCK_SIZE_N3)
+            mask3 = None
+            mask3_out = None
+            other3 = None
+            if not EVEN_M_N3:
+                other3 = 0.0
+                mask3_out = (x_offs_m < M)[:, None] & (x_offs_n3 < N3)[None, :]
+                if NUM_SPLITK_POW2 != NUM_SPLITK:
+                    mask3 = (
+                        (spk_offs < NUM_SPLITK)[:, None, None]
+                        & (x_offs_m < M)[None, :, None]
+                        & (x_offs_n3 < N3)[None, None, :]
+                    )
+                else:
+                    mask3 = (x_offs_m < M)[None, :, None] & (x_offs_n3 < N3)[
+                        None, None, :
+                    ]
+            elif NUM_SPLITK_POW2 != NUM_SPLITK:
+                other3 = 0.0
+                mask3 = (spk_offs < NUM_SPLITK)[:, None, None]
+
+            x3 = tl.load(
+                x3_ptr
+                + spk_offs[:, None, None] * x3_stride_spk
+                + x_offs_m[None, :, None] * x3_stride_m
+                + x_offs_n3[None, None, :],
+                mask=mask3,
+                other=other3,
+                cache_modifier=".cg",
+            ).to(tl.float32)
+            x3 = tl.sum(x3, axis=0)
+            tl.store(
+                out3_ptr + x_offs_m[:, None] * out3_stride_m + x_offs_n3[None, :],
+                x3.to(out3_ptr.dtype.element_ty),
+                mask=mask3_out,
+            )
+        return
+
+    if pid >= num_pid_m:
+        pid -= num_pid_m
+        if HAS_SECOND_INPUT:
+            if HAS_SPLITK:
+                spk_offs = tl.arange(0, NUM_SPLITK_POW2)
+            x_offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            x_offs_n2 = tl.arange(0, BLOCK_SIZE_N2)
+            mask2 = None
+            mask2_out = None
+            other2 = None
+
+            if HAS_SPLITK:
+                if not EVEN_M_N2:
+                    other2 = 0.0
+                    mask2_out = (x_offs_m < M)[:, None] & (x_offs_n2 < N2)[None, :]
+                    if NUM_SPLITK_POW2 != NUM_SPLITK:
+                        mask2 = (
+                            (spk_offs < NUM_SPLITK)[:, None, None]
+                            & (x_offs_m < M)[None, :, None]
+                            & (x_offs_n2 < N2)[None, None, :]
+                        )
+                    else:
+                        mask2 = (x_offs_m < M)[None, :, None] & (x_offs_n2 < N2)[
+                            None, None, :
+                        ]
+                elif NUM_SPLITK_POW2 != NUM_SPLITK:
+                    other2 = 0.0
+                    mask2 = (spk_offs < NUM_SPLITK)[:, None, None]
+
+                x2_ptrs = (
+                    x2_ptr
+                    + spk_offs[:, None, None] * x2_stride_spk
+                    + x_offs_m[None, :, None] * x2_stride_m
+                    + x_offs_n2[None, None, :]
+                )
+            else:
+                if not EVEN_M_N2:
+                    other2 = 0.0
+                    mask2_out = (x_offs_m < M)[:, None] & (x_offs_n2 < N2)[None, :]
+                    mask2 = (x_offs_m < M)[:, None] & (x_offs_n2 < N2)[None, :]
+
+                x2_ptrs = x2_ptr + x_offs_m[:, None] * x2_stride_m + x_offs_n2[None, :]
+
+            x2 = tl.load(
+                x2_ptrs,
+                mask=mask2,
+                other=other2,
+                cache_modifier=".cg",
+            ).to(tl.float32)
+
+            if HAS_SPLITK:
+                x2 = tl.sum(x2, axis=0)
+
+            w_mask2 = None
+            w_other2 = None
+            if not EVEN_M_N2:
+                w_mask2 = x_offs_n2 < N2
+                w_other2 = 0.0
+
+            w2 = tl.load(w2_ptr + x_offs_n2, mask=w_mask2, other=w_other2).to(
+                tl.float32
+            )
+
+            norm2 = _rmsmorm_op(x2, w2, N2, eps2)
+
+            tl.store(
+                out2_ptr + x_offs_m[:, None] * out2_stride_m + x_offs_n2[None, :],
+                norm2.to(out2_ptr.type.element_ty),
+                mask=mask2_out,
+            )
+        return
+
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    x_offs_n = tl.arange(0, BLOCK_SIZE_N)
+    x_offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    if HAS_SPLITK:
+        spk_offs = tl.arange(0, NUM_SPLITK_POW2)
+
+    mask1 = None
+    mask1_out = None
+    other1 = None
+    if HAS_SPLITK:
+        if not EVEN_M_N:
+            other1 = 0.0
+            mask1_out = (x_offs_m < M)[:, None] & (x_offs_n < N1)[None, :]
+            if NUM_SPLITK_POW2 != NUM_SPLITK:
+                mask1 = (
+                    (spk_offs < NUM_SPLITK)[:, None, None]
+                    & (x_offs_m < M)[None, :, None]
+                    & (x_offs_n < N1)[None, None, :]
+                )
+            else:
+                mask1 = (x_offs_m < M)[None, :, None] & (x_offs_n < N1)[None, None, :]
+        elif NUM_SPLITK_POW2 != NUM_SPLITK:
+            other1 = 0.0
+            mask1 = (spk_offs < NUM_SPLITK)[:, None, None]
+
+        x1_ptrs = (
+            x1_ptr
+            + spk_offs[:, None, None] * x1_stride_spk
+            + x_offs_m[None, :, None] * x1_stride_m
+            + x_offs_n[None, None, :]
+        )
+    else:
+        if not EVEN_M_N:
+            other1 = 0.0
+            mask1_out = (x_offs_m < M)[:, None] & (x_offs_n < N1)[None, :]
+            mask1 = (x_offs_m < M)[:, None] & (x_offs_n < N1)[None, :]
+
+        x1_ptrs = x1_ptr + x_offs_m[:, None] * x1_stride_m + x_offs_n[None, :]
+
+    x1 = tl.load(
+        x1_ptrs,
+        mask=mask1,
+        other=other1,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+
+    if HAS_SPLITK:
+        x1 = tl.sum(x1, axis=0)
+
+    if FIRST_INPUT_RES:
+        other1_res = None
+        mask1_res = None
+        if not EVEN_M_N:
+            other1_res = 0.0
+            mask1_res = (x_offs_m < M)[:, None] & (x_offs_n < N1)[None, :]
+
+        res1 = tl.load(
+            res1_ptr + x_offs_m[:, None] * res1_stride_m + x_offs_n[None, :],
+            mask=mask1_res,
+            other=other1_res,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        x1 = x1 + res1
+
+    w_mask1 = None
+    w_other1 = None
+    if not EVEN_M_N:
+        w_mask1 = x_offs_n < N1
+        w_other1 = 0.0
+
+    w1 = tl.load(w1_ptr + x_offs_n, mask=w_mask1, other=w_other1).to(tl.float32)
+
+    norm1 = _rmsmorm_op(x1, w1, N1, eps1)
+
+    if FIRST_INPUT_OUT:
+        tl.store(
+            out1_ptr + x_offs_m[:, None] * out1_stride_m + x_offs_n[None, :],
+            norm1.to(out1_ptr.dtype.element_ty),
+            mask=mask1_out,
+        )
+
+    out1_fp4, bs_e8m0 = _mxfp4_quant_op(
+        norm1, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+    )
+
+    # store the results
+    half_x_offs_n = tl.arange(0, BLOCK_SIZE_N // 2)
+    out_mask1 = None
+    if not EVEN_M_N:
+        out_mask1 = (x_offs_m < M)[:, None] & (half_x_offs_n < (N1 // 2))[None, :]
+
+    tl.store(
+        out1_fp4_ptr + x_offs_m[:, None] * out1_fp4_stride_m + half_x_offs_n[None, :],
+        out1_fp4,
+        mask=out_mask1,
+        cache_modifier=".cg",
+    )
+
+    bs_offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    bs_offs_n = tl.arange(0, NUM_QUANT_BLOCKS)
+    num_bs_cols = (N1 + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    if SHUFFLE:
+        bs_offs_0 = bs_offs_m[:, None] // 32
+        bs_offs_1 = bs_offs_m[:, None] % 32
+        bs_offs_2 = bs_offs_1 % 16
+        bs_offs_1 = bs_offs_1 // 16
+        bs_offs_3 = bs_offs_n[None, :] // 8
+        bs_offs_4 = bs_offs_n[None, :] % 8
+        bs_offs_5 = bs_offs_4 % 4
+        bs_offs_4 = bs_offs_4 // 4
+        bs_offs = (
+            bs_offs_1
+            + bs_offs_4 * 2
+            + bs_offs_2 * 2 * 2
+            + bs_offs_5 * 2 * 2 * 16
+            + bs_offs_3 * 2 * 2 * 16 * 4
+            + bs_offs_0 * 2 * 16 * SCALE_N_PAD
+        )
+        bs_mask_127 = (bs_offs_m < M)[:, None] & (bs_offs_n < num_bs_cols)[None, :]
+        bs_e8m0 = tl.where(bs_mask_127, bs_e8m0, 127)
+    else:
+        bs_offs = (
+            bs_offs_m[:, None] * out1_bs_stride_m
+            + bs_offs_n[None, :] * out1_bs_stride_n
+        )
+
+    bs_mask = None
+    if not EVEN_M_N:
+        if SHUFFLE_PAD:
+            bs_mask = (bs_offs_m < SCALE_M_PAD)[:, None] & (bs_offs_n < SCALE_N_PAD)[
+                None, :
+            ]
+        else:
+            bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < SCALE_N)[None, :]
+
+    tl.store(
+        out1_bs_ptr + bs_offs,
+        bs_e8m0.to(out1_bs_ptr.type.element_ty),
+        mask=bs_mask,
+        cache_modifier=".cg",
+    )
+
+    if FIRST_INPUT_RES:
+        tl.store(
+            out_res1_ptr + x_offs_m[:, None] * out_res1_stride_m + x_offs_n[None, :],
+            x1.to(out_res1_ptr.dtype.element_ty),
+            mask=mask1_out,
+            cache_modifier=".cg",
+        )
+
+
 @triton.jit
 def _fused_dynamic_mxfp4_quant_moe_sort_kernel(
     x_ptr,

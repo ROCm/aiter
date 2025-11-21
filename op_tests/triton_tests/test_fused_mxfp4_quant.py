@@ -5,6 +5,7 @@ from aiter.ops.triton.fused_mxfp4_quant import (
     fused_flatten_mxfp4_quant,
     fused_rms_mxfp4_quant,
     fused_reduce_act_mul_and_mxfp4_quant,
+    fused_reduce_rms_mxfp4_quant,
     fused_dynamic_mxfp4_quant_moe_sort,
 )
 from op_tests.triton_tests.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
@@ -30,24 +31,41 @@ def rmsnorm(input, weight, eps=1e-6):
     return rms_norm
 
 
-def calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, eps=1e-6, shuffle=False):
-    orig_dtype = x1.dtype
+def calculate_target_w_torch(
+    x1,
+    rms1_w,
+    resid1,
+    x2,
+    rms2_w,
+    x3=None,
+    eps=1e-6,
+    shuffle=False,
+    dtype=torch.bfloat16,
+):
+    out_dtype = dtype if dtype is not None else x1.dtype
+
+    out3 = None
+    if x3 is not None:
+        x1 = x1.to(torch.float32).sum(axis=0)
+        x2 = x2.to(torch.float32).sum(axis=0)
+        out3 = x3.to(torch.float32).sum(axis=0).to(out_dtype)
+
     x1 = x1.to(torch.float32)
     rms1_w = rms1_w.to(torch.float32)
     res1_out = None
     if resid1 is not None:
         resid1 = resid1.to(torch.float32)
         x1 = res1_out = x1 + resid1
-        res1_out = res1_out.to(orig_dtype)
+        res1_out = res1_out.to(out_dtype)
     x1 = rmsnorm(x1, rms1_w, eps)
-    out1 = x1.to(orig_dtype)
+    out1 = x1.to(out_dtype)
     out1_fp4, out1_scale = torch_dynamic_mxfp4_quant(x1)
 
     out2 = None
     if x2 is not None:
         x2 = x2.to(torch.float32)
         rms2_w = rms2_w.to(torch.float32)
-        out2 = rmsnorm(x2, rms2_w, eps).to(orig_dtype)
+        out2 = rmsnorm(x2, rms2_w, eps).to(out_dtype)
 
     if shuffle:
         out1_scale_pad = out1_scale
@@ -63,6 +81,8 @@ def calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, eps=1e-6, shuffle=F
         out1_scale = shuffle_scales(out1_scale_pad)
         out1_scale = out1_scale.view(out1_scale.shape[0] * 32, -1)
 
+    if x3 is not None:
+        return (out1_fp4, out1_scale), out1, out2, res1_out, out3
     return (out1_fp4, out1_scale), out1, out2, res1_out
 
 
@@ -325,6 +345,138 @@ def test_fused_reduce_act_mul_mxfp4_group_quant(
 
     torch.testing.assert_close(y_q_triton, y_q_torch)
     torch.testing.assert_close(y_s_triton, y_s_torch)
+
+
+def generate_fused_reduce_rms_quant_data(M, N1, N2, N3, SPK, dtype=torch.bfloat16):
+    if SPK > 1:
+        x1 = (
+            torch.randn((SPK, M, N1 + N2 + N3), dtype=torch.float32, device="cuda")[
+                ..., :N1
+            ]
+            / 20
+        )
+        x2 = (
+            torch.randn((SPK, M, N1 + N2 + N3), dtype=torch.float32, device="cuda")[
+                ..., :N2
+            ]
+            / 20
+        )
+        x3 = (
+            torch.randn((SPK, M, N1 + N2 + N3), dtype=torch.float32, device="cuda")[
+                ..., :N3
+            ]
+            / 20
+        )
+    else:
+        x1 = torch.randn((M, N1 + N2), dtype=dtype, device="cuda")[..., :N1] / 20
+        x2 = torch.randn((M, N1 + N2), dtype=dtype, device="cuda")[..., :N2] / 20
+        x3 = None
+
+    w1 = torch.ones((N1,), dtype=torch.float32, device="cuda")
+    w2 = torch.ones((N2,), dtype=torch.float32, device="cuda")
+    res1 = torch.randn((M, N1), dtype=dtype, device="cuda") / 20
+    return x1, w1, x2, w2, res1, x3
+
+
+@pytest.mark.parametrize("M", [1, 32, 256, 8192])
+@pytest.mark.parametrize("N1, N2, N3", [(256, 256, 256), (1536, 512, 64)])
+@pytest.mark.parametrize("SPK", [1, 4, 14])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shuffle", [True, False])
+@pytest.mark.parametrize("scale_shuffle_padding", [True, False])
+def test_fuse_reduce_rms_quant(
+    M: int,
+    N1: int,
+    N2: int,
+    N3: int,
+    SPK: int,
+    dtype,
+    shuffle: bool,
+    scale_shuffle_padding: bool,
+):
+
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+    x1, w1, x2, w2, res1, x3 = generate_fused_reduce_rms_quant_data(
+        M, N1, N2, N3, SPK, dtype
+    )
+    if x3 is None:
+        y3_torch = None
+        (y1_fp4_torch, y1_scales_torch), y1_torch, y2_torch, y1_res_torch = (
+            calculate_target_w_torch(
+                x1, w1, res1, x2, w2, x3=x3, shuffle=shuffle, dtype=dtype
+            )
+        )
+    else:
+        (y1_fp4_torch, y1_scales_torch), y1_torch, y2_torch, y1_res_torch, y3_torch = (
+            calculate_target_w_torch(
+                x1, w1, res1, x2, w2, x3=x3, shuffle=shuffle, dtype=dtype
+            )
+        )
+
+    (
+        (y1_fp4_triton, y1_scales_triton),
+        y1_triton,
+        y2_triton,
+        y1_res_triton,
+        y3_triton,
+    ) = fused_reduce_rms_mxfp4_quant(
+        x1,
+        w1,
+        1e-6,
+        x2,
+        w2,
+        1e-6,
+        x3,
+        res1,
+        shuffle=shuffle,
+        scale_shuffle_padding=scale_shuffle_padding,
+        output_unquantized_inp1=True,
+        dtype=dtype,
+    )
+
+    if y1_triton is not None:
+        torch.testing.assert_close(y1_torch, y1_triton)
+
+    if y2_triton is not None:
+        torch.testing.assert_close(y2_torch, y2_triton)
+
+    if y3_triton is not None:
+        torch.testing.assert_close(y3_torch, y3_triton)
+
+    if shuffle:
+        y1_scales_triton = un_shuffle_scales(
+            y1_scales_triton.view(y1_scales_triton.shape[0] // 32, -1)
+        )
+        y1_scales_torch = un_shuffle_scales(
+            y1_scales_torch.view(y1_scales_torch.shape[0] // 32, -1)
+        )
+
+    scaleN_valid = (N1 + 31) // 32
+    y1_scales_triton = y1_scales_triton[:M, :scaleN_valid]
+    y1_scales_torch = y1_scales_torch[:M, :scaleN_valid]
+
+    if y1_res_triton is not None:
+        torch.testing.assert_close(y1_res_torch, y1_res_triton)
+
+    y1_fp32_torch = convert_mxfp4_to_fp32(y1_fp4_torch, y1_scales_torch)
+    y1_fp32_triton = convert_mxfp4_to_fp32(y1_fp4_triton, y1_scales_triton)
+
+    tol_fraction = 0.1
+    atol = 0.05
+    rtol = 0.05
+    mismatch_fraction = (
+        torch.logical_or(
+            torch.abs(y1_fp32_torch - y1_fp32_triton) / y1_fp32_triton > rtol,
+            torch.abs(y1_fp32_torch - y1_fp32_triton) > atol,
+        )
+    ).nonzero().numel() / y1_fp32_triton.numel()
+    assert (
+        mismatch_fraction < tol_fraction
+    ), f"{tol_fraction*100} % of mismatched elements are allowed, there are {mismatch_fraction*100} % of elements mistatched"
+    # torch.testing.assert_close(y1_fp32_torch, y1_fp32_triton)
 
 
 def run_fused_dynamic_mxfp4_quant_moe_sort_ref(
