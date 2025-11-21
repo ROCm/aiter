@@ -142,6 +142,12 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
     const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
     float ave_time{0};
 
+    // auto Info = [&]()
+    // {
+    //     return concat(
+    //         '_', "moe_flatmm", gemm_prec_str<ADataType, BDataType>, FlatmmPipeline::GetName());
+    // }
+
     const auto Run = [&](const auto has_hot_loop_,
                          const auto tail_number_,
                          const auto memory_operation_) {
@@ -168,6 +174,10 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                                               scheduler,
                                                               has_hot_loop_v,
                                                               tail_number_v>>;
+
+        std::cerr << "kernel info" << std::endl;
+        std::cerr << ck_tile::gemm_prec_str<ADataType, BDataType>() << std::endl;
+        std::cerr << CodegenPipelineProblem::GetName() << std::endl;
 
         constexpr int BlockedXDLN_PerWarp =
             (MXFP4_Pipeline || (moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up))
