@@ -16,6 +16,7 @@ import logging
 
 try:
     import iris
+
     IRIS_AVAILABLE = True
 except ImportError:
     IRIS_AVAILABLE = False
@@ -73,7 +74,9 @@ def all_gather_m_kernel(
 
         # Load local shard
         shard_ptrs = shard_ptr + rm_local[:, None] * stride_sm + rn[None, :] * stride_sn
-        shard_data = tl.load(shard_ptrs, mask=mask_m_local[:, None] & mask_n[None, :], other=0.0)
+        shard_data = tl.load(
+            shard_ptrs, mask=mask_m_local[:, None] & mask_n[None, :], other=0.0
+        )
 
         # Send to all ranks at the appropriate M offset
         for dst in range(world_size):
@@ -83,15 +86,23 @@ def all_gather_m_kernel(
 
             if dst == cur_rank:
                 # Local store
-                out_ptrs = out_ptr + rm_global[:, None] * stride_om + rn[None, :] * stride_on
-                tl.store(out_ptrs, shard_data, mask=mask_m_global[:, None] & mask_n[None, :])
+                out_ptrs = (
+                    out_ptr + rm_global[:, None] * stride_om + rn[None, :] * stride_on
+                )
+                tl.store(
+                    out_ptrs, shard_data, mask=mask_m_global[:, None] & mask_n[None, :]
+                )
             else:
                 # Remote store using IRIS
                 # iris.put(from_ptr, to_ptr, from_rank, to_rank, heap_bases, mask)
                 # from_ptr: local source, to_ptr: remote destination
                 iris.put(
-                    shard_ptr + rm_local[:, None] * stride_sm + rn[None, :] * stride_sn,  # from_ptr (local source)
-                    out_ptr + rm_global[:, None] * stride_om + rn[None, :] * stride_on,  # to_ptr (remote dest)
+                    shard_ptr
+                    + rm_local[:, None] * stride_sm
+                    + rn[None, :] * stride_sn,  # from_ptr (local source)
+                    out_ptr
+                    + rm_global[:, None] * stride_om
+                    + rn[None, :] * stride_on,  # to_ptr (remote dest)
                     cur_rank,
                     dst,
                     heap_bases,
@@ -101,7 +112,7 @@ def all_gather_m_kernel(
 
 def all_gather_iris(
     input_shard: Tensor,
-    ctx: 'IrisCommContext',
+    ctx: "IrisCommContext",
     block_m: int = 64,
     block_n: int = 64,
     group_size_m: int = 8,
@@ -137,7 +148,9 @@ def all_gather_iris(
         raise RuntimeError("Iris library is not available. Cannot perform all-gather.")
 
     if not ctx._initialized:
-        raise RuntimeError("Iris context not initialized. Use IrisCommContext as context manager.")
+        raise RuntimeError(
+            "Iris context not initialized. Use IrisCommContext as context manager."
+        )
 
     # Get distributed parameters from context
     cur_rank = ctx.cur_rank
@@ -149,7 +162,9 @@ def all_gather_iris(
     M_shard, N = input_shard.shape
     M = M_shard * world_size
 
-    logger.info(f"Rank {cur_rank}/{world_size}: All-gather M_shard={M_shard}, N={N} -> M={M}")
+    logger.info(
+        f"Rank {cur_rank}/{world_size}: All-gather M_shard={M_shard}, N={N} -> M={M}"
+    )
 
     # Allocate output buffer in IRIS shared memory
     full_output = shmem.zeros((M, N), dtype=input_shard.dtype)
@@ -182,6 +197,8 @@ def all_gather_iris(
     torch.cuda.synchronize()
     shmem.barrier()
 
-    logger.info(f"Rank {cur_rank}: All-gather complete, output shape: {full_output.shape}")
+    logger.info(
+        f"Rank {cur_rank}: All-gather complete, output shape: {full_output.shape}"
+    )
 
     return full_output
