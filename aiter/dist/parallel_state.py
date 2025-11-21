@@ -416,14 +416,14 @@ class GroupCoordinator:
         assert (
             input_.numel() % world_size == 0
         ), "input shape error, input.numel() % world_size should equals to 0"
-        if input_.shape[0] % 8 == 0:
-            out_dim0 = input_.shape[0] // 8
+        if input_.shape[0] % world_size == 0:
+            out_dim0 = input_.shape[0] // world_size
             if out_dim0 == 1:
                 out_shape = input_.shape[1:]
             else:
                 out_shape = (out_dim0,) + input_.shape[1:]
         else:
-            out_shape = (input_.numel() // 8,)
+            out_shape = (input_.numel() // world_size,)
 
         output_ = torch.zeros(out_shape, dtype=input_.dtype, device=input_.device)
         if use_custom:
