@@ -239,7 +239,8 @@ def fused_moe_(
         bias2,
     )
 
-    print(metadata)
+    aiter.logger.info('print metadata')
+    aiter.logger.info(metadata)
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
 
@@ -841,6 +842,7 @@ def fused_moe_2stages(
             device=device,
         )
     aiter.logger.info(f'a1.dtype = {a1.dtype}, w1.dtype = {w1.dtype}, w2.dtype = {w2.dtype}')
+    aiter.logger.info('print a1')
 
     a2 = metadata.stage1(
         a1,
@@ -858,6 +860,8 @@ def fused_moe_2stages(
     )
 
     aiter.logger.info(f'a2 {a2.dtype}; quant_func {quant_func}')
+    aiter.logger.info('print a2')
+    aiter.logger.info(a2)
 
     if (
         quant_type == QuantType.per_1x32
@@ -903,6 +907,9 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
+    aiter.logger.info('print a2 after quantizing')
+    aiter.logger.info(a2)
+
     metadata.stage2(
         a2,
         w1,
@@ -917,6 +924,9 @@ def fused_moe_2stages(
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
     )
+
+    aiter.logger.info('print moe_out')
+    aiter.logger.info(moe_out)
 
     return moe_out
 
