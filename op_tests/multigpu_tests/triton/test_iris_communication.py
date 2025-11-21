@@ -4,8 +4,13 @@
 """
 Test script for Iris-based communication in AITER.
 
-This script demonstrates how to use Iris-based communication primitives
-for multi-GPU operations in AITER.
+NOTE: This test is currently deprecated as all_reduce_iris has been removed.
+The aiter.ops.triton.comms module now only provides:
+- reduce_scatter_iris
+- all_gather_iris  
+- reduce_scatter_rmsnorm_quant_all_gather (fused kernel)
+
+This file is kept for reference but will fail if run.
 """
 
 import torch
