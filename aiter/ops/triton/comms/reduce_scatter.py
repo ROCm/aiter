@@ -146,7 +146,7 @@ def reduce_scatter_iris(
 
     Example:
         >>> with IrisCommContext() as ctx:
-        >>>     input_tensor = ctx.iris_ctx.shmem.zeros((8192, 7168), dtype=torch.float32)
+        >>>     input_tensor = ctx.iris_ctx.zeros((8192, 7168), dtype=torch.float32)
         >>>     # ... initialize input_tensor ...
         >>>     output_shard = reduce_scatter_iris(input_tensor, ctx)
         >>>     print(output_shard.shape)  # [1024, 7168] for world_size=8
@@ -165,7 +165,7 @@ def reduce_scatter_iris(
     cur_rank = ctx.cur_rank
     world_size = ctx.num_ranks
     heap_bases = ctx.get_heap_bases()
-    shmem = ctx.iris_ctx.shmem
+    iris_ctx = ctx.iris_ctx
 
     # Input shape
     M, N = input_tensor.shape
@@ -179,7 +179,7 @@ def reduce_scatter_iris(
     )
 
     # Allocate output buffer in IRIS shared memory
-    output_shard = shmem.zeros((M_shard, N), dtype=input_tensor.dtype)
+    output_shard = iris_ctx.zeros((M_shard, N), dtype=input_tensor.dtype)
 
     # Launch kernel
     grid = (num_sms,)
@@ -207,7 +207,7 @@ def reduce_scatter_iris(
 
     # Synchronize
     torch.cuda.synchronize()
-    shmem.barrier()
+    iris_ctx.barrier()
 
     logger.info(
         f"Rank {cur_rank}: Reduce-scatter complete, output_shard shape: {output_shard.shape}"
