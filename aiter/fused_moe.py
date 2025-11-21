@@ -717,6 +717,8 @@ def get_2stage_cfgs(
         tag = ""
         block_m = ([el for el in tmpList if block_m < el] + [128])[0]
 
+    block_m = 128 # yadai force
+
     return MOEMetadata(
         functools.partial(
             asm_stage1,
