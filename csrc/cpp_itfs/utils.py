@@ -38,6 +38,13 @@ AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
+LOG_LEVEL = {
+    0: logging.ERROR,
+    1: logging.WARNING,
+    2: logging.INFO,
+    3: logging.DEBUG,
+}
+logger.setLevel(LOG_LEVEL[AITER_LOG_MORE])
 AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 
 if AITER_REBUILD >= 1:
@@ -139,13 +146,13 @@ def validate_and_update_archs():
 def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
     sub_build_dir = os.path.join(BUILD_DIR, folder)
     include_dir = f"{sub_build_dir}/include"
-    os.makedirs(include_dir, exist_ok=True)
+    if not os.path.exists(include_dir):
+        os.makedirs(include_dir, exist_ok=True)
     lock_path = f"{sub_build_dir}/lock"
     start_ts = time.perf_counter()
 
     def main_func(includes=None, sources=None, cxxflags=None):
-        if AITER_LOG_MORE >= 2:
-            logger.info(f"start build {sub_build_dir}")
+        logger.info(f"start build {sub_build_dir}")
         if includes is None:
             includes = []
         if sources is None:
@@ -226,10 +233,9 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         )
 
     def final_func():
-        if AITER_LOG_MORE >= 2:
-            logger.info(
-                f"finish build {sub_build_dir}, cost {time.perf_counter()-start_ts:.8f}s"
-            )
+        logger.info(
+            f"finish build {sub_build_dir}, cost {time.perf_counter()-start_ts:.8f}s"
+        )
 
     main_func = partial(
         main_func, includes=includes, sources=sources, cxxflags=cxxflags
@@ -283,8 +289,7 @@ def compile_template_op(
             sources = []
         if cxxflags is None:
             cxxflags = []
-        if AITER_LOG_MORE >= 2:
-            logger.info(f"compile_template_op {func_name = } with {locals()}...")
+        logger.info(f"compile_template_op {func_name = } with {locals()}...")
         src_file = src_template.render(func_name=func_name, **kwargs)
         compile_lib(src_file, folder, includes, sources, cxxflags)
     return run_lib(func_name, folder)
@@ -344,23 +349,31 @@ def compile_hsaco(
     constants=None,
     extra_metadata=None,
 ):
+    build_dir = f"{BUILD_DIR}/{gcnArchName}"
     constants = OrderedDict(constants or {})
     func_name = get_default_func_name(kernel_name, tuple(constants.values()))
-    metadata = {}
-    metadata["shared"] = shared
-    metadata["name"] = kernel_name
-    metadata["gcnArchName"] = gcnArchName
-    metadata.update(extra_metadata or {})
-    for key, value in constants.items():
-        metadata[key] = str(value)
-    build_dir = f"{BUILD_DIR}/{metadata["gcnArchName"]}"
+    lock_path = f"{build_dir}/{func_name}.lock"
     if not os.path.exists(build_dir):
         os.makedirs(build_dir, exist_ok=True)
-    with open(f"{build_dir}/{func_name}.hsaco", "wb") as f:
-        f.write(hsaco)
-    with open(f"{build_dir}/{func_name}.json", "w") as f:
-        json.dump(metadata, f)
-    return func_name
+
+    def main_func(constants):
+        metadata = {}
+        metadata["shared"] = shared
+        metadata["name"] = kernel_name
+        metadata["gcnArchName"] = gcnArchName
+        metadata.update(extra_metadata or {})
+        for key, value in constants.items():
+            metadata[key] = str(value)
+        with open(f"{build_dir}/{func_name}.hsaco", "wb") as f:
+            f.write(hsaco)
+        with open(f"{build_dir}/{func_name}.json", "w") as f:
+            json.dump(metadata, f)
+
+    def final_func():
+        logger.info(f"finish build {func_name}")
+
+    main_func = partial(main_func, constants=constants)
+    mp_lock(lock_path=lock_path, main_func=main_func, final_func=final_func)
 
 
 def check_hsaco(func_name, constants=None):

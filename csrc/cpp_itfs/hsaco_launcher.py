@@ -12,6 +12,14 @@ from typing import List, Tuple
 import logging
 
 logger = logging.getLogger("aiter")
+AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
+LOG_LEVEL = {
+    0: logging.ERROR,
+    1: logging.WARNING,
+    2: logging.INFO,
+    3: logging.DEBUG,
+}
+logger.setLevel(LOG_LEVEL[AITER_LOG_MORE])
 
 try:
     from hip import hip
