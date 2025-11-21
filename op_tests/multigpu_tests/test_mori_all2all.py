@@ -141,6 +141,7 @@ def run_mori_with_manager(
             * 2,
             num_local_experts=E // world_size,
             num_experts_per_token=topk,
+            gpu_per_node=1,
         )
 
         mori_op = mori_manager.get_handle(handle_kwargs)
