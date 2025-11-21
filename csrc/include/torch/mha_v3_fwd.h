@@ -15,6 +15,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                     int window_size_right,
                                     bool return_softmax_lse,
                                     bool return_dropout_randval,
+                                    int how_v3_bf16_cvt,
                                     std::optional<at::Tensor> out_,          // [b, sq, hq, d_v]
                                     std::optional<const at::Tensor> bias_,   // [sq, sk]
                                     std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]

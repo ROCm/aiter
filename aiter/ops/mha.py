@@ -202,6 +202,7 @@ def gen_fmha_v3_fwd_fake_tensors(
     window_size_right: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
+    how_v3_bf16_cvt: int,
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
@@ -226,6 +227,7 @@ def fmha_v3_fwd(
     window_size_right: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
+    how_v3_bf16_cvt: int,
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
@@ -1176,6 +1178,7 @@ def _flash_attn_forward(
     alibi_slopes: Optional[torch.Tensor],
     return_lse: bool,
     return_softmax: bool,
+    how_v3_bf16_cvt: Optional[int] = 1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1229,6 +1232,7 @@ def _flash_attn_forward(
             window_size_right,
             return_lse,
             return_softmax,
+            how_v3_bf16_cvt,
             None,
             bias,
             alibi_slopes,
@@ -1257,7 +1261,7 @@ def _flash_attn_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-@torch_compile_guard()
+# @torch_compile_guard(mutates_args=[])
 def can_impl_fmha_v3_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -1424,7 +1428,8 @@ def can_impl_fmha_v3_bwd(
         return ret
 
     # basic
-    ret = alibi_slopes is None
+    ret = get_gfx() == "gfx942"
+    ret &= alibi_slopes is None
     ret &= bias is None
     ret &= dbias is None
     ret &= dropout_p == 0.0
@@ -1436,6 +1441,42 @@ def can_impl_fmha_v3_bwd(
     return ret
 
 
+def _flash_attn_backward_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: Optional[torch.Tensor],
+    dk: Optional[torch.Tensor],
+    dv: Optional[torch.Tensor],
+    dbias: Optional[torch.Tensor],
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    deterministic: bool,
+    rng_state: Optional[torch.Tensor] = None,
+    is_v3_atomic_fp32: Optional[bool] = True,
+    how_v3_bf16_cvt: Optional[int] = 1,
+) -> torch.Tensor:
+    batch_size = q.size(0)
+    seqlen_q = q.size(1)
+    num_heads = q.size(2)
+
+    softmax_d = torch.empty(
+        (batch_size, num_heads, seqlen_q),  # {batch_size, num_heads, seqlen_q}
+        dtype=torch.float32,
+        device=q.device,
+    )
+    return softmax_d
+
+
+@torch_compile_guard(gen_fake=_flash_attn_backward_fake)
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -1626,6 +1667,7 @@ class FlashAttnFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
+            how_v3_bf16_cvt=how_v3_bf16_cvt,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
         )
@@ -1742,6 +1784,7 @@ def flash_attn_func(
     deterministic=True,
     return_lse=False,
     return_attn_probs=False,
+    how_v3_bf16_cvt=1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
 ):
@@ -1811,7 +1854,7 @@ def flash_attn_func(
         return_attn_probs,
         torch.is_grad_enabled(),
         True,  # is_v3_atomic_fp32
-        1,  # how_v3_bf16_cvt
+        how_v3_bf16_cvt,
         cu_seqlens_q,
         cu_seqlens_kv,
     )
@@ -2035,7 +2078,8 @@ def _flash_attn_varlen_backward(
 
     def can_impl_fmha_v3_bwd():
         # basic
-        ret = alibi_slopes is None
+        ret = get_gfx() == "gfx942"
+        ret &= alibi_slopes is None
         # ret &= bias is None
         # ret &= dbias is None
         ret &= dropout_p == 0.0
@@ -2352,6 +2396,7 @@ def flash_attn_varlen_func(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
+    how_v3_bf16_cvt=1,
     block_table=None,
     out=None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
@@ -2445,7 +2490,7 @@ def flash_attn_varlen_func(
         cu_seqlens_q_padded,
         cu_seqlens_k_padded,
         True,
-        1,
+        how_v3_bf16_cvt,
     )
 
 

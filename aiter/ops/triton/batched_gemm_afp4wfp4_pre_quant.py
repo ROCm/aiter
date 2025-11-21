@@ -4,7 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton._triton_kernels.batched_gemm_afp4wfp4_pre_quant import (
     _batched_gemm_afp4_wfp4_pre_quant_reduce_kernel,
@@ -33,19 +32,22 @@ def batched_gemm_afp4wfp4_pre_quant(
     config: Optional[dict] = None,
 ):
     """
-    Computes the matmul Y = X x W
-    W is an e2m1 fp4 tensor and w_scales is an e8m0 tensor.
-    Every 32 elements in the K dimension share one e8m0 scale.
-    X gets quantized to the microscale fp4 (mxfp4) format before the GEMM.
+    Computes batched FP4 matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.
+    X is quantized to MXFP4 during computation, W is pre-quantized FP4.
 
-    Key parameters:
-    - X: Matrix X with shape (B, M, K).
-    - W: Matrix W with shape (B, N, K).
-    - X_scales: Matrix with shape (B, M, K // 32)
-    - W_scales: Matrix with shape (B, N, K // 32)
+    Args:
+        x (torch.Tensor): Higher precision input batch with shape (B, M, K) (BF16 or FP16).
+            Quantized to MXFP4 on-the-fly during GEMM.
+        w (torch.Tensor): FP4 E2M1 weight batch with shape (B, N, K), internally transposed.
+        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (B, N, K//32).
+            One scale per 32 elements in K dimension.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (B, M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+        torch.Tensor: Output batch with shape (B, M, N).
     """
     _LOGGER.info(
         f"BATCHED_GEMM_AFP4WFP_PREQUANT: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w.shape)}"
@@ -58,7 +60,6 @@ def batched_gemm_afp4wfp4_pre_quant(
     By, _, _ = y.shape
     assert Bx == Bw == By
     Batch = Bx
-    w = w.transpose(1, 2)
 
     if config is None:
         config = _get_config(M, N, K)

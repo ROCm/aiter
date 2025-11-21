@@ -232,7 +232,7 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "pybind11>=3.0.1",
-        # "ninja",
+        "ninja",
         "pandas",
         "einops",
         "psutil",

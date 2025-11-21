@@ -34,29 +34,27 @@ def gemm_a8wfp4(
     config: Optional[dict] = None,
 ):
     """
-    Computes the matmul Y = X @ W.T (where W.T is the logical transpose of unpacked W)
+    Computes matrix multiplication Y = X @ W^T with FP8 activations and FP4 weights.
 
-    X is in fp8 e4m3 format.
-    W is in packed microscale fp4 (mxfp4) format, where 2 fp4 values are packed per uint8.
-    x_scales are in fp32 format (one scale per row of X).
-    w_scales are in e8m0 format (one scale per group of 32 elements in K dimension).
+    Args:
+        x (torch.Tensor): FP8 E4M3 input matrix with shape (M, K).
+        w (torch.Tensor): Packed FP4 weight matrix with shape (N, K//2), internally transposed.
+            Each uint8 contains 2 FP4 values.
+        y (torch.Tensor): Pre-allocated output tensor with shape (M, N).
+        x_scales (torch.Tensor): FP32 per-row scale for x with shape (M, 1).
+        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (N, K//32).
+            One scale per 32 elements in K dimension.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
 
-    Key parameters:
-    - x: Matrix X with shape (M, K) in fp8 e4m3 format
-    - w: Matrix W with shape (N, K//2) in packed fp4 format (2 values per uint8)
-    - y: Pre-allocated output matrix with shape (M, N)
-    - x_scales: Per-row scales for X with shape (M, 1) in fp32 format
-    - w_scales: Per-group scales for W with shape (N, K//32) in e8m0 format
-    - dtype: Output data type (default: torch.bfloat16)
+     Note:
+    - The logical shape of W after unpacking would be (N, K)
+    - Every 32 consecutive elements in the K dimension of W share
+    one E8M0 scale
 
     Returns:
-    - y: The output matrix with shape (M, N) containing X @ W.T
-
-    Note:
-    - W is stored in packed format where each uint8 contains 2 fp4 values
-    - The logical shape of W after unpacking would be (N, K)
-    - Every 32 consecutive elements in the K dimension of W share one e8m0 scale
-    - X uses per-row scaling (not per-group scaling)
+        torch.Tensor: Output with shape (M, N).
     """
     _LOGGER.info(
         f"GEMM_A8FP4: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)}  "

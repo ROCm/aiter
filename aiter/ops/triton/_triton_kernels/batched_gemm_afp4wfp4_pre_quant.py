@@ -4,12 +4,41 @@
 import functools
 import json
 import os
+
 import triton
 import triton.language as tl
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
 from ..utils._triton import arch_info
+from ..utils._triton.kernel_repr import make_kernel_repr
+from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from .quant import _mxfp4_quant_op
+
+_batched_gemm_afp4_wfp4_pre_quant_repr = make_kernel_repr(
+    "_batched_gemm_afp4_wfp4_pre_quant_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "cache_modifier",
+    ],
+)
+
+
+_batched_gemm_afp4_wfp4_pre_quant_reduce_repr = make_kernel_repr(
+    "_batched_gemm_afp4_wfp4_pre_quant_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
 
 
 @triton.heuristics(
@@ -21,7 +50,7 @@ from .quant import _mxfp4_quant_op
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_batched_gemm_afp4_wfp4_pre_quant_repr)
 def _batched_gemm_afp4_wfp4_pre_quant_kernel(
     a_ptr,
     b_ptr,
@@ -34,8 +63,8 @@ def _batched_gemm_afp4_wfp4_pre_quant_kernel(
     stride_am,
     stride_ak,
     stride_bb,
-    stride_bk,
     stride_bn,
+    stride_bk,
     stride_cb,
     stride_ck,
     stride_cm,
@@ -54,7 +83,8 @@ def _batched_gemm_afp4_wfp4_pre_quant_kernel(
     GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
-    """Kernel for computing the matmul C = A x B.
+    """
+    Kernel for computing the matmul C = A x B.
     A and B inputs are in the microscale fp4 (mxfp4) format.
     A_scales and B_scales are in e8m0 format.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -184,7 +214,7 @@ def _batched_gemm_afp4_wfp4_pre_quant_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(repr=_batched_gemm_afp4_wfp4_pre_quant_reduce_repr)
 def _batched_gemm_afp4_wfp4_pre_quant_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
