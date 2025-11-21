@@ -323,6 +323,105 @@ def _batched_gemm_a8w8_kernel(
     )
 
 
+@gluon.jit
+def _issue_loads(
+    load_idx,
+    smem_a,
+    smem_b,
+    a_ptr,
+    b_ptr,
+    offs_a: gl.constexpr,
+    offs_am: gl.constexpr,
+    offs_ak: gl.constexpr,
+    offs_b: gl.constexpr,
+    offs_bn: gl.constexpr,
+    offs_bk: gl.constexpr,
+    stride_ab,
+    stride_ak,
+    stride_bb,
+    stride_bk,
+    batch_id,
+    M: gl.constexpr,
+    N: gl.constexpr,
+    K: gl.constexpr,
+    BLOCK_SIZE_K: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    NUM_STAGES: gl.constexpr = 1,
+):
+    # Load the next block of A
+    if EVEN_K:
+        acp.buffer_load_to_shared(
+            dest=smem_a.index(load_idx % NUM_STAGES),
+            ptr=(a_ptr + batch_id * stride_ab),
+            offsets=offs_a,
+            mask=(offs_am[:, None] < M),
+            other=0.0,
+        )
+    else:
+        acp.buffer_load_to_shared(
+            dest=smem_a.index(load_idx % NUM_STAGES),
+            ptr=(a_ptr + batch_id * stride_ab),
+            offsets=offs_a,
+            mask=(
+                (offs_ak[None, :] < K - load_idx * BLOCK_SIZE_K)
+                & (offs_am[:, None] < M)
+            ),
+            other=0.0,
+        )
+
+    # Load the next block of B
+    if EVEN_K:
+        acp.buffer_load_to_shared(
+            dest=smem_b.index(load_idx % NUM_STAGES),
+            ptr=(b_ptr + batch_id * stride_bb),
+            offsets=offs_b,
+            mask=(offs_bn[None, :] < N),
+            other=0.0,
+        )
+    else:
+        acp.buffer_load_to_shared(
+            dest=smem_b.index(load_idx % NUM_STAGES),
+            ptr=(b_ptr + batch_id * stride_bb),
+            offsets=offs_b,
+            mask=(
+                (offs_bk[:, None] < K - load_idx * BLOCK_SIZE_K)
+                & (offs_bn[None, :] < N)
+            ),
+            other=0.0,
+        )
+
+    acp.commit_group()
+
+    return (
+        load_idx + 1,
+        offs_a + BLOCK_SIZE_K * stride_ak,
+        offs_b + BLOCK_SIZE_K * stride_bk,
+    )
+
+
+@gluon.jit
+def _compute_loop(
+    read_idx,
+    smem_a,
+    smem_b,
+    dot_a_layout,
+    dot_b_layout,
+    accumulator,
+    zeros,
+    NUM_STAGES=1,
+):
+    # Grab the current block of A from shared memory
+    cur_a = smem_a.index(read_idx % NUM_STAGES).load(layout=dot_a_layout)
+
+    # Grab the current block of B from shared memory
+    cur_b = smem_b.index(read_idx % NUM_STAGES).load(layout=dot_b_layout)
+
+    # Perform and store the MFMA operation
+    accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
+
+    return accumulator, read_idx + 1
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -368,6 +467,7 @@ def _batched_gemm_a8w8_kernel_async_copy(
     EVEN_K: gl.constexpr,
     GRID_MN: gl.constexpr,
     BUFFER_SIZE: gl.constexpr,
+    num_stages: gl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_a8w8 function
@@ -399,8 +499,6 @@ def _batched_gemm_a8w8_kernel_async_copy(
 
     remap_xcd(pid, GRID_MN)
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
-
-    num_k_iter = gl.cdiv(K, BLOCK_SIZE_K)
 
     gl.assume(pid_m >= 0)
     gl.assume(pid_n >= 0)
@@ -482,50 +580,40 @@ def _batched_gemm_a8w8_kernel_async_copy(
 
     # Allocate shared memory input matrices and scaling factors
     smem_a = gl.allocate_shared_memory(
-        a_ptr.type.element_ty, [2, BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
+        a_ptr.type.element_ty, [num_stages, BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
     )
     smem_b = gl.allocate_shared_memory(
-        b_ptr.type.element_ty, [2, BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
+        b_ptr.type.element_ty, [num_stages, BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
     )
 
-    # Load first block of A
-    if EVEN_K:
-        acp.buffer_load_to_shared(
-            dest=smem_a.index(0),
-            ptr=(a_ptr + batch_id * stride_ab),
-            offsets=offs_a,
-            mask=(offs_am[:, None] < M),
-            other=0.0,
-            cache_modifier=".cg",
-        )
-    else:
-        acp.buffer_load_to_shared(
-            dest=smem_a.index(0),
-            ptr=(a_ptr + batch_id * stride_ab),
-            offsets=offs_a,
-            mask=((offs_ak[None, :] < K) & (offs_am[:, None] < M)),
-            other=0.0,
-            cache_modifier=".cg",
-        )
+    load_idx = 0
+    read_idx = 0
 
-    # Load first block of B
-    if EVEN_K:
-        acp.buffer_load_to_shared(
-            dest=smem_b.index(0),
-            ptr=(b_ptr + batch_id * stride_bb),
-            offsets=offs_b,
-            mask=(offs_bn[None, :] < N),
-            other=0.0,
-            cache_modifier=".cg",
-        )
-    else:
-        acp.buffer_load_to_shared(
-            dest=smem_b.index(0),
-            ptr=(b_ptr + batch_id * stride_bb),
-            offsets=offs_b,
-            mask=((offs_bk[:, None] < K) & (offs_bn[None, :] < N)),
-            other=0.0,
-            cache_modifier=".cg",
+    # Load first num_stages - 1 blocks of A and B to shared memory
+    for _ in gl.static_range(num_stages - 1):
+        load_idx, offs_a, offs_b = _issue_loads(
+            load_idx,
+            smem_a,
+            smem_b,
+            a_ptr,
+            b_ptr,
+            offs_a,
+            offs_am,
+            offs_ak,
+            offs_b,
+            offs_bn,
+            offs_bk,
+            stride_ab,
+            stride_ak,
+            stride_bb,
+            stride_bk,
+            batch_id,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_K,
+            EVEN_K,
+            NUM_STAGES=num_stages,
         )
 
     # Run the main loop
@@ -534,73 +622,63 @@ def _batched_gemm_a8w8_kernel_async_copy(
         (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout
     )
     zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.int32, layout=mfma_layout)
-    for k in range(0, num_k_iter - 1):
-        # Wait for loads to finish before using shared memory
-        acp.async_wait(num_outstanding=0)
+    for _ in range(gl.cdiv(K, BLOCK_SIZE_K) - (num_stages - 1)):
+        # Load next blocks of A and B to shared memory
+        load_idx, offs_a, offs_b = _issue_loads(
+            load_idx,
+            smem_a,
+            smem_b,
+            a_ptr,
+            b_ptr,
+            offs_a,
+            offs_am,
+            offs_ak,
+            offs_b,
+            offs_bn,
+            offs_bk,
+            stride_ab,
+            stride_ak,
+            stride_bb,
+            stride_bk,
+            batch_id,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_K,
+            EVEN_K,
+            NUM_STAGES=num_stages,
+        )
 
-        # Advance the ptrs to the next K block.
-        offs_a += BLOCK_SIZE_K * stride_ak
-        offs_b += BLOCK_SIZE_K * stride_bk
+        # Wait for loads to finish before any compute
+        acp.wait_group(num_stages - 1)
 
-        # Load the next block of A
-        if EVEN_K:
-            acp.buffer_load_to_shared(
-                dest=smem_a.index((k + 1) % 2),
-                ptr=(a_ptr + batch_id * stride_ab),
-                offsets=offs_a,
-                mask=(offs_am[:, None] < M),
-                other=0.0,
-                cache_modifier=".cg",
-            )
-        else:
-            acp.buffer_load_to_shared(
-                dest=smem_a.index((k + 1) % 2),
-                ptr=(a_ptr + batch_id * stride_ab),
-                offsets=offs_a,
-                mask=(
-                    (offs_ak[None, :] < K - (k + 1) * BLOCK_SIZE_K)
-                    & (offs_am[:, None] < M)
-                ),
-                other=0.0,
-                cache_modifier=".cg",
-            )
+        accumulator, read_idx = _compute_loop(
+            read_idx,
+            smem_a,
+            smem_b,
+            dot_a_layout,
+            dot_b_layout,
+            accumulator,
+            zeros,
+            NUM_STAGES=num_stages,
+        )
 
-        # Load the next block of B
-        if EVEN_K:
-            acp.buffer_load_to_shared(
-                dest=smem_b.index((k + 1) % 2),
-                ptr=(b_ptr + batch_id * stride_bb),
-                offsets=offs_b,
-                mask=(offs_bn[None, :] < N),
-                other=0.0,
-                cache_modifier=".cg",
-            )
-        else:
-            acp.buffer_load_to_shared(
-                dest=smem_b.index((k + 1) % 2),
-                ptr=(b_ptr + batch_id * stride_bb),
-                offsets=offs_b,
-                mask=(
-                    (offs_bk[:, None] < K - (k + 1) * BLOCK_SIZE_K)
-                    & (offs_bn[None, :] < N)
-                ),
-                other=0.0,
-                cache_modifier=".cg",
-            )
+    # Compute last num_stages - 1 blocks
+    for i in gl.static_range(num_stages - 1):
+        # Wait for loads to finish before any compute
+        acp.wait_group(num_stages - 2 - i)
 
-        # Grab the current block of A from shared memory
-        cur_a = smem_a.index(k % 2).load(layout=dot_a_layout)
-
-        # Grab the current block of B from shared memory
-        cur_b = smem_b.index(k % 2).load(layout=dot_b_layout)
-
-        # Perform and store the MFMA operation
-        accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-
-    # Epilogue: use remaining A and B for last MFMA
-    cur_a = smem_a.index((num_k_iter - 1) % 2).load(layout=dot_a_layout)
-    cur_b = smem_b.index((num_k_iter - 1) % 2).load(layout=dot_b_layout)
-    accumulator += gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
+        # Compute next block
+        accumulator, read_idx = _compute_loop(
+            read_idx,
+            smem_a,
+            smem_b,
+            dot_a_layout,
+            dot_b_layout,
+            accumulator,
+            zeros,
+            NUM_STAGES=num_stages,
+        )
 
     # Apply scales
     accumulator *= a_scale[:, None] * b_scale[None, :]
