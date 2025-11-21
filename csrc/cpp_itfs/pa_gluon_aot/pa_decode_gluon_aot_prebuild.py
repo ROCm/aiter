@@ -926,21 +926,12 @@ def prebuild_pa_decode_gluon_aot_so():
         QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
         HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
         # HEAD_DIMENSION_OPTIONS = [256]
-        # BLOCK_SIZE_OPTIONS = [16, 64, 1024]
-        BLOCK_SIZE_OPTIONS = [16, 64]
+        BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+        # BLOCK_SIZE_OPTIONS = [16, 64]
         # BLOCK_SIZE_OPTIONS = [1024]
         HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
         QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-        CONTEXT_LENGTH_OPTIONS = [
-            256,
-            512,
-            1024,
-            2048,
-            4096,
-            8192,
-            # 16 * 1024,
-            # 32 * 1024,
-        ]
+        CONTEXT_LENGTH_OPTIONS = [512]
         # USE_AOT_IMPL_OPTIONS = [False, True]
         # USE_AOT_IMPL_OPTIONS = [False]
         USE_AOT_IMPL_OPTIONS = [True]

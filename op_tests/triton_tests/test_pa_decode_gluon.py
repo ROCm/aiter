@@ -1009,6 +1009,7 @@ def run_aiter_assembly_kernel(
         value_scale,
         None,
         query_output_indptr,
+        high_precision=0,
     )
 
 
