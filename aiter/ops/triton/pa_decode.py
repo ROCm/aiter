@@ -5,7 +5,6 @@ import math
 from typing import Optional
 
 import triton
-import triton.language as tl
 import torch
 from aiter.ops.triton._triton_kernels.pa_decode import (
     _paged_attn_decode_v1_wo_dot_kernel,
@@ -48,7 +47,27 @@ def paged_attention_decode(
     alibi_slopes: torch.Tensor = None,
 ) -> None:
     """
-    #TODO: Add Doc
+    Paged attention decode with automatic V1/V2 dispatch and quantization support.
+    V1 for short sequences (≤8192), V2 with sequence partitioning for longer sequences.
+
+    Args:
+        output (torch.Tensor): Pre-allocated output with shape (num_seqs, num_q_heads, head_dim).
+        query (torch.Tensor): Query tensor with shape (num_seqs, num_q_heads, head_dim).
+        key_cache (torch.Tensor): Paged key cache with shape (num_blocks, num_kv_heads, block_size, head_dim).
+        value_cache (torch.Tensor): Paged value cache with shape (num_blocks, num_kv_heads, block_size, head_dim).
+        seq_lens (torch.Tensor): Sequence lengths with shape (num_seqs,).
+        block_tables (torch.Tensor): Block table mapping with shape (num_seqs, max_blocks_per_seq).
+        attn_scale (float): Attention scale, typically 1/sqrt(head_dim).
+        max_seq_len (int): Maximum sequence length in batch.
+        compute_type: Compute precision type.
+        k_scale (torch.Tensor): Key quantization scale. Scalar for per-tensor,
+            shape (num_blocks, num_kv_heads, block_size) for per-token.
+        v_scale (torch.Tensor): Value quantization scale with same shape as k_scale.
+        num_seq_partitions (int): Number of sequence partitions (not currently used).
+        alibi_slopes (Optional[torch.Tensor]): ALiBi position bias slopes.
+
+    Returns:
+        None. Results written in-place to output.
     """
 
     _LOGGER.info(
@@ -185,7 +204,6 @@ def paged_attn_decode_v1(
             query.stride(1),
             output.stride(0),
             output.stride(1),
-            output.stride(2),
             key_cache.stride(0),
             key_cache.stride(1),
             key_cache.stride(2),
@@ -196,7 +214,6 @@ def paged_attn_decode_v1(
             HEAD_SZ=head_sz,
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
-            MAX_SEQ_LEN_POW2=max_seq_len,
         )
     # GQA - Grouped Query Attention
     else:
@@ -218,7 +235,6 @@ def paged_attn_decode_v1(
             v_scale,
             output.stride(0),
             output.stride(1),
-            output.stride(2),
             query.stride(0),
             query.stride(1),
             query.stride(2),
@@ -227,7 +243,6 @@ def paged_attn_decode_v1(
             key_cache.stride(2),
             key_cache.stride(3),
             block_tables.stride(0),
-            block_tables.stride(1),
             compute_type=compute_type,
             HEAD_SZ=head_sz,
             HEAD_SZ_POW2=head_sz_pow2,
@@ -326,8 +341,6 @@ def paged_attn_decode_v2(
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-            MAX_NUM_BLKS_PER_SEQ=block_tables.shape[1],
-            MAX_SEQ_LEN_POW2=max_seq_len,
         )
         grid = (num_q_heads, num_seqs, 1)
         _paged_attn_decode_v2_wo_dot_reduce_kernel[grid](
@@ -346,7 +359,6 @@ def paged_attn_decode_v2(
             HEAD_SZ=head_sz,
             HEAD_SZ_POW2=head_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-            MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
             MAX_NUM_SEQ_PARTITIONS_POW2=int(max_num_partitions_pow2),
         )
     # GQA
@@ -418,7 +430,6 @@ def paged_attn_decode_v2(
             QUERY_GRP_SZ=query_grp_sz,
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-            MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
             MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
         )
 
@@ -474,7 +485,6 @@ def paged_attn_decode_v1_per_token_quant(
             query.stride(1),
             output.stride(0),
             output.stride(1),
-            output.stride(2),
             key_cache.stride(0),
             key_cache.stride(1),
             key_cache.stride(2),
@@ -488,7 +498,6 @@ def paged_attn_decode_v1_per_token_quant(
             HEAD_SZ=head_sz,
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
-            MAX_SEQ_LEN_POW2=max_seq_len,
         )
     # GQA - Grouped Query Attention
     else:
@@ -510,7 +519,6 @@ def paged_attn_decode_v1_per_token_quant(
             v_scale,
             output.stride(0),
             output.stride(1),
-            output.stride(2),
             query.stride(0),
             query.stride(1),
             query.stride(2),
@@ -519,7 +527,6 @@ def paged_attn_decode_v1_per_token_quant(
             key_cache.stride(2),
             key_cache.stride(3),
             block_tables.stride(0),
-            block_tables.stride(1),
             k_scale.stride(0),
             k_scale.stride(1),
             k_scale.stride(2),
@@ -624,8 +631,6 @@ def paged_attn_decode_v2_per_token_quant(
             HEAD_SZ_POW2=head_sz_pow2,
             QUERY_GRP_SZ=query_grp_sz,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-            MAX_NUM_BLKS_PER_SEQ=block_tables.shape[1],
-            MAX_SEQ_LEN_POW2=max_seq_len,
         )
         grid = (num_q_heads, num_seqs, 1)
         _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant[grid](
@@ -644,7 +649,6 @@ def paged_attn_decode_v2_per_token_quant(
             HEAD_SZ=head_sz,
             HEAD_SZ_POW2=head_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-            MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
             MAX_NUM_SEQ_PARTITIONS_POW2=int(max_num_partitions_pow2),
         )
     # GQA
@@ -719,6 +723,5 @@ def paged_attn_decode_v2_per_token_quant(
             QUERY_GRP_SZ=query_grp_sz,
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             SEQ_PARTITION_SZ=_SEQ_PARTITION_SIZE,
-            MAX_NUM_SEQ_PARTITIONS=int(max_num_partitions),
             MAX_NUM_SEQ_PARTITIONS_POW2=int(triton.next_power_of_2(max_num_partitions)),
         )

@@ -24,6 +24,7 @@
 #include "gemm_a8w8_blockscale.h"
 #include "gemm_a8w8_bpreshuffle.h"
 #include "gemm_a8w8_blockscale_bpreshuffle.h"
+#include "gemm_a8w8_bpreshuffle_cktile.h"
 #include "gemm_common.h"
 #include "hipbsolgemm.cuh"
 #include "mla.h"

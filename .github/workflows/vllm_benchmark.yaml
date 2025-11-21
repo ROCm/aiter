@@ -34,7 +34,7 @@ jobs:
   build_vllm_image:
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: [check-signal]
-    runs-on: aiter-1gpu-runner
+    runs-on: aiter-k8s-build
 
     steps:
       - name: Checkout aiter repo
@@ -60,6 +60,8 @@ jobs:
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
+          RUN pip config set global.default-timeout 60
+          RUN pip config set global.retries 10
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
