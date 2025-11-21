@@ -45,7 +45,7 @@ enable_aot_gluon_mla = os.environ.get(
 )
 enable_aot_gluon_mla = enable_aot_gluon_mla == "1"
 
-if triton.__version__ >= "3.5.0":
+if triton.__version__ >= "3.5.0" and not enable_aot_gluon_mla:
     from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
     enable_gluon_mla = True
     enable_jit_gluon_mla = True
@@ -54,7 +54,6 @@ if triton.__version__ >= "3.5.0":
     )
 else:
     from triton.compiler import ASTSource
-    # assert triton.__version__ < "3.4.0"
     enable_gluon_mla = enable_aot_gluon_mla
     from aiter.ops.triton._triton_kernels.mla_decode_mi355 import (
         _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
