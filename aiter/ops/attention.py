@@ -391,11 +391,11 @@ def get_mla_metadata_info_v1(
     else:
         return (
             ((2), torch.uint64),  # work_metadata_ptrs
-            (batch_size * 16 + 1, torch.int32),  # work_indptr
-            ((batch_size * 16, 8), torch.int32),  # work_info_set
+            (batch_size * 32 + 1, torch.int32),  # work_indptr
+            ((batch_size * 32, 8), torch.int32),  # work_info_set
             ((batch_size + 1), torch.int32),  # reduce_indptr
             ((batch_size, 2), torch.int32),  # reduce_final_map
-            (batch_size * 16 + 1, torch.int32),  # reduce_partial_map
+            (batch_size * 32 + 1, torch.int32),  # reduce_partial_map
         )
 
 
