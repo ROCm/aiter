@@ -358,10 +358,15 @@ def compile_hsaco(
         os.makedirs(build_dir, exist_ok=True)
     with open(f"{build_dir}/{func_name}.hsaco", "wb") as f:
         f.write(hsaco)
-
     with open(f"{build_dir}/{func_name}.json", "w") as f:
         json.dump(metadata, f)
     return func_name
+
+
+def check_hsaco(func_name, constants=None):
+    constants = OrderedDict(constants or {})
+    hsaco_name = get_default_func_name(func_name, tuple(constants.values()))
+    return os.path.exists(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.hsaco")
 
 
 @lru_cache(maxsize=None)
@@ -380,7 +385,10 @@ def run_hsaco(
 ):
     constants = OrderedDict(constants or {})
     hsaco_name = get_default_func_name(func_name, tuple(constants.values()))
-    with open(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.json", "r") as f:
+    metadata_path = f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.json"
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+    with open(metadata_path, "r") as f:
         metadata = json.load(f)
     kernel_name = metadata["name"]
     hsaco_launcher = get_hsaco_launcher(hsaco_name, kernel_name)

@@ -174,7 +174,8 @@ class HsacoLauncher:
             elif isinstance(arg, (ctypes.c_void_p, ctypes.c_int32, ctypes.c_float)):
                 # Already a ctypes value
                 args.append(arg)
-
+            elif arg is None:
+                pass
             else:
                 raise TypeError(f"Unsupported argument type: {type(arg)}")
 
