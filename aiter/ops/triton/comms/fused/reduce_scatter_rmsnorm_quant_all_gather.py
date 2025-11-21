@@ -22,10 +22,13 @@ import logging
 
 try:
     import iris
+
     IRIS_AVAILABLE = True
 except ImportError:
     IRIS_AVAILABLE = False
-    logging.warning("Iris library not available. Fused communication kernels will not work.")
+    logging.warning(
+        "Iris library not available. Fused communication kernels will not work."
+    )
 
 logger = logging.getLogger("aiter")
 
@@ -49,13 +52,13 @@ def fused_reduce_scatter_rmsnorm_quant_all_gather_kernel(
 ):
     """
     Fused kernel: Reduce-scatter -> RMSNorm -> Quant -> All-gather
-    
+
     This kernel performs:
     1. Reduce-scatter: Each rank reduces its chunk and scatters to others
     2. RMSNorm: Normalize the reduced data
     3. Quantization: Quantize the normalized data (if enabled)
     4. All-gather: Gather quantized data from all ranks
-    
+
     Args:
         input_ptr: Input tensor pointer
         output_ptr: Output tensor pointer
@@ -73,25 +76,25 @@ def fused_reduce_scatter_rmsnorm_quant_all_gather_kernel(
         use_quant: Whether to use quantization
     """
     pid = tl.program_id(0)
-    
+
     # Calculate chunk size per rank
     chunk_size = N // world_size
     chunk_start = cur_rank * chunk_size
     chunk_end = chunk_start + chunk_size
-    
+
     # Process elements in blocks
     num_programs = tl.num_programs(0)
     for i in range(pid * BLOCK_SIZE, chunk_size, BLOCK_SIZE * num_programs):
         block_start = chunk_start + i
         block_end = tl.minimum(block_start + BLOCK_SIZE, chunk_end)
-        
+
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = (offsets >= chunk_start) & (offsets < chunk_end)
-        
+
         # Step 1: Reduce-scatter
         # Load local data
         local_data = tl.load(input_ptr + offsets, mask=mask, other=0.0)
-        
+
         # Reduce from all ranks using atomic operations
         for rank in range(world_size):
             if rank != cur_rank:
@@ -104,37 +107,37 @@ def fused_reduce_scatter_rmsnorm_quant_all_gather_kernel(
                     mask=mask,
                 )
                 local_data = local_data + remote_data
-        
+
         # Step 2: RMSNorm
         # Load residual
         residual = tl.load(residual_in_ptr + offsets, mask=mask, other=0.0)
         combined = local_data + residual
-        
+
         # Compute RMS
         rms = tl.sqrt(tl.sum(combined * combined) / chunk_size + epsilon)
-        
+
         # Normalize
         normalized = combined / rms
-        
+
         # Apply weight and bias
         weight = tl.load(weight_ptr + (offsets - chunk_start), mask=mask, other=0.0)
         bias = tl.load(bias_ptr + (offsets - chunk_start), mask=mask, other=0.0)
         normed = normalized * weight + bias
-        
+
         # Step 3: Quantization (if enabled)
         if use_quant:
             xscale = tl.load(xscale_ptr + (offsets - chunk_start), mask=mask, other=1.0)
             # Quantize (simplified - actual implementation would use proper quantization)
             quantized = (normed / xscale).to(tl.int8)
             yscale = tl.load(yscale_ptr + (offsets - chunk_start), mask=mask, other=1.0)
-            output_data = (quantized.to(tl.float32) * yscale)
+            output_data = quantized.to(tl.float32) * yscale
         else:
             output_data = normed
-        
+
         # Step 4: All-gather
         # Store to local output
         tl.store(output_ptr + offsets, output_data, mask=mask)
-        
+
         # Store to remote ranks using Iris store
         for rank in range(world_size):
             if rank != cur_rank:
@@ -161,10 +164,10 @@ def reduce_scatter_rmsnorm_quant_all_gather(
 ) -> Tensor:
     """
     Fused reduce-scatter + RMSNorm + quantization + all-gather operation.
-    
+
     This function combines multiple operations into a single Triton kernel
     for improved performance through fine-grained communication-computation overlap.
-    
+
     Args:
         input_tensor: Input tensor to reduce-scatter
         residual_in: Residual input for RMSNorm
@@ -175,44 +178,45 @@ def reduce_scatter_rmsnorm_quant_all_gather(
         ctx: Optional IrisCommContext. If None, a global context will be used.
         heap_size: Heap size for Iris context if ctx is None
         use_quant: Whether to apply quantization
-    
+
     Returns:
         Tensor: Result of all-gather after reduce-scatter, RMSNorm, and quantization
     """
     if not IRIS_AVAILABLE:
         raise RuntimeError("Iris library is not available.")
-    
+
     # Get rank and world size from context
     if ctx is None:
         from ..iris import _get_or_create_iris_context
+
         ctx = _get_or_create_iris_context(heap_size=heap_size)
-    
+
     rank = ctx.cur_rank
     world_size = ctx.num_ranks
-    
+
     if world_size == 1:
         # Single rank: just do RMSNorm + quant locally
         # TODO: Implement local-only path
         raise NotImplementedError("Single rank path not yet implemented")
-    
+
     # Allocate output tensor
     output = torch.empty_like(input_tensor)
-    
+
     # Get heap bases
     heap_bases = ctx.get_heap_bases()
-    
+
     # Launch kernel
     N = input_tensor.numel()
     BLOCK_SIZE = 256
-    
-    grid = lambda meta: (triton.cdiv(N // world_size, meta['BLOCK_SIZE']),)
-    
+
+    grid = lambda meta: (triton.cdiv(N // world_size, meta["BLOCK_SIZE"]),)
+
     # Prepare quantization scales if needed
     if use_quant and xscale is None:
         raise ValueError("xscale is required when use_quant=True")
-    
+
     yscale = torch.ones_like(xscale) if use_quant else None
-    
+
     fused_reduce_scatter_rmsnorm_quant_all_gather_kernel[grid](
         input_tensor,
         output,
@@ -229,7 +233,7 @@ def reduce_scatter_rmsnorm_quant_all_gather(
         heap_bases=heap_bases,
         use_quant=use_quant,
     )
-    
+
     return output
 
 
@@ -238,4 +242,3 @@ def reduce_scatter_rmsnorm_quant_all_gather(
 # - all_reduce_rmsnorm_quant (Triton version)
 # - reduce_scatter_attention_all_gather
 # etc.
-
