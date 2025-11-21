@@ -104,9 +104,8 @@ AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
 
 AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
-    f"{AITER_ROOT_DIR}/aiter/configs/tuned_gemm.csv",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
-
 
 class AITER_CONFIG(object):
     def __init__(self):
