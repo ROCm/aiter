@@ -16,10 +16,13 @@ import logging
 
 try:
     import iris
+
     IRIS_AVAILABLE = True
 except ImportError:
     IRIS_AVAILABLE = False
-    logging.warning("Iris library not available. Reduce-scatter operations will not work.")
+    logging.warning(
+        "Iris library not available. Reduce-scatter operations will not work."
+    )
 
 logger = logging.getLogger("aiter")
 
@@ -108,13 +111,15 @@ def reduce_scatter_m_kernel(
             accumulator += data.to(tl.float32)
 
         # Store the result to output shard
-        output_ptrs = output_ptr + rm_local[:, None] * stride_om + rn[None, :] * stride_on
+        output_ptrs = (
+            output_ptr + rm_local[:, None] * stride_om + rn[None, :] * stride_on
+        )
         tl.store(output_ptrs, accumulator.to(output_ptr.type.element_ty), mask=mask)
 
 
 def reduce_scatter_iris(
     input_tensor: Tensor,
-    ctx: 'IrisCommContext',
+    ctx: "IrisCommContext",
     block_m: int = 16,
     block_n: int = 64,
     group_size_m: int = 8,
@@ -147,10 +152,14 @@ def reduce_scatter_iris(
         >>>     print(output_shard.shape)  # [1024, 7168] for world_size=8
     """
     if not IRIS_AVAILABLE:
-        raise RuntimeError("Iris library is not available. Cannot perform reduce-scatter.")
+        raise RuntimeError(
+            "Iris library is not available. Cannot perform reduce-scatter."
+        )
 
     if not ctx._initialized:
-        raise RuntimeError("Iris context not initialized. Use IrisCommContext as context manager.")
+        raise RuntimeError(
+            "Iris context not initialized. Use IrisCommContext as context manager."
+        )
 
     # Get distributed parameters from context
     cur_rank = ctx.cur_rank
@@ -165,7 +174,9 @@ def reduce_scatter_iris(
     if M % world_size != 0:
         raise ValueError(f"M ({M}) must be divisible by world_size ({world_size})")
 
-    logger.info(f"Rank {cur_rank}/{world_size}: Reduce-scatter M={M}, N={N} -> M_shard={M_shard}")
+    logger.info(
+        f"Rank {cur_rank}/{world_size}: Reduce-scatter M={M}, N={N} -> M_shard={M_shard}"
+    )
 
     # Allocate output buffer in IRIS shared memory
     output_shard = shmem.zeros((M_shard, N), dtype=input_tensor.dtype)
@@ -198,6 +209,8 @@ def reduce_scatter_iris(
     torch.cuda.synchronize()
     shmem.barrier()
 
-    logger.info(f"Rank {cur_rank}: Reduce-scatter complete, output_shard shape: {output_shard.shape}")
+    logger.info(
+        f"Rank {cur_rank}: Reduce-scatter complete, output_shard shape: {output_shard.shape}"
+    )
 
     return output_shard
