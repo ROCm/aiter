@@ -76,3 +76,17 @@ from .ops.trans_ragged_layout import *
 from .ops.sample import *
 from .ops.fused_mrope_rms import *
 from . import mla
+
+# Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
+try:
+    from .ops.triton.comms import (
+        IrisCommContext,
+        all_reduce_iris,
+        all_reduce_iris_atomic,
+        reduce_scatter_iris,
+        all_gather_iris,
+        reduce_scatter_rmsnorm_quant_all_gather,
+    )
+except ImportError:
+    # Iris not available, skip import
+    pass
