@@ -161,7 +161,7 @@ def test_fmoe(
     if (
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16])
-        and (WQDType == dtypes.fp4x2)
+        # and (WQDType == dtypes.fp4x2)
     ):  # a16w4
         exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
         exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
