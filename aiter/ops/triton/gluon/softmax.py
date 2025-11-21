@@ -32,16 +32,22 @@ def _issue_loads(
     col_offsets = copy_idx * BLOCK_SIZE + gl.arange(0, BLOCK_SIZE, layout=layout)
     mask = col_offsets < n_cols
 
-    # acp.buffer_load_to_shared(
-    #     cols_smem.index(copy_idx % NUM_STAGES), row_start_ptr, col_offsets, mask, other=-float("inf"), cache_modifier=".cg"
-    # )
-    acp.global_load_to_shared(
+    acp.buffer_load_to_shared(
         cols_smem.index(copy_idx % NUM_STAGES),
-        row_start_ptr + col_offsets,
-        mask=mask,
+        row_start_ptr,
+        col_offsets,
+        mask,
         other=-float("inf"),
         cache_modifier=".cg",
     )
+    # acp.global_load_to_shared(
+    #     cols_smem.index(copy_idx % NUM_STAGES),
+    #     row_start_ptr + col_offsets,
+    #     mask=mask,
+    #     other=-float("inf"),
+    #     cache_modifier=".cg",
+    # )
+    acp.commit_group()
     return copy_idx + 1
 
 
@@ -125,7 +131,7 @@ def _softmax_kernel_online(
         order=[0],
     )
     shared_cols: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[0]
+        vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
     cols_smem = gl.allocate_shared_memory(
         input_ptr.type.element_ty, [NUM_STAGES, BLOCK_SIZE], layout=shared_cols
@@ -164,14 +170,14 @@ def _softmax_kernel_online(
         )
 
         # wait for a copy to finish before doing any computation
-        acp.async_wait(NUM_STAGES - 1)
+        acp.wait_group(NUM_STAGES - 1)
         m, row_sum, read_idx = _perform_loop1(
             m, row_sum, read_idx, cols_smem, blocked_cols, NUM_STAGES
         )
 
     # finish the pipeline
     for i in gl.static_range(NUM_STAGES - 1):
-        acp.async_wait(NUM_STAGES - 1 - i)
+        acp.wait_group(NUM_STAGES - 2 - i)
         m, row_sum, read_idx = _perform_loop1(
             m, row_sum, read_idx, cols_smem, blocked_cols, NUM_STAGES
         )
@@ -207,7 +213,7 @@ def _softmax_kernel_online(
         )
 
         # wait for a copy to finish before doing any computation
-        acp.async_wait(NUM_STAGES - 1)
+        acp.wait_group(NUM_STAGES - 1)
         read_idx = _perform_loop2(
             m,
             row_sum,
@@ -223,7 +229,7 @@ def _softmax_kernel_online(
 
     # finish the pipeline
     for i in gl.static_range(NUM_STAGES - 1):
-        acp.async_wait(NUM_STAGES - 1 - i)
+        acp.wait_group(NUM_STAGES - 2 - i)
         read_idx = _perform_loop2(
             m,
             row_sum,
