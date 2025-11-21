@@ -24,7 +24,6 @@ _USE_GEMM_SPLITK_BF16 = False
 def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
-    return dict(items_list)
 
 def batched_gemm_afp4wfp4_pre_quant_fake_tensor(
     x: Tensor,

@@ -74,8 +74,8 @@ def gemm_afp4wfp4_fake_tensor(
     y: Optional[torch.Tensor] = None,
     config: Optional[str] = None,
 ) -> Tensor:
-    M, K = x.shape
-    N, K = w.shape
+    M, _ = x.shape
+    N, _ = w.shape
     out = torch.empty((M, N), dtype=dtype, device=x.device)
     return out
 
