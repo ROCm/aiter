@@ -34,7 +34,7 @@ jobs:
   build_vllm_image:
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: [check-signal]
-    runs-on: aiter-1gpu-runner
+    runs-on: aiter-k8s-build
 
     steps:
       - name: Checkout aiter repo

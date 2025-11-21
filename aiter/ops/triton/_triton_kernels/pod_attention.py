@@ -1,6 +1,6 @@
-import torch
 import triton
 import triton.language as tl
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 import importlib.util
 from pathlib import Path
@@ -63,7 +63,36 @@ def get_cu_id():
     return (cu_id, se_id, xcc_id)
 
 
-@triton.jit
+_pod_persistent_repr = make_kernel_repr(
+    "pod_persistent",
+    [
+        "HEAD_DIM",
+        "BLOCK_M",
+        "BLOCK_N",
+        "batch_size",
+        "num_m_blocks",
+        "num_n_blocks",
+        "high_load_wgs",
+        "max_tiles_per_wg",
+        "tiles_per_head",
+        "num_splits",
+        "BLOCK_M_pf",
+        "BLOCK_N_pf",
+        "MASKED_BLOCKS",
+        "batch_size_pf",
+        "num_m_blocks_pf",
+        "num_n_blocks_pf",
+        "high_load_wgs_pf",
+        "max_tiles_per_wg_pf",
+        "tiles_per_head_pf",
+        "num_splits_pf",
+        "prefill_ratio",
+        "decode_ratio",
+    ],
+)
+
+
+@triton.jit(repr=_pod_persistent_repr)
 def pod_persistent(
     # Prefill/Decode Communication
     cu_ctr,

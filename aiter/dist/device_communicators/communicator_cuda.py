@@ -118,7 +118,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     self.all2all_manager.__class__.__name__,
                 )
 
-    def all_reduce(self, input_, ca_fp8_quant: bool = False) -> torch.Tensor:
+    def all_reduce(
+        self, input_, use_new: bool = False, ca_fp8_quant: bool = False
+    ) -> torch.Tensor:
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
@@ -137,7 +139,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
         ):
-            out = ca_comm.custom_all_reduce(input_, ca_fp8_quant)
+            out = ca_comm.custom_all_reduce(input_, use_new, ca_fp8_quant)
             assert out is not None
             return out
         symm_mem_comm = self.symm_mem_comm
