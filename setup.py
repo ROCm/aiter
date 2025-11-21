@@ -288,6 +288,16 @@ setup(
         "einops",
         "psutil",
     ],
+    extras_require={
+        # Triton-based communication using Iris
+        "triton_comms": [
+            "iris @ git+https://github.com/ROCm/iris.git",
+        ],
+        # Install all optional dependencies
+        "all": [
+            "iris @ git+https://github.com/ROCm/iris.git",
+        ],
+    },
     setup_requires=setup_requires,
     distclass=ForcePlatlibDistribution,
 )
