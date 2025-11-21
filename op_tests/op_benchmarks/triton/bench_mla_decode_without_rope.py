@@ -331,6 +331,7 @@ def create_benchmark_configs(args: argparse.Namespace):
     extra_args = {
         "dtype": args.dtype,
         "save_aot": args.aot,
+        "metric": args.metric,
     }
 
     if args.model:
