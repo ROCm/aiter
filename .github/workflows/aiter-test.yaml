@@ -104,6 +104,11 @@ jobs:
           --name aiter_test \
           ${{ env.DOCKER_IMAGE }}
 
+      - name: Setup pip config
+        run: |
+          docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root aiter_test bash -c "pip config set global.retries 10"
+
       - name: Setup Aiter
         run: |
           set -ex
@@ -183,10 +188,15 @@ jobs:
           --name aiter_test \
           ${{ env.DOCKER_IMAGE }}
 
-      - name: Setup-Triton
+      - name: Setup pip config
+        run: |
+          docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root aiter_test bash -c "pip config set global.retries 10"
+
+      - name: Setup-Aiter
         run: |
           set -ex
-          echo "Setting up Triton..."
+          echo "Setting up Aiter..."
           docker exec \
           -w /workspace \
           aiter_test \

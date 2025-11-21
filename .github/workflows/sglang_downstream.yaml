@@ -99,6 +99,11 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Setup pip config
+        run: |
+          docker exec -u root sglang_aiter_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root sglang_aiter_test bash -c "pip config set global.retries 10"
+
       - name: Install dependencies
         run: |
           cd sglang
