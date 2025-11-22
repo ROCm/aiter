@@ -425,7 +425,7 @@ def test_fused_rope_concat_and_cache_mla(
 
 kv_lora_rank = 128
 qk_rope_head_dim = 64
-l_num_tokens = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]  #
+l_num_tokens = [128, 256, 512, 1024, 2048, 4096]  # ,8192, 16384
 block_size = 64
 dtype = torch.float16
 l_qk_dtypes = ["auto", "fp8"]

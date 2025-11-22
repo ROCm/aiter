@@ -1493,7 +1493,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
     y = q_pe_rot[y_index];
   }
   if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-    buffer_o.template set(
+    buffer_o.template set_raw(
         vec_idx * vec_size_o,
         0,
         true,
@@ -1536,7 +1536,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
     auto buffer_o = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_o, oob_o);
     buffer_o.init_raw();
     if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
-        buffer_o.template set(
+        buffer_o.template set_raw(
             vec_idx * vec_size_o,
             0,
             true,
@@ -1686,7 +1686,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
         {
             vec_nxt = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
             if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
-                buffer_o.template set(
+                buffer_o.template set_raw(
                     (vec_idx - vec_stride) * vec_size_o,
                     0,
                     true,
@@ -1704,7 +1704,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
         if (vec_idx - vec_stride < num_vecs)
         {
             if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
-                buffer_o.template set(
+                buffer_o.template set_raw(
                     (vec_idx - vec_stride) * vec_size_o,
                     0,
                     true,
@@ -1752,7 +1752,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           size_t head_idx = (vec_idx - vec_stride)/ kv_lora_vec;
           size_t vec_dst_idx = (vec_idx - vec_stride) % kv_lora_vec;
           if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-              buffer_o.template set(
+              buffer_o.template set_raw(
                    (head_idx * head_size) + vec_dst_idx * vec_size_o,
                   0,
                   true,
@@ -1772,7 +1772,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           size_t head_idx = (vec_idx - vec_stride) / kv_lora_vec;
           size_t vec_dst_idx = (vec_idx - vec_stride) % kv_lora_vec;
           if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-              buffer_o.template set(
+              buffer_o.template set_raw(
                   (head_idx * head_size) + vec_dst_idx * vec_size_o,
                   0,
                   true,
@@ -1933,7 +1933,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           const scalar_t y = q_pe_in[y_index];
 
           if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-              q_buffer_o.template set(
+              q_buffer_o.template set_raw(
                    (head_idx * head_size) + vec_dst_idx * vec_size_o,
                   0,
                   true,
@@ -1966,7 +1966,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           size_t head_idx = (vec_idx - vec_stride)/ kv_lora_vec;
           size_t vec_dst_idx = (vec_idx - vec_stride) % kv_lora_vec;
           if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-              q_buffer_o.template set(
+              q_buffer_o.template set_raw(
                    (head_idx * head_size) + vec_dst_idx * vec_size_o,
                   0,
                   true,
@@ -1986,7 +1986,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           size_t head_idx = (vec_idx - vec_stride) / kv_lora_vec;
           size_t vec_dst_idx = (vec_idx - vec_stride) % kv_lora_vec;
           if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-              q_buffer_o.template set(
+              q_buffer_o.template set_raw(
                   (head_idx * head_size) + vec_dst_idx * vec_size_o,
                   0,
                   true,
