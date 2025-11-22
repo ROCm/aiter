@@ -229,15 +229,18 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                 q_pe.to(decode_q_pe_out_ptr.dtype.element_ty),
             )
 
-        if OUTPUT_Q_NOPE_ZEROS and pid < num_decode_toks_for_zeros * QH:
-            z = tl.zeros((BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
-            tl.store(
-                q_nope_zeros_out_ptr
-                + pid_b * q_nope_zeros_out_stride_b
-                + pid_hq * q_nope_zeros_out_stride_h
-                + dk_nope_offs * q_nope_zeros_out_stride_d,
-                z,
-            )
+        if OUTPUT_Q_NOPE_ZEROS:
+            if pid < num_decode_toks_for_zeros * QH:
+                z = tl.zeros(
+                    (BLOCK_DK_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty
+                )
+                tl.store(
+                    q_nope_zeros_out_ptr
+                    + pid_b * q_nope_zeros_out_stride_b
+                    + pid_hq * q_nope_zeros_out_stride_h
+                    + dk_nope_offs * q_nope_zeros_out_stride_d,
+                    z,
+                )
 
         if pid_hq % QH_PER_KH == 0:
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)

@@ -84,7 +84,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{get_asm_dir()}/pa/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m pa --output_dir {{}}'"
     },
     "module_pa": {
         "srcs": [
@@ -273,18 +273,39 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/deepgemm_pybind.cu'",
             "f'{AITER_CSRC_DIR}/ck_deepgemm/deepgemm.cu'"
-
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
         "md_name": "'module_deepgemm'",
         "extra_ldflags": "None",
-        "extra_include": ["f'{CK_DIR}/example/ck_tile/18_flatmm'", "f'{AITER_CSRC_DIR}/ck_deepgemm/include'"],
-        "verbose": "False", 
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/18_flatmm'",
+            "f'{AITER_CSRC_DIR}/ck_deepgemm/include'"
+        ],
+        "verbose": "False",
         "is_python_module": "True",
         "is_standalone": "False",
         "hip_clang_path": "os.environ.get('FLATMM_HIP_CLANG_PATH')",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_deepgemm/gen_instances.py --working_path {{}}'"
+    },
+    "module_gemm_a8w8_bpreshuffle_cktile": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_bpreshuffle_cktile_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
+            "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_cktile.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/include'",
+            "f'{CK_DIR}/example/ck_tile/18_flatmm'"
+        ],
+        "is_python_module": "True",
+        "is_standalone": "False",
+        "verbose": "False",
+        "hip_clang_path": "os.environ.get('FLATMM_HIP_CLANG_PATH')",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE}'"
     },
     "module_gemm_a8w8_asm": {
         "srcs": [
@@ -296,7 +317,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{get_asm_dir()}/i8gemm/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m i8gemm --output_dir {{}}'"
     },
     "module_gemm_a16w16_asm": {
         "srcs": [
@@ -308,7 +329,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{get_asm_dir()}/bf16gemm/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m bf16gemm --output_dir {{}}'"
     },
     "module_gemm_a4w4_asm": {
         "srcs": [
@@ -320,7 +341,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{get_asm_dir()}/f4gemm/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f4gemm --output_dir {{}}'"
     },
     "module_gemm_a8w8_blockscale_asm": {
         "srcs": [
@@ -365,8 +386,8 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{get_asm_dir()}/fmoe_2stages/codegen.py --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmoe/codegen.py --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe_2stages --output_dir {{}}'",
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'"
         ]
     },
     "module_moe_ck2stages": {
@@ -391,6 +412,24 @@
         "verbose": "False",
         "hip_clang_path": "os.environ.get('GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH')",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py --working_path {{}}'"
+    },
+    "module_moe_cktile2stages": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/ck_tile_gemm_moe_2stages/moe_cktile2stages.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/moe_cktile_2stages_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "md_name": "'module_moe_cktile2stages'",
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/ck_tile_gemm_moe_2stages/include'"
+        ],
+        "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
+        "hip_clang_path": "os.environ.get('FLATMM_HIP_CLANG_PATH')",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_tile_gemm_moe_2stages/gen_instances.py --working_path {{}}'"
     },
     "module_moe_sorting": {
         "srcs": [
@@ -561,6 +600,24 @@
         "is_python_module": "True",
         "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune'"
+    },
+    "module_gemm_a8w8_bpreshuffle_cktile_tune": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_bpreshuffle_cktile_tune_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_cktile_tune.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/include'",
+            "f'{CK_DIR}/example/ck_tile/18_flatmm'"
+        ],
+        "verbose": "False",
+        "hip_clang_path": "os.environ.get('FLATMM_HIP_CLANG_PATH')",
+        "is_python_module": "True",
+        "is_standalone": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune'"
     },
     "module_aiter_operator": {
         "srcs": [
@@ -935,7 +992,7 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_topk_per_row": {
+    "module_top_k_per_row": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/topk_per_row_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/topk_per_row_pybind.cu'"
@@ -966,7 +1023,8 @@
     "module_mla_reduce": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_reduce_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/reduce.cu'"],
+            "f'{AITER_CSRC_DIR}/kernels/mla/reduce.cu'"
+        ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
         "extra_ldflags": "None",

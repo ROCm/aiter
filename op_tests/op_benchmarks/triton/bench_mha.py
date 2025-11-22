@@ -6,10 +6,12 @@ import itertools
 import triton
 from aiter.ops.triton.mha import (
     flash_attn_func,
-    flash_attn_fp8_func,
     flash_attn_varlen_func,
-    flash_attn_varlen_fp8_func,
     mha_set_use_fused_bwd_kernel,
+)
+from aiter.ops.triton.mha_v3 import (
+    flash_attn_fp8_func,
+    flash_attn_varlen_fp8_func,
 )
 from aiter.test_mha_common import (
     generate_random_padding_mask,
@@ -440,11 +442,8 @@ def run_benchmark(custom, args):
                         cu_seqlens_k,
                         max_seqlen_q,
                         max_seqlen_k,
-                        dropout_p=dropout,
                         softmax_scale=sm_scale,
                         causal=causal,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
                     )
 
             else:
@@ -473,11 +472,8 @@ def run_benchmark(custom, args):
                         q_input,
                         k_input,
                         v_input,
-                        dropout_p=dropout,
                         softmax_scale=sm_scale,
                         causal=causal,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
                     )
 
             else:
