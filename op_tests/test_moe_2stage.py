@@ -190,11 +190,13 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
+        aiter.logger.info(f'shuffle as a16w4')
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif WQDType != dtypes.fp4x2 or preshuffle:
+        aiter.logger.info(f'shuffle path1')
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
