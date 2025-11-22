@@ -81,11 +81,8 @@ def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
     return interleaved.contiguous().view(src_type)
 
 
-def shuffle_scale_a16w4(
-    src: torch.Tensor, experts_cnt: int, gate_up: bool
-) -> torch.Tensor:
-    n_experts, k_ = src.shape
-    n_ = n_experts // experts_cnt
+def shuffle_scale_a16w4(src: torch.Tensor, gate_up: bool) -> torch.Tensor:
+    experts_cnt, n_, k_ = src.shape
     # MXFP4 constants
     K_Pack = 2
     N_Pack = 2

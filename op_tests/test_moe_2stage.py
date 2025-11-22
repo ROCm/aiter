@@ -152,8 +152,6 @@ def test_fmoe(
         exp_bias2_aiter = exp_bias2 = None
 
     # pre-shuffle
-    w1_scale_aiter = w1_scale
-    w2_scale_aiter = w2_scale
     if WQDType == torch.int4:  # int4 w quant
         w1_qt_aiter = rearrange_4bit_elements(
             convert_int8_to_uint32_int4(
@@ -173,9 +171,9 @@ def test_fmoe(
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
-        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, False)
     elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
@@ -350,7 +348,8 @@ parser.add_argument(
     2: aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8  # a8w8
     3: aiter.QuantType.per_Token, dtypes.fp8, torch.int4  # a8w4
     4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
-    5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8""",
+    5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8
+    6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2  # a16w4""",
 )
 
 parser.add_argument(
