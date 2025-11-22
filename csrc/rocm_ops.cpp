@@ -40,6 +40,7 @@
 #include "rope.h"
 #include "sample.h"
 #include "smoothquant.h"
+#include "topk_plain.h"
 #include <torch/extension.h>
 
 // #include "torch/mha_batch_prefill.h"
@@ -110,5 +111,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     MLA_METADATA_PYBIND;
     MLA_REDUCE_PYBIND;
     DEEPGEMM_PYBIND;
+    TOPK_PLAIN_PYBIND;
 }
 #endif
