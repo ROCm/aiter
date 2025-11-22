@@ -129,8 +129,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     "Using %s all2all manager.",
                     self._all2all_manager.__class__.__name__,
                 )
-        if self._all2all_manager is None:
-            raise ValueError(f"all2all_manager is None for {self.unique_name}")
+        # if self._all2all_manager is None:
+        #     raise ValueError(f"all2all_manager is None for {self.unique_name}")
         return self._all2all_manager
 
     @all2all_manager.setter

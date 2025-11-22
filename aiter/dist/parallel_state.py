@@ -1373,7 +1373,7 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
     MoE all2all (DeepEP) usually allocate the communication buffer
     based on the model shape for optimal performance.
     """
-    print("prepare_communication_buffer_for_model", _TP, _PP, _DP, _EP)
+    logger.debug(f"prepare_communication_buffer_for_model: {_TP} {_PP} {_DP} {_EP}")
     if _TP is not None:
         _TP.prepare_communication_buffer_for_model(model)
     if _PP is not None:
