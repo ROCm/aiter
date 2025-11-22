@@ -53,9 +53,17 @@ def call_hipb_mm(input, weight, bias, scale_a, scale_b, solidx, out_dtype):
     )
 
 
-def run_gemm_bf16_asm(inp, w, out, bias=None, splitK=None, kernelName=None):
+def run_gemm_bf16_asm(
+    inp, w, out, bias=None, splitK=None, kernelName=None, bpreshuffle=False
+):
     return aiter.gemm_a16w16_asm(
-        inp, w, out, bias=bias, splitK=splitK, kernelName=kernelName
+        inp,
+        w,
+        out,
+        bias=bias,
+        splitK=splitK,
+        kernelName=kernelName,
+        bpreshuffle=bpreshuffle,
     )
 
 
@@ -227,6 +235,8 @@ class Gemm:
             print(f"ASM kernel list file not exist: {file}")
             return {}
         df = pd.read_csv(file)
+        if "bPreshuffle" in df.columns:
+            df = df[df["bPreshuffle"] != 1]
         kernel_dict = (
             df.groupby(["tileM", "tileN", "pf"])["knl_name"].apply(list).to_dict()
         )
