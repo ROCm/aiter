@@ -396,7 +396,8 @@ namespace py = pybind11;
           py::arg("out"),                       \
           py::arg("bias")       = std::nullopt, \
           py::arg("splitK")     = std::nullopt, \
-          py::arg("kernelName") = std::nullopt);
+          py::arg("kernelName") = std::nullopt, \
+          py::arg("bpreshuffle")      = false);
 
 #define GEMM_A4W4_ASM_PYBIND                      \
     m.def("gemm_a4w4_asm",                        \
