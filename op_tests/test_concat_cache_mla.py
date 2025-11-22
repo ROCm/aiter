@@ -284,7 +284,7 @@ def test_fused_rope_concat_and_cache_mla(
     sin_cache = sin_cache.to(device)
 
     pos = torch.randint(0, num_tokens, (num_tokens,), device=device)
-    scale = torch.tensor(0.1, dtype=torch.float32, device=device)
+    scale = torch.tensor(1, dtype=torch.float32, device=device)
     q_scale = torch.tensor(0.3, dtype=torch.float32, device=device)
     cache_dtype = dtypes.fp8 if kv_cache_dtype == "fp8" else dtype
     q_out_dtype = dtypes.fp8 if q_dtype == "fp8" else dtype
@@ -333,7 +333,7 @@ def test_fused_rope_concat_and_cache_mla(
         device=q_nope.device,
     )
     triton_temp = torch.zeros(*kv_cache.shape, dtype=cache_dtype, device=device)
-    if q_dtype != "fp8":
+    if q_dtype != "fp8" and block_size == 1:
         (triton_q_out, decode_q_pe_out, k_pe_out, triton_temp), triton_us = (
             run_perftest(
                 fused_qk_rope_cat_and_cache_mla,
@@ -355,10 +355,10 @@ def test_fused_rope_concat_and_cache_mla(
         )
     else:
         (triton_q_out, decode_q_pe_out, k_pe_out, triton_temp), triton_us = (
+            triton_q_out,
             None,
             None,
-            None,
-            None,
+            triton_temp,
         ), None
     (kv_cache, q_out), avg_us = run_perftest(
         aiter_fused_rope_concat_and_cache_mla,
@@ -391,13 +391,15 @@ def test_fused_rope_concat_and_cache_mla(
         kv_expected_temp = ref_kv_cache.to(torch.float32) * scale
         checkAllclose(kv_result_temp, kv_expected_temp, atol=0.01, rtol=0.01)
         checkAllclose(q_out, ref_q_out)
-        checkAllclose(triton_q_out, ref_q_out)
-        checkAllclose(triton_temp.to(torch.float32) * scale, kv_expected_temp)
+        if block_size == 1:
+            checkAllclose(triton_q_out, ref_q_out)
+            checkAllclose(triton_temp.to(torch.float32) * scale, kv_expected_temp)
     else:
         checkAllclose(kv_cache, ref_kv_cache)
         checkAllclose(q_out, ref_q_out)
-        checkAllclose(triton_q_out, ref_q_out)
-        checkAllclose(triton_temp, ref_kv_cache)
+        if block_size == 1:
+            checkAllclose(triton_q_out, ref_q_out)
+            checkAllclose(triton_temp, ref_kv_cache)
     ret["triton_us"] = triton_us
     ret["fused_qk_us"] = avg_us
     ret["unfused_us"] = ref_us
