@@ -172,7 +172,7 @@ def test_fmoe(
     # pre-shuffle
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
-    if True：
+    if True:
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
