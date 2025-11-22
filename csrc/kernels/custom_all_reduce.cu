@@ -161,6 +161,67 @@ void all_reduce(fptr_t _fa,
 
 }
 
+void _reduce_scatter(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, hipStream_t stream)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    TORCH_CHECK(_is_weak_contiguous(out));
+    switch(out.scalar_type())
+    {
+    case at::ScalarType::Float: {
+        fa->dispatchReduceScatter<float>(stream,
+                                     reinterpret_cast<float*>(inp.data_ptr()),
+                                     reinterpret_cast<float*>(out.data_ptr()),
+                                     size);
+        break;
+    }
+    case at::ScalarType::Half: {
+        fa->dispatchReduceScatter<half>(stream,
+                                    reinterpret_cast<half*>(inp.data_ptr()),
+                                    reinterpret_cast<half*>(out.data_ptr()),
+                                    size);
+        break;
+    }
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case at::ScalarType::BFloat16: {
+        fa->dispatchReduceScatter<__hip_bfloat16>(stream,
+                                              reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
+                                              reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
+                                              size);
+        break;
+    }
+#endif
+    default:
+        throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
+    }
+}
+
+void reduce_scatter(fptr_t _fa,
+                torch::Tensor& inp,
+                torch::Tensor& out,
+                std::optional<torch::Tensor> reg_buffer)
+{
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+
+    if(reg_buffer.has_value())
+    {
+        auto input_size = inp.numel() * inp.element_size();
+        TORCH_CHECK(input_size <= reg_buffer.value().numel() * reg_buffer.value().element_size(),
+                    "registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync(reg_buffer.value().data_ptr(),
+                                inp.data_ptr(),
+                                input_size,
+                                hipMemcpyDeviceToDevice,
+                                stream));
+        _reduce_scatter(_fa, reg_buffer.value(), out, inp.numel(), stream);
+    }
+    else
+    {
+        _reduce_scatter(_fa, inp, out, inp.numel(), stream);
+    }
+}
+
 void _all_gather(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);

@@ -40,6 +40,12 @@ def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tenso
     return get_tp_group().custom_all_gather(input_)
 
 
+def tensor_model_parallel_reduce_scatter(
+    input_: torch.Tensor, use_custom: bool = True, dim: int = 0
+) -> torch.Tensor:
+    return get_tp_group().reduce_scatter_tensor(input_, use_custom, dim)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, use_custom: bool = False, dim: int = -1
 ) -> torch.Tensor:
