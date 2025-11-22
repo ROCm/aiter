@@ -846,6 +846,7 @@ def fused_moe_2stages(
     aiter.logger.info(f'a1.dtype = {a1.dtype}, w1.dtype = {w1.dtype}, w2.dtype = {w2.dtype}')
     aiter.logger.info('print a1')
     aiter.logger.info(a1)
+    aiter.logger.info(f'a1_max : {torch.max(torch.abs(a1))}')
     aiter.logger.info('print w1 scale')
     aiter.logger.info(w1_scale)
 
