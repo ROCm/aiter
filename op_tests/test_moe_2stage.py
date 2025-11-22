@@ -173,6 +173,7 @@ def test_fmoe(
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
     if WQDType == torch.int4:  # int4 w quant
+        aiter.logger.info(f'shuffle as int4')
         w1_qt_aiter = rearrange_4bit_elements(
             convert_int8_to_uint32_int4(
                 shuffle_weight(w1_qt_aiter, (16, 16), use_int4=True)
