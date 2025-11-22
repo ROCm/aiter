@@ -20,7 +20,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx
+from chip_info import get_gfx, get_gfx_list
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
 from torch_guard import torch_compile_guard  # noqa: E402
@@ -78,6 +78,12 @@ AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
 )
+
+AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_cktile_tuned_gemm.csv",
+)
+
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
@@ -176,6 +182,14 @@ class AITER_CONFIG(object):
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE",
+            AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE,
+            "a8w8_bpreshuffle_cktile_tuned_gemm",
         )
 
     def update_config_files(self, file_path: str, merge_name: str):
@@ -283,9 +297,16 @@ else:
 sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
-gfx = get_gfx()
-AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/"
-os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
+gfx = get_gfx_list()
+if len(gfx) == 1:
+    # single GPU arch
+    AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx[0]}/"
+    os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
+else:
+    # multiple GPU archs
+    AITER_ASM_DIR = [f"{AITER_META_DIR}/hsa/{g}/" for g in gfx]
+    os.environ["AITER_ASM_DIR"] = ":".join(AITER_ASM_DIR)
+
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
 )
