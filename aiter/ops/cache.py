@@ -96,6 +96,7 @@ def concat_and_cache_mla(
     scale: Tensor,
 ) -> None: ...
 
+
 @compile_ops("module_cache")
 def indexer_k_quant_and_cache(
     k: Tensor,
