@@ -6,3 +6,5 @@ pyyaml
 einops
 pybind11>=3.0.1
 ninja
+# Iris library for Triton-based GPU communication
+iris @ git+https://github.com/ROCm/iris.git
