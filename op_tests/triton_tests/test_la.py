@@ -4,6 +4,7 @@
 import sys
 import pytest
 import torch
+import math
 from typing import Union, List
 from aiter.ops.triton.lean_atten import (
     _persistent_lean_attention,
@@ -11,6 +12,7 @@ from aiter.ops.triton.lean_atten import (
 )
 from aiter.ops.triton._triton_kernels.lean_atten import _get_config
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+import pytest
 
 
 def get_lean_attn_inputs(
@@ -66,12 +68,13 @@ def get_lean_attn_inputs(
     return q, k, v, Mp, Lp, Op, locks, batch_num_block_n
 
 
-def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
+def reference_attention(q, k, v, n_ctx, n_ctx_q, causal):
 
     # Calculate Pytorch refence output
     ref_out = torch.empty_like(q, dtype=q.dtype)
     start = 0
     start_q = 0
+    d = q.shape[-1]
 
     for b in n_ctx:
         qb = q[start_q : (start_q + int(n_ctx_q)), :, :]
@@ -86,7 +89,7 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
             group_size = qb_reshaped.shape[0] // kb_reshaped.shape[0]
             kb_reshaped = kb_reshaped.repeat_interleave(group_size, dim=0)
             vb_reshaped = vb_reshaped.repeat_interleave(group_size, dim=0)
-        p = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) * sm_scale
+        p = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) / math.sqrt(d)
         if causal:
             M = torch.tril(torch.ones((n_ctx_q, b), device="cuda"))
             mask = M == 0
@@ -101,24 +104,159 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
 
 
 @pytest.mark.parametrize(
-    "causal, batch, hq, hk, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
+    "causal, batch, hq, hk, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, RAGGED_BATCH, waves_per_eu, num_warps ",
     [
-        (False, 2, 64, 64, 128, [65536, 65536], 128, 304, torch.float16, 128, 64, 1, 4),
-        (False, 2, 64, 64, 16, [65536, 65536], 128, 912, torch.float16, 16, 128, 3, 4),
-        (False, 1, 64, 64, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 64, 64, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 64, 64, 16, [524288], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 2, 96, 96, 16, [32768, 32768], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 96, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 96, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 96, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 96, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
-        (False, 1, 96, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),  #
-        (False, 1, 128, 128, 16, [32768], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 128, 16, [65536], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 128, 16, [131072], 128, 912, torch.float16, 16, 128, 2, 4),
-        (False, 1, 128, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (False, 1, 128, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
+        (
+            False,
+            2,
+            64,
+            64,
+            128,
+            [65536, 65536],
+            128,
+            304,
+            torch.float16,
+            128,
+            64,
+            False,
+            1,
+            4,
+        ),
+        (
+            False,
+            2,
+            64,
+            64,
+            16,
+            [65536, 65536],
+            128,
+            912,
+            torch.float16,
+            16,
+            128,
+            False,
+            3,
+            4,
+        ),
+        (False, 1, 64, 64, 16, [131072], 128, 912, torch.float16, 16, 128, False, 2, 4),
+        (False, 1, 64, 64, 16, [262144], 64, 912, torch.float16, 16, 64, False, 2, 4),
+        (False, 1, 64, 64, 16, [524288], 64, 912, torch.float16, 16, 64, False, 2, 4),
+        (
+            False,
+            2,
+            96,
+            96,
+            16,
+            [32768, 32768],
+            128,
+            912,
+            torch.float16,
+            16,
+            128,
+            False,
+            2,
+            4,
+        ),
+        (False, 1, 96, 96, 16, [65536], 128, 912, torch.float16, 16, 128, False, 2, 4),
+        (False, 1, 96, 96, 16, [131072], 128, 912, torch.float16, 16, 128, False, 2, 4),
+        (False, 1, 96, 96, 16, [262144], 64, 912, torch.float16, 16, 64, False, 2, 4),
+        (
+            False,
+            1,
+            96,
+            96,
+            16,
+            [524288],
+            16,
+            912,
+            torch.float16,
+            16,
+            256,
+            False,
+            1,
+            4,
+        ),  #
+        (
+            False,
+            1,
+            96,
+            96,
+            16,
+            [1048576],
+            16,
+            912,
+            torch.float16,
+            16,
+            256,
+            False,
+            1,
+            4,
+        ),  #
+        (
+            False,
+            1,
+            128,
+            128,
+            16,
+            [32768],
+            128,
+            912,
+            torch.float16,
+            16,
+            128,
+            False,
+            2,
+            4,
+        ),
+        (
+            False,
+            1,
+            128,
+            128,
+            16,
+            [65536],
+            128,
+            912,
+            torch.float16,
+            16,
+            128,
+            False,
+            2,
+            4,
+        ),
+        (
+            False,
+            1,
+            128,
+            128,
+            16,
+            [131072],
+            128,
+            912,
+            torch.float16,
+            16,
+            128,
+            False,
+            2,
+            4,
+        ),
+        (False, 1, 128, 128, 16, [262144], 64, 912, torch.float16, 16, 64, False, 2, 4),
+        (
+            False,
+            1,
+            128,
+            128,
+            16,
+            [524288],
+            16,
+            912,
+            torch.float16,
+            16,
+            256,
+            False,
+            1,
+            4,
+        ),  #
         (
             False,
             3,
@@ -131,6 +269,7 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
             torch.float16,
             16,
             128,
+            True,
             2,
             4,
         ),
@@ -146,6 +285,7 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
             torch.float16,
             16,
             64,
+            True,
             2,
             4,
         ),
@@ -161,10 +301,26 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
             torch.float16,
             128,
             64,
+            False,
             2,
             4,
         ),  # Causal=1,
-        (True, 2, 64, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
+        (
+            True,
+            2,
+            64,
+            64,
+            2048,
+            [2048, 2048],
+            128,
+            304,
+            torch.float16,
+            128,
+            64,
+            False,
+            2,
+            4,
+        ),
         # These test cases fail:
         # (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
         # (True, 1, 64, 4096, [4096], 128, 304, torch.float16, 128, 16, 3, 4),
@@ -173,6 +329,7 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
 )
 def test_persistent_lean_attention(
     request,
+    causal,
     batch,
     hq,
     hk,
@@ -183,9 +340,9 @@ def test_persistent_lean_attention(
     init_dtype,
     BLOCK_M,
     BLOCK_N,
+    RAGGED_BATCH,
     waves_per_eu,
     num_warps,
-    causal,
 ):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
@@ -218,8 +375,6 @@ def test_persistent_lean_attention(
         list_sum_block_n.append(len_sum)
     batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
 
-    sm_scale = 0.5
-
     q, k, v, Mp, Lp, Op, locks, batch_num_block_n = get_lean_attn_inputs(
         batch,
         n_ctx_q,
@@ -250,17 +405,26 @@ def test_persistent_lean_attention(
         XCD_REMAP,
         causal,
         batch,
-        sm_scale,
+        RAGGED_BATCH,
         num_warps,
         waves_per_eu,
     )
 
     # Calculate Pytorch refence output
-    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
+    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, causal)
     # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
-    torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+    # torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+    # # Compare result
+    # atol = 1e-2
+    # rtol = 1e-2
+    try:
+        torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+    except AssertionError:
+        print("Assertion failed! Showing mismatches:")
+        print_mismatches(ref_out, la_out, atol, rtol)
+        raise  # Re-raise the exception after printing mismatches
 
 
 # NOTE: Tests where the workload < num_sms currently fail.
@@ -276,6 +440,7 @@ def test_persistent_lean_attention(
 @pytest.mark.parametrize("d", [32])
 @pytest.mark.parametrize("causal", [(True), (False)])
 @pytest.mark.parametrize("init_dtype", [torch.float16])
+@pytest.mark.parametrize("RAGGED_BATCH", [False])
 def test_persistent_lean_attention_outer(
     batch,
     h,
@@ -284,10 +449,10 @@ def test_persistent_lean_attention_outer(
     d,
     init_dtype,
     causal,
+    RAGGED_BATCH,
 ):
     torch.manual_seed(20)
 
-    sm_scale = 0.5
     config = _get_config(
         batch_size=batch,
         causal=causal,
@@ -323,13 +488,13 @@ def test_persistent_lean_attention_outer(
         locks,
         batch_num_block_n,
         batch,
-        sm_scale,
         causal=causal,
+        RAGGED_BATCH=RAGGED_BATCH,
         config=config,
     )
 
     # Calculate Pytorch refence output
-    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
+    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, causal)
     # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
@@ -368,21 +533,30 @@ def print_mismatches(ref_out, la_out, atol=1e-8, rtol=1e-5):
 
 
 def main():
-    # (True, 2, 64, 8, 16384, [16384, 16384], 128, 608, torch.float16, 128, 64, 2, 4),
-    batch = 1
+    batch = 8
     causal = False
-    hq = 128
-    hk = 128
-    n_ctx_q = 8192
-    n_ctx = [8192] * 1  # [16384] #[8192]
+    hq = 64
+    hk = 64
+    n_ctx_q = 16
+    n_ctx = [
+        1024,
+        1024,
+        2048,
+        2048,
+        4096,
+        4096,
+        32768,
+        65536,
+    ]  # [4096, 32768, 65536]  # [131072] * batch  # [16384] #[8192]
     d = 128
-    total_programs = 304
+    total_programs = 912
     init_dtype = torch.float16
-    BLOCK_M = 128
+    BLOCK_M = 16
     BLOCK_N = 64
     XCD_REMAP = True
     waves_per_eu = 2
     num_warps = 4
+    RAGGED_BATCH = True
     assert batch == len(n_ctx)
 
     try:
@@ -404,8 +578,6 @@ def main():
         len_sum += list_num_block_n[i]
         list_sum_block_n.append(len_sum)
     batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
-
-    sm_scale = 0.5
 
     q, k, v, Mp, Lp, Op, locks, batch_num_block_n = get_lean_attn_inputs(
         batch,
@@ -435,25 +607,25 @@ def main():
         XCD_REMAP,
         causal,
         batch,
-        sm_scale,
+        RAGGED_BATCH,
         num_warps,
         waves_per_eu,
     )
     # print(f"ms={ms}")
 
-    # ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
+    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, causal)
 
     # # Compare result
-    # atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
-    # rtol = 1e-2 if init_dtype == "fp8" else 3e-3
-    # try:
-    #     torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
-    # except AssertionError:
-    #     print("Assertion failed! Showing mismatches:")
-    #     # print_mismatches(ref_out, la_out, atol, rtol)
-    #     raise  # Re-raise the exception after printing mismatches
+    atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
+    rtol = 1e-2 if init_dtype == "fp8" else 3e-3
+    try:
+        torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+    except AssertionError:
+        #     print("Assertion failed! Showing mismatches:")
+        #     # print_mismatches(ref_out, la_out, atol, rtol)
+        raise  # Re-raise the exception after printing mismatches
 
-    # # torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+    # torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":

@@ -25,19 +25,23 @@ def gemm_afp4wfp4_pre_quant(
     config: Optional[dict] = None,
 ):
     """
-    Computes the matmul Y = X x W
-    W is an e2m1 fp4 tensor and w_scales is an e8m0 tensor.
-    Every 32 elements in the K dimension share one e8m0 scale.
-    X gets quantized to the microscale fp4 (mxfp4) format before the GEMM.
+    Computes matrix multiplication Y = X @ W^T with on-the-fly FP4 quantization of activations.
+    X is quantized to MXFP4 during computation, W is pre-quantized FP4. Uses atomic operations for split-K reduction.
 
-
-    Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
-    - W_scales: Matrix with shape (N, K // 32)
+    Args:
+        x (torch.Tensor): Higher precision input matrix with shape (M, K) (BF16 or FP16).
+            Quantized to FP4 E2M1 on-the-fly during GEMM.
+        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N, K), internally transposed.
+        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (N, K//32).
+            One scale per 32 elements in K dimension.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+            Must be zero-initialized for atomic operations.
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+        torch.Tensor: Output with shape (M, N).
     """
 
     _LOGGER.info(

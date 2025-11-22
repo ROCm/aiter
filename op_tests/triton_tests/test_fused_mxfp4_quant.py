@@ -10,6 +10,7 @@ from op_tests.triton_tests.test_gemm_afp4wfp4 import (
     e8m0_to_f32,
     SCALE_GROUP_SIZE,
 )
+from op_tests.triton_tests.test_gemm_afp4wfp4 import shuffle_scales, un_shuffle_scales
 
 torch.manual_seed(0)
 
@@ -22,21 +23,39 @@ def rmsnorm(input, weight, eps=1e-6):
     return rms_norm
 
 
-def calculate_target_w_torch(mat1, rms1_w, resid1, mat2, rms2_w, eps=1e-6):
-    orig_dtype = mat1.dtype
-    mat1 = mat1.to(torch.float32)
+def calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, eps=1e-6, shuffle=False):
+    orig_dtype = x1.dtype
+    x1 = x1.to(torch.float32)
     rms1_w = rms1_w.to(torch.float32)
-    mat2 = mat2.to(torch.float32)
-    rms2_w = rms2_w.to(torch.float32)
     res1_out = None
     if resid1 is not None:
         resid1 = resid1.to(torch.float32)
-        mat1 = res1_out = mat1 + resid1
+        x1 = res1_out = x1 + resid1
         res1_out = res1_out.to(orig_dtype)
-    mat1 = rmsnorm(mat1, rms1_w, eps)
-    mat2 = rmsnorm(mat2, rms2_w, eps).to(orig_dtype)
-    q_fp4, q_scales = torch_dynamic_mxfp4_quant(mat1)
-    return (q_fp4, q_scales), mat2, res1_out
+    x1 = rmsnorm(x1, rms1_w, eps)
+    out1_fp4, out1_scale = torch_dynamic_mxfp4_quant(x1)
+
+    out2 = None
+    if x2 is not None:
+        x2 = x2.to(torch.float32)
+        rms2_w = rms2_w.to(torch.float32)
+        out2 = rmsnorm(x2, rms2_w, eps).to(orig_dtype)
+
+    if shuffle:
+        out1_scale_pad = out1_scale
+        M = out1_scale.shape[0]
+        N = x1.shape[1]
+        scaleM = (M + 255) // 256 * 256
+        scaleN_valid = (N + 31) // 32
+        scaleN = (scaleN_valid + 7) // 8 * 8
+        out1_scale_pad = torch.empty(
+            (scaleM, scaleN), dtype=out1_scale.dtype, device=out1_scale.device
+        )
+        out1_scale_pad[:M, :scaleN_valid] = out1_scale[:M, :scaleN_valid]
+        out1_scale = shuffle_scales(out1_scale_pad)
+        out1_scale = out1_scale.view(out1_scale.shape[0] * 32, -1)
+
+    return (out1_fp4, out1_scale), out2, res1_out
 
 
 def convert_mxfp4_to_fp32(x, x_scales):
@@ -48,25 +67,28 @@ def convert_mxfp4_to_fp32(x, x_scales):
 
 
 def generate_fused_rms_quant_data(
-    mat1_shape=(32, 1536),
-    mat1_stride=(2112, 1),
-    mat2_shape=(32, 512),
-    mat2_stride=(2112, 1),
-    residual=False,
+    x1_shape=(32, 1536),
+    x1_stride=(2112, 1),
+    x2_shape=(32, 512),
+    x2_stride=(2112, 1),
+    inp2=False,
+    res1=False,
     dtype=torch.bfloat16,
 ):
-    mat1 = torch.randn((mat1_shape[0], mat1_stride[0]), dtype=dtype, device="cuda")
-    mat1 = mat1[:, : mat1_shape[1]]
+    x1 = torch.randn((x1_shape[0], x1_stride[0]), dtype=dtype, device="cuda")
+    x1 = x1[:, : x1_shape[1]]
+    x2 = None
+    rms2_w = None
+    if inp2:
+        x2 = torch.randn((x2_shape[0], x2_stride[0]), dtype=dtype, device="cuda")
+        x2 = x2[:, : x2_shape[1]]
+        rms2_w = torch.randn(x2.shape[1], dtype=dtype, device="cuda")
 
-    mat2 = torch.randn((mat2_shape[0], mat2_stride[0]), dtype=dtype, device="cuda")
-    mat2 = mat2[:, : mat2_shape[1]]
-
-    rms1_w = torch.randn(mat1.shape[1], dtype=dtype, device="cuda")
-    rms2_w = torch.randn(mat2.shape[1], dtype=dtype, device="cuda")
+    rms1_w = torch.randn(x1.shape[1], dtype=dtype, device="cuda")
     resid1 = None
-    if residual:
-        resid1 = torch.randn_like(mat1, dtype=dtype, device="cuda")
-    return mat1, mat2, rms1_w, rms2_w, resid1
+    if res1:
+        resid1 = torch.randn_like(x1, dtype=dtype, device="cuda")
+    return x1, x2, rms1_w, rms2_w, resid1
 
 
 @pytest.mark.parametrize("B", [1, 4, 16, 32, 1000, 10000])
@@ -85,54 +107,81 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
     torch.testing.assert_close(triton_out, torch_out)
 
 
-@pytest.mark.parametrize("B", [1, 32, 256])
-@pytest.mark.parametrize("M", [128, 132, 2112])
-@pytest.mark.parametrize("N", [32, 96])
-@pytest.mark.parametrize("stride", [2112])
-@pytest.mark.parametrize("skip_second", [True, False])
-@pytest.mark.parametrize("residual", [True, False])
+@pytest.mark.parametrize(
+    "M, N1, N2, stride",
+    [
+        (M, N1, N2, stride)
+        for M in [1, 4, 33, 64, 132, 256]  # TODO: debug for 131072
+        for N1, N2, stride in [
+            (200, 200, 200),
+            (256, 256, 256),
+            (256, 256, 2112),
+        ]
+    ],
+)
+@pytest.mark.parametrize("inp2", [True, False])
+@pytest.mark.parametrize("res1", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shuffle", [True, False])
+@pytest.mark.parametrize("scale_shuffle_padding", [True, False])
 def test_fused_rms_quant(
-    B: int, M: int, N: int, stride: int, skip_second: bool, residual: bool, dtype
+    M: int,
+    N1: int,
+    N2: int,
+    stride: int,
+    inp2: bool,
+    res1: bool,
+    dtype,
+    shuffle: bool,
+    scale_shuffle_padding: bool,
 ):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-
-    mat1, mat2, rms1_w, rms2_w, resid1 = generate_fused_rms_quant_data(
-        mat1_shape=(B, M),
-        mat2_shape=(B, N),
-        mat1_stride=(stride, 1),
-        mat2_stride=(stride, 1),
-        residual=residual,
+    x1, x2, rms1_w, rms2_w, resid1 = generate_fused_rms_quant_data(
+        x1_shape=(M, N1),
+        x2_shape=(M, N2),
+        x1_stride=(stride, 1),
+        x2_stride=(stride, 1),
+        inp2=inp2,
+        res1=res1,
         dtype=dtype,
     )
-    (mat1_fp4_torch, mat1_scales_torch), mat2_torch, res1_out_torch = (
-        calculate_target_w_torch(mat1, rms1_w, resid1, mat2, rms2_w)
+    (x1_fp4_torch, x1_scales_torch), x2_torch, res1_out_torch = (
+        calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, shuffle=shuffle)
     )
-    if not skip_second:
-        if not residual:
-            (mat1_fp4_triton, mat1_scales_triton), mat2_triton = fused_rms_mxfp4_quant(
-                mat1, rms1_w, 1e-6, mat2, rms2_w, 1e-6, resid1
-            )
-        else:
-            (mat1_fp4_triton, mat1_scales_triton), mat2_triton, res1_out_triton = (
-                fused_rms_mxfp4_quant(mat1, rms1_w, 1e-6, mat2, rms2_w, 1e-6, resid1)
-            )
-    else:
-        if not residual:
-            (mat1_fp4_triton, mat1_scales_triton) = fused_rms_mxfp4_quant(
-                mat1, rms1_w, 1e-6, None, None, None, None
-            )
-        else:
-            (mat1_fp4_triton, mat1_scales_triton), res1_out_triton = (
-                fused_rms_mxfp4_quant(mat1, rms1_w, 1e-6, None, None, None, resid1)
-            )
-    if not skip_second:
-        torch.testing.assert_close(mat2_torch, mat2_triton)
 
-    if residual:
+    (x1_fp4_triton, x1_scales_triton), x2_triton, res1_out_triton = (
+        fused_rms_mxfp4_quant(
+            x1,
+            rms1_w,
+            1e-6,
+            x2,
+            rms2_w,
+            1e-6,
+            resid1,
+            shuffle=shuffle,
+            scale_shuffle_padding=scale_shuffle_padding,
+        )
+    )
+
+    if shuffle:
+        x1_scales_triton = un_shuffle_scales(
+            x1_scales_triton.view(x1_scales_triton.shape[0] // 32, -1)
+        )
+        x1_scales_torch = un_shuffle_scales(
+            x1_scales_torch.view(x1_scales_torch.shape[0] // 32, -1)
+        )
+
+    scaleN_valid = (N1 + 31) // 32
+    x1_scales_triton = x1_scales_triton[:M, :scaleN_valid]
+    x1_scales_torch = x1_scales_torch[:M, :scaleN_valid]
+
+    if x2_triton is not None:
+        torch.testing.assert_close(x2_torch, x2_triton)
+
+    if res1_out_triton is not None:
         torch.testing.assert_close(res1_out_torch, res1_out_triton)
 
-    res_fp32_torch = convert_mxfp4_to_fp32(mat1_fp4_torch, mat1_scales_torch)
-    res_fp32_triton = convert_mxfp4_to_fp32(mat1_fp4_triton, mat1_scales_triton)
+    res_fp32_torch = convert_mxfp4_to_fp32(x1_fp4_torch, x1_scales_torch)
+    res_fp32_triton = convert_mxfp4_to_fp32(x1_fp4_triton, x1_scales_triton)
 
     torch.testing.assert_close(res_fp32_torch, res_fp32_triton)

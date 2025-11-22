@@ -23,16 +23,20 @@ def gemm_a16w16_atomic(
     config: Optional[dict] = None,
 ):
     """
-    Computes the 16 bit matmul Y = X x W
-    NOTE: If dtype is set to bf16, aggregation in bf16 with atomic_add will lead to slight precision loss.
-    Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
-    - dtype: Optional parameter to specifcy bf16 or fp16 datatype. Default is bf16
-    - Y: Output Matrix Y with shape (M, N). If this is none, then it's created by this API and returned as output
+    Computes 16 bit matrix multiplication Y = X @ W^T using atomic operations for split-K reduction.
+
+    Args:
+        x (torch.Tensor): Input matrix with shape (M, K).
+        w (torch.Tensor): Weight matrix with shape (N, K), internally transposed.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+            Note: BF16 atomic aggregation may have slight precision loss.
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+            Must be zero-initialized for split-K (NUM_KSPLIT > 1).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, cache_modifier).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+        torch.Tensor: Output with shape (M, N).
     """
 
     _LOGGER.info(

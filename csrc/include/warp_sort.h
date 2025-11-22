@@ -211,7 +211,7 @@ __device__ __inline__ auto warp_bitonic_merge_sort_build(const T& x, int lane_id
         y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
         o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
 
-        
+
 
         y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
         o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
@@ -219,7 +219,7 @@ __device__ __inline__ auto warp_bitonic_merge_sort_build(const T& x, int lane_id
         o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
         y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
         o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
-        
+
 
         y   = warp_swap_(o, lane_idx, ck_tile::number<16>{});
         o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<16>{}, ck_tile::number<is_descending>{});
@@ -240,7 +240,7 @@ __device__ __inline__ auto warp_bitonic_merge_sort_build(const T& x, int lane_id
         o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
         y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
         o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
-        
+
         return o;
     }
     else if constexpr (lanegroup_size == 128) {
@@ -311,7 +311,7 @@ __device__ __inline__ auto warp_bitonic_merge_sort_build_with_early_stop(const T
         o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
         if constexpr (early_stop_stage == 8)    // stop at sort-8
             return o;
-        
+
 
         y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
         o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
@@ -461,7 +461,7 @@ __device__ __inline__ auto block_bitonic_merge_sort_to_reg(void* smem, const T& 
     int lane_idx = threadIdx.x;
     if constexpr (lanegroup_size == 128) {
         T c = warp_bitonic_merge_sort_build(x, lane_idx, ck_tile::number<128>{}, ck_tile::number<is_descending>{});
-    
+
         reinterpret_cast<T*>(smem)[lane_idx] = c;
         __syncthreads();
         T r = reinterpret_cast<T*>(smem)[lane_idx ^ 64];

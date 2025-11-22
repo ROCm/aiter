@@ -110,13 +110,38 @@ def all_reduce_fake(
 # There is same name all_reduce in aiter.op, use Alias
 @torch_compile_guard(gen_fake=all_reduce_fake)
 def all_reduce_(
-    tensor: torch.Tensor, group_name: str, ca_fp8_quant: bool
+    tensor: torch.Tensor, group_name: str, ca_use_new: bool, ca_fp8_quant: bool
 ) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    return group._all_reduce_out_place(tensor, ca_fp8_quant)
+    return group._all_reduce_out_place(tensor, ca_use_new, ca_fp8_quant)
+
+
+def fused_allreduce_rmsnorm_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(inp)
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
+def fused_allreduce_rmsnorm_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_out_place(inp, res_inp, w, eps)
 
 
 if supports_custom_op():
@@ -298,7 +323,7 @@ class GroupCoordinator:
             yield graph_capture_context
 
     def all_reduce(
-        self, input_: torch.Tensor, ca_fp8_quant: bool = False
+        self, input_: torch.Tensor, ca_use_new: bool = False, ca_fp8_quant: bool = False
     ) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -319,15 +344,42 @@ class GroupCoordinator:
             return input_
 
         return all_reduce_(
-            input_, group_name=self.unique_name, ca_fp8_quant=ca_fp8_quant
+            input_,
+            group_name=self.unique_name,
+            ca_use_new=ca_use_new,
+            ca_fp8_quant=ca_fp8_quant,
         )
 
     def _all_reduce_out_place(
-        self, input_: torch.Tensor, ca_fp8_quant: bool
+        self, input_: torch.Tensor, ca_use_new: bool, ca_fp8_quant: bool
     ) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_reduce(input_, ca_fp8_quant)
+        return self.device_communicator.all_reduce(input_, ca_use_new, ca_fp8_quant)
+
+    def fused_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return fused_allreduce_rmsnorm_(
+            input_, residual_inp_, weight_, eps, group_name=self.unique_name
+        )
+
+    def _fused_allreduce_rmsnorm_out_place(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm(
+            input_, residual_inp_, weight_, eps
+        )
 
     def _all_gather_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         ca_comm = self.device_communicator.ca_comm
@@ -339,6 +391,12 @@ class GroupCoordinator:
 
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
         return outplace_all_gather(input_, group_name=self.unique_name)
+
+    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.reduce_scatter(input_, dim)
+
 
     def all_gather(
         self, input_: torch.Tensor, use_custom: bool = False, dim: int = -1
@@ -829,7 +887,7 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
-from typing import Optional
+
 _DP: Optional[GroupCoordinator] = None
 
 
@@ -885,6 +943,8 @@ def init_distributed_environment(
     distributed_init_method: str = "env://",
     local_rank: int = -1,
     backend: str = "nccl",
+    data_parallel_size: int = 1,
+    data_parallel_rank: int = 0,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -894,6 +954,10 @@ def init_distributed_environment(
         distributed_init_method,
         backend,
     )
+    if data_parallel_size > 1:
+        # Adjust the rank and world size for data parallel
+        rank = data_parallel_rank * world_size + rank
+        world_size = data_parallel_size * world_size
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
@@ -905,10 +969,10 @@ def init_distributed_environment(
             update_environment_variables(
                 {"HIP_VISIBLE_DEVICES": (",".join(map(str, range(world_size))))}
             )
-        # this backend is used for WORLD
+
         torch.distributed.init_process_group(
             backend=backend,
-            # init_method=distributed_init_method,
+            init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
         )
@@ -920,7 +984,7 @@ def init_distributed_environment(
         # setting, where we can use rank as local rank
         if distributed_init_method == "env://":
             # local_rank = envs.LOCAL_RANK
-            local_rank = os.environ.get("LOCAL_RANK", "0")
+            local_rank = os.environ.get("LOCAL_RANK", rank)
         else:
             local_rank = rank
     global _WORLD
@@ -936,8 +1000,9 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
-    decode_context_model_parallel_size: Optional[int] = 1,
+    # decode_context_model_parallel_size: Optional[int] = 1,
     backend: Optional[str] = None,
+    data_parallel_size: int = 1,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -968,7 +1033,7 @@ def initialize_model_parallel(
     rank = torch.distributed.get_rank()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    data_parallel_size = 1
+    # data_parallel_size = 1
     # from vllm.config import get_current_vllm_config
 
     # config = get_current_vllm_config()
@@ -1067,6 +1132,7 @@ def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
     backend: Optional[str] = None,
+    data_parallel_size: int = 1,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -1075,7 +1141,10 @@ def ensure_model_parallel_initialized(
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(
-            tensor_model_parallel_size, pipeline_model_parallel_size, backend
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            backend,
+            data_parallel_size,
         )
         return
 

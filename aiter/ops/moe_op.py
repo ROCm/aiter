@@ -32,6 +32,12 @@ def topk_softmax_asm(
 ) -> None: ...
 
 
+@compile_ops("module_moe_topk")
+def topk_sigmoid(
+    topk_weights: Tensor, topk_indices: Tensor, gating_output: Tensor
+) -> None: ...
+
+
 @compile_ops("module_moe_asm")
 def moe_sum(input: Tensor, output: Tensor) -> None: ...
 
@@ -227,6 +233,7 @@ def cmdGenFunc_ck_moe_stage(
         activation,
         quant_type,
         mul_routed_weight_stage,
+        getattr(w1, "is_shuffled", False),
     )
     return {
         "md_name": md_name,
@@ -260,6 +267,7 @@ def cmdGenFunc_ck_moe_stage2(
         activation,
         quant_type,
         mul_routed_weight_stage,
+        getattr(w1, "is_shuffled", False),
     )
     return {
         "md_name": md_name,
@@ -307,6 +315,112 @@ def ck_moe_stage2(
 ) -> None: ...
 
 
+@compile_ops("module_moe_cktile2stages", fc_name="cktile_moe_gemm1")
+def moe_cktile2stages_gemm1_ck(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    sorted_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    max_token_ids: Tensor,
+    topk: int,
+    n_padded_zeros: Optional[int] = 0,
+    k_padded_zeros: Optional[int] = 0,
+    topk_weight: Optional[Tensor] = None,
+    x_scale: Optional[Tensor] = None,
+    w_scale: Optional[Tensor] = None,
+    exp_bias: Optional[Tensor] = None,
+    block_m: Optional[int] = 32,
+) -> Tensor: ...
+
+
+def moe_cktile2stages_gemm1(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    sorted_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    max_token_ids: Tensor,
+    topk: int,
+    n_padded_zeros: Optional[int] = 0,
+    k_padded_zeros: Optional[int] = 0,
+    topk_weight: Optional[Tensor] = None,
+    x_scale: Optional[Tensor] = None,
+    w_scale: Optional[Tensor] = None,
+    exp_bias: Optional[Tensor] = None,
+    block_m: Optional[int] = 32,
+):
+    return moe_cktile2stages_gemm1_ck(
+        XQ,
+        WQ,
+        Y,
+        sorted_ids,
+        sorted_expert_ids,
+        max_token_ids,
+        topk,
+        n_padded_zeros,
+        k_padded_zeros,
+        topk_weight,
+        x_scale,
+        w_scale,
+        exp_bias,
+        block_m,
+    )
+
+
+@compile_ops("module_moe_cktile2stages", fc_name="cktile_moe_gemm2")
+def moe_cktile2stages_gemm2_ck(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    sorted_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    max_token_ids: Tensor,
+    topk: int,
+    n_padded_zeros: Optional[int] = 0,
+    k_padded_zeros: Optional[int] = 0,
+    topk_weight: Optional[Tensor] = None,
+    x_scale: Optional[Tensor] = None,
+    w_scale: Optional[Tensor] = None,
+    exp_bias: Optional[Tensor] = None,
+    block_m: Optional[int] = 32,
+) -> Tensor: ...
+
+
+def moe_cktile2stages_gemm2(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    sorted_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    max_token_ids: Tensor,
+    topk: int,
+    n_padded_zeros: Optional[int] = 0,
+    k_padded_zeros: Optional[int] = 0,
+    topk_weight: Optional[Tensor] = None,
+    x_scale: Optional[Tensor] = None,
+    w_scale: Optional[Tensor] = None,
+    exp_bias: Optional[Tensor] = None,
+    block_m: Optional[int] = 32,
+):
+    return moe_cktile2stages_gemm2_ck(
+        XQ,
+        WQ,
+        Y,
+        sorted_ids,
+        sorted_expert_ids,
+        max_token_ids,
+        topk,
+        n_padded_zeros,
+        k_padded_zeros,
+        topk_weight,
+        x_scale,
+        w_scale,
+        exp_bias,
+        block_m,
+    )
+
+
 dtype2str_dict = {
     dtypes.fp16: "f16",
     dtypes.bf16: "b16",
@@ -326,6 +440,7 @@ def get_moe_stage_module(
     activation,
     quant_type,
     mul_routed_weight_stage,
+    preshuffle_mode=False,
 ):
     if isinstance(activation, int):
         activation = ActivationType(activation)
@@ -335,6 +450,10 @@ def get_moe_stage_module(
     Adtype = dtype2str_dict[input_dtype]
     Bdtype = dtype2str_dict[weight_dtype]
     Cdtype = dtype2str_dict[output_dtype]
+
+    preshuffle_str = ""
+    if preshuffle_mode and weight_dtype == dtypes.fp4x2:
+        preshuffle_str = "--preshuffle"
 
     quant_type = (
         QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
@@ -347,6 +466,7 @@ def get_moe_stage_module(
             "module_moe_ck2stages",
             Adtype,
             Bdtype,
+            "preshuffle_on" if preshuffle_mode else "preshuffle_off",
             Cdtype,
             act,
             quant_type,
@@ -354,7 +474,7 @@ def get_moe_stage_module(
         ]
     )
     blob_gen_cmd = [
-        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} -w {{}}"
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} -w {{}}"
     ]
 
     return md_name, blob_gen_cmd

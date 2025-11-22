@@ -6,6 +6,41 @@ import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
+
+
+_gemm_a16w16_repr = make_kernel_repr(
+    "_gemm_a16_w16_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "cache_modifier",
+        "activation",
+        "use_activation",
+        "ADD_BIAS",
+        "SKIP_REDUCE",
+    ],
+)
+
+
+_gemm_a16w16_reduce_repr = make_kernel_repr(
+    "_gemm_a16w16_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+        "activation",
+        "use_activation",
+        "ADD_BIAS",
+    ],
+)
 
 
 @triton.heuristics(
@@ -16,7 +51,7 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_gemm_a16w16_repr)
 def _gemm_a16_w16_kernel(
     a_ptr,
     b_ptr,
@@ -148,7 +183,7 @@ def _gemm_a16_w16_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(repr=_gemm_a16w16_reduce_repr)
 def _gemm_a16w16_reduce_kernel(
     bias_ptr,
     c_in_ptr,

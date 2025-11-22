@@ -1,5 +1,0 @@
-knl_name,knl_file,tn,tileM,tileN,pf
-_ZN5aiter28bf16gemm_outf32_tn_32x64_pf3E,bf16gemm_outf32_tn_32x64_pf3.co,1,32,64,3
-_ZN5aiter28bf16gemm_outf32_tn_48x64_pf3E,bf16gemm_outf32_tn_48x64_pf3.co,1,48,64,3
-_ZN5aiter28bf16gemm_outf32_tn_64x64_pf3E,bf16gemm_outf32_tn_64x64_pf3.co,1,64,64,3
-_ZN5aiter28bf16gemm_outf32_tn_96x64_pf3E,bf16gemm_outf32_tn_96x64_pf3.co,1,96,64,3

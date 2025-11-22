@@ -2,42 +2,26 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import aiter
 import pandas as pd
-import argparse
 import time
 import os
 import sys
 from aiter import QuantType
 from aiter.jit.core import (
-    get_asm_dir,
     AITER_CSRC_DIR,
     AITER_META_DIR,
     AITER_CONFIG_FMOE,
 )
-from aiter.fused_moe import (
-    fused_topk,
-    moe_sorting,
-    asm_stage1,
-    torch_moe_stage1,
-    torch_moe_stage2,
-    fused_moe_1stage_dict,
-    torch_moe,
-)
-from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
-from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.mp_tuner import mp_tuner
 
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
-from aiter.jit.utils.chip_info import get_gfx
 
 sys.path.insert(0, f"{AITER_META_DIR}/hsa/gfx942")
 from fmoe_2stages.tune import FmoeTuner
 
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
-from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
 
 
 torch.set_default_device("cuda")
@@ -56,7 +40,7 @@ def get_kernels_dict(file, key="tile_m"):
 class FmoeTuner950(FmoeTuner):
     ARG_DEFAULTS = {
         "verbose": False,
-        "tune_file": f"AITER_CONFIG_FMOE",
+        "tune_file": f"{AITER_CONFIG_FMOE}",
         "untune_file": "aiter/configs/untuned_fmoe.csv",
         "errRatio": 0.5,
         "batch": 100,
@@ -73,8 +57,6 @@ class FmoeTuner950(FmoeTuner):
             quantDtype = ""
         if doweight_stage1:
             extraInfo_1stage = "_tkw1"
-            if q_dtype_a == dtypes.fp8:
-                quantDtype = "Int8"  ## tmp solution, need to be updated
         if q_type == QuantType.No:
             quantDtype_1stage = "noquant"
         elif q_type == QuantType.per_1x128:
@@ -94,7 +76,7 @@ class FmoeTuner950(FmoeTuner):
         mp_num = args.mp
         startTS = time.perf_counter()
         # blockMs = [16, 32, 48, 64, 80, 96, 112, 128, 144, 160]
-        blockMs = [32, 64, 128]
+        blockMs = [16, 32, 64, 128]
 
         args = self.keys
         print(untunedf[args])
@@ -192,7 +174,7 @@ if __name__ == "__main__":
         "us2",
         "kernelName2",
         "err2",
-        "total_us",
+        "us",
         "run_1stage",
         "tflops",
         "bw",

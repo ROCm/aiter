@@ -1,13 +1,10 @@
 name: Operators Tuning
 
 on:
-  pull_request:
-    paths:
-      - 'aiter/configs/*untuned*.csv'
   workflow_dispatch:
     inputs:
       shapes:
-        description: 'Comma separated shape names to run (leave empty for all)'
+        description: 'Comma separated shape names to run, e.g. ck_batched_gemm_a8w8, ck_gemm_a8w8, ck_gemm_a8w8_blockscale, ck_gemm_a8w8_blockscale_bpreshuffle, ck_gemm_a8w8_bpreshuffle etc. (leave empty for all)'
         required: false
         default: ''
       arguments:
@@ -57,14 +54,14 @@ jobs:
           --name operators_tuning_test \
           rocm/pytorch:latest
 
-      - name: Setup-Triton
+      - name: Setup Aiter and Triton
         run: |
           set -ex
-          echo "Setting up Triton..."
+          echo "Setting up Aiter and Triton..."
           docker exec \
           -w /workspace \
           operators_tuning_test \
-          ./.github/scripts/build_triton.sh
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
       - name: Show Computing Units
         run: |

@@ -46,7 +46,7 @@ RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
         }
         else
         {
-            if(N < 1536)
+            if(N < 1536 || N % 128 != 0)
             {
                 return a8w8_bpreshuffle_256x128x64x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8x8x1_2x1_intrawave_v3<
                     DDataType,

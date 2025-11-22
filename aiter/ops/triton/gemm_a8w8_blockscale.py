@@ -25,21 +25,26 @@ def gemm_a8w8_blockscale(
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
+    skip_reduce: Optional[bool] = False,
 ):
     """
-    Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
+    Computes 8 bit matrix multiplication Y = X @ W^T using block-wise quantization scales.
+    Each block along K and N dimensions has independent scale factors for fine-grained quantization.
 
-    Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
-    - X_scale: Scale tensor for X with shape (M, *scale_k).
-    - W_scale: Scale tensor for W with shape (**scale_n, *scale_k).
+    Args:
+        x (torch.Tensor): INT8 input matrix with shape (M, K).
+        w (torch.Tensor): INT8 weight matrix with shape (N, K), internally transposed.
+        x_scale (torch.Tensor): Block-wise scale for x with shape (M, scale_k).
+            scale_k = ceil(K / scale_block_size_k).
+        w_scale (torch.Tensor): Block-wise scale for w with shape (scale_n, scale_k).
+            scale_n = ceil(N / scale_block_size_n).
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
-
-    *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k -> ceil_div(K, scale_block_size_k)
-    **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n -> ceil_div(N, scale_block_size_n)
+        torch.Tensor: Output with shape (M, N).
     """
     _LOGGER.info(
         f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
@@ -55,18 +60,20 @@ def gemm_a8w8_blockscale(
     w = w.T  # (K, N)
     w_scale = w_scale.T  # (scale_k, scale_n)
 
-    if y is None:
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
-
     if config is None:
         config = _get_config(M, N, K)
+
+    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
         K, config["NUM_KSPLIT"]
     )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
-            (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
+            (config["NUM_KSPLIT"], M, N),
+            dtype=torch.float32,
+            device=x.device,
         )
     else:
         y_pp = None
@@ -125,6 +132,9 @@ def gemm_a8w8_blockscale(
     )
 
     if config["NUM_KSPLIT"] > 1:
+        if skip_reduce:
+            return y_pp
+
         REDUCE_BLOCK_SIZE_M = 32
         REDUCE_BLOCK_SIZE_N = 32
         ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
