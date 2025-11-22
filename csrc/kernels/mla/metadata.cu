@@ -35,23 +35,25 @@
 //                                               reduced.
 //
 void get_mla_metadata_v1(
-    const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
-    const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
-    const int32_t        num_heads_per_head_k,
-    const int32_t        num_heads_k,
-    const bool           is_causal,
-    torch::Tensor&       work_metadata_ptrs,
-    torch::Tensor&       work_info_set,
-    torch::Tensor&       work_indptr,
-    torch::Tensor&       reduce_indptr,
-    torch::Tensor&       reduce_final_map,
-    torch::Tensor&       reduce_partial_map,
-    const int32_t        kv_granularity,
-    const int32_t        max_seqlen_qo,
-    const int32_t        uni_seqlen_qo,
-    const bool           fast_mode,
-    const int32_t        topk,
-    const int32_t        max_split_per_batch)
+    const torch::Tensor&                seqlens_qo_indptr,     // [batch size + 1]
+    const torch::Tensor&                seqlens_kv_indptr,     // [batch size + 1]
+    const int32_t                       num_heads_per_head_k,
+    const int32_t                       num_heads_k,
+    const bool                          is_causal,
+    torch::Tensor&                      work_metadata_ptrs,
+    torch::Tensor&                      work_info_set,
+    torch::Tensor&                      work_indptr,
+    torch::Tensor&                      reduce_indptr,
+    torch::Tensor&                      reduce_final_map,
+    torch::Tensor&                      reduce_partial_map,
+    const int32_t                       kv_granularity,
+    const int32_t                       max_seqlen_qo,
+    const int32_t                       uni_seqlen_qo,
+    const bool                          fast_mode,
+    const int32_t                       topk,
+    const int32_t                       max_split_per_batch,
+    const std::optional<at::ScalarType> dtype_q,
+    const std::optional<at::ScalarType> dtype_kv)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
 
@@ -66,6 +68,9 @@ void get_mla_metadata_v1(
     TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
                 __func__, ": seqlens_kv_indptr's element type should be int!");
 
+    at::ScalarType q_dtype = dtype_q.has_value() ? dtype_q.value() : at::ScalarType::BFloat16;
+    at::ScalarType kv_dtype = dtype_kv.has_value() ? dtype_kv.value() : at::ScalarType::BFloat16;
+
     if (fast_mode)
     {
         get_mla_metadata_v1_2_device(
@@ -79,6 +84,8 @@ void get_mla_metadata_v1(
             uni_seqlen_qo,
             topk,
             max_split_per_batch,
+            q_dtype,
+            kv_dtype,
             work_metadata_ptrs,
             work_info_set,
             work_indptr,
