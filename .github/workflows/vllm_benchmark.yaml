@@ -81,7 +81,7 @@ jobs:
       - name: Build Docker image
         run: |
           IMAGE_TAG=rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
-          docker build -t $IMAGE_TAG -f Dockerfile.mod .
+          docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
 
       - name: Push Docker image
         run: |
