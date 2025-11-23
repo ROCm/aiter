@@ -20,7 +20,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx
+from chip_info import get_gfx, get_gfx_list
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
 from torch_guard import torch_compile_guard  # noqa: E402
@@ -97,7 +97,8 @@ def update_config_files(file_path: str, merge_name: str):
     untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
     if os.path.exists(untuned_path):
         untunedf = pd.read_csv(untuned_path)
-        keys = untunedf.columns
+        keys = untunedf.columns.to_list()
+        keys.append("cu_num")
         merge_df = (
             merge_df.sort_values("us")
             .drop_duplicates(subset=keys, keep="first")
@@ -264,9 +265,16 @@ else:
 sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
-gfx = get_gfx()
-AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/"
-os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
+gfx = get_gfx_list()
+if len(gfx) == 1:
+    # single GPU arch
+    AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx[0]}/"
+    os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
+else:
+    # multiple GPU archs
+    AITER_ASM_DIR = [f"{AITER_META_DIR}/hsa/{g}/" for g in gfx]
+    os.environ["AITER_ASM_DIR"] = ":".join(AITER_ASM_DIR)
+
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
 )
