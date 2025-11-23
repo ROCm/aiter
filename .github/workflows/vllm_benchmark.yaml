@@ -34,7 +34,7 @@ jobs:
   build_vllm_image:
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: [check-signal]
-    runs-on: aiter-mi355-1gpu
+    runs-on: aiter-k8s-build
 
     steps:
       - name: Checkout aiter repo
@@ -60,6 +60,9 @@ jobs:
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
+          RUN apt-get update && apt-get install -y \
+            ca-certificates git curl openssl \
+            && update-ca-certificates
           RUN pip config set global.default-timeout 60 \
               && pip config set global.retries 10
           RUN pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
