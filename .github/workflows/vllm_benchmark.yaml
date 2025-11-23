@@ -60,8 +60,9 @@ jobs:
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
-          RUN pip config set global.default-timeout 60
-          RUN pip config set global.retries 10
+          RUN pip config set global.default-timeout 60 \
+              && pip config set global.retries 10 \
+              && pip config set global.index-url https://pypi.org/simple
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
