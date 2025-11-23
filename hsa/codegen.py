@@ -115,10 +115,13 @@ using CFG = std::unordered_map<std::string, {args.module}Config>;
 """
                 have_get_header = True
             cfg = [
-                'ADD_CFG('
+                "ADD_CFG("
                 + ", ".join(
-                    (f'{int(getattr(row, col)):>4}' if str(getattr(row, col)).replace('.', '', 1).isdigit()
-                    else f'"{getattr(row, col)}"')
+                    (
+                        f"{int(getattr(row, col)):>4}"
+                        if str(getattr(row, col)).replace(".", "", 1).isdigit()
+                        else f'"{getattr(row, col)}"'
+                    )
                     for col in other_columns
                 )
                 + f', "{row.arch}", "{relpath}/", "{row.knl_name}", "{row.co_name}"),'
