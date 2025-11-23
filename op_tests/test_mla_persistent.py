@@ -152,6 +152,7 @@ def test_mla(
     varlen,
     decode_qlen,
     max_split_per_batch,
+    non_persistent_mode,
 ):
     ret = {}
 
@@ -238,8 +239,8 @@ def test_mla(
         q.dtype,
         kv_buffer.dtype,
         is_sparse=False,
-        fast_mode=True,
-        intra_batch_mode=True,
+        fast_mode=True if not non_persistent_mode else False,
+        intra_batch_mode=non_persistent_mode,
     )
 
     # aiter implementation
@@ -263,54 +264,14 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
-    @functools.lru_cache(maxsize=1)
-    def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
-        if num_kv_splits is None:
-            gpu = torch.cuda.current_device()
-            device_properties = torch.cuda.get_device_properties(gpu)
-            cu_num = device_properties.multi_processor_count
-            avg_kv = total_kv / bs
-            overhead = 84.1
-            tmp = [
-                (
-                    bs
-                    * i
-                    / ((bs * i + cu_num - 1) // cu_num * cu_num)
-                    * avg_kv
-                    / (avg_kv + overhead * i),
-                    i,
-                )
-                for i in range(1, 17)
-            ]
-            num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
-        num_kv_splits = min(num_kv_splits, (total_kv + 15) // 16)
-
-        get_block_n_fp8 = {
-            16: 128,
-            32: 128,
-            48: 64,
-            64: 64,
-            128: 32,
-            256: 32,
-            384: 32,
-            512: 32,
-        }
-        if dtype == dtypes.fp8:
-            min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
-            num_kv_splits = min(
-                num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n
-            )
-
-        num_kv_splits_indptr = torch.arange(
-            0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
+    if non_persistent_mode:
+        num_kv_splits, num_kv_splits_indptr = aiter.mla.get_meta_param(
+            max_split_per_batch, batch_size, kv_indices.shape[0], nhead, decode_qlen, dtype,
         )
-        return num_kv_splits, num_kv_splits_indptr
-
-    num_kv_splits, num_kv_splits_indptr = get_meta_param(
-        # None, batch_size, kv_indices.shape[0], nhead, decode_qlen, torch.bfloat16
-        None, batch_size, kv_indices.shape[0], nhead, decode_qlen, dtypes.fp8
-    )
+    else:
+        num_kv_splits = max_split_per_batch
+        num_kv_splits_indptr = None
 
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
@@ -327,11 +288,10 @@ def test_mla(
         kv_granularity=max(page_size, 16),
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
-        fast_mode=False,
+        fast_mode=True if not non_persistent_mode else False,
         max_split_per_batch=num_kv_splits,
-        intera_batch_mode=True,
+        intera_batch_mode=non_persistent_mode,
     )
-    # import pdb;pdb.set_trace()
 
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -356,10 +316,8 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=True,
+            intra_batch_mode=non_persistent_mode,
         )
-
-        # import pdb;pdb.set_trace()
 
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
@@ -419,7 +377,7 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            intra_batch_mode=True,
+            intra_batch_mode=non_persistent_mode,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -580,6 +538,13 @@ parser.add_argument(
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
 )
+parser.add_argument(
+    "-nps",
+    "--non_persistent_mode",
+    action="store_true",
+    help="""variable kv seqlens per batch. Default: False.
+    --varlen # True""",
+)
 
 import pandas as pd
 
@@ -608,6 +573,7 @@ for nhead, decode_qlen in list_nhead:
             varlen=args.varlen,
             decode_qlen=decode_qlen,
             max_split_per_batch=max_split_per_batch,
+            non_persistent_mode=args.non_persistent_mode,
         )
         df.append(ret)
     df = pd.DataFrame(df)

@@ -246,8 +246,6 @@ def mla_decode_fwd(
         grid = (bs, nhead)
         extra_kargs = {"waves_per_eu": 4}
 
-        # import pdb;pdb.set_trace()
-
         _fwd_kernel_stage2_asm[grid](
             logits,
             attn_lse,
@@ -295,7 +293,6 @@ def mla_decode_fwd(
             (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
         )
         final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
-        # import pdb;pdb.set_trace()
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
@@ -320,36 +317,9 @@ def mla_decode_fwd(
         ):
             return logits.view(total_s, nhead, v_head_dim), attn_lse
 
-        Lv = v_head_dim
-        BLOCK_DV = triton.next_power_of_2(Lv)
-        grid = (bs, nhead)
-        # grid = (1, 1)
-
         extra_kargs = {"waves_per_eu": 4}
-        # import pdb;pdb.set_trace()
 
-        # _fwd_kernel_stage2_asm[grid](
-        #     logits,
-        #     attn_lse,
-        #     o,
-        #     qo_indptr,
-        #     kv_indptr,
-        #     num_kv_splits_indptr,
-        #     attn_lse.stride(0),
-        #     attn_lse.stride(2),
-        #     attn_lse.stride(1),
-        #     o.stride(0),
-        #     o.stride(1),
-        #     MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
-        #     BATCH_NUM=bs,
-        #     BLOCK_DV=BLOCK_DV,
-        #     Lv=Lv,
-        #     mgc=16,
-        #     num_warps=4,
-        #     num_stages=2,
-        #     **extra_kargs,
-        # )
-
+        # using hip reduce in fake non-ps
         aiter.mla_reduce_v1(
             logits,
             attn_lse,
