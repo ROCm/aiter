@@ -265,24 +265,9 @@ else:
 sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
-try:
-    gfx = get_gfx_list()
-except RuntimeError:
-    gfx = []
-    logger.warning("Failed to detect GPU, running in CPU mode")
-if len(gfx) == 1:
-    # single GPU arch
-    AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx[0]}/"
-    os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
-    logger.info(f"Detected single GPU arch: {gfx[0]}")
-elif len(gfx) > 1:
-    # multiple GPU archs
-    AITER_ASM_DIR = [f"{AITER_META_DIR}/hsa/{g}/" for g in gfx]
-    os.environ["AITER_ASM_DIR"] = ":".join(AITER_ASM_DIR)
-    logger.info(f"Detected multiple GPU archs: {', '.join(gfx)}")
-else:
-    logger.warning("Cannot find supported GPU archs, asm disabled.")
-    AITER_ASM_DIR = None
+gfxs = get_gfx_list()
+AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{get_gfx()}/"
+os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
