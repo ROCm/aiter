@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
-import sys
 import argparse
 import glob
-import pandas as pd
-import numpy as np
+import os
+import sys
 from collections import defaultdict
+
+import numpy as np
+import pandas as pd
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 base_dir = os.path.basename(this_dir)
-archs = [
-    os.path.basename(os.path.normpath(path))
-    for path in os.environ.get("AITER_ASM_DIR").split(":")
+archs = [el for el in os.environ["AITER_GPU_ARCHS"].split(";")]
+archs_supported = [
+    os.path.basename(os.path.normpath(path)) for path in glob.glob(f"{this_dir}/*/")
 ]
 
 
@@ -48,12 +49,10 @@ if __name__ == "__main__":
     cfgs = []
 
     csv_groups = defaultdict(list)
-    for arch in archs:
-        # print(f"{this_dir}/{arch}/{args.module}")
+    for arch in archs_supported:
         for el in glob.glob(
             f"{this_dir}/{arch}/{args.module}/**/*.csv", recursive=True
         ):
-            df = pd.read_csv(el)
             cfgname = os.path.basename(el).split(".")[0]
             csv_groups[cfgname].append({"file_path": el, "arch": arch})
 
@@ -115,9 +114,18 @@ using CFG = std::unordered_map<std::string, {args.module}Config>;
 """
                 have_get_header = True
             cfg = [
-                f'ADD_CFG({", ".join(f"\"{getattr(row, col)}\"" if not str(getattr(row, col)).isdigit() else f"{getattr(row, col):>4}" for col in other_columns)}, '
-                f'"{row.arch}", "{relpath}/", "{row.knl_name}", "{row.co_name}"),'
+                "ADD_CFG("
+                + ", ".join(
+                    (
+                        f"{int(getattr(row, col)):>4}"
+                        if str(getattr(row, col)).replace(".", "", 1).isdigit()
+                        else f'"{getattr(row, col)}"'
+                    )
+                    for col in other_columns
+                )
+                + f', "{row.arch}", "{relpath}/", "{row.knl_name}", "{row.co_name}"),'
                 for row in combine_df.itertuples(index=False)
+                if row.arch in archs
             ]
             cfg_txt = "\n    ".join(cfg) + "\n"
 
