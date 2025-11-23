@@ -63,7 +63,6 @@ jobs:
           RUN pip config set global.default-timeout 60 \
               && pip config set global.retries 10
           RUN pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
-          RUN pip config set global.extra-index-url https://pypi.org/simple
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
