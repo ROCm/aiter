@@ -270,6 +270,24 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
     x = tl.load(x_ptr + x_offs, mask=x_mask).to(tl.float32)
 
+    # TODO:(mcim) can we do this better or faster??
+    
+    # Hadamard Transform 
+    # we fuse here because this is hot spot tile is already laoded to register
+    # -------------------------------------------------------------
+    h_idx = tl.arange(0, 32)
+    h_mask = h_idx[:, None] & h_idx[None, :]
+    p = h_mask
+    p = p ^ (p >> 1)
+    p = p ^ (p >> 2)
+    p = p ^ (p >> 4)
+    p = p & 1  
+    h_mat = (1.0 - 2.0 * p.to(tl.float32))
+    h_mat = h_mat * 0.176776695
+    x = tl.dot(x, h_mat)
+    # -------------------------------------------------------------
+   
+    
     # Calculate scale
     amax = tl.max(tl.abs(x), axis=1, keep_dims=True)
     amax = amax.to(tl.int32, bitcast=True)
