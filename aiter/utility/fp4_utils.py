@@ -253,7 +253,6 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     scaleN_pad: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
-    SCALING_MODE: tl.constexpr,
     SHUFFLE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -384,16 +383,13 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
 
 
 def dynamic_mxfp4_quant(
-    x: torch.Tensor, scaling_mode: str = "even", shuffle: bool = False
+    x: torch.Tensor, shuffle: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.
 
     Args:
         x: The input tensor, typically fp16 or bf16.
-        scaling_mode: The method to calculate MX block scaling.
-            - "even" (default): `even_round` in `quark.torch.quantization.utils`.
-            - etc.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
@@ -436,7 +432,6 @@ def dynamic_mxfp4_quant(
         scaleN_pad=scaleN,
         BLOCK_SIZE=BLOCK_SIZE,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
         SHUFFLE=shuffle,
     )
 
