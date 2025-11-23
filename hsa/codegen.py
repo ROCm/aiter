@@ -96,6 +96,7 @@ if __name__ == "__main__":
                         for col in other_columns
                     ]
                 )
+                print(headers_list, sample_row, other_columns_cpp_def)
                 content += f"""
 #define ADD_CFG({other_columns_comma}, arch, path, knl_name, co_name)         \\
     {{                                         \\
@@ -115,8 +116,13 @@ using CFG = std::unordered_map<std::string, {args.module}Config>;
 """
                 have_get_header = True
             cfg = [
-                f'ADD_CFG({", ".join(f"\"{getattr(row, col)}\"" if not str(getattr(row, col)).isdigit() else f"{getattr(row, col):>4}" for col in other_columns)}, '
-                f'"{row.arch}", "{relpath}/", "{row.knl_name}", "{row.co_name}"),'
+                'ADD_CFG('
+                + ", ".join(
+                    (f'{int(getattr(row, col)):>4}' if str(getattr(row, col)).replace('.', '', 1).isdigit()
+                    else f'"{getattr(row, col)}"')
+                    for col in other_columns
+                )
+                + f', "{row.arch}", "{relpath}/", "{row.knl_name}", "{row.co_name}"),'
                 for row in combine_df.itertuples(index=False)
             ]
             cfg_txt = "\n    ".join(cfg) + "\n"
