@@ -14,6 +14,8 @@ import binascii
 import hashlib
 import logging
 import time
+import inspect
+import json
 
 
 logger = logging.getLogger("aiter")
@@ -299,3 +301,89 @@ def transfer_hsaco(hsaco_path):
 
 def str_to_bool(s):
     return True if s.lower() == "true" else False
+
+
+def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
+    import triton
+    import triton.language as tl
+
+    if not isinstance(kernel, triton.JITFunction):
+        raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
+    sig = inspect.signature(kernel.fn)
+
+    constant_indices = []
+    for idx, param in enumerate(sig.parameters.values()):
+        if param.annotation == tl.constexpr:
+            constant_indices.append(idx)
+    ccinfo = kernel.warmup(*args, grid=grid, **kwargs)
+    constants = {}
+    keys = list(sig.parameters.keys())
+    for idx, arg in enumerate(args):
+        if idx in constant_indices:
+            constants[keys[idx]] = arg
+    extra_metadata = {}
+    extra_metadata["waves_per_eu"] = kwargs.get("waves_per_eu", 1)
+    extra_metadata["num_stages"] = kwargs.get("num_stages", 1)
+    extra_metadata["num_warps"] = kwargs.get("num_warps", 1)
+    extra_metadata["num_ctas"] = kwargs.get("num_ctas", 1)
+    return compile_hsaco(
+        kernel.fn.__name__,
+        ccinfo.asm["hsaco"],
+        ccinfo.metadata.shared,
+        ccinfo.metadata.target.arch,
+        constants,
+        extra_metadata,
+    )
+
+
+def compile_hsaco(
+    kernel_name,
+    hsaco,
+    shared=0,
+    gcnArchName=GPU_ARCH,
+    constants=None,
+    extra_metadata=None,
+):
+    constants = OrderedDict(constants or {})
+    func_name = get_default_func_name(kernel_name, tuple(constants.values()))
+    metadata = {}
+    metadata["shared"] = shared
+    metadata["name"] = kernel_name
+    metadata["gcnArchName"] = gcnArchName
+    metadata.update(extra_metadata or {})
+    for key, value in constants.items():
+        metadata[key] = str(value)
+    build_dir = f"{BUILD_DIR}/{metadata["gcnArchName"]}"
+    if not os.path.exists(build_dir):
+        os.makedirs(build_dir, exist_ok=True)
+    with open(f"{build_dir}/{func_name}.hsaco", "wb") as f:
+        f.write(hsaco)
+
+    with open(f"{build_dir}/{func_name}.json", "w") as f:
+        json.dump(metadata, f)
+    return func_name
+
+
+@lru_cache(maxsize=None)
+def get_hsaco_launcher(hsaco_name, kernel_name):
+    from csrc.cpp_itfs.hsaco_launcher import HsacoLauncher, read_hsaco
+
+    hsaco = read_hsaco(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.hsaco")
+    hsaco_launcher = HsacoLauncher()
+    hsaco_launcher.load_module(hsaco)
+    hsaco_launcher.get_function(kernel_name)
+    return hsaco_launcher
+
+
+def run_hsaco(
+    func_name, *args, grid=(1, 1, 1), block=(256, 1, 1), stream=None, constants=None
+):
+    constants = OrderedDict(constants or {})
+    hsaco_name = get_default_func_name(func_name, tuple(constants.values()))
+    with open(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.json", "r") as f:
+        metadata = json.load(f)
+    kernel_name = metadata["name"]
+    hsaco_launcher = get_hsaco_launcher(hsaco_name, kernel_name)
+    hsaco_launcher.launch_kernel(
+        args, grid=grid, block=block, shared_mem_bytes=metadata["shared"], stream=stream
+    )
