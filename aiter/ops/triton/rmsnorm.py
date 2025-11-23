@@ -15,6 +15,7 @@ from aiter.ops.triton._triton_kernels.rmsnorm import (
     _quant_fused_add_rmsnorm_kernel,
     _rmsnorm_bwd_triton,
     _rmsnorm_bwd_dg_reduce_triton,
+    _rmsnorm_kernel_large_m_small_n,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -158,6 +159,29 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     return dx, dgamma
 
 
+def _should_use_large_m_small_n(M: int, N: int) -> bool:
+
+    if M > 8192 and N <= 2048:
+        return True
+
+    return False
+
+
+def rmsnorm_forward_inference(x: torch.Tensor, weight: torch.Tensor, eps: float):
+    assert x.ndim == 2 and weight.ndim == 1 and x.shape[1] == weight.shape[0]
+    x = x.contiguous()
+    weight = weight.contiguous()
+    M, N = x.shape
+
+    if _should_use_large_m_small_n(M, N):
+        return _rmsnorm_forward_large_m_small_n(x, weight, eps, return_rsigma=False)
+    else:
+        y, _ = _rmsnorm_forward(
+            x, weight, eps
+        )  # always returns rsigma, but we discard it
+        return y
+
+
 class _RMSNorm(torch.autograd.Function):
 
     @staticmethod
@@ -166,8 +190,18 @@ class _RMSNorm(torch.autograd.Function):
         is_grad = is_grad_enabled and any(
             tensor.requires_grad for tensor in [x, weight]
         )
-
-        y, rsigma = _rmsnorm_forward(x, weight, epsilon)
+        M, N = x.shape
+        if _should_use_large_m_small_n(M, N):
+            out = _rmsnorm_forward_large_m_small_n(
+                x, weight, epsilon, return_rsigma=is_grad
+            )
+            if is_grad:
+                y, rsigma = out
+            else:
+                y = out
+                rsigma = None
+        else:
+            y, rsigma = _rmsnorm_forward(x, weight, epsilon)
 
         if is_grad:
             ctx.save_for_backward(x, weight, rsigma)
@@ -528,3 +562,42 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
         USE_BLOCKED,
         NUM_PRGMS,
     )
+
+
+def _rmsnorm_forward_large_m_small_n(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    return_rsigma: bool = False,
+):
+    assert x.ndim == 2 and weight.ndim == 1 and x.shape[1] == weight.shape[0]
+    x, weight = x.contiguous(), weight.contiguous()
+    M, N = x.shape
+    y = torch.empty_like(x)
+    rsigma = (
+        torch.empty(M, dtype=torch.float32, device=x.device) if return_rsigma else None
+    )
+
+    BLOCK_N = triton.next_power_of_2(N)
+    BLOCK_M = min(16384 // BLOCK_N, 32)
+    BLOCK_M = max(BLOCK_M, 8)
+
+    grid = (triton.cdiv(M, BLOCK_M),)
+    _rmsnorm_kernel_large_m_small_n[grid](
+        x,
+        y,
+        weight,
+        rsigma,
+        M,
+        N,
+        eps,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        y.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        num_warps=8,
+        num_stages=2,
+    )
+    return (y, rsigma) if return_rsigma else y
