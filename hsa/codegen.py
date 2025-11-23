@@ -96,7 +96,6 @@ if __name__ == "__main__":
                         for col in other_columns
                     ]
                 )
-                print(headers_list, sample_row, other_columns_cpp_def)
                 content += f"""
 #define ADD_CFG({other_columns_comma}, arch, path, knl_name, co_name)         \\
     {{                                         \\
