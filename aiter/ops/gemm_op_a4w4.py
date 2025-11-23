@@ -122,7 +122,7 @@ def gemm_a4w4_asm(
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
     log2_k_split: Optional[int] = None,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_gemm_a4w4_blockscale")
@@ -133,7 +133,7 @@ def gemm_a4w4_blockscale(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_gemm_a4w4_blockscale_tune", fc_name="gemm_a4w4_blockscale_tune")
@@ -145,4 +145,4 @@ def gemm_a4w4_blockscale_tune(
     Out: torch.Tensor,
     kernelId: int,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> None: ...

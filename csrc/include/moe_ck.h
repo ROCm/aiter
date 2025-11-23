@@ -16,7 +16,9 @@ void ck_moe_stage1(torch::Tensor& hidden_states, // [m, k], input token
                    std::optional<torch::Tensor> w1_scale, // [e, 1, n], gate(up) scale
                    std::optional<torch::Tensor> a1_scale, // [m, 1], token scale
                    std::optional<int> block_m,
-                   std::optional<torch::Tensor> sorted_weights);
+                   std::optional<torch::Tensor> sorted_weights,
+                   int quant_type,
+                   int activation);
 
 void ck_moe_stage2(torch::Tensor& inter_states, // [m, k], input token
                    torch::Tensor& w1, // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
@@ -30,4 +32,6 @@ void ck_moe_stage2(torch::Tensor& inter_states, // [m, k], input token
                    std::optional<torch::Tensor> w2_scale, // [e, 1, n], gate(up) scale
                    std::optional<torch::Tensor> a2_scale, // [m, 1], token scale
                    std::optional<int> block_m,
-                   std::optional<torch::Tensor> sorted_weights); // [max_num_tokens_padded]);
+                   std::optional<torch::Tensor> sorted_weights, // [max_num_tokens_padded]);
+                   int quant_type,
+                   int activation);

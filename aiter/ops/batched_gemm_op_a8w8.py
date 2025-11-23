@@ -14,7 +14,23 @@ from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
 
 
-@compile_ops("module_batched_gemm_a8w8", fc_name="batched_gemm_a8w8")
+def gen_batched_gemm_a8w8_fake_tensors(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    bias: Optional[Tensor] = None,
+    splitK: int = 0,
+) -> Tensor:
+    return out
+
+
+@compile_ops(
+    "module_batched_gemm_a8w8",
+    fc_name="batched_gemm_a8w8",
+    gen_fake=gen_batched_gemm_a8w8_fake_tensors,
+)
 def batched_gemm_a8w8(
     XQ: Tensor,
     WQ: Tensor,
@@ -22,8 +38,8 @@ def batched_gemm_a8w8(
     w_scale: Tensor,
     out: Tensor,
     bias: Optional[Tensor] = None,
-    splitK=0,
-): ...
+    splitK: int = 0,
+) -> Tensor: ...
 
 
 @functools.lru_cache(maxsize=1024)
@@ -90,7 +106,23 @@ def batched_gemm_a8w8_CK(
     return batched_gemm_a8w8(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
 
 
-@compile_ops("module_batched_gemm_a8w8_tune", fc_name="batched_gemm_a8w8_tune")
+def gen_batched_gemm_a8w8_tune_fake_tensors(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    kernelId: int,
+    splitK: int = 0,
+) -> Tensor:
+    return out
+
+
+@compile_ops(
+    "module_batched_gemm_a8w8_tune",
+    fc_name="batched_gemm_a8w8_tune",
+    gen_fake=gen_batched_gemm_a8w8_tune_fake_tensors,
+)
 def batched_gemm_a8w8_tune(
     XQ: Tensor,
     WQ: Tensor,
@@ -98,5 +130,5 @@ def batched_gemm_a8w8_tune(
     w_scale: Tensor,
     out: Tensor,
     kernelId: int,
-    splitK=0,
-): ...
+    splitK: int = 0,
+) -> Tensor: ...

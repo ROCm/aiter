@@ -51,7 +51,6 @@ def destroy_dist_env():
 def all_reduce_asm(inp: torch.Tensor):
     tp_grp = get_tp_group()
     ca = tp_grp.ca_comm
-
     if ca._IS_CAPTURING:
         if torch.cuda.is_current_stream_capturing():
             return aiter.all_reduce_asm_(
