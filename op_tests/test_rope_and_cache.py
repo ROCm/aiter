@@ -197,6 +197,7 @@ nope_first: {nope_first}
 @benchmark()
 def test_reshape_and_cache(
     key,
+    value,
     ctx_lens: int,
     bs: int,
     num_heads: int,
@@ -228,9 +229,9 @@ def test_reshape_and_cache(
         kv_scale_shape = (kvhead, bs * max_token_num_support)
 
     # ##################################################### prefill part
-    value = torch.randn(
-        bs * ctx_lens, kvhead, head_size, dtype=DType_KV, device="cuda"
-    )
+    # value = torch.randn(
+    #     bs * ctx_lens, kvhead, head_size, dtype=DType_KV, device="cuda"
+    # )
     device = key.device
     k_cache = torch.empty(k_cache_shape, dtype=DType_KVCache, device=device)
     v_cache = torch.empty(v_cache_shape, dtype=DType_KVCache, device=device)
@@ -247,19 +248,19 @@ def test_reshape_and_cache(
         ]
     ).cuda()
 
-    k_cache_ref = k_cache.clone()
-    v_cache_ref = v_cache.clone()
-    out_ref, us_ref = run_torch(
-        key.view(bs, ctx_lens, kvhead, head_size),
-        value.view(bs, ctx_lens, kvhead, head_size),
-        k_cache_ref,
-        v_cache_ref,
-        slot_mapping,
-        block_size,
-        x,
-        asm_layout,
-        quantCfg,
-    )
+    # k_cache_ref = k_cache.clone()
+    # v_cache_ref = v_cache.clone()
+    # out_ref, us_ref = run_torch(
+    #     key.view(bs, ctx_lens, kvhead, head_size),
+    #     value.view(bs, ctx_lens, kvhead, head_size),
+    #     k_cache_ref,
+    #     v_cache_ref,
+    #     slot_mapping,
+    #     block_size,
+    #     x,
+    #     asm_layout,
+    #     quantCfg,
+    # )
 
     k_cache_a = k_cache.clone()
     v_cache_a = v_cache.clone()
@@ -279,16 +280,16 @@ def test_reshape_and_cache(
     )
     ret["us_prefill"] = us_a
 
-    print(f"prefill part: ref vs aiter {us_ref:>8.2f}us vs {us_a:>8.2f}us")
-    names = ["k_cache", "v_cache", "k_scale", "v_scale"]
-    for i, el in enumerate(out_ref):
-        if el is None:
-            continue
-        checkAllclose(
-            el.to(dtypes.fp32),
-            out_a[i].to(dtypes.fp32),
-            msg=f"{names[i]} {el.shape}",
-        )
+    # print(f"prefill part: ref vs aiter {us_ref:>8.2f}us vs {us_a:>8.2f}us")
+    # names = ["k_cache", "v_cache", "k_scale", "v_scale"]
+    # for i, el in enumerate(out_ref):
+    #     if el is None:
+    #         continue
+    #     checkAllclose(
+    #         el.to(dtypes.fp32),
+    #         out_a[i].to(dtypes.fp32),
+    #         msg=f"{names[i]} {el.shape}",
+    #     )
 
     # ##################################################### decode part
     
@@ -349,9 +350,9 @@ def test_reshape_and_cache(
     #         out_a[i].to(dtypes.fp32),
     #         msg=f"{names[i]} {el.shape}",
     #     )
-    print(
-        f"finish test {ctx_lens=} {bs=} {num_heads=} {head_size=} {block_size=} {DType_KV=} {DType_KVCache=}"
-    )
+    # print(
+    #     f"finish test {ctx_lens=} {bs=} {num_heads=} {head_size=} {block_size=} {DType_KV=} {DType_KVCache=}"
+    # )
     return ret
 
 @perftest()
@@ -400,11 +401,11 @@ def test_rope_cached_positions_offsets_2c_fwd_inplace_cachekv(
 ):
     MAX_TOKEN_SUPPORTED = 16384
     ret = {}
-    # quantCfg = (
-    #     {}
-    #     if DType_KVCache in [dtypes.bf16, dtypes.fp16]
-    #     else {"quant_dtype": DType_KVCache}
-    # )
+    quantCfg = (
+        {}
+        if DType_KVCache in [dtypes.bf16, dtypes.fp16]
+        else {"quant_dtype": DType_KVCache}
+    )
     # q, k, v
     qhead, kvhead = h
     query = torch.randn((s,b,qhead,d), dtype=dtype, device="cuda")
@@ -467,13 +468,41 @@ def test_rope_cached_positions_offsets_2c_fwd_inplace_cachekv(
     ).cuda()
 
     query_a = query.clone()
-    key_a = query.clone()
-    value_a = query.clone()
+    key_a = key.clone()
+    value_a = value.clone()
     k_cache_a = k_cache.clone()
     v_cache_a = v_cache.clone()
 
     hip_seperate_avg = 0.0001
     hip_fuse_avg = 0.0001
+
+    _, hip_rope_avg = hip_rope_cached_positions_offsets_2d_fwd_inplace(
+        query,
+        key,
+        cos,
+        sin,
+        positions,
+        offsets,
+        rotate_style,
+        True,
+        nope_first,
+    )
+    # print(hip_rope_avg)
+    key_cache_kernel = key.permute(1,0,2,3).reshape(b*s,h_y,d)
+    value_cache_kernel = value.permute(1,0,2,3).reshape(b*s,h_y,d)
+    ret = test_reshape_and_cache(
+                key_cache_kernel,
+                value_cache_kernel,
+                s,
+                b,
+                h_y,
+                d,
+                16,
+                dtype,
+                dtype,
+            )
+    hip_cache_avg = ret["us_prefill"]
+    # print(hip_cache_avg)
 
     _, hip_fuse_avg = hip_rope_cached_positions_offsets_2c_fwd_inplace_cachekv(
         query_a,
@@ -491,7 +520,9 @@ def test_rope_cached_positions_offsets_2c_fwd_inplace_cachekv(
         slot_mapping,
         asm_layout,
     )
-    print(hip_fuse_avg)
+    hip_seperate_avg = hip_rope_avg + hip_cache_avg
+    # print(hip_fuse_avg, hip_seperate_avg)
+    print(f"sep vs fuse {hip_seperate_avg:>8.2f}us vs {hip_fuse_avg:>8.2f}us")
 
 if __name__ == "__main__":
     l_dtype = ("fp16", "bf16")
@@ -680,64 +711,6 @@ if __name__ == "__main__":
             print(
                 f"{color}dtype: {dtype}, rotate_style: {rotate_style}, rpar: {rotary_percent_and_reuse}, (s,b,hx,hy,d): {s, b, h_x, h_y, d}, has_offsets: {has_offsets}{endc}"
             )
-            rotary_percent = rotary_percent_and_reuse[0]
-            reuse_freqs_front_part = rotary_percent_and_reuse[1]
-            nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
-            freqs_ratio = 2 if reuse_freqs_front_part else 1
-            freqs = torch.randn(
-                (s * 2, 1, 1, int(d * rotary_percent) // freqs_ratio),
-                dtype=dtype,
-                device="cuda",
-            )
-            positions = torch.randint(
-                int(s * 0.25) if has_offsets else 0,
-                int(s * 0.75) if has_offsets else s,
-                (
-                    s,
-                    b,
-                ),
-                device="cuda",
-            )
-            offsets = (
-                torch.randint(
-                    int(s * -0.25),
-                    int(s * 0.25),
-                    (
-                        s,
-                        b,
-                    ),
-                    device="cuda",
-                )
-                if has_offsets
-                else None
-            )
-            # input_x = torch.randn((s, b, h_x, d), dtype=dtype, device="cuda")
-            # input_y = torch.randn((s, b, h_y, d), dtype=dtype, device="cuda")
-            # compare_rope_sbhd_2c_positions_with_legacy(
-            #     input_x, # q
-            #     input_y, # k
-            #     freqs,
-            #     positions,
-            #     offsets,
-            #     rotate_style,
-            #     nope_first,
-            #     args.compare_check,
-            # )
-            # print(input_x.shape, input_y.shape)
-
-            # key = input_y.permute(1,0,2,3).reshape(b*s,h_y,d)
-            # print(key.shape)
-            # test_reshape_and_cache(
-            #     key,
-            #     s,
-            #     b,
-            #     h_y,
-            #     d,
-            #     16,
-            #     dtype,
-            #     dtype,
-            # )
-            ## TODO: impl standalone kernel combinations
             test_rope_cached_positions_offsets_2c_fwd_inplace_cachekv(
                 s,
                 b,
@@ -747,6 +720,5 @@ if __name__ == "__main__":
                 dtype,
                 dtype,
             )
-            # print("test over!")
-            # break
+            break
         print("test over!")
