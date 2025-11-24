@@ -156,7 +156,7 @@ void rope_cached_positions_offsets_2c_fwd_cachekv_impl(
     const bool           nope_first,
     const torch::Tensor& slot_mapping,              // [s*b]
     const bool           asm_layout
-)
+);
 
 void rope_thd_fwd_impl(
     torch::Tensor&       output,                    // [t, h, d]

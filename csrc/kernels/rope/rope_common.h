@@ -250,7 +250,7 @@ __device__ __forceinline__ void save_kvcache(const i_scalar_t k_data_0,
     {
         return;
     }
-    const int32_t did_0, did_1;
+    int32_t did_0, did_1;
     if constexpr(RotateStyle == ROTATE_STYLE_NEOX)
     {
         did_0 = did;
@@ -1140,7 +1140,7 @@ struct OpCachedFwd
                                                              const int32_t stride_oy_h,
                                                              const int32_t stride_oy_d,
                                                              const int32_t stride_iv_h,
-                                                             const int32_t stride_iv_d,)
+                                                             const int32_t stride_iv_d)
     {
         // rotate count
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
@@ -1203,8 +1203,8 @@ struct OpCachedFwd
                                                           stride_iv_d,
                                                           stride_iv_h,
                                                           size_half_r);
-                save_kvcache<RotateStyle, ASMLayout>(k_data_0,
-                                                     k_data_1,
+                save_kvcache<RotateStyle, ASMLayout>(output_y_0,
+                                                     output_y_1,
                                                      v_data_0,
                                                      v_data_1,
                                                      p_cache_y,
@@ -1215,7 +1215,7 @@ struct OpCachedFwd
                                                      x,
                                                      did,
                                                      hid,
-                                                     size_h,
+                                                     size_h_y,
                                                      size_d,
                                                      size_half_r);
             }
@@ -1275,8 +1275,8 @@ struct OpCachedFwd
                                                           stride_iv_d,
                                                           stride_iv_h,
                                                           size_half_r);
-                save_kvcache<RotateStyle, ASMLayout>(k_data_0,
-                                                     k_data_1,
+                save_kvcache<RotateStyle, ASMLayout>(output_y_0,
+                                                     output_y_1,
                                                      v_data_0,
                                                      v_data_1,
                                                      p_cache_y,
@@ -1287,7 +1287,7 @@ struct OpCachedFwd
                                                      x,
                                                      did,
                                                      hid,
-                                                     size_h,
+                                                     size_h_y,
                                                      size_d,
                                                      size_half_r);
             }
@@ -2540,7 +2540,7 @@ kn_entry_2c_value_sbhd_cached_indirect2_inplace(scalar_t* __restrict__ p_inout_x
                                                 const int32_t stride_v_s,
                                                 const int32_t stride_v_b,
                                                 const int32_t stride_v_h,
-                                                const int32_t stride_v_d,)
+                                                const int32_t stride_v_d)
 {
     const uint64_t sid    = blockIdx.x;
     const uint64_t bid    = blockIdx.y;
@@ -2550,7 +2550,7 @@ kn_entry_2c_value_sbhd_cached_indirect2_inplace(scalar_t* __restrict__ p_inout_x
     const int      token_elem_num = size_h_y * size_d;
     const int64_t  block_idx = slot / block_size;
     const int64_t  block_offset = slot % block_size;
-    const int64_t  offt_kcache, offt_vcache;
+    int64_t  offt_kcache, offt_vcache;
     if(slot < 0) 
     {
         // ignore padding token
