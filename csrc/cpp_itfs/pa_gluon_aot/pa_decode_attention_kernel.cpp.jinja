@@ -34,6 +34,9 @@ void {{func_name}}(void* exp_sums_ptr,           // [num_seqs, num_kv_heads, max
                     int query_scale_stride_0,
                     int kv_scale_stride_0,
                     int kv_scale_stride_1,
+                    int query_seq_len,
+                    int query_group_size,
+                    int head_size,
                     int num_seqs,
                     int num_kv_heads,
                     int max_context_partition_num,
@@ -74,17 +77,20 @@ void {{func_name}}(void* exp_sums_ptr,           // [num_seqs, num_kv_heads, max
                     int query_scale_stride_0,
                     int kv_scale_stride_0,
                     int kv_scale_stride_1,
+                    int query_seq_len,
+                    int query_group_size,
+                    int head_size,
                     int num_seqs,
                     int num_kv_heads,
                     int max_context_partition_num,
                     void* stream
                     ){
     {{triton_kernel}}(reinterpret_cast<hipStream_t>(stream), exp_sums_ptr, max_logits_ptr, output_ptr, query_ptr, key_cache_ptr, value_cache_ptr,
-                      block_tables_ptr, sequence_lengths_ptr, softmax_scale, query_scale, key_scale, value_scale,
-                      stride_max_logits_seq, stride_max_logits_head, stride_max_logits_part,
-                      stride_output_seq, stride_output_head, stride_output_part, stride_output_group,
-                      stride_query_seq, stride_query_head, stride_key_block, stride_key_head, stride_key_head_split,
-                      stride_key_block_elem, stride_value_block, stride_value_head, stride_value_head_size,
-                      stride_block_table_seq, query_scale_stride_0, kv_scale_stride_0, kv_scale_stride_1,
-                      num_seqs, num_kv_heads, max_context_partition_num);
+                    block_tables_ptr, sequence_lengths_ptr, softmax_scale, query_scale, key_scale, value_scale,
+                    stride_max_logits_seq, stride_max_logits_head, stride_max_logits_part,
+                    stride_output_seq, stride_output_head, stride_output_part, stride_output_group,
+                    stride_query_seq, stride_query_head, stride_key_block, stride_key_head, stride_key_head_split,
+                    stride_key_block_elem, stride_value_block, stride_value_head, stride_value_head_size,
+                    stride_block_table_seq, query_scale_stride_0, kv_scale_stride_0, kv_scale_stride_1, query_seq_len,
+                    query_group_size, head_size, num_seqs, num_kv_heads, max_context_partition_num);
 }
