@@ -17,6 +17,7 @@ torch.set_printoptions(sci_mode=False)
 # qdtype bf16, kdtype bf16: nhead16
 # qdtype fp8, kdtype fp8: nhead16, nhead128
 # qdtype fp8, kdtype bf16: nhead16
+import functools
 
 
 def cal_diff(
@@ -151,6 +152,7 @@ def test_mla(
     varlen,
     decode_qlen,
     max_split_per_batch,
+    non_persistent_mode,
 ):
     ret = {}
 
@@ -237,7 +239,8 @@ def test_mla(
         q.dtype,
         kv_buffer.dtype,
         is_sparse=False,
-        fast_mode=True,
+        fast_mode=True if not non_persistent_mode else False,
+        intra_batch_mode=non_persistent_mode,
     )
 
     # aiter implementation
@@ -261,6 +264,15 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
+
+    if non_persistent_mode:
+        num_kv_splits, num_kv_splits_indptr = aiter.mla.get_meta_param(
+            max_split_per_batch, batch_size, kv_indices.shape[0], nhead, decode_qlen, dtype,
+        )
+    else:
+        num_kv_splits = max_split_per_batch
+        num_kv_splits_indptr = None
+
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
@@ -276,8 +288,9 @@ def test_mla(
         kv_granularity=max(page_size, 16),
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
-        fast_mode=True,
-        max_split_per_batch=max_split_per_batch,
+        fast_mode=True if not non_persistent_mode else False,
+        max_split_per_batch=num_kv_splits,
+        intera_batch_mode=non_persistent_mode,
     )
 
     def test_absorb_decode_bf16():
@@ -295,13 +308,15 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
-            num_kv_splits=max_split_per_batch,
+            num_kv_splits=num_kv_splits,
+            num_kv_splits_indptr=num_kv_splits_indptr,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
             work_info_set=work_info_set,
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
+            intra_batch_mode=non_persistent_mode,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -317,21 +332,17 @@ def test_mla(
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
-        if dtype != dtypes.fp8 and nhead == 128:
-            aiter.logger.info("don't support this case:\n")
-            return None, 1e12
-
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
         q_fp8 = q.to(dtypes.fp8)
         q_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-        kv_buffer_fp8 = kv_buffer.to(kvtype)
+        kv_buffer_fp8 = kv_buffer.to(dtypes.fp8)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
-            q_fp8 if dtype == dtypes.fp8 else q,
+            q_fp8,
             kv_buffer_fp8,
             qo_indptr,
             kv_indptr,
@@ -347,7 +358,7 @@ def test_mla(
 
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
-            q_fp8 if dtype == dtypes.fp8 else q,
+            q_fp8,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
             out_asm,
             qo_indptr,
@@ -356,7 +367,8 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
-            num_kv_splits=max_split_per_batch,
+            num_kv_splits=num_kv_splits,
+            num_kv_splits_indptr=num_kv_splits_indptr,
             q_scale=q_scale,
             kv_scale=kv_scale,
             work_meta_data=work_meta_data,
@@ -365,6 +377,7 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
+            intra_batch_mode=non_persistent_mode,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -372,6 +385,7 @@ def test_mla(
         # checkAllclose(logits_ref, attn_logits,
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
+        # import pdb;pdb.set_trace()
         err = checkAllclose(
             out_ref,
             out_asm,
@@ -388,12 +402,8 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
-        nhead == 16 or (nhead in range(32, 128, 16) and decode_qlen == 1)
-    ):
-        err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and nhead in [16, 128]:
-        err, us_asm_decode = test_absorb_decode_fp8()
+    err, us_asm_decode = test_absorb_decode_bf16()
+    err, us_asm_decode = test_absorb_decode_fp8()
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
 
@@ -490,7 +500,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[21, 64, 256, 512, 1200, 3200, 5200, 8192],
+    default=[i for i in range(500, 1000)],
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -528,6 +538,13 @@ parser.add_argument(
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
 )
+parser.add_argument(
+    "-nps",
+    "--non_persistent_mode",
+    action="store_true",
+    help="""variable kv seqlens per batch. Default: False.
+    --varlen # True""",
+)
 
 import pandas as pd
 
@@ -556,6 +573,7 @@ for nhead, decode_qlen in list_nhead:
             varlen=args.varlen,
             decode_qlen=decode_qlen,
             max_split_per_batch=max_split_per_batch,
+            non_persistent_mode=args.non_persistent_mode,
         )
         df.append(ret)
     df = pd.DataFrame(df)

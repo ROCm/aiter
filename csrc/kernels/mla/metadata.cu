@@ -2,6 +2,7 @@
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include "metadata/v1_0_device.cuh"
 #include "metadata/v1_1_device.cuh"
 #include "metadata/v1_1_host.cuh"
 #include "metadata/v1_2_device.cuh"
@@ -51,7 +52,8 @@ void get_mla_metadata_v1(
     const int32_t        uni_seqlen_qo,
     const bool           fast_mode,
     const int32_t        topk,
-    const int32_t        max_split_per_batch)
+    const int32_t        max_split_per_batch,
+    const bool           intera_batch_mode)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
 
@@ -78,6 +80,25 @@ void get_mla_metadata_v1(
             max_seqlen_qo,
             uni_seqlen_qo,
             topk,
+            max_split_per_batch,
+            work_metadata_ptrs,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map);
+    }
+    else if (intera_batch_mode)
+    {
+        get_mla_metadata_v1_0_device(
+            seqlens_qo_indptr,
+            seqlens_kv_indptr,
+            num_heads_per_head_k,
+            num_heads_k,
+            is_causal,
+            kv_granularity,
+            max_seqlen_qo,
+            uni_seqlen_qo,
             max_split_per_batch,
             work_metadata_ptrs,
             work_info_set,
