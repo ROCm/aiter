@@ -1388,10 +1388,10 @@ namespace py = pybind11;
           py::arg("final_output"),       \
           py::arg("final_lse") = std::nullopt);
 
-#define TRTLLM_ALL_REDUCE_FUSION_PYBIND                                       \
-    m.def("init_trtllm_ar_fusion", &init_trtllm_ar_fusion);                   \
-    m.def("destroy_trtllm_ar_fusion", &destroy_trtllm_ar_fusion);             \
-    m.def("get_trtllm_ar_fusion_handle", &get_trtllm_ar_fusion_handle);       \
-    m.def("open_trtllm_ar_fusion_handles", &open_trtllm_ar_fusion_handles);   \
-    m.def("get_trtllm_ar_fusion_workspace", &get_trtllm_ar_fusion_workspace); \
-    m.def("trtllm_allreduce_rms", &trtllm_allreduce_rms);
+#define TRTLLM_ALL_REDUCE_FUSION_PYBIND                                        \
+    m.def("trtllm_init_ar_fusion", &trtllm::init_ar_fusion);                   \
+    m.def("trtllm_destroy_ar_fusion", &trtllm::destroy_ar_fusion);             \
+    m.def("trtllm_get_ar_fusion_handle", &trtllm::get_ar_fusion_handle);       \
+    m.def("trtllm_open_ar_fusion_handles", &trtllm::open_ar_fusion_handles);   \
+    m.def("trtllm_get_ar_fusion_workspace", &trtllm::get_ar_fusion_workspace); \
+    m.def("trtllm_allreduce_rms", &trtllm::allreduce_rms);
