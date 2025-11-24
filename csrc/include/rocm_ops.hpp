@@ -321,6 +321,7 @@ namespace py = pybind11;
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("out"),                                                                      \
+          py::arg("use_new"),                                                                  \
           py::arg("open_fp8_quant"),                                                           \
           py::arg("reg_buffer") = std::nullopt);                                               \
     m.def("fused_allreduce_rmsnorm",                                                           \
@@ -395,7 +396,8 @@ namespace py = pybind11;
           py::arg("out"),                       \
           py::arg("bias")       = std::nullopt, \
           py::arg("splitK")     = std::nullopt, \
-          py::arg("kernelName") = std::nullopt);
+          py::arg("kernelName") = std::nullopt, \
+          py::arg("bpreshuffle")      = false);
 
 #define GEMM_A4W4_ASM_PYBIND                      \
     m.def("gemm_a4w4_asm",                        \
@@ -524,6 +526,29 @@ namespace py = pybind11;
           py::arg("Out"),                 \
           py::arg("kernelId") = 0,        \
           py::arg("splitK")   = 0);
+
+#define GEMM_A8W8_BPRESHUFFLE_CKTILE_PYBIND      \
+    m.def("gemm_a8w8_bpreshuffle_cktile", \
+          &gemm_a8w8_bpreshuffle_cktile,  \
+          "gemm_a8w8_bpreshuffle_cktile", \
+          py::arg("XQ"),                  \
+          py::arg("WQ"),                  \
+          py::arg("x_scale"),             \
+          py::arg("w_scale"),             \
+          py::arg("Out"));
+
+#define GEMM_A8W8_BPRESHUFFLE_CKTILE_TUNE_PYBIND \
+    m.def("gemm_a8w8_bpreshuffle_cktile_tune",   \
+          &gemm_a8w8_bpreshuffle_cktile_tune,    \
+          "gemm_a8w8_bpreshuffle_cktile_tune",   \
+          py::arg("XQ"),                         \
+          py::arg("WQ"),                         \
+          py::arg("x_scale"),                    \
+          py::arg("w_scale"),                    \
+          py::arg("Out"),                        \
+          py::arg("kernelId") = 0,               \
+          py::arg("splitK")   = 0);
+
 #define MHA_BWD_ASM_PYBIND                        \
     m.def("fmha_v3_bwd",                          \
           &aiter::torch_itfs::fmha_v3_bwd,        \
