@@ -108,6 +108,7 @@ jobs:
         run: |
           cd sglang
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_install_dependency.sh
+          sed -i "4s/^GPU_ARCH=.*/GPU_ARCH=\"${GPU_ARCH}\"/" scripts/ci/amd_ci_install_dependency.sh
           bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Evaluate Accuracy
