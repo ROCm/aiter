@@ -252,7 +252,7 @@ if __name__ == "__main__":
     #blockscale
     # test_gemm("bf16", 16, 7168, 2048, "TN", True, "gluon", True)
     #pure fp8
-    test_gemm("bf16", 16, 7168, 2048, "TN", True, "gluon", False)
+    test_gemm("bf16", 8192, 7168, 2048, "TN", True, "gluon", False)
     # test_gemm("bf16", 16, 8192, 8192, "TN", True, "gluon", False)
     # test_gemm("bf16", 8192, 8192, 8320, "TN", True, "gluon", False)
     # test_gemm("bf16", 8192, 8192, 8320, "TN", True, "gluon", False)
