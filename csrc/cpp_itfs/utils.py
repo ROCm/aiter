@@ -351,6 +351,7 @@ def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
     extra_metadata["num_warps"] = kwargs.get("num_warps", 1)
     extra_metadata["num_ctas"] = kwargs.get("num_ctas", 1)
     extra_metadata["args"] = arg_names
+    extra_metadata["triton_version"] = triton.__version__
     return compile_hsaco(
         kernel.fn.__name__,
         ccinfo.asm["hsaco"],
