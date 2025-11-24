@@ -9,18 +9,38 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/python.h>
 
+namespace hk = HipKittens;
+namespace ct = ck_tile;
+
 template <typename Q_DTYPE_, typename KV_DTYPE_, int32_t kNumHead_>
 struct HkMlaDecodeFwdTraits
 {
     using Q_DTYPE  = Q_DTYPE_;
     using KV_DTYPE = KV_DTYPE_;
+    using gl_qo    = hk::gl<Q_DTYPE, -1, -1, -1, -1>;
+    using gl_kv    = hk::gl<KV_DTYPE, -1, -1, -1, -1>;
+    using gl_tmp   = hk::gl<float, -1, -1, -1, -1>
 
-    static constexpr int32_t kNumHead = kNumHead_;
+        static constexpr int32_t kNumHead   = kNumHead_;
+    static constexpr int32_t kKvLoraRank    = 512;
+    static constexpr int32_t kQkRopeHeadDim = 64;
 };
 
 template <typename Traits>
 struct HkMlaDecodeFwdParams
 {
+    // inputs
+    Traits::gl_qo query;
+    Traits::gl_kv kv_buffer;
+
+    // outputs
+    Traits::gl_tmp split_data;
+    Traits::gl_tmp split_lse;
+    Traits::gl_qo final_output;
+
+    // metadata
+    const int32_t* p_work_indptr;
+    const int32_t* p_work_info_set;
 };
 
 template <typename Traits>
