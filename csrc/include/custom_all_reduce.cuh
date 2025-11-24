@@ -975,9 +975,10 @@ namespace aiter
    * input case n dim should be divided by 4096 with dtype bf16
    * and should be divided by 2048 with dtype fp32
    * */
-  template <typename T, int tnum, int n_loop>
+  template <typename T, int ngpus, int tnum, int n_loop>
   __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm_naive(
       RankSignals sg,
+      Signal* self_sg,
       T* __restrict__ residual_inp,
       T* __restrict__ residual_out,
       T* __restrict__ results,
@@ -993,6 +994,7 @@ namespace aiter
     using A = typename packed_t<T>::A;
     __shared__ float smem[tnum];
     P* tmps = get_tmp_buf<P>(sg.signals[rank]);
+    start_sync<ngpus>(sg, self_sg, rank);
 
     for (int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
@@ -1045,9 +1047,10 @@ namespace aiter
    * block size can be 256 and 512
    * corresponding 2048 and 4096 elem per block
    * */
-  template <typename T, int tnum, int n_loop>
+  template <typename T, int ngpus, int tnum, int n_loop>
   __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(
       RankSignals sg,
+      Signal* self_sg,
       T* __restrict__ residual_inp,
       T* __restrict__ residual_out,
       T* __restrict__ results,
@@ -1063,6 +1066,7 @@ namespace aiter
     using A = typename packed_t<T>::A;
     __shared__ float smem[tnum];
     P* tmps = get_tmp_buf<P>(sg.signals[rank]);
+    start_sync<ngpus>(sg, self_sg, rank);
 
     for (int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
@@ -1117,9 +1121,10 @@ namespace aiter
     }
   }
 
-  template <typename T, int n_loop>
+  template <typename T, int ngpus, int n_loop>
   __global__ void __launch_bounds__(256, 1) local_device_load_rmsnorm_512n(
       RankSignals sg,
+      Signal* self_sg,
       T* __restrict__ residual_inp,
       T* __restrict__ residual_out,
       T* __restrict__ results,
@@ -1137,6 +1142,7 @@ namespace aiter
     int warp_id = threadIdx.x / 64;
     int lane_id = threadIdx.x % 64;
     int warp_num = blockDim.x / 64;
+    start_sync<ngpus>(sg, self_sg, rank);
 
     for (int bid = blockIdx.x * warp_num + warp_id; bid < m; bid += gridDim.x * warp_num)
     {
@@ -1693,13 +1699,30 @@ namespace aiter
       grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
     };
 
-#define launch_fused_allreduce_rmsnorm(template_kernel)                                                               \
-    do                                                                                                                \
-    {                                                                                                                 \
-      auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);                                               \
-      setGrid(naive_grid_size, kernel_ptr);                                                                           \
-      template_kernel<<<grid, block, 0, stream>>>(sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
+#define launch_fused_allreduce_rmsnorm(template_kernel, ...)                                                                                    \
+    do                                                                                                                                          \
+    {                                                                                                                                           \
+      auto kernel_ptr = reinterpret_cast<const void*>(template_kernel<T, __VA_ARGS__>);                                                         \
+      setGrid(naive_grid_size, kernel_ptr);                                                                                                     \
+      template_kernel<T, __VA_ARGS__><<<grid, block, 0, stream>>>(sg_, self_sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
     } while (0)
+
+#define dispatch_worldsize(kernel_name, ...)                           \
+    do                                                                 \
+    {                                                                  \
+      switch (world_size_)                                             \
+      {                                                                \
+        case 8:                                                        \
+          launch_fused_allreduce_rmsnorm(kernel_name, 8, __VA_ARGS__); \
+          break;                                                       \
+        case 4:                                                        \
+          launch_fused_allreduce_rmsnorm(kernel_name, 4, __VA_ARGS__); \
+          break;                                                       \
+        case 2:                                                        \
+          launch_fused_allreduce_rmsnorm(kernel_name, 2, __VA_ARGS__); \
+          break;                                                       \
+      }                                                                \
+    } while(0)
 
     if (n_bytes % 1024 == 0)
     {
@@ -1712,16 +1735,16 @@ namespace aiter
           switch (n_loop)
           {
             case 1:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 1>));
+              dispatch_worldsize(local_device_load_rmsnorm_naive, 512, 1);
               break;
             case 2:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 2>));
+              dispatch_worldsize(local_device_load_rmsnorm_naive, 512, 2);
               break;
             case 3:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 3>));
+              dispatch_worldsize(local_device_load_rmsnorm_naive, 512, 3);
               break;
             case 4:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 512, 4>));
+              dispatch_worldsize(local_device_load_rmsnorm_naive, 512, 4);
               break;
           }
         }
@@ -1731,13 +1754,13 @@ namespace aiter
           switch (n_loop)
           {
             case 2:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 2>));
+              dispatch_worldsize(local_device_load_rmsnorm, 512, 2);
               break;
             case 3:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 3>));
+              dispatch_worldsize(local_device_load_rmsnorm, 512, 3);
               break;
             case 4:
-              launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 4>));
+              dispatch_worldsize(local_device_load_rmsnorm, 512, 4);
               break;
           }
         }
@@ -1749,12 +1772,12 @@ namespace aiter
         if (n_bytes == 4096)
         {
           // naive n_loop = 1
-          launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_naive<T, 256, 1>));
+          dispatch_worldsize(local_device_load_rmsnorm_naive, 256, 1);
         }
         else
         {
           // n_loop = 2
-          launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 256, 2>));
+          dispatch_worldsize(local_device_load_rmsnorm, 256, 2);
         }
       }
       else if (1024 <= n_bytes && n_bytes < 4096)
@@ -1765,13 +1788,13 @@ namespace aiter
         switch (n_loop)
         {
           case 1:
-            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 1>));
+            dispatch_worldsize(local_device_load_rmsnorm_512n, 1);
             break;
           case 2:
-            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 2>));
+            dispatch_worldsize(local_device_load_rmsnorm_512n, 2);
             break;
           case 3:
-            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm_512n<T, 3>));
+            dispatch_worldsize(local_device_load_rmsnorm_512n, 3);
             break;
         }
       }
