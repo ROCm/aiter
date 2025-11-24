@@ -1435,7 +1435,7 @@ def paged_attention_decode_v2_reduce_gluon(
     context_partition_num = gl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
 
     # Select optimal memory layout based on maximum partition count
-    if MAX_CONTEXT_PARTITION_NUM_POW2 >= 256:
+    if MAX_CONTEXT_PARTITION_NUM_POW2 >= 128:
         blocked_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 2, 4],
             threads_per_warp=[4, 4, 4],
@@ -1499,7 +1499,7 @@ def paged_attention_decode_v2_reduce_gluon(
     )
 
     # Rescale exponential sums for numerical stability using global maximum
-    exp_sums *= gl.math.exp(max_logits - global_max_logits[None, :])
+    exp_sums *= gl.exp(max_logits - global_max_logits[None, :])
 
     # Compute global exponential sum across all partitions [QUERY_GROUP_SIZE_POW2]
     global_exp_sum = gl.sum(exp_sums, axis=0)
@@ -1511,7 +1511,7 @@ def paged_attention_decode_v2_reduce_gluon(
             mask=(kv_head_idx * query_group_size + query_group_offsets)
             < num_query_heads_total,
         )
-        global_exp_sum += gl.math.exp(sink_token_values - global_max_logits)
+        global_exp_sum += gl.exp(sink_token_values - global_max_logits)
 
     # ==================== ATTENTION PROBABILITY COMPUTATION ====================
     # Compute normalized attention probabilities [MAX_CONTEXT_PARTITION_NUM_POW2, QUERY_GROUP_SIZE_POW2]
@@ -2549,7 +2549,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
         All parameters from the reduction kernel plus execution grid configuration
     """
     # Configuration flag for kernel selection
-    USE_GLUON_KERNEL = False
+    USE_GLUON_KERNEL = True
     if QUERY_GROUP_SIZE < 16:
         QUERY_GROUP_SIZE_POW2 = 16
     else:
