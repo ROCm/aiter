@@ -114,20 +114,22 @@ def test_fmoe(
         w1_qt, w1_scale = weight_per_128x128_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = weight_per_128x128_quant(w2, quant_dtype=WQDType)
     else:
-        print(w1.shape)
-        print(w2.shape)
-        print(f'tag0 {WQDType}\n')
         if False:
             w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
             w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
         else:
             w1_qt, w1_scale = torch_quant(w1, quant_dtype=dtypes.i8, dtypeMax=7)
             w2_qt, w2_scale = torch_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
-        print('tag2\n')
+            w1_qt = w1_qt.view(*w1.shape[:-1], -1)
+            w2_qt = w2_qt.view(*w2.shape[:-1], -1)
+            w1_scale = w1_scale.view(w1.shape[0] * w1.shape[1], -1)
+            w2_scale = w2_scale.view(w1.shape[0] * w1.shape[1], -1)
         aiter.logger.info(f'w1_shape {w1.shape}')
         aiter.logger.info(f'w2_shape {w2.shape}')
-        aiter.logger.info(f'w1_qt_shape {w1_qt.shape}')
-        aiter.logger.info(f'w2_qt_shape {w2_qt.shape}')
+        aiter.logger.info(f'w1_qt_shape {w1_qt.shape} {w1_qt.dtype}')
+        aiter.logger.info(f'w2_qt_shape {w2_qt.shape} {w2_qt.dtype}')
+        aiter.logger.info(f'w1_scale_shape {w1_scale.shape} {w1_scale.dtype}')
+        aiter.logger.info(f'w2_scale_shape {w2_scale.shape} {w2_scale.dtype}')
 
     if qType != aiter.QuantType.per_1x32:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
@@ -213,15 +215,18 @@ def test_fmoe(
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
+
+    aiter.logger.info(f'w1_shape {w1.shape}')
+    aiter.logger.info(f'w2_shape {w2.shape}')
+    aiter.logger.info(f'w1_qt_shape {w1_qt.shape} {w1_qt.dtype}')
+    aiter.logger.info(f'w2_qt_shape {w2_qt.shape} {w2_qt.dtype}')
+    aiter.logger.info(f'w1_scale_shape {w1_scale.shape} {w1_scale.dtype}')
+    aiter.logger.info(f'w2_scale_shape {w2_scale.shape} {w2_scale.dtype}')
+    aiter.logger.info(f'w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
+    aiter.logger.info(f'w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
+    aiter.logger.info(f'w1_scale_aiter_shape {w1_scale_aiter.shape} {w1_scale_aiter.dtype}')
+    aiter.logger.info(f'w2_scale_aiter_shape {w2_scale_aiter.shape} {w2_scale_aiter.dtype}')
     # # ######################## stage 1 start ###########
-    # print(w1_qt)
-    # print(w1_qt_aiter)
-    # print(w2_qt)
-    # print(w2_qt_aiter)
-    aiter.logger.info('stage 1 start')
-    print(a1_qt.dtype, w1_qt.shape)
-    print(w1_qt.dtype, w1_qt.shape)
-    print(w1_qt_aiter.dtype, w1_qt_aiter.shape)
     out1_ref = torch_moe_stage1(
         a1_qt,
         w1_qt,

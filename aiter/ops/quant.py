@@ -10,6 +10,7 @@ import functools
 from .enum import QuantType, ActivationType
 from . import triton
 from ..utility import dtypes, fp4_utils
+import aiter
 
 
 @compile_ops("module_smoothquant")
@@ -63,7 +64,7 @@ def pertoken_quant(
         per_token_scale[per_token_scale == 0] = 1
 
     # quant hidden_states
-    print(quant_dtype)
+    aiter.logger.info(quant_dtype)
     y = (hidden_states / per_token_scale).to(dtype=quant_dtype)
     y_scale = per_token_scale.to(scale_dtype)
     return y, y_scale
