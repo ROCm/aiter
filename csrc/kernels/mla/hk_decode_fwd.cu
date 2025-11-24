@@ -5,8 +5,8 @@
 #include "hk/mi35x_decode_fwd_n128.cuh"
 
 void hk_mla_decode_fwd(
-    const torch::Tensor& query,
-    const torch::Tensor& kv_buffer,
+    torch::Tensor& query,
+    torch::Tensor& kv_buffer,
     const torch::Tensor& qo_indptr,
     const torch::Tensor& kv_indptr,
     const torch::Tensor& kv_page_indices,
@@ -15,7 +15,7 @@ void hk_mla_decode_fwd(
     const torch::Tensor& work_info_set,
     const int max_seqlen_q,
     const float softmax_scale,
-    torch::Tensor& split_data,
+    torch::Tensor& split_output,
     torch::Tensor& split_lse,
     torch::Tensor& final_output)
 {
@@ -34,7 +34,7 @@ void hk_mla_decode_fwd(
             work_info_set,
             max_seqlen_q,
             softmax_scale,
-            split_data,
+            split_output,
             split_lse,
             final_output);
     }

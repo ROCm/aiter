@@ -994,7 +994,7 @@ def hk_mla_decode_fwd(
     max_seqlen_q: int,
     softmax_scale: float,
     # [batch_size, num_kv_splits, num_heads, v_head_dim]
-    split_data: torch.Tensor,
+    split_output: torch.Tensor,
     # [batch_size, num_kv_splits, num_heads,  1]
     split_lse: torch.Tensor,
     final_output: torch.Tensor,

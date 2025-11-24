@@ -1826,6 +1826,6 @@ namespace py = pybind11;
           py::arg("work_info_set"),     \
           py::arg("max_seqlen_q"),      \
           py::arg("softmax_scale"),     \
-          py::arg("split_data"),        \
+          py::arg("split_output"),      \
           py::arg("split_lse"),         \
           py::arg("final_output"));

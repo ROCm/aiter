@@ -324,22 +324,23 @@ def mla_decode_fwd(
             else None
         )
 
-        aiter.hk_mla_decode_fwd(
-            q,
-            kv_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            work_indptr,
-            work_info_set,
-            max_seqlen_q,
-            sm_scale,
-            logits,
-            attn_lse,
-            o,
-        )
-        exit()
+        if nhead == 128:
+            aiter.hk_mla_decode_fwd(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                sm_scale,
+                logits,
+                attn_lse,
+                o,
+            )
+            exit()
 
         aiter.mla_decode_stage1_asm_fwd(
             q,
