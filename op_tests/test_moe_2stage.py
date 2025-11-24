@@ -131,6 +131,7 @@ def test_fmoe(
         aiter.logger.info(f'w1_scale_shape {w1_scale.shape} {w1_scale.dtype}')
         aiter.logger.info(f'w2_scale_shape {w2_scale.shape} {w2_scale.dtype}')
 
+
     if qType != aiter.QuantType.per_1x32:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
@@ -489,11 +490,13 @@ for (
     preshuffle,
 ) in itertools.product(l_dtype, l_quant, l_dim, l_doweight_stage1, l_preshuffle):
     print(f"wq_dtype {wq_dtype}")
-    if (quant_type, aq_dtype, wq_dtype) == (
-        aiter.QuantType.per_1x32,
-        dtypes.bf16,
-        dtypes.fp4x2,
-    ):
+    # if (quant_type, aq_dtype, wq_dtype) == (
+    #     aiter.QuantType.per_1x32,
+    #     dtypes.bf16,
+    #     dtypes.fp4x2,
+    # ):
+    if True:
+        aiter.logger.info('call a16w4 with swiglu')
         for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
             for m in l_tokenNum:
                 ret = test_fmoe(
