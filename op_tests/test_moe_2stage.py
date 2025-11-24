@@ -434,8 +434,7 @@ for (
     (quant_type, aq_dtype, wq_dtype),
     (model_dim, inter_dim),
     doweight_stage1,
-    preshuffle,
-) in itertools.product(l_dtype, l_quant, l_dim, l_doweight_stage1, l_preshuffle):
+) in itertools.product(l_dtype, l_quant, l_dim, l_doweight_stage1):
     if (quant_type, aq_dtype, wq_dtype) == (
         aiter.QuantType.per_1x32,
         dtypes.bf16,
