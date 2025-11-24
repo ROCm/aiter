@@ -4,7 +4,7 @@
 import os
 import argparse
 import random
-from typing import List, Optional, Tuple, Union, Dict
+from typing import Optional, Tuple, Union, Dict
 import shutil
 import subprocess
 from multiprocessing import Pool, cpu_count
@@ -462,7 +462,7 @@ def run_pa_gluon_test(
         use_aot_impl=use_aot_impl,
     )
 
-    results[f"us_gluon"] = 0
+    results["us_gluon"] = 0
 
     return results
 
@@ -947,7 +947,7 @@ def prebuild_pa_decode_gluon_aot_so():
     )
     if result.returncode != 0 and result.stderr:
         print(f"Warning: {result.stderr}")
-    print(f"Cleaning current directory cache completed!")
+    print("Cleaning current directory cache completed!")
     # Clean aiter build directory cache, only *.so files are left
     print(f"Cleaning aiter build directory cache: {BUILD_DIR}")
     clean_directory_except_so(BUILD_DIR)

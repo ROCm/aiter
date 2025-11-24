@@ -3,9 +3,6 @@
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
 import os
-import sys
-import math
-from typing import Optional, Dict, Tuple
 import torch
 import aiter
 
@@ -42,6 +39,7 @@ def parse_version(version_str):
 
 
 TRITON_VERSION = parse_version(triton.__version__)
+AITER_USE_HSACO = os.environ.get("AITER_USE_HSACO", "0")
 
 
 @gluon.jit
@@ -705,32 +703,32 @@ def paged_attention_decode_v2_gluon_fp8(
     value_cache_ptr,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
     context_lengths_ptr,  # [num_seqs]
-    softmax_scale,
+    softmax_scale: float,
     query_scale,  # [num_seqs, num_kv_heads * query_length * query_group_size, 1]
     key_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    stride_max_logits_seq,
-    stride_max_logits_head,
-    stride_max_logits_part,
-    stride_output_seq,
-    stride_output_head,
-    stride_output_part,
-    stride_output_group,
-    stride_query_seq,
-    stride_query_head,
-    stride_key_block,
-    stride_key_head,
-    stride_key_head_split,
-    stride_key_block_elem,
-    stride_value_block,
-    stride_value_head,
-    stride_value_head_size,
-    stride_block_table_seq,
-    query_scale_stride_0,
-    kv_scale_stride_0,
-    kv_scale_stride_1,
+    stride_max_logits_seq: int,
+    stride_max_logits_head: int,
+    stride_max_logits_part: int,
+    stride_output_seq: int,
+    stride_output_head: int,
+    stride_output_part: int,
+    stride_output_group: int,
+    stride_query_seq: int,
+    stride_query_head: int,
+    stride_key_block: int,
+    stride_key_head: int,
+    stride_key_head_split: int,
+    stride_key_block_elem: int,
+    stride_value_block: int,
+    stride_value_head: int,
+    stride_value_head_size: int,
+    stride_block_table_seq: int,
+    query_scale_stride_0: int,
+    kv_scale_stride_0: int,
+    kv_scale_stride_1: int,
     query_seq_len: int,
-    query_group_size_original,
+    query_group_size_original: int,
     head_size: int,
     num_seqs: int,
     num_kv_heads: int,
@@ -1437,7 +1435,7 @@ def paged_attention_decode_v2_reduce_gluon(
     context_partition_num = gl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
 
     # Select optimal memory layout based on maximum partition count
-    if MAX_CONTEXT_PARTITION_NUM_POW2 >= 256:
+    if MAX_CONTEXT_PARTITION_NUM_POW2 >= 128:
         blocked_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 2, 4],
             threads_per_warp=[4, 4, 4],
@@ -1446,9 +1444,9 @@ def paged_attention_decode_v2_reduce_gluon(
         )
     else:
         blocked_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[4, 1, 2],
+            size_per_thread=[1, 1, 8],
             threads_per_warp=[4, 4, 4],
-            warps_per_cta=[1, 1, 4],
+            warps_per_cta=[1, 4, 1],
             order=[2, 1, 0],
         )
 
@@ -1501,7 +1499,7 @@ def paged_attention_decode_v2_reduce_gluon(
     )
 
     # Rescale exponential sums for numerical stability using global maximum
-    exp_sums *= gl.math.exp(max_logits - global_max_logits[None, :])
+    exp_sums *= gl.exp(max_logits - global_max_logits[None, :])
 
     # Compute global exponential sum across all partitions [QUERY_GROUP_SIZE_POW2]
     global_exp_sum = gl.sum(exp_sums, axis=0)
@@ -1513,7 +1511,7 @@ def paged_attention_decode_v2_reduce_gluon(
             mask=(kv_head_idx * query_group_size + query_group_offsets)
             < num_query_heads_total,
         )
-        global_exp_sum += gl.math.exp(sink_token_values - global_max_logits)
+        global_exp_sum += gl.exp(sink_token_values - global_max_logits)
 
     # ==================== ATTENTION PROBABILITY COMPUTATION ====================
     # Compute normalized attention probabilities [MAX_CONTEXT_PARTITION_NUM_POW2, QUERY_GROUP_SIZE_POW2]
@@ -2041,6 +2039,148 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         else:
             waves_per_eu = 4
 
+        if query_scale is None:
+            query_scale = torch.empty(0, dtype=torch.float32, device="cuda")
+        if key_scale is None:
+            key_scale = torch.empty(0, dtype=torch.float32, device="cuda")
+        if value_scale is None:
+            value_scale = torch.empty(0, dtype=torch.float32, device="cuda")
+
+        if AITER_USE_HSACO == "1":
+            from csrc.cpp_itfs.utils import (
+                compile_hsaco_from_triton,
+                run_hsaco,
+                check_hsaco,
+            )
+
+            if not check_hsaco(
+                paged_attention_decode_v2_gluon_fp8.fn.__name__,
+                {
+                    "COMPUTE_TYPE": COMPUTE_TYPE,
+                    "QUERY_GROUP_SIZE_POW2": QUERY_GROUP_SIZE_POW2,
+                    "HEAD_SIZE_POW2": triton.next_power_of_2(HEAD_SIZE),
+                    "KV_BLOCK_SIZE": KV_BLOCK_SIZE,
+                    "CONTEXT_PARTITION_SIZE": CONTEXT_PARTITION_SIZE,
+                    "KV_COMPUTE_BLOCK_SIZE": KV_COMPUTE_BLOCK_SIZE,
+                    "QUERY_QUANT_MODE": QUERY_QUANT_MODE,
+                    "KV_QUANT_MODE": KV_QUANT_MODE,
+                    "FP8_MAX_VALUE": FP8_MAX_VALUE,
+                    "VALUE_TRANSPOSED": VALUE_TRANSPOSED,
+                    "IS_CAUSAL": IS_CAUSAL,
+                },
+            ):
+                compile_hsaco_from_triton(
+                    paged_attention_decode_v2_gluon_fp8,
+                    exp_sums_ptr,
+                    max_logits_ptr,
+                    output_ptr,
+                    query_ptr,
+                    key_cache_ptr,
+                    value_cache_ptr,
+                    block_tables_ptr,
+                    context_lengths_ptr,
+                    softmax_scale,
+                    query_scale,
+                    key_scale,
+                    value_scale,
+                    stride_max_logits_seq,
+                    stride_max_logits_head,
+                    stride_max_logits_part,
+                    stride_output_seq,
+                    stride_output_head,
+                    stride_output_part,
+                    stride_output_group,
+                    stride_query_seq,
+                    stride_query_head,
+                    stride_key_block,
+                    stride_key_head,
+                    stride_key_head_split,
+                    stride_key_block_elem,
+                    stride_value_block,
+                    stride_value_head_size,
+                    stride_value_block_elem,
+                    stride_block_table_seq,
+                    query_scale_stride_0,
+                    kv_scale_stride_0,
+                    kv_scale_stride_1,
+                    QUERY_SEQ_LEN,
+                    QUERY_GROUP_SIZE_ORIGINAL,
+                    HEAD_SIZE,
+                    grid[0],
+                    grid[1],
+                    grid[2],
+                    COMPUTE_TYPE,
+                    QUERY_GROUP_SIZE_POW2,
+                    triton.next_power_of_2(HEAD_SIZE),
+                    KV_BLOCK_SIZE,
+                    CONTEXT_PARTITION_SIZE,
+                    KV_COMPUTE_BLOCK_SIZE,
+                    QUERY_QUANT_MODE,
+                    KV_QUANT_MODE,
+                    FP8_MAX_VALUE,
+                    VALUE_TRANSPOSED,
+                    IS_CAUSAL,
+                    grid=grid,
+                    waves_per_eu=waves_per_eu,
+                    num_stages=1,
+                )
+            run_hsaco(
+                paged_attention_decode_v2_gluon_fp8.fn.__name__,
+                exp_sums_ptr,
+                max_logits_ptr,
+                output_ptr,
+                query_ptr,
+                key_cache_ptr,
+                value_cache_ptr,
+                block_tables_ptr,
+                context_lengths_ptr,
+                softmax_scale,
+                query_scale,
+                key_scale,
+                value_scale,
+                stride_max_logits_seq,
+                stride_max_logits_head,
+                stride_max_logits_part,
+                stride_output_seq,
+                stride_output_head,
+                stride_output_part,
+                stride_output_group,
+                stride_query_seq,
+                stride_query_head,
+                stride_key_block,
+                stride_key_head,
+                stride_key_head_split,
+                stride_key_block_elem,
+                stride_value_block,
+                stride_value_head_size,
+                stride_value_block_elem,
+                stride_block_table_seq,
+                query_scale_stride_0,
+                kv_scale_stride_0,
+                kv_scale_stride_1,
+                QUERY_SEQ_LEN,
+                QUERY_GROUP_SIZE_ORIGINAL,
+                HEAD_SIZE,
+                grid[0],
+                grid[1],
+                grid[2],
+                grid=grid,
+                constexprs={
+                    "COMPUTE_TYPE": COMPUTE_TYPE,
+                    "QUERY_GROUP_SIZE_POW2": QUERY_GROUP_SIZE_POW2,
+                    "HEAD_SIZE_POW2": triton.next_power_of_2(HEAD_SIZE),
+                    "KV_BLOCK_SIZE": KV_BLOCK_SIZE,
+                    "CONTEXT_PARTITION_SIZE": CONTEXT_PARTITION_SIZE,
+                    "KV_COMPUTE_BLOCK_SIZE": KV_COMPUTE_BLOCK_SIZE,
+                    "QUERY_QUANT_MODE": QUERY_QUANT_MODE,
+                    "KV_QUANT_MODE": KV_QUANT_MODE,
+                    "FP8_MAX_VALUE": FP8_MAX_VALUE,
+                    "VALUE_TRANSPOSED": VALUE_TRANSPOSED,
+                    "IS_CAUSAL": IS_CAUSAL,
+                },
+            )
+            return
+
     # Launch the selected kernel
     paged_attention_kernel[grid](
         exp_sums_ptr,
@@ -2141,7 +2281,9 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             max_logits_ptr,
             logits_ptr,
             context_lengths_ptr,
-            None,  # sink_token_ptr not used in this configuration
+            torch.empty(
+                0, dtype=torch.float32, device="cuda"
+            ),  # sink_token_ptr not used in this configuration
             stride_output_seq,
             stride_output_head,
             stride_exp_sums_seq,
@@ -2167,6 +2309,80 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
         kernel = paged_attention_decode_v2_reduce_kernel_triton34
         if TRITON_VERSION > (3, 4, 0):
             kernel = paged_attention_decode_v2_reduce_kernel
+        if os.environ.get("AITER_USE_HSACO") == "1":
+            from csrc.cpp_itfs.utils import (
+                compile_hsaco_from_triton,
+                run_hsaco,
+                check_hsaco,
+            )
+
+            if not check_hsaco(
+                kernel.fn.__name__,
+                {
+                    "QUERY_GROUP_SIZE_POW2": QUERY_GROUP_SIZE_POW2,
+                    "HEAD_SIZE_POW2": triton.next_power_of_2(HEAD_SIZE),
+                    "MAX_CONTEXT_PARTITION_NUM_POW2": triton.next_power_of_2(
+                        MAX_CONTEXT_PARTITION_NUM
+                    ),
+                    "CONTEXT_PARTITION_SIZE": CONTEXT_PARTITION_SIZE,
+                },
+            ):
+                compile_hsaco_from_triton(
+                    kernel,
+                    output_ptr,
+                    exp_sums_ptr,
+                    max_logits_ptr,
+                    logits_ptr,
+                    context_lengths_ptr,
+                    stride_output_seq,
+                    stride_output_head,
+                    stride_exp_sums_seq,
+                    stride_exp_sums_head,
+                    stride_exp_sums_part,
+                    stride_logits_seq,
+                    stride_logits_head,
+                    stride_logits_part,
+                    stride_logits_group,
+                    QUERY_GROUP_SIZE,
+                    HEAD_SIZE,
+                    grid[0],
+                    grid[1],
+                    QUERY_GROUP_SIZE_POW2,
+                    triton.next_power_of_2(HEAD_SIZE),
+                    triton.next_power_of_2(MAX_CONTEXT_PARTITION_NUM),
+                    CONTEXT_PARTITION_SIZE,
+                )
+            run_hsaco(
+                kernel.fn.__name__,
+                output_ptr,
+                exp_sums_ptr,
+                max_logits_ptr,
+                logits_ptr,
+                context_lengths_ptr,
+                stride_output_seq,
+                stride_output_head,
+                stride_exp_sums_seq,
+                stride_exp_sums_head,
+                stride_exp_sums_part,
+                stride_logits_seq,
+                stride_logits_head,
+                stride_logits_part,
+                stride_logits_group,
+                QUERY_GROUP_SIZE,
+                HEAD_SIZE,
+                grid[0],
+                grid[1],
+                grid=grid,
+                constexprs={
+                    "QUERY_GROUP_SIZE_POW2": QUERY_GROUP_SIZE_POW2,
+                    "HEAD_SIZE_POW2": triton.next_power_of_2(HEAD_SIZE),
+                    "MAX_CONTEXT_PARTITION_NUM_POW2": triton.next_power_of_2(
+                        MAX_CONTEXT_PARTITION_NUM
+                    ),
+                    "CONTEXT_PARTITION_SIZE": CONTEXT_PARTITION_SIZE,
+                },
+            )
+            return
         # Launch standard Triton reduction kernel
         kernel[grid](
             output_ptr,

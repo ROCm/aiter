@@ -397,7 +397,6 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.reduce_scatter(input_, dim)
 
-
     def all_gather(
         self, input_: torch.Tensor, use_custom: bool = False, dim: int = -1
     ) -> torch.Tensor:
@@ -885,7 +884,6 @@ _PP: Optional[GroupCoordinator] = None
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
-
 
 
 _DP: Optional[GroupCoordinator] = None
