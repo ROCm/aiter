@@ -115,9 +115,6 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
 
 
 class AITER_CONFIG(object):
-    def __init__(self):
-        pass
-
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
         return self.get_config_file(
@@ -233,8 +230,18 @@ class AITER_CONFIG(object):
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
             )
-        new_file_path = f"/tmp/{merge_name}.csv"
-        merge_df.to_csv(new_file_path, index=False)
+        from pathlib import Path
+
+        config_path = Path("/tmp/aiter_configs/")
+        if not config_path.exists():
+            config_path.mkdir(parents=True, exist_ok=True)
+        new_file_path = f"{config_path}/{merge_name}.csv"
+        lock_path = f"{new_file_path}.lock"
+
+        def write_config():
+            merge_df.to_csv(new_file_path, index=False)
+
+        mp_lock(lock_path, write_config)
         return new_file_path
 
     @functools.lru_cache(maxsize=20)
