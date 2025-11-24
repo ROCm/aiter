@@ -55,7 +55,8 @@ def test_fmoe(
         # return
         pass
     torch_quant = aiter.get_torch_quant(qType)
-    input = torch.randn((token, model_dim), dtype=dtype)
+    # input = torch.randn((token, model_dim), dtype=dtype)
+    input = torch.ones((token, model_dim), dtype=dtype)
     aiter.logger.info(f'input_dim {token} {model_dim}')
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
