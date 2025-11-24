@@ -193,7 +193,7 @@ def test_fmoe(
         aiter.logger.info(f'after shuffle w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
         aiter.logger.info(f'w1_scale_aiter_shape {w1_scale_aiter.shape} {w1_scale_aiter.dtype}')
         aiter.logger.info(f'w2_scale_aiter_shape {w2_scale_aiter.shape} {w2_scale_aiter.dtype}')
-        assert False, "temp stop here"
+        # assert False, "temp stop here"
     elif WQDType == torch.int4:  # int4 w quant
         aiter.logger.info(f'shuffle as int4')
         w1_qt_aiter = rearrange_4bit_elements(
