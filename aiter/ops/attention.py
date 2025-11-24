@@ -471,7 +471,7 @@ def mla_prefill_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_pa_metadata")
+@compile_ops("module_mla_metadata")
 def get_pa_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     seqlens_kv_indptr: torch.Tensor,
