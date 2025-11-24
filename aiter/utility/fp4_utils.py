@@ -282,7 +282,7 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     p = p ^ (p >> 4)
     p = p & 1  
     h_mat = (1.0 - 2.0 * p.to(tl.float32))
-    h_mat = h_mat * 0.176776695 # this is sqrt(32)
+    h_mat = h_mat * 0.176776695 # this is 1/sqrt(32)
     x = tl.dot(x, h_mat)
     # -------------------------------------------------------------
    
