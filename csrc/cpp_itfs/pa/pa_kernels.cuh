@@ -1118,7 +1118,7 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
 // -----------------------------------------------------------------------
 // -----------------------------------------------------------------------
 // ----------------------- Experimental ----------------------------------
-// Configs: head_dim=128, cache_t=bf16
+// Works for: head_dim=128, cache_t=bf16
 // Feature:
 // 1. continuous threads work together to load K cache into LDS, then each thread save the LDS into registers.
 // 2. Double buffer of K cache loading
@@ -1210,20 +1210,17 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
 
     // sub partition of tokens per warp for qk calculation
     constexpr int TOKENS_PER_WARP = T_PAR_SIZE / NWARPS; 
-    // constexpr int TLOOP = TOKENS_PER_WARP / 16; // each mfma16x16x16 instruction processes 16 tokens
-
     const int wg_start_head_idx    = kv_head_idx * GQA_RATIO_PER_LOOP; // Jacob: kv_head_idx=0, GQA_RATIO_PER_LOOP=6
     const int wg_start_kv_head_idx = kv_head_idx;
     const int total_num_heads      = gridDim.z * GQA_RATIO;
 
-    // Jacob: some variables which are dedicated for for Grok1: HEAD_SIZE=128, cache_t=bf16, blockSize 16/64/256
+    // HEAD_SIZE=128, cache_t=bf16, blockSize 16/64/256
     constexpr int BYTES_PER_WARP_FETCH = WARP_SIZE * 16; // 1024 bytes
     constexpr int TOKEN_PER_WARP_FETCH = BYTES_PER_WARP_FETCH / (HEAD_SIZE * sizeof(cache_t)); // 4 token
-    // constexpr int TLOOP = TOKENS_PER_WARP / TOKEN_PER_WARP_FETCH; // 16
-    // 1st Wavefront loads token   1~4 tokens, 17~20 tokens ...
-    // 2nd Wavefront loads token   5~8 tokens, 21~24 tokens ...
-    // 3rd Wavefront loads token  9~12 tokens, 25~28 tokens ...
-    // 4th Wavefront loads token 13~16 tokens, 29~32 tokens ... 61~64 tokens
+    // 1st Wavefront loads token   1~4 tokens, 65~68 tokens ...
+    // 2nd Wavefront loads token   5~8 tokens, 69~72 tokens ...
+    // 3rd Wavefront loads token  9~12 tokens, 73~76 tokens ...
+    // 4th Wavefront loads token 13~16 tokens, 77~80 tokens ... 253~256 tokens
     // The number of iterations to load 64 tokens
     constexpr int ITERS_16TK = 64 / (TOKEN_PER_WARP_FETCH * NWARPS); // 4
     // The number of iterations of ITERS_16TK to load 256 tokens
