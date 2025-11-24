@@ -794,6 +794,9 @@ def fused_moe_2stages(
         bias1,
         bias2,
     )
+    aiter.logger.info(w1)
+    aiter.logger.info(a1)
+    aiter.logger.info(a1_scale)
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -844,6 +847,10 @@ def fused_moe_2stages(
             device=device,
         )
     aiter.logger.info(f'stages run a1.dtype = {a1.dtype}, w1.dtype = {w1.dtype}, w2.dtype = {w2.dtype} w1_scale.dtype = {w1_scale.dtype}, w2_scale.dtype = {w2_scale.dtype}')
+    aiter.logger.info(w1)
+    aiter.logger.info(a1)
+    aiter.logger.info(a1_scale)
+    assert False
 
     a2 = metadata.stage1(
         a1,
