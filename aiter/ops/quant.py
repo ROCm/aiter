@@ -146,9 +146,9 @@ def per_block_quant_wrapper_int4(block_shape=(1, 128)):
                 x.shape[-1] % blk_n == 0
             ), f"block size {blk_n} not match {x.shape[-1]}"
             assert blk_m == 1, "only support 1xN block, TODO: support MxN"
-            print(x.shape)
-            print('call here!!')
-            print(quant_dtype)
+            # print(x.shape)
+            # print('call here!!')
+            # print(quant_dtype)
             # m, n = x.shape
             x = x.view(-1, blk_n)
             y, scale = per_token_quant_func(x, scale=scale, quant_dtype=quant_dtype, dtypeMax=dtypeMax)

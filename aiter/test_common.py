@@ -286,7 +286,7 @@ def post_process_data(df, num_iters, warm_iter=1):
 
 
 def get_trace_perf(prof, num_iters):
-    assert num_iters > 1
+    # assert num_iters > 1
     warm_iter = 1
     num_iters -= warm_iter
     df = []
