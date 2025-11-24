@@ -843,12 +843,7 @@ def fused_moe_2stages(
             dtype=dtype,
             device=device,
         )
-    aiter.logger.info(f'a1.dtype = {a1.dtype}, w1.dtype = {w1.dtype}, w2.dtype = {w2.dtype}')
-    aiter.logger.info('print a1')
-    aiter.logger.info(a1)
-    aiter.logger.info(f'a1_max : {torch.max(torch.abs(a1))}')
-    aiter.logger.info('print w1 scale')
-    aiter.logger.info(w1_scale)
+    aiter.logger.info(f'stages run a1.dtype = {a1.dtype}, w1.dtype = {w1.dtype}, w2.dtype = {w2.dtype} w1_scale.dtype = {w1_scale.dtype}, w2_scale.dtype = {w2_scale.dtype}')
 
     a2 = metadata.stage1(
         a1,
@@ -864,10 +859,6 @@ def fused_moe_2stages(
         w1_scale=w1_scale,
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
-
-    aiter.logger.info(f'a2 {a2.dtype}; quant_func {quant_func}')
-    aiter.logger.info('print a2')
-    aiter.logger.info(a2)
 
     if (
         quant_type == QuantType.per_1x32
