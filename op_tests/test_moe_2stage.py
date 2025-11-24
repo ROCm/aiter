@@ -155,7 +155,7 @@ def test_fmoe(
         and WQDType in [ dtypes.fp4x2, dtypes.i4x2 ] 
     ):  # a16w4
         a1_qt = input.to(AQDType)
-        aiter.logger.info(f'dump input {input.shape} a1_qt {a1_qt.shape}')
+        aiter.logger.info(f'dump input {input.shape} a1_qt {a1_qt.shape} {AQDType}')
         a1_scale = None
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
@@ -175,13 +175,25 @@ def test_fmoe(
     # pre-shuffle
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
+    aiter.logger.info(f'before shuffle w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
+    aiter.logger.info(f'before shuffle w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
     if True:
-        w1_qt_aiter = rearrange_4bit_elements(w1_qt_aiter)
-        w2_qt_aiter = rearrange_4bit_elements(w2_qt_aiter)
+        # w1_qt_aiter = rearrange_4bit_elements(w1_qt_aiter)
+        # w2_qt_aiter = rearrange_4bit_elements(w2_qt_aiter)
+        # assuming tensor with shape (s0, s1, s2) with uint8, pack 2uint8 into one uint8, and ignore high 4bits
+        w1_qt_aiter = convert_int8_to_uint32_int4_hack(w1_qt_aiter)
+        w2_qt_aiter = convert_int8_to_uint32_int4_hack(w2_qt_aiter)
+        aiter.logger.info(f'after pack w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
+        aiter.logger.info(f'after pack w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+        aiter.logger.info(f'after shuffle w1_qt_aiter_shape {w1_qt_aiter.shape} {w1_qt_aiter.dtype}')
+        aiter.logger.info(f'after shuffle w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
+        aiter.logger.info(f'w1_scale_aiter_shape {w1_scale_aiter.shape} {w1_scale_aiter.dtype}')
+        aiter.logger.info(f'w2_scale_aiter_shape {w2_scale_aiter.shape} {w2_scale_aiter.dtype}')
+        assert False, "temp stop here"
     elif WQDType == torch.int4:  # int4 w quant
         aiter.logger.info(f'shuffle as int4')
         w1_qt_aiter = rearrange_4bit_elements(
