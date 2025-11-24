@@ -58,6 +58,7 @@ def _flash_attn_forward(
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
+    sink: Optional[torch.Tensor] = None,
     config: Optional[dict[str, any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int, int]:
 
@@ -116,6 +117,10 @@ def _flash_attn_forward(
     assert (not IS_FP8) or (
         IS_FP8 and pe_head_dim == 0
     ), "Positional encoding doesn't support FP8."
+
+    assert (sink is None) or (
+        sink is not None and sink.dim() == 1 and sink.shape[0] == num_q_heads
+    ), "Sink must be 1D and have one element per query head."
 
     # softmax_lse [batch, num_q_heads, seqlen_q]
     if is_varlen:
@@ -201,6 +206,7 @@ def _flash_attn_forward(
         s_dmask,
         dropout_mask,
         softmax_lse,
+        sink,
         *q_strides,
         *k_strides,
         *v_strides,
@@ -239,6 +245,7 @@ def _flash_attn_forward(
         BATCH=batch,
         NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
+        ENABLE_SINK=sink is not None,
         **config,
     )
 
@@ -261,6 +268,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         deterministic,
         return_lse,
         return_softmax,
+        sink,
         is_grad_enabled,
         config=None,
     ):
@@ -288,6 +296,7 @@ class _FlashAttnFunc(torch.autograd.Function):
                 return_softmax=return_softmax and dropout_p > 0,
                 max_seqlen_q=q.shape[1],
                 max_seqlen_k=k.shape[1],
+                sink=sink,
                 config=config,
             )
         )
@@ -407,6 +416,7 @@ def flash_attn_func(
     deterministic=True,
     return_lse=False,
     return_attn_probs=False,
+    sink=None,
     config: Optional[dict[str, any]] = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -449,6 +459,7 @@ def flash_attn_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        sink: (nheads,), attention sink scores (one per Q head), or None
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -474,6 +485,7 @@ def flash_attn_func(
         deterministic,
         return_lse,
         return_attn_probs,
+        sink,
         torch.is_grad_enabled(),
         config,
     )
@@ -501,6 +513,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         block_table,
         out,
+        sink,
         is_grad_enabled,
         config=None,
     ):
@@ -530,6 +543,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 max_seqlen_k=max_seqlen_k,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
+                sink=sink,
                 config=config,
             )
         )
@@ -664,6 +678,7 @@ def flash_attn_varlen_func(
     return_attn_probs=False,
     block_table=None,
     out=None,
+    sink=None,
     config: Optional[dict[str, any]] = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -712,6 +727,7 @@ def flash_attn_varlen_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        sink: (nheads,), attention sink scores (one per Q head), or None
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -744,6 +760,7 @@ def flash_attn_varlen_func(
         return_attn_probs,
         block_table,
         out,
+        sink,
         torch.is_grad_enabled(),
         config,
     )
