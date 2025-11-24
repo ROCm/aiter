@@ -33,7 +33,6 @@
 #include "moe_op.h"
 #include "moe_sorting.h"
 #include "norm.h"
-#include "pa.h"
 #include "pos_encoding.h"
 #include "quant.h"
 #include "quick_all_reduce.h"
@@ -113,6 +112,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     MLA_METADATA_PYBIND;
     MLA_REDUCE_PYBIND;
     DEEPGEMM_PYBIND;
-    PA_METADATA_PYBIND;
 }
 #endif
