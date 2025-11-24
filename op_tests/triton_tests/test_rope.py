@@ -33,6 +33,7 @@ from aiter.ops.triton.rope import (
     rope_cached_thd_positions_offsets_2c_bwd,
     rope_fwd_2d,
     rope_fwd_2d_inplace,
+    rope_fwd_3d,
 )
 
 DEBUG_MODE = False
@@ -119,6 +120,26 @@ def generate_rope_inputs(
         sin = sin.reshape(S, freqs_D)
 
     return x, y, gx, gy, freqs, positions, offsets, cos, sin
+
+
+def rope_3d_params(max_seq_len, dim, theta=10000):
+    assert dim % 2 == 0
+    freqs = torch.outer(
+        torch.arange(max_seq_len),
+        1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)),
+    )
+    freqs = torch.polar(torch.ones_like(freqs), freqs)  # complex
+    return freqs
+
+
+def pad_freqs(original_tensor, target_len):
+    seq_len, s1, s2 = original_tensor.shape
+    pad_size = target_len - seq_len
+    padding_tensor = torch.ones(
+        pad_size, s1, s2, dtype=original_tensor.dtype, device=original_tensor.device
+    )
+    padded_tensor = torch.cat([original_tensor, padding_tensor], dim=0)
+    return padded_tensor
 
 
 def ref_rope_cached_thd_positions_offsets_2c_fwd(
@@ -1077,3 +1098,113 @@ def test_rope_2d_fwd(
         print(f"triton_out={triton_out}")
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+def rope_fwd_3d_torch(x, grid_sizes, freqs, sp_size, sp_rank):
+    B = x.size(0)
+    s = x.size(1)
+    n = x.size(2)
+    c = x.size(3) // 2
+
+    c1 = c - 2 * (c // 3)
+    c2 = c // 3
+    c3 = c // 3
+    freqs = freqs.split([c1, c2, c3], dim=1)
+
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+
+        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(s, n, -1, 2))
+
+        freqs_i = torch.cat(
+            [
+                freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(seq_len, 1, -1)
+        merged_real_sum = freqs_i.real.sum()
+        freqs_i = pad_freqs(freqs_i, s * sp_size)
+        s_per_rank = s
+        freqs_i_rank = freqs_i[
+            (sp_rank * s_per_rank) : ((sp_rank + 1) * s_per_rank), :, :
+        ]
+
+        x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
+        x_i = torch.cat([x_i, x[i, s:]])
+        output.append(x_i)
+
+    out = torch.stack(output).float()
+    return out
+
+
+@pytest.mark.parametrize("B", [1])
+@pytest.mark.parametrize("S", [9450])
+@pytest.mark.parametrize("N", [40])
+@pytest.mark.parametrize("C", [128])
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_rope_fwd_3d(
+    B: int,
+    S: int,
+    N: int,
+    C: int,
+    dtype: torch.dtype,
+):
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    sp_size = 8
+    max_seq_len = 1024
+
+    x = torch.arange(B * S * N * C, dtype=dtype, device=device).reshape(B, S, N, C)
+    x = x / (B * S * N * C)
+
+    grid_sizes = torch.tensor([[21, 45, 80]], dtype=torch.int32, device=device)
+
+    d_total = 128
+    d1 = d_total - 4 * (d_total // 6)
+    d2 = 2 * (d_total // 6)
+    d3 = 2 * (d_total // 6)
+
+    freqs_f = rope_3d_params(max_seq_len, d1)
+    freqs_h = rope_3d_params(max_seq_len, d2)
+    freqs_w = rope_3d_params(max_seq_len, d3)
+    freqs = torch.cat([freqs_f, freqs_h, freqs_w], dim=1).to(device)
+
+    sp_rank = 0
+    out_orig = rope_fwd_3d_torch(
+        x.clone(), grid_sizes.clone(), freqs.clone(), sp_size, sp_rank
+    )
+
+    out_triton = rope_fwd_3d(
+        x.clone(), grid_sizes.clone(), freqs.clone(), sp_size, sp_rank
+    )
+
+    print(f"the result compare: sp_rank={sp_rank}")
+    print("=" * 50)
+    shape_ok = out_orig.shape == out_triton.shape
+    sum_orig = out_orig.sum().item()
+    sum_triton = out_triton.sum().item()
+    sum_diff = abs(sum_orig - sum_triton) / abs(sum_orig)
+    sum_ok = sum_diff < 1e-2
+    feat_orig = out_orig[0, 0, 0, :4]
+    feat_triton = out_triton[0, 0, 0, :4]
+    feat_diff = torch.abs(feat_orig - feat_triton).max().item()
+    feat_ok = feat_diff < 1e-3
+
+    print(f"shape same {'yes' if shape_ok else 'no'}")
+    print(f"(sum diff<1%): {'yes' if sum_ok else 'no'}")
+    print(f"   - Original sum: {sum_orig:.6f}")
+    print(f"   - Triton sum:   {sum_triton:.6f}")
+    print(f"   - corellation diff %:     {sum_diff*100:.2f}%")
+    print(f"fisrt 4 tensor same {'yes' if feat_ok else 'no'}")
+    print(f"   - Original: {feat_orig.cpu().numpy()}")
+    print(f"   - Triton:   {feat_triton.cpu().numpy()}")
+    print(f"   - max diff: {feat_diff:.6f}")
+
+    if shape_ok and sum_ok and feat_ok:
+        print(f"\n sp_rank={sp_rank} test success")
+    else:
+        print(f"\n sp_rank={sp_rank} test failed")
+    print("=" * 60)

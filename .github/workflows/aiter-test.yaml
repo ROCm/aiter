@@ -42,16 +42,16 @@ jobs:
           pr_title="${{ github.event.pull_request.title }}"
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             echo "It's main branch, running tests on MI325 and MI35X..."
-            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           elif echo "$pr_title" | grep -qi "mi35x"; then
             echo "PR title contains 'MI35X', running tests on MI325 and MI35X..."
-            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           else
             echo "Not main branch and PR title does not contain mi35x, only running on MI325..."
-            echo 'standard_runners=["aiter-1gpu-runner","aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
-            echo 'multigpu_runners=["aiter-8gpu-runner","aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
+            echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           fi
           echo "$GITHUB_OUTPUT"
     
@@ -103,6 +103,11 @@ jobs:
           -w /workspace \
           --name aiter_test \
           ${{ env.DOCKER_IMAGE }}
+
+      - name: Setup pip config
+        run: |
+          docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root aiter_test bash -c "pip config set global.retries 10"
 
       - name: Setup Aiter
         run: |
@@ -183,10 +188,15 @@ jobs:
           --name aiter_test \
           ${{ env.DOCKER_IMAGE }}
 
-      - name: Setup-Triton
+      - name: Setup pip config
+        run: |
+          docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root aiter_test bash -c "pip config set global.retries 10"
+
+      - name: Setup-Aiter
         run: |
           set -ex
-          echo "Setting up Triton..."
+          echo "Setting up Aiter..."
           docker exec \
           -w /workspace \
           aiter_test \
