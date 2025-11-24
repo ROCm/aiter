@@ -1,13 +1,8 @@
 import os
-import sys
-import hashlib
 import time
-import logging
 from pathlib import Path
-from unittest import result
 from jinja2 import Template
 import triton
-import functools
 import aiter
 import torch
 import triton
@@ -28,18 +23,20 @@ try:
 except ImportError:
     print("Warning: compile_kernel or CompileArgs is not in triton.tools.compile!")
 
+from aiter.jit.utils.file_baton import FileBaton
 from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
     compile_gluon_kernel,
     CompileGluonArgs,
 )
 from csrc.cpp_itfs.torch_utils import torch_to_c_types
 from csrc.cpp_itfs.utils import (
-    compile_template_op,
     AITER_CORE_DIR,
     get_default_func_name,
+    compile_template_op,
+    mp_lock,
     not_built,
     run_lib,
-    mp_lock,
+    logger,
 )
 
 MD_NAME = "pa_decode_attention_reduce_kernel"
@@ -59,10 +56,6 @@ def parse_version(version_str):
             break
 
     return tuple(parts)
-
-
-TRITON_VERSION = parse_version(triton.__version__)
-logger = logging.getLogger("aiter")
 
 
 def compile(
@@ -108,6 +101,7 @@ def compile(
             raise RuntimeError(
                 "This version triton is not support gluon aot compile, please upgrade to 3.5.0 or higher!"
             )
+        TRITON_VERSION = parse_version(triton.__version__)
 
         kv_compute_block_size = 256
         waves_per_eu = 1
@@ -213,7 +207,6 @@ def compile(
         current_dir = os.getcwd()
         aot_file_dir = f"{current_dir}/{func_name}"
         os.makedirs(aot_file_dir, exist_ok=True)
-        # print(f"current_dir: {current_dir}")
 
         compile_args = CompileGluonArgs(
             path=f"{AITER_CORE_DIR}/aiter/ops/triton/gluon/pa_decode_gluon.py",
@@ -373,9 +366,6 @@ def pa_decode_gluon_aot(
 
     # Determine if causal masking is needed
     is_causal = query_sequence_length > 1
-
-    # Calculate elements per 16B load based on data type
-    kv_elements_per_16b = 16 // key_cache.dtype.itemsize
 
     assert (
         query_sequence_length <= 4
