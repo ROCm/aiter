@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -26,6 +26,7 @@ def all_reduce(
     _fa: int,
     inp: torch.Tensor,
     out: torch.Tensor,
+    use_new: bool,
     open_fp8_quant: bool,
     reg_buffer: Optional[torch.Tensor] = None,
 ) -> None: ...
@@ -38,6 +39,19 @@ def all_gather_reg(_fa: int, inp: torch.Tensor, out: torch.Tensor) -> None: ...
 @compile_ops("module_custom_all_reduce")
 def all_gather_unreg(
     _fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def fused_allreduce_rmsnorm(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    reg_buffer: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 
@@ -173,7 +187,7 @@ def register_buffer(
 
 
 @compile_ops("module_custom_all_reduce")
-def get_graph_buffer_ipc_meta(_fa: int) -> tuple[torch.Tensor, torch.Tensor]: ...
+def get_graph_buffer_ipc_meta(_fa: int) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
 @compile_ops("module_custom_all_reduce")

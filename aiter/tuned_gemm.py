@@ -27,12 +27,9 @@ from torch import Tensor
 from aiter import (
     dtypes,
     gemm_a16w16_asm,
-    getHipblasltKernelName,
     hipb_create_extension,
     hipb_mm,
     logger,
-    rocb_create_extension,
-    rocb_mm,
 )
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16_FILE, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num
@@ -42,7 +39,7 @@ from aiter.ops.gemm_op_common import get_padded_m
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
-solMap = ["torch", "hipblaslt", "rocblas", "skinny", "asm"]
+solMap = ["torch", "hipblaslt", "skinny", "asm"]
 
 
 def get_solfunc(soltype: int):
@@ -51,10 +48,8 @@ def get_solfunc(soltype: int):
     elif soltype == 1:
         return hipb_gemm
     elif soltype == 2:
-        return rocb_gemm
-    elif soltype == 3:
         return skinny_gemm
-    elif soltype == 4:
+    elif soltype == 3:
         return asm_gemm
 
 
@@ -130,7 +125,10 @@ def gen_gemm_a16w16_fake_tensor(
     scale_c: Optional[Tensor] = None,
 ) -> Tensor:
     out = torch.empty(
-        A.view(-1, A.size(-1)).shape[0], B.shape[0], dtype=A.dtype, device=A.device
+        A.view(-1, A.size(-1)).shape[0],
+        B.shape[0],
+        dtype=otype or A.dtype,
+        device=A.device,
     )
     return out.view(*A.shape[:-1], B.shape[0])
 
@@ -230,25 +228,6 @@ def hipb_gemm(
     return hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
 
 
-def rocb_gemm(
-    inp: Tensor,
-    weights: Tensor,
-    solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
-):
-    assert (
-        scale_a is None and scale_b is None and scale_c is None
-    ), "scale_a, scale_b, scale_c must be None for rocblas"
-    out = rocb_mm(inp, weights.t(), solidx)
-    if bias is not None:
-        out = out + bias
-    return out
-
-
 def torch_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -308,7 +287,7 @@ class TunedGemm:
     def __init__(self):
         self.extensions_created = False
         self.save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
-        self.untune_path = f"{this_dir}/configs/untuned_gemm.csv"
+        self.untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
         self.tune_path = AITER_CONFIG_GEMM_BF16_FILE
 
     def mm(
@@ -322,7 +301,6 @@ class TunedGemm:
         scale_c: Optional[Tensor] = None,
     ):
         if self.extensions_created == False:
-            rocb_create_extension()
             hipb_create_extension()
             self.extensions_created = True
         out = gemm_a16w16(

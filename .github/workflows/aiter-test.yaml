@@ -15,8 +15,21 @@ env:
   DOCKER_IMAGE: "rocm/pytorch:latest"
 
 jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
   define-runners:
     runs-on: ubuntu-latest
+    needs: [check-signal]
     outputs:
       standard_runners: ${{ steps.machines.outputs.standard_runners }}
       multigpu_runners: ${{ steps.machines.outputs.multigpu_runners }}
@@ -28,15 +41,15 @@ jobs:
           set -euo pipefail
           pr_title="${{ github.event.pull_request.title }}"
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            echo "It's main branch, running tests on MI300 and MI35X..."
+            echo "It's main branch, running tests on MI325 and MI35X..."
             echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
             echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           elif echo "$pr_title" | grep -qi "mi35x"; then
-            echo "PR title contains 'MI35X', running tests on MI300 and MI35X..."
+            echo "PR title contains 'MI35X', running tests on MI325 and MI35X..."
             echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
             echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           else
-            echo "Not main branch and PR title does not contain mi35x, only running on MI300..."
+            echo "Not main branch and PR title does not contain mi35x, only running on MI325..."
             echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
             echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
           fi
@@ -91,14 +104,14 @@ jobs:
           --name aiter_test \
           ${{ env.DOCKER_IMAGE }}
 
-      - name: Setup-Triton
+      - name: Setup Aiter
         run: |
           set -ex
-          echo "Setting up Triton..."
+          echo "Setting up Aiter..."
           docker exec \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/build_triton.sh
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
       
       - name: Tests
         run: |
@@ -177,7 +190,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/build_triton.sh
+          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
       
       - name: Tests
         run: |

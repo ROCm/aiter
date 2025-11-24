@@ -14,14 +14,27 @@ concurrency:
 env:
   VLLM_BRANCH: "main"
   VLLM_REPOSITORY_URL: "https://github.com/vllm-project/vllm"
-  BASE_IMAGE: rocm/vllm-dev:nightly
+  BASE_IMAGE: rocm/vllm-dev:nightly@sha256:9ed6489aa34b70f8dbd1b2e93f2c8bf8c2f2806c2c28c1b89ed4754057213066
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
 jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
   build_vllm_image:
     if: ${{ !github.event.pull_request.head.repo.fork }}
-    runs-on: aiter-1gpu-runner
+    needs: [check-signal]
+    runs-on: aiter-k8s-build
 
     steps:
       - name: Checkout aiter repo

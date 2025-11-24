@@ -92,20 +92,19 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
-                         nullptr, // cu_seqlen_q_ptr
-                         nullptr, // cu_seqlen_kv_ptr
-                         nullptr, // seqstart_q
-                         nullptr, // seqstart_k
+                         nullptr, // seqstart_q_ptr
+                         nullptr, // seqstart_k_ptr
+                         nullptr, // seqlen_q_ptr
                          nullptr, // seqlen_k_ptr
-                         nullptr, // seqstart_padded_q_ptr
-                         nullptr, // seqstart_padded_k_ptr
+                         nullptr, // cu_seqlen_q_ptr
+                         nullptr, // cu_seqlen_k_ptr
                          seqlen_q,
                          seqlen_k,
                          b,
                          seqlen_q,      // max_seqlen_q
                          d,             // hdim_q
                          d_v,           // hdim_v
-                         h,             // nhead
+                         h,             // nhead_q
                          h_k,           // nhead_k
                          softmax_scale, // scale_s
                          1,             // scale_p
@@ -134,7 +133,7 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                          mask.left,
                          mask.right,
                          static_cast<ck_tile::index_t>(mask.type),
-                         0,
+                         0, // min_seqlen_q
                          p_dropout,
                          has_dropout_randval,
                          drop_seed_offset};
@@ -150,6 +149,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                     int window_size_right,
                                     bool return_softmax_lse,
                                     bool return_dropout_randval,
+                                    int how_v3_bf16_cvt,
                                     std::optional<at::Tensor> out_,          // [b, sq, hq, d_v]
                                     std::optional<const at::Tensor> bias_,   // [sq, sk]
                                     std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
@@ -317,7 +317,8 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                  mask.type,
                                  bias_type,
                                  has_lse,
-                                 true);
+                                 true,
+                                 how_v3_bf16_cvt);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {
