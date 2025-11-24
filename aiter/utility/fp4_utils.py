@@ -255,6 +255,7 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     SCALING_MODE: tl.constexpr,
     SHUFFLE: tl.constexpr,
+    use_hadamard_transform: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -276,18 +277,19 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     
     # Hadamard Transform 
     # we fuse here because this is hot spot tile is already laoded to register
-    # -------------------------------------------------------------
-    h_idx = tl.arange(0, 32)
-    h_mask = h_idx[:, None] & h_idx[None, :]
-    p = h_mask
-    p = p ^ (p >> 1)
-    p = p ^ (p >> 2)
-    p = p ^ (p >> 4)
-    p = p & 1  
-    h_mat = (1.0 - 2.0 * p.to(tl.float32))
-    h_mat = h_mat * 0.176776695 # this is 1/sqrt(32)
-    x = tl.dot(x, h_mat)
-    # -------------------------------------------------------------
+    if use_hadamard_transform:
+        # -------------------------------------------------------------
+        h_idx = tl.arange(0, 32)
+        h_mask = h_idx[:, None] & h_idx[None, :]
+        p = h_mask
+        p = p ^ (p >> 1)
+        p = p ^ (p >> 2)
+        p = p ^ (p >> 4)
+        p = p & 1  
+        h_mat = (1.0 - 2.0 * p.to(tl.float32))
+        h_mat = h_mat * 0.176776695 # this is 1/sqrt(32)
+        x = tl.dot(x, h_mat)
+        # -------------------------------------------------------------
 
 
 
@@ -390,7 +392,7 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
 
 
 def dynamic_mxfp4_quant(
-    x: torch.Tensor, scaling_mode: str = "even", shuffle: bool = False
+    x: torch.Tensor, scaling_mode: str = "even", shuffle: bool = False, use_hadamard_transform: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.
@@ -444,6 +446,7 @@ def dynamic_mxfp4_quant(
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         SCALING_MODE=0,
         SHUFFLE=shuffle,
+        use_hadamard_transform=use_hadamard_transform,
     )
 
     return (x_fp4.view(dtypes.fp4x2), blockscale_e8m0.view(dtypes.fp8_e8m0))
