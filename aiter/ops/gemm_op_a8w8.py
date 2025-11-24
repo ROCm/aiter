@@ -468,7 +468,7 @@ def gemm_a8w8_bpreshuffle(
         cktile_config = None
 
     ck_config = get_bpreshuffle_GEMM_config(
-        m, n, k, dtypes.fp8, AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+        m, n, k, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
     )
     if cktile_config is not None and ck_config is not None:
         cktile_time = cktile_config.get("us", float("inf"))
