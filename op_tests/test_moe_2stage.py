@@ -137,7 +137,8 @@ def test_fmoe(
         aiter.logger.info(f'w2_qt_shape {w2_qt.shape} {w2_qt.dtype}')
         aiter.logger.info(f'w1_scale_shape {w1_scale.shape} {w1_scale.dtype}')
         aiter.logger.info(f'w2_scale_shape {w2_scale.shape} {w2_scale.dtype}')
-        aiter.logger.info(w1)
+        aiter.logger.info(w1_qt)
+        aiter.logger.info(w1_scale)
         # assert False, "temp stop here"
 
 
@@ -240,6 +241,10 @@ def test_fmoe(
 
     w1_scale_aiter = fp4_utils.f32_to_e8m0(w1_scale_aiter)
     w2_scale_aiter = fp4_utils.f32_to_e8m0(w2_scale_aiter)
+    aiter.logger.info('w1_scale_aiter')
+    aiter.logger.info(w1_scale_aiter)
+    aiter.logger.info('w1_scale')
+    aiter.logger.info(w1_scale)
 
     aiter.logger.info(f'w1_shape {w1.shape}')
     aiter.logger.info(f'w2_shape {w2.shape}')
