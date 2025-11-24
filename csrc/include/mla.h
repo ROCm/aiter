@@ -72,8 +72,8 @@ void mla_reduce_v1(const torch::Tensor& partial_output,
                    std::optional<torch::Tensor>& final_lse);
 
 void hk_mla_decode_fwd(
-    const torch::Tensor& query,             // [num_seqs, num_heads, head_size]
-    const torch::Tensor& kv_buffer,         // [num_page, page_size, num_kv_heads, head_size]
+    torch::Tensor& query,                   // [num_seqs, num_heads, head_size]
+    torch::Tensor& kv_buffer,               // [num_page, page_size, num_kv_heads, head_size]
     const torch::Tensor& qo_indptr,         // [batch_size+1]
     const torch::Tensor& kv_indptr,         // [batch_size+1]
     const torch::Tensor& kv_page_indices,   // [num_page_used]
