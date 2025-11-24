@@ -914,7 +914,6 @@ def fused_moe_2stages(
 
     aiter.logger.info('print a2 after quantizing')
     aiter.logger.info(a2)
-    assert False
 
     metadata.stage2(
         a2,
