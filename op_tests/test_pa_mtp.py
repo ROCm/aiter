@@ -468,7 +468,7 @@ def test_pa_mtp(
             (reduce_indptr_size, reduce_indptr_type),
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
-        ) = aiter.get_pa_metadata_v1(
+        ) = aiter.get_mla_metadata_info_v1(
             batch_size,
             max_qlen,
             num_query_heads,

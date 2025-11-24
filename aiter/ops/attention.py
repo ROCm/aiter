@@ -463,56 +463,67 @@ def mla_prefill_asm_fwd(
 ) -> None: ...
 
 
+@compile_ops("module_mla_metadata")
 def get_pa_metadata_v1(
-    batch_size: int,
-    max_seqlen_qo: int,
-    num_head_qo: int,
-    q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
-    is_sparse: int,
+    seqlens_qo_indptr: torch.Tensor,
+    seqlens_kv_indptr: torch.Tensor,
+    num_heads_per_head_k: int,
+    num_heads_k: int,
+    is_causal: bool,
+    work_metadata_ptrs: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    kv_granularity: int = 16,
+    max_seqlen_qo: int = -1,
+    uni_seqlen_qo: int = -1,
     fast_mode: bool = True,
-):
+    topk: int = -1,
+    max_split_per_batch: int = -1,
+) -> None:
     """
-    Returns:
-        1. Shape of work_metadata_ptrs followed by its scalar type.
-        2. Shape of work_indptr followed by its scalar type.
-        3. Shape of work_info_set followed by its scalar type.
-        4. Shape of reduce_indptr followed by its scalar type.
-        5. Shape of reduce_final_map followed by its scalar type.
-        6. Shape of reduce_partial_map followed by its scalar type.
+    Inputs:
+        cumulated seqlens of q/o: (batch_size + 1), dtype torch.int32.
+        cumulated seqlens of k/v: (batch_size + 1), dtype torch.int32.
+        num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
+        num_heads_k: num_heads_k.
+        is_causal: Whether causal mask is enabled.
+        Options: Detailed settings for spliting. All of them are optional.
+            kv_granularity: default=16. The granularity on kv sequence length when cutting batch.
+            max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
+            uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
+                           length is not fixed.
+            fast_mode: default=True. Whether user wants metadata become as fast as possible. Note that fast
+                       mode may lead to bad overall performance.
+            topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
+    Outputs:
+        [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
+                                                    work_info.
+        [1] work_indptr:        (#cu_part + 1),     The IDs of work handled by each cu_part.
+        [2] work_info           (#work, 8)
+        [2.0] bs_index:         (#work),            The index of batch handled by each work.
+        [2.1] partial_index:    (#work),            The index of tile in output buffer when splits. -1 means no split.
+        [2.2] q_start:          (#work),            The global index in seq where q/o starts. Use global index here can
+                                                    reduce memory access count in kernel.
+        [2.3] q_end:            (#work),            The global index in seq where q/o ends (not included).
+        [2.4] kv_start:         (#work),            The global index in seq where k/v starts.
+        [2.5] kv_end:           (#work),            The global index in seq where k/v ends (not included). Note that
+                                                    this value indicates the end of last qo sequence if there are
+                                                    multiple qo sequences included in the current work and causal mask
+                                                    is enabled.
+        [2.6] kv_offset:        (#work),            Remaining length in seq from kv_end to the end of current batch.
+        [2.7] pad               (#work, 1),         Pad to 8 DWs.
+        [3] reduce_indptr:      (sum(qo_seqlen_blk_count) + 1),
+                                                    The IDs in reduce_partial_map indicates the tiles should be merged
+                                                    together.
+        [4] reduce_final_map:   (sum(qo_seqlen_blk_count)),
+                                                    The final output location of each group of tiles.
+        [5] reduce_partial_map: (#partial_tiles),   The locations in partial buffer of partial tiles waiting for being
+                                                    reduced.
     """
-
-    assert num_head_qo % 16 == 0
-
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
-
-    max_qo_tiles_per_batch = (
-        int(math.ceil(max_seqlen_qo * num_head_qo / 128))
-        if num_head_qo == 16 or (num_head_qo == 128 and kv_dtype == dtypes.fp8)
-        else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
-    )
-    batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
-    tile_cnt = batch_size * max_qo_tiles_per_batch
-
-    if fast_mode:
-        max_work = tile_cnt + cu_num - 1
-        max_split_tiles = (
-            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
-        )
-    else:
-        max_work = tile_cnt * cu_num
-        max_split_tiles = tile_cnt * cu_num
-
-    return (
-        ((2), torch.uint64),  # work_metadata_ptrs
-        ((cu_num + 1), torch.int32),  # work_indptr
-        ((max_work, 8), torch.int32),  # work_info_set
-        ((tile_cnt + 1), torch.int32),  # reduce_indptr
-        ((tile_cnt, 2), torch.int32),  # reduce_final_map
-        (max_split_tiles, torch.int32),  # reduce_partial_map
-    )
+    ...
 
 
 def get_mla_metadata_info_v1(
