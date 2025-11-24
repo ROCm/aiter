@@ -795,7 +795,6 @@ def fused_moe_2stages(
         bias2,
     )
     aiter.logger.info(w1)
-    aiter.logger.info(a1)
     aiter.logger.info(a1_scale)
     if (
         quant_type == QuantType.per_1x32
