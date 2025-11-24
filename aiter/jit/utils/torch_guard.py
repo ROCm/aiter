@@ -78,23 +78,19 @@ NONE_WRAPPED_OP = [
     "qr_get_handle",
 ]
 
-# We default all args are inplace, you can define inplace args for specific op
-SPECIAL_OPS_MUTATES_ARGS = {}
 
-
-def generate_schema(func) -> str:
+def generate_schema(func, mutates_args: Union[list[str], str] = "unknown") -> str:
     import inspect
 
     import torch
 
     sig = inspect.signature(func)
     parameters = []
-    mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, [])
     for idx, (name, param) in enumerate(sig.parameters.items()):
         param_type = param.annotation
         flag = True
         is_mutates = True
-        if len(mutates_args) > 0 and name not in mutates_args:
+        if mutates_args != "unknown" and name not in mutates_args:
             is_mutates = False
 
         if param_type is torch.Tensor:
@@ -188,7 +184,7 @@ def generate_schema(func) -> str:
 
 
 def torch_compile_guard(
-    mutates_args: list[str] = [],
+    mutates_args: Union[list[str], str] = "unknown",
     device: str = "cpu",
     calling_func_: Optional[Callable[..., Any]] = None,
     gen_fake: Optional[Callable[..., Any]] = None,
@@ -224,11 +220,8 @@ def torch_compile_guard(
                 schema = generate_schema(calling_func)
             else:
                 sig = inspect.signature(calling_func)
-                mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(
-                    calling_func.__name__, "unknown"
-                )
                 if hasattr(torch.library, "infer_schema"):
-                    sig = torch.library.infer_schema(
+                    schema = torch.library.infer_schema(
                         calling_func, mutates_args=mutates_args
                     )
                 else:
@@ -237,14 +230,15 @@ def torch_compile_guard(
 
                     # torch 2.4 not support mutates "unknown" for inplace all param
                     if mutates_args == "unknown":
-                        mutates_args = []
+                        mutates_args_custom = []
 
                         for param_name, param in sig.parameters.items():
                             if param.annotation == torch.Tensor:
-                                mutates_args.append(param_name)
+                                mutates_args_custom.append(param_name)
 
-                    sig = torch._custom_op.impl.infer_schema(calling_func, mutates_args)
-                schema = f"{sig}"
+                    schema = torch._custom_op.impl.infer_schema(
+                        calling_func, mutates_args_custom
+                    )
             return schema
 
         schema = wrapper_register(calling_func)
@@ -280,11 +274,27 @@ def torch_compile_guard(
 
         loadName = calling_func.__name__
 
-        def abstract_impl(*args, custom_build_args={}, **kwargs):
-            if return_non_tensor:
-                return torch.empty(1, device=device), 1
+        def wrapper_custom(*args, **kwargs):
+            result = (
+                getattr(torch.ops.aiter, f"{loadName}")(*args, **kwargs)
+                if input_is_tensor
+                else getattr(torch.ops.aiter, f"{loadName}")(
+                    torch.empty(1, device=device), *args, **kwargs
+                )
+            )
+            return result[1] if return_non_tensor else result
+
+        if hasattr(torch.ops.aiter, loadName):
+            return wrapper_custom
+
+        def abstract_impl(*args, **kwargs):
             if gen_fake is not None:
-                return gen_fake(*args, **kwargs)
+                if return_non_tensor:
+                    return torch.empty(1, device=device), gen_fake(*args, **kwargs)
+                else:
+                    return gen_fake(*args, **kwargs)
+            if return_non_tensor:
+                return torch.empty(1, device=device), calling_func(*args, **kwargs)
             return calling_func(*args, **kwargs)
 
         def outer_wrapper(*args, **kwargs):
@@ -294,11 +304,14 @@ def torch_compile_guard(
                 else (torch.empty(1, device=device), wrapper(*args, **kwargs))
             )
 
-        def abstract_impl_dummy(dummy, *args, custom_build_args={}, **kwargs):
-            if return_non_tensor:
-                return torch.empty(1, device=device), 1
+        def abstract_impl_dummy(dummy, *args, **kwargs):
             if gen_fake is not None:
-                return gen_fake(*args, **kwargs)
+                if return_non_tensor:
+                    return torch.empty(1, device=device), gen_fake(*args, **kwargs)
+                else:
+                    return gen_fake(*args, **kwargs)
+            if return_non_tensor:
+                return torch.empty(1, device=device), calling_func(*args, **kwargs)
             return calling_func(*args, **kwargs)
 
         def outer_wrapper_dummy(dummy, *args, **kwargs):
@@ -324,16 +337,6 @@ def torch_compile_guard(
             aiter_lib.impl(f"aiter::{loadName}", custom_func, dispatch_key="CUDA")
             aiter_lib.impl(f"aiter::{loadName}", custom_func, dispatch_key="CPU")
             aiter_lib._register_fake(f"{loadName}", fake_func)
-
-        def wrapper_custom(*args, custom_build_args={}, **kwargs):
-            result = (
-                getattr(torch.ops.aiter, f"{loadName}")(*args, **kwargs)
-                if input_is_tensor
-                else getattr(torch.ops.aiter, f"{loadName}")(
-                    torch.empty(1, device=device), *args, **kwargs
-                )
-            )
-            return result[1] if return_non_tensor else result
 
         return wrapper_custom
 

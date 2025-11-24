@@ -442,8 +442,10 @@ namespace aiter
         }
         ((P *)result)[idx] = write_reg;
       }
+      __syncthreads();
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    // maybe do not need device sync
+    // end_sync<ngpus, true>(sg, self_sg, rank);
   }
 
   template <typename T, int ngpus>
@@ -511,6 +513,7 @@ namespace aiter
         }
         tmp_out[idx - start] = write_reg;
       }
+      __syncthreads();
     }
     end_sync<ngpus>(sg, self_sg, rank);
 
@@ -935,9 +938,8 @@ namespace aiter
 #pragma unroll
       for (int i = 0; i < pack_size; ++i)
       {
-        float res_x = ck_tile::type_convert<float>(input_reg.data[i]);
         float sum_x = *(reinterpret_cast<float*>(&tmp_smem[0]) + lane_id * pack_size + i);
-        rslt.data[i] = ck_tile::type_convert<T>(res_x + sum_x);
+        rslt.data[i] = ck_tile::type_convert<T>(sum_x);
       }
       tmps[warp_id][(rank * part + bid) * tnum_gpu + lane_id] = rslt;
     }
@@ -976,6 +978,8 @@ namespace aiter
   template <typename T, int tnum, int n_loop>
   __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm_naive(
       RankSignals sg,
+      T* __restrict__ residual_inp,
+      T* __restrict__ residual_out,
       T* __restrict__ results,
       T* __restrict__ weight,
       float eps,
@@ -999,14 +1003,18 @@ namespace aiter
       for (int n_iter = 0; n_iter < n_loop; ++n_iter)
       {
         int read_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
-        rmsnorm_inp[n_iter] = tmps[read_idx];
+        P reduce_out_pack = tmps[read_idx];
+        P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
         w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * blockDim.x + threadIdx.x);
         A reduce_pack;
 #pragma unroll
         for (int i = 0; i < pack_size; ++i)
         {
-          float ar_elem = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
-          reduce_pack.data[i] = ar_elem * ar_elem;
+          float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+          float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+          float rms_inp = res_inp + ar_out;
+          rmsnorm_inp[n_iter].data[i] = ck_tile::type_convert<T>(rms_inp);
+          reduce_pack.data[i] = rms_inp * rms_inp;
         }
         square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
       }
@@ -1028,6 +1036,7 @@ namespace aiter
         }
         int write_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
         *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
+        *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp[n_iter];
       }
     }
   }
@@ -1039,6 +1048,8 @@ namespace aiter
   template <typename T, int tnum, int n_loop>
   __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(
       RankSignals sg,
+      T* __restrict__ residual_inp,
+      T* __restrict__ residual_out,
       T* __restrict__ results,
       T* __restrict__ weight,
       float eps,
@@ -1064,14 +1075,18 @@ namespace aiter
         if (n_iter * tnum + threadIdx.x < (n / pack_size))
         {
           int read_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
-          rmsnorm_inp[n_iter] = tmps[read_idx];
+          P reduce_out_pack = tmps[read_idx];
+          P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
           w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
           A reduce_pack;
 #pragma unroll
           for (int i = 0; i < pack_size; ++i)
           {
-            float ar_elem = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
-            reduce_pack.data[i] = ar_elem * ar_elem;
+            float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+            float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+            float rms_inp = ar_out + res_inp;
+            rmsnorm_inp[n_iter].data[i] = ck_tile::type_convert<T>(rms_inp);
+            reduce_pack.data[i] = rms_inp * rms_inp;
           }
           square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
         }
@@ -1096,6 +1111,7 @@ namespace aiter
           }
           int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
           *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
+          *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp[n_iter];
         }
       }
     }
@@ -1104,6 +1120,8 @@ namespace aiter
   template <typename T, int n_loop>
   __global__ void __launch_bounds__(256, 1) local_device_load_rmsnorm_512n(
       RankSignals sg,
+      T* __restrict__ residual_inp,
+      T* __restrict__ residual_out,
       T* __restrict__ results,
       T* __restrict__ weight,
       float eps,
@@ -1129,14 +1147,18 @@ namespace aiter
       for (int n_iter = 0; n_iter < n_loop; ++n_iter)
       {
         int read_idx = bid * 64 * n_loop + n_iter * 64 + lane_id;
-        rmsnorm_inp[n_iter] = tmps[read_idx];
+        P reduce_out_pack = tmps[read_idx];
+        P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
         w_arr[n_iter] = *(reinterpret_cast<P*>(weight) + n_iter * 64 + lane_id);
         A reduce_pack;
 #pragma unroll
         for (int i = 0; i < pack_size; ++i)
         {
-          float ar_elem = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
-          reduce_pack.data[i] = ar_elem * ar_elem;
+          float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+          float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+          float rms_inp = ar_out + res_inp;
+          rmsnorm_inp[n_iter].data[i] = ck_tile::type_convert<T>(rms_inp);
+          reduce_pack.data[i] = rms_inp * rms_inp;
         }
         float tmp_sum = packReduce<AddFunctor, float, pack_size>(reduce_pack);
         square_sum += tmp_sum;
@@ -1156,6 +1178,7 @@ namespace aiter
         }
         int write_idx = bid * 64 * n_loop + n_iter * 64 + lane_id;
         *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
+        *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp[n_iter];
       }
     }
   }
@@ -1436,7 +1459,7 @@ namespace aiter
      * will cause contention on NVLink bus.
      */
     template <typename T>
-    void allreduce(hipStream_t stream, T *input, T *output, int size,
+    void allreduce(hipStream_t stream, T *input, T *output, int size, bool use_new = false,
 #ifndef USE_ROCM
                    int threads = 512, int block_limit = 20){
 #else
@@ -1458,48 +1481,52 @@ namespace aiter
 
     auto bytes = size * sizeof(T);
     size /= d;
-    int blocks = 16;
-    bool call_1stage = false;
-    bool call_2stage = false;
-    if (world_size_ == 2)
+
+    // use new version of allreduce kernel
+    if (use_new)
     {
-      call_1stage = true;
-    }
-    else if (full_nvlink_)
-    {
-      if ((world_size_ <= 4 && bytes < 160 * 1024) || (world_size_ <= 8 && bytes < 80 * 1024))
+      int blocks = 16;
+      bool call_1stage = false;
+      bool call_2stage = false;
+      if (world_size_ == 2)
       {
         call_1stage = true;
       }
-      else
+      else if (full_nvlink_)
       {
-        call_2stage = true;
+        if ((world_size_ <= 4 && bytes < 160 * 1024) || (world_size_ <= 8 && bytes < 80 * 1024))
+        {
+          call_1stage = true;
+        }
+        else
+        {
+          call_2stage = true;
+        }
       }
-    }
-    if (call_1stage)
-    {
-      blocks = std::min(kMaxBlocks, (size + (threads / world_size_) - 1) / (threads / world_size_));
-    }
-    else if (call_2stage)
-    {
-      blocks = std::min(kMaxBlocks, (size / world_size_ + (threads / world_size_) - 1) / (threads / world_size_));
-    }
+      if (call_1stage)
+      {
+        blocks = std::min(kMaxBlocks, (size + (threads / world_size_) - 1) / (threads / world_size_));
+      }
+      else if (call_2stage)
+      {
+        blocks = std::min(kMaxBlocks, (size / world_size_ + (threads / world_size_) - 1) / (threads / world_size_));
+      }
 
 #define KL(ngpus, name)                                                       \
   name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
                                                  rank_, size);
 
-#define dispatch(ngpus, name)   \
-    do                          \
-    {                           \
-      if (bytes % 128 == 0)     \
-      {                         \
-        KL(ngpus, name)         \
-      }                         \
-      else                      \
-      {                         \
-        KL(ngpus, name##_naive) \
-      }                         \
+#define dispatch(ngpus, name)                   \
+    do                                          \
+    {                                           \
+      if (bytes % 128 == 0 && world_size_ != 6) \
+      {                                         \
+        KL(ngpus, name)                         \
+      }                                         \
+      else                                      \
+      {                                         \
+        KL(ngpus, name##_naive)                 \
+      }                                         \
     } while(0)
 
 #define REDUCE_CASE(ngpus)                         \
@@ -1516,17 +1543,56 @@ namespace aiter
     break;                                         \
   }
 
-    switch (world_size_)
+      switch (world_size_)
+      {
+        REDUCE_CASE(2)
+        REDUCE_CASE(4)
+        REDUCE_CASE(6)
+        REDUCE_CASE(8)
+      default:
+        throw std::runtime_error(
+            "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
+            "gpus = " +
+            std::to_string(world_size_));
+      }
+    }
+    else // use vllm allreduce kernel
     {
-      REDUCE_CASE(2)
-      REDUCE_CASE(4)
-      REDUCE_CASE(6)
-      REDUCE_CASE(8)
-    default:
-      throw std::runtime_error(
-          "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
-          "gpus = " +
-          std::to_string(world_size_));
+      int blocks = std::min(block_limit, (size + threads - 1) / threads);
+#define VLLM_REDUCE_CASE(ngpus)                            \
+  case ngpus:                                              \
+  {                                                        \
+    if (world_size_ == 2)                                  \
+    {                                                      \
+      KL(ngpus, cross_device_reduce_1stage);               \
+    }                                                      \
+    else if (full_nvlink_)                                 \
+    {                                                      \
+      if ((world_size_ <= 4 && bytes < 512 * 1024) ||      \
+          (world_size_ <= 8 && bytes < 256 * 1024))        \
+      {                                                    \
+        KL(ngpus, cross_device_reduce_1stage_naive);       \
+      }                                                    \
+      else                                                 \
+      {                                                    \
+        KL(ngpus, cross_device_reduce_2stage_naive);       \
+      }                                                    \
+    }                                                      \
+    break;                                                 \
+  }
+
+      switch (world_size_)
+      {
+        VLLM_REDUCE_CASE(2)
+        VLLM_REDUCE_CASE(4)
+        VLLM_REDUCE_CASE(6)
+        VLLM_REDUCE_CASE(8)
+      default:
+        throw std::runtime_error(
+            "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
+            "gpus = " +
+            std::to_string(world_size_));
+      }
     }
 #undef REDUCE_CASE
 #undef KL
@@ -1581,7 +1647,7 @@ namespace aiter
   }
 
   template <typename T>
-  void dispatchFusedAllReduceRMSNorm(hipStream_t stream, T* input, T* output, T* weight, float eps, int m, int n)
+  void dispatchFusedAllReduceRMSNorm(hipStream_t stream, T* input, T* residual_inp, T* residual_out, T* output, T* weight, float eps, int m, int n)
   {
     auto d = packed_t<T>::P::size;
     int size = m * n;
@@ -1627,12 +1693,12 @@ namespace aiter
       grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
     };
 
-#define launch_fused_allreduce_rmsnorm(template_kernel)                                   \
-    do                                                                                    \
-    {                                                                                     \
-      auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);                   \
-      setGrid(naive_grid_size, kernel_ptr);                                               \
-      template_kernel<<<grid, block, 0, stream>>>(sg_, output, weight, eps, rank_, m, n); \
+#define launch_fused_allreduce_rmsnorm(template_kernel)                                                               \
+    do                                                                                                                \
+    {                                                                                                                 \
+      auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);                                               \
+      setGrid(naive_grid_size, kernel_ptr);                                                                           \
+      template_kernel<<<grid, block, 0, stream>>>(sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
     } while (0)
 
     if (n_bytes % 1024 == 0)

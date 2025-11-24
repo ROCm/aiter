@@ -93,12 +93,13 @@ you can also call the corresponding executables `benchmark_mha_bwd` to check whe
 ## the asm kernel performance of the attention forwards and attention backwards.
 the performance data was tested under the conditions of BF16 and BSHD in batch mode.
 
-![non-causal-bwd-perf picture](images/causal-fwd-perf.png)
-![causal-bwd-perf picture](images/non-causal-fwd-perf.png)
+
+![causal-fwd-perf picture](images/causal-fwd-perf.png)
+![non-causal-fwd-perf picture](images/non-causal-fwd-perf.png)
 *Figure 1: Evaluating GQA attention forwards performance under the conditions of batch=8, q_nheads=64 and kv_nheads=8.*
 
-![non-causal-bwd-perf picture](images/causal-bwd-perf.png)
-![causal-bwd-perf picture](images/non-causal-bwd-perf.png)
+![causal-bwd-perf picture](images/causal-bwd-perf.png)
+![non-causal-bwd-perf picture](images/non-causal-bwd-perf.png)
 *Figure 2: Evaluating GQA attention backwards(a16) performance under the conditions of batch=8, q_nheads=64 and kv_nheads=8.*
 
 **More performance test results are shown in the table below:**

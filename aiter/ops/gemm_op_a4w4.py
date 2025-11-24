@@ -2,9 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-import os
 from typing import Optional
 
+from aiter.jit.utils.torch_guard import torch_compile_guard
 import pandas as pd
 import torch
 from torch import Tensor
@@ -14,7 +14,6 @@ from aiter import logger
 from ..jit.core import (
     AITER_CONFIG_GEMM_A4W4_FILE,
     AITER_LOG_TUNED_CONFIG,
-    AITER_ROOT_DIR,
     compile_ops,
 )
 from ..jit.utils.chip_info import get_cu_num, get_gfx
@@ -60,6 +59,21 @@ def get_GEMM_config(M: int, N: int, K: int):
     return config
 
 
+def gemm_a4w4_fake(
+    A: Tensor,  # A:[M, K/2] f4x2
+    B: Tensor,  # B:[N, K/2] f4x2
+    A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
+    B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
+    out: Tensor,  # Out:[M, N] bf16
+    bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    alpha: Optional[float] = 1.0,
+    beta: Optional[float] = 0.0,
+    bpreshuffle: Optional[bool] = True,
+) -> torch.Tensor:
+    return out
+
+
+@torch_compile_guard(gen_fake=gemm_a4w4_fake)
 def gemm_a4w4(
     A: Tensor,  # A:[M, K/2] f4x2
     B: Tensor,  # B:[N, K/2] f4x2

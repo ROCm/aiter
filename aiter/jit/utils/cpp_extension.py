@@ -1145,7 +1145,6 @@ def _jit_compile(
     keep_intermediates=True,
     torch_exclude=False,
     hipify=True,
-    prebuild=0,
 ) -> None:
     if is_python_module and is_standalone:
         raise ValueError(
@@ -1237,7 +1236,6 @@ def _jit_compile(
                         is_python_module=is_python_module,
                         is_standalone=is_standalone,
                         torch_exclude=torch_exclude,
-                        prebuild=prebuild,
                     )
             elif verbose:
                 print(
@@ -1320,7 +1318,6 @@ def _write_ninja_file_and_build_library(
     is_python_module: bool,
     is_standalone: bool = False,
     torch_exclude: bool = False,
-    prebuild: int = 0,
 ) -> None:
     verify_ninja_availability()
 
@@ -1329,7 +1326,7 @@ def _write_ninja_file_and_build_library(
     if with_cuda is None:
         with_cuda = any(map(_is_cuda_file, sources))
     extra_ldflags = _prepare_ldflags(
-        extra_ldflags or [], with_cuda, verbose, is_standalone, torch_exclude, prebuild
+        extra_ldflags or [], with_cuda, verbose, is_standalone, torch_exclude
     )
     build_file_path = os.path.join(build_directory, "build.ninja")
     if verbose:
@@ -1348,7 +1345,6 @@ def _write_ninja_file_and_build_library(
         is_python_module=is_python_module,
         is_standalone=is_standalone,
         torch_exclude=torch_exclude,
-        prebuild=prebuild,
     )
 
     if verbose:
@@ -1374,9 +1370,7 @@ def verify_ninja_availability():
         raise RuntimeError("Ninja is required to load C++ extensions")
 
 
-def _prepare_ldflags(
-    extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude, prebuild
-):
+def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude):
     extra_ldflags.append("-mcmodel=large")
     extra_ldflags.append("-ffunction-sections")
     extra_ldflags.append("-fdata-sections ")
@@ -1388,18 +1382,15 @@ def _prepare_ldflags(
         _TORCH_PATH = os.path.join(os.path.dirname(torch.__file__))
         TORCH_LIB_PATH = os.path.join(_TORCH_PATH, "lib")
         extra_ldflags.append(f"-L{TORCH_LIB_PATH}")
-        if prebuild != 1:
-            extra_ldflags.append("-lc10")
-            if with_cuda:
-                extra_ldflags.append("-lc10_hip" if IS_HIP_EXTENSION else "-lc10_cuda")
-            extra_ldflags.append("-ltorch_cpu")
-            if with_cuda:
-                extra_ldflags.append(
-                    "-ltorch_hip" if IS_HIP_EXTENSION else "-ltorch_cuda"
-                )
-            extra_ldflags.append("-ltorch")
-            if not is_standalone:
-                extra_ldflags.append("-ltorch_python")
+        extra_ldflags.append("-lc10")
+        if with_cuda:
+            extra_ldflags.append("-lc10_hip" if IS_HIP_EXTENSION else "-lc10_cuda")
+        extra_ldflags.append("-ltorch_cpu")
+        if with_cuda:
+            extra_ldflags.append("-ltorch_hip" if IS_HIP_EXTENSION else "-ltorch_cuda")
+        extra_ldflags.append("-ltorch")
+        if not is_standalone:
+            extra_ldflags.append("-ltorch_python")
 
         if is_standalone:
             extra_ldflags.append(f"-Wl,-rpath,{TORCH_LIB_PATH}")
@@ -1409,8 +1400,7 @@ def _prepare_ldflags(
             print("Detected CUDA files, patching ldflags", file=sys.stderr)
 
         extra_ldflags.append(f'-L{_join_rocm_home("lib")}')
-        if prebuild != 1:
-            extra_ldflags.append("-lamdhip64")
+        extra_ldflags.append("-lamdhip64")
     return extra_ldflags
 
 
@@ -1538,7 +1528,6 @@ def _write_ninja_file_to_build_library(
     is_python_module,
     is_standalone,
     torch_exclude,
-    prebuild=0,
 ) -> None:
     extra_cflags = [flag.strip() for flag in extra_cflags]
     extra_cuda_cflags = [flag.strip() for flag in extra_cuda_cflags]
@@ -1571,10 +1560,7 @@ def _write_ninja_file_to_build_library(
     user_includes = [os.path.abspath(file) for file in extra_include_paths]
 
     if not torch_exclude:
-        if prebuild == 0:
-            common_cflags.append(f"-DTORCH_EXTENSION_NAME={name}")
-        else:
-            common_cflags.append(f"-DTORCH_EXTENSION_NAME=aiter_")
+        common_cflags.append(f"-DTORCH_EXTENSION_NAME={name}")
         # common_cflags.append("-DTORCH_API_INCLUDE_EXTENSION_H")
         # common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
         # common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
@@ -1589,8 +1575,6 @@ def _write_ninja_file_to_build_library(
         cuda_flags = ["-DWITH_HIP"] + cflags + COMMON_HIP_FLAGS + COMMON_HIPCC_FLAGS
         cuda_flags += extra_cuda_cflags
         cuda_flags += _get_rocm_arch_flags(cuda_flags)
-        if prebuild == 1:
-            cuda_flags += ["-fvisibility=default -DEXPORT_SYMBOLS"]
 
     def object_file_path(source_file: str) -> str:
         # '/path/to/file.cpp' -> 'file'
@@ -1608,8 +1592,6 @@ def _write_ninja_file_to_build_library(
 
     ext = EXEC_EXT if is_standalone else LIB_EXT
     library_target = f"{name}{ext}"
-    if prebuild == 2:
-        library_target = "aiter_.so"
 
     _write_ninja_file(
         path=path,
@@ -1623,7 +1605,6 @@ def _write_ninja_file_to_build_library(
         ldflags=ldflags,
         library_target=library_target,
         with_cuda=with_cuda,
-        prebuild=prebuild,
     )
 
 
@@ -1639,7 +1620,6 @@ def _write_ninja_file(
     ldflags,
     library_target,
     with_cuda,
-    prebuild=0,
 ) -> None:
     r"""Write a ninja file that does the desired compiling and linking.
 
@@ -1719,15 +1699,6 @@ def _write_ninja_file(
         source_file = source_file.replace(" ", "$ ")
         object_file = object_file.replace(" ", "$ ")
         build.append(f"build {object_file}: {rule} {source_file}")
-    if prebuild == 2:
-        o_path = path.split("build/aiter_")[0]
-        ldflags.append(f"-Wl,-rpath={o_path}")
-
-        for root, dirs, files in os.walk(o_path):
-            for file in files:
-                mid_file_dir = o_path + file
-                if file.endswith(".so") and file not in objects:
-                    objects.append(file)
 
     flags.append(f'ldflags = {" ".join(ldflags)}')
     if cuda_dlink_post_cflags:
@@ -1742,14 +1713,9 @@ def _write_ninja_file(
     if library_target is not None:
         link_rule = ["rule link"]
 
-        if prebuild == 2:
-            link_rule.append(
-                f"  command = $cxx @$out.rsp $ldflags -Wl,-rpath,'$$ORIGIN' -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
-            )
-        else:
-            link_rule.append(
-                "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
-            )
+        link_rule.append(
+            "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
+        )
 
         link = [f'build {library_target}: link {" ".join(objects)}']
 

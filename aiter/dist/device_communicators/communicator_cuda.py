@@ -118,7 +118,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     self.all2all_manager.__class__.__name__,
                 )
 
-    def all_reduce(self, input_, ca_fp8_quant: bool = False) -> torch.Tensor:
+    def all_reduce(
+        self, input_, use_new: bool = False, ca_fp8_quant: bool = False
+    ) -> torch.Tensor:
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
@@ -137,7 +139,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
         ):
-            out = ca_comm.custom_all_reduce(input_, ca_fp8_quant)
+            out = ca_comm.custom_all_reduce(input_, use_new, ca_fp8_quant)
             assert out is not None
             return out
         symm_mem_comm = self.symm_mem_comm
@@ -158,10 +160,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
-    def fused_allreduce_rmsnorm(self, input_, weight_, eps) -> torch.Tensor:
+    def fused_allreduce_rmsnorm(
+        self, input_, res_inp_, weight_, eps
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         n = input_.shape[-1]
         can_use_fuse_ar_rms = (
-            n <= 16384 and input_.numel() * input_.element_size() < 8 * 1024 * 8192
+            n <= 16384
+            and input_.numel() * input_.element_size() < 8 * 1024 * 8192
+            and self.world_size != 6
         )
         ca_comm = self.ca_comm
         if (
@@ -170,11 +176,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_custom_ar(input_)
             and can_use_fuse_ar_rms
         ):
-            out = ca_comm.custom_fused_ar_rms(input_, weight_, eps)
+            res_out, out = ca_comm.custom_fused_ar_rms(input_, res_inp_, weight_, eps)
             assert out is not None
-            return out
+            assert res_out is not None
+            return res_out, out
         # call split kernel
-        ar_out = all_reduce(input_)
+        ar_out = self.all_reduce(input_)
         out = torch.empty_like(ar_out)
         residual_out = torch.empty_like(ar_out)
         from aiter import rmsnorm2d_fwd_with_add
@@ -188,7 +195,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             eps,
             0,
         )
-        return out
+        return residual_out, out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size

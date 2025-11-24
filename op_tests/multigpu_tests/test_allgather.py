@@ -2,9 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
-import aiter
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 import argparse
 from aiter import dtypes
@@ -33,7 +31,15 @@ logger = logging.getLogger("aiter")
 set_start_method("spawn", force=True)
 
 
-def run_allgather(tp_size, pp_size, rankID, x, withGraph=False, use_custom=False):
+def run_allgather(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    withGraph=False,
+    use_custom=False,
+    distributed_init_method: Optional[str] = None,
+):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     # init
@@ -42,7 +48,7 @@ def run_allgather(tp_size, pp_size, rankID, x, withGraph=False, use_custom=False
     init_distributed_environment(
         world_size=tp_size,
         rank=rankID,
-        distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
+        distributed_init_method=distributed_init_method,
     )
     ensure_model_parallel_initialized(tp_size, pp_size)
     x = x.to(device)
@@ -82,7 +88,15 @@ def run_allgather(tp_size, pp_size, rankID, x, withGraph=False, use_custom=False
     return out
 
 
-def call_ccl_allgather_naive(tp_size, pp_size, rankID, x, use_custom=True, loop_time=1):
+def call_ccl_allgather_naive(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    use_custom=True,
+    loop_time=1,
+    distributed_init_method: Optional[str] = None,
+):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     # init
@@ -91,7 +105,7 @@ def call_ccl_allgather_naive(tp_size, pp_size, rankID, x, use_custom=True, loop_
     init_distributed_environment(
         world_size=tp_size,
         rank=rankID,
-        distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
+        distributed_init_method=distributed_init_method,
     )
     ensure_model_parallel_initialized(tp_size, pp_size)
     x = x.to(device)
@@ -111,7 +125,14 @@ def call_ccl_allgather_naive(tp_size, pp_size, rankID, x, use_custom=True, loop_
     return out
 
 
-def allgather_acctest(tp_size, pp_size, shape, dtype, use_custom=False):
+def allgather_acctest(
+    tp_size,
+    pp_size,
+    shape,
+    dtype,
+    use_custom=False,
+    distributed_init_method: Optional[str] = None,
+):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     pool = Pool(processes=tp_size)
@@ -124,7 +145,15 @@ def allgather_acctest(tp_size, pp_size, shape, dtype, use_custom=False):
         rets.append(
             pool.apply_async(
                 call_ccl_allgather_naive,
-                args=(tp_size, pp_size, i, input, use_custom, 1),
+                args=(
+                    tp_size,
+                    pp_size,
+                    i,
+                    input,
+                    use_custom,
+                    1,
+                    distributed_init_method,
+                ),
             )
             # pool.apply_async(call_aiter_allgather_naive, args=(tp_size, pp_size, i, input, 1))
         )
@@ -144,7 +173,13 @@ def allgather_acctest(tp_size, pp_size, shape, dtype, use_custom=False):
 
 @benchmark()
 def allgather_perftest(
-    tp_size, pp_size, shape, dtype, withGraph=False, use_custom=False
+    tp_size,
+    pp_size,
+    shape,
+    dtype,
+    withGraph=False,
+    use_custom=False,
+    distributed_init_method: Optional[str] = None,
 ):
     print(f"run perf test, use custom allgather {use_custom}")
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -158,7 +193,16 @@ def allgather_perftest(
         input_list.append(x)
         rets.append(
             pool.apply_async(
-                run_allgather, args=(tp_size, pp_size, i, x, withGraph, use_custom)
+                run_allgather,
+                args=(
+                    tp_size,
+                    pp_size,
+                    i,
+                    x,
+                    withGraph,
+                    use_custom,
+                    distributed_init_method,
+                ),
             )
             # pool.apply_async(run_cu, args=(x, weight, eps, i))
         )
@@ -218,5 +262,25 @@ if __name__ == "__main__":
         for shape in l_shape:
             # allgather_acctest(8, 1, shape, dtype, use_custom=False)
             # allgather_acctest(8, 1, shape, dtype, use_custom=True)
-            allgather_perftest(8, 1, shape, dtype, withGraph=False, use_custom=False)
-            allgather_perftest(8, 1, shape, dtype, withGraph=False, use_custom=True)
+            allgather_perftest(
+                8,
+                1,
+                shape,
+                dtype,
+                withGraph=False,
+                use_custom=False,
+                distributed_init_method=get_distributed_init_method(
+                    get_ip(), get_open_port()
+                ),
+            )
+            allgather_perftest(
+                8,
+                1,
+                shape,
+                dtype,
+                withGraph=False,
+                use_custom=True,
+                distributed_init_method=get_distributed_init_method(
+                    get_ip(), get_open_port()
+                ),
+            )
