@@ -198,6 +198,7 @@ def _deepgemm_fp8_paged_mqa_logits_ragged_k(
             + (pid_batch * next_n + pid_next_n) * stride_out_batch
             + (context_idx + tl.arange(0, ChunkK)),
             logits,
+            mask=(context_idx + tl.arange(0, ChunkK)) < max_model_len,
         )
 
 
@@ -283,7 +284,9 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
         o = tl.maximum(o, 0.0)
         o = o * scale_weight[None, :].T
 
-        mask = context_idx + tl.arange(0, ChunkK) <= context_length - pid_next_n
+        mask = (
+            context_idx + tl.arange(0, ChunkK) <= context_length - next_n + pid_next_n
+        )
         o = tl.where(mask[None, :], o, float("-inf"))
 
         tl.store(
@@ -377,7 +380,9 @@ def _deepgemm_fp8_paged_mqa_logits(
         o = tl.maximum(o, 0.0)
         o = o * scale_weight[None, :].T
 
-        mask = context_idx + tl.arange(0, ChunkK) <= context_length - pid_next_n
+        mask = (
+            context_idx + tl.arange(0, ChunkK) <= context_length - next_n + pid_next_n
+        )
         o = tl.where(mask[None, :], o, float("-inf"))
 
         logits = tl.reduce(o, axis=0, combine_fn=_sum_combine)
@@ -386,4 +391,69 @@ def _deepgemm_fp8_paged_mqa_logits(
             + (pid_batch * next_n + pid_next_n) * stride_out_batch
             + (context_idx + tl.arange(0, ChunkK)),
             logits,
+            mask=(context_idx + tl.arange(0, ChunkK)) < max_model_len,
         )
+
+
+@triton.jit
+def _gluon_deepgemm_fp8_paged_mqa_logits(
+    batch_size,
+    next_n,
+    heads_num,
+    Q_buffer,
+    stride_q_batch,
+    stride_q_next_n,
+    stride_q_heads,
+    KV_buffer,
+    stride_k_seq,
+    scale_buffer,
+    stride_scale_seq,
+    context_len_ptr,
+    kv_indices,
+    weights,
+    stride_w_batch,
+    OutLogits_buffer,
+    stride_out_batch,
+    max_model_len,
+    max_block_len,
+    SplitKV,
+    dummyPointerArg,  # dummy pointer for compatibility with triton3.5 on lower version
+    ChunkQ: tl.constexpr,
+    ChunkK: tl.constexpr,
+    HiddenDim: tl.constexpr,
+    KVBlockSize: tl.constexpr = 1,
+):
+    # for AOT load use, only need kernel have the same signature as implementation side
+    pass
+
+
+@triton.jit
+def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
+    batch_size,
+    next_n,
+    heads_num,
+    Q_buffer,
+    stride_q_batch,
+    stride_q_next_n,
+    stride_q_heads,
+    KV_buffer,
+    stride_k_seq,
+    scale_buffer,
+    stride_scale_seq,
+    context_len_ptr,
+    kv_indices,
+    weights,
+    stride_w_batch,
+    OutLogits_buffer,
+    stride_out_batch,
+    max_model_len,
+    max_block_len,
+    SplitKV,
+    dummyPointerArg,  # dummy pointer for compatibility with triton3.5 on lower version
+    ChunkQ: tl.constexpr,
+    ChunkK: tl.constexpr,
+    HiddenDim: tl.constexpr,
+    KVBlockSize: tl.constexpr = 16,
+):
+    # for AOT load use, only need kernel have the same signature as implementation side
+    pass

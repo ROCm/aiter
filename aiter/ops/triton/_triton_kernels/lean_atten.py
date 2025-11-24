@@ -21,22 +21,17 @@ import functools
 import json
 import triton
 import triton.language as tl
-from typing import Optional
-from bisect import bisect_right
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ..utils._triton.pid_preprocessing import remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
 
 
-LOG_TWO_E = 1.44269504  # log_2(e) value for softmax scaling
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
 
 
 @functools.lru_cache(maxsize=1024)
-def _get_config(
-    causal: bool,
-    batch_size: int,
-):
+def _get_config():
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json"
@@ -106,29 +101,34 @@ def _attention_inner(
     m_i,
     l_i,
     acc,
-    qk_scale,
-    causal,
     q_start_m,
     b_seq_size,
     offs_m,
     offs_n,
-    BLOCK_M,
-    BLOCK_N,
-    HEAD_DIM_ORIG: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
     local_iter,
     local_iter_end,
+    SM_SCALE: tl.constexpr,
+    causal: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM_ORIG: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     use_64_indexing: tl.constexpr,
 ):
     """
     Performs attention calculation for an (maybe partial) output tile
     """
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+
     # Define head-dimension mask for padded dims
     offs_k_local = tl.arange(0, HEAD_DIM)
     mask_k_cols_local = offs_k_local < HEAD_DIM_ORIG
     for l_iter in range(local_iter, local_iter_end):
         k = tl.load(k_ptrs, mask=mask_k_cols_local[:, None], other=0.0)
-        qk = tl.dot(q, k) * qk_scale
+        qk_scale = SM_SCALE * RCP_LN2
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk += tl.dot(q, k)
+        qk = qk * qk_scale
 
         if causal:
             # Get the starting column index of the current K block
@@ -208,14 +208,37 @@ def remap_xcd(pid, GRID_MN: tl.constexpr, NUM_XCDS: tl.constexpr = 8):
     return pid, pids_per_xcd
 
 
-@triton.jit
+_la_persistent_repr = make_kernel_repr(
+    "la_persistent",
+    [
+        "HEADS_PER_XCD",
+        "HEAD_DIM",
+        "BLOCK_M",
+        "BLOCK_N",
+        "MASKED_BLOCKS",
+        "XCD_REMAP",
+        "NUM_XCDS",
+        "batch_size",
+        "causal",
+        "num_m_blocks",
+        "num_n_blocks",
+        "total_programs",
+        "high_load_wgs",
+        "max_tiles_per_wg",
+        "tiles_per_head",
+        "num_splits",
+        "max_output_tile_cnt",
+    ],
+)
+
+
+@triton.jit(repr=_la_persistent_repr)
 def la_persistent(
     is_pod,
     pod_pid,
     Q,
     K,
     V,
-    qk_scale,
     Mp,
     Lp,
     Op,
@@ -238,6 +261,7 @@ def la_persistent(
     stride_oph,  # total_programs
     stride_opm,  # n_ctx_q
     stride_opn,  # head_dim
+    SM_SCALE,
     HEADS_PER_XCD: tl.constexpr,
     HEAD_DIM_ORIG: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -257,8 +281,6 @@ def la_persistent(
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
     max_output_tile_cnt: tl.constexpr,
-    num_heads_q: tl.constexpr,
-    num_heads_k: tl.constexpr,
     gqa_group_size: tl.constexpr,
     use_64_indexing: tl.constexpr,
     RAGGED_BATCH: tl.constexpr,
@@ -311,7 +333,6 @@ def la_persistent(
                 Q,
                 K,
                 V,
-                qk_scale,
                 Mp,
                 Lp,
                 Op,
@@ -338,14 +359,13 @@ def la_persistent(
                 current_pid=current_pid,
                 xcd_pid=xcd_pid,
                 xcd_id=xcd_id,
+                SM_SCALE=SM_SCALE,
                 HEADS_PER_XCD=HEADS_PER_XCD,
                 HEAD_DIM=HEAD_DIM,
                 HEAD_DIM_ORIG=HEAD_DIM_ORIG,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
                 MASKED_BLOCKS=MASKED_BLOCKS,
-                XCD_REMAP=XCD_REMAP,
-                NUM_XCDS=NUM_XCDS,
                 batch_size=batch_size,
                 causal=causal,
                 num_m_blocks=num_m_blocks,
@@ -366,7 +386,6 @@ def la_persistent_inner(
     Q,
     K,
     V,
-    qk_scale,
     Mp,
     Lp,
     Op,
@@ -393,14 +412,13 @@ def la_persistent_inner(
     current_pid,  # SOC pid
     xcd_pid,  # XCD pid
     xcd_id,  # The XCD the pid belongs to
-    HEADS_PER_XCD,
+    SM_SCALE,
+    HEADS_PER_XCD: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     HEAD_DIM_ORIG: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MASKED_BLOCKS: tl.constexpr,
-    XCD_REMAP: tl.constexpr,
-    NUM_XCDS: tl.constexpr,
     batch_size: tl.constexpr,
     causal: tl.constexpr,
     num_m_blocks: tl.constexpr,
@@ -618,18 +636,18 @@ def la_persistent_inner(
         m_i,
         l_i,
         acc,
-        qk_scale,
-        causal,
         q_start_m,
         b_seq_size,
         offs_m,
         offs_n,
+        local_iter,
+        local_iter_end,
+        SM_SCALE,
+        causal,
         BLOCK_M,
         BLOCK_N,
         HEAD_DIM_ORIG=HEAD_DIM_ORIG,
         HEAD_DIM=HEAD_DIM,
-        local_iter=local_iter,
-        local_iter_end=local_iter_end,
         use_64_indexing=use_64_indexing,
     )
 
