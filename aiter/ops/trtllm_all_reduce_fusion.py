@@ -109,7 +109,7 @@ class _ARFusion:
 
 
 class TRTLLMDistEnv:
-    def __init__(self, rank, world_size, init_process_group=False, port=22339):
+    def __init__(self, rank, world_size, dtype=torch.bfloat16, init_process_group=False, port=22339):
         torch.cuda.set_device(rank)
         if init_process_group:
             dist.init_process_group(
@@ -122,6 +122,8 @@ class TRTLLMDistEnv:
         self.world_size = world_size
         self.group = dist.group.WORLD
         self.ar_fusion = _ARFusion(group=self.group)
+        self.ref_tensor = torch.rand(1, dtype=dtype).cuda(rank)
+        self.workspace = self.ar_fusion.get_workspace(self.ref_tensor)
         self.barrier()
 
     def __del__(self):
@@ -189,7 +191,7 @@ class TRTLLMDistEnv:
             scale_out,
             eps,
             fp8_policy_id if fp8_out else 0,
-            self.ar_fusion.get_workspace(allreduce_in),
+            self.workspace,
         )
         if fp8_out:
             return residual_out, norm_out, scale_out
