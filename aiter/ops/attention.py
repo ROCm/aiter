@@ -181,6 +181,7 @@ def pa_persistent_fwd(
     Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
     K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]
     V: torch.Tensor,  # [num_blocks, kv_heads, block_size / x, head_dim, x]
+    output: torch.Tensor,
     max_qlen: int,  # default = 1
     qo_indptr: torch.Tensor,  # [batch+1], qolen prefix sum
     kv_indptr: torch.Tensor,  # [batch+1], kvlen prefix sum   1
@@ -196,7 +197,6 @@ def pa_persistent_fwd(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if softmax_scale is None:
         softmax_scale = 1.0 / (v_head_dim**0.5)
-    output = torch.empty_like(Q)
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
     logits = torch.empty(
@@ -218,8 +218,8 @@ def pa_persistent_fwd(
         kv_indptr,
         kv_indices,
         kv_last_page_lens,
-        max_qlen,
         softmax_scale,
+        max_qlen,
         K_QScale,
         V_QScale,
         output,
