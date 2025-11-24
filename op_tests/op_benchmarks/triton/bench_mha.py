@@ -361,6 +361,7 @@ def run_benchmark(custom, args):
         q = torch.randn((BATCH, N_CTX_Q, HQ, D_HEAD), device=device, dtype=dtype)
         k = torch.randn((BATCH, N_CTX_K, HK, D_HEAD), device=device, dtype=dtype)
         v = torch.randn((BATCH, N_CTX_K, HK, D_HEAD_V), device=device, dtype=dtype)
+        sink = torch.randn((HQ,), device=device, dtype=dtype) if args.sink else None
         q.requires_grad = requires_grad
         k.requires_grad = requires_grad
         v.requires_grad = requires_grad
@@ -462,6 +463,7 @@ def run_benchmark(custom, args):
                         causal=causal,
                         return_lse=return_lse,
                         return_attn_probs=return_attn_probs,
+                        sink=sink,
                     )
 
         else:
@@ -488,6 +490,7 @@ def run_benchmark(custom, args):
                         causal=causal,
                         return_lse=return_lse,
                         return_attn_probs=return_attn_probs,
+                        sink=sink,
                     )
 
         if mode == "bwd":
@@ -618,6 +621,9 @@ def parse_args():
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
+    )
+    parser.add_argument(
+        "-sink", action="store_true", default=False, help="use attention sink"
     )
     return parser.parse_args()
 
