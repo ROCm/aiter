@@ -849,7 +849,6 @@ def fused_moe_2stages(
     aiter.logger.info(w1)
     aiter.logger.info(a1)
     aiter.logger.info(a1_scale)
-    assert False
 
     a2 = metadata.stage1(
         a1,
