@@ -442,12 +442,6 @@ def gemm_a8w8_bpreshuffle(
     n = WQ.shape[0]
     k = XQ.shape[-1]
 
-<<<<<<< HEAD
-    get_bpreshuffle_GEMM_config(
-        m, n, k, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
-    )
-=======
->>>>>>> main
     # if (
     #     ck_config is None
     #     and dtype == dtypes.bf16
@@ -464,7 +458,11 @@ def gemm_a8w8_bpreshuffle(
     # CKTile only supports bf16 dtype
     if dtype == dtypes.bf16:
         cktile_config = get_bpreshuffle_GEMM_config(
-            m, n, k, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE
+            m,
+            n,
+            k,
+            dtypes.fp8,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE,
         )
     else:
         cktile_config = None
