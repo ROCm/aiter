@@ -859,6 +859,9 @@ def fused_moe_2stages(
         w1_scale=w1_scale,
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
+    
+    aiter.logger.info('print a2 before quantizing')
+    aiter.logger.info(a2)
 
     if (
         quant_type == QuantType.per_1x32
@@ -906,6 +909,7 @@ def fused_moe_2stages(
 
     aiter.logger.info('print a2 after quantizing')
     aiter.logger.info(a2)
+    assert False
 
     metadata.stage2(
         a2,
