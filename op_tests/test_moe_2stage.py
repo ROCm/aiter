@@ -57,7 +57,7 @@ def test_fmoe(
     torch_quant = aiter.get_torch_quant(qType)
     # input = torch.randn((token, model_dim), dtype=dtype)
     input = torch.ones((token, model_dim), dtype=dtype)
-    aiter.logger.info(f'input_dim {token} {model_dim}')
+    aiter.logger.info(f'input_dim {token} model_dim {model_dim} hidden_pad {hidden_pad} intermediate_pad {intermediate_pad}')
     if use_g1u1:
         # w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
         w1 = torch.ones((E, inter_dim * 2, model_dim), dtype=dtype)
@@ -137,6 +137,8 @@ def test_fmoe(
         aiter.logger.info(f'w2_qt_shape {w2_qt.shape} {w2_qt.dtype}')
         aiter.logger.info(f'w1_scale_shape {w1_scale.shape} {w1_scale.dtype}')
         aiter.logger.info(f'w2_scale_shape {w2_scale.shape} {w2_scale.dtype}')
+        aiter.logger.info(w1)
+        # assert False, "temp stop here"
 
 
     if qType != aiter.QuantType.per_1x32:
@@ -375,7 +377,8 @@ l_quant = [
 # l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_act = [aiter.ActivationType.Swiglu]
 l_doweight_stage1 = [False, True][:1]
-l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
+# l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
+l_hidden_intermediate_pad = [(0, 0)]
 l_preshuffle = [False, True]
 
 

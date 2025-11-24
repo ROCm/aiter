@@ -1089,9 +1089,11 @@ def torch_moe_stage1(
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
 ):
-    logger.info('torch_moe_stage1') 
+    logger.info('torch_moe_stage1 w1 dtype {w1.dtype}, hidden_states dtype {hidden_states.dtype}') 
     logger.info(hidden_states)
     logger.info(w1)
+    logger.info(w1_scale)
+    # assert False
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
     B, D = hidden_states.shape
