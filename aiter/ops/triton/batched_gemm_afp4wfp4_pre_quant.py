@@ -33,6 +33,10 @@ def batched_gemm_afp4wfp4_pre_quant_fake_tensor(
     y: Optional[torch.Tensor] = None,
     config: Optional[str] = None,
 ) -> Tensor:
+    if y is None:
+        Bx, M, _ = x.shape
+        _, N, _ = w.shape
+        return torch.empty(Bx, M, N), dtype=dtype, device=x.device)
     return y
 
 @torch_compile_guard(gen_fake=batched_gemm_afp4wfp4_pre_quant_fake_tensor)
@@ -55,6 +59,9 @@ def batched_gemm_afp4wfp4_pre_quant_(
     By, _, _ = y.shape
     assert Bx == Bw == By
     Batch = Bx
+
+    if y is None:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if config is None:
         config = _get_config(M, N, K)

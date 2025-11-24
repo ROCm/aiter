@@ -25,6 +25,10 @@ def gemm_a16w16_atomic_fake_tensor(
     y: Optional[torch.Tensor] = None,
     config: Optional[str] = None,
 ) -> Tensor:
+    if y is None:
+        M, _ = x.shape
+        _, N = w.shape
+        return torch.zeros((M, N), dtype=dtype, device=x.device)
     return y
 
 @torch_compile_guard(gen_fake=gemm_a16w16_atomic_fake_tensor)
