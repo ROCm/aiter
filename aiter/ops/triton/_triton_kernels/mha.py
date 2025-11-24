@@ -271,6 +271,7 @@ _attn_fwd_repr = make_kernel_repr(
         "VARLEN",
         "NUM_XCD",
         "USE_INT64_STRIDES",
+        "ENABLE_SINK",
     ],
 )
 
@@ -288,6 +289,7 @@ def _attn_fwd(
     s_dmask_ptr: torch.Tensor,
     dropout_mask_ptr: torch.Tensor,
     softmax_lse_ptr: torch.Tensor,
+    sink_ptr: torch.Tensor,
     stride_qz_in,
     stride_qh_in,
     stride_qm_in,
@@ -341,6 +343,7 @@ def _attn_fwd(
     BATCH,
     NUM_XCD: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
+    ENABLE_SINK: tl.constexpr,
 ):
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
@@ -631,7 +634,13 @@ def _attn_fwd(
         dropout_mask_ptrs = None
         philox_ptrs = None
 
-    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    if ENABLE_SINK:
+        RCP_LN2: tl.constexpr = 1.4426950408889634
+        m_i_value = tl.load(sink_ptr + off_q_head).to(tl.float32) * RCP_LN2
+    else:
+        m_i_value = float("-inf")
+
+    m_i = tl.full([BLOCK_M], m_i_value, dtype=tl.float32)
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=tl.float32)
     if BLOCK_DMODEL == BLOCK_DMODEL_POW2:
