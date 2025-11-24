@@ -114,20 +114,21 @@ def test_fmoe(
         w1_qt, w1_scale = weight_per_128x128_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = weight_per_128x128_quant(w2, quant_dtype=WQDType)
     else:
-        print(w1.shape)
-        print(w2.shape)
-        print(f'tag0 {WQDType}\n')
         if False:
             w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
             w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
         else:
             w1_qt, w1_scale = torch_quant(w1, quant_dtype=dtypes.i8, dtypeMax=7)
             w2_qt, w2_scale = torch_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
-        print('tag2\n')
+
+        aiter.logger.info(f'debug0')
         aiter.logger.info(f'w1_shape {w1.shape}')
         aiter.logger.info(f'w2_shape {w2.shape}')
         aiter.logger.info(f'w1_qt_shape {w1_qt.shape}')
         aiter.logger.info(f'w2_qt_shape {w2_qt.shape}')
+        aiter.logger.info(f'w1_scale_shape {w1_scale.shape}')
+        aiter.logger.info(f'w2_scale_shape {w2_scale.shape}')
+        aiter.logger.info(f'debug0 done')
 
     if qType != aiter.QuantType.per_1x32:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
@@ -484,11 +485,13 @@ for (
     preshuffle,
 ) in itertools.product(l_dtype, l_quant, l_dim, l_doweight_stage1, l_preshuffle):
     print(f"wq_dtype {wq_dtype}")
-    if (quant_type, aq_dtype, wq_dtype) == (
-        aiter.QuantType.per_1x32,
-        dtypes.bf16,
-        dtypes.fp4x2,
-    ):
+    # if (quant_type, aq_dtype, wq_dtype) == (
+    #     aiter.QuantType.per_1x32,
+    #     dtypes.bf16,
+    #     dtypes.fp4x2,
+    # ):
+    if True:
+        aiter.logger.info('call a16w4 with swiglu')
         for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
             for m in l_tokenNum:
                 ret = test_fmoe(
