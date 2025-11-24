@@ -4,7 +4,7 @@
 import os
 import argparse
 import random
-from typing import List, Optional, Tuple, Union, Dict
+from typing import Optional, Tuple, Union, Dict
 import shutil
 import subprocess
 from multiprocessing import Pool, cpu_count
@@ -462,7 +462,7 @@ def run_pa_gluon_test(
         use_aot_impl=use_aot_impl,
     )
 
-    results[f"us_gluon"] = 0
+    results["us_gluon"] = 0
 
     return results
 
@@ -926,21 +926,12 @@ def prebuild_pa_decode_gluon_aot_so():
         QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
         HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
         # HEAD_DIMENSION_OPTIONS = [256]
-        # BLOCK_SIZE_OPTIONS = [16, 64, 1024]
-        BLOCK_SIZE_OPTIONS = [16, 64]
+        BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+        # BLOCK_SIZE_OPTIONS = [16, 64]
         # BLOCK_SIZE_OPTIONS = [1024]
         HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
         QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-        CONTEXT_LENGTH_OPTIONS = [
-            256,
-            512,
-            1024,
-            2048,
-            4096,
-            8192,
-            # 16 * 1024,
-            # 32 * 1024,
-        ]
+        CONTEXT_LENGTH_OPTIONS = [512]
         # USE_AOT_IMPL_OPTIONS = [False, True]
         # USE_AOT_IMPL_OPTIONS = [False]
         USE_AOT_IMPL_OPTIONS = [True]
@@ -956,7 +947,7 @@ def prebuild_pa_decode_gluon_aot_so():
     )
     if result.returncode != 0 and result.stderr:
         print(f"Warning: {result.stderr}")
-    print(f"Cleaning current directory cache completed!")
+    print("Cleaning current directory cache completed!")
     # Clean aiter build directory cache, only *.so files are left
     print(f"Cleaning aiter build directory cache: {BUILD_DIR}")
     clean_directory_except_so(BUILD_DIR)

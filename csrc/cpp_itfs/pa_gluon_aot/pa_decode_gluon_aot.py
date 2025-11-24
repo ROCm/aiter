@@ -1,16 +1,11 @@
 import os
-import sys
-import hashlib
 import time
 import logging
 from pathlib import Path
-from unittest import result
 from jinja2 import Template
 import triton
-import functools
 import aiter
 import torch
-import triton
 import triton.language as tl
 
 GLUON_AOT_COMPILE_ENABLED = True
@@ -70,7 +65,6 @@ def compile(
     equivalent_query_group_size: int,
     head_size: int,
     kv_block_size: int,
-    max_context_partition_num: int,
     context_partition_size: int,
     query_quant_mode: int,
     kv_quant_mode: int,
@@ -80,7 +74,6 @@ def compile(
     func_name: str = None,
 ):
     """Compile the combined attention and reduce kernel for paged attention decode."""
-    max_context_partition_num_pow2 = triton.next_power_of_2(max_context_partition_num)
     head_size_pow2 = triton.next_power_of_2(head_size)
 
     if equivalent_query_group_size < 16:
@@ -96,7 +89,6 @@ def compile(
                 equi_query_group_size_pow2,
                 head_size_pow2,
                 kv_block_size,
-                max_context_partition_num_pow2,
                 context_partition_size,
                 query_quant_mode,
                 kv_quant_mode,
@@ -254,7 +246,6 @@ def compile(
             "i32:16",  # num_kv_heads
             f"{equi_query_group_size_pow2}",
             f"{head_size_pow2}",
-            f"{max_context_partition_num_pow2}",
             f"{context_partition_size}",
         ]
         reduce_signature = ",".join(reduce_signature_parts)
@@ -500,7 +491,6 @@ def pa_decode_gluon_aot(
         equivalent_query_group_size=equivalent_query_group_size,
         head_size=head_size,
         kv_block_size=kv_block_size,
-        max_context_partition_num=max_context_partition_num,
         context_partition_size=context_partition_size,
         query_quant_mode=query_quant_mode,
         kv_quant_mode=kv_quant_mode,
@@ -509,7 +499,7 @@ def pa_decode_gluon_aot(
         is_causal=int(is_causal),
     )
 
-    assert combined_func is not None, f"Combined function is not compiled"
+    assert combined_func is not None, "Combined function is not compiled"
     # Execute the combined kernel
     if run_compiled_kernel:
         combined_func(
