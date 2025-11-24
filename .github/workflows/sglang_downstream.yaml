@@ -29,7 +29,7 @@ jobs:
     needs: [check-signal]
     runs-on: aiter-mi355-1gpu
     env:
-      SGL_BRANCH: v0.5.3
+      SGL_BRANCH: v0.5.5
       GPU_ARCH: gfx950
       SGL_IMAGE: rocm/sgl-dev:v0.5.3.post3-rocm700-mi30x-20251019
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
