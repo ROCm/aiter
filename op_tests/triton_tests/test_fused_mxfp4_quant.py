@@ -182,7 +182,7 @@ def test_fused_rms_quant(
         dtype=dtype,
     )
     (y1_fp4_torch, y1_scales_torch), y1_torch, y2_torch, y1_res_torch = (
-        calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, shuffle=shuffle)
+        calculate_target_w_torch(x1, rms1_w, resid1, x2, rms2_w, shuffle=shuffle, dtype=dtype)
     )
 
     (y1_fp4_triton, y1_scales_triton), y1_triton, y2_triton, y1_res_triton = (
