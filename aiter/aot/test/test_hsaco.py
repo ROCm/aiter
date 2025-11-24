@@ -42,6 +42,6 @@ if __name__ == "__main__":
         1024,
         1,
         grid=((1024 + 16 - 1) / 16, (1024 + 16 - 1) / 16, 1),
-        constants={"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 16},
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 16, "BLOCK_K": 16},
     )
     print(C)
