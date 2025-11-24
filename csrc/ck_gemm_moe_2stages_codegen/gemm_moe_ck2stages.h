@@ -124,6 +124,28 @@ struct MulABScale
     }
 };
 
+// for gate, a_scale, b_scale
+struct MulABScale_Preshuffle
+{
+    template <typename E, typename C, typename D0, typename D1, typename D2>
+    __host__ __device__ constexpr void
+    operator()(E& e, const C& c, const D0& d0, const D1& d1, const D2& d2) const;
+
+    template <>
+    __host__ __device__ constexpr void operator()<F16, float, float, float, float>(
+        F16& e, const float& c, const float& d0, const float& d1, const float& d2) const
+    {
+        e = ck::type_convert<F16>(c);
+    }
+
+    template <>
+    __host__ __device__ constexpr void operator()<B16, float, float, float, float>(
+        B16& e, const float& c, const float& d0, const float& d1, const float& d2) const
+    {
+        e = ck::type_convert<B16>(c);
+    }
+};
+
 struct MulABScaleWint4
 {
     template <typename E, typename C, typename D0, typename D1, typename D2>
