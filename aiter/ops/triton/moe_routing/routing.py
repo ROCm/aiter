@@ -1,0 +1,314 @@
+import torch
+import triton
+from dataclasses import dataclass, field
+from .routing_details._routing_compute import _combined_routing
+from .routing_details._expt_data import _expt_data_compute
+
+
+@dataclass
+class GatherIndx:
+    """
+    Indices for an operation that performs:
+    Y = X[src_idx, :]
+    """
+    # array such that `dst_idx[src_idx] = arange(0, N)`
+    src_indx: torch.Tensor
+    dst_indx: torch.Tensor
+
+
+@dataclass
+class ScatterIndx:
+    """
+    Indices for an operation that performs:
+    Y[dst_idx, :] = X
+    """
+    # array such that `dst_idx[src_idx] = arange(0, N)`
+    src_indx: torch.Tensor
+    dst_indx: torch.Tensor
+
+
+@dataclass
+class ExptData:
+    # hist[i] is the number of tokens routed to expert i
+    hist: torch.Tensor
+    # token_offs_raw[i] is the offset of the first token routed
+    # to expert i in an expert-sorted array
+    token_offs_raw: torch.Tensor
+    # token_offs_pad[block][i] is the offset of the first token routed
+    # to expert i in an expert-sorted array, assuming histogram
+    # rounded to the next multiple of `block`
+    token_offs_pad: dict[int, torch.Tensor]
+    # block_id_map[block] contain one value for each `pid`` launched by
+    # the matrix multiplication kernel launched with BLOCK_M=block:
+    # - the value is -1 if the `pid` has no work to do
+    # - otherwise, the value is two int16 (packed as an int32) that
+    #   correspond respectively to (1) the expert assigned to
+    #   the tokens processed by this pid; (2) the block assigned to the
+    #   tokens processed by this pid (think `pid_m` in a regular matmul)
+    # see `test_routing.py` for a reference implementation and more details
+    block_pid_map: dict[int, torch.Tensor]
+
+    def __post_init__(self):
+        if self.hist is not None:
+            assert self.hist.dtype == torch.int32
+        if self.token_offs_raw is not None:
+            assert self.token_offs_raw.dtype == torch.int32
+        if self.token_offs_pad is not None:
+            for v in self.token_offs_pad.values():
+                assert v.dtype == torch.int32
+        if self.block_pid_map is not None:
+            for v in self.block_pid_map.values():
+                assert v.dtype == torch.int32
+
+
+@dataclass
+class RoutingData:
+    gate_scal: torch.Tensor = field()
+    expt_hist: torch.Tensor = field()
+    n_expts_tot: int = field()
+    n_expts_act: int = field()
+    expt_data: ExptData = None
+
+    # Used to make perf annotation cleaner: when we use expert sharding, we can
+    # use this to tell the "expected" number of local tokens per expert, because
+    # the actual number can vary per each input.
+    expected_tokens_per_expt: int = field(default=None)
+
+    def n_blocks(self, n_rows, block_m):
+        if n_rows <= self.n_expts_tot:
+            return n_rows
+        else:
+            return triton.cdiv(max(n_rows - self.n_expts_tot + 1, 0), block_m) + self.n_expts_tot - 1
+
+
+# --------------------------
+# sort tokens by expert
+# --------------------------
+
+
+def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, HIST_BLOCK_M):
+    INDX_OFFS_BLOCK_M = 512
+    MEMSET_BLOCK = 1024
+    cdiv = triton.cdiv
+
+    device = expt_scal.device
+    dtype = expt_scal.dtype
+    n_tokens, n_expts_act = expt_scal.shape
+    n_gates = n_tokens * n_expts_act
+
+    hist, partial_hist = bitmatrix.sum(partials_block_size=HIST_BLOCK_M)
+    hist = hist[:n_expts_tot]
+    assert hist.dtype == torch.int32
+    # scratchpad
+    expt_offs = torch.empty(n_expts_tot, dtype=torch.int32, device=device)
+    combined_indx = torch.empty(n_gates * 2, dtype=torch.int32, device=device)
+    # output
+    topk_indx = combined_indx[:n_gates]
+    gate_indx = combined_indx[n_gates:]
+    gate_scal = torch.empty(n_gates, dtype=dtype, device=device)
+
+    token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1a, MEMSET_BLOCK_A, HIST2_BLOCK_M, block_m_log2_start, block_m_num = _compute_expt_data_internal(
+        hist, n_expts_tot, n_gates)
+
+    blocks1b = cdiv(n_tokens, HIST_BLOCK_M)
+
+    indx_offs = partial_hist
+
+    _combined_routing[(blocks1a + blocks1b, )](
+        topk_indx, gate_indx, gate_scal,  # outputs
+        expt_scal, expt_indx, indx_offs, indx_offs.stride(0), indx_offs.stride(1),  # inputs
+        expt_offs, n_tokens,  # input shape
+        HIST_BLOCK_M, n_expts_act,  # constants
+        hist, hist.shape[0], n_expts_tot,  # inputs
+        token_offs_combined, token_offs_combined.stride(0),  #
+        blocks1a, block_pid_map, block_pid_map.stride(0), block_pid_map.shape[1],  #
+        block_m_log2_start, SIZES=block_m_num, BLOCK_A=MEMSET_BLOCK_A,  # optimization parameters
+        BLOCK_N=512,  # tunable parameters
+        num_warps=2
+    )
+
+    return hist, topk_indx, gate_indx, gate_scal, token_offs_raw, token_offs_pad, block_pid_map
+
+
+# --------------------------
+# expt_data
+# --------------------------
+
+
+def log2_power_of_two(x):
+    assert x > 0 and (x & (x - 1)) == 0, "x must be a power of two"
+    return x.bit_length() - 1
+
+
+block_m_log2_start = 4
+
+
+def _compute_expt_data_internal(expt_hist, n_expts_tot, n_gates):
+
+    MEMSET_BLOCK = 512
+    HIST2_BLOCK_M = 512
+    device = expt_hist.device
+    n_expts_tot = n_expts_tot
+    cdiv = triton.cdiv
+    # block_ms are all powers-of-two between 16 and 128 (inclusive)
+    block_m_log2_end = 9 #if is_hip() else 8
+    block_m_num = block_m_log2_end - block_m_log2_start
+    if n_gates <= n_expts_tot:
+        max_n_tiles = n_gates
+    else:
+        max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // 2**block_m_log2_start)
+    # allocate memory
+    pad = lambda x: cdiv(x, MEMSET_BLOCK) * MEMSET_BLOCK
+    dtype = torch.int32
+
+    token_offs_combined = torch.empty((block_m_num + 1, pad(n_expts_tot + 1)), dtype=dtype, device=device)
+
+    token_offs_raw = token_offs_combined[0][:n_expts_tot + 1]
+    token_offs_pad = token_offs_combined[1:]
+
+    block_pid_map = torch.empty((block_m_num, pad(max_n_tiles)), dtype=dtype, device=device)
+    memset_grid = torch.numel(block_pid_map) // MEMSET_BLOCK  # exact division
+    # compute outputs
+    token_offs_pad = token_offs_pad[:, :n_expts_tot + 1]
+    block_pid_map = block_pid_map[:, :max_n_tiles]
+
+    blocks1 = n_expts_tot * block_m_num + 1
+    return token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1, MEMSET_BLOCK, HIST2_BLOCK_M, block_m_log2_start, block_m_num
+
+
+def _unpack_into_dict(x):
+
+    block_m_log2_end = block_m_log2_start + x.shape[0]
+    x = {2**j: x[i, :] for i, j in enumerate(range(block_m_log2_start, block_m_log2_end))}
+    return x
+
+
+def compute_expt_data(expt_hist, n_expts_tot, n_gates):
+
+    if expt_hist is None:
+        return ExptData(None, None, None, None)
+
+    # this just computes the kernel arguments:
+    token_offs_combined, token_offs_raw, token_offs_pad, block_pid_map, blocks1, blocks2, MEMSET_BLOCK, HIST2_BLOCK_M, block_m_log2_start, block_m_num = _compute_expt_data_internal(
+        expt_hist, n_expts_tot, n_gates)
+
+    _expt_data_memset[(blocks1, )](
+        expt_hist, n_expts_tot,  #
+        token_offs_combined, token_offs_combined.stride(0),  #
+        block_pid_map,  #
+        block_m_log2_start, SIZES=block_m_num, BLOCK=MEMSET_BLOCK,  # optimization parameters
+        num_warps=4)
+    _expt_data_compute[(blocks2, )](
+        expt_hist, token_offs_pad, token_offs_pad.stride(0), block_pid_map, block_pid_map.stride(0),  # outputs
+        block_m_log2_start, SIZES=block_m_num, BLOCK=HIST2_BLOCK_M,  # optimization parameters
+        num_warps=4)
+
+    token_offs_pad = _unpack_into_dict(token_offs_pad)
+    block_pid_map = _unpack_into_dict(block_pid_map)
+    return ExptData(expt_hist, token_offs_raw, token_offs_pad, block_pid_map)
+
+
+# --------------------------
+# routing
+# --------------------------
+
+
+def routing(logits, n_expts_act, sm_first=False, expt_indx=None):
+    HIST_BLOCK_M = 32
+
+    from .topk import topk
+    if sm_first:
+        logits = torch.softmax(logits, dim=-1)
+    expt_scal, expt_indx, bitmatrix = topk(logits, n_expts_act, apply_softmax=not sm_first, y_indx=expt_indx, HIST_BLOCK_M=HIST_BLOCK_M)
+    n_expts_tot = logits.shape[-1]
+    
+    hist, topk_indx, gate_indx, gate_scal, token_offs_raw, token_offs_pad, block_pid_map = sort_tokens(
+        expt_scal, expt_indx, n_expts_tot, bitmatrix, HIST_BLOCK_M)
+    token_offs_pad = _unpack_into_dict(token_offs_pad)
+    block_pid_map = _unpack_into_dict(block_pid_map)
+    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
+
+    # pack the matmul data structure
+    gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
+    scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
+    return RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data), gather_indx, scatter_indx
+
+
+# --------------------------
+# torch reference
+# --------------------------
+
+
+def compute_expt_data_torch(hist, n_expts_tot, n_gates):
+    # offset for each experts
+    device = hist.device
+    token_offs_raw = torch.cumsum(hist, dim=0)
+    token_offs_raw = torch.cat((torch.zeros(1, device=device), token_offs_raw))
+    token_offs_raw = token_offs_raw.int()
+    # maximum number of tiles for all values of `block_m` considered
+    block_ms = [16, 32, 64, 128]
+    #if is_hip():
+    block_ms.append(256)
+    if n_gates <= n_expts_tot:
+        max_n_tiles = n_gates
+    else:
+        # ceil_div(n_gates - n_experts + 1, d_tile) + n_experts - 1
+        # ceil_div(x, y): -(-x // y)
+        max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // min(block_ms))
+    # fill up tile offset/infos for each block
+    token_offs_pad = dict()
+    block_pid_map = dict()
+    for block_m in block_ms:
+        n_tiles = (hist + block_m - 1) // block_m  # matmul blocks needed
+        token_offs_pad[block_m] = torch.cumsum(n_tiles, dim=0)
+        token_offs_pad[block_m] = torch.cat((torch.zeros(1, device=device), token_offs_pad[block_m]))
+        token_offs_pad[block_m] = token_offs_pad[block_m].int()
+        # compute data required to drive ragged batch matmul
+        block_pid_map[block_m] = -torch.ones(max_n_tiles, device=device)
+        for e in range(n_expts_tot):
+            offset = token_offs_pad[block_m][e]
+            for b in range(n_tiles[e]):
+                block_pid_map[block_m][offset + b] = (b << 16) + e
+        block_pid_map[block_m] = block_pid_map[block_m].int()
+    return ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
+
+
+def routing_torch(logits, n_expts_act, sm_first=False, expt_indx=None):
+    has_user_provided_indx = expt_indx is not None
+    n_gates_pad = logits.shape[0] * n_expts_act
+
+    def topk(vals, k, expt_indx):
+        # topk of experts
+        if has_user_provided_indx:
+            tk_indx = expt_indx
+        else:
+            tk_indx = torch.argsort(-vals, dim=1, stable=True)[:, :k]
+        tk_indx = tk_indx.long()
+        tk_val = torch.take_along_dim(vals, tk_indx, dim=1)
+        tk_indx = tk_indx.int()
+        return tk_val, tk_indx
+
+    _, n_expts_tot = logits.shape
+    if sm_first:
+        logits = torch.softmax(logits, dim=-1)
+    expt_scal, expt_indx = topk(logits, n_expts_act, expt_indx)
+    if not sm_first:
+        expt_scal = torch.softmax(expt_scal, dim=-1)
+    # sort each token's selections by expert
+    if not has_user_provided_indx:
+        expt_indx, sort_indices = torch.sort(expt_indx, dim=1)
+        expt_scal = torch.gather(expt_scal, 1, sort_indices)
+    # flatten topk data
+    expt_scal = expt_scal.reshape(-1)
+    expt_indx = expt_indx.reshape(-1).to(torch.int32)
+    # sort by expert_id so experts are contiguous for the matmul
+    topk_indx = torch.argsort(expt_indx, stable=True)
+    gate_indx = torch.argsort(topk_indx, stable=True)
+    gate_scal = expt_scal[topk_indx]
+    hist = torch.histc(expt_indx, bins=n_expts_tot, max=n_expts_tot - 1).int()  # histogram of tokens over experts
+    # pack the matmul data structure
+    gather_indx = GatherIndx(src_indx=topk_indx.int(), dst_indx=gate_indx.int())
+    scatter_indx = ScatterIndx(src_indx=gate_indx.int(), dst_indx=topk_indx.int())
+    # compute expt_data
+    expt_data = compute_expt_data_torch(hist, n_expts_tot, n_gates_pad)
+    return RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data), gather_indx, scatter_indx
