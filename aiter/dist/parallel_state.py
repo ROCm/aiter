@@ -101,9 +101,7 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)  # type: ignore
 
 
-def all_reduce_fake(
-    tensor: torch.Tensor, group_name: str, ca_fp8_quant: bool
-) -> torch.Tensor:
+def all_reduce_fake(tensor: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
@@ -396,7 +394,6 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.reduce_scatter(input_, dim)
-
 
     def all_gather(
         self, input_: torch.Tensor, use_custom: bool = False, dim: int = -1
@@ -885,7 +882,6 @@ _PP: Optional[GroupCoordinator] = None
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
-
 
 
 _DP: Optional[GroupCoordinator] = None
