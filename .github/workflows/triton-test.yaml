@@ -69,6 +69,11 @@ jobs:
           triton_test \
           bash -c "pip install speedtest-cli && speedtest-cli --simple" || true
 
+      - name: Setup pip config
+        run: |
+          docker exec -u root triton_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root triton_test bash -c "pip config set global.retries 10"
+
       - name: Setup Aiter and Triton
         run: |
           set -ex
