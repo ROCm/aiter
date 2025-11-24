@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from curses import flash
+import os
+from re import T
 import sys
 import argparse
 import random
@@ -9,9 +12,11 @@ import hashlib
 
 import pandas as pd
 import numpy as np
+from pandas.core.frame import com
 import torch
 import triton
 import triton.language as tl
+import pytest
 
 import aiter
 from aiter import dtypes
@@ -1384,7 +1389,7 @@ def run_pa_gluon_test(
             ).reshape(
                 batch_size * query_length, num_kv_heads * query_group_size, head_size
             )
-        print("\n=== Comparing Two Reference Implementations ===")
+        print(f"\n=== Comparing Two Reference Implementations ===")
         ref_diff = (
             (reference_output_quant - reference_output_flashattn).abs().max().item()
         )
@@ -1469,7 +1474,7 @@ def run_pa_gluon_test(
     )
     if err_gluon > 0:
         err_gluon = 1
-    print("\n=== Detailed Error Analysis ===")
+    print(f"\n=== Detailed Error Analysis ===")
     print("Gluon vs Original Ref:")
     diff_result = compare_arrays(
         final_output_gluon.to(torch.float32).detach().cpu().numpy(),
@@ -1480,8 +1485,8 @@ def run_pa_gluon_test(
     else:
         print("gluon_vs_torch_ref FAILED")
     # Track results based on implementation type
-    results["us_gluon"] = gluon_time
-    results["err_gluon"] = err_gluon
+    results[f"us_gluon"] = gluon_time
+    results[f"err_gluon"] = err_gluon
 
     if USE_TORCH_FLASH_REF:
         print("\nGluon vs FlashAttn-style Ref:")
@@ -1517,7 +1522,7 @@ def run_pa_gluon_test(
     # Bandwidth
     kernel_time_us = gluon_time
     bandwidth_tb_per_sec = pa_rw_bytes / (kernel_time_us * 1e6 * 1.024**4)
-    results["gluon_bandwith(TB/s)"] = bandwidth_tb_per_sec
+    results[f"gluon_bandwith(TB/s)"] = bandwidth_tb_per_sec
 
     # Test Assembly
     query_group_size = num_query_heads // num_kv_heads
@@ -1575,14 +1580,16 @@ def run_pa_gluon_test(
         ).hexdigest()
         print(f"assembly_md5={assembly_md5}")
 
-        results["us_asm"] = assembly_time
+        results[f"us_asm"] = assembly_time
         assembly_bandwidth = pa_rw_bytes / (assembly_time * 1e6 * 1.024**4)
-        results["asm_bandwith(TB/s)"] = assembly_bandwidth
+        results[f"asm_bandwith(TB/s)"] = assembly_bandwidth
 
-    if "us_asm" in results:
-        results["perf_gluon_vs_asm"] = f'{results["us_asm"] / results["us_gluon"]:.0%}'
+    if f"us_asm" in results:
+        results[f"perf_gluon_vs_asm"] = (
+            f'{results[f"us_asm"] / results[f"us_gluon"]:.0%}'
+        )
     else:
-        results["perf_gluon_vs_asm"] = "NaN"
+        results[f"perf_gluon_vs_asm"] = "NaN"
 
     print(f"Triton location: {triton}")
     print(f"Triton version: {triton.__version__}")
@@ -1954,7 +1961,7 @@ def parse_arg_and_run_test(sample_rate0: float = None):
         f"Tests failed! {total_errors} test case(s) exceeded the error threshold. "
         f"Please check rows with non-zero err_gluon in {output_file}."
     )
-    print("\n? All tests passed!")
+    print("\n✓ All tests passed!")
 
 
 # @pytest.mark.parametrize("block_size", BLOCK_SIZE_OPTIONS)

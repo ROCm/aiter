@@ -3,11 +3,7 @@
 
 import triton
 import triton.language as tl
-
-try:
-    from triton.tools.compile import compile_kernel, CompileArgs
-except ImportError:
-    print("Warning: compile_kernel or CompileArgs is not in triton.tools.compile!")
+from triton.tools.compile import compile_kernel, CompileArgs
 
 
 @triton.jit
@@ -15,15 +11,15 @@ def matmul_fp16(
     C,
     A,
     B,
-    M: int,
-    N: int,
-    K: int,
-    stride_cm: int,
-    stride_cn: int,
-    stride_am: int,
-    stride_ak: int,
-    stride_bk: int,
-    stride_bn: int,
+    M,
+    N,
+    K,
+    stride_cm,
+    stride_cn,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,

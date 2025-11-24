@@ -1,11 +1,16 @@
 import os
+import sys
+import hashlib
 import time
 import logging
 from pathlib import Path
+from unittest import result
 from jinja2 import Template
 import triton
+import functools
 import aiter
 import torch
+import triton
 import triton.language as tl
 
 GLUON_AOT_COMPILE_ENABLED = True
@@ -499,7 +504,7 @@ def pa_decode_gluon_aot(
         is_causal=int(is_causal),
     )
 
-    assert combined_func is not None, "Combined function is not compiled"
+    assert combined_func is not None, f"Combined function is not compiled"
     # Execute the combined kernel
     if run_compiled_kernel:
         combined_func(
