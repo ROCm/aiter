@@ -258,6 +258,11 @@ def test_fmoe(
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
     )
+    
+    aiter.logger.info('stage 1 done')
+    aiter.logger.info(f'out1_ref {out1_ref}')
+    
+
 
     # ######################## stage 2 start ###########
     if qType == aiter.QuantType.per_128x128:
@@ -277,8 +282,8 @@ def test_fmoe(
     a2_qt = a2_qt.view(token, topk, -1)
 
     aiter.logger.info('stage 2 start')
-    aiter.logger.info(f'w1_qt {w1_qt.dtype}, {w1_qt.shape}')
-    aiter.logger.info(f'w2_qt {w2_qt.dtype}, {w2_qt.shape}')
+    # aiter.logger.info(f'w1_qt {w1_qt.dtype}, {w1_qt.shape}')
+    # aiter.logger.info(f'w2_qt {w2_qt.dtype}, {w2_qt.shape}')
 
     out2_ref = torch_moe_stage2(
         a2_qt,
