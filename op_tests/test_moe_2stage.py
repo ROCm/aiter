@@ -229,6 +229,9 @@ def test_fmoe(
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
 
+    w1_scale_aiter = fp4_utils.f32_to_e8m0(w1_scale_aiter)
+    w2_scale_aiter = fp4_utils.f32_to_e8m0(w2_scale_aiter)
+
     aiter.logger.info(f'w1_shape {w1.shape}')
     aiter.logger.info(f'w2_shape {w2.shape}')
     aiter.logger.info(f'w1_qt_shape {w1_qt.shape} {w1_qt.dtype}')
@@ -239,6 +242,7 @@ def test_fmoe(
     aiter.logger.info(f'w2_qt_aiter_shape {w2_qt_aiter.shape} {w2_qt_aiter.dtype}')
     aiter.logger.info(f'w1_scale_aiter_shape {w1_scale_aiter.shape} {w1_scale_aiter.dtype}')
     aiter.logger.info(f'w2_scale_aiter_shape {w2_scale_aiter.shape} {w2_scale_aiter.dtype}')
+    
     # # ######################## stage 1 start ###########
     out1_ref = torch_moe_stage1(
         a1_qt,
@@ -291,10 +295,6 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    aiter.logger.info(f'w1_qt {w1_qt.dtype}, {w1_qt.shape}')
-    aiter.logger.info(f'w2_qt {w2_qt.dtype}, {w2_qt.shape}')
-    aiter.logger.info(f'w1_qt_aiter {w1_qt_aiter.dtype}, {w1_qt_aiter.shape}')
-    aiter.logger.info(f'w2_qt_aiter {w2_qt_aiter.dtype}, {w2_qt_aiter.shape}')
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
