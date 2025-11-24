@@ -83,11 +83,12 @@ def generate_cp_test_data(seq_len, seq_len_kv):
     return ks, ke
 
 
-@pytest.mark.parametrize("s_q", [1, 17, 61, 128, 1024])
-@pytest.mark.parametrize("s_k", [16, 76, 113, 1024, 2048])
-@pytest.mark.parametrize("num_heads", [16, 64])
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("disable_cp", [True, False])
+@pytest.mark.parametrize("s_q", [1, 17, 61, 128, 1024, 2011, 2048])
+@pytest.mark.parametrize("s_k", [16, 76, 113, 1024, 2048, 3047])
+@pytest.mark.parametrize("num_heads", [64])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("disable_cp", [False, True])
+@pytest.mark.parametrize("randomize", [False, True])
 @torch.inference_mode()
 def test_fp8_mqa_logits(
     s_q: int,
@@ -95,6 +96,7 @@ def test_fp8_mqa_logits(
     num_heads: int,
     head_dim: int,
     disable_cp: bool,
+    randomize: bool,
 ) -> None:
     torch.manual_seed(0)
     if s_q > s_k:
@@ -110,6 +112,12 @@ def test_fp8_mqa_logits(
         ke = torch.arange(s_q, dtype=torch.int, device="cuda") + (s_k - s_q)
     else:
         ks, ke = generate_cp_test_data(s_q, s_k)
+    # randomize indices
+    if randomize:
+        start = torch.randint(0, s_k, (s_q,), device="cuda")
+        end = torch.randint(0, s_k, (s_q,), device="cuda")
+        ks = torch.where(start < end, start, end)
+        ke = torch.where(start < end, end, start)
 
     q_fp8 = q.to(e4m3_type)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
