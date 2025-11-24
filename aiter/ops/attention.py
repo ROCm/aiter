@@ -114,6 +114,133 @@ def pa_fwd_asm(
 ) -> torch.Tensor: ...
 
 
+def gen_pa_ps_fwd_asm(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    softmax_scale: float,  # better have ?
+    max_qlen: int = 1,
+    K_QScale: Optional[torch.Tensor] = None,
+    V_QScale: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
+    work_meta_data: Optional[torch.Tensor] = None,
+    splitData: Optional[torch.Tensor] = None,
+    splitLse: Optional[torch.Tensor] = None,
+    high_precision: Optional[
+        int
+    ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: Optional[str] = None,
+) -> torch.Tensor:
+    if out_ is not None:
+        return out_
+    else:
+        return torch.empty_like(Q)
+
+
+@compile_ops("module_attention_asm", gen_fake=gen_pa_fwd_asm)
+def pa_ps_fwd_asm(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    softmax_scale: float,  # better have ?
+    max_qlen: int = 1,
+    K_QScale: Optional[torch.Tensor] = None,
+    V_QScale: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
+    work_meta_data: Optional[torch.Tensor] = None,
+    splitData: Optional[torch.Tensor] = None,
+    splitLse: Optional[torch.Tensor] = None,
+    high_precision: Optional[
+        int
+    ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: Optional[str] = None,
+) -> torch.Tensor: ...
+
+
+@compile_ops("module_mla_reduce")
+def pa_reduce_v1(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: Optional[torch.Tensor],
+    reduce_partial_map: torch.Tensor,
+    final_output: torch.Tensor,
+    final_lse: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
+def pa_persistent_fwd(
+    Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
+    K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]
+    V: torch.Tensor,  # [num_blocks, kv_heads, block_size / x, head_dim, x]
+    max_qlen: int,  # default = 1
+    qo_indptr: torch.Tensor,  # [batch+1], qolen prefix sum
+    kv_indptr: torch.Tensor,  # [batch+1], kvlen prefix sum   1
+    kv_indices: torch.Tensor,  # [sum_kvlen], packed kv ids    2
+    kv_last_page_lens: torch.Tensor,  # [batch]                       3
+    work_meta_data: torch.Tensor,
+    reduce_indptr: Optional[torch.Tensor] = None,
+    reduce_final_map: Optional[torch.Tenspr] = None,
+    reduce_partial_map: Optional[torch.Tensor] = None,
+    K_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
+    V_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
+    softmax_scale: float = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if softmax_scale is None:
+        softmax_scale = 1.0 / (v_head_dim**0.5)
+    output = torch.empty_like(Q)
+    device = Q.device
+    total_s, nhead, v_head_dim = output.shape
+    logits = torch.empty(
+        (reduce_partial_map.size(0) * max_qlen, 1, nhead, v_head_dim),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    splitLse = torch.empty(
+        (reduce_partial_map.size(0) * max_qlen, 1, nhead, 1),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+
+    pa_ps_fwd_asm(
+        Q,
+        K,
+        V,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        max_qlen,
+        softmax_scale,
+        K_QScale,
+        V_QScale,
+        output,
+        qo_indptr,
+        work_meta_data,
+        logits,
+        splitLse,
+    )
+    pa_reduce_v1(
+        logits,
+        splitLse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        output,
+        final_lse,
+    )
+
+    return logits, final_lse
+
+
 def paged_attention_rocm(
     out: torch.Tensor,
     exp_sums: torch.Tensor,
@@ -334,6 +461,58 @@ def mla_prefill_asm_fwd(
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor,
 ) -> None: ...
+
+
+def get_pa_metadata_v1(
+    batch_size: int,
+    max_seqlen_qo: int,
+    num_head_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    is_sparse: int,
+    fast_mode: bool = True,
+):
+    """
+    Returns:
+        1. Shape of work_metadata_ptrs followed by its scalar type.
+        2. Shape of work_indptr followed by its scalar type.
+        3. Shape of work_info_set followed by its scalar type.
+        4. Shape of reduce_indptr followed by its scalar type.
+        5. Shape of reduce_final_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type.
+    """
+
+    assert num_head_qo % 16 == 0
+
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+
+    max_qo_tiles_per_batch = (
+        int(math.ceil(max_seqlen_qo * num_head_qo / 128))
+        if num_head_qo == 16 or (num_head_qo == 128 and kv_dtype == dtypes.fp8)
+        else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
+    )
+    batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
+    tile_cnt = batch_size * max_qo_tiles_per_batch
+
+    if fast_mode:
+        max_work = tile_cnt + cu_num - 1
+        max_split_tiles = (
+            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
+        )
+    else:
+        max_work = tile_cnt * cu_num
+        max_split_tiles = tile_cnt * cu_num
+
+    return (
+        ((2), torch.uint64),  # work_metadata_ptrs
+        ((cu_num + 1), torch.int32),  # work_indptr
+        ((max_work, 8), torch.int32),  # work_info_set
+        ((tile_cnt + 1), torch.int32),  # reduce_indptr
+        ((tile_cnt, 2), torch.int32),  # reduce_final_map
+        (max_split_tiles, torch.int32),  # reduce_partial_map
+    )
 
 
 def get_mla_metadata_info_v1(

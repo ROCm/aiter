@@ -459,17 +459,62 @@ def test_pa_mtp(
     out_ref = torch_mha_extend(
         query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
     )
-    out_aiter_asm, us_aiter_asm = run_aiter_asm(
-        query,
-        k_quant_,
-        asm_V_shuffle(v_quant_),
-        block_tables,
-        seq_lens,
-        block_tables.size(1),
-        max_qlen,
-        k_scale_asm,
-        v_scale_asm,
-        qo_indptr,
+
+    if True:
+        (
+            (work_meta_data_size, work_meta_data_type),
+            (work_indptr_size, work_indptr_type),
+            (work_info_set_size, work_info_set_type),
+            (reduce_indptr_size, reduce_indptr_type),
+            (reduce_final_map_size, reduce_final_map_type),
+            (reduce_partial_map_size, reduce_partial_map_type),
+        ) = aiter.get_pa_metadata_v1(
+            batch_size,
+            max_qlen,
+            num_query_heads,
+            query.dtype,
+            k_quant_.dtype,
+            is_sparse=False,
+        )
+        work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
+        work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type)
+        work_info = torch.empty(work_info_set_size, dtype=work_info_set_type)
+        reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type)
+        reduce_final_map = torch.empty(
+            reduce_final_map_size, dtype=reduce_final_map_type
+        )
+        reduce_partial_map = torch.empty(
+            reduce_partial_map_size, dtype=reduce_partial_map_type
+        )
+        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
+        kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens, dim=0)
+
+        kv_max_sz = (
+            65536 * 32
+        )  # calculated by rest of mem after weight loaded in frameworks
+        num_page = (kv_max_sz + block_size - 1) // block_size
+
+        kv_indices = torch.randint(
+            0, num_page, (kv_indptr[-1].item(),), dtype=torch.int
+        )
+        kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+
+    out_aiter_asm, us_aiter_asm = aiter.pa_persistent_fwd(
+        Q=query,
+        K=k_quant_,
+        V=asm_V_shuffle(v_quant_),
+        softmax_scale=scale,
+        max_qlen=max_qlen,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        work_metadata_ptrs=work_metadata_ptrs,
+        work_indptr=work_indptr,
+        work_info=work_info,
+        reduce_indptr=reduce_indptr,
+        reduce_final_map=reduce_final_map,
+        reduce_partial_map=reduce_partial_map,
     )
     err = checkAllclose(
         out_ref,
