@@ -332,27 +332,31 @@ def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
         raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
     sig = inspect.signature(kernel.fn)
 
-    constant_indices = []
+    constexpr_indices = []
     for idx, param in enumerate(sig.parameters.values()):
         if param.annotation == tl.constexpr:
-            constant_indices.append(idx)
+            constexpr_indices.append(idx)
     ccinfo = kernel.warmup(*args, grid=grid, **kwargs)
-    constants = {}
+    constexprs = {}
+    arg_names = []
     keys = list(sig.parameters.keys())
     for idx, arg in enumerate(args):
-        if idx in constant_indices:
-            constants[keys[idx]] = arg
+        if idx in constexpr_indices:
+            constexprs[keys[idx]] = arg
+        else:
+            arg_names.append(keys[idx])
     extra_metadata = {}
     extra_metadata["waves_per_eu"] = kwargs.get("waves_per_eu", 1)
     extra_metadata["num_stages"] = kwargs.get("num_stages", 1)
     extra_metadata["num_warps"] = kwargs.get("num_warps", 1)
     extra_metadata["num_ctas"] = kwargs.get("num_ctas", 1)
+    extra_metadata["args"] = arg_names
     return compile_hsaco(
         kernel.fn.__name__,
         ccinfo.asm["hsaco"],
         ccinfo.metadata.shared,
         ccinfo.metadata.target.arch,
-        constants,
+        constexprs,
         extra_metadata,
     )
 
@@ -362,24 +366,24 @@ def compile_hsaco(
     hsaco,
     shared=0,
     gcnArchName=GPU_ARCH,
-    constants=None,
+    constexprs=None,
     extra_metadata=None,
 ):
     build_dir = f"{BUILD_DIR}/{gcnArchName}"
-    constants = OrderedDict(constants or {})
-    func_name = get_default_func_name(kernel_name, tuple(constants.values()))
+    constexprs = OrderedDict(constexprs or {})
+    func_name = get_default_func_name(kernel_name, tuple(constexprs.values()))
     lock_path = f"{build_dir}/{func_name}.lock"
     if not os.path.exists(build_dir):
         os.makedirs(build_dir, exist_ok=True)
 
-    def main_func(constants):
+    def main_func(constexprs):
         metadata = {}
         metadata["shared"] = shared
         metadata["name"] = kernel_name
         metadata["gcnArchName"] = gcnArchName
         metadata["commitId"] = commit_id
         metadata.update(extra_metadata or {})
-        for key, value in constants.items():
+        for key, value in constexprs.items():
             metadata[key] = str(value)
         with open(f"{build_dir}/{func_name}.hsaco", "wb") as f:
             f.write(hsaco)
@@ -389,13 +393,13 @@ def compile_hsaco(
     def final_func():
         logger.info(f"finish build {func_name}")
 
-    main_func = partial(main_func, constants=constants)
+    main_func = partial(main_func, constexprs=constexprs)
     mp_lock(lock_path=lock_path, main_func=main_func, final_func=final_func)
 
 
-def check_hsaco(func_name, constants=None):
-    constants = OrderedDict(constants or {})
-    hsaco_name = get_default_func_name(func_name, tuple(constants.values()))
+def check_hsaco(func_name, constexprs=None):
+    constexprs = OrderedDict(constexprs or {})
+    hsaco_name = get_default_func_name(func_name, tuple(constexprs.values()))
     return os.path.exists(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.hsaco")
 
 
@@ -411,10 +415,10 @@ def get_hsaco_launcher(hsaco_name, kernel_name):
 
 
 def run_hsaco(
-    func_name, *args, grid=(1, 1, 1), block=(256, 1, 1), stream=None, constants=None
+    func_name, *args, grid=(1, 1, 1), block=(256, 1, 1), stream=None, constexprs=None
 ):
-    constants = OrderedDict(constants or {})
-    hsaco_name = get_default_func_name(func_name, tuple(constants.values()))
+    constexprs = OrderedDict(constexprs or {})
+    hsaco_name = get_default_func_name(func_name, tuple(constexprs.values()))
     metadata_path = f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.json"
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Metadata file not found: {metadata_path}")

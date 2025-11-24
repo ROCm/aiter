@@ -2446,7 +2446,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 grid[1],
                 grid[2],
                 grid=grid,
-                constants={
+                constexprs={
                     "COMPUTE_TYPE": COMPUTE_TYPE,
                     "QUERY_GROUP_SIZE_POW2": QUERY_GROUP_SIZE_POW2,
                     "HEAD_SIZE_POW2": triton.next_power_of_2(HEAD_SIZE),
