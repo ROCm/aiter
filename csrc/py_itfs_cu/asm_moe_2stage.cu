@@ -7,7 +7,7 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
 #include "moe_op.h"
-#include "asm_moe_2stage_configs.hpp"
+#include "asm_fmoe_2stages_configs.hpp"
 #include "py_itfs_common.h"
 
 struct __attribute__((packed)) KernelArgs
@@ -104,7 +104,7 @@ static CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, Q
     }
 };
 
-std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *cfgs)
+std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *cfgs, std::string arch_id)
 {
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -118,13 +118,15 @@ std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *cfgs)
 
     for (const auto &el : *cfgs)
     {
+        if (el.first.find(arch_id) != 0)
+            continue;
         const auto &cfg = el.second;
-        if (cfg.tile_M != blockk_size || N % cfg.tile_N != 0)
+        if (cfg.tile_m != blockk_size || N % cfg.tile_n != 0)
         {
             continue;
         }
 
-        tg_num = (N + cfg.tile_N - 1) / cfg.tile_N * m_num;
+        tg_num = (N + cfg.tile_n - 1) / cfg.tile_n * m_num;
         uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
         if (local_round < round)
         {
@@ -171,9 +173,11 @@ void moe_stage1_g1u1(
     int model_dim = input.size(1);
     int hidden_dim = inter_dim;
     int sub_X_cnt = sorted_expert_ids.size(0);
+    std::string arch_id = get_gpu_arch();
+    kernelName = !kernelName.empty() ? arch_id + kernelName : "";
     if (kernelName.empty())
     {
-        kernelName = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map);
+        kernelName = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map, arch_id);
     }
 
     AiterAsmKernel *impl_ptr = nullptr;
@@ -181,10 +185,10 @@ void moe_stage1_g1u1(
     if (it != config_map->end())
     {
         const auto &cfg = it->second;
-        const char *name = cfg.name.c_str();
+        const char *name = cfg.knl_name.c_str();
         const char *co_name = cfg.co_name.c_str();
 
-        TORCH_CHECK(inter_dim % cfg.tile_N == 0, "ASM kernel " + std::string(name) + " is not supported for inter_dim = " + std::to_string(inter_dim));
+        TORCH_CHECK(inter_dim % cfg.tile_n == 0, "ASM kernel " + std::string(name) + " is not supported for inter_dim = " + std::to_string(inter_dim));
 
         auto result = impl_ptr_map.emplace(name, nullptr);
         if (result.second)
@@ -204,8 +208,8 @@ void moe_stage1_g1u1(
     int dim = w2.size(1);
     int eprt = w1.size(0);
     const auto &cfg = it->second;
-    uint32_t sub_GU = cfg.tile_N;
-    TORCH_CHECK(block_m == cfg.tile_M, __func__, " kernel: ", cfg.name, " need block_m == ", cfg.tile_M);
+    uint32_t sub_GU = cfg.tile_n;
+    TORCH_CHECK(block_m == cfg.tile_m, __func__, " kernel: ", cfg.knl_name, " need block_m == ", cfg.tile_m);
 
     int stride_X = input.stride(0) * input.element_size();
     int stride_GU = dim * w1.element_size();
