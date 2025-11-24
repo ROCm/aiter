@@ -4,6 +4,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
 import aiter
+from aiter.test_common import checkAllclose
 
 
 def worker(
@@ -56,7 +57,24 @@ def worker(
         norm_out_maxdiff = (norm_out.cpu().float() - ref_norm_out.cpu().float()).abs().max()
         scale_out_maxdiff = (scale_out.cpu().float() - ref_scale_out.cpu().float()).abs().max()
         # print(f"ref_norm_out:{ref_norm_out.float().cpu()}, norm_out:{norm_out.float().cpu()}")
-        print(f"rank:{rank}, residual_out_maxdiff:{residual_out_maxdiff}, norm_out_maxdiff:{norm_out_maxdiff}, scale_out_maxdiff:{scale_out_maxdiff}")
+        # print(f"rank:{rank}, residual_out_maxdiff:{residual_out_maxdiff}, norm_out_maxdiff:{norm_out_maxdiff}, scale_out_maxdiff:{scale_out_maxdiff}")
+        checkAllclose(
+            residual_out.float(),
+            ref_residual_out.float(),
+            rtol=1e-2,
+            atol=1e-2,
+            msg="residual_out",
+        )
+        checkAllclose(
+            norm_out.float(), ref_norm_out.float(), rtol=1e-2, atol=1e-2, msg="norm_out"
+        )
+        checkAllclose(
+            scale_out.float(),
+            ref_scale_out.float(),
+            rtol=1e-2,
+            atol=1e-2,
+            msg="scale_out",
+        )
 
 
 def testcase(
