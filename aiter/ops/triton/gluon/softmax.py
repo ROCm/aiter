@@ -131,7 +131,7 @@ def _softmax_kernel_online(
         order=[0],
     )
     shared_cols: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        vec=1, per_phase=1, max_phase=1, order=[0]
     )
     cols_smem = gl.allocate_shared_memory(
         input_ptr.type.element_ty, [NUM_STAGES, BLOCK_SIZE], layout=shared_cols
