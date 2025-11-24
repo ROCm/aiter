@@ -331,10 +331,10 @@ def per_token_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     return y, scale
 
 
-def per_1x32_f4_quant_triton(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
+def per_1x32_f4_quant_triton(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False, use_hadamard_transform=False):
     assert quant_dtype == dtypes.fp4x2
     # y, scale = triton.quant.dynamic_mxfp4_quant(x)
-    y, scale = fp4_utils.dynamic_mxfp4_quant(x, shuffle=shuffle)
+    y, scale = fp4_utils.dynamic_mxfp4_quant(x, shuffle=shuffle, use_hadamard_transform=use_hadamard_transform)
     return y.view(quant_dtype), scale
 
 
