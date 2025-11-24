@@ -1444,9 +1444,9 @@ def paged_attention_decode_v2_reduce_gluon(
         )
     else:
         blocked_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[4, 1, 2],
+            size_per_thread=[1, 1, 8],
             threads_per_warp=[4, 4, 4],
-            warps_per_cta=[1, 1, 4],
+            warps_per_cta=[1, 4, 1],
             order=[2, 1, 0],
         )
 
