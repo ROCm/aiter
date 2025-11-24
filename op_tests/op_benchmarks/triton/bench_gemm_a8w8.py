@@ -1,7 +1,12 @@
 import sys
 import triton
 import math
-from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
+from aiter.ops.triton.gemm_a8w8 import (
+    gemm_a8w8 as triton_gemm_a8w8,
+)
+from aiter.ops.triton.gluon.gemm_a8w8 import (
+    gemm_a8w8 as gluon_gemm_a8w8,
+)
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.test_gemm_a8w8 import (
     generate_gemm_a8w8_inputs,
@@ -20,7 +25,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
+def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, impl: callable):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = str_to_torch_dtype["bf16"]
     x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
@@ -35,7 +40,7 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: gemm_a8w8(x, weight, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
+        lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
         warmup=25,
         rep=100,
     )
@@ -92,7 +97,7 @@ def run_model_benchmark(args):
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
-def run_shape_benchmark(args):
+def run_shape_benchmark(args, impl):
     """
     Runs a benchmark with given tensor shapes.
     """
@@ -102,7 +107,7 @@ def run_shape_benchmark(args):
     def bench_gemm_a8w8(M, N, K, metric, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout)
+        return bench_gemm_fn(M, N, K, metric, args.layout, impl)
 
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -111,6 +116,10 @@ def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
+    if args.gluon:
+        impl = gluon_gemm_a8w8
+    else:
+        impl = triton_gemm_a8w8
     if args.model:
         unsupported_args = []
         for arg in unsupported_args:
@@ -130,12 +139,17 @@ def run_benchmark(args, defaults):
                 raise Exception(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
-        run_shape_benchmark(args)
+        run_shape_benchmark(args, impl)
 
 
 def parse_args():
     parser = get_parser(kernel_name="A8W8 GEMM")
     parser = add_argparse_ff(parser)
+    parser.add_argument(
+        "-gluon",
+        action="store_true",
+        help="Use Gluon implementation (experimental, requires latest Triton from main)",
+    )
     return get_ff_args(parser)
 
 
