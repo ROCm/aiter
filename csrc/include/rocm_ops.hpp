@@ -1429,6 +1429,28 @@ namespace py = pybind11;
           py::arg("dtype_kv")            = std::nullopt);           \
     m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
 
+#define PA_METADATA_PYBIND                       \
+    m.def("get_pa_metadata_v1",                  \
+          &get_pa_metadata_v1,                   \
+          "get_pa_metadata_v1",                  \
+          py::arg("seqlens_qo_indptr"),          \
+          py::arg("seqlens_kv_indptr"),          \
+          py::arg("num_heads_per_head_k"),       \
+          py::arg("num_heads_k"),                \
+          py::arg("is_causal"),                  \
+          py::arg("work_metadata_ptrs"),         \
+          py::arg("work_indptr"),                \
+          py::arg("work_info"),                  \
+          py::arg("reduce_indptr"),              \
+          py::arg("reduce_final_map"),           \
+          py::arg("reduce_partial_map"),         \
+          py::arg("kv_granularity")      = 16,   \
+          py::arg("max_seqlen_qo")       = -1,   \
+          py::arg("uni_seqlen_qo")       = -1,   \
+          py::arg("fast_mode")           = true, \
+          py::arg("topk")                = -1,   \
+          py::arg("max_split_per_batch") = -1);
+
 #define MLA_REDUCE_PYBIND                \
     m.def("mla_reduce_v1",               \
           &mla_reduce_v1,                \

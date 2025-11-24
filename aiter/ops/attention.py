@@ -165,7 +165,6 @@ def pa_ps_fwd_asm(
 ) -> torch.Tensor: ...
 
 
-@compile_ops("module_mla_reduce")
 def pa_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -174,7 +173,16 @@ def pa_reduce_v1(
     reduce_partial_map: torch.Tensor,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
-) -> None: ...
+) -> None:
+    mla_reduce_v1(
+        partial_output,
+        partial_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        final_output,
+        final_lse,
+    )
 
 
 def pa_persistent_fwd(
@@ -463,7 +471,7 @@ def mla_prefill_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_mla_metadata")
+@compile_ops("module_pa_metadata")
 def get_pa_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     seqlens_kv_indptr: torch.Tensor,
