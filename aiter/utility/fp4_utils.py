@@ -253,6 +253,7 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     scaleN_pad: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    SCALING_MODE: tl.constexpr,
     SHUFFLE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -269,6 +270,8 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
     x = tl.load(x_ptr + x_offs, mask=x_mask).to(tl.float32)
 
+
+
     # TODO:(mcim) can we do this better or faster??
     
     # Hadamard Transform 
@@ -282,11 +285,15 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     p = p ^ (p >> 4)
     p = p & 1  
     h_mat = (1.0 - 2.0 * p.to(tl.float32))
-    h_mat = h_mat * 0.176776695 # this is 1/sqrt(32)
+    h_mat = h_mat * 0.176776695 # this is sqrt(32)
     x = tl.dot(x, h_mat)
     # -------------------------------------------------------------
-   
-    
+
+
+
+
+
+
     # Calculate scale
     amax = tl.max(tl.abs(x), axis=1, keep_dims=True)
     amax = amax.to(tl.int32, bitcast=True)
@@ -383,13 +390,16 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
 
 
 def dynamic_mxfp4_quant(
-    x: torch.Tensor, shuffle: bool = False
+    x: torch.Tensor, scaling_mode: str = "even", shuffle: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.
 
     Args:
         x: The input tensor, typically fp16 or bf16.
+        scaling_mode: The method to calculate MX block scaling.
+            - "even" (default): `even_round` in `quark.torch.quantization.utils`.
+            - etc.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
@@ -432,6 +442,7 @@ def dynamic_mxfp4_quant(
         scaleN_pad=scaleN,
         BLOCK_SIZE=BLOCK_SIZE,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+        SCALING_MODE=0,
         SHUFFLE=shuffle,
     )
 
