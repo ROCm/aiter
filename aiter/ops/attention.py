@@ -197,7 +197,7 @@ def pa_persistent_fwd(
     kv_last_page_lens: torch.Tensor,  # [batch]                       3
     work_meta_data: torch.Tensor,
     reduce_indptr: Optional[torch.Tensor] = None,
-    reduce_final_map: Optional[torch.Tenspr] = None,
+    reduce_final_map: Optional[torch.Tensor] = None,
     reduce_partial_map: Optional[torch.Tensor] = None,
     K_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
     V_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
