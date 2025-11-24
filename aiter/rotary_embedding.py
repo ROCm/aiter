@@ -1256,7 +1256,7 @@ class MRotaryEmbeddingQKNormFused(nn.Module):
             q_weight,
             k_weight,
             self.cos_sin_cache,
-            positions,
+            positions.contiguous(),
             num_tokens,
             num_heads_q,
             num_heads_k,
