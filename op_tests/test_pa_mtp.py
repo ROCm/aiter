@@ -498,11 +498,26 @@ def test_pa_mtp(
             0, num_page, (kv_indptr[-1].item(),), dtype=torch.int
         )
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+        aiter.get_pa_metadata_v1(
+            qo_indptr,
+            kv_indptr,
+            num_query_heads // num_kv_heads,
+            num_kv_heads,
+            True,
+            work_metadata_ptrs,
+            work_indptr,
+            work_info,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+        )
+    output = torch.empty_like(query)
 
     out_aiter_asm, us_aiter_asm = aiter.pa_persistent_fwd(
         Q=query,
         K=k_quant_,
         V=asm_V_shuffle(v_quant_),
+        output=output,
         softmax_scale=scale,
         max_qlen=max_qlen,
         qo_indptr=qo_indptr,
