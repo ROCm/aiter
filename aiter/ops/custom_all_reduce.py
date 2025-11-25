@@ -26,6 +26,7 @@ def all_reduce(
     _fa: int,
     inp: torch.Tensor,
     out: torch.Tensor,
+    use_new: bool,
     open_fp8_quant: bool,
     reg_buffer: Optional[torch.Tensor] = None,
 ) -> None: ...
