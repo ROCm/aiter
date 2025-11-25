@@ -199,3 +199,12 @@ def test_batched_gemm_a8w8_layout(dtype, b, m, n, k, layout, output, impl: str):
     b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+
+
+if __name__ == "__main__":
+    dtype = "fp16"
+    b, m, n, k = 16, 1, 1, 1
+    output = False
+    impl = "gluon"
+
+    test_batched_gemm_a8w8(dtype, b, m, n, k, output, impl)
