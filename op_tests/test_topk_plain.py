@@ -30,7 +30,8 @@ def test_topk(
     topk_ids = torch.zeros((batch_size, topk), dtype=dtypes.i32, device=device)
     topk_value = torch.zeros((batch_size, topk), dtype=dtype, device=device)
 
-    x = torch.arange(hiddensize, dtype=dtype).repeat(batch_size, 1)
+    x = torch.randn((batch_size, hiddensize), dtype=dtype)
+
     for b in range(batch_size):
         x[b] = x[b, torch.randperm(hiddensize)]
 
@@ -92,23 +93,39 @@ def test_topk(
     )
 
     id_aiter, _aiter = torch.sort(topk_ids.to(torch.long))
-    err = checkAllclose(
-        id_ref,
-        id_aiter,
-        msg=(
-            f"topk_ids Performance Comparison:\n"
-            f"  {'Method':<10} {'Time (us)':>12}\n"
-            f"  {'-'*10} {'-'*12}\n"
-            f"  {'golden':<10} {us_ref:>12.2f}\n"
-            f"  {'triton':<10} {us_triton:>12.2f}\n"
-            f"  {'aiter':<10} {us_aiter:>12.2f}\n"
-        ),
-    )
-    # err = checkAllclose(
-    #     ref_value.gather(1, _ref),
-    #     topk_value.gather(1, _aiter),
-    #     msg="topk_values [golden vs aiter]",
-    # )
+
+    # Skip for float16 as it would has duplicates in topk_ids
+    if dtype != torch.float16:
+        err = checkAllclose(
+            ref_value,
+            topk_value,
+            msg="topk_values [golden vs aiter]",
+        )
+        err = checkAllclose(
+            id_ref,
+            id_aiter,
+            msg=(
+                f"topk_ids Performance Comparison:\n"
+                f"  {'Method':<10} {'Time (us)':>12}\n"
+                f"  {'-'*10} {'-'*12}\n"
+                f"  {'golden':<10} {us_ref:>12.2f}\n"
+                f"  {'triton':<10} {us_triton:>12.2f}\n"
+                f"  {'aiter':<10} {us_aiter:>12.2f}\n"
+            ),
+        )
+    else:
+        err = checkAllclose(
+            ref_value,
+            topk_value,
+            msg=(
+                f"topk_values [golden vs aiter]:\n"
+                f"  {'Method':<10} {'Time (us)':>12}\n"
+                f"  {'-'*10} {'-'*12}\n"
+                f"  {'golden':<10} {us_ref:>12.2f}\n"
+                f"  {'triton':<10} {us_triton:>12.2f}\n"
+                f"  {'aiter':<10} {us_aiter:>12.2f}\n"
+            ),
+        )
 
 
     return {

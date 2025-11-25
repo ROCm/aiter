@@ -307,17 +307,21 @@ __inline__ constexpr T get_lower_bound()
 {
     static_assert(utils::is_supported_type_v<T>,
                   "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
-    if constexpr(std::is_floating_point_v<T> && std::is_signed_v<T>)
+    if constexpr(std::is_same_v<T, _Float16>)
+    {
+        return -_Float16(0x7C00);
+    }
+    else if constexpr(std::is_same_v<T, __bf16>)
+    {
+        return -__bf16(0x7F80);
+    }
+    else if constexpr(std::is_floating_point_v<T> && std::is_signed_v<T>)
     {
         return -std::numeric_limits<T>::infinity();
     }
     else if constexpr(std::is_integral_v<T>)
     {
         return std::numeric_limits<T>::lowest();
-    }
-    else if constexpr(std::is_same_v<T, __bf16>)
-    {
-        return -__bf16(0x7F80);
     }
     else
     {
@@ -336,17 +340,21 @@ __inline__ constexpr T get_upper_bound()
 {
     static_assert(utils::is_supported_type_v<T>,
                   "Unsupported type T: only _Float16, __bf16, float, and int are implemented");
-    if constexpr(std::is_floating_point_v<T>)
+    if constexpr(std::is_same_v<T, _Float16>)
+    {
+        return _Float16(0x7C00);
+    }
+    else if constexpr(std::is_same_v<T, __bf16>)
+    {
+        return __bf16(0x7F80);
+    }
+    else if constexpr(std::is_floating_point_v<T>)
     {
         return std::numeric_limits<T>::infinity();
     }
     else if constexpr(std::is_integral_v<T>)
     {
         return std::numeric_limits<T>::max();
-    }
-    else if constexpr(std::is_same_v<T, __bf16>)
-    {
-        return __bf16(0x7F80);
     }
     else
     {
@@ -1504,10 +1512,10 @@ struct WaveTopkFilter
 
         if constexpr(std::is_same_v<T, _Float16>)
         {
-            constexpr IdxT tile       = elements;
-            const IdxT block_tile     = blockDim.x * tile;
-            const IdxT end_aligned    = start + utils::round_up_to_multiple_of(n, block_tile);
-            const IdxT tail           = end_aligned - block_tile;
+            constexpr IdxT tile    = elements;
+            const IdxT block_tile  = blockDim.x * tile;
+            const IdxT end_aligned = start + utils::round_up_to_multiple_of(n, block_tile);
+            const IdxT tail        = std::max(end_aligned - block_tile, 0);
 
             using VecType = std::conditional_t<std::is_same_v<T, __bf16>,
                                                buffer_load_helpers::bf16x8_t,
@@ -2125,8 +2133,16 @@ void AdaptiveTopK(int batch_size,
     }
     else
     {
-        calc_launch_parameter<BlockTopkFilter, T, IdxT>(
-            batch_size, len, k, &block_per_batch, &wave_per_block);
+        // TODO: Fixed setting for BlockTopkFilter
+        block_per_batch = 1;
+        if constexpr(std::is_same_v<T, float>)
+        {
+            wave_per_block = 2;
+        }
+        else
+        {
+            wave_per_block = 1;
+        }
         topk_kernel_launcher<greater, BlockTopkFilter, T, IdxT>(
             block_per_batch, wave_per_block, in, batch_size, len, k, out, out_idx, stream);
     }
@@ -2261,6 +2277,11 @@ void topk_plain(torch::Tensor& values,      // [batch, len]
                 int64_t stride0,
                 int64_t stride1)
 {
+    if(topk_ids.scalar_type() != torch::kInt32)
+    {
+        AT_ERROR("Unsupported index type for topk_ids");
+    }
+
     const int32_t max_len = values.size(-1);
     const int32_t batch   = values.size(0);
 
@@ -2272,19 +2293,16 @@ void topk_plain(torch::Tensor& values,      // [batch, len]
                                      rowStarts.numel() > 0 && rowEnds.numel() > 0;
 
     // Set default stride values if not specified
-    if(stride0 < 0) stride0 = max_len;
+    if(stride0 < 0)
+    {
+        stride0 = max_len;
+    }
 
     // Dispatch based on value tensor dtype
     VLLM_DISPATCH_FLOATING_TYPES(values.scalar_type(), "topk_plain", [&] {
         using input_dtype = typename t2ck<scalar_t>::type;
-        // Dispatch based on index tensor dtype
-        if(topk_ids.scalar_type() != torch::kInt32)
-        {
-            AT_ERROR("Unsupported index type for topk_ids");
-        }
 
-        using IdxT = int32_t;
-        // Get raw pointers using the PyTorch scalar_t type, not input_dtype
+        using IdxT                 = int32_t;
         const scalar_t* values_ptr = values.data_ptr<scalar_t>();
         scalar_t* topk_out_ptr     = topk_out.data_ptr<scalar_t>();
         IdxT* topk_ids_ptr         = topk_ids.data_ptr<IdxT>();
