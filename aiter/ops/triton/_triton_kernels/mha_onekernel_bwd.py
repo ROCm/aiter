@@ -514,6 +514,7 @@ _bwd_kernel_causal_repr = make_kernel_repr(
         "USE_EXP2",
         "IS_FP8",
         "USE_INT64_STRIDES",
+        "ENABLE_SINK",
     ],
 )
 
@@ -523,11 +524,13 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     Q,
     K,
     V,
+    Sink,
     sm_scale,
     DO,
     DQ,
     DK,
     DV,
+    DSink,
     M,
     Delta,
     stride_qb_in,
@@ -603,6 +606,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
+    ENABLE_SINK: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
         stride_qb = tl.cast(stride_qb_in, tl.int64)
@@ -1053,8 +1057,22 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             else:
                 q_pe = None
             do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
-            m = tl.load(M + adj_delta + offs_m * stride_deltam, mask=offs_m < seqlen_q)
+            mask_m = offs_m < seqlen_q
+            m = tl.load(M + adj_delta + offs_m * stride_deltam, mask=mask_m, other=0.0)
             m = m[:, None]
+
+            if ENABLE_SINK:
+                sink = tl.load(Sink + hqid).to(tl.float32)
+                delta = tl.load(
+                    Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0
+                )
+                if USE_EXP2:
+                    RCP_LN2: tl.constexpr = 1.4426950408889634
+                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
+                else:
+                    psink = tl.math.exp(sink - m)
+                dsink = tl.sum(-psink * delta[:, None])
+                tl.atomic_add(DSink + hqid, dsink)
 
             MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
             # start can only be 0 at minimum
@@ -1208,6 +1226,7 @@ _bwd_kernel_noncausal_repr = make_kernel_repr(
         "USE_EXP2",
         "IS_FP8",
         "USE_INT64_STRIDES",
+        "ENABLE_SINK",
     ],
 )
 
@@ -1217,11 +1236,13 @@ def bwd_kernel_noncausal(
     Q,
     K,
     V,
+    Sink,
     sm_scale,
     DO,
     DQ,
     DK,
     DV,
+    DSink,
     M,
     Delta,
     stride_qb_in,
@@ -1297,6 +1318,7 @@ def bwd_kernel_noncausal(
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
+    ENABLE_SINK: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
         stride_qb = tl.cast(stride_qb_in, tl.int64)
@@ -1613,8 +1635,22 @@ def bwd_kernel_noncausal(
             else:
                 q_pe = None
             do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
-            m = tl.load(M + adj_delta + offs_m * stride_deltam, mask=offs_m < seqlen_q)
+            mask_m = offs_m < seqlen_q
+            m = tl.load(M + adj_delta + offs_m * stride_deltam, mask=mask_m, other=0.0)
             m = m[:, None]
+
+            if ENABLE_SINK:
+                sink = tl.load(Sink + hqid).to(tl.float32)
+                delta = tl.load(
+                    Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0
+                )
+                if USE_EXP2:
+                    RCP_LN2: tl.constexpr = 1.4426950408889634
+                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
+                else:
+                    psink = tl.math.exp(sink - m)
+                dsink = tl.sum(-psink * delta[:, None])
+                tl.atomic_add(DSink + hqid, dsink)
 
             if IS_FP8:
                 descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
