@@ -103,8 +103,8 @@ def update_config_files(file_path: str, merge_name: str):
         untunedf = pd.read_csv(untuned_path)
         keys = untunedf.columns.tolist()
         
-        # 自动添加重要的去重维度（如果存在于 tuned 文件中）
-        # cu_num 代表不同的计算单元数量，不同 cu_num 的配置应该分别保留
+        # Automatically add important deduplication dimensions (if present in tuned file)
+        # cu_num represents different compute unit counts, configs with different cu_num should be preserved separately
         extra_dedup_keys = ['cu_num']
         for key in extra_dedup_keys:
             if key in merge_df.columns and key not in keys:
