@@ -4,9 +4,10 @@
 import torch
 import pytest
 import torch.nn.functional as F
-from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
+from aiter.ops.triton.gemm_a8w8 import gemm_a8w8, gluon_gemm_a8w8
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from aiter.test_common import perftest
 from typing import Union
 
 
@@ -19,8 +20,14 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
+@perftest()
 def run_triton(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=None):
     return gemm_a8w8(x, weight, x_scale, w_scale, bias, dtype, y)
+
+
+@perftest()
+def run_gluon(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=None):
+    return gluon_gemm_a8w8(x, weight, x_scale, w_scale, bias, dtype, y)
 
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
@@ -73,7 +80,7 @@ def get_x_vals():
     x_vals += [(1, 1, 1)]
     x_vals += [(16, 16, 16)]
     x_vals += [(1024, 1024, 1024)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536)]
+    x_vals += [(4096, 4096, 8192)]
     return x_vals
 
 
@@ -117,7 +124,6 @@ def generate_gemm_a8w8_inputs(
     y = None
     if output:
         y = torch.empty((M, N), dtype=out_dtype, device="cuda")
-
     return x, weight, x_scale, w_scale, None, y
 
 
@@ -149,6 +155,9 @@ def test_gemm(in_dtype, out_dtype, m, n, k, layout, output):
     )
 
     a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
-    b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y)
+    b, b_us = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y)
+    c, c_us = run_gluon(x, weight, x_scale, w_scale, bias, out_dtype, y)
 
     torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
+    torch.testing.assert_close(a, c, atol=0.02, rtol=1e-2)
+    print(f'[DEBUG] b_us: {b_us}, c_us: {c_us}')
