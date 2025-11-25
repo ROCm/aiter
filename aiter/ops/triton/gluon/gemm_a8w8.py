@@ -54,6 +54,7 @@ def _gemm_a8w8_kernel(
     GRID_MN: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    FP8_FORMAT: gl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8 function
@@ -92,7 +93,7 @@ def _gemm_a8w8_kernel(
 
     # Calculate new pid based on the new grouping
     # (for some reason triton compiler is smart enough to optimize the 
-    # if condition: xcd < tall_xcds during compile-time but gluon doesn't
+    # if xcd < tall_xcds condition during compile-time but gluon doesn't
     # perform the optimization so we manually do it) 
     if not GRID_MN % NUM_XCDS: 
         pid = xcd * pids_per_xcd + local_pid
@@ -132,12 +133,14 @@ def _gemm_a8w8_kernel(
         warps_per_cta=[1, NUM_WARPS],
         order=[0, 1],
     )
+
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16],
         transposed=True,
         warps_per_cta=[2, NUM_WARPS // 2],
     )
+    
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=1, max_phase=16, order=[1, 0]
     )
@@ -172,7 +175,6 @@ def _gemm_a8w8_kernel(
             mask=(offs_ak[None, :] < K)
             & (offs_am[:, None] < M),
         )
-    
 
     offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_kn))
     offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(
@@ -218,28 +220,19 @@ def _gemm_a8w8_kernel(
     smem_a = gl.allocate_shared_memory(
         a_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
     )
-
     smem_b = gl.allocate_shared_memory(
         b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
     )
 
-    # store first block of A and B to shared memory
+    # store first block of A to shared memory
     smem_a.store(a)
-    smem_b.store(b)
 
-    #accumulator
-    # acc_dtype = gl.float32 if (c_ptr.type.element_ty != gl.int8 and c_ptr.type.element_ty != gl.int32) else gl.int32
-    acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
-    # zeros_dtype = gl.float32 if a_ptr.type.element_ty != gl.int8 else gl.int32
+    acc_dtype = gl.float32 if a_ptr.type.element_ty != gl.int8 else gl.int32
     acc = gl.zeros(
         (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout
     )
-    # zeros = gl.zeros(
-    #     (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=zeros_dtype, layout=mfma_layout
-    # )
 
-    
-    #loop over K
+    #num_stages:2
     for k in range(0, gl.cdiv(K, BLOCK_SIZE_K) - 1):
         
         #advance block pointers for A and B
@@ -260,13 +253,11 @@ def _gemm_a8w8_kernel(
                 mask=(offs_ak[None, :] < K - (k + 1) * BLOCK_SIZE_K) 
                 & (offs_am[:, None] < M),
             )
-        
-        # if EVEN_K:
-        #     a = gl.load(a_ptrs)
-        # else:
-        #     a = gl.load(a_ptrs, mask = (offs_ak[None, :] < K - (k+1) * BLOCK_SIZE_K), other=0.0)
 
-        # load current block of A from shared memory
+        # store curr block of B to shared mem    
+        smem_b.store(b)
+        
+        # load curr block of A from shared mem
         cur_a = smem_a.load(layout=dot_a_layout)
         
         # buffer load next block of B
@@ -283,27 +274,31 @@ def _gemm_a8w8_kernel(
                 mask=(offs_bk[:, None] < K - (k + 1) * BLOCK_SIZE_K)
                 & (offs_bn[None, :] < N),
             )
-        # if EVEN_K:
-        #     b = gl.load(b_ptrs)
-        # else:
-        #     b = gl.load(b_ptrs, mask = (offs_bk[:, None] < K - (k+1) * BLOCK_SIZE_K), other=0.0)
             
         #load current block of B from shared memory
         cur_b = smem_b.load(layout=dot_b_layout)
 
-        acc = gl.amd.cdna4.mfma_scaled(a=cur_a, a_scale=None, a_format='e4m3', b=cur_b, b_scale=None, b_format='e4m3', acc=acc)
-        
-        # store next block of A and B to shared memory
+        if FP8_FORMAT is None: # in_dtype is int8
+            acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)
+        else:
+            acc = gl.amd.cdna4.mfma_scaled(a=cur_a, a_scale=None, a_format=FP8_FORMAT, b=cur_b, b_scale=None, b_format=FP8_FORMAT, acc=acc)
+
+        # store next block of A to shared memory
         smem_a.store(a)
-        smem_b.store(b)
 
     # ======= Epilogue ========
-
+    
+    #store last block of B to shared memory
+    smem_b.store(b)
+    
     #load last blocks of A and B from shared memory
     cur_a = smem_a.load(layout=dot_a_layout)
     cur_b = smem_b.load(layout=dot_b_layout)
 
-    acc = gl.amd.cdna4.mfma_scaled(a=cur_a, a_scale=None, a_format='e4m3', b=cur_b, b_scale=None, b_format='e4m3', acc=acc)
+    if FP8_FORMAT is None: # in_dtype is int8
+        acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)
+    else:
+        acc = gl.amd.cdna4.mfma_scaled(a=cur_a, a_scale=None, a_format=FP8_FORMAT, b=cur_b, b_scale=None, b_format=FP8_FORMAT, acc=acc)
 
     # apply scales to accumulator
     acc *= a_scale[:, None] * b_scale[None, :]
@@ -315,11 +310,9 @@ def _gemm_a8w8_kernel(
             offsets=offs_b_scale,
             mask=offs_b_scale < N,
         )
-        # bias = gl.load(bias_ptr + offs_b_scale)
         acc = acc.to(bias_ptr.type.element_ty) + bias[None, :]
 
     c = acc.to(c_ptr.type.element_ty)
-
 
     # # Write back the block of the output matrix C with masks.
     offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
@@ -337,9 +330,6 @@ def _gemm_a8w8_kernel(
     gl.amd.cdna4.buffer_store(
         stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask
     )
-    # c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    # c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    # tl.store(c_ptrs, c, mask=c_mask) 
 
 @functools.lru_cache(maxsize=1024)
 def _get_config(
@@ -405,6 +395,13 @@ def gemm_a8w8(
     if config is None:
         config = _get_config(M, N, K)
 
+    if x.dtype == torch.float8_e4m3fn:
+        fp8_format = "e4m3"
+    elif x.dtype == torch.float8_e5m2:
+        fp8_format = "e5m2"
+    else:
+        fp8_format = None # int8 case
+    
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
@@ -428,6 +425,7 @@ def gemm_a8w8(
         NUM_XCDS=get_num_xcds(),
         NUM_WARPS=config["num_warps"],
         **config,
+        FP8_FORMAT=fp8_format
     )
 
     return y

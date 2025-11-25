@@ -152,7 +152,7 @@ def test_gemm(in_dtype, out_dtype, m, n, k, layout, output, impl: str):
             "Gluon implementation is not supported on this device (requires CDNA4)."
         )
 
-    if in_dtype in ["fp8e4m3", "fp8e5m2"] and out_dtype in ["int8", "int32"]:
+    if out_dtype == "int32" and in_dtype in ["fp8e4m3", "fp8e5m2"]:
         pytest.skip(
             "This kernel is not supported for in_dtype of float and out_dtype of int."
         )
