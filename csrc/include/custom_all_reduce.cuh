@@ -943,6 +943,7 @@ namespace aiter
       }
       tmps[warp_id][(rank * part + bid) * tnum_gpu + lane_id] = rslt;
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
   }
 
   template <int reduce_range>
