@@ -207,10 +207,10 @@ def test_fmoe(
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
+    w1_qt_fp4 = w1_qt
     if qType != aiter.QuantType.per_1x32:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
-
     else:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
@@ -289,13 +289,13 @@ def test_fmoe(
         if qType == aiter.QuantType.per_Tensor:
             a1_scale = a1_scale.view(1).repeat(token)
             w1_scale = w1_scale.view(E, 1).repeat(1, w1.shape[-2])
-        _, a1_scale_shuffle = aiter.per_1x32_f4_quant(input, shuffle=False)
+        _, a1_scale_shuffle = aiter.per_1x32_f4_quant(input, shuffle=True)
         BLOCK_SIZE_M = 256
         out1_asm = torch.empty((token, topk, inter_dim), dtype=dtype)
         _, us = run_perftest(
             asm_stage1,
             a1_qt,
-            shuffle_weight(w1_qt, (16, 16)),
+            shuffle_weight(w1_qt_fp4, (16, 16)),
             shuffle_weight(w2_qt, (16, 16)),
             sorted_ids,
             sorted_expert_ids,
@@ -304,13 +304,14 @@ def test_fmoe(
             topk,
             kernelName="_ZN5aiter52fmoe_stage1_bf16_pertokenFp4_blockscale_g1u1_256x128E",
             a1_scale=fp4_utils.moe_mxfp4_sort(
-                a1_scale,
+                a1_scale_shuffle,
                 sorted_ids,
                 num_valid_ids,
                 a1_qt.shape[0],
                 256,
             ),
-            w1_scale=fp4_utils.e8m0_shuffle(w1_scale),
+            w1_scale=w1_scale,
+            # w1_scale=fp4_utils.e8m0_shuffle(w1_scale),
             activation=actType,
             quant_type=qType,
             block_m=BLOCK_SIZE_M,
