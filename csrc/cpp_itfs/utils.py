@@ -336,19 +336,9 @@ def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
     filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_param_names}
     bound_args = sig.bind(*args, **filtered_kwargs)
     bound_args.apply_defaults()
-    # constexpr_indices = []
-    # for idx, param in enumerate(sig.parameters.values()):
-    #     if param.annotation == tl.constexpr:
-    #         constexpr_indices.append(idx)
     ccinfo = kernel.warmup(*args, grid=grid, **kwargs)
     constexprs = {}
     arg_names = []
-    # keys = list(sig.parameters.keys())
-    # for idx, arg in enumerate(args):
-    #     if idx in constexpr_indices:
-    #         constexprs[keys[idx]] = arg
-    #     else:
-    #         arg_names.append(keys[idx])
     for param in sig.parameters.values():
         if param.name in bound_args.arguments and param.annotation != tl.constexpr:
             arg_names.append(param.name)
@@ -449,7 +439,7 @@ class HsacoKernel:
 
         if not isinstance(kernel, triton.JITFunction):
             raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
-        self.kernel = kernel
+        self.triton_kernel = kernel
         self.stream = stream
 
     def __getitem__(self, grid):
@@ -457,7 +447,7 @@ class HsacoKernel:
             if AITER_USE_HSACO:
                 import triton.language as tl
 
-                sig = inspect.signature(self.kernel.fn)
+                sig = inspect.signature(self.triton_kernel.fn)
                 valid_param_names = set(sig.parameters.keys())
                 filtered_kwargs = {
                     k: v for k, v in kwargs.items() if k in valid_param_names
@@ -476,20 +466,22 @@ class HsacoKernel:
                         )
                     elif param.annotation == tl.constexpr:
                         constexprs[param.name] = bound_args.arguments[param.name]
-                if not check_hsaco(self.kernel.fn.__name__, constexprs):
-                    compile_hsaco_from_triton(self.kernel, *args, grid=grid, **kwargs)
+                if not check_hsaco(self.triton_kernel.fn.__name__, constexprs):
+                    compile_hsaco_from_triton(
+                        self.triton_kernel, *args, grid=grid, **kwargs
+                    )
                 return run_hsaco(
-                    self.kernel.fn.__name__,
+                    self.triton_kernel.fn.__name__,
                     *ordered_args_without_constexprs,
                     grid=grid,
                     stream=self.stream,
                     constexprs=constexprs,
                 )
             else:
-                return self.kernel[grid](*args, **kwargs)
+                return self.triton_kernel[grid](*args, **kwargs)
 
         return _call
 
 
-def jit(kernel, stream=None):
-    return HsacoKernel(kernel, stream)
+def jit(triton_kernel, stream=None):
+    return HsacoKernel(triton_kernel, stream)
