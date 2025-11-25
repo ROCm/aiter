@@ -55,30 +55,35 @@ def test_fmoe(
         # return
         pass
     torch_quant = aiter.get_torch_quant(qType)
-    # input = torch.randn((token, model_dim), dtype=dtype)
-    input = torch.ones((token, model_dim), dtype=dtype)
-    aiter.logger.info(f'input_dim {token} model_dim {model_dim} hidden_pad {hidden_pad} intermediate_pad {intermediate_pad}')
+    input = torch.randn((token, model_dim), dtype=dtype)
+    # input = torch.ones((token, model_dim), dtype=dtype)
+    aiter.logger.info(f'input_dim {token} model_dim {model_dim} hidden_pad {hidden_pad} intermediate_pad {intermediate_pad} use {use_g1u1}')
     if use_g1u1:
-        # w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
-        w1 = torch.ones((E, inter_dim * 2, model_dim), dtype=dtype)
+        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
+        # generate w1 with 32 dim then broadcast to (E, inter_dim*2, model_dim)
+        # w1 = torch.randn(32).repeat(model_dim // 32).view(1, 1, model_dim).expand(E, inter_dim * 2, model_dim).contiguous()
+        
+        # w1 = torch.ones((E, inter_dim * 2, model_dim), dtype=dtype)
         if hidden_pad != 0 and intermediate_pad != 0:
             w1[:, :, -hidden_pad:] = 0
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
-        # exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
-        exp_bias1 = torch.clamp(torch.ones((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
+        exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
+        # exp_bias1 = torch.clamp(torch.ones((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
     else:
-        # w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
-        # exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
-        w1 = torch.ones((E, inter_dim, model_dim), dtype=dtype)
-        exp_bias1 = torch.clamp(torch.ones((E * inter_dim), dtype=dtype), -1.0, 1.0)
+        w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
+        exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
+        # w1 = torch.ones((E, inter_dim, model_dim), dtype=dtype)
+        # exp_bias1 = torch.clamp(torch.ones((E * inter_dim), dtype=dtype), -1.0, 1.0)
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
-    w2 = torch.ones((E, model_dim, inter_dim), dtype=dtype)
+    # w2 = torch.ones((E, model_dim, inter_dim), dtype=dtype)
+    # w2 = torch.randn(32).repeat(inter_dim // 32).view(1, 1, inter_dim).expand(E, model_dim, inter_dim).contiguous()
+    # w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
     if hidden_pad != 0 and intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
-    # exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
-    exp_bias2 = torch.clamp(torch.ones((E, model_dim), dtype=dtype), -1.0, 1.0)
+    exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
+    # exp_bias2 = torch.clamp(torch.ones((E, model_dim), dtype=dtype), -1.0, 1.0)
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
@@ -273,8 +278,8 @@ def test_fmoe(
         doweight=doweight_stage1,
     )
     
-    aiter.logger.info('stage 1 done')
-    aiter.logger.info(f'out1_ref {out1_ref}')
+    aiter.logger.info('ref stage 1 done')
+    aiter.logger.info(f'out1_ref {out1_ref} with info {out1_ref.shape} {out1_ref.dtype}')
     
 
 
@@ -312,6 +317,9 @@ def test_fmoe(
         w2_bias=exp_bias2,
         doweight=not doweight_stage1,
     )
+    
+    aiter.logger.info('ref stage 2 done')
+    aiter.logger.info(f'out2_ref {out2_ref} with info {out2_ref.shape} {out2_ref.dtype}')
 
     # ######################## stage 2 end ###########
     out2_ck, us2 = run_perftest(
@@ -334,11 +342,19 @@ def test_fmoe(
         num_warmup=0,
     )
     aiter.logger.info(f'run pertest done')
+    
+    err = checkAllclose(
+        out2_ref[0],
+        out2_ck[0],
+        msg=f"ck_moe_2stages subtensor 0 :{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+    )
+    
     err = checkAllclose(
         out2_ref,
         out2_ck,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
+    
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
         x, y = x.double(), y.double()
