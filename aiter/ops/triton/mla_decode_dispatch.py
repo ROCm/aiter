@@ -224,11 +224,11 @@ def _decode_grouped_att_m_fwd(
     mtp,
     config,
 ):
-    qk_rope_head_dim = q.shape[-1] - kv_lora_rank
-    # batch, head_num = kv_indptr.shape[0] - 1, q.shape[1]
-    batch, head_num = q.shape[0], q.shape[1]
-    kv_group_num = q.shape[1] // k_buffer.shape[-2]
-    page_block_size = k_buffer.shape[1]
+    qk_rope_head_dim = q.size(-1) - kv_lora_rank
+    # batch, head_num = kv_indptr.size(0) - 1, q.size(1)
+    batch, head_num = q.size(0), q.size(1)
+    kv_group_num = q.size(1) // k_buffer.size(-2)
+    page_block_size = k_buffer.size(1)
 
     # batch = batch*(mtp + 1)
 
@@ -397,6 +397,7 @@ def _fwd_kernel_stage2(
     batch: tl.constexpr,
     head_num: tl.constexpr,
     max_qo_len: tl.constexpr,
+    PAGE_BLOCK_SIZE: gl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -418,13 +419,16 @@ def _fwd_kernel_stage2(
 
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
     offs_logic = cur_batch * stride_mid_lse_b + cur_head * stride_mid_lse_h
+    # kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+    cur_batch_block_nums = gl.cdiv(cur_batch_seq_len, PAGE_BLOCK_SIZE)
+    blocks_per_split = gl.cdiv(cur_batch_block_nums, NUM_KV_SPLITS)
 
     for split_kv_id in range(0, NUM_KV_SPLITS):
-        kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
-        split_kv_start = kv_len_per_split * split_kv_id
-        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+        split_kv_start = blocks_per_split * split_kv_id * PAGE_BLOCK_SIZE
+        split_kv_end = tl.minimum(split_kv_start + blocks_per_split * PAGE_BLOCK_SIZE, cur_batch_seq_len)
 
         if split_kv_end > split_kv_start:
+
             tv = tl.load(
                 Att_Out + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
             )
@@ -451,17 +455,19 @@ def _decode_softmax_reducev_fwd(
     att_lse,
     q,
     o,
-    v_buffer,
+    k_buffer,
     kv_indptr,
     num_kv_splits,
     mtp,
     config,
 ):
-    batch, head_num = q.shape[0], q.shape[1]
-    Lv = v_buffer.shape[-1]
+    batch, head_num = q.size(0), q.size(1)
+    page_block_size = k_buffer.size(1)
+    Lv = o.size(-1)
     config["BLOCK_DV"] = triton.next_power_of_2(Lv)
 
     config["NUM_KV_SPLITS"] = num_kv_splits
+    config["PAGE_BLOCK_SIZE"] = page_block_size
 
     grid = (batch * head_num,)
     _fwd_kernel_stage2[grid](
@@ -560,7 +566,7 @@ def decode_attention_fwd_grouped(
         attn_lse,
         q,
         o,
-        v_buffer,
+        k_buffer,
         kv_indptr,
         num_kv_splits,
         mtp,
