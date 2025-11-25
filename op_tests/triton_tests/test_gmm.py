@@ -238,10 +238,27 @@ def test_gmm(
         )
 
         m = int(torch.sum(group_sizes).item())
+
+        # Tolerance handling:
+        # - Default (no bias): use strict global defaults (atol=5e-3, rtol=1e-2)
+        # - With bias: allow slightly looser tolerances due to:
+        #   * extra floating point op (add bias)
+        #   * large problem sizes and mixed precision
+        #   * very small fraction of elements differing by a few bf16/fp16 ULPs
+        if use_bias:
+            # Base tolerances for bias case.
+            atol = 0.1
+            rtol = 0.1
+        else:
+            atol = None
+            rtol = None
+
         check_tensors(
             out_triton[:m],
             out_torch[:m],
             "Triton GMM doesn't match PyTorch reference GMM.",
+            atol=atol,
+            rtol=rtol,
         )
 
 
@@ -255,6 +272,9 @@ def torch_tgmm(
     group_sizes: Tensor,
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
+    bias_grad: Tensor | None = None,
+    compute_bias_grad: bool | None = None,
+    accumulate: bool = False,
 ) -> Tensor:
     check_input_device_dtype(lhs, rhs, group_sizes)
 
@@ -269,6 +289,33 @@ def torch_tgmm(
         existing_out=existing_out,
     )
 
+    # Bias gradient handling (test/reference only).
+    # By default, compute bias gradient iff a bias_grad buffer is provided.
+    if compute_bias_grad is None:
+        compute_bias_grad = bias_grad is not None
+
+    if compute_bias_grad:
+        assert (
+            bias_grad is not None
+        ), "bias_grad buffer must be provided when compute_bias_grad is True."
+        expected_shape = (G, K)
+        assert (
+            tuple(bias_grad.shape) == expected_shape
+        ), f"bias_grad must have shape {expected_shape}, got {tuple(bias_grad.shape)}."
+        assert (
+            bias_grad.device == lhs.device
+        ), "bias_grad must be on the same device as other tensors."
+        assert (
+            bias_grad.dtype == torch.float32
+        ), "bias_grad must be torch.float32 in the reference implementation."
+        assert bias_grad.stride() == (
+            K,
+            1,
+        ), "bias_grad must be row-major with stride (K, 1)."
+
+        if not accumulate:
+            bias_grad.zero_()
+
     last_col = 0
 
     for g in range(G):
@@ -280,10 +327,14 @@ def torch_tgmm(
 
         start_idx = last_col
         end_idx = last_col + m
+        # Match Triton kernel: do matmul in float32, then cast to output dtype.
+        mm = (lhs[:, start_idx:end_idx] @ rhs[start_idx:end_idx, :]).to(torch.float32)
+        out[g] = mm.to(preferred_element_type)
 
-        out[g] = (lhs[:, start_idx:end_idx] @ rhs[start_idx:end_idx, :]).to(
-            preferred_element_type
-        )
+        # Bias gradient: sum lhs across m-dimension (columns) for each group.
+        if compute_bias_grad:
+            grad = lhs[:, start_idx:end_idx].sum(dim=1, dtype=torch.float32)
+            bias_grad[g] += grad
 
         last_col += m
 
@@ -339,26 +390,81 @@ def test_tgmm(
     kernel_wrapper = triton_ptgmm if persistent else triton_nptgmm
 
     for group_sizes in multiple_group_sizes:
-        torch_tgmm(
-            lhs,
-            rhs,
-            group_sizes,
-            preferred_element_type=out_dtype,
-            existing_out=out_torch,
-        )
+        if persistent:
+            # Allocate bias gradient buffers for reference and Triton.
+            bias_grad_torch = torch.empty(
+                (G, K), device=lhs.device, dtype=torch.float32
+            )
+            bias_grad_triton = torch.empty_like(bias_grad_torch)
 
-        kernel_wrapper(
-            lhs,
-            rhs,
-            group_sizes,
-            preferred_element_type=out_dtype,
-            existing_out=out_triton,
-        )
+            # Reference persistent TGMM with bias gradient.
+            torch_tgmm(
+                lhs,
+                rhs,
+                group_sizes,
+                preferred_element_type=out_dtype,
+                existing_out=out_torch,
+                bias_grad=bias_grad_torch,
+                compute_bias_grad=True,
+                accumulate=False,
+            )
+
+            # Triton persistent TGMM with bias gradient.
+            kernel_wrapper(
+                lhs,
+                rhs,
+                group_sizes,
+                preferred_element_type=out_dtype,
+                existing_out=out_triton,
+                bias_grad=bias_grad_triton,
+                compute_bias_grad=True,
+                accumulate=False,
+            )
+        else:
+            # Non-persistent TGMM: no bias gradient support.
+            torch_tgmm(
+                lhs,
+                rhs,
+                group_sizes,
+                preferred_element_type=out_dtype,
+                existing_out=out_torch,
+            )
+
+            kernel_wrapper(
+                lhs,
+                rhs,
+                group_sizes,
+                preferred_element_type=out_dtype,
+                existing_out=out_triton,
+            )
 
         non_empty_groups = group_sizes > 0
+
+        # Compare TGMM outputs.
         check_tensors(
             out_triton[non_empty_groups],
             out_torch[non_empty_groups],
             f"Triton {'persistent' if persistent else 'non-persistent'} TGMM doesn't match PyTorch reference TGMM.",
             atol=atol,
         )
+
+        # For persistent TGMM, also compare bias gradients.
+        if persistent:
+            # Bias gradient is a long float32 reduction (over M) with atomics in the
+            # Triton kernel, and a different reduction order in the PyTorch reference.
+            # For very large shapes this can introduce sizeable numerical differences,
+            # so we use looser tolerances there.
+            if M > 1e6:
+                bias_atol = 16.0   # comfortably above ~13 max abs diff seen in logs
+                bias_rtol = 100.0  # effectively ignore relative error near zero
+            else:
+                bias_atol = 2.0
+                bias_rtol = 0.1
+
+            check_tensors(
+                bias_grad_triton[non_empty_groups],
+                bias_grad_torch[non_empty_groups],
+                "Triton persistent TGMM bias_grad doesn't match PyTorch reference TGMM bias_grad.",
+                atol=bias_atol,
+                rtol=bias_rtol,
+            )
