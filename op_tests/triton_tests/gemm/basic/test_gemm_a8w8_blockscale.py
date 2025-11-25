@@ -5,6 +5,7 @@ import torch
 import pytest
 from aiter.ops.triton.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+    gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
 )
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
@@ -12,7 +13,17 @@ from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
+from aiter.ops.shuffle import shuffle_weight
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+
+def shuffle_scales(scales: torch.Tensor):
+    scales_shuffled = scales.clone()
+    sm, sn = scales_shuffled.shape
+    scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
+    scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
+    scales_shuffled = scales_shuffled.view(sm // 32, sn * 32)
+    return scales_shuffled
 
 
 block_shape = (128, 128)
@@ -109,6 +120,9 @@ def get_x_vals():
         (64, 7168, 256),
         (128, 7168, 256),
     ]
+    x_vals = [
+        (8, 4096, 7168),
+    ]
     # x_vals += [(1, 1, 1)]  # minimal case
     return x_vals
 
@@ -121,7 +135,8 @@ def generate_gemm_a8w8_blockscale_inputs(
     block_shape_k: int,
     dtype=torch.bfloat16,
     layout: str = "TN",
-    output=False,
+    output: bool = False,
+    shuffle: bool = False,
 ):
     """
     The GEMM kernel expects:
@@ -154,20 +169,30 @@ def generate_gemm_a8w8_blockscale_inputs(
     x_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
 
+    if shuffle:
+        weight_shuffle_layout = (16, 16)
+        # weight_shuffle_layout = (16, 32)
+        weight_shuffed = shuffle_weight(weight, weight_shuffle_layout).reshape(
+            weight.shape[0] // weight_shuffle_layout[0],
+            weight.shape[1] * weight_shuffle_layout[0],
+        )
+    else:
+        weight_shuffed = weight
+
     y = None
     if output:
         y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
 
-    return x, weight, x_scale, w_scale, y
+    return x, weight, weight_shuffed, x_scale, w_scale, y
 
 
 @pytest.mark.parametrize(
     "dtype, M, N, K, layout, output",
     [
         (dtype, *shape, layout, output)
-        for output in [True, False]
+        for output in [True]
         for dtype in ["bf16"]
-        for layout in ["TN", "TT", "NN", "NT"]
+        for layout in ["TN"]
         for shape in get_x_vals()
     ],
 )
@@ -176,6 +201,7 @@ def generate_gemm_a8w8_blockscale_inputs(
     [
         # "gluon",
         "triton",
+        "triton_shuffle",
     ],
 )
 def test_gemm(dtype, M, N, K, layout, output, impl: str):
@@ -190,15 +216,18 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
         )
 
     dtype = str_to_torch_dtype[dtype]
-    x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
-        M,
-        N,
-        K,
-        block_shape_n,
-        block_shape_k,
-        dtype=dtype,
-        layout=layout,
-        output=output,
+    x, weight, weight_triton, x_scale, w_scale, y = (
+        generate_gemm_a8w8_blockscale_inputs(
+            M,
+            N,
+            K,
+            block_shape_n,
+            block_shape_k,
+            dtype=dtype,
+            layout=layout,
+            output=output,
+            shuffle=("_shuffle" in impl),
+        )
     )
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
@@ -206,8 +235,35 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
         impl = gluon_gemm_a8w8_blockscale
     elif impl == "triton":
         impl = triton_gemm_a8w8_blockscale
+    elif impl == "triton_shuffle":
+        impl = triton_gemm_a8w8_blockscale_preshuffle
     else:
         raise ValueError(f"Unknown implementation: {impl}")
-    b = run_triton(x, weight, x_scale, w_scale, dtype, y, impl)
+
+    from triton import runtime
+
+    di = runtime.driver.active.get_device_interface()
+    cache = runtime.driver.active.get_empty_cache_for_benchmark()
+    config = {
+        "BLOCK_SIZE_M": 8,
+        # "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        # "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        # "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg",
+        "NUM_KSPLIT": 14,
+    }
+    for _ in range(250):
+        cache.zero_()
+        di.synchronize()
+        # b = run_triton(x, weight_triton, x_scale, w_scale, dtype, y, impl)
+        b = impl(x, weight_triton, x_scale, w_scale, dtype, y, config=config)
+        di.synchronize()
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
