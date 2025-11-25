@@ -140,6 +140,7 @@ def torch_gmm(
     group_sizes: Tensor,
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
+    bias: Tensor | None = None,
 ) -> Tensor:
     check_input_device_dtype(lhs, rhs, group_sizes)
 
@@ -165,9 +166,10 @@ def torch_gmm(
         start_idx = last_row
         end_idx = last_row + m
 
-        out[start_idx:end_idx, :] = (lhs[start_idx:end_idx, :] @ rhs[g]).to(
-            preferred_element_type
-        )
+        result = (lhs[start_idx:end_idx, :] @ rhs[g]).to(preferred_element_type)
+        if bias is not None:
+            result = result + bias[g].to(preferred_element_type)
+        out[start_idx:end_idx, :] = result
 
         last_row += m
 
@@ -179,6 +181,7 @@ def torch_gmm(
 @pytest.mark.parametrize("out_dtype_str", OUTPUT_DTYPES_STR)
 @pytest.mark.parametrize("trans_rhs_str", TRANS_RHS_STR)
 @pytest.mark.parametrize("rng_seed_str", RNG_SEED_STR)
+@pytest.mark.parametrize("use_bias", [False, True])
 def test_gmm(
     M: int,
     K: int,
@@ -188,6 +191,7 @@ def test_gmm(
     out_dtype_str: str,
     trans_rhs_str: str,
     rng_seed_str: str,
+    use_bias: bool,
 ):
     in_dtype = dtype_from_str(in_dtype_str)
     out_dtype = dtype_from_str(out_dtype_str)
@@ -208,6 +212,12 @@ def test_gmm(
     )
     out_triton = torch.empty_like(out_torch)
 
+    # Generate bias tensor if needed
+    bias = None
+    if use_bias:
+        torch.manual_seed(rng_seed + 1000)  # Different seed for bias
+        bias = torch.randn(G, N, dtype=in_dtype, device=lhs.device)
+
     for group_sizes in multiple_group_sizes:
         torch_gmm(
             lhs,
@@ -215,6 +225,7 @@ def test_gmm(
             group_sizes,
             preferred_element_type=out_dtype,
             existing_out=out_torch,
+            bias=bias,
         )
 
         triton_gmm(
@@ -223,6 +234,7 @@ def test_gmm(
             group_sizes,
             preferred_element_type=out_dtype,
             existing_out=out_triton,
+            bias=bias,
         )
 
         m = int(torch.sum(group_sizes).item())
