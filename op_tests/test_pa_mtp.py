@@ -162,6 +162,15 @@ def torch_mha_extend(
         v = v_cache.view(torch.int8)[idx].view(kv_dtype).to(torch.float)
         if v_scale is not None:
             v *= v_scale[:, idx].t().unsqueeze(-1)
+
+        nheads_kv = k.shape[1]
+        nheads_q = q.shape[1]
+        if nheads_q != nheads_kv:
+            assert nheads_q % nheads_kv == 0
+            g = nheads_q // nheads_kv
+            k = k.repeat_interleave(g, dim=1)
+            v = v.repeat_interleave(g, dim=1)
+
         o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=True)
         os.append(o)
     o = torch.concat(os)
@@ -253,75 +262,6 @@ def run_aiter_asm(
         # kernelName="_ZN5aiter42pa_bf16_pertokenFp8_gqa10_1tg_4w_mtp3_msk1E",
     )
 
-
-@perftest()
-def run_aiter_hip(
-    query,
-    k_cache,
-    v_cache,
-    block_tables,
-    seq_lens,
-    max_seq_len,
-    max_qlen,
-    kv_cache_dtype,
-    num_kv_heads,
-    scale,
-    k_scale=None,
-    v_scale=None,
-):
-    return ops.PagedAttention.forward_decode(
-        query,
-        k_cache,
-        v_cache,
-        block_tables,
-        seq_lens,
-        max_seq_len,
-        kv_cache_dtype,
-        num_kv_heads,
-        scale,
-        None,
-        k_scale,
-        v_scale,
-        mtp=max_qlen,
-    )
-
-
-@perftest()
-def run_aiter_hip(
-    query,
-    k_cache,
-    v_cache,
-    block_tables,
-    seq_lens,
-    max_seq_len,
-    max_qlen,
-    kv_cache_dtype,
-    num_kv_heads,
-    scale,
-    k_scale=None,
-    v_scale=None,
-    q_scale=None,
-    output_dtype=dtypes.bf16,
-):
-    return aiter.paged_attn.PagedAttention.forward_decode(
-        query,
-        k_cache,
-        v_cache,
-        block_tables,
-        seq_lens,
-        max_seq_len,
-        kv_cache_dtype,
-        num_kv_heads,
-        scale,
-        None,
-        k_scale,
-        v_scale,
-        q_scale=q_scale,
-        mtp=max_qlen,
-        output_dtype=output_dtype,
-    )
-
-
 def asm_V_shuffle(VC):
     # [num_blocks, num_kv_heads, head_size, block_size]
     x = 16 // VC.element_size()
@@ -331,6 +271,14 @@ def asm_V_shuffle(VC):
     VC = VC.permute(0, 1, 3, 2, 4).contiguous()
     return VC
 
+def undo_asm_V_shuffle(VC_shuffled):
+    # Input: [num_blocks, num_kv_heads, block_size/x, head_size, x]
+    # Output: [num_blocks, num_kv_heads, head_size, block_size]
+    num_blocks, num_kv_heads, bs_div_x, head_size, x = VC_shuffled.shape
+    VC = VC_shuffled.permute(0, 1, 3, 2, 4).contiguous()
+    VC = VC.view(num_blocks, num_kv_heads, head_size, bs_div_x * x)
+
+    return VC
 
 @benchmark()
 def test_pa_mtp(
@@ -343,168 +291,68 @@ def test_pa_mtp(
     qlen,
 ) -> dict:
     ret = {}
-    seed = 0
+
+    query = torch.load("/mnt/raid0/yilin/repo/aiter/zzz/query.pt", weights_only=False).cuda()
+    k_cache = torch.load("/mnt/raid0/yilin/repo/aiter/zzz/key_cache.pt", weights_only=False).cuda()
+    v_cache = torch.load("/mnt/raid0/yilin/repo/aiter/zzz/value_cache.pt", weights_only=False).cuda()
+    block_tables = torch.load("/mnt/raid0/yilin/repo/aiter/zzz/block_tables.pt", weights_only=False).cuda()
+    seq_lens = torch.load("/mnt/raid0/yilin/repo/aiter/zzz/context_lens.pt", weights_only=False).cuda()
+
+    num_blocks, num_kv_heads, block_size, head_size = k_cache.shape
+    x_ = 16 // k_cache.element_size()
+    k_cache = k_cache.view(num_blocks, num_kv_heads, head_size // x_, block_size, x_)
+    v_cache = v_cache.view(num_blocks, num_kv_heads, block_size // x_, head_size, x_)
+
     device = "cuda:0"
-    torch.set_default_device(device)
-    num_query_heads, num_kv_heads = num_heads
-
-    assert num_query_heads % num_kv_heads == 0
-    max_seq_len = 16384
-    max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
-    num_blocks = max_num_blocks_per_seq * batch_size
-    num_blocks_per_seq = (ctx_lens + block_size - 1) // block_size
-
-    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
-    seq_lens_qo = torch.randint(
-        1, 5, (batch_size,), dtype=torch.int, device=device
-    ).fill_(qlen)
-    # print(seq_lens_qo)
+    qo_indptr = torch.zeros(2, dtype=torch.int, device=device)
+    seq_lens_qo = torch.ones(batch_size, dtype=torch.int, device=device)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
-    total_qo = qo_indptr[-1].item()
-    max_qlen = seq_lens_qo.max().item()
-
-    qkv = torch.randn(
-        total_qo,
-        num_query_heads + 2 * num_kv_heads,
-        head_size,
-        dtype=dtype,
-    )
-    query, key, value = torch.split(
-        qkv, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
-    )
-    query.uniform_(*uniform_range)
-
-    # seq_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(batch_size)]
-    seq_lens = [ctx_lens for _ in range(batch_size)]
-    seq_lens = torch.tensor(seq_lens, dtype=torch.int)
-
-    # Create the block tables.
-    block_tables_lst: List[List[int]] = []
-    for _ in range(batch_size):
-        block_table = [
-            random.randint(0, num_blocks - 1) for _ in range(num_blocks_per_seq)
-        ]
-        block_tables_lst.append(block_table)
-
-    block_tables = torch.tensor(block_tables_lst, dtype=torch.int)
-
-    # Create the KV caches.
-    k_caches, v_caches = kv_cache_factory(
-        num_blocks,
-        block_size,
-        1,
-        num_kv_heads,
-        head_size,
-        "auto",
-        dtype,
-        seed,
-        device,
-    )
-    k_cache, v_cache = k_caches[0], v_caches[0]
 
     out_ref_noquant = torch_mha_extend(
         query,
         k_cache,
-        v_cache,
+        undo_asm_V_shuffle(v_cache),
         block_tables,
         seq_lens,
         qo_indptr,
     )
 
-    # out_asm_noquant, us_asm_noquant = run_aiter_asm(
-    #     query,
-    #     k_cache,
-    #     asm_V_shuffle(v_cache),
-    #     block_tables,
-    #     seq_lens,
-    #     block_tables.size(1),
-    #     max_qlen,
-    #     qo_indptr=qo_indptr,
-    # )
-    # err_noquant = checkAllclose(
-    #     out_ref_noquant,
-    #     out_asm_noquant,
-    #     msg=f"[torch vs  aiter_asm][No Quant]: {us_asm_noquant:>8.2f} us......",
-    # )
-    # ret["us_asm_bf16"] = us_asm_noquant
-    # ret["err_asm_bf16"] = err_noquant
-
-    scale = float(1.0 / (head_size**0.5))
-    out_hip_noquant, us_hip = run_aiter_hip(
+    out_asm_noquant, us_asm_noquant = run_aiter_asm(
         query,
         k_cache,
         v_cache,
         block_tables,
         seq_lens,
-        ctx_lens,
-        max_qlen,
-        "auto",
-        num_kv_heads,
-        scale,
+        block_tables.size(1),
+        5,
+        qo_indptr=qo_indptr,
     )
     err_noquant = checkAllclose(
         out_ref_noquant,
-        out_hip_noquant,
-        msg=f"[torch vs  aiter_hip][No Quant]: {us_hip:>8.2f} us......",
+        out_asm_noquant,
+        msg=f"[torch vs  aiter_asm][No Quant]: {us_asm_noquant:>8.2f} us......",
     )
-    ret["us_hip_bf16"] = us_hip
-    ret["err_hip_bf16"] = err_noquant
+    ret["us_asm_bf16"] = us_asm_noquant
+    ret["err_asm_bf16"] = err_noquant
 
-    # ################## quant start ######################
-    k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
-        pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
-    )
-
-    # torch ref
-    out_ref = torch_mha_extend(
-        query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
-    )
-    out_aiter_asm, us_aiter_asm = run_aiter_asm(
+    # no qo_indptr
+    print("-----------------------------------------------")
+    out_asm_noquant2, us_asm_noquant2 = run_aiter_asm(
         query,
-        k_quant_,
-        asm_V_shuffle(v_quant_),
+        k_cache,
+        v_cache,
         block_tables,
         seq_lens,
         block_tables.size(1),
-        max_qlen,
-        k_scale_asm,
-        v_scale_asm,
-        qo_indptr,
+        1,
     )
-    err = checkAllclose(
-        out_ref,
-        out_aiter_asm,
-        msg=f"[torch vs  aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
+    err_noquant2 = checkAllclose(
+        out_ref_noquant,
+        out_asm_noquant2,
+        msg=f"[torch vs  aiter_asm][No Quant]: {us_asm_noquant2:>8.2f} us......",
     )
-    ret["us_asm_fp8"] = us_aiter_asm
-    ret["err fp8"] = err
-
-    q_quant, q_scale = pertoken_quant(query, quant_dtype=aiter.dtypes.fp8)
-    q_scale = q_scale.squeeze(-1)
-
-    out_hip, us_hip = run_aiter_hip(
-        q_quant,
-        k_quant_,
-        asm_V_shuffle(v_quant_),
-        block_tables,
-        seq_lens,
-        ctx_lens,
-        max_qlen,
-        "fp8",
-        num_kv_heads,
-        scale,
-        k_scale_asm,
-        v_scale_asm,
-        q_scale,
-        output_dtype=dtype,
-    )
-    err = checkAllclose(
-        out_ref,
-        out_hip,
-        msg=f"[torch vs  aiter_hip][   Quant]: {us_hip:>8.2f} us......",
-    )
-    ret["us_hip_fp8"] = us_hip
-    ret["err_hip_fp8"] = err
+    ret["us_asm_bf16_2"] = us_asm_noquant2
+    ret["err_asm_bf16_2"] = err_noquant2
 
     return ret
 
@@ -588,21 +436,21 @@ if args.batch_size is not None:
     l_batch_size = [args.batch_size]
 l_block_size = args.block_size
 
-for dtype in l_dtype:
-    df = []
-    for num_heads, qlen, ctx_len, batch_size, block_size in itertools.product(
-        l_num_heads, l_qlen, l_ctx_len, l_batch_size, l_block_size
-    ):
-        ret = test_pa_mtp(
-            ctx_len,
-            batch_size,
-            num_heads,
-            head_dim,
-            block_size,
-            dtype,
-            qlen,
-        )
-        df.append(ret)
-    df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
-    # df.to_csv("mla_prefill.csv")
+# for dtype in l_dtype:
+df = []
+#     for num_heads, qlen, ctx_len, batch_size, block_size in itertools.product(
+#         l_num_heads, l_qlen, l_ctx_len, l_batch_size, l_block_size
+#     ):
+ret = test_pa_mtp(
+    5, # 5
+    1,
+    [14, 2], # head_num
+    64, # head_dim
+    1,
+    "bf16",
+    1,
+)
+df.append(ret)
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")
+# df.to_csv("mla_prefill.csv")
