@@ -425,7 +425,7 @@ class GroupCoordinator:
         else:
             out_shape = (input_.numel() // world_size,)
 
-        output_ = torch.zeros(out_shape, dtype=input_.dtype, device=input_.device)
+        output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
         if use_custom:
             outplace_reduce_scatter(
                 input_, output_, group_name=self.unique_name, dim=dim
