@@ -72,8 +72,7 @@ A16W16_A8W8_gemm1_gfx950_heuristic_dispatch = """
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant
-        && {Preshuffle} == is_preshuffled)
+        && {Quant} == quant)
     {{
         if (block_m == 32)
         {{
@@ -108,8 +107,7 @@ A16W16_A8W8_gemm1_heuristic_dispatch = """
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant
-        && {Preshuffle} == is_preshuffled)
+        && {Quant} == quant)
     {{
         if (block_m == 32)
         {{
@@ -144,8 +142,7 @@ A8W4_gemm1_heuristic_dispatch = """
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant
-        && {Preshuffle} == is_preshuffled)
+        && {Quant} == quant)
     {{
         if (block_m == 32)
         {{
@@ -247,8 +244,7 @@ A8W8_blockscale_gemm1_heuristic_dispatch = """
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {ActOP} == act_op
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant
-        && {Preshuffle} == is_preshuffled)
+        && {Quant} == quant)
     {{
         if (block_m == 16)
         {{
@@ -273,8 +269,7 @@ A16W16_A8W8_gemm2_gfx950_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant
-        && {Preshuffle} == is_preshuffled)
+        && {Quant} == quant)
     {{
         if (block_m == 32)
         {{
@@ -307,8 +302,7 @@ A16W16_A8W8_gemm2_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant
-        && {Preshuffle} == is_preshuffled)
+        && {Quant} == quant)
     {{
         if (block_m == 32)
         {{
@@ -341,8 +335,7 @@ A8W4_gemm2_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant
-        && {Preshuffle} == is_preshuffled)
+        && {Quant} == quant)
     {{
         if (block_m == 32)
         {{
@@ -491,8 +484,7 @@ A8W8_blockscale_gemm2_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant
-        && {Preshuffle} == is_preshuffled)
+        && {Quant} == quant)
     {{
         if (block_m == 16)
         {{
