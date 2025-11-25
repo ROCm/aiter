@@ -71,3 +71,42 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64(
     PAGE_BLOCK_SIZE: tl.constexpr,
 ):
     pass
+
+
+@triton.jit
+def _fwd_grouped_kernel_stage1_n16x2_prefetch_k_paged_64(
+    Q,  # Holds [Q_NOPE; Q_PE], b x h x (d+r)
+    K_Buffer,  # Holds [KV; K_PE], b*s x (c+r)
+    V_buffer,  # Holds [KV], b*s x (c)
+    sm_scale,
+    kv_indptr,
+    kv_indices,
+    Att_Out,  # b x h x NUM_KV_SPLITS x (kv_lora_rank)
+    Att_Lse,  # b x h x NUM_KV_SPLITS x (1)
+    stride_qb,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_mid_lse_b,
+    stride_mid_lse_h,
+    stride_mid_lse_s,
+    stride_b_block_table,
+    dummyPointerArg,
+    kv_lora_rank: tl.constexpr,
+    qk_rope_head_dim: tl.constexpr,
+    kv_group_num: tl.constexpr,
+    q_head_num: tl.constexpr,
+    batch: tl.constexpr,
+    logit_cap: tl.constexpr,
+    max_qo_len: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    PAGE_BLOCK_SIZE: tl.constexpr,
+):
+    pass

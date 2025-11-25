@@ -201,9 +201,6 @@ def ref_masked_attention(
         attn_weights_fp8 = attn_weights_exp.to(torch.float8_e4m3fnuz)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
 
-    
-    # import pdb;pdb.set_trace()
-    # print(attn_weights_exp[:,:, :27])
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
 
     out = out / l.transpose(0,1).unsqueeze(-1)
@@ -366,7 +363,13 @@ def create_benchmark_configs(args: argparse.Namespace):
 
 
 def run_benchmark(args: argparse.Namespace):
-    torch.manual_seed(0)
+    def setup_seed(seed):
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        random.seed(seed)
+        torch.backends.cudnn.deterministic = True
+
+    # setup_seed(10123)
 
     @triton.testing.perf_report(create_benchmark_configs(args))
     def bench_mla(
@@ -416,6 +419,7 @@ def run_benchmark(args: argparse.Namespace):
             )
         )
   
+        # q = torch.ones_like(q)
         # kv_cache = torch.ones_like(kv_cache)
 
         k_input, v_input = ref_preprocess(kv_cache, kv_lora_rank)
@@ -511,6 +515,8 @@ def run_benchmark(args: argparse.Namespace):
             sm_scale,
             logit_cap,
             mtp,
+            num_iters=2,
+            num_warmup=0,
         )
         cache_key = decode_attention_fwd_grouped(
             q_fp8 if dtype == "fp8" else q,
@@ -536,6 +542,7 @@ def run_benchmark(args: argparse.Namespace):
             msg=f"mla_decode-absorb    [golden vs triton]: {ms * 1000} us......",
         )
 
+        # import pdb;pdb.set_trace()
         cal_diff(out_ref, out_tri, "out", True)
 
         tflops = total_flops / ms * 1e-9

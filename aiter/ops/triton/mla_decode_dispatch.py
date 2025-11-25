@@ -52,11 +52,15 @@ if triton.__version__ >= "3.5.0" and not enable_aot_gluon_mla:
     from aiter.ops.triton.gluon.mla_decode_mi355 import (
         _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
     )
+    from aiter.ops.triton.gluon.mla_decode import (
+        _fwd_grouped_kernel_stage1_n16x2_prefetch_k_paged_64
+    )
 else:
     from triton.compiler import ASTSource
     enable_gluon_mla = enable_aot_gluon_mla
-    from aiter.ops.triton._triton_kernels.mla_decode_mi355 import (
-        _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
+    from aiter.ops.triton._triton_kernels.mla_decode import (
+        _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64,
+        _fwd_grouped_kernel_stage1_n16x2_prefetch_k_paged_64
     )
     enable_jit_gluon_mla = False
 
@@ -142,9 +146,12 @@ def _compile_mla(
         "name": "mla_n16x4_prefetch_k_paged_64",
     }
     kernel_fn = (
-        _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
+        _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64 if (
+            dtype == "fp8" or dev == "MI350X")
+        else _fwd_grouped_kernel_stage1_n16x2_prefetch_k_paged_64
     )
-    # import pdb; pdb.set_trace()
+    print(kernel_fn)
+
     src = ASTSource(
         fn=kernel_fn,
         signature=fn_signature,
@@ -428,7 +435,7 @@ def _fwd_kernel_stage2(
         split_kv_end = tl.minimum(split_kv_start + blocks_per_split * PAGE_BLOCK_SIZE, cur_batch_seq_len)
 
         if split_kv_end > split_kv_start:
-
+            # bs, num_splits, nhead, head_dim
             tv = tl.load(
                 Att_Out + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
             )
@@ -560,7 +567,6 @@ def decode_attention_fwd_grouped(
         mtp,
         config["fwd_grouped_kernel_stage1_rope_fp8"] if q.dtype == dtypes.fp8 else config["fwd_grouped_kernel_stage1_rope"],
     )
-    # import pdb ;pdb.set_trace()
     _decode_softmax_reducev_fwd(
         attn_logits,
         attn_lse,
