@@ -5,14 +5,17 @@
 
 #include "aiter_hip_common.h"
 #include "kittens.cuh"
+#include "mla.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/python.h>
 
-namespace hk  = kittens;
-namespace ckt = ck_tile;
+namespace hk     = kittens;
+namespace hkdart = hk::ducks::art;
+namespace hkm    = hk::macros;
+namespace ckt    = ck_tile;
 
-template <typename q_t_, typename kv_t_, int32_t kQoNumHead_>
+template <typename q_t_, typename kv_t_, typename out_t_, int32_t kQoNumHead_>
 struct HkMlaDecodeFwdTraits
 {
     static constexpr int32_t kQoNumHead     = kQoNumHead_;
@@ -26,15 +29,26 @@ struct HkMlaDecodeFwdTraits
     static constexpr int32_t kNumWarps      = 8;
     static constexpr int32_t kNumThreads    = kNumWarps * ckt::get_warp_size();
     static constexpr int32_t kOccupancy     = 1;
+    static constexpr int32_t kBlockM        = 128;
+    static constexpr int32_t kWarpBlockM    = kBlockM / kNumWarps;
+    static constexpr int32_t kBlockN        = 16;
 
-    using q_t  = q_t_;
-    using kv_t = kv_t_;
+    // base types
+    using q_t   = q_t_;
+    using kv_t  = kv_t_;
+    using out_t = out_t_;
+    // global memory tiles
     using gl_q = hk::gl<q_t, 1, -1, kQoNumHead, kQkHeadDim>; // [1, #batch*#seqlen, #head, 576]
     using gl_kv =
-        hk::gl<kv_t, -1, kPageSize, kKvNumHead, kQkHeadDim>;    // [#page, page_size, #head_kv, 576]
-    using gl_o    = hk::gl<q_t, 1, -1, kQoNumHead, kVoHeadDim>; // [1, #batch*#seqlen, #head, 512]
+        hk::gl<kv_t, -1, kPageSize, kKvNumHead, kQkHeadDim>; // [#page, page_size, #head_kv, 576]
+    using gl_o    = hk::gl<out_t, 1, -1, kQoNumHead, kVoHeadDim>; // [1, #batch*#seqlen, #head, 512]
     using gl_so   = hk::gl<float, 1, -1, kQoNumHead, kVoHeadDim>; // [1, #partial_slots, #head, 512]
     using gl_slse = hk::gl<float, 1, -1, kQoNumHead, 1>;          // [1, #partial_slots, #head, 1]
+    // lds tiles
+    static_assert(std::is_same_v<kv_t, hk::bf16> || std::is_same_v<kv_t, hk::fp8e4m3>);
+    using st_kv = std::conditional_t<std::is_same_v<kv_t, hk::fp8e4m3>,
+                                     hk::st_fp8e4m3<kBlockN, kKvLoraRank, hk::st_16x16_s>,
+                                     hk::st_bf<kBlockN, kKvLoraRank, hk::st_16x16_s>>;
 };
 
 template <typename Traits>
@@ -54,19 +68,60 @@ struct HkMlaDecodeFwdParams
     const int32_t* p_work_info_set;
 };
 
-template <typename Traits>
-__global__ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __attribute__((
-    amdgpu_num_vgpr(64))) void kn_ml_decode_fwd_n128(HkMlaDecodeFwdParams<Traits> params)
+template <typename T>
+__global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
+    __attribute__((amdgpu_num_vgpr(64))) void kn_ml_decode_fwd_n128(HkMlaDecodeFwdParams<T> params)
 {
+    using q_t    = T::q_t;
+    using kv_t   = T::kv_t;
+    using out_t  = T::out_t;
+    using comp_t = float;
+
+    using G = hk::group<T::kNumWarps>;
+
+    // LDS tiles
     extern __shared__ int32_t p_lds[];
     hk::shared_allocator al(p_lds);
+    auto lds_k = al.allocate<typename T::st_kv>();
 
-    if(blockIdx.x < 2)
+    // Reg tiles
+    using q_nope_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<92, 123>>, 2>; // 32 agprs
+    using q_rope_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<124, 127>>, 2>; // 4 agprs
+    using o_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<128, 255>>, 4>; // 128 vgprs
+    hkdart::clobber<q_nope_ranges>();
+    hkdart::clobber<q_rope_ranges>();
+    hkdart::clobber<o_ranges>();
+
+    hk::art<q_t, T::kWarpBlockM, T::kQkNopeHeadDim, hk::row_l, hk::rt_16x32_4_s, q_nope_ranges>
+        q_nope;
+    hk::art<q_t, T::kWarpBlockM, T::kQkRopeHeadDim, hk::row_l, hk::rt_16x32_4_s, q_rope_ranges>
+        q_rope;
+    hk::art<comp_t, T::kWarpBlockM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
+
+    const int32_t worker_idx     = blockIdx.x;
+    const int32_t work_start_idx = params.p_work_indptr[worker_idx];
+    const int32_t work_end_idx   = params.p_work_indptr[worker_idx + 1];
+    for(int32_t work_idx = work_start_idx; work_idx < work_end_idx; ++work_idx)
     {
-        if(threadIdx.x < 4)
-        {
-            printf("[hkmla-dbg][%d %d]\n", blockIdx.x, threadIdx.x);
-        }
+        const int32_t partial_qo_loc = params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 1];
+        const int32_t qo_start       = params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 2];
+        const int32_t qo_end         = params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 3];
+        const int32_t kv_start       = params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 4];
+        const int32_t kv_end         = params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 5];
+
+        ///
+        /// Load Q from VRAM to GPRs
+        ///
+        hk::load<2>(q_nope, params.query, {0, 0, qo_start, 0}, {0, 1, 0, 0});
+
+        ///
+        /// Outputs
+        ///
+        if(partial_qo_loc < 0) {}
+        else {}
     }
 }
 
@@ -158,7 +213,7 @@ void hk_mi35x_mla_decode_fwd_n128(torch::Tensor& query,
 
     if(q_is_fp8 && kv_is_fp8)
     {
-        using Traits = HkMlaDecodeFwdTraits<hk::fp8e4m3, hk::fp8e4m3, 128>;
+        using Traits = HkMlaDecodeFwdTraits<hk::fp8e4m3, hk::fp8e4m3, hk::bf16, 128>;
         dispatch_mla_decode_fwd_n128<Traits>(query,
                                              kv_buffer,
                                              qo_indptr,
@@ -173,23 +228,23 @@ void hk_mi35x_mla_decode_fwd_n128(torch::Tensor& query,
                                              split_lse,
                                              final_output);
     }
-    else if(q_is_bf16 && kv_is_bf16)
-    {
-        using Traits = HkMlaDecodeFwdTraits<hk::bf16, hk::bf16, 128>;
-        dispatch_mla_decode_fwd_n128<Traits>(query,
-                                             kv_buffer,
-                                             qo_indptr,
-                                             kv_indptr,
-                                             kv_page_indices,
-                                             kv_last_page_lens,
-                                             work_indptr,
-                                             work_info_set,
-                                             max_seqlen_q,
-                                             softmax_scale,
-                                             split_output,
-                                             split_lse,
-                                             final_output);
-    }
+    // else if(q_is_bf16 && kv_is_bf16)
+    // {
+    //     using Traits = HkMlaDecodeFwdTraits<hk::bf16, hk::bf16, hk::bf16, 128>;
+    //     dispatch_mla_decode_fwd_n128<Traits>(query,
+    //                                          kv_buffer,
+    //                                          qo_indptr,
+    //                                          kv_indptr,
+    //                                          kv_page_indices,
+    //                                          kv_last_page_lens,
+    //                                          work_indptr,
+    //                                          work_info_set,
+    //                                          max_seqlen_q,
+    //                                          softmax_scale,
+    //                                          split_output,
+    //                                          split_lse,
+    //                                          final_output);
+    // }
     else
     {
         TORCH_CHECK(false,
