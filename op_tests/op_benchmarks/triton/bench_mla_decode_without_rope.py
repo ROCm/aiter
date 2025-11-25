@@ -145,7 +145,9 @@ def input_helper(
             for j in range((ctx_len + page_block_size - 1) // page_block_size):
                 block_tables[i][j] = block_idx_pool[counter % num_blocks]
                 counter += 1
-                indices.append(torch.range(block_tables[i][j] * page_block_size, (block_tables[i][j] + 1) * page_block_size - 1, dtype=torch.int32))
+                car_len = min(ctx_len - j * page_block_size, page_block_size) - 1
+                car_begin = block_tables[i][j] * page_block_size
+                indices.append(torch.range(car_begin, car_begin + car_len, dtype=torch.int32))
             indice = torch.cat(indices)
             indices_list.append(indice[:max_model_len])
         kv_indices = torch.cat(indices_list).cuda()
@@ -327,6 +329,7 @@ def create_benchmark_configs(args: argparse.Namespace):
     configs = []
     extra_args = {
         "dtype": args.dtype,
+        "varlen": args.varlen,
         "save_aot": args.aot,
         "metric": args.metric,
     }
@@ -384,6 +387,7 @@ def run_benchmark(args: argparse.Namespace):
         sm_scale: float = 1.0,
         logit_cap: float = 0.0,
         device="cuda",
+        varlen: bool = False,
         save_aot: bool = False,
         metric: str = "bandwidth",
         **kwargs,
@@ -414,7 +418,7 @@ def run_benchmark(args: argparse.Namespace):
                 page_block_size,
                 torch.bfloat16,
                 device,
-                varlen=False,
+                varlen=varlen,
                 mtp=mtp,
             )
         )
@@ -537,7 +541,6 @@ def run_benchmark(args: argparse.Namespace):
 
         print(">>> ", cache_key)
         ms = us / 1000
-
         checkAllclose(out_ref, out_tri,
             msg=f"mla_decode-absorb    [golden vs triton]: {ms * 1000} us......",
         )
@@ -612,6 +615,12 @@ def parse_args():
         action="store_true",
         default=False,
         help="Enable aot load.",
+    )
+    parser.add_argument(
+        "--varlen",
+        action="store_true",
+        default=False,
+        help="KV variable length .",
     )
     parser.add_argument("--dtype", default="fp8")
     parser.add_argument(
