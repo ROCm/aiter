@@ -223,6 +223,7 @@ def cmdGenFunc_ck_moe_stage(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    is_preshuffled: bool = True,
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
@@ -233,7 +234,7 @@ def cmdGenFunc_ck_moe_stage(
         activation,
         quant_type,
         mul_routed_weight_stage,
-        getattr(w1, "is_shuffled", False),
+        is_preshuffled,
     )
     return {
         "md_name": md_name,
@@ -257,6 +258,7 @@ def cmdGenFunc_ck_moe_stage2(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    is_preshuffled: bool = True,
 ):
 
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
@@ -267,7 +269,7 @@ def cmdGenFunc_ck_moe_stage2(
         activation,
         quant_type,
         mul_routed_weight_stage,
-        getattr(w1, "is_shuffled", False),
+        is_preshuffled,
     )
     return {
         "md_name": md_name,
@@ -292,6 +294,7 @@ def ck_moe_stage1(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    is_preshuffled: bool = True,
 ) -> None: ...
 
 
@@ -312,6 +315,7 @@ def ck_moe_stage2(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    is_preshuffled: bool = True,
 ) -> None: ...
 
 
@@ -513,6 +517,7 @@ def ck_moe_stage1_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
+        getattr(w1, "is_shuffled", False),
     )
     return out
 
@@ -551,5 +556,6 @@ def ck_moe_stage2_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
+        getattr(w2, "is_shuffled", False),
     )
     return out
