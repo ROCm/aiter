@@ -804,10 +804,6 @@ def batched_gemm_a8w8(
         else _batched_gemm_a8w8_kernel
     )
 
-    print(
-        f"Using {'async copy' if use_async_copy else 'regular'} kernel for batched_gemm_a8w8"
-    )
-
     impl[grid](
         XQ,
         WQ,
