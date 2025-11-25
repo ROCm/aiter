@@ -63,7 +63,6 @@ def _batched_gemm_a8w8_kernel(
     GROUP_SIZE_M: gl.constexpr,
     EVEN_K: gl.constexpr,
     GRID_MN: gl.constexpr,
-    BUFFER_SIZE: gl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_a8w8 function
@@ -111,10 +110,10 @@ def _batched_gemm_a8w8_kernel(
 
     # Create layouts for contiguous access
     elems_per_thread_mk: gl.constexpr = triton.cdiv(
-        BLOCK_SIZE_M * BLOCK_SIZE_K // (gl.num_warps() * 64), BUFFER_SIZE
+        BLOCK_SIZE_M * BLOCK_SIZE_K // (gl.num_warps() * 64), 16
     )
     elems_per_thread_kn: gl.constexpr = triton.cdiv(
-        BLOCK_SIZE_K * BLOCK_SIZE_N // (gl.num_warps() * 64), BUFFER_SIZE
+        BLOCK_SIZE_K * BLOCK_SIZE_N // (gl.num_warps() * 64), 16
     )
     blocked_mk: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[elems_per_thread_mk, 16],
@@ -466,7 +465,6 @@ def _batched_gemm_a8w8_kernel_async_copy(
     GROUP_SIZE_M: gl.constexpr,
     EVEN_K: gl.constexpr,
     GRID_MN: gl.constexpr,
-    BUFFER_SIZE: gl.constexpr,
     num_stages: gl.constexpr,
 ):
     """
@@ -743,7 +741,7 @@ def batched_gemm_a8w8(
     splitK: Optional[int] = None,
     YQ: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
-    use_async_copy: bool = False,
+    use_async_copy: bool = True,
 ):
     """
     Computes the matmul YQ[i] = XQ[i] x WQ[i]T and applies a conversion scale for every i in a given batch.
@@ -800,14 +798,14 @@ def batched_gemm_a8w8(
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
-    assert XQ.element_size() == WQ.element_size()
-    buffer_size = 16 // XQ.element_size()
-    assert buffer_size == 16
-
     impl = (
         _batched_gemm_a8w8_kernel_async_copy
         if use_async_copy
         else _batched_gemm_a8w8_kernel
+    )
+
+    print(
+        f"Using {'async copy' if use_async_copy else 'regular'} kernel for batched_gemm_a8w8"
     )
 
     impl[grid](
@@ -833,7 +831,6 @@ def batched_gemm_a8w8(
         w_scale.stride(0),
         bias.stride(0) if has_bias else 0,
         has_bias,
-        BUFFER_SIZE=buffer_size,
         **config,
     )
 

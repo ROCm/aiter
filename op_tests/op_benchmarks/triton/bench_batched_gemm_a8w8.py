@@ -119,7 +119,7 @@ def run_model_benchmark(args, impl):
             metric,
             args.layout,
             impl,
-            args.async_copy if args.gluon else None,
+            not args.no_async_copy if args.gluon else None,
         )
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
@@ -142,7 +142,7 @@ def run_shape_benchmark(args, impl):
             metric,
             args.layout,
             impl,
-            args.async_copy if args.gluon else None,
+            not args.no_async_copy if args.gluon else None,
         )
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
@@ -156,10 +156,6 @@ def run_benchmark(args, defaults):
     if args.gluon:
         impl = gluon_batched_gemm_a8w8
     else:
-        if args.async_copy:
-            raise Exception(
-                f"Argument '{arg}' is not supported for benchmarking without the -gluon flag."
-            )
         impl = triton_batched_gemm_a8w8
 
     if args.model:
@@ -200,9 +196,9 @@ def parse_args():
         help="Use Gluon implementation (experimental, requires latest Triton from main)",
     )
     parser.add_argument(
-        "-async_copy",
+        "-no_async_copy",
         action="store_true",
-        help="Use async_copy loads for Gluon implementation (experimental, requires latest Triton from main)",
+        help="Do not use async_copy loads for Gluon implementation (experimental, requires latest Triton from main). This implementation uses registers to load blocks, and is restricted to 2 stages for pipelining.",
     )
     return get_ff_args(parser)
 
