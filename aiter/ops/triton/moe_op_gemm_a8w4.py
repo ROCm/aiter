@@ -75,11 +75,11 @@ def get_kernel_config(m, n, k, routing_data):
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
-
     split_k = 1
+    block_k = 256
+
     if block_m == 16:
         block_n = 128
-        block_k = 256
         num_warps = 4
 
         grid_m = routing_data.n_blocks(m, block_m)
@@ -90,10 +90,20 @@ def get_kernel_config(m, n, k, routing_data):
             grid_m = routing_data.n_blocks(m, block_m)
             grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
+
+    elif block_m == 32:
+        if n <= 1024:
+            block_n = 128
+            num_warps = 4
+        elif n <= 4096:
+            block_n = 256
+            num_warps = 8
+        else:
+            block_n = 512
+            num_warps = 8
+
     else:
-        # for scale preshuffling
         block_n = 512
-        block_k = 256
         num_warps = 8
 
     ret = {

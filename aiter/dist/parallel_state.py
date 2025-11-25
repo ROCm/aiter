@@ -101,22 +101,20 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)  # type: ignore
 
 
-def all_reduce_fake(
-    tensor: torch.Tensor, group_name: str, ca_fp8_quant: bool
-) -> torch.Tensor:
+def all_reduce_fake(tensor: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
 # There is same name all_reduce in aiter.op, use Alias
 @torch_compile_guard(gen_fake=all_reduce_fake)
 def all_reduce_(
-    tensor: torch.Tensor, group_name: str, ca_fp8_quant: bool
+    tensor: torch.Tensor, group_name: str, ca_use_new: bool, ca_fp8_quant: bool
 ) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    return group._all_reduce_out_place(tensor, ca_fp8_quant)
+    return group._all_reduce_out_place(tensor, ca_use_new, ca_fp8_quant)
 
 
 def fused_allreduce_rmsnorm_fake(
@@ -323,7 +321,7 @@ class GroupCoordinator:
             yield graph_capture_context
 
     def all_reduce(
-        self, input_: torch.Tensor, ca_fp8_quant: bool = False
+        self, input_: torch.Tensor, ca_use_new: bool = False, ca_fp8_quant: bool = False
     ) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -344,15 +342,18 @@ class GroupCoordinator:
             return input_
 
         return all_reduce_(
-            input_, group_name=self.unique_name, ca_fp8_quant=ca_fp8_quant
+            input_,
+            group_name=self.unique_name,
+            ca_use_new=ca_use_new,
+            ca_fp8_quant=ca_fp8_quant,
         )
 
     def _all_reduce_out_place(
-        self, input_: torch.Tensor, ca_fp8_quant: bool
+        self, input_: torch.Tensor, ca_use_new: bool, ca_fp8_quant: bool
     ) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_reduce(input_, ca_fp8_quant)
+        return self.device_communicator.all_reduce(input_, ca_use_new, ca_fp8_quant)
 
     def fused_allreduce_rmsnorm(
         self,
@@ -388,6 +389,11 @@ class GroupCoordinator:
 
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
         return outplace_all_gather(input_, group_name=self.unique_name)
+
+    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.reduce_scatter(input_, dim)
 
     def all_gather(
         self, input_: torch.Tensor, use_custom: bool = False, dim: int = -1
@@ -877,8 +883,6 @@ def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
 
-
-from typing import Optional
 
 _DP: Optional[GroupCoordinator] = None
 
