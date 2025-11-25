@@ -101,7 +101,16 @@ def update_config_files(file_path: str, merge_name: str):
     untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
     if os.path.exists(untuned_path):
         untunedf = pd.read_csv(untuned_path)
-        keys = untunedf.columns
+        keys = untunedf.columns.tolist()
+        
+        # 自动添加重要的去重维度（如果存在于 tuned 文件中）
+        # cu_num 代表不同的计算单元数量，不同 cu_num 的配置应该分别保留
+        extra_dedup_keys = ['cu_num']
+        for key in extra_dedup_keys:
+            if key in merge_df.columns and key not in keys:
+                keys.append(key)
+                logger.info(f"Add '{key}' to deduplication keys for better granularity")
+        
         merge_df = (
             merge_df.sort_values("us")
             .drop_duplicates(subset=keys, keep="first")
