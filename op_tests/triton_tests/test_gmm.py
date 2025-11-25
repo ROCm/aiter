@@ -468,3 +468,68 @@ def test_tgmm(
                 atol=bias_atol,
                 rtol=bias_rtol,
             )
+
+
+def test_tgmm_accumulate():
+    """Test ACCUMULATE semantics for persistent TGMM on a small, focused case."""
+    # Use the smallest TEST_ONLY_SHAPES entry to keep runtime low.
+    M, K, N, G = TEST_ONLY_SHAPES[0]
+
+    in_dtype = DTYPE
+    out_dtype = DTYPE
+    trans_lhs = False
+    rng_seed = 77
+
+    lhs, rhs, multiple_group_sizes, out_torch = gen_tgmm_tensors(
+        M,
+        K,
+        N,
+        G,
+        NUM_GROUP_SIZES,
+        input_type=in_dtype,
+        output_type=out_dtype,
+        trans_lhs=trans_lhs,
+        rng_seed=rng_seed,
+        unif_group_sizes=True,
+    )
+
+    # Take a single group_sizes configuration for this targeted test.
+    group_sizes = multiple_group_sizes[0]
+    non_empty_groups = group_sizes > 0
+
+    # Base output to accumulate into.
+    base_out = torch.randn_like(out_torch)
+
+    # Reference: compute TGMM delta into a fresh buffer, then add to base_out.
+    delta_ref = torch.empty_like(out_torch)
+    torch_tgmm(
+        lhs,
+        rhs,
+        group_sizes,
+        preferred_element_type=out_dtype,
+        existing_out=delta_ref,
+        bias_grad=None,
+        compute_bias_grad=False,
+        accumulate=False,
+    )
+    expected = base_out.clone()
+    expected[non_empty_groups] = expected[non_empty_groups] + delta_ref[non_empty_groups]
+
+    # Triton persistent TGMM with ACCUMULATE=True.
+    out_triton = base_out.clone()
+    triton_ptgmm(
+        lhs,
+        rhs,
+        group_sizes,
+        preferred_element_type=out_dtype,
+        existing_out=out_triton,
+        bias_grad=None,
+        compute_bias_grad=False,
+        accumulate=True,
+    )
+
+    check_tensors(
+        out_triton[non_empty_groups],
+        expected[non_empty_groups],
+        "Triton persistent TGMM ACCUMULATE semantics do not match reference behavior.",
+    )

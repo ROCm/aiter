@@ -377,7 +377,11 @@ def ptgmm(
         bias_grad_ptr = bias_grad
     else:
         # Dummy pointer; kernel won't touch it when COMPUTE_BIAS_GRAD is False.
-        bias_grad_ptr = out
+        # Must still be float32 because atomic_add does not support bf16/fp16,
+        # and Triton validates the pointer dtype even in dead branches.
+        bias_grad_ptr = torch.empty(
+            (1, 1), device=lhs.device, dtype=torch.float32
+        )
 
     grid = _ptgmm_grid(
         K,
