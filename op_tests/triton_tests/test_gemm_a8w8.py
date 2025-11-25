@@ -69,7 +69,11 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
+    x_vals = []
     x_vals += [(1, 1, 1)]
+    x_vals += [(16, 16, 16)]
+    x_vals += [(1024, 1024, 1024)]
+    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536)]
     return x_vals
 
 
@@ -114,7 +118,7 @@ def generate_gemm_a8w8_inputs(
     if output:
         y = torch.empty((M, N), dtype=out_dtype, device="cuda")
 
-    return x, weight, x_scale, w_scale, bias, y
+    return x, weight, x_scale, w_scale, None, y
 
 
 @pytest.mark.parametrize(

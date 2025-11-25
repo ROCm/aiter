@@ -10,6 +10,8 @@ from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton._triton_kernels.gemm_a8w8 import _gemm_a8w8_kernel, _get_config
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
+from aiter.ops.triton.gluon.gemm_a8w8 import _gemm_a8w8_kernel as _gluon_gemm_a8w8_kernel
+
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 
@@ -62,17 +64,24 @@ def gemm_a8w8(
 
     if config is None:
         config = _get_config(M, N, K)
+    config = config.copy()
+    if "NUM_WARPS" not in config:
+        config["NUM_WARPS"] = 4
+    if "cache_modifier" not in config:
+        config["cache_modifier"] = ".cg"
+    if "cdna_version" not in config:
+        config["cdna_version"] = 4 if "gfx950" in arch_info.get_arch() else 3
 
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
-    _gemm_a8w8_kernel[grid](
+    _gluon_gemm_a8w8_kernel[grid](
         x,
         w,
         x_scale,
         w_scale,
-        bias,
         y,
+        bias,
         M,
         N,
         K,
