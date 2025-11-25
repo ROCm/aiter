@@ -62,6 +62,7 @@ LOG_LEVEL = {
 }
 logger.setLevel(LOG_LEVEL[AITER_LOG_MORE])
 AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
+AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))
 
 if AITER_REBUILD >= 1:
     subprocess.run(f"rm -rf {BUILD_DIR}/*", shell=True)
@@ -331,25 +332,34 @@ def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
     if not isinstance(kernel, triton.JITFunction):
         raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
     sig = inspect.signature(kernel.fn)
-
-    constexpr_indices = []
-    for idx, param in enumerate(sig.parameters.values()):
-        if param.annotation == tl.constexpr:
-            constexpr_indices.append(idx)
+    valid_param_names = set(sig.parameters.keys())
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_param_names}
+    bound_args = sig.bind(*args, **filtered_kwargs)
+    bound_args.apply_defaults()
+    # constexpr_indices = []
+    # for idx, param in enumerate(sig.parameters.values()):
+    #     if param.annotation == tl.constexpr:
+    #         constexpr_indices.append(idx)
     ccinfo = kernel.warmup(*args, grid=grid, **kwargs)
     constexprs = {}
     arg_names = []
-    keys = list(sig.parameters.keys())
-    for idx, arg in enumerate(args):
-        if idx in constexpr_indices:
-            constexprs[keys[idx]] = arg
-        else:
-            arg_names.append(keys[idx])
+    # keys = list(sig.parameters.keys())
+    # for idx, arg in enumerate(args):
+    #     if idx in constexpr_indices:
+    #         constexprs[keys[idx]] = arg
+    #     else:
+    #         arg_names.append(keys[idx])
+    for param in sig.parameters.values():
+        if param.name in bound_args.arguments and param.annotation != tl.constexpr:
+            arg_names.append(param.name)
+        elif param.annotation == tl.constexpr:
+            constexprs[param.name] = bound_args.arguments[param.name]
+
     extra_metadata = {}
-    extra_metadata["waves_per_eu"] = kwargs.get("waves_per_eu", 1)
-    extra_metadata["num_stages"] = kwargs.get("num_stages", 1)
-    extra_metadata["num_warps"] = kwargs.get("num_warps", 1)
-    extra_metadata["num_ctas"] = kwargs.get("num_ctas", 1)
+    extra_metadata["waves_per_eu"] = ccinfo.metadata.waves_per_eu
+    extra_metadata["num_stages"] = ccinfo.metadata.num_stages
+    extra_metadata["num_warps"] = ccinfo.metadata.num_warps
+    extra_metadata["num_ctas"] = ccinfo.metadata.num_ctas
     extra_metadata["args"] = arg_names
     extra_metadata["triton_version"] = triton.__version__
     return compile_hsaco(
@@ -430,3 +440,56 @@ def run_hsaco(
     hsaco_launcher.launch_kernel(
         args, grid=grid, block=block, shared_mem_bytes=metadata["shared"], stream=stream
     )
+
+
+class HsacoKernel:
+
+    def __init__(self, kernel, stream=None):
+        import triton
+
+        if not isinstance(kernel, triton.JITFunction):
+            raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
+        self.kernel = kernel
+        self.stream = stream
+
+    def __getitem__(self, grid):
+        def _call(*args, **kwargs):
+            if AITER_USE_HSACO:
+                import triton.language as tl
+
+                sig = inspect.signature(self.kernel.fn)
+                valid_param_names = set(sig.parameters.keys())
+                filtered_kwargs = {
+                    k: v for k, v in kwargs.items() if k in valid_param_names
+                }
+                bound_args = sig.bind(*args, **filtered_kwargs)
+                bound_args.apply_defaults()
+                constexprs = {}
+                ordered_args_without_constexprs = []
+                for param in sig.parameters.values():
+                    if (
+                        param.name in bound_args.arguments
+                        and param.annotation != tl.constexpr
+                    ):
+                        ordered_args_without_constexprs.append(
+                            bound_args.arguments[param.name]
+                        )
+                    elif param.annotation == tl.constexpr:
+                        constexprs[param.name] = bound_args.arguments[param.name]
+                if not check_hsaco(self.kernel.fn.__name__, constexprs):
+                    compile_hsaco_from_triton(self.kernel, *args, grid=grid, **kwargs)
+                return run_hsaco(
+                    self.kernel.fn.__name__,
+                    *ordered_args_without_constexprs,
+                    grid=grid,
+                    stream=self.stream,
+                    constexprs=constexprs,
+                )
+            else:
+                return self.kernel[grid](*args, **kwargs)
+
+        return _call
+
+
+def jit(kernel, stream=None):
+    return HsacoKernel(kernel, stream)
