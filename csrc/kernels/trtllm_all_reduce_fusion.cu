@@ -470,13 +470,38 @@ __device__ __forceinline__ float reduce_abs_max(vec_t<T, VEC_SIZE> const &data) 
     return acc;
 }
 
+template <typename T, int VEC_SIZE>
+__device__ __forceinline__ void epilogue(
+    AllReduceFusionParams<T> const &params,
+    vec_t<T, VEC_SIZE> &rms_in,
+    vec_t<T, VEC_SIZE> &rms_weight,
+    int idx, int tidx) {
+    rms_in.store(reinterpret_cast<T *>(params.residual_out) + idx);
+    if (params.quant_type == QuantType::NONE) {
+        auto val = rms_norm<T, VEC_SIZE, T>(params, rms_in, rms_weight);
+        val.store(reinterpret_cast<T *>(params.norm_out) + idx);
+    } else {
+        auto val = rms_norm<T, VEC_SIZE, float>(params, rms_in, rms_weight);
+        float scale = reduce_abs_max<float, VEC_SIZE>(val);
+        if (params.quant_type == QuantType::FP8E4M3FN) {
+            scale = scale == 0.f ? 1.f : scale / fp8e4m3fn::max_value;
+            auto val_fp8 = convert_to_fp8<float, VEC_SIZE, fp8e4m3fn>(val, scale);
+            val_fp8.store(reinterpret_cast<fp8e4m3fn *>(params.norm_out) + idx);
+        } else {
+            scale = scale == 0.f ? 1.f : scale / fp8e4m3fnuz::max_value;
+            auto val_fp8 = convert_to_fp8<float, VEC_SIZE, fp8e4m3fnuz>(val, scale);
+            val_fp8.store(reinterpret_cast<fp8e4m3fnuz *>(params.norm_out) + idx);
+        }
+        if (threadIdx.x == 0)
+            reinterpret_cast<float *>(params.scale_out)[tidx] = scale;
+    }
+}
+
 template <typename T, int NRanks>
 __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> params) {
     static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
 
     int access_id_in_token = threadIdx.x * VEC_SIZE;
-    int access_id_begin =
-        (blockIdx.x * NRanks + 0) * params.hidden_dim + access_id_in_token;
 
     vec_t<T, VEC_SIZE> gamma;
     gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
@@ -523,26 +548,44 @@ __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> 
             data[1].load(reinterpret_cast<T *>(comm.comm_bufs[params.rank]) + params.size + idx);
             vec_add_<T, VEC_SIZE>(data[0], data[1]);
             data[0].store(reinterpret_cast<T *>(params.residual_out) + idx);
-            if (params.quant_type == QuantType::NONE) {
-                auto val = rms_norm<T, VEC_SIZE, T>(params, data[0], gamma);
-                val.store(reinterpret_cast<T *>(params.norm_out) + idx);
-            } else {
-                auto val = rms_norm<T, VEC_SIZE, float>(params, data[0], gamma);
-                float scale = reduce_abs_max<float, VEC_SIZE>(val);
-                if (params.quant_type == QuantType::FP8E4M3FN) {
-                    scale = scale == 0.f ? 1.f : scale / (float)fp8e4m3fn::max_value;
-                    auto val_fp8 = convert_to_fp8<float, VEC_SIZE, fp8e4m3fn>(val, scale);
-                    val_fp8.store(reinterpret_cast<fp8e4m3fn *>(params.norm_out) + idx);
-                } else {
-                    scale = scale == 0.f ? 1.f : scale / (float)fp8e4m3fnuz::max_value;
-                    auto val_fp8 = convert_to_fp8<float, VEC_SIZE, fp8e4m3fnuz>(val, scale);
-                    val_fp8.store(reinterpret_cast<fp8e4m3fnuz *>(params.norm_out) + idx);
-                }
-                if (threadIdx.x == 0)
-                    reinterpret_cast<float *>(params.scale_out)[tidx] = scale;
-            }
+            epilogue<T, VEC_SIZE>(params, data[0], gamma, idx, tidx);
         }
     }
+
+    comm.update(barrier.m_flag_value);
+}
+
+template <typename T, int NRanks>
+__global__ void allreduce_fusion_kernel_twoshot_single_load(AllReduceFusionParams<T> params) {
+    static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+
+    int access_id_in_token = threadIdx.x * VEC_SIZE;
+
+    vec_t<T, VEC_SIZE> gamma;
+    gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
+
+    comm::SyncComm<NRanks> comm(params.workspace);
+
+    int idx = blockIdx.x * params.hidden_dim + access_id_in_token;
+    reinterpret_cast<float4 *>(comm.comm_bufs[params.rank])[idx / VEC_SIZE] =
+        reinterpret_cast<float4 *>(params.allreduce_in)[idx / VEC_SIZE];
+
+    comm::Barrier<NRanks> barrier(params.rank, comm);
+    barrier.sync();
+
+    // cross-device load
+    vec_t<T, VEC_SIZE> vals[NRanks];
+#pragma unroll
+    for (int r = 0; r < NRanks; ++r) {
+        vals[r].load(reinterpret_cast<T *>(comm.comm_bufs[r]) + idx);
+    }
+    vec_add_r_<T, VEC_SIZE, NRanks>(vals);
+
+    int tidx = blockIdx.x;
+    vec_t<T, VEC_SIZE> residual;
+    residual.load(reinterpret_cast<T *>(params.residual_in) + idx);
+    vec_add_<T, VEC_SIZE>(residual, vals[0]);
+    epilogue<T, VEC_SIZE>(params, residual, gamma, idx, tidx);
 
     comm.update(barrier.m_flag_value);
 }
@@ -681,25 +724,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
         }
         vec_add_r_<T, VEC_SIZE, NRanks>(vals);
         vec_add_<T, VEC_SIZE>(vals[0], residual);
-        vals[0].store(reinterpret_cast<T *>(params.residual_out) + idx);
-        if (params.quant_type == QuantType::NONE) {
-            auto val = rms_norm<T, VEC_SIZE, T>(params, vals[0], gamma);
-            val.store(reinterpret_cast<T *>(params.norm_out) + idx);
-        } else {
-            auto val = rms_norm<T, VEC_SIZE, float>(params, vals[0], gamma);
-            float scale = reduce_abs_max<float, VEC_SIZE>(val);
-            if (params.quant_type == QuantType::FP8E4M3FN) {
-                scale = scale == 0.f ? 1.f : scale / (float)fp8e4m3fn::max_value;
-                auto val_fp8 = convert_to_fp8<float, VEC_SIZE, fp8e4m3fn>(val, scale);
-                val_fp8.store(reinterpret_cast<fp8e4m3fn *>(params.norm_out) + idx);
-            } else {
-                scale = scale == 0.f ? 1.f : scale / (float)fp8e4m3fnuz::max_value;
-                auto val_fp8 = convert_to_fp8<float, VEC_SIZE, fp8e4m3fnuz>(val, scale);
-                val_fp8.store(reinterpret_cast<fp8e4m3fnuz *>(params.norm_out) + idx);
-            }
-            if (threadIdx.x == 0)
-                reinterpret_cast<float *>(params.scale_out)[tidx] = scale;
-        }
+        epilogue<T, VEC_SIZE>(params, vals[0], gamma, idx, tidx);
     }
 
     comm.update(params.size * NRanks);
@@ -713,26 +738,20 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params,
     assert(params.hidden_dim % VEC_SIZE == 0);
     int token_num = params.size / params.hidden_dim;
     int threads_per_token = params.hidden_dim / VEC_SIZE;
-    int threads_per_block = threads_per_token;
-    dim3 threadsPerBlock(threads_per_block);
-    int nblocks = std::min(token_num, NBLOCKS_PER_GPU);
-    if (params.size * sizeof(T) >= 1024 * 1024 * 128) {
-        nblocks /= 2;
-    }
-    dim3 numBlocks(nblocks);
-    void *args[] = {(void *)&params};
-    if (token_num <= details::kOneShotMaxToken) {
-        // gpuLaunchCooperativeKernel(
-        //     allreduce_fusion_kernel_oneshot_lamport<T, NRanks>, numBlocks,
-        //     threadsPerBlock, args, 0, stream);
-        allreduce_fusion_kernel_oneshot_lamport<T, NRanks><<<numBlocks,
-        threadsPerBlock, 0, stream>>>(params);
+    dim3 threadsPerBlock(threads_per_token);
+    // void *args[] = {(void *)&params};
+    if (token_num <= NBLOCKS_PER_GPU) {
+        dim3 numBlocks(token_num);
+        allreduce_fusion_kernel_twoshot_single_load<T, NRanks><<<numBlocks,
+                                                                 threadsPerBlock, 0, stream>>>(params);
     } else {
-        // gpuLaunchCooperativeKernel(
-        //     allreduce_fusion_kernel_twoshot_direct<T, NRanks>, numBlocks,
-        //     threadsPerBlock, args, 0, stream);
+        int nblocks = std::min(token_num, NBLOCKS_PER_GPU);
+        if (params.size * sizeof(T) >= 1024 * 1024 * 128) {
+            nblocks /= 2;
+        }
+        dim3 numBlocks(nblocks);
         allreduce_fusion_kernel_twoshot_direct<T, NRanks><<<numBlocks,
-        threadsPerBlock, 0, stream>>>(params);
+                                                            threadsPerBlock, 0, stream>>>(params);
     }
 }
 
