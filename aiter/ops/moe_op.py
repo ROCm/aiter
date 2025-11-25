@@ -223,6 +223,7 @@ def cmdGenFunc_ck_moe_stage(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    is_preshuffled: bool = True,
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
@@ -233,7 +234,7 @@ def cmdGenFunc_ck_moe_stage(
         activation,
         quant_type,
         mul_routed_weight_stage,
-        getattr(w1, "is_shuffled", False),
+        is_preshuffled,
     )
     return {
         "md_name": md_name,
@@ -257,6 +258,7 @@ def cmdGenFunc_ck_moe_stage2(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    is_preshuffled: bool = True,
 ):
 
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
@@ -267,7 +269,7 @@ def cmdGenFunc_ck_moe_stage2(
         activation,
         quant_type,
         mul_routed_weight_stage,
-        getattr(w1, "is_shuffled", False),
+        is_preshuffled,
     )
     return {
         "md_name": md_name,
@@ -292,6 +294,7 @@ def ck_moe_stage1(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    is_preshuffled: bool = True,
 ) -> None: ...
 
 
@@ -312,6 +315,7 @@ def ck_moe_stage2(
     sorted_weights: Optional[Tensor] = None,
     quant_type: int = 0,
     activation: int = 0,
+    is_preshuffled: bool = True,
 ) -> None: ...
 
 
@@ -461,20 +465,10 @@ def get_moe_stage_module(
     act = str(activation).split(".")[-1].lower()
     quant_type = str(quant_type).split(".")[-1].lower()
 
-    md_name = ("_").join(
-        [
-            "module_moe_ck2stages",
-            Adtype,
-            Bdtype,
-            "preshuffle_on" if preshuffle_mode else "preshuffle_off",
-            Cdtype,
-            act,
-            quant_type,
-            f"mulWeightStage{mul_routed_weight_stage}",
-        ]
-    )
+    md_name = "module_moe_ck2stages"
+
     blob_gen_cmd = [
-        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} -w {{}}"
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -w {{}}"
     ]
 
     return md_name, blob_gen_cmd
@@ -513,6 +507,7 @@ def ck_moe_stage1_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
+        getattr(w1, "is_shuffled", False),
     )
     return out
 
@@ -551,5 +546,6 @@ def ck_moe_stage2_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
+        getattr(w2, "is_shuffled", False),
     )
     return out
