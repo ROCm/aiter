@@ -52,6 +52,8 @@ def flash_attn_onekernel_backward(
     descale_v: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
     USE_INT64_STRIDES: Optional[bool] = False,
+    sink: Optional[torch.Tensor] = None,
+    dsink: Optional[torch.Tensor] = None,
     config: Optional[Dict[str, any]] = None,
 ):
     """
@@ -90,6 +92,8 @@ def flash_attn_onekernel_backward(
         descale_v (Optional[torch.Tensor]): FP8 descaling factor for v.
         descale_do (Optional[torch.Tensor]): FP8 descaling factor for do.
         USE_INT64_STRIDES (Optional[bool]): Use 64-bit stride indexing for large tensors.
+        sink (Optional[torch.Tensor]): Attention sink scores (one per Q head). Shape (num_q_heads,).
+        dsink (Optional[torch.Tensor]): Pre-allocated sink gradient with same shape as sink.
         config (Optional[Dict[str, any]]): Kernel tuning parameters (preprocess_kernel,
             onekernel, onekernel_pe).
 
@@ -181,6 +185,16 @@ def flash_attn_onekernel_backward(
         IS_FP8 and pe_head_dim == 0
     ), "Positional encoding doesn't support FP8."
 
+    assert (sink is None) or (
+        sink is not None and sink.dim() == 1 and sink.shape[0] == num_q_heads
+    ), "Sink must be 1D and have one element per query head."
+    assert (dsink is None) or (
+        dsink is not None and dsink.dim() == 1 and dsink.shape[0] == num_q_heads
+    ), "Sink gradient must be 1D and have one element per query head."
+    assert (sink is None) == (
+        dsink is None
+    ), "Sink and its gradient must be both present or absent."
+
     # Configs
     if config is None:
         config = _get_config()
@@ -251,11 +265,13 @@ def flash_attn_onekernel_backward(
             q,
             k,
             v,
+            sink,
             sm_scale,
             do,
             dq,
             dk,
             dv,
+            dsink,
             softmax_lse,
             delta,
             *q_strides,
@@ -297,6 +313,7 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
+            ENABLE_SINK=sink is not None,
             **config_onekernel,
         )
     else:
@@ -304,11 +321,13 @@ def flash_attn_onekernel_backward(
             q,
             k,
             v,
+            sink,
             sm_scale,
             do,
             dq,
             dk,
             dv,
+            dsink,
             softmax_lse,
             delta,
             *q_strides,
@@ -350,6 +369,7 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
+            ENABLE_SINK=sink is not None,
             **config_onekernel,
         )
 
