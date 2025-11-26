@@ -262,7 +262,9 @@ class Gemm:
             shuffle_int = 1 if is_shuffle else 0
             df = df[df["bPreshuffle"] == shuffle_int]
         kernel_dict = (
-            df.groupby(["tileM", "tileN", "pf"])["knl_name"].apply(list).to_dict()
+            df.groupby(["tileM", "tileN", "pf", "splitK"])["knl_name"]
+            .apply(list)
+            .to_dict()
         )
         return kernel_dict
 
@@ -279,16 +281,18 @@ class Gemm:
         asm_tiles = [key for key in asm_kernels.keys()]
         solidx = 0
         task_asm = []
-        print("self is shuffle is ", self.is_shuffle)
 
         solutions = 0
         for key in asm_tiles:
-            tile_m, tile_n, pf = key
+            tile_m, tile_n, pf, splitK = key
             print(f"ASM Tile - M: {tile_m}, N: {tile_n}, PF: {pf}")
             kernelName = asm_kernels[key][0]
-            maxSplitK = compute_gemm_SplitK(
-                self.m, self.n, self.k, tile_m, tile_n, 256
-            )  # if self.splitK else 1
+            if splitK:
+                maxSplitK = compute_gemm_SplitK(
+                    self.m, self.n, self.k, tile_m, tile_n, 256
+                )  # if self.splitK else 1
+            else:
+                maxSplitK = 1
             solidx = solidx + 1
             self.asm_map[solidx] = kernelName
             for splitK in range(1, maxSplitK + 1):
@@ -633,7 +637,6 @@ class GemmTuner(GemmCommonTuner):
                 )
                 if args.verbose:
                     logger.info("skiped tuned shapes:")
-                    print(self.untunedf[mask])
                 self.untunedf = self.untunedf[~mask]
             self.untunedf.drop_duplicates().reset_index(drop=True)
 
@@ -677,7 +680,6 @@ class GemmTuner(GemmCommonTuner):
             }
             df = pd.DataFrame(entry)
             self.untunedf = pd.concat([self.untunedf, df], ignore_index=True)
-            print("self untunedf is ", self.untunedf)
         else:
             print(
                 f">>>Info: Found Duplicate shape(M:{m},"

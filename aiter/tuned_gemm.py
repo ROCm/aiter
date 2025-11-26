@@ -60,14 +60,31 @@ def get_GEMM_A16W16_config_():
     if os.path.exists(tuned_file):
         gemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
         gemm_dict = gemm_dict.set_index(
-            ["cu_num", "M", "N", "K", "bias", "dtype", "outdtype", "scaleAB"]
+            [
+                "cu_num",
+                "M",
+                "N",
+                "K",
+                "bias",
+                "dtype",
+                "outdtype",
+                "scaleAB",
+                "bpreshuffle",
+            ]
         ).to_dict("index")
     return gemm_dict
 
 
 @functools.lru_cache(maxsize=4096)
 def get_GEMM_A16W16_config(
-    M: int, N: int, K: int, bias: bool, dtype: str, otype: str, scaleAB: bool = False
+    M: int,
+    N: int,
+    K: int,
+    bias: bool,
+    dtype: str,
+    otype: str,
+    scaleAB: bool = False,
+    bpreshuffle: bool = False,
 ):
     cfg = get_GEMM_A16W16_config_()
     cu_num = get_cu_num()
@@ -76,19 +93,30 @@ def get_GEMM_A16W16_config(
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         config = cfg.get(
-            (cu_num, padded_M, N, K, bias, str(dtype), str(otype), scaleAB), None
+            (
+                cu_num,
+                padded_M,
+                N,
+                K,
+                bias,
+                str(dtype),
+                str(otype),
+                scaleAB,
+                bpreshuffle,
+            ),
+            None,
         )
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 kernelName = config["kernelName"] if config["libtype"] == "asm" else ""
                 logger.info(
-                    f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, libtype is {config['libtype']}, kernel name is {kernelName}"
+                    f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=} found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, libtype is {config['libtype']}, kernel name is {kernelName}"
                 )
             return config
     if config is None:
         default_config = {}
         logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config!"
+            f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=} , not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config!"
         )
         if dtype in [dtypes.fp16, dtypes.bf16] and K % 8 == 0:
             if (
@@ -108,7 +136,7 @@ def get_GEMM_A16W16_config(
             default_config["libtype"] = "torch"
             default_config["solidx"] = 0
         logger.info(
-            f"using {default_config['libtype']} solution:{default_config['solidx']} for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}"
+            f"using {default_config['libtype']} solution:{default_config['solidx']} for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
         )
         return default_config
 
@@ -142,6 +170,7 @@ def gemm_a16w16(
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
+    bpreshuffle: Optional[bool] = False,
 ) -> Tensor:
     if A.dim() >= 3:
         try:
@@ -163,6 +192,7 @@ def gemm_a16w16(
         dtype=str(inp_view.dtype),
         otype=str(otype) if otype is not None else str(inp_view.dtype),
         scaleAB=scale_a is not None or scale_b is not None,
+        bpreshuffle=bpreshuffle,
     )
     if config is not None and config["libtype"] == "asm":
         kernelName = config["kernelName"]
@@ -308,6 +338,10 @@ class TunedGemm:
         if self.extensions_created == False:
             hipb_create_extension()
             self.extensions_created = True
+        bpreshuffle = False
+        if hasattr(weights, "is_shuffled") and weights.is_shuffled is True:
+            bpreshuffle = True
+
         out = gemm_a16w16(
             inp,
             weights,
@@ -316,6 +350,7 @@ class TunedGemm:
             scale_a=scale_a,
             scale_b=scale_b,
             scale_c=scale_c,
+            bpreshuffle=bpreshuffle,
         )
         self.save_untuned_shapes(inp, weights, bias, otype, scale_a, scale_b, scale_c)
         return out
