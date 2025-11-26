@@ -83,7 +83,6 @@ jobs:
           RUN pip uninstall -y aiter
           RUN pip install --upgrade pandas zmq einops numpy==1.26.2
           RUN pip install --upgrade "pybind11>=3.0.1"
-          RUN pip install --upgrade "triton>=3.3.0"
           RUN pip install --upgrade "ninja>=1.11.1"
 
           RUN git clone ${{ env.GITHUB_REPO_URL }} \
