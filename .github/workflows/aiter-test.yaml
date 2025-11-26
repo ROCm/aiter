@@ -92,12 +92,15 @@ jobs:
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
-          RUN pip config set global.default-timeout 60 \
-              && pip config set global.retries 10
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
-          RUN PREBUILD_KERNELS=1 GPU_ARCHS="gfx942,gfx950" python3 setup.py develop
+          RUN rm -rf aiter \
+           && git clone ${{ env.GITHUB_REPO_URL }} \
+           && cd aiter \
+           && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
+           && git submodule update --init --recursive \
+           && PREBUILD_KERNELS=1 GPU_ARCHS=gfx950 python setup.py develop
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
