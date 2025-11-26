@@ -1,91 +1,77 @@
-# # Batch Prefill with Paged KV Cache Benchmark
+"""Batch Prefill with Paged KV Cache Benchmark.
 
-# This benchmark measures the performance of the batch prefill operation with paged KV cache, which is used in LLM inference for efficient memory management.
+This benchmark measures the performance of the batch prefill operation with paged KV cache,
+which is used in LLM inference for efficient memory management.
 
-# ## Usage
+Usage:
 
-# ### Custom Configuration
+    Custom Configuration:
+    Run with custom parameters:
 
-# Run with custom parameters:
+    python bench_batch_prefill.py -b 4 -hq 32 -hk 8 -sq 1024 -sk 1024 -d 128 -dtype fp16
 
-# ```bash
-# python bench_batch_prefill.py -b 4 -hq 32 -hk 8 -sq 1024 -sk 1024 -d 128 -dtype fp16
-# ```
+    Model-Based Configuration:
+    Run using predefined model configurations:
 
-# ### Model-Based Configuration
+    python bench_batch_prefill.py --model llama3-8B -b 1 -dtype fp16 -causal
 
-# Run using predefined model configurations:
+    Available models: llama3-8B, llama3-70B, llama3-405B, mixtral-7B, mixtral-22B, deepseek-V3
 
-# ```bash
-# python bench_batch_prefill.py --model llama3-8B -b 1 -dtype fp16 -causal
-# ```
+Options:
+    -b: Batch size (number of sequences)
+    -hq: Number of query heads
+    -hk: Number of key/value heads (for GQA/MQA)
+    -sq: Query/output sequence length
+    -sk: Key/value sequence length
+    -d: Head dimension
+    -dtype: Data type (fp16 or bf16 - fp32 not supported)
+    -page_size: Page size for paged attention (default: 1)
+    -causal: Enable causal attention mask
+    -logits_soft_cap: Enable logits soft capping with specified value
+    -equal_seqlens: Use equal sequence lengths for all sequences
+    -o: Save results to CSV file
 
-# Available models: llama3-8B, llama3-70B, llama3-405B, mixtral-7B, mixtral-22B, deepseek-V3
+Examples:
 
-# ### Options
+    Basic benchmark with causal attention:
+    python bench_batch_prefill.py -b 2 -hq 16 -hk 4 -sq 512 -sk 512 -d 128 -dtype fp16 -causal
 
-# - `-b`: Batch size (number of sequences)
-# - `-hq`: Number of query heads
-# - `-hk`: Number of key/value heads (for GQA/MQA)
-# - `-sq`: Query/output sequence length
-# - `-sk`: Key/value sequence length
-# - `-d`: Head dimension
-# - `-dtype`: Data type (fp16 or bf16 - fp32 not supported)
-# - `-page_size`: Page size for paged attention (default: 1)
-# - `-causal`: Enable causal attention mask
-# - `-logits_soft_cap`: Enable logits soft capping with specified value
-# - `-equal_seqlens`: Use equal sequence lengths for all sequences
-# - `-o`: Save results to CSV file
+    Benchmark with logits soft cap:
+    python bench_batch_prefill.py -b 4 -hq 32 -hk 8 -sq 1024 -sk 1024 -d 128 -dtype bf16 -logits_soft_cap 30.0
 
-# ## Examples
+    Save results to CSV:
+    python bench_batch_prefill.py --model llama3-8B -dtype fp16 -causal -o
 
-# ### Basic benchmark with causal attention:
-# ```bash
-# python bench_batch_prefill.py -b 2 -hq 16 -hk 4 -sq 512 -sk 512 -d 128 -dtype fp16 -causal
-# ```
+Metrics:
+    The benchmark reports three metrics for each configuration:
+    1. Time (ms): Execution time in milliseconds
+    2. TFLOPS: Throughput in teraFLOPS
+    3. Bandwidth (GB/s): Memory bandwidth utilization
 
-# ### Benchmark with logits soft cap:
-# ```bash
-# python bench_batch_prefill.py -b 4 -hq 32 -hk 8 -sq 1024 -sk 1024 -d 128 -dtype bf16 -logits_soft_cap 30.0
-# ```
+Notes:
+    - This benchmark uses the CK (Composable Kernel) backend, not Triton kernels
+    - Currently optimized for page_size=1 which is the most tested configuration
+    - Supports both MHA (Multi-Head Attention), GQA (Grouped Query Attention), and MQA (Multi-Query Attention)
+    - Causal attention is commonly used in autoregressive language model inference
+    - Only fp16 and bf16 data types are supported (fp32 is not supported by the kernel)
+    - VGPR analysis is not applicable since this uses CK kernels, not Triton kernels
+"""
 
-# ### Save results to CSV:
-# ```bash
-# python bench_batch_prefill.py --model llama3-8B -dtype fp16 -causal -o
-# ```
-
-# ## Metrics
-
-# The benchmark reports three metrics for each configuration:
-
-# 1. **Time (ms)**: Execution time in milliseconds
-# 2. **TFLOPS**: Throughput in teraFLOPS
-# 3. **Bandwidth (GB/s)**: Memory bandwidth utilization
-
-# ## Notes
-
-# - This benchmark uses the **CK (Composable Kernel)** backend, not Triton kernels
-# - Currently optimized for `page_size=1` which is the most tested configuration
-# - Supports both MHA (Multi-Head Attention), GQA (Grouped Query Attention), and MQA (Multi-Query Attention)
-# - Causal attention is commonly used in autoregressive language model inference
-# - Only fp16 and bf16 data types are supported (fp32 is not supported by the kernel)
-# - VGPR analysis is not applicable since this uses CK kernels, not Triton kernels
-
-import torch
 import sys
 import os
 import argparse
 import itertools
-import triton
+
+import torch
 import aiter
-import warnings
-from aiter import dtypes
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
     get_dtype_bytes,
     get_caller_name_no_ext,
 )
+
+import triton
 
 # Suppress verbose aiter logging
 os.environ.setdefault("AITER_LOG_LEVEL", "ERROR")
@@ -115,7 +101,15 @@ def model_benchmark_configs(args):
         kv_len = args.sk if args.sk else qo_len
 
         batch_prefill_configs.append(
-            (model_name, batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim)
+            (
+                model_name,
+                batch_size,
+                qo_len,
+                kv_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+            )
         )
 
     return batch_prefill_configs
@@ -145,11 +139,10 @@ def convert_lens_to_indptr(lens):
 
 def run_benchmark(args):
     dtype = arg_to_torch_dtype[args.dtype]
-    page_size = args.page_size if args.page_size else 1
-    
     # Suppress repetitive warnings from aiter framework
     import logging
-    logging.getLogger('aiter').setLevel(logging.ERROR)
+
+    logging.getLogger("aiter").setLevel(logging.ERROR)
 
     # Determine benchmark configurations
     if args.model:
@@ -175,9 +168,7 @@ def run_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batch_prefill(
-        BATCH, QO_LEN, KV_LEN, HQ, HK, HEAD_DIM, metric, model=None, config=None
-    ):
+    def bench_batch_prefill(BATCH, QO_LEN, KV_LEN, HQ, HK, HEAD_DIM, metric, **kwargs):
         """
         Benchmark function for batch prefill with paged KV cache.
         """
@@ -205,9 +196,7 @@ def run_benchmark(args):
 
         # Create q tensor with correct total length
         total_q_tokens = qo_lens.sum().item()
-        q = torch.randn(
-            total_q_tokens, HQ, HEAD_DIM, device="cuda", dtype=dtype
-        )
+        q = torch.randn(total_q_tokens, HQ, HEAD_DIM, device="cuda", dtype=dtype)
 
         # Calculate number of pages needed based on actual max lengths
         max_num_pages_per_seq = (kv_lens.max().item() + page_size - 1) // page_size
@@ -219,21 +208,19 @@ def run_benchmark(args):
         kv_data = torch.randn(
             total_num_pages, 2, HK, page_size, HEAD_DIM, device="cuda", dtype=dtype
         )
-        
         # Split into k_cache and v_cache
         # Expected final shape: [num_blocks, num_heads_k, head_size] when page_size=1
         chunks = torch.chunk(kv_data, 2, dim=1)
         # Use squeeze without args to remove all size-1 dimensions, then reshape as needed
         k_cache = chunks[0].squeeze()
         v_cache = chunks[1].squeeze()
-        
         # Ensure correct shape for the kernel: [num_blocks, num_heads_k, head_size]
         if page_size == 1:
             if k_cache.dim() == 2:  # [num_blocks, head_size] when HK=1
                 k_cache = k_cache.unsqueeze(1)  # [num_blocks, 1, head_size]
                 v_cache = v_cache.unsqueeze(1)
         else:
-            # For page_size > 1, reshape to flatten page dimension into the block dimension  
+            # For page_size > 1, reshape to flatten page dimension into the block dimension
             # [total_num_pages, HK, page_size, HEAD_DIM] -> [total_num_pages * page_size, HK, HEAD_DIM]
             k_cache = k_cache.reshape(total_num_pages * page_size, HK, HEAD_DIM)
             v_cache = v_cache.reshape(total_num_pages * page_size, HK, HEAD_DIM)
@@ -243,7 +230,9 @@ def run_benchmark(args):
         kv_indptr = convert_lens_to_indptr(kv_num_used_pages).to("cuda")
 
         # Generate random page indices
-        kv_page_indices = torch.randperm(total_num_pages, dtype=torch.int32)[:total_num_pages].to("cuda")
+        kv_page_indices = torch.randperm(total_num_pages, dtype=torch.int32)[
+            :total_num_pages
+        ].to("cuda")
 
         # Softmax scale
         softmax_scale = HEAD_DIM**-0.5
@@ -311,10 +300,12 @@ def run_benchmark(args):
 
         # Print actual lengths when using randomized lengths
         if not args.equal_seqlens and metric == "time":
-            print(f"  [Note: QO_LEN={QO_LEN}, KV_LEN={KV_LEN} are max constraints. "
-                  f"Actual randomized - Avg QO: {actual_qo_len}, Avg KV: {actual_kv_len}, "
-                  f"Max used: {qo_lens.max().item()}/{kv_lens.max().item()}]")
-        
+            print(
+                f"  [Note: QO_LEN={QO_LEN}, KV_LEN={KV_LEN} are max constraints. "
+                f"Actual randomized - Avg QO: {actual_qo_len}, Avg KV: {actual_kv_len}, "
+                f"Max used: {qo_lens.max().item()}/{kv_lens.max().item()}]"
+            )
+
         # Return the requested metric
         if metric == "time":
             return ms
@@ -331,7 +322,7 @@ def run_benchmark(args):
         print("RANDOMIZED MODE: Sequence lengths will vary between [max/2, max]")
         print("Table shows max constraints; actual values printed below.")
         print("=" * 70)
-    
+
     bench_batch_prefill.run(save_path="." if args.o else None, print_data=True)
 
 
@@ -359,7 +350,12 @@ def parse_args():
     parser.add_argument("-sq", type=int, default=0, help="Query/output sequence length")
     parser.add_argument("-sk", type=int, default=0, help="Key/value sequence length")
     parser.add_argument("-d", type=int, default=0, help="Head dimension")
-    parser.add_argument("-dtype", default="fp16", choices=["fp16", "bf16"], help="Data type (fp16 or bf16)")
+    parser.add_argument(
+        "-dtype",
+        default="fp16",
+        choices=["fp16", "bf16"],
+        help="Data type (fp16 or bf16)",
+    )
     parser.add_argument(
         "-page_size", type=int, default=1, help="Page size for paged attention"
     )
@@ -405,11 +401,10 @@ def main():
 
     # Note: VGPR printing not supported - this benchmark uses CK (Composable Kernel) backend,
     # not Triton. VGPR analysis only applies to Triton kernels.
-    
+
     run_benchmark(args)
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
