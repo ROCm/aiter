@@ -31,7 +31,7 @@ from aiter import (
     hipb_mm,
     logger,
 )
-from aiter.jit.core import AITER_CONFIG_GEMM_BF16_FILE, AITER_LOG_TUNED_CONFIG
+from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
@@ -55,7 +55,7 @@ def get_solfunc(soltype: int):
 
 @functools.lru_cache(maxsize=1)
 def get_GEMM_A16W16_config_():
-    tuned_file = AITER_CONFIG_GEMM_BF16_FILE
+    tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
     gemm_dict = {}
     if os.path.exists(tuned_file):
         gemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
@@ -82,13 +82,13 @@ def get_GEMM_A16W16_config(
             if AITER_LOG_TUNED_CONFIG:
                 kernelName = config["kernelName"] if config["libtype"] == "asm" else ""
                 logger.info(
-                    f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIG_GEMM_BF16_FILE}, libtype is {config['libtype']}, kernel name is {kernelName}"
+                    f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, libtype is {config['libtype']}, kernel name is {kernelName}"
                 )
             return config
     if config is None:
         default_config = {}
         logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {AITER_CONFIG_GEMM_BF16_FILE}, will use default config!"
+            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config!"
         )
         if dtype in [dtypes.fp16, dtypes.bf16] and K % 8 == 0:
             if (
@@ -288,7 +288,7 @@ class TunedGemm:
         self.extensions_created = False
         self.save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
         self.untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
-        self.tune_path = AITER_CONFIG_GEMM_BF16_FILE
+        self.tune_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
 
     def mm(
         self,
