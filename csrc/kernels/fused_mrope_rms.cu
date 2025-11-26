@@ -366,6 +366,7 @@ void fused_mrope_3d_rms(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Te
                     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
                     bool is_neox_style, std::vector<int64_t> mrope_section_, bool is_interleaved, double eps) {
     TORCH_CHECK(mrope_section_.size() == 3);
+    TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() && cos_sin.is_contiguous() && positions.is_contiguous());
     std::array<int64_t, 3> mrope_section;
     mrope_section[0] = mrope_section_[0];
     mrope_section[1] = mrope_section_[1];
@@ -396,4 +397,3 @@ void fused_mrope_3d_rms(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Te
                 stream);
         });
 }
-
