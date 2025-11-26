@@ -32,6 +32,7 @@ from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.ops.shuffle import shuffle_weight
+from aiter.jit.utils.chip_info import get_gfx
 
 aiter.hipb_create_extension()
 
@@ -272,8 +273,25 @@ class Gemm:
         if (
             self.scaleAB
             or self.k % 64 != 0
-            or (not (self.indtype == dtypes.bf16 and self.outdtype == dtypes.fp32))
-        ):
+            or self.indtype != dtypes.bf16
+            or self.outdtype != dtypes.fp32
+        ) and get_gfx() == "gfx942":
+            print(
+                f"only indtype=bf16 and outdtype=fp32 and k%64==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
+            )
+            self.asm_gtimedf = pd.DataFrame(columns=["gtimems", "libtype"])
+            return []
+        if (
+            self.scaleAB
+            or self.k % 256 != 0
+            or self.n % 256 != 0  # mismatch randomly
+            or self.indtype != dtypes.bf16
+            or self.outdtype != dtypes.bf16
+        ) and get_gfx() == "gfx950":
+            print(
+                f"only indtype=bf16 and outdtype=bf16 and k%256==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
+            )
+
             self.asm_gtimedf = pd.DataFrame(columns=["gtimems", "libtype"])
             return []
         asm_kernel_list_csv = f"{get_asm_dir()}/bf16gemm/bf16gemm_fp32bf16.csv"
@@ -607,13 +625,14 @@ class GemmTuner(GemmCommonTuner):
         else:
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
             if "outdtype" not in self.untunedf.columns:
-                self.untunedf["outdtype"] = ""
+                self.untunedf["outdtype"] = str(args.indtype)
             if "scaleAB" not in self.untunedf.columns:
                 self.untunedf["scaleAB"] = False
             if args.indtype is not None:
                 self.untunedf["dtype"] = str(args.indtype)
             if args.outdtype is not None:
                 self.untunedf["outdtype"] = str(args.outdtype)
+
             if args.all_bias:
                 for i in range(len(self.untunedf)):
                     ds = self.untunedf.iloc[i]
@@ -693,6 +712,7 @@ class GemmTuner(GemmCommonTuner):
             ds = df.loc[i, :]
             indtype = ds["dtype"]
             outdtype = ds["outdtype"]
+            outdtype = outdtype if outdtype is not None else indtype
             gemmobj = Gemm(
                 ds["M"],
                 ds["N"],
@@ -781,6 +801,8 @@ class GemmTuner(GemmCommonTuner):
 
             if len(gtimedf_dic[key]) == 0:
                 print(">>> No  hipblas or asm solutions found!", flush=True)
+                failedf = df.iloc[0:1]
+                self.failed = pd.concat([self.failed, failedf], ignore_index=True)
                 continue
             asm_gtimedf = gtimedf_dic[key][gtimedf_dic[key]["libtype"] == "asm"]
             hibs_gtimedf = gtimedf_dic[key][gtimedf_dic[key]["libtype"] == "hipblaslt"]
