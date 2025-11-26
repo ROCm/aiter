@@ -1,3 +1,3 @@
-knl_name,co_name,tn,tileM,tileN,pf,bPreshuffle
-_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE,bf16gemm_bf16_tn_256x256_bpreshuffle.co,1,256,256,0,1
-_ZN5aiter24bf16gemm_bf16_tn_256x256E,bf16gemm_bf16_tn_256x256.co,1,256,256,0,0
+knl_name,co_name,tn,tileM,tileN,pf,bPreshuffle,noSplitk
+_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE,bf16gemm_bf16_tn_256x256_bpreshuffle.co,1,256,256,0,1,1
+_ZN5aiter24bf16gemm_bf16_tn_256x256E,bf16gemm_bf16_tn_256x256.co,1,256,256,0,0,1
