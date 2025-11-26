@@ -29,7 +29,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   triton:
-    runs-on: aiter-1gpu-runner
+    runs-on: aiter-mi300-1gpu
     needs: [check-signal]
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
@@ -68,6 +68,11 @@ jobs:
           -w /workspace \
           triton_test \
           bash -c "pip install speedtest-cli && speedtest-cli --simple" || true
+
+      - name: Setup pip config
+        run: |
+          docker exec -u root triton_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root triton_test bash -c "pip config set global.retries 10"
 
       - name: Setup Aiter and Triton
         run: |

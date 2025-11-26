@@ -65,8 +65,7 @@ static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
 {
 
 #if defined(__Float4_e2m1fn_x2)
-    if(inp.dtype() == torch_fp4x2 &&
-       out.scalar_type() == at::ScalarType::BFloat16)
+    if(inp.dtype() == torch_fp4x2 && out.scalar_type() == at::ScalarType::BFloat16)
 #else
     if((inp.dtype() == torch::kUInt8) && out.scalar_type() == at::ScalarType::BFloat16)
 #endif
@@ -87,6 +86,7 @@ static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
 std::tuple<std::string, int> get_heuristic_kernel(int M,
                                                   int N,
                                                   int K,
+                                                  std::string arch_id,
                                                   std::optional<int> log2_k_split,
                                                   std::optional<bool> bpreshuffle,
                                                   CFG* cfgs)
@@ -107,6 +107,8 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
 
     for(const auto& el : *cfgs)
     {
+        if(el.first.find(arch_id) != 0)
+            continue;
         const auto& cfg = el.second;
         if(cfg.bpreshuffle == bpreshuffle_en &&
            ((cfg.splitK == log2_k_split_en) || !log2_k_split.has_value()))
@@ -197,8 +199,8 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    CFG* config_map           = get_cfg(A, out);
-    using DictKey             = std::tuple<int, int, int, std::optional<int>, std::optional<bool>>;
+    CFG* config_map          = get_cfg(A, out);
+    using DictKey            = std::tuple<int, int, int, std::optional<int>, std::optional<bool>>;
     struct SimpleHash
     {
         size_t operator()(const DictKey& key) const
@@ -220,6 +222,9 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
 
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 
+    std::string arch_id = get_gpu_arch();
+    kernelName          = kernelName.empty() ? "" : arch_id + kernelName;
+
     int selectedksplit = log2_k_split.has_value() ? log2_k_split.value() : 0;
     if(kernelName.empty())
     {
@@ -232,7 +237,8 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
         }
         else
         {
-            auto it = get_heuristic_kernel(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle, config_map);
+            auto it = get_heuristic_kernel(
+                Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, config_map);
 
             kernelName     = std::get<0>(it);
             selectedksplit = std::get<1>(it);
@@ -250,7 +256,7 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
     if(it != config_map->end())
     {
         const auto& cfg     = it->second;
-        const char* name    = cfg.name.c_str();
+        const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         SUBM                = cfg.tile_M;
         SUBN                = cfg.tile_N;
@@ -260,7 +266,8 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
             args.log2_k_split = selectedksplit;
             int k_num         = 1 << args.log2_k_split;
             TORCH_CHECK(Kdim % k_num == 0, __func__, " Kdim % (1 << args.log2_k_split) != 0 !");
-            if(k_num>1)out.zero_();
+            if(k_num > 1)
+                out.zero_();
             int k_per_tg = Kdim / k_num;
             k_per_tg     = ((k_per_tg + 256 - 1) / 256) * 256;
             gdz          = (Kdim + k_per_tg - 1) / k_per_tg;

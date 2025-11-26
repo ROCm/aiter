@@ -52,6 +52,7 @@ std::string get_heuristic_kernel(std::string q_type,
                                  int msk,
                                  int hp,
                                  int block_size,
+                                 std::string arch_id,
                                  CFG* cfgs)
 {
     const std::vector<int> mtp_flags = (mtp > 0) ? std::vector<int>{mtp, 1} : std::vector<int>{0};
@@ -63,11 +64,13 @@ std::string get_heuristic_kernel(std::string q_type,
             // find exact match
             for(const auto& el : *cfgs)
             {
+                if (el.first.find(arch_id) != 0)
+                    continue;
                 const auto& cfg = el.second;
                 // hp is just distinct from uhp
-                if(cfg.q_type == q_type && cfg.kv_type == kv_type && cfg.gqa == gqa_ &&
-                   cfg.mtp == mtp_ && cfg.msk == msk && (cfg.hp == hp || hp == 1) &&
-                   cfg.block_size == block_size)
+                if(cfg.qType == q_type && cfg.kvType == kv_type && cfg.Gqa == gqa_ &&
+                   cfg.Mtp == mtp_ && cfg.Msk == msk && (cfg.Hp == hp || hp == 1) &&
+                   cfg.blkSz == block_size)
 
                     return el.first;
             }
@@ -111,6 +114,7 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
 {
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch            = context_lens.size(0);
+    std::string arch_id = get_gpu_arch();
     // int block_tables_stride0 = block_tables.size(1);
     int num_heads       = Q.size(1);
     int head_size       = Q.size(2);
@@ -209,9 +213,9 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
 
     CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-
-    std::string kernelName = kernelName_.value_or(
-        get_heuristic_kernel(q_type, kv_type, gqa_ratio, mtp, msk, hp, block_size, config_map));
+    std::string kernelName = kernelName_.has_value() ? arch_id + kernelName_.value() : "";
+    if (kernelName.empty())
+        kernelName = get_heuristic_kernel(q_type, kv_type, gqa_ratio, mtp, msk, hp, block_size, arch_id, config_map);
     if(kernelName.empty())
     {
         TORCH_CHECK(false, __func__, "not supported this kernel now! ");
@@ -223,7 +227,7 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     if(it != config_map->end())
     {
         const auto& cfg     = it->second;
-        const char* name    = cfg.name.c_str();
+        const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         auto result         = impl_ptr_map.emplace(name, nullptr);
         if(result.second)

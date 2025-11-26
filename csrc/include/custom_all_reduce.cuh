@@ -442,8 +442,10 @@ namespace aiter
         }
         ((P *)result)[idx] = write_reg;
       }
+      __syncthreads();
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    // maybe do not need device sync
+    // end_sync<ngpus, true>(sg, self_sg, rank);
   }
 
   template <typename T, int ngpus>
@@ -1457,7 +1459,7 @@ namespace aiter
      * will cause contention on NVLink bus.
      */
     template <typename T>
-    void allreduce(hipStream_t stream, T *input, T *output, int size,
+    void allreduce(hipStream_t stream, T *input, T *output, int size, bool use_new = false,
 #ifndef USE_ROCM
                    int threads = 512, int block_limit = 20){
 #else
@@ -1479,32 +1481,36 @@ namespace aiter
 
     auto bytes = size * sizeof(T);
     size /= d;
-    int blocks = 16;
-    bool call_1stage = false;
-    bool call_2stage = false;
-    if (world_size_ == 2)
+
+    // use new version of allreduce kernel
+    if (use_new)
     {
-      call_1stage = true;
-    }
-    else if (full_nvlink_)
-    {
-      if ((world_size_ <= 4 && bytes < 160 * 1024) || (world_size_ <= 8 && bytes < 80 * 1024))
+      int blocks = 16;
+      bool call_1stage = false;
+      bool call_2stage = false;
+      if (world_size_ == 2)
       {
         call_1stage = true;
       }
-      else
+      else if (full_nvlink_)
       {
-        call_2stage = true;
+        if ((world_size_ <= 4 && bytes < 160 * 1024) || (world_size_ <= 8 && bytes < 80 * 1024))
+        {
+          call_1stage = true;
+        }
+        else
+        {
+          call_2stage = true;
+        }
       }
-    }
-    if (call_1stage)
-    {
-      blocks = std::min(kMaxBlocks, (size + (threads / world_size_) - 1) / (threads / world_size_));
-    }
-    else if (call_2stage)
-    {
-      blocks = std::min(kMaxBlocks, (size / world_size_ + (threads / world_size_) - 1) / (threads / world_size_));
-    }
+      if (call_1stage)
+      {
+        blocks = std::min(kMaxBlocks, (size + (threads / world_size_) - 1) / (threads / world_size_));
+      }
+      else if (call_2stage)
+      {
+        blocks = std::min(kMaxBlocks, (size / world_size_ + (threads / world_size_) - 1) / (threads / world_size_));
+      }
 
 #define KL(ngpus, name)                                                       \
   name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
@@ -1537,17 +1543,56 @@ namespace aiter
     break;                                         \
   }
 
-    switch (world_size_)
+      switch (world_size_)
+      {
+        REDUCE_CASE(2)
+        REDUCE_CASE(4)
+        REDUCE_CASE(6)
+        REDUCE_CASE(8)
+      default:
+        throw std::runtime_error(
+            "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
+            "gpus = " +
+            std::to_string(world_size_));
+      }
+    }
+    else // use vllm allreduce kernel
     {
-      REDUCE_CASE(2)
-      REDUCE_CASE(4)
-      REDUCE_CASE(6)
-      REDUCE_CASE(8)
-    default:
-      throw std::runtime_error(
-          "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
-          "gpus = " +
-          std::to_string(world_size_));
+      int blocks = std::min(block_limit, (size + threads - 1) / threads);
+#define VLLM_REDUCE_CASE(ngpus)                            \
+  case ngpus:                                              \
+  {                                                        \
+    if (world_size_ == 2)                                  \
+    {                                                      \
+      KL(ngpus, cross_device_reduce_1stage);               \
+    }                                                      \
+    else if (full_nvlink_)                                 \
+    {                                                      \
+      if ((world_size_ <= 4 && bytes < 512 * 1024) ||      \
+          (world_size_ <= 8 && bytes < 256 * 1024))        \
+      {                                                    \
+        KL(ngpus, cross_device_reduce_1stage_naive);       \
+      }                                                    \
+      else                                                 \
+      {                                                    \
+        KL(ngpus, cross_device_reduce_2stage_naive);       \
+      }                                                    \
+    }                                                      \
+    break;                                                 \
+  }
+
+      switch (world_size_)
+      {
+        VLLM_REDUCE_CASE(2)
+        VLLM_REDUCE_CASE(4)
+        VLLM_REDUCE_CASE(6)
+        VLLM_REDUCE_CASE(8)
+      default:
+        throw std::runtime_error(
+            "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
+            "gpus = " +
+            std::to_string(world_size_));
+      }
     }
 #undef REDUCE_CASE
 #undef KL
