@@ -329,6 +329,7 @@ def create_benchmark_configs(args: argparse.Namespace):
     configs = []
     extra_args = {
         "dtype": args.dtype,
+        "page_block_size": args.page_block_size,
         "varlen": args.varlen,
         "save_aot": args.aot,
         "metric": args.metric,
@@ -387,6 +388,7 @@ def run_benchmark(args: argparse.Namespace):
         sm_scale: float = 1.0,
         logit_cap: float = 0.0,
         device="cuda",
+        page_block_size: int = 64,
         varlen: bool = False,
         save_aot: bool = False,
         metric: str = "bandwidth",
@@ -405,8 +407,6 @@ def run_benchmark(args: argparse.Namespace):
         torch_dtype = dtypes.d_dtypes[dtype]
         # mtp = 1
         #
-        page_block_size = 64
-        # page_block_size = 1
         kv_indptr, block_tables, kv_indices, q, kv_cache, attn_logits, attn_lse, out_tri = (
             input_helper(
                 BATCH,
@@ -607,6 +607,13 @@ def parse_args():
         type=int,
         default=1,
         help="Q sequence length (mtp + 1 == qo_len) in MTP mode",
+    )
+    parser.add_argument(
+        "-pbs",
+        "--page_block_size",
+        type=int,
+        default=64,
+        help="kv cache page block size",
     )
     parser.add_argument(
         "--aot",
