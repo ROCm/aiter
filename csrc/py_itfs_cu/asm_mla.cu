@@ -385,6 +385,152 @@ void mla_decode_stage1_asm_fwd(
                              stream});
 }
 
+struct __attribute__((packed)) PsKernelArgs
+{
+    void *ptr_Q;
+    p2 _p0;
+    void *ptr_K;
+    p2 _p1;
+    void *ptr_V;
+    p2 _p2;
+    void *ptr_O;
+    p2 _p3;
+    void *ptr_PartialO;
+    p2 _p4;
+    void *ptr_PartialLSE;
+    p2 _p5;
+    void *ptr_WorkIndptr;
+    p2 _p6;
+    void *ptr_WorkInfo;
+    p2 _p7;
+    void *ptr_QOIndptr;
+    p2 _p8;
+    void *ptr_KVIndptr;
+    p2 _p9;
+    void *ptr_KVPageIndices;
+    p2 _p10;
+    void *ptr_QScale;
+    p2 _p11;
+    void *ptr_KScale;
+    p2 _p12;
+    void *ptr_VScale;
+    p2 _p13;
+    float scalar;
+    p3 _p14;
+    unsigned int num_q_tokens;
+    p3 _p15;
+    unsigned int num_head_q;
+    p3 _p16;
+    unsigned int num_page;
+    p3 _p17;
+    unsigned int num_used_page;
+    p3 _p18;
+};
+
+
+void mla_ps_prefill_asm_fwd(
+    torch::Tensor& Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
+    torch::Tensor& K,                   //   [num_page, num_kv_heads, qk_head_size], fp8
+    torch::Tensor& V,                   //   [num_page, num_kv_heads, v_head_size], fp8
+    torch::Tensor& qo_indptr,            //   [batch_size+1], int
+    torch::Tensor& kv_indptr,            //   [batch_size+1], int
+    torch::Tensor& kv_page_indices,      //   [num_page_used], int
+    std::optional<torch::Tensor>& work_indptr,            //   [available_tgs+1], int
+    std::optional<torch::Tensor>& work_info_set,          //   [max_works], int
+    int max_seqlen_q,
+    float softmax_scale, // following are output
+    bool is_causal,
+    torch::Tensor& splitData, //[num_q_heads, num_seqs, max_kv_split, v_head_dim], fp32
+    torch::Tensor& splitLse,  //[num_q_heads, num_seqs, max_kv_split,  1], fp32
+    torch::Tensor& output,    //[num_seqs, num_q_heads, v_head_dim], bf16
+    std::optional<torch::Tensor> q_scale  = std::nullopt,// fp32, scalar
+    std::optional<torch::Tensor> k_scale = std::nullopt, // fp32, scalar
+    std::optional<torch::Tensor> v_scale = std::nullopt  // fp32, scalar
+){
+    // TORCH_CHECK(Q.dtype() == at::ScalarType::Float8_e4m3fnuz || Q.dtype() == at::ScalarType::Float8_e4m3fn,
+    //             __func__, ": only support fp8 Q for now");
+    // TORCH_CHECK(K.dtype() == at::ScalarType::Float8_e4m3fnuz || K.dtype() == at::ScalarType::Float8_e4m3fn,
+    //             __func__, ": only support fp8 K for now");
+    // TORCH_CHECK(V.dtype() == at::ScalarType::Float8_e4m3fnuz || V.dtype() == at::ScalarType::Float8_e4m3fn,
+    //             __func__, ": only support fp8 V for now");
+    // TORCH_CHECK(q_scale.has_value() && k_scale.has_value() && v_scale.has_value(),
+    //             __func__, ": fp8 requires scale tensors");
+    // TORCH_CHECK(work_indptr.has_value() && work_info_set.has_value(),
+    //             __func__, ": persistent scheduling requires work_indptr and work_info_set");
+    
+    int num_q_tokens  = Q.size(0);
+    int num_head_q    = Q.size(1);
+    int num_page      = K.size(0);
+    int num_used_page = kv_page_indices.size(0);
+    int available_tgs = 1;
+    
+    // Setup kernel arguments
+    PsKernelArgs args;
+    size_t arg_size = sizeof(args);
+    
+    float k_scalar = softmax_scale;
+    
+    // Setup all pointers
+    args.ptr_Q             = Q.data_ptr();
+    args.ptr_K             = K.data_ptr();
+    args.ptr_V             = V.data_ptr();
+    args.ptr_O             = output.data_ptr();
+    args.ptr_PartialO      = splitData.data_ptr();
+    args.ptr_PartialLSE    = splitLse.data_ptr();
+    args.ptr_WorkIndptr    = work_indptr.value().data_ptr();
+    args.ptr_WorkInfo      = work_info_set.value().data_ptr();
+    args.ptr_QOIndptr      = qo_indptr.data_ptr();
+    args.ptr_KVIndptr      = kv_indptr.data_ptr();
+    args.ptr_KVPageIndices = kv_page_indices.data_ptr();
+    args.ptr_QScale        = q_scale.value().data_ptr();
+    args.ptr_KScale        = k_scale.value().data_ptr();
+    args.ptr_VScale        = v_scale.value().data_ptr();
+    args.scalar            = k_scalar;
+    args.num_q_tokens      = num_q_tokens;
+    args.num_head_q        = num_head_q;
+    args.num_page          = num_page;
+    args.num_used_page     = num_used_page;
+    
+    // Get CUDA/HIP stream and device guard
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    
+    // Kernel selection
+    AiterAsmKernel* impl_ptr = nullptr;
+    int wave_per_tg = 8;
+    
+    if (is_causal)
+    {
+        // mla_pfl_qh192_vh128_m32x8_n128x1_causal1.co
+        static AiterAsmKernel impl_ps_prefill(
+            "_ZN5aiter40mla_pfl_qh192_vh128_m32x8_n128x1_causal1E",
+            "/mla/mla_pfl_qh192_vh128_m32x8_n128x1_causal1.co");
+        impl_ptr = &impl_ps_prefill;
+    }
+    else
+    {
+        static AiterAsmKernel impl_ps_prefill(
+            "_ZN5aiter40mla_pfl_qh192_vh128_m32x8_n128x1_causal0E",
+            "/mla/mla_pfl_qh192_vh128_m32x8_n128x1_causal0.co");
+        impl_ptr = &impl_ps_prefill;
+    }
+    
+    // Launch kernel
+    int block_size_x = wave_per_tg * 64;  // 8 * 64 = 512
+    int grid_size_x  = available_tgs;
+    
+    impl_ptr->launch_kernel({&args,
+                             &arg_size,
+                             grid_size_x,  // gdx
+                             1,            // gdy
+                             1,            // gdz
+                             block_size_x, // bdx
+                             1,            // bdy
+                             1,            // bdz
+                             stream});
+}
+
+
 void mla_prefill_asm_fwd(
     torch::Tensor& Q,                 //   [num_seqs, num_heads, head_size]
     torch::Tensor& KV,                //   [num_page, page_size, num_kv_heads, head_size]
