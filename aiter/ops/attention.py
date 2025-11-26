@@ -336,6 +336,28 @@ def mla_prefill_asm_fwd(
 ) -> None: ...
 
 
+@compile_ops(MD_NAME)
+def mla_ps_prefill_asm_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: Optional[torch.Tensor],
+    work_info_set: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    softmax_scale: float,
+    is_causal: bool,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+    output: torch.Tensor,
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
 def get_mla_metadata_info_v1(
     batch_size: int,
     max_seqlen_qo: int,

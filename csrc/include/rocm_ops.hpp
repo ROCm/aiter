@@ -74,7 +74,27 @@ namespace py = pybind11;
           py::arg("max_seqlen_q"),             \
           py::arg("softmax_scale"),            \
           py::arg("splitData"),                \
-          py::arg("splitLse"));
+          py::arg("splitLse"));                \
+    m.def("mla_ps_prefill_asm_fwd",            \
+          &mla_ps_prefill_asm_fwd,             \
+          "mla_ps_prefill_asm_fwd",            \
+          py::arg("Q"),                        \
+          py::arg("K"),                        \
+          py::arg("V"),                        \
+          py::arg("qo_indptr"),                \
+          py::arg("kv_indptr"),                \
+          py::arg("kv_page_indices"),          \
+          py::arg("work_indptr"),              \
+          py::arg("work_info_set"),            \
+          py::arg("max_seqlen_q"),             \
+          py::arg("softmax_scale"),            \
+          py::arg("is_causal"),                \
+          py::arg("splitData"),                \
+          py::arg("splitLse"),                 \
+          py::arg("output"),                   \
+          py::arg("q_scale") = std::nullopt,   \
+          py::arg("k_scale") = std::nullopt,   \
+          py::arg("v_scale") = std::nullopt);
 
 #define ATTENTION_ASM_PYBIND                        \
     m.def("pa_fwd_asm",                             \
@@ -387,17 +407,17 @@ namespace py = pybind11;
           py::arg("bpreshuffle") = true,                                \
           py::arg("splitK")      = std::nullopt);
 
-#define GEMM_A16W16_ASM_PYBIND                  \
-    m.def("gemm_a16w16_asm",                    \
-          &gemm_a16w16_asm,                     \
-          "Asm gemm a16w16",                    \
-          py::arg("A"),                         \
-          py::arg("B"),                         \
-          py::arg("out"),                       \
-          py::arg("bias")       = std::nullopt, \
-          py::arg("splitK")     = std::nullopt, \
-          py::arg("kernelName") = std::nullopt, \
-          py::arg("bpreshuffle")      = false);
+#define GEMM_A16W16_ASM_PYBIND                   \
+    m.def("gemm_a16w16_asm",                     \
+          &gemm_a16w16_asm,                      \
+          "Asm gemm a16w16",                     \
+          py::arg("A"),                          \
+          py::arg("B"),                          \
+          py::arg("out"),                        \
+          py::arg("bias")        = std::nullopt, \
+          py::arg("splitK")      = std::nullopt, \
+          py::arg("kernelName")  = std::nullopt, \
+          py::arg("bpreshuffle") = false);
 
 #define GEMM_A4W4_ASM_PYBIND                      \
     m.def("gemm_a4w4_asm",                        \
@@ -527,14 +547,14 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,        \
           py::arg("splitK")   = 0);
 
-#define GEMM_A8W8_BPRESHUFFLE_CKTILE_PYBIND      \
-    m.def("gemm_a8w8_bpreshuffle_cktile", \
-          &gemm_a8w8_bpreshuffle_cktile,  \
-          "gemm_a8w8_bpreshuffle_cktile", \
-          py::arg("XQ"),                  \
-          py::arg("WQ"),                  \
-          py::arg("x_scale"),             \
-          py::arg("w_scale"),             \
+#define GEMM_A8W8_BPRESHUFFLE_CKTILE_PYBIND \
+    m.def("gemm_a8w8_bpreshuffle_cktile",   \
+          &gemm_a8w8_bpreshuffle_cktile,    \
+          "gemm_a8w8_bpreshuffle_cktile",   \
+          py::arg("XQ"),                    \
+          py::arg("WQ"),                    \
+          py::arg("x_scale"),               \
+          py::arg("w_scale"),               \
           py::arg("Out"));
 
 #define GEMM_A8W8_BPRESHUFFLE_CKTILE_TUNE_PYBIND \
