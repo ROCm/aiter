@@ -120,7 +120,7 @@ def gen_pa_ps_fwd_asm(
     V: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_page_indices: torch.Tensor,
-    kv_last_page_lens: torch.Tensor,
+    context_lens: torch.Tensor,
     softmax_scale: float,  # better have ?
     max_qlen: int = 1,
     K_QScale: Optional[torch.Tensor] = None,
@@ -148,7 +148,7 @@ def pa_ps_fwd_asm(
     V: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_page_indices: torch.Tensor,
-    kv_last_page_lens: torch.Tensor,
+    context_lens: torch.Tensor,
     softmax_scale: float,  # better have ?
     max_qlen: int = 1,
     K_QScale: Optional[torch.Tensor] = None,
@@ -194,7 +194,7 @@ def pa_persistent_fwd(
     qo_indptr: torch.Tensor,  # [batch+1], qolen prefix sum
     kv_indptr: torch.Tensor,  # [batch+1], kvlen prefix sum   1
     kv_indices: torch.Tensor,  # [sum_kvlen], packed kv ids    2
-    kv_last_page_lens: torch.Tensor,  # [batch]                       3
+    context_lens: torch.Tensor,  # [batch]                       3
     work_meta_data: torch.Tensor,
     reduce_indptr: Optional[torch.Tensor] = None,
     reduce_final_map: Optional[torch.Tensor] = None,
@@ -203,10 +203,10 @@ def pa_persistent_fwd(
     V_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
     softmax_scale: float = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if softmax_scale is None:
-        softmax_scale = 1.0 / (v_head_dim**0.5)
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
+    if softmax_scale is None:
+        softmax_scale = 1.0 / (v_head_dim**0.5)
     logits = torch.empty(
         (reduce_partial_map.size(0) * max_qlen, 1, nhead, v_head_dim),
         dtype=dtypes.fp32,
@@ -225,7 +225,7 @@ def pa_persistent_fwd(
         V,
         kv_indptr,
         kv_indices,
-        kv_last_page_lens,
+        context_lens,
         softmax_scale,
         max_qlen,
         K_QScale,
