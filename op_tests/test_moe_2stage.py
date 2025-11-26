@@ -13,6 +13,17 @@ import argparse
 import pandas as pd
 import os
 import numpy as np
+import random
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+    np.random.seed(seed)  # Numpy module.
+    random.seed(seed)  # Python random module.
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 from aiter.fused_moe import (
     fused_topk,
@@ -406,6 +417,10 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+
+# Set a fixed seed for reproducibility
+set_seed(1)
+
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
 else:
