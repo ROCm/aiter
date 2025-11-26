@@ -88,7 +88,9 @@ get_heuristic_kernel(int M,
         {
             // 1. select splitK
             int split_K = 1;
-            if(splitk.has_value())
+            if (cfg.noSplitk == 1)
+                split_K = 1;
+            else if(splitk.has_value())
                 split_K = splitk.value();
             else // auto select
             {

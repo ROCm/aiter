@@ -163,7 +163,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         out_asm = torch.empty(m, n, dtype=otype, device=x.device)
         wshuffle = shuffle_weight(weight, layout=(16, 16))
         (d, *_), avg_d = run_bf16gemm_asm(
-            x, wshuffle, out_asm, splitK=1, bpreshuffle=wshuffle.is_shuffled
+            x, wshuffle, out_asm, bpreshuffle=wshuffle.is_shuffled
         )
         # (d, *_), avg_d = run_bf16gemm_asm(x, weight, out_asm)
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
