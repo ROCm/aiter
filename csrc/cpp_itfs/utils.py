@@ -328,6 +328,7 @@ def str_to_bool(s):
 def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
     import triton
     import triton.language as tl
+    import torch
 
     if not isinstance(kernel, triton.JITFunction):
         raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
@@ -339,12 +340,17 @@ def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
     ccinfo = kernel.warmup(*args, grid=grid, **kwargs)
     constexprs = {}
     arg_names = []
+    arg_types = []
     for param in sig.parameters.values():
         if param.name in bound_args.arguments and param.annotation != tl.constexpr:
             arg_names.append(param.name)
+            if isinstance(bound_args.arguments[param.name], torch.Tensor):
+                arg_types.append(str(bound_args.arguments[param.name].dtype))
+            else:
+                arg_types.append(type(bound_args.arguments[param.name]).__name__)
         elif param.annotation == tl.constexpr:
             constexprs[param.name] = bound_args.arguments[param.name]
-
+    constexprs["ARG_TYPES"] = "_".join(arg_types)
     extra_metadata = {}
     extra_metadata["waves_per_eu"] = ccinfo.metadata.waves_per_eu
     extra_metadata["num_stages"] = ccinfo.metadata.num_stages
@@ -446,6 +452,7 @@ class HsacoKernel:
         def _call(*args, **kwargs):
             if AITER_USE_HSACO:
                 import triton.language as tl
+                import torch
 
                 sig = inspect.signature(self.triton_kernel.fn)
                 valid_param_names = set(sig.parameters.keys())
@@ -455,6 +462,7 @@ class HsacoKernel:
                 bound_args = sig.bind(*args, **filtered_kwargs)
                 bound_args.apply_defaults()
                 constexprs = {}
+                arg_types = []
                 ordered_args_without_constexprs = []
                 for param in sig.parameters.values():
                     if (
@@ -464,8 +472,17 @@ class HsacoKernel:
                         ordered_args_without_constexprs.append(
                             bound_args.arguments[param.name]
                         )
+                        if isinstance(bound_args.arguments[param.name], torch.Tensor):
+                            arg_types.append(
+                                str(bound_args.arguments[param.name].dtype)
+                            )
+                        else:
+                            arg_types.append(
+                                type(bound_args.arguments[param.name]).__name__
+                            )
                     elif param.annotation == tl.constexpr:
                         constexprs[param.name] = bound_args.arguments[param.name]
+                constexprs["ARG_TYPES"] = "_".join(arg_types)
                 if not check_hsaco(self.triton_kernel.fn.__name__, constexprs):
                     compile_hsaco_from_triton(
                         self.triton_kernel, *args, grid=grid, **kwargs
