@@ -20,6 +20,15 @@ torch.set_printoptions(sci_mode=False)
 # qdtype fp8, kdtype bf16: nhead16
 
 
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+setup_seed(23333)
+
+
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
         return False
