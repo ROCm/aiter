@@ -1,8 +1,7 @@
-import os
 import sys
 import hashlib
 import triton
-import functools
+import triton.language as tl
 import aiter
 import torch
 import numpy as np
@@ -10,27 +9,30 @@ import argparse
 
 from triton.tools.compile import compile_kernel, CompileArgs
 from jinja2 import Template
-from aiter.test_common import perftest, run_perftest
+from aiter.test_common import perftest
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     paged_attention_decode_v2_reduce_kernel_triton34,
     paged_attention_decode_v2_reduce_kernel,
 )
 from csrc.cpp_itfs.torch_utils import torch_to_c_types
-from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
-    compile_gluon_kernel,
-    CompileGluonArgs,
-)
 from csrc.cpp_itfs.utils import (
     compile_template_op,
     AITER_CORE_DIR,
     get_default_func_name,
-    not_built,
     run_lib,
+)
+from op_tests.triton_tests.test_pa_decode_gluon import (
+    torch_reduce_compute,
 )
 
 
 # os.environ['TRITON_CACHE_DIR'] = '/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache'
 compile_reduce_kernel_count = 0
+TORCH_TO_TL_DTYPE = {
+    aiter.dtypes.fp8: tl.float8e4b8,
+    torch.bfloat16: tl.bfloat16,
+    torch.float16: tl.float16,
+}
 
 
 def parse_version(version_str):
@@ -81,6 +83,7 @@ def tensor_to_hash(tensor: torch.Tensor, algorithm: str = "md5") -> str:
 
 
 def compile_reduce_kernel(
+    compute_type: tl.dtype,
     query_group_size: int,
     head_size: int,
     max_context_partition_num: int,
@@ -89,13 +92,19 @@ def compile_reduce_kernel(
     func_name: str = None,
 ):
     """Compile the reduce kernel for paged attention decode."""
+    head_size_pow2 = triton.next_power_of_2(head_size)
+
+    if query_group_size < 16:
+        query_group_size_pow2 = 16
+    else:
+        query_group_size_pow2 = triton.next_power_of_2(query_group_size)
+
     if func_name is None:
         func_name = get_default_func_name(
             md_name,
             (
-                query_group_size,
-                head_size,
-                max_context_partition_num,
+                query_group_size_pow2,
+                head_size_pow2,
                 context_partition_size,
             ),
         )
@@ -103,14 +112,23 @@ def compile_reduce_kernel(
     global compile_reduce_kernel_count
     compile_reduce_kernel_count += 1
 
+    if compute_type == tl.bfloat16:
+        logits_sig = "*bf16:16"
+        output_sig = "*bf16:16"
+    elif compute_type == tl.float16:
+        logits_sig = "*fp16:16"
+        output_sig = "*fp16:16"
+    else:
+        raise ValueError(f"Unsupported compute type: {compute_type}")
+
     # if not_built(func_name):
     if compile_reduce_kernel_count == 1:
         # Build signature based on kernel parameters
         signature_parts = [
-            "*bf16:16",  # output_ptr
+            output_sig,  # output_ptr
             "*fp32:16",  # exp_sums_ptr
             "*fp32:16",  # max_logits_ptr
-            "*bf16:16",  # logits_ptr
+            logits_sig,  # logits_ptr
             "*i32:16",  # context_lengths_ptr
             "i32:16",  # stride_output_seq
             "i32:16",  # stride_output_head
@@ -121,11 +139,12 @@ def compile_reduce_kernel(
             "i32:16",  # stride_logits_head
             "i32:16",  # stride_logits_part
             "i32:16",  # stride_logits_group
+            "i32:16",  # query_group_size
+            "i32:16",  # head_size
             "i32:16",  # num_seqs
             "i32:16",  # num_kv_heads
-            f"{query_group_size}",
-            f"{head_size}",
-            f"{max_context_partition_num}",
+            f"{query_group_size_pow2}",
+            f"{head_size_pow2}",
             f"{context_partition_size}",
         ]
         signature = ",".join(signature_parts)
@@ -182,6 +201,7 @@ def run_compiled_kernel(
     context_lengths: torch.Tensor,
     num_sequences: int,
     num_kv_heads: int,
+    compute_type: tl.dtype,
     query_group_size: int,
     head_size: int,
     max_context_partition_num: int,
@@ -193,11 +213,13 @@ def run_compiled_kernel(
     Compile and run the compiled kernel with perftest timing
     """
     reduce_func = compile_reduce_kernel(
+        compute_type=compute_type,
         query_group_size=query_group_size,
         head_size=head_size,
         max_context_partition_num=max_context_partition_num,
         context_partition_size=context_partition_size,
         md_name=md_name,
+        func_name=func_name,
     )
 
     reduce_func(
@@ -216,6 +238,8 @@ def run_compiled_kernel(
             temporary_output.stride(1),
             temporary_output.stride(2),
             temporary_output.stride(3),
+            query_group_size,
+            head_size,
             num_sequences,
             num_kv_heads,
             torch.cuda.current_stream(output.device),
@@ -243,6 +267,11 @@ def run_direct_kernel(
     # Configure grid
     grid = (num_seqs, num_kv_heads, 1)
 
+    if query_group_size < 16:
+        QUERY_GROUP_SIZE_POW2 = 16
+    else:
+        QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(query_group_size)
+
     kernel = paged_attention_decode_v2_reduce_kernel_triton34
     if TRITON_VERSION > (3, 4, 0):
         kernel = paged_attention_decode_v2_reduce_kernel
@@ -263,73 +292,14 @@ def run_direct_kernel(
         temporary_output.stride(1),
         temporary_output.stride(2),
         temporary_output.stride(3),
+        query_group_size,
+        head_size,
         num_seqs,
         num_kv_heads,
-        QUERY_GROUP_SIZE=query_group_size,
-        HEAD_SIZE=head_size,
-        MAX_CONTEXT_PARTITION_NUM=max_context_partition_num,
+        QUERY_GROUP_SIZE_POW2=QUERY_GROUP_SIZE_POW2,
+        HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
         CONTEXT_PARTITION_SIZE=context_partition_size,
     )
-
-
-def torch_reduce_reference(
-    output: torch.Tensor,  # [num_seqs, num_q_heads_total, head_size]
-    exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
-    max_logits: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
-    temporary_output: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
-    context_lengths: torch.Tensor,  # [num_seqs]
-    context_partition_size: int = 256,
-) -> torch.Tensor:
-    """
-    Reference implementation of the reduce kernel.
-    This mimics the reduce stage from torch_mha_extend_flashattn_style function.
-    """
-    num_seqs = output.shape[0]
-    num_q_heads_total = output.shape[1]
-    head_size = output.shape[2]
-    final_output = torch.zeros_like(output)
-    # final_output = torch.empty_like(output)
-
-    for seq_idx in range(num_seqs):
-        seq_len = context_lengths[seq_idx].item()
-        num_parts = (seq_len + context_partition_size - 1) // context_partition_size
-
-        # Global max across partitions
-        global_max = (
-            max_logits[seq_idx, :, :num_parts, :].max(dim=1).values
-        )  # [num_kv_heads, query_group_size]
-
-        # Rescale exp_sums
-        exp_sums_local = exp_sums[
-            seq_idx, :, :num_parts, :
-        ]  # [num_kv_heads, num_parts, query_group_size]
-        max_local = max_logits[
-            seq_idx, :, :num_parts, :
-        ]  # [num_kv_heads, num_parts, query_group_size]
-        exp_sums_rescaled = exp_sums_local * torch.exp(
-            max_local - global_max.unsqueeze(1)
-        )  # [num_kv_heads, num_parts, query_group_size]
-        global_exp_sum = exp_sums_rescaled.sum(
-            dim=1
-        )  # [num_kv_heads, query_group_size]
-
-        # Avoid division by zero
-        global_exp_sum = torch.clamp(global_exp_sum, min=1e-12)
-
-        # Weighted sum of partial outputs
-        weights = exp_sums_rescaled / global_exp_sum.unsqueeze(
-            1
-        )  # [num_kv_heads, num_parts, query_group_size]
-        partial_seq = temporary_output[
-            seq_idx, :, :num_parts, :, :
-        ]  # [num_kv_heads, num_parts, query_group_size, head]
-        weighted = (partial_seq * weights.unsqueeze(-1)).sum(
-            dim=1
-        )  # [num_kv_heads, query_group_size, head]
-
-        final_output[seq_idx] = weighted.view(num_q_heads_total, head_size)
-
-    return final_output
 
 
 def test_reduce_kernel(kernel_type: str = "compiled"):
@@ -341,37 +311,46 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
     print(f"\n=== Testing Reduce Kernel (Type: {kernel_type}) ===")
     setup_seed(123)
 
+    compute_type = aiter.dtypes.bf16
+    # compute_type = aiter.dtypes.fp16
+    data_type = compute_type
+    compute_type = TORCH_TO_TL_DTYPE[compute_type]
+
     query_sequence_length = 1
     query_group_size = 8
     head_size = 128
-    max_context_partition_num = 16
+    max_context_partition_num = 8
     context_partition_size = 256
     num_sequences = 128
-    num_kv_heads = 2
+    num_kv_heads = 8
     # num_kv_heads = 1
 
     equivalent_query_group_size = query_sequence_length * query_group_size
 
-    # print("\n=== Reduce Kernel Compile Parameters ===")
-    # print(f"  head_size: {head_size}")
-    # print(f"  query_group_size: {query_group_size}")
-    # print(f"  context_partition_size: {context_partition_size}")
-    # print(f"  max_context_partition_num: {max_context_partition_num}")
-
     # Create test tensors with the provided shapes
-    # output = torch.zeros((num_sequences, num_kv_heads * query_group_size, head_size),
+    # output = torch.zeros((num_sequences, num_kv_heads * equivalent_query_group_size, head_size),
     output = torch.empty(
-        (num_sequences, num_kv_heads * query_group_size, head_size),
-        dtype=torch.bfloat16,
+        (num_sequences, num_kv_heads * equivalent_query_group_size, head_size),
+        dtype=data_type,
         device="cuda",
     )
     exp_sums = torch.zeros(
-        (num_sequences, num_kv_heads, max_context_partition_num, query_group_size),
+        (
+            num_sequences,
+            num_kv_heads,
+            max_context_partition_num,
+            equivalent_query_group_size,
+        ),
         dtype=torch.float32,
         device="cuda",
     )
     max_logits = torch.zeros(
-        (num_sequences, num_kv_heads, max_context_partition_num, query_group_size),
+        (
+            num_sequences,
+            num_kv_heads,
+            max_context_partition_num,
+            equivalent_query_group_size,
+        ),
         dtype=torch.float32,
         device="cuda",
     )
@@ -380,10 +359,10 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
             num_sequences,
             num_kv_heads,
             max_context_partition_num,
-            query_group_size,
+            equivalent_query_group_size,
             head_size,
         ),
-        dtype=torch.bfloat16,
+        dtype=data_type,
         device="cuda",
     )
     context_lengths = torch.randint(
@@ -400,29 +379,8 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
     max_logits.uniform_(0.1, 5.0)
     temporary_output.uniform_(-1.0, 1.0)
 
-    # print("\n=== Reduce Kernel Execution Parameters ===")
-    # print("Tensor parameters:")
-    # print(f"  output: shape={output.shape}, dtype={output.dtype}")
-    # print(f"  exp_sums: shape={exp_sums.shape}, dtype={exp_sums.dtype}")
-    # print(f"  max_logits: shape={max_logits.shape}, dtype={max_logits.dtype}")
-    # print(f"  temporary_output: shape={temporary_output.shape}, dtype={temporary_output.dtype}")
-    # print(f"  context_lengths: shape={context_lengths.shape}, dtype={context_lengths.dtype}")
-
-    # print("\nScalar parameters:")
-    # print(f"  output.stride(0): {output.stride(0)}")
-    # print(f"  output.stride(1): {output.stride(1)}")
-    # print(f"  exp_sums.stride(0): {exp_sums.stride(0)}")
-    # print(f"  exp_sums.stride(1): {exp_sums.stride(1)}")
-    # print(f"  exp_sums.stride(2): {exp_sums.stride(2)}")
-    # print(f"  temporary_output.stride(0): {temporary_output.stride(0)}")
-    # print(f"  temporary_output.stride(1): {temporary_output.stride(1)}")
-    # print(f"  temporary_output.stride(2): {temporary_output.stride(2)}")
-    # print(f"  temporary_output.stride(3): {temporary_output.stride(3)}")
-    # print(f"  num_sequences: {num_sequences}")
-    # print(f"  num_kv_heads: {num_kv_heads}")
-
     # Run reference implementation
-    reference_output = torch_reduce_reference(
+    reference_output = torch_reduce_compute(
         output.clone(),
         exp_sums,
         max_logits,
@@ -443,6 +401,7 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
             context_lengths,
             num_sequences,
             num_kv_heads,
+            compute_type=compute_type,
             query_group_size=equivalent_query_group_size,
             head_size=head_size,
             max_context_partition_num=max_context_partition_num,
@@ -510,11 +469,11 @@ def test_reduce_kernel(kernel_type: str = "compiled"):
     tolerance = 5e-3
     if max_diff < tolerance:
         print(
-            f"\n✅ TEST PASSED: Max difference ({max_diff:.6e}) < tolerance ({tolerance})"
+            f"\n? TEST PASSED: Max difference ({max_diff:.6e}) < tolerance ({tolerance})"
         )
     else:
         print(
-            f"\n❌ TEST FAILED: Max difference ({max_diff:.6e}) >= tolerance ({tolerance})"
+            f"\n? TEST FAILED: Max difference ({max_diff:.6e}) >= tolerance ({tolerance})"
         )
 
     return {

@@ -19,6 +19,7 @@ from aiter import dtypes
 from aiter.test_common import benchmark
 from csrc.cpp_itfs.utils import (
     BUILD_DIR,
+    get_default_func_name,
 )
 
 from aiter.ops.triton.gluon.pa_decode_gluon import (
@@ -704,25 +705,27 @@ def run_multi_pa_gluon_test(
     test_configs = []
 
     for use_torch_flash_ref in use_torch_flash_ref_options:
-        for ct in compute_types:
-            for quant_q_and_kv_mode in quant_q_and_kv:
-                quant_q, quant_kv = quant_q_and_kv_mode
-                for trans_v_mode in trans_v:
-                    for kv_varlen_mode in kv_varlen:
-                        for context_partition_size in context_partition_size_options:
-                            qm_cnt = 0
-                            for qm in quant_mode:
-                                qm_cnt += 1
-                                if not quant_q and not quant_kv and qm_cnt > 1:
-                                    continue
-                                for bs in block_sizes:
-                                    for hc in head_configs:
-                                        for cl in context_length:
-                                            for bsz in batch_sizes:
-                                                for ql in query_lengths:
-                                                    for (
-                                                        head_size
-                                                    ) in HEAD_DIMENSION_OPTIONS:
+        for hc in head_configs:
+            for ct in compute_types:
+                for quant_q_and_kv_mode in quant_q_and_kv:
+                    quant_q, quant_kv = quant_q_and_kv_mode
+                    # if ct == aiter.dtypes.bf16:
+                    #     quant_q, quant_kv = [False, False]
+                    for trans_v_mode in trans_v:
+                        for kv_varlen_mode in kv_varlen:
+                            for (
+                                context_partition_size
+                            ) in context_partition_size_options:
+                                qm_cnt = 0
+                                for qm in quant_mode:
+                                    qm_cnt += 1
+                                    if not quant_q and not quant_kv and qm_cnt > 1:
+                                        continue
+                                    for bs in block_sizes:
+                                        for head_size in HEAD_DIMENSION_OPTIONS:
+                                            for ql in query_lengths:
+                                                for bsz in batch_sizes:
+                                                    for cl in context_length:
                                                         for (
                                                             use_aot_impl
                                                         ) in use_aot_impl_options:
@@ -743,12 +746,110 @@ def run_multi_pa_gluon_test(
                                                                 "head_size": head_size,
                                                                 "use_aot_impl": use_aot_impl,
                                                             }
+
+                                                            # Calculate func_name to filter duplicate configs
+                                                            # Extract parameters from test_config
+                                                            (
+                                                                num_query_heads,
+                                                                num_kv_heads,
+                                                            ) = hc
+                                                            query_group_size = (
+                                                                num_query_heads
+                                                                // num_kv_heads
+                                                            )
+                                                            equivalent_query_group_size = (
+                                                                ql * query_group_size
+                                                            )
+
+                                                            # Calculate power of 2 values
+                                                            if (
+                                                                equivalent_query_group_size
+                                                                < 16
+                                                            ):
+                                                                equi_query_group_size_pow2 = (
+                                                                    16
+                                                                )
+                                                            else:
+                                                                equi_query_group_size_pow2 = triton.next_power_of_2(
+                                                                    equivalent_query_group_size
+                                                                )
+                                                            head_size_pow2 = (
+                                                                triton.next_power_of_2(
+                                                                    head_size
+                                                                )
+                                                            )
+
+                                                            # Determine quantization modes
+                                                            if quant_q:
+                                                                if qm == "per_tensor":
+                                                                    query_quant_mode = 0
+                                                                else:  # per_token
+                                                                    query_quant_mode = 1
+                                                            else:
+                                                                query_quant_mode = -1
+
+                                                            if quant_kv:
+                                                                if qm == "per_tensor":
+                                                                    kv_quant_mode = 0
+                                                                else:  # per_token
+                                                                    kv_quant_mode = 1
+                                                            else:
+                                                                kv_quant_mode = -1
+
+                                                            # Determine fp8_max_value
+                                                            if kv_quant_mode >= 0:
+                                                                fp8_max_value = (
+                                                                    torch.finfo(
+                                                                        aiter.dtypes.fp8
+                                                                    ).max
+                                                                )
+                                                            else:
+                                                                fp8_max_value = 1.0
+
+                                                            # Determine is_causal
+                                                            is_causal = int(ql > 1)
+
+                                                            # Calculate func_name
+                                                            func_name = get_default_func_name(
+                                                                MD_NAME,
+                                                                (
+                                                                    TORCH_TO_TL_DTYPE[
+                                                                        ct
+                                                                    ],
+                                                                    equi_query_group_size_pow2,
+                                                                    head_size_pow2,
+                                                                    bs,
+                                                                    context_partition_size,
+                                                                    query_quant_mode,
+                                                                    kv_quant_mode,
+                                                                    fp8_max_value,
+                                                                    int(trans_v_mode),
+                                                                    is_causal,
+                                                                ),
+                                                            )
+                                                            # Store func_name in test_config for deduplication
+                                                            test_config["func_name"] = (
+                                                                func_name
+                                                            )
                                                             test_configs.append(
                                                                 test_config
                                                             )
+    # Filter out duplicate test configs based on func_name
+    total_before_dedup = len(test_configs)
+    print(f"\nTotal test cases before deduplication: {total_before_dedup}")
 
+    seen_func_names = set()
+    unique_test_configs = []
+    for test_config in test_configs:
+        func_name = test_config.get("func_name")
+        if func_name not in seen_func_names:
+            seen_func_names.add(func_name)
+            unique_test_configs.append(test_config)
+
+    test_configs = unique_test_configs
     total = len(test_configs)
-    print(f"\nTotal test cases: {total}")
+    print(f"Total test cases after deduplication: {total}")
+    print(f"Removed {total_before_dedup - total} duplicate configurations")
 
     # Prepare arguments for multiprocessing
     test_args = [(config, idx + 1, total) for idx, config in enumerate(test_configs)]
@@ -769,9 +870,11 @@ def run_multi_pa_gluon_test(
 
 def parse_arg_and_run_test():
     """Parse arguments and run tests."""
+    print(f"Triton location: {triton}")
+    print(f"Triton version: {triton.__version__}")
+
     parser = create_argument_parser()
     args = parser.parse_args()
-
     (
         compute_types,
         block_sizes,
@@ -804,10 +907,6 @@ def parse_arg_and_run_test():
         context_partition_size_options,
         num_processes=args.num_processes,
     )
-    # output_file = f"pa_decode_gluon_aot_prebuild.triton.{TRITON_VERSION}.csv"
-    # results_df.to_csv(output_file, index=False)
-    # print(f"\nResults saved to {output_file}")
-    # print(f"\nSummary:\n{results_df}")
     print("All the so under different configurations have been built successfully!")
 
 
@@ -881,60 +980,21 @@ def prebuild_pa_decode_gluon_aot_so():
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS
 
-    # use_simple_config = True
-    use_simple_config = False
-    if use_simple_config:
-        USE_TORCH_FLASH_REF_OPTIONS = [True]
-        CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-        BLOCK_SIZE_OPTIONS = [16, 1024]
-        # BLOCK_SIZE_OPTIONS = [16]
-        # BLOCK_SIZE_OPTIONS = [1024]
-        QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-        # QUERY_LENGTH_OPTIONS = [1]
-        BATCH_SIZE_OPTIONS = [3]
-        HEAD_CONFIGURATIONS = [(16, 1), (10, 1)]
-        # HEAD_CONFIGURATIONS = [(16, 1)]
-        # HEAD_CONFIGURATIONS = [(10, 1)]
-        # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024, 64 * 1024, 128 * 1024]
-        # CONTEXT_LENGTH_OPTIONS = [4096, 32 * 1024]
-        CONTEXT_LENGTH_OPTIONS = [4096]
-        COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
-        # COMPUTE_TYPE_OPTIONS = ["fp8"]
-        QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
-        # QUANT_MODE_OPTIONS = ["per_tensor"]
-        # HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
-        HEAD_DIMENSION_OPTIONS = [128]
-        # QUANT_MODE_OPTIONS = ["per_tensor"]
-        TRANS_V_OPTIONS = [False, True]
-        # TRANS_V_OPTIONS = [False]
-        # TRANS_V_OPTIONS = [True]
-        KV_VARLEN_OPTIONS = [False, True]
-        # KV_VARLEN_OPTIONS = [False]
-        # QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
-        QUANT_Q_AND_KV_OPTIONS = [[True, True]]
-        # USE_AOT_IMPL_OPTIONS = [False, True]
-        # USE_AOT_IMPL_OPTIONS = [False]
-        USE_AOT_IMPL_OPTIONS = [True]
-    else:
-        USE_TORCH_FLASH_REF_OPTIONS = [True]
-        CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-        BATCH_SIZE_OPTIONS = [3]
-        KV_VARLEN_OPTIONS = [False]
-        TRANS_V_OPTIONS = [False, True]
-        QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
-        COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
-        QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
-        HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
-        # HEAD_DIMENSION_OPTIONS = [256]
-        BLOCK_SIZE_OPTIONS = [16, 64, 1024]
-        # BLOCK_SIZE_OPTIONS = [16, 64]
-        # BLOCK_SIZE_OPTIONS = [1024]
-        HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
-        QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-        CONTEXT_LENGTH_OPTIONS = [512]
-        # USE_AOT_IMPL_OPTIONS = [False, True]
-        # USE_AOT_IMPL_OPTIONS = [False]
-        USE_AOT_IMPL_OPTIONS = [True]
+    USE_TORCH_FLASH_REF_OPTIONS = [True]
+    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+    BATCH_SIZE_OPTIONS = [4]
+    KV_VARLEN_OPTIONS = [False]
+    TRANS_V_OPTIONS = [False, True]
+    QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
+    # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+    COMPUTE_TYPE_OPTIONS = ["fp8"]
+    QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
+    HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
+    BLOCK_SIZE_OPTIONS = [16, 64, 1024]
+    HEAD_CONFIGURATIONS = [(5, 1), (8, 1), (10, 1), (16, 1)]
+    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+    CONTEXT_LENGTH_OPTIONS = [512]
+    USE_AOT_IMPL_OPTIONS = [True]
 
     parse_arg_and_run_test()
 

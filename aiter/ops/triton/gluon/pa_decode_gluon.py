@@ -2325,6 +2325,10 @@ def pa_decode_gluon(
     # Configure execution grid
     grid = (num_sequences, num_kv_heads, max_context_partition_num)
 
+    # thre are some precision problems for tl.bfloat16 and tl.float16, so only support tl.float8e4b8 now
+    assert compute_type in [
+        tl.float8e4b8
+    ], f"compute_type == {compute_type} not in [tl.float8e4b8]"
     assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
     # Validate input params constraint
     assert query.dtype in [
