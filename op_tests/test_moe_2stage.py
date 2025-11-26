@@ -15,6 +15,7 @@ import os
 import numpy as np
 import random
 
+
 def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -24,6 +25,7 @@ def set_seed(seed):
     random.seed(seed)  # Python random module.
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+
 
 from aiter.fused_moe import (
     fused_topk,
