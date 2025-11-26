@@ -75,10 +75,10 @@ def test_fmoe(
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
         # w1 = torch.ones((E, inter_dim, model_dim), dtype=dtype)
         # exp_bias1 = torch.clamp(torch.ones((E * inter_dim), dtype=dtype), -1.0, 1.0)
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
+    # w2 = torch.ones((E, model_dim, inter_dim), dtype=dtype)
     # w2 = torch.ones((E, model_dim, inter_dim), dtype=dtype)
     # w2 = torch.randn(32).repeat(inter_dim // 32).view(1, 1, inter_dim).expand(E, model_dim, inter_dim).contiguous()
-    # w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
     if hidden_pad != 0 and intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
@@ -135,7 +135,7 @@ def test_fmoe(
             w1_qt = w1_qt.view(*w1.shape[:-1], -1)
             w2_qt = w2_qt.view(*w2.shape[:-1], -1)
             w1_scale = w1_scale.view(w1.shape[0] * w1.shape[1], -1)
-            w2_scale = w2_scale.view(w1.shape[0] * w1.shape[1], -1)
+            w2_scale = w2_scale.view(w2.shape[0] * w2.shape[1], -1)
         aiter.logger.info(f'w1_shape {w1.shape}')
         aiter.logger.info(f'w2_shape {w2.shape}')
         aiter.logger.info(f'w1_qt_shape {w1_qt.shape} {w1_qt.dtype}')
@@ -343,17 +343,20 @@ def test_fmoe(
     )
     aiter.logger.info(f'run pertest done')
     
+    '''
     err = checkAllclose(
-        out2_ref[0],
-        out2_ck[0],
+        out1_ref,
+        out2_ck,
         msg=f"ck_moe_2stages subtensor 0 :{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
-    
+
+    '''    
     err = checkAllclose(
         out2_ref,
         out2_ck,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
+
     
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
