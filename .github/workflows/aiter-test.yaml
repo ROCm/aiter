@@ -69,18 +69,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Sync submodules
+      - name: Show current directory
         run: |
-          set -euo pipefail
-          if [[ ${{ github.ref }} == "refs/heads/main" ]]; then
-            echo "It's main branch, syncing latest CK..."
-            git submodule sync
-            git submodule update --init --recursive --remote --depth 1 --jobs 4
-          else
-            echo "It's a PR branch, syncing specific CK..."
-            git submodule sync
-            git submodule update --init --recursive --depth 1 --jobs 4
-          fi
+          echo "Current directory: $(pwd)"
+          echo "ls -a $(pwd)"
 
       - name: Generate Dockerfile
         run: |
@@ -94,12 +86,12 @@ jobs:
           RUN pip install --upgrade "triton>=3.3.0"
           RUN pip install --upgrade "ninja>=1.11.1"
 
-          RUN rm -rf aiter \
-           && git clone ${{ env.GITHUB_REPO_URL }} \
+          RUN git clone ${{ env.GITHUB_REPO_URL }} \
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
            && git submodule update --init --recursive \
            && pip install -r requirements.txt \
+           && ls -a $(pwd) \
            && PREBUILD_KERNELS=1 GPU_ARCHS=gfx950 python setup.py develop
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
