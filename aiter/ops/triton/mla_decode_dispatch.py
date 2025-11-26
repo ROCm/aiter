@@ -427,8 +427,8 @@ def _fwd_kernel_stage2(
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
     offs_logic = cur_batch * stride_mid_lse_b + cur_head * stride_mid_lse_h
     # kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
-    cur_batch_block_nums = gl.cdiv(cur_batch_seq_len, PAGE_BLOCK_SIZE)
-    blocks_per_split = gl.cdiv(cur_batch_block_nums, NUM_KV_SPLITS)
+    cur_batch_block_nums = tl.cdiv(cur_batch_seq_len, PAGE_BLOCK_SIZE)
+    blocks_per_split = tl.cdiv(cur_batch_block_nums, NUM_KV_SPLITS)
 
     for split_kv_id in range(0, NUM_KV_SPLITS):
         split_kv_start = blocks_per_split * split_kv_id * PAGE_BLOCK_SIZE
