@@ -53,6 +53,7 @@ jobs:
           --device=/dev/dri \
           --device=/dev/kfd \
           --shm-size=16G \
+          --network=host \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
