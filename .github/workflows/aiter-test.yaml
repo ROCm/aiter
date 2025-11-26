@@ -155,6 +155,7 @@ jobs:
       - name: Run the container
         run: |
           set -ex
+          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           echo "Starting container: aiter_test"
           docker run -dt \
           --device=/dev/dri \
@@ -226,6 +227,7 @@ jobs:
       - name: Run the container
         run: |
           set -ex
+          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           echo "Starting container: aiter_test"
           docker run -dt \
           --device=/dev/dri \
