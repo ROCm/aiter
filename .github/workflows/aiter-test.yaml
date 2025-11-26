@@ -87,7 +87,7 @@ jobs:
       
       - name: Generate Dockerfile
         run: |
-          cat <<EOF > Dockerfile.mod
+          cat <<EOF > aiter/Dockerfile.mod
           FROM ${{ env.DOCKER_IMAGE }}
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
@@ -97,18 +97,18 @@ jobs:
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
-          RUN cd aiter && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942;gfx950 python3 setup.py develop
+          RUN cd aiter && PREBUILD_KERNELS=1 GPU_ARCHS="gfx942,gfx950" python3 setup.py develop
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
 
       - name: Show Dockerfile
-        run: cat Dockerfile.mod
+        run: cat aiter/Dockerfile.mod
 
       - name: Build Docker image
         run: |
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
-          docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
+          cd aiter && docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
 
       - name: Push Docker image
         run: |
@@ -163,10 +163,10 @@ jobs:
           --name aiter_test \
           rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
 
-      - name: Setup pip config
-        run: |
-          docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
-          docker exec -u root aiter_test bash -c "pip config set global.retries 10"
+      #- name: Setup pip config
+      #  run: |
+      #    docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
+      #    docker exec -u root aiter_test bash -c "pip config set global.retries 10"
 
       #- name: Setup Aiter
       #  run: |
@@ -234,10 +234,10 @@ jobs:
           --name aiter_test \
           rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
 
-      - name: Setup pip config
-        run: |
-          docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
-          docker exec -u root aiter_test bash -c "pip config set global.retries 10"
+      #- name: Setup pip config
+      #  run: |
+      #    docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
+      #    docker exec -u root aiter_test bash -c "pip config set global.retries 10"
 
       # - name: Setup-Aiter
       #   run: |
