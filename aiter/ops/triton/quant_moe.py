@@ -8,6 +8,17 @@ from aiter.ops.triton._triton_kernels.quant_moe import (
 )
 
 
+def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):
+    assert x.ndim == 3
+    E, M, N = x.shape
+
+    x2d = x.reshape(E * M, N).contiguous()
+
+    y2d = downcast_to_static_fp8(x2d, scale)
+    y3d = y2d.reshape(E, M, N)
+    return y3d
+
+
 def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
     M, N = x.shape
     y = torch.empty((M, N), dtype=torch.float8_e4m3fn, device="cuda")
