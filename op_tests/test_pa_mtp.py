@@ -497,7 +497,8 @@ def test_pa_mtp(
         kv_indices = torch.randint(
             0, num_page, (kv_indptr[-1].item(),), dtype=torch.int
         )
-        kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+        context_lens = torch.full((batch_size,), ctx_lens)
+        # kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         aiter.get_pa_metadata_v1(
             qo_indptr,
             kv_indptr,
@@ -523,7 +524,7 @@ def test_pa_mtp(
         qo_indptr=qo_indptr,
         kv_indptr=kv_indptr,
         kv_indices=kv_indices,
-        kv_last_page_lens=kv_last_page_lens,
+        context_lens=context_lens,
         work_metadata_ptrs=work_metadata_ptrs,
         work_indptr=work_indptr,
         work_info=work_info,

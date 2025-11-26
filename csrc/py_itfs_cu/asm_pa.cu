@@ -303,7 +303,7 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     torch::Tensor& V, //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
     torch::Tensor& kv_indptr, //   [batch_size+1], kvlen prefix sum
     torch::Tensor& kv_indices, //   [sum_kvlen], packed kv ids
-    torch::Tensor& kv_last_page_lens, //   [batch_size]
+    torch::Tensor& context_lens, //   [batch_size]
     float softmax_scale,
     int max_qlen                           = 1,
     std::optional<torch::Tensor> K_QScale  = std::nullopt,

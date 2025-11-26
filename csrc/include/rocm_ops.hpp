@@ -101,7 +101,7 @@ namespace py = pybind11;
           py::arg("V"),                             \
           py::arg("kv_indptr"),                     \
           py::arg("kv_indices"),                    \
-          py::arg("kv_last_page_lens"),             \
+          py::arg("context_lens"),                  \
           py::arg("softmax_scale"),                 \
           py::arg("max_qlen")       = 1,            \
           py::arg("K_QScale")       = std::nullopt, \
