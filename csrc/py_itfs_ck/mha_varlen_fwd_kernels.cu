@@ -449,7 +449,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right) + "," + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
     }
-
+    bool has_sink = mask.sink > 0? true : false;
     CHECK_SHAPE(q, total_q, num_heads, head_size_q);
     if (!paged_KV) {
         const int total_k = k.size(0);
@@ -574,7 +574,8 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                                              true, //is_group_mode
                                              mask.type,
                                              bias_type,
-                                             has_lse);
+                                             has_lse,
+                                             has_sink);
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
         }
         else
@@ -618,6 +619,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                                      mask.type,
                                      bias_type,
                                      has_lse,
+                                     has_sink,
                                      false, // use_ext_asm
                                      1);     // how_v3_bf16_cvt
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");

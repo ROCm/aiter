@@ -20,6 +20,7 @@ struct mha_fwd_traits : public fmha_fwd_traits
                    bias_enum bias_type,
                    bool has_lse,
                    bool has_dropout,
+                   bool has_sink,
                    bool use_ext_asm,
                    int how_v3_bf16_cvt,
                    bool skip_min_seqlen_q)
@@ -34,7 +35,8 @@ struct mha_fwd_traits : public fmha_fwd_traits
                           has_lse,
                           has_dropout,
                           false, // do_fp8_static_quant
-                          skip_min_seqlen_q},
+                          skip_min_seqlen_q,
+                          has_sink},
           use_ext_asm(use_ext_asm),
           how_v3_bf16_cvt(how_v3_bf16_cvt)
     {
@@ -52,7 +54,8 @@ struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
                            bool has_logits_soft_cap,
                            mask_enum mask_type,
                            bias_enum bias_type,
-                           bool has_lse)
+                           bool has_lse,
+                           bool has_sink)
         : fmha_fwd_splitkv_traits{head_size_q,
                                   head_size_v,
                                   dtype,
@@ -62,7 +65,8 @@ struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
                                   mask_type,
                                   bias_type,
                                   has_lse,
-                                  false} // do_fp8_static_quant
+                                  false, // do_fp8_static_quant
+                                  has_sink} 
     {
     }
 };
@@ -78,6 +82,7 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      mask_enum mask_type,
                                                      bias_enum bias_type,
                                                      bool has_lse,
+                                                     bool has_sink,
                                                      bool use_ext_asm,
                                                      int how_v3_bf16_cvt                = 1,
                                                      const void* seqstart_q_padding_ptr = nullptr,
@@ -91,7 +96,8 @@ mha_fwd_splitkv(mha_fwd_splitkv_args args,
                 bool is_group_mode,
                 mask_enum mask_type,
                 bias_enum bias_type,
-                bool has_lse);
+                bool has_lse,
+                bool has_sink);
 
 __attribute__((visibility("default"))) float
 mha_batch_prefill(mha_batch_prefill_args args,

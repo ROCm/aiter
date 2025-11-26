@@ -235,6 +235,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
 >>>>>>> 4d29695a (add sink_size parameter in mha_fwd and varlen_mha_fwd)
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
     }
+    bool has_sink = mask.sink > 0? true : false;
 
     TORCH_CHECK(!(bias_.has_value() && alibi_slopes_.has_value()), "cannot apply bias and alibi at the same time");
     bias_enum bias_type = bias_.has_value() ? bias_enum::elementwise_bias :
@@ -348,6 +349,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                                  mask.type,
                                  bias_type,
                                  has_lse,
+                                 has_sink,
                                  false);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
