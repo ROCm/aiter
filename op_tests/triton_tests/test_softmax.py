@@ -36,3 +36,5 @@ def test_softmax(M, N, dtype):
         atol, rtol = 1e-5, 1e-5
 
     triton.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
+
+test_softmax(32768, 8192, "bf16")
