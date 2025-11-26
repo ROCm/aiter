@@ -383,7 +383,7 @@ def run_benchmark(args: argparse.Namespace):
         qk_rope_head_dim: int,
         mtp: int,
         dtype: str,
-        num_kv_splits: int = 8,
+        num_kv_splits: int = 5,
         sm_scale: float = 1.0,
         logit_cap: float = 0.0,
         device="cuda",
@@ -519,8 +519,6 @@ def run_benchmark(args: argparse.Namespace):
             sm_scale,
             logit_cap,
             mtp,
-            num_iters=2,
-            num_warmup=0,
         )
         cache_key = decode_attention_fwd_grouped(
             q_fp8 if dtype == "fp8" else q,
