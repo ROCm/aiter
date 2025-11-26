@@ -16,7 +16,11 @@ from aiter.ops.triton.moe_op_gemm_a8w8 import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
-from aiter.ops.triton.quant_moe import downcast_to_static_fp8, downcast_to_mxfp, downcast_to_static_fp8_3d
+from aiter.ops.triton.quant_moe import (
+    downcast_to_static_fp8,
+    downcast_to_mxfp,
+    downcast_to_static_fp8_3d,
+)
 import inspect
 
 
@@ -151,7 +155,9 @@ def bench_mlp(
         wg, _ = quantize(wg, "bf16")
         w1, w1_scale = quantize(w1, w_dtype)
         w2, w2_scale = quantize(w2, w_dtype)
-        w1_scale, swizzle_mx_scale1 = check_and_swizzle_scales(w1_scale, dim2 // TP, dim1)
+        w1_scale, swizzle_mx_scale1 = check_and_swizzle_scales(
+            w1_scale, dim2 // TP, dim1
+        )
         w2_scale, swizzle_mx_scale2 = check_and_swizzle_scales(
             w2_scale, dim1, dim2 // TP // 2
         )
@@ -385,7 +391,7 @@ if __name__ == "__main__":
         (4096, 8200, 4096),
     ]
     batch_sizes_moe = list(chain(*[range(*r) for r in batch_ranges_moe]))
-    quantized_dtypes = [args.act_dtype, args.w_dtype] 
+    quantized_dtypes = [args.act_dtype, args.w_dtype]
 
     roofline_mlp(
         batch_sizes_moe,

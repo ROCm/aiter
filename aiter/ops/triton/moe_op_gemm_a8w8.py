@@ -242,7 +242,7 @@ def moe_gemm_a8w8(
         stride_w_mx_e = 0
         stride_w_mx_k = 0
         stride_w_mx_n = 0
-    
+
     x_has_mx = x_scales is not None
     if x_has_mx:
         assert x.stride(-1) == 1, "'x' must be row-major when it has data-type mxfp"

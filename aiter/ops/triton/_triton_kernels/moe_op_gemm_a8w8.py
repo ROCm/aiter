@@ -353,7 +353,9 @@ def _moe_gemm_a8w8(
         WMxScale += expt_id * stride_w_mx_e
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
             NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 32
-            PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
+            PACKED_MX_BLOCK: tl.constexpr = (
+                MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
+            )
             SCALE_BLOCK_N: tl.constexpr = BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE
         else:
             PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K
