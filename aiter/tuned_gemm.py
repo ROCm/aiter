@@ -164,7 +164,6 @@ def gemm_a16w16(
         otype=str(otype) if otype is not None else str(inp_view.dtype),
         scaleAB=scale_a is not None or scale_b is not None,
     )
-
     if config is not None and config["libtype"] == "asm":
         kernelName = config["kernelName"]
         splitK = config["splitK"]
@@ -289,6 +288,12 @@ class TunedGemm:
         self.save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
         self.untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
         self.tune_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
+        if self.save_gemm == 1:
+            self.tuned_df = pd.DataFrame(
+                columns=["M", "N", "K", "bias", "dtype", "outdtype", "scaleAB"]
+            )
+        else:
+            self.tuned_df = None
 
     def mm(
         self,
@@ -312,7 +317,48 @@ class TunedGemm:
             scale_b=scale_b,
             scale_c=scale_c,
         )
+        self.save_untuned_shapes(inp, weights, bias, otype, scale_a, scale_b, scale_c)
         return out
+
+    def save_untuned_shapes(
+        self,
+        A,
+        B,
+        bias,
+        otype,
+        scale_a,
+        scale_b,
+        scale_c,
+    ):
+        if A.dim() >= 3:
+            inp_view = A.view(-1, A.size(-1))
+            batched = True
+        else:
+            inp_view = A
+        m, k = inp_view.shape
+        n = B.shape[0]
+        save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
+        if save_gemm:
+            dtype = inp_view.dtype
+            otype = otype if otype is not None else inp_view.dtype
+            scaleAB = scale_a is not None or scale_b is not None
+            self.tuned_df = pd.concat(
+                [
+                    self.tuned_df,
+                    pd.DataFrame(
+                        {
+                            "M": [m],
+                            "N": [n],
+                            "K": [k],
+                            "bias": [bias is not None],
+                            "dtype": [dtype],
+                            "outdtype": [otype],
+                            "scaleAB": [scaleAB],
+                        }
+                    ),
+                ]
+            ).drop_duplicates()
+            self.tuned_df.to_csv(self.untune_path, index=False)
 
 
 tgemm = TunedGemm()
