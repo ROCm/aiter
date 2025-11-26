@@ -21,40 +21,40 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
     }
 )
 @triton.jit
-def _fused_kv_proj_cat_kernel(
+def _fused_gemm_a8w8_blockscale_split_cat(
     # Pointers to matrices
-    kv_c_ptr,
-    w_ptr,
-    k_pe_ptr,
-    k_ptr, # [K, M, N] when splitK, otherwise [M, H, P+R]
-    v_ptr, # [M, H, V]
-    kv_c_scale_ptr,
-    w_scale_ptr,
+    a_ptr,
+    b_ptr,
+    y_ptr,
+    c1_ptr,
+    c2_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
     # Matrix dimensions
     M,
     N,
     K,
-    H,
-    R,
-    P,
-    V,
+    D,
+    S1,
+    S2,
+    S3,
     # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
+    # moving by 1 element in a particular dimension. E.g. `stride_a_m` is
     # how much to increase `a_ptr` by to get the element one row down
     # (A has M rows).
-    stride_kv_c_m,
-    stride_kv_c_k,
-    stride_w_k,
-    stride_w_n,
-    stride_k_pe_m,
-    stride_k_pe_h,
-    stride_k_pe_r,
-    stride_k_out_k, # dimension K when splitK, otherwise dimension H
-    stride_k_out_m,
-    stride_k_out_n, # dimension N when splitK, otherwise dimension P+R
-    stride_v_out_m,
-    stride_v_out_h,
-    stride_v_out_v,
+    stride_a_m,
+    stride_a_k,
+    stride_b_k,
+    stride_b_n,
+    stride_y_m,
+    stride_y_d,
+    stride_y_s,
+    stride_c1_k,
+    stride_c1_m,
+    stride_c1_n,
+    stride_c2_m,
+    stride_c2_d,
+    stride_c2_s,
     stride_ascale_m,
     stride_ascale_k,
     stride_bscale_k,
@@ -65,7 +65,7 @@ def _fused_kv_proj_cat_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_R: tl.constexpr,
+    BLOCK_SIZE_S3: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
@@ -73,19 +73,18 @@ def _fused_kv_proj_cat_kernel(
     GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
-    tl.assume(stride_kv_c_m > 0)
-    tl.assume(stride_kv_c_k > 0)
-    tl.assume(stride_w_k > 0)
-    tl.assume(stride_w_n > 0)
-    tl.assume(stride_k_pe_m > 0)
-    tl.assume(stride_k_pe_h >= 0) # due to expand
-    tl.assume(stride_k_pe_r > 0)
-    tl.assume(stride_k_out_k > 0)
-    tl.assume(stride_k_out_m > 0)
-    tl.assume(stride_k_out_n > 0)
-    tl.assume(stride_v_out_h > 0)
-    tl.assume(stride_v_out_m > 0)
-    tl.assume(stride_v_out_v > 0)
+    tl.assume(stride_a_m > 0)
+    tl.assume(stride_a_k > 0)
+    tl.assume(stride_b_k > 0)
+    tl.assume(stride_b_n > 0)
+    tl.assume(stride_y_m > 0)
+    tl.assume(stride_y_s > 0)
+    tl.assume(stride_c1_k > 0)
+    tl.assume(stride_c1_m > 0)
+    tl.assume(stride_c1_n > 0)
+    tl.assume(stride_c2_d > 0)
+    tl.assume(stride_c2_m > 0)
+    tl.assume(stride_c2_s > 0)
     tl.assume(stride_ascale_m > 0)
     tl.assume(stride_ascale_k > 0)
     tl.assume(stride_bscale_k > 0)
@@ -119,180 +118,185 @@ def _fused_kv_proj_cat_kernel(
         # Create pointers for first block of A and B input matrices
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
-        offs_kv_c_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_w_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-        kv_c_ptrs = kv_c_ptr + (
-            offs_kv_c_m[:, None] * stride_kv_c_m + offs_k_split[None, :] * stride_kv_c_k
+        offs_a_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_b_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        a_ptrs = a_ptr + (
+            offs_a_m[:, None] * stride_a_m + offs_k_split[None, :] * stride_a_k
         )
-        w_ptrs = w_ptr + (
-            offs_k_split[:, None] * stride_w_k + offs_w_n[None, :] * stride_w_n
+        b_ptrs = b_ptr + (
+            offs_k_split[:, None] * stride_b_k + offs_b_n[None, :] * stride_b_n
         )
 
         # Create pointers for the scales
         offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
-        kv_c_scale_ptrs = (
-            kv_c_scale_ptr + offs_kv_c_m * stride_ascale_m + offs_k_scale * stride_ascale_k
+        a_scale_ptrs = (
+            a_scale_ptr + offs_a_m * stride_ascale_m + offs_k_scale * stride_ascale_k
         )
-        offs_w_scale_n = offs_w_n // GROUP_N
-        w_scale_ptrs = (
-            w_scale_ptr
+        offs_b_scale_n = offs_b_n // GROUP_N
+        b_scale_ptrs = (
+            b_scale_ptr
             + offs_k_scale * stride_bscale_k
-            + offs_w_scale_n * stride_bscale_n
+            + offs_b_scale_n * stride_bscale_n
         )
         offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
-        acc_dtype = tl.float32 if k_ptr.type.element_ty != tl.int8 else tl.int32
+        acc_dtype = tl.float32 if c1_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
-                a = tl.load(kv_c_ptrs)
-                b = tl.load(w_ptrs, cache_modifier=cache_modifier)
+                a = tl.load(a_ptrs)
+                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a = tl.load(
-                    kv_c_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
                 )
                 b = tl.load(
-                    w_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
                 )
 
-            kv_c_scale = tl.load(kv_c_scale_ptrs)
-            w_scale = tl.load(w_scale_ptrs)
+            a_scale = tl.load(a_scale_ptrs)
+            b_scale = tl.load(b_scale_ptrs)
 
             # Perform dot operation and apply scale
             accumulator += (
                 tl.dot(a, b, input_precision="ieee")
-                * kv_c_scale[:, None]
-                * w_scale[None, :]
+                * a_scale[:, None]
+                * b_scale[None, :]
             )
 
             # Advance the ptrs to the next K block.
-            kv_c_ptrs += BLOCK_SIZE_K * stride_kv_c_k
-            w_ptrs += BLOCK_SIZE_K * stride_w_k
+            a_ptrs += BLOCK_SIZE_K * stride_a_k
+            b_ptrs += BLOCK_SIZE_K * stride_b_k
 
             # k_cur = k * BLOCK_SIZE_K // GROUP_K
             # k_nxt = (k + 1) * BLOCK_SIZE_K // GROUP_K
             # offs_ks = k_nxt - k_cur
-            kv_c_scale_ptrs += offs_ks_step * stride_ascale_k
-            w_scale_ptrs += offs_ks_step * stride_bscale_k
+            a_scale_ptrs += offs_ks_step * stride_ascale_k
+            b_scale_ptrs += offs_ks_step * stride_bscale_k
 
-        c = accumulator.to(k_ptr.type.element_ty) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        c = accumulator.to(c1_ptr.type.element_ty) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
 
         if NUM_KSPLIT == 1:
             offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
             offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
-            offs_h = offs_n // (P + V)
-            offs_pv = offs_n % (P + V)
+            offs_d = offs_n // (S1 + S2)
+            offs_s = offs_n % (S1 + S2)
 
-            # Write back the block of the output matrix k_nope with masks.
-            k_nope_ptrs = (
-                k_ptr
-                + stride_k_out_m * offs_m[:, None]
-                + stride_k_out_k * offs_h[None, :]
-                + stride_k_out_n * offs_pv[None, :]
+            # Write back the block of the output matrix C1 with masks.
+            c1_ptrs = (
+                c1_ptr
+                + stride_c1_m * offs_m[:, None]
+                + stride_c1_k * offs_d[None, :]
+                + stride_c1_n * offs_s[None, :]
             )
-            k_nope_mask = (
+            c1_mask = (
                 (offs_m[:, None] < M)
-                & (offs_h[None, :] < H)
-                & (offs_pv[None, :] < P)
+                & (offs_d[None, :] < D)
+                & (offs_s[None, :] < S1)
             )
-            tl.store(k_nope_ptrs, c, mask=k_nope_mask)
+            tl.store(c1_ptrs, c, mask=c1_mask)
 
-            # Write back the block of the output matrix v with masks.
-            v_ptrs = (
-                v_ptr
-                + stride_v_out_m * offs_m[:, None] 
-                + stride_v_out_h * offs_h[None, :]
-                + stride_v_out_v * (offs_pv[None, :] - P)
+            # Write back the block of the output matrix C2 with masks.
+            c2_ptrs = (
+                c2_ptr
+                + stride_c2_m * offs_m[:, None] 
+                + stride_c2_d * offs_d[None, :]
+                + stride_c2_s * (offs_s[None, :] - S1)
             )
-            v_mask = (
+            c2_mask = (
                 (offs_m[:, None] < M)
-                & (offs_h[None, :] < H)
-                & (offs_pv[None, :] >= P)
-                & (offs_pv[None, :] < P + V)
+                & (offs_d[None, :] < D)
+                & (offs_s[None, :] >= S1)
+                & (offs_s[None, :] < S1 + S2)
             )
-            tl.store(v_ptrs, c, mask=v_mask)
+            tl.store(c2_ptrs, c, mask=c2_mask)
 
-            # Handle k_pe
-            offs_n = pid_n * BLOCK_SIZE_R + tl.arange(0, BLOCK_SIZE_R).to(tl.int64)
-            offs_h = offs_n // R
-            offs_r = offs_n % R
+            # Handle y
+            offs_n = pid_n * BLOCK_SIZE_S3 + tl.arange(0, BLOCK_SIZE_S3).to(tl.int64)
+            offs_d = offs_n // S3
+            offs_s = offs_n % S3
 
-            # Load k_pe
-            k_pe_ptrs = (
-                k_pe_ptr
-                + stride_k_pe_m * offs_m[:, None]
-                + stride_k_pe_h * offs_h[None, :]
-                + stride_k_pe_r * offs_r[None, :]
+            # Load y
+            y_ptrs = (
+                y_ptr
+                + stride_y_m * offs_m[:, None]
+                + stride_y_d * offs_d[None, :]
+                + stride_y_s * offs_s[None, :]
             )
-            k_pe_mask = (
+            y_mask = (
                 (offs_m[:, None] < M)
-                & (offs_h[None, :] < H)
-                & (offs_r[None, :] < R)
+                & (offs_d[None, :] < D)
+                & (offs_s[None, :] < S3)
             )
-            k_pe = tl.load(k_pe_ptrs, mask=k_pe_mask)
+            y = tl.load(y_ptrs, mask=y_mask)
 
-            # Concat k_pe to the output matrix k.
-            k_pe_ptrs = (
-                k_ptr
-                + stride_k_out_m * offs_m[:, None]
-                + stride_k_out_k * offs_h[None, :]
-                + stride_k_out_n * (offs_r[None, :] + P)
+            # Concat y to the output matrix C1.
+            c1_ptrs = (
+                c1_ptr
+                + stride_c1_m * offs_m[:, None]
+                + stride_c1_k * offs_d[None, :]
+                + stride_c1_n * (offs_s[None, :] + S1)
             )
-            tl.store(k_pe_ptrs, k_pe, mask=k_pe_mask)
+            tl.store(c1_ptrs, y, mask=y_mask)
         else:
             # SPLIT K
             # Write back the block of the output matrix C with masks.
-            offs_k_out_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-            offs_k_out_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
-            k_out_ptrs = (
-                k_ptr
-                + stride_k_out_m * offs_k_out_m[:, None]
-                + stride_k_out_n * offs_k_out_n[None, :]
-                + stride_k_out_k * pid_k
+            offs_c1_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+            offs_c1_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+            c1_ptrs = (
+                c1_ptr
+                + stride_c1_m * offs_c1_m[:, None]
+                + stride_c1_n * offs_c1_n[None, :]
+                + stride_c1_k * pid_k
             )
-            k_mask = (offs_k_out_m[:, None] < M) & (offs_k_out_n[None, :] < N)
-            tl.store(k_out_ptrs, c, mask=k_mask)
-
+            c1_mask = (offs_c1_m[:, None] < M) & (offs_c1_n[None, :] < N)
+            tl.store(c1_ptrs, c, mask=c1_mask)
 
 
 @triton.jit
-def _fused_kv_proj_cat_reduce_kernel(
+def _fused_gemm_a8w8_blockscale_split_cat_reduce(
     c_ptr,
-    k_ptr,
-    v_ptr,
-    k_pe_ptr,
+    c1_ptr,
+    c2_ptr,
+    y_ptr,
     M,
     N,
-    H,
-    R,
-    P,
-    V,
+    D,
+    S1,
+    S2,
+    S3,
     stride_c_k,
     stride_c_m,
     stride_c_n,
-    stride_k_m,
-    stride_k_h,
-    stride_k_pr,
-    stride_v_m,
-    stride_v_h,
-    stride_v_v,
-    stride_k_pe_m,
-    stride_k_pe_h,
-    stride_k_pe_r,
+    stride_c1_m,
+    stride_c1_d,
+    stride_c1_s,
+    stride_c2_m,
+    stride_c2_d,
+    stride_c2_s,
+    stride_y_m,
+    stride_y_d,
+    stride_y_s,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_R: tl.constexpr,
+    BLOCK_SIZE_S3: tl.constexpr,
     ACTUAL_KSPLIT: tl.constexpr,
     MAX_KSPLIT: tl.constexpr,
 ):
     tl.assume(stride_c_k > 0)
     tl.assume(stride_c_m > 0)
     tl.assume(stride_c_n > 0)
-    tl.assume(stride_k_m > 0)
-    tl.assume(stride_k_pr > 0)
+    tl.assume(stride_c1_m > 0)
+    tl.assume(stride_c1_d > 0)
+    tl.assume(stride_c1_s > 0)
+    tl.assume(stride_c2_m > 0)
+    tl.assume(stride_c2_d > 0)
+    tl.assume(stride_c2_s > 0)
+    tl.assume(stride_y_m > 0)
+    tl.assume(stride_y_s > 0)
 
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -316,69 +320,69 @@ def _fused_kv_proj_cat_reduce_kernel(
         c = tl.load(c_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
     c = tl.sum(c, axis=0)
 
-    c = c.to(k_ptr.type.element_ty)
+    c = c.to(c1_ptr.type.element_ty)
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_h = offs_n // (P + V)
-    offs_pv = offs_n % (P + V)
+    offs_d = offs_n // (S1 + S2)
+    offs_s = offs_n % (S1 + S2)
 
-    # store k_nope to output matrix k
-    k_nope_ptrs = (
-        k_ptr
-        + stride_k_m * offs_m[:, None]
-        + stride_k_h * offs_h[None, :]
-        + stride_k_pr * offs_pv[None, :]
+    # store c to output matrix c1
+    c1_ptrs = (
+        c1_ptr
+        + stride_c1_m * offs_m[:, None]
+        + stride_c1_d * offs_d[None, :]
+        + stride_c1_s * offs_s[None, :]
     )
-    k_nope_mask = (
+    c1_mask = (
         (offs_m[:, None] < M)
-        & (offs_h[None, :] < H)
-        & (offs_pv[None, :] < P)
+        & (offs_d[None, :] < D)
+        & (offs_s[None, :] < S1)
     )
-    tl.store(k_nope_ptrs, c, mask=k_nope_mask)
+    tl.store(c1_ptrs, c, mask=c1_mask)
 
-    # store v to output matrix v
-    v_ptrs = (
-        v_ptr
-        + stride_v_m * offs_m[:, None] 
-        + stride_v_h * offs_h[None, :]
-        + stride_v_v * (offs_pv[None, :] - P)
+    # store c to output matrix c2
+    c2_ptrs = (
+        c2_ptr
+        + stride_c2_m * offs_m[:, None] 
+        + stride_c2_d * offs_d[None, :]
+        + stride_c2_s * (offs_s[None, :] - S1)
     )
-    v_mask = (
+    c2_mask = (
         (offs_m[:, None] < M)
-        & (offs_h[None, :] < H)
-        & (offs_pv[None, :] >= P)
-        & (offs_pv[None, :] < P + V)
+        & (offs_d[None, :] < D)
+        & (offs_s[None, :] >= S1)
+        & (offs_s[None, :] < S1 + S2)
     )
-    tl.store(v_ptrs, c, mask=v_mask)
+    tl.store(c2_ptrs, c, mask=c2_mask)
 
-    # handle k_pe
-    offs_n = pid_n * BLOCK_SIZE_R + tl.arange(0, BLOCK_SIZE_R)
-    offs_h = offs_n // R
-    offs_r = offs_n % R
+    # handle y
+    offs_n = pid_n * BLOCK_SIZE_S3 + tl.arange(0, BLOCK_SIZE_S3)
+    offs_d = offs_n // S3
+    offs_s = offs_n % S3
 
-    # load k_pe
-    k_pe_ptrs = (
-        k_pe_ptr
-        + stride_k_pe_m * offs_m[:, None]
-        + stride_k_pe_h * offs_h[None, :]
-        + stride_k_pe_r * offs_r[None, :]
+    # load y
+    y_ptrs = (
+        y_ptr
+        + stride_y_m * offs_m[:, None]
+        + stride_y_d * offs_d[None, :]
+        + stride_y_s * offs_s[None, :]
     )
-    k_pe_mask = (
+    y_mask = (
         (offs_m[:, None] < M)
-        & (offs_h[None, :] < H)
-        & (offs_r[None, :] < R)
+        & (offs_d[None, :] < D)
+        & (offs_s[None, :] < S3)
     )
-    k_pe = tl.load(k_pe_ptrs, mask=k_pe_mask)
+    y = tl.load(y_ptrs, mask=y_mask)
 
-    # concat k_pe to k_nope
-    k_pe_ptrs = (
-        k_ptr
-        + stride_k_m * offs_m[:, None]
-        + stride_k_h * offs_h[None, :]
-        + stride_k_pr * (offs_r[None, :] + P)
+    # concat y to c1
+    c1_ptrs = (
+        c1_ptr
+        + stride_c1_m * offs_m[:, None]
+        + stride_c1_d * offs_d[None, :]
+        + stride_c1_s * (offs_s[None, :] + S1)
     )
-    tl.store(k_pe_ptrs, k_pe, mask=k_pe_mask)
+    tl.store(c1_ptrs, y, mask=y_mask)
 
 
 @functools.lru_cache(maxsize=1024)

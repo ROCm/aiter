@@ -3,7 +3,7 @@
 
 import torch
 import pytest
-from aiter.ops.triton.fused_kv_proj_cat import fused_kv_proj_cat
+from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import fused_gemm_a8w8_blockscale_split_cat
 
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
@@ -16,46 +16,44 @@ DEVICE_ARCH = arch_info.get_device()
 
 
 def run_torch(
-    kv_c, w, k_pe,
-    kv_c_scale, w_scale,
-    nope_head_dim, v_head_dim,
-    num_heads,
+    x, w, y,
+    x_scale, w_scale,
+    S1, S2, D,
     dtype=torch.bfloat16
 ):
     block_shape_n, block_shape_k = block_shape
-    m, k = kv_c.shape
+    m, c1 = x.shape
     n = w.shape[0]
 
-    kv_c_scale = kv_c_scale.repeat_interleave(block_shape_k, dim=1)
-    kv_c = kv_c.to(kv_c_scale.dtype) * kv_c_scale[:m, :k]
-    kv_c = kv_c.view(m, k)
+    x_scale = x_scale.repeat_interleave(block_shape_k, dim=1)
+    x = x.to(x_scale.dtype) * x_scale[:m, :c1]
+    x = x.view(m, c1)
+
     w_scale = w_scale.repeat_interleave(block_shape_n, dim=0)
     w_scale = w_scale.repeat_interleave(block_shape_k, dim=1)
-    w_scale = w_scale[:n, :k]
+    w_scale = w_scale[:n, :c1]
     w = w.to(w_scale.dtype) * w_scale
 
-    kv_nope = F.linear(kv_c.to(torch.float32), w.to(torch.float32))
-    kv_nope = kv_nope.view(-1, num_heads, nope_head_dim + v_head_dim)
-    k_nope, v = kv_nope.split([nope_head_dim, v_head_dim], dim=-1)
-    k = torch.cat([k_nope, k_pe.expand((*k_nope.shape[:-1], -1))], dim=-1)
+    c = F.linear(x.to(torch.float32), w.to(torch.float32))
+    c = c.view(-1, D, S1 + S2)
+    c1, c2 = c.split([S1, S2], dim=-1)
+    c1 = torch.cat([c1, y.expand((*c1.shape[:-1], -1))], dim=-1)
 
-    return k.to(dtype), v.to(dtype)
+    return c1.to(dtype), c2.to(dtype)
 
 
 def run_triton(
-    kv_c, w, k_pe,
-    kv_c_scale, w_scale,
-    nope_head_dim, v_head_dim,
-    num_heads,
+    x, w, y,
+    x_scale, w_scale,
+    S1, S2, D,
     dtype=torch.bfloat16
 ):
-    m = kv_c.shape[0]
-    h = num_heads
+    m = x.shape[0]
 
-    return fused_kv_proj_cat(
-        kv_c, w, k_pe.expand(m, h, -1),
-        kv_c_scale, w_scale,
-        nope_head_dim, v_head_dim,
+    return fused_gemm_a8w8_blockscale_split_cat(
+        x, w, y.expand(m, D, -1),
+        x_scale, w_scale,
+        S1, S2,
         dtype
     )
 
@@ -131,11 +129,11 @@ def get_shapes():
     return x_vals
 
 
-def generate_fused_kv_proj_cat_inputs(
+def generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
     M: int,
     N: int,
     K: int,
-    R: int,
+    S3: int,
     block_shape_n: int,
     block_shape_k: int,
     dtype=torch.bfloat16,
@@ -143,16 +141,17 @@ def generate_fused_kv_proj_cat_inputs(
 ):
     """
     The GEMM kernel expects:
-    - kv_c: (M, K) -> row-major format
+    - x: (M, K) -> row-major format
     - w: (N, K) -> column-major format
+    - y: (M, D, S3)
     """
     scale_n = (N + block_shape_n - 1) // block_shape_n
     scale_k = (K + block_shape_k - 1) // block_shape_k
 
     if layout[0] == "T":
-        kv_c = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(e4m3_type)
+        x = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(e4m3_type)
     else:
-        kv_c = (
+        x = (
             (torch.rand((K, M), dtype=torch.float16, device="cuda") / 10)
             .to(e4m3_type)
             .T
@@ -169,26 +168,26 @@ def generate_fused_kv_proj_cat_inputs(
             .T
         )
 
-    kv_c_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
+    x_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
 
-    k_pe = torch.rand((M, R), dtype=torch.bfloat16, device="cuda").unsqueeze(1)
+    y = torch.rand((M, S3), dtype=torch.bfloat16, device="cuda").unsqueeze(1)
 
-    return kv_c, w, k_pe, kv_c_scale, w_scale
+    return x, w, y, x_scale, w_scale
 
 
 @pytest.mark.parametrize(
-    "dtype, M, N, K, H, R, layout",
+    "dtype, M, N, K, D, S3, layout",
     [
-        (dtype, *shape, num_heads, nope_dim, layout)
+        (dtype, *shape, d, s3, layout)
         for dtype in ["bf16"]
         for shape in get_shapes()
-        for num_heads in [16, 32, 64, 128]
-        for nope_dim in [16, 32, 64, 128]
+        for d in [16, 32, 64, 128]
+        for s3 in [16, 32, 64, 128]
         for layout in ["TN", "TT", "NN", "NT"]
     ],
 )
-def test_fused_kv_proj_cat(dtype, M, N, K, H, R, layout):
+def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()
 
@@ -200,30 +199,30 @@ def test_fused_kv_proj_cat(dtype, M, N, K, H, R, layout):
             "Latest upstream compiler as of Aug 22 (necessary for Gluon) causes"
             " infinite hang when EVEN_K is false. Try seeing if it's fixed if it's been a while."
         )
-    if N % H != 0:
+    if N % D != 0:
         pytest.skip(
-            "N must be divisible by H as N = H * (P + V)"
+            "N must be divisible by D as N = D * (S1 + S2)"
         )
 
     # deconstruct N
-    PV = N // H
-    P = PV // 2
-    V = PV - P
+    S = N // D
+    S1 = S // 2
+    S2 = S - S1
 
     dtype = str_to_torch_dtype[dtype]
-    kv_c, w, k_pe, kv_c_scale, w_scale = generate_fused_kv_proj_cat_inputs(
+    x, w, y, x_scale, w_scale = generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
         M,
         N,
         K,
-        R,
+        S3,
         block_shape_n,
         block_shape_k,
         dtype=dtype,
         layout=layout,
     )
 
-    k_torch, v_torch = run_torch(kv_c, w, k_pe, kv_c_scale, w_scale, P, V, H, dtype)
-    k_triton, v_triton = run_triton(kv_c, w, k_pe, kv_c_scale, w_scale, P, V, H, dtype)
+    c1_torch, c2_torch = run_torch(x, w, y, x_scale, w_scale, S1, S2, D, dtype)
+    c1_triton, c2_triton = run_triton(x, w, y, x_scale, w_scale, S1, S2, D, dtype)
 
-    torch.testing.assert_close(k_torch, k_triton, atol=0.01, rtol=1e-2)
-    torch.testing.assert_close(v_torch, v_triton, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(c1_torch, c1_triton, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(c2_torch, c2_triton, atol=0.01, rtol=1e-2)
