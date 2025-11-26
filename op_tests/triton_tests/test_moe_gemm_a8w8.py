@@ -314,20 +314,19 @@ def test_op(
         x_ref = (x_tri.float() * x_static_scale).to(torch.bfloat16)
         out_dtype = torch.float8_e4m3fn
 
-    if act_mxfp8 or weight_mxfp8:
-        maxtol = 4e-1
-        rmstol = 4e-2
-    else:
-        maxtol = 4e-1
-        rmstol = 5e-2
-
     ref_y = moe_gemm_torch(
         x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
     )
     if not act_mxfp8 and fused_quant:
         quant_static_scale = ref_y.abs().max().float() / 448.0
+        out_dtype = torch.float8_e4m3fn
+        maxtol = 4e-1
+        rmstol = 4e-2
     else:
         quant_static_scale = None
+        out_dtype = torch.bfloat16
+        maxtol = 4e-2
+        rmstol = None
     tri_y = moe_gemm_a8w8(
         x_tri,
         w_tri,
