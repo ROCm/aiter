@@ -116,7 +116,8 @@ __device__ __forceinline__ void warp_rms_norm_(
 
 template <typename T, int VEC_SIZE, int HEAD_SIZE, bool IS_INTERLEAVED, int M>
 __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE> &out,
-                                                       const T *cos_sin, const int64_t *positions, int64_t token_id, int64_t num_tokens,
+                                                       const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
+                                                       int64_t token_id, int64_t num_tokens,
                                                        int access_id_in_head, std::array<int64_t, M> &mrope_section) {
     constexpr int HALF_HEAD_SIZE = HEAD_SIZE / 2;
     if constexpr (IS_INTERLEAVED) {
@@ -125,10 +126,10 @@ __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE> &out,
             auto id_ = (access_id_in_head < HALF_HEAD_SIZE) ? id : id - HALF_HEAD_SIZE;
             auto mid_ = id_ % M;
             if (mid_ >= 1 && id_ < mrope_section[mid_] * M) {
-                auto p = positions[mid_ * num_tokens + token_id];
+                auto p = positions[mid_ * ps0 + token_id * ps1];
                 out[i] = cos_sin[p * HEAD_SIZE + id];
             } else {
-                out[i] = cos_sin[positions[token_id] * HEAD_SIZE + id];
+                out[i] = cos_sin[positions[token_id * ps1] * HEAD_SIZE + id];
             }
         }
     } else {
@@ -142,7 +143,7 @@ __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE> &out,
                 if (id_ < end)
                     break;
             }
-            auto p = positions[mid * num_tokens + token_id];
+            auto p = positions[mid * ps0 + token_id * ps1];
             out[i] = cos_sin[p * HEAD_SIZE + id];
         }
     }
@@ -150,7 +151,7 @@ __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE> &out,
 
 template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED, int M>
 __global__ void fused_mrope_rms_neox_kernel(
-    T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions,
+    T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps) {
     constexpr int VEC_SIZE = HEAD_SIZE / 32;
@@ -180,9 +181,9 @@ __global__ void fused_mrope_rms_neox_kernel(
     x_vec.load(qkv_ + access_id_in_head);
     if constexpr (IS_MROPE) {
         mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
-            cos_sin_vec, cos_sin, positions, token_id, num_tokens, access_id_in_head, mrope_section);
+            cos_sin_vec, cos_sin, positions, ps0, ps1, token_id, num_tokens, access_id_in_head, mrope_section);
     } else {
-        auto position_ = positions[token_id];
+        auto position_ = positions[token_id * ps1];
         cos_sin_vec.load(&cos_sin[position_ * HEAD_SIZE + access_id_in_head]);
     }
 
@@ -206,7 +207,7 @@ __global__ void fused_mrope_rms_neox_kernel(
 
 template <typename T, int HEAD_SIZE, bool IS_MROPE, bool IS_INTERLEAVED, int M>
 __global__ void fused_mrope_rms_noneox_kernel(
-    T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions,
+    T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, double eps,
     std::array<int64_t, M> mrope_section, int64_t num_tokens, int64_t total_warps) {
     constexpr int VEC_SIZE = HEAD_SIZE / 32;
@@ -235,11 +236,11 @@ __global__ void fused_mrope_rms_noneox_kernel(
     x_vec.load(qkv_ + access_id_in_head);
     if constexpr (IS_MROPE) {
         mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
-            cos_vec, cos_sin, positions, token_id, num_tokens, access_id_in_head / 2, mrope_section);
+            cos_vec, cos_sin, positions, ps0, ps1, token_id, num_tokens, access_id_in_head / 2, mrope_section);
         mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
-            sin_vec, cos_sin, positions, token_id, num_tokens, access_id_in_head / 2 + HALF_HEAD_SIZE, mrope_section);
+            sin_vec, cos_sin, positions, ps0, ps1, token_id, num_tokens, access_id_in_head / 2 + HALF_HEAD_SIZE, mrope_section);
     } else {
-        auto position_ = positions[token_id];
+        auto position_ = positions[token_id * ps1];
         cos_vec.load(&cos_sin[position_ * HEAD_SIZE + access_id_in_head / 2]);
         sin_vec.load(&cos_sin[position_ * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
     }
@@ -295,7 +296,7 @@ void fused_rope_rms(
 
 template <typename T, int M>
 void fused_mrope_rms(
-    T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions,
+    T *qkv, const T *q_w, const T *k_w, const T *cos_sin, const int64_t *positions, int64_t ps0, int64_t ps1,
     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
     bool is_neox_style, double eps, std::array<int64_t, M> mrope_section, bool is_interleaved, hipStream_t stream) {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
@@ -310,10 +311,10 @@ void fused_mrope_rms(
 #define DISPATCH_NEOX(HEAD_SIZE, IS_INTERLEAVED)                                                                                    \
     if (is_neox_style) {                                                                                                            \
         fused_mrope_rms_neox_kernel<T, HEAD_SIZE, true, IS_INTERLEAVED, M><<<numBlocks, threadsPerBlock, 0, stream>>>(              \
-            qkv, q_w, k_w, cos_sin, positions, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps); \
+            qkv, q_w, k_w, cos_sin, positions, ps0, ps1, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps); \
     } else {                                                                                                                        \
         fused_mrope_rms_noneox_kernel<T, HEAD_SIZE, true, IS_INTERLEAVED, M><<<numBlocks, threadsPerBlock, 0, stream>>>(            \
-            qkv, q_w, k_w, cos_sin, positions, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps); \
+            qkv, q_w, k_w, cos_sin, positions, ps0, ps1, num_heads_q, num_heads_k, num_heads_v, eps, mrope_section, num_tokens, total_warps); \
     }
 
     if (is_interleaved) {
@@ -366,12 +367,15 @@ void fused_mrope_3d_rms(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Te
                     int64_t num_tokens, int64_t num_heads_q, int64_t num_heads_k, int64_t num_heads_v, int64_t head_size,
                     bool is_neox_style, std::vector<int64_t> mrope_section_, bool is_interleaved, double eps) {
     TORCH_CHECK(mrope_section_.size() == 3);
+    TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() && cos_sin.is_contiguous());
     std::array<int64_t, 3> mrope_section;
     mrope_section[0] = mrope_section_[0];
     mrope_section[1] = mrope_section_[1];
     mrope_section[2] = mrope_section_[2];
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(qkv));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    auto pos_strides = positions.strides();
+    TORCH_CHECK(pos_strides.size() == 2);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         kBFloat16,
         kHalf,
@@ -384,6 +388,8 @@ void fused_mrope_3d_rms(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Te
                 (T*)kw.data_ptr<scalar_t>(),
                 (T*)cos_sin.data_ptr<scalar_t>(),
                 positions.data_ptr<int64_t>(),
+                pos_strides[0],
+                pos_strides[1],
                 num_tokens,
                 num_heads_q,
                 num_heads_k,
@@ -396,4 +402,3 @@ void fused_mrope_3d_rms(Tensor &qkv, Tensor &qw, Tensor &kw, Tensor &cos_sin, Te
                 stream);
         });
 }
-
