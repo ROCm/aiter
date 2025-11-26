@@ -319,7 +319,6 @@ FMoeKernel* get_heuristic_kernel(
             num_persistent_tgs = cfg.tg_num_perCU * num_cu;
         else
             num_persistent_tgs = 0;
-	printf("DEBUG_LOG: fmoe will be using %s kernel \n", name);
         if(result.second)
             result.first->second =
                 std::make_unique<FMoeKernel>(name, co_name, cfg.subGU_n, num_persistent_tgs);
