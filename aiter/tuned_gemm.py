@@ -320,7 +320,16 @@ class TunedGemm:
         self.tune_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
         if self.save_gemm == 1:
             self.tuned_df = pd.DataFrame(
-                columns=["M", "N", "K", "bias", "dtype", "outdtype", "scaleAB"]
+                columns=[
+                    "M",
+                    "N",
+                    "K",
+                    "bias",
+                    "dtype",
+                    "outdtype",
+                    "scaleAB",
+                    "bpreshuffle",
+                ]
             )
         else:
             self.tuned_df = None
@@ -352,10 +361,12 @@ class TunedGemm:
             scale_c=scale_c,
             bpreshuffle=bpreshuffle,
         )
-        self.save_untuned_shapes(inp, weights, bias, otype, scale_a, scale_b, scale_c)
+        self.save_shapes(
+            inp, weights, bias, otype, scale_a, scale_b, scale_c, bpreshuffle
+        )
         return out
 
-    def save_untuned_shapes(
+    def save_shapes(
         self,
         A,
         B,
@@ -364,10 +375,10 @@ class TunedGemm:
         scale_a,
         scale_b,
         scale_c,
+        bpreshuffle,
     ):
         if A.dim() >= 3:
             inp_view = A.view(-1, A.size(-1))
-            batched = True
         else:
             inp_view = A
         m, k = inp_view.shape
@@ -389,6 +400,7 @@ class TunedGemm:
                             "dtype": [dtype],
                             "outdtype": [otype],
                             "scaleAB": [scaleAB],
+                            "bpreshuffle": [bpreshuffle],
                         }
                     ),
                 ]

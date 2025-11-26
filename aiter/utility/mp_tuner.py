@@ -208,25 +208,22 @@ def mp_tuner(
         ref_data_index = np.searchsorted(
             cumulative, np.arange(len(task_group)), side="right"
         )
-    try:
-        rets = [
-            pool.apply_async(
-                work_group,
-                args=(
-                    gpu_map,
-                    fast_mode,
-                    err_ratio,
-                    in_datas[ref_data_index[k]],
-                    task_group[k],
-                ),
-            )
-            for k in range(len(task_group))
-        ]
-    except Exception as e:
-        print("error is ", e)
-    finally:
-        pool.close()
-        pool.join()
+
+    rets = [
+        pool.apply_async(
+            work_group,
+            args=(
+                gpu_map,
+                fast_mode,
+                err_ratio,
+                in_datas[ref_data_index[k]],
+                task_group[k],
+            ),
+        )
+        for k in range(len(task_group))
+    ]
+    pool.close()
+    pool.join()
 
     import itertools
 
