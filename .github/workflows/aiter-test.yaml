@@ -87,7 +87,7 @@ jobs:
       
       - name: Generate Dockerfile
         run: |
-          cat <<EOF > aiter/Dockerfile.mod
+          cat <<EOF > Dockerfile.mod
           FROM ${{ env.DOCKER_IMAGE }}
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
@@ -103,12 +103,12 @@ jobs:
           EOF
 
       - name: Show Dockerfile
-        run: cat aiter/Dockerfile.mod
+        run: cat Dockerfile.mod
 
       - name: Build Docker image
         run: |
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
-          cd aiter && docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
+          docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
 
       - name: Push Docker image
         run: |
