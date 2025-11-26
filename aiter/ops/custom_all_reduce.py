@@ -26,6 +26,7 @@ def all_reduce(
     _fa: int,
     inp: torch.Tensor,
     out: torch.Tensor,
+    use_new: bool,
     open_fp8_quant: bool,
     reg_buffer: Optional[torch.Tensor] = None,
 ) -> None: ...
@@ -45,6 +46,7 @@ def all_gather_unreg(
 def fused_allreduce_rmsnorm(
     _fa: int,
     inp: torch.Tensor,
+    res_inp: torch.Tensor,
     res_out: torch.Tensor,
     out: torch.Tensor,
     w: torch.Tensor,

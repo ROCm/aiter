@@ -8,7 +8,6 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -149,7 +148,8 @@ def test_mla(
     kvtype,
     page_size,
     varlen,
-    mtp,
+    decode_qlen,
+    max_split_per_batch,
 ):
     ret = {}
 
@@ -199,9 +199,9 @@ def test_mla(
 
     # ############################## absorb: decode
     # seq_lens_qo = torch.randint(1, 5, (batch_size,), dtype=torch.int)
-    # if nhead == 16 and mtp != 1:
+    # if nhead == 16 and decode_qlen != 1:
     #     return
-    seq_lens_qo.fill_(mtp)
+    seq_lens_qo.fill_(decode_qlen)
 
     max_seqlen_qo = seq_lens_qo.max().item()
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -274,8 +274,11 @@ def test_mla(
         reduce_partial_map,
         kv_granularity=max(page_size, 16),
         max_seqlen_qo=int(max_seqlen_qo),
-        uni_seqlen_qo=mtp,
+        uni_seqlen_qo=decode_qlen,
         fast_mode=True,
+        max_split_per_batch=max_split_per_batch,
+        dtype_q=q.dtype,
+        dtype_kv=kv_buffer.dtype,
     )
 
     def test_absorb_decode_bf16():
@@ -293,6 +296,7 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
+            num_kv_splits=max_split_per_batch,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
             work_info_set=work_info_set,
@@ -353,6 +357,7 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
+            num_kv_splits=max_split_per_batch,
             q_scale=q_scale,
             kv_scale=kv_scale,
             work_meta_data=work_meta_data,
@@ -385,7 +390,7 @@ def test_mla(
     err = None
     us_asm_decode = 1e12
     if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and (
-        nhead == 16 or (nhead in range(32, 128, 16) and mtp == 1)
+        (nhead in [16]) or (decode_qlen == 1 and nhead in range(32, 128 + 1, 16))
     ):
         err, us_asm_decode = test_absorb_decode_bf16()
     elif kvtype == dtypes.fp8 and nhead in [16, 128]:
@@ -393,7 +398,7 @@ def test_mla(
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
 
-    flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+    flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
     bytes = (
         total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
         + total_q * nhead * qk_head_dim * (torch.finfo(dtype).bits // 8)
@@ -510,6 +515,15 @@ parser.add_argument(
     e.g.: -n 16,1""",
 )
 parser.add_argument(
+    "-ms",
+    "--max_split_per_batch",
+    type=int,
+    nargs="*",
+    default=[16, 32],
+    help="""kv seqlens max split num for per batch.
+    e.g.: -ms 32""",
+)
+parser.add_argument(
     "--varlen",
     action="store_true",
     help="""variable kv seqlens per batch. Default: False.
@@ -524,10 +538,10 @@ l_kv_dtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
 if args.nhead is not None:
     list_nhead = [args.nhead]
 
-for nhead, mtp in list_nhead:
+for nhead, decode_qlen in list_nhead:
     df = []
-    for dtype, kvtype, ctx_len, batch_size in itertools.product(
-        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize
+    for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
+        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
     ):
         ret = test_mla(
             ctx_len,
@@ -541,9 +555,10 @@ for nhead, mtp in list_nhead:
             kvtype,
             args.block_size,
             varlen=args.varlen,
-            mtp=mtp,
+            decode_qlen=decode_qlen,
+            max_split_per_batch=max_split_per_batch,
         )
         df.append(ret)
     df = pd.DataFrame(df)
-    # df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")
+    # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
     aiter.logger.info(f"summary:\n{df}")

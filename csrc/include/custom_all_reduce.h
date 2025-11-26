@@ -31,6 +31,7 @@ fptr_t init_custom_ar(torch::Tensor& meta,
 void all_reduce(fptr_t _fa,
                 torch::Tensor& inp,
                 torch::Tensor& out,
+                bool use_new,
                 bool open_fp8_quant,
                 std::optional<torch::Tensor> reg_buffer);
 void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
@@ -40,6 +41,7 @@ void all_gather_unreg(fptr_t _fa,
                       torch::Tensor& out);
 void fused_allreduce_rmsnorm(fptr_t _fa,
                 torch::Tensor& inp,
+                torch::Tensor& res_inp,
                 torch::Tensor& res_out,
                 torch::Tensor& out,
                 torch::Tensor& w,

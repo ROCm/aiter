@@ -45,6 +45,8 @@ struct __attribute__((packed)) KernelArgs
     p2 _p21;
     void* ptr_KVSCALE;
     p2 _p22;
+    unsigned int out_16_nosplit;
+    p3 _p23;
 };
 
 void mla_decode_stage1_asm_fwd(
@@ -98,6 +100,7 @@ void mla_decode_stage1_asm_fwd(
     args.s_Q_Bs      = stride_Q;
     args.s_Bs        = stride_Page;
     args.s_log2_plen = log2_page;
+    args.out_16_nosplit = kv_split;
 
     if (persistent)
     {
@@ -126,8 +129,8 @@ void mla_decode_stage1_asm_fwd(
     {
         args.ptr_STP = num_kv_splits_indptr.value().data_ptr();
     }
-	args.ptr_RP = output.data_ptr();
-
+    args.ptr_RP = output.data_ptr(); //final output
+    
 
     // std::cout << "mla args" << std::endl;
     // std::cout << "ptr_R: " << args.ptr_R << std::endl;
@@ -146,6 +149,7 @@ void mla_decode_stage1_asm_fwd(
     // std::cout << "ptr_RP: " << args.ptr_RP << std::endl;
     // std::cout << "ptr_QTP: " << args.ptr_QTP << std::endl;
     // std::cout << "ptr_STP: " << args.ptr_STP << std::endl;
+    // std::cout << "out_16_nosplit: " << args.out_16_nosplit << std::endl;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -233,11 +237,6 @@ void mla_decode_stage1_asm_fwd(
         assert(q_scale.value().data_ptr() != nullptr && kv_scale.value().data_ptr() != nullptr);
         args.ptr_QSCALE  = q_scale.value().data_ptr();
         args.ptr_KVSCALE = kv_scale.value().data_ptr();
-
-        if(!persistent && kv_split == 1)
-        {
-            args.ptr_R = output.data_ptr();
-        }
 
         if(gqa_ratio == 16)
         {

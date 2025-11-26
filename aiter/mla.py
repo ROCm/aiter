@@ -3,14 +3,15 @@
 
 # user interface
 
+import functools
+
 import torch
-import aiter
-from aiter import dtypes
 import triton
 import triton.language as tl
-import functools
+
+import aiter
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 
 @triton.jit
@@ -21,11 +22,11 @@ def _fwd_kernel_stage2_asm(
     qo_indptr,
     kv_indptr,
     num_kv_splits_indptr,
-    stride_mid_ob,
-    stride_mid_oh,
-    stride_mid_os,
-    stride_obs,
-    stride_oh,
+    stride_mid_ob: tl.int64,
+    stride_mid_oh: tl.int64,
+    stride_mid_os: tl.int64,
+    stride_obs: tl.int64,
+    stride_oh: tl.int64,
     MAYBE_FINAL_OUT: tl.constexpr,
     BATCH_NUM: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -96,7 +97,7 @@ def _fwd_kernel_stage2_asm(
             )
 
 
-@functools.lru_cache()
+@functools.lru_cache(maxsize=1)
 def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     if num_kv_splits is None:
         cu_num = get_cu_num()
@@ -128,7 +129,7 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         512: 32,
     }
 
-    if dtype == get_fp8_e4m3_dtype():
+    if dtype == dtypes.fp8:
         min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
         num_kv_splits = min(
             num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n
@@ -138,7 +139,12 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     mgc = get_mgc[nhead]
     if max_seqlen_q == 1 and nhead == 16:
         mgc = 64
-    return num_kv_splits, mgc
+
+    num_kv_splits_indptr = torch.arange(
+        0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
+    )
+
+    return num_kv_splits, mgc, num_kv_splits_indptr
 
 
 def mla_decode_fwd(
@@ -176,30 +182,34 @@ def mla_decode_fwd(
 
     persistent_mode = work_meta_data is not None
 
-    if num_kv_splits_indptr is None and not persistent_mode:
-        num_kv_splits, mgc = get_meta_param(
-            None, bs, total_kv, nhead, max_seqlen_q, q.dtype
-        )
-        num_kv_splits_indptr = torch.arange(
-            0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device=device
-        )
-
-    if num_kv_splits is None:
-        num_kv_splits = get_cu_num()
-
     io_transformed = False
 
     if not persistent_mode:
+        num_kv_splits, mgc, num_kv_splits_indptr = get_meta_param(
+            num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
+        )
+
         MAYBE_FINAL_OUT = True
 
         if nhead == 16 and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
 
-        logits = torch.empty(
-            (total_s, num_kv_splits, nhead, v_head_dim),
-            dtype=dtypes.fp32,
-            device=device,
+        logits = (
+            o.view((total_s, num_kv_splits, nhead, v_head_dim))
+            if (
+                num_kv_splits == 1
+                and (
+                    q.dtype == dtypes.fp8
+                    or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+                )
+            )
+            else torch.empty(
+                (total_s, num_kv_splits, nhead, v_head_dim),
+                dtype=dtypes.fp32,
+                device=device,
+            )
         )
+
         attn_lse = torch.empty(
             (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
         )
@@ -225,7 +235,9 @@ def mla_decode_fwd(
             kv_scale,
         )
 
-        if num_kv_splits == 1 and q.dtype != torch.bfloat16:
+        if num_kv_splits == 1 and (
+            q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+        ):
             return logits.view(total_s, nhead, v_head_dim), attn_lse
 
         Lv = v_head_dim
@@ -255,10 +267,12 @@ def mla_decode_fwd(
             **extra_kargs,
         )
     else:
-        if nhead == 16 or (nhead == 128 and kv_buffer.dtype == get_fp8_e4m3_dtype()):
+        if num_kv_splits is None:
+            num_kv_splits = get_cu_num()
+        if nhead == 16 or (nhead == 128 and kv_buffer.dtype == dtypes.fp8):
             # Natively support cases
             pass
-        elif nhead in range(32, 512 + 1, 16) and persistent_mode and max_seqlen_q == 1:
+        elif nhead in range(32, 128 + 1, 16) and persistent_mode and max_seqlen_q == 1:
             # we use nhead=16 to simulate such cases by customized metadata
             # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
             total_s = ori_total_s * (ori_nhead // 16)
