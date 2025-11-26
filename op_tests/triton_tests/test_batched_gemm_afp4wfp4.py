@@ -58,7 +58,7 @@ def generate_batched_gemm_afp4wfp4_inputs(
         124, 128, (B, K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device="cuda"
     )
     x_scales = x_scales.transpose(1, 2)
-    w_scales = w_scales.transpose(1, 2).contiguous()
+    w_scales = w_scales.transpose(1, 2)
 
     y = None
     if output:
