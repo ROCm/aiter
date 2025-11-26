@@ -97,7 +97,7 @@ jobs:
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
-          RUN cd aiter && PREBUILD_KERNELS=1 GPU_ARCHS="gfx942,gfx950" python3 setup.py develop
+          RUN PREBUILD_KERNELS=1 GPU_ARCHS="gfx942,gfx950" python3 setup.py develop
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
