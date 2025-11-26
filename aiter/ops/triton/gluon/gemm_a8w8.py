@@ -128,6 +128,12 @@ def _gemm_a8w8_kernel(
     smem_b = gl.allocate_shared_memory(
         b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
     )
+    smem_a_0 = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
+    )
+    smem_b_0 = gl.allocate_shared_memory(
+        b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
+    )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=16
     )
@@ -158,25 +164,54 @@ def _gemm_a8w8_kernel(
     acc = gl.zeros(
         (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=mfma_layout
     )
-    zeros = gl.zeros(
-        (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=mfma_layout
-    )
     
-    for k in range(0, gl.cdiv(K, BLOCK_SIZE_K)):
-        a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a)
-        b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b)
-        
-        smem_a.store(a)
-        smem_b.store(b)
-        
-        cur_a = smem_a.load(layout=dot_a_layout)
-        cur_b = smem_b.load(layout=dot_b_layout)
-        
-        acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)
+    num_iters = gl.cdiv(K, BLOCK_SIZE_K)
+    
+    a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a)
+    b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b)
+    
+    smem_a.store(a)
+    smem_b.store(b)
+    for k in range(0, num_iters - 1):
+        if k % 2 == 0:
+            smem_a_read = smem_a
+            smem_b_read = smem_b
+            smem_a_write = smem_a_0
+            smem_b_write = smem_b_0
+        else:
+            smem_a_read = smem_a_0
+            smem_b_read = smem_b_0
+            smem_a_write = smem_a
+            smem_b_write = smem_b
         
         offs_a += BLOCK_SIZE_K * stride_ak
         offs_b += BLOCK_SIZE_K * stride_bk
         
+        cur_a = smem_a_read.load(layout=dot_a_layout)
+        cur_b = smem_b_read.load(layout=dot_b_layout)
+        
+        a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a)
+        b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b)
+        
+        acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)
+        
+        smem_a_write.store(a)
+        smem_b_write.store(b)
+    
+    if (num_iters - 1) % 2 == 0:
+        smem_a_read = smem_a
+        smem_b_read = smem_b
+        smem_a_write = smem_a_0
+        smem_b_write = smem_b_0
+    else:
+        smem_a_read = smem_a_0
+        smem_b_read = smem_b_0
+        smem_a_write = smem_a
+        smem_b_write = smem_b
+        
+    cur_a = smem_a_read.load(layout=dot_a_layout)
+    cur_b = smem_b_read.load(layout=dot_b_layout)
+    acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)    
     acc = acc * a_scale[:, None] * b_scale[None, :]
         
     # ====== Epilogue ======
