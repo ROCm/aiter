@@ -157,6 +157,10 @@ def fused_moe_fake(
     num_local_tokens: Optional[torch.Tensor] = None,
     moe_sorting_dispatch_policy: bool = 0,
     dtype: Optional[torch.dtype] = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: Optional[torch.Tensor] = None,
+    bias2: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
