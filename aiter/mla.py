@@ -4,6 +4,7 @@
 # user interface
 
 import functools
+from typing import Optional
 
 import torch
 import triton
@@ -387,3 +388,64 @@ def mla_prefill_fwd(
 
     # return logits.view(bs, nhead, v_head_dim).to(o.dtype), attn_lse
     return o.view(bs, nhead, v_head_dim), attn_lse
+
+
+def mla_ps_prefill_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    output: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: Optional[torch.Tensor],
+    work_info_set: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    is_causal: bool,
+    reduce_indptr: Optional[torch.Tensor] = None,
+    reduce_final_map: Optional[torch.Tensor] = None,
+    reduce_partial_map: Optional[torch.Tensor] = None,
+    softmax_scale: float = None,
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+) -> None:
+    device = Q.device
+    total_s, nhead, v_head_dim = output.shape
+    if softmax_scale is None:
+        softmax_scale = 1.0 / (v_head_dim**0.5)
+
+    bs, _, _ = output.shape
+
+    num_kv_splits = 1
+
+    # logits = o.view(bs, num_kv_splits, nhead, v_head_dim)
+    logits = torch.empty(
+        (bs, num_kv_splits, nhead, v_head_dim), dtype=dtypes.fp32, device=device
+    )
+    attn_lse = torch.empty(
+        (bs, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
+    )
+
+    aiter.mla_ps_prefill_asm_fwd(
+        Q,
+        K,
+        V,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        work_indptr,
+        work_info_set,
+        max_seqlen_q,
+        softmax_scale,
+        is_causal,
+        logits,
+        attn_lse,
+        output,
+        q_scale,
+        k_scale,
+        v_scale,
+    )
+    return output.view(bs, nhead, v_head_dim), attn_lse
+
+    # We will add reduce later, now use non split
