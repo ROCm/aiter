@@ -88,9 +88,17 @@ jobs:
           RUN git clone ${{ env.GITHUB_REPO_URL }} \
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
-           && git submodule update --init --recursive \
+           && if [[ ${{ github.ref }} == "refs/heads/main" ]]; then
+              echo "It's main branch, syncing latest CK..."
+              git submodule sync
+              git submodule update --init --recursive --remote --depth 1 --jobs 4
+            else
+              echo "It's a PR branch, syncing specific CK..."
+              git submodule sync
+              git submodule update --init --recursive --depth 1 --jobs 4
+            fi
            && pip install -r requirements.txt \
-           && ls -a $(pwd) \
+           && ls -all \
            && PREBUILD_KERNELS=1 GPU_ARCHS=gfx950 python setup.py develop
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
