@@ -190,8 +190,8 @@ class Case:
             # TP1
             Case(
                 16,
-                7168,
                 4096,
+                7168,
                 "mxfloat8_e4m3fn",
                 "mxfloat8_e4m3fn",
                 256,
@@ -200,8 +200,8 @@ class Case:
             ),
             Case(
                 1024,
-                2048,
                 7168,
+                2048,
                 "mxfloat8_e4m3fn",
                 "mxfloat8_e4m3fn",
                 256,
