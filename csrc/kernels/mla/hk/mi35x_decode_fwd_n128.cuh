@@ -15,6 +15,43 @@ namespace hkdart = hk::ducks::art;
 namespace hkm    = hk::macros;
 namespace ckt    = ck_tile;
 
+// ================================================================
+// Temp Helper functions
+// ================================================================
+union FUI
+{
+    uint32_t ui;
+    hk::fp8e4m3_4 fp8_4;
+    struct
+    {
+        ckt::fp8_t x;
+        ckt::fp8_t y;
+        ckt::fp8_t z;
+        ckt::fp8_t w;
+    };
+};
+__device__ float4 convert_fp8x4_to_float4(FUI in)
+{
+    static constexpr __hip_fp8_interpretation_t interpret = __HIP_E4M3_FNUZ;
+    float4 r;
+    r.x = static_cast<float>(__half(__hip_cvt_fp8_to_halfraw(in.x, interpret)));
+    r.y = static_cast<float>(__half(__hip_cvt_fp8_to_halfraw(in.y, interpret)));
+    r.z = static_cast<float>(__half(__hip_cvt_fp8_to_halfraw(in.z, interpret)));
+    r.w = static_cast<float>(__half(__hip_cvt_fp8_to_halfraw(in.w, interpret)));
+    return r;
+}
+
+template <int GPR>
+__device__ constexpr int reg_2_loc_q()
+{
+    constexpr int off = GPR - 92;
+    return (off % 2) * 4 + (off / 2) * 32;
+}
+
+// ================================================================
+// Main part
+// ================================================================
+
 template <typename q_t_, typename kv_t_, typename out_t_, int32_t kQoNumHead_>
 struct HkMlaDecodeFwdTraits
 {
@@ -29,16 +66,20 @@ struct HkMlaDecodeFwdTraits
     static constexpr int32_t kNumWarps      = 8;
     static constexpr int32_t kNumThreads    = kNumWarps * ckt::get_warp_size();
     static constexpr int32_t kOccupancy     = 1;
-    static constexpr int32_t kBlockM        = 128;
-    static constexpr int32_t kWarpBlockM    = kBlockM / kNumWarps;
+    static constexpr int32_t kBlockM        = 128; // Block=ThreadBlock
     static constexpr int32_t kBlockN        = 16;
+    static constexpr int32_t kTileM         = kBlockM / kNumWarps; // Tile=ThreadWarp
+    static constexpr int32_t kNumTilesM     = kBlockM / kTileM;
+
+    static_assert(kBlockM == kQoNumHead, "Only supports nhead=128!");
 
     // base types
     using q_t   = q_t_;
     using kv_t  = kv_t_;
     using out_t = out_t_;
     // global memory tiles
-    using gl_q = hk::gl<q_t, 1, -1, kQoNumHead, kQkHeadDim>; // [1, #batch*#seqlen, #head, 576]
+    using gl_q = hk::gl<q_t, -1, kNumTilesM, kTileM, kQkHeadDim>; // [#batch*#seqlen, #warp, #head /
+                                                                  // #warp, 576]
     using gl_kv =
         hk::gl<kv_t, -1, kPageSize, kKvNumHead, kQkHeadDim>; // [#page, page_size, #head_kv, 576]
     using gl_o    = hk::gl<out_t, 1, -1, kQoNumHead, kVoHeadDim>; // [1, #batch*#seqlen, #head, 512]
@@ -79,6 +120,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
     using G = hk::group<T::kNumWarps>;
 
+    const int32_t worker_idx     = blockIdx.x;
+    const int32_t work_start_idx = __builtin_amdgcn_readfirstlane(params.p_work_indptr[worker_idx]);
+    const int32_t work_end_idx =
+        __builtin_amdgcn_readfirstlane(params.p_work_indptr[worker_idx + 1]);
+    if(work_start_idx >= work_end_idx)
+    {
+        return;
+    }
+
     // LDS tiles
     extern __shared__ int32_t p_lds[];
     hk::shared_allocator al(p_lds);
@@ -95,27 +145,114 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     hkdart::clobber<q_rope_ranges>();
     hkdart::clobber<o_ranges>();
 
-    hk::art<q_t, T::kWarpBlockM, T::kQkNopeHeadDim, hk::row_l, hk::rt_16x32_4_s, q_nope_ranges>
-        q_nope;
-    hk::art<q_t, T::kWarpBlockM, T::kQkRopeHeadDim, hk::row_l, hk::rt_16x32_4_s, q_rope_ranges>
-        q_rope;
-    hk::art<comp_t, T::kWarpBlockM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
+    hk::art<q_t, T::kTileM, T::kQkNopeHeadDim, hk::row_l, hk::rt_16x32_s, q_nope_ranges> q_nope;
+    hk::art<q_t, T::kTileM, T::kQkRopeHeadDim, hk::row_l, hk::rt_16x32_s, q_rope_ranges> q_rope;
+    hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
 
-    const int32_t worker_idx     = blockIdx.x;
-    const int32_t work_start_idx = params.p_work_indptr[worker_idx];
-    const int32_t work_end_idx   = params.p_work_indptr[worker_idx + 1];
+    // Runtime constants
+    const int32_t warp_idx = ckt::get_warp_id();
+
     for(int32_t work_idx = work_start_idx; work_idx < work_end_idx; ++work_idx)
     {
-        const int32_t partial_qo_loc = params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 1];
-        const int32_t qo_start       = params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 2];
-        const int32_t qo_end         = params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 3];
-        const int32_t kv_start       = params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 4];
-        const int32_t kv_end         = params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 5];
+        const int32_t partial_qo_loc = __builtin_amdgcn_readfirstlane(
+            params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 1]);
+        const int32_t qo_start = __builtin_amdgcn_readfirstlane(
+            params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 2]);
+        const int32_t qo_end = __builtin_amdgcn_readfirstlane(
+            params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 3]);
+        const int32_t kv_start = __builtin_amdgcn_readfirstlane(
+            params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 4]);
+        const int32_t kv_end = __builtin_amdgcn_readfirstlane(
+            params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 5]);
 
         ///
         /// Load Q from VRAM to GPRs
         ///
-        hk::load<2>(q_nope, params.query, {0, 0, qo_start, 0}, {0, 1, 0, 0});
+        hk::load<2>(q_nope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0});
+        hk::load<2>(
+            q_rope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0}, T::kQkNopeHeadDim);
+
+        if((threadIdx.x % 64) < 3)
+        {
+            float4 nope_92  = convert_fp8x4_to_float4(FUI{hkm::get_gpr<92>()});
+            float4 nope_93  = convert_fp8x4_to_float4(FUI{hkm::get_gpr<93>()});
+            float4 nope_96  = convert_fp8x4_to_float4(FUI{hkm::get_gpr<96>()});
+            float4 nope_100 = convert_fp8x4_to_float4(FUI{hkm::get_gpr<100>()});
+            float4 rope_124 = convert_fp8x4_to_float4(FUI{hkm::get_gpr<124>()});
+            float4 rope_125 = convert_fp8x4_to_float4(FUI{hkm::get_gpr<125>()});
+            float4 rope_126 = convert_fp8x4_to_float4(FUI{hkm::get_gpr<126>()});
+            float4 rope_127 = convert_fp8x4_to_float4(FUI{hkm::get_gpr<127>()});
+
+            printf("[mla-dbg][%d, %d] %d=(%f,%f,%f,%f), %d=(%f,%f,%f,%f), %d=(%f,%f,%f,%f), "
+                   "%d=(%f,%f,%f,%f)\n",
+                   blockIdx.x,
+                   threadIdx.x,
+                   reg_2_loc_q<92>(),
+                   nope_92.x,
+                   nope_92.y,
+                   nope_92.z,
+                   nope_92.w,
+                   reg_2_loc_q<93>(),
+                   nope_93.x,
+                   nope_93.y,
+                   nope_93.z,
+                   nope_93.w,
+                   reg_2_loc_q<96>(),
+                   nope_96.x,
+                   nope_96.y,
+                   nope_96.z,
+                   nope_96.w,
+                   reg_2_loc_q<100>(),
+                   nope_100.x,
+                   nope_100.y,
+                   nope_100.z,
+                   nope_100.w);
+            printf("[mla-dbg][%d, %d] %d=(%f,%f,%f,%f), %d=(%f,%f,%f,%f), %d=(%f,%f,%f,%f), "
+                   "%d=(%f,%f,%f,%f)\n",
+                   blockIdx.x,
+                   threadIdx.x,
+                   reg_2_loc_q<124>(),
+                   rope_124.x,
+                   rope_124.y,
+                   rope_124.z,
+                   rope_124.w,
+                   reg_2_loc_q<125>(),
+                   rope_125.x,
+                   rope_125.y,
+                   rope_125.z,
+                   rope_125.w,
+                   reg_2_loc_q<126>(),
+                   rope_126.x,
+                   rope_126.y,
+                   rope_126.z,
+                   rope_126.w,
+                   reg_2_loc_q<127>(),
+                   rope_127.x,
+                   rope_127.y,
+                   rope_127.z,
+                   rope_127.w);
+
+            // uint32_t nope_92  = hkm::get_gpr< 92>();
+            // uint32_t nope_93  = hkm::get_gpr< 93>();
+            // uint32_t nope_96  = hkm::get_gpr< 96>();
+            // uint32_t nope_122 = hkm::get_gpr<122>();
+            // uint32_t nope_123 = hkm::get_gpr<123>();
+            // uint32_t nope_124 = hkm::get_gpr<124>();
+            // uint32_t nope_125 = hkm::get_gpr<125>();
+            // uint32_t nope_127 = hkm::get_gpr<127>();
+
+            // printf("[mla-dbg][%d, %d] %d=0x%08X, %d=0x%08X, %d=0x%08X, %d=0x%08X, %d=0x%08X,
+            // %d=0x%08X, %d=0x%08X, %d=0x%08X\n",
+            //     blockIdx.x, threadIdx.x,
+            //     (92-92)*32, nope_92,
+            //     (93-92)*32, nope_93,
+            //     (96-92)*32, nope_96,
+            //     (122-92)*32, nope_122,
+            //     (123-92)*32, nope_123,
+            //     (124-92)*32, nope_124,
+            //     (125-92)*32, nope_125,
+            //     (127-92)*32, nope_127);
+        }
 
         ///
         /// Outputs
@@ -150,9 +287,9 @@ void dispatch_mla_decode_fwd_n128(torch::Tensor& query,
     HkMlaDecodeFwdParams<Traits> params = {
         hk::make_gl<typename Traits::gl_q>(
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(query.data_ptr())),
-            1,
             query.size(0),
-            Traits::kQoNumHead,
+            Traits::kNumTilesM,
+            Traits::kTileM,
             Traits::kQkHeadDim),
         hk::make_gl<typename Traits::gl_kv>(
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(kv_buffer.data_ptr())),
