@@ -18,6 +18,16 @@ torch.set_printoptions(sci_mode=False)
 # qdtype fp8, kdtype bf16: nhead16
 
 
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+setup_seed(23333)
+
+
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
@@ -294,6 +304,30 @@ def test_mla(
         dtype_q=dtype,
         dtype_kv=kvtype,
     )
+
+    # Print metadata tensors
+    valid_work_cnt = valid_work_cnt = work_indptr[-1].item()
+    valid_batch_size = batch_size * (
+        (nhead // 16) if (nhead != 128 and nhead % 16 == 0) else (nhead + 64 - 1) // 64
+    )
+    valid_reduce_partial_cnt = reduce_indptr[valid_batch_size].item()
+
+    # print(f"seq_lens_kv({seq_lens_kv.shape}):")
+    # print(seq_lens_kv)
+    # print(f"kv_indptr({kv_indptr.shape}):")
+    # print(kv_indptr)
+    # print(f"kv_indices({kv_indices.shape}):")
+    # print(kv_indices)
+    print(f"work_indptr({work_indptr.shape}):")
+    print(work_indptr)
+    print(f"work_info_set({work_info_set.shape}.{valid_work_cnt}):")
+    print(work_info_set[:valid_work_cnt])
+    print(f"reduce_indptr({valid_batch_size + 1}):")
+    print(reduce_indptr[: valid_batch_size + 1])
+    print(f"reduce_final_map({valid_batch_size}):")
+    print(reduce_final_map[:valid_batch_size])
+    print(f"reduce_partial_map({reduce_partial_map.shape}.{valid_reduce_partial_cnt}):")
+    print(reduce_partial_map[:valid_reduce_partial_cnt])
 
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
