@@ -7,6 +7,7 @@ from aiter.ops.triton._triton_kernels.quant_moe import (
     _upcast_from_mxfp,
 )
 
+
 def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):
     assert x.ndim == 3
     E, M, N = x.shape
@@ -16,6 +17,7 @@ def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):
     y2d = downcast_to_static_fp8(x2d, scale)
     y3d = y2d.reshape(E, M, N)
     return y3d
+
 
 def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
     M, N = x.shape

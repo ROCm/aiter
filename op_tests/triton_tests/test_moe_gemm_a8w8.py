@@ -36,7 +36,7 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 def alloc_rand(shape, device, dtype):
     if dtype.itemsize == 1:
-        tmp = 2**-(torch.randint(4, 8, shape, device=device, dtype=torch.bfloat16))
+        tmp = 2 ** -(torch.randint(4, 8, shape, device=device, dtype=torch.bfloat16))
         return tmp
     return torch.randn(shape, device=device, dtype=dtype)
 
@@ -188,15 +188,87 @@ class Case:
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
             # TP1
-            Case(16,  7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
-            Case(1024, 2048, 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
-            Case(4096, 4096, 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
-            Case(8192, 7168, 2048, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
-            # TP8 
-            Case(16, 512, 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
-            Case(1024, 7168, 256, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
-            Case(4096, 512  , 7168, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
-            Case(8192, 7168, 256, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 256, 8, hbm_swizzling=True),
+            Case(
+                16,
+                7168,
+                4096,
+                "mxfloat8_e4m3fn",
+                "mxfloat8_e4m3fn",
+                256,
+                8,
+                hbm_swizzling=True,
+            ),
+            Case(
+                1024,
+                2048,
+                7168,
+                "mxfloat8_e4m3fn",
+                "mxfloat8_e4m3fn",
+                256,
+                8,
+                hbm_swizzling=True,
+            ),
+            Case(
+                4096,
+                4096,
+                7168,
+                "mxfloat8_e4m3fn",
+                "mxfloat8_e4m3fn",
+                256,
+                8,
+                hbm_swizzling=True,
+            ),
+            Case(
+                8192,
+                7168,
+                2048,
+                "mxfloat8_e4m3fn",
+                "mxfloat8_e4m3fn",
+                256,
+                8,
+                hbm_swizzling=True,
+            ),
+            # TP8
+            Case(
+                16,
+                512,
+                7168,
+                "mxfloat8_e4m3fn",
+                "mxfloat8_e4m3fn",
+                256,
+                8,
+                hbm_swizzling=True,
+            ),
+            Case(
+                1024,
+                7168,
+                256,
+                "mxfloat8_e4m3fn",
+                "mxfloat8_e4m3fn",
+                256,
+                8,
+                hbm_swizzling=True,
+            ),
+            Case(
+                4096,
+                512,
+                7168,
+                "mxfloat8_e4m3fn",
+                "mxfloat8_e4m3fn",
+                256,
+                8,
+                hbm_swizzling=True,
+            ),
+            Case(
+                8192,
+                7168,
+                256,
+                "mxfloat8_e4m3fn",
+                "mxfloat8_e4m3fn",
+                256,
+                8,
+                hbm_swizzling=True,
+            ),
             # Precision combinations
             Case(4096, 7168, 4096, "float8_e4m3fn", "float8_e4m3fn", 256, 8),
             Case(4096, 7168, 4096, "mxfloat8_e4m3fn", "float8_e4m3fn", 256, 8),
@@ -309,7 +381,7 @@ def test_op(
         out_dtype = torch.bfloat16
     else:
         x_mx_scales_tri = None
-        x_static_scale = x_tri.abs().max().float() / 448.0 
+        x_static_scale = x_tri.abs().max().float() / 448.0
         x_tri = downcast_to_static_fp8(x_tri, x_static_scale)
         x_ref = (x_tri.float() * x_static_scale).to(torch.bfloat16)
         out_dtype = torch.float8_e4m3fn
