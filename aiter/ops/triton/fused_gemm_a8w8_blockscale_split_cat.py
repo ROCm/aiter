@@ -4,9 +4,9 @@
 from typing import Optional
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.fused_kv_proj_cat import (
-    _fused_kv_proj_cat_kernel,
-    _fused_kv_proj_cat_reduce_kernel,
+from aiter.ops.triton._triton_kernels.fused_gemm_a8w8_blockscale_split_cat import (
+    _fused_gemm_a8w8_blockscale_split_cat,
+    _fused_gemm_a8w8_blockscale_split_cat_reduce,
     _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -14,52 +14,56 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-def fused_kv_proj_cat(
-    kv_c: torch.Tensor,
+def fused_gemm_a8w8_blockscale_split_cat(
+    x: torch.Tensor,
     w: torch.Tensor,
-    k_pe: torch.Tensor,
-    kv_c_scale: torch.Tensor,
+    y: torch.Tensor,
+    x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    nope_head_dim: int,
-    v_head_dim: int,
+    S1: int,
+    S2: int,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     config: Optional[dict] = None,
 ):
     """
-    Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
-    Then split the product Y into k_nope and v, and concatenate k_pe to k_nope at the last dimension.
+    Computes the 8 bit matmul C = X @ W^T using the block-scale quantization approach.
+    Then split the product C into C1 and C2 with sizes S1 and S2 at the last dimension respectively.
+    Finally concatenate Y to C1 at the last dimension.
+
+    Equivalent to the following sequence:
+    c = (x @ w).view(-1, y.shape(1), S1 + S2)
+    c1, c2 = c.split([S1, S2], dim=-1)
+    c1 = c1.cat(y, dim=-1)
+    return c1, c2
 
     Key parameters:
-    - kv_c: Matrix X with shape (M, K).
+    - x: Matrix X with shape (M, K).
     - w: Matrix W with shape (N, K).
-    - k_pe: Matrix with shape (M, H, R).
-    - kv_c_scale: Scale tensor for X with shape (M, *scale_k).
+    - y: Tensor Y with shape (M, D, S3).
+    - x_scale: Scale tensor for X with shape (M, *scale_k).
     - w_scale: Scale tensor for W with shape (**scale_n, *scale_k).
 
-    M is the KV sequence length, K is the latent dimension for K/V, N is H * (P + V)
-    H is the number of attention heads, P is nope dimension, V is the V head dimension
-    R is the rope dimension
-
     Returns:
-    - k: The output matrix with shape (M, H, P+R).
-    - v: The output matrix with shape (M, H, V).
+    - c1: The output matrix with shape (M, D, S1 + S3).
+    - c2: The output matrix with shape (M, D, S2).
 
     *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k -> ceil_div(K, scale_block_size_k)
     **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n -> ceil_div(N, scale_block_size_n)
+
+    NOTE: N must be D * (S1 + S2)
     """
     _LOGGER.info(
-        f"GEMM_A8W8_BLOCKSCALE_CAT: k_c_normed={tuple(kv_c.shape)} w={tuple(w.shape)} k_c_normed_scale={tuple(kv_c_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        f"FUSED_GEMM_A8W8_BLOCKSCALE_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
     )
 
-    M, K = kv_c.shape
+    M, K = x.shape
     N, K = w.shape
-    M, H, R = k_pe.shape
-    P, V = nope_head_dim, v_head_dim
+    M, D, S3 = y.shape
 
     # Check constraints.
-    assert kv_c.shape[1] == w.shape[1], "Incompatible dimensions!!!"
-    assert k_pe.shape[0] == kv_c.shape[0], "Incompatible dimensions!!!"
-    assert N == H * (P + V), "N is not H*(P+V)"
+    assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
+    assert y.shape[0] == x.shape[0], "Incompatible dimensions!!!"
+    assert N == D * (S1 + S2), "N is not D * (S1 + S2)"
 
     # Transpose w and w_scale
     w = w.T  # (K, N)
@@ -68,20 +72,20 @@ def fused_kv_proj_cat(
     if config is None:
         config = _get_config(M, N, K)
 
-    k = torch.empty((M, H, P + R), dtype=dtype, device=kv_c.device)
-    v = torch.empty((M, H, V), dtype=dtype, device=kv_c.device)
+    c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)
+    c2 = torch.empty((M, D, S2), dtype=dtype, device=x.device)
 
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
         K, config["NUM_KSPLIT"]
     )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
-        k_pp = torch.empty(
+        c_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
             dtype=torch.float32,
-            device=kv_c.device,
+            device=x.device,
         )
     else:
-        k_pp = None
+        c_pp = None
 
     # If block size is greater than split k size, shrink the block size
     if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
@@ -101,9 +105,9 @@ def fused_kv_proj_cat(
         triton.cdiv(N, w_scale.shape[1])
     )  # scale_block_size_n
 
-    # Block size R
-    config["BLOCK_SIZE_R"] = triton.next_power_of_2(
-        triton.cdiv(H * R, triton.cdiv(N, config["BLOCK_SIZE_N"]))
+    # S3 block sizes
+    config["BLOCK_SIZE_S3"] = triton.next_power_of_2(
+        triton.cdiv(D * S3, triton.cdiv(N, config["BLOCK_SIZE_N"]))
     )
 
     assert (
@@ -118,36 +122,36 @@ def fused_kv_proj_cat(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _fused_kv_proj_cat_kernel[grid](
-        kv_c,
+    _fused_gemm_a8w8_blockscale_split_cat[grid](
+        x,
         w,
-        k_pe,
-        k if config["NUM_KSPLIT"] == 1 else k_pp,
-        v,
-        kv_c_scale,
+        y,
+        c1 if config["NUM_KSPLIT"] == 1 else c_pp,
+        c2,
+        x_scale,
         w_scale,
         M,
         N,
         K,
-        H,
-        R,
-        P,
-        V,
-        kv_c.stride(0),
-        kv_c.stride(1),
+        D,
+        S1,
+        S2,
+        S3,
+        x.stride(0),
+        x.stride(1),
         w.stride(0),
         w.stride(1),
-        k_pe.stride(0),
-        k_pe.stride(1),
-        k_pe.stride(2),
-        k.stride(1) if config["NUM_KSPLIT"] == 1 else k_pp.stride(0),
-        k.stride(0) if config["NUM_KSPLIT"] == 1 else k_pp.stride(1),
-        k.stride(2) if config["NUM_KSPLIT"] == 1 else k_pp.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        kv_c_scale.stride(0),
-        kv_c_scale.stride(1),
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        c1.stride(1) if config["NUM_KSPLIT"] == 1 else c_pp.stride(0),
+        c1.stride(0) if config["NUM_KSPLIT"] == 1 else c_pp.stride(1),
+        c1.stride(2) if config["NUM_KSPLIT"] == 1 else c_pp.stride(2),
+        c2.stride(0),
+        c2.stride(1),
+        c2.stride(2),
+        x_scale.stride(0),
+        x_scale.stride(1),
         w_scale.stride(0),
         w_scale.stride(1),
         **config,
@@ -156,36 +160,36 @@ def fused_kv_proj_cat(
     if config["NUM_KSPLIT"] > 1:
         REDUCE_BLOCK_SIZE_M = 32
         REDUCE_BLOCK_SIZE_N = 32
-        REDUCE_BLOCK_SIZE_R = triton.next_power_of_2(triton.cdiv(H * R, triton.cdiv(N, REDUCE_BLOCK_SIZE_N)))
+        REDUCE_BLOCK_SIZE_R = triton.next_power_of_2(triton.cdiv(D * S3, triton.cdiv(N, REDUCE_BLOCK_SIZE_N)))
         ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
 
         grid_reduce = (
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _fused_kv_proj_cat_reduce_kernel[grid_reduce](
-            k_pp,
-            k,
-            v,
-            k_pe,
+        _fused_gemm_a8w8_blockscale_split_cat_reduce[grid_reduce](
+            c_pp,
+            c1,
+            c2,
+            y,
             M,
             N,
-            H,
-            R,
-            P,
-            V,
-            k_pp.stride(0),
-            k_pp.stride(1),
-            k_pp.stride(2),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            k_pe.stride(0),
-            k_pe.stride(1),
-            k_pe.stride(2),
+            D,
+            S1,
+            S2,
+            S3,
+            c_pp.stride(0),
+            c_pp.stride(1),
+            c_pp.stride(2),
+            c1.stride(0),
+            c1.stride(1),
+            c1.stride(2),
+            c2.stride(0),
+            c2.stride(1),
+            c2.stride(2),
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
             REDUCE_BLOCK_SIZE_M,
             REDUCE_BLOCK_SIZE_N,
             REDUCE_BLOCK_SIZE_R,
@@ -193,4 +197,4 @@ def fused_kv_proj_cat(
             triton.next_power_of_2(config["NUM_KSPLIT"]),
         )
 
-    return k, v
+    return c1, c2
