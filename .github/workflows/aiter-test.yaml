@@ -158,7 +158,6 @@ jobs:
           docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           echo "Starting container: aiter_test"
           docker run -dt \
-          --user runner \
           --device=/dev/dri \
           --device=/dev/kfd \
           --shm-size=16G \
