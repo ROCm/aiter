@@ -2252,7 +2252,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             logits_soft_cap=logits_soft_cap,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
-            sink_size=window_size[2],
+            sink_size=window_size[2] if len(window_size) > 2 else 0,
             bias=bias,
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
