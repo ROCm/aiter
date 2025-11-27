@@ -338,7 +338,7 @@ void mla_decode_stage1_asm_fwd(
 
     if(persistent)
     {
-        gdx = num_kv_splits_indptr.has_value() ? kv_split * batch : work_indptr.value().size(0) - 1;
+        gdx = work_indptr.value().size(0) - 1;
         gdy = 1;
         gdz = 1;
     }

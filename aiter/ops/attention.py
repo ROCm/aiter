@@ -342,8 +342,9 @@ def get_mla_metadata_info_v1(
     num_head_qo: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
-    is_sparse: int,
+    is_sparse: bool,
     fast_mode: bool = True,
+    num_kv_splits: int = 32,
     intra_batch_mode: bool = False,
 ):
     """
@@ -357,11 +358,11 @@ def get_mla_metadata_info_v1(
     """
 
     assert num_head_qo % 16 == 0
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
 
     if not intra_batch_mode:
-        gpu = torch.cuda.current_device()
-        device_properties = torch.cuda.get_device_properties(gpu)
-        cu_num = device_properties.multi_processor_count
 
         max_qo_tiles_per_batch = (
             int(math.ceil(max_seqlen_qo * num_head_qo / 128))
@@ -391,11 +392,11 @@ def get_mla_metadata_info_v1(
     else:
         return (
             ((2), torch.uint64),  # work_metadata_ptrs
-            (batch_size * 32 + 1, torch.int32),  # work_indptr
-            ((batch_size * 32, 8), torch.int32),  # work_info_set
+            (cu_num + 1, torch.int32),  # work_indptr
+            ((batch_size * num_kv_splits, 8), torch.int32),  # work_info_set
             ((batch_size + 1), torch.int32),  # reduce_indptr
             ((batch_size, 2), torch.int32),  # reduce_final_map
-            (batch_size * 32 + 1, torch.int32),  # reduce_partial_map
+            (batch_size * num_kv_splits + 1, torch.int32),  # reduce_partial_map
         )
 
 

@@ -75,7 +75,6 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
             work_info.kv_end    = ck_tile::min(work_info.kv_start + payload * params.kv_granularity, kv_end);
             work_info.kv_offset = kv_end - work_info.kv_end;
             p_work_info_set[work_index] = work_info;
-            params.p_work_indptr[work_index + 1] = work_index + 1;
             params.p_reduce_partial_map[work_index] = work_info.partial_qo_loc;
         }
 
@@ -84,12 +83,21 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
         params.p_reduce_final_map[bid * 2 + 1] = work_info.qo_end;
     }
 
-    int32_t work_end = p_lds_shift[params.num_batches - 1] + p_lds_split[params.num_batches - 1];
-    int32_t reduce_end = params.p_reduce_indptr[params.num_batches];
 
-    for (int32_t work_id = work_end + lane_idx; work_id < params.num_batches * params.num_splits; work_id += ck_tile::get_warp_size())
+
+    int32_t work_end = p_lds_shift[params.num_batches - 1] + p_lds_split[params.num_batches - 1];
+    int32_t work_per_cu = (work_end + params.num_cu - 1) / params.num_cu;
+    int32_t used_cu = (work_end + work_per_cu - 1) / work_per_cu;
+
+    int32_t reduce_end = params.p_reduce_indptr[params.num_batches];
+    for (int32_t work_id = lane_idx + 1; work_id < used_cu; work_id += ck_tile::get_warp_size())
     {
-        params.p_work_indptr[work_id + 1] = work_end;
+        params.p_work_indptr[work_id] = min(work_id * work_per_cu, work_end);
+    }
+
+    for (int32_t work_id = used_cu + lane_idx; work_id < params.num_cu + 1; work_id += ck_tile::get_warp_size())
+    {
+        params.p_work_indptr[work_id] = work_end;
     }
 
     for (int32_t reduce_id = params.num_batches + lane_idx; reduce_id <= params.fixed_num_batches; reduce_id += ck_tile::get_warp_size())
@@ -158,8 +166,7 @@ void get_mla_metadata_v1_0_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.p_seqlens_kv_indptr          = seqlens_kv_indptr.data_ptr<int32_t>();
     params.num_batches                  = num_batches;
     params.num_heads                    = num_heads_k * num_heads_per_head_k;
-    // params.num_cu                       = num_clusters;
-    params.num_cu                       = num_splits * num_batches;
+    params.num_cu                       = num_clusters;
     params.num_splits                   = num_splits;
     params.fixed_num_batches            = fixed_num_batches;
     params.reduce_indptr_size           = reduce_indptr.size(0);

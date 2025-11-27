@@ -240,6 +240,7 @@ def test_mla(
         kv_buffer.dtype,
         is_sparse=False,
         fast_mode=True if not non_persistent_mode else False,
+        num_kv_splits=max_split_per_batch,
         intra_batch_mode=non_persistent_mode,
     )
 
@@ -264,15 +265,6 @@ def test_mla(
         reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
     )
 
-
-    if non_persistent_mode:
-        num_kv_splits, num_kv_splits_indptr = aiter.mla.get_meta_param(
-            max_split_per_batch, batch_size, kv_indices.shape[0], nhead, decode_qlen, dtype,
-        )
-    else:
-        num_kv_splits = max_split_per_batch
-        num_kv_splits_indptr = None
-
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
@@ -289,7 +281,7 @@ def test_mla(
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=True if not non_persistent_mode else False,
-        max_split_per_batch=num_kv_splits,
+        max_split_per_batch=max_split_per_batch,
         intera_batch_mode=non_persistent_mode,
     )
 
@@ -308,8 +300,7 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
-            num_kv_splits=num_kv_splits,
-            num_kv_splits_indptr=num_kv_splits_indptr,
+            num_kv_splits=max_split_per_batch,
             work_meta_data=work_meta_data,
             work_indptr=work_indptr,
             work_info_set=work_info_set,
@@ -367,8 +358,7 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
-            num_kv_splits=num_kv_splits,
-            num_kv_splits_indptr=num_kv_splits_indptr,
+            num_kv_splits=max_split_per_batch,
             q_scale=q_scale,
             kv_scale=kv_scale,
             work_meta_data=work_meta_data,
