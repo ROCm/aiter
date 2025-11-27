@@ -14,6 +14,8 @@ import pandas as pd
 import os
 import numpy as np
 import random
+import inspect
+import subprocess
 
 
 def set_seed(seed):
@@ -278,6 +280,56 @@ def test_fmoe(
         return 1 - sim
 
     logits_diff = calc_diff(out2_ref, out2_ck)
+    if logits_diff >= 1e-3:
+        print(f"logits_diff ({logits_diff}) >= 1e-3, saving inputs to fmoe_inputs.pt")
+
+        fused_moe_source = inspect.getsource(fused_moe)
+        fused_moe_file = inspect.getfile(fused_moe)
+        inputs_to_save = {
+            "fused_moe_name": fused_moe.__name__,
+            "fused_moe_file": fused_moe_file,
+            "fused_moe_source": fused_moe_source,
+            "input": input,
+            "w1_qt_aiter": w1_qt_aiter,
+            "w2_qt_aiter": w2_qt_aiter,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "w1_scale": w1_scale_aiter,
+            "w2_scale": w2_scale_aiter,
+            "quant_type": qType,
+            "activation": actType,
+            "doweight_stage1": doweight_stage1,
+            "intermediate_pad": intermediate_pad,
+            "hidden_pad": hidden_pad,
+            "bias1": exp_bias1_aiter,
+            "bias2": exp_bias2_aiter,
+            "out2_ref": out2_ref,
+            "out2_ck": out2_ck,
+        }
+        print("Saved variables' information:")
+        for k, v in inputs_to_save.items():
+            if k == "fused_moe_source":
+                print(f"  {k}: (source code saved to file)")
+                continue
+
+            if isinstance(v, torch.Tensor):
+                print(
+                    f"  {k}: tensor(shape={v.shape}, dtype={v.dtype}, device={v.device})"
+                )
+            else:
+                print(f"  {k}: {v}")
+
+        print("\n" + "=" * 20 + " rocm-smi output " + "=" * 20)
+        try:
+            result = subprocess.run(
+                ["rocm-smi"], capture_output=True, text=True, check=True
+            )
+            print(result.stdout)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"Failed to run 'rocm-smi': {e}")
+        print("=" * (40 + len(" rocm-smi output ")) + "\n")
+
+        torch.save(inputs_to_save, "fmoe_inputs.pt")
     assert logits_diff < 1e-3
 
     return {"us": us2, "err": err}
