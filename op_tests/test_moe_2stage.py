@@ -155,6 +155,13 @@ def test_fmoe(
         # w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2])
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2])
+        w1_qt_aiter = w1_qt_aiter + 8
+        w2_qt_aiter = w2_qt_aiter + 8
+    
+    aiter.logger.info(f'w1_qt = {w1_qt}')
+    aiter.logger.info(f'w1_qt_aiter = {w1_qt_aiter}')
+    aiter.logger.info(f'w2_qt = {w2_qt}')
+    aiter.logger.info(f'w2_qt_aiter = {w2_qt_aiter}')
 
     # Quant-ing a
     aiter.logger.info(f'quantize a qType {qType} {AQDType} {WQDType}')
