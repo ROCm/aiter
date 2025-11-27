@@ -516,6 +516,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         key_block = gl.amd.cdna3.buffer_load(
             ptr=key_cache_ptr, offsets=key_block_offsets
         )
+        key_block = key_block.to(COMPUTE_TYPE)
         # ==================== Scale QK Scores ====================
         if KV_QUANT_MODE >= 0:
             if KV_QUANT_MODE == 1:
@@ -595,7 +596,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
             # Transpose to [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
             value_block = gl.permute(value_block, [1, 0])
-
+        value_block = value_block.to(COMPUTE_TYPE)
         qk_matrix = gl.reshape(
             qk_matrix, [QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE]
         )
@@ -816,7 +817,7 @@ def paged_attention_decode_v2_gluon_fp8(
         This kernel uses AMD CDNA3 MFMA instructions for efficient matrix operations
         and supports both FP8 and BF16 data types with various quantization modes.
     """
-    if KV_QUANT_MODE >= 0:
+    if COMPUTE_TYPE == gl.float8e4b8:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 16
     else:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 8
@@ -1173,7 +1174,7 @@ def paged_attention_decode_v2_gluon_fp8(
             offsets=key_block_offsets,
             mask=valid_block_mask[:, None, None, None],
         )
-
+        key_tensor = key_tensor.to(COMPUTE_TYPE)
         # Prepare QK MFMA while key loads (these don't depend on key data)
         qk_accumulator = gl.zeros(
             (QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE),
@@ -1242,6 +1243,7 @@ def paged_attention_decode_v2_gluon_fp8(
         # ==================== VALUE LOADING WITH QK MFMA OVERLAP ====================
         # Convert key layout for MFMA (query_converted and qk_accumulator already prepared above)
         key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
+
         if VALUE_TRANSPOSED:
             # Load values from transposed cache layout
             kv_block_numbers_reshaped = gl.convert_layout(
@@ -1263,6 +1265,7 @@ def paged_attention_decode_v2_gluon_fp8(
                 ptr=value_cache_ptr,
                 offsets=value_block_offsets,
             )
+            value_tensor = value_tensor.to(COMPUTE_TYPE)
             gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)  # MFMA
             # Compute QK attention scores using MFMA (overlaps with value load)
             attention_scores = gl.amd.cdna3.mfma(
@@ -1293,6 +1296,7 @@ def paged_attention_decode_v2_gluon_fp8(
                 ptr=value_cache_ptr,
                 offsets=value_block_offsets,
             )
+            value_tensor = value_tensor.to(COMPUTE_TYPE)
             gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)  # MFMA
             # Compute QK attention scores using MFMA (overlaps with value load)
             attention_scores = gl.amd.cdna3.mfma(
@@ -2258,6 +2262,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             max_logits_ptr,
             logits_ptr,
             context_lengths_ptr,
+            None,
             stride_output_seq,
             stride_output_head,
             stride_exp_sums_seq,
@@ -2389,9 +2394,9 @@ def pa_decode_gluon(
     grid = (num_sequences, num_kv_heads, max_context_partition_num)
 
     # thre are some precision problems for tl.bfloat16 and tl.float16, so only support tl.float8e4b8 now
-    assert compute_type in [
-        tl.float8e4b8
-    ], f"compute_type == {compute_type} not in [tl.float8e4b8]"
+    # assert compute_type in [
+    #     tl.float8e4b8
+    # ], f"compute_type == {compute_type} not in [tl.float8e4b8]"
     assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
     # Validate input params constraint
     assert query.dtype in [
