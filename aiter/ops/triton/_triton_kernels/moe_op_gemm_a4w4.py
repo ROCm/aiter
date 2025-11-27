@@ -222,9 +222,7 @@ def _mxfp4_quant_kernel(
 
     # Store quantized x blocks
     out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
-    out_offs = (
-        offs_m[:, None] * stride_fp4_m + out_offs_n[None, :] * stride_fp4_n
-    )
+    out_offs = offs_m[:, None] * stride_fp4_m + out_offs_n[None, :] * stride_fp4_n
 
     if EVEN_M_N:
         tl.store(x_fp4_ptr + out_offs, out_tensor)
@@ -238,9 +236,7 @@ def _mxfp4_quant_kernel(
     bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
 
-    bs_offs = (
-        bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-    )
+    bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
     bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < num_blocks_total)[None, :]
 
     if EVEN_M_N:
@@ -406,7 +402,10 @@ def _moe_gemm_a4w4(
 
     # A pointers
     offs_x_m = PACKED_BLOCK_M_X * block_id + tl.arange(0, PACKED_BLOCK_M_X)
-    offs_x_m = tl.max_contiguous(tl.multiple_of(offs_x_m % (M // X_M_DIVISOR), PACKED_BLOCK_M_X), PACKED_BLOCK_M_X)
+    offs_x_m = tl.max_contiguous(
+        tl.multiple_of(offs_x_m % (M // X_M_DIVISOR), PACKED_BLOCK_M_X),
+        PACKED_BLOCK_M_X,
+    )
     if GatherIndx is None:
         X += start_m * stride_x_m
     else:
@@ -415,8 +414,8 @@ def _moe_gemm_a4w4(
         offs_x_m = tl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
     offs_x_k = PACKED_BLOCK_K_X * pid_k + tl.arange(0, PACKED_BLOCK_K_X)
     XPtrs = (
-        X 
-        + offs_x_m.to(index_type)[:, None] * stride_x_m 
+        X
+        + offs_x_m.to(index_type)[:, None] * stride_x_m
         + offs_x_k.to(index_type)[None, :] * stride_x_k
     )
 
@@ -532,7 +531,10 @@ def _moe_gemm_a4w4(
     # scalar fp8 scale
     if X_static_scale is not None:
         # should not go in here since static scale fp4 is disabled
-        tl.static_assert(X_static_scale == None, f"Static scale is disabled for fp4 precision. got {X_static_scale}")
+        tl.static_assert(
+            X_static_scale == None,
+            f"Static scale is disabled for fp4 precision. got {X_static_scale}",
+        )
 
     # bias
     offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
