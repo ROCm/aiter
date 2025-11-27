@@ -10,7 +10,7 @@ import torch
 import argparse
 from aiter.ops.triton.moe_routing.routing import routing
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.moe_op_gemm_a4w4 import moe_gemm_a4w4, swizzle_scales
+from aiter.ops.triton.moe_op_gemm_a4w4 import mxfp4_quant, moe_gemm_a4w4, swizzle_scales
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
@@ -134,9 +134,9 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
         logits = gemm_a16w16(xg, wg.T, bg)
         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
         assert x_dtype_str == "mx4"
-        x, x_scale = quantize(x, x_dtype_str)
+        x, x_scale = mxfp4_quant(x)
         x = moe_gemm_a4w4(x, w1, x_scale, w1_scale, None, None, b1, rdata, gather_indx=gather_indx, swizzle_mx_scale="CDNA4_SCALE", apply_swiglu=True)
-        x, x_scale = quantize(x, x_dtype_str)
+        x, x_scale = mxfp4_quant(x)
         x = moe_gemm_a4w4(x, w2, x_scale, w2_scale, None, None, b2, rdata, scatter_indx=scatter_indx, swizzle_mx_scale="CDNA4_SCALE")
     proton.finalize()
     return parse_profile(fpath.with_suffix(".hatchet"), useful_op_regex=op_regex, reps=reps)

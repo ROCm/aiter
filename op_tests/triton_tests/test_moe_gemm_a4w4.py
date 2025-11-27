@@ -13,6 +13,7 @@ from aiter.ops.triton.moe_routing.routing import routing
 
 # matmul utilities
 from aiter.ops.triton.moe_op_gemm_a4w4 import (
+    mxfp4_quant,
     moe_gemm_a4w4,
     moe_gemm_torch,
     swizzle_scales,
@@ -283,7 +284,7 @@ def test_op(
     else:
         swizzle_mx_scale = None
 
-    x_tri, x_mx_scales_tri = downcast_to_mxfp(x_tri, act_dtype, axis=-1)
+    x_tri, x_mx_scales_tri = mxfp4_quant(x_tri)
     x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)
     x_static_scale = None
     out_dtype = torch.bfloat16

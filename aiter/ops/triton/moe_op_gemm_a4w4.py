@@ -10,6 +10,7 @@ from enum import Enum, auto
 import math
 from aiter.ops.triton.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe_op_gemm_a4w4 import (
+    _mxfp4_quant_kernel,
     _moe_gemm_a4w4,
     _reduce_grouped,
 )
@@ -203,6 +204,58 @@ def reduce_grouped(
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
+
+
+# This is fixed by spec for MXFP4. Do not tune this.
+MXFP4_QUANT_BLOCK_SIZE = 32
+
+def mxfp4_quant(
+    x: torch.Tensor,
+    block_size_m: int = 16,
+    block_size_n: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize a 2D tensor `x` of shape [M, K] (bf16/fp16/fp32) to MXFP4 (E2M1) format
+    quantized along the K dimension.
+
+    Returns:
+    - A packed MXFP4 tensor `x_fp4` of shape [M, N // 2] (stored as uint8), where
+        each byte stores two 4-bit values.
+    - A block-scale tensor `x_scale` of shape [M, N / 32], where each entry
+        corresponds to one MXFP4 quantization block of 32 elements along the K dimension.
+    """
+    M, N = x.shape
+    assert N % MXFP4_QUANT_BLOCK_SIZE == 0
+    assert block_size_n % MXFP4_QUANT_BLOCK_SIZE == 0
+
+    x_fp32 = x.to(torch.float32)
+    x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+    x_scale = torch.empty((M, N // MXFP4_QUANT_BLOCK_SIZE), dtype=torch.uint8, device=x.device)
+
+    grid = (
+        triton.cdiv(M, block_size_m),
+        triton.cdiv(N, block_size_n),
+    )
+
+    _mxfp4_quant_kernel[grid](
+        x_fp32,
+        x_fp4,
+        x_scale,
+        x_fp32.stride(0),
+        x_fp32.stride(1),
+        x_fp4.stride(0),
+        x_fp4.stride(1),
+        x_scale.stride(0),
+        x_scale.stride(1),
+        M,
+        N,
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+        EVEN_M_N=(M % block_size_m == 0) and (N % block_size_n == 0),
+    )
+
+    return x_fp4, x_scale
 
 
 def moe_gemm_a4w4(
