@@ -194,14 +194,14 @@ def _batched_gemm_a16wfp4_kernel(
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a_bf16 = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0
+                    a_ptrs, mask=offs_k_bf16[None, :] < K - k * BLOCK_SIZE_K, other=0
                 )
                 b = tl.load(
                     b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
                 )
 
             if PRE_QUANT:  # TODO add PRE_QUANT = False
-                a, a_scales = _mxfp4_quant_op(a_bf16, BLOCK_SIZE_K, BLOCK_SIZE_M, 32)
+                a, a_scales = _mxfp4_quant_op(a_bf16, BLOCK_SIZE_K, BLOCK_SIZE_M, SCALE_GROUP_SIZE)
 
             accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
 
