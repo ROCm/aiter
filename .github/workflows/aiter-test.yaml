@@ -116,6 +116,7 @@ jobs:
       - name: Push Docker image
         run: |
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           docker push $IMAGE_TAG
 
       - name: Success message
