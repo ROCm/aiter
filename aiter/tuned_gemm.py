@@ -212,6 +212,7 @@ def skinny_gemm(
         out += bias
     return out
 
+extensions_created = False
 
 def hipb_gemm(
     inp: Tensor,
@@ -223,6 +224,10 @@ def hipb_gemm(
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
 ):
+    global extensions_created
+    if not extensions_created:
+        hipb_create_extension()
+        extensions_created = True
     if otype is None:
         otype = inp.dtype
     return hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
@@ -300,9 +305,6 @@ class TunedGemm:
         scale_b: Optional[Tensor] = None,
         scale_c: Optional[Tensor] = None,
     ):
-        if self.extensions_created == False:
-            hipb_create_extension()
-            self.extensions_created = True
         out = gemm_a16w16(
             inp,
             weights,

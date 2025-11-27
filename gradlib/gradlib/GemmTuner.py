@@ -336,7 +336,7 @@ class Gemm:
                     self.m,
                     self.n,
                     self.k,
-                    False,
+                    True if self.bias is not None else False,
                     str(self.indtype),
                     str(self.outdtype),
                     self.scaleAB,
