@@ -173,9 +173,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         ///
         /// Load Q from VRAM to GPRs
         ///
-        hk::load<2>(q_nope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0});
-        hk::load<2>(
-            q_rope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0}, T::kQkNopeHeadDim);
+        hk::load<2, 0>(q_nope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0});
+        hk::load<2, T::kQkNopeHeadDim>(
+            q_rope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0});
 
         if((threadIdx.x % 64) < 3)
         {
