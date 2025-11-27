@@ -188,7 +188,7 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_batched_gemm_bf16/include'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_bf16/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_BF16_BATCHED_GEMM_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_bf16/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE}'"
     },
     "module_batched_gemm_a8w8": {
         "srcs": [
@@ -198,7 +198,7 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_batched_gemm_a8w8/include'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_A8W8_BATCHED_GEMM_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE}'"
     },
     "module_gemm_a8w8": {
         "srcs": [
@@ -208,7 +208,7 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/include'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_GEMM_A8W8_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE}'"
     },
     "module_gemm_a8w8_blockscale": {
         "srcs": [
@@ -223,7 +223,7 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
     },
     "module_gemm_a8w8_blockscale_bpreshuffle": {
         "srcs": [
@@ -238,7 +238,7 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE}'"
     },
     "module_gemm_a4w4_blockscale": {
         "srcs": [
@@ -254,7 +254,7 @@
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
         ],
         "hip_clang_path": "os.environ.get('GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH')",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_GEMM_A4W4_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE}'"
     },
     "module_gemm_a8w8_bpreshuffle": {
         "srcs": [
@@ -267,7 +267,7 @@
         ],
         "is_python_module": "True",
         "is_standalone": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE}'"
     },
     "module_deepgemm": {
         "srcs": [
@@ -305,7 +305,7 @@
         "is_standalone": "False",
         "verbose": "False",
         "hip_clang_path": "os.environ.get('FLATMM_HIP_CLANG_PATH')",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE}'"
     },
     "module_gemm_a8w8_asm": {
         "srcs": [
