@@ -32,7 +32,12 @@ union FUI
 };
 __device__ float4 convert_fp8x4_to_float4(FUI in)
 {
-    static constexpr __hip_fp8_interpretation_t interpret = __HIP_E4M3_FNUZ;
+    static constexpr __hip_fp8_interpretation_t interpret =
+#if defined(__gfx950__)
+        __HIP_E4M3;
+#else
+        __HIP_E4M3_FNUZ;
+#endif
     float4 r;
     r.x = static_cast<float>(__half(__hip_cvt_fp8_to_halfraw(in.x, interpret)));
     r.y = static_cast<float>(__half(__hip_cvt_fp8_to_halfraw(in.y, interpret)));
@@ -174,14 +179,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
         if((threadIdx.x % 64) < 3)
         {
-            float4 nope_92  = convert_fp8x4_to_float4(FUI{hkm::get_gpr<92>()});
-            float4 nope_93  = convert_fp8x4_to_float4(FUI{hkm::get_gpr<93>()});
-            float4 nope_96  = convert_fp8x4_to_float4(FUI{hkm::get_gpr<96>()});
-            float4 nope_100 = convert_fp8x4_to_float4(FUI{hkm::get_gpr<100>()});
-            float4 rope_124 = convert_fp8x4_to_float4(FUI{hkm::get_gpr<124>()});
-            float4 rope_125 = convert_fp8x4_to_float4(FUI{hkm::get_gpr<125>()});
-            float4 rope_126 = convert_fp8x4_to_float4(FUI{hkm::get_gpr<126>()});
-            float4 rope_127 = convert_fp8x4_to_float4(FUI{hkm::get_gpr<127>()});
+            float4 nope_92  = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<92>()});
+            float4 nope_93  = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<93>()});
+            float4 nope_96  = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<96>()});
+            float4 nope_100 = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<100>()});
+            float4 rope_124 = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<124>()});
+            float4 rope_125 = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<125>()});
+            float4 rope_126 = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<126>()});
+            float4 rope_127 = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<127>()});
 
             printf("[mla-dbg][%d, %d] %d=(%f,%f,%f,%f), %d=(%f,%f,%f,%f), %d=(%f,%f,%f,%f), "
                    "%d=(%f,%f,%f,%f)\n",
@@ -231,27 +236,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                    rope_127.y,
                    rope_127.z,
                    rope_127.w);
-
-            // uint32_t nope_92  = hkm::get_gpr< 92>();
-            // uint32_t nope_93  = hkm::get_gpr< 93>();
-            // uint32_t nope_96  = hkm::get_gpr< 96>();
-            // uint32_t nope_122 = hkm::get_gpr<122>();
-            // uint32_t nope_123 = hkm::get_gpr<123>();
-            // uint32_t nope_124 = hkm::get_gpr<124>();
-            // uint32_t nope_125 = hkm::get_gpr<125>();
-            // uint32_t nope_127 = hkm::get_gpr<127>();
-
-            // printf("[mla-dbg][%d, %d] %d=0x%08X, %d=0x%08X, %d=0x%08X, %d=0x%08X, %d=0x%08X,
-            // %d=0x%08X, %d=0x%08X, %d=0x%08X\n",
-            //     blockIdx.x, threadIdx.x,
-            //     (92-92)*32, nope_92,
-            //     (93-92)*32, nope_93,
-            //     (96-92)*32, nope_96,
-            //     (122-92)*32, nope_122,
-            //     (123-92)*32, nope_123,
-            //     (124-92)*32, nope_124,
-            //     (125-92)*32, nope_125,
-            //     (127-92)*32, nope_127);
         }
 
         ///
