@@ -161,41 +161,59 @@ void get_pa_metadata_v1(
     const int32_t        topk,
     const int32_t        max_split_per_batch)
 {
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
+    // const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
 
-    TORCH_CHECK((kv_granularity & (kv_granularity - 1)) == 0,
-                __func__, ": kv_granularity Must be power of 2!");
-    TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
-                __func__, ": seqlens_qo_indptr should be continuous!");
-    TORCH_CHECK(seqlens_qo_indptr.scalar_type() == at::ScalarType::Int,
-                __func__, ": seqlens_qo_indptr's element type should be int!");
-    TORCH_CHECK(seqlens_kv_indptr.stride(0) == 1,
-                __func__, ": seqlens_kv_indptr should be continuous!");
-    TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
-                __func__, ": seqlens_kv_indptr's element type should be int!");
+    // TORCH_CHECK((kv_granularity & (kv_granularity - 1)) == 0,
+    //             __func__, ": kv_granularity Must be power of 2!");
+    // TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
+    //             __func__, ": seqlens_qo_indptr should be continuous!");
+    // TORCH_CHECK(seqlens_qo_indptr.scalar_type() == at::ScalarType::Int,
+    //             __func__, ": seqlens_qo_indptr's element type should be int!");
+    // TORCH_CHECK(seqlens_kv_indptr.stride(0) == 1,
+    //             __func__, ": seqlens_kv_indptr should be continuous!");
+    // TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
+    //             __func__, ": seqlens_kv_indptr's element type should be int!");
 
-    if (fast_mode)
-    {
-        get_mla_metadata_v1_2_device(
-            seqlens_qo_indptr,
-            seqlens_kv_indptr,
-            num_heads_per_head_k,
-            num_heads_k,
-            is_causal,
-            kv_granularity,
-            max_seqlen_qo,
-            uni_seqlen_qo,
-            topk,
-            max_split_per_batch,
-            work_metadata_ptrs,
-            work_info_set,
-            work_indptr,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map);
-    }
-    else{
-        TORCH_CHECK(false, "Unsupported slow mode");
-    }
- 
+    // if (fast_mode)
+    // {
+    //     get_mla_metadata_v1_2_device(
+    //         seqlens_qo_indptr,
+    //         seqlens_kv_indptr,
+    //         num_heads_per_head_k,
+    //         num_heads_k,
+    //         is_causal,
+    //         kv_granularity,
+    //         max_seqlen_qo,
+    //         uni_seqlen_qo,
+    //         topk,
+    //         max_split_per_batch,
+    //         work_metadata_ptrs,
+    //         work_info_set,
+    //         work_indptr,
+    //         reduce_indptr,
+    //         reduce_final_map,
+    //         reduce_partial_map);
+
+    //     // get_mla_metadata_v1_2_device(
+    //     //     seqlens_qo_indptr,
+    //     //     seqlens_kv_indptr,
+    //     //     num_heads_per_head_k,
+    //     //     num_heads_k,
+    //     //     is_causal,
+    //     //     kv_granularity,
+    //     //     max_seqlen_qo,
+    //     //     uni_seqlen_qo,
+    //     //     topk,
+    //     //     max_split_per_batch,
+    //     //     work_metadata_ptrs,
+    //     //     work_info_set,
+    //     //     work_indptr,
+    //     //     reduce_indptr,
+    //     //     reduce_final_map,
+    //     //     reduce_partial_map);
+    // }
+    // else{
+    //     TORCH_CHECK(false, "Unsupported slow mode");
+    // }
+
 }
