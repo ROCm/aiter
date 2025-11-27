@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.quant_moe import _compute_static_fp8_quant
+from aiter.ops.triton._triton_kernels.quant import _mxfp4_quant_op
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -184,6 +185,72 @@ def _reduce_grouped(
     else:
         out_n_mask = pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT) < Nrem
         tl.store(out_ptr, acc, mask=out_n_mask)
+
+
+@triton.jit
+def _mxfp4_quant_kernel(
+    x_ptr,
+    x_fp4_ptr,
+    bs_ptr,
+    stride_x_m,
+    stride_x_n,
+    stride_fp4_m,
+    stride_fp4_n,
+    stride_bs_m,
+    stride_bs_n,
+    M,
+    N,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    EVEN_M_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    mask = mask_m[:, None] & mask_n[None, :]
+    x_offs = offs_m[:, None] * stride_x_m + offs_n[None, :] * stride_x_n
+    x = tl.load(x_ptr + x_offs, mask=mask, other=0).to(tl.float32)
+
+    out_tensor, bs_e8m0 = _mxfp4_quant_op(
+        x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+    )
+
+    # Store quantized x blocks
+    out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
+    out_offs = (
+        offs_m[:, None] * stride_fp4_m + out_offs_n[None, :] * stride_fp4_n
+    )
+
+    if EVEN_M_N:
+        tl.store(x_fp4_ptr + out_offs, out_tensor)
+    else:
+        out_mask = (offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
+        tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
+
+    # Store scale blocks
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    num_blocks_total = N // MXFP4_QUANT_BLOCK_SIZE
+    bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
+
+    bs_offs = (
+        bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+    )
+    bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < num_blocks_total)[None, :]
+
+    if EVEN_M_N:
+        tl.store(bs_ptr + bs_offs, bs_e8m0)
+    else:
+        tl.store(
+            bs_ptr + bs_offs,
+            bs_e8m0,
+            mask=bs_mask,
+        )
 
 
 @triton.jit(launch_metadata=matmul_launch_metadata)
