@@ -573,14 +573,6 @@ def test_pa_mtp(
             kv_indices_lst += block_tables_lst[i][: actual_blocks[i]]
         kv_indices = torch.tensor(kv_indices_lst, dtype=torch.int)
 
-        qo_indptr = torch.tensor([0, 1, 2], dtype=torch.int32)
-        seq_lens_kv = torch.tensor([4097, 4097], dtype=torch.int32)
-
-        # print(f"==> kv_indptr: {kv_indptr}")
-        # print(f"==> kv_indices: {kv_indices}")
-        # print(f"==> context_lens: {seq_lens_kv}")
-        # print(f"==> K shape: {k_quant_.shape}")
-
         aiter.get_pa_metadata_v1(
             qo_indptr,
             kv_indptr,
@@ -607,22 +599,12 @@ def test_pa_mtp(
         print(f"kv_indices: {kv_indices.tolist()}")
         print(f"seq_lens_kv: {seq_lens_kv.tolist()}")
 
-        print(f"==>work_idptr: {work_indptr}")
-        print(f"==>work_info: {work_info}")
-        print(f"==>reduce_indptr: {reduce_indptr}")
-        print(f"==>reduce_final_map: {reduce_final_map}")
-        print(f"==>reduce_partial_map: {reduce_partial_map}")
+        print(f"==>work_idptr: \n{work_indptr}")
+        print(f"==>work_info: \n{work_info}")
+        print(f"==>reduce_indptr: \n{reduce_indptr}")
+        print(f"==>reduce_final_map: \n{reduce_final_map}")
+        print(f"==>reduce_partial_map: \n{reduce_partial_map}")
         torch.set_printoptions(threshold=999999, linewidth=120)
-        # print(f"==>work_idptr:\n {work_indptr}")
-        # print(f"==>work_info:\n {work_info}")
-        # print(f"==>reduce_indptr:\n {reduce_indptr}")
-        # print(f"==>reduce_final_map:\n {reduce_final_map}")
-        # print(f"==>reduce_partial_map:\n {reduce_partial_map}")
-        # actual_num_work = work_indptr.max().item()
-        # work_indptr = work_indptr[:actual_num_work+1]
-        # work_info = work_info[:actual_num_work]
-        # print(f"==>work_idptr:\n {work_indptr}")
-        # print(f"==>work_info:\n {work_info}")
 
     output = torch.empty_like(query)
     out_aiter_asm, us_aiter_asm = aiter.pa_persistent_fwd(
