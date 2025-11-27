@@ -23,11 +23,43 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import torch, math
+import torch
+import functools
+import json
+import os
 import triton
 import triton.language as tl
+from ..utils._triton.kernel_repr import make_kernel_repr
+from ..utils._triton import arch_info
+from ..utils.core import AITER_TRITON_CONFIGS_PATH
 
-@triton.jit
+
+_attn_fwd_inner_repr = make_kernel_repr(
+    "_attn_fwd_inner",
+    [
+        "BLOCK_M",
+        "HEAD_DIM",
+        "BLOCK_N",
+        "STAGE",
+    ],
+)
+
+
+_attn_fwd_repr = make_kernel_repr(
+    "_attn_fwd",
+    [
+        "H",
+        "num_kv_groups",
+        "HEAD_DIM",
+        "BLOCK_M",
+        "BLOCK_N",
+        "STAGE",
+        "RETURN_LSE",
+    ],
+)
+
+
+@triton.jit(repr=_attn_fwd_inner_repr)
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn, 
                     start_m, mask_ptrs, stride_maskn,
@@ -35,7 +67,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
                     ):
     lo, hi = 0, kv_len
-    for start_n in range(lo, hi, BLOCK_N):
+    for start_n in range(lo, hi, BLOCK_N, num_stages=STAGE):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_block = None
         skip = False
@@ -136,10 +168,105 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
         l_i = tl.log2(l_i) + m_i
         tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
 
-def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, output_dtype=torch.float16, return_lse=False):
-    BLOCK_M = 64#128
-    BLOCK_N = 16#64
-    stage = 1
+
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    """
+    Load config for attention kernel based on sequence lengths and head dimension.
+    
+    Args:
+        M: Query/output sequence length (M dimension)
+        N: Key/value sequence length (N dimension)
+        K: Head dimension (K dimension)
+    
+    Returns:
+        dict: Kernel configuration parameters
+    """
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        _get_config._config_dict = {}
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/attn/{dev}-ATTN-QK-INT8-PER-BLOCK.json"
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(
+                f"Config file not found: {fpath}\n"
+                f"Please ensure the attention kernel config file exists for device '{dev}'.\n"
+                f"Expected location: {AITER_TRITON_CONFIGS_PATH}/attn/{dev}-ATTN-QK-INT8-PER-BLOCK.json"
+            )
+        with open(fpath, "r", encoding="utf-8") as file:
+            config = json.load(file)
+            _get_config._config_dict["default"] = config
+
+    key = f"{N}_{K}"
+    if key not in _get_config._config_dict.keys():
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/attn/{dev}-ATTN-QK-INT8-PER-BLOCK-KV={N}-HEAD_DIM={K}.json"
+        if os.path.exists(fpath):
+            with open(fpath, "r", encoding="utf-8") as file:
+                config = json.load(file)
+                _get_config._config_dict[key] = config
+        else:
+            key = "default"  # fall back to default config
+
+    # Select config based on M (similar to M dimension in GEMM)
+    if M < 32 and "small" in _get_config._config_dict[key]:
+        return _get_config._config_dict[key]["small"]
+    elif M <= 128:
+        BLK_M = triton.next_power_of_2(M)
+        if BLK_M == 32 and "medium_M32" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_M32"]
+        elif BLK_M == 64 and "medium_M64" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_M64"]
+        elif BLK_M == 128 and "medium_M128" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_M128"]
+    elif M <= 256 and "large" in _get_config._config_dict[key]:
+        return _get_config._config_dict[key]["large"]
+    else:
+        BLK_M = triton.next_power_of_2(M)
+        if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
+        elif "xlarge" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["xlarge"]
+
+    return _get_config._config_dict[key]["any"]
+
+
+def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, output_dtype=torch.float16, return_lse=False, config=None):
+    """
+    Forward pass for attention with QK int8 per-block quantization.
+    
+    Args:
+        q: Query tensor (B, H_qo, seq_len, head_dim) or (B, seq_len, H_qo, head_dim)
+        k: Key tensor (B, H_kv, seq_len, head_dim) or (B, seq_len, H_kv, head_dim)
+        v: Value tensor (B, H_kv, seq_len, head_dim) or (B, seq_len, H_kv, head_dim)
+        q_scale: Q scale tensor
+        k_scale: K scale tensor
+        tensor_layout: "HND" or "NHD"
+        attn_mask: Optional attention mask
+        output_dtype: Output dtype
+        return_lse: Whether to return log-sum-exp values
+        config: Optional kernel config dict (if None, will be loaded from config files)
+    
+    Returns:
+        output tensor and optionally LSE tensor
+    """
+    if config is None:
+        if tensor_layout == "HND":
+            _, _, qo_len, head_dim = q.shape
+            _, _, kv_len, _ = k.shape
+        else:
+            _, qo_len, _, head_dim = q.shape
+            _, kv_len, _, _ = k.shape
+        # Use M, N, K convention for _get_config to match GEMM pattern
+        # M = qo_len, N = kv_len, K = head_dim
+        config = _get_config(qo_len, kv_len, head_dim)
+    
+    BLOCK_M = config.get("BLOCK_SIZE_M", 64)
+    BLOCK_N = config.get("BLOCK_SIZE_N", 16)
+    num_stages = config.get("num_stages", 3)
 
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
 
@@ -186,9 +313,9 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, outp
         qo_len, kv_len,
         h_qo, num_kv_groups,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,  
-        STAGE=stage, RETURN_LSE=return_lse,
-        num_warps=2,
-        num_stages=3,
-        waves_per_eu=2)
+        STAGE=num_stages, RETURN_LSE=return_lse,
+        num_warps=config.get("num_warps", 2),
+        num_stages=num_stages,
+        waves_per_eu=config.get("waves_per_eu", 2))
 
     return o, lse
