@@ -1,4 +1,5 @@
 import triton
+from functools import lru_cache
 
 # For now, there is 1-to-1 correspondence between arch and device
 _ARCH_TO_DEVICE = {
@@ -8,6 +9,7 @@ _ARCH_TO_DEVICE = {
 }
 
 
+@lru_cache(maxsize=1)
 def get_arch():
     try:
         arch = (
@@ -22,6 +24,7 @@ def get_arch():
     return arch
 
 
+@lru_cache(maxsize=1)
 def get_device():
     return _ARCH_TO_DEVICE[get_arch()]
 

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -21,13 +21,8 @@ import torch
 import triton
 
 # @manual=//triton:triton
-import triton.language as tl
-import functools
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.common_utils import (
     prev_power_of_2,
-    autotune_max_seq_len,
     switch_to_contiguous_if_needed,
 )
 from aiter.ops.triton._triton_kernels.hstu_attention import (
@@ -38,21 +33,6 @@ from aiter.ops.triton._triton_kernels.hstu_attention import (
 )
 
 
-try:
-    from triton.language.extra.libdevice import (
-        fast_dividef,
-        fast_expf,
-    )  # @manual=//triton:triton
-except ImportError:
-    try:
-        # @manual=//triton:triton
-        from triton.language.extra.hip.libdevice import fast_dividef, fast_expf
-    except ImportError:
-        # pyre-ignore[21]
-        from triton.language.math import (
-            fast_dividef,
-            fast_expf,
-        )  # @manual=//triton:triton
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -73,23 +53,26 @@ def triton_hstu_attention_fwd(
     config: Optional[dict] = None,
 ) -> torch.Tensor:
     """
-    Computes HSTU attention fwd pass, compute the math dot(silu(dot(q * trans(k))) * v). inputs q, kv are of the jagged formats
+    HSTU attention forward pass with SiLU activation: Y = silu(alpha * (Q @ K^T)) @ V.
+    Works with jagged tensors (variable-length sequences concatenated along batch dimension).
 
-    Key parameters:
-    - N: max sequence length
-    - alpha: scale parameter to multiply output of first dot
-    - q: tensor with shape (L, H, D), L are sum of lengths of all sequences
-    - k: tensor with shape (L, H, D), L are sum of lengths of all sequences
-    - v: tensor with shape (L, H, D), L are sum of lengths of all sequences
-    - seq_offsets: tensor with shape (B + 1), indicates lengths of each sequences.
-    - causal: whether use causal mask.
-    - num_targets: number of targets.
-    - contextual_seq_len: contexual sequence length.
-    - sort_by_length_indices: indices of sequences sorted by lengths
-    - config: Optional, tuning configs to run the kernel
+    Args:
+        N (int): Maximum sequence length across all sequences.
+        alpha (float): Scale factor applied to Q @ K^T before SiLU activation.
+        q (torch.Tensor): Query jagged tensor with shape (total_tokens, num_heads, head_dim).
+        k (torch.Tensor): Key jagged tensor with shape (total_tokens, num_heads, head_dim).
+        v (torch.Tensor): Value jagged tensor with shape (total_tokens, num_heads, head_dim).
+        seq_offsets (torch.Tensor): Sequence boundaries with shape (batch_size + 1,).
+            Element i contains cumulative token count up to sequence i.
+        causal (bool): Apply causal masking.
+        num_targets (Optional[torch.Tensor]): Number of target tokens per sequence for masking.
+        max_attn_len (int): Maximum attention span limit. 0 disables limit.
+        contextual_seq_len (int): Contextual prefix length. 0 disables contextual masking.
+        sort_by_length_indices (Optional[torch.Tensor]): Indices to process sequences in descending length order.
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_M, BLOCK_N).
 
     Returns:
-    - Y: output with the shape (L, H, D).
+        torch.Tensor: Output jagged tensor with shape (total_tokens, num_heads, head_dim).
     """
     _LOGGER.info(
         f"HSTU_ATTENTION_FWD: N={N} alpha={alpha} q={tuple(q.shape)} k={tuple(k.shape)}  v={tuple(v.shape)} seq_offsets={tuple(seq_offsets.shape)}"
@@ -106,13 +89,12 @@ def triton_hstu_attention_fwd(
     if L == 0:
         return out
 
-    max_seq_len = autotune_max_seq_len(N)
     DeltaSize = 0
     IS_DELTA_Q = False
 
     if config is None:
         config = _get_fwd_config(
-            AUTOTUNE_Z, H, max_seq_len, DimQ, DimV, DeltaSize, IS_DELTA_Q
+            AUTOTUNE_Z,
         )
 
     grid = lambda meta: (  # noqa E731
@@ -137,13 +119,8 @@ def triton_hstu_attention_fwd(
         stride_om=out.stride(0),
         stride_oh=out.stride(1),
         alpha=alpha,
-        Z=Z,
-        AUTOTUNE_Z=AUTOTUNE_Z,
         H=H,
         MAX_SEQ_LEN=N,
-        AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(N),
-        DimQ=DimQ,
-        DimV=DimV,
         DeltaSize=DeltaSize,
         contextual_seq_len=contextual_seq_len,
         max_attn_len=max_attn_len,
@@ -181,28 +158,28 @@ def triton_hstu_attention_bwd(
     config: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Computes HSTU attention bwd pass.
+    HSTU attention backward pass computing gradients for Q, K, V.
 
-    Key parameters:
-    - dout: tensor with shape (L, H, D)
-    - q: tensor with shape (L, H, D), L are sum of lengths of all sequences
-    - k: tensor with shape (L, H, D), L are sum of lengths of all sequences
-    - v: tensor with shape (L, H, D), L are sum of lengths of all sequences
-    - dq: tensor with shape (L, H, D), gradients of q
-    - dk: tensor with shape (L, H, D), gradients of k
-    - dv: tensor with shape (L, H, D), gradients of v
-    - seq_offsets: tensor with shape (B + 1), indicates lengths of each sequences.
-    - num_targets: number of targets.
-    - N: max sequence length
-    - alpha: scale parameter to multiply output of first dot
-    - max_attn_len: max attn length
-    - causal: whether use causal mask.
-    - contextual_seq_len: contexual sequence length.
-    - sort_by_length_indices: indices of sequences sorted by lengths
-    - config: Optional, tuning configs to run the kernel
+    Args:
+        dout (torch.Tensor): Output gradient with shape (total_tokens, num_heads, head_dim).
+        q (torch.Tensor): Query jagged tensor with shape (total_tokens, num_heads, head_dim).
+        k (torch.Tensor): Key jagged tensor with shape (total_tokens, num_heads, head_dim).
+        v (torch.Tensor): Value jagged tensor with shape (total_tokens, num_heads, head_dim).
+        dq (torch.Tensor): Pre-allocated query gradient with shape (total_tokens, num_heads, head_dim).
+        dk (torch.Tensor): Pre-allocated key gradient with shape (total_tokens, num_heads, head_dim).
+        dv (torch.Tensor): Pre-allocated value gradient with shape (total_tokens, num_heads, head_dim).
+        seq_offsets (torch.Tensor): Sequence boundaries with shape (batch_size + 1,).
+        num_targets (Optional[torch.Tensor]): Number of target tokens per sequence.
+        N (int): Maximum sequence length.
+        alpha (float): Scale factor for Q @ K^T.
+        max_attn_len (int): Maximum attention span limit.
+        causal (float): Apply causal masking.
+        contextual_seq_len (int): Contextual prefix length.
+        sort_by_length_indices (Optional[torch.Tensor]): Indices for length-sorted processing.
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_M, BLOCK_N, SEQUENCE_PARALLEL).
 
     Returns:
-    - dq, dk, dv: gradients of q, k, and v
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Gradients (dq, dk, dv).
     """
     _LOGGER.info(
         f"HSTU_ATTENTION_BKWD: dout={dout.shape}  q={tuple(q.shape)} k={tuple(k.shape)}  v={tuple(v.shape)} dq={tuple(dq.shape)} dk={tuple(dk.shape)}  dv={tuple(dv.shape)}"
@@ -217,10 +194,11 @@ def triton_hstu_attention_bwd(
     _, H, DimQ = q.shape
     _, _, DimV = v.shape
 
-    max_seq_len = autotune_max_seq_len(N)
     AUTOTUNE_Z = prev_power_of_2(Z)
     if config is None:
-        config = _get_bwd_config(AUTOTUNE_Z, H, max_seq_len, DimQ, DimV)
+        config = _get_bwd_config(
+            AUTOTUNE_Z,
+        )
 
     grid = lambda meta: (  # noqa E731
         Z * H,
@@ -268,13 +246,8 @@ def triton_hstu_attention_bwd(
         alpha=alpha,
         contextual_seq_len=contextual_seq_len,
         max_attn_len=max_attn_len,
-        Z=Z,
-        AUTOTUNE_Z=AUTOTUNE_Z,
         H=H,
         MAX_SEQ_LEN=N,
-        AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(N),
-        DimQ=DimQ,
-        DimV=DimV,
         CAUSAL=causal,
         HAS_MULTIPLE_TARGETS=num_targets is not None,
         HAS_CONTEXTUAL_SEQ_LEN=contextual_seq_len > 0,
