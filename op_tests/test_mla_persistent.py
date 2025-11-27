@@ -287,8 +287,8 @@ def test_mla(
         uni_seqlen_qo=decode_qlen,
         fast_mode=True,
         max_split_per_batch=max_split_per_batch,
-        dtype_q=q.dtype,
-        dtype_kv=kv_buffer.dtype,
+        dtype_q=dtype,
+        dtype_kv=kvtype,
     )
 
     # Print metadata tensors
