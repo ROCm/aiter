@@ -242,7 +242,7 @@ def skinny_gemm(
         out += bias
     return out
 
-
+extensions_created = False
 def hipb_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -255,6 +255,9 @@ def hipb_gemm(
 ):
     if otype is None:
         otype = inp.dtype
+    if extensions_created == False:
+        hipb_create_extension()
+    extensions_created = True
     return hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
 
 
@@ -315,7 +318,7 @@ class TunedGemm:
     """bf16/fp16 with per tensor fp8 quant"""
 
     def __init__(self):
-        self.extensions_created = False
+        # self.extensions_created = False
         self.save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
         self.untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
         self.tune_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
@@ -345,9 +348,6 @@ class TunedGemm:
         scale_b: Optional[Tensor] = None,
         scale_c: Optional[Tensor] = None,
     ):
-        if self.extensions_created == False:
-            hipb_create_extension()
-            self.extensions_created = True
         bpreshuffle = False
         if hasattr(weights, "is_shuffled") and weights.is_shuffled is True:
             bpreshuffle = True
