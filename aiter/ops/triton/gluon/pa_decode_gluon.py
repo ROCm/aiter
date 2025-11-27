@@ -559,12 +559,12 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
                 + value_dim2_offsets[None, None, :]
             )
             # Load transposed value block
-            gl.amd.cdna3.sched_group_barrier(0x020, 1, 0)  # VMEM
+            # gl.amd.cdna3.sched_group_barrier(0x020, 1, 0)  # VMEM
             value_block = gl.amd.cdna3.buffer_load(
                 ptr=value_cache_ptr, offsets=value_block_offsets
             )
             # Perform matrix multiplication
-            gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)  # MFMA
+            # gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)  # MFMA
             qk_matrix = gl.amd.cdna3.mfma(
                 query_converted, key_converted, qk_accumulator
             )
@@ -1851,6 +1851,7 @@ def paged_attention_decode_v2_reduce_kernel(
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
     logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
     context_lengths_ptr,  # [num_seqs]
+    sink_token_ptr,  # [num_query_heads]
     stride_output_seq,
     stride_output_head,
     stride_exp_sums_seq,
@@ -1892,6 +1893,7 @@ def paged_attention_decode_v2_reduce_kernel(
     # Mathematical constant for exponential calculations
     LOG2_E: tl.constexpr = 1.4426950408889634
     MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 16
+    num_query_heads_total = gl.num_programs(1) * query_group_size
 
     # ==================== INITIALIZATION ====================
     sequence_idx = tl.program_id(0)
@@ -1951,6 +1953,14 @@ def paged_attention_decode_v2_reduce_kernel(
         # Update and accumulate global exponential sum
         global_exp_sum = update_scale * global_exp_sum + tl.sum(exp_sums, axis=0)
         global_max_prev = global_max
+
+    if sink_token_ptr is not None:
+        sink_token_values = gl.load(
+            sink_token_ptr + (kv_head_idx * query_group_size + query_group_offsets),
+            mask=(kv_head_idx * query_group_size + query_group_offsets)
+            < num_query_heads_total,
+        )
+        global_exp_sum += gl.exp(sink_token_values - global_max)
 
     # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
     for iter_idx in range(num_iterations):
