@@ -120,7 +120,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         # version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[4, 1]
         version=3,
-        instr_shape=[16, 16, 16],
+        instr_shape=[16, 16],
         transposed=True,
         warps_per_cta=[1, 4],
     )
@@ -132,7 +132,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     )
 
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16, 16], transposed=False, warps_per_cta=[1, 4]
+        version=3, instr_shape=[16, 16], transposed=False, warps_per_cta=[1, 4]
     )
     pv_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=pv_mfma_layout, k_width=16
@@ -519,6 +519,11 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
     SEQ_PARTITION_SZ,
     MAX_NUM_SEQ_PARTITIONS,
 ):
+    if QUERY_GRP_SZ < 16:
+        QUERY_GROUP_SIZE_POW2 = 16
+    else:
+        QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(QUERY_GRP_SZ)
+
     _paged_attn_decode_v2_w_dot_reduce_kernel[grid](
         out_ptr,  # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
         exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
@@ -535,10 +540,11 @@ def _paged_attn_decode_v2_w_dot_reduce_kernel_wrapper(
         stride_logits_h,
         stride_logits_p,
         stride_logits_g,
-        HEAD_SZ=HEAD_SZ,
-        QUERY_GRP_SZ=QUERY_GRP_SZ,
-        SEQ_PARTITION_SZ=SEQ_PARTITION_SZ,
-        MAX_NUM_SEQ_PARTITIONS=MAX_NUM_SEQ_PARTITIONS,
+        QUERY_GRP_SZ,
+        HEAD_SZ,
+        HEAD_SIZE_POW2=triton.next_power_of_2(HEAD_SZ),
+        QUERY_GROUP_SIZE_POW2=QUERY_GROUP_SIZE_POW2,
+        CONTEXT_PARTITION_SIZE=SEQ_PARTITION_SZ,
     )
 
 
@@ -2482,148 +2488,206 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_load4(
     tl.store(logits_ptr + logits_offs, acc, mask=q_mask)
 
 
-@gluon.jit
+@triton.jit
 def _paged_attn_decode_v2_w_dot_reduce_kernel(
-    out_ptr,  # [num_seqs, num_kv_heads, q_grp_sz, head_sz]
-    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz]
-    logits_ptrs,  # [num_seqs, num_kv_heads, max_parts, q_grp_sz, head_sz]
-    seq_lens_ptr,  # [num_seqs]
-    sink_ptr,  # [num_query_heads]
-    stride_o_s,
-    stride_o_h,
-    stride_exp_sums_s,
-    stride_exp_sums_h,
-    stride_exp_sums_p,
-    stride_logits_s,
-    stride_logits_h,
-    stride_logits_p,
-    stride_logits_g,
-    HEAD_SZ: tl.constexpr,
-    QUERY_GRP_SZ: tl.constexpr,
-    SEQ_PARTITION_SZ: tl.constexpr,
-    MAX_NUM_SEQ_PARTITIONS: tl.constexpr,
+    output_ptr,  # [num_seqs, num_kv_heads, query_group_size, head_size]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
+    context_lengths_ptr,  # [num_seqs]
+    sink_token_ptr,  # [num_query_heads]
+    stride_output_seq,
+    stride_output_head,
+    stride_exp_sums_seq,
+    stride_exp_sums_head,
+    stride_exp_sums_part,
+    stride_logits_seq,
+    stride_logits_head,
+    stride_logits_part,
+    stride_logits_group,
+    query_group_size,
+    head_size,
+    QUERY_GROUP_SIZE_POW2: tl.constexpr,
+    HEAD_SIZE_POW2: tl.constexpr,
+    CONTEXT_PARTITION_SIZE: tl.constexpr,
 ):
-    if QUERY_GRP_SZ <= 16:
-        QUERY_GRP_SZ_POW2: gl.constexpr = 16
-    else:
-        QUERY_GRP_SZ_POW2: gl.constexpr = triton.next_power_of_2(QUERY_GRP_SZ)
+    """
+    Triton reduction kernel for paged attention decode that combines partial results.
 
-    MAX_NUM_SEQ_PARTITIONS_POW2: gl.constexpr = triton.next_power_of_2(
-        MAX_NUM_SEQ_PARTITIONS
-    )
-    HEAD_SZ_POW2: gl.constexpr = triton.next_power_of_2(HEAD_SZ)
-    seq_idx = gl.program_id(0)
-    kv_head_idx = gl.program_id(1)
-    num_query_heads = gl.num_programs(1) * QUERY_GRP_SZ
-    seq_len = gl.load(seq_lens_ptr + seq_idx)
-    num_partitions = gl.cdiv(seq_len, SEQ_PARTITION_SZ)
-    if MAX_NUM_SEQ_PARTITIONS_POW2 >= 256:
-        blocked_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[1, 2, 4],
-            threads_per_warp=[4, 4, 4],
-            warps_per_cta=[4, 1, 1],
-            order=[2, 1, 0],
+    This version uses a fixed MAX_CONTEXT_PARTITION_NUM=16 and loops through partitions
+    in chunks to handle arbitrary numbers of context partitions.
+
+    This kernel performs the final reduction by:
+    1. Finding global maximum logits across partitions (first pass)
+    2. Rescaling exponential sums for numerical stability (second pass)
+    3. Computing normalized attention probabilities (second pass)
+    4. Weighted summation of partial logits (second pass)
+
+    Args:
+        output_ptr: Output tensor for final attention results
+        exp_sums_ptr: Exponential sums from partial computations
+        max_logits_ptr: Maximum logits from partial computations
+        logits_ptr: Partial logit tensors from each sequence partition
+        context_lengths_ptr: Sequence lengths for each sequence
+        Various stride parameters for tensor access
+        Compile-time constants for kernel configuration (no MAX_CONTEXT_PARTITION_NUM needed)
+    """
+    # Mathematical constant for exponential calculations
+    LOG2_E: tl.constexpr = 1.4426950408889634
+    MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 16
+    num_query_heads_total = gl.num_programs(1) * query_group_size
+
+    # ==================== INITIALIZATION ====================
+    sequence_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+
+    context_length = tl.load(context_lengths_ptr + sequence_idx)
+    context_partition_num = tl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
+
+    # Generate coordinate ranges
+    query_group_offsets = tl.arange(0, QUERY_GROUP_SIZE_POW2)
+    head_size_offsets = tl.arange(0, HEAD_SIZE_POW2)
+
+    # Initialize global accumulation variables
+    global_max = tl.full((QUERY_GROUP_SIZE_POW2,), float("-inf"), dtype=tl.float32)
+    global_max_prev = global_max
+    global_exp_sum = tl.zeros((QUERY_GROUP_SIZE_POW2,), dtype=tl.float32)
+    final_output = tl.zeros((QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=tl.float32)
+
+    # Calculate number of iterations needed
+    num_iterations = tl.cdiv(context_partition_num, MAX_CONTEXT_PARTITION_NUM)
+
+    # ==================== FIRST PASS: FIND GLOBAL MAX ====================
+    # Loop through partitions in chunks of MAX_CONTEXT_PARTITION_NUM
+    for iter_idx in range(num_iterations):
+        partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
+        partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM) + partition_base
+
+        # Calculate offsets for exponential sums and max logits
+        exp_sums_offsets = (
+            sequence_idx * stride_exp_sums_seq
+            + kv_head_idx * stride_exp_sums_head
+            + partition_offsets[:, None] * stride_exp_sums_part
+            + query_group_offsets[None, :]
         )
-    else:
-        blocked_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[4, 1, 2],
-            threads_per_warp=[4, 4, 4],
-            warps_per_cta=[1, 2, 2],
-            order=[2, 1, 0],
+
+        # Create mask for valid partitions and query groups
+        exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (
+            query_group_offsets[None, :] < query_group_size
         )
-    query_grp_sz_layout: gl.constexpr = gl.SliceLayout(
-        0, gl.SliceLayout(2, blocked_layout)
-    )
-    head_sz_layout: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, blocked_layout))
-    seq_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, blocked_layout))
 
-    part_offs = gl.arange(0, MAX_NUM_SEQ_PARTITIONS_POW2, layout=seq_layout)
-    q_grp_offs = gl.arange(0, QUERY_GRP_SZ_POW2, layout=query_grp_sz_layout)
-    head_offs = gl.arange(0, HEAD_SZ_POW2, layout=head_sz_layout)
-
-    # get global max logit
-    exp_sums_offs = (
-        seq_idx * stride_exp_sums_s
-        + kv_head_idx * stride_exp_sums_h
-        + part_offs[:, None] * stride_exp_sums_p
-        + q_grp_offs[None, :]
-    )
-    exp_sums_mask = (part_offs[:, None] < num_partitions) & (
-        q_grp_offs[None, :] < QUERY_GRP_SZ
-    )
-
-    # max_logits: [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2]
-    max_logits = gl.amd.cdna3.buffer_load(
-        ptr=max_logits_ptr,
-        offsets=exp_sums_offs,
-        mask=exp_sums_mask,
-        other=float("-inf"),
-    )
-    # max_logit: [QUERY_GRP_SZ_POW2]
-    ml = tl.max(max_logits, axis=0)
-
-    # Rescale the exp sums and compute the global sum
-    # exp_sums: [MAX_NUM_SEQ_PARTITIONS, QUERY_GRP_SZ_POW2]
-    exp_sums = gl.amd.cdna3.buffer_load(
-        ptr=exp_sums_ptr, offsets=exp_sums_offs, mask=exp_sums_mask, other=0.0
-    )
-    exp_sums *= tl.exp(max_logits - ml[None, :])
-
-    # exp_sum: [QUERY_GRP_SZ_POW2]
-    exp_sum = tl.sum(exp_sums, axis=0)
-    if sink_ptr is not None:
-        M = gl.load(
-            sink_ptr + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs),
-            mask=(kv_head_idx * QUERY_GRP_SZ + q_grp_offs) < num_query_heads,
+        # Load maximum logits from current chunk of partitions
+        max_logits = tl.load(
+            max_logits_ptr + exp_sums_offsets, mask=exp_sums_mask, other=float("-inf")
         )
-        exp_sum += tl.math.exp(M - ml)
-    # p: [MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2]
-    p = exp_sums / exp_sum[None, :]
-    p = tl.reshape(p, (MAX_NUM_SEQ_PARTITIONS_POW2, QUERY_GRP_SZ_POW2, 1))
+        exp_sums = tl.load(
+            exp_sums_ptr + exp_sums_offsets, mask=exp_sums_mask, other=0.0
+        )
 
-    # logits_offset
-    logits_offset = (
-        seq_idx * stride_logits_s
-        + kv_head_idx * stride_logits_h
-        + part_offs[:, None, None] * stride_logits_p
-        + q_grp_offs[None, :, None] * stride_logits_g
-        + head_offs[None, None, :]
-    )
-    # load logits
-    logits_mask = (part_offs[:, None] < num_partitions) & (
-        q_grp_offs[None, :] < QUERY_GRP_SZ
-    )
-    logits = gl.amd.cdna3.buffer_load(
-        ptr=logits_ptrs, offsets=logits_offset, mask=logits_mask[:, :, None], other=0.0
-    )
-    # out: [QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
-    out = tl.sum(
-        (logits.to(gl.float32) * gl.convert_layout(p, layout=blocked_layout)), axis=0
-    ).to(out_ptr.dtype.element_ty)
-    out_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[4, 16],
-        warps_per_cta=[4, 1],
-        order=[1, 0],
-    )
-    query_grp_sz_out_layout: gl.constexpr = gl.SliceLayout(1, out_layout)
-    head_sz_out_layout: gl.constexpr = gl.SliceLayout(0, out_layout)
-    q_grp_offs_out = gl.arange(0, QUERY_GRP_SZ_POW2, layout=query_grp_sz_out_layout)
-    head_offs_out = gl.arange(0, HEAD_SZ_POW2, layout=head_sz_out_layout)
-    # store output
-    out_offs = (
-        seq_idx * stride_o_s
-        + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs_out[:, None]) * stride_o_h
-        + head_offs_out[None, :]
+        # Update global maximum logit
+        chunk_max_logits = tl.max(max_logits, axis=0)
+        global_max = tl.maximum(global_max, chunk_max_logits)
+        # Compute update scale for exponential sums
+        update_scale = tl.exp(global_max_prev - global_max)
+
+        # Rescale exponential sums using global maximum for numerical stability
+        exp_sums *= tl.exp(max_logits - global_max[None, :])
+        # Update and accumulate global exponential sum
+        global_exp_sum = update_scale * global_exp_sum + tl.sum(exp_sums, axis=0)
+        global_max_prev = global_max
+
+    if sink_token_ptr is not None:
+        sink_token_values = gl.load(
+            sink_token_ptr + (kv_head_idx * query_group_size + query_group_offsets),
+            mask=(kv_head_idx * query_group_size + query_group_offsets)
+            < num_query_heads_total,
+        )
+        global_exp_sum += gl.exp(sink_token_values - global_max)
+
+    # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
+    for iter_idx in range(num_iterations):
+        partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
+        partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM) + partition_base
+
+        # Calculate offsets for exponential sums and max logits
+        exp_sums_offsets = (
+            sequence_idx * stride_exp_sums_seq
+            + kv_head_idx * stride_exp_sums_head
+            + partition_offsets[:, None] * stride_exp_sums_part
+            + query_group_offsets[None, :]
+        )
+
+        # Create mask for valid partitions and query groups
+        exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (
+            query_group_offsets[None, :] < query_group_size
+        )
+
+        # Load maximum logits and exponential sums from current chunk
+        max_logits = tl.load(
+            max_logits_ptr + exp_sums_offsets, mask=exp_sums_mask, other=float("-inf")
+        )
+        # BUGFIX: Add other=0.0 to prevent loading undefined values for invalid partitions
+        exp_sums = tl.load(
+            exp_sums_ptr + exp_sums_offsets, mask=exp_sums_mask, other=0.0
+        )
+
+        # Rescale exponential sums using global maximum for numerical stability
+        exp_sums *= tl.exp(max_logits - global_max[None, :])
+
+        # ==================== ATTENTION PROBABILITY AND WEIGHTED SUMMATION ====================
+        # Compute normalized attention probabilities for this chunk
+        attention_probs = exp_sums / global_exp_sum[None, :]
+
+        # Reshape probabilities for broadcasting with logits
+        attention_probs = tl.reshape(
+            attention_probs, (MAX_CONTEXT_PARTITION_NUM, QUERY_GROUP_SIZE_POW2, 1)
+        )
+
+        # Calculate offsets for loading partial logits
+        logits_offsets = (
+            sequence_idx * stride_logits_seq
+            + kv_head_idx * stride_logits_head
+            + partition_offsets[None, :, None] * stride_logits_part
+            + query_group_offsets[:, None, None] * stride_logits_group
+            + head_size_offsets[None, None, :]
+        )
+
+        # Create mask for valid logits access
+        logits_mask = (partition_offsets[None, :] < context_partition_num) & (
+            query_group_offsets[:, None] < query_group_size
+        )
+
+        # Load partial logits from current chunk of partitions
+        partial_logits = tl.load(
+            logits_ptr + logits_offsets, mask=logits_mask[:, :, None], other=0.0
+        )
+
+        # Permute to match the expected dimension order
+        partial_logits = tl.permute(partial_logits, (1, 0, 2)).to(tl.float32)
+        updated_output = partial_logits * attention_probs
+
+        # Accumulate weighted sum of logits
+        final_output += tl.sum(updated_output, axis=0)
+
+    # ==================== FINAL OUTPUT STORING ====================
+    # Calculate output tensor offsets
+    output_offsets = (
+        sequence_idx * stride_output_seq
+        + (kv_head_idx * query_group_size + query_group_offsets[:, None])
+        * stride_output_head
+        + head_size_offsets[None, :]
     )
 
-    gl.amd.cdna3.buffer_store(
-        stored_value=gl.convert_layout(out, layout=out_layout),
-        ptr=out_ptr,
-        offsets=out_offs,
-        mask=(q_grp_offs_out[:, None] < QUERY_GRP_SZ)
-        & (head_offs_out[None, :] < HEAD_SZ),
+    # Create mask for valid output storage
+    output_mask = (query_group_offsets[:, None] < query_group_size) & (
+        head_size_offsets[None, :] < head_size
+    )
+
+    # Store final output to global memory
+    tl.store(
+        output_ptr + output_offsets,
+        final_output.to(output_ptr.dtype.element_ty),
+        mask=output_mask,
     )
 
 
