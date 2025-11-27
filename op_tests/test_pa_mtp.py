@@ -499,7 +499,7 @@ def test_pa_mtp(
         )
         context_lens = torch.full((batch_size,), ctx_lens)
         # kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
-        aiter.get_pa_metadata_v1(
+        aiter.get_mla_metadata_v1(
             qo_indptr,
             kv_indptr,
             num_query_heads // num_kv_heads,
@@ -519,18 +519,18 @@ def test_pa_mtp(
         K=k_quant_,
         V=asm_V_shuffle(v_quant_),
         output=output,
-        softmax_scale=scale,
         max_qlen=max_qlen,
         qo_indptr=qo_indptr,
         kv_indptr=kv_indptr,
         kv_indices=kv_indices,
         context_lens=context_lens,
-        work_metadata_ptrs=work_metadata_ptrs,
-        work_indptr=work_indptr,
-        work_info=work_info,
+        work_meta_data=work_metadata_ptrs,
+        # work_indptr=work_indptr,
+        # work_info=work_info,
         reduce_indptr=reduce_indptr,
         reduce_final_map=reduce_final_map,
         reduce_partial_map=reduce_partial_map,
+        softmax_scale=scale,
     )
     err = checkAllclose(
         out_ref,
@@ -573,7 +573,9 @@ def test_pa_mtp(
 head_dim = 128
 l_block_size = [16]
 l_dtype = ["bf16"]
-l_num_heads = [(5, 1), (8, 1), (10, 1)]
+l_num_heads = [
+    (16, 1)
+]  # num_query_heads must be multiple of 16 for get_mla_metadata_info_v1
 l_qlen = [1, 2, 3, 4]
 l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
 l_batch_size = [128]
