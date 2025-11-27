@@ -342,7 +342,11 @@ def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
     arg_names = []
     arg_types = []
     for param in sig.parameters.values():
-        if param.name in bound_args.arguments and param.annotation != tl.constexpr:
+        if (
+            param.name in bound_args.arguments
+            and param.annotation != tl.constexpr
+            and bound_args.arguments[param.name] is not None
+        ):
             arg_names.append(param.name)
             if isinstance(bound_args.arguments[param.name], torch.Tensor):
                 arg_types.append(str(bound_args.arguments[param.name].dtype))
@@ -468,6 +472,7 @@ class HsacoKernel:
                     if (
                         param.name in bound_args.arguments
                         and param.annotation != tl.constexpr
+                        and bound_args.arguments[param.name] is not None
                     ):
                         ordered_args_without_constexprs.append(
                             bound_args.arguments[param.name]
