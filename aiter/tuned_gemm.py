@@ -41,6 +41,8 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 solMap = ["torch", "hipblaslt", "skinny", "asm"]
 
+extensions_created = False
+
 
 def get_solfunc(soltype: int):
     if soltype == 0:
@@ -225,6 +227,10 @@ def hipb_gemm(
 ):
     if otype is None:
         otype = inp.dtype
+    global extensions_created
+    if extensions_created == False:
+        hipb_create_extension()
+        extensions_created = True
     return hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
 
 
@@ -300,9 +306,7 @@ class TunedGemm:
         scale_b: Optional[Tensor] = None,
         scale_c: Optional[Tensor] = None,
     ):
-        if self.extensions_created == False:
-            hipb_create_extension()
-            self.extensions_created = True
+
         out = gemm_a16w16(
             inp,
             weights,
