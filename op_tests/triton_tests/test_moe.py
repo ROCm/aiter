@@ -324,7 +324,7 @@ def quantize_fp8(
     tensor: torch.Tensor, dim=()
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     dev = arch_info.get_device()
-    if dev == "MI350X":
+    if dev in ["MI350X", "R9700"]:
         fp8_type = torch.float8_e4m3fn
     else:
         fp8_type = torch.float8_e4m3fnuz

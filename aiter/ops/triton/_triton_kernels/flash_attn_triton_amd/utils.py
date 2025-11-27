@@ -632,7 +632,7 @@ def is_fp8(x) -> bool:
     def _is_fp8_single(t: torch.Tensor) -> bool:
         if is_dtype_fp8(t.dtype):
             arch = get_arch()
-            if arch not in ("gfx942", "gfx950"):
+            if arch not in ("gfx942", "gfx950", "gfx1201"):
                 raise RuntimeError(
                     f"{arch} is not in the list of supported architectures for FP8"
                 )

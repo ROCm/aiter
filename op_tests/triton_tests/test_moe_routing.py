@@ -95,7 +95,7 @@ n_tokens = [4, 7, 8, 64, 255, 256, 371, 911, 1023, 1024, 4096, 8192]
 @pytest.mark.parametrize("use_expt_indx", [False, True])
 @pytest.mark.parametrize("sm_first", [True, False])
 def test_op(n_tokens, n_expts_tot, n_expts_act, sm_first, use_expt_indx):
-    if get_arch() != "gfx950":
+    if get_arch() not in  ["gfx950", "gfx1201"]:
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
     device = "cuda"
