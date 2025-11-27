@@ -5,6 +5,15 @@
 
 #include "v1_comm.cuh"
 
+__device__ int32_t get_local_splits(int32_t seqlen_kv,
+                                    int32_t num_splits,
+                                    int32_t num_splits_per_cu)
+{
+    int32_t ex_splits = seqlen_kv / 196; // magic num 196. Experiments shows 196 per splits can get better performance.
+    
+	return ck_tile::min(ck_tile::min(ex_splits, num_splits_per_cu), num_splits);
+}
+
 __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
 {
@@ -27,6 +36,8 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
     int32_t* p_lds_payload = p_lds_split  + params.num_batches;
     int32_t* p_lds_kv_seqlen = p_lds_payload + params.num_batches;
 
+    int32_t num_splits_per_cu = params.num_cu / params.num_batches;
+
     for(int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
         const int32_t kv_begin  = params.p_seqlens_kv_indptr[bid];
@@ -35,7 +46,8 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
 
         const int32_t num_blocks = integer_divide_ceil_power2(
             seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
-        const int32_t payload = ck_tile::integer_divide_ceil(num_blocks, params.num_splits);
+        const int32_t num_splits = get_local_splits(seqlen_kv, params.num_splits, num_splits_per_cu);
+        const int32_t payload = ck_tile::integer_divide_ceil(num_blocks, num_splits);
         const int32_t split_local = ck_tile::integer_divide_ceil(num_blocks, payload);
         p_lds_split[bid] = split_local;
         p_lds_payload[bid] = payload;
@@ -53,6 +65,10 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
         }
     }
     __syncthreads();
+
+    int32_t work_end = p_lds_shift[params.num_batches - 1] + p_lds_split[params.num_batches - 1];
+    int32_t work_per_cu = (work_end + params.num_cu - 1) / params.num_cu;
+    int32_t used_cu = (work_end + work_per_cu - 1) / work_per_cu;
 
     for(int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
@@ -82,12 +98,6 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
         params.p_reduce_final_map[bid * 2]     = work_info.qo_start;
         params.p_reduce_final_map[bid * 2 + 1] = work_info.qo_end;
     }
-
-
-
-    int32_t work_end = p_lds_shift[params.num_batches - 1] + p_lds_split[params.num_batches - 1];
-    int32_t work_per_cu = (work_end + params.num_cu - 1) / params.num_cu;
-    int32_t used_cu = (work_end + work_per_cu - 1) / work_per_cu;
 
     int32_t reduce_end = params.p_reduce_indptr[params.num_batches];
     for (int32_t work_id = lane_idx + 1; work_id < used_cu; work_id += ck_tile::get_warp_size())
