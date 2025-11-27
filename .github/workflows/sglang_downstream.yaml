@@ -73,7 +73,7 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -t sglang_aiter_test:ci -f Dockerfile.mod .
+          docker build --network=host -t sglang_aiter_test:ci -f Dockerfile.mod .
 
       - name: Start CI container
         run: |
@@ -91,6 +91,7 @@ jobs:
           -v "${GITHUB_WORKSPACE:-$PWD}/sglang:/sglang-checkout" \
           --ipc=host --group-add video \
           --shm-size 32g \
+          --network=host \
           --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
           --security-opt seccomp=unconfined \
