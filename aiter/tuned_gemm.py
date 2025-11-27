@@ -184,7 +184,7 @@ def gemm_a16w16(
     m, k = inp_view.shape
     n = B.shape[0]
     use_bias = bias is not None
-    otype = otype if otype is not None else str(inp_view.dtype)
+    otype = otype if otype is not None else inp_view.dtype
     config = get_GEMM_A16W16_config(
         M=m,
         N=n,
