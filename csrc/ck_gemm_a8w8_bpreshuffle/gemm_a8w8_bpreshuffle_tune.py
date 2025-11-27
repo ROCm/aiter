@@ -118,16 +118,31 @@ def generate_data_asm(
     return x, weight, weight_shuffle, x_scale, w_scale, out, bias_f32
 
 
+def libtype_list(string):
+    values = string.split(",")
+    for value in values:
+        if value not in ["all", "asm", "ck", "cktile"]:
+            raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
+    return values
+
+
 class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE}",
         "untune_file": "aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv",
     }
-    libtype_list = ["ck", "cktile", "asm"]
 
     def _setup_specific_arguments(self):
-        pass
+        self.parser.add_argument(
+            "--libtype",
+            # nargs='+',
+            # choices=['all', 'asm', 'ck', 'cktile'],
+            type=libtype_list,
+            default=["all"],
+            required=False,
+            help="choose libtype to be tuned, support ['all', 'asm', 'ck', 'cktile']",
+        )
 
     def calculate(self, results, bpes=(1, 1, 2)):
         ## bpes = (inbpe, w_bpe, outbpe)
@@ -356,21 +371,24 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             total_kernel_nums = 0
             # kernels_num = len(kernels_list_ck)
             info_keys = (cu_num, M, N, K, q_dtype_w)
-            task.extend(
-                self.get_ck_gemm_a8w8_bpreshuffle_tune_task(
-                    info_keys,
-                    useSplitK,
-                    seed,
+            if "all" in args.libtype or "ck" in args.libtype:
+                task.extend(
+                    self.get_ck_gemm_a8w8_bpreshuffle_tune_task(
+                        info_keys,
+                        useSplitK,
+                        seed,
+                    )
                 )
-            )
-            task.extend(
-                self.get_cktile_gemm_a8w8_bpreshuffle_tune_task(
-                    info_keys,
-                    useSplitK,
-                    seed,
+            if "all" in args.libtype or "cktile" in args.libtype:
+                task.extend(
+                    self.get_cktile_gemm_a8w8_bpreshuffle_tune_task(
+                        info_keys,
+                        useSplitK,
+                        seed,
+                    )
                 )
-            )
-            task.extend(self.get_asm_gemm_i8_tasks(info_keys, useSplitK, 0, seed))
+            if "all" in args.libtype or "asm" in args.libtype:
+                task.extend(self.get_asm_gemm_i8_tasks(info_keys, useSplitK, 0, seed))
 
             total_kernel_nums = len(task)
 

@@ -456,41 +456,20 @@ def gemm_a8w8_bpreshuffle(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     # CKTile only supports bf16 dtype
-    if dtype == dtypes.bf16:
-        cktile_config = get_bpreshuffle_GEMM_config(
+    config = get_bpreshuffle_GEMM_config(
             m,
             n,
             k,
             dtypes.fp8,
-            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
         )
-    else:
-        cktile_config = None
-
-    ck_config = get_bpreshuffle_GEMM_config(
-        m, n, k, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
-    )
-    if cktile_config is not None and ck_config is not None:
-        cktile_time = cktile_config.get("us", float("inf"))
-        ck_time = ck_config.get("us", float("inf"))
-
-        if AITER_LOG_TUNED_CONFIG:
-            logger.info(
-                f"Both CKTile and CK configs found for M:{m}, N:{n}, K:{k} - "
-                f"CKTile time: {cktile_time:.6f}us, CK time: {ck_time:.6f}us"
-            )
-
-        if cktile_time <= ck_time:
-            if AITER_LOG_TUNED_CONFIG:
-                logger.info(f"Using CKTile implementation (faster)")
-            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
-        else:
-            if AITER_LOG_TUNED_CONFIG:
-                logger.info(f"Using CK implementation (faster)")
+    if config is not None:
+        libtype = config['libtype']
+        if libtype == "ck":
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+        elif libtype == "cktile":
+            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
     else:
-        if AITER_LOG_TUNED_CONFIG:
-            logger.info(f"default Using CK implementation")
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
