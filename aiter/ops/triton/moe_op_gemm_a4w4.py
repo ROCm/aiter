@@ -209,6 +209,7 @@ def reduce_grouped(
 # This is fixed by spec for MXFP4. Do not tune this.
 MXFP4_QUANT_BLOCK_SIZE = 32
 
+
 def mxfp4_quant(
     x: torch.Tensor,
     block_size_m: int = 16,
@@ -230,7 +231,9 @@ def mxfp4_quant(
 
     x_fp32 = x.to(torch.float32)
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
-    x_scale = torch.empty((M, N // MXFP4_QUANT_BLOCK_SIZE), dtype=torch.uint8, device=x.device)
+    x_scale = torch.empty(
+        (M, N // MXFP4_QUANT_BLOCK_SIZE), dtype=torch.uint8, device=x.device
+    )
 
     grid = (
         triton.cdiv(M, block_size_m),
