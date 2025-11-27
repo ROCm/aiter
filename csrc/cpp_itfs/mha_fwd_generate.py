@@ -165,6 +165,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
+                                     false,
                                      use_ext_asm);
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
