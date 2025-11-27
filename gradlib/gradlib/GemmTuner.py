@@ -385,7 +385,7 @@ class Gemm:
                     self.m,
                     self.n,
                     self.k,
-                    False,
+                    True if self.bias is not None else False,
                     str(self.indtype),
                     str(self.outdtype),
                     self.scaleAB,
@@ -658,6 +658,7 @@ class GemmTuner(GemmCommonTuner):
                     logger.info("skiped tuned shapes:")
                 self.untunedf = self.untunedf[~mask]
             self.untunedf.drop_duplicates().reset_index(drop=True)
+            print("untunedf is ", self.untunedf)
 
     def add_gemm(
         self,

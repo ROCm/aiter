@@ -40,6 +40,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
 solMap = ["torch", "hipblaslt", "skinny", "asm"]
+extensions_created = False
 
 
 def get_solfunc(soltype: int):
@@ -242,7 +243,7 @@ def skinny_gemm(
         out += bias
     return out
 
-extensions_created = False
+
 def hipb_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -255,9 +256,10 @@ def hipb_gemm(
 ):
     if otype is None:
         otype = inp.dtype
+    global extensions_created
     if extensions_created == False:
         hipb_create_extension()
-    extensions_created = True
+        extensions_created = True
     return hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
 
 
