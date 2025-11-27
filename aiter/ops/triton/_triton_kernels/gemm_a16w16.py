@@ -7,6 +7,9 @@ from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.kernel_repr import make_kernel_repr
+from ..utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 _gemm_a16w16_repr = make_kernel_repr(
@@ -260,6 +263,7 @@ def _get_config(
         dev = arch_info.get_device()
         _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16.json"
+        _LOGGER.info(f"Loading default GEMM config from: {fpath}")
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict["default"] = config
@@ -269,19 +273,23 @@ def _get_config(
         dev = arch_info.get_device()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16-N={N}-K={K}.json"
         if os.path.exists(fpath):
+            _LOGGER.info(f"Loading specific GEMM config from: {fpath}")
             with open(fpath, "r") as file:
                 config = json.load(file)
                 _get_config._config_dict[key] = config
         else:
             key = "default"  # fall back to default config
+            _LOGGER.info(f"Specific config not found, using default config for N={N}, K={K}")
 
     bounds = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
     for bound in bounds:
         if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
             temp_config = _get_config._config_dict[key][f"M_LEQ_{bound}"]
+            _LOGGER.info(f"Using config for M <= {bound} with N={N}, K={K}")
             break
     else:
         temp_config = _get_config._config_dict[key]["any"]
+        _LOGGER.info(f"Using 'any' config for M={M}, N={N}, K={K}")
 
     # Copy to avoid mutating the cached config
     chosen_config = dict(temp_config)

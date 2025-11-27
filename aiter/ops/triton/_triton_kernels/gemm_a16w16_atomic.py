@@ -11,6 +11,9 @@ from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
 from ..utils._triton.kernel_repr import make_kernel_repr
+from ..utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 _gemm_a16w16_atomic_repr = make_kernel_repr(
@@ -171,16 +174,22 @@ def _get_config(
             # single config. for the default path
             return _get_config._config_dict[key]["any"]
     if M < 32:
+        _LOGGER.info(f"Using 'small' ATOMIC config for M={M}, N={N}, K={K}")
         return _get_config._config_dict[key]["small"]
     elif M <= 128:
         BLK_M = triton.next_power_of_2(M)
         if BLK_M == 32:
+            _LOGGER.info(f"Using 'medium_M32' ATOMIC config for M={M}, N={N}, K={K}")
             return _get_config._config_dict[key]["medium_M32"]
         elif BLK_M == 64:
+            _LOGGER.info(f"Using 'medium_M64' ATOMIC config for M={M}, N={N}, K={K}")
             return _get_config._config_dict[key]["medium_M64"]
         elif BLK_M == 128:
+            _LOGGER.info(f"Using 'medium_M128' ATOMIC config for M={M}, N={N}, K={K}")
             return _get_config._config_dict[key]["medium_M128"]
     elif M <= 256:
+        _LOGGER.info(f"Using 'large' ATOMIC config for M={M}, N={N}, K={K}")
         return _get_config._config_dict[key]["large"]
     else:
+        _LOGGER.info(f"Using 'xlarge' ATOMIC config for M={M}, N={N}, K={K}")
         return _get_config._config_dict[key]["xlarge"]
