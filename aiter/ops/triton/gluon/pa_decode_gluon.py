@@ -63,23 +63,25 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     stride_v_nh,
     stride_v_hz,
     stride_bt_s,
+    head_size,
+    query_group_size,
     compute_type: gl.constexpr,
-    HEAD_SZ: gl.constexpr,
-    QUERY_GRP_SZ: gl.constexpr,
-    KV_BLK_SZ: gl.constexpr,
+    HEAD_SZ_POW2: gl.constexpr,
+    QUERY_GRP_SZ_POW2: gl.constexpr,
+    KV_BLK_SZ_POW2: gl.constexpr,
     SEQ_PARTITION_SZ: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
 ):
     """
     #TODO: Add Doc
     """
-    if QUERY_GRP_SZ <= 16:
-        QUERY_GRP_SZ_POW2: gl.constexpr = 16
-    else:
-        QUERY_GRP_SZ_POW2: gl.constexpr = triton.next_power_of_2(QUERY_GRP_SZ)
+    # if QUERY_GRP_SZ <= 16:
+    #     QUERY_GRP_SZ_POW2: gl.constexpr = 16
+    # else:
+    #     QUERY_GRP_SZ_POW2: gl.constexpr = triton.next_power_of_2(QUERY_GRP_SZ)
 
-    HEAD_SZ_POW2: gl.constexpr = triton.next_power_of_2(HEAD_SZ)
-    KV_BLK_SZ_POW2: gl.constexpr = triton.next_power_of_2(KV_BLK_SZ)
+    # HEAD_SZ_POW2: gl.constexpr = triton.next_power_of_2(HEAD_SZ)
+    # KV_BLK_SZ_POW2: gl.constexpr = triton.next_power_of_2(KV_BLK_SZ)
     seq_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
     seq_part_idx = gl.program_id(2)
@@ -94,8 +96,10 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         return
 
     seq_end_idx = gl.minimum(seq_start_idx + SEQ_PARTITION_SZ, seq_len)
-    MAX_NUM_KV_BLKS: gl.constexpr = (SEQ_PARTITION_SZ + KV_BLK_SZ - 1) // KV_BLK_SZ
-    num_kv_blks = gl.cdiv(seq_end_idx - seq_start_idx, KV_BLK_SZ)
+    MAX_NUM_KV_BLKS: gl.constexpr = (
+        SEQ_PARTITION_SZ + KV_BLK_SZ_POW2 - 1
+    ) // KV_BLK_SZ_POW2
+    num_kv_blks = gl.cdiv(seq_end_idx - seq_start_idx, KV_BLK_SZ_POW2)
 
     # # 1 x QUERY_GRP_SZ_POW2 x HEAD_SZ_POW2
     # # 1 x 8(mdim) x 128(kdim)
@@ -184,9 +188,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         alibi_slope = gl.zeros([QUERY_GRP_SZ_POW2], dtype=gl.float32)
     else:
         alibi_slope = gl.amd.cdna3.buffer_load(
-            ptr=alibi_slopes + kv_head_idx * QUERY_GRP_SZ,
+            ptr=alibi_slopes + kv_head_idx * query_group_size,
             offsets=qk_row_offs,
-            mask=qk_row_offs < QUERY_GRP_SZ,
+            mask=qk_row_offs < query_group_size,
         )
 
     # load all kv blocks in one time
@@ -200,10 +204,12 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     # load q[QUERY_GRP_SZ_POW2, HEAD_SZ_POW2]
     q_offs = (
         seq_idx * stride_q_s
-        + (kv_head_idx * QUERY_GRP_SZ + q_grp_offs[:, None]) * stride_q_nh
+        + (kv_head_idx * query_group_size + q_grp_offs[:, None]) * stride_q_nh
         + head_sz_offs[None, :]
     )
-    q_mask = (q_grp_offs[:, None] < QUERY_GRP_SZ) & (head_sz_offs[None, :] < HEAD_SZ)
+    q_mask = (q_grp_offs[:, None] < query_group_size) & (
+        head_sz_offs[None, :] < head_size
+    )
     q = gl.amd.cdna3.buffer_load(ptr=q_ptr, offsets=q_offs, mask=q_mask)
     q_shared = gl.allocate_shared_memory(q.dtype, q.shape, shared_a_layout, q)
     # k_blk_offs[MAX_NUM_KV_BLKS, K_HEAD_SZ_POW2_SPLIT, KV_BLK_SZ_POW2, CONTIGUOUS_KV_ELEMS_16B_LOAD]
@@ -244,7 +250,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         )
 
     qk = gl.where(
-        (qk_row_offs[:, None] < QUERY_GRP_SZ) & (qk_col_offs[None, :] < seq_len),
+        (qk_row_offs[:, None] < query_group_size) & (qk_col_offs[None, :] < seq_len),
         qk,
         float("-inf"),
     )
@@ -266,7 +272,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         + seq_part_idx * stride_max_logits_p
         + m_l_base_offs
     )
-    m_l_grp_mask = m_l_base_offs < QUERY_GRP_SZ
+    m_l_grp_mask = m_l_base_offs < query_group_size
     gl.amd.cdna3.buffer_store(
         stored_value=max_logit_new,
         ptr=max_logits_ptr,
@@ -276,6 +282,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     gl.amd.cdna3.buffer_store(
         stored_value=exp_sum, ptr=exp_sums_ptr, offsets=m_l_offs, mask=m_l_grp_mask
     )
+
     # MAX_NUM_KV_BLKS x HEAD_SZ_POW2 x KV_BLK_SZ_POW2
     # 16(kdim0) x 128(ndim) x 16(kdim1)
     blocked_v_layout: gl.constexpr = gl.DistributedLinearLayout(  # 256x128
@@ -346,7 +353,9 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
     o_head_sz_offs = gl.arange(
         0, HEAD_SZ_POW2, layout=gl.SliceLayout(0, pv_mfma_layout)
     )
-    o_mask = (o_grp_offs[:, None] < QUERY_GRP_SZ) & (o_head_sz_offs[None, :] < HEAD_SZ)
+    o_mask = (o_grp_offs[:, None] < query_group_size) & (
+        o_head_sz_offs[None, :] < head_size
+    )
     logits_offs = seq_idx * stride_logits_s
     logits_offs += kv_head_idx * stride_logits_nh
     logits_offs += (
@@ -354,6 +363,7 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_noloop_qk_gluon(
         + o_grp_offs[:, None] * stride_logits_g
         + o_head_sz_offs[None, :]
     )
+
     gl.amd.cdna3.buffer_store(
         stored_value=acc, ptr=logits_ptr, offsets=logits_offs, mask=o_mask
     )
@@ -419,6 +429,10 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
     # pdb.set_trace()
 
     # if 1:
+    if QUERY_GRP_SZ < 16:
+        QUERY_GRP_SZ_POW2 = 16
+    else:
+        QUERY_GRP_SZ_POW2 = triton.next_power_of_2(QUERY_GRP_SZ)
     if 0:
         with open(ttgir_file_path, "r") as f:
             ttgir_content = f.read()
@@ -488,12 +502,16 @@ def _paged_attn_decode_v2_w_dot_kernel_reshape_wrapper(
             stride_v_hz,
             stride_v_bz,
             stride_bt_s,
+            HEAD_SZ,
+            QUERY_GRP_SZ,
             compute_type=compute_type,
-            HEAD_SZ=HEAD_SZ,
-            QUERY_GRP_SZ=QUERY_GRP_SZ,
-            KV_BLK_SZ=KV_BLK_SZ,
+            HEAD_SZ_POW2=triton.next_power_of_2(HEAD_SZ),
+            QUERY_GRP_SZ_POW2=QUERY_GRP_SZ_POW2,
+            KV_BLK_SZ_POW2=triton.next_power_of_2(KV_BLK_SZ),
             SEQ_PARTITION_SZ=SEQ_PARTITION_SZ,
             SLIDING_WINDOW=SLIDING_WINDOW,
+            waves_per_eu=4,
+            num_stages=1,
         )
 
 
