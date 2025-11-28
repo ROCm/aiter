@@ -29,6 +29,7 @@
 #include "hipbsolgemm.cuh"
 #include "mla.h"
 #include "moe_ck.h"
+#include "moe_cktile2stages.h"
 #include "moe_op.h"
 #include "moe_sorting.h"
 #include "norm.h"
@@ -86,6 +87,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     POS_ENCODING_PYBIND;
     ATTENTION_PYBIND;
     MOE_CK_2STAGES_PYBIND;
+    MOE_CKTILE_2STAGES_PYBIND;
     QUANT_PYBIND;
     ATTENTION_ASM_PYBIND;
     ATTENTION_RAGGED_PYBIND;
