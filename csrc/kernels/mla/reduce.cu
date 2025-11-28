@@ -27,7 +27,7 @@ struct MlaReduceKernelV1Traits
     // implicitly set by reduce_partial_map[1] - reduce_partial_map[0].
     static constexpr bool    kOmitReduceFinalMap = kOmitReduceFinalMap_;
 
-    static_assert((kNumHeadQ & (kNumHeadQ - 1)) == 0, "kNumHeadQ must be power of 2!");
+    // static_assert((kNumHeadQ & (kNumHeadQ - 1)) == 0, "kNumHeadQ must be power of 2!");
 };
 
 struct MlaReduceKernelV1Params
@@ -482,6 +482,14 @@ __global__ void kn_mla_reduce_v1(
         NUM_HEAD,   8, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NAME, __VA_ARGS__)                    \
     MLA_MERGE_CASE_EF(                                                                                      \
         NUM_HEAD,   8, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_IF(                                                                                      \
+        NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NAME, __VA_ARGS__)                   \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NAME, __VA_ARGS__)                   \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NAME, __VA_ARGS__)                   \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NAME, __VA_ARGS__)                   \
     MLA_MERGE_CASE_EF(                                                                                      \
         NUM_HEAD,  16, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NAME, __VA_ARGS__)                    \
     MLA_MERGE_CASE_EF(                                                                                      \
