@@ -54,6 +54,21 @@ def run_torch(
     return ref_kv_cache
 
 
+## compare with vllm impl
+# from vllm import _custom_ops as ops
+# @perftest()
+# def run_vllm(
+#    kv_c,
+#    k_pe,
+#    kv_cache,
+#    slot_mapping,
+#    kv_cache_dtype: str,
+#    scale,
+# ):
+#    ops.concat_and_cache_mla(kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale)
+#    return kv_cache
+
+
 @benchmark()
 def test_concat_and_cache_mla(
     kv_lora_rank: int,
@@ -90,23 +105,42 @@ def test_concat_and_cache_mla(
         kv_c, k_pe, ref_temp, slot_mapping, kv_cache_dtype, scale, kv_cache.dtype
     )
 
+    # vllm_temp = torch.zeros(*kv_cache.shape, dtype=cache_dtype, device=device)
+    # vllm_kv_cache, vllm_us = run_vllm(
+    #    kv_c, k_pe, vllm_temp, slot_mapping, kv_cache_dtype, scale
+    # )
+
     if kv_cache_dtype == "fp8":
         result_temp = kv_cache.to(torch.float32) * scale
         expected_temp = ref_kv_cache.to(torch.float32) * scale
+        # result_temp = torch.empty_like(kv_cache, dtype=torch.float32)
+        # ops.convert_fp8(result_temp, kv_cache, scale.item(), kv_dtype=kv_cache_dtype)
+        # expected_vllm = torch.empty_like(vllm_kv_cache, dtype=torch.float32)
+        # ops.convert_fp8(
+        #    expected_vllm, vllm_kv_cache, scale.item(), kv_dtype=kv_cache_dtype
+        # )
         checkAllclose(result_temp, expected_temp, atol=0.01, rtol=0.01)
     else:
         checkAllclose(kv_cache, ref_kv_cache)
     ret["aiter_us"] = avg_us
     ret["torch_us"] = ref_us
+    # ret["vllm_us"] = vllm_us
+    ret["aiter_bw(TB/s)"] = (
+        num_tokens
+        * (kv_lora_rank + qk_rope_head_dim)
+        * 2
+        * (torch.finfo(dtype).bits // 8)
+        / (avg_us * 1e6)
+    )
     return ret
 
 
 df = []
 kv_lora_rank = 128
 qk_rope_head_dim = 64
-l_num_tokens = [128, 256, 512, 1024, 2048, 4096]  # 8192, 16384
+l_num_tokens = [128, 256, 512, 1024, 2048, 4096]  # , 8192, 16384
 block_size = 64
-dtype = torch.bfloat16
+dtype = torch.float16
 device = "cuda"
 l_kv_cache_dtypes = ["auto", "fp8"]
 
@@ -143,8 +177,6 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=str,
-    choices=["fp16", "bf16"],
-    nargs="*",
     default="bf16",
     help="""Data type of input.
     e.g.: -d bf16""",

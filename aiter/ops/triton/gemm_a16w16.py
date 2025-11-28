@@ -5,8 +5,6 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton._triton_kernels.gemm_a16w16 import (
     _gemm_a16_w16_kernel,
     _gemm_a16w16_reduce_kernel,
@@ -21,25 +19,32 @@ _LOGGER = AiterTritonLogger()
 def gemm_a16w16(
     x,
     w,
+    bias: Optional[torch.Tensor] = None,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
     activation: Optional[str] = None,
+    skip_reduce: Optional[bool] = False,
 ):
     """
-    Computes the 16 bit matmul Y = X x W
+    Computes 16 bit matrix multiplication Y = X @ W^T
 
-    Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
-    - dtype: Optional parameter to specifcy bf16 or fp16 datatype. Default is bf16
-    - Y: Output Matrix Y with shape (M, N).
-    If this is none, then it's created by this API and returned as output.
-    - activation: Optional activation function to apply to the output.
-    One of ("gelu", "gelu_tanh", "silu", "silu_exp2", "relu"). Default is None.
+    Args:
+        x (torch.Tensor): Input matrix with shape (M, K).
+        w (torch.Tensor): Weight matrix with shape (N, K), internally transposed.
+        bias (Optional[torch.Tensor]): Bias vector with shape (N,).
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
+        activation (Optional[str]): Activation function ("gelu", "gelu_tanh", "silu",
+            "silu_exp2", "relu").
+        skip_reduce (Optional[bool]): Skip reduction of split-K partial results.
+            Enables kernel fusion with downstream operations (FP8/FP4 quantization,
+            RMSNorm). Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+        torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
     """
 
     _LOGGER.info(f"GEMM_A16W16: x={tuple(x.shape)} w={tuple(w.shape)}")
@@ -50,15 +55,17 @@ def gemm_a16w16(
     N, K = w.shape
     w = w.T
 
-    if y is None:
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
-
     if config is None:
         config = _get_config(M, N, K)
 
+    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
+
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
-            (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
+            (config["NUM_KSPLIT"], M, N),
+            dtype=torch.float32,
+            device=y.device if y is not None else x.device,
         )
     else:
         y_pp = None
@@ -73,6 +80,7 @@ def gemm_a16w16(
     _gemm_a16_w16_kernel[grid](
         x,
         w,
+        bias,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
         M,
         N,
@@ -86,10 +94,15 @@ def gemm_a16w16(
         y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
         activation=_get_activation_from_str(activation) if activation else "",
         use_activation=activation is not None,
+        ADD_BIAS=(bias is not None),
+        SKIP_REDUCE=skip_reduce,
         **config,
     )
 
     if config["NUM_KSPLIT"] > 1:
+        if skip_reduce:
+            return y_pp
+
         REDUCE_BLOCK_SIZE_M = 32
         REDUCE_BLOCK_SIZE_N = 32
         ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
@@ -99,6 +112,7 @@ def gemm_a16w16(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
         _gemm_a16w16_reduce_kernel[grid_reduce](
+            bias,
             y_pp,
             y,
             M,
@@ -114,6 +128,7 @@ def gemm_a16w16(
             triton.next_power_of_2(config["NUM_KSPLIT"]),
             activation=_get_activation_from_str(activation) if activation else "",
             use_activation=activation is not None,
+            ADD_BIAS=(bias is not None),
         )
 
     return y

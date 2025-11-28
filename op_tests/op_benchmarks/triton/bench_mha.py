@@ -6,10 +6,12 @@ import itertools
 import triton
 from aiter.ops.triton.mha import (
     flash_attn_func,
-    flash_attn_fp8_func,
     flash_attn_varlen_func,
-    flash_attn_varlen_fp8_func,
     mha_set_use_fused_bwd_kernel,
+)
+from aiter.ops.triton.mha_v3 import (
+    flash_attn_fp8_func,
+    flash_attn_varlen_fp8_func,
 )
 from aiter.test_mha_common import (
     generate_random_padding_mask,
@@ -114,6 +116,7 @@ def create_benchmark_configs(custom, args):
     hk = args.hq if not args.hk else args.hk
     sk = args.sq if not args.sk else args.sk
     head_size = 128 if not args.d else args.d
+    head_size_v = head_size if not args.dv else args.dv
     mode = args.mode
     x_names = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
     causal = args.causal
@@ -121,7 +124,13 @@ def create_benchmark_configs(custom, args):
 
     configs = []
     plot_name = get_caller_name_no_ext()
-    extra_args = {"D_HEAD": head_size, "dtype": dtype, "causal": causal, "mode": mode}
+    extra_args = {
+        "D_HEAD": head_size,
+        "D_HEAD_V": head_size_v,
+        "dtype": dtype,
+        "causal": causal,
+        "mode": mode,
+    }
 
     if custom:
         x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
@@ -150,7 +159,7 @@ def create_benchmark_configs(custom, args):
         if args.fused_bwd:
             line_vals = [f"fused-bwd({unit})"]
         else:
-            line_vals = [f"fused-bwd({unit})", f"bwd({unit})"]
+            line_vals = [f"onekernel-bwd({unit})"]
     else:
         line_vals = [f"fwd({unit})"]
 
@@ -161,7 +170,7 @@ def create_benchmark_configs(custom, args):
         if args.fused_bwd:
             line_vals = [f"fused-bwd({unit})"]
         else:
-            line_vals = [f"bwd({unit})"]
+            line_vals = [f"onekernel-bwd({unit})"]
 
     configs.append(
         triton.testing.Benchmark(
@@ -190,6 +199,7 @@ def run_benchmark(custom, args):
         N_CTX_Q,
         N_CTX_K,
         D_HEAD,
+        D_HEAD_V,
         dtype,
         causal,
         mode,
@@ -208,11 +218,16 @@ def run_benchmark(custom, args):
         return_lse = True
         return_attn_probs = False
         varlen = args.layout == "thd"
+        has_pe = D_HEAD > D_HEAD_V
+        assert not (
+            args.fp8 and has_pe
+        ), "Positional Encoding (PE) doesn't support FP8 data type."
+        assert not (
+            has_pe and "fused-bwd" in provider
+        ), "'Fused' backward implementation doesn't support Positional Encoding (PE)."
 
         global _USE_FUSED_BWD
-
         fused_backward = "fused-bwd" in provider
-
         mha_set_use_fused_bwd_kernel(fused_backward)
 
         # Default softmax scale to match standard attention
@@ -227,65 +242,117 @@ def run_benchmark(custom, args):
                 f"Testing kernel implementation <{provider}> against Torch with shape:"
             )
             print(
-                f"BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}, D_HEAD={D_HEAD}"
+                f"BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}, D_HEAD={D_HEAD}, D_HEAD_V={D_HEAD_V}"
             )
-            if varlen:
-                test_mha.test_mha(
-                    BATCH,
-                    N_CTX_Q,
-                    N_CTX_K,
-                    HQ,
-                    HK,
-                    D_HEAD,
-                    dropout,
-                    True,
-                    True,
-                    causal,
-                    args.fp8,
-                    dtype,
-                )
+            if not varlen:
+                if not has_pe:
+                    test_mha.test_mha(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        dropout,
+                        True,
+                        True,
+                        causal,
+                        args.fp8,
+                        dtype,
+                    )
+                else:
+                    test_mha.test_mha_with_pe(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        D_HEAD_V,
+                        dropout,
+                        causal,
+                    )
                 print("Forward test passed!")
-                test_mha.test_mha_backward_varlen(
-                    BATCH,
-                    N_CTX_Q,
-                    N_CTX_K,
-                    HQ,
-                    HK,
-                    D_HEAD,
-                    dropout,
-                    causal,
-                    args.fp8,
-                    dtype,
-                )
+                if not has_pe:
+                    test_mha.test_mha_backward_varlen(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        dropout,
+                        causal,
+                        args.fp8,
+                        dtype,
+                    )
+                else:
+                    test_mha.test_mha_backward_with_pe(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        D_HEAD_V,
+                        dropout,
+                        causal,
+                    )
                 print("Backward test passed!")
             else:
-                test_mha.test_mha_varlen(
-                    BATCH,
-                    N_CTX_Q,
-                    N_CTX_K,
-                    HQ,
-                    HK,
-                    D_HEAD,
-                    dropout,
-                    True,
-                    True,
-                    causal,
-                    args.fp8,
-                    dtype,
-                )
+                if not has_pe:
+                    test_mha.test_mha_varlen(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        dropout,
+                        True,
+                        True,
+                        causal,
+                        args.fp8,
+                        dtype,
+                    )
+                else:
+                    test_mha.test_mha_varlen_with_pe(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        D_HEAD_V,
+                        dropout,
+                        causal,
+                    )
                 print("Forward test passed!")
-                test_mha.test_mha_backward(
-                    BATCH,
-                    N_CTX_Q,
-                    N_CTX_K,
-                    HQ,
-                    HK,
-                    D_HEAD,
-                    dropout,
-                    causal,
-                    args.fp8,
-                    dtype,
-                )
+                if not has_pe:
+                    test_mha.test_mha_backward(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        dropout,
+                        causal,
+                        args.fp8,
+                        dtype,
+                    )
+                else:
+                    test_mha.test_mha_backward_varlen_with_pe(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        D_HEAD_V,
+                        dropout,
+                        causal,
+                    )
                 print("Backward test passed!")
 
             return 0
@@ -293,13 +360,13 @@ def run_benchmark(custom, args):
         # Generate base inputs
         q = torch.randn((BATCH, N_CTX_Q, HQ, D_HEAD), device=device, dtype=dtype)
         k = torch.randn((BATCH, N_CTX_K, HK, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, N_CTX_K, HK, D_HEAD), device=device, dtype=dtype)
+        v = torch.randn((BATCH, N_CTX_K, HK, D_HEAD_V), device=device, dtype=dtype)
         q.requires_grad = requires_grad
         k.requires_grad = requires_grad
         v.requires_grad = requires_grad
 
         # FLOPS calculation variables
-        flops_per_matmul = 0
+        total_flops = 0.0
 
         # Input preparation
         if varlen:
@@ -342,9 +409,9 @@ def run_benchmark(custom, args):
                         if seqlen_q > seqlen_k
                         else (seqlen_q * seqlen_k - ((seqlen_q**2 - seqlen_q) / 2))
                     )
-                    flops_per_matmul += valid_out_elements * HQ * D_HEAD * 2
+                    total_flops += valid_out_elements * HQ * (D_HEAD + D_HEAD_V) * 2.0
                 else:
-                    flops_per_matmul += seqlen_q * seqlen_k * HQ * D_HEAD * 2
+                    total_flops += seqlen_q * seqlen_k * HQ * (D_HEAD + D_HEAD_V) * 2.0
         else:
             q_input, k_input, v_input = q, k, v
 
@@ -354,9 +421,13 @@ def run_benchmark(custom, args):
                     if N_CTX_Q > N_CTX_K
                     else (N_CTX_Q * N_CTX_K - ((N_CTX_Q**2 - N_CTX_Q) / 2))
                 )
-                flops_per_matmul = 2.0 * BATCH * HQ * valid_out_elements * D_HEAD
+                total_flops += (
+                    2.0 * BATCH * HQ * valid_out_elements * (D_HEAD + D_HEAD_V)
+                )
             else:
-                flops_per_matmul = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * D_HEAD
+                total_flops += (
+                    2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+                )
 
         # Benchmark mode
         if varlen:
@@ -371,11 +442,8 @@ def run_benchmark(custom, args):
                         cu_seqlens_k,
                         max_seqlen_q,
                         max_seqlen_k,
-                        dropout_p=dropout,
                         softmax_scale=sm_scale,
                         causal=causal,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
                     )
 
             else:
@@ -404,11 +472,8 @@ def run_benchmark(custom, args):
                         q_input,
                         k_input,
                         v_input,
-                        dropout_p=dropout,
                         softmax_scale=sm_scale,
                         causal=causal,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
                     )
 
             else:
@@ -441,23 +506,31 @@ def run_benchmark(custom, args):
 
         ms = triton.testing.do_bench(fn)
 
-        total_flops = 2 * flops_per_matmul
         if mode == "bwd":
             total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
 
-        input_bytes = q.element_size()
-        output_bytes = q.element_size()
         if varlen:
             total_num_tokens_q = cu_seqlens_q[-1].item()
             total_num_tokens_k = cu_seqlens_k[-1].item()
         else:
             total_num_tokens_q = BATCH * N_CTX_Q
             total_num_tokens_k = BATCH * N_CTX_K
-        mem = (
-            total_num_tokens_q * HQ * D_HEAD * input_bytes
-            + 2 * total_num_tokens_k * HK * D_HEAD * input_bytes
-            + total_num_tokens_q * HQ * D_HEAD * output_bytes
-        )
+        q_size = total_num_tokens_q * HQ * D_HEAD * q.element_size()
+        k_size = total_num_tokens_k * HK * D_HEAD * k.element_size()
+        v_size = total_num_tokens_k * HK * D_HEAD_V * v.element_size()
+        o_size = total_num_tokens_q * HQ * D_HEAD_V * q.element_size()
+        if mode == "fwd":
+            # read q, k, v
+            mem_read = q_size + k_size + v_size
+            # write o
+            mem_write = o_size
+        else:
+            # read q, k, v, do
+            mem_read = q_size + k_size + v_size + o_size
+            # write dq, dk, dv
+            mem_write = q_size + k_size + v_size
+        mem = mem_read + mem_write
+
         # return ms
         if "ms" in provider:
             return ms
@@ -505,7 +578,13 @@ def parse_args():
         default=False,
         help="If specified, uses equal sequence lengths with thd layout, i.e t = b * sq",
     )
-    parser.add_argument("-d", type=int, default=0)
+    parser.add_argument(
+        "-d",
+        type=int,
+        default=0,
+        help="Q and K head size, if -dv is absent then -d specifies V head size too",
+    )
+    parser.add_argument("-dv", type=int, default=0, help="optional V head size")
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-quantize_p", action="store_true", default=False)
@@ -573,17 +652,19 @@ def main():
     assert (
         args.layout == "thd" or not args.equal_seqlens or args.model
     ), "Equal sequence lengths arg must be used with the thd layout or a model config."
-    if args.hq or args.hk or args.d:
+    if args.hq or args.hk or args.d or args.dv:
         custom_config = True
+        if not args.dv:
+            args.dv = args.d
         assert (
-            args.b and args.hq and args.sq and args.d
+            args.b and args.hq and args.sq and args.d and args.dv
         ), "If custom config is specified, please provide \
                 all of batch, number of Q heads, Q sequence length \
                 and head size."
 
     if args.model:
         assert not (
-            args.hq or args.hk or args.d
+            args.hq or args.hk or args.d or args.dv
         ), "Specifying model fixes hq, hk and d already. Do not provide them!"
 
     assert (

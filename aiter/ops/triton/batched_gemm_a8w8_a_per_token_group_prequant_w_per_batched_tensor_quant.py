@@ -4,9 +4,6 @@
 from typing import Optional
 import torch
 import triton
-import triton.language as tl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton._triton_kernels.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
     _get_config,
@@ -23,29 +20,44 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     splitK: Optional[int] = None,
     YQ: Optional[torch.Tensor] = None,
     transpose_bm: Optional[bool] = False,
+    transpose_bm_in: Optional[bool] = False,
     config: Optional[dict] = None,
 ):
     """
-    Computes the matmul YQ[i] = XQ[i] x WQ[i]T and applies a conversion scale for every i in a given batch.
-    Optionally, adds a bias to each result.
+    Computes batched 8 bit matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.
+    X is quantized to INT8 during computation using per-token grouped quantization.
+    W is pre-quantized INT8 with per-batch-element scaling.
 
-    The conversion scale for each matmul is received in the form of two 1D tensors that are multiplied to form a
-    2D one before being applied.
-
-    Key parameters:
-    - XQ: Batch tensor XQ with shape (B, M, K).
-    - WQ: Batch tensor WQ with shape (B, N, K).
-    - W_scale: Second scale batch tensor with shape (1, ).
-    - Bias: Bias batch tensor with shape (B, 1, N).
-    - YQ: Output Matrix Y with shape (B, M, N). If this is none, then it's created by this API and returned as output
+    Args:
+        X (torch.Tensor): Higher precision input batch with shape (B, M, K) or (M, B, K) if transpose_bm_in=True.
+            Quantized to INT8 on-the-fly during GEMM.
+        WQ (torch.Tensor): Pre-quantized INT8 weight batch with shape (B, N, K), internally transposed.
+        w_scale (torch.Tensor): Per-batch scale for WQ with shape (1,).
+        group_size (int): Group size for per-token grouped quantization of X. Must be power of 2.
+        bias (Optional[torch.Tensor]): Bias batch with shape (B, 1, N).
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        splitK (Optional[int]): Not supported. Must be None.
+        YQ (Optional[torch.Tensor]): Pre-allocated output tensor with shape (B, M, N) or (M, B, N) if transpose_bm=True.
+        transpose_bm (Optional[bool]): Transpose batch and M dimensions in output.
+        transpose_bm_in (Optional[bool]): Transpose batch and M dimensions in input.
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M).
 
     Returns:
-    - YQ: The output batch tensor with shape (B, M, N).
+        torch.Tensor: Output batch with shape (B, M, N) or (M, B, N) if transpose_bm=True.
     """
 
     # Check constraints.
-    assert X.shape[0] == WQ.shape[0], "Incompatible Batch dimensions!!!"
-    assert X.shape[2] == WQ.shape[2], "Incompatible K dimensions!!!"
+    if not transpose_bm_in:
+        B = X.shape[0]
+        M = X.shape[1]
+    else:
+        M = X.shape[0]
+        B = X.shape[1]
+    K = X.shape[2]
+    N = WQ.shape[1]
+
+    assert B == WQ.shape[0], "Incompatible Batch dimensions!!!"
+    assert K == WQ.shape[2], "Incompatible K dimensions!!!"
     assert (
         triton.next_power_of_2(group_size) == group_size
     ), "group_size mush be power of 2"
@@ -54,11 +66,6 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         torch.float16,
     ], f"Output {dtype=} is currently not supported in batched_gemm_a8w8"
     assert splitK is None, "Currently, there isn't any support for splitK on Triton"
-
-    B = X.shape[0]
-    M = X.shape[1]
-    K = X.shape[2]
-    N = WQ.shape[1]
 
     WQ = WQ.transpose(1, 2)
 
@@ -81,6 +88,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     if config is None:
         config = _get_config(M, N, K)
     config["BLOCK_SIZE_K"] = group_size
+    config["kpack"] = 1
 
     grid = lambda META: (  # noqa: E731
         B,
@@ -104,8 +112,8 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         M,
         N,
         K,
-        X.stride(0),
-        X.stride(1),
+        X.stride(0) if not transpose_bm_in else X.stride(1),
+        X.stride(1) if not transpose_bm_in else X.stride(0),
         X.stride(2),
         WQ.stride(0),
         WQ.stride(1),

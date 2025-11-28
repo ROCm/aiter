@@ -183,11 +183,6 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
     torch.cuda.synchronize()
 
     block_shape_n, block_shape_k = block_shape
-    if K % block_shape_k != 0:
-        pytest.skip(
-            "Latest upstream compiler as of Aug 22 (necessary for Gluon) causes"
-            " infinite hang when EVEN_K is false. Try seeing if it's fixed if it's been a while."
-        )
 
     if impl == "gluon" and int(DEVICE_ARCH.split("MI")[1].replace("X", "")) < 350:
         pytest.skip(

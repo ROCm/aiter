@@ -49,6 +49,7 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
                                   std::optional<c10::ScalarType> out_dtype = std::nullopt,
                                   std::optional<torch::Tensor> scaleA      = std::nullopt,
                                   std::optional<torch::Tensor> scaleB      = std::nullopt,
-                                  std::optional<torch::Tensor> scaleC      = std::nullopt);
+                                  std::optional<torch::Tensor> scaleC      = std::nullopt,
+                                  bool bpreshuffle                         = false);
 
 std::string getHipblasltKernelName(int solution_index);

@@ -84,7 +84,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{get_asm_dir()}/pa/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m pa --output_dir {{}}'"
     },
     "module_pa": {
         "srcs": [
@@ -188,7 +188,7 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_batched_gemm_bf16/include'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_bf16/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_BF16_BATCHED_GEMM_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_bf16/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE}'"
     },
     "module_batched_gemm_a8w8": {
         "srcs": [
@@ -198,7 +198,7 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_batched_gemm_a8w8/include'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_A8W8_BATCHED_GEMM_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE}'"
     },
     "module_gemm_a8w8": {
         "srcs": [
@@ -208,7 +208,7 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/include'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_GEMM_A8W8_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE}'"
     },
     "module_gemm_a8w8_blockscale": {
         "srcs": [
@@ -223,7 +223,7 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
     },
     "module_gemm_a8w8_blockscale_bpreshuffle": {
         "srcs": [
@@ -238,7 +238,7 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
         ],
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE}'"
     },
     "module_gemm_a4w4_blockscale": {
         "srcs": [
@@ -254,7 +254,7 @@
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
         ],
         "hip_clang_path": "os.environ.get('GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH')",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_GEMM_A4W4_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE}'"
     },
     "module_gemm_a8w8_bpreshuffle": {
         "srcs": [
@@ -267,7 +267,45 @@
         ],
         "is_python_module": "True",
         "is_standalone": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE}'"
+    },
+    "module_deepgemm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/deepgemm_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/ck_deepgemm/deepgemm.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "md_name": "'module_deepgemm'",
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/18_flatmm'",
+            "f'{AITER_CSRC_DIR}/ck_deepgemm/include'"
+        ],
+        "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
+        "hip_clang_path": "os.environ.get('FLATMM_HIP_CLANG_PATH')",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_deepgemm/gen_instances.py --working_path {{}}'"
+    },
+    "module_gemm_a8w8_bpreshuffle_cktile": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_bpreshuffle_cktile_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
+            "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_cktile.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/include'",
+            "f'{CK_DIR}/example/ck_tile/18_flatmm'"
+        ],
+        "is_python_module": "True",
+        "is_standalone": "False",
+        "verbose": "False",
+        "hip_clang_path": "os.environ.get('FLATMM_HIP_CLANG_PATH')",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE}'"
     },
     "module_gemm_a8w8_asm": {
         "srcs": [
@@ -279,7 +317,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m i8gemm --output_dir {{}}'"
     },
     "module_gemm_a16w16_asm": {
         "srcs": [
@@ -291,7 +329,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{get_asm_dir()}/bf16gemm/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m bf16gemm --output_dir {{}}'"
     },
     "module_gemm_a4w4_asm": {
         "srcs": [
@@ -303,7 +341,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{get_asm_dir()}/f4gemm/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f4gemm --output_dir {{}}'"
     },
     "module_gemm_a8w8_blockscale_asm": {
         "srcs": [
@@ -348,8 +386,8 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{get_asm_dir()}/fmoe_2stages/codegen.py --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmoe/codegen.py --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe_2stages --output_dir {{}}'",
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'"
         ]
     },
     "module_moe_ck2stages": {
@@ -375,6 +413,24 @@
         "hip_clang_path": "os.environ.get('GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH')",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py --working_path {{}}'"
     },
+    "module_moe_cktile2stages": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/ck_tile_gemm_moe_2stages/moe_cktile2stages.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/moe_cktile_2stages_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "md_name": "'module_moe_cktile2stages'",
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/ck_tile_gemm_moe_2stages/include'"
+        ],
+        "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
+        "hip_clang_path": "os.environ.get('FLATMM_HIP_CLANG_PATH')",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_tile_gemm_moe_2stages/gen_instances.py --working_path {{}}'"
+    },
     "module_moe_sorting": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/moe_sorting_kernels.cu'",
@@ -389,6 +445,22 @@
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/13_moe_sorting/'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_moe_topk": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/moe_topk_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/topk_sigmoid_kernels.cu'",
+            "f'{CK_DIR}/example/ck_tile/09_topk_softmax/topk_softmax_api.cpp'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/ck_tile'",
+            "f'{CK_DIR}/example/ck_tile/09_topk_softmax'"
         ],
         "verbose": "False",
         "blob_gen_cmd": "''"
@@ -528,6 +600,24 @@
         "is_python_module": "True",
         "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune'"
+    },
+    "module_gemm_a8w8_bpreshuffle_cktile_tune": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_bpreshuffle_cktile_tune_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_cktile_tune.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/include'",
+            "f'{CK_DIR}/example/ck_tile/18_flatmm'"
+        ],
+        "verbose": "False",
+        "hip_clang_path": "os.environ.get('FLATMM_HIP_CLANG_PATH')",
+        "is_python_module": "True",
+        "is_standalone": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune'"
     },
     "module_aiter_operator": {
         "srcs": [
@@ -899,6 +989,46 @@
         "extra_include": [
             "f'{AITER_GRADLIB_DIR}/include/'"
         ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_top_k_per_row": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/topk_per_row_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/topk_per_row_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_mla_metadata": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_metadata_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_comm.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_1_device.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_1_host.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_2_device.cuh'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_mla_reduce": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_reduce_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/reduce.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     }

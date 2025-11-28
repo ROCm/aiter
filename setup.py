@@ -87,6 +87,34 @@ if IS_ROCM:
             "module_mha_bwd",
             "module_mha_varlen_bwd",
         ]
+    elif PREBUILD_KERNELS == 2:
+        exclude_ops = [
+            # "libmha_fwd",
+            "libmha_bwd",
+            # "module_fmha_v3_fwd",
+            # "module_mha_fwd",
+            # "module_mha_varlen_fwd",
+            "module_mha_batch_prefill",
+            "module_fmha_v3_bwd",
+            "module_fmha_v3_varlen_bwd",
+            # "module_fmha_v3_varlen_fwd",
+            "module_mha_bwd",
+            "module_mha_varlen_bwd",
+        ]
+    elif PREBUILD_KERNELS == 3:
+        exclude_ops = [
+            # "libmha_fwd",
+            # "libmha_bwd",
+            # "module_fmha_v3_fwd",
+            # "module_mha_fwd",
+            # "module_mha_varlen_fwd",
+            # "module_mha_batch_prefill",
+            # "module_fmha_v3_bwd",
+            # "module_fmha_v3_varlen_bwd",
+            # "module_fmha_v3_varlen_fwd",
+            # "module_mha_bwd",
+            # "module_mha_varlen_bwd",
+        ]
 
         all_opts_args_build, prebuild_link_param = core.get_args_of_build(
             "all", exclude=exclude_ops
@@ -94,16 +122,14 @@ if IS_ROCM:
         os.system(f"rm -rf {core.get_user_jit_dir()}/build")
         os.system(f"rm -rf {core.get_user_jit_dir()}/*.so")
         prebuild_dir = f"{core.get_user_jit_dir()}/build/aiter_/build"
-        core.recopy_ck()
         os.makedirs(prebuild_dir + "/srcs")
 
         def build_one_module(one_opt_args):
             core.build_module(
                 md_name=one_opt_args["md_name"],
                 srcs=one_opt_args["srcs"],
-                flags_extra_cc=one_opt_args["flags_extra_cc"] + ["-DPREBUILD_KERNELS"],
-                flags_extra_hip=one_opt_args["flags_extra_hip"]
-                + ["-DPREBUILD_KERNELS"],
+                flags_extra_cc=one_opt_args["flags_extra_cc"],
+                flags_extra_hip=one_opt_args["flags_extra_hip"],
                 blob_gen_cmd=one_opt_args["blob_gen_cmd"],
                 extra_include=one_opt_args["extra_include"],
                 extra_ldflags=None,
@@ -111,7 +137,6 @@ if IS_ROCM:
                 is_python_module=True,
                 is_standalone=False,
                 torch_exclude=False,
-                prebuild=1,
             )
 
         # step 1, build *.cu -> module*.so
@@ -127,44 +152,6 @@ if IS_ROCM:
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
 
-        ck_batched_gemm_folders = [
-            f"{this_dir}/csrc/{name}/include"
-            for name in os.listdir(f"{this_dir}/csrc")
-            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name))
-            and name.startswith("ck_batched_gemm")
-        ]
-        ck_gemm_folders = [
-            f"{this_dir}/csrc/{name}/include"
-            for name in os.listdir(f"{this_dir}/csrc")
-            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name))
-            and name.startswith("ck_gemm_a")
-        ]
-        ck_gemm_inc = ck_batched_gemm_folders + ck_gemm_folders
-        for src in ck_gemm_inc:
-            dst = f"{prebuild_dir}/include"
-            shutil.copytree(src, dst, dirs_exist_ok=True)
-
-        shutil.copytree(
-            f"{this_dir}/csrc/include", f"{prebuild_dir}/include", dirs_exist_ok=True
-        )
-
-        # step 2, link module*.so -> aiter_.so
-        core.build_module(
-            md_name="aiter_",
-            srcs=[f"{prebuild_dir}/srcs/rocm_ops.cu"],
-            flags_extra_cc=prebuild_link_param["flags_extra_cc"]
-            + ["-DPREBUILD_KERNELS"],
-            flags_extra_hip=prebuild_link_param["flags_extra_hip"]
-            + ["-DPREBUILD_KERNELS"],
-            blob_gen_cmd=prebuild_link_param["blob_gen_cmd"],
-            extra_include=prebuild_link_param["extra_include"],
-            extra_ldflags=None,
-            verbose=False,
-            is_python_module=True,
-            is_standalone=False,
-            torch_exclude=False,
-            prebuild=2,
-        )
 else:
     raise NotImplementedError("Only ROCM is supported")
 
@@ -233,7 +220,7 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "pybind11>=3.0.1",
-        # "ninja",
+        "ninja",
         "pandas",
         "einops",
         "psutil",

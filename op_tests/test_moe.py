@@ -290,21 +290,22 @@ def test_fmoe(
                 and (w1b.dtype == dtypes.i8 and inter_dim == w1b.shape[1])
             )
         ):
-            out_b2, avg_b2 = asm_moe_test(
-                input,
-                w1b,
-                w2b,
-                topk_weights,
-                topk_ids,
-                fc1_scale,
-                fc2_scale,
-                fc1_smooth_scale,
-                fc2_smooth_scale,
-                a16=True,
-                activation=activation,
-            )
-            msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
-            checkAllclose(ref2, out_b2, atol=100, msg=msg)
+            if input.dtype == dtypes.bf16:
+                out_b2, avg_b2 = asm_moe_test(
+                    input,
+                    w1b,
+                    w2b,
+                    topk_weights,
+                    topk_ids,
+                    fc1_scale,
+                    fc2_scale,
+                    fc1_smooth_scale,
+                    fc2_smooth_scale,
+                    a16=True,
+                    activation=activation,
+                )
+                msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
+                checkAllclose(ref2, out_b2, atol=100, msg=msg)
 
         msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)

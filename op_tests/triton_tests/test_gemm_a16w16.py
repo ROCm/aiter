@@ -9,7 +9,7 @@ from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
-def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
+def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=False):
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
 
@@ -24,6 +24,10 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
     else:
         weight = torch.randn((N, K), dtype=dtype, device="cuda")
 
+    bias_tensor = None
+    if bias:
+        bias_tensor = torch.empty((N), dtype=dtype, device="cuda")
+
     y = None
     if output:
         y = torch.empty((M, N), dtype=dtype, device="cuda")
@@ -31,7 +35,7 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
     else:
         out_dtype = dtype
 
-    return x, weight, out_dtype, y
+    return x, weight, bias_tensor, out_dtype, y
 
 
 def get_x_vals():
@@ -76,7 +80,7 @@ def get_x_vals():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activation):
-    x, w, out_dtype, y = generate_gemm_a16w16_inputs(
+    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
         M,
         N,
         K,
@@ -98,6 +102,7 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
         triton_out = gemm_a16w16(
             x,
             w,
+            None,
             out_dtype,
             y,
             activation=activation,
@@ -106,6 +111,7 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
         triton_out = gemm_a16w16(
             x,
             w,
+            None,
             out_dtype,
             activation=activation,
         )
@@ -119,14 +125,16 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
 def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
+    x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
+        M, N, K, dtype, output=output, bias=True
+    )
 
-    torch_out = F.linear(x, w, bias=None)
+    torch_out = F.linear(x, w, bias=bias)
 
     if output:
-        triton_out = gemm_a16w16(x, w, out_dtype, y)
+        triton_out = gemm_a16w16(x, w, bias, out_dtype, y)
     else:
-        triton_out = gemm_a16w16(x, w, out_dtype)
+        triton_out = gemm_a16w16(x, w, bias, out_dtype)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
@@ -138,16 +146,16 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
 def test_gemm_a16_w16_layout(M: int, N: int, K: int, dtype, layout, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, out_dtype, y = generate_gemm_a16w16_inputs(
+    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
         M, N, K, dtype, layout=layout, output=output
     )
 
     torch_out = F.linear(x, w, bias=None)
 
     if output:
-        triton_out = gemm_a16w16(x, w, out_dtype, y)
+        triton_out = gemm_a16w16(x, w, None, out_dtype, y)
     else:
-        triton_out = gemm_a16w16(x, w, out_dtype)
+        triton_out = gemm_a16w16(x, w, None, out_dtype)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
@@ -158,7 +166,7 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, dtype, layout, output):
 def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
+    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
 
     torch_out = F.linear(x, w, bias=None)
 
@@ -179,7 +187,7 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
 def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, dtype, layout, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, out_dtype, y = generate_gemm_a16w16_inputs(
+    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
         M, N, K, dtype, layout=layout, output=output
     )
 

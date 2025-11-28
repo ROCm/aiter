@@ -11,6 +11,36 @@ import triton.language as tl
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
 from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.kernel_repr import make_kernel_repr
+
+
+_gemm_a8w8_blockscale_repr = make_kernel_repr(
+    "_gemm_a8w8_blockscale_kernel",
+    [
+        "GROUP_K",
+        "GROUP_N",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "GRID_MN",
+        "cache_modifier",
+    ],
+)
+
+
+_gemm_a8w8_blockscale_reduce_repr = make_kernel_repr(
+    "_gemm_a8w8_blockscale_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
 
 
 @triton.heuristics(
@@ -20,7 +50,7 @@ from ..utils.core import AITER_TRITON_CONFIGS_PATH
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_gemm_a8w8_blockscale_repr)
 def _gemm_a8w8_blockscale_kernel(
     # Pointers to matrices
     a_ptr,
@@ -195,7 +225,7 @@ def _gemm_a8w8_blockscale_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(repr=_gemm_a8w8_blockscale_reduce_repr)
 def _gemm_a8w8_blockscale_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
@@ -275,5 +305,24 @@ def _get_config(
                 _get_config._config_dict[key] = config
         else:
             key = "default"  # fall back to default config
+
+    if M < 32 and "small" in _get_config._config_dict[key]:
+        return _get_config._config_dict[key]["small"]
+    elif M <= 128:
+        BLK_M = triton.next_power_of_2(M)
+        if BLK_M == 32 and "medium_M32" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_M32"]
+        elif BLK_M == 64 and "medium_M64" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_M64"]
+        elif BLK_M == 128 and "medium_M128" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_M128"]
+    elif M <= 256 and "large" in _get_config._config_dict[key]:
+        return _get_config._config_dict[key]["large"]
+    else:
+        BLK_M = triton.next_power_of_2(M)
+        if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
+        elif "xlarge" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["xlarge"]
 
     return _get_config._config_dict[key]["any"]

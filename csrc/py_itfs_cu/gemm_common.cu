@@ -30,8 +30,12 @@ int getPaddedM(int M, int N, int K, int gl) {
             padded_m = (M + 127) / 128 * 128; // Round up to the next multiple of 128
         }
     } else if (gl == 1) {
-        padded_m = nextPow2(M);
-    }
+        if (M > 8192 && N > 4096) {
+            padded_m = 8192;
+        } else {
+            padded_m = nextPow2(M);
+        }
+    } 
     return padded_m;
     
 }

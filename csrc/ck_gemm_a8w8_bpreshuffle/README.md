@@ -5,20 +5,21 @@
 `python3 setup.py develop`
 
 2. Add GEMM shapes in `aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv`
-    |**M**|**N**|**K**|
-    |-----|-----|-----|
-    |128  |1536 |7168 |
+    |**M**|**N**|**K**|******q_dtype_w******|
+    |-----|-----|-----|---------------------|
+    |128  |1536 |7168 |torch.float8_e4m3fnuz|
 
 
 3. Start tuning:
 Run the following cmd to start tuning, please wait a few minutes as it will build gemm_a8w8_bpreshuffle_tune via jit:
 `python3 csrc/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_tune.py -i aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv -o aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv`
 You can find the results of this tuning in `aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv`.
-    |**cu_num**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|
-    |----------|-----|-----|-----|------------|----------|------|--------------|
-    |80        |128  |1536 |7168 |23          |0         |32.99 |xxxxxxxx      |
+    |**cu_num**|**M**|**N**|**K**|******q_dtype_w******|**kernelId**|**splitK**|**us**|**kernelName**|
+    |----------|-----|-----|-----|---------------------|------------|----------|------|--------------|
+    |80        |128  |1536 |7168 |torch.float8_e4m3fnuz|23          |0         |32.99 |xxxxxxxx      |
 
     `cu_num` means the number of compute units, and it is used to distinguish between graphics.
+    `q_dtype_w` means the quantization data type of weight, and it is used to distinguish between different quantization data types. support torch.int8 and fp8
 
 4. Build tuned kernels and test:
 Test the performance, modify the test instance in `op_tests/test_gemm_a8w8.py` and run it, please wait a few minutes as it will build gemm_a8w8 tuned kernels in `aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv` via jit:

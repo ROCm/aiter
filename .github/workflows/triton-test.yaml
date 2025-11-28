@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    paths:
+      - "aiter/ops/triton/**"
+      - "op_tests/triton_tests/**"
+      - ".github/workflows/triton-test.yaml"
   workflow_dispatch:
 
 concurrency:
@@ -12,8 +16,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
   triton:
-    runs-on: aiter-1gpu-runner
+    runs-on: aiter-mi300-1gpu
+    needs: [check-signal]
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"
@@ -52,14 +69,19 @@ jobs:
           triton_test \
           bash -c "pip install speedtest-cli && speedtest-cli --simple" || true
 
-      - name: Setup-Triton
+      - name: Setup pip config
+        run: |
+          docker exec -u root triton_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root triton_test bash -c "pip config set global.retries 10"
+
+      - name: Setup Aiter and Triton
         run: |
           set -ex
-          echo "Setuping Triton..."
+          echo "Setting up Aiter and Triton..."
           docker exec \
           -w /workspace \
           triton_test \
-          ./.github/scripts/build_triton.sh
+          ./.github/scripts/build_aiter_triton.sh
 
       - name: Install Pytest
         run: |

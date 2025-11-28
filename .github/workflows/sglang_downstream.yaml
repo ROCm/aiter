@@ -12,12 +12,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
   sglang:
     name: sglang integration
-    runs-on: aiter-mi325-1gpu
+    needs: [check-signal]
+    runs-on: aiter-mi300-1gpu
     env:
-      SGL_BRANCH: v0.5.2
+      SGL_BRANCH: v0.5.5
       GPU_ARCH: gfx942
+      GPU_ARCH_CI: mi300 # used in sglang ci scripts
+      SGL_IMAGE: rocm/sgl-dev:v0.5.5.post3-rocm700-mi30x-20251124
+      GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
+      GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
     steps:
       - name: Checkout aiter repo
@@ -27,29 +44,36 @@ jobs:
         run: |
           git clone -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git
 
-      # TODO: Currently, we use PAT, it should be replaced by repo token
-      - name: Make authenticated API request
+      - name: Pull SGlang base image
         run: |
-          curl -sSfL https://api.github.com/repos/casey/just/releases/latest
-      
-      - name: Workaround to change the connection of unbuntu from http to https
-        run: |
-          cd sglang
-          sed -i "79iRUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/* && sed -i 's|http://|https://|g' /etc/apt/sources.list && apt update -o Acquire::https::Verify-Peer=false && apt install -o Acquire::https::Verify-Peer=false ca-certificates -y && echo 'Acquire::https::Verify-Peer \"false\";' > /etc/apt/apt.conf.d/99insecure" docker/Dockerfile.rocm
+          docker pull ${{ env.SGL_IMAGE }}
 
-      - name: Build sglang_aiter_test image
+      - name: Generate Dockerfile
         run: |
-          cd sglang
-          sed -i '/ENV AITER_COMMIT="v0.1.4"/c\ARG AITER_COMMIT="v0.1.4"\nENV AITER_COMMIT=${AITER_COMMIT}' docker/Dockerfile.rocm
-          docker build --no-cache \
-          --build-arg SGL_BRANCH=${SGL_BRANCH} \
-          --build-arg GPU_ARCH=${GPU_ARCH} \
-          --build-arg AITER_REPO=${GITHUB_REPO_URL} \
-          --build-arg AITER_COMMIT=${GITHUB_COMMIT_SHA} \
-          -t sglang_aiter_test:ci -f docker/Dockerfile.rocm .
-        env:
-          GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
-          GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.SGL_IMAGE }}
+
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
+          RUN pip uninstall -y aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+
+          RUN rm -rf aiter \
+           && git clone ${{ env.GITHUB_REPO_URL }} \
+           && cd aiter \
+           && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
+           && git submodule update --init --recursive \
+           && PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop
+
+          RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
+          EOF
+
+      - name: Show Dockerfile
+        run: cat Dockerfile.mod
+
+      - name: Build Docker image
+        run: |
+          docker build -t sglang_aiter_test:ci -f Dockerfile.mod .
 
       - name: Start CI container
         run: |
@@ -76,21 +100,24 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Install wget
-        run: sudo apt-get update && sudo apt-get install -y wget
+      - name: Setup pip config
+        run: |
+          docker exec -u root sglang_aiter_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root sglang_aiter_test bash -c "pip config set global.retries 10"
 
       - name: Install dependencies
         run: |
           cd sglang
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_install_dependency.sh
+          sed -i "4s/^GPU_ARCH=.*/GPU_ARCH=\"${GPU_ARCH_CI}\"/" scripts/ci/amd_ci_install_dependency.sh
           bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Evaluate Accuracy
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: |
           cd sglang
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_exec.sh
-          bash scripts/ci/amd_ci_exec.sh pip show aiter || true
+          bash scripts/ci/amd_ci_exec.sh printenv | grep GPU_ARCH || true
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
           bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
           bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py

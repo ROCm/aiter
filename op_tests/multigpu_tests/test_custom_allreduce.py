@@ -1,38 +1,42 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import logging
 import os
+from multiprocessing import Pool, freeze_support, set_start_method
+from typing_extensions import Optional
 
 import torch
 import torch.distributed as dist
-import argparse
-from aiter import dtypes
 
+from aiter import dtypes
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
     ensure_model_parallel_initialized,
-    init_distributed_environment,
-    set_custom_all_reduce,
     get_tp_group,
     graph_capture,
-    destroy_model_parallel,
-    destroy_distributed_environment,
+    init_distributed_environment,
+    set_custom_all_reduce,
 )
-from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.test_common import (
-    checkAllclose,
-    perftest,
-    benchmark,
-)
-from multiprocessing import set_start_method, Pool, freeze_support
-import logging
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 logger = logging.getLogger("aiter")
 
 set_start_method("spawn", force=True)
 
 
-def allreduce_custom(tp_size, pp_size, rankID, x, withGraph=False):
+def allreduce_custom(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    withGraph=False,
+    distributed_init_method: Optional[str] = None,
+):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     # init
@@ -41,7 +45,7 @@ def allreduce_custom(tp_size, pp_size, rankID, x, withGraph=False):
     init_distributed_environment(
         world_size=tp_size,
         rank=rankID,
-        distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
+        distributed_init_method=distributed_init_method,
     )
     ensure_model_parallel_initialized(tp_size, pp_size)
     x = x.to(device)
@@ -82,7 +86,14 @@ def allreduce_custom(tp_size, pp_size, rankID, x, withGraph=False):
 
 
 @benchmark()
-def test_allreduce_custom(tp_size, pp_size, shape, dtype, withGraph=False):
+def test_allreduce_custom(
+    tp_size,
+    pp_size,
+    shape,
+    dtype,
+    withGraph=False,
+    distributed_init_method: Optional[str] = None,
+):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     pool = Pool(processes=tp_size)
@@ -92,7 +103,10 @@ def test_allreduce_custom(tp_size, pp_size, shape, dtype, withGraph=False):
         x = torch.randn(shape, dtype=dtype)
         ref += x
         rets.append(
-            pool.apply_async(allreduce_custom, args=(tp_size, pp_size, i, x, withGraph))
+            pool.apply_async(
+                allreduce_custom,
+                args=(tp_size, pp_size, i, x, withGraph, distributed_init_method),
+            )
         )
     pool.close()
     pool.join()
@@ -138,5 +152,14 @@ if __name__ == "__main__":
         l_shape = [args.shape]
     for dtype in l_dtype:
         for shape in l_shape:
-            test_allreduce_custom(8, 1, shape, dtype, withGraph=True)
+            test_allreduce_custom(
+                8,
+                1,
+                shape,
+                dtype,
+                withGraph=True,
+                distributed_init_method=get_distributed_init_method(
+                    get_ip(), get_open_port()
+                ),
+            )
             # test_allreduce_custom(8, 1, shape, dtype, withGraph=False)
