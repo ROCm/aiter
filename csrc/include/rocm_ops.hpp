@@ -1550,7 +1550,8 @@ namespace py = pybind11;
           py::arg("softmax_scale"),     \
           py::arg("split_output"),      \
           py::arg("split_lse"),         \
-          py::arg("final_output"));
+          py::arg("final_output"),      \
+          py::arg("dbg_tr"));
 
 #define TOPK_PLAIN_PYBIND           \
     m.def("topk_plain",             \

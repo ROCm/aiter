@@ -162,6 +162,7 @@ def mla_decode_fwd(
     q_scale=None,
     kv_scale=None,
     intra_batch_mode=False,
+    dbg_tr=None,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -309,6 +310,7 @@ def mla_decode_fwd(
                 logits,
                 attn_lse,
                 o,
+                dbg_tr,
             )
             exit()
 
