@@ -392,7 +392,9 @@ def test_mla(
         nhead == 16 or (nhead in range(32, 128, 16) and decode_qlen == 1)
     ):
         err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and nhead in [16, 128]:
+    elif kvtype == dtypes.fp8 and (
+        nhead in [16, 128] or (nhead in range(32, 128, 16) and decode_qlen == 1)
+    ):
         err, us_asm_decode = test_absorb_decode_fp8()
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
