@@ -105,9 +105,9 @@ struct __attribute__((packed)) fmha_bwd_v3_args_gfx950
     p2 _p40;
     unsigned int max_seqlen_dq;    // 0x290: gorup mode max seqlen q for a16 dq_acc store, padding to 16x
     p3 _p41;
-    int mask_x;                     // 0x290
+    int mask_x;                     // 0x2a0
     p3 _p42;
-    int mask_y;                     // 0x2a0
+    int mask_y;                     // 0x2b0
     p3 _p43;
 };
 
@@ -656,11 +656,13 @@ class fmha_bwd_v3_kernel
         int gdx = (fmha_v3_traits.sk + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
         int gdy = fmha_v3_traits.h;
         int gdz = fmha_v3_traits.b;
-        if(fmha_v3_traits.mask > 0)
+        
+        if(fmha_v3_traits.mask > 0 && args.mask_x == 0 && args.mask_y == 0)
         {
             int num_tg = (fmha_v3_traits.sk + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
             gdx        = (num_tg % 2) ? (num_tg / 2 + 1) : (num_tg / 2);
         }
+
         HIP_CALL(hipModuleLaunchKernel(kernel_func,
                                        gdx,
                                        gdy,
@@ -1117,6 +1119,19 @@ float fmha_bwd_v3_genl_gfx942(const ck_tile::stream_config& s, fmha_bwd_args a, 
         args.ptr_qseq_padded    = a.seqstart_q_ptr;
     }
     args.max_seqlen_dq     = (a.max_seqlen_q + 15) / 16 * 16;
+    
+    // convert l/r to x/y HERE
+    if (a.window_size_left == -1 && a.window_size_right == 0) {
+        args.mask_y = 0;
+        args.mask_x = 0; 
+    } else {
+        auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(
+            a.window_size_left, a.window_size_right, a.seqlen_q, a.seqlen_k,
+            (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) || 
+            a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
+        args.mask_y = generic_mask.at(ck_tile::number<0>{});
+        args.mask_x = generic_mask.at(ck_tile::number<1>{});
+    }
 
     auto traits = fmha_bwd_v3_traits{a.batch,
                                       a.nhead_q,
@@ -1195,9 +1210,14 @@ float fmha_bwd_v3_genl_gfx942(const ck_tile::stream_config& s, fmha_bwd_args a, 
     }
 
     // convert l/r to x/y HERE
-    auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(a.window_size_left, a.window_size_right, a.seqlen_q, a.seqlen_k, (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) || a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
-    args.mask_y = generic_mask.at(ck_tile::number<0>{});
-    args.mask_x = generic_mask.at(ck_tile::number<1>{});
+    if (a.window_size_left == -1 && a.window_size_right == 0) {
+        args.mask_y = 0;
+        args.mask_x = 0; 
+    } else {
+        auto generic_mask = ck_tile::make_generic_attention_mask_coordinates_from_lr_window(a.window_size_left, a.window_size_right, a.seqlen_q, a.seqlen_k, (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) || a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
+        args.mask_y = generic_mask.at(ck_tile::number<0>{});
+        args.mask_x = generic_mask.at(ck_tile::number<1>{});
+    }
 
     auto traits = fmha_bwd_v3_traits{a.batch,
                                       a.nhead_q,
