@@ -17,7 +17,8 @@ void hk_mla_decode_fwd(
     const float softmax_scale,
     torch::Tensor& split_output,
     torch::Tensor& split_lse,
-    torch::Tensor& final_output)
+    torch::Tensor& final_output,
+    std::optional<torch::Tensor>& dbg_tr)
 {
     const int32_t num_head = query.size(1);
 
@@ -36,6 +37,7 @@ void hk_mla_decode_fwd(
             softmax_scale,
             split_output,
             split_lse,
-            final_output);
+            final_output,
+            dbg_tr);
     }
 }
