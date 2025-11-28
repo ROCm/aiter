@@ -117,7 +117,7 @@ def test_async_load_mfma(
     #     order=[1, 0],
     # )
     mfma_layout_qk: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+        version=3, instr_shape=[16, 16, 16], transposed=True, warps_per_cta=[1, 4]
     )
     dot_q_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout_qk, k_width=16
@@ -136,6 +136,9 @@ def test_async_load_mfma(
         0, BLOCK_C, layout=gl.SliceLayout(0, blocked_ld_out)
     )
 
+    shared_q: gl.constexpr = gl.SwizzledSharedLayout(
+        8, 1, 1, [1, 0]
+    )
     smem_a = gl.allocate_shared_memory(
         A_ptr.type.element_ty, [BLOCK_H * 4, BLOCK_C], layout=shared_q
     )
@@ -159,7 +162,7 @@ def test_async_load_mfma(
     shared_in: gl.constexpr = gl.SwizzledSharedLayout(
         8, 1, 1, [1, 0]
     )
-    shared_cal: gl.constexpr = gl.SwizzledSharedLayout(
+    shared_k_cal: gl.constexpr = gl.SwizzledSharedLayout(
         8, 1, 1, [0, 1]
     )
     smem_kv1 = gl.allocate_shared_memory(
@@ -216,7 +219,7 @@ def test_async_load_mfma(
     offs_out = cur_head_out1[:, None] * BLOCK_H * 4 + cur_head_out2[None, :]
 
     gl.amd.cdna3.buffer_store(
-        stored_value=cur_o,
+        stored_value=out.to(output.type.element_ty),
         ptr=output,
         offsets=offs_out,
     )
