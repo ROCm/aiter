@@ -15,7 +15,7 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
 from aiter import logger
 from aiter.jit.core import (
-    AITER_CONFIG_FMOE_FILE,
+    AITER_CONFIGS,
     PY,
     bd_dir,
     get_asm_dir,
@@ -157,6 +157,10 @@ def fused_moe_fake(
     num_local_tokens: Optional[torch.Tensor] = None,
     moe_sorting_dispatch_policy: bool = 0,
     dtype: Optional[torch.dtype] = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: Optional[torch.Tensor] = None,
+    bias2: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -254,9 +258,6 @@ def fused_moe_(
     )
 
     if metadata.run_1stage:
-        assert (
-            doweight_stage1 == False
-        ), "doweight_stage1 not support in fused_moe_1stage"
         return metadata.stage1(
             hidden_states,
             w1,
@@ -278,6 +279,9 @@ def fused_moe_(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             num_local_tokens=num_local_tokens,
+            M=M,
+            device=topk_ids.device,
+            doweight_stage1=doweight_stage1,
         )
     else:
         return fused_moe_2stages(
@@ -333,6 +337,9 @@ def fused_moe_1stage(
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
+    M: int = None,
+    device=None,
+    doweight_stage1: bool = None,
 ):
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
@@ -347,7 +354,31 @@ def fused_moe_1stage(
             num_valid_ids,
             topk,
         )
+    elif quant_type == QuantType.per_Token and doweight_stage1 and isG1U1:
+        a8_type = w1.dtype
+        _, model_dim, _ = w2.shape
 
+        a8 = torch.empty((M, model_dim), dtype=a8_type, device=device)
+        a8_scale = torch.empty(M, dtype=dtypes.fp32, device=device)
+        aiter.dynamic_per_token_scaled_quant(a8, hidden_states, a8_scale)
+
+        aiter.fmoe_g1u1_tkw1(
+            moe_buf,
+            a8,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            topk,
+            a8_scale,
+            w1_scale,
+            w2_scale,
+            kernelName,
+            a2_scale,
+            activation,
+        )
     else:
         quant_func = get_quant(quant_type)
         if hidden_states.dtype != q_dtype_a:
@@ -451,23 +482,25 @@ cfg_2stages = None
 fused_moe_1stage_dict = {
     "gfx942":
     {
-        # activation,                    quant_type,        dtype,    q_dtype_a,    q_dtype_w,   isG1U1,      API
-        (ActivationType.Silu,          QuantType.No,  dtypes.bf16,   dtypes.bf16,   dtypes.bf16,   False) : aiter.fmoe,
-        (ActivationType.Silu,          QuantType.No,  dtypes.fp16,   dtypes.fp16,   dtypes.fp16,   False) : aiter.fmoe,
-        (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,    dtypes.fp8,   dtypes.i4x2,    True) : aiter.fmoe_g1u1,
-        (ActivationType.Silu,    QuantType.per_1x32,  dtypes.bf16,  dtypes.fp4x2,  dtypes.fp4x2,    True) : aiter.fmoe_g1u1,
-        (ActivationType.Silu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,    True) : aiter.fmoe_g1u1,
-        (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,    True) : aiter.fmoe_g1u1,
-        (ActivationType.Silu,   QuantType.per_Token,  dtypes.bf16,    dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_g1u1,
-        (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,    dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_g1u1,
-        (ActivationType.Silu,   QuantType.per_1x128,  dtypes.bf16,    dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_g1u1,
-        (ActivationType.Silu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,   False) : aiter.fmoe_int8_g1u0,
-        (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,   False) : aiter.fmoe_int8_g1u0,
+        # activation,                    quant_type,        dtype,    q_dtype_a,    q_dtype_w,   isG1U1,    doweight_stage1,      API
+        (ActivationType.Silu,          QuantType.No,  dtypes.bf16,   dtypes.bf16,   dtypes.bf16,   False,   False) : aiter.fmoe,
+        (ActivationType.Silu,          QuantType.No,  dtypes.fp16,   dtypes.fp16,   dtypes.fp16,   False,   False) : aiter.fmoe,
+        (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,    dtypes.fp8,   dtypes.i4x2,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,    QuantType.per_1x32,  dtypes.bf16,  dtypes.fp4x2,  dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,   QuantType.per_Token,  dtypes.bf16,    dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,    dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,   QuantType.per_1x128,  dtypes.bf16,    dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,   False,   False) : aiter.fmoe_int8_g1u0,
+        (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,   False,   False) : aiter.fmoe_int8_g1u0,
     },
     "gfx950":
     {
-        (ActivationType.Silu,    QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True) : aiter.fmoe_g1u1,
-        (ActivationType.Silu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_fp8_blockscale_g1u1,
+        (ActivationType.Silu,    QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_fp8_blockscale_g1u1,
+        (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,    dtypes.bf16,   dtypes.bf16,   False,   False) : aiter.fmoe,
+        (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   True)  : aiter.fmoe_g1u1_tkw1,
     }
 }
 # fmt: on
@@ -544,8 +577,8 @@ def get_2stage_cfgs(
         return cfg_2stages
 
     global cfg_2stages
-    config_path = os.path.dirname(AITER_CONFIG_FMOE_FILE)
-    tune_file = AITER_CONFIG_FMOE_FILE
+    config_path = os.path.dirname(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
+    tune_file = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
@@ -601,21 +634,20 @@ def get_2stage_cfgs(
         kernelName2 = ""
         run_1stage = False
         if (
-            not doweight_stage1
-            and (
-                activation,
-                q_type,
-                dtype,
-                q_dtype_a,
-                q_dtype_w,
-                use_g1u1,
-            )
-            in fused_moe_1stage_dict[get_gfx()]
-        ):
+            activation,
+            q_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            use_g1u1,
+            doweight_stage1,
+        ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
                 run_1stage = True and (inter_dim % 256 == 0)
-            elif q_type == QuantType.per_Token and q_dtype_w in [dtypes.i8, dtypes.fp8]:
+            elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
+            elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
+                run_1stage = token > 16
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
 
