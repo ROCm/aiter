@@ -745,7 +745,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params,
         allreduce_fusion_kernel_twoshot_single_load<T, NRanks><<<numBlocks,
                                                                  threadsPerBlock, 0, stream>>>(params);
     } else {
-        int nblocks = std::min(token_num, NBLOCKS_PER_GPU);
+        int nblocks = std::min((token_num + NRanks - 1) / NRanks, NBLOCKS_PER_GPU);
         if (params.size * sizeof(T) >= 1024 * 1024 * 128) {
             nblocks /= 2;
         }
