@@ -387,17 +387,17 @@ namespace py = pybind11;
           py::arg("bpreshuffle") = true,                                \
           py::arg("splitK")      = std::nullopt);
 
-#define GEMM_A16W16_ASM_PYBIND                  \
-    m.def("gemm_a16w16_asm",                    \
-          &gemm_a16w16_asm,                     \
-          "Asm gemm a16w16",                    \
-          py::arg("A"),                         \
-          py::arg("B"),                         \
-          py::arg("out"),                       \
-          py::arg("bias")       = std::nullopt, \
-          py::arg("splitK")     = std::nullopt, \
-          py::arg("kernelName") = std::nullopt, \
-          py::arg("bpreshuffle")      = false);
+#define GEMM_A16W16_ASM_PYBIND                   \
+    m.def("gemm_a16w16_asm",                     \
+          &gemm_a16w16_asm,                      \
+          "Asm gemm a16w16",                     \
+          py::arg("A"),                          \
+          py::arg("B"),                          \
+          py::arg("out"),                        \
+          py::arg("bias")        = std::nullopt, \
+          py::arg("splitK")      = std::nullopt, \
+          py::arg("kernelName")  = std::nullopt, \
+          py::arg("bpreshuffle") = false);
 
 #define GEMM_A4W4_ASM_PYBIND                      \
     m.def("gemm_a4w4_asm",                        \
@@ -527,14 +527,14 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,        \
           py::arg("splitK")   = 0);
 
-#define GEMM_A8W8_BPRESHUFFLE_CKTILE_PYBIND      \
-    m.def("gemm_a8w8_bpreshuffle_cktile", \
-          &gemm_a8w8_bpreshuffle_cktile,  \
-          "gemm_a8w8_bpreshuffle_cktile", \
-          py::arg("XQ"),                  \
-          py::arg("WQ"),                  \
-          py::arg("x_scale"),             \
-          py::arg("w_scale"),             \
+#define GEMM_A8W8_BPRESHUFFLE_CKTILE_PYBIND \
+    m.def("gemm_a8w8_bpreshuffle_cktile",   \
+          &gemm_a8w8_bpreshuffle_cktile,    \
+          "gemm_a8w8_bpreshuffle_cktile",   \
+          py::arg("XQ"),                    \
+          py::arg("WQ"),                    \
+          py::arg("x_scale"),               \
+          py::arg("w_scale"),               \
           py::arg("Out"));
 
 #define GEMM_A8W8_BPRESHUFFLE_CKTILE_TUNE_PYBIND \
@@ -1429,4 +1429,5 @@ namespace py = pybind11;
           py::arg("softmax_scale"),     \
           py::arg("split_output"),      \
           py::arg("split_lse"),         \
-          py::arg("final_output"));
+          py::arg("final_output"),      \
+          py::arg("dbg_tr"));
