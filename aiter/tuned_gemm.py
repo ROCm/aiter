@@ -41,6 +41,20 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 solMap = ["torch", "hipblaslt", "skinny", "asm"]
 extensions_created = False
+untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
+tune_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
+tuned_df = pd.DataFrame(
+    columns=[
+        "M",
+        "N",
+        "K",
+        "bias",
+        "dtype",
+        "outdtype",
+        "scaleAB",
+        "bpreshuffle",
+    ]
+)
 
 
 def get_solfunc(soltype: int):
@@ -91,6 +105,7 @@ def get_GEMM_A16W16_config(
     cu_num = get_cu_num()
     padded_M = M
     config = None
+
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         config = cfg.get(
@@ -114,6 +129,7 @@ def get_GEMM_A16W16_config(
                     f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=} found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, libtype is {config['libtype']}, kernel name is {kernelName}"
                 )
             return config
+
     if config is None:
         default_config = {}
         logger.info(
@@ -144,6 +160,39 @@ def get_GEMM_A16W16_config(
     return config
 
 
+def save_shapes(
+    M,
+    N,
+    K,
+    bias,
+    dtype,
+    otype,
+    scaleAB,
+    bpreshuffle,
+):
+    save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
+    global tuned_df
+    if save_gemm:
+        tuned_df = pd.concat(
+            [
+                tuned_df,
+                pd.DataFrame(
+                    {
+                        "M": [M],
+                        "N": [N],
+                        "K": [K],
+                        "bias": [bias is not None],
+                        "dtype": [dtype],
+                        "outdtype": [otype],
+                        "scaleAB": [scaleAB],
+                        "bpreshuffle": [bpreshuffle],
+                    }
+                ),
+            ]
+        ).drop_duplicates()
+        tuned_df.to_csv(untune_path, index=False)
+
+
 def gen_gemm_a16w16_fake_tensor(
     A: Tensor,
     B: Tensor,
@@ -171,8 +220,10 @@ def gemm_a16w16(
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
-    bpreshuffle: Optional[bool] = False,
 ) -> Tensor:
+    bpreshuffle = False
+    if hasattr(B, "is_shuffled") and B.is_shuffled is True:
+        bpreshuffle = True
     if A.dim() >= 3:
         try:
             inp_view = A.view(-1, A.size(-1))
@@ -209,6 +260,16 @@ def gemm_a16w16(
         out = out.view(*A.shape[:-1], B.shape[0])
     if otype is not None:
         out = out.to(otype)
+    save_shapes(
+        m,
+        n,
+        k,
+        bias,
+        inp_view.dtype,
+        otype,
+        scale_a is not None or scale_b is not None,
+        bpreshuffle,
+    )
     return out
 
 
@@ -350,9 +411,6 @@ class TunedGemm:
         scale_b: Optional[Tensor] = None,
         scale_c: Optional[Tensor] = None,
     ):
-        bpreshuffle = False
-        if hasattr(weights, "is_shuffled") and weights.is_shuffled is True:
-            bpreshuffle = True
 
         out = gemm_a16w16(
             inp,
@@ -362,53 +420,8 @@ class TunedGemm:
             scale_a=scale_a,
             scale_b=scale_b,
             scale_c=scale_c,
-            bpreshuffle=bpreshuffle,
-        )
-        self.save_shapes(
-            inp, weights, bias, otype, scale_a, scale_b, scale_c, bpreshuffle
         )
         return out
-
-    def save_shapes(
-        self,
-        A,
-        B,
-        bias,
-        otype,
-        scale_a,
-        scale_b,
-        scale_c,
-        bpreshuffle,
-    ):
-        if A.dim() >= 3:
-            inp_view = A.view(-1, A.size(-1))
-        else:
-            inp_view = A
-        m, k = inp_view.shape
-        n = B.shape[0]
-        save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
-        if save_gemm:
-            dtype = inp_view.dtype
-            otype = otype if otype is not None else inp_view.dtype
-            scaleAB = scale_a is not None or scale_b is not None
-            self.tuned_df = pd.concat(
-                [
-                    self.tuned_df,
-                    pd.DataFrame(
-                        {
-                            "M": [m],
-                            "N": [n],
-                            "K": [k],
-                            "bias": [bias is not None],
-                            "dtype": [dtype],
-                            "outdtype": [otype],
-                            "scaleAB": [scaleAB],
-                            "bpreshuffle": [bpreshuffle],
-                        }
-                    ),
-                ]
-            ).drop_duplicates()
-            self.tuned_df.to_csv(self.untune_path, index=False)
 
 
 tgemm = TunedGemm()
