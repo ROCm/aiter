@@ -129,17 +129,17 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
     # Data type validation
     gl.static_assert(
-        query_ptr.dtype.element_ty == gl.float8e4b8
+        query_ptr.dtype.element_ty == gl.float8e4nv
         or query_ptr.dtype.element_ty == gl.bfloat16
         or query_ptr.dtype.element_ty == gl.float16
     )
     gl.static_assert(
-        key_cache_ptr.dtype.element_ty == gl.float8e4b8
+        key_cache_ptr.dtype.element_ty == gl.float8e4nv
         or key_cache_ptr.dtype.element_ty == gl.bfloat16
         or key_cache_ptr.dtype.element_ty == gl.float16
     )
     gl.static_assert(
-        value_cache_ptr.dtype.element_ty == gl.float8e4b8
+        value_cache_ptr.dtype.element_ty == gl.float8e4nv
         or value_cache_ptr.dtype.element_ty == gl.bfloat16
         or value_cache_ptr.dtype.element_ty == gl.float16
     )
@@ -151,7 +151,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
     # ==================== Constants and Configuration ====================
-    if COMPUTE_TYPE == gl.float8e4b8:
+    if COMPUTE_TYPE == gl.float8e4nv:
         OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
     else:
         OUTPUT_DTYPE: gl.constexpr = COMPUTE_TYPE
@@ -187,7 +187,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     )
     blocked_key_layout: gl.constexpr = (
         blocked_key_layout_fp8
-        if COMPUTE_TYPE == gl.float8e4b8
+        if COMPUTE_TYPE == gl.float8e4nv
         else blocked_key_layout_f16
     )
 
@@ -509,7 +509,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     key_block = gl.amd.cdna3.buffer_load(ptr=key_cache_ptr, offsets=key_block_offsets)
     key_block = key_block.to(COMPUTE_TYPE)
     # Convert layouts for MFMA operation
-    if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE == gl.float8e4b8:
+    if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE == gl.float8e4nv:
         # Quantize bf16 query to fp8
         # Convert query to float32 for computation
         query_f32 = query_tensor.to(gl.float32)
@@ -520,7 +520,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
         # Add epsilon to avoid division by zero
         query_scale_value = query_max_abs / float(FP8_MAX_VALUE)
         # Quantize: scale query to fp8 range and convert to fp8 type
-        query_tensor = query_f32.to(gl.float8e4b8)
+        query_tensor = query_f32.to(gl.float8e4nv)
 
     # ==================== Scale QK Scores ====================
     if KV_QUANT_MODE >= 0:
@@ -819,7 +819,7 @@ def paged_attention_decode_v2_gluon_fp8(
         This kernel uses AMD CDNA3 MFMA instructions for efficient matrix operations
         and supports both FP8 and BF16 data types with various quantization modes.
     """
-    if COMPUTE_TYPE == gl.float8e4b8:
+    if COMPUTE_TYPE == gl.float8e4nv:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 16
     else:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 8
@@ -832,17 +832,20 @@ def paged_attention_decode_v2_gluon_fp8(
 
     # Data type validation
     gl.static_assert(
-        query_ptr.dtype.element_ty == gl.float8e4b8
+        query_ptr.dtype.element_ty == gl.float8e4nv
+        or query_ptr.dtype.element_ty == gl.float8e4nv
         or query_ptr.dtype.element_ty == gl.bfloat16
         or query_ptr.dtype.element_ty == gl.float16
     )
     gl.static_assert(
-        key_cache_ptr.dtype.element_ty == gl.float8e4b8
+        key_cache_ptr.dtype.element_ty == gl.float8e4nv
+        or key_cache_ptr.dtype.element_ty == gl.float8e4nv
         or key_cache_ptr.dtype.element_ty == gl.bfloat16
         or key_cache_ptr.dtype.element_ty == gl.float16
     )
     gl.static_assert(
-        value_cache_ptr.dtype.element_ty == gl.float8e4b8
+        value_cache_ptr.dtype.element_ty == gl.float8e4nv
+        or value_cache_ptr.dtype.element_ty == gl.float8e4nv
         or value_cache_ptr.dtype.element_ty == gl.bfloat16
         or value_cache_ptr.dtype.element_ty == gl.float16
     )
@@ -854,7 +857,7 @@ def paged_attention_decode_v2_gluon_fp8(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
     # ==================== CONSTANTS AND CONFIGURATION ====================
-    if COMPUTE_TYPE == gl.float8e4b8:
+    if COMPUTE_TYPE == gl.float8e4nv:
         OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
     else:
         OUTPUT_DTYPE: gl.constexpr = COMPUTE_TYPE
@@ -891,7 +894,7 @@ def paged_attention_decode_v2_gluon_fp8(
     # )
     # blocked_key_layout: gl.constexpr = (
     #     blocked_key_layout_fp8
-    #     if COMPUTE_TYPE == gl.float8e4b8
+    #     if COMPUTE_TYPE == gl.float8e4nv
     #     else blocked_key_layout_f16
     # )
 
@@ -1129,7 +1132,7 @@ def paged_attention_decode_v2_gluon_fp8(
         return  # No computation needed for this partition
 
     SEQUENCE_PARTITION_KV_BLOCKS: gl.constexpr = CONTEXT_PARTITION_SIZE // KV_BLOCK_SIZE
-    if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE == gl.float8e4b8:
+    if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE == gl.float8e4nv:
         # Quantize bf16 query to fp8
         # Convert query to float32 for computation
         query_f32 = query_tensor.to(gl.float32)
@@ -1140,7 +1143,7 @@ def paged_attention_decode_v2_gluon_fp8(
         # Add epsilon to avoid division by zero
         query_scale_value = query_max_abs / float(FP8_MAX_VALUE)
         # Quantize: scale query to fp8 range and convert to fp8 type
-        query_tensor = query_f32.to(gl.float8e4b8)
+        query_tensor = query_f32.to(gl.float8e4nv)
     # KV_COMPUTE_BLOCK_COUNT: gl.constexpr = (
     #     CONTEXT_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE)
     # Process KV sequence in compute blocks
@@ -2368,7 +2371,7 @@ def pa_decode_gluon(
         Maximum sequence length supported
 
     compute_type
-        Data type for computation (tl.float8e4b8, tl.bfloat16, tl.float16)
+        Data type for computation (tl.float8e4nv, tl.bfloat16, tl.float16)
 
     query_scale : torch.Tensor
         Quantization scales for queries
@@ -2418,10 +2421,10 @@ def pa_decode_gluon(
 
     grid = (num_sequences, num_kv_heads, max_context_partition_num)
 
-    # thre are some precision problems for tl.bfloat16 and tl.float16, so only support tl.float8e4b8 now
+    # thre are some precision problems for tl.bfloat16 and tl.float16, so only support tl.float8e4nv now
     # assert compute_type in [
-    #     tl.float8e4b8
-    # ], f"compute_type == {compute_type} not in [tl.float8e4b8]"
+    #     tl.float8e4nv
+    # ], f"compute_type == {compute_type} not in [tl.float8e4nv]"
     assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
     # Validate input params constraint
     assert query.dtype in [

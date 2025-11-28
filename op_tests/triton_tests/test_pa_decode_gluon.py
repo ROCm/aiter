@@ -54,12 +54,12 @@ STR_DTYPE_TO_TORCH_DTYPE = {
 
 # Triton to PyTorch dtype mapping
 TL_TO_TORCH_DTYPE = {
-    tl.float8e4b8: aiter.dtypes.fp8,
+    tl.float8e4nv: aiter.dtypes.fp8,
     tl.bfloat16: torch.bfloat16,
     tl.float16: torch.float16,
 }
 TORCH_TO_TL_DTYPE = {
-    aiter.dtypes.fp8: tl.float8e4b8,
+    aiter.dtypes.fp8: tl.float8e4nv,
     torch.bfloat16: tl.bfloat16,
     torch.float16: tl.float16,
 }
