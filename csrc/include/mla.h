@@ -104,6 +104,7 @@ void hk_mla_decode_fwd(
     const torch::Tensor& work_info_set,
     const int max_seqlen_q,
     const float softmax_scale,
-    torch::Tensor& split_data,    // Output: [batch_size, num_kv_splits, num_heads, v_head_dim]
-    torch::Tensor& split_lse,     // Output: [batch_size, num_kv_splits, num_heads,  1]
-    torch::Tensor& final_output); // Output: [batch_size, num_heads, v_head_dim]
+    torch::Tensor& split_data,   // Output: [batch_size, num_kv_splits, num_heads, v_head_dim]
+    torch::Tensor& split_lse,    // Output: [batch_size, num_kv_splits, num_heads,  1]
+    torch::Tensor& final_output, // Output: [batch_size, num_heads, v_head_dim]
+    std::optional<torch::Tensor>& dbg_tr);

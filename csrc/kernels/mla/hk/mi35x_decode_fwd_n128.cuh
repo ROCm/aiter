@@ -46,11 +46,11 @@ __device__ float4 convert_fp8x4_to_float4(FUI in)
     return r;
 }
 
-template <int GPR>
-__device__ constexpr int reg_2_loc_q()
+template <int GPR, int GPR_START>
+__device__ constexpr int reg_2_col_q()
 {
-    constexpr int off = GPR - 92;
-    return (off % 2) * 4 + (off / 2) * 32;
+    constexpr int off = GPR - GPR_START;
+    return (off % 2) * 4 + (off / 2) * 32 + (ckt::get_lane_id() / 16) * 8;
 }
 
 // ================================================================
@@ -112,6 +112,9 @@ struct HkMlaDecodeFwdParams
     // metadata
     const int32_t* p_work_indptr;
     const int32_t* p_work_info_set;
+
+    // debug
+    float* p_dbg;
 };
 
 template <typename T>
@@ -177,65 +180,33 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         hk::load<2, T::kQkNopeHeadDim>(
             q_rope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0});
 
-        if((threadIdx.x % 64) < 3)
-        {
-            float4 nope_92  = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<92>()});
-            float4 nope_93  = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<93>()});
-            float4 nope_96  = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<96>()});
-            float4 nope_100 = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<100>()});
-            float4 rope_124 = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<124>()});
-            float4 rope_125 = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<125>()});
-            float4 rope_126 = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<126>()});
-            float4 rope_127 = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<127>()});
+        asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)");
+        __builtin_amdgcn_s_waitcnt(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
 
-            printf("[mla-dbg][%d, %d] %d=(%f,%f,%f,%f), %d=(%f,%f,%f,%f), %d=(%f,%f,%f,%f), "
-                   "%d=(%f,%f,%f,%f)\n",
-                   blockIdx.x,
-                   threadIdx.x,
-                   reg_2_loc_q<92>(),
-                   nope_92.x,
-                   nope_92.y,
-                   nope_92.z,
-                   nope_92.w,
-                   reg_2_loc_q<93>(),
-                   nope_93.x,
-                   nope_93.y,
-                   nope_93.z,
-                   nope_93.w,
-                   reg_2_loc_q<96>(),
-                   nope_96.x,
-                   nope_96.y,
-                   nope_96.z,
-                   nope_96.w,
-                   reg_2_loc_q<100>(),
-                   nope_100.x,
-                   nope_100.y,
-                   nope_100.z,
-                   nope_100.w);
-            printf("[mla-dbg][%d, %d] %d=(%f,%f,%f,%f), %d=(%f,%f,%f,%f), %d=(%f,%f,%f,%f), "
-                   "%d=(%f,%f,%f,%f)\n",
-                   blockIdx.x,
-                   threadIdx.x,
-                   reg_2_loc_q<124>(),
-                   rope_124.x,
-                   rope_124.y,
-                   rope_124.z,
-                   rope_124.w,
-                   reg_2_loc_q<125>(),
-                   rope_125.x,
-                   rope_125.y,
-                   rope_125.z,
-                   rope_125.w,
-                   reg_2_loc_q<126>(),
-                   rope_126.x,
-                   rope_126.y,
-                   rope_126.z,
-                   rope_126.w,
-                   reg_2_loc_q<127>(),
-                   rope_127.x,
-                   rope_127.y,
-                   rope_127.z,
-                   rope_127.w);
+        if(params.p_dbg != nullptr)
+        {
+            ckt::static_for<92, 128, 1>{}([&](auto i) {
+                const float4 f4   = convert_fp8x4_to_float4(FUI{hkm::v_get_gpr<i.value>()});
+                const int64_t row = qo_start * T::kQoNumHead + warp_idx * T::kTileM +
+                                    (ckt::get_lane_id() % T::kTileM);
+                const int64_t col    = reg_2_col_q<i.value, 92>();
+                const int64_t offset = row * T::kQkHeadDim + col;
+                if(blockIdx.x == 0 && warp_idx == 1 && i.value == 92)
+                {
+                    printf("[mla-dbg][%d, %d] row=%d, col=%d, offset=%d\n",
+                           blockIdx.x,
+                           threadIdx.x,
+                           row,
+                           col,
+                           offset);
+                }
+                params.p_dbg[offset]     = f4.x;
+                params.p_dbg[offset + 1] = f4.y;
+                params.p_dbg[offset + 2] = f4.z;
+                params.p_dbg[offset + 3] = f4.w;
+            });
         }
 
         ///
@@ -259,7 +230,8 @@ void dispatch_mla_decode_fwd_n128(torch::Tensor& query,
                                   const float softmax_scale,
                                   torch::Tensor& split_output,
                                   torch::Tensor& split_lse,
-                                  torch::Tensor& final_output)
+                                  torch::Tensor& final_output,
+                                  std::optional<torch::Tensor>& dbg_tr)
 {
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -301,7 +273,9 @@ void dispatch_mla_decode_fwd_n128(torch::Tensor& query,
             1),
         // metadata
         work_indptr.data_ptr<int32_t>(),
-        work_info_set.data_ptr<int32_t>()};
+        work_info_set.data_ptr<int32_t>(),
+        // debug
+        dbg_tr.has_value() ? dbg_tr.value().data_ptr<float>() : nullptr};
 
     const dim3 grid        = dim3(dev_prop.multiProcessorCount);
     const int32_t lds_size = dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy;
@@ -321,7 +295,8 @@ void hk_mi35x_mla_decode_fwd_n128(torch::Tensor& query,
                                   const float softmax_scale,
                                   torch::Tensor& split_output,
                                   torch::Tensor& split_lse,
-                                  torch::Tensor& final_output)
+                                  torch::Tensor& final_output,
+                                  std::optional<torch::Tensor>& dbg_tr)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(final_output));
 
@@ -347,7 +322,8 @@ void hk_mi35x_mla_decode_fwd_n128(torch::Tensor& query,
                                              softmax_scale,
                                              split_output,
                                              split_lse,
-                                             final_output);
+                                             final_output,
+                                             dbg_tr);
     }
     // else if(q_is_bf16 && kv_is_bf16)
     // {

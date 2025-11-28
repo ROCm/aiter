@@ -619,6 +619,10 @@ def test_mla(
         )
         return err, us_asm_decode
 
+    dbg_tr = torch.empty((total_q, nhead, qk_head_dim), dtype=torch.float32).fill_(
+        -233.0
+    )
+
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
@@ -683,8 +687,8 @@ def test_mla(
             kv_scale=kv_scale,
         )
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
-            aiter.mla.mla_decode_fwd,
+        # (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        aiter.mla.mla_decode_fwd(
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
             out_asm,
@@ -706,6 +710,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            dbg_tr=dbg_tr,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
