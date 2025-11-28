@@ -479,7 +479,6 @@ def run_benchmark(custom, args):
             assert not has_pe, "Positional Encoding (PE) not supported in unified attention yet."
             assert not dropout > 0.0, "Dropout not supported in unified attention yet."
             assert not return_attn_probs, "return_attn_probs not supported in unified attention yet."
-            assert not return_lse, "return_lse not supported in unified attention yet."
             assert not fused_backward, "Fused backward not supported in unified attention yet."
             assert mode == "fwd", "Only forward mode supported in unified attention yet."
             assert varlen, "Only varlen layout supported in unified attention yet."
@@ -582,6 +581,7 @@ def parse_args():
         default=0,
         help="Q and K head size, if -dv is absent then -d specifies V head size too",
     )
+    parser.add_argument("-unified_attention", action="store_true", default=False)
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
