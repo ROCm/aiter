@@ -342,9 +342,9 @@ struct __attribute__((packed)) fmha_bwd_v3_swa_genl_args
 
 struct __attribute__((packed)) fmha_bwd_odo_args
 {
-    void *ptr_o;
+    const void *ptr_o;
     p2 _p0;
-    void *ptr_do;
+    const void *ptr_do;
     p2 _p1;
     void *ptr_d;
     p2 _p2;
@@ -364,9 +364,9 @@ struct __attribute__((packed)) fmha_bwd_odo_args
     p3 _p9;
     unsigned int head_dim;
     p3 _p10;
-    const void *ptr_seqstart_q;
+    const void *ptr_qseq;
     p2 _p11;
-    const void *ptr_seqstart_q_padded;
+    const void *ptr_qseq_padded;
     p2 _p12;
 };
 
@@ -397,8 +397,6 @@ struct __attribute__((packed)) fmha_bwd_post_kernel_args
     p2 _p10;
     const void* ptr_qseq_padded;
     p2 _p11;
-    unsigned int max_seqlen_dq;
-    p3 _p12;
 };
 
 struct fmha_bwd_v3_traits
