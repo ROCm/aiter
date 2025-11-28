@@ -688,10 +688,11 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
         vec=8, per_phase=1, max_phase=8, order=[1, 0]
     )
     shared_k_store: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        vec=8, per_phase=1, max_phase=1, order=[1, 0]
     )
     shared_k: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8, per_phase=1, max_phase=16, order=[0, 1]
+        # vec=8, per_phase=1, max_phase=16, order=[0, 1]
+        vec=8, per_phase=1, max_phase=1, order=[0, 1]
     )
     shared_k_rope: gl.constexpr = gl.SwizzledSharedLayout(
         vec=8, per_phase=1, max_phase=16, order=[0, 1]
@@ -749,7 +750,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
     mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
     mask_h = mask_h & (cur_head < q_head_num)
 
-    TILE_N: gl.constexpr = BLOCK_H // 8
+    TILE_N: gl.constexpr = BLOCK_N // 8
 
     cur_N = gl.arange(
         0, TILE_N, layout=gl.SliceLayout(1, blocked_ld_k_nope_kn_async)
@@ -813,8 +814,10 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
     blocks_per_split = gl.cdiv(cur_batch_block_nums, NUM_KV_SPLITS)
     split_kv_start = blocks_per_split * split_kv_id
     
-    if split_kv_start * PAGE_BLOCK_SIZE > cur_batch_seq_len:
+    if split_kv_start * PAGE_BLOCK_SIZE >= cur_batch_seq_len:
         return
+    # tl.device_print("split_kv_start", split_kv_start)
+    # tl.device_print("cur_batch_seq_len", cur_batch_seq_len)
 
     split_kv_end = gl.minimum(split_kv_start + blocks_per_split, cur_batch_block_nums)
 
@@ -899,59 +902,59 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
     smem_kv21 = smem_kv2.slice(TILE_N,     TILE_N)
     smem_kv22 = smem_kv2.slice(TILE_N * 2, TILE_N)
     smem_kv23 = smem_kv2.slice(TILE_N * 3, TILE_N)
-    smem_kv24 = smem_kv1.slice(TILE_N * 4, TILE_N)
-    smem_kv25 = smem_kv1.slice(TILE_N * 5, TILE_N)
-    smem_kv26 = smem_kv1.slice(TILE_N * 6, TILE_N)
-    smem_kv27 = smem_kv1.slice(TILE_N * 7, TILE_N)
+    smem_kv24 = smem_kv2.slice(TILE_N * 4, TILE_N)
+    smem_kv25 = smem_kv2.slice(TILE_N * 5, TILE_N)
+    smem_kv26 = smem_kv2.slice(TILE_N * 6, TILE_N)
+    smem_kv27 = smem_kv2.slice(TILE_N * 7, TILE_N)
 
     ### =======   load kv1 ====== ###
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv10,
         K_Buffer,
         offsets=offs_buf_kv,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv11,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv12,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank * 2,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 * 2,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv13,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank * 3,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 * 3,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv14,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank * 4,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 * 4,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv15,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank * 5,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 * 5,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv16,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank * 6,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 * 6,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv17,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank * 7,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 * 7,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     ### =======   load kv1 end  ====== ###
 
@@ -962,49 +965,50 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
         smem_kv20,
         K_Buffer,
         offsets=offs_buf_kv + 256,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv21,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank + 256,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv22,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank * 2 + 256,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 * 2 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv23,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank * 3 + 256,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 * 3 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
+
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv24,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank * 4 + 256,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 * 4 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv25,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank * 5 + 256,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 * 5 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv26,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank * 6 + 256,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 * 6 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_kv27,
         K_Buffer,
-        offsets=offs_buf_kv + TILE_N * kv_lora_rank * 7 + 256,
-        mask=mask_k[:, None] & mask_k_c[None, :],
+        offsets=offs_buf_kv + TILE_N * 576 * 7 + 256,
+        # mask=mask_k[:, None] & mask_k_c[None, :],
     )
     ### =======   load kv2 end  ====== ###
 
@@ -1032,8 +1036,15 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
     smem_kv2 = smem_kv2._reinterpret(
         K_Buffer.type.element_ty, [kv_lora_rank // 2, BLOCK_N], layout=shared_k)
 
+
+    gl.amd.cdna4.async_copy.async_wait(0)
     cur_k1 = smem_kv1.load(layout=dot_k_layout)
+
+    gl.amd.cdna4.async_copy.async_wait(0)
     cur_k2 = smem_kv2.load(layout=dot_k_layout)
+    # if pid == 0:
+    #     tl.device_print("cur_k2", cur_k2)
+    #     tl.device_print("offs_buf_kv", offs_buf_kv)
 
     smem_k_rope.store(k_pe.T)
     gl.amd.cdna3.sched_barrier(0x0)
@@ -1059,18 +1070,16 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
         gl.amd.cdna3.sched_barrier(0x0)
 
         qk = gl.amd.cdna3.mfma(q0, cur_k1, zeros)
-        qk = gl.amd.cdna3.mfma(q1, cur_k2, qk)
-
         smem_kv1 = smem_kv1.permute([1, 0])
-        smem_kv2 = smem_kv2.permute([1, 0])
-
         cur_k1 = smem_kv1.load(layout=dot_v_layout)
+
+
+        qk = gl.amd.cdna3.mfma(q1, cur_k2, qk)
+        smem_kv2 = smem_kv2.permute([1, 0])
         cur_k2 = smem_kv2.load(layout=dot_v_layout)
         gl.amd.cdna3.sched_barrier(0x0)
 
         smem_kv1 = smem_kv1._reinterpret(
-            K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank], layout=shared_k_store)
-        smem_kv2 = smem_kv2._reinterpret(
             K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank], layout=shared_k_store)
 
         ### =======   load kv1 ====== ###
@@ -1083,48 +1092,49 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv11,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank,
+            offsets=offs_buf_kv + TILE_N * 576,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv12,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank * 2,
+            offsets=offs_buf_kv + TILE_N * 576 * 2,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv13,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank * 3,
+            offsets=offs_buf_kv + TILE_N * 576 * 3,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv14,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank * 4,
+            offsets=offs_buf_kv + TILE_N * 576 * 4,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv15,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank * 5,
+            offsets=offs_buf_kv + TILE_N * 576 * 5,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv16,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank * 6,
+            offsets=offs_buf_kv + TILE_N * 576 * 6,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv17,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank * 7,
+            offsets=offs_buf_kv + TILE_N * 576 * 7,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         ### =======   load kv1 end  ====== ###
 
-        gl.amd.cdna3.sched_barrier(0x0)
+        smem_kv2 = smem_kv2._reinterpret(
+            K_Buffer.type.element_ty, [BLOCK_N, kv_lora_rank], layout=shared_k_store)
 
         ### =======   load kv2  ====== ###
         # gl.amd.cdna3.sched_barrier(0x0)
@@ -1138,43 +1148,43 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv21,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank + 256,
+            offsets=offs_buf_kv + TILE_N * 576 + 256,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv22,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank * 2 + 256,
+            offsets=offs_buf_kv + TILE_N * 576 * 2 + 256,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv23,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank * 3 + 256,
+            offsets=offs_buf_kv + TILE_N * 576 * 3 + 256,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv24,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank * 4 + 256,
+            offsets=offs_buf_kv + TILE_N * 576 * 4 + 256,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv25,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank * 5 + 256,
+            offsets=offs_buf_kv + TILE_N * 576 * 5 + 256,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv26,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank * 6 + 256,
+            offsets=offs_buf_kv + TILE_N * 576 * 6 + 256,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_kv27,
             K_Buffer,
-            offsets=offs_buf_kv + TILE_N * kv_lora_rank * 7 + 256,
+            offsets=offs_buf_kv + TILE_N * 576 * 7 + 256,
             mask=mask_k[:, None] & mask_k_c[None, :],
         )
         ### =======   load kv2 end  ====== ###
@@ -1230,15 +1240,18 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
         smem_kv2 = smem_kv2._reinterpret(
             K_Buffer.type.element_ty, [kv_lora_rank // 2, BLOCK_N], layout=shared_k)
 
+        gl.amd.cdna4.async_copy.async_wait(0)
         cur_k1 = smem_kv1.load(layout=dot_k_layout)
         cur_k2 = smem_kv2.load(layout=dot_k_layout)
 
     qk = gl.amd.cdna3.mfma(q0, cur_k1, zeros)
     qk = gl.amd.cdna3.mfma(q1, cur_k2, qk)
-
     cur_k_pe = smem_k_rope.load(layout=dot_k_layout)
 
     qk = gl.amd.cdna3.mfma(q_pe, cur_k_pe, qk)
+    # if pid == 0:
+    #     tl.device_print("qk ", qk )
+
 
     # if pid == 5:
     #     tl.device_print("qk", qk)
@@ -1327,6 +1340,10 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
     )
 
     mask_lse = offs_om < (cur_head_id + 1) * VALID_BLOCK_H
+    # if pid == 1:
+    #     # tl.device_print("e_max", e_max)
+    #     tl.device_print("mask_lse", mask_lse)
+    
     gl.amd.cdna3.buffer_store(
         stored_value=e_max - gl.log(e_sum),
         ptr=Att_Lse,

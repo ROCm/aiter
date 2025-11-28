@@ -180,6 +180,7 @@ def ref_masked_attention(
         scale *= q_scale * kv_scale
 
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
+    # print("!@!!!!!!!", attn_weights)
     # import pdb;pdb.set_trace()
     # print(attn_weights[:,:, :27])
     if is_causal:
@@ -373,7 +374,7 @@ def run_benchmark(args: argparse.Namespace):
         random.seed(seed)
         torch.backends.cudnn.deterministic = True
 
-    # setup_seed(10123)
+    setup_seed(10123)
 
     @triton.testing.perf_report(create_benchmark_configs(args))
     def bench_mla(
@@ -536,7 +537,7 @@ def run_benchmark(args: argparse.Namespace):
             logit_cap,
             mtp,
         )
-        import pdb;pdb.set_trace()
+        # import pdb;pdb.set_trace()
 
         print(">>> ", cache_key)
         ms = us / 1000
@@ -544,13 +545,13 @@ def run_benchmark(args: argparse.Namespace):
             msg=f"mla_decode-absorb    [golden vs triton]: {ms * 1000} us......",
         )
 
-        # import pdb;pdb.set_trace()
-        cal_diff(out_ref, out_tri, "out", True)
-
         tflops = total_flops / ms * 1e-9
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         print(f"{tflops=}")
         print(f"{bandwidth=}")
+
+        # import pdb;pdb.set_trace()
+        cal_diff(out_ref, out_tri, "out", True)
 
         if save_aot:
             from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
