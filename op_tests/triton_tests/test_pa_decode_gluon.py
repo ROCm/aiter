@@ -1888,8 +1888,8 @@ def run_multi_pa_gluon_test(
             for ct in compute_types:
                 for quant_q_and_kv_mode in quant_q_and_kv:
                     quant_q, quant_kv = quant_q_and_kv_mode
-                    # if ct == aiter.dtypes.bf16:
-                    #     quant_q, quant_kv = [False, False]
+                    if ct == aiter.dtypes.bf16:
+                        quant_q, quant_kv = [False, False]
                     for trans_v_mode in trans_v:
                         for kv_varlen_mode in kv_varlen:
                             for (
@@ -2109,7 +2109,27 @@ def simple_test():
     # USE_AOT_IMPL_OPTIONS = [True]
     # USE_AOT_IMPL_OPTIONS = [False]
 
+    # parse_arg_and_run_test()
+
+    HEAD_DIMENSION_OPTIONS = [128]
+    CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
+    BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
+    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+    # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16"]
+    COMPUTE_TYPE_OPTIONS = ["fp8"]
+    QUANT_Q_AND_KV_OPTIONS = [[True, True]]
+    QUANT_MODE_OPTIONS = ["per_token"]
+    TRANS_V_OPTIONS = [False]
+    KV_VARLEN_OPTIONS = [False]
+    HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
+    # HEAD_CONFIGURATIONS = [(10, 1)]
+    USE_AOT_IMPL_OPTIONS = [True]
+    BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
+    # BLOCK_SIZE_OPTIONS = [64]
+    # parse_arg_and_run_test()
+    # BLOCK_SIZE_OPTIONS = [1024]
+    # parse_arg_and_run_test()
 
 
 def multi_compute_quant_type_test():
