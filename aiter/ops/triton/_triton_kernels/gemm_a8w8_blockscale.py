@@ -43,6 +43,44 @@ _gemm_a8w8_blockscale_reduce_repr = make_kernel_repr(
 )
 
 
+@triton.jit
+def group_broadcast(
+    x,
+    xM: tl.constexpr,
+    xN: tl.constexpr,
+    group_size: tl.constexpr,
+    broadcast_dim: tl.constexpr,
+):
+    """
+    Broadcasts the input tensor `x` along the specified dimension `broadcast_dim`
+    in groups of size `group_size`.
+
+    Parameters:
+    - x: Input tensor to be broadcasted.
+    - group_size: Size of each group for broadcasting.
+    - broadcast_dim: Dimension along which to perform the broadcasting.
+
+    Returns:
+    - A tensor with the same shape as `x`, but with values broadcasted
+      in groups along the specified dimension.
+    """
+    if broadcast_dim == 0:
+        assert xM > 0, "broadcast_dim must be specified"
+        if xM > 1:
+            x = x.reshape(xM, 1, xN)
+            x = tl.broadcast_to(x, (xM, group_size, xN))
+            x = x.reshape(xM * group_size, xN)
+        # else: singleton dimension, no need to broadcast
+    else:
+        assert xN > 0, "broadcast_dim must be specified"
+        if xN > 1:
+            x = x.reshape(xM, xN, 1)
+            x = tl.broadcast_to(x, (xM, xN, group_size))
+            x = x.reshape(xM, xN * group_size)
+
+    return x
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -131,7 +169,7 @@ def _gemm_a8w8_blockscale_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        pid = remap_xcd(pid, GRID_MN)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
@@ -152,7 +190,8 @@ def _gemm_a8w8_blockscale_kernel(
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        pid_bn = pid_n * BLOCK_SIZE_N
+        offs_bn = pid_bn + tl.arange(0, BLOCK_SIZE_N)
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
@@ -165,12 +204,19 @@ def _gemm_a8w8_blockscale_kernel(
         a_scale_ptrs = (
             a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
         )
-        offs_b_scale_n = offs_bn // GROUP_N
+        num_unique_scales_along_bn: tl.constexpr = (
+            BLOCK_SIZE_N + GROUP_N - 1
+        ) // GROUP_N
+        num_unique_scales_along_n: tl.constexpr = (N + GROUP_N - 1) // GROUP_N
+        offs_b_scale_n = (
+            pid_n * BLOCK_SIZE_N // GROUP_N + tl.arange(0, num_unique_scales_along_bn)
+        ) % num_unique_scales_along_n
         b_scale_ptrs = (
             b_scale_ptr
             + offs_k_scale * stride_bscale_k
             + offs_b_scale_n * stride_bscale_n
         )
+
         offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
@@ -180,26 +226,39 @@ def _gemm_a8w8_blockscale_kernel(
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
-                a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                a = tl.load(a_ptrs, mask=offs_am[:, None] < M, other=0.0)
+                b = tl.load(
+                    b_ptrs,
+                    cache_modifier=cache_modifier,
+                    mask=offs_bn[None, :] < N,
+                    other=0.0,
+                )
             else:
                 a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                    a_ptrs,
+                    mask=offs_k[None, :] < K - k * BLOCK_SIZE_K
+                    and offs_am[:, None] < M,
+                    other=0.0,
                 )
                 b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                    b_ptrs,
+                    mask=offs_k[:, None] < K - k * BLOCK_SIZE_K
+                    and offs_bn[None, :] < N,
+                    other=0.0,
                 )
-
-            a_scale = tl.load(a_scale_ptrs)
+            a_scale = tl.load(a_scale_ptrs, mask=offs_am < M)
             b_scale = tl.load(b_scale_ptrs)
-
-            # Perform dot operation and apply scale
-            accumulator += (
-                tl.dot(a, b, input_precision="ieee")
-                * a_scale[:, None]
-                * b_scale[None, :]
+            b_scale = group_broadcast(
+                b_scale,
+                xM=1,
+                xN=num_unique_scales_along_bn,
+                group_size=GROUP_N,
+                broadcast_dim=1,
             )
 
+            accumulator += (
+                tl.dot(a, b, input_precision="ieee") * a_scale[:, None] * b_scale
+            )
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
             b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -213,8 +272,8 @@ def _gemm_a8w8_blockscale_kernel(
         c = accumulator.to(c_ptr.type.element_ty)
 
         # Write back the block of the output matrix C with masks.
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = (
             c_ptr
             + stride_cm * offs_cm[:, None]
@@ -316,13 +375,23 @@ def _get_config(
             return _get_config._config_dict[key]["medium_M64"]
         elif BLK_M == 128 and "medium_M128" in _get_config._config_dict[key]:
             return _get_config._config_dict[key]["medium_M128"]
+        else:
+            return _get_config._config_dict[
+                key if key in _get_config._config_dict else "default"
+            ]["any"]
     elif M <= 256 and "large" in _get_config._config_dict[key]:
         return _get_config._config_dict[key]["large"]
+    elif M <= 2000:
+        return _get_config._config_dict[key]["medium_M2000"]
+    elif M <= 6017:
+        return _get_config._config_dict[key]["medium_M6017"]
     else:
         BLK_M = triton.next_power_of_2(M)
         if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
             return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
         elif "xlarge" in _get_config._config_dict[key]:
             return _get_config._config_dict[key]["xlarge"]
-
-    return _get_config._config_dict[key]["any"]
+        else:
+            return _get_config._config_dict[
+                key if key in _get_config._config_dict else "default"
+            ]["any"]
