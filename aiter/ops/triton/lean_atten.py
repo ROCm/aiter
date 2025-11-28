@@ -445,6 +445,8 @@ def get_num_splits_and_buffer_sizes(
     else:
         # Decode or Not Causal
         tiles_per_head = num_m_blocks * num_n_blocks
+        # Decode or Not Causal
+        tiles_per_head = num_m_blocks * num_n_blocks
 
     # Total tiles across all Q heads
     if XCD_REMAP:
@@ -489,6 +491,7 @@ def get_num_splits_and_buffer_sizes(
 
     # Needed for causal. This is (per batch n_ctx) // BLOCK_N
     num_n_blocks = num_n_blocks // batch_size
+    num_n_blocks = num_n_blocks // batch_size
 
     return (
         num_m_blocks,
@@ -512,7 +515,7 @@ def calculate_max_output_tiles_analytically(
     MASKED_BLOCKS: int,
     MODE: int,  # 0-ping-pong, 1-sequential
     batch_size: int,
-    batch_num_block_n: Optional[Union[torch.Tensor, Sequence[int]]] = None,
+    batch_num_block_n: Optional[torch.Tensor] = None,
 ):
     """
     Calculates maximum output tiles per workgroup for buffer allocation.
