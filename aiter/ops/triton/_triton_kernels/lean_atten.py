@@ -158,7 +158,6 @@ def _attention_inner(
         # Update accumulator
         acc = acc * alpha[:, None]
         v = tl.load(v_ptrs, mask=mask_k_cols_local[None, :], other=0.0)
-        v = tl.load(v_ptrs, mask=mask_k_cols_local[None, :], other=0.0)
         acc += tl.dot(p.to(v.dtype), v)
 
         # Update stats
@@ -166,16 +165,6 @@ def _attention_inner(
         l_i = l_i * alpha + l_ij
         m_i = m_ij.to(m_i.dtype)
 
-        # update k/v pointer with optional 64-bit indexing to avoid overflow
-        if use_64_indexing:
-            BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
-            stride_kn64 = tl.full((), stride_kn, tl.int64)
-            stride_vn64 = tl.full((), stride_vn, tl.int64)
-            v_ptrs += BLOCK_N64 * stride_vn64
-            k_ptrs += BLOCK_N64 * stride_kn64
-        else:
-            v_ptrs += BLOCK_N * stride_vn
-            k_ptrs += BLOCK_N * stride_kn
         # update k/v pointer with optional 64-bit indexing to avoid overflow
         if use_64_indexing:
             BLOCK_N64 = tl.full((), BLOCK_N, tl.int64)
@@ -269,13 +258,11 @@ def la_persistent(
     stride_oh,  # Head
     stride_on,  # head_dim
     n_ctx_q_rows,
-    n_ctx_q_rows,
     stride_oph,  # total_programs
     stride_opm,  # n_ctx_q
     stride_opn,  # head_dim
     SM_SCALE,
     HEADS_PER_XCD: tl.constexpr,
-    HEAD_DIM_ORIG: tl.constexpr,
     HEAD_DIM_ORIG: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -298,6 +285,7 @@ def la_persistent(
     num_heads_k: tl.constexpr,
     gqa_group_size: tl.constexpr,
     use_64_indexing: tl.constexpr,
+    RAGGED_BATCH: tl.constexpr,
 ):
     if is_pod:
         current_pid = pod_pid
@@ -428,9 +416,8 @@ def la_persistent_inner(
     xcd_id,  # The XCD the pid belongs to
     SM_SCALE,
     HEADS_PER_XCD: tl.constexpr,
+    HEAD_DIM_ORIG: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    HEAD_DIM_ORIG: tl.constexpr,
-    HEAD_DIM_ORIG: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MASKED_BLOCKS: tl.constexpr,
@@ -505,11 +492,15 @@ def la_persistent_inner(
         ) * num_m_blocks + per_head_tile_idx
     else:
         if not RAGGED_BATCH:
-            group_size = tiles_per_head // batch_size
-            tile_batch_idx = (iter % tiles_per_head) // group_size
-            tile_idx = tile_head_idx * batch_size + tile_batch_idx
-            tile_iter = tile_head_idx * tiles_per_head + (tile_batch_idx * group_size)
-            tile_iter_end = tile_iter + group_size
+            # For non-causal, each output M-block processes num_n_blocks K/V tiles
+            # tiles_per_head = num_m_blocks * num_n_blocks
+            # We need to find which M-block this iter belongs to
+            local_head_iter = iter % tiles_per_head
+            m_block_idx = local_head_iter // num_n_blocks
+            tile_batch_idx = m_block_idx  # Use m_block_idx as the "batch" index for Q access
+            tile_idx = tile_head_idx * num_m_blocks + m_block_idx
+            tile_iter = tile_head_idx * tiles_per_head + m_block_idx * num_n_blocks
+            tile_iter_end = tile_iter + num_n_blocks
         else:
             tile_idx = (
                 tile_head_idx * batch_size
@@ -547,18 +538,18 @@ def la_persistent_inner(
     tile_head_idx_global = HEADS_PER_XCD * xcd_id + tile_head_idx
     # Map Q head index to K/V head index via GQA grouping
     tile_khead_idx_global = tile_head_idx_global // gqa_group_size
-    # Map Q head index to K/V head index via GQA grouping
-    tile_khead_idx_global = tile_head_idx_global // gqa_group_size
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, HEAD_DIM)
     mask_k_cols = offs_k < HEAD_DIM_ORIG
-    mask_k_cols = offs_k < HEAD_DIM_ORIG
 
-    if causal or not RAGGED_BATCH:
-        # Prefill or non RAGGED_BATCH
+    if causal:
+        # Prefill - K/V offset based on batch position
         b_seq_size = tile_batch_idx * num_n_blocks
+    elif not RAGGED_BATCH:
+        # Non-causal, non-ragged: all M-blocks attend to full K/V range starting at 0
+        b_seq_size = 0
     else:
         # Decode with RAGGED_BATCH
         tile_batch_idx = tile_idx % batch_size
@@ -643,7 +634,6 @@ def la_persistent_inner(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    q = tl.load(q_ptrs, mask=mask_k_cols[None, :], other=0.0)
     q = tl.load(q_ptrs, mask=mask_k_cols[None, :], other=0.0)
 
     m_i, l_i, acc = _attention_inner(
@@ -911,13 +901,6 @@ def la_persistent_inner(
 
         acc0 = acc0 / l_i[:, None]
         acc1 = acc1 / l_i[:, None]
-        COLS_HALF: tl.constexpr = HEAD_DIM // 2
-        offs0 = tl.arange(0, COLS_HALF)
-        offs1 = tl.arange(0, COLS_HALF) + COLS_HALF
-        mask_cols0 = offs0 < HEAD_DIM_ORIG
-        mask_cols1 = offs1 < HEAD_DIM_ORIG
-        tl.store(o_ptrs0, acc0.to(Out.type.element_ty), mask=mask_cols0[None, :])
-        tl.store(o_ptrs1, acc1.to(Out.type.element_ty), mask=mask_cols1[None, :])
         COLS_HALF: tl.constexpr = HEAD_DIM // 2
         offs0 = tl.arange(0, COLS_HALF)
         offs1 = tl.arange(0, COLS_HALF) + COLS_HALF

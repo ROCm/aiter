@@ -24,7 +24,6 @@ import math
 import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.lean_atten import la_persistent, _get_config
-from aiter.ops.triton._triton_kernels.lean_atten import la_persistent, _get_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils._triton import arch_info
@@ -207,7 +206,6 @@ def _persistent_lean_attention(
         N_CTX_Q,
         N_CTX_K,
         H,
-        H_K,
         BLOCK_M,
         BLOCK_N,
         total_programs,
@@ -226,7 +224,7 @@ def _persistent_lean_attention(
             f"HEADS_PER_XCD={HEADS_PER_XCD}, NUM_XCDS={NUM_XCDS}. XCD_REMAP={XCD_REMAP}"
         )
 
-    CAUSAL_MODE = 0  # 0:ping-pong, 1: sequential
+    CAUSAL_MODE = 1  # 0:ping-pong, 1: sequential
     max_output_tile_cnt = calculate_max_output_tiles_analytically(
         tiles_per_head=tiles_per_head,
         num_m_blocks=num_m_blocks,
@@ -239,8 +237,7 @@ def _persistent_lean_attention(
         batch_size=batch_size,
         batch_num_block_n=batch_num_block_n,
     )
-    if not causal:
-        max_output_tile_cnt = math.ceil((H * batch_size) / total_programs) + 4
+   
 
     if DEBUG:
         print(f"max_output_tile_cnt={max_output_tile_cnt}")
@@ -267,7 +264,6 @@ def _persistent_lean_attention(
         N_CTX_Q,
         N_CTX_K,
         H,
-        H_K,
         BLOCK_M,
         BLOCK_N,
         total_programs,
@@ -316,7 +312,6 @@ def _persistent_lean_attention(
     kernel_timing["attn_fwd"]["start_event"].record()
     """
 
-    """
     la_kernel = la_persistent[grid](
         False,
         0,
@@ -348,7 +343,7 @@ def _persistent_lean_attention(
         sm_scale,
         HEADS_PER_XCD=HEADS_PER_XCD,
         HEAD_DIM_ORIG=HEAD_DIM_K,
-        HEAD_DIM=HEAD_DIM_K,
+        HEAD_DIM=HEAD_DIM_PADDED,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         MASKED_BLOCKS=MASKED_BLOCKS,
@@ -379,9 +374,8 @@ def _persistent_lean_attention(
             or (Op.stride(1) * N_CTX_Q) >= (1 << 31)
             or (o.stride(0) * N_CTX_Q) >= (1 << 31)
         ),
-        **config,
+        RAGGED_BATCH=RAGGED_BATCH,
     )
-    """
 
     """
     kernel_timing["attn_fwd"]["end_event"].record()
@@ -449,8 +443,8 @@ def get_num_splits_and_buffer_sizes(
         # Does not support ragged batch for causal.
         tiles_per_head = tiles_per_head * batch_size
     else:
-        # Decode or Not Causal: tiles_per_head equals total # of N-blocks across the batch
-        tiles_per_head = num_n_blocks
+        # Decode or Not Causal
+        tiles_per_head = num_m_blocks * num_n_blocks
 
     # Total tiles across all Q heads
     if XCD_REMAP:
@@ -494,8 +488,7 @@ def get_num_splits_and_buffer_sizes(
     high_load_tbs = total_tiles - ((max_tiles_per_tb - 1) * xcd_programs)
 
     # Needed for causal. This is (per batch n_ctx) // BLOCK_N
-    if causal:
-        num_n_blocks = num_n_blocks // batch_size
+    num_n_blocks = num_n_blocks // batch_size
 
     return (
         num_m_blocks,
