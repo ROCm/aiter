@@ -688,7 +688,7 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
         vec=8, per_phase=1, max_phase=8, order=[1, 0]
     )
     shared_k_store: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8, per_phase=1, max_phase=16, order=[1, 0]
+        vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
     shared_k: gl.constexpr = gl.SwizzledSharedLayout(
         vec=8, per_phase=1, max_phase=16, order=[0, 1]
@@ -1008,9 +1008,9 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
     )
     ### =======   load kv2 end  ====== ###
 
-    k_id_pe = kv_loc * page_block_size + cur_N_pe
+    k_id_pe = kv_loc * PAGE_BLOCK_SIZE + cur_N_pe
     offs_buf_k_pe = k_id_pe[:, None] * stride_buf_kh + offs_k_r[None, :]
-    mask_k_id = split_kv_start * page_block_size + cur_N_pe
+    mask_k_id = split_kv_start * PAGE_BLOCK_SIZE + cur_N_pe
     mask_k_pe = mask_k_id < cur_batch_seq_len 
 
     k_pe = gl.amd.cdna4.buffer_load(
@@ -1028,9 +1028,9 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
     # cur_k1 = gl.convert_layout(kv1.T, layout=dot_k_layout)
     # cur_k2 = gl.convert_layout(kv2.T, layout=dot_k_layout)
     smem_kv1 = smem_kv1._reinterpret(
-        K_Buffer.type.element_ty, [kv_lora_rank, BLOCK_N], layout=shared_k)
+        K_Buffer.type.element_ty, [kv_lora_rank // 2, BLOCK_N], layout=shared_k)
     smem_kv2 = smem_kv2._reinterpret(
-        K_Buffer.type.element_ty, [kv_lora_rank, BLOCK_N], layout=shared_k)
+        K_Buffer.type.element_ty, [kv_lora_rank // 2, BLOCK_N], layout=shared_k)
 
     cur_k1 = smem_kv1.load(layout=dot_k_layout)
     cur_k2 = smem_kv2.load(layout=dot_k_layout)
@@ -1217,20 +1217,18 @@ def _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async(
 
         cur_p = smem_p.load(layout=dot_p_layout)
 
-        smem_kv1.store(kv1.T)
         acc1 = acc1 * re_scale[:, None]
         acc1 = gl.amd.cdna3.mfma(cur_p, cur_k1, acc1)
         e_sum = e_sum * re_scale + gl.sum(p, 1)
 
-        smem_kv2.store(kv2.T)
         acc2 = acc2 * re_scale[:, None]
         acc2 = gl.amd.cdna3.mfma(cur_p, cur_k2, acc2)
         smem_k_rope.store(k_pe.T)
         e_max = n_e_max
         smem_kv1 = smem_kv1._reinterpret(
-            K_Buffer.type.element_ty, [kv_lora_rank, BLOCK_N], layout=shared_k)
+            K_Buffer.type.element_ty, [kv_lora_rank // 2, BLOCK_N], layout=shared_k)
         smem_kv2 = smem_kv2._reinterpret(
-            K_Buffer.type.element_ty, [kv_lora_rank, BLOCK_N], layout=shared_k)
+            K_Buffer.type.element_ty, [kv_lora_rank // 2, BLOCK_N], layout=shared_k)
 
         cur_k1 = smem_kv1.load(layout=dot_k_layout)
         cur_k2 = smem_kv2.load(layout=dot_k_layout)

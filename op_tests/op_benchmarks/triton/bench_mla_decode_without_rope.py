@@ -384,7 +384,7 @@ def run_benchmark(args: argparse.Namespace):
         qk_rope_head_dim: int,
         mtp: int,
         dtype: str,
-        num_kv_splits: int = 5,
+        num_kv_splits: int = 8,
         sm_scale: float = 1.0,
         logit_cap: float = 0.0,
         device="cuda",
@@ -536,6 +536,7 @@ def run_benchmark(args: argparse.Namespace):
             logit_cap,
             mtp,
         )
+        import pdb;pdb.set_trace()
 
         print(">>> ", cache_key)
         ms = us / 1000
