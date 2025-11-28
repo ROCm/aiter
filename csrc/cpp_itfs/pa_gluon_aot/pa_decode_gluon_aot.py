@@ -181,7 +181,7 @@ def compile(
             "i32:16",  # query_scale_stride_0
             "i32:16",  # kv_scale_stride_0
             "i32:16",  # kv_scale_stride_1
-            "i32:16",  # query_sequence_length
+            "i32:16",  # query_length
             "i32:16",  # query_group_size
             "i32:16",  # head_size
             "i32:16",  # num_seqs
@@ -329,18 +329,21 @@ def compile(
 
 
 def pa_decode_gluon_aot(
-    output: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
-    query: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, head_size]
+    output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
+    output_gluon: torch.Tensor,  # [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
+    query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
+    query_gluon: torch.Tensor,  # [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
+    query_scale_gluon: torch.Tensor,  # [num_seqs, num_kv_heads * query_length * query_group_size, 1] or [1]
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
-    query_sequence_length: int,
+    query_length: int,
     max_context_length: int,
     context_partition_size: int,
     compute_type: tl.dtype,
-    query_scale: torch.Tensor,  # [num_seqs, num_kv_heads * query_group_size, 1]
+    query_scale: torch.Tensor,  # [num_seqs * query_length, num_query_heads, 1] or [1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     exp_sums: torch.Tensor,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
@@ -349,11 +352,45 @@ def pa_decode_gluon_aot(
     alibi_slopes: torch.Tensor = None,
     run_compiled_kernel: bool = True,
 ) -> dict:
-    # Extract tensor dimensions
-    num_sequences = query.shape[0]
-    num_query_heads_total = query.shape[1]
-    num_query_heads_total = num_query_heads_total // query_sequence_length
+    # Import transpose functions
+    from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot import (
+        transpose_query_gluon_aot,
+        transpose_output_gluon_aot,
+    )
+
+    # Extract tensor dimensions from input tensors
+    num_query_heads = query.shape[1]
+    head_size = query.shape[-1]
+    batch_size = query.shape[0] // query_length
     num_kv_heads = key_cache.shape[1]
+    query_group_size = num_query_heads // num_kv_heads
+
+    if query_length > 1:
+        # Transpose query and query_scale from [num_seqs * query_length, num_query_heads, head_size]
+        # to [num_seqs, num_kv_heads * query_length * query_group_size, head_size]
+        transpose_query_gluon_aot(
+            input_tensor=query,
+            output_tensor=query_gluon,
+            batch_size=batch_size,
+            seq_len=query_length,
+            num_kv_heads=num_kv_heads,
+            query_group_size=query_group_size,
+            last_dim=head_size,
+            input_scale=(
+                query_scale
+                if (query_scale is not None and len(query_scale.shape) > 1)
+                else None
+            ),
+            output_scale=(
+                query_scale_gluon
+                if (query_scale is not None and len(query_scale.shape) > 1)
+                else None
+            ),
+            run_compiled_kernel=run_compiled_kernel,
+        )
+
+    num_sequences = batch_size
+    num_query_heads_total = num_query_heads
     max_context_partition_num = int(
         (max_context_length + context_partition_size - 1) // context_partition_size
     )
@@ -362,18 +399,16 @@ def pa_decode_gluon_aot(
     query_group_size = num_query_heads_total // num_kv_heads
 
     # Calculate equivalent group sizes for kernel configuration
-    equivalent_query_group_size = query_sequence_length * query_group_size
+    equivalent_query_group_size = query_length * query_group_size
 
     # Determine if causal masking is needed
-    is_causal = query_sequence_length > 1
+    is_causal = query_length > 1
 
     # thre are some precision problems for tl.bfloat16 and tl.float16, so only support tl.float8e4b8 now
     assert compute_type in [
         tl.float8e4b8
     ], f"compute_type == {compute_type} not in [tl.float8e4b8]"
-    assert (
-        query_sequence_length <= 4
-    ), f"query_sequence_length == {query_sequence_length} exceeds maximum of 4"
+    assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
     # Validate input params constraint
     assert query.dtype in [
         aiter.dtypes.fp8,
@@ -503,21 +538,21 @@ def pa_decode_gluon_aot(
     if run_compiled_kernel:
         combined_func(
             *torch_to_c_types(
-                output,
+                output_gluon,
                 exp_sums,
                 max_logits,
                 temporary_output,
-                query,
+                query_gluon,
                 key_cache,
                 value_cache,
                 block_tables,
                 context_lengths,
                 softmax_scale,
-                query_scale,
+                query_scale_gluon,
                 key_scale,
                 value_scale,
-                output.stride(0),
-                output.stride(1),
+                output_gluon.stride(0),
+                output_gluon.stride(1),
                 exp_sums.stride(0),
                 exp_sums.stride(1),
                 exp_sums.stride(2),
@@ -525,8 +560,8 @@ def pa_decode_gluon_aot(
                 temporary_output.stride(1),
                 temporary_output.stride(2),
                 temporary_output.stride(3),
-                query.stride(0),
-                query.stride(1),
+                query_gluon.stride(0),
+                query_gluon.stride(1),
                 key_cache.stride(0),
                 key_cache.stride(1),
                 key_cache.stride(2),
@@ -541,10 +576,25 @@ def pa_decode_gluon_aot(
                 num_sequences,
                 num_kv_heads,
                 max_context_partition_num,
-                query_sequence_length,
+                query_length,
                 query_group_size,
                 equivalent_query_group_size,
                 head_size,
                 torch.cuda.current_stream(output.device),
             )
+        )
+
+    # Transpose output from [num_seqs, num_kv_heads, query_length, query_group_size, head_size]
+    # back to [num_seqs * query_length, num_query_heads, head_size]
+    # Only needed when query_length > 1
+    if query_length > 1:
+        transpose_output_gluon_aot(
+            input_tensor=output_gluon,
+            output_tensor=output,
+            batch_size=batch_size,
+            seq_len=query_length,
+            num_kv_heads=num_kv_heads,
+            query_group_size=query_group_size,
+            last_dim=head_size,
+            run_compiled_kernel=run_compiled_kernel,
         )

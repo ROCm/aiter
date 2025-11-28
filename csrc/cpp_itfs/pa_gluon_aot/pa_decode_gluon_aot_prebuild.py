@@ -28,6 +28,9 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
 )
+from csrc.cpp_itfs.pa_gluon_aot.transpose_query_output_gluon_aot_prebuild import (
+    prebuild_transpose_query_gluon_aot_so,
+)
 
 try:
     from triton.experimental import gluon
@@ -91,7 +94,10 @@ BATCH_SIZE_OPTIONS = [4, 80, 128]
 
 def run_gluon_kernel(
     output: torch.Tensor,
+    output_transposed: torch.Tensor,
     query: torch.Tensor,
+    query_transposed: torch.Tensor,
+    query_scale_transposed: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     context_lengths: torch.Tensor,
@@ -109,15 +115,39 @@ def run_gluon_kernel(
     temporary_output: torch.Tensor,
     alibi_slopes: Optional[torch.Tensor] = None,
     use_aot_impl: bool = False,
-) -> Dict:
-    """Run Gluon FP8 kernel for paged attention.
+) -> None:
+    """Run Gluon FP8/BF16/FP16 kernel for paged attention using Triton transpose kernel.
 
-    This function can run in aot or jit mode based on use_aot_impl flag:
+    This function is similar to run_gluon_kernel but uses the transpose_query_for_gluon
+    Triton kernel to perform query and output transpositions instead of PyTorch operations.
+
+    Args:
+        output: Output tensor [batch_size * query_length, num_query_heads, head_size]
+        output_transposed: Pre-allocated tensor [batch_size, num_kv_heads * query_length * query_group_size, head_size] (3D physical)
+        query: Query tensor [batch_size * query_length, num_query_heads, head_size]
+        query_transposed: Pre-allocated tensor [batch_size, num_kv_heads * query_length * query_group_size, head_size] (3D physical)
+        query_scale_transposed: Pre-allocated tensor [batch_size, num_kv_heads * query_length * query_group_size, 1] (3D) or [1] (scalar)
+        key_cache: Key cache tensor [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
+        value_cache: Value cache tensor [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+        context_lengths: Current context lengths for each sequence [num_seqs]
+        block_tables: Mapping from sequences to physical cache blocks [num_seqs, max_num_blocks_per_seq]
+        attention_scale: Attention scale
+        query_sequence_length: Query sequence length
+        max_context_length: Maximum sequence length supported
+        context_partition_size: Context partition size
+
+    Returns:
+        None (modifies output in-place)
+
+    This function can run in aot or jit mode based on use_aot_impl flag.
     """
     if use_aot_impl:
         pa_decode_gluon_aot(
             output,
+            output_transposed,
             query,
+            query_transposed,
+            query_scale_transposed,
             key_cache,
             value_cache,
             context_lengths,
@@ -141,7 +171,10 @@ def run_gluon_kernel(
         if pa_decode_gluon is not None:
             pa_decode_gluon(
                 output,
+                output_transposed,
                 query,
+                query_transposed,
+                query_scale_transposed,
                 key_cache,
                 value_cache,
                 context_lengths,
@@ -382,7 +415,7 @@ def run_pa_gluon_test(
     if query_length > 1:
         # Reshaped tensors for query_length > 1
         # quantized_query_gluon: [batch_size, num_kv_heads * query_length * query_group_size, head_size]
-        quantized_query_gluon = torch.empty(
+        query_transposed = torch.empty(
             batch_size,
             num_kv_heads * query_length * query_group_size,
             head_size,
@@ -391,7 +424,7 @@ def run_pa_gluon_test(
         )
 
         # output_gluon: [batch_size, num_kv_heads * query_length * query_group_size, head_size]
-        output_gluon = torch.empty(
+        output_transposed = torch.empty(
             batch_size,
             num_kv_heads * query_length * query_group_size,
             head_size,
@@ -402,7 +435,7 @@ def run_pa_gluon_test(
         # Handle query scale factors based on quantization mode
         if query_scale_factors is not None and len(query_scale_factors.shape) > 1:
             # Per-token quantization: [batch_size, num_kv_heads * query_length * query_group_size, 1]
-            query_scale_gluon = torch.empty(
+            query_scale_transposed = torch.empty(
                 batch_size,
                 num_kv_heads * query_length * query_group_size,
                 1,
@@ -411,12 +444,12 @@ def run_pa_gluon_test(
             )
         else:
             # Per-tensor quantization or no quantization
-            query_scale_gluon = query_scale_factors
+            query_scale_transposed = query_scale_factors
     else:
         # query_length == 1: no reshape needed
-        quantized_query_gluon = quantized_query
-        query_scale_gluon = query_scale_factors
-        output_gluon = torch.empty(
+        query_transposed = quantized_query
+        query_scale_transposed = query_scale_factors
+        output_transposed = torch.empty(
             total_queries, num_query_heads, head_size, dtype=data_type, device=device
         )
 
@@ -441,9 +474,17 @@ def run_pa_gluon_test(
         dtype=data_type,
         device=device,
     )
+    # Create output tensor for final results
+    output = torch.empty(
+        total_queries, num_query_heads, head_size, dtype=data_type, device=device
+    )
+
     run_gluon_kernel(
-        output_gluon,
-        quantized_query_gluon,
+        output,
+        output_transposed,
+        quantized_query,
+        query_transposed,
+        query_scale_transposed,
         quantized_keys,
         quantized_values,
         context_lengths,
@@ -453,7 +494,7 @@ def run_pa_gluon_test(
         context_lengths.max().item(),
         context_partition_size,
         TORCH_TO_TL_DTYPE[compute_type],
-        query_scale=query_scale_gluon,
+        query_scale=query_scale_factors,
         key_scale=key_scale_original,
         value_scale=value_scale_original,
         exp_sums=exp_sums,
@@ -986,8 +1027,8 @@ def prebuild_pa_decode_gluon_aot_so():
     KV_VARLEN_OPTIONS = [False]
     TRANS_V_OPTIONS = [False, True]
     QUANT_Q_AND_KV_OPTIONS = [[False, False], [False, True], [True, True]]
-    # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
-    COMPUTE_TYPE_OPTIONS = ["fp8"]
+    COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
+    # COMPUTE_TYPE_OPTIONS = ["fp8"]
     QUANT_MODE_OPTIONS = ["per_token", "per_tensor"]
     HEAD_DIMENSION_OPTIONS = [64, 128, 192, 256]
     BLOCK_SIZE_OPTIONS = [16, 64, 1024]
@@ -1046,4 +1087,5 @@ def prebuild_pa_decode_gluon_aot_so():
 
 
 if __name__ == "__main__":
+    prebuild_transpose_query_gluon_aot_so()
     prebuild_pa_decode_gluon_aot_so()
