@@ -30,9 +30,11 @@ def nonvarlen_benchmark_configs():
     N_HEADS = [16, 48]
     seq_len_q = [1, 1024, 4096]
     seq_len_k = [163, 8192]
+    HEAD_DIM=128
+    V_HEAD_DIM=HEAD_DIM
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
     configs = [
-        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k)
+        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k, HEAD_DIM, V_HEAD_DIM)
         for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
     ]
     return configs
@@ -43,9 +45,11 @@ def varlen_benchmark_configs():
     N_HEADS = [16, 48]
     seq_len_q = [1, 1024, 4096]
     seq_len_k = [163, 8192]
+    HEAD_DIM=128
+    V_HEAD_DIM=HEAD_DIM
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
     configs = [
-        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k)
+        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k, HEAD_DIM, V_HEAD_DIM)
         for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
     ]
     return configs
@@ -67,14 +71,15 @@ def model_benchmark_configs(args):
         N_CTX_Q = args.sq if args.sq else [2**i for i in range(1, 14)]
         N_CTX_K = args.sk if args.sk else N_CTX_Q
         HEAD_DIM = config["hidden_size"] // HQ
+        V_HEAD_DIM = HEAD_DIM
         if isinstance(N_CTX_Q, list):
             for seq_len in N_CTX_Q:
                 fa_configs.append(
-                    (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM)
+                    (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM, V_HEAD_DIM)
                 )
         else:
             fa_configs.append(
-                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM)
+                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM, V_HEAD_DIM)
             )
 
     return fa_configs
@@ -118,22 +123,20 @@ def create_benchmark_configs(custom, args):
     head_size = 128 if not args.d else args.d
     head_size_v = head_size if not args.dv else args.dv
     mode = args.mode
-    x_names = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
+    x_names = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "D_HEAD_V"]
     causal = args.causal
     varlen = args.layout == "thd"
 
     configs = []
     plot_name = get_caller_name_no_ext()
     extra_args = {
-        "D_HEAD": head_size,
-        "D_HEAD_V": head_size_v,
         "dtype": dtype,
         "causal": causal,
         "mode": mode,
     }
 
     if custom:
-        x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
+        x_vals_list = [(args.b, args.hq, hk, args.sq, sk, head_size, head_size_v)]
     else:
         if varlen:
             x_vals_list = varlen_benchmark_configs()  # Assume this exists
@@ -142,7 +145,7 @@ def create_benchmark_configs(custom, args):
 
         if args.model:
             x_vals_list = model_benchmark_configs(args)
-            x_names = ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD"]
+            x_names = ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "D_HEAD_V"]
             plot_name = f"fused-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
