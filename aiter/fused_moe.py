@@ -15,7 +15,7 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
 from aiter import logger
 from aiter.jit.core import (
-    AITER_CONFIG_FMOE_FILE,
+    AITER_CONFIGS,
     PY,
     bd_dir,
     get_asm_dir,
@@ -157,6 +157,10 @@ def fused_moe_fake(
     num_local_tokens: Optional[torch.Tensor] = None,
     moe_sorting_dispatch_policy: bool = 0,
     dtype: Optional[torch.dtype] = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: Optional[torch.Tensor] = None,
+    bias2: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -573,8 +577,8 @@ def get_2stage_cfgs(
         return cfg_2stages
 
     global cfg_2stages
-    config_path = os.path.dirname(AITER_CONFIG_FMOE_FILE)
-    tune_file = AITER_CONFIG_FMOE_FILE
+    config_path = os.path.dirname(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
+    tune_file = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:

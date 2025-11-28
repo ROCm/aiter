@@ -9,7 +9,7 @@ import pandas as pd
 from ..jit.core import (
     compile_ops,
     AITER_ROOT_DIR,
-    AITER_CONFIG_A8W8_BATCHED_GEMM_FILE,
+    AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
 )
 from ..utility import dtypes
@@ -66,9 +66,12 @@ def get_CKBatchedGEMM_config(
     K: int,
 ):
     if not hasattr(get_CKBatchedGEMM_config, "ck_batched_gemm_dict"):
-        print("Loading CKBatchedGEMM config from:", AITER_CONFIG_A8W8_BATCHED_GEMM_FILE)
+        print(
+            "Loading CKBatchedGEMM config from:",
+            AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE,
+        )
         ck_batched_gemm_dict = pd.read_csv(
-            AITER_CONFIG_A8W8_BATCHED_GEMM_FILE
+            AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE
         ).drop_duplicates()
 
         get_CKBatchedGEMM_config.ck_batched_gemm_dict = ck_batched_gemm_dict.set_index(
@@ -81,7 +84,7 @@ def get_CKBatchedGEMM_config(
     if config is not None:
         if AITER_LOG_TUNED_CONFIG:
             logger.info(
-                f"shape is B:{B}, M:{M}, N:{N}, K:{K}, is tuned on cu_num = {cu_num} in {AITER_CONFIG_A8W8_BATCHED_GEMM_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
+                f"shape is B:{B}, M:{M}, N:{N}, K:{K}, is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
             )
         mnk = config["kernelName"].split("_")[3].split("x")[1:]
         config["tile_m"] = int(mnk[0])

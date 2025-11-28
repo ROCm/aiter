@@ -29,7 +29,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   triton:
-    runs-on: aiter-mi325-1gpu
+    runs-on: aiter-mi300-1gpu
     needs: [check-signal]
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import sys
 from dataclasses import dataclass
@@ -16,9 +16,9 @@ from gemm_a8w8_bpreshuffle_cktile_common import (
 )
 
 
-""" 
+"""
 
-gemm_a8w8_bpreshuffle_cktile instance gen 
+gemm_a8w8_bpreshuffle_cktile instance gen
 
 """
 
@@ -69,9 +69,9 @@ torch::Tensor
 
 """
 
-        INSTANCE_CONTENT_nobias = f"""using FlatmmInstance = CustomConfig<        
-            DDataType, EDataType, 
-            {k.sTransposeC},{k.sUseStructuredSparsity}, {k.sTileParitionerGroupNum}, 
+        INSTANCE_CONTENT_nobias = f"""using FlatmmInstance = CustomConfig<
+            DDataType, EDataType,
+            {k.sTransposeC},{k.sUseStructuredSparsity}, {k.sTileParitionerGroupNum},
             {k.sTileParitionerM01}, {k.sNumWaveGroups}, {k.sDoubleSmemBuffer},
             {k.PadM},  {k.PadN},  {k.PadK},
             {k.BlockPerCu},

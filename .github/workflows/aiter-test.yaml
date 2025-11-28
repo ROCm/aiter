@@ -124,7 +124,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/aiter_test.sh 
+          bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh" 
       
       - name: Upload test logs
         uses: actions/upload-artifact@v4
@@ -209,7 +209,7 @@ jobs:
           -e MULTIGPU=TRUE \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/aiter_test.sh
+          bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh"
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4

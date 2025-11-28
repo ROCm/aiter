@@ -667,10 +667,10 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
             self.max_position_embeddings * self.scaling_factor, dtype=dtypes.fp32
         )
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos() * self.mscale
-        sin = freqs.sin() * self.mscale
-        cache = torch.cat((cos, sin), dim=-1)
-        return cache
+        cos = freqs.cos().unsqueeze(-2).unsqueeze(-2) * self.mscale
+        sin = freqs.sin().unsqueeze(-2).unsqueeze(-2) * self.mscale
+        # cache = torch.cat((cos, sin), dim=-1)
+        return cos, sin
 
 
 class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
