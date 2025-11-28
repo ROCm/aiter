@@ -286,6 +286,17 @@ def create_benchmark_configs(custom, args):
     )
     return configs
 
+from einops import repeat
+def generate_exact_padding_mask(seqlens, device):
+    max_seqlen = seqlens.max()
+    batch_size = len(seqlens)
+    lengths = seqlens.to(device).unsqueeze(1)
+    padding_mask = (
+        repeat(torch.arange(max_seqlen, device=device), "s -> b s", b=batch_size)
+        < lengths
+    )
+    return padding_mask
+
 
 def run_benchmark(custom, args):
     torch.manual_seed(20)
@@ -316,6 +327,21 @@ def run_benchmark(custom, args):
         requires_grad = mode == "bwd" or args.test_mode
         return_lse = True
         return_attn_probs = False
+        
+        exact_lengths_provided = isinstance(N_CTX_Q, str)
+        if exact_lengths_provided:
+            assert args.layout == "thd"
+            seqlens_q = torch.tensor([int(x.strip()) for x in N_CTX_Q.split(",")])
+            if isinstance(N_CTX_K, str):
+                seqlens_k = torch.tensor([int(x.strip()) for x in N_CTX_K.split(",")])
+            else:
+                seqlens_k = torch.ones_like(seqlens_q) * N_CTX_K
+            max_seqlen_q = seqlens_q.max()
+            max_seqlen_k = seqlens_k.max()
+        else:
+            max_seqlen_q = N_CTX_Q
+            max_seqlen_k = N_CTX_K
+
         varlen = args.layout == "thd"
         has_pe = D_HEAD > D_HEAD_V
         assert not (
@@ -334,9 +360,9 @@ def run_benchmark(custom, args):
             sm_scale = 1.0 / (D_HEAD**0.5)
 
         # Generate base inputs
-        q = torch.randn((BATCH, N_CTX_Q, HQ, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((BATCH, N_CTX_K, HK, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, N_CTX_K, HK, D_HEAD_V), device=device, dtype=dtype)
+        q = torch.randn((BATCH, max_seqlen_q, HQ, D_HEAD), device=device, dtype=dtype)
+        k = torch.randn((BATCH, max_seqlen_k, HK, D_HEAD), device=device, dtype=dtype)
+        v = torch.randn((BATCH, max_seqlen_k, HK, D_HEAD_V), device=device, dtype=dtype)
         q.requires_grad = requires_grad
         k.requires_grad = requires_grad
         v.requires_grad = requires_grad
@@ -346,12 +372,20 @@ def run_benchmark(custom, args):
 
         # Input preparation
         if varlen:
-            query_padding_mask = generate_random_padding_mask(
-                N_CTX_Q, BATCH, device, mode="full" if args.equal_seqlens else "random"
-            )
-            key_padding_mask = generate_random_padding_mask(
-                N_CTX_K, BATCH, device, mode="full" if args.equal_seqlens else "random"
-            )
+            if exact_lengths_provided:
+                query_padding_mask = generate_exact_padding_mask(
+                    seqlens_q, device
+                )
+                key_padding_mask = generate_exact_padding_mask(
+                    seqlens_k, device
+                )
+            else:
+                query_padding_mask = generate_random_padding_mask(
+                    N_CTX_Q, BATCH, device, mode="full" if args.equal_seqlens else "random"
+                )
+                key_padding_mask = generate_random_padding_mask(
+                    N_CTX_K, BATCH, device, mode="full" if args.equal_seqlens else "random"
+                )
             (
                 q_unpad,
                 k_unpad,
@@ -405,6 +439,7 @@ def run_benchmark(custom, args):
                     2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
                 )
 
+        
         # Benchmark mode
         if varlen:
             if args.fp8:
@@ -567,8 +602,17 @@ def parse_args():
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
-    parser.add_argument("-sq", type=int, default=0)
-    parser.add_argument("-sk", type=int, default=0)
+    def parse_int_or_list(value):
+        if ',' in value:
+            return value.strip() # if list, return stripped string and parse when creating tensor
+        else:
+            return int(value)
+    
+    parser.add_argument("-sq", type=parse_int_or_list, default=0, 
+                       help="Query sequence length - can be a single number or comma-separated list. -b is overwritten as the list length.")
+    parser.add_argument("-sk", type=parse_int_or_list, default=0,
+                       help="Key sequence length - can be a single number or comma-separated list. Defaults to the same as sq if 0")
+
     parser.add_argument(
         "-equal_seqlens",
         action="store_true",
@@ -629,6 +673,12 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
+    
+    if isinstance(args.sk, int) and args.sk == 0:
+        args.sk = args.sq
+
+    if isinstance(args.sq, str):
+        args.b = len([x for x in args.sq.split(",")])
 
     if args.model:
         if args.causal is None:  # User didn't specify -causal
