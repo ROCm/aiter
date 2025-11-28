@@ -17,6 +17,7 @@ import random
 import inspect
 import subprocess
 
+torch.set_printoptions(threshold=100000) # 设置一个很大的阈值，防止省略
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -306,18 +307,18 @@ def test_fmoe(
             "out2_ref": out2_ref,
             "out2_ck": out2_ck,
         }
-        print("Saved variables' information:")
+        print("Saved variables' information (generating repr for log restoration):")
+        # 为了能从日志还原，我们打印成类似Python字典的格式
+        print("{")
         for k, v in inputs_to_save.items():
             if k == "fused_moe_source":
-                print(f"  {k}: (source code saved to file)")
+                # 源代码含有换行符，需要特殊处理成Python多行字符串
+                print(f'    "{k}": """{v}""",')
                 continue
 
-            if isinstance(v, torch.Tensor):
-                print(
-                    f"  {k}: tensor(shape={v.shape}, dtype={v.dtype}, device={v.device})"
-                )
-            else:
-                print(f"  {k}: {v}")
+            # 使用 repr() 来获得可以被Python直接解析的字符串表示
+            print(f'    "{k}": {repr(v)},')
+        print("}")
 
         print("\n" + "=" * 20 + " rocm-smi output " + "=" * 20)
         try:
