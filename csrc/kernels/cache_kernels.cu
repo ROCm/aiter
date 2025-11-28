@@ -1400,9 +1400,8 @@ template <typename scalar_t, typename cache_t, bool IS_NEOX>
           k_pe + token_head_in, kv_cache + token_head, cos_ptr, sin_ptr, inv_kscale, rot_offset, embed_dim);
     }
   }
-
- template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt>
-__global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
+ template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt, bool is_neox, bool is_nope_first=true>
+inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
     const scalar_t* __restrict__ q_nope,  // [num_tokens, num_heads, kv_lora_rank]
     const scalar_t* __restrict__ q_pe,  // [num_tokens, num_heads, pe_dim]
     const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
@@ -1426,7 +1425,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
     const int pe_dim,                          // 64
     const int block_size,                      //
     const float* k_scale,                         //
-    const float* q_scale, bool is_neox, bool is_nope_first
+    const float* q_scale
 ) {
   const int64_t token_idx = blockIdx.x / num_heads; //num_heads
   const int64_t head_idx = blockIdx.x % num_heads;
@@ -1460,8 +1459,6 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
   if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
       inv_qscale = 1.0f / *q_scale;
   }
-  //kv_lora_rank =  512;
-
   static constexpr int32_t q_ooba_o = 4 / sizeof(query_t);
   const int32_t q_oob_o             = (kv_lora_rank + q_ooba_o - 1) / q_ooba_o * q_ooba_o;
   auto const* q_ptr_i               = reinterpret_cast<scalar_t const*>(q_nope + token_idx * q_nope_stride + head_idx * kv_lora_rank);
@@ -1479,13 +1476,26 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
 
   scalar_t cos, sin;
   scalar_t x,y;
+  int x_index,y_index;
   if(threadIdx.x < nq)
   {
-    // GPT-NeoX style rotary embedding.
-    int x_index = threadIdx.x;
-    int y_index = embed_dim + threadIdx.x;
-    cos = cos_ptr[x_index];
-    sin = sin_ptr[x_index];
+    // GPT-NeoX style rotary embedding. 
+    if constexpr (is_neox)
+    {
+      // GPT-NeoX style rotary embedding.
+      x_index = threadIdx.x;
+      y_index = embed_dim + threadIdx.x;
+      cos = VLLM_LDG(cos_ptr + x_index);
+      sin = VLLM_LDG(sin_ptr + x_index);
+    }
+    else
+    {
+      // GPT-J style rotary embedding.
+      x_index = 2 * threadIdx.x;
+      y_index = 2 * threadIdx.x + 1;
+      cos = VLLM_LDG(cos_ptr + x_index / 2);
+      sin = VLLM_LDG(sin_ptr + x_index / 2);
+    }
     const int64_t token_head_in = token_idx * q_pe_stride + head_idx * pe_dim;
     const int rot_offset = threadIdx.x;
     const scalar_t * q_pe_rot = q_pe + token_head_in;
@@ -1523,9 +1533,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
      scalar_t k_x, k_y;
     if (threadIdx.x < 32)
     {
-       int x_index = threadIdx.x;
-       int y_index = embed_dim + threadIdx.x;
-      const int rot_offset = threadIdx.x;//% embed_dim;
+      const int rot_offset = threadIdx.x;
       const scalar_t* k_pe_rot =  k_pe + token_head_in;
 
       k_x = k_pe_rot[x_index];
@@ -1551,8 +1559,6 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
     }
     if (threadIdx.x < 32)
     {
-        int x_index = threadIdx.x;
-        int y_index = embed_dim + threadIdx.x;
         kv_cache += kv_lora_rank;
         const int64_t token_head = kv_cache_offset;
         cache_t* kv_cache_rot = kv_cache + token_head;
@@ -1571,8 +1577,6 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
   {
     const int64_t token_head = token_idx * q_out_stride + head_idx * head_size;
     query_t * q_out_rot = q_out + token_head;
-    int x_index = threadIdx.x;
-    int y_index = embed_dim + threadIdx.x;
     if constexpr (std::is_same_v<query_t, ck_tile::fp8_t>) {
         q_out_rot[x_index] = ck_tile::type_convert<query_t>(
                 ck_tile::type_convert<float>(x * cos - y * sin) * inv_qscale);
@@ -1584,6 +1588,43 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
     }
   }
 
+}
+ template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt>
+__global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
+    const scalar_t* __restrict__ q_nope,  // [num_tokens, num_heads, kv_lora_rank]
+    const scalar_t* __restrict__ q_pe,  // [num_tokens, num_heads, pe_dim]
+    const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
+    const scalar_t* __restrict__ k_pe,  // [num_tokens, pe_dim]
+    cache_t* __restrict__ kv_cache,  // [num_blocks, block_size, (qk_lora_rank
+                                     // + pe_dim)]
+    query_t* __restrict__ q_out,  // [num_tokens, num_heads, kv_lora_rank + pe_dim]
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const int64_t* __restrict__ positions,     // [num_tokens]
+    const scalar_t *__restrict__ cos_cache,        // [max_position, rot_dim //2]
+    const scalar_t *__restrict__ sin_cache,        // [max_position, rot_dim //2]
+    const int block_stride,                    //
+    const int entry_stride,                    //
+    const int q_nope_stride,                   //
+    const int q_pe_stride,                     //
+    const int q_out_stride,                    //
+    const int num_heads,                       //
+    const int kv_c_stride,                     //
+    const int k_pe_stride,                     //
+    const int kv_lora_rank,                    //
+    const int pe_dim,                          // 64
+    const int block_size,                      //
+    const float* k_scale,                         //
+    const float* q_scale, bool is_neox, bool is_nope_first
+) {
+  if (is_neox) {
+    fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl<scalar_t, cache_t, query_t, kv_dt, q_dt, true>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, 
+                                                  positions, cos_cache, sin_cache,block_stride, entry_stride, q_nope_stride, q_pe_stride, q_out_stride, num_heads,
+                                                 kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, k_scale, q_scale);
+  } else {
+    fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl<scalar_t, cache_t, query_t, kv_dt, q_dt, false>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, 
+                                                  positions, cos_cache, sin_cache,block_stride, entry_stride, q_nope_stride, q_pe_stride, q_out_stride, num_heads,
+                                                 kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, k_scale, q_scale);
+  }
 
 }
   template <typename scalar_t, typename cache_t, typename query_t, bool IS_NEOX, bool is_nope_first>
@@ -1907,7 +1948,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
       const int embed_dim = 32;
 
       const int nq = num_heads * embed_dim;
-      if constexpr (is_neox)
+      if constexpr (is_nope_first)
       {
         q_out += head_size - pe_dim;
       }
@@ -1922,10 +1963,23 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           int x_index, y_index;
           scalar_t cos, sin;
           // GPT-NeoX style rotary embedding.
-          x_index = rot_offset;
-          y_index = embed_dim + rot_offset;
-          cos = VLLM_LDG(cos_ptr + x_index);
-          sin = VLLM_LDG(sin_ptr + x_index);
+          if constexpr (is_neox)
+          {
+            // GPT-NeoX style rotary embedding.
+            x_index = rot_offset;
+            y_index = embed_dim + rot_offset;
+            cos = VLLM_LDG(cos_ptr + x_index);
+            sin = VLLM_LDG(sin_ptr + x_index);
+          }
+          else
+          {
+            // GPT-J style rotary embedding.
+            x_index = 2 * rot_offset;
+            y_index = 2 * rot_offset + 1;
+            cos = VLLM_LDG(cos_ptr + x_index / 2);
+            sin = VLLM_LDG(sin_ptr + x_index / 2);
+          }
+
           const int r_head_idx = cur_idx / 32;//embed_dim;
           const int64_t token_head_in = token_idx * q_pe_stride + r_head_idx * pe_dim;
           const scalar_t* q_pe_in = q_pe + token_head_in;
@@ -2004,7 +2058,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
     const int nk =  embed_dim;
     if (threadIdx.x < nk)
     {
-      if constexpr (is_neox)
+      if constexpr (is_nope_first)
       {
         kv_cache += head_size - pe_dim;
       }
@@ -2012,7 +2066,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
       const int64_t token_head_in = token_idx * k_pe_stride;// + head_idx * embed_dim;
       const int64_t token_head = kv_cache_offset;
       const int rot_offset = threadIdx.x;// % embed_dim;
-      apply_token_rotary_embedding<scalar_t, cache_t, is_nope_first>(
+      apply_token_rotary_embedding<scalar_t, cache_t, is_neox>(
           k_pe + token_head_in, kv_cache + token_head, cos_ptr, sin_ptr, inverted_kscale, rot_offset, embed_dim);
     }
     }
@@ -2039,17 +2093,21 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
         bool is_neox, bool is_nope_first
     ) {
       if (is_neox && is_nope_first) {
-        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, true, true>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions, cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride, q_pe_stride, q_out_stride, num_heads, kv_c_stride, k_pe_stride,
-        kv_lora_rank, pe_dim, block_size, scale, q_scale);
+        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, true, true>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions, 
+                                           cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride, q_pe_stride, q_out_stride, num_heads, kv_c_stride, k_pe_stride,
+                                           kv_lora_rank, pe_dim, block_size, scale, q_scale);
       } else if (is_neox && !is_nope_first) {
-        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, true, false>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions, cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride, q_pe_stride, q_out_stride, num_heads, kv_c_stride, k_pe_stride,
-        kv_lora_rank, pe_dim, block_size, scale, q_scale);
+        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, true, false>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions, 
+                                            cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride, q_pe_stride, q_out_stride, num_heads, kv_c_stride, k_pe_stride,
+                                            kv_lora_rank, pe_dim, block_size, scale, q_scale);
       } else if (!is_neox && is_nope_first) {
-        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, false, true>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions, cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride, q_pe_stride, q_out_stride, num_heads, kv_c_stride, k_pe_stride,
-        kv_lora_rank, pe_dim, block_size, scale, q_scale);
+        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, false, true>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions, 
+                                            cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride, q_pe_stride, q_out_stride, num_heads, kv_c_stride, k_pe_stride,
+                                            kv_lora_rank, pe_dim, block_size, scale, q_scale);
       } else {
-        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, false, false>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions, cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride, q_pe_stride, q_out_stride, num_heads, kv_c_stride, k_pe_stride,
-        kv_lora_rank, pe_dim, block_size, scale, q_scale);
+        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, false, false>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions, 
+                                            cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride, q_pe_stride, q_out_stride, num_heads, kv_c_stride, k_pe_stride,
+                                            kv_lora_rank, pe_dim, block_size, scale, q_scale);
       }
     }
 
@@ -2827,26 +2885,26 @@ void fused_qk_rope_concat_and_cache_mla(
                                   // pe_dim)]
     torch::Tensor& q_out,        // [num_tokens, num_heads, qk_lora_rank+pe_dim]
     torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
-    const std::string& kv_cache_dtype,
     torch::Tensor& k_scale,   // scale for k
     torch::Tensor& q_scale,   // scale for q
     torch::Tensor& positions, // [num_tokens]
     torch::Tensor &cos_cache, // [max_position, rot_dim//2]
     torch::Tensor &sin_cache, // [max_position, rot_dim//2]
-    bool is_neox, bool is_nope_first,
-    std::optional<torch::Dtype> q_out_dtype
+    bool is_neox, bool is_nope_first
 ) {
   int num_tokens = slot_mapping.size(0);
-  int kv_lora_rank = kv_c.size(1);
-  int pe_dim = k_pe.size(1);
+  int kv_lora_rank = kv_c.size(-1);
+  int pe_dim = k_pe.size(-1);
   int block_size = kv_cache.size(1);
   int num_heads = q_nope.size(1);
-  int qk_lora_rank = q_nope.size(2);
-  int rot_dim = cos_cache.size(1) * 2;
+  int qk_lora_rank = q_nope.size(-1);
+  int rot_dim = cos_cache.size(-1) * 2;
   int num_blocks = (num_tokens + block_size - 1) / block_size;
   int num_actual_tokens = slot_mapping.size(0);
   int num_slots = slot_mapping.size(0);
 
+  TORCH_CHECK(q_nope.dim() == q_pe.dim());
+  TORCH_CHECK(q_nope.size(1) == q_pe.size(1));
   TORCH_CHECK(kv_cache.size(2) == kv_lora_rank + pe_dim);
   TORCH_CHECK(q_out.size(2) == qk_lora_rank + pe_dim);
   int kv_c_stride = kv_c.stride(0);
@@ -2861,19 +2919,31 @@ void fused_qk_rope_concat_and_cache_mla(
   const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard1(device_of(q_out));
   const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-  auto q_out_data_type = q_out_dtype.has_value() ? q_out_dtype.value() : q_out.scalar_type();
+ // auto q_out_data_type = q_out_dtype.has_value() ? q_out_dtype.value() : q_out.scalar_type();
   std::string q_out_type = "auto";
-  if (q_out_data_type == kv_cache.scalar_type()) {
+  std::string kv_cache_dtype = "auto";
+  if (kv_cache.scalar_type() == torch::kFloat ||
+             kv_cache.scalar_type() == torch::kFloat16  ||
+             kv_cache.scalar_type() == torch::kBFloat16) {
+    kv_cache_dtype = "auto";
+  } else if(kv_cache.scalar_type() == torch::kFloat8_e4m3fn || kv_cache.scalar_type() == torch::kFloat8_e5m2 || kv_cache.scalar_type() ==torch::kFloat8_e4m3fnuz) {
+    kv_cache_dtype = "fp8";
+  } else{
+    TORCH_CHECK(false, "kv cache data type is not supported");
+  }
+  if (q_out.scalar_type() == kv_cache.scalar_type()) {
     q_out_type = kv_cache_dtype;
-  } else if (q_out_data_type == at::ScalarType::Float ||
-             q_out_data_type == at::ScalarType::Half  ||
-             q_out_data_type == at::ScalarType::BFloat16) {
+  } else if (q_out.scalar_type() == torch::kFloat ||
+             q_out.scalar_type() == torch::kFloat16  ||
+             q_out.scalar_type() == torch::kBFloat16) {
     q_out_type = "auto";
-  } else {
+  } else if(q_out.scalar_type() == torch::kFloat8_e4m3fn || q_out.scalar_type() == torch::kFloat8_e5m2 || q_out.scalar_type() ==torch::kFloat8_e4m3fnuz) {
     q_out_type = "fp8";
+  } else{
+    TORCH_CHECK(false, "kv cache data type is not supported");
   }
 
-  if (is_nope_first && is_neox && kv_lora_rank <= 1024 && block_size == 1 &&
+  if (is_nope_first && kv_lora_rank <= 1024 && block_size == 1 &&
      rot_dim == 64 && num_tokens < 256) {
     dim3 grid(num_tokens*num_heads);
     dim3 block(std::min<int64_t>(kv_lora_rank, 1024)/8);

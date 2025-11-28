@@ -126,7 +126,6 @@ def fused_qk_rope_concat_and_cache_mla(
     kv_cache: Tensor,
     q_out: Tensor,
     slot_mapping: Tensor,
-    kv_cache_dtype: str,
     k_scale: Tensor,
     q_scale: Tensor,
     positions: Tensor,
@@ -134,5 +133,4 @@ def fused_qk_rope_concat_and_cache_mla(
     sin_cache: Tensor,
     is_neox: bool,
     is_nope_first: bool,
-    q_out_dtype: Optional[torch.dtype] = None,
 ) -> None: ...

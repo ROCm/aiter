@@ -7,7 +7,7 @@ import argparse
 import itertools
 import pandas as pd
 import random
-import time
+from typing_extensions import List
 
 
 @perftest()
@@ -52,7 +52,7 @@ def aiter_fused_rope_concat_and_cache_mla(
         kv_cache,
         q_out,
         slot_mapping,
-        kv_cache_dtype,
+        # kv_cache_dtype,
         k_scale,
         q_scale,
         positions,
@@ -60,7 +60,7 @@ def aiter_fused_rope_concat_and_cache_mla(
         sin_cache,
         is_neox,
         is_nope_first,
-        q_out_dtype,
+        # q_out_dtype,
     )
     return kv_cache, q_out
 
@@ -262,6 +262,7 @@ def test_fused_rope_concat_and_cache_mla(
     device: str,
     kv_cache_dtype: str,
     q_dtype: str,
+    is_neox: bool,
 ):
     ret = {}
     torch.set_default_device(device)
@@ -297,7 +298,7 @@ def test_fused_rope_concat_and_cache_mla(
         device=q_nope.device,
     )
     is_nope_first = True
-    is_neox = True
+    # is_neox = True
 
     ref_q_out = torch.empty(
         (num_tokens, num_heads, qk_rope_head_dim + kv_lora_rank),
@@ -434,6 +435,7 @@ l_kv_cache_dtypes = ["auto", "fp8"]
 ltests = ["normal", "fused_qk"]
 l_num_heads = [1, 2, 4, 8]
 num_heads = 4
+l_neox = [True, False]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -510,6 +512,14 @@ parser.add_argument(
     e.g.: -qd auto""",
 )
 parser.add_argument(
+    "--is_neox",
+    nargs="?",
+    default=[True, False],
+    help="""true: GPT-NeoX style rotary embedding or false: GPT-J style rotary embedding.
+    e.g.: --is_neox False""",
+)
+
+parser.add_argument(
     "-c",
     "--case",
     type=str,
@@ -543,6 +553,7 @@ if args.case is not None:
 if args.head is not None:
     l_num_heads = args.head
 
+l_neox: List[bool] = args.is_neox
 
 if "normal" in ltests:
     df = []
@@ -570,21 +581,23 @@ if "fused_qk" in ltests:
         num_blocks = num_token // block_size
         for num_heads in l_num_heads:
             for kv_cache_dtype in l_kv_cache_dtypes:
-                for q_dtype in l_qk_dtypes:
-                    if q_dtype == "fp8" and kv_cache_dtype != "fp8":
-                        continue
-                    ret = test_fused_rope_concat_and_cache_mla(
-                        kv_lora_rank,
-                        qk_rope_head_dim,
-                        num_token,
-                        block_size,
-                        num_blocks,
-                        num_heads,
-                        dtype,
-                        device,
-                        kv_cache_dtype,
-                        q_dtype,
-                    )
-                    df.append(ret)
+                for is_neox in l_neox:
+                    for q_dtype in l_qk_dtypes:
+                        if q_dtype == "fp8" and kv_cache_dtype != "fp8":
+                            continue
+                        ret = test_fused_rope_concat_and_cache_mla(
+                            kv_lora_rank,
+                            qk_rope_head_dim,
+                            num_token,
+                            block_size,
+                            num_blocks,
+                            num_heads,
+                            dtype,
+                            device,
+                            kv_cache_dtype,
+                            q_dtype,
+                            is_neox,
+                        )
+                        df.append(ret)
     df = pd.DataFrame(df)
     aiter.logger.info(f"fused_rope_concat_and_cache_mla summary:\n{df}")

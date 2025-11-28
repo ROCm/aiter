@@ -298,15 +298,13 @@ namespace py = pybind11;
           "                     Tensor! kv_cache,"                                  \
           "                     Tensor! q_out, "                                    \
           "                     Tensor slot_mapping,"                               \
-          "                     str kv_cache_dtype,"                                \
           "                     Tensor k_scale,"                                    \
           "                     Tensor q_scale,"                                    \
           "                     Tensor positions,"                                  \
           "                     Tensor cos_cache,"                                  \
           "                     Tensor sin_cache,"                                  \
           "                     bool is_neox    ,"                                  \
-          "                     bool is_nope_first,"                                \
-          "                     std::optional<torch::Dtype> q_out_dtype = std::nullopt)->()",                      \
+          "                     bool is_nope_first)->()",                           \
           py::arg("q_nope"),                                                        \
           py::arg("q_pe"),                                                          \
           py::arg("kv_c"),                                                          \
@@ -314,15 +312,13 @@ namespace py = pybind11;
           py::arg("kv_cache"),                                                      \
           py::arg("q_out"),                                                         \
           py::arg("slot_mapping"),                                                  \
-          py::arg("kv_cache_dtype"),                                                \
           py::arg("k_scale"),                                                       \
           py::arg("q_scale"),                                                       \
           py::arg("positions"),                                                     \
           py::arg("cos_cache"),                                                     \
           py::arg("sin_cache"),                                                     \
           py::arg("is_neox"),                                                       \
-          py::arg("is_nope_first"),                                                  \
-          py::arg("q_out_dtype")  = std::nullopt);
+          py::arg("is_nope_first"));
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
     m.def("init_custom_ar",                                                                    \
@@ -420,17 +416,17 @@ namespace py = pybind11;
           py::arg("bpreshuffle") = true,                                \
           py::arg("splitK")      = std::nullopt);
 
-#define GEMM_A16W16_ASM_PYBIND                  \
-    m.def("gemm_a16w16_asm",                    \
-          &gemm_a16w16_asm,                     \
-          "Asm gemm a16w16",                    \
-          py::arg("A"),                         \
-          py::arg("B"),                         \
-          py::arg("out"),                       \
-          py::arg("bias")       = std::nullopt, \
-          py::arg("splitK")     = std::nullopt, \
-          py::arg("kernelName") = std::nullopt, \
-          py::arg("bpreshuffle")      = false);
+#define GEMM_A16W16_ASM_PYBIND                   \
+    m.def("gemm_a16w16_asm",                     \
+          &gemm_a16w16_asm,                      \
+          "Asm gemm a16w16",                     \
+          py::arg("A"),                          \
+          py::arg("B"),                          \
+          py::arg("out"),                        \
+          py::arg("bias")        = std::nullopt, \
+          py::arg("splitK")      = std::nullopt, \
+          py::arg("kernelName")  = std::nullopt, \
+          py::arg("bpreshuffle") = false);
 
 #define GEMM_A4W4_ASM_PYBIND                      \
     m.def("gemm_a4w4_asm",                        \
@@ -560,14 +556,14 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,        \
           py::arg("splitK")   = 0);
 
-#define GEMM_A8W8_BPRESHUFFLE_CKTILE_PYBIND      \
-    m.def("gemm_a8w8_bpreshuffle_cktile", \
-          &gemm_a8w8_bpreshuffle_cktile,  \
-          "gemm_a8w8_bpreshuffle_cktile", \
-          py::arg("XQ"),                  \
-          py::arg("WQ"),                  \
-          py::arg("x_scale"),             \
-          py::arg("w_scale"),             \
+#define GEMM_A8W8_BPRESHUFFLE_CKTILE_PYBIND \
+    m.def("gemm_a8w8_bpreshuffle_cktile",   \
+          &gemm_a8w8_bpreshuffle_cktile,    \
+          "gemm_a8w8_bpreshuffle_cktile",   \
+          py::arg("XQ"),                    \
+          py::arg("WQ"),                    \
+          py::arg("x_scale"),               \
+          py::arg("w_scale"),               \
           py::arg("Out"));
 
 #define GEMM_A8W8_BPRESHUFFLE_CKTILE_TUNE_PYBIND \
