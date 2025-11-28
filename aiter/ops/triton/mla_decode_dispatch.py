@@ -49,9 +49,7 @@ if triton.__version__ >= "3.5.0" and not enable_aot_gluon_mla:
     from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
     enable_gluon_mla = True
     enable_jit_gluon_mla = True
-    from aiter.ops.triton.gluon.mla_decode_mi355 import (
-        _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
-    )
+    from aiter.ops.triton.gluon.mla_decode_mi355 import _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64_async as _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
     from aiter.ops.triton.gluon.mla_decode import (
         _fwd_grouped_kernel_stage1_n16x2_prefetch_k_paged_64
     )
