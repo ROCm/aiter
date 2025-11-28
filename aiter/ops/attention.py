@@ -127,7 +127,9 @@ def gen_pa_ps_fwd_asm(
     V_QScale: Optional[torch.Tensor] = None,
     out_: Optional[torch.Tensor] = None,
     qo_indptr: Optional[torch.Tensor] = None,
-    work_meta_data: Optional[torch.Tensor] = None,
+    # work_meta_data: Optional[torch.Tensor] = None,
+    work_indptr: Optional[torch.Tensor] = None,
+    work_info: Optional[torch.Tensor] = None,
     splitData: Optional[torch.Tensor] = None,
     splitLse: Optional[torch.Tensor] = None,
     high_precision: Optional[
@@ -155,9 +157,12 @@ def pa_ps_fwd_asm(
     V_QScale: Optional[torch.Tensor] = None,
     out_: Optional[torch.Tensor] = None,
     qo_indptr: Optional[torch.Tensor] = None,
-    work_meta_data: Optional[torch.Tensor] = None,
+    # work_meta_data: Optional[torch.Tensor] = None,
+    work_indptr: Optional[torch.Tensor] = None,
+    work_info: Optional[torch.Tensor] = None,
     splitData: Optional[torch.Tensor] = None,
     splitLse: Optional[torch.Tensor] = None,
+    mask: int = 0,
     high_precision: Optional[
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
@@ -195,13 +200,16 @@ def pa_persistent_fwd(
     kv_indptr: torch.Tensor,  # [batch+1], kvlen prefix sum   1
     kv_indices: torch.Tensor,  # [sum_kvlen], packed kv ids    2
     context_lens: torch.Tensor,  # [batch]                       3
-    work_meta_data: torch.Tensor,
+    # work_meta_data: torch.Tensor,
+    work_indptr: Optional[torch.Tensor] = None,
+    work_info: Optional[torch.Tensor] = None,
     reduce_indptr: Optional[torch.Tensor] = None,
     reduce_final_map: Optional[torch.Tensor] = None,
     reduce_partial_map: Optional[torch.Tensor] = None,
     K_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
     V_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
     softmax_scale: float = None,
+    mask: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
@@ -232,9 +240,11 @@ def pa_persistent_fwd(
         V_QScale,
         output,
         qo_indptr,
-        work_meta_data,
+        work_indptr,
+        work_info,
         logits,
         splitLse,
+        mask,
     )
     pa_reduce_v1(
         logits,
@@ -471,10 +481,60 @@ def mla_prefill_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_mla_metadata")
+def get_pa_metadata_info_v1(
+    batch_size: int,
+    max_seqlen_qo: int,
+    num_head_qo: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    is_sparse: int,
+    fast_mode: bool = True,
+):
+    """
+    Returns:
+        1. Shape of work_metadata_ptrs followed by its scalar type.
+        2. Shape of work_indptr followed by its scalar type.
+        3. Shape of work_info_set followed by its scalar type.
+        4. Shape of reduce_indptr followed by its scalar type.
+        5. Shape of reduce_final_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type.
+    """
+
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+
+    tile_q = 16  # TODO: fix hack
+    # max_qo_tiles_per_batch = max_seqlen_qo * gqa_ratio / tile_q
+    # tile_q related to kernel dispatch strategy
+    # better hide inside get_xxx_metadata csrc?
+    max_qo_tiles_per_batch = int(math.ceil(max_seqlen_qo * num_head_qo / tile_q))
+    batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
+    tile_cnt = batch_size * max_qo_tiles_per_batch
+
+    if fast_mode:
+        max_work = tile_cnt + cu_num - 1
+        max_split_tiles = (
+            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
+        )
+    else:
+        max_work = tile_cnt * cu_num
+        max_split_tiles = tile_cnt * cu_num
+
+    return (
+        ((2), torch.uint64),  # work_metadata_ptrs
+        ((cu_num + 1), torch.int32),  # work_indptr
+        ((max_work, 8), torch.int32),  # work_info_set
+        ((tile_cnt + 1), torch.int32),  # reduce_indptr
+        ((tile_cnt, 2), torch.int32),  # reduce_final_map
+        (max_split_tiles, torch.int32),  # reduce_partial_map
+    )
+
+
+@compile_ops("module_pa_metadata")
 def get_pa_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
-    seqlens_kv_indptr: torch.Tensor,
+    pages_kv_indptr: torch.Tensor,
     num_heads_per_head_k: int,
     num_heads_k: int,
     is_causal: bool,
@@ -494,7 +554,7 @@ def get_pa_metadata_v1(
     """
     Inputs:
         cumulated seqlens of q/o: (batch_size + 1), dtype torch.int32.
-        cumulated seqlens of k/v: (batch_size + 1), dtype torch.int32.
+        cumulated used pages of k/v: (batch_size + 1), dtype torch.int32.
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: Whether causal mask is enabled.
@@ -516,13 +576,13 @@ def get_pa_metadata_v1(
         [2.2] q_start:          (#work),            The global index in seq where q/o starts. Use global index here can
                                                     reduce memory access count in kernel.
         [2.3] q_end:            (#work),            The global index in seq where q/o ends (not included).
-        [2.4] kv_start:         (#work),            The global index in seq where k/v starts.
-        [2.5] kv_end:           (#work),            The global index in seq where k/v ends (not included). Note that
-                                                    this value indicates the end of last qo sequence if there are
+        [2.4] kv_start:         (#work),            The global index in kv_indices where k/v starts.
+        [2.5] kv_end:           (#work),            The global index in kv_indices where k/v ends (not included). Note
+                                                    that this value indicates the end of last qo sequence if there are
                                                     multiple qo sequences included in the current work and causal mask
                                                     is enabled.
-        [2.6] kv_offset:        (#work),            Remaining length in seq from kv_end to the end of current batch.
-        [2.7] pad               (#work, 1),         Pad to 8 DWs.
+        [2.6] kv_offset:        (#work),            Not used.
+        [2.7] pad               (#work, 1),         The start index(low 16bits) and end index(high 16bits) of q heads.
         [3] reduce_indptr:      (sum(qo_seqlen_blk_count) + 1),
                                                     The IDs in reduce_partial_map indicates the tiles should be merged
                                                     together.

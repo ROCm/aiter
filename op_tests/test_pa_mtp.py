@@ -226,6 +226,49 @@ def pertoken_quant_kvcache_symm(
 
 
 @perftest()
+def run_aiter_asm_ps(
+    Q,
+    K,
+    V,
+    output,
+    max_qlen,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    context_lens,
+    K_QScale,
+    V_QScale,
+    work_indptr,
+    work_info,
+    reduce_indptr,
+    reduce_final_map,
+    reduce_partial_map,
+    softmax_scale,
+    mask,
+):
+    return aiter.pa_persistent_fwd(
+        Q=Q,
+        K=K,
+        V=V,
+        output=output,
+        max_qlen=max_qlen,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        context_lens=context_lens,
+        K_QScale=K_QScale,
+        V_QScale=V_QScale,
+        work_indptr=work_indptr,
+        work_info=work_info,
+        reduce_indptr=reduce_indptr,
+        reduce_final_map=reduce_final_map,
+        reduce_partial_map=reduce_partial_map,
+        softmax_scale=softmax_scale,
+        mask=mask,
+    )
+
+
+@perftest()
 def run_aiter_asm(
     query,
     k_cache,
@@ -340,7 +383,8 @@ def test_pa_mtp(
     head_size: int,
     block_size: int,
     dtype: torch.dtype,
-    qlen,
+    qlen: int,
+    varlen: bool,
 ) -> dict:
     ret = {}
     seed = 0
@@ -354,7 +398,15 @@ def test_pa_mtp(
     num_blocks = max_num_blocks_per_seq * batch_size
     num_blocks_per_seq = (ctx_lens + block_size - 1) // block_size
 
-    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
+    if varlen:
+        for i in range(batch_size):
+            # seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
+            seq_lens_kv[i] = random.uniform(5, ctx_lens)
+    else:
+        seq_lens_kv.fill_(ctx_lens)
     seq_lens_qo = torch.randint(
         1, 5, (batch_size,), dtype=torch.int, device=device
     ).fill_(qlen)
@@ -373,10 +425,6 @@ def test_pa_mtp(
         qkv, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
     )
     query.uniform_(*uniform_range)
-
-    # seq_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(batch_size)]
-    seq_lens = [ctx_lens for _ in range(batch_size)]
-    seq_lens = torch.tensor(seq_lens, dtype=torch.int)
 
     # Create the block tables.
     block_tables_lst: List[List[int]] = []
@@ -407,7 +455,7 @@ def test_pa_mtp(
         k_cache,
         v_cache,
         block_tables,
-        seq_lens,
+        seq_lens_kv,
         qo_indptr,
     )
 
@@ -416,7 +464,7 @@ def test_pa_mtp(
     #     k_cache,
     #     asm_V_shuffle(v_cache),
     #     block_tables,
-    #     seq_lens,
+    #     seq_lens_kv,
     #     block_tables.size(1),
     #     max_qlen,
     #     qo_indptr=qo_indptr,
@@ -435,20 +483,20 @@ def test_pa_mtp(
         k_cache,
         v_cache,
         block_tables,
-        seq_lens,
+        seq_lens_kv,
         ctx_lens,
         max_qlen,
         "auto",
         num_kv_heads,
         scale,
     )
-    err_noquant = checkAllclose(
-        out_ref_noquant,
-        out_hip_noquant,
-        msg=f"[torch vs  aiter_hip][No Quant]: {us_hip:>8.2f} us......",
-    )
-    ret["us_hip_bf16"] = us_hip
-    ret["err_hip_bf16"] = err_noquant
+    # err_noquant = checkAllclose(
+    #     out_ref_noquant,
+    #     out_hip_noquant,
+    #     msg=f"[torch vs  aiter_hip][No Quant]: {us_hip:>8.2f} us......",
+    # )
+    # ret["us_hip_bf16"] = us_hip
+    # ret["err_hip_bf16"] = err_noquant
 
     # ################## quant start ######################
     k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
@@ -457,8 +505,35 @@ def test_pa_mtp(
 
     # torch ref
     out_ref = torch_mha_extend(
-        query, k_quant_, v_quant_, block_tables, seq_lens, qo_indptr, k_scale_, v_scale_
+        query,
+        k_quant_,
+        v_quant_,
+        block_tables,
+        seq_lens_kv,
+        qo_indptr,
+        k_scale_,
+        v_scale_,
     )
+
+    # out_asm_noquant, us_asm_noquant = run_aiter_asm(
+    #     query,
+    #     k_quant_,
+    #     asm_V_shuffle(v_quant_),
+    #     block_tables,
+    #     seq_lens_kv,
+    #     block_tables.size(1),
+    #     max_qlen,
+    #     k_scale=k_scale_,
+    #     v_scale=v_scale_,
+    #     qo_indptr=qo_indptr,
+    # )
+    # err_noquant = checkAllclose(
+    #     out_ref_noquant,
+    #     out_asm_noquant,
+    #     msg=f"[torch vs  aiter_asm][No Quant]: {us_asm_noquant:>8.2f} us......",
+    # )
+    # ret["us_asm_bf16"] = us_asm_noquant
+    # ret["err_asm_bf16"] = err_noquant
 
     if True:
         (
@@ -468,7 +543,7 @@ def test_pa_mtp(
             (reduce_indptr_size, reduce_indptr_type),
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
-        ) = aiter.get_mla_metadata_info_v1(
+        ) = aiter.get_pa_metadata_info_v1(
             batch_size,
             max_qlen,
             num_query_heads,
@@ -486,20 +561,27 @@ def test_pa_mtp(
         reduce_partial_map = torch.empty(
             reduce_partial_map_size, dtype=reduce_partial_map_type
         )
-        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int, device=device)
-        kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens, dim=0)
 
-        kv_max_sz = (
-            65536 * 32
-        )  # calculated by rest of mem after weight loaded in frameworks
-        num_page = (kv_max_sz + block_size - 1) // block_size
+        # FIX: kv_indptr: seq_lens prefix sum -> actual_blocks prefix sum
+        # refer: https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/flashinfer.py#L731-L735
+        actual_blocks = (seq_lens_kv + block_size - 1) // block_size
+        kv_indptr[1 : batch_size + 1] = torch.cumsum(actual_blocks, dim=0)
+        # FIX: kv_indices: random -> pack block_table actual blocks
+        # refer: https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/flashinfer.py#L1545
+        kv_indices_lst = []
+        for i in range(0, batch_size):
+            kv_indices_lst += block_tables_lst[i][: actual_blocks[i]]
+        kv_indices = torch.tensor(kv_indices_lst, dtype=torch.int)
 
-        kv_indices = torch.randint(
-            0, num_page, (kv_indptr[-1].item(),), dtype=torch.int
-        )
-        context_lens = torch.full((batch_size,), ctx_lens)
-        # kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
-        aiter.get_mla_metadata_v1(
+        qo_indptr = torch.tensor([0, 1, 2], dtype=torch.int32)
+        seq_lens_kv = torch.tensor([4097, 4097], dtype=torch.int32)
+
+        # print(f"==> kv_indptr: {kv_indptr}")
+        # print(f"==> kv_indices: {kv_indices}")
+        # print(f"==> context_lens: {seq_lens_kv}")
+        # print(f"==> K shape: {k_quant_.shape}")
+
+        aiter.get_pa_metadata_v1(
             qo_indptr,
             kv_indptr,
             num_query_heads // num_kv_heads,
@@ -511,9 +593,38 @@ def test_pa_mtp(
             reduce_indptr,
             reduce_final_map,
             reduce_partial_map,
+            kv_granularity=max(block_size, 16),
+            max_seqlen_qo=int(max_qlen),
+            uni_seqlen_qo=qlen,
+            fast_mode=True,
+            max_split_per_batch=-1,
         )
-    output = torch.empty_like(query)
+        print(
+            f"batch_size: {batch_size}, num_query_heads: {num_query_heads}, num_kv_heads: {num_kv_heads}"
+        )
+        print(f"qo_indptr: {qo_indptr.tolist()}")
+        print(f"kv_indptr: {kv_indptr.tolist()}")
+        print(f"kv_indices: {kv_indices.tolist()}")
+        print(f"seq_lens_kv: {seq_lens_kv.tolist()}")
 
+        print(f"==>work_idptr: {work_indptr}")
+        print(f"==>work_info: {work_info}")
+        print(f"==>reduce_indptr: {reduce_indptr}")
+        print(f"==>reduce_final_map: {reduce_final_map}")
+        print(f"==>reduce_partial_map: {reduce_partial_map}")
+        torch.set_printoptions(threshold=999999, linewidth=120)
+        # print(f"==>work_idptr:\n {work_indptr}")
+        # print(f"==>work_info:\n {work_info}")
+        # print(f"==>reduce_indptr:\n {reduce_indptr}")
+        # print(f"==>reduce_final_map:\n {reduce_final_map}")
+        # print(f"==>reduce_partial_map:\n {reduce_partial_map}")
+        # actual_num_work = work_indptr.max().item()
+        # work_indptr = work_indptr[:actual_num_work+1]
+        # work_info = work_info[:actual_num_work]
+        # print(f"==>work_idptr:\n {work_indptr}")
+        # print(f"==>work_info:\n {work_info}")
+
+    output = torch.empty_like(query)
     out_aiter_asm, us_aiter_asm = aiter.pa_persistent_fwd(
         Q=query,
         K=k_quant_,
@@ -523,62 +634,68 @@ def test_pa_mtp(
         qo_indptr=qo_indptr,
         kv_indptr=kv_indptr,
         kv_indices=kv_indices,
-        context_lens=context_lens,
-        work_meta_data=work_metadata_ptrs,
-        # work_indptr=work_indptr,
-        # work_info=work_info,
+        context_lens=seq_lens_kv,
+        K_QScale=k_scale_,
+        V_QScale=v_scale_,
+        # work_meta_data=work_metadata_ptrs,
+        work_indptr=work_indptr,
+        work_info=work_info,
         reduce_indptr=reduce_indptr,
         reduce_final_map=reduce_final_map,
         reduce_partial_map=reduce_partial_map,
         softmax_scale=scale,
+        mask=1,
     )
+    print("run pa_persistent_fwd successfully")
+    print(f"seq_lens_kv: {seq_lens_kv.tolist()}")
     err = checkAllclose(
         out_ref,
-        out_aiter_asm,
-        msg=f"[torch vs  aiter_asm][   Quant]: {us_aiter_asm:>8.2f} us......",
+        output,
+        msg="[torch vs  pa_persistent_fwd][   Quant]: us......",
     )
     ret["us_asm_fp8"] = us_aiter_asm
     ret["err fp8"] = err
 
-    q_quant, q_scale = pertoken_quant(query, quant_dtype=aiter.dtypes.fp8)
-    q_scale = q_scale.squeeze(-1)
+    # q_quant, q_scale = pertoken_quant(query, quant_dtype=aiter.dtypes.fp8)
+    # q_scale = q_scale.squeeze(-1)
 
-    out_hip, us_hip = run_aiter_hip(
-        q_quant,
-        k_quant_,
-        asm_V_shuffle(v_quant_),
-        block_tables,
-        seq_lens,
-        ctx_lens,
-        max_qlen,
-        "fp8",
-        num_kv_heads,
-        scale,
-        k_scale_asm,
-        v_scale_asm,
-        q_scale,
-        output_dtype=dtype,
-    )
-    err = checkAllclose(
-        out_ref,
-        out_hip,
-        msg=f"[torch vs  aiter_hip][   Quant]: {us_hip:>8.2f} us......",
-    )
-    ret["us_hip_fp8"] = us_hip
-    ret["err_hip_fp8"] = err
+    # out_hip, us_hip = run_aiter_hip(
+    #     q_quant,
+    #     k_quant_,
+    #     asm_V_shuffle(v_quant_),
+    #     block_tables,
+    #     seq_lens_kv,
+    #     ctx_lens,
+    #     max_qlen,
+    #     "fp8",
+    #     num_kv_heads,
+    #     scale,
+    #     k_scale_asm,
+    #     v_scale_asm,
+    #     q_scale,
+    #     output_dtype=dtype,
+    # )
+    # err = checkAllclose(
+    #     out_ref,
+    #     out_hip,
+    #     msg=f"[torch vs  aiter_hip][   Quant]: {us_hip:>8.2f} us......",
+    # )
+    # ret["us_hip_fp8"] = us_hip
+    # ret["err_hip_fp8"] = err
 
     return ret
 
 
 head_dim = 128
-l_block_size = [16]
+l_block_size = [1024]
 l_dtype = ["bf16"]
 l_num_heads = [
     (16, 1)
 ]  # num_query_heads must be multiple of 16 for get_mla_metadata_info_v1
-l_qlen = [1, 2, 3, 4]
+l_qlen = [1]
 l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
-l_batch_size = [128]
+# l_ctx_len = [1024]
+l_batch_size = [2]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -636,6 +753,12 @@ parser.add_argument(
     help="""Batch size.
     e.g. -b 128""",
 )
+parser.add_argument(
+    "--varlen",
+    action="store_true",
+    help="""variable kv seqlens per batch. Default: False.
+    --varlen # True""",
+)
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -650,6 +773,7 @@ if args.ctx_len is not None:
 if args.batch_size is not None:
     l_batch_size = [args.batch_size]
 l_block_size = args.block_size
+l_varlen = args.varlen
 
 for dtype in l_dtype:
     df = []
@@ -664,8 +788,321 @@ for dtype in l_dtype:
             block_size,
             dtype,
             qlen,
+            l_varlen,
         )
         df.append(ret)
     df = pd.DataFrame(df)
     aiter.logger.info(f"summary:\n{df}")
-    # df.to_csv("mla_prefill.csv")
+    df.to_csv("mla_prefill.csv")
+
+
+def test_pa_ps_simple():
+    """Test PA persistent scheduling with hardcoded dummy data"""
+    print("\n" + "=" * 80)
+    print("Testing PA Persistent Scheduling (PS) - Simple Test")
+    print("=" * 80)
+
+    device = "cuda:0"
+    torch.set_default_device(device)
+
+    # batch_size = 4
+    # num_head_q = 16
+    # num_head_kv = 1
+    # head_dim = 128
+    # block_size = 16
+    # dtype = dtypes.bf16
+
+    # qo_indptr = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)
+    # kv_indptr_tokens = torch.tensor([0, 16, 18, 30, 36], dtype=torch.int32)
+    # seq_lens_kv = torch.tensor([16, 2, 12, 6], dtype=torch.int32)
+
+    batch_size = 2
+    num_head_q = 16
+    num_head_kv = 1
+    head_dim = 128
+    block_size = 1024
+    dtype = dtypes.bf16
+
+    qo_indptr = torch.tensor([0, 1, 2], dtype=torch.int32)
+    kv_indptr_tokens = torch.tensor([0, 5, 10], dtype=torch.int32)
+    seq_lens_kv = torch.tensor([1025, 1025], dtype=torch.int32)
+    # 2048 + 16 = 2064
+
+    actual_blocks = (seq_lens_kv + block_size - 1) // block_size
+    kv_indptr_blocks = torch.zeros(batch_size + 1, dtype=torch.int32)
+    kv_indptr_blocks[1:] = torch.cumsum(actual_blocks, dim=0)
+
+    num_blocks = kv_indptr_blocks[-1].item()
+    kv_indices = torch.arange(num_blocks, dtype=torch.int32)
+
+    # This is generate by yang gen metadata cpp
+    # work_indptr = torch.tensor([0, 1, 2, 4, 6, 7], dtype=torch.int32)
+    # work_info = torch.tensor([
+    #     [0,  0, 0,  4,  0,  8, 655360,      0],
+    #     [0, 16, 0,  4,  8, 16,      0, 655360],
+    #     [1, -1, 4,  6, 16, 18,      0, 655360],
+    #     [2, 32, 6, 12, 18, 24, 655360,      0],
+    #     [2, 48, 6, 12, 24, 30,      0, 655360],
+    #     [3, 64, 12, 15, 30, 32, 655360,      0],
+    #     [3, 80, 12, 15, 32, 36,      0, 655360],
+    # ], dtype=torch.int32)
+
+    # 2 Not reduce: this is pass
+    # work_indptr = torch.tensor([0, 1, 2], dtype=torch.int32)
+    # # work_info: (2) [
+    # # work[  0]:          0,4294967295,         0,         1,         0,         5,         0,    655360(0,10)
+    # # work[  1]:          1,4294967295,         1,         2,         5,        10,         0,    655360(0,10)
+    # work_info = torch.tensor([
+    #     [0, -1, 0, 1, 0, 5, 0, 655360],
+    #     [1, -1, 1, 2, 5, 10, 0, 655360],
+    # ], dtype=torch.int32)
+
+    # work_indptr:(6) [0,1,2,2,2,2]
+    # work_info: (2) [
+    # work[  0]:          0,4294967295,         0,         1,         0,         1,         0,   1048576(0,16)
+    # work[  1]:          1,4294967295,         1,         2,         1,         2,         0,   1048576(0,16)
+    # ]
+    # work_indptr = torch.tensor([0, 1, 2, 2, 2, 2], dtype=torch.int32)
+    # work_info = torch.tensor([
+    #     [0, -1, 0, 1, 0, 1, 0, 1048576],
+    #     [1, -1, 1, 2, 1, 2, 0, 1048576],
+    # ], dtype=torch.int32)
+
+    # 3 Reduce
+    # work_indptr = torch.tensor([0,1,3,4,5], dtype=torch.int32)
+    # work_info = torch.tensor([
+    #     [0, 0, 0, 1, 0, 3, 0, 655360],
+    #     [0, 1, 0, 1, 3, 5, 0, 655360],
+    #     [1, 2, 1, 2, 5, 6, 0, 655360],
+    #     [1, 3, 1, 2, 6, 9, 0, 655360],
+    #     [1, 4, 1, 2, 9, 10, 0, 655360],
+    # ], dtype=torch.int32)
+
+    # 4 reduce
+    # work_indptr = torch.tensor([0,1,2], dtype=torch.int32)
+    # work_info = torch.tensor([
+    #     [0, 0, 0, 1, 0, 1, 0, 1048576],
+    #     [0, 1, 0, 1, 1, 2, 0, 1048576],
+    # ], dtype=torch.int32)
+
+    # 2
+    # reduce_indptr = torch.tensor([0, 1, 2, 3, 4, 5, 6], dtype=torch.int32)
+    # reduce_final_map = torch.tensor([
+    #     [0, 4, 0], [0, 4, 655360],
+    #     [12, 18, 0], [12, 18, 655360],
+    #     [24, 27, 0], [24, 27, 655360],
+    # ], dtype=torch.int32)
+    # reduce_partial_map = torch.tensor([0, 16, 32, 48, 64, 80], dtype=torch.int32)
+
+    # reduce_indptr = torch.tensor([0], dtype=torch.int32)
+    # reduce_final_map = torch.tensor([0], dtype=torch.int32)
+    # reduce_partial_map = torch.tensor([0], dtype=torch.int32)
+
+    # 3----------reduce_indptr:
+    # reduce_indptr = torch.tensor([0, 2, 5], dtype=torch.int32)
+    # reduce_final_map = torch.tensor([
+    #     [0, 1],
+    #     [1, 2],
+    # ], dtype=torch.int32)
+    # reduce_partial_map = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)
+
+    # 4 reduce
+    # reduce_indptr = torch.tensor([0, 2], dtype=torch.int32)
+    # reduce_final_map = torch.tensor([
+    #     [0, 1],
+    # ], dtype=torch.int32)
+    # reduce_partial_map = torch.tensor([0, 1], dtype=torch.int32)
+
+    total_qo = qo_indptr[-1].item()
+
+    print(f"batch_size: {batch_size}, num_heads: {num_head_q}")
+    print(f"qo_indptr: {qo_indptr.tolist()}")
+    print(f"kv_indptr_blocks: {kv_indptr_blocks.tolist()}")
+    print(f"seq_lens_kv: {seq_lens_kv.tolist()}")
+    # print(f"work_indptr: {work_indptr.tolist()}")
+
+    Q = torch.randn(total_qo, num_head_q, head_dim, dtype=dtype, device=device)
+
+    k_caches, v_caches = kv_cache_factory(
+        num_blocks, block_size, 1, num_head_kv, head_dim, "auto", dtype, 0, device
+    )
+    k_cache, v_cache = k_caches[0], v_caches[0]
+
+    k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
+        pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
+    )
+
+    scale = head_dim**-0.5
+    max_qlen = 1
+    output = torch.empty_like(Q)
+
+    # Create block_tables for reference implementation
+    block_tables_lst = []
+    for i in range(batch_size):
+        # Get blocks for this batch
+        start_idx = kv_indptr_blocks[i].item()
+        end_idx = kv_indptr_blocks[i + 1].item()
+        blocks = kv_indices[start_idx:end_idx].tolist()
+        # Pad to max blocks per seq if needed
+        max_blocks = max(actual_blocks).item()
+        blocks += [0] * (max_blocks - len(blocks))
+        block_tables_lst.append(blocks)
+
+    block_tables = torch.tensor(block_tables_lst, dtype=torch.int32, device=device)
+
+    print("\n=== Computing reference output ===")
+    out_ref = torch_mha_extend(
+        Q, k_quant_, v_quant_, block_tables, seq_lens_kv, qo_indptr, k_scale_, v_scale_
+    )
+    print(f"Reference output shape: {out_ref.shape}")
+
+    print("\n=== Testing PA Persistent Forward ===")
+    # out_aiter_asm_ps, us_aiter_asm_ps = run_aiter_asm_ps(
+    #     Q,
+    #     k_quant_,
+    #     asm_V_shuffle(v_quant_),
+    #     output,
+    #     max_qlen,
+    #     qo_indptr,
+    #     kv_indptr_blocks,
+    #     kv_indices,
+    #     seq_lens_kv,
+    #     k_scale_,
+    #     v_scale_,
+    #     work_indptr,
+    #     work_info,
+    #     reduce_indptr,
+    #     reduce_final_map,
+    #     reduce_partial_map,
+    #     scale,
+    # )
+
+    # use work info:
+
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_pa_metadata_info_v1(
+        batch_size,
+        max_qlen,
+        num_head_q,
+        Q.dtype,
+        k_quant_.dtype,
+        is_sparse=False,
+    )
+    work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type)
+    work_info = torch.empty(work_info_set_size, dtype=work_info_set_type)
+    reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type)
+    reduce_final_map = torch.empty(reduce_final_map_size, dtype=reduce_final_map_type)
+    reduce_partial_map = torch.empty(
+        reduce_partial_map_size, dtype=reduce_partial_map_type
+    )
+
+    # FIX: kv_indptr: seq_lens prefix sum -> actual_blocks prefix sum
+    # refer: https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/flashinfer.py#L731-L735
+    actual_blocks = (seq_lens_kv + block_size - 1) // block_size
+    kv_indptr_blocks[1 : batch_size + 1] = torch.cumsum(actual_blocks, dim=0)
+    # FIX: kv_indices: random -> pack block_table actual blocks
+    # refer: https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/flashinfer.py#L1545
+    kv_indices_lst = []
+    for i in range(0, batch_size):
+        kv_indices_lst += block_tables_lst[i][: actual_blocks[i]]
+    kv_indices = torch.tensor(kv_indices_lst, dtype=torch.int)
+
+    print(f"==> kv_indptr: {kv_indptr_blocks}")
+    print(f"==> kv_indices: {kv_indices}")
+    print(f"==> context_lens: {seq_lens_kv}")
+    print(f"==> K shape: {k_quant_.shape}")
+
+    aiter.get_pa_metadata_v1(
+        qo_indptr,
+        kv_indptr_blocks,
+        num_head_q // num_head_kv,
+        num_head_kv,
+        True,
+        work_metadata_ptrs,
+        work_indptr,
+        work_info,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        kv_granularity=max(block_size, 16),
+        max_seqlen_qo=int(max_qlen),
+        uni_seqlen_qo=1,
+        fast_mode=True,
+        max_split_per_batch=-1,
+    )
+    # print(f"==>work_idptr: {work_indptr}")
+    # print(f"==>work_info: {work_info}")
+    # print(f"==>reduce_indptr: {reduce_indptr}")
+    # print(f"==>reduce_final_map: {reduce_final_map}")
+    # print(f"==>reduce_partial_map: {reduce_partial_map}")
+    torch.set_printoptions(threshold=999999, linewidth=120)
+    print(f"==>work_idptr:\n {work_indptr}")
+    print(f"==>work_info:\n {work_info}")
+    print(f"==>reduce_indptr:\n {reduce_indptr}")
+    print(f"==>reduce_final_map:\n {reduce_final_map}")
+    print(f"==>reduce_partial_map:\n {reduce_partial_map}")
+    actual_num_work = work_indptr.max().item()
+    work_indptr = work_indptr[: actual_num_work + 1]
+    work_info = work_info[:actual_num_work]
+
+    _, us_aiter_asm_ps = run_aiter_asm_ps(
+        Q=Q,
+        K=k_quant_,
+        V=asm_V_shuffle(v_quant_),
+        output=output,
+        max_qlen=max_qlen,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr_blocks,
+        kv_indices=kv_indices,
+        context_lens=seq_lens_kv,
+        K_QScale=k_scale_,
+        V_QScale=v_scale_,
+        work_indptr=work_indptr,
+        work_info=work_info,
+        reduce_indptr=reduce_indptr,
+        reduce_final_map=reduce_final_map,
+        reduce_partial_map=reduce_partial_map,
+        softmax_scale=scale,
+        mask=1,
+    )
+
+    print("PA PS forward succeeded!")
+    print(f"Output shape: {output.shape}")
+
+    err = checkAllclose(
+        out_ref,
+        output,
+        msg="PA PS [torch_ref vs pa_persistent_fwd]",
+    )
+
+    print("\n=== Accuracy Check ===")
+    print(f"Error: {err}")
+
+    # PA without persistent
+    # out_asm_noquant, us_asm_noquant = run_aiter_asm(
+    #     Q,
+    #     k_quant_,
+    #     asm_V_shuffle(v_quant_),
+    #     block_tables,
+    #     seq_lens_kv,
+    #     block_tables.size(1),
+    #     max_qlen,
+    #     k_scale=k_scale_,
+    #     v_scale=v_scale_,
+    #     qo_indptr=qo_indptr,
+    # )
+
+    # print("Check performance:")
+    # print(f"PA PS forward: {us_aiter_asm_ps:>8.2f} us")
+    # print(f"PA without persistent: {us_asm_noquant:>8.2f} us")
+
+
+if __name__ == "__main__":
+    test_pa_ps_simple()
