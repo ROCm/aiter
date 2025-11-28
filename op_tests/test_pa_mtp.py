@@ -599,12 +599,12 @@ def test_pa_mtp(
         print(f"kv_indices: {kv_indices.tolist()}")
         print(f"seq_lens_kv: {seq_lens_kv.tolist()}")
 
+        torch.set_printoptions(threshold=999999, linewidth=120)
         print(f"==>work_idptr: \n{work_indptr}")
         print(f"==>work_info: \n{work_info}")
         print(f"==>reduce_indptr: \n{reduce_indptr}")
         print(f"==>reduce_final_map: \n{reduce_final_map}")
         print(f"==>reduce_partial_map: \n{reduce_partial_map}")
-        torch.set_printoptions(threshold=999999, linewidth=120)
 
     output = torch.empty_like(query)
     out_aiter_asm, us_aiter_asm = aiter.pa_persistent_fwd(
