@@ -160,7 +160,7 @@ def fused_gemm_a8w8_blockscale_split_cat(
     if config["NUM_KSPLIT"] > 1:
         REDUCE_BLOCK_SIZE_M = 32
         REDUCE_BLOCK_SIZE_N = 32
-        REDUCE_BLOCK_SIZE_R = triton.next_power_of_2(triton.cdiv(D * S3, triton.cdiv(N, REDUCE_BLOCK_SIZE_N)))
+        REDUCE_BLOCK_SIZE_S3 = triton.next_power_of_2(triton.cdiv(D * S3, triton.cdiv(N, REDUCE_BLOCK_SIZE_N)))
         ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
 
         grid_reduce = (
@@ -192,7 +192,7 @@ def fused_gemm_a8w8_blockscale_split_cat(
             y.stride(2),
             REDUCE_BLOCK_SIZE_M,
             REDUCE_BLOCK_SIZE_N,
-            REDUCE_BLOCK_SIZE_R,
+            REDUCE_BLOCK_SIZE_S3,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
         )
