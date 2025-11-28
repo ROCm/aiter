@@ -1086,5 +1086,5 @@ def test_pa_ps_simple():
     # print(f"PA without persistent: {us_asm_noquant:>8.2f} us")
 
 
-if __name__ == "__main__":
-    test_pa_ps_simple()
+# if __name__ == "__main__":
+#     test_pa_ps_simple()
