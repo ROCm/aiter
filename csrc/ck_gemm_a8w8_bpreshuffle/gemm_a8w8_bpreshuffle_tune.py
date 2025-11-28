@@ -407,7 +407,11 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             kernelName = (
                 "None"
                 if time == self.INVALID_TIME
-                else self.getKernelName(kernelId) if kernelName == "" else kernelName
+                else (
+                    self.getKernelName(kernelId, libtype)
+                    if kernelName == ""
+                    else kernelName
+                )
             )
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))

@@ -79,10 +79,10 @@ AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
 )
 
-#AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE = os.getenv(
+# AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE = os.getenv(
 #    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE",
 #    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_cktile_tuned_gemm.csv",
-#)
+# )
 #
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
@@ -180,14 +180,6 @@ class AITER_CONFIG(object):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
         )
-
-    #@property
-    #def AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE_FILE(self):
-    #    return self.get_config_file(
-    #        "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE",
-    #        AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_CKTILE,
-    #        "a8w8_bpreshuffle_cktile_tuned_gemm",
-    #    )
 
     def update_config_files(self, file_path: str, merge_name: str):
         path_list = file_path.split(os.pathsep) if file_path else []

@@ -292,7 +292,7 @@ def get_bpreshuffle_GEMM_config(
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
-                    f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}!"
+                    f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}, libtype is {config['libtype']}!"
                 )
             break
     if config is None:
@@ -457,14 +457,14 @@ def gemm_a8w8_bpreshuffle(
 
     # CKTile only supports bf16 dtype
     config = get_bpreshuffle_GEMM_config(
-            m,
-            n,
-            k,
-            dtypes.fp8,
-            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
-        )
+        m,
+        n,
+        k,
+        dtypes.fp8,
+        AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+    )
     if config is not None:
-        libtype = config['libtype']
+        libtype = config["libtype"]
         if libtype == "ck":
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
         elif libtype == "cktile":
