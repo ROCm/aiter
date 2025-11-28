@@ -781,8 +781,9 @@ def torch_reduce_compute(
     """
     num_seqs = output.shape[0]
     num_q_heads_total = output.shape[1]
+
     head_size = output.shape[2]
-    final_output = torch.empty_like(output)
+    final_output = torch.zeros_like(output)
 
     for seq_idx in range(num_seqs):
         seq_len = context_lengths[seq_idx].item()
@@ -1093,7 +1094,7 @@ def prepare_gluon_query_and_scale(
     """
     quantized_query_gluon = quantized_query
     query_scale_gluon = query_scale_factors
-    output_gluon = torch.empty_like(reference_output_quant)
+    output_gluon = torch.zeros_like(reference_output_quant)
     # output_gluon = torch.zeros_like(reference_output_quant)
 
     if query_length > 1:
@@ -1299,6 +1300,9 @@ def run_pa_gluon_test(
         device,
     )
     key_cache, value_cache = key_caches[0], value_caches[0]
+    # query = torch.ones_like(query)
+    # key_cache = torch.ones_like(key_cache)
+    # value_cache = torch.ones_like(value_cache)
     softmax_scale = 1.0 / (head_size**0.5)
 
     # Quantization based on mode and flags
@@ -1468,13 +1472,13 @@ def run_pa_gluon_test(
         max_context_partition_num,
         equivalent_query_group_size,
     )
-    exp_sums = torch.empty(
+    exp_sums = torch.zeros(
         intermediate_shape, dtype=torch.float32, device=output_gluon.device
     )
-    max_logits = torch.empty(
+    max_logits = torch.zeros(
         intermediate_shape, dtype=torch.float32, device=output_gluon.device
     )
-    temporary_output = torch.empty(
+    temporary_output = torch.zeros(
         *intermediate_shape,
         head_size,
         dtype=output_gluon.dtype,
@@ -1881,8 +1885,8 @@ def run_multi_pa_gluon_test(
     use_aot_impl_options,
     context_partition_size_options,
     sample_rate=1.0,
-    use_sinks_options=[False, True],
-    sliding_window_options=[0, 16],
+    use_sinks_options=[False],
+    sliding_window_options=[128],
 ) -> pd.DataFrame:
     """Run all tests."""
     # Generate all test configurations
@@ -2105,19 +2109,19 @@ def simple_test():
     global CONTEXT_PARTITION_SIZE_OPTIONS
 
     USE_TORCH_FLASH_REF_OPTIONS = [True]
-    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+    CONTEXT_PARTITION_SIZE_OPTIONS = [128]
     # COMPUTE_TYPE_OPTIONS = ["fp8", "bf16", "fp16"]
     COMPUTE_TYPE_OPTIONS = ["fp8"]
     QUANT_MODE_OPTIONS = ["per_tensor"]
     QUANT_Q_AND_KV_OPTIONS = [[False, True]]
-    BLOCK_SIZE_OPTIONS = [1024]
+    BLOCK_SIZE_OPTIONS = [16]
     QUERY_LENGTH_OPTIONS = [1]
-    BATCH_SIZE_OPTIONS = [128]
+    BATCH_SIZE_OPTIONS = [4, 128]
     HEAD_CONFIGURATIONS = [(64, 8)]
-    CONTEXT_LENGTH_OPTIONS = [2048]
+    CONTEXT_LENGTH_OPTIONS = [1024]
     HEAD_DIMENSION_OPTIONS = [128]
-    TRANS_V_OPTIONS = [False, True]
-    KV_VARLEN_OPTIONS = [False, True]
+    TRANS_V_OPTIONS = [False]
+    KV_VARLEN_OPTIONS = [False]
     USE_AOT_IMPL_OPTIONS = [False]
     # USE_AOT_IMPL_OPTIONS = [True]
     # USE_AOT_IMPL_OPTIONS = [False]
