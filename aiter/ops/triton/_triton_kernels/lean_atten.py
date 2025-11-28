@@ -281,6 +281,8 @@ def la_persistent(
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
     max_output_tile_cnt: tl.constexpr,
+    num_heads_q: tl.constexpr,
+    num_heads_k: tl.constexpr,
     gqa_group_size: tl.constexpr,
     use_64_indexing: tl.constexpr,
     RAGGED_BATCH: tl.constexpr,
@@ -414,8 +416,8 @@ def la_persistent_inner(
     xcd_id,  # The XCD the pid belongs to
     SM_SCALE,
     HEADS_PER_XCD: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
     HEAD_DIM_ORIG: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MASKED_BLOCKS: tl.constexpr,
@@ -490,11 +492,15 @@ def la_persistent_inner(
         ) * num_m_blocks + per_head_tile_idx
     else:
         if not RAGGED_BATCH:
-            group_size = tiles_per_head // batch_size
-            tile_batch_idx = (iter % tiles_per_head) // group_size
-            tile_idx = tile_head_idx * batch_size + tile_batch_idx
-            tile_iter = tile_head_idx * tiles_per_head + (tile_batch_idx * group_size)
-            tile_iter_end = tile_iter + group_size
+            # For non-causal, each output M-block processes num_n_blocks K/V tiles
+            # tiles_per_head = num_m_blocks * num_n_blocks
+            # We need to find which M-block this iter belongs to
+            local_head_iter = iter % tiles_per_head
+            m_block_idx = local_head_iter // num_n_blocks
+            tile_batch_idx = m_block_idx  # Use m_block_idx as the "batch" index for Q access
+            tile_idx = tile_head_idx * num_m_blocks + m_block_idx
+            tile_iter = tile_head_idx * tiles_per_head + m_block_idx * num_n_blocks
+            tile_iter_end = tile_iter + num_n_blocks
         else:
             tile_idx = (
                 tile_head_idx * batch_size
@@ -538,9 +544,12 @@ def la_persistent_inner(
     offs_k = tl.arange(0, HEAD_DIM)
     mask_k_cols = offs_k < HEAD_DIM_ORIG
 
-    if causal or not RAGGED_BATCH:
-        # Prefill or non RAGGED_BATCH
+    if causal:
+        # Prefill - K/V offset based on batch position
         b_seq_size = tile_batch_idx * num_n_blocks
+    elif not RAGGED_BATCH:
+        # Non-causal, non-ragged: all M-blocks attend to full K/V range starting at 0
+        b_seq_size = 0
     else:
         # Decode with RAGGED_BATCH
         tile_batch_idx = tile_idx % batch_size

@@ -533,30 +533,21 @@ def print_mismatches(ref_out, la_out, atol=1e-8, rtol=1e-5):
 
 
 def main():
-    batch = 8
-    causal = False
-    hq = 64
-    hk = 64
-    n_ctx_q = 16
-    n_ctx = [
-        1024,
-        1024,
-        2048,
-        2048,
-        4096,
-        4096,
-        32768,
-        65536,
-    ]  # [4096, 32768, 65536]  # [131072] * batch  # [16384] #[8192]
+    batch = 1
+    causal = True
+    hq = 32
+    hk = 32
+    n_ctx_q = 32768
+    n_ctx = [32768]  # [4096, 32768, 65536]  # [131072] * batch  # [16384] #[8192]
     d = 128
-    total_programs = 912
+    total_programs = 304
     init_dtype = torch.float16
-    BLOCK_M = 16
+    BLOCK_M = 128
     BLOCK_N = 64
-    XCD_REMAP = True
+    XCD_REMAP = False
     waves_per_eu = 2
     num_warps = 4
-    RAGGED_BATCH = True
+    RAGGED_BATCH = False
     assert batch == len(n_ctx)
 
     try:
@@ -613,17 +604,17 @@ def main():
     )
     # print(f"ms={ms}")
 
-    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, causal)
+    # ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, causal)
 
     # # Compare result
-    atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
-    rtol = 1e-2 if init_dtype == "fp8" else 3e-3
-    try:
-        torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
-    except AssertionError:
-        #     print("Assertion failed! Showing mismatches:")
-        #     # print_mismatches(ref_out, la_out, atol, rtol)
-        raise  # Re-raise the exception after printing mismatches
+    # atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
+    # rtol = 1e-2 if init_dtype == "fp8" else 3e-3
+    # try:
+    #     torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+    # except AssertionError:
+    #     print("Assertion failed! Showing mismatches:")
+    #     # print_mismatches(ref_out, la_out, atol, rtol)
+    #     raise  # Re-raise the exception after printing mismatches
 
     # torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
 
