@@ -893,6 +893,7 @@ namespace aiter
     __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
     int warp_id = threadIdx.x / tnum_gpu;
     int lane_id = threadIdx.x % tnum_gpu;
+    int tid = blockIdx.x * tnum_gpu + lane_id;
     const P* ptrs[ngpus];
     P* tmps[ngpus];
 #pragma unroll
@@ -903,12 +904,11 @@ namespace aiter
     }
     start_sync<ngpus>(sg, self_sg, rank);
 
-    // the case of fused_allreduce_rmsnorm does not need thread level boundary check
-    int part = size / (pack_size * tnum_gpu) / ngpus;
-    for (int bid = blockIdx.x; bid < part; bid += gridDim.x)
+    int part = size / (pack_size * ngpus);
+    for (int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
     {
       // cross device read by all warp
-      P input_reg = ptrs[warp_id][(rank * part + bid) * tnum_gpu + lane_id];
+      P input_reg = ptrs[warp_id][rank * part + idx];
       *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
       __syncthreads();
       // calculate and save in first warp
@@ -929,20 +929,21 @@ namespace aiter
             add_reg.data[j] += ck_tile::type_convert<float>(tmp_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
           }
         }
-        *(reinterpret_cast<A*>(&tmp_smem[0]) + lane_id) = add_reg;
+        P add_rslt;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          add_rslt.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+        }
+        *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
       }
       __syncthreads();
 
       // cross device store
-      P rslt;
-#pragma unroll
-      for (int i = 0; i < pack_size; ++i)
-      {
-        float sum_x = *(reinterpret_cast<float*>(&tmp_smem[0]) + lane_id * pack_size + i);
-        rslt.data[i] = ck_tile::type_convert<T>(sum_x);
-      }
-      tmps[warp_id][(rank * part + bid) * tnum_gpu + lane_id] = rslt;
+      P rslt = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
+      tmps[warp_id][rank * part + idx] = rslt;
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
   }
 
   template <int reduce_range>

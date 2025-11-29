@@ -1815,6 +1815,10 @@ class FmoeTuner(TunerCommon):
             )
             prorfiles.append(profileDF)
 
+            ## remove invalid candidate
+            profileDF = profileDF[
+                (profileDF["err"] < args.errRatio) & (profileDF["us"] != float("-inf"))
+            ]
             profileDF = profileDF.sort_values("us").drop_duplicates(
                 ["stage", "block_m"], keep="first"
             )
@@ -1895,14 +1899,6 @@ class FmoeTuner(TunerCommon):
             )
             profileDF["run_1stage"] = 0
             profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
-            ## remove invalid candidate
-            profileDF = profileDF[
-                (profileDF["err1"] < args.errRatio)
-                & (profileDF["err2"] < args.errRatio)
-            ]
-            profileDF = profileDF[
-                (profileDF["us1"] != float("inf")) & (profileDF["us2"] != float("-inf"))
-            ]
             if len(profileDF) == 0:
                 print(
                     f"no valid candidate found for {key}, please check the time or errRatio in all result file running with --profile_file"

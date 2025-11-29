@@ -87,6 +87,34 @@ if IS_ROCM:
             "module_mha_bwd",
             "module_mha_varlen_bwd",
         ]
+    elif PREBUILD_KERNELS == 2:
+        exclude_ops = [
+            # "libmha_fwd",
+            "libmha_bwd",
+            # "module_fmha_v3_fwd",
+            # "module_mha_fwd",
+            # "module_mha_varlen_fwd",
+            "module_mha_batch_prefill",
+            "module_fmha_v3_bwd",
+            "module_fmha_v3_varlen_bwd",
+            # "module_fmha_v3_varlen_fwd",
+            "module_mha_bwd",
+            "module_mha_varlen_bwd",
+        ]
+    elif PREBUILD_KERNELS == 3:
+        exclude_ops = [
+            # "libmha_fwd",
+            # "libmha_bwd",
+            # "module_fmha_v3_fwd",
+            # "module_mha_fwd",
+            # "module_mha_varlen_fwd",
+            # "module_mha_batch_prefill",
+            # "module_fmha_v3_bwd",
+            # "module_fmha_v3_varlen_bwd",
+            # "module_fmha_v3_varlen_fwd",
+            # "module_mha_bwd",
+            # "module_mha_varlen_bwd",
+        ]
 
         all_opts_args_build, prebuild_link_param = core.get_args_of_build(
             "all", exclude=exclude_ops
