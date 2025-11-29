@@ -416,7 +416,7 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
 
     // 3. "gqa_ratio"
     // gqa = (gqa_ratio <= 8) ? 8 : 16;
-    gqa = 16;
+    gqa = 0;
 
     // 4. "mtp" , 5. "mask"
     // if(qo_indptr && max_qlen > 1)
@@ -443,7 +443,7 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     
     // gqa_ratio * max_qlen <= qTile
     int required_qTile = gqa_ratio * max_qlen;
-    std::vector<int> available_qTiles = {16, 32, 40};
+    std::vector<int> available_qTiles = {16, 32, 40, 48, 64};
     int qTile = -1;
     
     for (int tile : available_qTiles) {
