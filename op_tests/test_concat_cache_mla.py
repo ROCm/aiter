@@ -118,14 +118,26 @@ def run_torch_fused(
     aiter.concat_and_cache_mla(
         k_nope, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale
     )
-
+    if is_nope_first:
+        kv_cache_swapped = kv_cache
+    else:
+        kv_cache_swapped = torch.cat(
+            [kv_cache[..., k_nope.shape[-1] :], kv_cache[..., : k_nope.shape[-1]]],
+            dim=-1,
+        )
     if out_dtype == dtypes.fp8:
         q_nope_scale = (q_nope.to(torch.float32) / q_scale.item()).to(out_dtype)
         q_pe_scale = (q_pe.to(torch.float32) / q_scale.item()).to(out_dtype)
-        q_out = torch.cat((q_nope_scale, q_pe_scale), dim=-1)
+        if is_nope_first:
+            q_out = torch.cat((q_nope_scale, q_pe_scale), dim=-1)
+        else:
+            q_out = torch.cat((q_pe_scale, q_nope_scale), dim=-1)
     else:
-        q_out = torch.cat((q_nope, q_pe), dim=-1)
-    return kv_cache, q_out
+        if is_nope_first:
+            q_out = torch.cat((q_nope, q_pe), dim=-1)
+        else:
+            q_out = torch.cat((q_pe, q_nope), dim=-1)
+    return kv_cache_swapped, q_out
 
 
 @perftest(3)
@@ -392,13 +404,13 @@ def test_fused_rope_concat_and_cache_mla(
         kv_expected_temp = ref_kv_cache.to(torch.float32) * scale
         checkAllclose(kv_result_temp, kv_expected_temp, atol=0.01, rtol=0.01)
         checkAllclose(q_out, ref_q_out)
-        if block_size == 1:
+        if block_size == 1 and is_nope_first:
             checkAllclose(triton_q_out, ref_q_out)
             checkAllclose(triton_temp.to(torch.float32) * scale, kv_expected_temp)
     else:
         checkAllclose(kv_cache, ref_kv_cache)
         checkAllclose(q_out, ref_q_out)
-        if block_size == 1:
+        if block_size == 1 and is_nope_first:
             checkAllclose(triton_q_out, ref_q_out)
             checkAllclose(triton_temp, ref_kv_cache)
     ret["triton_us"] = triton_us

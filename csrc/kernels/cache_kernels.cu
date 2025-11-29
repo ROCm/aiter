@@ -1367,7 +1367,7 @@ template <typename scalar_t, typename cache_t, bool IS_NEOX>
       const int64_t q_pe_stride, const int64_t key_stride,
       const int64_t q_out_stride, const int64_t kv_cache_offset)
   {
-    const int embed_dim = 32;//rot_dim / 2;
+    const int embed_dim = rot_dim / 2;
     // const scalar_t *cos_ptr = cache_ptr;
     // const scalar_t *sin_ptr = cache_ptr + embed_dim;
 
@@ -1380,22 +1380,21 @@ template <typename scalar_t, typename cache_t, bool IS_NEOX>
 
     for (int i = threadIdx.x; i < nq; i += blockDim.x)
     {
-      const int head_idx = i / 32;//embed_dim;
+      const int head_idx = i / embed_dim;
       const int64_t token_head_in = token_idx * q_pe_stride + head_idx * rot_dim;
       const int64_t token_head = token_idx * q_out_stride + head_idx * head_size;
-      const int rot_offset = i % 32;//embed_dim;
+      const int rot_offset = i % embed_dim;
       // to opt -> vec
       apply_token_rotary_embedding<scalar_t, query_t, IS_NEOX>(
           q_pe + token_head_in, q_out + token_head, cos_ptr, sin_ptr, inv_qscale, rot_offset, embed_dim);
     }
     const int nk = num_kv_heads * embed_dim;
-    //for (int i = threadIdx.x; i < nk; i += blockDim.x)
-    if (threadIdx.x < nk)
+    for (int i = threadIdx.x; i < nk; i += blockDim.x) 
     {
-      //const int head_idx = i / embed_dim;
-      const int64_t token_head_in = token_idx * key_stride;// + head_idx * embed_dim;
+      const int head_idx = i / embed_dim;
+      const int64_t token_head_in = token_idx * key_stride + head_idx * embed_dim;
       const int64_t token_head = kv_cache_offset;
-      const int rot_offset = threadIdx.x;// % embed_dim;
+      const int rot_offset = i % embed_dim;
       apply_token_rotary_embedding<scalar_t, cache_t, IS_NEOX>(
           k_pe + token_head_in, kv_cache + token_head, cos_ptr, sin_ptr, inv_kscale, rot_offset, embed_dim);
     }
@@ -1701,6 +1700,10 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
       static constexpr int32_t ooba_o = 4 / sizeof(cache_t);
       auto out_offset = block_idx * block_stride + block_offset * entry_stride;
       const int64_t qH_per_kH = num_heads;
+      int32_t nope_offset = 0;
+      if (!is_nope_first) {
+        nope_offset = pe_dim;
+      }
       //bool is_head_zero = threadIdx.x / kv_lora_rank == 0;
       auto copy = [&](const scalar_t* __restrict__ src, cache_t* __restrict__ dst,
                     int src_stride, int dst_stride, int size, int offset) {
@@ -1761,7 +1764,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
         }
       };
       //if (is_head_zero) {
-        copy(kv_c, kv_cache, kv_c_stride, block_stride, kv_lora_rank, 0);
+        copy(kv_c, kv_cache, kv_c_stride, block_stride, kv_lora_rank, nope_offset);
       //}
 //
       const float inverted_qscale = 1.0f / *q_scale;
@@ -1794,13 +1797,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           size_t vec_dst_idx = (vec_idx - vec_stride) % kv_lora_vec;
           if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
               buffer_o.template set_raw(
-                   (head_idx * head_size) + vec_dst_idx * vec_size_o,
+                   (head_idx * head_size) + vec_dst_idx * vec_size_o + nope_offset,
                   0,
                   true,
                   vec_cur.template get_as<query_t>());
           } else {
               buffer_o.template set(
-                  (head_idx * head_size) + vec_dst_idx * vec_size_o,
+                  (head_idx * head_size) + vec_dst_idx * vec_size_o  + nope_offset,
                   0,
                   true,
                   ck_tile::vec_convert<query_t, scalar_t, vec_size_i>(vec_cur, inverted_qscale)
@@ -1814,13 +1817,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           size_t vec_dst_idx = (vec_idx - vec_stride) % kv_lora_vec;
           if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
               buffer_o.template set_raw(
-                  (head_idx * head_size) + vec_dst_idx * vec_size_o,
+                  (head_idx * head_size) + vec_dst_idx * vec_size_o  + nope_offset,
                   0,
                   true,
                   vec_cur.template get_as<query_t>());
           } else {
               buffer_o.template set(
-                  (head_idx * head_size) + vec_dst_idx * vec_size_o,
+                  (head_idx * head_size) + vec_dst_idx * vec_size_o + nope_offset,
                   0,
                   true,
                   ck_tile::vec_convert<query_t, scalar_t, vec_size_i>(vec_cur, inverted_qscale)
@@ -1887,8 +1890,12 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
       const int64_t qH_per_kH = num_heads;
       const int32_t oob_i             = (kv_lora_rank + ooba_i - 1) / ooba_i * ooba_i;
       const int32_t oob_o             = (kv_lora_rank + ooba_o - 1) / ooba_o * ooba_o;
+      int32_t nope_offset = 0;
+      if constexpr (!is_nope_first) {
+        nope_offset = pe_dim;
+      }
       auto const* ptr_i               = reinterpret_cast<scalar_t const*>(kv_c + token_idx * kv_c_stride);
-      auto* ptr_o                     = reinterpret_cast<cache_t*>(kv_cache + out_offset);
+      auto* ptr_o                     = reinterpret_cast<cache_t*>(kv_cache + out_offset + nope_offset);
       auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_i, oob_i);
       buffer_i.init_raw();
       auto buffer_o = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_o, oob_o);
@@ -1910,6 +1917,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
       const int32_t q_oob_i             = (size + ooba_i - 1) / ooba_i * ooba_i;
       const int32_t q_oob_o             = (num_heads * head_size + q_ooba_o - 1) / q_ooba_o * q_ooba_o;
       auto const* q_ptr_i               = reinterpret_cast<scalar_t const*>(q_nope + token_idx * q_nope_stride);
+
       auto* q_ptr_o                     = reinterpret_cast<query_t*>(q_out + q_out_stride * token_idx);
       auto q_buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(q_ptr_i, q_oob_i);
       q_buffer_i.init_raw();
@@ -1988,13 +1996,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
 
           if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
               q_buffer_o.template set_raw(
-                   (head_idx * head_size) + vec_dst_idx * vec_size_o,
+                   (head_idx * head_size) + vec_dst_idx * vec_size_o + nope_offset,
                   0,
                   true,
                   vec_cur.template get_as<query_t>());
           } else {
               q_buffer_o.template set(
-                  (head_idx * head_size) + vec_dst_idx * vec_size_o,
+                  (head_idx * head_size) + vec_dst_idx * vec_size_o  + nope_offset,
                   0,
                   true,
                   ck_tile::vec_convert<query_t, scalar_t, vec_size_i>(vec_cur, inverted_qscale)
@@ -2021,13 +2029,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           size_t vec_dst_idx = (vec_idx - vec_stride) % kv_lora_vec;
           if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
               q_buffer_o.template set_raw(
-                   (head_idx * head_size) + vec_dst_idx * vec_size_o,
+                   (head_idx * head_size) + vec_dst_idx * vec_size_o + nope_offset,
                   0,
                   true,
                   vec_cur.template get_as<query_t>());
           } else {
               q_buffer_o.template set(
-                  (head_idx * head_size) + vec_dst_idx * vec_size_o,
+                  (head_idx * head_size) + vec_dst_idx * vec_size_o + nope_offset,
                   0,
                   true,
                   ck_tile::vec_convert<query_t, scalar_t, vec_size_i>(vec_cur, inverted_qscale)
@@ -2041,13 +2049,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           size_t vec_dst_idx = (vec_idx - vec_stride) % kv_lora_vec;
           if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
               q_buffer_o.template set_raw(
-                  (head_idx * head_size) + vec_dst_idx * vec_size_o,
+                  (head_idx * head_size) + vec_dst_idx * vec_size_o + nope_offset,
                   0,
                   true,
                   vec_cur.template get_as<query_t>());
           } else {
               q_buffer_o.template set(
-                  (head_idx * head_size) + vec_dst_idx * vec_size_o,
+                  (head_idx * head_size) + vec_dst_idx * vec_size_o + nope_offset,
                   0,
                   true,
                   ck_tile::vec_convert<query_t, scalar_t, vec_size_i>(vec_cur, inverted_qscale)
@@ -2954,8 +2962,7 @@ void fused_qk_rope_concat_and_cache_mla(
     dim3 block(256);
     DISPATCH_BY_KV_CACHE_QUERY_DTYPE(kv_c.dtype(), kv_cache_dtype, q_out_type,
                                CALL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA);
-  }
-  else {
+ } else {
     dim3 grid(num_tokens);
     dim3 block(std::min<int64_t>(kv_lora_rank*num_heads, 2048)/8);
     DISPATCH_BY_KV_CACHE_QUERY_DTYPE(kv_c.dtype(), kv_cache_dtype, q_out_type,
