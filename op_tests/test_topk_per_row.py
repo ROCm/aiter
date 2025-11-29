@@ -165,7 +165,12 @@ def run_top_k_per_row_decode(
 
 
 @benchmark()
-def test_top_k_per_row_prefill(num_rows: int, num_prefix: int, top_k: int) -> dict:
+def test_top_k_per_row_prefill(
+    num_rows: int, 
+    num_prefix: int, 
+    top_k: int, 
+    data_generation: str = "random"
+) -> dict:
     """
     Test topk_per_row_prefill.
     """
@@ -174,7 +179,7 @@ def test_top_k_per_row_prefill(num_rows: int, num_prefix: int, top_k: int) -> di
 
     # Create test data
     row_starts, row_ends = create_row_boundaries(num_rows, num_prefix)
-    logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
+    logits = create_random_logits(row_starts, row_ends, torch.float32, 42, data_generation)
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
@@ -340,11 +345,12 @@ args = parser.parse_args()
 
 
 df = []
-for m in args.context_len:
-    for k in args.top_k:
-        for num_prefix in args.num_prefix:
-            ret = test_top_k_per_row_prefill(m, num_prefix, k)
-            df.append(ret)
+for data_generation in args.data_generation:
+    for m in args.context_len:
+        for k in args.top_k:
+            for num_prefix in args.num_prefix:
+                ret = test_top_k_per_row_prefill(m, num_prefix, k, data_generation)
+                df.append(ret)
 
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary for top_k_per_row_prefill kernel:\n{df}")
