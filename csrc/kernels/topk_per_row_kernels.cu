@@ -111,7 +111,7 @@ template <typename T, int BitsPerPass>
 __device__ constexpr int calc_start_bit(int pass)
 {
     int start_bit = static_cast<int>(sizeof(T) * 8) - (pass + 1) * BitsPerPass;
-    int r = start_bit < 0 ? 0 : start_bit;
+    int r         = start_bit < 0 ? 0 : start_bit;
     return r;
 }
 
@@ -127,13 +127,15 @@ template <typename T>
 __device__ typename hipcub::Traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
 {
     auto bits = reinterpret_cast<typename hipcub::Traits<T>::UnsignedBits&>(key);
-    if constexpr (std::is_same_v<T, float>){
+    if constexpr(std::is_same_v<T, float>)
+    {
         // TODO: hardcoded for select_min is false!
         uint32_t mask = (key < 0) ? 0 : 0x7fffffff;
         return bits ^ mask;
     }
-    else {
-        bits      = hipcub::Traits<T>::TwiddleIn(bits);
+    else
+    {
+        bits = hipcub::Traits<T>::TwiddleIn(bits);
         if(!select_min)
         {
             bits = ~bits;
@@ -625,7 +627,8 @@ __device__ void last_filter(T const* in_buf,
     IdxT* p_out_cnt              = &counter->out_cnt;
     IdxT* p_out_back_cnt         = &counter->out_back_cnt;
     IdxT* p_equal                = out_idx + k - num_of_kth_needed;
-    if(in_idx_buf) {
+    if(in_idx_buf)
+    {
         for(IdxT i = threadIdx.x; i < current_len; i += blockDim.x)
         {
             const T value   = in_buf[i];
@@ -660,7 +663,9 @@ __device__ void last_filter(T const* in_buf,
                 }
             }
         }
-    }else {
+    }
+    else
+    {
         for(IdxT i = threadIdx.x; i < current_len; i += blockDim.x)
         {
             const T value   = in_buf[i];
@@ -1192,12 +1197,13 @@ __device__ void filter_and_histogram_for_one_block(T const* in_buf,
         auto const kth_value_bits    = counter->kth_value_bits;
         int const previous_start_bit = calc_start_bit<T, BitsPerPass>(pass - 1);
 
-        if(in_idx_buf) {
+        if(in_idx_buf)
+        {
             for(IdxT i = threadIdx.x; i < previous_len; i += blockDim.x)
             {
                 const T value            = in_buf[i];
                 auto const previous_bits = (twiddle_in(value, select_min) >> previous_start_bit)
-                                        << previous_start_bit;
+                                           << previous_start_bit;
                 if(previous_bits == kth_value_bits)
                 {
 
@@ -1218,12 +1224,14 @@ __device__ void filter_and_histogram_for_one_block(T const* in_buf,
                     out_idx[pos] = in_idx_buf[i];
                 }
             }
-        } else {
+        }
+        else
+        {
             for(IdxT i = threadIdx.x; i < previous_len; i += blockDim.x)
             {
                 const T value            = in_buf[i];
                 auto const previous_bits = (twiddle_in(value, select_min) >> previous_start_bit)
-                                        << previous_start_bit;
+                                           << previous_start_bit;
                 if(previous_bits == kth_value_bits)
                 {
 
@@ -1389,6 +1397,160 @@ __global__ void radix_topk_one_block_kernel(T const* in,
     }
 }
 
+template <typename T,
+          typename IdxT,
+          int BitsPerPass,
+          int BlockSize,
+          bool WRITE_TOPK_VALUES,
+          bool prioritize_smaller_indice = false>
+__global__ void radix_topk_one_block_one_pass_kernel(T const* in,
+                                                     IdxT const* in_idx,
+                                                     const int64_t len,
+                                                     const IdxT* rowStarts,
+                                                     const IdxT* rowEnds,
+                                                     const IdxT k,
+                                                     T* out,
+                                                     IdxT* out_idx,
+                                                     bool const select_min)
+{
+    constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
+    __shared__ Counter<T, IdxT> counter;
+    __shared__ IdxT histogram[num_buckets];
+
+    const int64_t batch_id = blockIdx.x;
+    const IdxT rowStart    = rowStarts[batch_id];
+    const IdxT rowEnd      = rowEnds[batch_id];
+    const IdxT row_len     = rowEnd - rowStart;
+    if(threadIdx.x == 0)
+    {
+        counter.k              = k;
+        counter.len            = row_len;
+        counter.previous_len   = row_len;
+        counter.kth_value_bits = 0;
+        counter.out_cnt        = 0;
+        counter.out_back_cnt   = 0;
+    }
+    __syncthreads();
+
+    in += batch_id * len;
+    if(in_idx)
+    {
+        in_idx += batch_id * len;
+    }
+
+    out += batch_id * k;
+    out_idx += batch_id * k;
+    if(row_len <= k)
+    {
+        in += rowStart;
+        for(int rowIt = threadIdx.x; rowIt < k; rowIt += BlockSize)
+        {
+            out_idx[rowIt] = rowIt < row_len ? rowIt + rowStart : -1;
+            if(WRITE_TOPK_VALUES)
+            {
+                out[rowIt] = rowIt < row_len ? in[rowIt] : 0;
+            }
+        }
+        return;
+    }
+
+    {
+
+        const IdxT current_len = counter.len;
+        const IdxT current_k   = counter.k;
+        IdxT previous_len      = counter.previous_len;
+
+        for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+        {
+            histogram[i] = 0;
+        }
+        IdxT* p_filter_cnt = &counter.filter_cnt;
+        if(threadIdx.x == 0)
+        {
+            *p_filter_cnt = 0;
+        }
+        __syncthreads();
+
+        // histogram calculation
+        unsigned const mask = (1 << BitsPerPass) - 1;
+        auto f              = [select_min, mask](T value, IdxT) {
+            int bucket = calc_bucket<T, BitsPerPass>(value, 0, mask, select_min);
+            atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+        };
+        vectorized_process(threadIdx.x, blockDim.x, in, previous_len, f);
+        __syncthreads();
+
+        scan<IdxT, BitsPerPass, BlockSize>(histogram);
+        __syncthreads();
+
+        // choose bucket
+        for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+        {
+            IdxT prev = (i == 0) ? 0 : histogram[i - 1];
+            IdxT cur  = histogram[i];
+
+            // one and only one thread will satisfy this condition, so counter is
+            // written by only one thread
+            if(prev < k && cur >= k)
+            {
+                counter.k   = k - prev;   // how many values still are there to find
+                counter.len = cur - prev; // number of values in next pass
+                typename hipcub::Traits<T>::UnsignedBits bucket = i;
+                counter.kth_value_bits                          = bucket;
+            }
+        }
+
+        if(threadIdx.x == 0)
+        {
+            counter.previous_len = current_len;
+        }
+        __syncthreads();
+
+        auto const kth_value_bits = counter.kth_value_bits;
+
+        // last filtering
+        const IdxT num_of_kth_needed = counter.k;
+        IdxT* p_out_cnt              = &counter.out_cnt;
+        IdxT* p_out_back_cnt         = &counter.out_back_cnt;
+
+        for(IdxT i = threadIdx.x; i < current_len; i += blockDim.x)
+        {
+            const T value   = in[i];
+            auto const bits = twiddle_in(value, select_min) & mask;
+
+            if(bits < kth_value_bits)
+            {
+                IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+                if(WRITE_TOPK_VALUES)
+                {
+                    out[pos] = value;
+                }
+                // For one-block version, `in_idx_buf` could be nullptr at pass 0.
+                // For non one-block version, if writing has been skipped, `in_idx_buf`
+                // could be nullptr if `in_buf` is `in`
+                out_idx[pos] = i;
+            }
+            else if(bits == kth_value_bits)
+            {
+                IdxT new_idx  = i;
+                IdxT back_pos = atomicAdd(p_out_back_cnt, static_cast<IdxT>(1));
+                if(back_pos < num_of_kth_needed)
+                {
+                    IdxT pos = k - 1 - back_pos;
+                    if(WRITE_TOPK_VALUES)
+                    {
+                        out[pos] = value;
+                    }
+                    if constexpr(!prioritize_smaller_indice)
+                    {
+                        out_idx[pos] = new_idx;
+                    }
+                }
+            }
+        }
+    }
+}
+
 inline size_t calc_aligned_size(std::vector<size_t> const& sizes)
 {
     const size_t ALIGN_BYTES = 256;
@@ -1539,6 +1701,28 @@ void standalone_stable_radix_topk_(void* buf,
     }
 }
 
+#define LAUNCH_TOPK_ONE_BLOCK_ONE_PASS_KERNEL(BitsOnePass)                                   \
+    radix_topk_one_block_one_pass_kernel<T, IdxT, BitsOnePass, BlockSize, WRITE_TOPK_VALUES> \
+        <<<batch_size, BlockSize, 0, stream>>>(                                              \
+            in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min);
+
+#define FOR_EACH_BITS(M) \
+    M(1)                 \
+    M(2)                 \
+    M(3)                 \
+    M(4)                 \
+    M(5)                 \
+    M(6)                 \
+    M(7)                 \
+    M(8)                 \
+    M(9)                 \
+    M(10)                \
+    M(11)                \
+    M(12)                
+
+#define GEN_CASE(B) \
+    case B: LAUNCH_TOPK_ONE_BLOCK_ONE_PASS_KERNEL(B); return;
+
 template <typename T, typename IdxT, int BitsPerPass, int BlockSize, bool WRITE_TOPK_VALUES>
 void standalone_stable_radix_topk_one_block_(void* buf,
                                              size_t& buf_size,
@@ -1552,10 +1736,21 @@ void standalone_stable_radix_topk_one_block_(void* buf,
                                              T* out,
                                              IdxT* out_idx,
                                              bool select_min,
+                                             int msb_diff,
                                              hipStream_t stream,
                                              bool sorted = false)
 {
     static_assert(calc_num_passes<T, BitsPerPass>() > 1);
+
+    if(msb_diff <= 12) // shared memory limit
+    {
+        switch(msb_diff)
+        {
+            FOR_EACH_BITS(GEN_CASE)
+        default: break;
+        }
+        return;
+    }
 
     char* bufs         = nullptr;
     IdxT* topk_out_idx = nullptr;
@@ -1597,6 +1792,7 @@ void standalone_stable_radix_11bits(void* buf,
                                     T* out,
                                     IdxT* out_idx,
                                     bool greater,
+                                    int msb_diff,
                                     hipStream_t stream)
 {
     constexpr int items_per_thread   = 32;
@@ -1617,6 +1813,7 @@ void standalone_stable_radix_11bits(void* buf,
             out,
             out_idx,
             !greater,
+            msb_diff,
             stream,
             sorted);
     }
@@ -1642,6 +1839,7 @@ void standalone_stable_radix_11bits(void* buf,
                 out,
                 out_idx,
                 !greater,
+                msb_diff,
                 stream,
                 sorted);
         }
@@ -2241,6 +2439,7 @@ int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0)
             out_val,
             out_idx,
             !is_largest,
+            32,
             0,
             sorted);
     }
@@ -2287,6 +2486,20 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
     auto options            = torch::TensorOptions().dtype(torch::kUInt8).device(logits.device());
     torch::Tensor workspace = torch::empty({workspace_size}, options);
 
+    // global min and max. TODO: is last row guaranteed to compute diff?
+    auto global_minmax = torch::aminmax(logits.index({numRows - 1, torch::indexing::Slice()}));
+    auto float_to_sortable_uint_host = [](float x) {
+        uint32_t bits;
+        std::memcpy(&bits, &x, sizeof(float));
+        bits = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
+        return bits;
+    };
+    auto global_min = float_to_sortable_uint_host(std::get<0>(global_minmax).item<float>());
+    auto global_max = float_to_sortable_uint_host(std::get<1>(global_minmax).item<float>());
+
+    uint32_t diff = global_min ^ global_max;
+    int msb_diff  = 32 - __builtin_clz(diff);
+
     if(values.has_value())
     {
         aiter::standalone_stable_radix_11bits<float, int, true, true>(
@@ -2301,6 +2514,7 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
             values->data_ptr<float>(),
             indices.data_ptr<int>(),
             is_largest,
+            msb_diff,
             stream);
     }
     else
@@ -2317,6 +2531,7 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
             nullptr,
             indices.data_ptr<int>(),
             is_largest,
+            msb_diff,
             stream);
     }
 }
