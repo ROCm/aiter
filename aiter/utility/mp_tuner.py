@@ -180,6 +180,8 @@ def mp_tuner(
     mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
     parallel_num = mp_num
     start_idx = 0
+    if not tasks:
+        return []
     if mp_num == 1 & fast_mode == 0:
         shape_grouped = True
     pool = mp.Pool(processes=parallel_num)
@@ -188,8 +190,6 @@ def mp_tuner(
     # time.sleep(2)
     task_group = []
     # dispatch per shape to one pid
-    if not tasks:
-        return []
     if shape_grouped:
         start = 0
         for kernel_nums, _ in in_datas:
@@ -208,6 +208,7 @@ def mp_tuner(
         ref_data_index = np.searchsorted(
             cumulative, np.arange(len(task_group)), side="right"
         )
+
     rets = [
         pool.apply_async(
             work_group,
@@ -221,7 +222,6 @@ def mp_tuner(
         )
         for k in range(len(task_group))
     ]
-
     pool.close()
     pool.join()
 
@@ -231,4 +231,5 @@ def mp_tuner(
         result = list(itertools.chain.from_iterable(el.get() for el in rets))
     else:
         result = [el.get()[0] for el in rets]
+
     return result

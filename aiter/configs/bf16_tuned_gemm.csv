@@ -1,9 +1,8 @@
-M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,splitK,us,kernelName,err_ratio,tflops,bw
-64,256,5120,False,torch.bfloat16,torch.float32,False,80,asm,1,10,8.3,_ZN5aiter28bf16gemm_outf32_tn_32x64_pf3E,0.0,20.21,402.69
-80,256,5120,False,torch.bfloat16,torch.float32,False,80,asm,2,10,8.8,_ZN5aiter28bf16gemm_outf32_tn_48x64_pf3E,0.0,23.83,400.29
-128,256,5120,False,torch.bfloat16,torch.float32,False,80,asm,3,10,11.2,_ZN5aiter28bf16gemm_outf32_tn_64x64_pf3E,0.0,29.96,362.79
-150,256,5120,False,torch.bfloat16,torch.float32,False,80,asm,2,5,11.7,_ZN5aiter28bf16gemm_outf32_tn_48x64_pf3E,0.0,33.61,368.46
-192,256,5120,False,torch.bfloat16,torch.float32,False,80,asm,5,10,12.8,_ZN5aiter28bf16gemm_outf32_tn_96x64_pf3E,0.0,39.32,373.76
-220,256,5120,False,torch.bfloat16,torch.float32,False,80,asm,3,5,13.1,_ZN5aiter28bf16gemm_outf32_tn_64x64_pf3E,0.0,44.02,389.28
-256,256,5120,False,torch.bfloat16,torch.float32,False,80,asm,3,5,14.4,_ZN5aiter28bf16gemm_outf32_tn_64x64_pf3E,0.0,46.6,382.29
-384,256,5120,False,torch.bfloat16,torch.float32,False,80,asm,5,5,19.7,_ZN5aiter28bf16gemm_outf32_tn_96x64_pf3E,0.0,51.1,352.63
+cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,kernelName,err_ratio,tflops,bw
+80,64,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,1,10,9.3967,_ZN5aiter30bf16gemm_fp32bf16_tn_32x64_pf3E,0.0,17.85,355.69
+80,80,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,2,10,9.7635,_ZN5aiter30bf16gemm_fp32bf16_tn_48x64_pf3E,0.0,21.48,360.79
+80,128,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,3,10,10.8196,_ZN5aiter30bf16gemm_fp32bf16_tn_64x64_pf3E,0.0,31.01,375.54
+80,150,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,2,5,13.2734,_ZN5aiter30bf16gemm_fp32bf16_tn_48x64_pf3E,0.0,29.62,324.79
+80,192,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,2,5,15.0013,_ZN5aiter30bf16gemm_fp32bf16_tn_48x64_pf3E,0.0,33.55,318.91
+80,220,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,3,5,14.6675,_ZN5aiter30bf16gemm_fp32bf16_tn_64x64_pf3E,0.0,39.32,347.67
+80,256,256,5120,False,torch.bfloat16,torch.float32,False,False,asm,3,5,16.2047,_ZN5aiter30bf16gemm_fp32bf16_tn_64x64_pf3E,0.0,41.41,339.72
