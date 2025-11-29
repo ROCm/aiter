@@ -3,6 +3,7 @@
 
 from typing import Optional
 import torch
+from torch import Tensor
 import triton
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton._triton_kernels.batched_gemm_afp4wfp4_pre_quant import (
@@ -11,6 +12,8 @@ from aiter.ops.triton._triton_kernels.batched_gemm_afp4wfp4_pre_quant import (
     _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_string
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
@@ -22,33 +25,29 @@ def set_use_gemm_splitk_bf16(value: bool):
     global _USE_GEMM_SPLITK_BF16
     _USE_GEMM_SPLITK_BF16 = value
 
-
-def batched_gemm_afp4wfp4_pre_quant(
-    x,
-    w,
-    w_scales,
-    dtype: Optional[float] = torch.bfloat16,
+def batched_gemm_afp4wfp4_pre_quant_fake_tensor(
+    x: Tensor,
+    w: Tensor,
+    w_scales: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-):
-    """
-    Computes batched FP4 matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.
-    X is quantized to MXFP4 during computation, W is pre-quantized FP4.
+    config: Optional[str] = None,
+) -> Tensor:
+    if y is None:
+        Bx, M, _ = x.shape
+        _, N, _ = w.shape
+        return torch.empty((Bx, M, N), dtype=dtype, device=x.device)
+    return y
 
-    Args:
-        x (torch.Tensor): Higher precision input batch with shape (B, M, K) (BF16 or FP16).
-            Quantized to MXFP4 on-the-fly during GEMM.
-        w (torch.Tensor): FP4 E2M1 weight batch with shape (B, N, K), internally transposed.
-        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (B, N, K//32).
-            One scale per 32 elements in K dimension.
-        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
-        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (B, M, N).
-        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
-            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
-
-    Returns:
-        torch.Tensor: Output batch with shape (B, M, N).
-    """
+@torch_compile_guard(gen_fake=batched_gemm_afp4wfp4_pre_quant_fake_tensor)
+def batched_gemm_afp4wfp4_pre_quant_(
+    x: Tensor,
+    w: Tensor,
+    w_scales: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[str] = None,
+) -> Tensor:
     _LOGGER.info(
         f"BATCHED_GEMM_AFP4WFP_PREQUANT: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w.shape)}"
     )
@@ -61,8 +60,13 @@ def batched_gemm_afp4wfp4_pre_quant(
     assert Bx == Bw == By
     Batch = Bx
 
+    if y is None:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
+
     if config is None:
         config = _get_config(M, N, K)
+    else:
+        config = deserialize_string(config)
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
@@ -154,3 +158,32 @@ def batched_gemm_afp4wfp4_pre_quant(
             config["NUM_KSPLIT"],
         )
     return y
+
+def batched_gemm_afp4wfp4_pre_quant(
+    x: Tensor,
+    w: Tensor,
+    w_scales: Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+) -> Tensor:
+    """
+    Computes batched FP4 matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.
+    X is quantized to MXFP4 during computation, W is pre-quantized FP4.
+
+    Args:
+        x (torch.Tensor): Higher precision input batch with shape (B, M, K) (BF16 or FP16).
+            Quantized to MXFP4 on-the-fly during GEMM.
+        w (torch.Tensor): FP4 E2M1 weight batch with shape (B, N, K), internally transposed.
+        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (B, N, K//32).
+            One scale per 32 elements in K dimension.
+        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (B, M, N).
+        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
+
+    Returns:
+        torch.Tensor: Output batch with shape (B, M, N).
+    """
+    config_hashable = serialize_dict(config) if config else None
+    return batched_gemm_afp4wfp4_pre_quant_(x, w, w_scales, dtype, y, config_hashable)
