@@ -530,11 +530,11 @@ def acc_test_cudagraph_on(
 #     for i in range(len(ar_rslt)):
 #         checkAllclose(cpu_rslt[i], ar_rslt[i].to(ref))
 
-l_dtype = ["bf16"]
-l_shape = [(64, 7168)]
+l_dtype = ["fp16", "bf16"]
+l_shape = [(13, 512), (13, 1024), (13, 2048), (17, 4096), (17, 7168), (19, 8192)]
 l_tp = [8]
 l_pp = [1]
-l_graph = [True, False]
+l_graph = [False, True]
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(

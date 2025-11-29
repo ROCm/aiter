@@ -998,7 +998,7 @@ namespace aiter
     for (int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
       float square_sum = 0.0f;
-      P rmsnorm_inp[n_loop];
+      A rms_inp_f32[n_loop];
       P w_arr[n_loop];
 #pragma unroll
       for (int n_iter = 0; n_iter < n_loop; ++n_iter)
@@ -1014,7 +1014,7 @@ namespace aiter
           float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
           float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
           float rms_inp = res_inp + ar_out;
-          rmsnorm_inp[n_iter].data[i] = ck_tile::type_convert<T>(rms_inp);
+          rms_inp_f32[n_iter].data[i] = rms_inp;
           reduce_pack.data[i] = rms_inp * rms_inp;
         }
         square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
@@ -1028,16 +1028,18 @@ namespace aiter
       for (int n_iter = 0; n_iter < n_loop; ++n_iter)
       {
         P rmsnorm_rslt;
+        P rmsnorm_inp;
 #pragma unroll
         for (int i = 0; i < pack_size; ++i)
         {
-          float x_f32 = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
+          float x_f32 = rms_inp_f32[n_iter].data[i];
           float w_f32 = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+          rmsnorm_inp.data[i] = ck_tile::type_convert<T>(x_f32);
           rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
         }
         int write_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
         *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
-        *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp[n_iter];
+        *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
       }
     }
   }
@@ -1068,7 +1070,7 @@ namespace aiter
     for (int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
       float square_sum = 0.0f;
-      P rmsnorm_inp[n_loop];
+      A rms_inp_f32[n_loop];
       P w_arr[n_loop];
 #pragma unroll
       for (int n_iter = 0; n_iter < n_loop; ++n_iter)
@@ -1086,7 +1088,7 @@ namespace aiter
             float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
             float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
             float rms_inp = ar_out + res_inp;
-            rmsnorm_inp[n_iter].data[i] = ck_tile::type_convert<T>(rms_inp);
+            rms_inp_f32[n_iter].data[i] = rms_inp;
             reduce_pack.data[i] = rms_inp * rms_inp;
           }
           square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
@@ -1103,16 +1105,18 @@ namespace aiter
         if (n_iter * tnum + threadIdx.x < (n / pack_size))
         {
           P rmsnorm_rslt;
+          P rmsnorm_inp;
 #pragma unroll
           for (int i = 0; i < pack_size; ++i)
           {
-            float x_f32 = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
+            float x_f32 = rms_inp_f32[n_iter].data[i];
             float w_f32 = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+            rmsnorm_inp.data[i] = ck_tile::type_convert<T>(x_f32);
             rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
           }
           int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
           *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
-          *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp[n_iter];
+          *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
         }
       }
     }
@@ -1142,7 +1146,7 @@ namespace aiter
     for (int bid = blockIdx.x * warp_num + warp_id; bid < m; bid += gridDim.x * warp_num)
     {
       float square_sum = 0.0f;
-      P rmsnorm_inp[n_loop];
+      A rms_inp_f32[n_loop];
       P w_arr[n_loop];
 #pragma unroll
       for (int n_iter = 0; n_iter < n_loop; ++n_iter)
@@ -1158,7 +1162,7 @@ namespace aiter
           float ar_out = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
           float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
           float rms_inp = ar_out + res_inp;
-          rmsnorm_inp[n_iter].data[i] = ck_tile::type_convert<T>(rms_inp);
+          rms_inp_f32[n_iter].data[i] = rms_inp;
           reduce_pack.data[i] = rms_inp * rms_inp;
         }
         float tmp_sum = packReduce<AddFunctor, float, pack_size>(reduce_pack);
@@ -1170,16 +1174,18 @@ namespace aiter
       for (int n_iter = 0; n_iter < n_loop; ++n_iter)
       {
         P rmsnorm_rslt;
+        P rmsnorm_inp;
 #pragma unroll
         for (int i = 0; i < pack_size; ++i)
         {
-          float x_f32 = ck_tile::type_convert<float>(rmsnorm_inp[n_iter].data[i]);
+          float x_f32 = rms_inp_f32[n_iter].data[i];
           float w_f32 = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+          rmsnorm_inp.data[i] = ck_tile::type_convert<T>(x_f32);
           rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
         }
         int write_idx = bid * 64 * n_loop + n_iter * 64 + lane_id;
         *(reinterpret_cast<P*>(results) + write_idx) = rmsnorm_rslt;
-        *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp[n_iter];
+        *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
       }
     }
   }
