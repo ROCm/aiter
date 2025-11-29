@@ -3,6 +3,7 @@
 
 import argparse
 import itertools
+import numpy as np
 import random
 from typing import List, Optional, Tuple, Union
 
@@ -316,7 +317,9 @@ def test_pa_mtp(
     block_size: int,
     dtype: torch.dtype,
     qlen: int,
-    varlen: bool,
+    varlen: bool = False,
+    load_metadata: bool = False,
+    dump_metadata: bool = False,
 ) -> dict:
     ret = {}
     seed = 0
@@ -367,6 +370,14 @@ def test_pa_mtp(
         block_tables_lst.append(block_table)
 
     block_tables = torch.tensor(block_tables_lst, dtype=torch.int)
+
+    # convert input for pa persistent interface
+    actual_blocks = (seq_lens_kv + block_size - 1) // block_size
+    kv_indptr[1 : batch_size + 1] = torch.cumsum(actual_blocks, dim=0)
+    kv_indices_lst = []
+    for i in range(0, batch_size):
+        kv_indices_lst += block_tables_lst[i][: actual_blocks[i]]
+    kv_indices = torch.tensor(kv_indices_lst, dtype=torch.int)
 
     # Create the KV caches.
     k_caches, v_caches = kv_cache_factory(
@@ -430,44 +441,52 @@ def test_pa_mtp(
     # ret["us_asm_bf16"] = us_asm_noquant
     # ret["err_asm_bf16"] = err_noquant
 
-    if True:
-        (
-            (work_meta_data_size, work_meta_data_type),
-            (work_indptr_size, work_indptr_type),
-            (work_info_set_size, work_info_set_type),
-            (reduce_indptr_size, reduce_indptr_type),
-            (reduce_final_map_size, reduce_final_map_type),
-            (reduce_partial_map_size, reduce_partial_map_type),
-        ) = aiter.get_pa_metadata_info_v1(
-            batch_size,
-            max_qlen,
-            num_query_heads,
-            query.dtype,
-            k_quant_.dtype,
-            is_sparse=False,
-        )
-        work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
-        work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type)
-        work_info = torch.empty(work_info_set_size, dtype=work_info_set_type)
-        reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type)
-        reduce_final_map = torch.empty(
-            reduce_final_map_size, dtype=reduce_final_map_type
-        )
-        reduce_partial_map = torch.empty(
-            reduce_partial_map_size, dtype=reduce_partial_map_type
-        )
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_pa_metadata_info_v1(
+        batch_size,
+        max_qlen,
+        num_query_heads,
+        query.dtype,
+        k_quant_.dtype,
+        is_sparse=False,
+    )
+    work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type)
+    work_info = torch.empty(work_info_set_size, dtype=work_info_set_type)
+    reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type)
+    reduce_final_map = torch.empty(
+        reduce_final_map_size, dtype=reduce_final_map_type
+    )
+    reduce_partial_map = torch.empty(
+        reduce_partial_map_size, dtype=reduce_partial_map_type
+    )
 
-        # FIX: kv_indptr: seq_lens prefix sum -> actual_blocks prefix sum
-        # refer: https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/flashinfer.py#L731-L735
-        actual_blocks = (seq_lens_kv + block_size - 1) // block_size
-        kv_indptr[1 : batch_size + 1] = torch.cumsum(actual_blocks, dim=0)
-        # FIX: kv_indices: random -> pack block_table actual blocks
-        # refer: https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/flashinfer.py#L1545
-        kv_indices_lst = []
-        for i in range(0, batch_size):
-            kv_indices_lst += block_tables_lst[i][: actual_blocks[i]]
-        kv_indices = torch.tensor(kv_indices_lst, dtype=torch.int)
+    metadata_map = {
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "seq_lens_kv": seq_lens_kv,
+        "work_indptr": work_indptr,
+        "work_info": work_info,
+        "reduce_indptr": reduce_indptr,
+        "reduce_final_map": reduce_final_map,
+        "reduce_partial_map": reduce_partial_map,
+    }
 
+    if load_metadata:
+        for name, meta in metadata_map.items():
+            file_name = f"{name}.bin"
+            shape = meta.shape
+            array = np.fromfile(file_name, dtype=np.uint32)
+            meta = torch.from_numpy(array).reshape(shape)
+            torch.set_printoptions(threshold=999999, linewidth=120)
+            print(f"==>load {name} from {file_name}:\n{meta}")
+    else:
         aiter.get_pa_metadata_v1(
             qo_indptr,
             kv_indptr,
@@ -486,20 +505,13 @@ def test_pa_mtp(
             fast_mode=True,
             max_split_per_batch=-1,
         )
-        print(
-            f"batch_size: {batch_size}, num_query_heads: {num_query_heads}, num_kv_heads: {num_kv_heads}"
-        )
-        print(f"qo_indptr: {qo_indptr.tolist()}")
-        print(f"kv_indptr: {kv_indptr.tolist()}")
-        print(f"kv_indices: {kv_indices.tolist()}")
-        print(f"seq_lens_kv: {seq_lens_kv.tolist()}")
 
-        torch.set_printoptions(threshold=999999, linewidth=120)
-        print(f"==>work_idptr: \n{work_indptr}")
-        print(f"==>work_info: \n{work_info}")
-        print(f"==>reduce_indptr: \n{reduce_indptr}")
-        print(f"==>reduce_final_map: \n{reduce_final_map}")
-        print(f"==>reduce_partial_map: \n{reduce_partial_map}")
+    if dump_metadata:
+        for name, meta in metadata_map.items():
+            file_name = f"{name}.bin"
+            torch.set_printoptions(threshold=999999, linewidth=120)
+            print(f"==>dump {name} to {file_name}:\n{meta}")
+            meta.cpu().numpy().astype(np.uint32).tofile(file_name)
 
     output = torch.empty_like(query)
     out_aiter_asm, us_aiter_asm = aiter.pa_persistent_fwd(
@@ -610,6 +622,18 @@ parser.add_argument(
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
 )
+parser.add_argument(
+    "--load_metadata",
+    action="store_true",
+    help="""load metadata by metadata_map Default: False.
+    --load_metadata # True""",
+)
+parser.add_argument(
+    "--dump_metadata",
+    action="store_true",
+    help="""dump metadata by metadata_map. Default: False.
+    --dump_metadata # True""",
+)
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -640,6 +664,8 @@ for dtype in l_dtype:
             dtype,
             qlen,
             l_varlen,
+            args.load_metadata,
+            args.dump_metadata,
         )
         df.append(ret)
     df = pd.DataFrame(df)
