@@ -1292,7 +1292,6 @@ __device__ void radix_topk_one_block_kernel(T const* in,
     }
     __syncthreads();
 
-    in += batch_id * len;
     if(in_idx)
     {
         in_idx += batch_id * len;
@@ -1300,19 +1299,6 @@ __device__ void radix_topk_one_block_kernel(T const* in,
 
     out += batch_id * k;
     out_idx += batch_id * k;
-    if(row_len <= k)
-    {
-        in += rowStart;
-        for(int rowIt = threadIdx.x; rowIt < k; rowIt += BlockSize)
-        {
-            out_idx[rowIt] = rowIt < row_len ? rowIt + rowStart : -1;
-            if(WRITE_TOPK_VALUES)
-            {
-                out[rowIt] = rowIt < row_len ? in[rowIt] : 0;
-            }
-        }
-        return;
-    }
 
     const IdxT buf_len = calc_buf_len<T, IdxT, unsigned>(row_len);
     bufs += batch_id * buf_len * 2 * (sizeof(T) + sizeof(IdxT));
@@ -1432,7 +1418,6 @@ __device__ void radix_topk_one_block_one_pass_kernel(T const* in,
     }
     __syncthreads();
 
-    in += batch_id * len;
     if(in_idx)
     {
         in_idx += batch_id * len;
@@ -1440,19 +1425,6 @@ __device__ void radix_topk_one_block_one_pass_kernel(T const* in,
 
     out += batch_id * k;
     out_idx += batch_id * k;
-    if(row_len <= k)
-    {
-        in += rowStart;
-        for(int rowIt = threadIdx.x; rowIt < k; rowIt += BlockSize)
-        {
-            out_idx[rowIt] = rowIt < row_len ? rowIt + rowStart : -1;
-            if(WRITE_TOPK_VALUES)
-            {
-                out[rowIt] = rowIt < row_len ? in[rowIt] : 0;
-            }
-        }
-        return;
-    }
 
     {
 
@@ -1570,15 +1542,54 @@ __global__ void dispatch_radix_topk_one_block(T const* in,
                                               T const* global_min_values,
                                               T const* global_max_values)
 {
-    __shared__ bool use_one_pass;
+    const IdxT rowStart = rowStarts[blockIdx.x];
+    const IdxT rowEnd   = rowEnds[blockIdx.x];
+    const IdxT row_len  = rowEnd - rowStart;
 
-    if(threadIdx.x == 0)
+    in += blockIdx.x * len;
+    if(row_len <= k)
     {
-        auto global_min_bits = twiddle_in(global_min_values[0], select_min);
-        auto global_max_bits = twiddle_in(global_max_values[0], select_min);
-        uint32_t diff        = global_min_bits ^ global_max_bits;
+        for(int rowIt = threadIdx.x; rowIt < k; rowIt += BlockSize)
+        {
+            out_idx[rowIt] = rowIt < row_len ? rowIt + rowStart : -1;
+            if(WRITE_TOPK_VALUES)
+            {
+                out[rowIt] = rowIt < row_len ? in[rowIt + rowStart] : 0;
+            }
+        }
+        return;
+    }
 
-        use_one_pass = diff < (1u << BitsPerPass);
+    __shared__ bool use_one_pass;
+    {
+        using BlockReduceT =
+            hipcub::BlockReduce<T, BlockSize, hipcub::BLOCK_REDUCE_WARP_REDUCTIONS>;
+        __shared__ typename BlockReduceT::TempStorage temp_storage;
+
+        T local_min = std::numeric_limits<T>::max();
+        T local_max = std::numeric_limits<T>::lowest();
+        auto f      = [&local_min, &local_max](T value, IdxT) {
+            if(value < local_min)
+            {
+                local_min = value;
+            }
+            if(value > local_max)
+            {
+                local_max = value;
+            }
+        };
+        vectorized_process(threadIdx.x, BlockSize, in + rowStart, row_len, f);
+
+        T global_min = BlockReduceT(temp_storage).Reduce(local_min, hipcub::Min());
+        T global_max = BlockReduceT(temp_storage).Reduce(local_max, hipcub::Max());
+
+        if(threadIdx.x == 0)
+        {
+            auto global_min_bits = twiddle_in(global_min, select_min);
+            auto global_max_bits = twiddle_in(global_max, select_min);
+            uint32_t diff        = global_min_bits ^ global_max_bits;
+            use_one_pass         = diff < (1u << BitsPerPass);
+        }
     }
     __syncthreads();
 
@@ -2523,9 +2534,9 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
     torch::Tensor workspace = torch::empty({workspace_size}, options);
 
     // global min and max. TODO: is last row guaranteed to compute diff?
-    auto global_minmax = torch::aminmax(logits.index({numRows - 1, torch::indexing::Slice()}));
-    auto global_min    = std::get<0>(global_minmax);
-    auto global_max    = std::get<1>(global_minmax);
+    // auto global_minmax = torch::aminmax(logits.index({numRows - 1, torch::indexing::Slice()}));
+    // auto global_min    = std::get<0>(global_minmax);
+    // auto global_max    = std::get<1>(global_minmax);
 
     if(values.has_value())
     {
@@ -2541,8 +2552,8 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
             values->data_ptr<float>(),
             indices.data_ptr<int>(),
             is_largest,
-            global_min.data_ptr<float>(),
-            global_max.data_ptr<float>(),
+            static_cast<float*>(nullptr),
+            static_cast<float*>(nullptr),
             stream);
     }
     else
@@ -2559,8 +2570,8 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
             nullptr,
             indices.data_ptr<int>(),
             is_largest,
-            global_min.data_ptr<float>(),
-            global_max.data_ptr<float>(),
+            static_cast<float*>(nullptr),
+            static_cast<float*>(nullptr),
             stream);
     }
 }

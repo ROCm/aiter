@@ -23,7 +23,7 @@ def create_random_logits(
         logits = torch.randn(
             row_starts.shape[0], max(row_ends), dtype=dtype, device="cuda"
         )
-    elif data_generation == "10LSBits":
+    elif data_generation == "10LSBits" or data_generation == "mixed":
         top_22_bits_mask = 0xFFFFFC00
         last_10_bits_mask = 0x000003FF
         fixed_top_22_bits = 0x3F900000
@@ -40,6 +40,14 @@ def create_random_logits(
             random_bottom_bits & last_10_bits_mask
         )
         logits = logits_bits.view(dtype)
+
+    if data_generation == "mixed":
+        logits_random = torch.randn(
+            row_starts.shape[0], max(row_ends), dtype=dtype, device="cuda"
+        )
+        # Mix the two logits tensors randomly
+        mask = torch.randint(0, 2, (row_starts.shape[0], 1), device="cuda").bool()
+        logits = torch.where(mask, logits, logits_random)
 
     for i, end in enumerate(row_ends):
         logits[i, end:] = float("-inf")
@@ -166,10 +174,7 @@ def run_top_k_per_row_decode(
 
 @benchmark()
 def test_top_k_per_row_prefill(
-    num_rows: int, 
-    num_prefix: int, 
-    top_k: int, 
-    data_generation: str = "random"
+    num_rows: int, num_prefix: int, top_k: int, data_generation: str = "random"
 ) -> dict:
     """
     Test topk_per_row_prefill.
@@ -179,7 +184,9 @@ def test_top_k_per_row_prefill(
 
     # Create test data
     row_starts, row_ends = create_row_boundaries(num_rows, num_prefix)
-    logits = create_random_logits(row_starts, row_ends, torch.float32, 42, data_generation)
+    logits = create_random_logits(
+        row_starts, row_ends, torch.float32, 42, data_generation
+    )
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
@@ -193,7 +200,6 @@ def test_top_k_per_row_prefill(
         row_ends,
         indices,
         None,  # values
-        # values,
         num_rows,
         logits.stride(0),
         logits.stride(1),
@@ -335,7 +341,7 @@ parser.add_argument(
     "--data_generation",
     type=str,
     default=["random"],
-    choices=["random", "10LSBits"],
+    choices=["random", "10LSBits", "mixed"],
     nargs="+",
     help="""Specify method for generating logits.
     e.g.: -d random""",
