@@ -474,7 +474,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
             # )
 
             # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
-            gl.amd.cdna3.sched_group_barrier(0x020, 2, 0)  # 2 VMEM reads
+            # gl.amd.cdna3.sched_group_barrier(0x020, 2, 0)  # 2 VMEM reads
             key_scale_value_blocked = gl.amd.cdna3.buffer_load(
                 ptr=key_scale, offsets=key_scale_offsets
             )
@@ -584,12 +584,12 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
             + (current_page_offset + value_dim1_offsets)[None, :]
         )
         # Load standard value block
-        gl.amd.cdna3.sched_group_barrier(0x020, 1, 0)  # VMEM
+        # gl.amd.cdna3.sched_group_barrier(0x020, 1, 0)  # VMEM
         value_block = gl.amd.cdna3.buffer_load(
             ptr=value_cache_ptr, offsets=value_block_offsets
         )
         # Perform matrix multiplication
-        gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)  # MFMA
+        # gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)  # MFMA
         qk_matrix = gl.amd.cdna3.mfma(query_converted, key_converted, qk_accumulator)
 
         # Transpose to [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
@@ -1143,7 +1143,7 @@ def paged_attention_decode_v2_gluon_fp8(
         # Add epsilon to avoid division by zero
         query_scale_value = query_max_abs / float(FP8_MAX_VALUE)
         # Quantize: scale query to fp8 range and convert to fp8 type
-        query_tensor = query_f32.to(gl.float8e4nv)
+        query_tensor = query_f32.to(COMPUTE_TYPE)
     # KV_COMPUTE_BLOCK_COUNT: gl.constexpr = (
     #     CONTEXT_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE)
     # Process KV sequence in compute blocks
@@ -1179,7 +1179,7 @@ def paged_attention_decode_v2_gluon_fp8(
     )
 
     # Optimize: Start key load, then prepare QK MFMA accumulators/query (overlaps with key load)
-    gl.amd.cdna3.sched_group_barrier(0x020, 1, 0)  # 1 large VMEM read
+    # gl.amd.cdna3.sched_group_barrier(0x020, 1, 0)  # 1 large VMEM read
     key_tensor = gl.amd.cdna3.buffer_load(
         ptr=key_cache_ptr,
         offsets=key_block_offsets,
@@ -1222,7 +1222,7 @@ def paged_attention_decode_v2_gluon_fp8(
             # )
 
             # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
-            gl.amd.cdna3.sched_group_barrier(0x020, 2, 0)  # 2 VMEM reads
+            # gl.amd.cdna3.sched_group_barrier(0x020, 2, 0)  # 2 VMEM reads
             key_scale_value_blocked = gl.amd.cdna3.buffer_load(
                 ptr=key_scale, offsets=key_scale_offsets
             )
@@ -1270,13 +1270,13 @@ def paged_attention_decode_v2_gluon_fp8(
             * CONTIGUOUS_KV_ELEMENTS_PER_16B_LOAD
             + value_dim3_offsets[None, None, None, :]
         )
-        gl.amd.cdna3.sched_group_barrier(0x020, 1, 0)  # VMEM
+        # gl.amd.cdna3.sched_group_barrier(0x020, 1, 0)  # VMEM
         value_tensor = gl.amd.cdna3.buffer_load(
             ptr=value_cache_ptr,
             offsets=value_block_offsets,
         )
         value_tensor = value_tensor.to(COMPUTE_TYPE)
-        gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)  # MFMA
+        # gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)  # MFMA
         # Compute QK attention scores using MFMA (overlaps with value load)
         attention_scores = gl.amd.cdna3.mfma(
             query_converted, key_converted, qk_accumulator
