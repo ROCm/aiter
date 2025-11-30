@@ -190,9 +190,23 @@ def flatmm_a8w8_blockscale_asm(
 ) -> Tensor: ...
 
 
+def gen_gemm_a8w8_blockscale_bpreshuffle_asm_fake_tensors(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    bias: Optional[Tensor] = None,
+    splitK: Optional[int] = None,
+    kernelName: Optional[str] = None,
+    bpreshuffle: Optional[bool] = True,
+) -> Tensor:
+    return out
+
 @compile_ops(
     "module_gemm_a8w8_blockscale_bpreshuffle_asm",
     fc_name="gemm_a8w8_blockscale_bpreshuffle_asm",
+    gen_fake=gen_gemm_a8w8_blockscale_bpreshuffle_asm_fake_tensors,
 )
 def gemm_a8w8_blockscale_bpreshuffle_asm(
     A: Tensor,
