@@ -614,7 +614,7 @@ void mla_reduce_v1(
 
     const bool output_lse = final_lse.has_value();
     const bool no_reduce_final_map = (reduce_final_map.has_value() == false);
-    const int32_t num_reduce_tile = reduce_indptr.size(0) - 1;
+    const int32_t num_reduce_tile = reduce_indptr[-1].item<int32_t>();
     const int32_t num_heads = partial_output.size(-2);
     const int32_t head_dim = final_output.size(-1);
 
