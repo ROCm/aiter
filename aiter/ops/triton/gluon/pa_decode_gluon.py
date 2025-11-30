@@ -1906,7 +1906,10 @@ def paged_attention_decode_v2_reduce_kernel(
     """
     # Mathematical constant for exponential calculations
     LOG2_E: tl.constexpr = 1.4426950408889634
-    MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 8
+    if SLIDING_WINDOW > 0:
+        MAX_CONTEXT_PARTITION_NUM: tl.constexpr = triton.next_power_of_2(SLIDING_WINDOW // CONTEXT_PARTITION_SIZE)
+    else:
+        MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 16
     
     # ==================== INITIALIZATION ====================
     sequence_idx = tl.program_id(0)
