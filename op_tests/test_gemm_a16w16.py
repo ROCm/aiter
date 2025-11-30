@@ -144,24 +144,19 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     if (
         dtype == dtypes.bf16
         and bias is None
-        and (
-            (
-                get_gfx() == "gfx942"
-                and (otype == dtypes.fp32 or otype == dtypes.bf16)
-                and k % 64 == 0
-                and n % 64 == 0
-            )
-            or (
-                get_gfx() == "gfx950"
-                and otype == dtypes.bf16
-                and k % 256 == 0
-                and n % 256 == 0
-            )
-        )
+        and (otype == dtypes.fp32 or otype == dtypes.bf16)
+        and k % 64 == 0
+        and n % 64 == 0
     ):
         # out_asm = torch.empty((m + 191) // 192 * 192, n, dtype=otype)
         out_asm = torch.empty(m, n, dtype=otype, device=x.device)
         wshuffle = shuffle_weight(weight, layout=(16, 16))
+        # (d, *_), avg_d = run_bf16gemm_asm(
+        #     x,
+        #     weight,
+        #     out_asm,
+        #     splitK=None,
+        # )
         (d, *_), avg_d = run_bf16gemm_asm(
             x, wshuffle, out_asm, bpreshuffle=wshuffle.is_shuffled
         )
