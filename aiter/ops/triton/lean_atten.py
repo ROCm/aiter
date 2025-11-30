@@ -172,7 +172,7 @@ def _persistent_lean_attention(
         HEAD_DIM_PADDED = 16
 
     # MASKED_BLOCKS is used for prefill/causal for BLOCK_M > BLOCK_N
-    # For MI300, BLOCK_M=128, BLOCK_N=64 is better for performance
+    # For gfx942, BLOCK_M=128, BLOCK_N=64 is better for performance
     MASKED_BLOCKS = BLOCK_M // BLOCK_N
 
     if causal:

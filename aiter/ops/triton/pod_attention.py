@@ -110,7 +110,7 @@ def pod_attention(
     qk_scale = sm_scale * 1.44269504
 
     # We assume the kernel functions fused by pod attention are persistent kernel functions
-    # For MI300, we launch total 608 WGs. Each CU will get 2 WG --- one WG will be doing decode and one prefill
+    # For gfx942, we launch total 608 WGs. Each CU will get 2 WG --- one WG will be doing decode and one prefill
     # For different decode:prefill ratios, assign (decode+prefill)*304 number of WGs
     total_wgs = total_programs // 2
 
@@ -144,7 +144,7 @@ def pod_attention(
     N_CTX_K_pf = k_pf.shape[0]  # This is the sum of all ctx_n in a batch
 
     # MASKED_BLOCKS is used for prefill/causal for BLOCK_M > BLOCK_N
-    # For MI300, BLOCK_M=128, BLOCK_N=64 is better for performance
+    # For gfx942, BLOCK_M=128, BLOCK_N=64 is better for performance
     MASKED_BLOCKS = BLOCK_M_pf // BLOCK_N_pf
 
     # if causal_pf:

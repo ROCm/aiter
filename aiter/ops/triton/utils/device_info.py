@@ -10,5 +10,5 @@ def get_num_sms():
 
 
 def get_num_xcds():
-    # Currently, you can't query this programmatically. For Mi300/Mi35x it's 8, so we hardcode that here.
+    # Currently, you can't query this programmatically. For gfx942/gfx950 it's 8, so we hardcode that here.
     return 8
