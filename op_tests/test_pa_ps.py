@@ -308,6 +308,78 @@ def asm_V_shuffle(VC):
     return VC
 
 
+def benchmark_with_percentile(func, num_runs=20, warmup=5):
+    """
+    Run a function multiple times and compute performance statistics.
+
+    Args:
+        func: Function to benchmark (should return (output, time_in_us))
+        num_runs: Number of runs for statistics (default: 20)
+        warmup: Number of warmup runs (default: 5)
+
+    Returns:
+        output: Function output from last run
+        stats: Dict with p50, p95, p99, mean, min, max (all in microseconds)
+    """
+    import numpy as np
+
+    # Warmup
+    for _ in range(warmup):
+        output, _ = func()
+
+    # Collect timing data
+    times = []
+    for _ in range(num_runs):
+        output, time_us = func()
+        if isinstance(time_us, torch.Tensor):
+            time_us = time_us.item()
+        times.append(time_us)
+
+    times = np.array(times)
+    stats = {
+        "p50": np.percentile(times, 50),
+        "p95": np.percentile(times, 95),
+        "p99": np.percentile(times, 99),
+        "mean": np.mean(times),
+        "min": np.min(times),
+        "max": np.max(times),
+    }
+
+    return output, stats
+
+
+def print_performance_comparison(name1, stats1, name2, stats2, seq_lens=None):
+    print("\n" + "=" * 80)
+    print("PERFORMANCE COMPARISON")
+    print("=" * 80)
+
+    if seq_lens is not None:
+        print(f"Sequence Lengths: {seq_lens[0]}")
+        print("-" * 80)
+
+    # Header
+    print(
+        f"{'Method':<30} {'Mean':>10} {'P50':>10} {'P95':>10} {'P99':>10} {'Min':>10} {'Max':>10}"
+    )
+    print("-" * 80)
+
+    # Method 1
+    print(
+        f"{name1:<30} {stats1['mean']:>9.2f}ms {stats1['p50']:>9.2f}ms {stats1['p95']:>9.2f}ms {stats1['p99']:>9.2f}ms {stats1['min']:>9.2f}ms {stats1['max']:>9.2f}ms"
+    )
+
+    # Method 2
+    print(
+        f"{name2:<30} {stats2['mean']:>9.2f}ms {stats2['p50']:>9.2f}ms {stats2['p95']:>9.2f}ms {stats2['p99']:>9.2f}ms {stats2['min']:>9.2f}ms {stats2['max']:>9.2f}ms"
+    )
+
+    # Speedup
+    print("-" * 80)
+    speedup = stats2["p99"] / stats1["p99"] if stats1["p99"] > 0 else 0
+    print(f"{'Speedup (P99)':<30} {speedup:>9.2f}x")
+    print("=" * 80 + "\n")
+
+
 @benchmark()
 def test_pa_mtp(
     ctx_lens: int,
@@ -320,6 +392,7 @@ def test_pa_mtp(
     varlen: bool = False,
     load_metadata: bool = False,
     dump_metadata: bool = False,
+    use_p99: bool = False,
 ) -> dict:
     ret = {}
     seed = 0
@@ -421,26 +494,6 @@ def test_pa_mtp(
         v_scale_,
     )
 
-    # out_asm_noquant, us_asm_noquant = run_aiter_asm(
-    #     query,
-    #     k_quant_,
-    #     asm_V_shuffle(v_quant_),
-    #     block_tables,
-    #     seq_lens_kv,
-    #     block_tables.size(1),
-    #     max_qlen,
-    #     k_scale=k_scale_,
-    #     v_scale=v_scale_,
-    #     qo_indptr=qo_indptr,
-    # )
-    # err_noquant = checkAllclose(
-    #     out_ref_noquant,
-    #     out_asm_noquant,
-    #     msg=f"[torch vs  aiter_asm][No Quant]: {us_asm_noquant:>8.2f} us......",
-    # )
-    # ret["us_asm_bf16"] = us_asm_noquant
-    # ret["err_asm_bf16"] = err_noquant
-
     (
         (work_meta_data_size, work_meta_data_type),
         (work_indptr_size, work_indptr_type),
@@ -511,37 +564,135 @@ def test_pa_mtp(
             print(f"==>dump {name} to {file_name}:\n{meta}")
             meta.cpu().numpy().astype(np.uint32).tofile(file_name)
 
+    # Benchmark PA Persistent Scheduling
     output = torch.empty_like(query)
-    out_aiter_asm, us_aiter_asm = aiter.pa_persistent_fwd(
-        Q=query,
-        K=k_quant_,
-        V=asm_V_shuffle(v_quant_),
-        output=output,
-        max_qlen=max_qlen,
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_indices=kv_indices,
-        context_lens=seq_lens_kv,
-        K_QScale=k_scale_,
-        V_QScale=v_scale_,
-        # work_meta_data=work_metadata_ptrs,
-        work_indptr=work_indptr,
-        work_info=work_info,
-        reduce_indptr=reduce_indptr,
-        reduce_final_map=reduce_final_map,
-        reduce_partial_map=reduce_partial_map,
-        softmax_scale=scale,
-        mask=1,
-    )
-    # print("run pa_persistent_fwd successfully")
-    # print(f"seq_lens_kv: {seq_lens_kv.tolist()}")
-    err = checkAllclose(
-        out_ref,
-        output,
-        msg="[torch vs  pa_persistent_fwd][   Quant]: us......",
-    )
-    ret["us_asm_fp8"] = us_aiter_asm
-    ret["err fp8"] = err
+
+    if use_p99:
+        out_aiter_asm, stats_ps = benchmark_with_percentile(
+            lambda: run_aiter_asm_ps(
+                Q=query,
+                K=k_quant_,
+                V=asm_V_shuffle(v_quant_),
+                output=output,
+                max_qlen=max_qlen,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                context_lens=seq_lens_kv,
+                K_QScale=k_scale_,
+                V_QScale=v_scale_,
+                work_indptr=work_indptr,
+                work_info=work_info,
+                reduce_indptr=reduce_indptr,
+                reduce_final_map=reduce_final_map,
+                reduce_partial_map=reduce_partial_map,
+                softmax_scale=scale,
+                mask=1,
+            ),
+            num_runs=10,
+            warmup=3,
+        )
+
+        _, stats_no_ps = benchmark_with_percentile(
+            lambda: run_aiter_asm(
+                query,
+                k_quant_,
+                asm_V_shuffle(v_quant_),
+                block_tables,
+                seq_lens_kv,
+                block_tables.size(1),
+                max_qlen,
+                k_scale=k_scale_,
+                v_scale=v_scale_,
+                qo_indptr=qo_indptr,
+            ),
+            num_runs=10,
+            warmup=3,
+        )
+
+        # Verify correctness
+        err = checkAllclose(
+            out_ref,
+            output,
+            msg="[torch vs  pa_persistent_fwd][   Quant]: us......",
+        )
+
+        # Print performance comparison
+        print_performance_comparison(
+            "PA with Persistent Scheduling",
+            stats_ps,
+            "PA without Persistent Scheduling",
+            stats_no_ps,
+            seq_lens=seq_lens_kv.tolist(),
+        )
+
+        # Store results
+        ret["us_asm_fp8"] = stats_ps["p99"]
+        ret["us_asm_fp8_mean"] = stats_ps["mean"]
+        ret["us_asm_fp8_p50"] = stats_ps["p50"]
+        ret["us_asm_fp8_p95"] = stats_ps["p95"]
+        ret["us_asm_noquant_p99"] = stats_no_ps["p99"]
+        ret["us_asm_noquant_mean"] = stats_no_ps["mean"]
+        ret["speedup_p99"] = (
+            stats_no_ps["p99"] / stats_ps["p99"] if stats_ps["p99"] > 0 else 0
+        )
+        ret["err fp8"] = err
+    else:
+        out_aiter_asm, us_aiter_asm = run_aiter_asm_ps(
+            Q=query,
+            K=k_quant_,
+            V=asm_V_shuffle(v_quant_),
+            output=output,
+            max_qlen=max_qlen,
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            context_lens=seq_lens_kv,
+            K_QScale=k_scale_,
+            V_QScale=v_scale_,
+            work_indptr=work_indptr,
+            work_info=work_info,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            softmax_scale=scale,
+            mask=1,
+        )
+
+        _, us_asm_noquant = run_aiter_asm(
+            query,
+            k_quant_,
+            asm_V_shuffle(v_quant_),
+            block_tables,
+            seq_lens_kv,
+            block_tables.size(1),
+            max_qlen,
+            k_scale=k_scale_,
+            v_scale=v_scale_,
+            qo_indptr=qo_indptr,
+        )
+
+        err = checkAllclose(
+            out_ref,
+            output,
+            msg="[torch vs  pa_persistent_fwd][   Quant]: us......",
+        )
+
+        if isinstance(us_aiter_asm, torch.Tensor):
+            us_aiter_asm = us_aiter_asm.item()
+        if isinstance(us_asm_noquant, torch.Tensor):
+            us_asm_noquant = us_asm_noquant.item()
+
+        print(f"seq_lens_kv: {seq_lens_kv.tolist()[0]}")
+        print(f"batch_size: {batch_size}")
+        print(f"PA PS forward: {us_aiter_asm:>8.2f} ms")
+        print(f"PA without persistent: {us_asm_noquant:>8.2f} ms")
+        print(
+            f"Speedup: {us_asm_noquant / us_aiter_asm if us_aiter_asm > 0 else 0:.2f}x"
+        )
+
+        ret["us_asm_fp8"] = us_aiter_asm
+        ret["err fp8"] = err
 
     return ret
 
@@ -551,18 +702,20 @@ l_block_size = [1024]
 l_dtype = ["bf16"]
 l_num_heads = [
     (10, 1),
-    (16, 1),
+    # (16, 1),
 ]  # num_query_heads must be multiple of 16 for get_mla_metadata_info_v1
 l_qlen = [1, 2, 3, 4]
-# l_qlen = [2]
+# l_qlen = [4]
 # q_Tile is [max_qlen * num_query_heads // num_kv_heads]
 kv_lens_list0 = [i * 256 for i in range(1, 10)]
 kv_lens_list1 = [i - 1 for i in kv_lens_list0]
 kv_lens_list3 = [i + 10 for i in kv_lens_list0]
 kv_lens_list4 = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384, 90002, 90004]
 # l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
-l_ctx_len = kv_lens_list0 + kv_lens_list1 + kv_lens_list3 + kv_lens_list4
-l_batch_size = [2]
+# l_ctx_len = kv_lens_list0 + kv_lens_list1 + kv_lens_list3 + kv_lens_list4
+# l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384, 90002, 90004]
+l_ctx_len = [3460, 16700, 7900, 2580, 4140, 6360, 2270]
+l_batch_size = [64, 128]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -638,6 +791,12 @@ parser.add_argument(
     help="""dump metadata by metadata_map. Default: False.
     --dump_metadata # True""",
 )
+parser.add_argument(
+    "--use_p99",
+    action="store_true",
+    help="""Enable P99 performance benchmarking (10 runs). Default: False (single run).
+    --use_p99 # Enable detailed performance stats""",
+)
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -670,6 +829,7 @@ for dtype in l_dtype:
             l_varlen,
             args.load_metadata,
             args.dump_metadata,
+            args.use_p99,
         )
         df.append(ret)
     df = pd.DataFrame(df)
