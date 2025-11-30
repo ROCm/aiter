@@ -629,8 +629,6 @@ def mi350_a8w8_blockscale_ASM(
     assert dtype in [
         dtypes.bf16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
-    m = XQ.shape[0]
-    n = WQ.shape[0]
     return mi350_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
 
