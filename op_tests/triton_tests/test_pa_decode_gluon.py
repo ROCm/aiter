@@ -1886,7 +1886,7 @@ def run_multi_pa_gluon_test(
     context_partition_size_options,
     sample_rate=1.0,
     use_sinks_options=[False],
-    sliding_window_options=[128],
+    sliding_window_options=[0, 128],
 ) -> pd.DataFrame:
     """Run all tests."""
     # Generate all test configurations

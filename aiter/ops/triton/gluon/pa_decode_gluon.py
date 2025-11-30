@@ -193,7 +193,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
     # QK matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[1, 4]
     )
     qk_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=qk_mfma_layout, k_width=16
@@ -276,7 +276,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
     # PV matrix multiplication layout using AMD MFMA instructions
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[1, 4]
     )
     pv_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=pv_mfma_layout, k_width=16
@@ -900,7 +900,7 @@ def paged_attention_decode_v2_gluon_fp8(
 
     # QK Matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[1, 4]
     )
     qk_lhs_operand_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=qk_mfma_layout, k_width=16
@@ -1000,7 +1000,7 @@ def paged_attention_decode_v2_gluon_fp8(
 
     # PV Matrix multiplication layout using AMD MFMA instructions
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
+        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[1, 4]
     )
     pv_lhs_operand_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=pv_mfma_layout, k_width=16
@@ -2045,7 +2045,8 @@ def paged_attention_decode_v2_reduce_kernel(
         )
 
         # Permute to match the expected dimension order
-        partial_logits = tl.permute(partial_logits, (1, 0, 2)).to(tl.float32)
+        # partial_logits = tl.permute(partial_logits, (1, 0, 2)).to(tl.float32)
+        partial_logits = partial_logits.to(tl.float32)
         updated_output = partial_logits * attention_probs
 
         # Accumulate weighted sum of logits
