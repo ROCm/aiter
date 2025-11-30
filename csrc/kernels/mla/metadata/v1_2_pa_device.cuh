@@ -17,7 +17,7 @@ struct PaMetadataV12Traits
     // ==  0: read from PaMetadataV1KernelParameter::uni_seqlen_qo
     // >=  1: read from PaMetadataV12Traits::kUniSeqlenQo
     static constexpr int32_t kUniSeqlenQo            = kUniSeqlenQo_;
-    static constexpr int32_t kFixedOverheadNumBlocks = 16;
+    static constexpr int32_t kFixedOverheadNumBlocks = 1;
     static constexpr int32_t kIsSparse               = kIsSparse_;
     static constexpr int32_t kLdsBatchInfo           = kLdsBatchInfo_;
 };
