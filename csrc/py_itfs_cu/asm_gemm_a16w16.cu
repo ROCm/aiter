@@ -96,7 +96,10 @@ get_heuristic_kernel(int M,
                     ((M + cfg.tileM - 1) / cfg.tileM) * (N / cfg.tileN); // M-orient support OOB
                 if(pure_tg_num < num_cu)
                 {
-                    int max_split = (num_cu / pure_tg_num) < 64 ? (num_cu / pure_tg_num) : 64;
+                    int max_split = std::min(
+                        std::min(static_cast<int>(num_cu / pure_tg_num), 64),
+                        static_cast<int>(K / cfg.subK)    // “K-dim must satisfy min 128 bytes. BF16 are 2 bytes each, this means min ele of K is 64.”
+                    );
                     for(int i = max_split; i >= 1; i--)
                     {
                         if(K % 64 == 0)
