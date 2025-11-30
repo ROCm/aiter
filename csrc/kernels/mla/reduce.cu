@@ -27,7 +27,6 @@ struct MlaReduceKernelV1Traits
     // implicitly set by reduce_partial_map[1] - reduce_partial_map[0].
     static constexpr bool    kOmitReduceFinalMap = kOmitReduceFinalMap_;
 
-    // static_assert((kNumHeadQ & (kNumHeadQ - 1)) == 0, "kNumHeadQ must be power of 2!");
 };
 
 struct MlaReduceKernelV1Params
