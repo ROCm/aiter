@@ -193,7 +193,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
     # QK matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[1, 4]
+        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
     )
     qk_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=qk_mfma_layout, k_width=16
@@ -276,7 +276,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
 
     # PV matrix multiplication layout using AMD MFMA instructions
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[1, 4]
+        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
     )
     pv_lhs_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=pv_mfma_layout, k_width=16
@@ -900,7 +900,7 @@ def paged_attention_decode_v2_gluon_fp8(
 
     # QK Matrix multiplication layout using AMD MFMA instructions
     qk_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[1, 4]
+        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
     )
     qk_lhs_operand_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=qk_mfma_layout, k_width=16
@@ -1000,7 +1000,7 @@ def paged_attention_decode_v2_gluon_fp8(
 
     # PV Matrix multiplication layout using AMD MFMA instructions
     pv_mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[1, 4]
+        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[1, 4]
     )
     pv_lhs_operand_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=pv_mfma_layout, k_width=16
@@ -1352,13 +1352,11 @@ def paged_attention_decode_v2_gluon_fp8(
     boundary_mask = boundary_mask & causal_mask
 
     # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-    attention_scores = tl.where(boundary_mask, attention_scores, float(-3.4e38))
+    
     if SLIDING_WINDOW > 0:
-        attention_scores = gl.where(
-            qk_column_offsets[None, :] > context_length - SLIDING_WINDOW,
-            attention_scores,
-            float(-3.4e38),
-        )
+        boundary_mask = boundary_mask & (qk_column_offsets[None, :] > context_length - SLIDING_WINDOW)
+  
+    attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
     # ==================== SOFTMAX COMPUTATION ====================
     # Update running maximum for numerical stability
     max_logits = gl.max(attention_scores, axis=1)
@@ -1908,24 +1906,15 @@ def paged_attention_decode_v2_reduce_kernel(
     """
     # Mathematical constant for exponential calculations
     LOG2_E: tl.constexpr = 1.4426950408889634
-    MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 16
-    num_query_heads_total = gl.num_programs(1) * query_group_size
-
+    MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 8
+    
     # ==================== INITIALIZATION ====================
     sequence_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
+    num_query_heads_total = kv_head_idx * query_group_size
 
     context_length = tl.load(context_lengths_ptr + sequence_idx)
-    context_partition_num = tl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
-    if SLIDING_WINDOW > 0:
-        skiped_context_partition_num = (
-            context_length - SLIDING_WINDOW
-        ) // CONTEXT_PARTITION_SIZE
-        skiped_num_iterations = (
-            skiped_context_partition_num // MAX_CONTEXT_PARTITION_NUM
-        )
-    else:
-        skiped_num_iterations = 0
+
     # Generate coordinate ranges
     query_group_offsets = tl.arange(0, QUERY_GROUP_SIZE_POW2)
     head_size_offsets = tl.arange(0, HEAD_SIZE_POW2)
@@ -1937,11 +1926,23 @@ def paged_attention_decode_v2_reduce_kernel(
     final_output = tl.zeros((QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=tl.float32)
 
     # Calculate number of iterations needed
+    context_partition_num = tl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
+    if SLIDING_WINDOW > 0:
+        skiped_context_partition_num = (
+            context_length - SLIDING_WINDOW
+        ) // CONTEXT_PARTITION_SIZE
+        skiped_num_iterations = (
+            skiped_context_partition_num // MAX_CONTEXT_PARTITION_NUM
+        )
+    else:
+        skiped_num_iterations = 0
+
     num_iterations = tl.cdiv(context_partition_num, MAX_CONTEXT_PARTITION_NUM)
 
     # ==================== FIRST PASS: FIND GLOBAL MAX ====================
     # Loop through partitions in chunks of MAX_CONTEXT_PARTITION_NUM
     for iter_idx in range(skiped_num_iterations, num_iterations):
+        # iter_idx += skiped_num_iterations
         partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
         partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM) + partition_base
 
@@ -1954,9 +1955,7 @@ def paged_attention_decode_v2_reduce_kernel(
         )
 
         # Create mask for valid partitions and query groups
-        exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (
-            query_group_offsets[None, :] < query_group_size
-        )
+        exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (query_group_offsets[None, :] < query_group_size)
 
         # Load maximum logits from current chunk of partitions
         max_logits = tl.load(
@@ -1970,10 +1969,10 @@ def paged_attention_decode_v2_reduce_kernel(
         chunk_max_logits = tl.max(max_logits, axis=0)
         global_max = tl.maximum(global_max, chunk_max_logits)
         # Compute update scale for exponential sums
-        update_scale = tl.exp(global_max_prev - global_max)
+        update_scale = tl.exp2((global_max_prev - global_max) * LOG2_E)
 
         # Rescale exponential sums using global maximum for numerical stability
-        exp_sums *= tl.exp(max_logits - global_max[None, :])
+        exp_sums *= tl.exp2((max_logits - global_max[None, :]) * LOG2_E)
         # Update and accumulate global exponential sum
         global_exp_sum = update_scale * global_exp_sum + tl.sum(exp_sums, axis=0)
         global_max_prev = global_max
@@ -1988,6 +1987,7 @@ def paged_attention_decode_v2_reduce_kernel(
 
     # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
     for iter_idx in range(skiped_num_iterations, num_iterations):
+        # iter_idx += skiped_num_iterations
         partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
         partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM) + partition_base
 
@@ -2000,9 +2000,7 @@ def paged_attention_decode_v2_reduce_kernel(
         )
 
         # Create mask for valid partitions and query groups
-        exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (
-            query_group_offsets[None, :] < query_group_size
-        )
+        exp_sums_mask = (partition_offsets[:, None] < context_partition_num) & (query_group_offsets[None, :] < query_group_size)
 
         # Load maximum logits and exponential sums from current chunk
         max_logits = tl.load(
@@ -2014,7 +2012,7 @@ def paged_attention_decode_v2_reduce_kernel(
         )
 
         # Rescale exponential sums using global maximum for numerical stability
-        exp_sums *= tl.exp(max_logits - global_max[None, :])
+        exp_sums *= tl.exp2((max_logits - global_max[None, :]) * LOG2_E)
 
         # ==================== ATTENTION PROBABILITY AND WEIGHTED SUMMATION ====================
         # Compute normalized attention probabilities for this chunk
@@ -2024,7 +2022,6 @@ def paged_attention_decode_v2_reduce_kernel(
         attention_probs = tl.reshape(
             attention_probs, (MAX_CONTEXT_PARTITION_NUM, QUERY_GROUP_SIZE_POW2, 1)
         )
-
         # Calculate offsets for loading partial logits
         logits_offsets = (
             sequence_idx * stride_logits_seq
@@ -2035,18 +2032,15 @@ def paged_attention_decode_v2_reduce_kernel(
         )
 
         # Create mask for valid logits access
-        logits_mask = (partition_offsets[None, :] < context_partition_num) & (
-            query_group_offsets[:, None] < query_group_size
-        )
+        logits_mask = (partition_offsets[None, :] < context_partition_num) & (query_group_offsets[:, None] < query_group_size)
 
         # Load partial logits from current chunk of partitions
         partial_logits = tl.load(
             logits_ptr + logits_offsets, mask=logits_mask[:, :, None], other=0.0
         )
-
         # Permute to match the expected dimension order
-        # partial_logits = tl.permute(partial_logits, (1, 0, 2)).to(tl.float32)
-        partial_logits = partial_logits.to(tl.float32)
+        partial_logits = tl.permute(partial_logits, (1, 0, 2)).to(tl.float32)
+        # partial_logits = partial_logits.to(tl.float32)
         updated_output = partial_logits * attention_probs
 
         # Accumulate weighted sum of logits
