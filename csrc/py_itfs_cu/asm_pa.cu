@@ -380,6 +380,8 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     args.ptr_WorkInfo = work_info ? work_info.value().data_ptr() : nullptr;
     args.ptr_SplitO   = work_info ? splitData.value().data_ptr() : nullptr;
     args.ptr_SplitLSE = work_info ? splitLse.value().data_ptr() : nullptr;
+    args.mtp          = max_qlen - 1;
+
     // std::cout << "sclg2e: " << args.sclg2e << " mblk:" << args.mblk
     //           << " kv_nheads:" << args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs
     //           << " KVs:" << args.KVs << std::endl;
@@ -415,24 +417,12 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
         TORCH_CHECK(false, __func__, ": unsupport K dtype:", K.scalar_type());
 
     // 3. "gqa_ratio"
-    // gqa = (gqa_ratio <= 8) ? 8 : 16;
-    gqa = 0;
-
     // 4. "mtp" , 5. "mask"
-    // if(qo_indptr && max_qlen > 1)
-    // {
-    //     mtp = max_qlen + 10; // for kernels only support qlen=3, we encode it as 3+10=13
-    //     msk = 1;
-    // }
-    // else
-    // {
-    //     mtp = 0;
-    //     msk = 0;
-    // }
-    mtp = max_qlen - 1;
+    // We make mtp=0, gqa=0 to dispatch kernel, since we only focus on qTile
     msk = mask;
+    gqa = 0;
+    mtp = 0;
 
-    args.mtp          = mtp;  //fix
     // 6. "high_precision" , 7. "ultra_precision"
     switch(high_precision.value())
     {

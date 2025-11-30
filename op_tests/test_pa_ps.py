@@ -460,9 +460,7 @@ def test_pa_mtp(
     work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type)
     work_info = torch.empty(work_info_set_size, dtype=work_info_set_type)
     reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type)
-    reduce_final_map = torch.empty(
-        reduce_final_map_size, dtype=reduce_final_map_type
-    )
+    reduce_final_map = torch.empty(reduce_final_map_size, dtype=reduce_final_map_type)
     reduce_partial_map = torch.empty(
         reduce_partial_map_size, dtype=reduce_partial_map_type
     )
@@ -535,8 +533,8 @@ def test_pa_mtp(
         softmax_scale=scale,
         mask=1,
     )
-    print("run pa_persistent_fwd successfully")
-    print(f"seq_lens_kv: {seq_lens_kv.tolist()}")
+    # print("run pa_persistent_fwd successfully")
+    # print(f"seq_lens_kv: {seq_lens_kv.tolist()}")
     err = checkAllclose(
         out_ref,
         output,
@@ -555,9 +553,15 @@ l_num_heads = [
     (10, 1),
     (16, 1),
 ]  # num_query_heads must be multiple of 16 for get_mla_metadata_info_v1
-l_qlen = [1]
-l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
-# l_ctx_len = [1024]
+l_qlen = [1, 2, 3, 4]
+# l_qlen = [2]
+# q_Tile is [max_qlen * num_query_heads // num_kv_heads]
+kv_lens_list0 = [i * 256 for i in range(1, 10)]
+kv_lens_list1 = [i - 1 for i in kv_lens_list0]
+kv_lens_list3 = [i + 10 for i in kv_lens_list0]
+kv_lens_list4 = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384, 90002, 90004]
+# l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
+l_ctx_len = kv_lens_list0 + kv_lens_list1 + kv_lens_list3 + kv_lens_list4
 l_batch_size = [2]
 
 parser = argparse.ArgumentParser(
