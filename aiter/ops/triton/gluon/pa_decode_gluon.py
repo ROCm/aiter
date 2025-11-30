@@ -1347,15 +1347,13 @@ def paged_attention_decode_v2_gluon_fp8(
         causal_mask = qk_column_offsets[None, :] < context_length
 
     boundary_mask = boundary_mask & causal_mask
-
+    if SLIDING_WINDOW > 0:
+        boundary_mask = boundary_mask & (
+            qk_column_offsets[None, :] > context_length - SLIDING_WINDOW
+        )
     # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
     attention_scores = tl.where(boundary_mask, attention_scores, float(-3.4e38))
-    if SLIDING_WINDOW > 0:
-        attention_scores = gl.where(
-            qk_column_offsets[None, :] > context_length - SLIDING_WINDOW,
-            attention_scores,
-            float(-3.4e38),
-        )
+
     # ==================== SOFTMAX COMPUTATION ====================
     # Update running maximum for numerical stability
     max_logits = gl.max(attention_scores, axis=1)
@@ -1905,7 +1903,7 @@ def paged_attention_decode_v2_reduce_kernel(
     """
     # Mathematical constant for exponential calculations
     LOG2_E: tl.constexpr = 1.4426950408889634
-    MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 16
+    MAX_CONTEXT_PARTITION_NUM: tl.constexpr = 8
     num_query_heads_total = gl.num_programs(1) * query_group_size
 
     # ==================== INITIALIZATION ====================
