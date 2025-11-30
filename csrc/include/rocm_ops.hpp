@@ -396,7 +396,8 @@ namespace py = pybind11;
           py::arg("out"),                       \
           py::arg("bias")       = std::nullopt, \
           py::arg("splitK")     = std::nullopt, \
-          py::arg("kernelName") = std::nullopt);
+          py::arg("kernelName") = std::nullopt, \
+          py::arg("bpreshuffle")      = false);
 
 #define GEMM_A4W4_ASM_PYBIND                      \
     m.def("gemm_a4w4_asm",                        \
@@ -664,6 +665,9 @@ namespace py = pybind11;
           py::arg("out")           = std::nullopt, \
           py::arg("bias")          = std::nullopt, \
           py::arg("alibi_slopes")  = std::nullopt, \
+          py::arg("q_descale")     = std::nullopt, \
+          py::arg("k_descale")     = std::nullopt, \
+          py::arg("v_descale")     = std::nullopt, \
           py::arg("gen")           = std::nullopt);
 
 #define MHA_VARLEN_FWD_ASM_PYBIND                 \
@@ -820,6 +824,9 @@ namespace py = pybind11;
           py::arg("block_table")         = std::nullopt, \
           py::arg("bias")                = std::nullopt, \
           py::arg("alibi_slopes")        = std::nullopt, \
+          py::arg("q_descale")           = std::nullopt, \
+          py::arg("k_descale")           = std::nullopt, \
+          py::arg("v_descale")           = std::nullopt, \
           py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt);
@@ -1257,6 +1264,8 @@ namespace py = pybind11;
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
+#define FUSED_MROPE_RMS_PYBIND m.def("fused_mrope_3d_rms", &fused_mrope_3d_rms);
+
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
@@ -1375,27 +1384,29 @@ namespace py = pybind11;
           py::arg("stride0"),      \
           py::arg("stride1"));
 
-#define MLA_METADATA_PYBIND                     \
-    m.def("get_mla_metadata_v1",                \
-          &get_mla_metadata_v1,                 \
-          "get_mla_metadata_v1",                \
-          py::arg("seqlens_qo_indptr"),         \
-          py::arg("seqlens_kv_indptr"),         \
-          py::arg("num_heads_per_head_k"),      \
-          py::arg("num_heads_k"),               \
-          py::arg("is_causal"),                 \
-          py::arg("work_metadata_ptrs"),        \
-          py::arg("work_info_set"),             \
-          py::arg("work_indptr"),               \
-          py::arg("reduce_indptr"),             \
-          py::arg("reduce_final_map"),          \
-          py::arg("reduce_partial_map"),        \
-          py::arg("kv_granularity") = 16,       \
-          py::arg("max_seqlen_qo")  = -1,       \
-          py::arg("uni_seqlen_qo")  = -1,       \
-          py::arg("fast_mode")      = true,     \
-          py::arg("topk")           = -1,       \
-          py::arg("max_split_per_batch") = -1); \
+#define MLA_METADATA_PYBIND                              \
+    m.def("get_mla_metadata_v1",                         \
+          &get_mla_metadata_v1,                          \
+          "get_mla_metadata_v1",                         \
+          py::arg("seqlens_qo_indptr"),                  \
+          py::arg("seqlens_kv_indptr"),                  \
+          py::arg("num_heads_per_head_k"),               \
+          py::arg("num_heads_k"),                        \
+          py::arg("is_causal"),                          \
+          py::arg("work_metadata_ptrs"),                 \
+          py::arg("work_info_set"),                      \
+          py::arg("work_indptr"),                        \
+          py::arg("reduce_indptr"),                      \
+          py::arg("reduce_final_map"),                   \
+          py::arg("reduce_partial_map"),                 \
+          py::arg("kv_granularity")      = 16,           \
+          py::arg("max_seqlen_qo")       = -1,           \
+          py::arg("uni_seqlen_qo")       = -1,           \
+          py::arg("fast_mode")           = true,         \
+          py::arg("topk")                = -1,           \
+          py::arg("max_split_per_batch") = -1,           \
+          py::arg("dtype_q")             = std::nullopt, \
+          py::arg("dtype_kv")            = std::nullopt);           \
     m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
 
 #define MLA_REDUCE_PYBIND                \
