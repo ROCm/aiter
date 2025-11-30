@@ -403,7 +403,7 @@ __global__ void kn_mla_reduce_v1_ps(
     for (int32_t work_idx = blockIdx.x; work_idx < tot_work; work_idx += gridDim.x)
     {
         const int32_t head_idx = work_idx & Traits::kNumHeadQMask;
-        const int32_t tile_idx = work_idx >> Traits::kNumHeadQLog2;
+        const int32_t tile_idx = work_idx / Traits::kNumHeadQ;
 
         const int32_t reduce_tile_start = params.p_reduce_indptr[tile_idx];
         const int32_t reduce_tile_end = params.p_reduce_indptr[tile_idx + 1];
@@ -614,7 +614,7 @@ void mla_reduce_v1(
 
     const bool output_lse = final_lse.has_value();
     const bool no_reduce_final_map = (reduce_final_map.has_value() == false);
-    const int32_t num_reduce_tile = reduce_indptr[-1].item<int32_t>();
+    const int32_t num_reduce_tile = reduce_indptr.size(0) - 1;
     const int32_t num_heads = partial_output.size(-2);
     const int32_t head_dim = final_output.size(-1);
 
