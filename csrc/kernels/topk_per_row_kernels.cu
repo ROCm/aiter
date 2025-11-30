@@ -1262,7 +1262,7 @@ template <typename T,
           int BlockSize,
           bool WRITE_TOPK_VALUES,
           bool prioritize_smaller_indice = false>
-__global__ void radix_topk_one_block_kernel(T const* in,
+__device__ void radix_topk_one_block_kernel(T const* in,
                                             IdxT const* in_idx,
                                             const int64_t len,
                                             const IdxT* rowStarts,
@@ -1403,7 +1403,7 @@ template <typename T,
           int BlockSize,
           bool WRITE_TOPK_VALUES,
           bool prioritize_smaller_indice = false>
-__global__ void radix_topk_one_block_one_pass_kernel(T const* in,
+__device__ void radix_topk_one_block_one_pass_kernel(T const* in,
                                                      IdxT const* in_idx,
                                                      const int64_t len,
                                                      const IdxT* rowStarts,
@@ -1548,6 +1548,59 @@ __global__ void radix_topk_one_block_one_pass_kernel(T const* in,
                 }
             }
         }
+    }
+}
+
+template <typename T,
+          typename IdxT,
+          int BitsPerPass,
+          int BlockSize,
+          bool WRITE_TOPK_VALUES,
+          bool prioritize_smaller_indice = false>
+__global__ void dispatch_radix_topk_one_block(T const* in,
+                                              IdxT const* in_idx,
+                                              const int64_t len,
+                                              const IdxT* rowStarts,
+                                              const IdxT* rowEnds,
+                                              const IdxT k,
+                                              T* out,
+                                              IdxT* out_idx,
+                                              bool const select_min,
+                                              char* bufs,
+                                              T const* global_min_values,
+                                              T const* global_max_values)
+{
+    __shared__ bool use_one_pass;
+
+    if(threadIdx.x == 0)
+    {
+        auto global_min_bits = twiddle_in(global_min_values[0], select_min);
+        auto global_max_bits = twiddle_in(global_max_values[0], select_min);
+        uint32_t diff        = global_min_bits ^ global_max_bits;
+
+        use_one_pass = diff < (1u << BitsPerPass);
+    }
+    __syncthreads();
+
+    if(use_one_pass)
+    {
+        radix_topk_one_block_one_pass_kernel<T,
+                                             IdxT,
+                                             BitsPerPass,
+                                             BlockSize,
+                                             WRITE_TOPK_VALUES,
+                                             prioritize_smaller_indice>(
+            in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min);
+    }
+    else
+    {
+        radix_topk_one_block_kernel<T,
+                                    IdxT,
+                                    BitsPerPass,
+                                    BlockSize,
+                                    WRITE_TOPK_VALUES,
+                                    prioritize_smaller_indice>(
+            in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs);
     }
 }
 
@@ -1701,28 +1754,6 @@ void standalone_stable_radix_topk_(void* buf,
     }
 }
 
-#define LAUNCH_TOPK_ONE_BLOCK_ONE_PASS_KERNEL(BitsOnePass)                                   \
-    radix_topk_one_block_one_pass_kernel<T, IdxT, BitsOnePass, BlockSize, WRITE_TOPK_VALUES> \
-        <<<batch_size, BlockSize, 0, stream>>>(                                              \
-            in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min);
-
-#define FOR_EACH_BITS(M) \
-    M(1)                 \
-    M(2)                 \
-    M(3)                 \
-    M(4)                 \
-    M(5)                 \
-    M(6)                 \
-    M(7)                 \
-    M(8)                 \
-    M(9)                 \
-    M(10)                \
-    M(11)                \
-    M(12)                
-
-#define GEN_CASE(B) \
-    case B: LAUNCH_TOPK_ONE_BLOCK_ONE_PASS_KERNEL(B); return;
-
 template <typename T, typename IdxT, int BitsPerPass, int BlockSize, bool WRITE_TOPK_VALUES>
 void standalone_stable_radix_topk_one_block_(void* buf,
                                              size_t& buf_size,
@@ -1736,21 +1767,12 @@ void standalone_stable_radix_topk_one_block_(void* buf,
                                              T* out,
                                              IdxT* out_idx,
                                              bool select_min,
-                                             int msb_diff,
+                                             T* global_min,
+                                             T* global_max,
                                              hipStream_t stream,
                                              bool sorted = false)
 {
     static_assert(calc_num_passes<T, BitsPerPass>() > 1);
-
-    if(msb_diff <= 12) // shared memory limit
-    {
-        switch(msb_diff)
-        {
-            FOR_EACH_BITS(GEN_CASE)
-        default: break;
-        }
-        return;
-    }
 
     char* bufs         = nullptr;
     IdxT* topk_out_idx = nullptr;
@@ -1775,9 +1797,19 @@ void standalone_stable_radix_topk_one_block_(void* buf,
         topk_out_idx = static_cast<decltype(topk_out_idx)>(aligned_pointers[1]);
     }
 
-    radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false>
-        <<<batch_size, BlockSize, 0, stream>>>(
-            in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs);
+    dispatch_radix_topk_one_block<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false>
+        <<<batch_size, BlockSize, 0, stream>>>(in,
+                                               in_idx,
+                                               len,
+                                               rowStarts,
+                                               rowEnds,
+                                               k,
+                                               out,
+                                               out_idx,
+                                               select_min,
+                                               bufs,
+                                               global_min,
+                                               global_max);
 }
 
 template <typename T, typename IdxT, bool WRITE_TOPK_VALUES, bool sorted = false>
@@ -1792,7 +1824,8 @@ void standalone_stable_radix_11bits(void* buf,
                                     T* out,
                                     IdxT* out_idx,
                                     bool greater,
-                                    int msb_diff,
+                                    T* global_min,
+                                    T* global_max,
                                     hipStream_t stream)
 {
     constexpr int items_per_thread   = 32;
@@ -1813,7 +1846,8 @@ void standalone_stable_radix_11bits(void* buf,
             out,
             out_idx,
             !greater,
-            msb_diff,
+            global_min,
+            global_max,
             stream,
             sorted);
     }
@@ -1839,7 +1873,8 @@ void standalone_stable_radix_11bits(void* buf,
                 out,
                 out_idx,
                 !greater,
-                msb_diff,
+                global_min,
+                global_max,
                 stream,
                 sorted);
         }
@@ -2439,7 +2474,8 @@ int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0)
             out_val,
             out_idx,
             !is_largest,
-            32,
+            static_cast<T*>(nullptr),
+            static_cast<T*>(nullptr),
             0,
             sorted);
     }
@@ -2488,17 +2524,8 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
 
     // global min and max. TODO: is last row guaranteed to compute diff?
     auto global_minmax = torch::aminmax(logits.index({numRows - 1, torch::indexing::Slice()}));
-    auto float_to_sortable_uint_host = [](float x) {
-        uint32_t bits;
-        std::memcpy(&bits, &x, sizeof(float));
-        bits = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
-        return bits;
-    };
-    auto global_min = float_to_sortable_uint_host(std::get<0>(global_minmax).item<float>());
-    auto global_max = float_to_sortable_uint_host(std::get<1>(global_minmax).item<float>());
-
-    uint32_t diff = global_min ^ global_max;
-    int msb_diff  = 32 - __builtin_clz(diff);
+    auto global_min    = std::get<0>(global_minmax);
+    auto global_max    = std::get<1>(global_minmax);
 
     if(values.has_value())
     {
@@ -2514,7 +2541,8 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
             values->data_ptr<float>(),
             indices.data_ptr<int>(),
             is_largest,
-            msb_diff,
+            global_min.data_ptr<float>(),
+            global_max.data_ptr<float>(),
             stream);
     }
     else
@@ -2531,7 +2559,8 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
             nullptr,
             indices.data_ptr<int>(),
             is_largest,
-            msb_diff,
+            global_min.data_ptr<float>(),
+            global_max.data_ptr<float>(),
             stream);
     }
 }
