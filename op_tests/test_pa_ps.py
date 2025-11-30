@@ -659,18 +659,18 @@ def test_pa_mtp(
             mask=1,
         )
 
-        _, us_asm_noquant = run_aiter_asm(
-            query,
-            k_quant_,
-            asm_V_shuffle(v_quant_),
-            block_tables,
-            seq_lens_kv,
-            block_tables.size(1),
-            max_qlen,
-            k_scale=k_scale_,
-            v_scale=v_scale_,
-            qo_indptr=qo_indptr,
-        )
+        # _, us_asm_noquant = run_aiter_asm(
+        #     query,
+        #     k_quant_,
+        #     asm_V_shuffle(v_quant_),
+        #     block_tables,
+        #     seq_lens_kv,
+        #     block_tables.size(1),
+        #     max_qlen,
+        #     k_scale=k_scale_,
+        #     v_scale=v_scale_,
+        #     qo_indptr=qo_indptr,
+        # )
 
         err = checkAllclose(
             out_ref,
@@ -678,18 +678,18 @@ def test_pa_mtp(
             msg="[torch vs  pa_persistent_fwd][   Quant]: us......",
         )
 
-        if isinstance(us_aiter_asm, torch.Tensor):
-            us_aiter_asm = us_aiter_asm.item()
-        if isinstance(us_asm_noquant, torch.Tensor):
-            us_asm_noquant = us_asm_noquant.item()
+        # if isinstance(us_aiter_asm, torch.Tensor):
+        #     us_aiter_asm = us_aiter_asm.item()
+        # if isinstance(us_asm_noquant, torch.Tensor):
+        #     us_asm_noquant = us_asm_noquant.item()
 
-        print(f"seq_lens_kv: {seq_lens_kv.tolist()[0]}")
-        print(f"batch_size: {batch_size}")
-        print(f"PA PS forward: {us_aiter_asm:>8.2f} ms")
-        print(f"PA without persistent: {us_asm_noquant:>8.2f} ms")
-        print(
-            f"Speedup: {us_asm_noquant / us_aiter_asm if us_aiter_asm > 0 else 0:.2f}x"
-        )
+        # print(f"seq_lens_kv: {seq_lens_kv.tolist()[0]}")
+        # print(f"batch_size: {batch_size}")
+        # print(f"PA PS forward: {us_aiter_asm:>8.2f} ms")
+        # print(f"PA without persistent: {us_asm_noquant:>8.2f} ms")
+        # print(
+        #     f"Speedup: {us_asm_noquant / us_aiter_asm if us_aiter_asm > 0 else 0:.2f}x"
+        # )
 
         ret["us_asm_fp8"] = us_aiter_asm
         ret["err fp8"] = err
@@ -710,12 +710,32 @@ l_qlen = [1, 2, 3, 4]
 kv_lens_list0 = [i * 256 for i in range(1, 10)]
 kv_lens_list1 = [i - 1 for i in kv_lens_list0]
 kv_lens_list3 = [i + 10 for i in kv_lens_list0]
-kv_lens_list4 = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384, 90002, 90004]
+kv_lens_list = [
+    7,
+    26,
+    57,
+    66,
+    109,
+    128,
+    257,
+    282,
+    3460,
+    16700,
+    7900,
+    2580,
+    4140,
+    6360,
+    4097,
+    16384,
+    90002,
+    90004,
+]
 # l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
-# l_ctx_len = kv_lens_list0 + kv_lens_list1 + kv_lens_list3 + kv_lens_list4
-# l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384, 90002, 90004]
-l_ctx_len = [3460, 16700, 7900, 2580, 4140, 6360, 2270]
-l_batch_size = [64, 128]
+# l_ctx_len = kv_lens_list0 + kv_lens_list1 + kv_lens_list3 + kv_lens_list
+l_ctx_len = kv_lens_list
+# l_ctx_len = [3460, 16700, 7900, 2580, 4140, 6360, 2270]
+# l_ctx_len = [16000]
+l_batch_size = [32, 64, 80]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
