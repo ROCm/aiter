@@ -3,7 +3,7 @@ import pytest
 from aiter.ops.triton.fused_mul_add import fused_mul_add
 
 
-def generate_qk_inputs(shape, a_type_is_scalar, b_type_is_scalar, dtype):
+def generate_fused_mul_add_inputs(shape, a_type_is_scalar, b_type_is_scalar, dtype):
     x = torch.randn(*shape, dtype=dtype, device="cuda")
 
     if a_type_is_scalar[1]:
@@ -29,7 +29,7 @@ def generate_qk_inputs(shape, a_type_is_scalar, b_type_is_scalar, dtype):
     return x, a, b
 
 
-def ref_mul_add(x, a, b):
+def run_torch(x, a, b):
     return (a * x.to(torch.float32) + b).to(x.dtype)
 
 
@@ -50,9 +50,11 @@ def test_mul_add(shape, a_type_is_scalar, b_type_is_scalar, output: bool, dtype)
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, a, b = generate_qk_inputs(shape, a_type_is_scalar, b_type_is_scalar, dtype)
+    x, a, b = generate_fused_mul_add_inputs(
+        shape, a_type_is_scalar, b_type_is_scalar, dtype
+    )
 
-    x_torch = ref_mul_add(x, a, b).clone()
+    x_torch = run_torch(x, a, b).clone()
     if output:
         x_triton = torch.empty_like(x)
         fused_mul_add(x, a, b, x_triton)
