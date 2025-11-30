@@ -212,7 +212,8 @@ class AITER_CONFIG(object):
         untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
-            keys = untunedf.columns
+            keys = untunedf.columns.to_list()
+            keys.append("cu_num")
             merge_df = (
                 merge_df.sort_values("us")
                 .drop_duplicates(subset=keys, keep="first")
