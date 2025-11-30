@@ -150,7 +150,9 @@ std::string get_heuristic_kernel(std::string q_type,
                 " block_size:",
                 block_size,
                 " ps:",
-                ps);
+                ps,
+                " qTile:",
+                qTile);
     return "";
 }
 const float f_log2E = log2f(expf(1));
