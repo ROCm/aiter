@@ -203,6 +203,7 @@ def gen_gemm_a8w8_blockscale_bpreshuffle_asm_fake_tensors(
 ) -> Tensor:
     return out
 
+
 @compile_ops(
     "module_gemm_a8w8_blockscale_bpreshuffle_asm",
     fc_name="gemm_a8w8_blockscale_bpreshuffle_asm",
