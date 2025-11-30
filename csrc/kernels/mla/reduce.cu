@@ -27,7 +27,6 @@ struct MlaReduceKernelV1Traits
     // implicitly set by reduce_partial_map[1] - reduce_partial_map[0].
     static constexpr bool    kOmitReduceFinalMap = kOmitReduceFinalMap_;
 
-    static_assert((kNumHeadQ & (kNumHeadQ - 1)) == 0, "kNumHeadQ must be power of 2!");
 };
 
 struct MlaReduceKernelV1Params
@@ -164,7 +163,8 @@ CK_TILE_DEVICE void reduce_lse(
                 const int32_t reduce_partial_map = ((lane_idx == 0) ? reduce_partial_map_0 : reduce_partial_map_1);
                 const int64_t reduce_tile_pos = reduce_partial_map * int64_t(Traits::kNumHeadQ);
                 lse = p_partial_lse_seq_base[reduce_tile_pos];
-                max_lse = ck_tile::max(max_lse, lse);
+                if (!std::isnan(lse))
+                    max_lse = ck_tile::max(max_lse, lse);
             }
             local_lse[0] = lse;
 
@@ -185,7 +185,8 @@ CK_TILE_DEVICE void reduce_lse(
                     const int64_t reduce_tile_pos =
                         params.p_reduce_partial_map[tile_idx] * int64_t(Traits::kNumHeadQ);
                     lse = p_partial_lse_seq_base[reduce_tile_pos];
-                    max_lse = ck_tile::max(max_lse, lse);
+                    if (!std::isnan(lse))
+                        max_lse = ck_tile::max(max_lse, lse);
                 }
                 return lse;
             };
@@ -214,7 +215,8 @@ CK_TILE_DEVICE void reduce_lse(
         for (int32_t offset = ck_tile::get_warp_size() / 2; offset > 0; offset /= 2)
         {
             const int32_t srd_lane = (offset ^ ck_tile::get_warp_size()) ^ ck_tile::get_lane_id();
-            max_lse = ck_tile::max(max_lse, ck_tile::warp_shuffle(max_lse, srd_lane));
+            if (!std::isnan(max_lse))
+                max_lse = ck_tile::max(max_lse, ck_tile::warp_shuffle(max_lse, srd_lane));
         }
 
         // Get sum of LSE
@@ -222,13 +224,15 @@ CK_TILE_DEVICE void reduce_lse(
         #pragma unroll 2
         for (int32_t i = 0; i < num_lse_per_thr; ++i)
         {
-            sum_lse += expf(local_lse[i] - max_lse);
+            if (!std::isnan(local_lse[i]))
+                sum_lse += expf(local_lse[i] - max_lse);
         }
         #pragma unroll
         for (int32_t offset = ck_tile::get_warp_size() / 2; offset > 0; offset /= 2)
         {
             const int32_t srd_lane = (offset ^ ck_tile::get_warp_size()) ^ ck_tile::get_lane_id();
-            sum_lse += ck_tile::warp_shuffle(sum_lse, srd_lane);
+            if (!std::isnan(sum_lse))
+                sum_lse += ck_tile::warp_shuffle(sum_lse, srd_lane);
         }
 
         // Get global LSE
@@ -282,7 +286,10 @@ CK_TILE_DEVICE void reduce_output(
         const float lse_scale = p_lds_lse_scale[split_idx];
         auto oaccu = ck_tile::load_tile(oaccu_window);
         ck_tile::sweep_tile(oaccu, [&](auto idx) {
-            reg_out(idx) += lse_scale * oaccu(idx);
+            if (std::isnan(oaccu(idx)) || std::isnan(lse_scale))
+                reg_out(idx) += 0;
+            else
+                reg_out(idx) += lse_scale * oaccu(idx);
         });
     };
 
@@ -395,8 +402,8 @@ __global__ void kn_mla_reduce_v1_ps(
     const int32_t tot_work = Traits::kNumHeadQ * params.num_reduce_tile;
     for (int32_t work_idx = blockIdx.x; work_idx < tot_work; work_idx += gridDim.x)
     {
-        const int32_t head_idx = work_idx & Traits::kNumHeadQMask;
-        const int32_t tile_idx = work_idx >> Traits::kNumHeadQLog2;
+        const int32_t head_idx = work_idx % Traits::kNumHeadQ;
+        const int32_t tile_idx = work_idx / Traits::kNumHeadQ;
 
         const int32_t reduce_tile_start = params.p_reduce_indptr[tile_idx];
         const int32_t reduce_tile_end = params.p_reduce_indptr[tile_idx + 1];
@@ -482,6 +489,14 @@ __global__ void kn_mla_reduce_v1(
         NUM_HEAD,   8, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NAME, __VA_ARGS__)                    \
     MLA_MERGE_CASE_EF(                                                                                      \
         NUM_HEAD,   8, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NAME, __VA_ARGS__)                    \
+    MLA_MERGE_CASE_IF(                                                                                      \
+        NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NAME, __VA_ARGS__)                   \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, false, NAME, __VA_ARGS__)                   \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, true,  NAME, __VA_ARGS__)                   \
+    MLA_MERGE_CASE_EF(                                                                                      \
+        NUM_HEAD,   10, HEAD_DIM, 128, OUTPUT_LSE, false, NRFM, false, NAME, __VA_ARGS__)                   \
     MLA_MERGE_CASE_EF(                                                                                      \
         NUM_HEAD,  16, HEAD_DIM, 128, OUTPUT_LSE, true,  NRFM, true,  NAME, __VA_ARGS__)                    \
     MLA_MERGE_CASE_EF(                                                                                      \

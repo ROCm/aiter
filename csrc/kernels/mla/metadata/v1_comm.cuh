@@ -9,6 +9,7 @@
 #include "aiter_hip_common.h"
 #include "custom_all_reduce.cuh"
 #include "mla.h"
+#include "pa.h"
 
 
 CK_TILE_HOST_DEVICE int32_t cal_cost(
@@ -67,6 +68,14 @@ struct MlaMetadataV1KernelParameter
     int32_t        qk_batch_ratio;
     int32_t        num_splits;
     bool           is_causal;
+};
+
+struct PaMetadataV1KernelParameter: MlaMetadataV1KernelParameter
+{
+    // Inputs
+    const int32_t* p_pages_kv_indptr;
+    int32_t        num_heads_k;
+    int32_t        gqa_ratio;
 };
 
 template <typename T>
@@ -294,6 +303,12 @@ public:
         {
             return Traits::kUniSeqlenQo * (batch_idx + 1);
         }
+    }
+
+    CK_TILE_DEVICE int32_t get_q_head_range(
+        const int32_t q_head_start, const int32_t q_head_end) {
+        int32_t q_head_range = (q_head_end << 16) | (q_head_start & 0xFFFF);
+        return q_head_range;
     }
 
 private:
