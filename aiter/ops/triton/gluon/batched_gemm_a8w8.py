@@ -349,18 +349,33 @@ def _issue_loads(
 ):
     # Load the next block of A
     if EVEN_K:
-        acp.buffer_load_to_shared(
+        # acp.buffer_load_to_shared(
+        #     dest=smem_a.index(load_idx % NUM_STAGES),
+        #     ptr=(a_ptr + batch_id * stride_ab),
+        #     offsets=offs_a,
+        #     mask=(offs_am[:, None] < M),
+        #     other=0.0,
+        # )
+        acp.global_load_to_shared(
             dest=smem_a.index(load_idx % NUM_STAGES),
-            ptr=(a_ptr + batch_id * stride_ab),
-            offsets=offs_a,
+            ptr=(a_ptr + batch_id * stride_ab + offs_a),
             mask=(offs_am[:, None] < M),
             other=0.0,
         )
     else:
-        acp.buffer_load_to_shared(
+        # acp.buffer_load_to_shared(
+        #     dest=smem_a.index(load_idx % NUM_STAGES),
+        #     ptr=(a_ptr + batch_id * stride_ab),
+        #     offsets=offs_a,
+        #     mask=(
+        #         (offs_ak[None, :] < K - load_idx * BLOCK_SIZE_K)
+        #         & (offs_am[:, None] < M)
+        #     ),
+        #     other=0.0,
+        # )
+        acp.global_load_to_shared(
             dest=smem_a.index(load_idx % NUM_STAGES),
-            ptr=(a_ptr + batch_id * stride_ab),
-            offsets=offs_a,
+            ptr=(a_ptr + batch_id * stride_ab + offs_a),
             mask=(
                 (offs_ak[None, :] < K - load_idx * BLOCK_SIZE_K)
                 & (offs_am[:, None] < M)
@@ -370,18 +385,33 @@ def _issue_loads(
 
     # Load the next block of B
     if EVEN_K:
-        acp.buffer_load_to_shared(
+        # acp.buffer_load_to_shared(
+        #     dest=smem_b.index(load_idx % NUM_STAGES),
+        #     ptr=(b_ptr + batch_id * stride_bb),
+        #     offsets=offs_b,
+        #     mask=(offs_bn[None, :] < N),
+        #     other=0.0,
+        # )
+        acp.global_load_to_shared(
             dest=smem_b.index(load_idx % NUM_STAGES),
-            ptr=(b_ptr + batch_id * stride_bb),
-            offsets=offs_b,
+            ptr=(b_ptr + batch_id * stride_bb + offs_b),
             mask=(offs_bn[None, :] < N),
             other=0.0,
         )
     else:
-        acp.buffer_load_to_shared(
+        # acp.buffer_load_to_shared(
+        #     dest=smem_b.index(load_idx % NUM_STAGES),
+        #     ptr=(b_ptr + batch_id * stride_bb),
+        #     offsets=offs_b,
+        #     mask=(
+        #         (offs_bk[:, None] < K - load_idx * BLOCK_SIZE_K)
+        #         & (offs_bn[None, :] < N)
+        #     ),
+        #     other=0.0,
+        # )
+        acp.global_load_to_shared(
             dest=smem_b.index(load_idx % NUM_STAGES),
-            ptr=(b_ptr + batch_id * stride_bb),
-            offsets=offs_b,
+            ptr=(b_ptr + batch_id * stride_bb + offs_b),
             mask=(
                 (offs_bk[:, None] < K - load_idx * BLOCK_SIZE_K)
                 & (offs_bn[None, :] < N)
