@@ -47,7 +47,9 @@ struct __attribute__((packed)) KernelArgs
     unsigned int K;
     p3 _p16;
     unsigned int splitk;
-    p2 _p17;
+    p3 _p17;
+    unsigned int is_out_b16;
+    p3 _p18;
 };
 
 std::tuple<std::string, int>
@@ -55,6 +57,8 @@ get_heuristic_kernel(int M,
                      int N,
                      int K,
                      CFG* cfgs,
+                     std::string arch_id,
+                     bool bpreshuffle,
                      std::optional<int> splitk             = std::nullopt,
                      std::optional<std::string> kernelName = std::nullopt)
 {
@@ -75,16 +79,18 @@ get_heuristic_kernel(int M,
 
     for(const auto& el : *cfgs)
     {
-        const auto& cfg = el.second;
-        if(kernelName.has_value() && kernelName.value() != el.first)
+        if (el.first.find(arch_id) != 0)
             continue;
-        if(N % cfg.tileN == 0)
+        const auto& cfg = el.second;
+        if(kernelName.has_value() && el.first != (arch_id + kernelName.value()))
+            continue;
+        if(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0))
         {
             // 1. select splitK
             int split_K = 1;
             if(splitk.has_value())
                 split_K = splitk.value();
-            else // auto select
+            else if (cfg.splitK == 1)// auto select
             {
                 pure_tg_num =
                     ((M + cfg.tileM - 1) / cfg.tileM) * (N / cfg.tileN); // M-orient support OOB
@@ -125,6 +131,7 @@ get_heuristic_kernel(int M,
                 compute2mem_effi   = local_compute2mem_effi;
                 oob                = (M % cfg.tileM == 0) ? 0 : cfg.tileM - (M % cfg.tileM);
                 selectedKernelName = el.first;
+                // printf("Selected Kernel: %s\n", selectedKernelName.c_str());
                 selectedsplitK     = split_K;
             }
         }
@@ -139,11 +146,13 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
                               torch::Tensor& out, // Out:[M, N] f32
                               std::optional<torch::Tensor> bias,
                               std::optional<int> splitK,
-                              std::optional<std::string> kernelName)
+                              std::optional<std::string> kernelName,
+                              bool bpreshuffle = false)
 {
-    TORCH_CHECK(out.dtype() == torch::ScalarType::Float,
-                "GEMM A16W16 asm only support Float32 output now!");
-
+    TORCH_CHECK(out.dtype() == torch::ScalarType::Float || out.dtype() == torch::ScalarType::BFloat16,
+                "GEMM A16W16 asm only support Float32 or Bf16 output now!");
+    
+    std::string arch_id = get_gpu_arch();
     // 1. prepare args
     int Mdim = A.size(0);
     int Ndim = B.size(0);
@@ -167,10 +176,14 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     int strideA1      = 0;
     int strideB0      = 0;
     int strideB1      = 0;
+    int is_out_b16   = 0;
     // A row major, B col major, C row major
     strideA0 = strideA1 = Kdim * 2; // in bytes
     strideB0 = strideB1 = Kdim * 2;
-    strideC0 = strideC1 = strideD0 = strideD1 = Ndim * 4; // inbytes
+    const auto elem_bytes = out.element_size(); 
+    strideC0 = strideC1 = strideD0 = strideD1 = Ndim * elem_bytes; // inbytes
+    if (out.dtype() == torch::ScalarType::BFloat16)
+        is_out_b16 = 1;
 
     szA += sz_A_pad;
     szB += sz_B_pad;
@@ -191,6 +204,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     args.M         = Mdim;
     args.N         = Ndim;
     args.K         = Kdim;
+    args.is_out_b16 = is_out_b16;
 
     // args.stride_D0 = 25;
     // args.stride_D1 = 80;
@@ -200,18 +214,20 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     // 2. select kl
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
     AiterAsmKernel* impl_ptr = nullptr;
-    CFG* config_map          = &cfg_bf16gemm_outf32;
+    CFG* config_map          = &cfg_bf16gemm_fp32bf16;
 
     // 2.1 static dict
-    std::string selectedKernelName = kernelName.value_or("");
+    std::string selectedKernelName = kernelName.has_value() ? arch_id + kernelName.value() : "";
     int selectedksplit             = splitK.value_or(0) ?: 1;
-    if(!kernelName.has_value() || kernelName == "")
+    if(!kernelName.has_value() || kernelName == "" || !splitK.has_value())
     {
 
         auto it_sel        = get_heuristic_kernel(Mdim,
                                            Ndim,
                                            Kdim,
                                            config_map,
+                                           arch_id,
+                                           bpreshuffle,
                                            splitK.has_value() ? splitK : std::nullopt,
                                            kernelName.has_value() ? kernelName : std::nullopt);
         selectedKernelName = std::get<0>(it_sel);
@@ -237,13 +253,14 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     // printf("N: %u\n", args.N);
     // printf("K: %u\n", args.K);
     // printf("splitk: %u\n", args.splitk);
+    // printf("is_out_b16: %u\n", args.is_out_b16);
     // printf("=======================================\n");
 
     auto it_kl = config_map->find(selectedKernelName);
     if(it_kl != config_map->end())
     {
         const auto& cfg     = it_kl->second;
-        const char* name    = cfg.name.c_str();
+        const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         SUBM                = cfg.tileM;
         SUBN                = cfg.tileN;

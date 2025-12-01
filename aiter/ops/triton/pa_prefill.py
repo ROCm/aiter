@@ -9,7 +9,6 @@
 
 import torch
 import triton
-import triton.language as tl
 from aiter.ops.triton._triton_kernels.pa_prefill import _fwd_kernel, _fwd_kernel_alibi
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -40,7 +39,33 @@ def context_attention_fwd(
     skip_decode=False,
 ):
     """
-    #TODO: Add Doc
+    Paged attention prefill for multi-token context processing with paged KV cache.
+    Supports variable-length sequences, GQA, FP8 quantization, ALiBi, and sliding window.
+
+    Args:
+        q (torch.Tensor): Query tensor with shape (total_tokens, num_q_heads, head_dim).
+        k (torch.Tensor): Key tensor for prefill tokens with shape (total_tokens, num_kv_heads, head_dim).
+        v (torch.Tensor): Value tensor for prefill tokens with shape (total_tokens, num_kv_heads, head_dim).
+        o (torch.Tensor): Pre-allocated output tensor with shape (total_tokens, num_q_heads, head_dim).
+        kv_cache_dtype (str): KV cache data type ("auto", "fp8", "fp8_e4m3").
+        k_cache (torch.Tensor): Paged key cache with shape
+            (num_blocks, num_kv_heads, head_dim//x, block_size, x) for vectorized layout.
+        v_cache (torch.Tensor): Paged value cache with shape
+            (num_blocks, num_kv_heads, head_dim, block_size).
+        b_loc (torch.Tensor): Block location table mapping tokens to cache blocks with shape
+            (batch_size, max_blocks_per_seq).
+        b_start_loc (torch.Tensor): Start token index for each sequence with shape (batch_size + 1,).
+        b_seq_len (torch.Tensor): Sequence length for each sequence with shape (batch_size,).
+        max_input_len (int): Maximum input length across all sequences in batch.
+        k_scale (torch.Tensor): Quantization scale for key cache.
+        v_scale (torch.Tensor): Quantization scale for value cache.
+        alibi_slopes (Optional[torch.Tensor]): ALiBi position bias slopes with shape (num_q_heads,).
+        sliding_window (Optional[int]): Sliding window size for local attention. 0 or None disables.
+        sm_scale (Optional[float]): Softmax scale, defaults to 1/sqrt(head_dim).
+        skip_decode (bool): Skip decode-only sequences (single-token) in mixed batch.
+
+    Returns:
+        None. Results written in-place to o.
     """
 
     _LOGGER.info(

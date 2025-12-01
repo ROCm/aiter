@@ -19,6 +19,7 @@ def act_mul_and_mxfp4_quant(
     activation: Literal["silu", "gelu", "gelu_tanh"],
     scaling_mode: str = "even",
     shuffle: bool = False,
+    scale_shuffle_padding: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply the activation function and quantize the result to MX FP4 format.
@@ -53,22 +54,18 @@ def act_mul_and_mxfp4_quant(
     x_fp4 = torch.empty((M, N_half // 2), dtype=torch.uint8, device=x.device)
     scaleN_valid = triton.cdiv(N_half, MXFP4_QUANT_BLOCK_SIZE)
     # Setting scale M to be multiple of 256 and scale N to be multiple of 8
-    if shuffle:
+    use_scale_shuffle_padding = shuffle or scale_shuffle_padding
+    if use_scale_shuffle_padding:
         scaleM = triton.cdiv(M, 256) * 256
         scaleN = triton.cdiv(scaleN_valid, 8) * 8
-        blockscale_e8m0 = torch.empty(
-            (scaleM, scaleN),
-            dtype=torch.uint8,
-            device=x.device,
-        )
     else:
         scaleM = M
         scaleN = scaleN_valid
-        blockscale_e8m0 = torch.empty(
-            (scaleN, scaleM),
-            dtype=torch.uint8,
-            device=x.device,
-        ).T
+    blockscale_e8m0 = torch.empty(
+        (scaleM, scaleN),
+        dtype=torch.uint8,
+        device=x.device,
+    )
 
     # for large N values
     if M <= 32:
@@ -116,7 +113,7 @@ def act_mul_and_mxfp4_quant(
         SCALING_MODE=0,
         ACTIVATION=activation,
         scaleN=scaleN_valid,
-        scaleM_pad=scaleM,
+        scaleM_pad=(scaleM if use_scale_shuffle_padding else 1),
         scaleN_pad=scaleN,
         SHUFFLE=shuffle,
         NUM_ITER=NUM_ITER,
