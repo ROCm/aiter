@@ -262,7 +262,7 @@ __device__ __forceinline__ void vec_add_r_(vec_t<T, VEC_SIZE> (&self)[NRanks]) {
 
 using namespace kernel_utils;
 
-#define WARP_SIZE 64
+#define WARP_SIZE 32
 
 template <int NRanks>
 struct CommPtrs {
