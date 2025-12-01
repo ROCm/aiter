@@ -123,6 +123,133 @@ struct HkMlaDecodeFwdParams
 };
 
 template <typename T>
+inline __device__ void async_load_k(uintptr_t p_lds_k_nope,
+                                    uintptr_t p_lds_k_rope,
+                                    typename T::gl_kv& kv_buffer,
+                                    const int32_t* p_kv_indices,
+                                    const int32_t kv_start,
+                                    const int32_t kv_end)
+{
+    // Note: always assumes that kv_end - kv_start <= T::kBlockN
+
+    /// TODO: LDS back conflict
+    /// TODO: ROPE async load can be further optimized.
+
+    using kv_t = T::kv_t;
+
+    // Restrictions of this function
+    static_assert(sizeof(kv_t) == 1, "Only fp8 is supported!");
+    static_assert((T::kQkNopeHeadDim == 512) && (T::kQkRopeHeadDim == 64) && (T::kBlockN == 32),
+                  "Unsupported layout!");
+    static_assert(T::kPageSize == 1, "Only supports page size 1 for now!");
+
+    const int32_t warp_idx = ckt::get_warp_id();
+    const int32_t lane_idx = ckt::get_lane_id();
+
+#if defined(__gfx950__)
+    constexpr int32_t kNumRowsPerWarp = T::kBlockN / T::kNumWarps;
+    constexpr int32_t kNumRowsPerIter = kNumRowsPerWarp / 2;
+    static_assert((kNumRowsPerWarp == 4));
+    const int32_t sub_warp_idx = lane_idx >> 0x5;
+    const int32_t sub_lane_idx = lane_idx & 0x1f;
+#pragma unroll
+    for(int32_t col_idx = sub_warp_idx; col_idx < kNumRowsPerWarp; col_idx += kNumRowsPerIter)
+    {
+        // Load NOPE
+        // Each warp takes 4 cols (#cols = BlockN = 32). Warp 0 takes col 0-3. The rest warps are in
+        // a similar fashion. Each thread takes 2 rounds of 16 bytes. x4 lds loads insts should be
+        // used. Lane 0-31 read col 0 and 2 and lane 32-63 read col 1 and 3
+        constexpr int32_t bytes_per_thread_nope = (T::kQkNopeHeadDim * 2) / ckt::get_warp_size();
+        static_assert(bytes_per_thread_nope == 16);
+
+        int32_t voffset_nope, voffset_rope;
+        const int32_t col_idx = kv_start + col_idx + warp_idx * kNumRowsPerWarp;
+        if(col_idx < kv_end)
+        {
+            const int32_t col = p_kv_indices[col_idx];
+            voffset_nope      = col * T::kQkHeadDim + sub_lane_idx * bytes_per_thread_nope;
+            voffset_rope      = col * T::kQkHeadDim + sub_lane_idx * bytes_per_thread_nope;
+        }
+        else
+        {
+            voffset_nope = 0x80000000;
+            voffset_rope = 0x80000000;
+        }
+
+        const hk::i32x4 srsrc =
+            hk::make_srsrc(&kv_buffer[{0, 0, 0, 0}], T::kQkHeadDim * T::kBlockN * sizeof(kv_t));
+        uintptr_t p_lds_warp_nope =
+            p_lds_k_nope + warp_idx * (col_idx & 0xffffffffe) * T::kQkNopeHeadDim * sizeof(kv_t);
+
+        hk::llvm_amdgcn_raw_buffer_load_lds(
+            srsrc, (as3_uint32_ptr)(p_lds_warp_nope), bytes_per_thread_nope, voffset_nope, 0, 0, 0);
+
+        // Load ROPE
+        // Each thread take 2 bytes
+        constexpr int32_t bytes_per_thread_rope = T::kQkRopeHeadDim / (ckt::get_warp_size() / 2);
+        static_assert(bytes_per_thread_rope == 2);
+
+        uintptr_t p_lds_warp_rope =
+            p_lds_k_rope + warp_idx * (col_idx & 0xffffffffe) * T::kQkRopeHeadDim * sizeof(kv_t);
+
+        hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                            (as3_uint32_ptr)(p_lds_warp_rope),
+                                            bytes_per_thread_rope,
+                                            voffset_rope,
+                                            T::kQkNopeHeadDim,
+                                            0,
+                                            0);
+    }
+#elif defined(__gfx94__)
+    for(int32_t col_base = kv_start + warp_idx; col_base < kv_end; col_base += T::kNumWarps)
+    {
+        // Load NOPE
+        // Each warp takes 4 cols (#cols = BlockN = 32). Warp 0 takes col 0, 8, 18, 24. The rest
+        // warps are in similar. On each col, each thread takes kQkNopeHeadDim/warp_size = 512/64 =
+        // 8 bytes which equals 2 rounds of 4 bytes. Lane 0 reads 0-3 bytes and 256-259 bytes.
+        constexpr int32_t bytes_per_thread_nope = T::kQkNopeHeadDim / ckt::get_warp_size() / 2;
+        static_assert(bytes_per_thread_nope == 4);
+
+        const int32_t col          = __builtin_amdgcn_readfirstlane(p_kv_indices[col_base]);
+        const int32_t voffset_nope = lane_idx * bytes_per_thread_nope;
+        const kv_t* p_col          = &kv_buffer[{0, col, 0, 0}];
+        const hk::i32x4 srsrc = hk::make_srsrc(p_col, T::kQkHeadDim * T::kBlockN * sizeof(kv_t));
+        uintptr_t p_lds_warp_nope =
+            p_lds_k_nope + (col_base - kv_start) * T::kQkNopeHeadDim * sizeof(kv_t);
+
+        hk::llvm_amdgcn_raw_buffer_load_lds(
+            srsrc, (as3_uint32_ptr)(p_lds_warp_nope), bytes_per_thread_nope, voffset_nope, 0, 0, 0);
+        hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                            (as3_uint32_ptr)(p_lds_warp_nope),
+                                            bytes_per_thread_nope,
+                                            voffset_nope,
+                                            0,
+                                            T::kQkNopeHeadDim / 2,
+                                            0);
+
+        // load ROPE
+        // Each warp takes 4 cols (#cols = BlockN = 32). Warp 0 takes col 0, 8, 18, 24. The rest
+        // warps are in similar. On each col, each threads takes kQkRopeHeadDim/warp_size = 64/64 =
+        // 1 byte.
+        constexpr int32_t bytes_per_thread_rope = T::kQkRopeHeadDim / ckt::get_warp_size();
+        static_assert(bytes_per_thread_rope == 1);
+
+        const int32_t voffset_rope = lane_idx * bytes_per_thread_rope;
+        uintptr_t p_lds_warp_rope =
+            p_lds_k_rope + (col_base - kv_start) * T::kQkRopeHeadDim * sizeof(kv_t);
+
+        hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                            (as3_uint32_ptr)(p_lds_warp_rope),
+                                            bytes_per_thread_rope,
+                                            voffset_rope,
+                                            T::kQkNopeHeadDim,
+                                            0,
+                                            0);
+    }
+#endif
+}
+
+template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     __attribute__((amdgpu_num_vgpr(64))) void kn_ml_decode_fwd_n128(HkMlaDecodeFwdParams<T> params)
 {
@@ -147,10 +274,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     hk::shared_allocator al(p_lds);
     typename T::st_kv_nope(&lds_k_nope) = al.allocate<typename T::st_kv_nope>();
     typename T::st_kv_rope(&lds_k_rope) = al.allocate<typename T::st_kv_rope>();
-    // manually LDS manage
-    // constexpr int32_t kSzLdsKNope = T::kBlockN * (T::kQkNopeHeadDim + 1);
-    // constexpr int32_t kSzLdsKRope = T::kBlockN * (T::kQkRopeHeadDim + 1);
-    // kv_t* p_lds_k_nope = reinterpret_cast<kv_t*>(p_lds);
+    // Manually LDS manage. HK doesn't supports paged kv for now. We need the following info to
+    // manually load data from VRAM to LDS. On loading LDS to GPR, HK function will be used.
+    constexpr int32_t kSzLdsKNope = T::kBlockN * (T::kQkNopeHeadDim + 1);
+    constexpr int32_t kSzLdsKRope = T::kBlockN * (T::kQkRopeHeadDim + 1);
+    kv_t* p_lds_k_nope            = reinterpret_cast<kv_t*>(p_lds);
+    kv_t* p_lds_k_rope            = p_lds_k_nope + kSzLdsKNope;
 
     // Reg tiles
     constexpr uint32_t k_o_sz      = 128;
@@ -234,29 +363,130 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             q_rope, params.query, {qo_start, 0, 0, 0}, {0, warp_idx, 0, 0});
 
         // Async load K from VRAM to LDS
-        /// TODO:
-        // const int32_t k_idx = __builtin_amdgcn_readfirstlane(params.p_kv_indices[kv_start]);
-        // G::template load<1, false>(lds_k_nope, params.kv_buffer, {0, k_idx ,0, 0});
+        async_load_k<T>(reinterpret_cast<uintptr_t>(p_lds_k_nope),
+                        reinterpret_cast<uintptr_t>(p_lds_k_rope),
+                        params.kv_buffer,
+                        params.p_kv_indices,
+                        kv_start,
+                        ckt::min(kv_start + T::kBlockN, kv_end));
+
+        __builtin_amdgcn_s_waitcnt(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+
+        // Debug: load k nope to test tensor
+        {
+            const int32_t tot_elem = ckt::min(T::kQoNumHead, kv_end - kv_start) * T::kQkNopeHeadDim;
+            for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
+            {
+                uint32_t data            = *reinterpret_cast<uint32_t*>(p_lds_k_nope + idx);
+                const float4 f4          = convert_fp8x4_to_float4(FUI{data});
+                const int32_t row        = idx / T::kQkNopeHeadDim + qo_start * T::kQoNumHead;
+                const int32_t col        = idx % T::kQkNopeHeadDim;
+                const int32_t offset     = row * T::kQkHeadDim + col;
+                params.p_dbg[offset]     = f4.x;
+                params.p_dbg[offset + 1] = f4.y;
+                params.p_dbg[offset + 2] = f4.z;
+                params.p_dbg[offset + 3] = f4.w;
+            }
+        }
+
+        // Debug: load k rope to test tensor
+        {
+            const int32_t tot_elem = ckt::min(T::kQoNumHead, kv_end - kv_start) * T::kQkRopeHeadDim;
+            for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
+            {
+                uint32_t data            = *reinterpret_cast<uint32_t*>(p_lds_k_rope + idx);
+                const float4 f4          = convert_fp8x4_to_float4(FUI{data});
+                const int32_t row        = idx / T::kQkRopeHeadDim + qo_start * T::kQoNumHead;
+                const int32_t col        = (idx % T::kQkRopeHeadDim) + T::kQkNopeHeadDim;
+                const int32_t offset     = row * T::kQkHeadDim + col;
+                params.p_dbg[offset]     = f4.x;
+                params.p_dbg[offset + 1] = f4.y;
+                params.p_dbg[offset + 2] = f4.z;
+                params.p_dbg[offset + 3] = f4.w;
+            }
+        }
 
         // QK Gemm
         ckt::static_for<k_q_nope_begin, k_q_rope_end + 1, 2 * 2>{}([&](auto idx) {
-            using q_range_0 =
-                hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value + 1>>, 2>;
-            using q_range_1 =
-                hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value + 3>>,
-                                     2>;
-            hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
-            hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
+            constexpr int32_t loop_idx  = (idx.value - k_q_nope_begin) / 4;
+            const int32_t kv_start_loop = kv_start + loop_idx * T::kBlockN;
+            // Async load K from VRAM to LDS
+            async_load_k<T>(reinterpret_cast<uintptr_t>(p_lds_k_nope),
+                            reinterpret_cast<uintptr_t>(p_lds_k_rope),
+                            params.kv_buffer,
+                            params.p_kv_indices,
+                            kv_start_loop,
+                            ckt::min(kv_start_loop + T::kBlockN, kv_end));
 
-            if constexpr(idx.value == k_q_nope_begin)
+            __builtin_amdgcn_s_waitcnt(0);
+            __builtin_amdgcn_s_barrier();
+            __builtin_amdgcn_sched_barrier(0);
+
+            // Debug: load k nope to test tensor
             {
-                hk::mma_ABt(p_comp, q_0, kv_0);
+                const int32_t tot_elem =
+                    ckt::min(T::kQoNumHead, kv_end - kv_start) * T::kQkNopeHeadDim;
+                for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
+                {
+                    uint32_t data   = *reinterpret_cast<uint32_t*>(p_lds_k_nope + idx);
+                    const float4 f4 = convert_fp8x4_to_float4(FUI{data});
+                    const int32_t row =
+                        idx / T::kQkNopeHeadDim + qo_start * T::kQoNumHead + loop_idx * T::kBlockN;
+                    if(row >= T::kQoNumHead)
+                        break;
+                    const int32_t col        = idx % T::kQkNopeHeadDim;
+                    const int32_t offset     = row * T::kQkHeadDim + col;
+                    params.p_dbg[offset]     = f4.x;
+                    params.p_dbg[offset + 1] = f4.y;
+                    params.p_dbg[offset + 2] = f4.z;
+                    params.p_dbg[offset + 3] = f4.w;
+                }
             }
-            else
+
+            // Debug: load k rope to test tensor
             {
-                hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
+                const int32_t tot_elem =
+                    ckt::min(T::kQoNumHead, kv_end - kv_start) * T::kQkRopeHeadDim;
+                for(int32_t idx = threadIdx.x * 4; idx < tot_elem; idx += T::kNumThreads * 4)
+                {
+                    uint32_t data   = *reinterpret_cast<uint32_t*>(p_lds_k_rope + idx);
+                    const float4 f4 = convert_fp8x4_to_float4(FUI{data});
+                    const int32_t row =
+                        idx / T::kQkRopeHeadDim + qo_start * T::kQoNumHead + loop_idx * T::kBlockN;
+                    if(row >= T::kQoNumHead)
+                        break;
+                    const int32_t col        = (idx % T::kQkRopeHeadDim) + T::kQkNopeHeadDim;
+                    const int32_t offset     = row * T::kQkHeadDim + col;
+                    params.p_dbg[offset]     = f4.x;
+                    params.p_dbg[offset + 1] = f4.y;
+                    params.p_dbg[offset + 2] = f4.z;
+                    params.p_dbg[offset + 3] = f4.w;
+                }
             }
-            hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
+
+            // using q_range_0 =
+            //     hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value + 1>>,
+            //     2>;
+            // using q_range_1 =
+            //     hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value +
+            //     3>>,
+            //                          2>;
+            // hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
+            // hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
+
+            // // Load K from LDS to GPR
+
+            // if constexpr(idx.value == k_q_nope_begin)
+            // {
+            //     hk::mma_ABt(p_comp, q_0, kv_0);
+            // }
+            // else
+            // {
+            //     hk::mma_ABt(p_comp, q_0, kv_0, p_comp);
+            // }
+            // hk::mma_ABt(p_comp, q_1, kv_1, p_comp);
         });
 
         // Loop start from 2nd iter
