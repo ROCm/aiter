@@ -10,9 +10,11 @@ from aiter.ops.triton.attn_qk_int8_per_block import (
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
+    print_vgpr,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
+    add_argparse_ff,
 )
 from typing import Tuple
 
@@ -142,6 +144,7 @@ def parse_args():
     Parse command-line arguments for attention benchmark.
     """
     parser = get_parser(kernel_name="QK Int8 Per Block Attention")
+    parser = add_argparse_ff(parser)  # Adds -print_vgpr, -o, --shape, and other common flags
     
     # Add attention-specific arguments
     parser.add_argument(
@@ -168,18 +171,6 @@ def parse_args():
         default=128,
         help="Head dimension",
     )
-    parser.add_argument(
-        "--shape",
-        type=int,
-        nargs=4,
-        metavar=("BATCH_SIZE", "NUM_HEADS", "SEQ_LEN", "HEAD_DIM"),
-        help="Shape to benchmark as (batch_size, num_heads, seq_len, head_dim). Overrides individual flags.",
-    )
-    parser.add_argument(
-        "-o",
-        action="store_true",
-        help="Write performance results to CSV file",
-    )
     
     args = parser.parse_args()
     return args
@@ -187,6 +178,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+        fun = lambda: run_shape_benchmark(args)  # noqa: E731
+        print_vgpr(fun, get_caller_name_no_ext())
+        return 0
     run_shape_benchmark(args)
 
 
