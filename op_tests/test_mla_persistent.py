@@ -71,7 +71,7 @@ def ref_masked_attention(
     l = attn_weights_exp.sum(-1)
 
     if is_fp8_q:
-        attn_weights_fp8 = attn_weights_exp.to(dtype)
+        attn_weights_fp8 = attn_weights_exp.to(get_fp8_e4m3_dtype())
         attn_weights_exp = attn_weights_fp8.to(torch.float)
 
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
@@ -326,10 +326,10 @@ def test_mla(
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
-        q_fp8 = q.to(dtypes.fp8)
+        q_fp8 = q.to(get_fp8_e4m3_dtype())
         q_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-        kv_buffer_fp8 = kv_buffer.to(dtypes.fp8)
+        kv_buffer_fp8 = kv_buffer.to(get_fp8_e4m3_dtype())
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
         out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
