@@ -737,7 +737,6 @@ class GemmTuner(GemmCommonTuner):
             )
 
             ret.extend(gemmobj.run_solutions())
-            print("ret is ", ret)
             gemmobj.cleanup()
             del gemmobj
 
