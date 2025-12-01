@@ -234,9 +234,8 @@ def gemm_a16w16(
         splitK = config["splitK"]
         out = asm_gemm(inp_view, B, bias, otype, splitK, kernelName)
     else:
-        soltype = solMap.index(config["libtype"])
         solution_idx = config["solidx"]
-        solfunc = get_solfunc(soltype)
+        solfunc = solMap[config["libtype"]]
         out = solfunc(inp_view, B, solution_idx, bias, otype, scale_a, scale_b, scale_c)
     if batched:
         out = out.view(*A.shape[:-1], B.shape[0])
