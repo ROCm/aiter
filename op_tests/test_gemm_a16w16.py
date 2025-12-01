@@ -96,6 +96,8 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
     weight = torch.rand(n, k, dtype=otype, device="cuda").to(dtype)
+    if otype is None:
+        otype = dtype
     if bias:
         bias = torch.rand(n, dtype=dtype, device="cuda")
     else:
