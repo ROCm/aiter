@@ -19,6 +19,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
     ):
+        self._all2all_manager = None
+        self._all2all_manager_created = False
+
         super().__init__(cpu_group, device, device_group, unique_name)
         if "tp" not in unique_name:
             # custom allreduce or torch symm mem can be used only by tp
@@ -84,39 +87,57 @@ class CudaCommunicator(DeviceCommunicatorBase):
             #     # currently be an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
-        if self.use_all2all:
+    @property
+    def all2all_manager(self):
+        # Lazily create all2all_manager to avoid tp/dp/ep group haven't been created yet
+        if not self._all2all_manager_created and self.use_all2all:
+            self._all2all_manager_created = True
+
             if self.all2all_backend == "naive":
                 from .all2all import NaiveAll2AllManager
 
-                self.all2all_manager = NaiveAll2AllManager(self.cpu_group)
+                self._all2all_manager = NaiveAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "allgather_reducescatter":
                 from .all2all import AgRsAll2AllManager
 
-                self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
+                self._all2all_manager = AgRsAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "pplx":
                 from .all2all import PPLXAll2AllManager
 
-                self.all2all_manager = PPLXAll2AllManager(self.cpu_group)
+                self._all2all_manager = PPLXAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "deepep_high_throughput":
                 from .all2all import DeepEPHTAll2AllManager
 
-                self.all2all_manager = DeepEPHTAll2AllManager(self.cpu_group)
+                self._all2all_manager = DeepEPHTAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "deepep_low_latency":
                 from .all2all import DeepEPLLAll2AllManager
 
-                self.all2all_manager = DeepEPLLAll2AllManager(self.cpu_group)
+                self._all2all_manager = DeepEPLLAll2AllManager(self.cpu_group)
+            elif self.all2all_backend == "mori":
+                from .all2all import MoriAll2AllManager
+
+                self._all2all_manager = MoriAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "flashinfer_all2allv":
                 from .all2all import FlashInferAllToAllManager
 
-                self.all2all_manager = FlashInferAllToAllManager(self.cpu_group)
+                self._all2all_manager = FlashInferAllToAllManager(self.cpu_group)
             else:
                 raise ValueError(f"Unknown all2all backend: {self.all2all_backend}")
 
             if is_global_first_rank():
                 logger.info(
                     "Using %s all2all manager.",
-                    self.all2all_manager.__class__.__name__,
+                    self._all2all_manager.__class__.__name__,
                 )
+        # if self._all2all_manager is None:
+        #     raise ValueError(f"all2all_manager is None for {self.unique_name}")
+        return self._all2all_manager
+
+    @all2all_manager.setter
+    def all2all_manager(self, value):
+        self._all2all_manager = value
+        if value is not None:
+            self._all2all_manager_created = True
 
     def all_reduce(
         self, input_, use_new: bool = False, ca_fp8_quant: bool = False
@@ -179,7 +200,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             res_out, out = ca_comm.custom_fused_ar_rms(input_, res_inp_, weight_, eps)
             assert out is not None
             assert res_out is not None
-            return res_out, out
+            return out, res_out
         # call split kernel
         ar_out = self.all_reduce(input_)
         out = torch.empty_like(ar_out)
@@ -189,13 +210,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         rmsnorm2d_fwd_with_add(
             out,
             ar_out,
-            input_,
+            res_inp_,
             residual_out,
             weight_,
             eps,
             0,
         )
-        return residual_out, out
+        return out, residual_out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
