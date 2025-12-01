@@ -250,7 +250,7 @@ def gemm_a16w16(
     if config is not None and config["libtype"] == "asm":
         kernelName = config["kernelName"]
         splitK = config["splitK"]
-        out = asm_gemm(inp_view, B, bias, otype, splitK, kernelName)
+        out = asm_gemm(inp_view, B, bias, otype, splitK, kernelName, bpreshuffle)
     else:
         soltype = solMap.index(config["libtype"])
         solution_idx = config["solidx"]
@@ -369,12 +369,13 @@ def asm_gemm(
     otype=None,
     splitK=None,
     KernelName=None,
+    bpreshuffle=False,
 ):
     # just support bf16gemm_outFp32
     out_asm = torch.empty(
         inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
     )
-    return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName)
+    return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName, bpreshuffle)
 
 
 class TunedGemm:
