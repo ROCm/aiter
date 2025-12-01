@@ -10,6 +10,7 @@ from setuptools import Distribution, setup
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
+os.environ["AITER_META_DIR"] = this_dir
 sys.path.insert(0, f"{this_dir}/aiter/")
 from concurrent.futures import ThreadPoolExecutor
 
@@ -73,49 +74,36 @@ if IS_ROCM:
         ck_dir
     ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
 
-    if PREBUILD_KERNELS == 1:
-        exclude_ops = [
-            "libmha_fwd",
-            "libmha_bwd",
-            "module_fmha_v3_fwd",
-            "module_mha_fwd",
-            "module_mha_varlen_fwd",
-            "module_mha_batch_prefill",
-            "module_fmha_v3_bwd",
-            "module_fmha_v3_varlen_bwd",
-            "module_fmha_v3_varlen_fwd",
-            "module_mha_bwd",
-            "module_mha_varlen_bwd",
-        ]
-    elif PREBUILD_KERNELS == 2:
-        exclude_ops = [
-            # "libmha_fwd",
-            "libmha_bwd",
-            # "module_fmha_v3_fwd",
-            # "module_mha_fwd",
-            # "module_mha_varlen_fwd",
-            "module_mha_batch_prefill",
-            "module_fmha_v3_bwd",
-            "module_fmha_v3_varlen_bwd",
-            # "module_fmha_v3_varlen_fwd",
-            "module_mha_bwd",
-            "module_mha_varlen_bwd",
-        ]
-    elif PREBUILD_KERNELS == 3:
-        exclude_ops = [
-            # "libmha_fwd",
-            # "libmha_bwd",
-            # "module_fmha_v3_fwd",
-            # "module_mha_fwd",
-            # "module_mha_varlen_fwd",
-            # "module_mha_batch_prefill",
-            # "module_fmha_v3_bwd",
-            # "module_fmha_v3_varlen_bwd",
-            # "module_fmha_v3_varlen_fwd",
-            # "module_mha_bwd",
-            # "module_mha_varlen_bwd",
-        ]
+    def get_exclude_ops():
+        if PREBUILD_KERNELS == 1:
+            return [
+                "libmha_fwd",
+                "libmha_bwd",
+                "module_fmha_v3_fwd",
+                "module_mha_fwd",
+                "module_mha_varlen_fwd",
+                "module_mha_batch_prefill",
+                "module_fmha_v3_bwd",
+                "module_fmha_v3_varlen_bwd",
+                "module_fmha_v3_varlen_fwd",
+                "module_mha_bwd",
+                "module_mha_varlen_bwd",
+            ]
+        elif PREBUILD_KERNELS == 2:
+            return [
+                "libmha_bwd",
+                "module_mha_batch_prefill",
+                "module_fmha_v3_bwd",
+                "module_fmha_v3_varlen_bwd",
+                "module_mha_bwd",
+                "module_mha_varlen_bwd",
+            ]
+        elif PREBUILD_KERNELS == 3:
+            return []
 
+    exclude_ops = get_exclude_ops()
+
+    if PREBUILD_KERNELS != 0:
         all_opts_args_build, prebuild_link_param = core.get_args_of_build(
             "all", exclude=exclude_ops
         )
@@ -125,11 +113,21 @@ if IS_ROCM:
         os.makedirs(prebuild_dir + "/srcs")
 
         def build_one_module(one_opt_args):
+            flags_cc = list(one_opt_args["flags_extra_cc"]) + (
+                [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
+                if PREBUILD_KERNELS != 0
+                else []
+            )
+            flags_hip = list(one_opt_args["flags_extra_hip"]) + (
+                [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
+                if PREBUILD_KERNELS != 0
+                else []
+            )
             core.build_module(
                 md_name=one_opt_args["md_name"],
                 srcs=one_opt_args["srcs"],
-                flags_extra_cc=one_opt_args["flags_extra_cc"],
-                flags_extra_hip=one_opt_args["flags_extra_hip"],
+                flags_extra_cc=flags_cc,
+                flags_extra_hip=flags_hip,
                 blob_gen_cmd=one_opt_args["blob_gen_cmd"],
                 extra_include=one_opt_args["extra_include"],
                 extra_ldflags=None,
@@ -139,9 +137,7 @@ if IS_ROCM:
                 torch_exclude=False,
             )
 
-        # step 1, build *.cu -> module*.so
         prebuid_thread_num = 5
-        # Respect MAX_JOBS environment variable, fallback to auto-calculation
         max_jobs = os.environ.get("MAX_JOBS")
         if max_jobs is not None and max_jobs.isdigit() and int(max_jobs) > 0:
             prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
@@ -193,7 +189,7 @@ setup_requires = [
     "ninja",
     "setuptools_scm",
 ]
-if PREBUILD_KERNELS == 1:
+if PREBUILD_KERNELS != 0:
     setup_requires.append("pandas")
 
 
