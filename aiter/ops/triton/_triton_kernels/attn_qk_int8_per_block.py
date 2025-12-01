@@ -1,4 +1,13 @@
 """
+Copied from https://raw.githubusercontent.com/thu-ml/SageAttention/0f9da83e6038f8330c195cc4bda7f9008a42f679/sageattention/triton/attn_qk_int8_per_block.py
+with the following changes:
+- 64x16 blocks instead of 128x64 blocks.
+- num_warps=2
+- num_stages=3
+- waves_per_eu=2
+
+TODO create patch file, upstream or share this in a separate repo.
+
 Copyright (c) 2024 by SageAttention team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -129,7 +138,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
 
 def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, output_dtype=torch.float16, return_lse=False):
     BLOCK_M = 128
-    BLOCK_N = 64
+    BLOCK_N = 32
     stage = 1
 
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
@@ -178,7 +187,8 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, outp
         h_qo, num_kv_groups,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,  
         STAGE=stage, RETURN_LSE=return_lse,
-        num_warps=4 if head_dim == 64 else 8,
-        num_stages=3 if head_dim == 64 else 4)
+        num_warps=4,
+        num_stages=3,
+        waves_per_eu=2)
 
     return o, lse
