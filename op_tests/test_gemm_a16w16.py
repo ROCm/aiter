@@ -501,7 +501,7 @@ for test in args.test:
                         scaleA=args.scale_a,
                         scaleB=args.scale_b,
                     )
-                df.append(ret)
+                    df.append(ret)
 
     elif test == "skinny":
         ret = test_skinny_gemm()
