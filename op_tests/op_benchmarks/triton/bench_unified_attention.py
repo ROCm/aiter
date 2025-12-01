@@ -530,9 +530,9 @@ def run_benchmark(custom, args):
                 head_size=D_HEAD,
                 sliding_window=None,
                 dtype=dtype,
-                block_size=64,
+                block_size=32,
                 soft_cap=None,
-                num_blocks=256,
+                num_blocks=1024,
                 q_dtype=torch.uint8 if args.fp8 else None,
             )
     
