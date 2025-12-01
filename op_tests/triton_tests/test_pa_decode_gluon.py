@@ -54,12 +54,14 @@ STR_DTYPE_TO_TORCH_DTYPE = {
 
 # Triton to PyTorch dtype mapping
 TL_TO_TORCH_DTYPE = {
-    tl.float8e4b8: aiter.dtypes.fp8,
+    tl.float8e4b8: torch.float8_e4m3fnuz,
+    tl.float8e4nv: torch.float8_e4m3fn,
     tl.bfloat16: torch.bfloat16,
     tl.float16: torch.float16,
 }
 TORCH_TO_TL_DTYPE = {
-    aiter.dtypes.fp8: tl.float8e4b8,
+    tl.float8e4b8: torch.float8_e4m3fnuz,
+    tl.float8e4nv: torch.float8_e4m3fn,
     torch.bfloat16: tl.bfloat16,
     torch.float16: tl.float16,
 }
@@ -1384,7 +1386,14 @@ def run_pa_gluon_test(
         batch_size
         * head_size
         * (
-            2 * context_length * num_kv_heads * quantized_keys.dtype.itemsize
+            2
+            * (
+                min(context_length, sliding_window)
+                if sliding_window > 0
+                else context_length
+            )
+            * num_kv_heads
+            * quantized_keys.dtype.itemsize
             + 2 * query_length * num_query_heads * quantized_query.dtype.itemsize
         )
     )
@@ -1886,7 +1895,7 @@ def run_multi_pa_gluon_test(
     context_partition_size_options,
     sample_rate=1.0,
     use_sinks_options=[False],
-    sliding_window_options=[128],
+    sliding_window_options=[0, 128],
 ) -> pd.DataFrame:
     """Run all tests."""
     # Generate all test configurations
@@ -2116,10 +2125,10 @@ def simple_test():
     QUANT_Q_AND_KV_OPTIONS = [[False, True]]
     BLOCK_SIZE_OPTIONS = [16]
     QUERY_LENGTH_OPTIONS = [1]
-    BATCH_SIZE_OPTIONS = [4, 128]
+    BATCH_SIZE_OPTIONS = [128]
     HEAD_CONFIGURATIONS = [(64, 8)]
     CONTEXT_LENGTH_OPTIONS = [1024]
-    HEAD_DIMENSION_OPTIONS = [128]
+    HEAD_DIMENSION_OPTIONS = [64]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
     USE_AOT_IMPL_OPTIONS = [False]

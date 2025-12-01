@@ -1,0 +1,5 @@
+context_length,batch_size,num_heads,head_size,block_size,data_type,query_length,quant_mode,context_partition_size,trans_v,kv_varlen,use_aot_impl,us_gluon_fp8,err_gluon,gluon_fp8_bandwith(TB/s),us_asm_fp8,asm_fp8_bandwith(TB/s),perf_fp8_gluon_vs_asm
+4096,128,"(64, 8)",128,16,torch.bfloat16,1,per_token,256,False,False,False,530.89896969697,0,1.843043412179364,421.338333333333,2.322290119894494,79%
+4096,128,"(64, 8)",128,16,torch.bfloat16,1,per_token,256,False,True,False,377.0384999999997,0,2.5951457175668082,247.47492000000003,3.953814183000088,66%
+4096,128,"(64, 8)",128,16,torch.bfloat16,1,per_token,256,True,False,False,525.0726224489802,0,1.863494318308107,421.4503086419752,2.3216731096619716,80%
+4096,128,"(64, 8)",128,16,torch.bfloat16,1,per_token,256,True,True,False,373.2502020202019,0,2.6214851146412865,248.117303030303,3.94357764123089,66%
