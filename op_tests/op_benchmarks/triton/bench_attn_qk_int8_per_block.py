@@ -1,24 +1,23 @@
 # Inspired by https://github.com/thu-ml/SageAttention/blob/main/bench/bench_qk_int8_pv_fp16_triton.py
 #
 
+import sys
 import torch
+import triton
 from aiter.ops.triton.attn_qk_int8_per_block import (
     attn_qk_int8_per_block,
     _get_config,
 )
-from triton.testing import do_bench
-
-import argparse
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+)
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+)
 from typing import Tuple
-import json
 
 
-def get_tensors(args: argparse.Namespace) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch_size = args.batch_size
-    num_heads = args.num_heads
-    seq_len = args.seq_len
-    head_dim = args.head_dim
-
+def get_tensors(batch_size: int, num_heads: int, seq_len: int, head_dim: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # Load actual config to get BLOCK_SIZE_M and BLOCK_SIZE_N for scale tensor generation
     config = _get_config(batch_size, num_heads, seq_len, head_dim)
     BLOCK_SIZE_M = config["BLOCK_SIZE_M"]
@@ -34,51 +33,162 @@ def get_tensors(args: argparse.Namespace) -> Tuple[torch.Tensor, torch.Tensor, t
     return q, k, v, q_scale, k_scale
 
 
-def get_parser():
-    parser = argparse.ArgumentParser(description='Benchmark QK Int8 PV FP16 Attention on MI300X')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-    parser.add_argument('--num_heads', type=int, default=5, help='Number of heads')
-    parser.add_argument('--seq_len', type=int, default=75600, help='Sequence length')
-    parser.add_argument('--head_dim', type=int, default=128, help='Head dimension')
-    parser.add_argument('--repeats', type=int, default=100, help='Number of repeats')
-    parser.add_argument("--output_json", type=str, default=None, help='Output JSON file')
-    return parser.parse_args()
-
-def get_flops(args: argparse.Namespace) -> int:
-    return 4 * args.num_heads * args.batch_size * args.head_dim * args.seq_len * args.seq_len
-
-def benchmark(args: argparse.Namespace) -> float:
-    q, k, v, q_scale, k_scale = get_tensors(args)
-
-    forward_fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, output_dtype=torch.bfloat16)
-    time = do_bench(forward_fn, warmup=25, rep=args.repeats)
+def bench_attn_fn(batch_size: int, num_heads: int, seq_len: int, head_dim: int, metric: str):
+    """
+    Benchmark function for attention kernel.
     
-    return time
+    Args:
+        batch_size: Batch size
+        num_heads: Number of attention heads
+        seq_len: Sequence length
+        head_dim: Head dimension
+        metric: Metric to report ('time', 'throughput', or 'bandwidth')
+    
+    Returns:
+        The requested metric value
+    """
+    q, k, v, q_scale, k_scale = get_tensors(batch_size, num_heads, seq_len, head_dim)
+    
+    # Calculate FLOPs: 4 * num_heads * batch_size * head_dim * seq_len * seq_len
+    flops = 4.0 * num_heads * batch_size * head_dim * seq_len * seq_len
+    
+    # Calculate memory transfer
+    # Read: q, k, v, q_scale, k_scale
+    mem_read = (
+        q.element_size() * q.numel() +
+        k.element_size() * k.numel() +
+        v.element_size() * v.numel() +
+        q_scale.element_size() * q_scale.numel() +
+        k_scale.element_size() * k_scale.numel()
+    )
+    # Write: output (batch_size, num_heads, seq_len, head_dim) in bfloat16
+    mem_write = batch_size * num_heads * seq_len * head_dim * 2  # bfloat16 = 2 bytes
+    mem = mem_read + mem_write
+    
+    # Benchmark
+    forward_fn = lambda: attn_qk_int8_per_block(q, k, v, q_scale, k_scale, output_dtype=torch.bfloat16)
+    ms = triton.testing.do_bench(forward_fn, warmup=25, rep=100)
+    
+    # Return exactly one scalar depending on which metric is active
+    if metric == "time":
+        return ms
+    elif metric == "throughput":
+        tflops = flops / ms * 1e-9
+        return tflops
+    elif metric == "bandwidth":
+        bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
+        return bandwidth
+    else:
+        raise ValueError("Unknown metric: " + metric)
 
-def output_json(args: argparse.Namespace, flops: float, time: float):
-    with open(args.output_json, 'a') as f:
-        f.write(json.dumps({
-            'method': 'sage_v1_triton',
-            'hw': 'MI300x',
-            'batch_size': args.batch_size,
-            'num_heads': args.num_heads,
-            'seq_len': args.seq_len,
-            'head_dim': args.head_dim,
-            'flops': flops,
-            'time': time,
-        }) + '\n')
+
+def run_shape_benchmark(args):
+    """
+    Runs benchmark for attention kernel with specified shape.
+    """
+    # Determine shape parameters
+    if args.shape is not None:
+        if len(args.shape) != 4:
+            raise ValueError(f"--shape must have 4 dimensions (batch_size, num_heads, seq_len, head_dim), got {len(args.shape)}")
+        batch_size, num_heads, seq_len, head_dim = args.shape
+    else:
+        batch_size = args.batch_size
+        num_heads = args.num_heads
+        seq_len = args.seq_len
+        head_dim = args.head_dim
+    
+    # Set up benchmark configuration
+    x_names = ["batch_size", "num_heads", "seq_len", "head_dim"]
+    x_vals_list = [[batch_size, num_heads, seq_len, head_dim]]
+    
+    if args.metric == "time":
+        ylabel = "Time (ms)"
+    elif args.metric == "throughput":
+        ylabel = "Throughput (TFLOPS)"
+    elif args.metric == "bandwidth":
+        ylabel = "Bandwidth (GB/s)"
+    else:
+        raise NotImplementedError(f"{args.metric} is not supported")
+    
+    evaluation_metric_to_unit = {
+        "throughput": "TFLOPS",
+        "time": "Time_(ms)",
+        "bandwidth": "Bandwidth_(GB/s)",
+    }
+    
+    benchmark = triton.testing.Benchmark(
+        x_names=x_names,
+        x_vals=x_vals_list,
+        x_log=False,
+        y_log=False,
+        line_arg="unit",
+        line_vals=[evaluation_metric_to_unit[args.metric]],
+        line_names=[evaluation_metric_to_unit[args.metric]],
+        styles=[("green", "-")],
+        ylabel=ylabel,
+        plot_name=get_caller_name_no_ext(),
+        args={"metric": args.metric},
+    )
+    
+    @triton.testing.perf_report([benchmark])
+    def bench_attn_qk_int8_per_block(batch_size, num_heads, seq_len, head_dim, metric, **kwargs):
+        return bench_attn_fn(batch_size, num_heads, seq_len, head_dim, metric)
+    
+    bench_attn_qk_int8_per_block.run(save_path="." if args.o else None, print_data=True)
+
+
+def parse_args():
+    """
+    Parse command-line arguments for attention benchmark.
+    """
+    parser = get_parser(kernel_name="QK Int8 Per Block Attention")
+    
+    # Add attention-specific arguments
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Batch size",
+    )
+    parser.add_argument(
+        "--num_heads",
+        type=int,
+        default=5,
+        help="Number of attention heads",
+    )
+    parser.add_argument(
+        "--seq_len",
+        type=int,
+        default=75600,
+        help="Sequence length",
+    )
+    parser.add_argument(
+        "--head_dim",
+        type=int,
+        default=128,
+        help="Head dimension",
+    )
+    parser.add_argument(
+        "--shape",
+        type=int,
+        nargs=4,
+        metavar=("BATCH_SIZE", "NUM_HEADS", "SEQ_LEN", "HEAD_DIM"),
+        help="Shape to benchmark as (batch_size, num_heads, seq_len, head_dim). Overrides individual flags.",
+    )
+    parser.add_argument(
+        "-o",
+        action="store_true",
+        help="Write performance results to CSV file",
+    )
+    
+    args = parser.parse_args()
+    return args
+
 
 def main():
-    args = get_parser()
-    time = benchmark(args)
-    flops = get_flops(args)/time*1e-9
-    if args.output_json is not None:
-        output_json(args, flops, time)
-    else:
-        print('MI300X QK Int8 PV FP16 Attention Benchmark')
-        print(f'batch_size: {args.batch_size}, num_heads: {args.num_heads}, seq_len: {args.seq_len}, head_dim: {args.head_dim}')
-        print(f'time: {time:.3f} ms')
-        print(f'TFLOPS: {flops:.2f}')
+    args = parse_args()
+    run_shape_benchmark(args)
+
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
