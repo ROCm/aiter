@@ -1384,7 +1384,7 @@ def run_pa_gluon_test(
         batch_size
         * head_size
         * (
-            2 * context_length * num_kv_heads * quantized_keys.dtype.itemsize
+            2 * (min(context_length, sliding_window) if sliding_window > 0 else context_length) * num_kv_heads * quantized_keys.dtype.itemsize
             + 2 * query_length * num_query_heads * quantized_query.dtype.itemsize
         )
     )
@@ -2116,11 +2116,11 @@ def simple_test():
     QUANT_Q_AND_KV_OPTIONS = [[False, True]]
     BLOCK_SIZE_OPTIONS = [16]
     QUERY_LENGTH_OPTIONS = [1]
-    BATCH_SIZE_OPTIONS = [4, 128]
+    BATCH_SIZE_OPTIONS = [128]
     HEAD_CONFIGURATIONS = [(64, 8)]
     CONTEXT_LENGTH_OPTIONS = [1024]
-    HEAD_DIMENSION_OPTIONS = [128]
-    TRANS_V_OPTIONS = [False]
+    HEAD_DIMENSION_OPTIONS = [64]
+    TRANS_V_OPTIONS = [False, True]
     KV_VARLEN_OPTIONS = [False]
     USE_AOT_IMPL_OPTIONS = [False]
     # USE_AOT_IMPL_OPTIONS = [True]
