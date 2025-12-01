@@ -24,13 +24,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from aiter import (
-    dtypes,
-    gemm_a16w16_asm,
-    hipb_create_extension,
-    hipb_mm,
-    logger,
-)
+from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -39,7 +33,6 @@ from aiter.ops.gemm_op_common import get_padded_m
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
-solMap = ["torch", "hipblaslt", "skinny", "asm"]
 extensions_created = False
 untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
 tune_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
@@ -55,17 +48,6 @@ tuned_df = pd.DataFrame(
         "bpreshuffle",
     ]
 )
-
-
-def get_solfunc(soltype: int):
-    if soltype == 0:
-        return torch_gemm
-    elif soltype == 1:
-        return hipb_gemm
-    elif soltype == 2:
-        return skinny_gemm
-    elif soltype == 3:
-        return asm_gemm
 
 
 @functools.lru_cache(maxsize=1)
@@ -375,6 +357,33 @@ def asm_gemm(
         inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
     )
     return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName)
+
+
+def triton_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
+):
+    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+
+    assert (
+        scale_a is None and scale_b is None and scale_c is None
+    ), "Triton gemm_a16w16 does not support scaling yet"
+    return gemm_a16w16(inp, weights, bias=bias, dtype=otype)
+
+
+solMap = {
+    "torch": torch_gemm,
+    "hipblaslt": hipb_gemm,
+    "skinny": skinny_gemm,
+    "asm": asm_gemm,
+    "triton": triton_gemm,
+}
 
 
 class TunedGemm:
