@@ -9,30 +9,55 @@ from datetime import datetime
 import torch
 from tqdm import tqdm
 
+from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 
-from gemm_a16w16 import gemm_a16w16  # type: ignore
+from op_tests.triton_tests.utils.types import str_to_torch_dtype
+
 from utils.core import AITER_TRITON_CONFIGS_PATH  # type: ignore
 
 mp.set_start_method("spawn", force=True)
 
 
-DTYPE_MAP = {
-    "float32": torch.float32,
-    "float16": torch.float16,
-    "half": torch.half,
-    "bfloat16": torch.bfloat16,
-}
+def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=False):
+    if isinstance(dtype, str):
+        dtype = str_to_torch_dtype[dtype]
+
+    # TN is default layout
+    if layout[0] == "T":
+        print(M, K)
+        print(dtype)
+        x = torch.randn((M, K), dtype=dtype, device="cuda")
+    else:
+        x = torch.randn((K, M), dtype=dtype, device="cuda").T
+
+    if layout[1] == "T":
+        weight = torch.randn((K, N), dtype=dtype, device="cuda").T
+    else:
+        weight = torch.randn((N, K), dtype=dtype, device="cuda")
+
+    bias_tensor = None
+    if bias:
+        bias_tensor = torch.empty((N), dtype=dtype, device="cuda")
+
+    y = None
+    if output:
+        y = torch.empty((M, N), dtype=dtype, device="cuda")
+        out_dtype = (None,)
+    else:
+        out_dtype = dtype
+
+    return x, weight, bias_tensor, out_dtype, y
 
 
 def get_configs_compute_bound():
     configs = []
-    for num_stages in [2]:
-        for block_m in [16]:
-            for block_k in [64]:
-                for block_n in [32]:
-                    for num_warps in [4]:
-                        for group_size in [1]:
-                            for waves_per_eu in [3]:
+    for num_stages in [2, 3, 4, 5]:
+        for block_m in [16, 32, 64, 128, 256]:
+            for block_k in [64, 128]:
+                for block_n in [32, 64, 128, 256]:
+                    for num_warps in [4, 8]:
+                        for group_size in [1, 16, 32, 64]:
+                            for waves_per_eu in [2, 3, 4]:
                                 configs.append(
                                     {
                                         "BLOCK_SIZE_M": block_m,
@@ -41,46 +66,17 @@ def get_configs_compute_bound():
                                         "GROUP_SIZE_M": group_size,
                                         "num_warps": num_warps,
                                         "num_stages": num_stages,
-                                        "waves_per_eu": waves_per_eu,  # TODO check if compatible
-                                        "matrix_instr_nonkdim": 16,  # TODO
-                                        "cache_modifier": None,  # TODO
-                                        "NUM_KSPLIT": 1,  # TODO
-                                        "kpack": 1,  # TODO
-                                        "SPLITK_BLOCK_SIZE": 1,
+                                        "waves_per_eu": waves_per_eu,
+                                        "NUM_KSPLIT": 1,
+                                        "kpack": 1,
+                                        "SPLITK_BLOCK_SIZE": 1, # Why are those 2 needed for gfx1201
+                                        "cache_modifier": None  # but does not exist in other configs?
                                     }
                                 )
     return configs
 
 
-# def get_configs_compute_bound():
-#     configs = []
-#     for num_stages in [2, 3, 4, 5]:
-#         for block_m in [16, 32, 64, 128, 256]:
-#             for block_k in [64, 128]:
-#                 for block_n in [32, 64, 128, 256]:
-#                     for num_warps in [4, 8]:
-#                         for group_size in [1, 16, 32, 64]:
-#                             for waves_per_eu in [1,2,3,4]:
-#                                 configs.append(
-#                                     {
-#                                         "BLOCK_SIZE_M": block_m,
-#                                         "BLOCK_SIZE_N": block_n,
-#                                         "BLOCK_SIZE_K": block_k,
-#                                         "GROUP_SIZE_M": group_size,
-#                                         "num_warps": num_warps,
-#                                         "num_stages": num_stages,
-#                                         "waves_per_eu": waves_per_eu, # TODO check if compatible
-#                                         "matrix_instr_nonkdim": 16, # TODO
-#                                         "cache_modifier": None, # TODO
-#                                         "NUM_KSPLIT": 1, # TODO
-#                                         "kpack": 1, # TODO
-#                                         "SPLITK_BLOCK_SIZE":1,
-#                                     }
-#                                 )
-#     return configs
-
-
-def get_weight_shapes(tp_size):
+def get_weight_shapes():
     total = [
         (1024, 1024),
         (4096, 1024),
@@ -98,8 +94,8 @@ def get_weight_shapes(tp_size):
 
 def benchmark_config(x, w, bias, dtype, y, config, activation, num_iters=10):
     def run():
-        gemm_a16w16(x, w, bias, dtype, y, config, activation)
-
+        gemm_a16w16(x, w, bias=bias, dtype=dtype, y=y, config=config, activation=activation)
+    
     torch.cuda.synchronize()
     # JIT complication & warmup
     for _ in range(5):
@@ -121,22 +117,20 @@ def benchmark_config(x, w, bias, dtype, y, config, activation, num_iters=10):
     return avg
 
 
-def tune(M, N, K, out_dtype, search_space, input_type):
-    if input_type == "bfloat16":
-        fp16_info = torch.finfo(torch.bfloat16)
-        fp16_max, fp16_min = fp16_info.max, fp16_info.min
-
-        x_fp32 = (
-            (torch.rand(M, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp16_max
-        )
-        x = x_fp32.clamp(min=fp16_min, max=fp16_max).to(torch.bfloat16)
-
-        w_fp32 = (
-            (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp16_max
-        )
-        w = w_fp32.clamp(min=fp16_min, max=fp16_max).to(torch.bfloat16)
-    else:
-        raise RuntimeError("Currently, only support tune w16a16 block fp16 kernel.")
+def tune(M, N, K, dtype, search_space):
+    (
+        x,
+        w,
+        _,
+        _,
+        _,
+    ) = generate_gemm_a16w16_inputs(
+        M,
+        N,
+        K,
+        dtype,
+        output=False,
+    )
 
     best_config = None
     best_time = float("inf")
@@ -146,7 +140,7 @@ def tune(M, N, K, out_dtype, search_space, input_type):
                 x=x,
                 w=w,
                 bias=None,
-                dtype=torch.bfloat16,
+                dtype=dtype,
                 y=None,
                 config=config,
                 activation=None,
@@ -193,9 +187,8 @@ def tune_on_gpu(args_dict):
     torch.cuda.set_device(gpu_id)
     print(f"Starting tuning on GPU {gpu_id} with batch sizes {batch_sizes}")
 
-    out_dtype = DTYPE_MAP[args.out_dtype]
+    dtype = str_to_torch_dtype[args.dtype]
     save_path = AITER_TRITON_CONFIGS_PATH + "/gemm/"
-    input_type = args.input_type
 
     search_space = get_configs_compute_bound()
 
@@ -208,9 +201,8 @@ def tune_on_gpu(args_dict):
                 batch_size,
                 N,
                 K,
-                out_dtype,
+                dtype,
                 search_space,
-                input_type,
             )
             for batch_size in tqdm(batch_sizes, desc=f"GPU {gpu_id} - Batch sizes")
         ]
@@ -224,16 +216,6 @@ def tune_on_gpu(args_dict):
     print(f"Tuning on GPU {gpu_id} took {end - start:.2f} seconds")
 
 
-def distribute_batch_sizes(batch_sizes, num_gpus):
-    """Distribute batch sizes across available GPUs."""
-    batches_per_gpu = []
-    for i in range(num_gpus):
-        start_idx = i * len(batch_sizes) // num_gpus
-        end_idx = (i + 1) * len(batch_sizes) // num_gpus
-        batches_per_gpu.append(batch_sizes[start_idx:end_idx])
-    return batches_per_gpu
-
-
 def main(args):
     print(args)
     num_gpus = torch.cuda.device_count()
@@ -243,29 +225,23 @@ def main(args):
 
     torch.cuda.init()
 
-    if args.batch_size is None:
-        batch_sizes = [
-            64,
-            128,
-            256,
-            512,
-            2048,
-            4096,
-        ]
-    else:
-        batch_sizes = [args.batch_size]
-        num_gpus = 1  # If only one batch size, use only one GPU
+    batch_sizes = [
+        64,
+        128,
+        256,
+        512,
+        2048,
+        4096,
+    ]
 
-    weight_shapes = get_weight_shapes(args.tp_size)
-
-    batches_per_gpu = distribute_batch_sizes(batch_sizes, 1)
+    weight_shapes = get_weight_shapes()
 
     process_args = []
     for gpu_id in range(1):
         process_args.append(
             {
                 "gpu_id": gpu_id,
-                "batch_sizes": batches_per_gpu[gpu_id],
+                "batch_sizes": batch_sizes,
                 "weight_shapes": weight_shapes,  # Each GPU processes all weight shapes
                 "args": args,
             }
@@ -283,17 +259,12 @@ if __name__ == "__main__":
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
-    parser.add_argument("--tp-size", "-tp", type=int, default=1)
     parser.add_argument(
-        "--input-type", type=str, choices=["bfloat16"], default="bfloat16"
-    )
-    parser.add_argument(
-        "--out-dtype",
+        "--dtype",
         type=str,
         choices=["float32", "float16", "bfloat16", "half"],
         default="bfloat16",
     )
-    parser.add_argument("--batch-size", type=int, required=False)
     args = parser.parse_args()
 
     main(args)
