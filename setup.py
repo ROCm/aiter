@@ -100,6 +100,8 @@ if IS_ROCM:
             ]
         elif PREBUILD_KERNELS == 3:
             return []
+        else:
+            return []
 
     exclude_ops = get_exclude_ops()
 
@@ -113,16 +115,13 @@ if IS_ROCM:
         os.makedirs(prebuild_dir + "/srcs")
 
         def build_one_module(one_opt_args):
-            flags_cc = list(one_opt_args["flags_extra_cc"]) + (
-                [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
-                if PREBUILD_KERNELS != 0
-                else []
-            )
-            flags_hip = list(one_opt_args["flags_extra_hip"]) + (
-                [f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"]
-                if PREBUILD_KERNELS != 0
-                else []
-            )
+            flags_cc = list(one_opt_args["flags_extra_cc"]) + [
+                f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
+            ]
+            flags_hip = list(one_opt_args["flags_extra_hip"]) + [
+                f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
+            ]
+
             core.build_module(
                 md_name=one_opt_args["md_name"],
                 srcs=one_opt_args["srcs"],
