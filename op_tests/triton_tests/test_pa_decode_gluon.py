@@ -60,8 +60,8 @@ TL_TO_TORCH_DTYPE = {
     tl.float16: torch.float16,
 }
 TORCH_TO_TL_DTYPE = {
-    tl.float8e4b8: torch.float8_e4m3fnuz,
-    tl.float8e4nv: torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz: tl.float8e4b8,
+    torch.float8_e4m3fn: tl.float8e4nv,
     torch.bfloat16: tl.bfloat16,
     torch.float16: tl.float16,
 }
