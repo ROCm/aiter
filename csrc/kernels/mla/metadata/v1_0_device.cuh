@@ -98,6 +98,12 @@ void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
             work_info.kv_start  = kv_begin + (sid * payload * params.kv_granularity);
             work_info.kv_end    = ck_tile::min(work_info.kv_start + payload * params.kv_granularity, kv_end);
             work_info.kv_offset = kv_end - work_info.kv_end;
+            if (work_info.kv_offset <= 4)
+            {
+                work_info.kv_end = kv_end;
+                work_info.kv_offset = 0;
+                sid++;
+            }
             p_work_info_set[work_index] = work_info;
             params.p_reduce_partial_map[work_index] = work_info.partial_qo_loc;
         }
