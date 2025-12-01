@@ -50,7 +50,7 @@ jobs:
           set -ex
           echo "Starting container: triton_test"
           docker run -dt \
-          --device="${{gha_render_devices}}" \
+          --device="${{ gha_render_devices }}" \
           --device=/dev/kfd \
           --shm-size=16G \
           --group-add $(getent group render | cut -d: -f3) \
