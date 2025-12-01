@@ -189,7 +189,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                              2>; // 4 vgprs
     using p_comp_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin, k_p_comp_end>>,
-                             8>; // 8 vgprs
+                             4>; // 8 vgprs
     using p_mfma_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_p_mfma_begin, k_p_mfma_end>>,
                              2>; // 2 vgprs
@@ -208,7 +208,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     hk::art<q_t, T::kTileM, T::kQkRopeHeadDim, hk::row_l, hk::rt_16x32_s, q_rope_ranges> q_rope;
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_ranges> kv_0;
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_ranges> kv_1;
-    hk::art<comp_t, T::kTileM, T::kBlockN, hk::col_l, hk::rt_16x32_s, p_comp_ranges> p_comp;
+    hk::art<comp_t, T::kTileM, T::kBlockN, hk::col_l, hk::rt_16x16_s, p_comp_ranges> p_comp;
     hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, p_mfma_ranges> p_mfma;
     hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
 
