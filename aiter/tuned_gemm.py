@@ -32,7 +32,7 @@ from aiter import (
     logger,
 )
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
-from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
 
@@ -135,7 +135,24 @@ def get_GEMM_A16W16_config(
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=} , not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config!"
         )
-        if dtype in [dtypes.fp16, dtypes.bf16] and K % 8 == 0:
+        if bpreshuffle:
+            default_config["bpreshuflle"] = True
+            if get_gfx() == "gfx942":
+                default_config["libtype"] = "hipblaslt"
+                default_config["solidx"] = -1
+                default_config["kernelName"] = ""
+            elif (
+                eval(dtype) == dtypes.bf16 and N % 64 == 0 and K % 64 == 0 and not bias
+            ):
+                default_config["libtype"] = "asm"
+                default_config["solidx"] = 0
+                default_config["splitK"] = None
+                default_config["kernelName"] = None
+            else:
+                assert (
+                    False
+                ), f"no solution for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
+        elif eval(dtype) in [dtypes.fp16, dtypes.bf16] and K % 8 == 0:
             if (
                 ((M == 1 and N <= 2 * cu_num) or (M > 1 and M <= 4 and N <= cu_num))
                 and K <= 9216
@@ -148,7 +165,7 @@ def get_GEMM_A16W16_config(
                 default_config["libtype"] = "skinny"
                 default_config["solidx"] = 2
                 default_config["kernelName"] = ""
-                return {"libtype": "skinny", "solidx": 2, "kernelName": ""}
+                # return {"libtype": "skinny", "solidx": 2, "kernelName": ""}
         else:
             default_config["libtype"] = "torch"
             default_config["solidx"] = 0
@@ -255,7 +272,17 @@ def gemm_a16w16(
         soltype = solMap.index(config["libtype"])
         solution_idx = config["solidx"]
         solfunc = get_solfunc(soltype)
-        out = solfunc(inp_view, B, solution_idx, bias, otype, scale_a, scale_b, scale_c)
+        out = solfunc(
+            inp_view,
+            B,
+            solution_idx,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            bpreshuffle,
+        )
     if batched:
         out = out.view(*A.shape[:-1], B.shape[0])
     if otype is not None:
@@ -282,9 +309,11 @@ def skinny_gemm(
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
+    bpreshuffle=False,
 ):
     import aiter as ops
 
+    assert not bpreshuffle, "bpreshuffle is not supported in skinny_gemm!"
     if solidx == 0:
         out = torch.empty(
             inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
@@ -314,6 +343,7 @@ def hipb_gemm(
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
+    bpreshuffle=False,
 ):
     if otype is None:
         otype = inp.dtype
@@ -321,7 +351,9 @@ def hipb_gemm(
     if extensions_created == False:
         hipb_create_extension()
         extensions_created = True
-    return hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
+    return hipb_mm(
+        inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c, bpreshuffle
+    )
 
 
 def torch_gemm(
@@ -333,7 +365,9 @@ def torch_gemm(
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
+    bpreshuffle=False,
 ):
+    assert not bpreshuffle, "bpreshuffle is not supported in skinny_gemm!"
     if inp.dtype == dtypes.fp8:
         if scale_a is None:
             scale_a = torch.ones(1, dtype=dtypes.fp32, device=inp.device)

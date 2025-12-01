@@ -137,7 +137,11 @@ def get_gemm_ref(inp, weights, bias, scale, indtype, outdtype):
         if type(ref) is tuple and len(ref) == 2:
             ref = ref[0]
     else:
-        ref = F.linear(inp, weights).to(outdtype) + bias.to(outdtype)
+        ref = (
+            F.linear(inp, weights).to(outdtype) + bias.to(outdtype)
+            if bias is not None
+            else F.linear(inp, weights).to(outdtype)
+        )
     return ref
 
 
