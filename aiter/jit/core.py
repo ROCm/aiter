@@ -111,6 +111,7 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+
 class AITER_CONFIG(object):
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
