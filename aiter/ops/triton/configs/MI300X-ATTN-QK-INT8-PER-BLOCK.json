@@ -1,0 +1,51 @@
+{
+  "small": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 32,
+    "num_warps": 4,
+    "num_stages": 3,
+    "waves_per_eu": 2,
+    "stage": 1
+  },
+  "medium_M64": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 32,
+    "num_warps": 4,
+    "num_stages": 3,
+    "waves_per_eu": 2,
+    "stage": 1
+  },
+  "medium_M128": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 32,
+    "num_warps": 4,
+    "num_stages": 3,
+    "waves_per_eu": 2,
+    "stage": 1
+  },
+  "large": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 32,
+    "num_warps": 4,
+    "num_stages": 3,
+    "waves_per_eu": 2,
+    "stage": 1
+  },
+  "xlarge": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 32,
+    "num_warps": 4,
+    "num_stages": 3,
+    "waves_per_eu": 2,
+    "stage": 1
+  },
+  "any": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 32,
+    "num_warps": 4,
+    "num_stages": 3,
+    "waves_per_eu": 2,
+    "stage": 1
+  }
+}
+
