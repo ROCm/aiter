@@ -1933,7 +1933,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     CONTEXT_PARTITION_SIZE,
     QUERY_QUANT_MODE,
     KV_QUANT_MODE,
-    FP8_MAX_VALUE,
     VALUE_TRANSPOSED,
     IS_CAUSAL,
     SLIDING_WINDOW,
@@ -2343,11 +2342,6 @@ def pa_decode_gluon(
     else:
         raise RuntimeError(f"Unsupported value cache shape: {value_cache.shape}")
 
-    # ==================== FP8 CONFIGURATION ====================
-    fp8_max_value = 1.0
-    if value_cache.dtype == aiter.dtypes.fp8:
-        fp8_max_value = torch.finfo(aiter.dtypes.fp8).max
-
     # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
     _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         grid,
@@ -2392,7 +2386,6 @@ def pa_decode_gluon(
         CONTEXT_PARTITION_SIZE=context_partition_size,
         QUERY_QUANT_MODE=query_quant_mode,
         KV_QUANT_MODE=kv_quant_mode,
-        FP8_MAX_VALUE=fp8_max_value,
         VALUE_TRANSPOSED=value_transposed,
         IS_CAUSAL=is_causal,
         SLIDING_WINDOW=sliding_window,
