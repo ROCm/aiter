@@ -348,7 +348,7 @@ class Gemm:
                             self.scaleAB,
                             self.is_shuffle,
                             0,
-                            self.bias,
+                            self.has_bias,
                         ),
                         run_gemm_bf16_asm,
                         ([0, 6, 5, 3], splitK, kernelName, self.is_shuffle),
