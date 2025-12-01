@@ -28,6 +28,16 @@ namespace py = pybind11;
           py::arg("out"),                               \
           py::arg("input"));
 
+#define CAUSAL_CONV1D_PYBIND                            \
+    m.def("causal_conv1d_fwd",                          \
+          &aiter::causal_conv1d_fwd,                    \
+          "Causal 1D convolution forward pass.",        \
+          py::arg("out"),                               \
+          py::arg("x"),                                 \
+          py::arg("weight"),                            \
+          py::arg("bias"),                              \
+          py::arg("use_silu"));
+
 #define AITER_OPERATOR_PYBIND                                                   \
     m.def("add", &aiter_add, "apply for add with transpose and broadcast.");    \
     m.def("mul", &aiter_mul, "apply for mul with transpose and broadcast.");    \

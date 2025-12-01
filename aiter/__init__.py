@@ -60,6 +60,7 @@ from .ops.batched_gemm_op_bf16 import *
 from .ops.deepgemm import *
 from .ops.aiter_operator import *
 from .ops.activation import *
+from .ops.conv1d import *
 from .ops.attention import *
 from .ops.custom import *
 from .ops.custom_all_reduce import *
