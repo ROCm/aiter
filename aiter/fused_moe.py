@@ -623,7 +623,7 @@ def get_2stage_cfgs(
             BLOCK_SIZE_M
             if run_1stage
             else (
-                64
+                16
                 if q_type == QuantType.per_1x128
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
@@ -831,6 +831,7 @@ def fused_moe_2stages(
             device=device,
         )
 
+    # print(f'{sorted_ids.shape[0]=}, {sorted_expert_ids=}, {num_valid_ids=}')
     a2 = metadata.stage1(
         a1,
         w1,
