@@ -1297,9 +1297,6 @@ __device__ void radix_topk_one_block_kernel(T const* in,
         in_idx += batch_id * len;
     }
 
-    out += batch_id * k;
-    out_idx += batch_id * k;
-
     const IdxT buf_len = calc_buf_len<T, IdxT, unsigned>(row_len);
     bufs += batch_id * buf_len * 2 * (sizeof(T) + sizeof(IdxT));
 
@@ -1423,9 +1420,6 @@ __device__ void radix_topk_one_block_one_pass_kernel(T const* in,
         in_idx += batch_id * len;
     }
 
-    out += batch_id * k;
-    out_idx += batch_id * k;
-
     {
 
         const IdxT current_len = counter.len;
@@ -1547,6 +1541,8 @@ __global__ void dispatch_radix_topk_one_block(T const* in,
     const IdxT row_len  = rowEnd - rowStart;
 
     in += blockIdx.x * len;
+    out += blockIdx.x * k;
+    out_idx += blockIdx.x * k;
     if(row_len <= k)
     {
         for(int rowIt = threadIdx.x; rowIt < k; rowIt += BlockSize)
