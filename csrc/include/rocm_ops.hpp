@@ -1431,5 +1431,6 @@ namespace py = pybind11;
     m.def("trtllm_ar_fusion_capture", &trtllm::ar_fusion_capture);                             \
     m.def("trtllm_ar_fusion_capture_clear", &trtllm::ar_fusion_capture_clear);                 \
     m.def("trtllm_get_ar_fusion_captured_handles", &trtllm::get_ar_fusion_captured_handles);   \
+    m.def("trtllm_get_ar_fusion_captured_offsets", &trtllm::get_ar_fusion_captured_offsets);   \
     m.def("trtllm_open_ar_fusion_captured_handles", &trtllm::open_ar_fusion_captured_handles); \
     m.def("trtllm_allreduce_rms", &trtllm::allreduce_rms);

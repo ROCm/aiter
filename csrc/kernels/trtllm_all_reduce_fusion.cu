@@ -749,17 +749,26 @@ public:
         cached_offsets_.clear();
     }
 
-    std::tuple<std::vector<Tensor>, std::vector<int64_t>> get_captured_handles() {
+    std::vector<Tensor> get_captured_handles() {
         int num_datas = cached_ptrs_.size();
         std::vector<Tensor> ipc_handles;
-        std::vector<int64_t> offsets;
         ipc_handles.reserve(num_datas);
-        offsets.reserve(num_datas);
         for (int i = 0; i < num_datas; ++i) {
             ipc_handles.push_back(ipc_details::get_handle(cached_base_ptrs_[i]));
+        }
+        return ipc_handles;
+    }
+
+    Tensor get_captured_offsets() {
+        int num_datas = cached_ptrs_.size();
+        std::vector<int64_t> offsets;
+        offsets.reserve(num_datas);
+        for (int i = 0; i < num_datas; ++i) {
             offsets.push_back(cached_offsets_[i]);
         }
-        return {ipc_handles, offsets};
+        auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+        auto t = torch::tensor(offsets, options);
+        return t;
     }
 
     void open_captured_handles(std::vector<Tensor> &handles, std::vector<int64_t> &offsets, int64_t ptr_idx) {
@@ -839,9 +848,14 @@ void ar_fusion_capture_clear(fptr_t fptr) {
     ptr->capture_clear();
 }
 
-std::tuple<std::vector<Tensor>, std::vector<int64_t>> get_ar_fusion_captured_handles(fptr_t fptr) {
+std::vector<Tensor> get_ar_fusion_captured_handles(fptr_t fptr) {
     auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
     return ptr->get_captured_handles();
+}
+
+Tensor get_ar_fusion_captured_offsets(fptr_t fptr) {
+    auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
+    return ptr->get_captured_offsets();
 }
 
 void open_ar_fusion_captured_handles(fptr_t fptr, std::vector<Tensor> handles, std::vector<int64_t> offsets, int64_t ptr_idx) {

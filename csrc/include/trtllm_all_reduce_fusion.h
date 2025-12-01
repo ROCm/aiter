@@ -19,7 +19,8 @@ void open_ar_fusion_barrier_handles(fptr_t fptr, std::vector<Tensor> handles);
 void open_ar_fusion_data_handles(fptr_t fptr, std::vector<Tensor> handles);
 void ar_fusion_capture(fptr_t fptr, const Tensor& input);
 void ar_fusion_capture_clear(fptr_t fptr);
-std::tuple<std::vector<Tensor>, std::vector<int64_t>> get_ar_fusion_captured_handles(fptr_t fptr);
+std::vector<Tensor> get_ar_fusion_captured_handles(fptr_t fptr);
+Tensor get_ar_fusion_captured_offsets(fptr_t fptr);
 void open_ar_fusion_captured_handles(fptr_t fptr,
                                      std::vector<Tensor> handles,
                                      std::vector<int64_t> offsets,

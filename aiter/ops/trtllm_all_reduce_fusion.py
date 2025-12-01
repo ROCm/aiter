@@ -84,6 +84,18 @@ def trtllm_open_ar_fusion_captured_handles(
 
 
 @compile_ops("module_trtllm_all_reduce_fusion")
+def trtllm_get_ar_fusion_captured_handles(
+    fptr_t: int,
+) -> list[Tensor]: ...
+
+
+@compile_ops("module_trtllm_all_reduce_fusion")
+def trtllm_get_ar_fusion_captured_offsets(
+    fptr_t: int,
+) -> Tensor: ...
+
+
+@compile_ops("module_trtllm_all_reduce_fusion")
 def trtllm_allreduce_rms(
     fptr_t: int,
     allreduce_in: Tensor,
@@ -150,12 +162,13 @@ class TRTLLMDistEnv:
 
     def consume_capture(self):
         self.barrier()
-        handles, offsets = trtllm_get_ar_fusion_captured_handles(self.fptr)
+        handles = trtllm_get_ar_fusion_captured_handles(self.fptr)
+        offsets = trtllm_get_ar_fusion_captured_offsets(self.fptr)
         for idx in range(len(handles)):
             handle_list = [None] * self.world_size
             offset_list = [None] * self.world_size
             dist.all_gather_object(handle_list, handles[idx], group=self.group)
-            dist.all_gather_object(offset_list, offsets[idx], group=self.group)
+            dist.all_gather_object(offset_list, int(offsets[idx].item()), group=self.group)
             self.barrier()
             trtllm_open_ar_fusion_captured_handles(self.fptr, handle_list, offset_list, idx)
         trtllm_ar_fusion_capture_clear(self.fptr)
