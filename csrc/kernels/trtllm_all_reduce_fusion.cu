@@ -35,17 +35,32 @@ static_assert(sizeof(void*) == sizeof(fptr_t));
 namespace details {
 
 static constexpr int kBytesPerAccess = 16;
-static constexpr int kOneShotMaxToken = 128;
-static constexpr int kOneShotMaxSize =
-    kOneShotMaxToken * 1024 * kBytesPerAccess;
+
+template <bool RELAXED = true>
+__device__ __forceinline__ void st_flag(int *addr, int flag) {
+    __scoped_atomic_store_n(addr, flag,
+                            RELAXED ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
+                            __MEMORY_SCOPE_SYSTEM);
+}
+
+template <bool RELAXED = true>
+__device__ __forceinline__ int ld_flag(int *addr) {
+    int flag;
+    flag = __scoped_atomic_load_n(addr,
+                                  RELAXED ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
+                                  __MEMORY_SCOPE_SYSTEM);
+    return flag;
+}
 
 } // namespace details
 
 #define gpuSuccess hipSuccess
 #define gpuMemcpy hipMemcpy
+#define gpuMemcpyAsync hipMemcpyAsync
 #define gpuMemset hipMemset
 #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define gpuMemcpyHostToDevice hipMemcpyHostToDevice
+#define gpuMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define gpuMalloc hipMalloc
 #define gpuFree hipFree
 #define gpuDeviceSynchronize hipDeviceSynchronize
@@ -57,6 +72,8 @@ static constexpr int kOneShotMaxSize =
 #define gpuIpcGetMemHandle hipIpcGetMemHandle
 #define gpuIpcOpenMemHandle hipIpcOpenMemHandle
 #define gpuIpcMemLazyEnablePeerAccess hipIpcMemLazyEnablePeerAccess
+#define gpuDeviceptr_t hipDeviceptr_t
+#define gpuPointerGetAttribute hipPointerGetAttribute
 
 namespace kernel_utils {
 
@@ -122,30 +139,30 @@ struct alignas(1) fp8e4m3fnuz {
     }
 };
 
-template <typename T, typename func_t>
+template <typename T, int WARP_SIZE, typename func_t>
 __device__ __forceinline__ T warp_reduce(T val, func_t fn) {
 #pragma unroll
-    for (int offset = (32 >> 1); offset > 0; offset >>= 1) {
-        val = fn(val, __shfl_xor(val, offset, 32));
+    for (int offset = (WARP_SIZE >> 1); offset > 0; offset >>= 1) {
+        val = fn(val, __shfl_xor(val, offset, WARP_SIZE));
     }
     return val;
 }
 
-template <typename T, typename func_t>
-__inline__ __device__ T block_reduce(T val, func_t fn) {
-    static __shared__ T shared[32];
+template <typename T, int WARP_SIZE, typename func_t>
+__device__ __forceinline__ T block_reduce(T val, func_t fn) {
+    static __shared__ T shared[1024 / WARP_SIZE];
     const int tid = threadIdx.x;
-    const int w_tid = tid % 32;
-    const int wid = tid / 32;
-    val = warp_reduce<T, func_t>(val, fn);
+    const int w_tid = tid % WARP_SIZE;
+    const int wid = tid / WARP_SIZE;
+    val = warp_reduce<T, WARP_SIZE, func_t>(val, fn);
     if (w_tid == 0) {
         shared[wid] = val;
     }
     __syncthreads();
-    bool is_mask = threadIdx.x < (blockDim.x / 32.f);
+    bool is_mask = threadIdx.x < (blockDim.x / (float)WARP_SIZE);
     val = is_mask ? shared[w_tid] : (T)(0.0f);
     __syncthreads();
-    val = warp_reduce<T, func_t>(val, fn);
+    val = warp_reduce<T, WARP_SIZE, func_t>(val, fn);
     return val;
 }
 
@@ -245,152 +262,60 @@ __device__ __forceinline__ void vec_add_r_(vec_t<T, VEC_SIZE> (&self)[NRanks]) {
 
 using namespace kernel_utils;
 
-namespace comm {
+#define WARP_SIZE 64
+
+template <int NRanks>
+struct CommPtrs {
+    std::array<void *, NRanks> barrier_flag_ptrs;
+    std::array<void *, NRanks> data_ptrs;
+    void *sync_clock;
+    int rank;
+};
+
+struct HostCommPtrs {
+    std::vector<void *> barrier_flag_ptrs;
+    std::vector<void *> data_ptrs;
+    void *sync_clock;
+    int rank;
+    int nranks;
+};
 
 template <int NRanks>
 struct SyncComm {
-    __device__ __forceinline__ SyncComm(void **workspace) {
-        counter_ptr = (int *)workspace[NRanks * 3 + 0];
-        flag_ptr = (int *)workspace[NRanks * 3 + 1];
-        flag_value = *flag_ptr;
+    __device__ __forceinline__ SyncComm(CommPtrs<NRanks> &cptrs) {
+#pragma unroll
         for (int r = 0; r < NRanks; ++r) {
-            comm_bufs[r] = workspace[r];
-            barrier_flags[r] = workspace[NRanks + r];
+            barrier_flags[r] = cptrs.barrier_flag_ptrs[r];
         }
+        flag_ptr = ((int *)cptrs.sync_clock) + blockIdx.x;
+        int rank = cptrs.rank;
         __syncthreads();
-        if (threadIdx.x == 0) {
-            atomicAdd(counter_ptr, 1);
-        }
-    }
-
-    __device__ __forceinline__ void update(int new_flag_value) {
-        if (blockIdx.x == 0 && threadIdx.x == 0) {
-            while (atomicAdd(counter_ptr, 0) != gridDim.x) {
-            }
-            *flag_ptr = new_flag_value;
-            *counter_ptr = 0;
-        }
-    }
-
-    int *counter_ptr;
-    int *flag_ptr;
-    void *comm_bufs[NRanks];
-    void *barrier_flags[NRanks];
-    int flag_value;
-};
-
-template <int NRanks>
-class Barrier {
-public:
-    __device__ __forceinline__ Barrier(int rank, SyncComm<NRanks> const &comm) {
         if (threadIdx.x < NRanks) {
-            m_flag_value = comm.flag_value;
-            int current_rank = rank;
             int target_rank = threadIdx.x;
-            m_target_flag = reinterpret_cast<int *>(comm.barrier_flags[target_rank]) + current_rank;
-            m_current_flag =
-                reinterpret_cast<int *>(comm.barrier_flags[current_rank]) + blockIdx.x * NRanks + target_rank;
+            target_flag = reinterpret_cast<int *>(barrier_flags[target_rank]) + blockIdx.x * NRanks + rank;
+            current_flag = reinterpret_cast<int *>(barrier_flags[rank]) + blockIdx.x * NRanks + target_rank;
         }
     }
 
+    template <bool RELAXED = true>
     __device__ __forceinline__ void sync() {
-        constexpr int kBarrierFlagCount = NBLOCKS_PER_GPU;
-        __syncthreads();
+        auto flag = (*flag_ptr) + 1;
         if (threadIdx.x < NRanks) {
-            m_flag_value = next_flag(m_flag_value);
-            // To avoid the ABA problem, we need to synchronize the correct flag value
-            // to all barrier_flags, even if the corresponding CTA has not been
-            // launched.
-            for (int flag_idx = blockIdx.x; flag_idx < kBarrierFlagCount;
-                 flag_idx += gridDim.x) {
-                st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
-            }
-            while (ld_flag(m_current_flag) == prev_flag(m_flag_value)) {
+            details::st_flag<RELAXED>(target_flag, flag);
+            while (details::ld_flag<RELAXED>(current_flag) < flag) {
             }
         }
-        __syncthreads();
-    }
-
-protected:
-    __device__ void st_flag(int *addr, int flag) {
-#ifdef __CUDACC__
-        asm volatile("st.global.release.sys.b32 [%1], %0;" ::"r"(flag), "l"(addr));
-#else
-        __scoped_atomic_store_n(addr, flag, __ATOMIC_RELEASE,
-                                __MEMORY_SCOPE_SYSTEM);
-#endif
-    }
-
-    __device__ int ld_flag(int *addr) {
-        int flag;
-#ifdef __CUDACC__
-        asm volatile("ld.global.acquire.sys.b32 %0, [%1];"
-                     : "=r"(flag)
-                     : "l"(addr));
-#else
-        flag =
-            __scoped_atomic_load_n(addr, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
-#endif
-        return flag;
-    }
-
-    __device__ __forceinline__ int next_flag(int flag) {
-        return flag == 2 ? 0 : flag + 1;
-    }
-
-    __device__ __forceinline__ int prev_flag(int flag) {
-        return flag == 0 ? 2 : flag - 1;
-    }
-
-public:
-    volatile int m_flag_value;
-
-private:
-    int *m_target_flag;
-    int *m_current_flag;
-};
-
-template <int NRanks>
-struct LamportComm {
-    __device__ __forceinline__ LamportComm(void **workspace, int rank) {
-        counter_ptr = (int *)workspace[NRanks * 3 + 0];
-        flag_ptr = (int *)workspace[NRanks * 3 + 2];
-        int comm_size = *reinterpret_cast<int *>(workspace[NRanks * 3 + 3]);
-        clear_ptr = (int *)workspace[NRanks * 3 + 4];
-        flag_value = *flag_ptr;
-        clear_size = *clear_ptr;
-        int data_offset = flag_value % 3;
-        int clear_offset = (flag_value + 2) % 3;
-        for (int r = 0; r < NRanks; ++r) {
-            data_bufs[r] = reinterpret_cast<uint8_t *>(workspace[2 * NRanks + r]) + static_cast<int64_t>(data_offset) * comm_size;
-        }
-        clear_buf = reinterpret_cast<uint8_t *>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
         __syncthreads();
         if (threadIdx.x == 0) {
-            atomicAdd(counter_ptr, 1);
+            *flag_ptr = flag;
         }
     }
 
-    __device__ __forceinline__ void update(int new_clear_size) {
-        if (blockIdx.x == 0 && threadIdx.x == 0) {
-            while (atomicAdd(counter_ptr, 0) != gridDim.x) {
-            }
-            *flag_ptr = (flag_value + 1) % 3;
-            *clear_ptr = new_clear_size;
-            *counter_ptr = 0;
-        }
-    }
-
-    int *counter_ptr;
     int *flag_ptr;
-    int *clear_ptr;
-    uint8_t *data_bufs[NRanks];
-    uint8_t *clear_buf;
-    int clear_size;
-    int flag_value;
+    void *barrier_flags[NRanks];
+    int *target_flag;
+    int *current_flag;
 };
-
-} // namespace comm
 
 enum QuantType {
     NONE = 0,
@@ -404,7 +329,6 @@ struct AllReduceFusionParams {
     int rank;
     int size;
     int hidden_dim;
-    void **workspace;
     void *allreduce_in;
     void *residual_in;
     void *residual_out;
@@ -438,7 +362,7 @@ __device__ __forceinline__ vec_t<OutT, VEC_SIZE> rms_norm(AllReduceFusionParams<
         float v = static_cast<float>(reinterpret_cast<T const *>(&residual)[i]);
         acc += v * v;
     }
-    acc = block_reduce<float>(acc, std::plus<float>());
+    acc = block_reduce<float, WARP_SIZE>(acc, std::plus<float>());
     if (threadIdx.x == 0) {
         s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
     }
@@ -461,7 +385,7 @@ __device__ __forceinline__ float reduce_abs_max(vec_t<T, VEC_SIZE> const &data) 
         float v = static_cast<float>(reinterpret_cast<T const *>(&data)[i]);
         acc = fn(acc, std::abs(v));
     }
-    acc = block_reduce<float>(acc, fn);
+    acc = block_reduce<float, WARP_SIZE>(acc, fn);
     if (threadIdx.x == 0) {
         s_val = acc;
     }
@@ -470,13 +394,14 @@ __device__ __forceinline__ float reduce_abs_max(vec_t<T, VEC_SIZE> const &data) 
     return acc;
 }
 
-template <typename T, int VEC_SIZE>
+template <typename T, int VEC_SIZE, bool STORE = true>
 __device__ __forceinline__ void epilogue(
     AllReduceFusionParams<T> const &params,
     vec_t<T, VEC_SIZE> &rms_in,
     vec_t<T, VEC_SIZE> &rms_weight,
     int idx, int tidx) {
-    rms_in.store(reinterpret_cast<T *>(params.residual_out) + idx);
+    if constexpr (STORE)
+        rms_in.store(reinterpret_cast<T *>(params.residual_out) + idx);
     if (params.quant_type == QuantType::NONE) {
         auto val = rms_norm<T, VEC_SIZE, T>(params, rms_in, rms_weight);
         val.store(reinterpret_cast<T *>(params.norm_out) + idx);
@@ -484,11 +409,11 @@ __device__ __forceinline__ void epilogue(
         auto val = rms_norm<T, VEC_SIZE, float>(params, rms_in, rms_weight);
         float scale = reduce_abs_max<float, VEC_SIZE>(val);
         if (params.quant_type == QuantType::FP8E4M3FN) {
-            scale = scale == 0.f ? 1.f : scale / fp8e4m3fn::max_value;
+            scale = scale == 0.f ? 1.f : scale / (float)fp8e4m3fn::max_value;
             auto val_fp8 = convert_to_fp8<float, VEC_SIZE, fp8e4m3fn>(val, scale);
             val_fp8.store(reinterpret_cast<fp8e4m3fn *>(params.norm_out) + idx);
         } else {
-            scale = scale == 0.f ? 1.f : scale / fp8e4m3fnuz::max_value;
+            scale = scale == 0.f ? 1.f : scale / (float)fp8e4m3fnuz::max_value;
             auto val_fp8 = convert_to_fp8<float, VEC_SIZE, fp8e4m3fnuz>(val, scale);
             val_fp8.store(reinterpret_cast<fp8e4m3fnuz *>(params.norm_out) + idx);
         }
@@ -498,28 +423,18 @@ __device__ __forceinline__ void epilogue(
 }
 
 template <typename T, int NRanks>
-__global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> params) {
+__global__ void allreduce_fusion_kernel_twoshot(AllReduceFusionParams<T> params, CommPtrs<NRanks> cptrs) {
     static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
 
     int access_id_in_token = threadIdx.x * VEC_SIZE;
+    int access_id_begin =
+        (blockIdx.x * NRanks + 0) * params.hidden_dim + access_id_in_token;
 
     vec_t<T, VEC_SIZE> gamma;
     gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
 
-    comm::SyncComm<NRanks> comm(params.workspace);
-
-#pragma unroll
-    for (int r = 0; r < NRanks; ++r) {
-        for (int idx =
-                 (blockIdx.x * NRanks + r) * params.hidden_dim + access_id_in_token;
-             idx < params.size; idx += gridDim.x * NRanks * params.hidden_dim) {
-            reinterpret_cast<float4 *>(comm.comm_bufs[params.rank])[idx / VEC_SIZE] =
-                reinterpret_cast<float4 *>(params.allreduce_in)[idx / VEC_SIZE];
-        }
-    }
-
-    comm::Barrier<NRanks> barrier(params.rank, comm);
-    barrier.sync();
+    SyncComm<NRanks> comm(cptrs);
+    comm.sync();
 
     // allreduce
     for (int idx = (blockIdx.x * NRanks + params.rank) * params.hidden_dim + access_id_in_token;
@@ -527,16 +442,16 @@ __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> 
         vec_t<T, VEC_SIZE> vals[NRanks];
 #pragma unroll
         for (int r = 0; r < NRanks; ++r) {
-            vals[r].load(reinterpret_cast<T *>(comm.comm_bufs[r]) + idx);
+            vals[r].load(reinterpret_cast<T *>(cptrs.data_ptrs[r]) + idx);
         }
         vec_add_r_<T, VEC_SIZE, NRanks>(vals);
 #pragma unroll
         for (int r = 0; r < NRanks; ++r) {
-            vals[0].store(reinterpret_cast<T *>(comm.comm_bufs[r]) + params.size + idx);
+            vals[0].store(reinterpret_cast<T *>(cptrs.data_ptrs[r]) + params.size + idx);
         }
     }
 
-    barrier.sync();
+    comm.template sync<false>();
 
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
@@ -545,229 +460,143 @@ __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> 
              idx < params.size; idx += gridDim.x * NRanks * params.hidden_dim, tidx += gridDim.x * NRanks) {
             vec_t<T, VEC_SIZE> data[2];
             data[0].load(reinterpret_cast<T *>(params.residual_in) + idx);
-            data[1].load(reinterpret_cast<T *>(comm.comm_bufs[params.rank]) + params.size + idx);
+            data[1].load(reinterpret_cast<T *>(cptrs.data_ptrs[params.rank]) + params.size + idx);
             vec_add_<T, VEC_SIZE>(data[0], data[1]);
-            data[0].store(reinterpret_cast<T *>(params.residual_out) + idx);
             epilogue<T, VEC_SIZE>(params, data[0], gamma, idx, tidx);
         }
     }
-
-    comm.update(barrier.m_flag_value);
 }
 
-template <typename T, int NRanks>
-__global__ void allreduce_fusion_kernel_twoshot_single_load(AllReduceFusionParams<T> params) {
+template <typename T, int NRanks, int BLOCK_SIZE, bool USE_EPILOGUE>
+__global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_w(AllReduceFusionParams<T> params, CommPtrs<NRanks> cptrs) {
     static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+    constexpr int WARP_SIZE_ = BLOCK_SIZE / NRanks;
+    SyncComm<NRanks> comm(cptrs);
 
-    int access_id_in_token = threadIdx.x * VEC_SIZE;
+    __shared__ T shared[NRanks * WARP_SIZE_ * VEC_SIZE];
+    int warp_id = threadIdx.x / WARP_SIZE_;
+    int lane_id = threadIdx.x % WARP_SIZE_;
 
-    vec_t<T, VEC_SIZE> gamma;
-    gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
+    comm.sync();
 
-    comm::SyncComm<NRanks> comm(params.workspace);
-
-    int idx = blockIdx.x * params.hidden_dim + access_id_in_token;
-    reinterpret_cast<float4 *>(comm.comm_bufs[params.rank])[idx / VEC_SIZE] =
-        reinterpret_cast<float4 *>(params.allreduce_in)[idx / VEC_SIZE];
-
-    comm::Barrier<NRanks> barrier(params.rank, comm);
-    barrier.sync();
-
-    // cross-device load
-    vec_t<T, VEC_SIZE> vals[NRanks];
-#pragma unroll
-    for (int r = 0; r < NRanks; ++r) {
-        vals[r].load(reinterpret_cast<T *>(comm.comm_bufs[r]) + idx);
-    }
-    vec_add_r_<T, VEC_SIZE, NRanks>(vals);
-
-    int tidx = blockIdx.x;
-    vec_t<T, VEC_SIZE> residual;
-    residual.load(reinterpret_cast<T *>(params.residual_in) + idx);
-    vec_add_<T, VEC_SIZE>(residual, vals[0]);
-    epilogue<T, VEC_SIZE>(params, residual, gamma, idx, tidx);
-
-    comm.update(barrier.m_flag_value);
-}
-
-template <typename T>
-struct neg_zero { static constexpr T value = -T(0); };
-
-template <>
-struct neg_zero<__half> {
-    static constexpr unsigned short neg_zero_bits = 0x8000U;
-    static constexpr __half value = __half_raw{neg_zero_bits};
-    using bits_type = unsigned short;
-};
-
-template <>
-struct neg_zero<__bfloat16> {
-    static constexpr unsigned short neg_zero_bits = 0x8000U;
-    static constexpr __bfloat16 value = __hip_bfloat16_raw{neg_zero_bits};
-    using bits_type = unsigned short;
-};
-
-template <>
-struct neg_zero<float> {
-    static constexpr unsigned int neg_zero_bits = 0x80000000U;
-    static constexpr float value = -0.0f;
-    using bits_type = unsigned int;
-};
-
-template <>
-struct neg_zero<double> {
-    static constexpr uint64_t neg_zero_bits = 0x8000000000000000ULL;
-    static constexpr double value = -0.0f;
-    using bits_type = uint64_t;
-};
-
-template <typename T>
-__device__ static constexpr T neg_zero_v = neg_zero<T>::value;
-
-template <typename T>
-__device__ bool is_negative_zero(T) {
-    return false;
-}
-
-// float specialization
-template <>
-__device__ bool is_negative_zero<float>(float x) {
-    return (__float_as_int(x) == 0x80000000);
-}
-
-// double specialization
-template <>
-__device__ bool is_negative_zero<double>(double x) {
-    return (__double_as_longlong(x) == 0x8000000000000000ULL);
-}
-
-// __half specialization
-template <>
-__device__ bool is_negative_zero<__half>(__half x) {
-    return (__half_as_ushort(x) == 0x8000);
-}
-
-// __bfloat16 specialization
-template <>
-__device__ bool is_negative_zero<__bfloat16>(__bfloat16 x) {
-    return (__bfloat16_as_ushort(x) == 0x8000);
-}
-
-template <typename T, uint32_t VEC_SIZE>
-__device__ __forceinline__ bool has_neg_zero(const vec_t<T, VEC_SIZE> &vec) {
-#pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-        if (is_negative_zero<T>(vec[i])) {
-            return true;
-        }
-    }
-    return false;
-}
-
-template <typename T, uint32_t VEC_SIZE>
-__device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE> &vec) {
-#pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-        vec[i] = (is_negative_zero<T>(vec[i])) ? static_cast<T>(0.f) : vec[i];
-    }
-}
-
-template <typename T, int NRanks>
-__global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T> params) {
-    static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
-    int token_id = blockIdx.x;
-    int access_id_in_token = threadIdx.x * VEC_SIZE;
-    int access_id = token_id * params.hidden_dim + access_id_in_token;
-    int access_stride = gridDim.x * params.hidden_dim;
-
-    vec_t<T, VEC_SIZE> clear_vec;
-    clear_vec.cast_fill(neg_zero<T>::neg_zero_bits);
-
-    vec_t<T, VEC_SIZE> gamma;
-    gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
-
-    comm::LamportComm<NRanks> comm(params.workspace, params.rank);
-    int clear_access = comm.clear_size;
-
-    for (int idx = access_id; idx < params.size; idx += access_stride) {
+    for (
+        int idx = ((blockIdx.x * NRanks + params.rank) * WARP_SIZE_ + lane_id) * VEC_SIZE;
+        // int idx = ((params.rank * gridDim.x + blockIdx.x) * WARP_SIZE_ + lane_id) * VEC_SIZE;
+        idx < params.size;
+        idx += gridDim.x * NRanks * WARP_SIZE_ * VEC_SIZE) {
         vec_t<T, VEC_SIZE> val;
-        val.load(reinterpret_cast<T *>(params.allreduce_in) + idx);
-        remove_neg_zero<T, VEC_SIZE>(val);
+        val.load(reinterpret_cast<T *>(cptrs.data_ptrs[warp_id]) + idx);
+        val.store(&shared[0] + threadIdx.x * VEC_SIZE);
+        __syncthreads();
+        if (warp_id == 0) {
+            vec_t<T, VEC_SIZE> acc;
+            acc.load(&shared[0] + lane_id * VEC_SIZE);
 #pragma unroll
-        for (int r = 0; r < NRanks; ++r) {
-            // Push data to other ranks
-            val.store(reinterpret_cast<T *>(comm.data_bufs[r]) + params.rank * params.size + idx);
-        }
-    }
-
-    for (int idx = access_id; idx < clear_access; idx += access_stride) {
-        // Clear comm buffer that previous kernel used
-        clear_vec.store(reinterpret_cast<T *>(comm.clear_buf) + idx);
-    }
-
-    for (int idx = access_id, tidx = token_id; idx < params.size;
-         idx += access_stride, tidx += gridDim.x) {
-        vec_t<T, VEC_SIZE> residual;
-        residual.load(reinterpret_cast<T *>(params.residual_in) + idx);
-
-        vec_t<T, VEC_SIZE> vals[NRanks];
-        volatile bool done = false;
-        while (!done) {
-            done = true;
-            __threadfence();
-#pragma unroll
-            for (int r = 0; r < NRanks; ++r) {
-                // LDG.128 from local rank
-                vals[r].load(reinterpret_cast<T *>(comm.data_bufs[params.rank]) + r * params.size + idx);
-                done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
+            for (int r = 1; r < NRanks; ++r) {
+                vec_t<T, VEC_SIZE> vec;
+                vec.load(&shared[0] + (r * WARP_SIZE_ + lane_id) * VEC_SIZE);
+                vec_add_<T, VEC_SIZE>(acc, vec);
             }
+            acc.store(&shared[0] + lane_id * VEC_SIZE);
         }
-        vec_add_r_<T, VEC_SIZE, NRanks>(vals);
-        vec_add_<T, VEC_SIZE>(vals[0], residual);
-        epilogue<T, VEC_SIZE>(params, vals[0], gamma, idx, tidx);
+        __syncthreads();
+        val.load(&shared[0] + lane_id * VEC_SIZE);
+        vec_t<T, VEC_SIZE> res;
+        res.load(reinterpret_cast<T *>(params.residual_in) + idx);
+        vec_add_<T, VEC_SIZE>(val, res);
+        val.store(reinterpret_cast<T *>(cptrs.data_ptrs[warp_id]) + idx);
     }
 
-    comm.update(params.size * NRanks);
+    if constexpr (USE_EPILOGUE) {
+        comm.template sync<false>();
+        int access_id_in_token = threadIdx.x * VEC_SIZE;
+        vec_t<T, VEC_SIZE> gamma;
+        gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
+        for (
+            int idx = blockIdx.x * params.hidden_dim + access_id_in_token, tidx = blockIdx.x;
+            idx < params.size;
+            idx += gridDim.x * params.hidden_dim, tidx += gridDim.x) {
+            vec_t<T, VEC_SIZE> val;
+            val.load(reinterpret_cast<T *>(cptrs.data_ptrs[params.rank]) + idx);
+            epilogue<T, VEC_SIZE, true>(params, val, gamma, idx, tidx);
+        }
+    } else {
+        comm.sync();
+    }
 }
 
 template <typename T, int NRanks>
-void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params,
-                                      gpuStream_t stream) {
+void allreduce_fusion_kernel_twoshot_launcher(
+    AllReduceFusionParams<T> const &params,
+    CommPtrs<NRanks> const &cptrs,
+    gpuStream_t stream) {
     static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
     assert(params.size % params.hidden_dim == 0);
     assert(params.hidden_dim % VEC_SIZE == 0);
     int token_num = params.size / params.hidden_dim;
     int threads_per_token = params.hidden_dim / VEC_SIZE;
     dim3 threadsPerBlock(threads_per_token);
-    // void *args[] = {(void *)&params};
-    if (token_num <= NBLOCKS_PER_GPU) {
-        dim3 numBlocks(token_num);
-        allreduce_fusion_kernel_twoshot_single_load<T, NRanks><<<numBlocks,
-                                                                 threadsPerBlock, 0, stream>>>(params);
-    } else {
-        int nblocks = std::min(token_num, NBLOCKS_PER_GPU);
-        if (params.size * sizeof(T) >= 1024 * 1024 * 128) {
-            nblocks /= 2;
-        }
-        dim3 numBlocks(nblocks);
-        allreduce_fusion_kernel_twoshot_direct<T, NRanks><<<numBlocks,
-                                                            threadsPerBlock, 0, stream>>>(params);
+    int nblocks = std::min((token_num + NRanks - 1) / NRanks, NBLOCKS_PER_GPU);
+    if (params.size * sizeof(T) >= 2048 * 1024 * 128) {
+        nblocks /= 2;
     }
+    // void *args[] = {(void *)&params};
+    dim3 numBlocks(nblocks);
+    allreduce_fusion_kernel_twoshot<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params, cptrs);
+}
+
+template <typename T, int NRanks, int HIDDEN_DIM>
+void allreduce_fusion_kernel_w_launcher(
+    AllReduceFusionParams<T> const &params,
+    CommPtrs<NRanks> const &cptrs,
+    gpuStream_t stream) {
+    constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+    constexpr int BLOCK_SIZE = HIDDEN_DIM / VEC_SIZE;
+    assert(params.size % params.hidden_dim == 0);
+    assert(params.hidden_dim % VEC_SIZE == 0);
+    assert(params.hidden_dim == HIDDEN_DIM);
+    int token_num = params.size / params.hidden_dim;
+    dim3 threadsPerBlock(BLOCK_SIZE);
+    token_num = token_num <= 2 ? 1 : token_num;
+    dim3 numBlocks(token_num);
+    allreduce_fusion_kernel_w<T, NRanks, BLOCK_SIZE, true><<<numBlocks, threadsPerBlock, 0, stream>>>(params, cptrs);
+}
+
+template <typename T, int NRanks>
+void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params,
+                                      CommPtrs<NRanks> const &cptrs,
+                                      gpuStream_t stream) {
+    int token_num = params.size / params.hidden_dim;
+    if (token_num <= 1024) {
+        switch (params.hidden_dim) {
+        case 4096:
+            allreduce_fusion_kernel_w_launcher<T, NRanks, 4096>(params, cptrs, stream);
+            return;
+        case 2048:
+            allreduce_fusion_kernel_w_launcher<T, NRanks, 2048>(params, cptrs, stream);
+            return;
+        case 1024:
+            allreduce_fusion_kernel_w_launcher<T, NRanks, 1024>(params, cptrs, stream);
+            return;
+        default:
+            break;
+        }
+    }
+    allreduce_fusion_kernel_twoshot_launcher<T, NRanks>(params, cptrs, stream);
 }
 
 template <typename T>
-void allreduce_rms_fusion_impl(void **workspace, int rank, int nranks, int size,
+void allreduce_rms_fusion_impl(HostCommPtrs host_cptrs, int size,
                                int hidden_dim, void *allreduce_in,
                                void *residual_in, void *residual_out,
                                void *norm_out, void *rms_gamma, float eps,
                                int quant_type = 0, void *scale_out = nullptr,
                                gpuStream_t stream = 0) {
     AllReduceFusionParams<T> params;
-    params.nranks = nranks;
-    params.rank = rank;
+    params.nranks = host_cptrs.nranks;
+    params.rank = host_cptrs.rank;
     params.size = size;
     params.hidden_dim = hidden_dim;
-    params.workspace = workspace;
     params.allreduce_in = allreduce_in;
     params.residual_in = residual_in;
     params.residual_out = residual_out;
@@ -776,157 +605,189 @@ void allreduce_rms_fusion_impl(void **workspace, int rank, int nranks, int size,
     params.rms_eps = eps;
     params.scale_out = scale_out;
     params.quant_type = (QuantType)quant_type;
+
+#define DISPATCH_NRANKS(NRANKS)                                             \
+    {                                                                       \
+        CommPtrs<NRANKS> cptrs;                                             \
+        for (int i = 0; i < NRANKS; ++i) {                                  \
+            cptrs.barrier_flag_ptrs[i] = host_cptrs.barrier_flag_ptrs[i];   \
+            cptrs.data_ptrs[i] = host_cptrs.data_ptrs[i];                   \
+        }                                                                   \
+        cptrs.sync_clock = host_cptrs.sync_clock;                           \
+        cptrs.rank = host_cptrs.rank;                                       \
+        allreduce_fusion_kernel_launcher<T, NRANKS>(params, cptrs, stream); \
+    }
+
+    int nranks = host_cptrs.nranks;
     if (nranks == 8) {
-        allreduce_fusion_kernel_launcher<T, 8>(params, stream);
+        DISPATCH_NRANKS(8)
     } else if (nranks == 4) {
-        allreduce_fusion_kernel_launcher<T, 4>(params, stream);
+        DISPATCH_NRANKS(4)
     } else if (nranks == 2) {
-        allreduce_fusion_kernel_launcher<T, 2>(params, stream);
+        DISPATCH_NRANKS(2)
     } else {
         assert(false);
     }
+
+#undef DISPATCH_NRANKS
 }
 
-class CommWorkspace {
-    static constexpr int MAX_RANKS = 16;
+namespace ipc_details {
 
-    template <typename T>
-    void flush_data(void *data, int one_shot_comm_size) {
-        using element_t = typename neg_zero<T>::bits_type;
-        std::vector<element_t> arr;
-        arr.resize(one_shot_comm_size / sizeof(T));
-        for (int i = 0; i < one_shot_comm_size / sizeof(element_t); ++i) {
-            volatile element_t v = neg_zero<T>::neg_zero_bits;
-            arr[i] = v;
-        }
-        gpuMemcpy(data, arr.data(), one_shot_comm_size, gpuMemcpyHostToDevice);
+Tensor get_handle(void *ptr) {
+    gpuIpcMemHandle_t handle;
+    TORCH_CHECK(gpuIpcGetMemHandle(&handle, ptr) == gpuSuccess);
+    auto options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
+    auto data_handle = torch::empty({static_cast<int64_t>(sizeof(gpuIpcMemHandle_t))}, options);
+    std::memcpy(data_handle.data_ptr(), &handle, sizeof(gpuIpcMemHandle_t));
+    return data_handle;
+}
+
+void open_handles(int rank, std::vector<Tensor> &handles, void *ptr, std::vector<void *> &ipc_ptrs) {
+    std::vector<gpuIpcMemHandle_t> ipc_handles;
+    int world_size = handles.size();
+    ipc_handles.reserve(world_size);
+    ipc_ptrs.resize(world_size);
+    for (auto &handle : handles) {
+        // Ensure the tensor is on the same device as the current device.
+        gpuIpcMemHandle_t ipc_handle;
+        std::memcpy(&ipc_handle, handle.data_ptr(), sizeof(gpuIpcMemHandle_t));
+        ipc_handles.push_back(ipc_handle);
     }
+    for (int i = 0; i < world_size; ++i) {
+        if (i != rank) {
+            TORCH_CHECK(
+                gpuIpcOpenMemHandle((void **)&ipc_ptrs[i], ipc_handles[i], gpuIpcMemLazyEnablePeerAccess) == gpuSuccess);
+        } else {
+            ipc_ptrs[i] = ptr;
+        }
+    }
+}
 
+} // namespace ipc_details
+
+class CommWorkspace {
 public:
-    CommWorkspace(int64_t rank, int64_t world_size, int64_t size_in_bytes) {
-        TORCH_CHECK(world_size < MAX_RANKS && rank < world_size);
+    CommWorkspace(int64_t rank, int64_t world_size, int64_t size_in_bytes, int64_t max_thread_blocks = NBLOCKS_PER_GPU) {
+        TORCH_CHECK(rank < world_size);
         gpuSetDevice(rank);
         rank_ = rank;
         world_size_ = world_size;
         size_in_bytes_ = size_in_bytes;
-        int data_size = size_in_bytes * 2 + NBLOCKS_PER_GPU * world_size * sizeof(int);
-        int one_shot_comm_size = details::kOneShotMaxSize * world_size_ * 3;
-        data_size += one_shot_comm_size;
-        gpuMalloc(&data_, data_size);
-        gpuMalloc(&counter_, sizeof(int));
-        gpuMemset(counter_, 0, sizeof(int));
-        gpuMalloc(&twoshot_sync_clock_, sizeof(int));
-        gpuMemset(twoshot_sync_clock_, 0, sizeof(int));
-        // oneshot
-        gpuMalloc(&oneshot_sync_clock_, sizeof(int));
-        gpuMemset(oneshot_sync_clock_, 0, sizeof(int));
-        int size = details::kOneShotMaxSize * world_size;
-        gpuMalloc(&oneshot_comm_size_, sizeof(int));
-        gpuMemcpy(oneshot_comm_size_, &size, sizeof(int), gpuMemcpyHostToDevice);
-        gpuMalloc(&oneshot_clear_, sizeof(int));
-        gpuMemset(oneshot_clear_, 0, sizeof(int));
-        flush_data<float>((void *)((char *)data_ + size_in_bytes * 2 + NBLOCKS_PER_GPU * world_size * sizeof(int)), one_shot_comm_size);
-        dtype_ = ScalarType::Float;
-        gpuDeviceSynchronize();
+        max_thread_blocks_ = max_thread_blocks;
+        gpuMalloc(&sync_clock_, max_thread_blocks_ * sizeof(int));
+        gpuMalloc(&barrier_flags_, max_thread_blocks_ * world_size_ * sizeof(int));
+        gpuMalloc(&data_, size_in_bytes_ * 2);
+        gpuMemset(sync_clock_, 0, max_thread_blocks_ * sizeof(int));
+        gpuMemset(barrier_flags_, 0, max_thread_blocks_ * world_size_ * sizeof(int));
     }
 
     ~CommWorkspace() {
-        gpuFree(counter_);
-        gpuFree(twoshot_sync_clock_);
+        gpuFree(sync_clock_);
+        gpuFree(barrier_flags_);
         gpuFree(data_);
-        gpuFree(oneshot_sync_clock_);
-        gpuFree(oneshot_clear_);
-        gpuFree(oneshot_comm_size_);
     }
 
-    Tensor get_handle() {
-        gpuIpcMemHandle_t handle;
-        TORCH_CHECK(gpuIpcGetMemHandle(&handle, data_) == gpuSuccess);
-        auto options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
-        auto data_handle = torch::empty({static_cast<int64_t>(sizeof(gpuIpcMemHandle_t))}, options);
-        std::memcpy(data_handle.data_ptr(), &handle, sizeof(gpuIpcMemHandle_t));
-        return data_handle;
+    Tensor get_barrier_handle() {
+        return ipc_details::get_handle(barrier_flags_);
     }
 
-    void open_handles(std::vector<Tensor> handles) {
-        std::vector<gpuIpcMemHandle_t> ipc_handles;
-        ipc_handles.reserve(world_size_);
-        for (auto &handle : handles) {
-            // Ensure the tensor is on the same device as the current device.
-            gpuIpcMemHandle_t ipc_handle;
-            std::memcpy(&ipc_handle, handle.data_ptr(), sizeof(gpuIpcMemHandle_t));
-            ipc_handles.push_back(ipc_handle);
-        }
-        for (int i = 0; i < world_size_; ++i) {
-            if (i != rank_) {
-                TORCH_CHECK(
-                    gpuIpcOpenMemHandle((void **)&ipc_data_[i], ipc_handles[i], gpuIpcMemLazyEnablePeerAccess) == gpuSuccess);
-            } else {
-                ipc_data_[i] = data_;
+    Tensor get_data_handle() {
+        return ipc_details::get_handle(data_);
+    }
+
+    void open_barrier_handles(std::vector<Tensor> handles) {
+        ipc_details::open_handles(rank_, handles, barrier_flags_, ipc_barrier_flags_);
+    }
+
+    void open_data_handles(std::vector<Tensor> handles) {
+        ipc_details::open_handles(rank_, handles, data_, ipc_data_);
+    }
+
+    HostCommPtrs get_cptrs(const Tensor &input, gpuStream_t stream) {
+        HostCommPtrs cptrs;
+        cptrs.data_ptrs.resize(world_size_);
+        cptrs.barrier_flag_ptrs.resize(world_size_);
+        void *ptr = (void *)input.data_ptr();
+        auto it = cached_ipc_data_.find(ptr);
+        if (it != cached_ipc_data_.end()) {
+            for (int r = 0; r < world_size_; ++r) {
+                cptrs.data_ptrs[r] = (it->second)[r];
+            }
+        } else {
+            gpuMemcpyAsync(data_, ptr, input.numel() * input.element_size(), gpuMemcpyDeviceToDevice, stream);
+            for (int r = 0; r < world_size_; ++r) {
+                cptrs.data_ptrs[r] = ipc_data_[r];
             }
         }
-        for (int i = 0; i < world_size_; ++i) {
-            twoshot_comm_bufs_[i] = ipc_data_[i];
-            twoshot_barrier_flags_[i] = (int *)((char *)ipc_data_[i] + 2 * size_in_bytes_);
-            // oneshot
-            oneshot_comm_bufs_[i] = (void *)((char *)ipc_data_[i] + 2 * size_in_bytes_ + NBLOCKS_PER_GPU * world_size_ * sizeof(int));
+        for (int r = 0; r < world_size_; ++r) {
+            cptrs.barrier_flag_ptrs[r] = ipc_barrier_flags_[r];
         }
+        cptrs.sync_clock = sync_clock_;
+        cptrs.rank = rank_;
+        cptrs.nranks = world_size_;
+        return cptrs;
     }
 
-    Tensor get_workspace(const Tensor &ref) {
-        std::vector<void *> workspace(world_size_ * 3 + 5);
-        auto dtype = ref.scalar_type();
-        int one_shot_comm_size = details::kOneShotMaxSize * world_size_ * 3;
-        if (dtype != dtype_) {
-            if (dtype == ScalarType::Float) {
-                flush_data<float>(oneshot_comm_bufs_[rank_], one_shot_comm_size);
-            } else if (dtype == ScalarType::Half) {
-                flush_data<__half>(oneshot_comm_bufs_[rank_], one_shot_comm_size);
-            } else if (dtype == ScalarType::BFloat16) {
-                flush_data<__bfloat16>(oneshot_comm_bufs_[rank_], one_shot_comm_size);
-            } else {
-                TORCH_CHECK("datatype not support!");
-            }
-            dtype_ = dtype;
+    void capture(const Tensor &input) {
+        if (input.numel() * input.element_size() > 1024 * 4096 * 16) {
+            return;
         }
-        for (int peer = 0; peer < world_size_; ++peer) {
-            workspace[peer] = (void *)twoshot_comm_bufs_[peer];
-            workspace[world_size_ + peer] = (void *)twoshot_barrier_flags_[peer];
-            workspace[2 * world_size_ + peer] = (void *)oneshot_comm_bufs_[peer];
+        void *ptr = (void *)input.data_ptr();
+        void *base_ptr;
+        if (gpuPointerGetAttribute(&base_ptr, HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR, (gpuDeviceptr_t)ptr) != gpuSuccess) {
+            throw std::runtime_error("failed to get pointer attr");
         }
-        workspace[world_size_ * 3 + 0] = (void *)counter_;
-        workspace[world_size_ * 3 + 1] = (void *)twoshot_sync_clock_;
-        // oneshot
-        workspace[world_size_ * 3 + 2] = (void *)oneshot_sync_clock_;
-        workspace[world_size_ * 3 + 3] = (void *)oneshot_comm_size_;
-        workspace[world_size_ * 3 + 4] = (void *)oneshot_clear_;
-        auto options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
-        auto workspace_tensor = torch::empty({static_cast<int64_t>(workspace.size() * sizeof(void *))}, options);
-        std::memcpy(workspace_tensor.data_ptr(), workspace.data(), workspace.size() * sizeof(void *));
-        return workspace_tensor.to(ref.device());
+        cached_ptrs_.push_back(ptr);
+        cached_base_ptrs_.push_back(base_ptr);
+        cached_offsets_.push_back(((char *)ptr) - ((char *)base_ptr));
+    }
+
+    void capture_clear() {
+        cached_ptrs_.clear();
+        cached_base_ptrs_.clear();
+        cached_offsets_.clear();
+    }
+
+    std::tuple<std::vector<Tensor>, std::vector<int64_t>> get_captured_handles() {
+        int num_datas = cached_ptrs_.size();
+        std::vector<Tensor> ipc_handles;
+        std::vector<int64_t> offsets;
+        ipc_handles.reserve(num_datas);
+        offsets.reserve(num_datas);
+        for (int i = 0; i < num_datas; ++i) {
+            ipc_handles.push_back(ipc_details::get_handle(cached_base_ptrs_[i]));
+            offsets.push_back(cached_offsets_[i]);
+        }
+        return {ipc_handles, offsets};
+    }
+
+    void open_captured_handles(std::vector<Tensor> &handles, std::vector<int64_t> &offsets, int64_t ptr_idx) {
+        auto ptr = cached_ptrs_[ptr_idx];
+        auto base_ptr = cached_base_ptrs_[ptr_idx];
+        std::vector<void *> ipc_data;
+        ipc_details::open_handles(rank_, handles, base_ptr, ipc_data);
+        for (int i = 0; i < offsets.size(); ++i) {
+            ipc_data[i] = (void *)((char *)ipc_data[i] + offsets[i]);
+        }
+        cached_ipc_data_[ptr] = ipc_data;
     }
 
 private:
-    // meta
     int rank_;
     int world_size_;
     int size_in_bytes_;
-
-    // data
+    int max_thread_blocks_;
+    void *sync_clock_;
+    void *barrier_flags_;
     void *data_;
-    void *ipc_data_[MAX_RANKS];
-
-    int *counter_;
-    // twoshot
-    void *twoshot_comm_bufs_[MAX_RANKS];    // 2 * size * sizeof(T)
-    int *twoshot_barrier_flags_[MAX_RANKS]; // nblocks * world_size
-    int *twoshot_sync_clock_;
-    // oneshot
-    void *oneshot_comm_bufs_[MAX_RANKS];
-    int *oneshot_sync_clock_;
-    int *oneshot_comm_size_;
-    int *oneshot_clear_;
-    ScalarType dtype_;
+    std::vector<void *> ipc_barrier_flags_;
+    std::vector<void *> ipc_data_;
+    // capture
+    std::vector<void *> cached_ptrs_;
+    std::vector<void *> cached_base_ptrs_;
+    std::vector<int64_t> cached_offsets_;
+    std::unordered_map<void *, std::vector<void *>> cached_ipc_data_;
 };
 
 fptr_t init_ar_fusion(int64_t rank, int64_t world_size, int64_t max_size_in_bytes) {
@@ -948,19 +809,44 @@ void destroy_ar_fusion(fptr_t fptr) {
     delete ptr;
 }
 
-Tensor get_ar_fusion_handle(fptr_t fptr) {
+Tensor get_ar_fusion_barrier_handle(fptr_t fptr) {
     auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
-    return ptr->get_handle();
+    return ptr->get_barrier_handle();
 }
 
-void open_ar_fusion_handles(fptr_t fptr, std::vector<Tensor> handles) {
+Tensor get_ar_fusion_data_handle(fptr_t fptr) {
     auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
-    ptr->open_handles(handles);
+    return ptr->get_data_handle();
 }
 
-Tensor get_ar_fusion_workspace(fptr_t fptr, const Tensor &ref) {
+void open_ar_fusion_barrier_handles(fptr_t fptr, std::vector<Tensor> handles) {
     auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
-    return ptr->get_workspace(ref);
+    ptr->open_barrier_handles(handles);
+}
+
+void open_ar_fusion_data_handles(fptr_t fptr, std::vector<Tensor> handles) {
+    auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
+    ptr->open_data_handles(handles);
+}
+
+void ar_fusion_capture(fptr_t fptr, const Tensor &input) {
+    auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
+    ptr->capture(input);
+}
+
+void ar_fusion_capture_clear(fptr_t fptr) {
+    auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
+    ptr->capture_clear();
+}
+
+std::tuple<std::vector<Tensor>, std::vector<int64_t>> get_ar_fusion_captured_handles(fptr_t fptr) {
+    auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
+    return ptr->get_captured_handles();
+}
+
+void open_ar_fusion_captured_handles(fptr_t fptr, std::vector<Tensor> handles, std::vector<int64_t> offsets, int64_t ptr_idx) {
+    auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
+    ptr->open_captured_handles(handles, offsets, ptr_idx);
 }
 
 template <typename T>
@@ -974,14 +860,18 @@ struct KernelElementType<c10::BFloat16> {
     using type = __bfloat16;
 };
 
-void allreduce_rms(int64_t rank, int64_t nranks, Tensor &allreduce_in, Tensor &residual_in,
+void allreduce_rms(fptr_t fptr, Tensor &allreduce_in, Tensor &residual_in,
                    Tensor &rms_gamma, Tensor &residual_out, Tensor &norm_out, Tensor &scale_out,
-                   double eps, int64_t quant_type, Tensor &workspace) {
+                   double eps, int64_t quant_type) {
+    TORCH_CHECK(allreduce_in.is_contiguous() && residual_in.is_contiguous() && rms_gamma.is_contiguous());
+    TORCH_CHECK(residual_out.is_contiguous() && norm_out.is_contiguous() && scale_out.is_contiguous());
     auto dev = allreduce_in.device();
     c10::DeviceGuard dev_guard(dev);
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     int size = allreduce_in.numel();
     int hidden_dim = allreduce_in.size(-1);
+    auto ptr = reinterpret_cast<CommWorkspace *>(fptr);
+    auto cptrs = ptr->get_cptrs(allreduce_in, stream);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         kHalf,
         kBFloat16,
@@ -989,9 +879,7 @@ void allreduce_rms(int64_t rank, int64_t nranks, Tensor &allreduce_in, Tensor &r
         "allreduce_rms", [&] {
             using k_scalar_t = KernelElementType<scalar_t>::type;
             allreduce_rms_fusion_impl<k_scalar_t>(
-                (void **)workspace.data_ptr(),
-                rank,
-                nranks,
+                cptrs,
                 size,
                 hidden_dim,
                 (void *)allreduce_in.data_ptr<scalar_t>(),

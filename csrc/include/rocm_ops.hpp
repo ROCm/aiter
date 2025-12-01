@@ -387,17 +387,17 @@ namespace py = pybind11;
           py::arg("bpreshuffle") = true,                                \
           py::arg("splitK")      = std::nullopt);
 
-#define GEMM_A16W16_ASM_PYBIND                  \
-    m.def("gemm_a16w16_asm",                    \
-          &gemm_a16w16_asm,                     \
-          "Asm gemm a16w16",                    \
-          py::arg("A"),                         \
-          py::arg("B"),                         \
-          py::arg("out"),                       \
-          py::arg("bias")       = std::nullopt, \
-          py::arg("splitK")     = std::nullopt, \
-          py::arg("kernelName") = std::nullopt, \
-          py::arg("bpreshuffle")      = false);
+#define GEMM_A16W16_ASM_PYBIND                   \
+    m.def("gemm_a16w16_asm",                     \
+          &gemm_a16w16_asm,                      \
+          "Asm gemm a16w16",                     \
+          py::arg("A"),                          \
+          py::arg("B"),                          \
+          py::arg("out"),                        \
+          py::arg("bias")        = std::nullopt, \
+          py::arg("splitK")      = std::nullopt, \
+          py::arg("kernelName")  = std::nullopt, \
+          py::arg("bpreshuffle") = false);
 
 #define GEMM_A4W4_ASM_PYBIND                      \
     m.def("gemm_a4w4_asm",                        \
@@ -527,14 +527,14 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,        \
           py::arg("splitK")   = 0);
 
-#define GEMM_A8W8_BPRESHUFFLE_CKTILE_PYBIND      \
-    m.def("gemm_a8w8_bpreshuffle_cktile", \
-          &gemm_a8w8_bpreshuffle_cktile,  \
-          "gemm_a8w8_bpreshuffle_cktile", \
-          py::arg("XQ"),                  \
-          py::arg("WQ"),                  \
-          py::arg("x_scale"),             \
-          py::arg("w_scale"),             \
+#define GEMM_A8W8_BPRESHUFFLE_CKTILE_PYBIND \
+    m.def("gemm_a8w8_bpreshuffle_cktile",   \
+          &gemm_a8w8_bpreshuffle_cktile,    \
+          "gemm_a8w8_bpreshuffle_cktile",   \
+          py::arg("XQ"),                    \
+          py::arg("WQ"),                    \
+          py::arg("x_scale"),               \
+          py::arg("w_scale"),               \
           py::arg("Out"));
 
 #define GEMM_A8W8_BPRESHUFFLE_CKTILE_TUNE_PYBIND \
@@ -1413,10 +1413,15 @@ namespace py = pybind11;
           py::arg("final_output"),       \
           py::arg("final_lse") = std::nullopt);
 
-#define TRTLLM_ALL_REDUCE_FUSION_PYBIND                                        \
-    m.def("trtllm_init_ar_fusion", &trtllm::init_ar_fusion);                   \
-    m.def("trtllm_destroy_ar_fusion", &trtllm::destroy_ar_fusion);             \
-    m.def("trtllm_get_ar_fusion_handle", &trtllm::get_ar_fusion_handle);       \
-    m.def("trtllm_open_ar_fusion_handles", &trtllm::open_ar_fusion_handles);   \
-    m.def("trtllm_get_ar_fusion_workspace", &trtllm::get_ar_fusion_workspace); \
+#define TRTLLM_ALL_REDUCE_FUSION_PYBIND                                                        \
+    m.def("trtllm_init_ar_fusion", &trtllm::init_ar_fusion);                                   \
+    m.def("trtllm_destroy_ar_fusion", &trtllm::destroy_ar_fusion);                             \
+    m.def("trtllm_get_ar_fusion_barrier_handle", &trtllm::get_ar_fusion_barrier_handle);       \
+    m.def("trtllm_get_ar_fusion_data_handle", &trtllm::get_ar_fusion_data_handle);             \
+    m.def("trtllm_open_ar_fusion_barrier_handles", &trtllm::open_ar_fusion_barrier_handles);   \
+    m.def("trtllm_open_ar_fusion_data_handles", &trtllm::open_ar_fusion_data_handles);         \
+    m.def("trtllm_ar_fusion_capture", &trtllm::ar_fusion_capture);                             \
+    m.def("trtllm_ar_fusion_capture_clear", &trtllm::ar_fusion_capture_clear);                 \
+    m.def("trtllm_get_ar_fusion_captured_handles", &trtllm::get_ar_fusion_captured_handles);   \
+    m.def("trtllm_open_ar_fusion_captured_handles", &trtllm::open_ar_fusion_captured_handles); \
     m.def("trtllm_allreduce_rms", &trtllm::allreduce_rms);
