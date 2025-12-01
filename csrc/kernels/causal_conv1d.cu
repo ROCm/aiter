@@ -117,7 +117,7 @@ void causal_conv1d_fwd(
     const int32_t threads = 256;
     const int32_t blocks = (total_elements + threads - 1) / threads;
     
-    AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "causal_conv1d_fwd", [&] {
+    VLLM_DISPATCH_FLOATING_TYPES(x.scalar_type(), "causal_conv1d_fwd", [&] {
         using dtype = typename t2ck<scalar_t>::type;
         
         const dtype* bias_ptr_typed = bias_ptr ? reinterpret_cast<const dtype*>(bias_ptr) : nullptr;
