@@ -122,7 +122,7 @@ def generate_gemm_afp4wfp4_inputs(
         w_shuffed,
         x_scales[:M],
         w_scales,
-        x_scales_shuffled,
+        x_scales_shuffled[:M],
         w_scales_shuffled,
         out_dtype,
         y,

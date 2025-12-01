@@ -665,6 +665,9 @@ namespace py = pybind11;
           py::arg("out")           = std::nullopt, \
           py::arg("bias")          = std::nullopt, \
           py::arg("alibi_slopes")  = std::nullopt, \
+          py::arg("q_descale")     = std::nullopt, \
+          py::arg("k_descale")     = std::nullopt, \
+          py::arg("v_descale")     = std::nullopt, \
           py::arg("gen")           = std::nullopt);
 
 #define MHA_VARLEN_FWD_ASM_PYBIND                 \
@@ -821,6 +824,9 @@ namespace py = pybind11;
           py::arg("block_table")         = std::nullopt, \
           py::arg("bias")                = std::nullopt, \
           py::arg("alibi_slopes")        = std::nullopt, \
+          py::arg("q_descale")           = std::nullopt, \
+          py::arg("k_descale")           = std::nullopt, \
+          py::arg("v_descale")           = std::nullopt, \
           py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt);
@@ -1257,6 +1263,8 @@ namespace py = pybind11;
           py::arg("nope_first"));                                                             \
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
+
+#define FUSED_MROPE_RMS_PYBIND m.def("fused_mrope_3d_rms", &fused_mrope_3d_rms);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
