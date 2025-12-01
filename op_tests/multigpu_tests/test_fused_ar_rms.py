@@ -72,7 +72,7 @@ def fused_ar_rmsnorm(
         graph = torch.cuda.CUDAGraph()
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
-                res_out, out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
                     x, x, weight, eps
                 )
         out.fill_(0)
@@ -88,7 +88,7 @@ def fused_ar_rmsnorm(
 
         @perftest()
         def run_ca(x):
-            res_out, out = tensor_model_parallel_fused_allreduce_rmsnorm(
+            out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
                 x, x, weight, eps
             )
             return out
@@ -138,7 +138,7 @@ def get_acc_value_with_cudagraph(
     with graph_capture() as gc:
         with torch.cuda.graph(graph, stream=gc.stream):
             # out = torch.empty_like(x)
-            res_out, out = tensor_model_parallel_fused_allreduce_rmsnorm(
+            out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
                 x, x, weight, eps
             )
     out.fill_(0)
@@ -190,7 +190,7 @@ def get_acc_value_only(
     torch.cuda.synchronize()
 
     for i in range(loop_time):
-        res, out = tensor_model_parallel_fused_allreduce_rmsnorm(x, x, weight, eps)
+        out, res = tensor_model_parallel_fused_allreduce_rmsnorm(x, x, weight, eps)
 
     # destroy
     if dist.is_initialized():
