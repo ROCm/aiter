@@ -8,10 +8,8 @@ from . import comms
 try:
     from .comms import (
         IrisCommContext,
-        all_reduce_iris,
-        all_reduce_iris_atomic,
-        reduce_scatter_iris,
-        all_gather_iris,
+        reduce_scatter,
+        all_gather,
         reduce_scatter_rmsnorm_quant_all_gather,
     )
 
@@ -25,10 +23,8 @@ if _COMMS_AVAILABLE:
     __all__.extend(
         [
             "IrisCommContext",
-            "all_reduce_iris",
-            "all_reduce_iris_atomic",
-            "reduce_scatter_iris",
-            "all_gather_iris",
+            "reduce_scatter",
+            "all_gather",
             "reduce_scatter_rmsnorm_quant_all_gather",
         ]
     )

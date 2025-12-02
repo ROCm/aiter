@@ -33,8 +33,8 @@ class IrisCommContext:
 
     Example:
         >>> with IrisCommContext(heap_size=2**30) as ctx:
-        >>>     shard = ctx.iris_ctx.zeros((1024, 1024), dtype=torch.float32)
-        >>>     full = all_gather_iris(shard, ctx)
+        >>>     shard = ctx.iris_ctx.shmem.zeros((1024, 1024), dtype=torch.float32)
+        >>>     full = all_gather(shard, ctx)
     """
 
     def __init__(self, heap_size=1 << 30):
