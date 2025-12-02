@@ -797,7 +797,7 @@ def paged_attention_decode_v2_gluon_fp8(
     IS_CAUSAL: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr = 0,
     CDNA_VERSION: gl.constexpr = 3,
-    sink_token_ptr=None,
+    sinks_ptr=None,
 ):
     """
     Paged Attention Decode Kernel with FP8/BF16 support for AMD GPUs.
@@ -1140,8 +1140,8 @@ def paged_attention_decode_v2_gluon_fp8(
         )
 
     # Initialize attention state variables
-    max_logits = max_logits_base_offsets.to(gl.float32) * float(0.0) - float("inf")
-    exp_sums = max_logits_base_offsets.to(gl.float32) * float(0.0)
+    # max_logits = max_logits_base_offsets.to(gl.float32) * float(0.0) - float("inf")
+    # exp_sums = max_logits_base_offsets.to(gl.float32) * float(0.0)
     attention_accumulator = gl.zeros(
         (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
     )
@@ -1382,7 +1382,7 @@ def paged_attention_decode_v2_gluon_fp8(
 
     # Compute attention probabilities
     attention_probs = tl.math.exp2((attention_scores - max_logits[:, None]) * LOG2_E)
-    exp_sums = exp_sums + gl.sum(attention_probs, axis=1)
+    exp_sums = gl.sum(attention_probs, axis=1)
 
     # ==================== VALUE ACCUMULATION ====================
     # Handle value quantization scaling for FP8
@@ -1446,12 +1446,15 @@ def paged_attention_decode_v2_gluon_fp8(
     # ==================== OUTPUT NORMALIZATION AND STORING ====================
     # Normalize attention output by softmax denominator
     if SLIDING_WINDOW > 0 and SLIDING_WINDOW <= CONTEXT_PARTITION_SIZE:
-        if sink_token_ptr is not None:
-            sink_token_values = gl.load(
-                sink_token_ptr + (kv_head_idx * query_group_size + query_group_offsets),
+        if sinks_ptr is not None:
+            sinks_values = gl.load(
+                sinks_ptr + (kv_head_idx * query_group_size + query_group_offsets),
                 mask=query_group_offsets < query_group_size,
             )
-            exp_sums += gl.exp(sink_token_values - max_logits)
+            exp_sums += gl.exp(
+                gl.convert_layout(sinks_values, layout=max_logits.type.layout)
+                - max_logits
+            )
 
     exp_sums_reciprocal = 1.0 / exp_sums
     exp_sums_reciprocal_cvt = gl.convert_layout(
@@ -1947,6 +1950,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     VALUE_TRANSPOSED,
     IS_CAUSAL,
     SLIDING_WINDOW,
+    sinks_ptr=None,
 ):
     """
     Wrapper function for paged attention decode kernel with dynamic kernel selection.
@@ -2031,6 +2035,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         IS_CAUSAL=IS_CAUSAL,
         SLIDING_WINDOW=SLIDING_WINDOW,
         CDNA_VERSION=CDNA_VERSION,
+        sinks_ptr=sinks_ptr,
         waves_per_eu=waves_per_eu,
         num_stages=1,
     )
@@ -2141,7 +2146,7 @@ def pa_decode_gluon(
     softmax_scale: float,
     query_length: int,
     max_context_length: int,
-    context_partition_size: int,
+    # context_partition_size: int,
     compute_type: tl.dtype,
     query_scale: torch.Tensor,  # [num_seqs, num_kv_heads * query_length * query_group_size, 1]
     key_scale: torch.Tensor,  # [num_blocks, num_kv_heads, kv_block_size, 1]
@@ -2224,9 +2229,12 @@ def pa_decode_gluon(
     num_query_heads_total = query.shape[1]
     num_query_heads_total = num_query_heads_total // query_length
     num_kv_heads = key_cache.shape[1]
-    max_context_partition_num = int(
-        (max_context_length + context_partition_size - 1) // context_partition_size
-    )
+    context_partition_size = 256
+    if sliding_window > 0:
+        max_context_length = min(max_context_length, sliding_window)
+        if max_context_length <= 128:
+            context_partition_size = 128
+    max_context_partition_num = triton.cdiv(max_context_length, context_partition_size)
     head_size = query.shape[-1]
     kv_block_size = key_cache.shape[-2]
     query_group_size = num_query_heads_total // num_kv_heads
@@ -2406,6 +2414,7 @@ def pa_decode_gluon(
             VALUE_TRANSPOSED=value_transposed,
             IS_CAUSAL=is_causal,
             SLIDING_WINDOW=sliding_window,
+            sinks_ptr=sinks,
         )
         return
     else:
