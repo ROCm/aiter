@@ -225,6 +225,12 @@ def run_benchmark(custom, args):
         assert not (
             has_pe and "fused-bwd" in provider
         ), "'Fused' backward implementation doesn't support Positional Encoding (PE)."
+        assert not (
+            args.fp8 and args.sink
+        ), "Attention sink doesn't support FP8 data type."
+        assert not (
+            args.sink and "fused-bwd" in provider
+        ), "'Fused' backward implementation doesn't support Attention Sink."
 
         global _USE_FUSED_BWD
         fused_backward = "fused-bwd" in provider
@@ -358,13 +364,29 @@ def run_benchmark(custom, args):
             return 0
 
         # Generate base inputs
-        q = torch.randn((BATCH, N_CTX_Q, HQ, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((BATCH, N_CTX_K, HK, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, N_CTX_K, HK, D_HEAD_V), device=device, dtype=dtype)
-        sink = torch.randn((HQ,), device=device, dtype=dtype) if args.sink else None
-        q.requires_grad = requires_grad
-        k.requires_grad = requires_grad
-        v.requires_grad = requires_grad
+        q = torch.randn(
+            (BATCH, N_CTX_Q, HQ, D_HEAD),
+            device=device,
+            dtype=dtype,
+            requires_grad=requires_grad,
+        )
+        k = torch.randn(
+            (BATCH, N_CTX_K, HK, D_HEAD),
+            device=device,
+            dtype=dtype,
+            requires_grad=requires_grad,
+        )
+        v = torch.randn(
+            (BATCH, N_CTX_K, HK, D_HEAD_V),
+            device=device,
+            dtype=dtype,
+            requires_grad=requires_grad,
+        )
+        sink = (
+            torch.randn((HQ,), device=device, dtype=dtype, requires_grad=requires_grad)
+            if args.sink
+            else None
+        )
 
         # FLOPS calculation variables
         total_flops = 0.0
@@ -394,9 +416,9 @@ def run_benchmark(custom, args):
             ) = generate_qkv(
                 q, k, v, query_padding_mask, key_padding_mask, kvpacked=False
             )
-            q_unpad.requires_grad = True
-            k_unpad.requires_grad = True
-            v_unpad.requires_grad = True
+            q_unpad.requires_grad = requires_grad
+            k_unpad.requires_grad = requires_grad
+            v_unpad.requires_grad = requires_grad
 
             q_input, k_input, v_input = q_unpad, k_unpad, v_unpad
 
@@ -498,10 +520,14 @@ def run_benchmark(custom, args):
                 triton_out = fn()[0]
                 d_out = torch.randn_like(triton_out)
 
+                grad_inputs = (q_input, k_input, v_input)
+                if sink is not None:
+                    grad_inputs += (sink,)
+
                 def fn():
                     grads = torch.autograd.grad(
                         triton_out,
-                        (q_input, k_input, v_input),
+                        grad_inputs,
                         d_out,
                         retain_graph=True,
                     )
