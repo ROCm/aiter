@@ -13,6 +13,7 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num
+from aiter.test_common import checkAllclose
 
 
 @triton.jit
@@ -342,6 +343,11 @@ def mla_decode_fwd(
                 o,
                 dbg_tr,
             )
+            kvc = torch.index_select(kv_buffer, 0, kv_indices).to(dtype=torch.float32)
+            for idx in range(kv_indptr[-1].item()):
+                checkAllclose(
+                    dbg_tr[idx], kvc[idx][0][0], msg=f"dbg_tr[{idx}] vs. kvc[{idx}]"
+                )
             exit()
 
         aiter.mla_decode_stage1_asm_fwd(
