@@ -124,7 +124,11 @@ def get_GEMM_A16W16_config(
                 default_config["solidx"] = -1
                 default_config["kernelName"] = ""
             elif (
-                eval(dtype) == dtypes.bf16 and N % 64 == 0 and K % 64 == 0 and not bias
+                eval(dtype) == dtypes.bf16
+                and N % 64 == 0
+                and K % 64 == 0
+                and not bias
+                and (eval(otype) == dtypes.bf16 or eval(otype) == dtypes.fp32)
             ):
                 default_config["libtype"] = "asm"
                 default_config["solidx"] = 0
@@ -252,7 +256,7 @@ def gemm_a16w16(
         out = asm_gemm(inp_view, B, bias, otype, splitK, kernelName, bpreshuffle)
     else:
         solution_idx = config["solidx"]
-        solfunc = get_solfunc(soltype)
+        solfunc = solMap[config["soltype"]]
         out = solfunc(
             inp_view,
             B,
@@ -348,7 +352,7 @@ def torch_gemm(
     scale_c: Optional[Tensor] = None,
     bpreshuffle=False,
 ):
-    assert not bpreshuffle, "bpreshuffle is not supported in skinny_gemm!"
+    assert not bpreshuffle, "bpreshuffle is not supported in torch_gemm!"
     if inp.dtype == dtypes.fp8:
         if scale_a is None:
             scale_a = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
@@ -402,12 +406,14 @@ def triton_gemm(
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
+    bpreshuffle: Optional[bool] = False,
 ):
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "Triton gemm_a16w16 does not support scaling yet"
+    assert not bpreshuffle, "Triton gemm_a16w16 does not support bpreshuffle yet."
     return gemm_a16w16(inp, weights, bias=bias, dtype=otype)
 
 
