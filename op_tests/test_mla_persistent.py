@@ -329,7 +329,8 @@ def test_mla(
     print(f"reduce_partial_map({reduce_partial_map.shape}.{valid_reduce_partial_cnt}):")
     print(reduce_partial_map[:valid_reduce_partial_cnt])
 
-    dbg_tr = torch.empty((total_q, nhead, qk_head_dim), dtype=torch.float32).fill_(
+    num_dbg_tr_rows = max(total_q * nhead, kv_indptr[-1].item())
+    dbg_tr = torch.empty((num_dbg_tr_rows, qk_head_dim), dtype=torch.float32).fill_(
         -233.0
     )
 
