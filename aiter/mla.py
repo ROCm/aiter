@@ -417,20 +417,26 @@ def mla_ps_prefill_fwd(
     v_scale: Optional[torch.Tensor] = None,
 ) -> None:
     device = Q.device
-    total_s, nhead, v_head_dim = output.shape
+    bs, nhead, v_head_dim = output.shape
     if softmax_scale is None:
         softmax_scale = 1.0 / (v_head_dim**0.5)
 
-    bs, _, _ = output.shape
+    max_partial_loc = reduce_partial_map[:, 0].max().item()
 
-    num_kv_splits = 1
+    q_lens = reduce_final_map[:, 1] - reduce_final_map[:, 0]
+    typical_tile_size = q_lens.max().item()
 
-    # logits = o.view(bs, num_kv_splits, nhead, v_head_dim)
+    padded_num_tokens = max_partial_loc + typical_tile_size
+
+    available_tgs = work_indptr.size(0) - 1
+
     logits = torch.empty(
-        (bs, num_kv_splits, nhead, v_head_dim), dtype=dtypes.fp32, device=device
+        (padded_num_tokens * available_tgs, nhead, v_head_dim),
+        dtype=dtypes.fp32, device=device
     )
     attn_lse = torch.empty(
-        (bs, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
+        (padded_num_tokens * available_tgs, nhead),
+        dtype=dtypes.fp32, device=device
     )
 
     aiter.mla_ps_prefill_asm_fwd(
@@ -452,6 +458,103 @@ def mla_ps_prefill_fwd(
         k_scale,
         v_scale,
     )
+
+    mla_prefill_reduce(
+        logits,
+        attn_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        output,
+    )
     return output.view(bs, nhead, v_head_dim), attn_lse
 
-    # We will add reduce later, now use non split
+
+
+def mla_prefill_reduce(
+    partial_output: torch.Tensor,      # [padded_num_tokens * available_tgs, num_head_q, v_head_dim]
+    partial_lse: torch.Tensor,         # [padded_num_tokens * available_tgs, num_head_q]
+    reduce_indptr: torch.Tensor,       # [num_reduce_groups + 1], int32
+    reduce_final_map: torch.Tensor,    # [num_reduce_groups, 4], int32
+                                       # [qo_start, qo_end, q_head_start, q_head_end]
+    reduce_partial_map: torch.Tensor,  # [num_partial_tiles, 3], int32
+                                       # [partial_qo_loc, q_head_start, q_head_end]
+    output: torch.Tensor,              # [total_tokens, num_head_q, v_head_dim], output buffer
+) -> None:
+
+
+    num_reduce_groups = reduce_indptr.shape[0] - 1
+    device = partial_output.device
+    dtype = partial_output.dtype
+
+    for group_id in range(num_reduce_groups):
+        start_idx = reduce_indptr[group_id].item()  # 0
+        end_idx = reduce_indptr[group_id + 1].item() # 2
+        num_partials = end_idx - start_idx
+
+        if num_partials == 0:
+            continue
+
+        final_map = reduce_final_map[group_id]
+        qo_start = final_map[0].item()
+        qo_end = final_map[1].item()
+        q_head_start = final_map[2].item()
+        q_head_end = final_map[3].item()
+
+        q_len = qo_end - qo_start
+        num_heads = q_head_end - q_head_start
+        v_head_dim = partial_output.shape[2]
+
+        partial_indices = []
+        partial_heads = []
+
+        for partial_idx in range(start_idx, end_idx):
+            partial_map = reduce_partial_map[partial_idx]
+            partial_qo_loc = partial_map[0].item()
+            partial_q_head_start = partial_map[1].item()
+            partial_q_head_end = partial_map[2].item()
+
+            partial_indices.append(partial_qo_loc)  # [4, 10]
+            partial_heads.append((partial_q_head_start, partial_q_head_end))  # [(0, 1), (0, 1)]
+
+        for head_offset in range(num_heads):
+            head_idx = q_head_start + head_offset
+
+            partial_lses = []
+            partial_outputs = []
+
+            for i, (partial_qo_loc, (ph_start, ph_end)) in enumerate(
+                zip(partial_indices, partial_heads)  # [(4, 10), (0, 1), (0, 1)]
+            ):
+                if ph_start <= head_idx < ph_end:
+                    # Extract LSE: [q_len]
+                    lse = partial_lse[
+                        partial_qo_loc : partial_qo_loc + q_len, head_idx
+                    ]
+                    partial_lses.append(lse)
+
+                    # Extract output: [q_len, v_head_dim]
+                    out = partial_output[
+                        partial_qo_loc : partial_qo_loc + q_len, head_idx, :
+                    ]
+                    partial_outputs.append(out)
+
+            if len(partial_lses) == 0:
+                continue
+
+            # Stack: [num_partials, q_len] and [num_partials, q_len, v_head_dim]
+            partial_lses = torch.stack(partial_lses, dim=0)  # [K, q_len]
+            partial_outputs = torch.stack(partial_outputs, dim=0)  # [K, q_len, D]
+
+            max_lse = torch.max(partial_lses, dim=0)[0]  # [q_len]
+
+            sum_exp = torch.sum(torch.exp(partial_lses - max_lse.unsqueeze(0)), dim=0)
+
+            #  final_lse
+            final_lse = max_lse + torch.log(sum_exp)
+
+            scales = torch.exp(partial_lses - final_lse.unsqueeze(0)).unsqueeze(-1)
+
+            final_output = torch.sum(partial_outputs * scales, dim=0)
+
+            output[qo_start:qo_end, head_idx, :] = final_output
