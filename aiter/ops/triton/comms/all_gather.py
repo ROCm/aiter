@@ -26,9 +26,10 @@ logger = logging.getLogger("aiter")
 
 
 @triton.jit
-def all_gather_m_kernel(
-    shard_ptr,  # *[M_shard, N]
-    out_ptr,  # *[M, N]
+def _all_gather_impl(
+    pid,
+    shard_ptr,
+    out_ptr,
     M,
     M_shard,
     N,
@@ -45,11 +46,14 @@ def all_gather_m_kernel(
     NUM_SMS: tl.constexpr,
 ):
     """
-    All-gather kernel along M dimension with 1D persistent-style PID mapping.
-    Each rank sends its (M_shard)×N to all other ranks.
-    """
-    pid = tl.program_id(0)
+    Shared all-gather implementation using push-based approach with iris.put. 1D persistent-style PID mapping
 
+    Each rank sends its (M_shard)×N to all other ranks at the appropriate offset.
+
+    Args:
+        pid: Program ID,  1D persistent-style PID mapping
+        from tl.program_id(0) or passed from parent kernel
+    """
     num_pid_m = tl.cdiv(M_shard, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
     total_tiles = num_pid_m * num_pid_n
@@ -83,43 +87,84 @@ def all_gather_m_kernel(
             # Calculate global M indices
             rm_global = cur_rank * M_shard + rm_local
             mask_m_global = rm_global < M
+            final_mask = mask_m_global[:, None] & mask_n[None, :]
+
+            out_ptrs = (
+                out_ptr + rm_global[:, None] * stride_om + rn[None, :] * stride_on
+            )
 
             if dst == cur_rank:
                 # Local store
-                out_ptrs = (
-                    out_ptr + rm_global[:, None] * stride_om + rn[None, :] * stride_on
-                )
-                tl.store(
-                    out_ptrs, shard_data, mask=mask_m_global[:, None] & mask_n[None, :]
-                )
+                tl.store(out_ptrs, shard_data, mask=final_mask)
             else:
-                # Remote store using IRIS
-                # iris.put(from_ptr, to_ptr, from_rank, to_rank, heap_bases, mask)
+                # Remote store using iris.put
                 # from_ptr: local source, to_ptr: remote destination
                 iris.put(
-                    shard_ptr
-                    + rm_local[:, None] * stride_sm
-                    + rn[None, :] * stride_sn,  # from_ptr (local source)
-                    out_ptr
-                    + rm_global[:, None] * stride_om
-                    + rn[None, :] * stride_on,  # to_ptr (remote dest)
+                    shard_ptr + rm_local[:, None] * stride_sm + rn[None, :] * stride_sn,
+                    out_ptrs,
                     cur_rank,
                     dst,
                     heap_bases,
-                    mask=mask_m_global[:, None] & mask_n[None, :],
+                    mask=final_mask,
                 )
 
 
-def all_gather_iris(
+@triton.jit
+def _all_gather_kernel(
+    shard_ptr,  # *[M_shard, N]
+    out_ptr,  # *[M, N]
+    M,
+    M_shard,
+    N,
+    stride_sm,
+    stride_sn,
+    stride_om,
+    stride_on,
+    cur_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    heap_bases: tl.tensor,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    """
+    All-gather kernel entry point.
+
+    This is a wrapper around _all_gather_impl that gets the program ID.
+    """
+    pid = tl.program_id(0)
+    _all_gather_impl(
+        pid,
+        shard_ptr,
+        out_ptr,
+        M,
+        M_shard,
+        N,
+        stride_sm,
+        stride_sn,
+        stride_om,
+        stride_on,
+        cur_rank,
+        world_size,
+        heap_bases,
+        BLOCK_M,
+        BLOCK_N,
+        GROUP_SIZE_M,
+        NUM_SMS,
+    )
+
+
+def all_gather(
     input_shard: Tensor,
-    ctx: "IrisCommContext",
+    ctx: "IrisCommContext" = None,
     block_m: int = 64,
     block_n: int = 64,
     group_size_m: int = 8,
     num_sms: int = 256,
 ) -> Tensor:
     """
-    Perform all-gather along the M (row) dimension using Iris.
+    Perform all-gather along the M (row) dimension.
 
     This operation:
     1. Each rank has a shard of shape [M_shard, N]
@@ -128,7 +173,7 @@ def all_gather_iris(
 
     Args:
         input_shard (Tensor): Input shard of shape [M_shard, N] in Iris shared memory
-        ctx (IrisCommContext): Iris communication context
+        ctx (IrisCommContext): Iris communication context. Optional if global context exists.
         block_m (int): Block size for M dimension. Default: 64
         block_n (int): Block size for N dimension. Default: 64
         group_size_m (int): Group size for swizzling. Default: 8
@@ -139,9 +184,9 @@ def all_gather_iris(
 
     Example:
         >>> with IrisCommContext() as ctx:
-        >>>     input_shard = ctx.iris_ctx.zeros((1024, 7168), dtype=torch.float32)
+        >>>     input_shard = ctx.iris_ctx.shmem.zeros((1024, 7168), dtype=torch.float32)
         >>>     # ... initialize input_shard ...
-        >>>     full_tensor = all_gather_iris(input_shard, ctx)
+        >>>     full_tensor = all_gather(input_shard, ctx)
         >>>     print(full_tensor.shape)  # [8192, 7168] for world_size=8
     """
     if not IRIS_AVAILABLE:
@@ -171,7 +216,7 @@ def all_gather_iris(
 
     # Launch kernel
     grid = (num_sms,)
-    all_gather_m_kernel[grid](
+    _all_gather_kernel[grid](
         input_shard,
         full_output,
         M,
