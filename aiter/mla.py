@@ -411,7 +411,7 @@ def mla_ps_prefill_fwd(
     v_scale: Optional[torch.Tensor] = None,
 ) -> None:
     device = Q.device
-    bs, nhead, v_head_dim = output.shape
+    total_s, nhead, v_head_dim = output.shape
     if softmax_scale is None:
         softmax_scale = 1.0 / (v_head_dim**0.5)
 
