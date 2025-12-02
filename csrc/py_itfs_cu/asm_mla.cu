@@ -487,7 +487,10 @@ void mla_ps_prefill_asm_fwd(
     
     // Launch kernel
     int block_size_x = wave_per_tg * 64;  // 8 * 64 = 512
-    int grid_size_x  = available_tgs;
+    // int grid_size_x  = get_num_cu_func();
+    // std::cout << "grid_size_x" << grid_size_x << std::endl;
+    int grid_size_x = work_indptr.value().size(0) - 1;
+    // std::cout << "grid_size_x" << grid_size_x << std::endl;
     
     impl_ptr->launch_kernel({&args,
                              &arg_size,
