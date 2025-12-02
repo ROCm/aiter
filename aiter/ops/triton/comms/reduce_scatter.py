@@ -28,9 +28,10 @@ logger = logging.getLogger("aiter")
 
 
 @triton.jit
-def reduce_scatter_m_kernel(
-    input_ptr,  # Local input tensor in IRIS memory: *[M, N]
-    output_ptr,  # Output shard in IRIS memory: *[M_shard, N]
+def _reduce_scatter_impl(
+    pid,
+    input_ptr,
+    output_ptr,
     M,
     M_shard,
     N,
@@ -47,7 +48,7 @@ def reduce_scatter_m_kernel(
     NUM_SMS: tl.constexpr,
 ):
     """
-    Reduce-scatter kernel along M dimension using pull-based approach with iris.load.
+    Shared reduce-scatter implementation using pull-based approach with iris.load.
 
     Each rank computes its own output shard by:
     - Loading the relevant portion from all ranks (including itself)
@@ -61,10 +62,9 @@ def reduce_scatter_m_kernel(
     - Loading input[0:M_shard, :] from rank 7 (remote via iris.load)
     - Summing all loaded data
 
-    This kernel is called once per rank.
+    Args:
+        pid: Program ID (from tl.program_id(0) or passed from parent kernel)
     """
-    pid = tl.program_id(0)
-
     num_pid_m = tl.cdiv(M_shard, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
     total_tiles = num_pid_m * num_pid_n
@@ -117,16 +117,62 @@ def reduce_scatter_m_kernel(
         tl.store(output_ptrs, accumulator.to(output_ptr.type.element_ty), mask=mask)
 
 
-def reduce_scatter_iris(
+@triton.jit
+def _reduce_scatter_kernel(
+    input_ptr,  # Local input tensor in IRIS memory: *[M, N]
+    output_ptr,  # Output shard in IRIS memory: *[M_shard, N]
+    M,
+    M_shard,
+    N,
+    stride_im,
+    stride_in,
+    stride_om,
+    stride_on,
+    cur_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    heap_bases: tl.tensor,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    """
+    Reduce-scatter kernel entry point.
+
+    This is a wrapper around _reduce_scatter_impl that gets the program ID.
+    """
+    pid = tl.program_id(0)
+    _reduce_scatter_impl(
+        pid,
+        input_ptr,
+        output_ptr,
+        M,
+        M_shard,
+        N,
+        stride_im,
+        stride_in,
+        stride_om,
+        stride_on,
+        cur_rank,
+        world_size,
+        heap_bases,
+        BLOCK_M,
+        BLOCK_N,
+        GROUP_SIZE_M,
+        NUM_SMS,
+    )
+
+
+def reduce_scatter(
     input_tensor: Tensor,
-    ctx: "IrisCommContext",
+    ctx: "IrisCommContext" = None,
     block_m: int = 16,
     block_n: int = 64,
     group_size_m: int = 8,
     num_sms: int = 256,
 ) -> Tensor:
     """
-    Perform reduce-scatter along the M (row) dimension using Iris.
+    Perform reduce-scatter along the M (row) dimension.
 
     This operation:
     1. Sums the input_tensor across all ranks (M×N on each rank)
@@ -135,7 +181,7 @@ def reduce_scatter_iris(
 
     Args:
         input_tensor (Tensor): Input tensor of shape [M, N] in Iris shared memory
-        ctx (IrisCommContext): Iris communication context
+        ctx (IrisCommContext): Iris communication context. Optional if global context exists.
         block_m (int): Block size for M dimension. Default: 16
         block_n (int): Block size for N dimension. Default: 64
         group_size_m (int): Group size for swizzling. Default: 8
@@ -146,9 +192,9 @@ def reduce_scatter_iris(
 
     Example:
         >>> with IrisCommContext() as ctx:
-        >>>     input_tensor = ctx.iris_ctx.zeros((8192, 7168), dtype=torch.float32)
+        >>>     input_tensor = ctx.iris_ctx.shmem.zeros((8192, 7168), dtype=torch.float32)
         >>>     # ... initialize input_tensor ...
-        >>>     output_shard = reduce_scatter_iris(input_tensor, ctx)
+        >>>     output_shard = reduce_scatter(input_tensor, ctx)
         >>>     print(output_shard.shape)  # [1024, 7168] for world_size=8
     """
     if not IRIS_AVAILABLE:
@@ -183,7 +229,7 @@ def reduce_scatter_iris(
 
     # Launch kernel
     grid = (num_sms,)
-    reduce_scatter_m_kernel[grid](
+    _reduce_scatter_kernel[grid](
         input_tensor,
         output_shard,
         M,

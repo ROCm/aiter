@@ -18,15 +18,15 @@ __all__ = []
 
 try:
     from .iris import IrisCommContext
-    from .reduce_scatter import reduce_scatter_iris
-    from .all_gather import all_gather_iris
+    from .reduce_scatter import reduce_scatter
+    from .all_gather import all_gather
     from .fused import reduce_scatter_rmsnorm_quant_all_gather
 
     __all__.extend(
         [
             "IrisCommContext",
-            "reduce_scatter_iris",
-            "all_gather_iris",
+            "reduce_scatter",
+            "all_gather",
             "reduce_scatter_rmsnorm_quant_all_gather",
         ]
     )
@@ -39,8 +39,8 @@ except ImportError as e:
     logger.debug(f"Iris communication primitives not available: {e}")
     # Define stub variables so code can check for availability
     IrisCommContext = None
-    reduce_scatter_iris = None
-    all_gather_iris = None
+    reduce_scatter = None
+    all_gather = None
     reduce_scatter_rmsnorm_quant_all_gather = None
 
 __all__.append("IRIS_COMM_AVAILABLE")
