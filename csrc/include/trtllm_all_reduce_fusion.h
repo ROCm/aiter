@@ -11,7 +11,8 @@ using fptr_t = int64_t;
 
 namespace trtllm {
 
-fptr_t init_ar_fusion(int64_t rank, int64_t world_size, int64_t max_size_in_bytes);
+fptr_t
+init_ar_fusion(int64_t device_id, int64_t rank, int64_t world_size, int64_t max_size_in_bytes);
 void destroy_ar_fusion(fptr_t fptr);
 Tensor get_ar_fusion_barrier_handle(fptr_t fptr);
 Tensor get_ar_fusion_data_handle(fptr_t fptr);

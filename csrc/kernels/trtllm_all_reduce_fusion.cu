@@ -668,9 +668,10 @@ void open_handles(int rank, std::vector<Tensor> &handles, void *ptr, std::vector
 
 class CommWorkspace {
 public:
-    CommWorkspace(int64_t rank, int64_t world_size, int64_t size_in_bytes, int64_t max_thread_blocks = NBLOCKS_PER_GPU) {
+    CommWorkspace(int64_t device_id, int64_t rank, int64_t world_size, int64_t size_in_bytes, int64_t max_thread_blocks = NBLOCKS_PER_GPU) {
         TORCH_CHECK(rank < world_size);
-        gpuSetDevice(rank);
+        gpuSetDevice(device_id);
+        device_id_ = device_id;
         rank_ = rank;
         world_size_ = world_size;
         size_in_bytes_ = size_in_bytes;
@@ -783,6 +784,7 @@ public:
     }
 
 private:
+    int device_id_;
     int rank_;
     int world_size_;
     int size_in_bytes_;
@@ -799,7 +801,7 @@ private:
     std::unordered_map<void *, std::vector<void *>> cached_ipc_data_;
 };
 
-fptr_t init_ar_fusion(int64_t rank, int64_t world_size, int64_t max_size_in_bytes) {
+fptr_t init_ar_fusion(int64_t device_id, int64_t rank, int64_t world_size, int64_t max_size_in_bytes) {
     switch (world_size) {
     case 8:
     case 4:
@@ -810,7 +812,7 @@ fptr_t init_ar_fusion(int64_t rank, int64_t world_size, int64_t max_size_in_byte
     }
     if (rank < 0 || rank >= world_size)
         throw std::invalid_argument("invalid rank passed in");
-    return (fptr_t) new CommWorkspace(rank, world_size, max_size_in_bytes);
+    return (fptr_t) new CommWorkspace(device_id, rank, world_size, max_size_in_bytes);
 }
 
 void destroy_ar_fusion(fptr_t fptr) {

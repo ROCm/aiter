@@ -23,6 +23,7 @@ fp8_policy_id = fp8_policy_id_[fp8]
 
 @compile_ops("module_trtllm_all_reduce_fusion")
 def trtllm_init_ar_fusion(
+    device_id: int,
     rank: int,
     world_size: int,
     max_size_in_bytes: int,
@@ -109,45 +110,35 @@ def trtllm_allreduce_rms(
 ) -> None: ...
 
 
-class TRTLLMDistEnv:
+class AiterDistEnv:
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
 
     def __init__(
         self,
-        rank: int,
-        world_size: int,
         group: ProcessGroup = None,
+        device_id: int = None,
         max_size_in_bytes=16384 * 16384,
         dtype: torch.dtype=torch.bfloat16,
-        init_process_group: bool = False,
-        port: int=22339
     ) -> None:
-        if init_process_group:
-            dist.init_process_group(
-                backend="nccl",
-                init_method=f"tcp://127.0.0.1:{port}",
-                rank=rank,
-                world_size=world_size,
-            )
         self.group = group
-        rank = dist.get_rank(group=self.group)
-        torch.cuda.set_device(rank)
-        self.rank = rank
+        self.device_id = device_id
+        self.rank = dist.get_rank(group=self.group)
+        self.world_size = dist.get_world_size(group=self.group)
         self.fptr = None
-        world_size = dist.get_world_size(group=self.group)
-        self.world_size = world_size
-        if world_size == 1:
+        torch.cuda.set_device(self.device_id)
+
+        if self.world_size == 1:
             return
 
-        if world_size not in TRTLLMDistEnv._SUPPORTED_WORLD_SIZES:
+        if self.world_size not in AiterDistEnv._SUPPORTED_WORLD_SIZES:
             return
 
-        torch.cuda.set_device(rank)
-        self.fptr = trtllm_init_ar_fusion(rank, world_size, max_size_in_bytes)
+        self.fptr = trtllm_init_ar_fusion(self.device_id, self.rank, self.world_size, max_size_in_bytes)
         barrier_handle = trtllm_get_ar_fusion_barrier_handle(self.fptr)
         data_handle = trtllm_get_ar_fusion_data_handle(self.fptr)
-        barrier_handle_list = [None] * world_size
-        data_handle_list = [None] * world_size
+        self.barrier()
+        barrier_handle_list = [None] * self.world_size
+        data_handle_list = [None] * self.world_size
         dist.all_gather_object(barrier_handle_list, barrier_handle, group=self.group)
         dist.all_gather_object(data_handle_list, data_handle, group=self.group)
         trtllm_open_ar_fusion_barrier_handles(self.fptr, barrier_handle_list)
@@ -156,8 +147,8 @@ class TRTLLMDistEnv:
         self._IS_CAPTURED = False
 
     def barrier(self):
-        torch.cuda.set_device(self.rank)
-        torch.cuda.synchronize(self.rank)
+        torch.cuda.set_device(self.device_id)
+        torch.cuda.synchronize(self.device_id)
         dist.barrier(group=self.group)
 
     def consume_capture(self):
@@ -188,10 +179,6 @@ class TRTLLMDistEnv:
         self.consume_capture()
 
     def __del__(self):
-        if getattr(self, 'group', None):
-            dist.destroy_process_group(self.group)
-        else:
-            dist.destroy_process_group(self.group)
         if self.fptr:
             trtllm_destroy_ar_fusion(self.fptr)
 
@@ -204,7 +191,7 @@ class TRTLLMDistEnv:
             x = x * torch.rsqrt(variance + eps)
             x = x.to(input_dtype)
             return weight * x
-        dist.all_reduce(allreduce_in)
+        dist.all_reduce(allreduce_in, group=self.group)
         residual_out = allreduce_in + residual_in
         norm_out = rms_norm_forward(residual_out, rms_weight, eps)
         if fp8_out:
