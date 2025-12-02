@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import pytest
-import os
 import torch
 from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
@@ -122,7 +121,7 @@ def generate_gemm_afp4wfp4_inputs(
         w_shuffed,
         x_scales[:M],
         w_scales,
-        x_scales_shuffled,
+        x_scales_shuffled[:M],
         w_scales_shuffled,
         out_dtype,
         y,

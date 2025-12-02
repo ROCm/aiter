@@ -36,15 +36,16 @@ jobs:
 
     steps:
       - name: Define whether runs on MI35X
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         id: machines
         run: |
           set -euo pipefail
-          pr_title="${{ github.event.pull_request.title }}"
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             echo "It's main branch, running tests on MI325 and MI35X..."
             echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
             echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
-          elif echo "$pr_title" | grep -qi "mi35x"; then
+          elif echo "${PR_TITLE}" | grep -qi "mi35x"; then
             echo "PR title contains 'MI35X', running tests on MI325 and MI35X..."
             echo 'standard_runners=["aiter-mi355-1gpu"]' >> "$GITHUB_OUTPUT"
             echo 'multigpu_runners=["aiter-mi355-8gpu"]' >> "$GITHUB_OUTPUT"
@@ -104,6 +105,11 @@ jobs:
           --name aiter_test \
           ${{ env.DOCKER_IMAGE }}
 
+      - name: Setup pip config
+        run: |
+          docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root aiter_test bash -c "pip config set global.retries 10"
+
       - name: Setup Aiter
         run: |
           set -ex
@@ -119,7 +125,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/aiter_test.sh 
+          bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh" 
       
       - name: Upload test logs
         uses: actions/upload-artifact@v4
@@ -183,10 +189,15 @@ jobs:
           --name aiter_test \
           ${{ env.DOCKER_IMAGE }}
 
-      - name: Setup-Triton
+      - name: Setup pip config
+        run: |
+          docker exec -u root aiter_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root aiter_test bash -c "pip config set global.retries 10"
+
+      - name: Setup-Aiter
         run: |
           set -ex
-          echo "Setting up Triton..."
+          echo "Setting up Aiter..."
           docker exec \
           -w /workspace \
           aiter_test \
@@ -199,7 +210,7 @@ jobs:
           -e MULTIGPU=TRUE \
           -w /workspace \
           aiter_test \
-          ./.github/scripts/aiter_test.sh
+          bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh"
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
