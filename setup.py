@@ -73,6 +73,7 @@ if IS_ROCM:
         ck_dir
     ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
 
+    print("PREBUILD_KERNELS =", PREBUILD_KERNELS, type(PREBUILD_KERNELS))
     if PREBUILD_KERNELS == 1:
         exclude_ops = [
             "libmha_fwd",
