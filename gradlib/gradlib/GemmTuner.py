@@ -263,7 +263,7 @@ class Gemm:
             shuffle_int = 1 if is_shuffle else 0
             df = df[df["bPreshuffle"] == shuffle_int]
         kernel_dict = (
-            df.groupby(["tileM", "tileN", "pf", "splitK"])["knl_name"]
+            df.groupby(["tileM", "tileN", "pf", "splitK", "subK"])["knl_name"]
             .apply(list)
             .to_dict()
         )
@@ -271,10 +271,7 @@ class Gemm:
 
     def asm_gemm_all_solutions(self):
         if (
-            self.scaleAB
-            or self.k % 64 != 0
-            or self.indtype != dtypes.bf16
-            or self.outdtype != dtypes.fp32
+            self.scaleAB or self.k % 64 != 0 or self.indtype != dtypes.bf16
         ) and get_gfx() == "gfx942":
             print(
                 f"only indtype=bf16 and outdtype=fp32 and k%64==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
@@ -283,10 +280,9 @@ class Gemm:
             return []
         if (
             self.scaleAB
-            or self.k % 256 != 0
-            or self.n % 256 != 0  # mismatch randomly
+            or self.k % 64 != 0
+            or self.n % 64 != 0  # mismatch randomly
             or self.indtype != dtypes.bf16
-            or self.outdtype != dtypes.bf16
         ) and get_gfx() == "gfx950":
             print(
                 f"only indtype=bf16 and outdtype=bf16 and k%256==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
@@ -302,8 +298,8 @@ class Gemm:
 
         solutions = 0
         for key in asm_tiles:
-            tile_m, tile_n, pf, splitK = key
-            print(f"ASM Tile - M: {tile_m}, N: {tile_n}, PF: {pf}")
+            tile_m, tile_n, pf, splitK, subK = key
+            print(f"ASM Tile - M: {tile_m}, N: {tile_n}, PF: {pf}, splitK: {subK}")
             kernelName = asm_kernels[key][0]
             if splitK:
                 maxSplitK = compute_gemm_SplitK(
@@ -330,6 +326,8 @@ class Gemm:
                     "asm",
                     kernelName,
                 )
+                if self.k / splitK < subK:
+                    break
                 task_asm.append(
                     (
                         info,
