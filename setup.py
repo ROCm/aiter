@@ -10,7 +10,6 @@ from setuptools import Distribution, setup
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
-os.environ["AITER_META_DIR"] = this_dir
 sys.path.insert(0, f"{this_dir}/aiter/")
 from concurrent.futures import ThreadPoolExecutor
 
@@ -74,6 +73,13 @@ if IS_ROCM:
         ck_dir
     ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
 
+    if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
+        shutil.rmtree("aiter_meta")
+    shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+    shutil.copytree("hsa", "aiter_meta/hsa")
+    shutil.copytree("gradlib", "aiter_meta/gradlib")
+    shutil.copytree("csrc", "aiter_meta/csrc")
+
     def get_exclude_ops():
         if PREBUILD_KERNELS == 1:
             return [
@@ -99,9 +105,80 @@ if IS_ROCM:
                 "module_mha_varlen_bwd",
             ]
         elif PREBUILD_KERNELS == 3:
-            return []
+            return [
+                "libmha_fwd",
+                "libmha_bwd",
+            ]
         else:
-            return []
+            return [
+                "module_activation",
+                "module_attention",
+                "module_pa_ragged",
+                "module_pa_v1",
+                "module_attention_asm",
+                "module_pa",
+                "module_mla_asm",
+                "module_cache",
+                "module_custom_all_reduce",
+                "module_quick_all_reduce",
+                "module_custom",
+                "module_gemm_common",
+                "module_batched_gemm_bf16",
+                "module_batched_gemm_a8w8",
+                "module_gemm_a8w8",
+                "module_gemm_a8w8_blockscale",
+                "module_gemm_a8w8_blockscale_bpreshuffle",
+                "module_gemm_a4w4_blockscale",
+                "module_gemm_a8w8_bpreshuffle",
+                "module_deepgemm",
+                "module_gemm_a8w8_bpreshuffle_cktile",
+                "module_gemm_a8w8_asm",
+                "module_gemm_a16w16_asm",
+                "module_gemm_a4w4_asm",
+                "module_gemm_a8w8_blockscale_asm",
+                "module_gemm_a8w8_blockscale_bpreshuffle_asm",
+                "module_gemm_mi350_a8w8_blockscale_asm",
+                "module_moe_asm",
+                "module_moe_ck2stages",
+                "module_moe_cktile2stages",
+                "module_moe_sorting",
+                "module_moe_topk",
+                "module_norm",
+                "module_pos_encoding",
+                "module_rmsnorm",
+                "module_smoothquant",
+                "module_batched_gemm_bf16_tune",
+                "module_batched_gemm_a8w8_tune",
+                "module_gemm_a8w8_tune",
+                "module_gemm_a8w8_blockscale_tune",
+                "module_gemm_a8w8_blockscale_bpreshuffle_tune",
+                "module_gemm_a4w4_blockscale_tune",
+                "module_gemm_a8w8_bpreshuffle_tune",
+                "module_gemm_a8w8_bpreshuffle_cktile_tune",
+                "module_aiter_operator",
+                "module_aiter_unary",
+                "module_quant",
+                "module_sample",
+                "module_rope_general_fwd",
+                "module_rope_general_bwd",
+                "module_rope_pos_fwd",
+                "module_fused_mrope_rms",
+                "module_fmha_v3_fwd",
+                "module_mha_fwd",
+                "module_mha_varlen_fwd",
+                "module_fmha_v3_bwd",
+                "module_fmha_v3_varlen_bwd",
+                "module_fmha_v3_varlen_fwd",
+                "module_mha_bwd",
+                "module_mha_varlen_bwd",
+                # "libmha_fwd",
+                # "libmha_bwd",
+                "module_rocsolgemm",
+                "module_hipbsolgemm",
+                "module_top_k_per_row",
+                "module_mla_metadata",
+                "module_mla_reduce",
+            ]
 
     exclude_ops = get_exclude_ops()
 
@@ -151,13 +228,7 @@ else:
     raise NotImplementedError("Only ROCM is supported")
 
 
-if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
-    shutil.rmtree("aiter_meta")
-## link "3rdparty", "hsa", "csrc" into "aiter_meta"
-shutil.copytree("3rdparty", "aiter_meta/3rdparty")
-shutil.copytree("hsa", "aiter_meta/hsa")
-shutil.copytree("gradlib", "aiter_meta/gradlib")
-shutil.copytree("csrc", "aiter_meta/csrc")
+# aiter_meta prepared above
 
 
 class NinjaBuildExtension(BuildExtension):
