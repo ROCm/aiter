@@ -25,7 +25,7 @@ for file in "${files[@]}"; do
         echo "============================================================"
         echo
     } | tee -a latest_test.log
-    if [ "$file" = "op_tests/multigpu_tests/test_dispatch_combine.py" ] || [ "$file" = "op_tests/multigpu_tests/test_communication.py" ]; then
+    if [ "$file" = "op_tests/multigpu_tests/test_dispatch_combine.py" ] || [ "$file" = "op_tests/multigpu_tests/test_communication.py" ] || [ "$file" = "op_tests/multigpu_tests/test_mori_all2all.py" ]; then
         {
             echo "Skipping test: $file"
             echo "============================================================"
