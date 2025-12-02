@@ -119,15 +119,13 @@ def triton_unified_attn_func_caller(
     )
 
 
-
-
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
     N_HEADS = [16, 48]
     seq_len_q = [1, 1024, 4096]
     seq_len_k = [163, 8192]
-    HEAD_DIM=128
-    V_HEAD_DIM=HEAD_DIM
+    HEAD_DIM = 128
+    V_HEAD_DIM = HEAD_DIM
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
     configs = [
         (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k, HEAD_DIM, V_HEAD_DIM)
@@ -141,8 +139,8 @@ def varlen_benchmark_configs():
     N_HEADS = [16, 48]
     seq_len_q = [1, 1024, 4096]
     seq_len_k = [163, 8192]
-    HEAD_DIM=128
-    V_HEAD_DIM=HEAD_DIM
+    HEAD_DIM = 128
+    V_HEAD_DIM = HEAD_DIM
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
     configs = [
         (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k, HEAD_DIM, V_HEAD_DIM)
@@ -171,7 +169,16 @@ def model_benchmark_configs(args):
         if isinstance(N_CTX_Q, list):
             for seq_len in N_CTX_Q:
                 fa_configs.append(
-                    (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM, V_HEAD_DIM)
+                    (
+                        model_name,
+                        batch_size,
+                        HQ,
+                        HK,
+                        seq_len,
+                        seq_len,
+                        HEAD_DIM,
+                        V_HEAD_DIM,
+                    )
                 )
         else:
             fa_configs.append(
@@ -241,7 +248,16 @@ def create_benchmark_configs(custom, args):
 
         if args.model:
             x_vals_list = model_benchmark_configs(args)
-            x_names = ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "D_HEAD_V"]
+            x_names = [
+                "model",
+                "BATCH",
+                "HQ",
+                "HK",
+                "N_CTX_Q",
+                "N_CTX_K",
+                "D_HEAD",
+                "D_HEAD_V",
+            ]
             plot_name = f"fused-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
@@ -286,7 +302,10 @@ def create_benchmark_configs(custom, args):
     )
     return configs
 
+
 from einops import repeat
+
+
 def generate_exact_padding_mask(seqlens, device):
     max_seqlen = seqlens.max()
     batch_size = len(seqlens)
@@ -327,7 +346,7 @@ def run_benchmark(custom, args):
         requires_grad = mode == "bwd" or args.test_mode
         return_lse = True
         return_attn_probs = False
-        
+
         exact_lengths_provided = isinstance(N_CTX_Q, str)
         if exact_lengths_provided:
             assert args.layout == "thd"
@@ -373,18 +392,20 @@ def run_benchmark(custom, args):
         # Input preparation
         if varlen:
             if exact_lengths_provided:
-                query_padding_mask = generate_exact_padding_mask(
-                    seqlens_q, device
-                )
-                key_padding_mask = generate_exact_padding_mask(
-                    seqlens_k, device
-                )
+                query_padding_mask = generate_exact_padding_mask(seqlens_q, device)
+                key_padding_mask = generate_exact_padding_mask(seqlens_k, device)
             else:
                 query_padding_mask = generate_random_padding_mask(
-                    N_CTX_Q, BATCH, device, mode="full" if args.equal_seqlens else "random"
+                    N_CTX_Q,
+                    BATCH,
+                    device,
+                    mode="full" if args.equal_seqlens else "random",
                 )
                 key_padding_mask = generate_random_padding_mask(
-                    N_CTX_K, BATCH, device, mode="full" if args.equal_seqlens else "random"
+                    N_CTX_K,
+                    BATCH,
+                    device,
+                    mode="full" if args.equal_seqlens else "random",
                 )
             (
                 q_unpad,
@@ -439,10 +460,10 @@ def run_benchmark(custom, args):
                     2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
                 )
 
-        
         # Benchmark mode
         if varlen:
             if args.fp8:
+
                 def fn():
                     return flash_attn_varlen_fp8_func(
                         q_input,
@@ -455,7 +476,9 @@ def run_benchmark(custom, args):
                         softmax_scale=sm_scale,
                         causal=causal,
                     )
+
             else:
+
                 def fn():
                     return flash_attn_varlen_func(
                         q_input,
@@ -474,6 +497,7 @@ def run_benchmark(custom, args):
 
         else:
             if args.fp8:
+
                 def fn():
                     return flash_attn_fp8_func(
                         q_input,
@@ -482,7 +506,9 @@ def run_benchmark(custom, args):
                         softmax_scale=sm_scale,
                         causal=causal,
                     )
+
             else:
+
                 def fn():
                     return flash_attn_func(
                         q_input,
@@ -511,11 +537,19 @@ def run_benchmark(custom, args):
 
         if args.unified_attention:
             assert not args.fp8, "FP8 not supported in unified attention yet."
-            assert not has_pe, "Positional Encoding (PE) not supported in unified attention yet."
+            assert (
+                not has_pe
+            ), "Positional Encoding (PE) not supported in unified attention yet."
             assert not dropout > 0.0, "Dropout not supported in unified attention yet."
-            assert not return_attn_probs, "return_attn_probs not supported in unified attention yet."
-            assert not fused_backward, "Fused backward not supported in unified attention yet."
-            assert mode == "fwd", "Only forward mode supported in unified attention yet."
+            assert (
+                not return_attn_probs
+            ), "return_attn_probs not supported in unified attention yet."
+            assert (
+                not fused_backward
+            ), "Fused backward not supported in unified attention yet."
+            assert (
+                mode == "fwd"
+            ), "Only forward mode supported in unified attention yet."
             assert varlen, "Only varlen layout supported in unified attention yet."
             assert causal, "Only causal attention supported in unified attention yet."
             fn = triton_unified_attn_func_caller(
@@ -535,7 +569,7 @@ def run_benchmark(custom, args):
                 num_blocks=1024,
                 q_dtype=torch.uint8 if args.fp8 else None,
             )
-    
+
         ms = triton.testing.do_bench(fn)
 
         if mode == "bwd":
@@ -602,16 +636,27 @@ def parse_args():
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
+
     def parse_int_or_list(value):
-        if ',' in value:
-            return value.strip() # if list, return stripped string and parse when creating tensor
+        if "," in value:
+            return (
+                value.strip()
+            )  # if list, return stripped string and parse when creating tensor
         else:
             return int(value)
-    
-    parser.add_argument("-sq", type=parse_int_or_list, default=0, 
-                       help="Query sequence length - can be a single number or comma-separated list. -b is overwritten as the list length.")
-    parser.add_argument("-sk", type=parse_int_or_list, default=0,
-                       help="Key sequence length - can be a single number or comma-separated list. Defaults to the same as sq if 0")
+
+    parser.add_argument(
+        "-sq",
+        type=parse_int_or_list,
+        default=0,
+        help="Query sequence length - can be a single number or comma-separated list. -b is overwritten as the list length.",
+    )
+    parser.add_argument(
+        "-sk",
+        type=parse_int_or_list,
+        default=0,
+        help="Key sequence length - can be a single number or comma-separated list. Defaults to the same as sq if 0",
+    )
 
     parser.add_argument(
         "-equal_seqlens",
@@ -673,7 +718,7 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
-    
+
     if isinstance(args.sk, int) and args.sk == 0:
         args.sk = args.sq
 

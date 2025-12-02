@@ -30,8 +30,8 @@ def nonvarlen_benchmark_configs():
     N_HEADS = [16, 48]
     seq_len_q = [1, 1024, 4096]
     seq_len_k = [163, 8192]
-    HEAD_DIM=128
-    V_HEAD_DIM=HEAD_DIM
+    HEAD_DIM = 128
+    V_HEAD_DIM = HEAD_DIM
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
     configs = [
         (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k, HEAD_DIM, V_HEAD_DIM)
@@ -45,8 +45,8 @@ def varlen_benchmark_configs():
     N_HEADS = [16, 48]
     seq_len_q = [1, 1024, 4096]
     seq_len_k = [163, 8192]
-    HEAD_DIM=128
-    V_HEAD_DIM=HEAD_DIM
+    HEAD_DIM = 128
+    V_HEAD_DIM = HEAD_DIM
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
     configs = [
         (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k, HEAD_DIM, V_HEAD_DIM)
@@ -75,7 +75,16 @@ def model_benchmark_configs(args):
         if isinstance(N_CTX_Q, list):
             for seq_len in N_CTX_Q:
                 fa_configs.append(
-                    (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM, V_HEAD_DIM)
+                    (
+                        model_name,
+                        batch_size,
+                        HQ,
+                        HK,
+                        seq_len,
+                        seq_len,
+                        HEAD_DIM,
+                        V_HEAD_DIM,
+                    )
                 )
         else:
             fa_configs.append(
@@ -145,7 +154,16 @@ def create_benchmark_configs(custom, args):
 
         if args.model:
             x_vals_list = model_benchmark_configs(args)
-            x_names = ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "D_HEAD_V"]
+            x_names = [
+                "model",
+                "BATCH",
+                "HQ",
+                "HK",
+                "N_CTX_Q",
+                "N_CTX_K",
+                "D_HEAD",
+                "D_HEAD_V",
+            ]
             plot_name = f"fused-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
