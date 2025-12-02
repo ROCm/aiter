@@ -123,8 +123,9 @@ class DeviceCommunicatorBase:
         #     all2all_backend = config.parallel_config.all2all_backend
 
         self.is_ep_communicator = "ep" in unique_name
-        self.use_all2all = self.is_ep_communicator and use_ep
-        self.all2all_backend = all2all_backend
+        self.use_all2all = self.is_ep_communicator
+        # self.all2all_backend = all2all_backend
+        self.all2all_backend = "mori"
         self.all2all_manager: All2AllManagerBase | None = None
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:

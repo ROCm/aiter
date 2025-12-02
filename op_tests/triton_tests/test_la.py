@@ -14,6 +14,8 @@ from aiter.ops.triton._triton_kernels.lean_atten import _get_config
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 import pytest
 
+DEBUG_MODE = False
+
 
 def get_lean_attn_inputs(
     batch: int,
@@ -422,8 +424,9 @@ def test_persistent_lean_attention(
     try:
         torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
     except AssertionError:
-        print("Assertion failed! Showing mismatches:")
-        print_mismatches(ref_out, la_out, atol, rtol)
+        if DEBUG_MODE:
+            print("Assertion failed! Showing mismatches:")
+            print_mismatches(ref_out, la_out, atol, rtol)
         raise  # Re-raise the exception after printing mismatches
 
 
