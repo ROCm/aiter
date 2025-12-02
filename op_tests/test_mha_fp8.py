@@ -175,11 +175,19 @@ parser.add_argument(
 )
 parser.add_argument(
     "-d",
-    "--d_qkv",
+    "--d_qk",
     type=int,
     default=128,
     help="""Dimension of query and key. Default is 128.
     e.g.: -d 128""",
+)
+parser.add_argument(
+    "-dv",
+    "--d_v",
+    type=int,
+    default=128,
+    help="""Dimension of query and key. Default is 128.
+    e.g.: -dv 128""",
 )
 parser.add_argument(
     "-c",
@@ -204,8 +212,8 @@ if __name__ == "__main__":
         args.nheads_k,
         args.seqlen_q,
         args.seqlen_k,
-        args.d_qkv,
-        args.d_qkv,
+        args.d_qk,
+        args.d_v,
         args.causal,
         args.local,
     )
