@@ -120,6 +120,7 @@ def get_x_vals():
         for m in range(0, 9)
         for (n, k) in [(512, 128), (128, 512)]
     ]
+    # x_vals_with_batch = [(1, 1, 128, 512+128), ] # TODO check
     return x_vals_with_batch
 
 
