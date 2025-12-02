@@ -366,7 +366,7 @@ class CustomAllreduce:
             eps,
             None if registered else self.buffer,
         )
-        return res_out, out
+        return out, res_out
 
     def custom_fused_ar_rms(
         self,

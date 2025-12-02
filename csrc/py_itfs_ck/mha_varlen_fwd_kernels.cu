@@ -30,6 +30,9 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           std::optional<const at::Tensor> &seqlens_k,
                                           std::optional<const at::Tensor> &bias_,
                                           std::optional<const at::Tensor> &alibi_slopes_,
+                                          std::optional<const at::Tensor> &q_descale_,
+                                          std::optional<const at::Tensor> &k_descale_,
+                                          std::optional<const at::Tensor> &v_descale_,
                                           at::Tensor out,
                                           at::Tensor softmax_lse,
                                           at::Tensor dropout_randval,
@@ -96,7 +99,11 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
         bias_ptr = alibi_slopes.data_ptr();
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
-        
+
+    const void *q_descale_ptr = q_descale_.has_value() ? q_descale_.value().data_ptr() : nullptr;
+    const void *k_descale_ptr = k_descale_.has_value() ? k_descale_.value().data_ptr() : nullptr;
+    const void *v_descale_ptr = v_descale_.has_value() ? v_descale_.value().data_ptr() : nullptr;
+
     const void* seqstart_k_ptr = nullptr;
     const void* seqstart_q_ptr = nullptr;
     const void* cu_seqlen_k_ptr = nullptr;
@@ -117,57 +124,58 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     }
 
     return mha_fwd_args{q.data_ptr(),
-                         k.data_ptr(),
-                         v.data_ptr(),
-                         bias_ptr,
-                         has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
-                         has_lse ? softmax_lse.data_ptr() : nullptr,
-                         out.data_ptr(),
-                         seqstart_q_ptr, // seqstart_q_ptr (cumulative physical with padding)
-                         seqstart_k_ptr, // seqstart_k_ptr (cumulative physical with padding)
-                         nullptr, // seqlen_q_ptr (per-sequence logical, alternative to cu_seqlen_q_ptr)
-                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr (per-sequence logical K lengths)
-                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
-                         cu_seqlen_k_ptr, // cu_seqlen_k_ptr
-                         total_q,
-                         total_k,
-                         b,
-                         max_seqlen_q,
-                         d,             // hdim_q
-                         d_v,           // hdim_v
-                         h,             // nhead_q
-                         h_k,           // nhead_k
-                         softmax_scale, // scale_s
-                         1,             // scale_p
-                         1,             // scale_o
-                         logits_soft_cap,
-                         stride_q,
-                         stride_k,
-                         stride_v,
-                         stride_bias,
-                         stride_randval,
-                         stride_o,
-                         nhead_stride_q,
-                         nhead_stride_k,
-                         nhead_stride_v,
-                         nhead_stride_bias,
-                         nhead_stride_randval,
-                         nhead_stride_lse,
-                         nhead_stride_o,
-                         batch_stride_q,
-                         batch_stride_k,
-                         batch_stride_v,
-                         batch_stride_bias,
-                         batch_stride_randval,
-                         batch_stride_lse,
-                         batch_stride_o,
-                         mask.left,
-                         mask.right,
-                         static_cast<ck_tile::index_t>(mask.type),
-                         min_seqlen_q,
-                         p_dropout,
-                         has_dropout_randval,
-                         drop_seed_offset};
+                        k.data_ptr(),
+                        v.data_ptr(),
+                        bias_ptr,
+                        q_descale_ptr,
+                        k_descale_ptr,
+                        v_descale_ptr,
+                        has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
+                        has_lse ? softmax_lse.data_ptr() : nullptr,
+                        out.data_ptr(),
+                        seqstart_q_ptr, // seqstart_q_ptr (cumulative physical with padding)
+                        seqstart_k_ptr, // seqstart_k_ptr (cumulative physical with padding)
+                        nullptr, // seqlen_q_ptr (per-sequence logical, alternative to cu_seqlen_q_ptr)
+                        seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr (per-sequence logical K lengths)
+                        cu_seqlen_q_ptr, // cu_seqlen_q_ptr
+                        cu_seqlen_k_ptr, // cu_seqlen_k_ptr
+                        total_q,
+                        total_k,
+                        b,
+                        max_seqlen_q,
+                        d,             // hdim_q
+                        d_v,           // hdim_v
+                        h,             // nhead_q
+                        h_k,           // nhead_k
+                        softmax_scale, // scale_s
+                        logits_soft_cap,
+                        stride_q,
+                        stride_k,
+                        stride_v,
+                        stride_bias,
+                        stride_randval,
+                        stride_o,
+                        nhead_stride_q,
+                        nhead_stride_k,
+                        nhead_stride_v,
+                        nhead_stride_bias,
+                        nhead_stride_randval,
+                        nhead_stride_lse,
+                        nhead_stride_o,
+                        batch_stride_q,
+                        batch_stride_k,
+                        batch_stride_v,
+                        batch_stride_bias,
+                        batch_stride_randval,
+                        batch_stride_lse,
+                        batch_stride_o,
+                        mask.left,
+                        mask.right,
+                        static_cast<ck_tile::index_t>(mask.type),
+                        min_seqlen_q,
+                        p_dropout,
+                        has_dropout_randval,
+                        drop_seed_offset};
 }
 
 fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
@@ -319,7 +327,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     return args;
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 mha_varlen_fwd(
     at::Tensor& q,                                 // [total_q, hq, d]
     const at::Tensor& k,                           // [total_k, hk, d]
@@ -342,28 +350,40 @@ mha_varlen_fwd(
     std::optional<const at::Tensor> block_table_,  // [hq] or [b, hq]
     std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
     std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
+    std::optional<const at::Tensor> q_descale_,    // [1]
+    std::optional<const at::Tensor> k_descale_,    // [1]
+    std::optional<const at::Tensor> v_descale_,    // [1]
     std::optional<at::Generator> gen_,
     std::optional<const at::Tensor> cu_seqlens_q_padded_, // [b+1] physical starts with PAD
     std::optional<const at::Tensor> cu_seqlens_k_padded_) // [b+1]
 {
     auto q_dtype = q.scalar_type();
-    bool isQKVFp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
+    bool is_qkv_fp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
 
-    TORCH_CHECK(q_dtype == at::ScalarType::Half || q_dtype == at::ScalarType::BFloat16 || isQKVFp8,
+    TORCH_CHECK(q_dtype == at::ScalarType::Half || q_dtype == at::ScalarType::BFloat16 || is_qkv_fp8,
                 "FlashAttention only support fp16, bf16 and fp8_e4m3 data type");
 
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
-    std::string q_dtype_str;
+    std::string dtype_str;
     if (q_dtype == at::ScalarType::Half)
-        q_dtype_str = "fp16";
+        dtype_str = "fp16";
     else if (q_dtype == at::ScalarType::BFloat16)
-        q_dtype_str = "bf16";
-    else if (isQKVFp8)
-        q_dtype_str = "fp8bf16"; // only support bf16 out for fp8
+        dtype_str = "bf16";
+    else if (is_qkv_fp8) {
+        if (!out_.has_value() || out_.value().dtype() == at::ScalarType::BFloat16)
+            dtype_str = "fp8bf16"; // only support bf16 out for fp8
+        else
+            TORCH_CHECK(false, "For FP8 input, output must have dtype BF16 for now");
+    }
 
-    // TODO - support descale
+    TORCH_CHECK(q_descale_.has_value() == k_descale_.has_value() &&
+                k_descale_.has_value() == v_descale_.has_value(),
+                "q_descale, k_descale, v_descale must be all provided or all not provided");
+
+    quant_scale_enum qscale_type =
+        q_descale_.has_value() ? quant_scale_enum::pertensor : quant_scale_enum::no_scale;
 
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     if (cu_seqlens_k.has_value()) {
@@ -463,8 +483,10 @@ mha_varlen_fwd(
     if (cu_seqlens_k.has_value()) {
         CHECK_SHAPE(cu_seqlens_k.value(), batch_size + 1);
     }
+
+    // TODO - Support fp8fp16
     auto opts = q.options();
-    auto out_type = isQKVFp8 ? at::ScalarType::BFloat16 : q_dtype;
+    auto out_type = dtype_str == "fp8bf16" ? at::ScalarType::BFloat16 : q_dtype;
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -568,7 +590,7 @@ mha_varlen_fwd(
 
             float t = aiter::mha_fwd_splitkv(args,
                                              stream_config,
-                                             q_dtype_str,
+                                             dtype_str,
                                              true, //is_group_mode
                                              mask.type,
                                              bias_type,
@@ -599,6 +621,9 @@ mha_varlen_fwd(
                     seqlens_k,
                     bias_,
                     alibi_slopes_,
+                    q_descale_,
+                    k_descale_,
+                    v_descale_,
                     out,
                     softmax_lse,
                     p,
@@ -611,11 +636,12 @@ mha_varlen_fwd(
 
             float t = aiter::mha_fwd(args,
                                      stream_config,
-                                     q_dtype_str,
+                                     dtype_str,
                                      true, //is_group_mode
                                      mask.type,
                                      bias_type,
                                      has_lse,
+                                     qscale_type,
                                      false, // use_ext_asm
                                      1);     // how_v3_bf16_cvt
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
