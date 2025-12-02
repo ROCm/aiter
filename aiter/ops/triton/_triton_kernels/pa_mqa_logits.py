@@ -417,7 +417,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     max_model_len,
     max_block_len,
     SplitKV,
-    dummyPointerArg,
+    dummyPointerArg,  # dummy pointer for compatibility with triton3.5 on lower version
     ChunkQ: tl.constexpr,
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
@@ -449,7 +449,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     max_model_len,
     max_block_len,
     SplitKV,
-    dummyPointerArg,
+    dummyPointerArg,  # dummy pointer for compatibility with triton3.5 on lower version
     ChunkQ: tl.constexpr,
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
