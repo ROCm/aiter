@@ -5,7 +5,7 @@
 """
 Test script for Iris-based reduce-scatter and all-gather communication primitives.
 
-This script demonstrates how to use the reduce_scatter_iris and all_gather_iris
+This script demonstrates how to use the reduce_scatter and all_gather
 functions for multi-GPU communication in AITER.
 
 Usage:
@@ -24,8 +24,8 @@ import torch.distributed as dist
 try:
     from aiter.ops.triton.comms import (
         IrisCommContext,
-        reduce_scatter_iris,
-        all_gather_iris,
+        reduce_scatter,
+        all_gather,
     )
 
     IRIS_AVAILABLE = True
@@ -70,7 +70,7 @@ def test_reduce_scatter(M=8192, N=7168):
         )
 
         # Perform reduce-scatter
-        output_shard = reduce_scatter_iris(input_tensor, ctx)
+        output_shard = reduce_scatter(input_tensor, ctx)
 
         M_shard = M // world_size
         print(
@@ -132,7 +132,7 @@ def test_all_gather(M_shard=1024, N=7168):
         )
 
         # Perform all-gather
-        full_tensor = all_gather_iris(input_shard, ctx)
+        full_tensor = all_gather(input_shard, ctx)
 
         M = M_shard * world_size
         print(
@@ -203,11 +203,11 @@ def test_reduce_scatter_all_gather_round_trip(M=8192, N=7168):
         )
 
         # Step 1: Reduce-scatter
-        output_shard = reduce_scatter_iris(input_tensor, ctx)
+        output_shard = reduce_scatter(input_tensor, ctx)
         print(f"[Rank {rank}] After reduce-scatter, shard shape: {output_shard.shape}")
 
         # Step 2: All-gather
-        reconstructed_tensor = all_gather_iris(output_shard, ctx)
+        reconstructed_tensor = all_gather(output_shard, ctx)
         print(
             f"[Rank {rank}] After all-gather, tensor shape: {reconstructed_tensor.shape}"
         )

@@ -30,67 +30,17 @@ except ImportError:
         "Iris library not available. Fused communication kernels will not work."
     )
 
+# Import shared implementations
+from ..reduce_scatter import _reduce_scatter_impl
+from ..all_gather import _all_gather_impl
+
 logger = logging.getLogger("aiter")
 
 
-@triton.jit
-def _reduce_scatter_stage(
-    pid,
-    input_ptr,
-    output_ptr,
-    M,
-    M_shard,
-    N,
-    stride_im,
-    stride_in,
-    stride_om,
-    stride_on,
-    cur_rank: tl.constexpr,
-    world_size: tl.constexpr,
-    heap_bases: tl.tensor,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-):
-    """Reduce-scatter stage using pull-based iris.load"""
-    num_pid_m = tl.cdiv(M_shard, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    total_tiles = num_pid_m * num_pid_n
-
-    for tile_id in range(pid, total_tiles, NUM_SMS):
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = tile_id // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-        pid_n = (tile_id % num_pid_in_group) // group_size_m
-
-        rm_local = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-        rm_local = tl.max_contiguous(tl.multiple_of(rm_local, BLOCK_M), BLOCK_M)
-        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_N), BLOCK_N)
-
-        mask_m_local = rm_local < M_shard
-        mask_n = rn < N
-        mask = mask_m_local[:, None] & mask_n[None, :]
-
-        rm_global = cur_rank * M_shard + rm_local
-        mask_m_global = rm_global < M
-        load_mask = mask_m_global[:, None] & mask_n[None, :]
-
-        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        src_ptrs = input_ptr + rm_global[:, None] * stride_im + rn[None, :] * stride_in
-
-        for src_rank in tl.static_range(world_size):
-            data = iris.load(src_ptrs, cur_rank, src_rank, heap_bases, mask=load_mask)
-            accumulator += data.to(tl.float32)
-
-        output_ptrs = (
-            output_ptr + rm_local[:, None] * stride_om + rn[None, :] * stride_on
-        )
-        tl.store(output_ptrs, accumulator.to(output_ptr.type.element_ty), mask=mask)
+# Note: Communication primitives are imported from their respective modules:
+# - _reduce_scatter_impl from reduce_scatter.py
+# - _all_gather_impl from all_gather.py
+# This avoids code duplication between standalone and fused kernels
 
 
 @triton.jit
@@ -213,77 +163,8 @@ def _quantize_fp8_stage(
         tl.store(qx_ptr + row_offsets, quantized, mask=mask_cols, cache_modifier=".cs")
 
 
-@triton.jit
-def _all_gather_stage(
-    pid,
-    shard_ptr,
-    out_ptr,
-    M,
-    M_shard,
-    N,
-    stride_sm,
-    stride_sn,
-    stride_om,
-    stride_on,
-    cur_rank: tl.constexpr,
-    world_size: tl.constexpr,
-    heap_bases: tl.tensor,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-):
-    """All-gather stage using push-based iris.put"""
-    num_pid_m = tl.cdiv(M_shard, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    total_tiles = num_pid_m * num_pid_n
-
-    for tile_id in range(pid, total_tiles, NUM_SMS):
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = tile_id // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-        pid_n = (tile_id % num_pid_in_group) // group_size_m
-
-        rm_local = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-        rm_local = tl.max_contiguous(tl.multiple_of(rm_local, BLOCK_M), BLOCK_M)
-        rn = tl.max_contiguous(tl.multiple_of(rn, BLOCK_N), BLOCK_N)
-
-        mask_m_local = rm_local < M_shard
-        mask_n = rn < N
-        mask = mask_m_local[:, None] & mask_n[None, :]
-
-        shard_data = tl.load(
-            shard_ptr + rm_local[:, None] * stride_sm + rn[None, :] * stride_sn,
-            mask=mask,
-            other=0.0,
-        )
-
-        for dst in range(world_size):
-            rm_global = cur_rank * M_shard + rm_local
-            mask_m_global = rm_global < M
-            final_mask = mask_m_global[:, None] & mask_n[None, :]
-
-            out_ptrs = (
-                out_ptr + rm_global[:, None] * stride_om + rn[None, :] * stride_on
-            )
-
-            if dst == cur_rank:
-                # Local store
-                tl.store(out_ptrs, shard_data, mask=final_mask)
-            else:
-                # Remote store using iris.put
-                iris.put(
-                    shard_ptr + rm_local[:, None] * stride_sm + rn[None, :] * stride_sn,
-                    out_ptrs,
-                    cur_rank,
-                    dst,
-                    heap_bases,
-                    mask=final_mask,
-                )
+# Note: _all_gather_impl is now imported from all_gather.py
+# This avoids code duplication between standalone and fused kernels
 
 
 @triton.jit
@@ -336,8 +217,8 @@ def fused_pipeline_kernel(
     """
     pid = tl.program_id(axis=0)
 
-    # Stage 1: Reduce-scatter
-    _reduce_scatter_stage(
+    # Stage 1: Reduce-scatter (using shared implementation)
+    _reduce_scatter_impl(
         pid,
         input_ptr,
         shard_ptr,
@@ -390,7 +271,7 @@ def fused_pipeline_kernel(
         )
 
         if do_allgather:
-            _all_gather_stage(
+            _all_gather_impl(
                 pid,
                 fp8_ptr,
                 gather_ptr,
@@ -411,7 +292,7 @@ def fused_pipeline_kernel(
             )
     else:  # No quantization
         if do_allgather:
-            _all_gather_stage(
+            _all_gather_impl(
                 pid,
                 norm_ptr,
                 gather_ptr,
