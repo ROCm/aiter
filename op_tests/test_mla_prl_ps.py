@@ -134,7 +134,8 @@ def torch_mla_extend(
 
 
 batch_size = 1
-seq_len = 522
+# seq_len = 522
+seq_len = 766
 nhead = 1
 nhead_kv = 1
 qk_head_dim = 192  # 128 (kv_lora_rank) + 64 (qk_rope_head_dim)
@@ -213,12 +214,9 @@ print(f"  num_page: {num_page}, total_kv: {total_kv}")
 # work_indptr = torch.tensor([0, 1] + [1] * (num_cus - 1), dtype=torch.int32)
 
 available_tgs = 2
-work_indptr_ = [0]
-current_work_id = 0
-for tg_idx in range(available_tgs):
-    current_work_id += 1
-    work_indptr_.append(current_work_id)
-work_indptr = torch.tensor(work_indptr_, dtype=torch.int32, device=qo_indptr.device)
+# TG 0: work 0, 1 (indices 0-2)
+# TG 1: work 2, 3 (indices 2-4)
+work_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=qo_indptr.device)
 
 # work_indptr = torch.tensor([0, 1], dtype=torch.int32)
 # work_info_set = torch.tensor(
@@ -232,11 +230,21 @@ work_indptr = torch.tensor(work_indptr_, dtype=torch.int32, device=qo_indptr.dev
 # work_info_set = torch.tensor(
 #     [0, -1, 0, 256, 0, 256, 0, 655360], dtype=torch.int32)
 
-work_info_set = torch.tensor([[0, -1, 0, 256, 0, 522, 0, 655360],
+# work_info_set = torch.tensor([[0, -1, 0, 256, 0, 522, 0, 655360],
+#                               [0, 0, 256, 512, 0, 384, 0, 655360],
+#                               [0, 256, 256, 512, 384, 522, 0, 655360],
+#                               [0, -1, 512, 522, 0, 522, 0, 655360]], dtype=torch.int32)
+
+# ==== TG 0: work from 0 to 2 ====
+#   work_id 0: bs_idx=0, q_head_idx=0, partial_idx=-1, local q_start=0, local q_end=256, local kv_start=0, local kv_end=766
+#   work_id 1: bs_idx=0, q_head_idx=0, partial_idx=0, local q_start=256, local q_end=512, local kv_start=0, local kv_end=384
+# ==== TG 1: work from 2 to 4 ====
+#   work_id 2: bs_idx=0, q_head_idx=0, partial_idx=256, local q_start=256, local q_end=512, local kv_start=384, local kv_end=766
+#   work_id 3: bs_idx=0, q_head_idx=0, partial_idx=-1, local q_start=512, local q_end=766, local kv_start=0, local kv_end=766
+work_info_set = torch.tensor([[0, -1, 0, 256, 0, 766, 0, 655360],
                               [0, 0, 256, 512, 0, 384, 0, 655360],
-                              [0, 256, 256, 512, 384, 522, 0, 655360],
-                              [0, -1, 512, 522, 0, 522, 0, 655360]], dtype=torch.int32)
-
+                              [0, 256, 256, 512, 384, 766, 0, 655360],
+                              [0, -1, 512, 766, 0, 766, 0, 655360]], dtype=torch.int32)
 
 # work_info_set = torch.zeros((1, 8), dtype=torch.int32, device="cuda")
 # for i in range(batch_size):
@@ -258,9 +266,7 @@ padded_num_tokens = num_q_tile * tile_q  # 3 * 256 = 768
 
 reduce_indptr = torch.tensor([0, 2], dtype=torch.int32)
 # [<qo_start, qo_end, q_head_start, q_head_end>]
-# reduce_final_map = torch.tensor([[0, 256, 0, 1], [256, 512, 0, 1], [256, 512, 0, 1], [512, 522, 0, 1]], dtype=torch.int32)
 reduce_final_map = torch.tensor([[256, 512, 0, 1]], dtype=torch.int32)
-
 
 # [<partial_qo_loc, q_head_start, q_head_end>]
 reduce_partial_map = torch.tensor(
