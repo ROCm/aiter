@@ -175,9 +175,6 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                                               has_hot_loop_v,
                                                               tail_number_v>>;
 
-        std::cerr << "kernel info" << std::endl;
-        std::cerr << ck_tile::gemm_prec_str<ADataType, BDataType>() << std::endl;
-        std::cerr << CodegenPipelineProblem::GetName() << std::endl;
 
         constexpr int BlockedXDLN_PerWarp =
             (MXFP4_Pipeline || (moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up))

@@ -239,8 +239,6 @@ def fused_moe_(
         bias2,
     )
 
-    aiter.logger.info('print metadata')
-    aiter.logger.info(metadata)
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
 
@@ -639,13 +637,7 @@ def get_2stage_cfgs(
         run_1stage = cfg.get("run_1stage", False)
 
     tag = f"({kernelName1=}, {kernelName2=})"
-    aiter.logger.info(f'dtype = {dtype}'),
-    aiter.logger.info(f'q_dtype_a = {q_dtype_a}'),
-    aiter.logger.info(f'q_dtype_w = {q_dtype_w}'),
-    aiter.logger.info(f'q_type = {q_type}'),
-    logger.info(
-        f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
-    )
+
     if run_1stage:
         return MOEMetadata(
             functools.partial(
@@ -664,7 +656,6 @@ def get_2stage_cfgs(
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
     ):
-        aiter.logger.info('use ck_tiles')
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
@@ -771,9 +762,6 @@ def fused_moe_2stages(
 
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    aiter.logger.info(f'2stages {E}, {model_dim}, {inter_dim}')
-    aiter.logger.info(w1.shape)
-    aiter.logger.info(w2.shape)
     dtype = moe_out.dtype
     device = hidden_states.device
     metadata = get_2stage_cfgs(
@@ -794,8 +782,7 @@ def fused_moe_2stages(
         bias1,
         bias2,
     )
-    aiter.logger.info(w1)
-    aiter.logger.info(a1_scale)
+    
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -845,10 +832,6 @@ def fused_moe_2stages(
             dtype=dtype,
             device=device,
         )
-    aiter.logger.info(f'stages run a1.dtype = {a1.dtype}, w1.dtype = {w1.dtype}, w2.dtype = {w2.dtype} w1_scale.dtype = {w1_scale.dtype}, w2_scale.dtype = {w2_scale.dtype}')
-    aiter.logger.info(f'w1 = {w1}')
-    aiter.logger.info(f'a1 = {a1}')
-    aiter.logger.info(f'w1_scale = {w1_scale}')
 
     a2 = metadata.stage1(
         a1,
@@ -865,9 +848,6 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
     )
     
-    aiter.logger.info(f'print a2 before quantizing a2 shape {a2.shape}')
-    aiter.logger.info(a2)
-    # return a2
 
     if (
         quant_type == QuantType.per_1x32
@@ -913,9 +893,8 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
-    aiter.logger.info('print a2 after quantizing')
-    aiter.logger.info(f'a2 = {a2}')
-
+    
+    sorted_weights_value = sorted_weights if not doweight_stage1 else None
     metadata.stage2(
         a2,
         w1,
@@ -931,8 +910,6 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if not doweight_stage1 else None,
     )
 
-    aiter.logger.info('print moe_out')
-    aiter.logger.info(f'moe_out = {moe_out}')
 
     return moe_out
 
