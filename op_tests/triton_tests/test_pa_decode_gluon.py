@@ -1523,6 +1523,7 @@ def run_pa_gluon_test(
     )
     final_output_gluon = output_gluon
     if query_length > 1:
+        query_group_size = num_query_heads // num_kv_heads
         final_output_gluon = output_gluon.reshape(
             batch_size, num_kv_heads, query_length, query_group_size, head_size
         )
