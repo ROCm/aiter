@@ -1194,7 +1194,7 @@ def run_gluon_kernel(
                 attention_scale,
                 query_sequence_length,
                 max_context_length,
-                context_partition_size,
+                # context_partition_size,
                 compute_type,
                 query_scale,
                 key_scale,
@@ -1472,8 +1472,13 @@ def run_pa_gluon_test(
     # Create intermediate tensors for attention computation
     num_seqs = batch_size
     num_kv_heads = num_kv_heads
+    max_context_length = (
+        min(context_lengths.max().item(), sliding_window)
+        if sliding_window > 0
+        else context_lengths.max().item()
+    )
     max_context_partition_num = (
-        context_lengths.max().item() + context_partition_size - 1
+        max_context_length + context_partition_size - 1
     ) // context_partition_size
     equivalent_query_group_size = query_length * (num_query_heads // num_kv_heads)
     intermediate_shape = (
@@ -1503,7 +1508,7 @@ def run_pa_gluon_test(
         block_tables,
         softmax_scale,
         query_length,
-        context_lengths.max().item(),
+        max_context_length,
         context_partition_size,
         TORCH_TO_TL_DTYPE[compute_type],
         query_scale=query_scale_gluon,
@@ -1897,7 +1902,7 @@ def run_multi_pa_gluon_test(
     use_aot_impl_options,
     context_partition_size_options,
     sample_rate=1.0,
-    use_sinks_options=[False],
+    use_sinks_options=[False, True],
     sliding_window_options=[0, 128],
 ) -> pd.DataFrame:
     """Run all tests."""
