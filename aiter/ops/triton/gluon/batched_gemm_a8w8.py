@@ -27,7 +27,7 @@ import triton.experimental.gluon.language.amd.cdna4.async_copy as acp
     }
 )
 @gluon.jit
-def _batched_gemm_a8w8_kernel(
+def _batched_gemm_a8w8_kernel_basic(
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -65,8 +65,8 @@ def _batched_gemm_a8w8_kernel(
     GRID_MN: gl.constexpr,
 ):
     """
-    Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_a8w8 function
-    below
+    NOTE: This is purely a reference implementation of batched_gemm_a8w8 using Gluon, using a pipeline approach
+    of just 2 stages and without any asynchronous copy directly into shared memory. This is not meant to be called directly.
 
     Computes the matmul C[i] = A[i] x B[i] and applies a conversion scale for every i in a given batch.
     Optionally, adds a bias to each result.
@@ -336,90 +336,109 @@ def _issue_loads(
     offs_bn: gl.constexpr,
     offs_bk: gl.constexpr,
     stride_ab,
+    stride_am,
     stride_ak,
     stride_bb,
     stride_bk,
+    stride_bn,
     batch_id,
     M: gl.constexpr,
     N: gl.constexpr,
     K: gl.constexpr,
+    BLOCK_SIZE_M: gl.constexpr,
+    BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_K: gl.constexpr,
     EVEN_K: gl.constexpr,
     NUM_STAGES: gl.constexpr = 1,
+    USE_ASYNC_COPY: gl.constexpr = True,
 ):
-    # Load the next block of A
-    if EVEN_K:
+    # Create masks depending on whether K is evenly split
+    mask_a = (
+        (offs_am[:, None] < M)
+        if EVEN_K
+        else ((offs_ak[None, :] < K - load_idx * BLOCK_SIZE_K) & (offs_am[:, None] < M))
+    )
+    mask_b = (
+        (offs_bn[None, :] < N)
+        if EVEN_K
+        else ((offs_bk[:, None] < K - load_idx * BLOCK_SIZE_K) & (offs_bn[None, :] < N))
+    )
+
+    # Figure out conditions where ttg.async_copy_global_to_local would be illegal op,
+    # in which case we fall back to regular load + store to shared memory.
+    # The operation is illegal when the contiguous array of values we are trying to copy
+    # is less than 4 bytes (or elements, since this is a8w8) in size.
+
+    # TODO: Figure out whether we need to consider the memory layout when deciding
+    # to bypass the asynchronous copy
+
+    # can_copy_a = True
+    # if stride_ak == 1:      # layout[0] == "T"
+    #     if K < 4 or BLOCK_SIZE_K < 4:
+    #         can_copy_a = False
+    # if stride_am == 1:    # layout[0] == "N"
+    #     if M < 4 or BLOCK_SIZE_M < 4:
+    #         can_copy_a = False
+    # can_copy_b = True
+    # if stride_bn == 1:      # layout[1] == "T"
+    #     if N < 4 or BLOCK_SIZE_N < 4:
+    #         can_copy_b = False
+    # if stride_bk == 1:    # layout[1] == "N"
+    #     if K < 4 or BLOCK_SIZE_K < 4:
+    #         can_copy_b = False
+
+    can_copy_a = M >= 4 and BLOCK_SIZE_M >= 4
+    can_copy_b = N >= 4 and BLOCK_SIZE_N >= 4
+
+    # If not using asynchronous copy functions, load A and B to registers
+    # and then store in shared memory
+    if USE_ASYNC_COPY and can_copy_a and can_copy_b:
+        # Load the next block of A
         # acp.buffer_load_to_shared(
         #     dest=smem_a.index(load_idx % NUM_STAGES),
         #     ptr=(a_ptr + batch_id * stride_ab),
         #     offsets=offs_a,
-        #     mask=(offs_am[:, None] < M),
+        #     mask=mask_a,
         #     other=0.0,
         # )
         acp.global_load_to_shared(
             dest=smem_a.index(load_idx % NUM_STAGES),
             ptr=(a_ptr + batch_id * stride_ab + offs_a),
-            mask=(offs_am[:, None] < M),
-            other=0.0,
-        )
-    else:
-        # acp.buffer_load_to_shared(
-        #     dest=smem_a.index(load_idx % NUM_STAGES),
-        #     ptr=(a_ptr + batch_id * stride_ab),
-        #     offsets=offs_a,
-        #     mask=(
-        #         (offs_ak[None, :] < K - load_idx * BLOCK_SIZE_K)
-        #         & (offs_am[:, None] < M)
-        #     ),
-        #     other=0.0,
-        # )
-        acp.global_load_to_shared(
-            dest=smem_a.index(load_idx % NUM_STAGES),
-            ptr=(a_ptr + batch_id * stride_ab + offs_a),
-            mask=(
-                (offs_ak[None, :] < K - load_idx * BLOCK_SIZE_K)
-                & (offs_am[:, None] < M)
-            ),
+            mask=mask_a,
             other=0.0,
         )
 
-    # Load the next block of B
-    if EVEN_K:
+        # Load the next block of B
         # acp.buffer_load_to_shared(
         #     dest=smem_b.index(load_idx % NUM_STAGES),
         #     ptr=(b_ptr + batch_id * stride_bb),
         #     offsets=offs_b,
-        #     mask=(offs_bn[None, :] < N),
+        #     mask=mask_b,
         #     other=0.0,
         # )
         acp.global_load_to_shared(
             dest=smem_b.index(load_idx % NUM_STAGES),
             ptr=(b_ptr + batch_id * stride_bb + offs_b),
-            mask=(offs_bn[None, :] < N),
-            other=0.0,
-        )
-    else:
-        # acp.buffer_load_to_shared(
-        #     dest=smem_b.index(load_idx % NUM_STAGES),
-        #     ptr=(b_ptr + batch_id * stride_bb),
-        #     offsets=offs_b,
-        #     mask=(
-        #         (offs_bk[:, None] < K - load_idx * BLOCK_SIZE_K)
-        #         & (offs_bn[None, :] < N)
-        #     ),
-        #     other=0.0,
-        # )
-        acp.global_load_to_shared(
-            dest=smem_b.index(load_idx % NUM_STAGES),
-            ptr=(b_ptr + batch_id * stride_bb + offs_b),
-            mask=(
-                (offs_bk[:, None] < K - load_idx * BLOCK_SIZE_K)
-                & (offs_bn[None, :] < N)
-            ),
+            mask=mask_b,
             other=0.0,
         )
 
-    acp.commit_group()
+        acp.commit_group()
+    else:
+        a = gl.amd.cdna4.buffer_load(
+            ptr=(a_ptr + batch_id * stride_ab),
+            offsets=offs_a,
+            mask=mask_a,
+            other=0.0,
+        )
+        smem_a.index(load_idx % NUM_STAGES).store(a)
+        b = gl.amd.cdna4.buffer_load(
+            ptr=(b_ptr + batch_id * stride_bb),
+            offsets=offs_b,
+            mask=mask_b,
+            other=0.0,
+        )
+        smem_b.index(load_idx % NUM_STAGES).store(b)
 
     return (
         load_idx + 1,
@@ -459,7 +478,7 @@ def _compute_loop(
     }
 )
 @gluon.jit
-def _batched_gemm_a8w8_kernel_async_copy(
+def _batched_gemm_a8w8_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -496,6 +515,7 @@ def _batched_gemm_a8w8_kernel_async_copy(
     EVEN_K: gl.constexpr,
     GRID_MN: gl.constexpr,
     num_stages: gl.constexpr,
+    USE_ASYNC_COPY: gl.constexpr = True,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_a8w8 function
@@ -543,6 +563,9 @@ def _batched_gemm_a8w8_kernel_async_copy(
     # NOTE: Different from original Gluon kernel, size_per_thread must have size 16, as both
     # buffer_load_to_shared and global_load_to_shared require that size_of_thread * 8 == 128 bits
     # (the kernel is loading 8-bit elements from the tensors)
+
+    # TODO: Figure out why changing threads_per_warp to [64, 1] causes compiler errors
+    # when using asynchronous copy functions.
     blocked_mk: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 16],
         threads_per_warp=[16, 4],
@@ -632,16 +655,21 @@ def _batched_gemm_a8w8_kernel_async_copy(
             offs_bn,
             offs_bk,
             stride_ab,
+            stride_am,
             stride_ak,
             stride_bb,
             stride_bk,
+            stride_bn,
             batch_id,
             M,
             N,
             K,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
             BLOCK_SIZE_K,
             EVEN_K,
             NUM_STAGES=num_stages,
+            USE_ASYNC_COPY=USE_ASYNC_COPY,
         )
 
     # Run the main loop
@@ -665,20 +693,26 @@ def _batched_gemm_a8w8_kernel_async_copy(
             offs_bn,
             offs_bk,
             stride_ab,
+            stride_am,
             stride_ak,
             stride_bb,
             stride_bk,
+            stride_bn,
             batch_id,
             M,
             N,
             K,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
             BLOCK_SIZE_K,
             EVEN_K,
             NUM_STAGES=num_stages,
+            USE_ASYNC_COPY=USE_ASYNC_COPY,
         )
 
-        # Wait for loads to finish before any compute
-        acp.wait_group(num_stages - 1)
+        if USE_ASYNC_COPY:
+            # Wait for loads to finish before any compute
+            acp.wait_group(num_stages - 1)
 
         accumulator, read_idx = _compute_loop(
             read_idx,
@@ -693,8 +727,9 @@ def _batched_gemm_a8w8_kernel_async_copy(
 
     # Compute last num_stages - 1 blocks
     for i in gl.static_range(num_stages - 1):
-        # Wait for loads to finish before any compute
-        acp.wait_group(num_stages - 2 - i)
+        if USE_ASYNC_COPY:
+            # Wait for loads to finish before any compute
+            acp.wait_group(num_stages - 2 - i)
 
         # Compute next block
         accumulator, read_idx = _compute_loop(
@@ -828,13 +863,7 @@ def batched_gemm_a8w8(
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
-    impl = (
-        _batched_gemm_a8w8_kernel_async_copy
-        if use_async_copy
-        else _batched_gemm_a8w8_kernel
-    )
-
-    impl[grid](
+    _batched_gemm_a8w8_kernel[grid](
         XQ,
         WQ,
         YQ,
@@ -857,6 +886,7 @@ def batched_gemm_a8w8(
         w_scale.stride(0),
         bias.stride(0) if has_bias else 0,
         has_bias,
+        USE_ASYNC_COPY=use_async_copy,
         **config,
     )
 
