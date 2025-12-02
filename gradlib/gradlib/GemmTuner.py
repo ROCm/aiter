@@ -17,22 +17,19 @@
 
 import functools
 import os
+from functools import lru_cache
 
-import aiter
 import pandas as pd
-from aiter import dtypes
 import torch
 import torch.nn.functional as F
-from aiter import logger
 
-from aiter.utility.mp_tuner import mp_tuner
-from functools import lru_cache
-from aiter.jit.core import get_asm_dir
-from aiter.jit.utils.chip_info import get_cu_num
+import aiter
+from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
-from aiter.utility.base_tuner import GemmCommonTuner
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.shuffle import shuffle_weight
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.utility.base_tuner import GemmCommonTuner
+from aiter.utility.mp_tuner import mp_tuner
 
 aiter.hipb_create_extension()
 
