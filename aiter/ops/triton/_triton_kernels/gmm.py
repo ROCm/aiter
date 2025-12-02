@@ -206,7 +206,7 @@ def gmm_kernel(
                 else:
                     rhs_ptrs += BLOCK_SIZE_K * N
 
-            # Add bias if enabled (before converting to output dtype for better precision)
+            # Add bias if enabled
             if USE_BIAS:
                 offs_bias_n = tile_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
                 bias_ptrs = bias_ptr + g.to(tl.int64) * N + offs_bias_n
@@ -350,8 +350,7 @@ def tgmm_persistent_kernel(
 
             acc = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.float32)
             
-            # Initialize bias accumulator unconditionally to avoid NameError
-            # Only used when COMPUTE_BIAS_GRAD=True and tile_n==0
+            # Initialize bias accumulator
             bias_acc = tl.zeros((BLOCK_SIZE_K,), dtype=tl.float32)
 
             for _ in range(0, loop_m):

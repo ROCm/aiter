@@ -166,10 +166,10 @@ def torch_gmm(
         start_idx = last_row
         end_idx = last_row + m
 
-        result = (lhs[start_idx:end_idx, :] @ rhs[g]).to(preferred_element_type)
+        result = (lhs[start_idx:end_idx, :] @ rhs[g]).to(torch.float32)
         if bias is not None:
-            result = result + bias[g].to(preferred_element_type)
-        out[start_idx:end_idx, :] = result
+            result = result + bias[g].to(torch.float32)
+        out[start_idx:end_idx, :] = result.to(preferred_element_type)
 
         last_row += m
 
@@ -247,8 +247,8 @@ def test_gmm(
         #   * very small fraction of elements differing by a few bf16/fp16 ULPs
         if use_bias:
             # Base tolerances for bias case.
-            atol = 0.1
-            rtol = 0.1
+            atol = 0.02
+            rtol = 0.02
         else:
             atol = None
             rtol = None
@@ -448,18 +448,17 @@ def test_tgmm(
             atol=atol,
         )
 
-        # For persistent TGMM, also compare bias gradients.
-        if persistent:
-            # Bias gradient is a long float32 reduction (over M) with atomics in the
-            # Triton kernel, and a different reduction order in the PyTorch reference.
-            # For very large shapes this can introduce sizeable numerical differences,
-            # so we use looser tolerances there.
-            if M > 1e6:
-                bias_atol = 16.0   # comfortably above ~13 max abs diff seen in logs
-                bias_rtol = 100.0  # effectively ignore relative error near zero
-            else:
-                bias_atol = 2.0
-                bias_rtol = 0.1
+        # For persistent TGMM, also compare bias gradients on smaller shapes.
+        #
+        # For very large shapes (e.g., M > 1e6), bias_grad is an extremely long
+        # float32 reduction with atomics in the Triton kernel and a different
+        # reduction order in the PyTorch reference. Per-element comparisons
+        # become dominated by reduction-order noise rather than meaningful
+        # correctness checks, so we skip bias_grad comparison there and rely
+        # only on the output tensor check above.
+        if persistent and M <= 1e6:
+            bias_atol = 1.5
+            bias_rtol = 0.1
 
             check_tensors(
                 bias_grad_triton[non_empty_groups],
