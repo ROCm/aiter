@@ -598,3 +598,44 @@ def pa_decode_gluon_aot(
             last_dim=head_size,
             run_compiled_kernel=run_compiled_kernel,
         )
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--compute_type", type=str, required=True, help="tl.float8e4b8 / tl.bfloat16 / tl.float16")
+    parser.add_argument("--equivalent_query_group_size", type=int, required=True)
+    parser.add_argument("--head_size", type=int, required=True)
+    parser.add_argument("--kv_block_size", type=int, required=True)
+    parser.add_argument("--context_partition_size", type=int, required=True)
+    parser.add_argument("--query_quant_mode", type=int, required=True)
+    parser.add_argument("--kv_quant_mode", type=int, required=True)
+    parser.add_argument("--fp8_max_value", type=float, required=True)
+    parser.add_argument("--value_transposed", type=int, required=True)
+    parser.add_argument("--is_causal", type=int, required=True)
+    parser.add_argument("--func_name", type=str, default=None)
+
+    args = parser.parse_args()
+
+    if args.compute_type == "fp8e4b8" or args.compute_type == "tl.float8e4b8":
+        compute_type = tl.float8e4b8
+    elif args.compute_type == "bf16" or args.compute_type == "tl.bfloat16":
+        compute_type = tl.bfloat16
+    elif args.compute_type == "fp16" or args.compute_type == "tl.float16":
+        compute_type = tl.float16
+    else:
+        raise ValueError(f"unknown compute_type = {args.compute_type}")
+
+    compile(
+        compute_type=compute_type,
+        equivalent_query_group_size=args.equivalent_query_group_size,
+        head_size=args.head_size,
+        kv_block_size=args.kv_block_size,
+        context_partition_size=args.context_partition_size,
+        query_quant_mode=args.query_quant_mode,
+        kv_quant_mode=args.kv_quant_mode,
+        fp8_max_value=args.fp8_max_value,
+        value_transposed=args.value_transposed,
+        is_causal=args.is_causal,
+        func_name=args.func_name,
+    )
