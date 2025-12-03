@@ -106,11 +106,6 @@ if IS_ROCM:
             ]
         elif PREBUILD_KERNELS == 3:
             return [
-                "libmha_fwd",
-                "libmha_bwd",
-            ]
-        else:
-            return [
                 "module_activation",
                 "module_attention",
                 "module_pa_ragged",
@@ -163,22 +158,24 @@ if IS_ROCM:
                 "module_rope_general_bwd",
                 "module_rope_pos_fwd",
                 "module_fused_mrope_rms",
-                "module_fmha_v3_fwd",
+                # "module_fmha_v3_fwd",
                 "module_mha_fwd",
                 "module_mha_varlen_fwd",
-                "module_fmha_v3_bwd",
+                # "module_fmha_v3_bwd",
                 "module_fmha_v3_varlen_bwd",
                 "module_fmha_v3_varlen_fwd",
                 "module_mha_bwd",
                 "module_mha_varlen_bwd",
-                # "libmha_fwd",
-                # "libmha_bwd",
+                "libmha_fwd",
+                "libmha_bwd",
                 "module_rocsolgemm",
                 "module_hipbsolgemm",
                 "module_top_k_per_row",
                 "module_mla_metadata",
                 "module_mla_reduce",
             ]
+        else:
+            return []
 
     exclude_ops = get_exclude_ops()
 
