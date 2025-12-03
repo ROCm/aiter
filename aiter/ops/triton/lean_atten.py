@@ -308,7 +308,6 @@ def _persistent_lean_attention(
     kernel_timing["attn_fwd"]["start_event"].record()
     """
 
-    """
     la_kernel = la_persistent[grid](
         False,
         0,
@@ -373,7 +372,6 @@ def _persistent_lean_attention(
         RAGGED_BATCH=RAGGED_BATCH,
         **config,
     )
-    """
 
     """
     kernel_timing["attn_fwd"]["end_event"].record()
