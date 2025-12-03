@@ -690,7 +690,7 @@ def mla_prefill_reduce(
     use_triton: bool = True,           # Whether to use Triton kernel
 ) -> None:
 
-    if False:
+    if True:
         try:
             return mla_prefill_reduce_triton(
                 partial_output, partial_lse, reduce_indptr,
