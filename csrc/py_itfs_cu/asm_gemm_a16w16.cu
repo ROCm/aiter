@@ -12,13 +12,13 @@
 // start to prepare the input and output buffer
 struct __attribute__((packed)) KernelArgs
 {
-    void* ptr_D;
+    void *ptr_D;
     p2 _p0;
-    void* ptr_C;
+    void *ptr_C;
     p2 _p1;
-    void* ptr_A;
+    void *ptr_A;
     p2 _p2;
-    void* ptr_B;
+    void *ptr_B;
     p2 _p3;
     float alpha;
     p3 _p4;
@@ -50,6 +50,10 @@ struct __attribute__((packed)) KernelArgs
     p3 _p17;
     unsigned int is_out_b16;
     p3 _p18;
+    void *ptr_Bias;
+    p2 _p19;
+    unsigned int add_bias;
+    p3 _p20;
 };
 
 std::tuple<std::string, int>
@@ -169,6 +173,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     int szA           = Mdim * Kdim;
     int szB           = Kdim * Ndim;
     int szC           = Mdim * Ndim;
+    int szBias = 1 * Ndim;
     int sz_A_pad      = 0;
     int sz_B_pad      = 0;
     int sz_C_pad      = 0;
@@ -181,6 +186,9 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     int strideB0      = 0;
     int strideB1      = 0;
     int is_out_b16   = 0;
+    int add_bias =   0;
+    if (bias.has_value())
+        add_bias = 1;
     // A row major, B col major, C row major
     strideA0 = strideA1 = Kdim * 2; // in bytes
     strideB0 = strideB1 = Kdim * 2;
@@ -200,6 +208,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     args.ptr_C     = (void*)NULL;
     args.ptr_A     = (void*)A.data_ptr();
     args.ptr_B     = (void*)B.data_ptr();
+    args.ptr_Bias  =  bias.has_value() ? (void*)bias.value().data_ptr() : nullptr;
     args.alpha     = alpha;
     args.beta      = beta;
     args.stride_C0 = strideC0;
@@ -209,6 +218,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     args.N         = Ndim;
     args.K         = Kdim;
     args.is_out_b16 = is_out_b16;
+    args.add_bias   = add_bias;
 
     // args.stride_D0 = 25;
     // args.stride_D1 = 80;
