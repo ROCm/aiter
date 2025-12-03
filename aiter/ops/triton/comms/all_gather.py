@@ -184,7 +184,7 @@ def all_gather(
 
     Example:
         >>> with IrisCommContext() as ctx:
-        >>>     input_shard = ctx.iris_ctx.shmem.zeros((1024, 7168), dtype=torch.float32)
+        >>>     input_shard = ctx.iris_ctx.zeros((1024, 7168), dtype=torch.float32)
         >>>     # ... initialize input_shard ...
         >>>     full_tensor = all_gather(input_shard, ctx)
         >>>     print(full_tensor.shape)  # [8192, 7168] for world_size=8
