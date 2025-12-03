@@ -64,7 +64,9 @@ struct __attribute__((packed)) KernelArgs
     unsigned int eSMQs;
     p3 _p24;
     unsigned int topk;
-    p3 _p25;
+    // WA for MI300
+    unsigned int ps_deno2;
+    p2 _p25;
     unsigned int total_tgs;
     p3 _p26;
     unsigned int ps_deno;
@@ -157,12 +159,14 @@ class FMoeKernel
         args.ptr_GU     = w1.data_ptr();
         args.ptr_XC     = num_valid_ids.data_ptr();
         args.ptr_D      = w2.data_ptr();
+	bool block_scale_fp8_WA = false;
         if constexpr(std::is_same<T, uint8_t>::value)
         {
             args.ptr_XQ  = input_dqn.value().data_ptr();
             args.ptr_GUQ = w1_dqn.value().data_ptr();
             args.ptr_DQ  = w2_dqn.value().data_ptr();
             args.ptr_SMQ = w2_smooth_qnt.has_value() ? w2_smooth_qnt.value().data_ptr() : nullptr;
+	    block_scale_fp8_WA = (sub_GU == 320);
         }
         else
         {
@@ -189,7 +193,11 @@ class FMoeKernel
         args.eSMQs     = stride_expert_SMTDQN;
         args.topk      = topk;
         args.ps_deno   = ((inter_dim + sub_GU - 1) / sub_GU);
+        args.ps_deno2   = args.ps_deno;
         args.total_tgs = this->num_persistent_tgs / args.ps_deno * args.ps_deno;
+
+	if (block_scale_fp8_WA)
+	  args.topk = args.total_tgs;
 
         void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
                           &args,
