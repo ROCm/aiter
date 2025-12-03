@@ -160,7 +160,7 @@ def paged_attention_decode_v2_gluon_large_block_fp8(
     if COMPUTE_TYPE.is_fp8():
         OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
         if COMPUTE_TYPE == gl.float8e4nv:
-            FP8_MAX_VALUE: gl.constexpr = 224
+            FP8_MAX_VALUE: gl.constexpr = 448
         else:
             FP8_MAX_VALUE: gl.constexpr = 240
     else:
@@ -863,7 +863,7 @@ def paged_attention_decode_v2_gluon_fp8(
     # ==================== CONSTANTS AND CONFIGURATION ====================
     if COMPUTE_TYPE.is_fp8():
         if COMPUTE_TYPE == gl.float8e4nv:
-            FP8_MAX_VALUE: gl.constexpr = 224
+            FP8_MAX_VALUE: gl.constexpr = 448
         else:
             FP8_MAX_VALUE: gl.constexpr = 240
         OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
