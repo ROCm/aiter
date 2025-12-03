@@ -151,8 +151,7 @@ def get_GEMM_A16W16_config(
                 default_config["libtype"] = "skinny"
                 default_config["solidx"] = 2
                 default_config["kernelName"] = ""
-                # return {"libtype": "skinny", "solidx": 2, "kernelName": ""}
-        else:
+        if not default_config:
             default_config["libtype"] = "torch"
             default_config["solidx"] = 0
         logger.info(
