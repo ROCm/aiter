@@ -1281,6 +1281,12 @@ def paged_attention_decode_v2_gluon_fp8(
                 1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
             ),
         )
+        valid_block_mask = gl.convert_layout(
+            valid_block_mask,
+            layout=gl.SliceLayout(
+                1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
+            ),
+        )
         value_block_offsets = (
             kv_block_numbers_reshaped[:, None, None, None] * stride_value_block
             + kv_head_idx * stride_value_head
@@ -1292,6 +1298,7 @@ def paged_attention_decode_v2_gluon_fp8(
         value_tensor = gl.amd.cdna3.buffer_load(
             ptr=value_cache_ptr,
             offsets=value_block_offsets,
+            mask=valid_block_mask[:, None, None, None],
         )
         value_tensor = value_tensor.to(COMPUTE_TYPE)
         # Compute QK attention scores using MFMA (overlaps with value load)
@@ -1308,6 +1315,10 @@ def paged_attention_decode_v2_gluon_fp8(
             kv_block_numbers,
             layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
         )
+        valid_block_mask = gl.convert_layout(
+            valid_block_mask,
+            layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
+        )
         value_block_offsets = (
             kv_block_numbers_reshaped[:, None, None] * stride_value_block
             + kv_head_idx * stride_value_head
@@ -1319,6 +1330,7 @@ def paged_attention_decode_v2_gluon_fp8(
         value_tensor = gl.amd.cdna3.buffer_load(
             ptr=value_cache_ptr,
             offsets=value_block_offsets,
+            mask=valid_block_mask[:, None, None],
         )
         # Compute QK attention scores using MFMA (overlaps with value load)
         attention_scores = gl.amd.cdna3.mfma(
