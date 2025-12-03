@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   DOCKER_IMAGE: "rocm/pytorch:latest"
@@ -158,9 +158,15 @@ jobs:
           set -ex
           docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           echo "Starting container: aiter_test"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
           docker run -dt \
-          --device=/dev/dri \
-          --device=/dev/kfd \
+          --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
           --network=host \
           --group-add $(getent group render | cut -d: -f3) \
@@ -225,9 +231,15 @@ jobs:
           set -ex
           docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           echo "Starting container: aiter_test"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
           docker run -dt \
-          --device=/dev/dri \
-          --device=/dev/kfd \
+          --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
           --network=host \
           --group-add $(getent group render | cut -d: -f3) \
