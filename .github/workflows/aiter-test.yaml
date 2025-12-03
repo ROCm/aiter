@@ -87,7 +87,8 @@ jobs:
           RUN pip install --upgrade "ninja>=1.11.1"
           RUN pip list
 
-          RUN git clone ${{ env.GITHUB_REPO_URL }} aiter \
+          RUN rm -rf aiter \
+           && git clone ${{ env.GITHUB_REPO_URL }} aiter \
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
            && if [ "${GITHUB_REF:-}" = "refs/heads/main" ]; then \
