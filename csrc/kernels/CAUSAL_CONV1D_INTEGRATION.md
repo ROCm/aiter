@@ -27,8 +27,8 @@ aiter/
 
 1. `aiter/jit/optCompilerConfig.json` - 添加 `module_causal_conv1d` JIT 配置
 2. `csrc/include/rocm_ops.hpp` - 添加 `CAUSAL_CONV1D_PYBIND` 宏
-3. `aiter/__init__.py` - 添加 `from .ops.conv1d import *`
-4. `aiter/ops/__init__.py` - 添加 `from .conv1d import causal_conv1d_fwd`
+3. `aiter/__init__.py` - 添加 `from .ops.causal_conv1d import *`
+4. `aiter/ops/__init__.py` - 添加 `from .causal_conv1d import causal_conv1d_fwd`
 
 ### **测试文件（1 个）**
 

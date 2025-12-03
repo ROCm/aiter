@@ -133,10 +133,10 @@ def test_causal_conv1d_no_bias(batch, dim, seqlen, width, dtype, use_silu=False)
 
 
 # Test configurations (默认使用小规模配置快速验证)
-l_dtype = ["float16"]
-l_batch = [2]
-l_dim = [256]
-l_seqlen = [1024]
+l_dtype = ["float32"]
+l_batch = [4]
+l_dim = [64]
+l_seqlen = [2048]
 l_width = [4]
 
 parser = argparse.ArgumentParser(

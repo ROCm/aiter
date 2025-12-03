@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-from .conv1d import causal_conv1d_fwd
+from .causal_conv1d import causal_conv1d_fwd
