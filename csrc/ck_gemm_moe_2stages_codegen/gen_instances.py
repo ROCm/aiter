@@ -311,7 +311,7 @@ A8W8_blockscale_gemm1_heuristic_dispatch = """
     }}
 """
 
-A16W16_A8W8_gemm2_gfx950_heuristic_dispatch = """
+A16W16_gemm2_gfx950_heuristic_dispatch = """
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
@@ -361,6 +361,40 @@ A16W16_A8W8_gemm2_gfx950_heuristic_dispatch = """
             {{
                 return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
             }}
+        }}
+        else
+        {{
+            TORCH_CHECK(
+                false,
+                "Unsupported block_m value for moe heuristic dispatch: ",
+                block_m);
+        }}
+    }}
+"""
+
+# NOTE: temporarily not using KPerBlock=64 for inter_dim=192 cases due to gfx950 fp8 mfma instruction limitation
+A8W8_gemm2_gfx950_heuristic_dispatch = """
+    if (dtype_checker<{A0DataType}>{{}}(x_dtype)
+        && dtype_checker<{B0DataType}>{{}}(w_dtype)
+        && dtype_checker<{EDataType}>{{}}(y_dtype)
+        && {MulRoutedWeight} == mul_routed_weight_stage
+        && {Quant} == quant)
+    {{
+        if (block_m == 32)
+        {{
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else if (block_m == 64)
+        {{
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else if (block_m == 128)
+        {{
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else if (block_m == 256)
+        {{
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
         }}
         else
         {{
@@ -609,7 +643,7 @@ A8W8_blockscale_gemm2_heuristic_dispatch = """
 heuristic_dispatch_dict = {
     "a8w8_gfx950": [
         A16W16_A8W8_gemm1_gfx950_heuristic_dispatch,
-        A16W16_A8W8_gemm2_gfx950_heuristic_dispatch,
+        A8W8_gemm2_gfx950_heuristic_dispatch,
     ],
     "a8w8": [
         A16W16_A8W8_gemm1_heuristic_dispatch,
@@ -621,7 +655,7 @@ heuristic_dispatch_dict = {
     ],
     "a16w16_gfx950": [
         A16W16_A8W8_gemm1_gfx950_heuristic_dispatch,
-        A16W16_A8W8_gemm2_gfx950_heuristic_dispatch,
+        A16W16_gemm2_gfx950_heuristic_dispatch,
     ],
     "a16w16": [
         A16W16_A8W8_gemm1_heuristic_dispatch,
