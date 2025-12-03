@@ -85,7 +85,7 @@ jobs:
           RUN pip install --upgrade pandas zmq einops numpy==1.26.2
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip install --upgrade "ninja>=1.11.1"
-          RUN ls -al
+          RUN pip list
 
           RUN git clone ${{ env.GITHUB_REPO_URL }} aiter \
            && cd aiter \
