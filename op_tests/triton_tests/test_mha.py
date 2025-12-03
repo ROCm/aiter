@@ -508,7 +508,7 @@ def test_mha_backward(
     # TODO: Enable these test cases once this is fixed
     if arch == "gfx942":
         pytest.skip(
-            "Backward accuracy issues due to Triton compiler on gfx942 archictecture"
+            "Backward accuracy issues due to Triton compiler on gfx942 architecture"
         )
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
