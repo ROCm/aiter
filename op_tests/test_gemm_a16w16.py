@@ -143,7 +143,6 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     ### run bf16gemm_f32 asm
     if (
         dtype == dtypes.bf16
-        and bias is None
         and (otype == dtypes.fp32 or otype == dtypes.bf16)
         and k % 64 == 0
         and n % 64 == 0
@@ -158,7 +157,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         #     splitK=None,
         # )
         (d, *_), avg_d = run_bf16gemm_asm(
-            x, wshuffle, out_asm, bpreshuffle=wshuffle.is_shuffled
+            x, wshuffle, out_asm, bias, bpreshuffle=wshuffle.is_shuffled
         )
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
         err_asm = checkAllclose(b, d, msg=msg)
