@@ -89,6 +89,8 @@ if IS_ROCM:
             "module_mha_varlen_bwd",
         ]
     elif PREBUILD_KERNELS == 2:
+        print("DEBUG")
+        print("PREBUILD_KERNELS =", PREBUILD_KERNELS, type(PREBUILD_KERNELS)
         exclude_ops = [
             # "libmha_fwd",
             "libmha_bwd",
