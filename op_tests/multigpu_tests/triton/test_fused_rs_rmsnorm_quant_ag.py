@@ -401,7 +401,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--heap_size",
         type=int,
-        default=2 ** 31,
+        default=2**31,
         help="Iris heap size in bytes (default: 2GB)",
     )
     parser.add_argument(
