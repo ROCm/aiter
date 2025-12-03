@@ -45,7 +45,7 @@ except ImportError as e:
 logger = logging.getLogger("aiter")
 
 
-def run_reduce_scatter_test(tp_size, gpuID, M, N, heap_size=2 ** 30):
+def run_reduce_scatter_test(tp_size, gpuID, M, N, heap_size=1 << 30):
     """
     Run reduce-scatter test on a single GPU.
 
@@ -124,7 +124,7 @@ def run_reduce_scatter_test(tp_size, gpuID, M, N, heap_size=2 ** 30):
         aiter.destroy_dist_env()
 
 
-def run_all_gather_test(tp_size, gpuID, M_shard, N, heap_size=2 ** 30):
+def run_all_gather_test(tp_size, gpuID, M_shard, N, heap_size=1 << 30):
     """
     Run all-gather test on a single GPU.
 
@@ -205,7 +205,7 @@ def run_all_gather_test(tp_size, gpuID, M_shard, N, heap_size=2 ** 30):
         aiter.destroy_dist_env()
 
 
-def run_round_trip_test(tp_size, gpuID, M, N, heap_size=2 ** 30):
+def run_round_trip_test(tp_size, gpuID, M, N, heap_size=1 << 30):
     """
     Run reduce-scatter + all-gather round trip test on a single GPU.
 
@@ -289,7 +289,7 @@ def run_round_trip_test(tp_size, gpuID, M, N, heap_size=2 ** 30):
         aiter.destroy_dist_env()
 
 
-def test_reduce_scatter(tp_size, M=8192, N=7168, heap_size=2 ** 30):
+def test_reduce_scatter(tp_size, M=8192, N=7168, heap_size=1 << 30):
     """Test reduce-scatter operation."""
     if M % tp_size != 0:
         raise ValueError(f"M ({M}) must be divisible by tp_size ({tp_size})")
@@ -334,7 +334,7 @@ def test_reduce_scatter(tp_size, M=8192, N=7168, heap_size=2 ** 30):
         raise AssertionError("Reduce-scatter test failed")
 
 
-def test_all_gather(tp_size, M_shard=1024, N=7168, heap_size=2 ** 30):
+def test_all_gather(tp_size, M_shard=1024, N=7168, heap_size=1 << 30):
     """Test all-gather operation."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49377"
@@ -388,7 +388,7 @@ def test_all_gather(tp_size, M_shard=1024, N=7168, heap_size=2 ** 30):
         raise AssertionError("All-gather test failed")
 
 
-def test_round_trip(tp_size, M=8192, N=7168, heap_size=2 ** 30):
+def test_round_trip(tp_size, M=8192, N=7168, heap_size=1 << 30):
     """Test reduce-scatter + all-gather round trip."""
     if M % tp_size != 0:
         raise ValueError(f"M ({M}) must be divisible by tp_size ({tp_size})")
