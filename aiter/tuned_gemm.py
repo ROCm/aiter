@@ -256,7 +256,7 @@ def gemm_a16w16(
         out = asm_gemm(inp_view, B, bias, otype, splitK, kernelName, bpreshuffle)
     else:
         solution_idx = config["solidx"]
-        solfunc = solMap[config["soltype"]]
+        solfunc = solMap[config["libtype"]]
         out = solfunc(
             inp_view,
             B,
