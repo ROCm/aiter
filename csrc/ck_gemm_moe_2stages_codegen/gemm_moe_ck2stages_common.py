@@ -202,7 +202,7 @@ a8w8_gemm1_kernels_list_gfx950= {
      21: kernelInstanceGEMM1(      256,       128,       128,       256,     1,       4,        3,),
     #  22: kernelInstanceGEMM1(      256,       256,       128,       256,     1,       4,        3,),
      23: kernelInstanceGEMM1(      256,       256,       128,       128,     1,       4,        3,),
-     24: kernelInstanceGEMM1(      256,       256,        64,       256,     1,       4,        3,),
+     24: kernelInstanceGEMM1(      256,       256,        64,       128,     1,       4,        3,),
      25: kernelInstanceGEMM1(      256,        16,        64,       256,     1,       4,        1,),
      26: kernelInstanceGEMM1(      256,        16,        64,       256,     1,       4,        1,),
 }
@@ -233,7 +233,7 @@ a8w8_gemm1_kernels_list= {
      21: kernelInstanceGEMM1(      256,       128,       128,       256,     1,       4,        3,),
     #  22: kernelInstanceGEMM1(      256,       256,       128,       256,     1,       4,        3,),
      23: kernelInstanceGEMM1(      256,       256,       128,       128,     1,       4,        3,),
-     24: kernelInstanceGEMM1(      256,       256,        64,       256,     1,       4,        3,),
+    #  24: kernelInstanceGEMM1(      256,       256,        64,       128,     1,       4,        3,),
      25: kernelInstanceGEMM1(      256,        16,        64,       256,     1,       4,        1,),
      26: kernelInstanceGEMM1(      256,        16,        64,       256,     1,       4,        1,),
 }
@@ -385,9 +385,9 @@ a8w8_gemm2_kernels_list_gfx950= {
      25: kernelInstanceGEMM2(      256,        16,        64,       256,     1,       4,        1,),
      26: kernelInstanceGEMM2(      256,        16,        64,       256,     1,       4,        1,),
 
-     27: kernelInstanceGEMM2(       64,        32,         32,      128,     1,       1,        1,),
-     28: kernelInstanceGEMM2(       64,        64,        128,      128,     1,       1,        3,),
-     29: kernelInstanceGEMM2(       64,       128,        128,      128,     1,       1,        3,),
+     27: kernelInstanceGEMM2(       64,        32,        128,      256,     1,       1,        1,),
+     28: kernelInstanceGEMM2(       64,        64,         64,      128,     1,       1,        1,),
+     29: kernelInstanceGEMM2(       64,       128,        128,      128,     1,       1,        1,),
      30: kernelInstanceGEMM2(       64,        16,         16,      128,     1,       1,        1,),
 }
 
@@ -417,14 +417,15 @@ a8w8_gemm2_kernels_list= {
      21: kernelInstanceGEMM2(      256,       128,       128,       256,     1,       4,        3,),
     #  22: kernelInstanceGEMM2(      256,       256,       128,       256,     1,       4,        3,),
      23: kernelInstanceGEMM2(      256,       256,       128,       128,     1,       4,        3,),
-     24: kernelInstanceGEMM2(      256,       256,        64,       256,     1,       4,        3,),
+    #  24: kernelInstanceGEMM2(      256,       256,        64,       128,     1,       4,        3,),
      25: kernelInstanceGEMM2(      256,        16,        64,       256,     1,       4,        1,),
      26: kernelInstanceGEMM2(      256,        16,        64,       256,     1,       4,        1,),
 
      27: kernelInstanceGEMM2(       64,        32,         32,      128,     1,       1,        1,),
-     28: kernelInstanceGEMM2(       64,        64,        128,      128,     1,       1,        3,),
-     29: kernelInstanceGEMM2(       64,       128,        128,      128,     1,       1,        3,),
+     28: kernelInstanceGEMM2(       64,        64,         64,      128,     1,       1,        1,),
+     29: kernelInstanceGEMM2(       64,       128,        128,      128,     1,       1,        1,),
      30: kernelInstanceGEMM2(       64,        16,         16,      128,     1,       1,        1,),
+     31: kernelInstanceGEMM2(       64,       128,         64,      128,     1,       1,        1,),
 }
 
 # gemm2 MXDLPerWave out:bf16/fp16 AB:fp8/i8
@@ -492,7 +493,7 @@ def get_gemm1_kernels_list(
     QuantType: str,
     ActOP: str,
     MulRoutedWeight: bool,
-    preshuffle: bool,
+    preshuffle: bool=False,
 ) -> list:
     arch = get_gfx()
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
@@ -556,7 +557,7 @@ def get_gemm2_kernels_list(
     Nswizzle: bool,
     QuantType: str,
     MulRoutedWeight: bool,
-    preshuffle: bool,
+    preshuffle: bool=False,
 ) -> list:
     arch = get_gfx()
 
