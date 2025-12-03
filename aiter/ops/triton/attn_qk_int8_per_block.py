@@ -40,11 +40,10 @@ def _get_config(
         return _get_config._config_dict[key]["small"]
     elif seq_len <= 32768:
         # Check for M-specific medium configs based on BLOCK_SIZE_M
-        BLK_M = triton.next_power_of_2(min(seq_len // 64, 128))
-        if BLK_M == 64 and "medium_M64" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key]["medium_M64"]
-        elif BLK_M == 128 and "medium_M128" in _get_config._config_dict[key]:
-            return _get_config._config_dict[key]["medium_M128"]
+        if seq_len < 29760.0 and "medium_1" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_1"]
+        elif seq_len >= 29760.0 and "medium_2" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key]["medium_2"]
     elif seq_len <= 65536 and "large" in _get_config._config_dict[key]:
         return _get_config._config_dict[key]["large"]
     elif seq_len > 65536:
