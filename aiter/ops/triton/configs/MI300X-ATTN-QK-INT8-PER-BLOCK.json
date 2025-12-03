@@ -5,17 +5,17 @@
     "num_warps": 4,
     "num_stages": 3,
     "waves_per_eu": 2,
-    "matrix_instr_nonkdim": 32,
-    "cache_modifier": ".ca"
+    "matrix_instr_nonkdim": 16,
+    "cache_modifier": null
   },
   "medium_M64": {
     "BLOCK_SIZE_M": 128,
-    "BLOCK_SIZE_N": 32,
+    "BLOCK_SIZE_N": 16,
     "num_warps": 4,
     "num_stages": 3,
     "waves_per_eu": 2,
-    "matrix_instr_nonkdim": 32,
-    "cache_modifier": ".ca"
+    "matrix_instr_nonkdim": 16,
+    "cache_modifier": null
   },
   "medium_M128": {
     "BLOCK_SIZE_M": 128,
@@ -24,7 +24,7 @@
     "num_stages": 3,
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 32,
-    "cache_modifier": ".ca"
+    "cache_modifier": null
   },
   "large": {
     "BLOCK_SIZE_M": 128,
@@ -32,8 +32,8 @@
     "num_warps": 4,
     "num_stages": 3,
     "waves_per_eu": 2,
-    "matrix_instr_nonkdim": 32,
-    "cache_modifier": ".ca"
+    "matrix_instr_nonkdim": 16,
+    "cache_modifier": null
   },
   "xlarge": {
     "BLOCK_SIZE_M": 128,
@@ -42,7 +42,7 @@
     "num_stages": 3,
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 32,
-    "cache_modifier": ".ca"
+    "cache_modifier": null
   },
   "any": {
     "BLOCK_SIZE_M": 128,
@@ -51,6 +51,6 @@
     "num_stages": 3,
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 32,
-    "cache_modifier": ".ca"
+    "cache_modifier": null
   }
 }
