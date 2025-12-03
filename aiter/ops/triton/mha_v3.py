@@ -6,6 +6,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 
 class _FlashAttnV3Func(torch.autograd.Function):
@@ -718,7 +719,7 @@ class _FlashAttnFP8Wrapper(torch.autograd.Function):
         _, _, num_kv_heads, _ = k.shape
 
         # Quantize inputs to FP8
-        fp8_dtype = torch.float8_e4m3fnuz
+        fp8_dtype = get_fp8_e4m3_dtype()
 
         # For GQA/MQA: quantize query with grouped scaling
         group_size = (
@@ -1002,7 +1003,7 @@ class _FlashAttnVarlenFP8Wrapper(torch.autograd.Function):
         num_kv_heads = k.shape[1]
 
         # Quantize inputs to FP8 using _quantize_thd for varlen tensors
-        fp8_dtype = torch.float8_e4m3fnuz
+        fp8_dtype = get_fp8_e4m3_dtype()
 
         # For GQA/MQA: quantize query with grouped scaling
         group_size = (
