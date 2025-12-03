@@ -8,6 +8,7 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
+from aiter import per_tensor_quant
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -296,12 +297,16 @@ def test_mla(
         out_asm = torch.empty(
             (total_q_prefill, nhead, v_head_dim), dtype=out_dtype
         ).fill_(-1)
+        quant_dtype = dtypes.fp8
+        q_quant, q_scale = per_tensor_quant(q, scale=torch.tensor(1), quant_dtype=quant_dtype)
+        k_quant, k_scale = per_tensor_quant(K, scale=torch.tensor(1), quant_dtype=quant_dtype)
+        v_quant, v_scale = per_tensor_quant(V, scale=torch.tensor(1), quant_dtype=quant_dtype)
 
         (out_result, attn_lse), us_asm_prefill = run_perftest(
             aiter.mla.mla_ps_prefill_fwd,
-            q,
-            K,
-            V,
+            q_quant,
+            k_quant,
+            v_quant,
             out_asm,
             qo_indptr_prefill,
             kv_indptr,
@@ -314,6 +319,9 @@ def test_mla(
             reduce_final_map,
             reduce_partial_map,
             sm_scale,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
         # Check results

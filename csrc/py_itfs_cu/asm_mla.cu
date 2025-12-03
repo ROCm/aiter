@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
+#include "asm_mla_configs.hpp"
+#include "py_itfs_common.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_fp16.h>
@@ -48,6 +50,45 @@ struct __attribute__((packed)) KernelArgs
     unsigned int out_16_nosplit;
     p3 _p23;
 };
+
+std::string get_heuristic_kernel_mla(std::string q_type,
+                                     std::string kv_type,
+                                     int gqa,
+                                     int ps,
+                                     int prefill,
+                                     int causal,
+                                     int qseqlen,
+                                     std::string arch_id,
+                                     CFG* cfgs)
+{
+    for(const auto& el : *cfgs)
+    {
+        if (el.first.find(arch_id) != 0)
+            continue;
+        const auto& cfg = el.second;
+        
+        if (cfg.qType != q_type || cfg.kvType != kv_type)
+            continue;
+        if (cfg.Gqa != gqa || cfg.ps != ps || cfg.prefill != prefill)
+            continue;
+        if (cfg.causal != causal || cfg.qSeqLen != qseqlen)
+            continue;
+        
+        return el.first;
+    }
+    
+    TORCH_CHECK(false,
+                __func__,
+                ": cannot get heuristic kernel!"
+                " q_type:", q_type,
+                " kv_type:", kv_type,
+                " gqa:", gqa,
+                " ps:", ps,
+                " prefill:", prefill,
+                " causal:", causal,
+                " qseqlen:", qseqlen);
+    return "";
+}
 
 void mla_decode_stage1_asm_fwd(
     torch::Tensor& Q,                    //   [num_seqs, num_heads, head_size]
@@ -154,7 +195,6 @@ void mla_decode_stage1_asm_fwd(
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    AiterAsmKernel* impl_ptr = nullptr;
     TORCH_CHECK(Q.is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
     TORCH_CHECK(num_kv_heads == 1, __func__, ":only support num_kv_heads==1 for now");
     TORCH_CHECK(head_size == KV.size(3), __func__, ":only support head_size == KV.size(3) for now");
@@ -357,6 +397,104 @@ void mla_decode_stage1_asm_fwd(
         }
 
     }
+    else if((KV.dtype() == at::ScalarType::Float8_e4m3fnuz || KV.dtype() == at::ScalarType::Float8_e4m3fn) && kv_scale.has_value())
+    {
+        assert(kv_scale.value().data_ptr() != nullptr);
+        args.ptr_KVSCALE = kv_scale.value().data_ptr();
+    }
+
+    // Determine data types
+    std::string q_type, kv_type;
+    if(Q.dtype() == at::ScalarType::BFloat16)
+        q_type = "bf16";
+    else if(Q.dtype() == at::ScalarType::Float8_e4m3fnuz || Q.dtype() == at::ScalarType::Float8_e4m3fn)
+        q_type = "fp8";
+    else
+        TORCH_CHECK(false, __func__, ": unsupport Q dtype:", Q.scalar_type());
+
+    if(KV.dtype() == at::ScalarType::BFloat16)
+        kv_type = "bf16";
+    else if(KV.dtype() == at::ScalarType::Float8_e4m3fnuz || KV.dtype() == at::ScalarType::Float8_e4m3fn)
+        kv_type = "fp8";
+    else
+        TORCH_CHECK(false, __func__, ": unsupport KV dtype:", KV.scalar_type());
+
+    // Get kernel using config dispatch
+    std::string arch_id = get_gpu_arch();
+    CFG* config_map = &cfg_mla_asm;
+    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    
+    int ps = persistent ? 1 : 0;
+    int prefill = 0; // decode stage
+    int causal = 0;
+    int config_max_seqlen_q = max_seqlen_q;
+    int sub_Q = 128; // default value
+    
+    if(gqa_ratio == 128){
+        config_max_seqlen_q = 0;
+        sub_Q = 128;
+        if (q_type == "bf16" && kv_type == "bf16"){
+            ps = 0; // not use ps
+        }
+    }
+    else if(gqa_ratio == 16){
+        sub_Q = 128;
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(persistent){
+                if (max_seqlen_q <= 4){
+                    config_max_seqlen_q = 4; // padding it
+                }
+            }else{
+                if(max_seqlen_q == 1){
+                    config_max_seqlen_q = 1;
+                    sub_Q = 16;
+                }else if(max_seqlen_q <= 4){
+                    config_max_seqlen_q = 4;
+                }else{
+                    config_max_seqlen_q = 8;
+                }
+            }
+        }else if (q_type == "bf16" && kv_type == "fp8"){
+            if(persistent){
+                if(max_seqlen_q <= 4){
+                    config_max_seqlen_q = 4;
+                }
+            }
+        }else if (q_type == "fp8"){
+            if(max_seqlen_q == 1){
+                config_max_seqlen_q = 1;
+            }else if(max_seqlen_q == 2){
+                config_max_seqlen_q = 2;
+            }else if(max_seqlen_q <= 4){
+                config_max_seqlen_q = 4;
+            }else if (max_seqlen_q > 4){
+                TORCH_CHECK(false, __func__, ":only support fp8 mla decoding for qo_len <= 4");
+            }
+        }
+    } 
+
+    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map);
+    
+    TORCH_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
+    
+    AiterAsmKernel* impl_ptr = nullptr;
+    
+    auto it = config_map->find(kernelName);
+    if(it != config_map->end())
+    {
+        const auto& cfg     = it->second;
+        const char* name    = cfg.knl_name.c_str();
+        const char* co_name = cfg.co_name.c_str();
+        auto result         = impl_ptr_map.emplace(name, nullptr);
+        if(result.second)
+        {
+            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
+        }
+        impl_ptr = result.first->second.get();
+        
+    }
+    else
+        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
 
     TORCH_CHECK(impl_ptr != nullptr, __func__,
         ": unsupport current data type or shape. please refer to asm_mla.cu");
@@ -495,25 +633,54 @@ void mla_ps_prefill_asm_fwd(
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     
-    // Kernel selection
+    // Determine data types
+    std::string q_type, k_type;
+    if(Q.dtype() == at::ScalarType::Float8_e4m3fnuz || Q.dtype() == at::ScalarType::Float8_e4m3fn)
+        q_type = "fp8";
+    else
+        TORCH_CHECK(false, __func__, ": unsupport Q dtype:", Q.scalar_type());
+
+    if(K.dtype() == at::ScalarType::Float8_e4m3fnuz || K.dtype() == at::ScalarType::Float8_e4m3fn)
+        k_type = "fp8";
+    else
+        TORCH_CHECK(false, __func__, ": unsupport K dtype:", K.scalar_type());
+
+    // Get kernel using config dispatch
+    std::string arch_id = get_gpu_arch();
+    if(arch_id == "gfx942"){
+        TORCH_CHECK(false, __func__, ": fp8 mla persistent prefill is not supported on gfx942");
+    }
+    CFG* config_map = &cfg_mla_asm;
+    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    
+    int ps = 1; // ps_prefill always uses persistent scheduling
+    int prefill = 1; // prefill stage
+    int causal_flag = is_causal ? 1 : 0;
+    int num_kv_heads = K.size(2);
+    int qseqlen = 0; // not used for prefill
+    // For ps_prefill, gqa is based on num_kv_heads (typically 1)
+    std::string kernelName = get_heuristic_kernel_mla(q_type, k_type, num_kv_heads, ps, prefill, causal_flag, qseqlen, arch_id, config_map);
+    
+    TORCH_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
+    
     AiterAsmKernel* impl_ptr = nullptr;
     int wave_per_tg = 8;
     
-    if (is_causal)
+    auto it = config_map->find(kernelName);
+    if(it != config_map->end())
     {
-        // mla_pfl_qh192_vh128_m32x8_n128x1_causal1.co
-        static AiterAsmKernel impl_ps_prefill(
-            "_ZN5aiter40mla_pfl_qh192_vh128_m32x8_n128x1_causal1E",
-            "/mla/mla_pfl_qh192_vh128_m32x8_n128x1_causal1.co");
-        impl_ptr = &impl_ps_prefill;
+        const auto& cfg     = it->second;
+        const char* name    = cfg.knl_name.c_str();
+        const char* co_name = cfg.co_name.c_str();
+        auto result         = impl_ptr_map.emplace(name, nullptr);
+        if(result.second)
+        {
+            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
+        }
+        impl_ptr = result.first->second.get();
     }
     else
-    {
-        static AiterAsmKernel impl_ps_prefill(
-            "_ZN5aiter40mla_pfl_qh192_vh128_m32x8_n128x1_causal0E",
-            "/mla/mla_pfl_qh192_vh128_m32x8_n128x1_causal0.co");
-        impl_ptr = &impl_ps_prefill;
-    }
+        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
     
     // Launch kernel
     int block_size_x = wave_per_tg * 64;  // 8 * 64 = 512
@@ -582,30 +749,55 @@ void mla_prefill_asm_fwd(
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    AiterAsmKernel* impl_ptr = nullptr;
     TORCH_CHECK(Q.is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
     TORCH_CHECK(gqa_ratio == 16 || gqa_ratio == 128,
                 __func__,
                 ":only support num_q_heads/num_kv_heads==16 or 128 for now");
     TORCH_CHECK(num_kv_heads == 1, __func__, ":only support num_kv_heads==1 for now");
     TORCH_CHECK(head_size == KV.size(3), __func__, ":only support head_size == KV.size(3) for now");
+    
+    // Determine data types
+    std::string q_type, kv_type;
     if(Q.dtype() == at::ScalarType::BFloat16)
+        q_type = "bf16";
+    else 
+        TORCH_CHECK(false, __func__, ": unsupport Q dtype:", Q.scalar_type());
+
+    if(KV.dtype() == at::ScalarType::BFloat16)
+        kv_type = "bf16";
+    else
+        TORCH_CHECK(false, __func__, ": unsupport KV dtype:", KV.scalar_type());
+
+    // Get kernel using config dispatch
+    std::string arch_id = get_gpu_arch();
+    CFG* config_map = &cfg_mla_asm;
+    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    
+    int ps = 0; // prefill without persistent scheduling
+    int prefill = 1; // prefill stage
+    int causal_flag = 0;
+    int qseqlen = 0;
+    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal_flag, qseqlen, arch_id, config_map);
+    
+    TORCH_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
+    
+    AiterAsmKernel* impl_ptr = nullptr;
+    
+    auto it = config_map->find(kernelName);
+    if(it != config_map->end())
     {
-        if(gqa_ratio == 16)
+        const auto& cfg     = it->second;
+        const char* name    = cfg.knl_name.c_str();
+        const char* co_name = cfg.co_name.c_str();
+        auto result         = impl_ptr_map.emplace(name, nullptr);
+        if(result.second)
         {
-            static AiterAsmKernel impl_a16w16_bf16(
-                "_ZN5aiter39mla_pfl_bf16_a16w16_causal_subQ16_mqa16E",
-                "/mla/mla_pfl_bf16_a16w16_causal_subQ16_mqa16.co");
-            impl_ptr = &impl_a16w16_bf16;
+            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
         }
-        else if(gqa_ratio == 128)
-        {
-            static AiterAsmKernel impl_a16w16_bf16(
-                "_ZN5aiter41mla_pfl_bf16_a16w16_causal_subQ128_mqa128E",
-                "/mla/mla_pfl_bf16_a16w16_causal_subQ128_mqa128.co");
-            impl_ptr = &impl_a16w16_bf16;
-        }
+        impl_ptr = result.first->second.get();
     }
+    else
+        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
 
     TORCH_CHECK(impl_ptr != nullptr, __func__, ": unsupport current Q_type:", Q.scalar_type());
     impl_ptr->launch_kernel({&args,
