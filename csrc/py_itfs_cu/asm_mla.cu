@@ -408,9 +408,11 @@ void mla_ps_prefill_asm_fwd(
     int num_q_tokens  = Q.size(0);
     int num_head_q    = Q.size(1);
     int num_page      = K.size(0);
+    int num_kv_heads = K.size(1);
     int num_used_page = kv_page_indices.size(0);
     int available_tgs = 1;
-    
+    const int gqa_ratio = num_head_q / num_kv_heads;
+
     // Setup kernel arguments
     PsKernelArgs args;
     size_t arg_size = sizeof(args);
@@ -465,10 +467,9 @@ void mla_ps_prefill_asm_fwd(
     int ps = 1; // ps_prefill always uses persistent scheduling
     int prefill = 1; // prefill stage
     int causal_flag = is_causal ? 1 : 0;
-    int num_kv_heads = K.size(2);
     int qseqlen = 0; // not used for prefill
-    // For ps_prefill, gqa is based on num_kv_heads (typically 1)
-    std::string kernelName = get_heuristic_kernel_mla(q_type, k_type, num_kv_heads, ps, prefill, causal_flag, qseqlen, arch_id, config_map);
+    
+    std::string kernelName = get_heuristic_kernel_mla(q_type, k_type, gqa_ratio, ps, prefill, causal_flag, qseqlen, arch_id, config_map);
     
     TORCH_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
