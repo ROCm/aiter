@@ -12,5 +12,15 @@ void causal_conv1d_fwd(
     const torch::Tensor& bias,    // [dim] or empty
     bool use_silu);
 
+void causal_conv1d_update(
+    torch::Tensor& x,                          // [batch, dim, seqlen] - new input (typically seqlen=1)
+    torch::Tensor& conv_state,                 // [batch, dim, state_len] - state buffer (updated in-place)
+    const torch::Tensor& weight,               // [dim, width]
+    const torch::Tensor& bias,                 // [dim] or empty
+    torch::Tensor& out,                        // [batch, dim, seqlen] - output
+    bool use_silu,
+    const torch::Tensor& cache_seqlens,        // [batch] - optional, for circular buffer
+    const torch::Tensor& conv_state_indices);  // [batch] - optional, for continuous batching
+
 } // namespace aiter
 
