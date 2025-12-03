@@ -345,6 +345,7 @@ def mla_decode_fwd(
             )
             kvc = torch.index_select(kv_buffer, 0, kv_indices).to(dtype=torch.float32)
             for idx in range(kv_indptr[-1].item()):
+                # for idx in range(1):
                 checkAllclose(
                     dbg_tr[idx], kvc[idx][0][0], msg=f"dbg_tr[{idx}] vs. kvc[{idx}]"
                 )
