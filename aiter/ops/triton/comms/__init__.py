@@ -17,7 +17,7 @@ logger = logging.getLogger("aiter")
 __all__ = []
 
 try:
-    from .iris import IrisCommContext
+    from .iris import IrisCommContext, calculate_heap_size
     from .reduce_scatter import reduce_scatter
     from .all_gather import all_gather
     from .fused import reduce_scatter_rmsnorm_quant_all_gather
@@ -25,6 +25,7 @@ try:
     __all__.extend(
         [
             "IrisCommContext",
+            "calculate_heap_size",
             "reduce_scatter",
             "all_gather",
             "reduce_scatter_rmsnorm_quant_all_gather",
@@ -39,6 +40,7 @@ except ImportError as e:
     logger.debug(f"Iris communication primitives not available: {e}")
     # Define stub variables so code can check for availability
     IrisCommContext = None
+    calculate_heap_size = None
     reduce_scatter = None
     all_gather = None
     reduce_scatter_rmsnorm_quant_all_gather = None

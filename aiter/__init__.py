@@ -81,6 +81,7 @@ from . import mla
 try:
     from .ops.triton.comms import (
         IrisCommContext,
+        calculate_heap_size,
         reduce_scatter,
         all_gather,
         reduce_scatter_rmsnorm_quant_all_gather,
