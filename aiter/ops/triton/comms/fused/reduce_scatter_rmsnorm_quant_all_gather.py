@@ -14,6 +14,7 @@ Based on Iris example: examples/22_rs_rmsnorm_fp8quant_ag/reduce_scatter_rmsnorm
 """
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 import triton
 import triton.language as tl
@@ -33,101 +34,15 @@ except ImportError:
 # Import shared implementations
 from ..reduce_scatter import _reduce_scatter_impl
 from ..all_gather import _all_gather_impl
+from ..._triton_kernels.rmsnorm import _rms_norm_kernel
 
 logger = logging.getLogger("aiter")
 
 
-# Note: Communication primitives are imported from their respective modules:
+# Note: Shared implementations imported to avoid code duplication:
 # - _reduce_scatter_impl from reduce_scatter.py
 # - _all_gather_impl from all_gather.py
-# This avoids code duplication between standalone and fused kernels
-
-
-@triton.jit
-def _rmsnorm_stage(
-    pid,
-    input_ptr,
-    output_ptr,
-    g_ptr,
-    rsigma_ptr,
-    input_row_stride,
-    output_row_stride,
-    n_rows,
-    n_cols,
-    epsilon,
-    BLOCK_SIZE: tl.constexpr,
-    USE_BLOCKED: tl.constexpr,
-    NUM_WORKERS: tl.constexpr,
-):
-    """RMSNorm stage with AITER optimizations"""
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-
-    if USE_BLOCKED:
-        for row_idx in tl.range(pid, n_rows, NUM_WORKERS, num_stages=1):
-            row_input_ptr = input_ptr + row_idx * input_row_stride
-            row_output_ptr = output_ptr + row_idx * output_row_stride
-
-            n_cols_blks = tl.cdiv(n_cols, BLOCK_SIZE) - 1
-            sum_squares = 0.0
-            for blk_idx in tl.range(0, n_cols_blks, num_stages=2):
-                cols = blk_idx * BLOCK_SIZE + col_offsets
-                input_ptrs = row_input_ptr + cols
-                input_ptrs = tl.multiple_of(input_ptrs, (16,))
-                x = tl.load(input_ptrs, cache_modifier=".cg").to(tl.float32)
-                sum_squares += tl.sum(x * x, axis=0)
-
-            cols = n_cols_blks * BLOCK_SIZE + col_offsets
-            mask = cols < n_cols
-            input_ptrs = row_input_ptr + cols
-            input_ptrs = tl.multiple_of(input_ptrs, (16,))
-            x = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(
-                tl.float32
-            )
-            sum_squares += tl.sum(x * x, axis=0)
-
-            mean_square = sum_squares / n_cols
-            norm_factor = tl.rsqrt(mean_square + epsilon)
-            tl.store(rsigma_ptr + row_idx, norm_factor)
-
-            for blk_idx in tl.range(0, n_cols_blks, num_stages=2):
-                cols = blk_idx * BLOCK_SIZE + col_offsets
-                input_ptrs = row_input_ptr + cols
-                input_ptrs = tl.multiple_of(input_ptrs, (16,))
-                x = tl.load(input_ptrs, cache_modifier=".cg").to(tl.float32)
-                g_ptrs = g_ptr + cols
-                g = tl.load(g_ptrs).to(tl.float32)
-                rms_norm = x * norm_factor * g
-                output_ptrs = row_output_ptr + cols
-                tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty))
-
-            cols = n_cols_blks * BLOCK_SIZE + col_offsets
-            mask = cols < n_cols
-            input_ptrs = row_input_ptr + cols
-            x = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(
-                tl.float32
-            )
-            g_ptrs = g_ptr + cols
-            g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
-            rms_norm = x * norm_factor * g
-            output_ptrs = row_output_ptr + cols
-            tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty), mask=mask)
-    else:
-        mask = col_offsets < n_cols
-        for row_idx in tl.range(pid, n_rows, NUM_WORKERS, num_stages=2):
-            input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
-            input_ptrs = tl.multiple_of(input_ptrs, (16,))
-            row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(
-                tl.float32
-            )
-            g = tl.load(g_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-            row_norm = row * row
-            row_norm = tl.sum(row_norm, axis=-1)
-            norm_factor = tl.math.rsqrt((row_norm / n_cols) + epsilon)
-            tl.store(rsigma_ptr + row_idx, norm_factor)
-            rms_norm = row * norm_factor * g
-            output_ptrs = output_ptr + row_idx * output_row_stride + col_offsets
-            output_ptrs = tl.multiple_of(output_ptrs, (16,))
-            tl.store(output_ptrs, rms_norm.to(output_ptr.type.element_ty), mask=mask)
+# - _rms_norm_kernel from _triton_kernels/rmsnorm.py (tl.program_id(0) works in nested calls)
 
 
 @triton.jit
@@ -238,9 +153,8 @@ def fused_pipeline_kernel(
         NUM_SMS=NUM_SMS,
     )
 
-    # Stage 2: RMSNorm
-    _rmsnorm_stage(
-        pid,
+    # Stage 2: RMSNorm (using shared kernel - tl.program_id(0) works in nested calls)
+    _rms_norm_kernel(
         shard_ptr,
         norm_ptr,
         gamma_ptr,
@@ -252,7 +166,7 @@ def fused_pipeline_kernel(
         eps,
         BLOCK_SIZE=RMS_BLOCK_SIZE,
         USE_BLOCKED=USE_BLOCKED,
-        NUM_WORKERS=NUM_WORKERS,
+        NUM_PRGMS=NUM_WORKERS,
     )
 
     # Stage 3 & 4: Quantization + All-gather (if requested)
@@ -321,6 +235,11 @@ def reduce_scatter_rmsnorm_quant_all_gather(
     heap_size: int = 1 << 30,
     quant_mode: str = "none",
     do_allgather: bool = True,
+    # Pre-allocated buffers (optional, for reuse across iterations)
+    rs_buffer: Optional[Tensor] = None,
+    norm_buffer: Optional[Tensor] = None,
+    fp8_out: Optional[Tensor] = None,
+    gather_out: Optional[Tensor] = None,
 ) -> tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     """
     Fused reduce-scatter + RMSNorm + quantization + all-gather operation.
@@ -333,16 +252,22 @@ def reduce_scatter_rmsnorm_quant_all_gather(
         heap_size (int): Heap size for Iris context if ctx is None
         quant_mode (str): Quantization mode - "none", "fp8_per_token". Default: "none"
         do_allgather (bool): Whether to perform all-gather stage. Default: True
+        rs_buffer (Tensor, optional): Pre-allocated reduce-scatter buffer [M_shard, N]
+        norm_buffer (Tensor, optional): Pre-allocated normalization buffer [M_shard, N]
+        fp8_out (Tensor, optional): Pre-allocated FP8 output buffer [M_shard, N]
+        gather_out (Tensor, optional): Pre-allocated all-gather output buffer [M, N]
 
     Returns:
         tuple: (normalized_shard, quantized_output, full_gathered_output)
-            - normalized_shard: RMSNorm output [M_shard, N]
+            - normalized_shard: RMSNorm output [M_shard, N] in **float32** (if quant_mode="none")
+              Note: Computed in float32 for numerical accuracy. Convert to input dtype if needed.
             - quantized_output: FP8 quantized output [M_shard, N] (if quant_mode="fp8_per_token")
             - full_gathered_output: All-gathered result [M, N] (if do_allgather=True)
 
     Example:
         >>> with IrisCommContext() as ctx:
-        >>>     input_tensor = ctx.iris_ctx.shmem.ones((8192, 7168), dtype=torch.float32)
+        >>>     # Input must be in Iris shared memory for reduce-scatter
+        >>>     input_tensor = ctx.iris_ctx.ones((8192, 7168), dtype=torch.float32)
         >>>     gamma = torch.ones(7168, device="cuda")
         >>>     norm, quant, gathered = reduce_scatter_rmsnorm_quant_all_gather(
         >>>         input_tensor, gamma, ctx=ctx, quant_mode="fp8_per_token"
@@ -367,7 +292,6 @@ def reduce_scatter_rmsnorm_quant_all_gather(
     cur_rank = ctx.cur_rank
     world_size = ctx.num_ranks
     heap_bases = ctx.get_heap_bases()
-    shmem = ctx.iris_ctx.shmem
 
     # Input shape
     M, N = input_tensor.shape
@@ -380,18 +304,25 @@ def reduce_scatter_rmsnorm_quant_all_gather(
         f"Rank {cur_rank}/{world_size}: Fused pipeline M={M}, N={N} -> M_shard={M_shard}"
     )
 
-    # Allocate buffers
+    # Allocate or reuse buffers
     device = input_tensor.device
     dtype = input_tensor.dtype
 
-    rs_buffer = shmem.zeros((M_shard, N), dtype=dtype)
-    norm_buffer = torch.empty((M_shard, N), dtype=torch.float32, device=device)
+    # Reduce-scatter buffer (allocate if not provided)
+    if rs_buffer is None:
+        rs_buffer = ctx.iris_ctx.zeros((M_shard, N), dtype=dtype)
+
+    # Normalization buffer (allocate if not provided)
+    if norm_buffer is None:
+        norm_buffer = torch.empty((M_shard, N), dtype=torch.float32, device=device)
+
     rsigma = torch.empty(M_shard, dtype=torch.float32, device=device)
 
     # Quantization buffers
     if quant_mode == "fp8_per_token":
         fp8_dtype = getattr(torch, "float8_e4m3fn", torch.int8)
-        fp8_out = shmem.empty((M_shard, N), dtype=fp8_dtype)
+        if fp8_out is None:
+            fp8_out = ctx.iris_ctx.empty((M_shard, N), dtype=fp8_dtype)
         scales = torch.empty(M_shard, dtype=torch.float32, device=device)
         fp8_dtype_max = (
             448.0
@@ -399,16 +330,19 @@ def reduce_scatter_rmsnorm_quant_all_gather(
             else float(torch.iinfo(torch.int8).max)
         )
     else:
-        fp8_out = norm_buffer  # Reuse norm buffer
+        if fp8_out is None:
+            fp8_out = norm_buffer  # Reuse norm buffer
         scales = torch.zeros(M_shard, dtype=torch.float32, device=device)
         fp8_dtype_max = 1.0
 
-    # All-gather buffer
+    # All-gather buffer (allocate if not provided)
     if do_allgather:
         gather_dtype = fp8_out.dtype if quant_mode == "fp8_per_token" else dtype
-        gather_out = shmem.zeros((M, N), dtype=gather_dtype)
+        if gather_out is None:
+            gather_out = ctx.iris_ctx.zeros((M, N), dtype=gather_dtype)
     else:
-        gather_out = norm_buffer  # Reuse norm buffer
+        if gather_out is None:
+            gather_out = norm_buffer  # Reuse norm buffer
 
     # Kernel parameters
     BLOCK_M = 16
@@ -470,11 +404,14 @@ def reduce_scatter_rmsnorm_quant_all_gather(
 
     # Synchronize
     torch.cuda.synchronize()
-    shmem.barrier()
+    if dist.is_initialized():
+        dist.barrier()
 
     logger.info(f"Rank {cur_rank}: Fused pipeline complete")
 
     # Return results based on configuration
+    # Note: norm_buffer is in float32 for numerical accuracy during RMSNorm
+    # Users should convert to input dtype if needed: norm_buffer.to(input_dtype)
     norm_result = norm_buffer if quant_mode == "none" else None
     quant_result = fp8_out if quant_mode == "fp8_per_token" else None
     gather_result = gather_out if do_allgather else None
