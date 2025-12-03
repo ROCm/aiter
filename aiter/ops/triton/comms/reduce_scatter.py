@@ -192,7 +192,7 @@ def reduce_scatter(
 
     Example:
         >>> with IrisCommContext() as ctx:
-        >>>     input_tensor = ctx.iris_ctx.shmem.zeros((8192, 7168), dtype=torch.float32)
+        >>>     input_tensor = ctx.iris_ctx.zeros((8192, 7168), dtype=torch.float32)
         >>>     # ... initialize input_tensor ...
         >>>     output_shard = reduce_scatter(input_tensor, ctx)
         >>>     print(output_shard.shape)  # [1024, 7168] for world_size=8
