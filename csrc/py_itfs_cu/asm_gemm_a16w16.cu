@@ -63,6 +63,7 @@ get_heuristic_kernel(int M,
                      CFG* cfgs,
                      std::string arch_id,
                      bool bpreshuffle,
+                     int add_bias,
                      std::optional<int> splitk             = std::nullopt,
                      std::optional<std::string> kernelName = std::nullopt)
 {
@@ -88,7 +89,20 @@ get_heuristic_kernel(int M,
         const auto& cfg = el.second;
         if(kernelName.has_value() && el.first != (arch_id + kernelName.value()))
             continue;
-        if(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0))
+        if(kernelName.has_value())
+        {
+            TORCH_CHECK(
+                N % cfg.tileN == 0 && 
+                cfg.bPreshuffle == (bpreshuffle ? 1 : 0) && 
+                (add_bias == 0 || cfg.bias == 1),
+                __func__, 
+                " the specified kernel name ", el.first, 
+                " cannot support the input shape (N=", N, ", tileN=", cfg.tileN, 
+                ") or bias/preshuffle setting (preshuffle=", bpreshuffle, 
+                ", bias=", add_bias, ")."
+            );
+        }
+        if(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0) && (add_bias == 0 || cfg.bias == 1))
         {
             // 1. select splitK
             int split_K = 1;
@@ -186,9 +200,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     int strideB0      = 0;
     int strideB1      = 0;
     int is_out_b16   = 0;
-    int add_bias =   0;
-    if (bias.has_value())
-        add_bias = 1;
+    int add_bias = bias.has_value() ? 1 : 0;
     // A row major, B col major, C row major
     strideA0 = strideA1 = Kdim * 2; // in bytes
     strideB0 = strideB1 = Kdim * 2;
@@ -208,7 +220,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
     args.ptr_C     = (void*)NULL;
     args.ptr_A     = (void*)A.data_ptr();
     args.ptr_B     = (void*)B.data_ptr();
-    args.ptr_Bias  =  bias.has_value() ? (void*)bias.value().data_ptr() : nullptr;
+    args.ptr_Bias = bias.has_value() ? (void*)bias.value().data_ptr() : nullptr;
     args.alpha     = alpha;
     args.beta      = beta;
     args.stride_C0 = strideC0;
@@ -242,6 +254,7 @@ torch::Tensor gemm_a16w16_asm(torch::Tensor& A,   // A:[M, K] bf16
                                            config_map,
                                            arch_id,
                                            bpreshuffle,
+                                           add_bias,
                                            splitK.has_value() ? splitK : std::nullopt,
                                            kernelName.has_value() ? kernelName : std::nullopt);
         selectedKernelName = std::get<0>(it_sel);
