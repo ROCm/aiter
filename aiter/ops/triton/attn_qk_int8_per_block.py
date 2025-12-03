@@ -137,11 +137,7 @@ def attn_qk_int8_per_block(
     if config is None:
         config = _get_config(b, h_qo, qo_len, head_dim)
 
-    BLOCK_M = config["BLOCK_SIZE_M"]
-    BLOCK_N = config["BLOCK_SIZE_N"]
-    stage = config.get("stage", 1)
-
-    grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b)
+    grid = (triton.cdiv(qo_len, config["BLOCK_SIZE_M"]), h_qo, b)
     _attn_fwd[grid](
         q,
         k,
@@ -171,14 +167,9 @@ def attn_qk_int8_per_block(
         kv_len,
         h_qo,
         num_kv_groups,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         HEAD_DIM=HEAD_DIM_K,
-        STAGE=stage,
         RETURN_LSE=return_lse,
-        num_warps=config.get("num_warps", 4),
-        num_stages=config.get("num_stages", 3),
-        waves_per_eu=config.get("waves_per_eu", 2),
+        **config
     )
 
     return o, lse

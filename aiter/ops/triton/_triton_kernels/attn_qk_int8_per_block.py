@@ -1,13 +1,4 @@
 """
-Copied from https://raw.githubusercontent.com/thu-ml/SageAttention/0f9da83e6038f8330c195cc4bda7f9008a42f679/sageattention/triton/attn_qk_int8_per_block.py
-with the following changes:
-- 64x16 blocks instead of 128x64 blocks.
-- num_warps=2
-- num_stages=3
-- waves_per_eu=2
-
-TODO create patch file, upstream or share this in a separate repo.
-
 Copyright (c) 2024 by SageAttention team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,11 +23,12 @@ from ..utils._triton.kernel_repr import make_kernel_repr
 _attn_fwd_repr = make_kernel_repr(
     "_attn_fwd",
     [
-        "BLOCK_M",
-        "BLOCK_N",
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
         "HEAD_DIM",
-        "STAGE",
+        "num_stages",
         "RETURN_LSE",
+        "cache_modifier",
     ],
 )
 
@@ -45,12 +37,13 @@ _attn_fwd_repr = make_kernel_repr(
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn, 
                     start_m, mask_ptrs, stride_maskn,
-                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
-                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
+                    BLOCK_SIZE_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,  
+                    num_stages: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
+                    cache_modifier: tl.constexpr,
                     ):
     lo, hi = 0, kv_len
-    for start_n in range(lo, hi, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
+    for start_n in range(lo, hi, BLOCK_SIZE_N):
+        start_n = tl.multiple_of(start_n, BLOCK_SIZE_N)
         mask_block = None
         skip = False
         if mask_ptrs is not None:
@@ -62,7 +55,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                 mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
         if not skip:
             k_mask = offs_n[None, :] < (kv_len - start_n)
-            k = tl.load(K_ptrs, mask=k_mask)
+            k = tl.load(K_ptrs, mask=k_mask, cache_modifier=cache_modifier)
             k_scale = tl.load(K_scale_ptr)
 
             qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
@@ -85,14 +78,14 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
             
             acc = acc * alpha[:, None]
             
-            v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
+            v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n), cache_modifier=cache_modifier)
             p = p.to(tl.float16)
             
             acc += tl.dot(p, v, out_dtype=tl.float16)   
             m_i = m_ij
-        K_ptrs += BLOCK_N * stride_kn
+        K_ptrs += BLOCK_SIZE_N * stride_kn
         K_scale_ptr += 1
-        V_ptrs += BLOCK_N * stride_vn
+        V_ptrs += BLOCK_SIZE_N * stride_vn
     return acc, l_i, m_i
 
 @triton.jit(repr=_attn_fwd_repr)
@@ -104,21 +97,22 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
               stride_maskz, stride_maskh, stride_maskm, stride_maskn,
               qo_len, kv_len, H: tl.constexpr, num_kv_groups: tl.constexpr,
               HEAD_DIM: tl.constexpr,  
-              BLOCK_M: tl.constexpr,  
-              BLOCK_N: tl.constexpr,  
-              STAGE: tl.constexpr,
+              BLOCK_SIZE_M: tl.constexpr,  
+              BLOCK_SIZE_N: tl.constexpr,  
+              num_stages: tl.constexpr,
               RETURN_LSE: tl.constexpr,
+              cache_modifier: tl.constexpr,
               ):
     start_m = tl.program_id(0)
 
     off_z = tl.program_id(2).to(tl.int64)
     off_h = tl.program_id(1).to(tl.int64)
 
-    q_scale_offset = (off_z * H + off_h) * tl.cdiv(qo_len, BLOCK_M)
-    k_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * tl.cdiv(kv_len, BLOCK_N)  
+    q_scale_offset = (off_z * H + off_h) * tl.cdiv(qo_len, BLOCK_SIZE_M)
+    k_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * tl.cdiv(kv_len, BLOCK_SIZE_N)  
     
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
+    offs_m = start_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, HEAD_DIM)
     Q_ptrs = Q + (off_z * stride_qz + off_h * stride_qh) + offs_m[:, None] * stride_qn + offs_k[None, :]
     Q_scale_ptr = Q_scale + q_scale_offset + start_m
@@ -131,16 +125,17 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
     else:
         mask_ptrs = mask + (off_z * stride_maskz + off_h * stride_maskh) + offs_m[:, None] * stride_maskm + offs_n[None, :] * stride_maskn
 
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    m_i = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_SIZE_M, HEAD_DIM], dtype=tl.float32)
     
     q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
     q_scale = tl.load(Q_scale_ptr)
     acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
                                     start_m, mask_ptrs, stride_maskn,
-                                    BLOCK_M, HEAD_DIM, BLOCK_N,  
-                                    4 - STAGE, offs_m, offs_n 
+                                    BLOCK_SIZE_M, HEAD_DIM, BLOCK_SIZE_N,  
+                                    num_stages, offs_m, offs_n,
+                                    cache_modifier,
                                     )
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
