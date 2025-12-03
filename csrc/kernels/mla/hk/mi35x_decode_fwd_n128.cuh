@@ -157,19 +157,16 @@ inline __device__ void async_load_k(uintptr_t p_lds_k_nope,
     if((kCheckBoundary == false) || (kv_indices_base < kv_end))
     {
         const int32_t rows[kNumRowsPerWarp] = {
-            __builtin_amdgcn_readfirstlane(p_kv_indices[kv_indices_base + 0]),
+            p_kv_indices[kv_indices_base + 0],
             kCheckBoundary
-                ? __builtin_amdgcn_readfirstlane(
-                      ((kv_indices_base + 1) < kv_end) ? p_kv_indices[kv_indices_base + 1] : -1)
-                : __builtin_amdgcn_readfirstlane(p_kv_indices[kv_indices_base + 1]),
+                ? (((kv_indices_base + 1) < kv_end) ? p_kv_indices[kv_indices_base + 1] : -1)
+                : p_kv_indices[kv_indices_base + 1],
             kCheckBoundary
-                ? __builtin_amdgcn_readfirstlane(
-                      ((kv_indices_base + 2) < kv_end) ? p_kv_indices[kv_indices_base + 2] : -1)
-                : __builtin_amdgcn_readfirstlane(p_kv_indices[kv_indices_base + 2]),
+                ? (((kv_indices_base + 2) < kv_end) ? p_kv_indices[kv_indices_base + 2] : -1)
+                : p_kv_indices[kv_indices_base + 2],
             kCheckBoundary
-                ? __builtin_amdgcn_readfirstlane(
-                      ((kv_indices_base + 3) < kv_end) ? p_kv_indices[kv_indices_base + 3] : -1)
-                : __builtin_amdgcn_readfirstlane(p_kv_indices[kv_indices_base + 3]),
+                ? (((kv_indices_base + 3) < kv_end) ? p_kv_indices[kv_indices_base + 3] : -1)
+                : p_kv_indices[kv_indices_base + 3],
         };
 
         // Load NOPE
@@ -187,22 +184,24 @@ inline __device__ void async_load_k(uintptr_t p_lds_k_nope,
             kNumBytesPerThreadPerRoundNope * ckt::get_warp_size();
         const int32_t offset_in_warp = lane_idx * kNumBytesPerThreadPerRoundNope;
 
-        ckt::static_for<0, kNumRowsPerWarp * T::kQkNopeHeadDim, kNumBytesPerWarpPerRound>{}(
-            [&](auto rid) {
-                const int32_t didx        = rid.value + lane_idx * kNumBytesPerThreadPerRoundNope;
-                const int32_t row         = rows[didx / T::kQkNopeHeadDim];
-                const int32_t col         = didx % T::kQkNopeHeadDim;
-                uintptr_t p_lds_warp_nope = p_lds_warp_nope_base + rid.value;
-                const int64_t voffset_nope =
-                    (row == -1) ? 0x80000000 : ((int64_t)row * T::kQkHeadDim + col);
-                hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                                    (as3_uint32_ptr)(p_lds_warp_nope),
-                                                    kNumBytesPerThreadPerRoundNope,
-                                                    voffset_nope,
-                                                    0,
-                                                    0,
-                                                    0);
-            });
+#pragma unroll
+        for(int32_t rid = 0; rid < kNumRowsPerWarp * T::kQkNopeHeadDim;
+            rid += kNumBytesPerWarpPerRound)
+        {
+            const int32_t didx        = rid + lane_idx * kNumBytesPerThreadPerRoundNope;
+            const int32_t row         = rows[didx / T::kQkNopeHeadDim];
+            const int32_t col         = didx % T::kQkNopeHeadDim;
+            uintptr_t p_lds_warp_nope = p_lds_warp_nope_base + rid;
+            const int32_t voffset_nope =
+                (kCheckBoundary && (row == -1)) ? 0x80000000 : (row * T::kQkHeadDim + col);
+            hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                                (as3_uint32_ptr)(p_lds_warp_nope),
+                                                kNumBytesPerThreadPerRoundNope,
+                                                voffset_nope,
+                                                0,
+                                                0,
+                                                0);
+        }
 
         // Load ROPE
         const int32_t sub_warp_rope_idx          = lane_idx >> 0x4;
@@ -211,10 +210,10 @@ inline __device__ void async_load_k(uintptr_t p_lds_k_nope,
         static_assert(kNumBytesPerThreadRope == 4);
         const int32_t row_rope = rows[sub_warp_rope_idx];
         const int32_t col_rope = sub_lane_rope_idx * kNumBytesPerThreadRope;
-        const int64_t voffset_rope =
-            (row_rope == -1)
+        const int32_t voffset_rope =
+            (kCheckBoundary && (row_rope == -1))
                 ? 0x80000000
-                : ((int64_t)row_rope * T::kQkHeadDim + col_rope + T::kQkNopeHeadDim) * sizeof(kv_t);
+                : (row_rope * T::kQkHeadDim + col_rope + T::kQkNopeHeadDim) * sizeof(kv_t);
         uintptr_t p_lds_warp_rope =
             p_lds_k_rope + warp_idx * kNumRowsPerWarp * T::kQkRopeHeadDim * sizeof(kv_t);
         hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
