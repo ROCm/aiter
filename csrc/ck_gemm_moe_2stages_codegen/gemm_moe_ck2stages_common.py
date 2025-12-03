@@ -252,6 +252,7 @@ a16w16_gemm2_kernels_list= {
      8: kernelInstanceGEMM2(       256,        64,       128,        64,     1,       4,         3,),
      9: kernelInstanceGEMM2(       256,        64,        64,        64,     1,       4,         1,),
     10: kernelInstanceGEMM2(       256,       128,        64,        64,     1,       4,         3,),
+    11: kernelInstanceGEMM2(       256,       256,        64,        64,     1,       4,         3,),
 }
 
 # gemm2 out:bf16/fp16 AB:fp8/i8
