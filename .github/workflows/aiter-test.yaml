@@ -101,7 +101,7 @@ jobs:
               fi \
            && pip install -r requirements.txt \
            && ls -al \
-           && PREBUILD_KERNELS=1 GPU_ARCHS=gfx950 python setup.py develop
+           && PREBUILD_KERNELS=3 GPU_ARCHS=gfx950 python setup.py develop
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
